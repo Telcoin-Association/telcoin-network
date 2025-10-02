@@ -46,7 +46,9 @@ pub(super) struct Peer {
     connection_direction: Option<ConnectionDirection>,
     /// Indicates if the peer is part of the node's kademlia routing table.
     ///
-    /// Routable peers are used to query kad records and are prioritized connections. Peer manager prioritizes non-routable peers during connection limit pruning. If a peer is not in the routing table and this node needs to prune connections, then the peer may be disconnected.
+    /// Routable peers are used to query kad records and are prioritized connections. Peer manager
+    /// prioritizes non-routable peers during connection limit pruning. If a peer is not in the
+    /// routing table and this node needs to prune connections, then the peer may be disconnected.
     routable: bool,
 }
 

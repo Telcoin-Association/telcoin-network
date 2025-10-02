@@ -22,14 +22,13 @@ impl NetworkBehaviour for PeerManager {
 
     fn handle_pending_outbound_connection(
         &mut self,
-        connection_id: ConnectionId,
+        _connection_id: ConnectionId,
         maybe_peer: Option<PeerId>,
-        addresses: &[Multiaddr],
-        effective_role: Endpoint,
+        addresses: &[Multiaddr], // kad may dial by PeerId only
+        _effective_role: Endpoint,
     ) -> Result<Vec<Multiaddr>, ConnectionDenied> {
         // kademlia can initiate dial attempts
-        error!(target: "peer-manager", ?connection_id, ?maybe_peer, ?addresses, ?effective_role, "pending outbound connection!!!");
-
+        //
         // ensure PeerId isn't banned if known and register dial attempt
         if let Some(peer_id) = maybe_peer {
             // PeerManager and Kad may initiate dials
@@ -38,6 +37,7 @@ impl NetworkBehaviour for PeerManager {
                 return Ok(vec![]);
             }
 
+            debug!(target: "peer-manager", ?peer_id, ?addresses, "kad initiated dial attempt for peer");
             // peer is not registered, ensure can be dialed
             if self.can_dial(&peer_id) {
                 trace!(target: "peer-manager", ?peer_id, "can_dial success");
@@ -50,18 +50,10 @@ impl NetworkBehaviour for PeerManager {
             }
         }
 
-        // ensure multiaddr contains ip that isn't banned
-        debug!(target: "peer-manager", ?addresses, "sanitizing addresses:");
-        self.sanitize_pending_connection(addresses)?;
-
-        // TODO
+        // do not check peer connection limits since kad may try to find better peers for routing
+        // excess peers are pruned next heartbeat
         //
-        //
-        // - check peer limits?
-        //      - what if kad has to dial this peer anyway?
-        //      - how to sync peer counts?
-
-        // NOTE: kademplia extends addresses by default
+        // NOTE: kademlia extends addresses by default
         // See swarm `WithPeerId::build` -> DialOpts
         Ok(vec![])
     }
@@ -73,7 +65,8 @@ impl NetworkBehaviour for PeerManager {
         _local_addr: &Multiaddr,
         remote_addr: &Multiaddr,
     ) -> Result<(), ConnectionDenied> {
-        self.sanitize_pending_connection(&[remote_addr.clone()])
+        debug!(target: "network", ?remote_addr, "handle pending inbound connection");
+        self.sanitize_ip_addr(remote_addr)
     }
 
     fn handle_established_inbound_connection(
@@ -105,6 +98,9 @@ impl NetworkBehaviour for PeerManager {
             error!(target: "peer-manager", ?peer, ?addr, "established outbound connection with banned peer - disconnecting...");
             return Err(ConnectionDenied::new("peer is banned"));
         }
+
+        // kad may dial peers by PeerId only, so always santize ban IPs after connection established
+        self.sanitize_ip_addr(addr)?;
 
         Ok(ConnectionHandler)
     }
@@ -191,13 +187,11 @@ impl NetworkBehaviour for PeerManager {
 }
 
 impl PeerManager {
-    /// Logic to ensure a pending connection supports ipv4 or ipv6, and that the ip address isn't banned.
-    fn sanitize_pending_connection(
-        &self,
-        remote_addr: &[Multiaddr],
-    ) -> Result<(), ConnectionDenied> {
+    /// Logic to ensure a pending connection supports ipv4 or ipv6, and that the ip address isn't
+    /// banned.
+    fn sanitize_ip_addr(&self, remote_addr: &Multiaddr) -> Result<(), ConnectionDenied> {
         // only support ipv4 and ipv6
-        if !self.has_valid_unbanned_ips(remote_addr) {
+        if !self.has_valid_unbanned_ips(&[remote_addr.clone()]) {
             return Err(ConnectionDenied::new(
                 "Connection denied: peer has no valid unbanned IP addresses".to_string(),
             ));
@@ -243,6 +237,9 @@ impl PeerManager {
         // TODO: Issue #254 update metrics
 
         // check connection limits
+        let x = self.peer_limit_reached(endpoint);
+        let y = self.peer_is_important(&peer_id);
+        tracing::warn!(target: "network", ?x, ?y, "delete me");
         if self.peer_limit_reached(endpoint) && !self.peer_is_important(&peer_id) {
             debug!(target: "peer-manager", ?peer_id, "peer limit reached - disconnecting with PX");
             // gracefully disconnect and indicate excess peers

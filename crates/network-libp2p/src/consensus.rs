@@ -21,7 +21,7 @@ use libp2p::{
         TopicHash,
     },
     identify::{self, Event as IdentifyEvent, Info as IdentifyInfo},
-    kad::{self, store::RecordStore, Mode, QueryId, RoutingUpdate},
+    kad::{self, store::RecordStore, Mode, QueryId},
     multiaddr::Protocol,
     request_response::{
         self, Codec, Event as ReqResEvent, InboundFailure as ReqResInboundFailure,
@@ -410,11 +410,6 @@ where
                 kad::Quorum::One,
             );
 
-            //
-            // TODO: do we need to do this every time we publish to peer?
-            // - this could get noisy
-            // - need to understand `put_record_to` implications
-            //
             // Also publish our record locally and to the network.
             if let Err(err) =
                 self.swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One)
@@ -494,16 +489,6 @@ where
                     return Err(NetworkError::AllListenersClosed);
                 }
             }
-            SwarmEvent::Dialing { peer_id, connection_id } => {
-                // kad initiates dial attempts
-                // - register
-                // TNBehavior::handle_pending_outbound_connection
-                error!(target: "peer-manager", ?peer_id, ?connection_id, "DIALING PEER!!!");
-            }
-            // TODO: kad emits SwarmEvent::NewExternalAddrOfPeer - update PM here?
-            // - no, do this on routing updated?
-            // - this should match node record
-            //
             // other events handled by peer manager and other behaviors
             _ => {}
         }
@@ -683,11 +668,18 @@ where
                 let res = self.swarm.disconnect_peer_id(peer_id);
                 send_or_log_error!(reply, res, "DisconnectPeer");
             }
-            NetworkCommand::PeerExchange { peers, channel } => {
+            NetworkCommand::PeerExchange { peer, peers, channel } => {
+                debug!(target: "network", ?peers, "processing peer exchange");
                 self.swarm.behaviour_mut().peer_manager.process_peer_exchange(peers);
                 // send empty ack and ignore errors
                 let ack = PeerExchangeMap::default().into();
                 let _ = self.swarm.behaviour_mut().req_res.send_response(channel, ack);
+
+                // expect sender to temp ban this node
+                // initiate disconnect from this peer to prevent redial attempts
+                if let Some((peer_id, _)) = self.swarm.behaviour().peer_manager.auth_to_peer(peer) {
+                    self.swarm.behaviour_mut().peer_manager.disconnect_peer(peer_id, false);
+                }
             }
             NetworkCommand::PeersForExchange { reply } => {
                 let peers = self.swarm.behaviour_mut().peer_manager.peers_for_exchange();
@@ -844,17 +836,18 @@ where
             ReqResEvent::Message { peer, message, connection_id: _ } => {
                 match message {
                     request_response::Message::Request { request_id, request, channel } => {
+                        debug!(target: "network", ?peer, ?request, "request received");
                         // We should not be able to recieve a message from an unknown peer so this
                         // should always work. It is possible (mostly in
                         // testing) to have a race where we don't know the requester YET.
                         // If so send an error back but this should be so infrequent on a real
                         // network that we can ignore and it should not
                         // cause any lasting damage if triggered.
-                        if let Some(peer) = self.swarm.behaviour().peer_manager.peer_to_bls(&peer) {
+                        if let Some(bls) = self.swarm.behaviour().peer_manager.peer_to_bls(&peer) {
                             let (notify, cancel) = oneshot::channel();
                             // forward request to handler without blocking other events
                             if let Err(e) = self.event_stream.try_send(NetworkEvent::Request {
-                                peer,
+                                peer: bls,
                                 request,
                                 channel,
                                 cancel,
@@ -876,7 +869,7 @@ where
                                 let _ = channel.send(());
                             }
                         } else if let Err(e) = self.event_stream.try_send(NetworkEvent::Error(
-                            "requesting peer unknown".to_string(),
+                            format!("requesting peer unknown: {peer:?}"),
                             channel,
                         )) {
                             error!(target: "network", topics=?self.authorized_publishers.keys(), ?request_id, ?e, "failed to forward request!");
@@ -906,6 +899,7 @@ where
                 // px attempts to support peer discovery, but failures are okay
                 // this node disconnects after a px timeout
                 if self.pending_px_disconnects.remove(&request_id).is_some() {
+                    debug!(target: "network", "outbound failure expected because of px disconnect");
                     return Ok(());
                 }
 
@@ -919,7 +913,8 @@ where
                     .map(|ack| ack.send(Err(error.into())));
             }
             ReqResEvent::InboundFailure { peer, request_id, error, connection_id: _ } => {
-                debug!(target: "network", ?peer, ?error, "Inbound failure for req/res");
+                debug!(target: "network", ?peer, ?error, pending=?self.inbound_requests, "Inbound failure for req/res");
+                debug!(target: "network", my_id=?self.swarm.local_peer_id(), "this node");
                 match error {
                     ReqResInboundFailure::Io(e) => {
                         // penalize peer since this is an attack surface
@@ -954,7 +949,11 @@ where
                 }
             }
 
-            ReqResEvent::ResponseSent { .. } => {}
+            ReqResEvent::ResponseSent { request_id, .. } => {
+                if let Some(channel) = self.inbound_requests.remove(&request_id) {
+                    let _ = channel.send(());
+                }
+            }
         }
 
         Ok(())
@@ -994,6 +993,9 @@ where
                 // remove from request-response
                 // NOTE: gossipsub/identify handle `FromSwarm::ConnectionClosed`
                 let _ = self.swarm.disconnect_peer_id(peer_id);
+
+                // remove from kad routing table
+                self.swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
             }
             PeerEvent::PeerDisconnected(peer_id) => {
                 debug!(target: "network", ?peer_id, "peer disconnected event from peer manager");
@@ -1034,6 +1036,7 @@ where
                 }
             }
             PeerEvent::DisconnectPeerX(peer_id, peer_exchange) => {
+                debug!(target: "peer-manager", ?peer_id, "disconnecting from peer with exchange info");
                 // attempt to exchange peer information if limits allow
                 if self.pending_px_disconnects.len() < self.config.max_px_disconnects {
                     let (reply, done) = oneshot::channel();
@@ -1062,6 +1065,9 @@ where
                     let _ = self.swarm.disconnect_peer_id(peer_id);
                 }
 
+                // remove peer from kad - will redial if necessary
+                self.swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
+
                 // remove from connected peers
                 self.connected_peers.retain(|peer| *peer != peer_id);
             }
@@ -1070,27 +1076,7 @@ where
                 // NOTE: gossipsub handles `FromSwarm::ConnectionEstablished`
                 self.swarm.add_peer_address(peer_id, addr.clone());
                 // add as a kademlia peer
-                let routing_update =
-                    self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
-                match routing_update {
-                    RoutingUpdate::Success => {
-                        trace!(target: "network-kad", ?routing_update, ?peer_id, "peer added to routing table");
-                        // TODO: update peer to indicate they are in kbucket
-                        // - ensure this is updated when old peer replaced by kad as well in RoutingUpdated event
-                    }
-                    _ => {
-                        // do nothing
-                        trace!(target: "network-kad", ?routing_update, ?peer_id, "routing updated for peer add_address");
-                    }
-                }
-                // TODO: pass routing update to PM for prioritizing prune operations
-                // - heirarchy:
-                //      - success
-                //          - update here or when RoutingUpdated event?
-                //      - pending
-                //      - failed
-
-                // TODO: publish data here to PUSH or PULL?
+                self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
                 self.publish_our_data_to_peer(peer_id);
 
                 // manage connected peers for
@@ -1098,14 +1084,8 @@ where
 
                 // if this is a trusted/validator (important) peer, mark it as explicit in gossipsub
                 if self.swarm.behaviour().peer_manager.peer_is_important(&peer_id) {
-                    // TODO: is this a potential issue with lots of validators?
-                    // - only validators on the gossip network?
                     self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                 }
-
-                // TODO: request record here
-                // - if record is invalid, the normal flow should cause disconnect
-                // - connecting with peer first also improves changes of retrieving record
             }
             PeerEvent::Banned(peer_id) => {
                 warn!(target: "network", ?peer_id, "peer banned");
@@ -1128,7 +1108,6 @@ where
             }
             PeerEvent::Discovery => {
                 let peer_id = PeerId::random();
-                // TODO: save query id?
                 self.swarm.behaviour_mut().kademlia.get_closest_peers(peer_id);
             }
         }
@@ -1160,6 +1139,23 @@ where
                     kad::InboundRequest::GetRecord { num_closer_peers: _, present_locally: _ } => {}
                     kad::InboundRequest::PutRecord { source, connection: _, record } => {
                         if let Some(record) = record {
+                            // check if source or publisher are banned
+                            let publisher_is_banned = record
+                                .publisher
+                                .map(|peer| self.swarm.behaviour().peer_manager.peer_banned(&peer))
+                                .unwrap_or(true); // reject records without publisher
+                            let source_is_banned =
+                                self.swarm.behaviour().peer_manager.peer_banned(&source);
+
+                            // reject record
+                            if publisher_is_banned || source_is_banned {
+                                // race condition
+                                self.swarm.behaviour_mut().kademlia.remove_record(&record.key);
+                                // self.swarm.behaviour_mut().kademlia.
+                                // todo!();
+                                return Ok(());
+                            }
+
                             if let Some((key, value)) = self.peer_record_valid(&record) {
                                 self.swarm
                                     .behaviour_mut()
@@ -1274,9 +1270,6 @@ where
                     kad::QueryResult::StartProviding(Err(err)) => {
                         error!(target: "network-kad", "Failed to put provider record: {err:?}");
                     }
-                    kad::QueryResult::Bootstrap(Ok(todo)) => {
-                        // todo!()
-                    }
                     kad::QueryResult::GetClosestPeers(Ok(result)) => {
                         // process peers for potential discovery attempts
                         debug!(target: "network-kad", ?result, "GetClosestPeers for discovery");
@@ -1289,79 +1282,34 @@ where
                 }
             }
             kad::Event::RoutingUpdated { peer, is_new_peer, addresses, bucket_range, old_peer } => {
-                // let behaviour = self.swarm.behaviour_mut();
-                // if behaviour.peer_manager.peer_banned(&peer) {
-                //     behaviour.kademlia.remove_peer(&peer);
-                //     warn!(target: "network-kad", "Removing banned peer from routing peer {peer:?} addresses {addresses:?}")
-                // }
-                // debug!(target: "network-kad", "routing updated peer {peer:?} new {is_new_peer} addrs {addresses:?} bucketr {bucket_range:?} old {old_peer:?}")
+                debug!(target: "network-kad", "routing updated peer {peer:?} new {is_new_peer} addrs {addresses:?} bucketr {bucket_range:?} old {old_peer:?}");
 
-                // TODO: if old_peer, then kad removed from routing table
-                // - should PM be notified to prioritize them for disconnect?
-                //
-                // - if !is_new_peer, the addresses updated
-                //      - notify PM
+                // update newly added peer
+                if is_new_peer {
+                    self.swarm.behaviour_mut().peer_manager.update_routing_for_peer(&peer, true);
 
-                // TODO:
-                // this is triggerd when `add_address` is called on Kad
-                //  - this should happen on peer connected PM event
-                //      - confirmed this is the current approach, so good here
-                //  - see `add_address` doc comment for additional considerations
-                //
-                // - this also happens when the kbucket entry is already present in kad::on_connection
-                //      - is_new_peer = false
-                //      - call PM to check update IP addresses
-                //          - ensure none are banned, otherwise disconnect
-                //
-                //
-                // TODO: update old_peer in PM as candidate for pruning
-                // flow:
-                //  - kad discovers better peer
-                // - initiates dial attempt
-                //      - PM does not filter dials based on target counts
-                // - connection established, evict old_peer
-                // - updated peer info to indicate no longer part of the routing table
-                // - pruning will prioritize peers that aren't part of kad
-                //      - should be okay since target peer count is higher than K-target
-                // - this method will always update peer's routing status bc it is always emitted after successful add_address
-
-                // TODO: add to peer manager - see issue #301
-                if self.swarm.behaviour().peer_manager.peer_is_important(&peer) {
-                    // add to kad cache #301
-                }
-
-                // update routable peer
-                self.swarm.behaviour_mut().peer_manager.update_routing_for_peer(&peer, true);
-
-                // update old peer if evicted from routing table
-                if let Some(old) = old_peer {
-                    self.swarm.behaviour_mut().peer_manager.update_routing_for_peer(&old, false);
+                    // update old peer if evicted from routing table
+                    if let Some(old) = old_peer {
+                        self.swarm
+                            .behaviour_mut()
+                            .peer_manager
+                            .update_routing_for_peer(&old, false);
+                    }
                 }
             }
             kad::Event::UnroutablePeer { peer } => {
                 // unknown peer queried a record - noop
-                debug!(target: "network-kad", "unroutable peer {peer:?}")
+                trace!(target: "network-kad", "unroutable peer {peer:?}")
             }
             kad::Event::RoutablePeer { peer, address } => {
-                // kad discovered a new peer
-                debug!(target: "network-kad", "routable peer {peer:?}/{address:?}");
-
-                // TODO: does kademlia enforce strict peer id verification?
-
-                // notify peer manager
-                // self.swarm.behaviour_mut().peer_manager.process_routable_peer(peer, address);
-
-                // see L1323 `on_connection_updated`:
-                // - this is what to do, except L1409:
-                //      - pass dial to PM, not swarm
+                // kad discovered a new peer - peer is added to table on `PeerEvent::Connected`
+                trace!(target: "network-kad", "routable peer {peer:?}/{address:?}");
             }
             kad::Event::PendingRoutablePeer { peer, address } => {
-                debug!(target: "network-kad", "pending routable peer {peer:?}/{address:?}")
-                // TODO: should this also notify peer manager?
-                //  - confirm default kad flow
+                trace!(target: "network-kad", "pending routable peer {peer:?}/{address:?}")
             }
             kad::Event::ModeChanged { new_mode } => {
-                debug!(target: "network-kad", "mode changed {new_mode:?}")
+                trace!(target: "network-kad", "mode changed {new_mode:?}")
             }
         }
         Ok(())

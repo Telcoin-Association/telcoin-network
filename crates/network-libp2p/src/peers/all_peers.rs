@@ -705,7 +705,8 @@ impl AllPeers {
 
     /// Sort connected peers considering both score and Kademlia routing table status.
     ///
-    /// The shuffle ensures peers with equal scores are sorted in a random order. Peers with the lowest score and are not part of the kademlia table are prioritized.
+    /// The shuffle ensures peers with equal scores are sorted in a random order. Peers with the
+    /// lowest score and are not part of the kademlia table are prioritized.
     pub(super) fn connected_peers_by_score_and_routability(&self) -> Vec<(&PeerId, &Peer)> {
         let mut connected_peers: Vec<_> =
             self.peers.iter().filter(|(_, peer)| peer.connection_status().is_connected()).collect();

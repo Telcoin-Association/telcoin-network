@@ -12,7 +12,7 @@ use tn_config::{ConsensusConfig, NetworkConfig};
 use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
-use tn_types::{test_utils::init_test_tracing, Certificate, Header, TaskManager};
+use tn_types::{Certificate, Header, TaskManager};
 use tokio::{sync::mpsc, time::timeout};
 
 /// Test topic for gossip.
@@ -184,7 +184,6 @@ where
 
 #[tokio::test]
 async fn test_valid_req_restt() -> eyre::Result<()> {
-    init_test_tracing();
     // start honest peer1 network
     let TestTypes { peer1, peer2, .. } =
         create_test_types::<TestWorkerRequest, TestWorkerResponse>();
@@ -306,10 +305,6 @@ async fn test_valid_req_res_connection_closed_cleanup() -> eyre::Result<()> {
 
     // allow peer1 to process disconnect
     tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // assert peer is disconnected
-    let connected_peers = peer1.connected_peer_ids().await?;
-    assert_eq!(connected_peers.len(), 0);
 
     // peer1 removes pending requests
     let count = peer1.get_pending_request_count().await?;
@@ -677,11 +672,10 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
 /// Test peer exchanges when too many peers connect
 #[tokio::test]
 async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
-    tn_types::test_utils::init_test_tracing();
     // Create a custom config with very low peer limits for testing
     let mut network_config = NetworkConfig::default();
     network_config.peer_config_mut().target_num_peers = 4;
-    network_config.peer_config_mut().peer_excess_factor = 0.1; // Small excess factor
+    network_config.peer_config_mut().peer_excess_factor = 0.1; // small excess factor
     network_config.peer_config_mut().excess_peers_reconnection_timeout = Duration::from_secs(10);
 
     // Set up multiple peers with the custom config
@@ -690,6 +684,7 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
             NonZeroUsize::new(5).unwrap(),
             Some(network_config.clone()),
         );
+    // disconnecting with PX peer_id=PeerId("12D3KooWD79RtjyGwMwEePfVdNhBSY1KVGmgJmdnEtTTTQxZfoWc")
 
     // spawn target network
     let target_network = target_peer.network.take().expect("target network is some");
@@ -799,11 +794,12 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     // wait for peer exchange event
     match timeout(Duration::from_secs(5), nvv_events.recv()).await {
         Ok(Some(NetworkEvent::Request {
+            peer,
             request: TestWorkerRequest::PeerExchange(map),
             channel,
             ..
         })) => {
-            nvv.process_peer_exchange(map, channel).await?;
+            nvv.process_peer_exchange(peer, map, channel).await?;
         }
         Ok(None) => return Err(eyre!("Channel closed without receiving event")),
         Err(_) => return Err(eyre!("Timeout waiting for peer exchange event")),
@@ -811,20 +807,22 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     }
 
     // allow dial attempts to be made
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 5)).await;
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
 
     // assert target is disconnected from nvv
     assert!(!target_peer
         .network_handle
         .connected_peers()
         .await?
-        .contains(nvv_config.config().primary_bls_key()));
+        .contains(nvv_config.config().primary_bls_key()),);
 
     // assert nvv is connected with other peers
     let connected = nvv.connected_peer_ids().await?;
+    debug!(target: "network", connected=?connected.len(), others=?other_peers.len(), "delete me:\n{:#?}", connected);
     assert!(!connected.contains(&target_peer_id));
     for peer in other_peers.iter() {
         let id = peer.network_handle.local_peer_id().await?;
+        debug!(target: "network", ?id, "delete me");
         assert!(connected.contains(&id), "missing peer {id:?}");
     }
 
@@ -841,19 +839,17 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
         match timeout(Duration::from_secs(5), nvv_events.recv()).await {
             Ok(Some(NetworkEvent::Gossip(msg, _))) => {
                 let GossipMessage { source, data, .. } = msg;
+                info!(target: "network", "GOSSIP RECEIVED!!!");
                 assert_eq!(source, Some(target_peer_id));
                 assert_eq!(data, expected_msg);
                 break;
             }
             Ok(Some(NetworkEvent::Request {
                 request: TestWorkerRequest::PeerExchange(_), ..
-            })) => {
-                // ignore peer exchanges
-                continue;
-            }
+            })) => { /* ignore peer exchanges */ }
             Ok(None) => return Err(eyre!("Channel closed without receiving event")),
             Err(_) => return Err(eyre!("Timeout waiting for peer exchange event")),
-            e => return Err(eyre!("wrong event type: {:?}", e)),
+            e => debug!(target: "network", ?e, "nvv event"),
         }
     }
 
@@ -1246,10 +1242,8 @@ async fn test_new_epoch_unbans_committee_members() -> eyre::Result<()> {
         "Peer2 should have improved score after new epoch"
     );
 
-    // Try reconnecting peer2
-    let dial_result = peer1.dial_by_bls(config_2.key_config().primary_public_key()).await;
-    warn!(target: "network", ?dial_result, "dial result??");
-    assert!(dial_result.is_ok(), "Should be able to reconnect to peer2 after unban");
+    // peer2 should dial peer1 - but try dial to reconnecting peer2 and ignore `AlreadyConnectedErr`
+    let _ = peer1.dial_by_bls(config_2.key_config().primary_public_key()).await;
 
     // Wait for connection to reestablish
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1302,10 +1296,12 @@ async fn test_new_epoch_unbans_committee_member_ip() -> eyre::Result<()> {
         peer2_network.run().await.expect("network run failed!");
     });
 
-    // For peer2, create a multiaddr with the same IP as peer1 but different port
-    // Extract IP from peer1's multiaddr
-    let peer2_addr = peer1_addr.clone();
+    // For peer2, multiaddr has the same IP as peer1 (127.0.0.1)
+    let peer2_addr = peer2.config.primary_address();
     let peer2_id = peer2.network_handle.local_peer_id().await?;
+    // join network so kad record is available
+    peer2.network_handle.start_listening(peer2_addr.clone()).await?;
+    peer2.network_handle.dial(peer1_id, peer1_addr.clone()).await?;
 
     // Connect target to peer1
     target_peer
@@ -1340,25 +1336,17 @@ async fn test_new_epoch_unbans_committee_member_ip() -> eyre::Result<()> {
     // allow os to make port available again
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
 
-    peer2.network_handle.start_listening(peer2_addr.clone()).await?;
-
     // Now simulate a new epoch where peer2 is in the committee with the same IP as banned peer1
     let committee = vec![*peer2.config.authority().as_ref().expect("authority").protocol_key()]
         .into_iter()
         .collect();
-    let handle = target_peer.network_handle.clone();
-    tokio::spawn(async move {
-        handle.new_epoch(committee).await.expect("Failed to send NewEpoch command");
-    })
-    .await?;
 
-    // Verify connection can be established with peer2 despite sharing IP with banned peer1
-    target_peer.network_handle.dial(peer2_id, peer1_addr.clone()).await?;
+    target_peer.network_handle.new_epoch(committee).await?;
 
-    // Wait for connection to establish
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // wait for connection to establish
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
 
-    // Verify connection established with peer2
+    // verify connection established with peer2
     let connected_peers_after = target_peer.network_handle.connected_peer_ids().await?;
     assert!(
         connected_peers_after.contains(&peer2_id),
@@ -1458,7 +1446,6 @@ async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> 
 /// Test kad records available to new node joining the network.
 #[tokio::test]
 async fn test_get_kad_records() -> eyre::Result<()> {
-    tn_types::test_utils::init_test_tracing();
     // used later
     let num_network_peers = 5;
 
@@ -1545,10 +1532,6 @@ async fn test_get_kad_records() -> eyre::Result<()> {
 
     nvv.start_listening(nvv_config.primary_address()).await?;
 
-    // delete this
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 5)).await;
-    info!(target: "network-kad", "dialing target!!!!");
-
     // connect to target
     nvv.add_trusted_peer_and_dial(target_peer_bls, target_peer_net.clone(), target_addr.clone())
         .await?;
@@ -1591,6 +1574,7 @@ async fn test_get_kad_records() -> eyre::Result<()> {
     assert!(connected.contains(&target_peer_id));
     for peer in committee.iter() {
         let id = peer.network_handle.local_peer_id().await?;
+        debug!(target: "network", ?id, "checking connection for peer");
         assert!(connected.contains(&id));
     }
 

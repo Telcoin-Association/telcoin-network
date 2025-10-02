@@ -273,6 +273,8 @@ where
     },
     /// Process peer information and possibly discover new peers.
     PeerExchange {
+        /// The peer that initiated the exchange and will be temporarily banned.
+        peer: BlsPublicKey,
         /// Peers for discovery.
         peers: PeerExchangeMap,
         /// The libp2p response channel to send back an ack.
@@ -510,10 +512,11 @@ where
     /// receive peer exchange requests and pass them back to the peer manager.
     pub async fn process_peer_exchange(
         &self,
+        peer: BlsPublicKey,
         peers: PeerExchangeMap,
         channel: ResponseChannel<Res>,
     ) -> NetworkResult<()> {
-        self.sender.send(NetworkCommand::PeerExchange { peers, channel }).await?;
+        self.sender.send(NetworkCommand::PeerExchange { peer, peers, channel }).await?;
         Ok(())
     }
 
