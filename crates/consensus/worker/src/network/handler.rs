@@ -71,7 +71,7 @@ where
                 let store = self.consensus_config.node_storage();
                 if !matches!(store.get::<Batches>(&batch_hash), Ok(Some(_))) {
                     // If we don't have this batch already then try to get it.
-                    // If we are CVV then we should already have it.
+                    // If we are a CVV then we should already have it.
                     // This allows non-CVVs to pre fetch batches they will soon need.
                     match self.network_handle.request_batches(vec![batch_hash]).await {
                         Ok(batches) => {

@@ -1329,13 +1329,13 @@ where
         let rx_event_stream = self.worker_event_stream.subscribe();
         debug!(target: "epoch-manager", "spawning worker network for epoch");
 
-        let committe_keys: HashSet<BlsPublicKey> = consensus_config
+        let committee_keys: HashSet<BlsPublicKey> = consensus_config
             .committee()
             .authorities()
             .into_iter()
             .map(|a| *a.protocol_key())
             .collect();
-        network_handle.inner_handle().new_epoch(committe_keys).await?;
+        network_handle.inner_handle().new_epoch(committee_keys.clone()).await?;
 
         // start listening if the network needs to be initialized
         if *initial_epoch {
@@ -1376,6 +1376,15 @@ where
         network_handle
             .inner_handle()
             .subscribe(tn_config::LibP2pConfig::worker_txn_topic())
+            .await?;
+        // Get gossip from committee members about batches.
+        // Useful for non-CVVs to prefetch and harmless for CVVs.
+        network_handle
+            .inner_handle()
+            .subscribe_with_publishers(
+                tn_config::LibP2pConfig::worker_topic(),
+                committee_keys.into_iter().collect(),
+            )
             .await?;
 
         // spawn worker network
