@@ -1149,10 +1149,17 @@ where
 
                             // reject record
                             if publisher_is_banned || source_is_banned {
-                                // race condition
+                                // handle race condition with PM
                                 self.swarm.behaviour_mut().kademlia.remove_record(&record.key);
-                                // self.swarm.behaviour_mut().kademlia.
-                                // todo!();
+
+                                // assess penalty for pushing record without publisher
+                                if record.publisher.is_none() {
+                                    self.swarm
+                                        .behaviour_mut()
+                                        .peer_manager
+                                        .process_penalty(source, Penalty::Mild);
+                                }
+
                                 return Ok(());
                             }
 

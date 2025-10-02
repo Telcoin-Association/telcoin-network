@@ -1,7 +1,7 @@
 //! Configuration for network variables.
 
 use crate::{ConfigFmt, ConfigTrait, TelcoinDirs};
-use libp2p::{request_response::ProtocolSupport, StreamProtocol};
+use libp2p::{kad::K_VALUE, request_response::ProtocolSupport, StreamProtocol};
 use serde::{Deserialize, Serialize};
 use std::{sync::OnceLock, time::Duration};
 use tn_types::Round;
@@ -321,9 +321,12 @@ pub struct PeerConfig {
 
 impl Default for PeerConfig {
     fn default() -> Self {
+        // 50% more than kademlia target
+        let target_num_peers = (K_VALUE.get() / 2) + K_VALUE.get();
+
         Self {
             heartbeat_interval: 30,
-            target_num_peers: 30,
+            target_num_peers,
             dial_timeout: Duration::from_secs(15),
             min_score_for_disconnect: -20.0,
             min_score_for_ban: -50.0,

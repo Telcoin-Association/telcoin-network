@@ -34,6 +34,7 @@ impl NetworkBehaviour for PeerManager {
             // PeerManager and Kad may initiate dials
             // intercept kad dial attempts, sanitize, and register
             if self.dial_attempt_already_registered(&peer_id) {
+                // peer manager has already approved this dial attempt
                 return Ok(vec![]);
             }
 
@@ -44,7 +45,9 @@ impl NetworkBehaviour for PeerManager {
                 self.register_dial_attempt(peer_id, None);
             } else {
                 debug!(target: "peer-manager", ?peer_id, "can_dial failed");
-                return Err(ConnectionDenied::new("Outbound connection to peer denied: peer cannot be dialed".to_string()));
+                return Err(ConnectionDenied::new(
+                    "Outbound connection to peer denied: peer cannot be dialed".to_string(),
+                ));
             }
         }
 
@@ -235,9 +238,6 @@ impl PeerManager {
         // TODO: Issue #254 update metrics
 
         // check connection limits
-        let x = self.peer_limit_reached(endpoint);
-        let y = self.peer_is_important(&peer_id);
-        tracing::warn!(target: "network", ?x, ?y, "delete me");
         if self.peer_limit_reached(endpoint) && !self.peer_is_important(&peer_id) {
             debug!(target: "peer-manager", ?peer_id, "peer limit reached - disconnecting with PX");
             // gracefully disconnect and indicate excess peers

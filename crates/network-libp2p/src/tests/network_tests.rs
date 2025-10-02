@@ -684,7 +684,6 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
             NonZeroUsize::new(5).unwrap(),
             Some(network_config.clone()),
         );
-    // disconnecting with PX peer_id=PeerId("12D3KooWD79RtjyGwMwEePfVdNhBSY1KVGmgJmdnEtTTTQxZfoWc")
 
     // spawn target network
     let target_network = target_peer.network.take().expect("target network is some");
@@ -760,14 +759,6 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     tokio::spawn(async move {
         network.run().await.expect("network run failed!");
     });
-    debug!(target: "network", "all ids");
-    debug!(target: "network", ?target_peer_id);
-    for peer in &other_peers {
-        let peer_id = peer.network_handle.local_peer_id().await?;
-        debug!(target: "network", ?peer_id);
-    }
-    let nvv_id = nvv.local_peer_id().await?;
-    debug!(target: "network", ?nvv_id);
 
     target_peer
         .network_handle
@@ -818,7 +809,6 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
 
     // assert nvv is connected with other peers
     let connected = nvv.connected_peer_ids().await?;
-    debug!(target: "network", connected=?connected.len(), others=?other_peers.len(), "delete me:\n{:#?}", connected);
     assert!(!connected.contains(&target_peer_id));
     for peer in other_peers.iter() {
         let id = peer.network_handle.local_peer_id().await?;
@@ -839,7 +829,6 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
         match timeout(Duration::from_secs(5), nvv_events.recv()).await {
             Ok(Some(NetworkEvent::Gossip(msg, _))) => {
                 let GossipMessage { source, data, .. } = msg;
-                info!(target: "network", "GOSSIP RECEIVED!!!");
                 assert_eq!(source, Some(target_peer_id));
                 assert_eq!(data, expected_msg);
                 break;
@@ -1551,7 +1540,6 @@ async fn test_get_kad_records() -> eyre::Result<()> {
     // find other committee members through kad
     let authorities: Vec<BlsPublicKey> =
         committee.iter().map(|peer| peer.config.key_config().primary_public_key()).collect();
-    info!(target: "network", "finding authorities!!!");
     let node_records = nvv.find_authorities(authorities.clone()).await?;
 
     for record in node_records {

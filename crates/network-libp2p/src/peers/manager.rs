@@ -488,7 +488,7 @@ impl PeerManager {
     /// removed until excess peer count reaches target.
     fn prune_connected_peers(&mut self) {
         // connected peers sorted from lowest to highest aggregate score
-        // peers that do not participate in the kad routing table are prioritized as well
+        // peers that do not participate in the kad routing table are prioritized for disconnect
         let connected_peers = self.peers.connected_peers_by_score_and_routability();
         let mut excess_peer_count =
             connected_peers.len().saturating_sub(self.config.target_num_peers);
