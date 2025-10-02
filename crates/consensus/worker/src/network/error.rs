@@ -29,6 +29,9 @@ pub enum WorkerNetworkError {
     /// The peer's request is invalid.
     #[error("{0}")]
     InvalidRequest(String),
+    /// Invalid topic- something was published to the wrong topic.
+    #[error("Gossip was published to the wrong topic")]
+    InvalidTopic,
 }
 
 impl From<WorkerNetworkError> for Option<Penalty> {
@@ -63,7 +66,9 @@ impl From<WorkerNetworkError> for Option<Penalty> {
             // may occur at epoch boundaries
             WorkerNetworkError::NonCommitteeBatch => Some(Penalty::Medium),
             // fatal
-            WorkerNetworkError::Decode(_) => Some(Penalty::Fatal),
+            WorkerNetworkError::InvalidTopic | WorkerNetworkError::Decode(_) => {
+                Some(Penalty::Fatal)
+            }
             // ignore
             WorkerNetworkError::Timeout(_)
             | WorkerNetworkError::Network(_)

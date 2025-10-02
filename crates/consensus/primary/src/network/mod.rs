@@ -80,7 +80,7 @@ impl PrimaryNetworkHandle {
         key: BlsPublicKey,
         signature: BlsSignature,
     ) -> NetworkResult<()> {
-        let data = encode(&PrimaryGossip::Consenus(Box::new(ConsensusResult {
+        let data = encode(&PrimaryGossip::Consensus(Box::new(ConsensusResult {
             epoch,
             number: consensus_block_num,
             hash: consensus_header_hash,

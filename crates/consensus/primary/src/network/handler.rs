@@ -90,7 +90,7 @@ where
                 let unverified_cert = cert.validate_received().map_err(CertManagerError::from)?;
                 self.state_sync.process_peer_certificate(unverified_cert).await?;
             }
-            PrimaryGossip::Consenus(result) => {
+            PrimaryGossip::Consensus(result) => {
                 ensure!(
                     topic.to_string().eq(&tn_config::LibP2pConfig::consensus_output_topic()),
                     PrimaryNetworkError::InvalidTopic

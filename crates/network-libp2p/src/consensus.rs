@@ -646,7 +646,10 @@ where
                 self.outbound_requests.insert((peer, request_id), reply);
             }
             NetworkCommand::SendRequestAny { request, reply } => {
-                self.connected_peers.rotate_left(1);
+                // Rotating an empty list will panic...
+                if !self.connected_peers.is_empty() {
+                    self.connected_peers.rotate_left(1);
+                }
                 if let Some(peer) = self.connected_peers.front() {
                     let request_id = self.swarm.behaviour_mut().req_res.send_request(peer, request);
                     self.outbound_requests.insert((*peer, request_id), reply);
