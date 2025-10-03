@@ -20,7 +20,6 @@ use libp2p::{
         self, Event as GossipEvent, IdentTopic, Message as GossipMessage, MessageAcceptance, Topic,
         TopicHash,
     },
-    identify::{self, Event as IdentifyEvent, Info as IdentifyInfo},
     kad::{self, store::RecordStore, Mode, QueryId},
     multiaddr::Protocol,
     request_response::{
@@ -59,8 +58,6 @@ pub(crate) struct TNBehavior<C, DB>
 where
     C: Codec + Send + Clone + 'static,
 {
-    /// The identify behavior used to confirm externally observed addresses.
-    pub(crate) identify: identify::Behaviour,
     /// The gossipsub network behavior.
     pub(crate) gossipsub: gossipsub::Behaviour,
     /// The request-response network behavior.
@@ -78,14 +75,13 @@ where
 {
     /// Create a new instance of Self.
     pub(crate) fn new(
-        identify: identify::Behaviour,
         gossipsub: gossipsub::Behaviour,
         req_res: request_response::Behaviour<C>,
         kademlia: kad::Behaviour<KadStore<DB>>,
         peer_config: &PeerConfig,
     ) -> Self {
         let peer_manager = PeerManager::new(peer_config);
-        Self { identify, gossipsub, req_res, peer_manager, kademlia }
+        Self { gossipsub, req_res, peer_manager, kademlia }
     }
 }
 
@@ -214,15 +210,6 @@ where
         task_spawner: TaskSpawner,
         kad_type: KadStoreType,
     ) -> NetworkResult<Self> {
-        let identify_config = identify::Config::new(
-            network_config.libp2p_config().identify_protocol().to_string(),
-            keypair.public(),
-        )
-        // disable discovery to prevent auto redials to disconnected peers
-        .with_cache_size(0);
-
-        let identify = identify::Behaviour::new(identify_config);
-
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             // explicitly set default
             .heartbeat_interval(Duration::from_secs(1))
@@ -262,7 +249,7 @@ where
 
         // create custom behavior
         let mut behavior =
-            TNBehavior::new(identify, gossipsub, req_res, kademlia, network_config.peer_config());
+            TNBehavior::new(gossipsub, req_res, kademlia, network_config.peer_config());
 
         // Load the Kad records from DB into the local peer cache.
         for record in kad_store.records() {
@@ -451,7 +438,6 @@ where
     ) -> NetworkResult<()> {
         match event {
             SwarmEvent::Behaviour(behavior) => match behavior {
-                TNBehaviorEvent::Identify(event) => self.process_identify_event(event)?,
                 TNBehaviorEvent::Gossipsub(event) => self.process_gossip_event(event)?,
                 TNBehaviorEvent::ReqRes(event) => self.process_reqres_event(event)?,
                 TNBehaviorEvent::PeerManager(event) => self.process_peer_manager_event(event)?,
@@ -713,56 +699,6 @@ where
         Ok(())
     }
 
-    /// Process identify events.
-    fn process_identify_event(&mut self, event: IdentifyEvent) -> NetworkResult<()> {
-        match event {
-            IdentifyEvent::Received {
-                peer_id,
-                info:
-                    IdentifyInfo {
-                        public_key,
-                        protocol_version,
-                        agent_version,
-                        listen_addrs,
-                        protocols,
-                        observed_addr,
-                        signed_peer_record,
-                    },
-                .. // connection_id
-            } => {
-                debug!(
-                    target: "network",
-                    ?peer_id,
-                    ?public_key,
-                    ?protocol_version,
-                    ?agent_version,
-                    ?listen_addrs,
-                    ?protocols,
-                    ?observed_addr,
-                    ?signed_peer_record,
-                    "identify event received",
-                );
-
-                // received info from peer about this node
-                if !self.swarm.behaviour().peer_manager.peer_banned(&peer_id) {
-                    self.swarm.add_external_address(observed_addr);
-                }
-            }
-            IdentifyEvent::Sent { peer_id, .. } => {
-                debug!(target: "network", ?peer_id, "sent identify to peer:");
-            }
-            IdentifyEvent::Pushed { peer_id, info, .. } => {
-                debug!(target: "network", ?peer_id, ?info, "pushed identify to peer:");
-            }
-            IdentifyEvent::Error { peer_id, error, .. } => {
-                // errors appear when connection is closed
-                debug!(target: "network", ?peer_id, ?error, "identify error:");
-            }
-        }
-
-        Ok(())
-    }
-
     /// Process gossip events.
     fn process_gossip_event(&mut self, event: GossipEvent) -> NetworkResult<()> {
         match event {
@@ -994,7 +930,7 @@ where
             PeerEvent::DisconnectPeer(peer_id) => {
                 debug!(target: "network", ?peer_id, "peer manager: disconnect peer");
                 // remove from request-response
-                // NOTE: gossipsub/identify handle `FromSwarm::ConnectionClosed`
+                // NOTE: gossipsub handle `FromSwarm::ConnectionClosed`
                 let _ = self.swarm.disconnect_peer_id(peer_id);
 
                 // remove from kad routing table
