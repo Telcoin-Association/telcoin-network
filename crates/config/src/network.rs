@@ -1,7 +1,7 @@
 //! Configuration for network variables.
 
 use crate::{ConfigFmt, ConfigTrait, TelcoinDirs};
-use libp2p::{request_response::ProtocolSupport, StreamProtocol};
+use libp2p::{kad::K_VALUE, request_response::ProtocolSupport, StreamProtocol};
 use serde::{Deserialize, Serialize};
 use std::{sync::OnceLock, time::Duration};
 use tn_types::Round;
@@ -321,13 +321,16 @@ pub struct PeerConfig {
 
 impl Default for PeerConfig {
     fn default() -> Self {
+        // 50% more than kademlia target
+        let target_num_peers = (K_VALUE.get() / 2) + K_VALUE.get();
+
         Self {
             heartbeat_interval: 30,
-            target_num_peers: 5,
+            target_num_peers,
             dial_timeout: Duration::from_secs(15),
             min_score_for_disconnect: -20.0,
             min_score_for_ban: -50.0,
-            peer_excess_factor: 0.2,
+            peer_excess_factor: 0.3,
             priority_peer_excess: 0.2,
             target_outbound_only_factor: 0.3,
             min_outbound_only_factor: 0.2,
@@ -371,6 +374,11 @@ impl PeerConfig {
         (self.target_num_peers as f32
             * (1.0 + self.peer_excess_factor + self.priority_peer_excess / 2.0))
             .ceil() as usize
+    }
+
+    /// The max number of peers to maintain for potential discovery attempts.
+    pub fn max_discovery_peers(&self) -> usize {
+        self.target_num_peers * 2
     }
 }
 

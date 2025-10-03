@@ -3,7 +3,7 @@
 //! Peers that score poorly are eventually banned.
 
 use libp2p::PeerId;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::peer::Peer;
 use std::{
@@ -67,7 +67,9 @@ impl BannedPeers {
         peer_id: &PeerId,
         ip_addresses: impl Iterator<Item = IpAddr>,
     ) {
+        debug!(target: "peer-manager", ips=?self.banned_peers_by_ip, "filtering banned ips for validators");
         for ip in ip_addresses {
+            debug!(target: "peer-manager", ?ip, "removing banned ip for validator");
             if let Some((_, _)) = self.banned_peers_by_ip.remove_entry(&ip) {
                 warn!(target: "peer-manager", ?peer_id, "removed banned ip address associated with validator");
                 self.total = self.total.saturating_sub(1);

@@ -142,26 +142,37 @@ fn test_connected_peers_by_score() {
     let mut all_peers = create_all_peers(None);
 
     // Add some connected peers
-    for _ in 1..4 {
-        let peer_id = PeerId::random();
+    let mut first_peer_id = PeerId::random();
+    for i in 1..4 {
+        let new_peer_id = PeerId::random();
         let addr = create_multiaddr(None);
 
         all_peers.update_connection_status(
-            &peer_id,
+            &new_peer_id,
             NewConnectionStatus::Connected {
                 multiaddr: addr,
                 direction: ConnectionDirection::Incoming,
             },
         );
+        // track first peer id
+        if i == 1 {
+            first_peer_id = new_peer_id;
+        }
     }
 
-    let peers_by_score = all_peers.connected_peers_by_score();
+    // update last peer id as routable
+    all_peers.update_routing_for_peer(&first_peer_id, true);
+
+    let peers_by_score = all_peers.connected_peers_by_score_and_routability();
     assert_eq!(peers_by_score.len(), 3);
 
     // Ensure they're sorted by score
     for i in 1..peers_by_score.len() {
         assert!(peers_by_score[i - 1].1.score() <= peers_by_score[i].1.score());
     }
+
+    // assert routable peer is last
+    assert!(peers_by_score.last().map(|peer| peer.1.is_routable()).unwrap())
 }
 
 #[test]

@@ -14,7 +14,8 @@ use crate::{
     send_or_log_error,
     types::{AuthorityInfoRequest, NetworkInfo, NetworkResult},
 };
-use libp2p::{core::ConnectedPoint, Multiaddr, PeerId};
+use libp2p::{core::ConnectedPoint, kad::PeerInfo, multiaddr::Protocol, Multiaddr, PeerId};
+use rand::seq::IteratorRandom as _;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::IpAddr,
@@ -23,7 +24,7 @@ use std::{
 use tn_config::PeerConfig;
 use tn_types::BlsPublicKey;
 use tokio::sync::oneshot;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 #[cfg(test)]
 #[path = "../tests/peer_manager.rs"]
@@ -67,6 +68,11 @@ pub(crate) struct PeerManager {
     /// The implementation uses `FnvHashSet` instead of the default Rust hasher `SipHash`
     /// for improved performance for short keys.
     temporarily_banned: BannedPeerCache<PeerId>,
+    /// Potential peers discovered through kad.
+    ///
+    /// These peers are not connected and reserved for dial attempts at heartbeat intervals if
+    /// connections drop.
+    discovery_peers: HashMap<PeerId, Vec<Multiaddr>>,
 }
 
 impl PeerManager {
@@ -94,6 +100,7 @@ impl PeerManager {
             events: Default::default(),
             dial_requests: Default::default(),
             temporarily_banned,
+            discovery_peers: Default::default(),
         }
     }
 
@@ -184,6 +191,14 @@ impl PeerManager {
         self.dial_requests.push_back(request);
     }
 
+    /// Check if this peer is already registered as dialing.
+    ///
+    /// Self and kad behaviors can initiate dial attempts. This is used to filter pending outbound
+    /// connections.
+    pub(super) fn dial_attempt_already_registered(&self, peer_id: &PeerId) -> bool {
+        self.peers.get_peer(peer_id).is_some_and(|peer| peer.connection_status().is_dialing())
+    }
+
     /// Push a [PeerEvent].
     pub(super) fn push_event(&mut self, event: PeerEvent) {
         self.events.push_back(event);
@@ -246,9 +261,14 @@ impl PeerManager {
 
         // TODO: Issue #254 update metrics
 
+        // enforce connection limits
         self.prune_connected_peers();
 
+        // update timestamps
         self.unban_temp_banned_peers();
+
+        // manage discovery peers
+        self.discovery_heartbeat();
     }
 
     /// Apply a [PeerAction].
@@ -262,6 +282,7 @@ impl PeerManager {
             }
             PeerAction::Disconnect => {
                 debug!(target: "peer-manager", ?peer_id, "reputation update results in disconnect");
+                self.temporarily_banned.insert(peer_id);
                 self.push_event(PeerEvent::DisconnectPeer(peer_id));
             }
             PeerAction::DisconnectWithPX => {
@@ -467,11 +488,12 @@ impl PeerManager {
     /// removed until excess peer count reaches target.
     fn prune_connected_peers(&mut self) {
         // connected peers sorted from lowest to highest aggregate score
-        let connected_peers = self.peers.connected_peers_by_score();
+        // peers that do not participate in the kad routing table are prioritized for disconnect
+        let connected_peers = self.peers.connected_peers_by_score_and_routability();
         let mut excess_peer_count =
             connected_peers.len().saturating_sub(self.config.target_num_peers);
         if excess_peer_count == 0 {
-            // target num peers within range
+            // no excess peers
             return;
         }
 
@@ -487,7 +509,7 @@ impl PeerManager {
             })
             .collect::<Vec<_>>();
 
-        // disconnect peers until excess_peer_count is 0
+        // disconnect peers until excess_peer_count is 0 or no more peers
         for peer_id in ready_to_prune {
             if excess_peer_count > 0 {
                 self.disconnect_peer(peer_id, true);
@@ -526,11 +548,10 @@ impl PeerManager {
                     NetworkInfo { pubkey: net_key.clone(), multiaddrs: multiaddrs.clone() },
                 );
             }
-            // skip peers that are already connected
-            let peer = self.peers.get_peer(&peer_id);
-            if peer.is_none() || peer.expect("have peer").can_dial() {
-                let request = DialRequest { peer_id, multiaddrs, reply: None };
-                self.dial_requests.push_back(request);
+
+            // dial peers that are unknown or can be dialed
+            if self.peers.can_dial(&peer_id) {
+                self.dial_peer(peer_id, multiaddrs, None);
             }
         }
     }
@@ -560,7 +581,7 @@ impl PeerManager {
                 self.known_peers.get(bls_key)
             {
                 let peer_id: PeerId = pubkey.clone().into();
-                tracing::info!(target: "peer-manager", "adding committee member {bls_key}/{peer_id}");
+                info!(target: "peer-manager", "adding committee member {bls_key}/{peer_id}");
                 if self.temporarily_banned.remove(&peer_id) {
                     warn!(target: "peer-manager", ?peer_id, "removed committee member from temporarily banned list");
                 }
@@ -623,5 +644,125 @@ impl PeerManager {
     /// Find the BlsPublicKey for a known PeerId.
     pub(crate) fn peer_to_bls(&self, peer_id: &PeerId) -> Option<BlsPublicKey> {
         self.known_peerids.get(peer_id).copied()
+    }
+
+    /// Visibility helper for behavior to evaluate pending outbound connection attempts.
+    pub(super) fn can_dial(&self, peer_id: &PeerId) -> bool {
+        self.peers.can_dial(peer_id) && !self.temporarily_banned.contains(peer_id)
+    }
+
+    /// Extract IP addresses from multiaddrs and check if any are banned.
+    ///
+    /// Returns `true` if the peer has valid IP addresses and NONE are banned.
+    /// Returns `false` if no valid IPs found OR any IP is banned.
+    pub(super) fn has_valid_unbanned_ips(&self, multiaddrs: &[Multiaddr]) -> bool {
+        let mut found_valid_ip = false;
+
+        for addr in multiaddrs {
+            if let Some(ip) = Self::extract_ip_from_multiaddr(addr) {
+                found_valid_ip = true;
+                if self.is_ip_banned(&ip) {
+                    return false; // Early return on first banned IP
+                }
+            }
+        }
+
+        found_valid_ip
+    }
+
+    /// Extract IP address from a single multiaddr.
+    ///
+    /// Only supports IPv4 and IPv6.
+    fn extract_ip_from_multiaddr(addr: &Multiaddr) -> Option<IpAddr> {
+        addr.iter().find_map(|protocol| match protocol {
+            Protocol::Ip4(ip) => Some(IpAddr::V4(ip)),
+            Protocol::Ip6(ip) => Some(IpAddr::V6(ip)),
+            _ => None,
+        })
+    }
+
+    /// Check if peer is eligible for discovery.
+    ///
+    /// A peer is eligible if:
+    /// - it has at least one valid ip address (ipv4/ipv6)
+    /// - none of its ip addresses are banned
+    /// - it can be dialed (not connected/dialing/banned)
+    fn eligible_for_discovery(&self, info: &PeerInfo) -> bool {
+        self.has_valid_unbanned_ips(&info.addrs) && self.peers.can_dial(&info.peer_id)
+    }
+
+    /// Process newly discovered peers for potential dial attempts.
+    ///
+    /// Only eligible peers are stored for dialing during heartbeat.
+    pub(crate) fn process_peers_for_discovery(&mut self, mut peers: Vec<PeerInfo>) {
+        peers.retain(|peer| self.eligible_for_discovery(peer));
+        let peers: HashSet<_> = peers.into_iter().map(|info| (info.peer_id, info.addrs)).collect();
+        self.discovery_peers.extend(peers);
+    }
+
+    /// Check peer counts and initiate dial attempts to maintain connection targets.
+    fn discovery_heartbeat(&mut self) {
+        // take discovery peers and filter ineligble peers
+        let mut discovery_peers = std::mem::take(&mut self.discovery_peers);
+        discovery_peers.retain(|peer_id, addrs| {
+            let peer_info = PeerInfo { peer_id: *peer_id, addrs: addrs.clone() };
+            self.eligible_for_discovery(&peer_info)
+        });
+
+        // calculate dial attempts needed for target connection limits
+        let connected_or_dialing = self.connected_or_dialing_peers().len();
+        let peers_needed = self.config.target_num_peers.saturating_sub(connected_or_dialing);
+
+        // used for random selections
+        let mut rng = rand::rng();
+
+        // initiate dial attempts
+        if peers_needed > 0 {
+            // randomly select peers to dial
+            let to_dial: Vec<(PeerId, Vec<Multiaddr>)> = discovery_peers
+                .iter()
+                .map(|(id, addrs)| (*id, addrs.clone()))
+                .choose_multiple(&mut rng, peers_needed);
+
+            // remove from discovery and dial discovery candidate
+            for (peer, addrs) in to_dial {
+                debug!(target: "peer-manager", ?peer, "dialing peer for discovery");
+                discovery_peers.remove(&peer);
+                self.dial_peer(peer, addrs, None);
+            }
+        }
+
+        // manage target discovery peer counts
+        let max_discovery_peers = self.config.max_discovery_peers();
+        let current_count = discovery_peers.len();
+        if current_count > max_discovery_peers {
+            debug!(target: "peer-manager", "pruning discovery peers");
+            // prune excess
+            let excess = current_count - max_discovery_peers;
+            let to_remove: Vec<PeerId> =
+                discovery_peers.keys().copied().choose_multiple(&mut rng, excess);
+            for peer in to_remove {
+                discovery_peers.remove(&peer);
+            }
+
+            debug!(
+                target: "peer-manager",
+                pruned = excess,
+                remaining = discovery_peers.len(),
+                "pruned excess discovery peers"
+            );
+        } else if current_count < max_discovery_peers {
+            // emit discovery event to find closest peers
+            debug!(target: "peer-manager", "discovery peers low");
+            self.events.push_back(PeerEvent::Discovery);
+        }
+
+        // store discovery peers
+        self.discovery_peers = discovery_peers;
+    }
+
+    /// Update a peer's status in the routing table.
+    pub(crate) fn update_routing_for_peer(&mut self, peer_id: &PeerId, routable: bool) {
+        self.peers.update_routing_for_peer(peer_id, routable);
     }
 }

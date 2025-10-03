@@ -703,15 +703,18 @@ impl AllPeers {
             .into()
     }
 
-    /// Sort connected peers from lowest to highest score.
+    /// Sort connected peers considering both score and Kademlia routing table status.
     ///
-    /// The shuffle ensures peers with equal scores are sorted in a random order.
-    pub(super) fn connected_peers_by_score(&self) -> Vec<(&PeerId, &Peer)> {
+    /// The shuffle ensures peers with equal scores are sorted in a random order. Peers with the
+    /// lowest score and are not part of the kademlia table are prioritized.
+    pub(super) fn connected_peers_by_score_and_routability(&self) -> Vec<(&PeerId, &Peer)> {
         let mut connected_peers: Vec<_> =
             self.peers.iter().filter(|(_, peer)| peer.connection_status().is_connected()).collect();
 
+        // shuffle here for unbiased tie-breakers
         connected_peers.shuffle(&mut rand::rng());
-        connected_peers.sort_by_key(|(_, peer)| peer.score());
+        // sort by (score, routable) - lowest score first, then non-routable first
+        connected_peers.sort_by_key(|(_, peer)| (peer.score(), peer.is_routable()));
         connected_peers
     }
 
@@ -872,5 +875,21 @@ impl AllPeers {
 
         // return any unban actions for committee peers
         actions
+    }
+
+    /// Check if a peer is eligible for dial attempt.
+    ///
+    /// This method implicitly evaluates peers which are in the process
+    /// of being banned (connected/disconnecting).
+    pub(super) fn can_dial(&self, peer_id: &PeerId) -> bool {
+        // unknown peers are eligible for dial attempts
+        self.peers.get(peer_id).map(|peer| peer.can_dial()).unwrap_or(true)
+    }
+
+    /// Update a peer's status in the routing table.
+    pub(super) fn update_routing_for_peer(&mut self, peer_id: &PeerId, routable: bool) {
+        if let Some(peer) = self.peers.get_mut(peer_id) {
+            peer.update_routability(routable)
+        }
     }
 }
