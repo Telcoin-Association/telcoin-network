@@ -37,14 +37,17 @@ pub(crate) enum PrimaryNetworkError {
     Internal(String),
     /// Unknown consensus header.
     #[error("Unknown consensus header: {0}")]
-    UnknowConsensusHeaderNumber(u64),
+    UnknownConsensusHeaderNumber(u64),
     /// Unknown consensus header.
     #[error("Unknown consensus header: {0}")]
-    UnknowConsensusHeaderDigest(BlockHash),
+    UnknownConsensusHeaderDigest(BlockHash),
+    /// Unknown consensus header certificate.
+    #[error("Unknown consensus header certificate for: {0}")]
+    UnknownConsensusHeaderCert(BlockHash),
     /// Peer that is not committee published invalid gosip.
     /// Temparily disabled, will be back soon.
     #[error("Peer {0} is not in the committee!")]
-    _PeerNotInCommittee(Box<BlsPublicKey>),
+    PeerNotInCommittee(Box<BlsPublicKey>),
     /// Unavaliable epoch (either it is invalid or this node does not have it).
     #[error("Unknown epoch record: {0}")]
     UnavailableEpoch(Epoch),
@@ -101,20 +104,17 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
                 | CertManagerError::RequestBounds(_)
                 | CertManagerError::TNSend(_) => None,
             },
-            // mild
-            PrimaryNetworkError::UnknowConsensusHeaderNumber(_)
+            PrimaryNetworkError::UnknownConsensusHeaderNumber(_)
             | PrimaryNetworkError::InvalidRequest(_)
-            | PrimaryNetworkError::UnknowConsensusHeaderDigest(_) => Some(Penalty::Mild),
-            // medium
+            | PrimaryNetworkError::UnknownConsensusHeaderDigest(_)
+            | PrimaryNetworkError::UnknownConsensusHeaderCert(_) => Some(Penalty::Mild),
             PrimaryNetworkError::InvalidEpochRequest
             | PrimaryNetworkError::StdIo(_) => Some(Penalty::Medium),
-            // fatal
             PrimaryNetworkError::InvalidTopic
             | PrimaryNetworkError::Decode(_) => Some(Penalty::Fatal),
-            // ignore
             PrimaryNetworkError::UnavailableEpoch(_)  // A node might not have this yet...
             | PrimaryNetworkError::UnavailableEpochDigest(_)  // A node might not have this yet....
-            | PrimaryNetworkError::_PeerNotInCommittee(_)
+            | PrimaryNetworkError::PeerNotInCommittee(_)
             | PrimaryNetworkError::Storage(_)
             | PrimaryNetworkError::Internal(_) => None,
         }
@@ -147,12 +147,12 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         | HeaderError::ParentMissingSignature
         | HeaderError::InvalidParentTimestamp { .. }
         | HeaderError::UnkownWorkerId
-        | HeaderError::InvalidEpoch { .. }
         | HeaderError::InvalidHeaderDigest
         | HeaderError::UnknownAuthority(_) => Some(Penalty::Fatal),
         // ignore
         HeaderError::PendingCertificateOneshot
         | HeaderError::TNSend(_)
+        | HeaderError::InvalidEpoch { .. }
         | HeaderError::ClosedWatchChannel => None,
     }
 }

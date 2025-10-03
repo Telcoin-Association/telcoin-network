@@ -39,9 +39,10 @@ async fn propose_header_to_form_certificate() {
     let cb = ConsensusBus::new();
     let mut rx_new_certificates = cb.new_certificates().subscribe();
     // Spawn the core.
-    let synchronizer = StateSynchronizer::new(primary.consensus_config(), cb.clone());
-
     let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(primary.consensus_config(), cb.clone(), task_manager.get_spawner());
+
     synchronizer.spawn(&task_manager);
     Certifier::spawn(
         primary.consensus_config(),
@@ -98,9 +99,10 @@ async fn propose_header_failure() {
     let cb = ConsensusBus::new();
     let mut rx_new_certificates = cb.new_certificates().subscribe();
     // Spawn the core.
-    let synchronizer = StateSynchronizer::new(primary.consensus_config(), cb.clone());
-
     let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(primary.consensus_config(), cb.clone(), task_manager.get_spawner());
+
     synchronizer.spawn(&task_manager);
     Certifier::spawn(
         primary.consensus_config(),
@@ -189,8 +191,9 @@ async fn run_vote_aggregator_with_param(
     let cb = ConsensusBus::new();
     let mut rx_new_certificates = cb.new_certificates().subscribe();
     // Spawn the core.
-    let synchronizer = StateSynchronizer::new(primary.consensus_config(), cb.clone());
     let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(primary.consensus_config(), cb.clone(), task_manager.get_spawner());
     synchronizer.spawn(&task_manager);
     Certifier::spawn(
         primary.consensus_config(),
@@ -242,10 +245,11 @@ async fn test_shutdown_core() {
 
     let cb = ConsensusBus::new();
     // Make a synchronizer for the core.
-    let synchronizer = StateSynchronizer::new(primary.consensus_config(), cb.clone());
+    let mut task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(primary.consensus_config(), cb.clone(), task_manager.get_spawner());
 
     // Spawn the core.
-    let mut task_manager = TaskManager::default();
     synchronizer.spawn(&task_manager);
     Certifier::spawn(
         primary.consensus_config(),

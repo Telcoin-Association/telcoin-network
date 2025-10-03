@@ -14,7 +14,7 @@ use tn_network_libp2p::types::NetworkEvent;
 use tn_primary_metrics::{ChannelMetrics, ConsensusMetrics, ExecutorMetrics, Metrics};
 use tn_types::{
     error::HeaderError, BlockHash, BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader,
-    ConsensusOutput, EpochVote, Header, Round, TnReceiver, TnSender, CHANNEL_CAPACITY,
+    ConsensusOutput, Epoch, EpochVote, Header, Round, TnReceiver, TnSender, CHANNEL_CAPACITY,
 };
 use tokio::{
     sync::{
@@ -153,6 +153,11 @@ struct ConsensusBusAppInner {
     /// Hold onto a receiver to keep it "open".
     _rx_gc_round_updates: watch::Receiver<Round>,
 
+    /// An epoch we need an epoch record for.
+    tx_requested_missing_epoch: watch::Sender<Epoch>,
+    /// Hold onto a receiver to keep it "open".
+    _rx_requested_missing_epoch: watch::Receiver<Epoch>,
+
     /// Signals a new round
     tx_primary_round_updates: watch::Sender<Round>,
     /// Hold onto the primary metrics (allow early creation)
@@ -207,6 +212,8 @@ impl ConsensusBusAppInner {
             watch::channel(Round::default());
 
         let (tx_gc_round_updates, _rx_gc_round_updates) = watch::channel(Round::default());
+        let (tx_requested_missing_epoch, _rx_requested_missing_epoch) =
+            watch::channel(Epoch::default());
 
         let (tx_primary_round_updates, _rx_primary_round_updates) = watch::channel(0u32);
         let (tx_last_consensus_header, _rx_last_consensus_header) =
@@ -226,6 +233,8 @@ impl ConsensusBusAppInner {
             _rx_committed_round_updates,
             tx_gc_round_updates,
             _rx_gc_round_updates,
+            tx_requested_missing_epoch,
+            _rx_requested_missing_epoch,
 
             tx_primary_round_updates,
             _rx_primary_round_updates,
@@ -454,6 +463,11 @@ impl ConsensusBus {
         &self.inner_app.tx_gc_round_updates
     }
 
+    /// Contains the last requested epoch to retrieve a record.
+    pub fn requested_missing_epoch(&self) -> &watch::Sender<Epoch> {
+        &self.inner_app.tx_requested_missing_epoch
+    }
+
     /// Signals a new round
     pub fn primary_round_updates(&self) -> &watch::Sender<Round> {
         &self.inner_app.tx_primary_round_updates
@@ -498,14 +512,15 @@ impl ConsensusBus {
         &self.inner_app.tx_recent_blocks
     }
 
-    /// Track the latest consensus header.
+    /// Track the latest consensus header we have seen.
+    /// Note, this should be a valid header (authenticated by it's epoch's committee).
     pub fn last_consensus_header(&self) -> &watch::Sender<ConsensusHeader> {
         &self.inner_app.tx_last_consensus_header
     }
 
     /// Track the latest published consensus header block number and hash seen on the gossip
-    /// network. This is straight from the pub/sub network and should be verified before taking
-    /// action with it.
+    /// network. This value will have been verified and can be trusted to be the correct hash
+    /// for block number.  DO NOT send unverified values to this watch.
     pub fn last_published_consensus_num_hash(&self) -> &watch::Sender<(u64, BlockHash)> {
         &self.inner_app.tx_last_published_consensus_num_hash
     }
