@@ -261,10 +261,11 @@ impl PrimaryNetworkHandle {
     /// Notify peer manager of peer exchange information.
     pub(crate) async fn process_peer_exchange(
         &self,
+        peer: BlsPublicKey,
         peers: PeerExchangeMap,
         channel: ResponseChannel<PrimaryResponse>,
     ) {
-        if let Err(e) = self.handle.process_peer_exchange(peers, channel).await {
+        if let Err(e) = self.handle.process_peer_exchange(peer, peers, channel).await {
             warn!(target: "primary::network", ?e, "process peer exchange failed");
         }
     }
@@ -340,7 +341,7 @@ where
                     self.process_consensus_output_request(peer, number, hash, channel, cancel)
                 }
                 PrimaryRequest::PeerExchange { peers } => {
-                    self.process_peer_exchange(peers, channel)
+                    self.process_peer_exchange(peer, peers, channel)
                 }
                 PrimaryRequest::EpochRecord { epoch, hash } => {
                     self.process_epoch_record_request(peer, epoch, hash, channel, cancel)
@@ -495,13 +496,14 @@ where
     /// Process peer exchange.
     fn process_peer_exchange(
         &self,
+        peer: BlsPublicKey,
         peers: PeerExchangeMap,
         channel: ResponseChannel<PrimaryResponse>,
     ) {
         let network_handle = self.network_handle.clone();
         // notify peer manager and respond with ack
         self.task_spawner.spawn_task("ProcessPeerExchange", async move {
-            network_handle.process_peer_exchange(peers, channel).await;
+            network_handle.process_peer_exchange(peer, peers, channel).await;
         });
     }
 }
