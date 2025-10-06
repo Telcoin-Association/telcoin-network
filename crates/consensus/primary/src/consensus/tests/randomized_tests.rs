@@ -19,7 +19,7 @@ use std::{
 };
 use tn_primary::test_utils::mock_certificate_with_rand;
 use tn_storage::{mem_db::MemDatabase, open_db, ConsensusStore};
-use tn_test_utils::CommitteeFixture;
+use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     Authority, AuthorityIdentifier, Certificate, CertificateDigest, Committee, Hash as _, Round,
     VotingPower,

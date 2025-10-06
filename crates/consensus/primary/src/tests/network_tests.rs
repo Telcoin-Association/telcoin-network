@@ -9,7 +9,7 @@ use crate::{
 use assert_matches::assert_matches;
 use std::collections::{BTreeMap, BTreeSet};
 use tn_storage::mem_db::MemDatabase;
-use tn_test_utils::CommitteeFixture;
+use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     error::HeaderError, now, AuthorityIdentifier, BlockHash, BlockHeader, BlockNumHash,
     BlsPublicKey, Certificate, CertificateDigest, ExecHeader, Hash as _, SealedHeader, TaskManager,

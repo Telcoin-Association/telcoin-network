@@ -4,7 +4,7 @@ use indexmap::IndexMap;
 use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
 use std::{collections::BTreeSet, num::NonZeroUsize};
 use tn_storage::mem_db::MemDatabase;
-use tn_test_utils::{AuthorityFixture, CommitteeFixture};
+use tn_test_utils_committee::{AuthorityFixture, CommitteeFixture};
 use tn_types::{
     AuthorityIdentifier, BlockNumHash, BlsPublicKey, BlsSignature, Certificate, Committee, Header,
     Vote, VotingPower,
