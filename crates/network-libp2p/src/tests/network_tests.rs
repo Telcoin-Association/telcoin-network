@@ -50,6 +50,7 @@ fn create_test_peers<Req: TNMessage, Res: TNMessage>(
                 db,
                 task_manager.get_spawner(),
                 KadStoreType::Primary,
+                config.primary_address(),
             )
             .expect("peer1 network created");
 
@@ -148,6 +149,7 @@ where
             MemDatabase::default(),
             task_manager.get_spawner(),
             KadStoreType::Primary,
+            config_1.primary_address(),
         )
         .expect("peer1 network created");
     let network_handle_1 = peer1_network.network_handle();
@@ -169,6 +171,7 @@ where
             MemDatabase::default(),
             task_manager.get_spawner(),
             KadStoreType::Primary,
+            config_2.primary_address(),
         )
         .expect("peer2 network created");
     let network_handle_2 = peer2_network.network_handle();
@@ -798,7 +801,7 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     }
 
     // allow dial attempts to be made
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 2)).await;
 
     // assert target is disconnected from nvv
     assert!(!target_peer

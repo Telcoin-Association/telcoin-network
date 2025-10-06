@@ -332,6 +332,7 @@ where
             self.key_config.clone(),
             self.consensus_db.clone(),
             node_task_spawner.clone(),
+            self.builder.tn_config.node_info.primary_network_address().clone(),
         )?;
         let primary_network_handle = primary_network.network_handle();
         let node_shutdown = self.node_shutdown.subscribe();
@@ -359,6 +360,7 @@ where
             self.key_config.clone(),
             self.consensus_db.clone(),
             node_task_spawner.clone(),
+            self.builder.tn_config.node_info.worker_network_address().clone(),
         )?;
         let worker_network_handle = worker_network.network_handle();
         let node_shutdown = self.node_shutdown.subscribe();
