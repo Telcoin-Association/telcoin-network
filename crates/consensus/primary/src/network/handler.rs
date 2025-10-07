@@ -95,7 +95,11 @@ where
                     topic.to_string().eq(&tn_config::LibP2pConfig::consensus_output_topic()),
                     PrimaryNetworkError::InvalidTopic
                 );
-                let ConsensusResult { epoch, number, hash, validator: key, signature } = *result;
+                // We want to confirm all the data (including but not limited to the consensus
+                // header hash) against the signature.
+                let consensus_result_hash = result.digest();
+                let ConsensusResult { epoch, round, number, hash, validator: key, signature } =
+                    *result;
                 let (old_number, old_hash) =
                     *self.consensus_bus.last_published_consensus_num_hash().borrow();
                 if hash == old_hash || old_number >= number {
@@ -112,7 +116,7 @@ where
                         PrimaryNetworkError::PeerNotInCommittee(Box::new(key))
                     );
                     ensure!(
-                        signature.verify_secure(&to_intent_message(hash), &key),
+                        signature.verify_secure(&to_intent_message(consensus_result_hash), &key),
                         PrimaryNetworkError::UnknownConsensusHeaderCert(hash)
                     );
                     // Once we have seen 1/3 + 1 committe members have signed this it should be
@@ -124,20 +128,21 @@ where
                         if (sigs + 1) as usize >= enough_sigs {
                             // Last consensus block we have executed, us this to determine if we are
                             // too far behind.
-                            let (exec_number, exec_epoch) = self
+                            let (exec_number, exec_epoch, exec_round) = self
                                 .consensus_config
                                 .node_storage()
                                 .last_record::<ConsensusBlocks>()
-                                .map(|(n, h)| (n, h.sub_dag.leader_epoch()))
-                                .unwrap_or((0, 0));
+                                .map(|(n, h)| {
+                                    (n, h.sub_dag.leader_epoch(), h.sub_dag.leader_round())
+                                })
+                                .unwrap_or((0, 0, 0));
                             // Use GC depth to estimate how many blocks we can be behind (roughly
                             // one block every two rounds).
-                            let allowed_behind =
-                                (self.consensus_config.parameters().gc_depth / 2) - 2;
+                            let gc_depth = self.consensus_config.parameters().gc_depth;
                             if matches!(
                                 *self.consensus_bus.node_mode().borrow(),
                                 NodeMode::CvvActive
-                            ) && ((exec_number + allowed_behind as u64) < number
+                            ) && ((exec_round + gc_depth) < round
                                 || (epoch > exec_epoch && exec_number + 1 < number))
                             {
                                 // We seem to be too far behind to be an active CVV, try to go

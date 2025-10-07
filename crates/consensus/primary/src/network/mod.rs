@@ -7,8 +7,8 @@ use std::{sync::Arc, time::Duration};
 
 use crate::{proposer::OurDigestMessage, state_sync::StateSynchronizer, ConsensusBus};
 use handler::RequestHandler;
-use message::{ConsensusResult, PrimaryGossip, PrimaryRPCError};
 pub use message::{MissingCertificatesRequest, PrimaryRequest, PrimaryResponse};
+use message::{PrimaryGossip, PrimaryRPCError};
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     error::NetworkError,
@@ -19,13 +19,14 @@ use tn_network_types::{WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerTo
 use tn_storage::PayloadStore;
 use tn_types::{
     encode, BlockHash, BlsPublicKey, BlsSignature, Certificate, CertificateDigest, ConsensusHeader,
-    Database, Epoch, EpochCertificate, EpochRecord, EpochVote, Header, TaskSpawner, TnReceiver,
-    TnSender, Vote,
+    Database, Epoch, EpochCertificate, EpochRecord, EpochVote, Header, Round, TaskSpawner,
+    TnReceiver, TnSender, Vote,
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 pub mod handler;
 mod message;
+pub use message::ConsensusResult;
 
 #[cfg(test)]
 #[path = "../tests/network_tests.rs"]
@@ -75,6 +76,7 @@ impl PrimaryNetworkHandle {
     pub async fn publish_consensus(
         &self,
         epoch: Epoch,
+        round: Round,
         consensus_block_num: u64,
         consensus_header_hash: BlockHash,
         key: BlsPublicKey,
@@ -82,6 +84,7 @@ impl PrimaryNetworkHandle {
     ) -> NetworkResult<()> {
         let data = encode(&PrimaryGossip::Consenus(Box::new(ConsensusResult {
             epoch,
+            round,
             number: consensus_block_num,
             hash: consensus_header_hash,
             validator: key,

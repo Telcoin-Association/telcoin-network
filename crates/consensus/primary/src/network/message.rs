@@ -11,16 +11,39 @@ use tn_network_libp2p::{types::IntoRpcError, PeerExchangeMap, TNMessage};
 use tn_types::{
     error::HeaderError, AuthorityIdentifier, BlockHash, BlsPublicKey, BlsSignature, Certificate,
     CertificateDigest, ConsensusHeader, Epoch, EpochCertificate, EpochRecord, EpochVote, Header,
-    Round, Vote,
+    Round, Vote, B256,
 };
 
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ConsensusResult {
     pub epoch: Epoch,
+    pub round: Round,
     pub number: u64,
     pub hash: BlockHash,
     pub validator: BlsPublicKey,
     pub signature: BlsSignature,
+}
+
+impl ConsensusResult {
+    /// Return the digest of the data fields (epoch, round, number and hash).
+    /// This will be the same for all validadors and is what signature signs
+    /// (verifying all the data fields not just the hash).
+    pub fn digest(&self) -> BlockHash {
+        Self::digest_data(self.epoch, self.round, self.number, self.hash)
+    }
+
+    /// Return the digest of the data fields (epoch, round, number and hash).
+    /// Used for generating the signature of the raw data.
+    /// This will be the same for all validadors and is what signature signs
+    /// (verifying all the data fields not just the hash).
+    pub fn digest_data(epoch: Epoch, round: Round, number: u64, hash: BlockHash) -> BlockHash {
+        let mut hasher = tn_types::DefaultHashFunction::new();
+        hasher.update(&epoch.to_be_bytes());
+        hasher.update(&round.to_be_bytes());
+        hasher.update(&number.to_be_bytes());
+        hasher.update(hash.as_ref());
+        B256::from_slice(hasher.finalize().as_bytes())
+    }
 }
 
 /// Primary messages on the gossip network.
