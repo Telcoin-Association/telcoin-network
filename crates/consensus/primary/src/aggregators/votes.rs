@@ -5,11 +5,10 @@ use tn_primary_metrics::PrimaryMetrics;
 use tn_types::{
     ensure,
     error::{DagError, DagResult},
-    to_intent_message, AuthorityIdentifier, BlsAggregateSignature, BlsSignature, Certificate,
-    Committee, Digest, Hash as _, Header, ProtocolSignature, SignatureVerificationState,
-    ValidatorAggregateSignature, Vote, VotingPower,
+    to_intent_message, AuthorityIdentifier, BlsSignature, Certificate, Committee, Header,
+    ProtocolSignature, SignatureVerificationState, Vote, VotingPower,
 };
-use tracing::{trace, warn};
+use tracing::trace;
 
 /// Aggregates votes for a particular header to form a certificate
 pub(crate) struct VotesAggregator {
@@ -48,8 +47,21 @@ impl VotesAggregator {
             self.authorities_seen.insert(author.clone()),
             DagError::AuthorityReuse(author.to_string())
         );
+        // ensure digest matches the header
+        ensure!(vote.header_digest == header.digest(), DagError::InvalidHeaderDigest);
+        // ensure this came from a committee member and that the signature is valid
+        if let Some(auth) = committee.authority(author) {
+            ensure!(
+                vote.signature()
+                    .verify_secure(&to_intent_message(vote.header_digest), auth.protocol_key()),
+                DagError::InvalidSignature
+            );
+        } else {
+            return Err(DagError::UnknownAuthority(author.to_string()));
+        }
 
         // accumulate vote and voting power
+        // note that we have verified the vote already so are good to save and count it
         self.votes.push((author.clone(), *vote.signature()));
         self.weight += committee.voting_power_by_id(author);
 
@@ -60,49 +72,14 @@ impl VotesAggregator {
         if self.weight >= committee.quorum_threshold() {
             let mut cert =
                 Certificate::new_unverified(committee, header.clone(), self.votes.clone())?;
-            let (_, pks) = cert.signed_by(committee);
 
-            let certificate_digest: Digest<{ tn_types::DIGEST_LENGTH }> =
-                Digest::from(cert.digest());
+            trace!(target: "primary::votes_aggregator", ?cert, "certificate verified");
+            // cert signature verified
+            cert.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
+                cert.aggregated_signature().ok_or(DagError::InvalidSignature)?,
+            ));
 
-            // check aggregate signature verification
-            if !BlsAggregateSignature::from_signature(
-                &cert.aggregated_signature().ok_or(DagError::InvalidSignature)?,
-            )
-            .verify_secure(&to_intent_message(certificate_digest), &pks[..])
-            {
-                warn!(
-                    target: "primary::votes_aggregator",
-                    ?certificate_digest,
-                    "Failed to verify aggregated sig on certificate",
-                );
-                self.votes.retain(|(id, sig)| {
-                    if let Some(auth) = committee.authority(id) {
-                        let pk = auth.protocol_key();
-                        if !sig.verify_secure(&to_intent_message(certificate_digest), pk) {
-                            warn!(target: "primary::votes_aggregator", "Invalid signature on header from authority: {}", id);
-                            self.weight -= committee.voting_power(pk);
-                            false
-                        } else {
-                            true
-                        }
-                    } else {
-                        false
-                    }
-                });
-
-                return Ok(None);
-            } else {
-                trace!(target: "primary::votes_aggregator", ?cert, "certificate verified");
-                // cert signature verified
-                cert.set_signature_verification_state(
-                    SignatureVerificationState::VerifiedDirectly(
-                        cert.aggregated_signature().ok_or(DagError::InvalidSignature)?,
-                    ),
-                );
-
-                return Ok(Some(cert));
-            }
+            return Ok(Some(cert));
         }
         Ok(None)
     }

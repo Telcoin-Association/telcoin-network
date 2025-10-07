@@ -2,10 +2,7 @@
 
 #![warn(unused_crate_dependencies)]
 
-pub use tn_test_utils_committee::AuthorityFixture;
-pub use tn_test_utils_committee::Builder;
-pub use tn_test_utils_committee::CommitteeFixture;
-pub use tn_test_utils_committee::WorkerFixture;
+pub use tn_test_utils_committee::{AuthorityFixture, Builder, CommitteeFixture, WorkerFixture};
 mod consensus;
 pub use consensus::*;
 mod execution;

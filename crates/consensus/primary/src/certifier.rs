@@ -279,7 +279,7 @@ impl<DB: Database> Certifier<DB> {
 
         // Reset the votes aggregator and sign our own header.
         let mut votes_aggregator = VotesAggregator::new(self.metrics.clone());
-        let vote = Vote::new(&header, self.authority_id.clone(), &self.signature_service).await;
+        let vote = Vote::new(&header, self.authority_id.clone(), &self.signature_service);
         let mut certificate = votes_aggregator.append(vote, &self.committee, &header)?;
 
         // Trigger vote requests.
@@ -301,13 +301,23 @@ impl<DB: Database> Certifier<DB> {
 
                     match result {
                         Some(Ok(vote)) => {
-                            certificate = votes_aggregator.append(
+                            let authority_id = vote.author.clone();
+                            // Make sure not to let an error here stop certification (else a crafted vote could break consensus).
+                            certificate = match votes_aggregator.append(
                                 vote,
                                 &self.committee,
                                 &header,
-                            )?;
+                            ) {
+                                Ok(cert) => cert,
+                                Err(e) => {
+                                    error!(target: "primary::certifier", ?authority_id, "received an invalid vote: {e:?}");
+                                    None
+                                }
+                            }
                         },
-                        Some(Err(e)) => error!(target: "primary::certifier", ?authority_id, "failed to get vote for header {header:?}: {e:?}"),
+                        Some(Err(e)) => {
+                            error!(target: "primary::certifier", ?authority_id, "failed to get vote for header {header:?}: {e:?}");
+                        }
                         None => {
                             break;
                         }
