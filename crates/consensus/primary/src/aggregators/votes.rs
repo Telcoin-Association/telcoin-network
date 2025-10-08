@@ -17,7 +17,7 @@ pub(crate) struct VotesAggregator {
     /// This amount is used to verify enough voting power to reach quorum within the committee.
     weight: VotingPower,
     /// The vote received from a peer.
-    votes: Vec<(AuthorityIdentifier, BlsSignature)>,
+    verified_votes: Vec<(AuthorityIdentifier, BlsSignature)>,
     /// The collection of authority ids that have already voted.
     authorities_seen: HashSet<AuthorityIdentifier>,
     /// Metrics for votes aggregator.
@@ -29,7 +29,7 @@ impl VotesAggregator {
     pub(crate) fn new(metrics: Arc<PrimaryMetrics>) -> Self {
         metrics.votes_received_last_round.set(0);
 
-        Self { weight: 0, votes: Vec::new(), authorities_seen: HashSet::new(), metrics }
+        Self { weight: 0, verified_votes: Vec::new(), authorities_seen: HashSet::new(), metrics }
     }
 
     /// Append the vote to the collection.
@@ -62,16 +62,19 @@ impl VotesAggregator {
 
         // accumulate vote and voting power
         // note that we have verified the vote already so are good to save and count it
-        self.votes.push((author.clone(), *vote.signature()));
+        self.verified_votes.push((author.clone(), *vote.signature()));
         self.weight += committee.voting_power_by_id(author);
 
         // update metrics
-        self.metrics.votes_received_last_round.set(self.votes.len() as i64);
+        self.metrics.votes_received_last_round.set(self.verified_votes.len() as i64);
 
         // check if this vote reaches quorum
         if self.weight >= committee.quorum_threshold() {
-            let mut cert =
-                Certificate::new_unverified(committee, header.clone(), self.votes.clone())?;
+            let mut cert = Certificate::new_unverified(
+                committee,
+                header.clone(),
+                self.verified_votes.clone(),
+            )?;
 
             trace!(target: "primary::votes_aggregator", ?cert, "certificate verified");
             // cert signature verified
