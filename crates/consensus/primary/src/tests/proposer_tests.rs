@@ -3,7 +3,7 @@
 use super::*;
 use crate::consensus::LeaderSwapTable;
 use tn_storage::mem_db::MemDatabase;
-use tn_test_utils::CommitteeFixture;
+use tn_test_utils_committee::CommitteeFixture;
 use tn_types::B256;
 
 #[tokio::test]

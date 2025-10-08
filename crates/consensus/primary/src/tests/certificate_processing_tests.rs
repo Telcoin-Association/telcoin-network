@@ -14,7 +14,7 @@ use assert_matches::assert_matches;
 use std::{collections::BTreeSet, time::Duration};
 use tn_primary::test_utils::{make_optimal_signed_certificates, signed_cert_for_test};
 use tn_storage::{mem_db::MemDatabase, CertificateStore};
-use tn_test_utils::{AuthorityFixture, CommitteeFixture};
+use tn_test_utils_committee::{AuthorityFixture, CommitteeFixture};
 use tn_types::{
     error::CertificateError, Certificate, CertificateDigest, Database, Hash as _, Round,
     TaskManager, TnReceiver as _, TnSender,

@@ -10,7 +10,7 @@ use tempfile::TempDir;
 use tn_primary::test_utils::temp_dir;
 use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_storage::{mem_db::MemDatabase, open_db, CertificateStore, ConsensusStore, ProposerStore};
-use tn_test_utils::CommitteeFixture;
+use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Hash as _, Header,
     HeaderBuilder, ReputationScores, Round,

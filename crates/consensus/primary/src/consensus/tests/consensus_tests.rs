@@ -7,7 +7,7 @@ use crate::{
 };
 use std::{collections::BTreeSet, sync::Arc};
 use tn_storage::{mem_db::MemDatabase, CertificateStore, ConsensusStore};
-use tn_test_utils::CommitteeFixture;
+use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     Certificate, ExecHeader, Hash as _, ReputationScores, SealedHeader, TaskManager, TnReceiver,
     TnSender, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,

@@ -15,7 +15,7 @@ use tn_network_types::MockPrimaryToWorkerClient;
 use tn_primary::test_utils::make_optimal_signed_certificates;
 use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_storage::{mem_db::MemDatabase, CertificateStore, PayloadStore};
-use tn_test_utils::CommitteeFixture;
+use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     now, AuthorityIdentifier, BlockNumHash, Certificate, Committee, ExecHeader, Hash as _,
     SealedHeader, SignatureVerificationState, TaskManager,

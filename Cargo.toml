@@ -7,8 +7,8 @@ members = [
     "crates/node",
     "crates/storage",
     "crates/test-utils",
+    "crates/test-utils-committee",
     "crates/tn-utils",
-    "crates/test-utils",
     "crates/types",
     "crates/network-types",
     "crates/network-libp2p",
@@ -174,6 +174,7 @@ tn-worker = { path = "./crates/consensus/worker" }
 tn-storage = { path = "./crates/storage" }
 tn-primary = { path = "./crates/consensus/primary" }
 tn-test-utils = { path = "./crates/test-utils" }
+tn-test-utils-committee = { path = "./crates/test-utils-committee" }
 consensus-metrics = { path = "./crates/consensus/consensus-metrics" }
 tn-primary-metrics = { path = "./crates/consensus/primary-metrics" }
 

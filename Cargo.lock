@@ -11875,7 +11875,7 @@ dependencies = [
  "tn-primary-metrics",
  "tn-reth",
  "tn-storage",
- "tn-test-utils",
+ "tn-test-utils-committee",
  "tn-types",
  "tokio",
  "tracing",
@@ -11986,12 +11986,22 @@ dependencies = [
  "clap",
  "eyre",
  "indexmap 2.9.0",
- "rand 0.9.1",
  "telcoin-network",
  "tempfile",
  "tn-config",
  "tn-faucet",
  "tn-node",
+ "tn-reth",
+ "tn-test-utils-committee",
+ "tn-types",
+]
+
+[[package]]
+name = "tn-test-utils-committee"
+version = "0.1.0"
+dependencies = [
+ "rand 0.9.1",
+ "tn-config",
  "tn-reth",
  "tn-types",
 ]
