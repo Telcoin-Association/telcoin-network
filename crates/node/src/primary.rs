@@ -1,5 +1,4 @@
 //! Hierarchical type to hold tasks spawned for a worker in the network.
-use crate::manager::PRIMARY_TASK_MANAGER;
 use std::sync::Arc;
 use tn_config::ConsensusConfig;
 use tn_executor::{Executor, SubscriberResult};
@@ -33,12 +32,11 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
 
     /// Starts the primary node with the provided info. If the node is already running then this
     /// method will return an error instead.
-    async fn start(&mut self) -> eyre::Result<TaskManager> {
-        let task_manager = TaskManager::new(PRIMARY_TASK_MANAGER);
+    async fn start(&mut self, task_manager: &TaskManager) -> eyre::Result<()> {
         // spawn primary and update `self`
-        self.spawn_primary(&task_manager).await?;
+        self.spawn_primary(task_manager).await?;
 
-        Ok(task_manager)
+        Ok(())
     }
 
     /// Spawn a new primary. Optionally also spawn the consensus and a client executing
@@ -118,12 +116,12 @@ impl<CDB: ConsensusDatabase> PrimaryNode<CDB> {
         Self { internal: Arc::new(RwLock::new(inner)) }
     }
 
-    pub async fn start(&self) -> eyre::Result<TaskManager>
+    pub async fn start(&self, task_manager: &TaskManager) -> eyre::Result<()>
     where
         CDB: ConsensusDatabase,
     {
         let mut guard = self.internal.write().await;
-        guard.start().await
+        guard.start(task_manager).await
     }
 
     pub async fn shutdown(&self) {

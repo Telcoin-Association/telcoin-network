@@ -169,6 +169,7 @@ impl QuorumWaiterTrait for QuorumWaiter {
                         match res? {
                             Ok(stake) => {
                                 total_stake += stake;
+                                available_stake -= stake;
                                 if total_stake >= threshold {
                                     let remaining_time =
                                         start_time.elapsed().saturating_sub(timeout);
@@ -216,7 +217,7 @@ impl QuorumWaiterTrait for QuorumWaiter {
                     // check if quorum is impossible
                     if rejected_stake > max_rejected_stake {
                         // Can no longer reach quorum because our batch was explicitly rejected by
-                        // to much stack.
+                        // to much stake.
                         break Err(QuorumWaiterError::QuorumRejected);
                     }
                     if total_stake + available_stake < threshold {

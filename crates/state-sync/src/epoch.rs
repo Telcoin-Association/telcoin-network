@@ -97,7 +97,7 @@ where
     result_epoch
 }
 
-/// Spawn a long running task to collect missing epoc records.
+/// Spawn a long running task to collect missing epoch records.
 ///
 /// Most likely because a node is syncing.
 pub async fn spawn_epoch_record_collector<DB>(

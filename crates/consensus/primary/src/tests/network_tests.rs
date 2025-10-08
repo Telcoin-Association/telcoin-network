@@ -2,17 +2,22 @@
 
 use crate::{
     error::PrimaryNetworkError,
-    network::{MissingCertificatesRequest, RequestHandler},
+    network::{
+        message::{ConsensusResult, PrimaryGossip},
+        MissingCertificatesRequest, RequestHandler,
+    },
     state_sync::StateSynchronizer,
     ConsensusBus, RecentBlocks,
 };
 use assert_matches::assert_matches;
 use std::collections::{BTreeMap, BTreeSet};
+use tn_network_libp2p::{GossipMessage, TopicHash};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     error::HeaderError, now, AuthorityIdentifier, BlockHash, BlockHeader, BlockNumHash,
-    BlsPublicKey, Certificate, CertificateDigest, ExecHeader, Hash as _, SealedHeader, TaskManager,
+    BlsPublicKey, Certificate, CertificateDigest, EpochVote, ExecHeader, Hash as _, SealedHeader,
+    TaskManager, TnReceiver, TnSender,
 };
 use tracing::debug;
 
@@ -53,6 +58,8 @@ struct TestTypes<DB = MemDatabase> {
     /// Task manager the synchronizer (in RequestHandler) is spawned on.
     /// Save it so that task is not dropped early if needed.
     task_manager: TaskManager,
+    /// The consensus bus for tests.
+    consensus_bus: ConsensusBus,
 }
 
 /// Helper function to create an instance of [RequestHandler] for the first authority in the
@@ -80,7 +87,7 @@ fn create_test_types() -> TestTypes {
         .expect("watch channel updates for default parent in primary handler tests");
 
     let handler = RequestHandler::new(config.clone(), cb.clone(), synchronizer);
-    TestTypes { committee, handler, parent, task_manager }
+    TestTypes { committee, handler, parent, task_manager, consensus_bus: cb }
 }
 
 #[tokio::test]
@@ -293,4 +300,58 @@ async fn test_vote_fails_unknown_authority() -> eyre::Result<()> {
     debug!(target: "primary::handler_tests", ?res);
     assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::UnknownAuthority(wrong))) if wrong == wrong_authority.to_string());
     Ok(())
+}
+
+/// Test that primary pub/sub is enforcing topics.
+#[tokio::test]
+async fn test_primary_batch_gossip_topics() {
+    let TestTypes { handler, task_manager, consensus_bus, .. } = create_test_types();
+
+    task_manager.spawn_task("process-gossip-test", async move {
+        let mut rx = consensus_bus.new_epoch_votes().subscribe();
+        while let Some((_, tx)) = rx.recv().await {
+            let _ = tx.send(Ok(()));
+        }
+    });
+
+    let gossip = PrimaryGossip::Certificate(Box::new(Certificate::default()));
+    let data = tn_types::encode(&gossip);
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::primary_topic());
+    let goodish_msg =
+        GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
+    let res = handler.process_gossip(&goodish_msg).await;
+    // This will be rejected for other reasons, but make sure not for an invalid topic.
+    assert!(!matches!(res, Err(PrimaryNetworkError::InvalidTopic)));
+
+    let gossip = PrimaryGossip::Consensus(Box::new(ConsensusResult::default()));
+    let data = tn_types::encode(&gossip);
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::consensus_output_topic());
+    let good_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
+    assert!(handler.process_gossip(&good_msg).await.is_ok());
+
+    let gossip = PrimaryGossip::EpochVote(Box::new(EpochVote::default()));
+    let data = tn_types::encode(&gossip);
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::epoch_vote_topic());
+    let good_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
+    assert!(handler.process_gossip(&good_msg).await.is_ok());
+
+    let gossip = PrimaryGossip::Certificate(Box::new(Certificate::default()));
+    let data = tn_types::encode(&gossip);
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::epoch_vote_topic());
+    let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
+    let res = handler.process_gossip(&bad_msg).await;
+    // This will be rejected for other reasons, but make sure it is for an invalid topic.
+    assert!(matches!(res, Err(PrimaryNetworkError::InvalidTopic)));
+
+    let gossip = PrimaryGossip::Consensus(Box::new(ConsensusResult::default()));
+    let data = tn_types::encode(&gossip);
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::primary_topic());
+    let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
+    assert!(handler.process_gossip(&bad_msg).await.is_err());
+
+    let gossip = PrimaryGossip::EpochVote(Box::new(EpochVote::default()));
+    let data = tn_types::encode(&gossip);
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::consensus_output_topic());
+    let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
+    assert!(handler.process_gossip(&bad_msg).await.is_err());
 }

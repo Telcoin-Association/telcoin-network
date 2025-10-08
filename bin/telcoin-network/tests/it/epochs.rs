@@ -67,7 +67,6 @@ async fn test_epoch_boundary_inner(
     })
     .await?;
 
-    //tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     // submit txs to: issue NFT, stake, and activate new validator
     for tx in txs {
         let mut pending = provider.send_raw_transaction(&tx).await?;
@@ -75,7 +74,7 @@ async fn test_epoch_boundary_inner(
         // Once that is no longer true then should remove this retry loop.
         loop {
             debug!(target: "epoch-test", "pending tx: {pending:?}");
-            match timeout(Duration::from_secs(3), pending.watch()).await {
+            match timeout(Duration::from_secs(5), pending.watch()).await {
                 Err(_) => {
                     pending = provider.send_raw_transaction(&tx).await?;
                     continue;
