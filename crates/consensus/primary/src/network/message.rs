@@ -14,7 +14,7 @@ use tn_types::{
     Round, Vote,
 };
 
-#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub struct ConsensusResult {
     pub epoch: Epoch,
     pub number: u64,
@@ -35,7 +35,7 @@ pub enum PrimaryGossip {
     /// NOTE: `snappy` is slightly larger than uncompressed.
     Certificate(Box<Certificate>),
     /// Consensus output reached- publish the consensus chain height and new block hash.
-    Consenus(Box<ConsensusResult>),
+    Consensus(Box<ConsensusResult>),
     /// Signed hash sent out by committee memebers at epoch start.
     EpochVote(Box<EpochVote>),
 }
