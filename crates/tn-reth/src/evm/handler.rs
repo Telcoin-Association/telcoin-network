@@ -77,7 +77,7 @@ where
         let coinbase_account = context.journal().load_account(beneficiary)?;
         coinbase_account.data.mark_touch();
 
-        let gas_used = (gas.spent() - gas.refunded() as u64) as u128;
+        let gas_used = gas.spent_sub_refunded() as u128;
         coinbase_account.data.info.balance = coinbase_account
             .data
             .info
