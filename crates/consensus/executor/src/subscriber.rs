@@ -287,6 +287,8 @@ impl<DB: Database> Subscriber<DB> {
                         }
                         Err(e) => {
                             error!(target: "subscriber", "error fetching batches: {e}");
+                            // Failure to fetch batches is a fatal condition, return an error which will trigger node shutdown.
+                            return Err(e);
                         }
                     }
                 },
