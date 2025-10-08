@@ -14,13 +14,22 @@ use tn_types::{
     Round, Vote, B256,
 };
 
-#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// Info that is published (via gossip) by validators once they reach consensus.
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub struct ConsensusResult {
+    // epoch for this result (i.e. the current epoch)
     pub epoch: Epoch,
+    // reound for epoch that consensus was reached on
     pub round: Round,
+    /// the consensus header block number
     pub number: u64,
+    /// hash of the consensus header that was reached
     pub hash: BlockHash,
+    /// the validator that produced this result
     pub validator: BlsPublicKey,
+    /// the signature of the validator publishing this record
+    /// see digest() below, this is a signature over the has of the epoch, round, number and hash
+    /// fields
     pub signature: BlsSignature,
 }
 
@@ -58,7 +67,7 @@ pub enum PrimaryGossip {
     /// NOTE: `snappy` is slightly larger than uncompressed.
     Certificate(Box<Certificate>),
     /// Consensus output reached- publish the consensus chain height and new block hash.
-    Consenus(Box<ConsensusResult>),
+    Consensus(Box<ConsensusResult>),
     /// Signed hash sent out by committee memebers at epoch start.
     EpochVote(Box<EpochVote>),
 }

@@ -6,7 +6,7 @@
 use crate::{
     engine::{ExecutionNode, TnBuilder},
     primary::PrimaryNode,
-    worker::WorkerNode,
+    worker::{worker_task_manager_name, WorkerNode},
     EngineToPrimaryRpc,
 };
 use consensus_metrics::start_prometheus_server;
@@ -60,11 +60,8 @@ const EPOCH_TASK_MANAGER: &str = "Epoch Task Manager";
 /// The execution engine task manager name.
 const ENGINE_TASK_MANAGER: &str = "Engine Task Manager";
 
-/// The primary task manager name.
-pub(super) const PRIMARY_TASK_MANAGER: &str = "Primary Task Manager";
-
 /// The worker's base task manager name. This is used by `fn worker_task_manager_name(id)`.
-pub(super) const WORKER_TASK_MANAGER_BASE: &str = "Worker Task Manager";
+pub(super) const WORKER_TASK_BASE: &str = "Worker Task";
 
 /// The long-running type that oversees epoch transitions.
 #[derive(Debug)]
@@ -459,12 +456,17 @@ where
             )
             .await?;
 
+        // This needs to be created early so required machinery for other tasks exists when needed.
+        let mut worker = worker_node.new_worker().await?;
+
         // Produce a "dummy" epoch 0 EpochRecord if missing.
         // This will let us use simple code to find any epoch including 0 at startup.
         if self.consensus_db.get_committee_keys(0).is_none() {
             let current_epoch = primary.current_committee().await.epoch();
             if current_epoch != 0 {
-                panic!("We have epoch 0 in our database if we are past epoch 0, on {current_epoch}")
+                return Err(eyre::eyre!(
+                    "We have epoch 0 in our database if we are past epoch 0, on {current_epoch}"
+                ));
             }
             // No keys for epoch 0, fix that.
             // We are on epoch 0 so load up that committee in Db as well.
@@ -485,10 +487,11 @@ where
 
         gas_accumulator.rewards_counter().set_committee(primary.current_committee().await);
         // start primary
-        let mut primary_task_manager = primary.start().await?;
+        primary.start(&epoch_task_manager).await?;
 
-        // start worker
-        let (mut worker_task_manager, worker) = worker_node.start().await?;
+        let worker_task_manager_name = worker_task_manager_name(worker_node.id().await);
+        // start batch builder
+        worker.spawn_batch_builder(&worker_task_manager_name, &epoch_task_manager);
 
         // consensus config for shutdown subscribers
         let consensus_shutdown = primary.shutdown_signal().await;
@@ -504,12 +507,7 @@ where
             .await?;
 
         // update tasks
-        primary_task_manager.update_tasks();
-        worker_task_manager.update_tasks();
-
-        // add epoch-specific tasks to manager
-        epoch_task_manager.add_task_manager(primary_task_manager);
-        epoch_task_manager.add_task_manager(worker_task_manager);
+        epoch_task_manager.update_tasks();
 
         info!(target: "epoch-manager", tasks=?epoch_task_manager, "EPOCH TASKS\n");
 
@@ -557,6 +555,8 @@ where
             },
         }
 
+        // If the select exitted because of a join() then do not join() again- we are already
+        // shutting down.
         if need_join {
             consensus_shutdown.notify();
             // abort all epoch-related tasks
@@ -589,6 +589,12 @@ where
         let committee = primary.current_committee().await;
         let epoch = committee.epoch();
         if epoch == 0 {
+            // Epoch 0 will have a "dummy" epoch record to make the initial committee avaliable to
+            // code using these records. In this case there will not be a cert so we
+            // want to overwrite this with the correct record. That is why we need to
+            // use Some(_) (this means we have a certificate) instead of _ like in the general case.
+            // Without this we never overwrite the dummy epoch 0 record with the proper record and
+            // would break sync.
             if let Some((epoch_rec, Some(_))) = self.consensus_db.get_epoch_by_number(epoch) {
                 // We already have this record...
                 self.epoch_record = Some(epoch_rec);
@@ -1333,13 +1339,13 @@ where
         let rx_event_stream = self.worker_event_stream.subscribe();
         debug!(target: "epoch-manager", "spawning worker network for epoch");
 
-        let committe_keys: HashSet<BlsPublicKey> = consensus_config
+        let committee_keys: HashSet<BlsPublicKey> = consensus_config
             .committee()
             .authorities()
             .into_iter()
             .map(|a| *a.protocol_key())
             .collect();
-        network_handle.inner_handle().new_epoch(committe_keys).await?;
+        network_handle.inner_handle().new_epoch(committee_keys.clone()).await?;
 
         // start listening if the network needs to be initialized
         if *initial_epoch {
@@ -1379,7 +1385,16 @@ where
         // update the authorized publishers for gossip every epoch
         network_handle
             .inner_handle()
-            .subscribe(consensus_config.network_config().libp2p_config().worker_txn_topic())
+            .subscribe(tn_config::LibP2pConfig::worker_txn_topic())
+            .await?;
+        // Get gossip from committee members about batches.
+        // Useful for non-CVVs to prefetch and harmless for CVVs.
+        network_handle
+            .inner_handle()
+            .subscribe_with_publishers(
+                tn_config::LibP2pConfig::worker_topic(),
+                committee_keys.into_iter().collect(),
+            )
             .await?;
 
         // spawn worker network

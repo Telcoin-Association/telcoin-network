@@ -100,7 +100,7 @@ impl EpochRecord {
 /// Each committee member should gossip this on epoch start and other nodes
 /// should collect them and aggregate signatures.
 /// Note this is gossipped by the outgoing (previous committee).
-#[derive(PartialEq, Serialize, Deserialize, Copy, Clone, Debug)]
+#[derive(PartialEq, Serialize, Deserialize, Copy, Clone, Debug, Default)]
 pub struct EpochVote {
     /// The hash of the ['EpochRecord'].
     /// Store the hash not the record to keep gossip size down.
@@ -230,5 +230,3 @@ mod test {
         }
     }
 }
-
-// If we have the record but not the cert then wait a beat for it to show up.

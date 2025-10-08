@@ -14,14 +14,15 @@ async fn test_empty_proposal() {
 
     let cb = ConsensusBus::new();
     let mut rx_headers = cb.headers().subscribe();
+    let task_manager = TaskManager::default();
     let proposer = Proposer::new(
         primary.consensus_config(),
         primary.consensus_config().authority_id().expect("authority"),
         cb.clone(),
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+        task_manager.get_spawner(),
     );
 
-    let task_manager = TaskManager::default();
     proposer.spawn(&task_manager);
 
     // Ensure the proposer makes a correct empty header.
@@ -48,14 +49,15 @@ async fn test_equivocation_protection_after_restart() {
     // Spawn the proposer.
     let cb = ConsensusBus::new();
     let mut rx_headers = cb.headers().subscribe();
+    let mut task_manager = TaskManager::default();
     let proposer = Proposer::new(
         primary.consensus_config(),
         primary.consensus_config().authority_id().expect("authority"),
         cb.clone(),
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+        task_manager.get_spawner(),
     );
 
-    let mut task_manager = TaskManager::default();
     proposer.spawn(&task_manager);
 
     // Send enough digests for the header payload.
@@ -95,14 +97,15 @@ async fn test_equivocation_protection_after_restart() {
 
     let cb = ConsensusBus::new();
     let mut rx_headers = cb.headers().subscribe();
+    let task_manager = TaskManager::default();
     let proposer = Proposer::new(
         primary.consensus_config(),
         primary.consensus_config().authority_id().expect("authority"),
         cb.clone(),
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+        task_manager.get_spawner(),
     );
 
-    let task_manager = TaskManager::default();
     proposer.spawn(&task_manager);
 
     // Send enough digests for the header payload.

@@ -90,20 +90,22 @@ where
                 let unverified_cert = cert.validate_received().map_err(CertManagerError::from)?;
                 self.state_sync.process_peer_certificate(unverified_cert).await?;
             }
-            PrimaryGossip::Consenus(result) => {
+            PrimaryGossip::Consensus(result) => {
                 ensure!(
                     topic.to_string().eq(&tn_config::LibP2pConfig::consensus_output_topic()),
                     PrimaryNetworkError::InvalidTopic
                 );
                 // We want to confirm all the data (including but not limited to the consensus
                 // header hash) against the signature.
+                // Used to track signature counts as well to avoid any mismatched data errors.
                 let consensus_result_hash = result.digest();
                 let ConsensusResult { epoch, round, number, hash, validator: key, signature } =
                     *result;
                 let (old_number, old_hash) =
                     *self.consensus_bus.last_published_consensus_num_hash().borrow();
                 if hash == old_hash || old_number >= number {
-                    return Ok(()); // We have already dealt with this hash.
+                    // We have already dealt with this hash or we are past this output.
+                    return Ok(());
                 }
                 if let Some(committee) =
                     self.consensus_config.node_storage().get_committee_keys(epoch)
@@ -123,7 +125,7 @@ where
                     // valid.
                     let enough_sigs = (committee.len() / 3) + 1;
                     let mut consensus_certs = self.consensus_certs.lock();
-                    let sigs = consensus_certs.get(&hash).copied();
+                    let sigs = consensus_certs.get(&consensus_result_hash).copied();
                     if let Some(sigs) = sigs {
                         if (sigs + 1) as usize >= enough_sigs {
                             // Last consensus block we have executed, us this to determine if we are
@@ -139,12 +141,22 @@ where
                             // Use GC depth to estimate how many blocks we can be behind (roughly
                             // one block every two rounds).
                             let gc_depth = self.consensus_config.parameters().gc_depth;
-                            if matches!(
+                            let active_cvv = matches!(
                                 *self.consensus_bus.node_mode().borrow(),
                                 NodeMode::CvvActive
-                            ) && ((exec_round + gc_depth) < round
-                                || (epoch > exec_epoch && exec_number + 1 < number))
-                            {
+                            );
+                            // is our round outside the GC window
+                            // Will be false when not the same epoch (can't compare rounds) but
+                            // epoch_behind will work in that case.
+                            let outside_gc_window =
+                                epoch == exec_epoch && (exec_round + gc_depth) < round;
+                            // are we on older epoch?
+                            // note, we need to make wure we are not at the epoch boundary otherwise
+                            // we can get false positives
+                            let epoch_behind = epoch > exec_epoch && exec_number + 1 < number;
+                            // check if this node is inactive cvv and should be inactive (it is not
+                            // caught up enough to be a CVV)
+                            if active_cvv && (outside_gc_window || epoch_behind) {
                                 // We seem to be too far behind to be an active CVV, try to go
                                 // inactive to catch up.
                                 let _ = self.consensus_bus.node_mode().send(NodeMode::CvvInactive);
@@ -153,20 +165,20 @@ where
                                 return Ok(());
                             }
                             // Make sure we don't get old gossip and go backwards.
-                            if number > old_number {
-                                // Only send this when we are sure it is valid.
-                                // Receivers will count on this being verified.
-                                let _ = self
-                                    .consensus_bus
-                                    .last_published_consensus_num_hash()
-                                    .send((number, hash));
-                            }
+                            // number has to be greater than old_number due to an early check so
+                            // this is safe Only send this when we are
+                            // sure it is valid. Receivers will count on
+                            // this being verified.
+                            let _ = self
+                                .consensus_bus
+                                .last_published_consensus_num_hash()
+                                .send((number, hash));
                             consensus_certs.clear();
                         } else {
-                            consensus_certs.insert(hash, sigs + 1);
+                            consensus_certs.insert(consensus_result_hash, sigs + 1);
                         }
                     } else {
-                        consensus_certs.insert(hash, 1);
+                        consensus_certs.insert(consensus_result_hash, 1);
                     }
                 } else {
                     let latest_missing = *self.consensus_bus.requested_missing_epoch().borrow();
