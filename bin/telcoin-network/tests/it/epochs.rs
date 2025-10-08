@@ -7,12 +7,17 @@ use alloy::{
     sol_types::SolCall,
 };
 use clap::Parser as _;
+use nix::{
+    sys::signal::{self, Signal},
+    unistd::Pid,
+};
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::{
     panic,
     path::{Path, PathBuf},
     process::{Child, Command},
     sync::Arc,
+    time::Duration,
 };
 use telcoin_network::genesis::GenesisArgs;
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, NodeInfo};
@@ -64,8 +69,22 @@ async fn test_epoch_boundary_inner(
 
     // submit txs to: issue NFT, stake, and activate new validator
     for tx in txs {
-        let pending = &provider.send_raw_transaction(&tx).await?;
-        debug!(target: "epoch-test", "pending tx: {pending:?}");
+        let mut pending = provider.send_raw_transaction(&tx).await?;
+        // Currently submitting a txn on an epoch boundary can be lost.
+        // Once that is no longer true then should remove this retry loop.
+        loop {
+            debug!(target: "epoch-test", "pending tx: {pending:?}");
+            match timeout(Duration::from_secs(5), pending.watch()).await {
+                Err(_) => {
+                    pending = provider.send_raw_transaction(&tx).await?;
+                    continue;
+                }
+                Ok(res) => {
+                    res?;
+                }
+            }
+            break;
+        }
     }
 
     // retrieve current committee
@@ -93,7 +112,7 @@ async fn test_epoch_boundary_inner(
     for i in 0..25 {
         let new_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
         if new_epoch_info == current_epoch_info && last_pause != i {
-            tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION / 2)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
             last_pause = i + 1;
             continue;
         }
@@ -143,6 +162,99 @@ async fn test_epoch_boundary_inner(
     }
 }
 
+async fn loop_epochs(start: u32, iterations: u32) -> eyre::Result<()> {
+    // create rpc client for node1 default rpc address
+    let rpc_url = "http://127.0.0.1:8545".to_string();
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    // retrieve current committee
+    let consensus_registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &provider);
+    let mut current_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
+
+    let mut last_pause = 100;
+    let mut last_epoch_block_height = current_epoch_info.blockHeight;
+    for i in start..start + iterations {
+        let new_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
+        if new_epoch_info == current_epoch_info && last_pause != i {
+            tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
+            last_pause = i + 1;
+            continue;
+        }
+        last_pause = i;
+        assert!(new_epoch_info != current_epoch_info, "Old and new epoch equal on iteration {i}");
+        assert!(new_epoch_info.blockHeight > last_epoch_block_height);
+        assert_eq!(new_epoch_info.epochDuration as u64, EPOCH_DURATION);
+
+        // store the last seen epoch info that is expected to change every epoch
+        last_epoch_block_height = new_epoch_info.blockHeight;
+        current_epoch_info = new_epoch_info;
+
+        // sleep for epoch duration
+        tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION)).await;
+    }
+    Ok(())
+}
+
+async fn test_epoch_sync_inner(
+    child: Arc<std::sync::Mutex<Child>>,
+    nodes_to_start: &[(&str, Address)],
+    temp_path: &Path,
+) -> eyre::Result<()> {
+    // create rpc client for node1 default rpc address
+    let rpc_url = "http://127.0.0.1:8545".to_string();
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+
+    // wait for node rpc to become available
+    timeout(std::time::Duration::from_secs(20), async {
+        let mut result = provider.get_chain_id().await;
+        while let Err(e) = result {
+            debug!(target: "epoch-test", "provider error getting chain id: {e:?}");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+            // make next request
+            result = provider.get_chain_id().await;
+        }
+    })
+    .await?;
+
+    // sleep for first epoch with 1s offset and begin assertions loop
+    tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
+
+    // Go through at least 5 epochs.
+    loop_epochs(0, 5).await?;
+    // Kill a node
+    send_term(&mut *child.lock().unwrap());
+    let _ = child.lock().unwrap().wait();
+
+    // Make sure the node really is down.
+    let rpc_url = format!("http://127.0.0.1:8543");
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    assert!(provider.get_chain_id().await.is_err(), "Node not down!");
+
+    loop_epochs(5, 5).await?;
+    // Restart the node
+    let new_child = start_nodes(temp_path, nodes_to_start)?.pop().expect("child");
+    *child.lock().expect("poison") = new_child;
+    loop_epochs(10, 5).await?;
+
+    tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION * 2)).await;
+
+    // Do a check to make sure all the nodes have valid (certified) Epoch Records.
+    // The node that was down should also have all these records after syncing.
+    // TODO issue 375, should use tn_latestHeader RPC for this when fixed.
+    let latest_epoch = 15;
+    for p in 8540..=8545 {
+        let rpc_url = format!("http://127.0.0.1:{p}");
+        let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+        for epoch in 0..=latest_epoch {
+            let (epoch_rec, cert): (EpochRecord, EpochCertificate) =
+                provider.raw_request("tn_epochRecord".into(), (epoch,)).await?;
+            assert!(epoch_rec.verify_with_cert(&cert), "invalid epoch record!");
+        }
+    }
+
+    Ok(())
+}
+
 fn kill_procs(procs: &Vec<Arc<std::sync::Mutex<Child>>>) {
     // We need to capture the result above and then kill all the procs.
     for proc in procs.iter() {
@@ -150,6 +262,13 @@ fn kill_procs(procs: &Vec<Arc<std::sync::Mutex<Child>>>) {
     }
     for proc in procs {
         let _ = proc.lock().unwrap().wait();
+    }
+}
+
+/// Send SIGTERM to child, can use this to pre-send TERM to all children when shutting down.
+fn send_term(child: &mut Child) {
+    if let Err(e) = signal::kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM) {
+        tracing::error!(target: "restart-test", ?e, "error killing child");
     }
 }
 
@@ -196,6 +315,57 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
 
     let r =
         test_epoch_boundary_inner(genesis, governance_wallet, temp_path, &mut new_validator).await;
+    kill_procs(&procs);
+    r
+}
+
+#[ignore = "only run independently from all other it tests"]
+#[tokio::test]
+/// Test that sync works to fill in missing epochs.
+async fn test_epoch_sync() -> eyre::Result<()> {
+    tn_types::test_utils::init_test_tracing();
+    // create validator and governance wallets for adding new validator later
+    let new_validator = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(6));
+    let mut committee = vec![
+        ("validator-1", Address::from_slice(&[0x11; 20])),
+        ("validator-2", Address::from_slice(&[0x22; 20])),
+        ("validator-3", Address::from_slice(&[0x33; 20])),
+        ("validator-4", Address::from_slice(&[0x44; 20])),
+        ("validator-5", Address::from_slice(&[0x55; 20])),
+    ];
+
+    // setup genesis
+    let temp_dir = tempfile::TempDir::with_prefix("epoch_sync")?;
+    let temp_path = temp_dir.path();
+
+    let governance_wallet =
+        TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
+    let _genesis = create_genesis_for_test(
+        temp_path,
+        new_validator.address(),
+        governance_wallet.address(),
+        &committee,
+    )?;
+
+    // start nodes (committee + new validator)
+    committee.push((NEW_VALIDATOR, new_validator.address()));
+    let procs = start_nodes(temp_path, &committee)?;
+    let procs: Vec<Arc<std::sync::Mutex<Child>>> =
+        procs.into_iter().map(|c| Arc::new(std::sync::Mutex::new(c))).collect();
+    let procs_clone = procs.clone();
+    // Use a panic hook to make sure we kill the node procs on a panic (assert failure).
+    let org_panic = panic::take_hook();
+    panic::set_hook(Box::new(move |a| {
+        kill_procs(&procs_clone);
+        org_panic(a);
+    }));
+
+    let r = test_epoch_sync_inner(
+        procs[2].clone(),
+        &[("validator-3", Address::from_slice(&[0x33; 20]))],
+        temp_path,
+    )
+    .await;
     kill_procs(&procs);
     r
 }
@@ -339,7 +509,7 @@ fn config_committee(
 }
 
 /// Start the network using the node cli command.
-fn start_nodes(temp_path: &Path, validators: &Vec<(&str, Address)>) -> eyre::Result<Vec<Child>> {
+fn start_nodes(temp_path: &Path, validators: &[(&str, Address)]) -> eyre::Result<Vec<Child>> {
     let mut children = Vec::new();
     for (v, _) in validators.iter() {
         let dir = temp_path.join(v);

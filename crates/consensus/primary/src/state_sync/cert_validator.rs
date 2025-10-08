@@ -13,7 +13,7 @@ use tn_config::ConsensusConfig;
 use tn_storage::CertificateStore;
 use tn_types::{
     error::CertificateError, Certificate, CertificateDigest, Database, Hash as _, Round,
-    SignatureVerificationState, TnSender as _,
+    SignatureVerificationState, TaskSpawner, TnSender as _,
 };
 use tokio::sync::oneshot;
 use tracing::{debug, error, trace};
@@ -52,6 +52,8 @@ pub(super) struct CertificateValidator<DB> {
     highest_processed_round: AtomicRound,
     /// Highest round of verfied certificate that has been received.
     highest_received_round: AtomicRound,
+    /// Spawner for async tasks.
+    task_spawner: TaskSpawner,
 }
 
 impl<DB> CertificateValidator<DB>
@@ -65,8 +67,16 @@ where
         gc_round: AtomicRound,
         highest_processed_round: AtomicRound,
         highest_received_round: AtomicRound,
+        task_spawner: TaskSpawner,
     ) -> Self {
-        Self { consensus_bus, config, gc_round, highest_processed_round, highest_received_round }
+        Self {
+            consensus_bus,
+            config,
+            gc_round,
+            highest_processed_round,
+            highest_received_round,
+            task_spawner,
+        }
     }
 
     /// Convenience method for obtaining a new [CertificateManager].
@@ -234,7 +244,7 @@ where
             // spawn task to synchronize batches for this header
             //
             // NOTE: this should be okay bc header is already certified by quorum of signatures
-            tokio::task::spawn(async move {
+            self.task_spawner.spawn_task("sync header batches", async move {
                 let sync_header = HeaderValidator::new(config, bus);
                 let res = sync_header.sync_header_batches(&header, true, max_age).await;
                 if let Err(e) = res {
@@ -408,6 +418,9 @@ where
         certs: Vec<(usize, Certificate)>,
     ) -> tokio::task::JoinHandle<CertManagerResult<Vec<(usize, Certificate)>>> {
         let validator = self.clone();
+        // Don't have an equivelent on the task spawner.  Since this is a
+        // strictly sync task even if we did it would not really do
+        // anything special so Ok for now.
         tokio::task::spawn_blocking(move || {
             let now = Instant::now();
             let mut sanitized_certs = Vec::new();

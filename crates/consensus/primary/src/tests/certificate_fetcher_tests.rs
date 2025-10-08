@@ -94,8 +94,9 @@ async fn fetch_certificates_basic() {
 
     let cb = ConsensusBus::new();
     // Make a synchronizer for certificates.
-    let synchronizer = StateSynchronizer::new(primary.consensus_config(), cb.clone());
     let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(primary.consensus_config(), cb.clone(), task_manager.get_spawner());
     synchronizer.spawn(&task_manager);
 
     let (sender, mut fake_receiver) = mpsc::channel(1000);

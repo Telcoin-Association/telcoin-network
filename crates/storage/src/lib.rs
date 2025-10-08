@@ -12,8 +12,8 @@ pub use stores::*;
 pub use redb::database::ReDB;
 use tables::{
     Batches, CertificateDigestByOrigin, CertificateDigestByRound, Certificates,
-    ConsensusBlockNumbersByDigest, ConsensusBlocks, KadProviderRecords, KadRecords,
-    KadWorkerProviderRecords, KadWorkerRecords, LastProposed, Payload, Votes,
+    ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache, KadProviderRecords,
+    KadRecords, KadWorkerProviderRecords, KadWorkerRecords, LastProposed, Payload, Votes,
 };
 // Always build redb, we use it as the default for persistant consensus data.
 pub mod layered_db;
@@ -47,6 +47,7 @@ const PAYLOAD_CF: &str = "payload";
 const BATCHES_CF: &str = "batches";
 const CONSENSUS_BLOCK_CF: &str = "consensus_block";
 const CONSENSUS_BLOCK_NUMBER_BY_DIGEST_CF: &str = "consensus_block_number_by_digest";
+const CONSENSUS_BLOCK_CACHE_CF: &str = "consensus_block_cache";
 const EPOCH_RECORDS_CF: &str = "epoch_record_by_number";
 const EPOCH_CERTS_CF: &str = "epoch_cert_by_number";
 const EPOCH_RECORDS_INDEX_CF: &str = "epoch_records_index";
@@ -88,7 +89,10 @@ pub mod tables {
         Batches;crate::BATCHES_CF;<BlockHash, Batch>,
         // These tables are for the consensus chain not the normal consensus.
         ConsensusBlocks;crate::CONSENSUS_BLOCK_CF;<u64, ConsensusHeader>,
+        // This can contain mappings for confirmed but not executed blocks (block might be ConsensusBlocks OR ConsensusBlocksCache).
         ConsensusBlockNumbersByDigest;crate::CONSENSUS_BLOCK_NUMBER_BY_DIGEST_CF;<BlockHash, u64>,
+        // This is a cache to store verified but unprocessed consensus headers, remove once processed.
+        ConsensusBlocksCache;crate::CONSENSUS_BLOCK_CACHE_CF;<u64, ConsensusHeader>,
         // These tables are for the epoch chain not the normal consensus.
         EpochRecords;crate::EPOCH_RECORDS_CF;<Epoch, EpochRecord>,
         EpochCerts;crate::EPOCH_CERTS_CF;<B256, EpochCertificate>,
@@ -137,6 +141,7 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<Batches>().expect("failed to open table!");
     db.open_table::<ConsensusBlocks>().expect("failed to open table!");
     db.open_table::<ConsensusBlockNumbersByDigest>().expect("failed to open table!");
+    db.open_table::<ConsensusBlocksCache>().expect("failed to open table!");
     db.open_table::<EpochRecords>().expect("failed to open table!");
     db.open_table::<EpochCerts>().expect("failed to open table!");
     db.open_table::<EpochRecordsIndex>().expect("failed to open table!");
@@ -156,6 +161,7 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<Batches>();
     db.open_table::<ConsensusBlocks>();
     db.open_table::<ConsensusBlockNumbersByDigest>();
+    db.open_table::<ConsensusBlocksCache>();
     db.open_table::<EpochRecords>();
     db.open_table::<EpochCerts>();
     db.open_table::<EpochRecordsIndex>();
@@ -181,6 +187,7 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<Batches>().expect("failed to open table!");
     db.open_table::<ConsensusBlocks>().expect("failed to open table!");
     db.open_table::<ConsensusBlockNumbersByDigest>().expect("failed to open table!");
+    db.open_table::<ConsensusBlocksCache>().expect("failed to open table!");
     db.open_table::<EpochRecords>().expect("failed to open table!");
     db.open_table::<EpochCerts>().expect("failed to open table!");
     db.open_table::<EpochRecordsIndex>().expect("failed to open table!");
@@ -199,6 +206,7 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<Batches>();
     db.open_table::<ConsensusBlocks>();
     db.open_table::<ConsensusBlockNumbersByDigest>();
+    db.open_table::<ConsensusBlocksCache>();
     db.open_table::<EpochRecords>();
     db.open_table::<EpochCerts>();
     db.open_table::<EpochRecordsIndex>();

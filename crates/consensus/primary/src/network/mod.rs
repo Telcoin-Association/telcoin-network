@@ -18,14 +18,15 @@ use tn_network_libp2p::{
 use tn_network_types::{WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerToPrimaryClient};
 use tn_storage::PayloadStore;
 use tn_types::{
-    encode, BlockHash, BlsPublicKey, Certificate, CertificateDigest, ConsensusHeader, Database,
-    Epoch, EpochCertificate, EpochRecord, EpochVote, Header, TaskSpawner, TnReceiver, TnSender,
-    Vote,
+    encode, BlockHash, BlsPublicKey, BlsSignature, Certificate, CertificateDigest, ConsensusHeader,
+    Database, Epoch, EpochCertificate, EpochRecord, EpochVote, Header, Round, TaskSpawner,
+    TnReceiver, TnSender, Vote,
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 pub mod handler;
 mod message;
+pub use message::ConsensusResult;
 
 #[cfg(test)]
 #[path = "../tests/network_tests.rs"]
@@ -74,11 +75,22 @@ impl PrimaryNetworkHandle {
     /// Publish a consensus block number and hash of the header.
     pub async fn publish_consensus(
         &self,
+        epoch: Epoch,
+        round: Round,
         consensus_block_num: u64,
         consensus_header_hash: BlockHash,
+        key: BlsPublicKey,
+        signature: BlsSignature,
     ) -> NetworkResult<()> {
-        let data = encode(&PrimaryGossip::Consensus(consensus_block_num, consensus_header_hash));
-        self.handle.publish(tn_config::LibP2pConfig::primary_topic(), data).await?;
+        let data = encode(&PrimaryGossip::Consensus(Box::new(ConsensusResult {
+            epoch,
+            round,
+            number: consensus_block_num,
+            hash: consensus_header_hash,
+            validator: key,
+            signature,
+        })));
+        self.handle.publish(tn_config::LibP2pConfig::consensus_output_topic(), data).await?;
         Ok(())
     }
 
@@ -151,6 +163,7 @@ impl PrimaryNetworkHandle {
     }
 
     /// Request consensus header from specific peer.
+    /// Will verify the returned header matches hash if provided (strong) or number if not (weak).
     pub async fn request_consensus_from_peer(
         &self,
         peer: BlsPublicKey,
@@ -161,7 +174,27 @@ impl PrimaryNetworkHandle {
         let res = self.handle.send_request(request, peer).await?;
         let res = res.await??;
         match res {
-            PrimaryResponse::ConsensusHeader(header) => Ok(Arc::unwrap_or_clone(header)),
+            PrimaryResponse::ConsensusHeader(header) => match (hash, number) {
+                (Some(hash), _) => {
+                    if header.digest() == hash {
+                        Ok(Arc::unwrap_or_clone(header))
+                    } else {
+                        Err(NetworkError::RPCError(
+                            "Got wrong response, header does not match hash!".to_string(),
+                        ))
+                    }
+                }
+                (_, Some(number)) => {
+                    if header.number == number {
+                        Ok(Arc::unwrap_or_clone(header))
+                    } else {
+                        Err(NetworkError::RPCError(
+                            "Got wrong response, number does not match header!".to_string(),
+                        ))
+                    }
+                }
+                _ => Ok(Arc::unwrap_or_clone(header)),
+            },
             PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
             _ => Err(NetworkError::RPCError(
                 "Got wrong response, not a consensus header!".to_string(),
@@ -170,6 +203,7 @@ impl PrimaryNetworkHandle {
     }
 
     /// Request consensus header from a random peer up to three times from three different peers.
+    /// Will verify the returned header matches hash if provided (strong) or number if not (weak).
     pub async fn request_consensus(
         &self,
         number: Option<u64>,
@@ -182,7 +216,23 @@ impl PrimaryNetworkHandle {
             let res = self.handle.send_request_any(request.clone()).await?;
             let res = res.await?;
             if let Ok(PrimaryResponse::ConsensusHeader(header)) = res {
-                return Ok(Arc::unwrap_or_clone(header));
+                match (hash, number) {
+                    (Some(hash), _) => {
+                        if header.digest() == hash {
+                            return Ok(Arc::unwrap_or_clone(header));
+                        }
+                    }
+                    (_, Some(number)) => {
+                        if header.number == number {
+                            return Ok(Arc::unwrap_or_clone(header));
+                        }
+                    }
+                    _ => {
+                        return Err(NetworkError::RPCError(
+                            "Must provide hash or number!".to_string(),
+                        ));
+                    }
+                }
             }
         }
         Err(NetworkError::RPCError("Could not get the consensus header!".to_string()))
@@ -199,8 +249,7 @@ impl PrimaryNetworkHandle {
         // This could be a lot more complicated but this KISS method should work fine.
         for _ in 0..3 {
             let res = self.handle.send_request_any(request.clone()).await?;
-            let res = res.await?;
-            if let Ok(PrimaryResponse::EpochRecord { record, certificate }) = res {
+            if let Ok(Ok(PrimaryResponse::EpochRecord { record, certificate })) = res.await {
                 return Ok((record, certificate));
             }
         }
@@ -434,7 +483,7 @@ where
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
-        let task_name = format!("ProcessGossip-{propagation_source}");
+        let task_name = format!("ProcessGossip-{}-{propagation_source}", msg.topic);
         // spawn task to process gossip
         self.task_spawner.spawn_task(task_name, async move {
             if let Err(e) = request_handler.process_gossip(&msg).await {

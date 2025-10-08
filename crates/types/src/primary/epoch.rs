@@ -17,7 +17,7 @@ use serde_with::serde_as;
 
 /// Record of an Epoch.  Will be created at epoch start for the previous epoch
 /// and signed by that epochs committee members.
-#[derive(PartialEq, Serialize, Deserialize, Clone, Debug)]
+#[derive(PartialEq, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct EpochRecord {
     /// The epoch this record is for.
     pub epoch: Epoch,
@@ -100,7 +100,7 @@ impl EpochRecord {
 /// Each committee member should gossip this on epoch start and other nodes
 /// should collect them and aggregate signatures.
 /// Note this is gossipped by the outgoing (previous committee).
-#[derive(PartialEq, Serialize, Deserialize, Copy, Clone, Debug)]
+#[derive(PartialEq, Serialize, Deserialize, Copy, Clone, Debug, Default)]
 pub struct EpochVote {
     /// The hash of the ['EpochRecord'].
     /// Store the hash not the record to keep gossip size down.

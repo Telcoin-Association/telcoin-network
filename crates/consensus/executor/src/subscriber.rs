@@ -14,13 +14,15 @@ use std::{
 use tn_config::ConsensusConfig;
 use tn_network_types::{local::LocalNetwork, PrimaryToWorkerClient};
 use tn_primary::{
-    consensus::ConsensusRound, network::PrimaryNetworkHandle, ConsensusBus, NodeMode,
+    consensus::ConsensusRound,
+    network::{ConsensusResult, PrimaryNetworkHandle},
+    ConsensusBus, NodeMode,
 };
 use tn_storage::CertificateStore;
 use tn_types::{
-    Address, AuthorityIdentifier, Batch, BlockHash, CertifiedBatch, CommittedSubDag, Committee,
-    ConsensusHeader, ConsensusOutput, Database, Hash as _, Noticer, TaskManager, TaskSpawner,
-    Timestamp, TnReceiver, TnSender, B256,
+    encode, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash, BlsSigner as _,
+    CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput, Database,
+    Hash as _, Noticer, TaskManager, TaskSpawner, Timestamp, TnReceiver, TnSender, B256,
 };
 use tracing::{debug, error, info};
 
@@ -162,7 +164,7 @@ impl<DB: Database> Subscriber<DB> {
 
     /// Catch up to current consensus and then try to rejoin as an active CVV.
     async fn catch_up_rejoin_consensus(&self, tasks: TaskSpawner) -> SubscriberResult<()> {
-        // Get a receiver than stream any missing headers so we don't miss them.
+        // Get a receiver and then stream any missing headers so we don't miss them.
         let mut rx_consensus_headers = self.consensus_bus.consensus_header().subscribe();
         stream_missing_consensus(&self.config, &self.consensus_bus).await?;
         spawn_state_sync(
@@ -179,6 +181,7 @@ impl<DB: Database> Subscriber<DB> {
                 // We are caught up enough so try to jump back into consensus
                 info!(target: "subscriber", "attempting to rejoin consensus, consensus block height {consensus_header_number}");
                 let _ = self.consensus_bus.node_mode().send(NodeMode::CvvActive);
+                self.config.shutdown().notify();
                 return Ok(());
             }
         }
@@ -254,7 +257,12 @@ impl<DB: Database> Subscriber<DB> {
                         error!(target: "subscriber", "error sending latest consensus header for authority {:?}: {}", self.inner.authority_id, e);
                         return Err(SubscriberError::ClosedChannel("failed to send last consensus header on bus".to_string()));
                     }
-                    if let Err(e) = self.network_handle.publish_consensus(number, last_parent).await {
+                    let epoch = sub_dag.leader_epoch();
+                    let round = sub_dag.leader_round();
+                    let consensus_result_hash = ConsensusResult::digest_data(epoch, round, number, last_parent);
+                    let sig =
+                        self.config.key_config().request_signature_direct(&encode(&to_intent_message(consensus_result_hash)));
+                    if let Err(e) = self.network_handle.publish_consensus(epoch, round, number, last_parent, self.config.key_config().public_key(), sig).await {
                         error!(target: "subscriber", "error publishing latest consensus to network {:?}: {}", self.inner.authority_id, e);
                     }
                     last_number += 1;

@@ -192,7 +192,7 @@ impl PeerManager {
     /// banned.
     fn sanitize_ip_addr(&self, remote_addr: &Multiaddr) -> Result<(), ConnectionDenied> {
         // only support ipv4 and ipv6
-        if !self.has_valid_unbanned_ips(&[remote_addr.clone()]) {
+        if !self.has_valid_unbanned_ips(std::slice::from_ref(remote_addr)) {
             return Err(ConnectionDenied::new(
                 "Connection denied: peer has no valid unbanned IP addresses".to_string(),
             ));
