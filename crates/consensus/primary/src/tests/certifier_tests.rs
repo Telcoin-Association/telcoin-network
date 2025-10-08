@@ -9,7 +9,7 @@ use rand::{rngs::StdRng, SeedableRng};
 use std::{collections::HashMap, num::NonZeroUsize};
 use tn_network_libp2p::types::{NetworkCommand, NetworkHandle};
 use tn_storage::mem_db::MemDatabase;
-use tn_test_utils::CommitteeFixture;
+use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{BlsKeypair, Notifier, SignatureVerificationState, TnSender};
 use tokio::sync::mpsc;
 

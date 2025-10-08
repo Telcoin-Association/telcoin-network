@@ -51,7 +51,7 @@ tn-storage = { workspace = true }
 assert_matches = { workspace = true }
 tn-types = { workspace = true, features = ["test-utils"] }
 tn-primary = { workspace = true, features = ["test-utils"] }
-tn-test-utils = { workspace = true }
+tn-test-utils-committee = { workspace = true }
 
 [features]
 default = []

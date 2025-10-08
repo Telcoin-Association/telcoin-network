@@ -13,7 +13,7 @@ use crate::{
 use std::collections::{BTreeSet, HashMap};
 use tn_config::{ConsensusConfig, NetworkConfig};
 use tn_storage::{mem_db::MemDatabase, open_db, CertificateStore};
-use tn_test_utils::CommitteeFixture;
+use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     AuthorityIdentifier, ExecHeader, Notifier, SealedHeader, TaskManager, TnReceiver, TnSender,
     B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,

@@ -3,7 +3,7 @@
 use rand::{rngs::StdRng, SeedableRng};
 use std::num::NonZeroUsize;
 use tn_storage::mem_db::MemDatabase;
-use tn_test_utils::CommitteeFixture;
+use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{AuthorityIdentifier, BlsKeypair, Certificate, SignatureVerificationState, Vote};
 
 #[test]

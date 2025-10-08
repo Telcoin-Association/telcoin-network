@@ -5,7 +5,7 @@ use std::{collections::BTreeSet, num::NonZeroUsize};
 use tempfile::TempDir;
 use tn_primary::test_utils::mock_certificate;
 use tn_storage::{mem_db::MemDatabase, open_db, ConsensusStore};
-use tn_test_utils::CommitteeFixture;
+use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{AuthorityIdentifier, Certificate, CommittedSubDag, ReputationScores, Round};
 
 #[tokio::test]
