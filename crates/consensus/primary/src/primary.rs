@@ -92,6 +92,7 @@ impl<DB: Database> Primary<DB> {
                 config.authority_id().expect("CVV has an auth id"),
                 consensus_bus.clone(),
                 leader_schedule,
+                task_manager.get_spawner(),
             );
 
             proposer.spawn(task_manager);
@@ -99,6 +100,8 @@ impl<DB: Database> Primary<DB> {
             // This is a dumb task to keep the parents channel clear when not
             // a cvv.  Otherwise the senders to this channel will eventually "back up"
             // and cause hung tasks.  Not the end of the world but wastes resources.
+            // TODO- issue 457- remove this once we have a clean way to handle this at the consensus
+            // bus.
             let mut parents_rx = consensus_bus.parents().subscribe();
             task_manager.spawn_critical_task("Clear parent certs for non-CVV", async move {
                 while (parents_rx.recv().await).is_some() {}

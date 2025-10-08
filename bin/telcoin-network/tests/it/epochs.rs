@@ -75,7 +75,7 @@ async fn test_epoch_boundary_inner(
         // Once that is no longer true then should remove this retry loop.
         loop {
             debug!(target: "epoch-test", "pending tx: {pending:?}");
-            match timeout(Duration::from_secs(3), pending.watch()).await {
+            match timeout(Duration::from_secs(5), pending.watch()).await {
                 Err(_) => {
                     pending = provider.send_raw_transaction(&tx).await?;
                     continue;
