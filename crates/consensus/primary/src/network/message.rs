@@ -15,7 +15,7 @@ use tn_types::{
 };
 
 /// Info that is published (via gossip) by validators once they reach consensus.
-#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub struct ConsensusResult {
     // epoch for this result (i.e. the current epoch)
     pub epoch: Epoch,
@@ -67,7 +67,7 @@ pub enum PrimaryGossip {
     /// NOTE: `snappy` is slightly larger than uncompressed.
     Certificate(Box<Certificate>),
     /// Consensus output reached- publish the consensus chain height and new block hash.
-    Consenus(Box<ConsensusResult>),
+    Consensus(Box<ConsensusResult>),
     /// Signed hash sent out by committee memebers at epoch start.
     EpochVote(Box<EpochVote>),
 }

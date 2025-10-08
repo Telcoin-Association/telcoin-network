@@ -10,8 +10,8 @@ use tn_network_libp2p::GossipMessage;
 use tn_network_types::{WorkerOthersBatchMessage, WorkerToPrimaryClient};
 use tn_storage::tables::Batches;
 use tn_types::{
-    now, try_decode, Batch, BatchValidation, BlockHash, BlsPublicKey, Database, SealedBatch,
-    WorkerId,
+    ensure, now, try_decode, Batch, BatchValidation, BlockHash, BlsPublicKey, Database,
+    SealedBatch, WorkerId,
 };
 use tracing::debug;
 
@@ -56,18 +56,22 @@ where
     /// Batch.
     pub(super) async fn process_gossip(&self, msg: &GossipMessage) -> WorkerNetworkResult<()> {
         // deconstruct message
-        let GossipMessage { data, source: _, sequence_number: _, topic: _ } = msg;
+        let GossipMessage { data, source: _, sequence_number: _, topic } = msg;
 
         // gossip is uncompressed
         let gossip = try_decode(data)?;
 
         match gossip {
             WorkerGossip::Batch(batch_hash) => {
+                ensure!(
+                    topic.to_string().eq(&tn_config::LibP2pConfig::worker_topic()),
+                    WorkerNetworkError::InvalidTopic
+                );
                 // Retrieve the block...
                 let store = self.consensus_config.node_storage();
                 if !matches!(store.get::<Batches>(&batch_hash), Ok(Some(_))) {
                     // If we don't have this batch already then try to get it.
-                    // If we are CVV then we should already have it.
+                    // If we are a CVV then we should already have it.
                     // This allows non-CVVs to pre fetch batches they will soon need.
                     match self.network_handle.request_batches(vec![batch_hash]).await {
                         Ok(batches) => {
@@ -86,6 +90,10 @@ where
                 }
             }
             WorkerGossip::Txn(tx_bytes) => {
+                ensure!(
+                    topic.to_string().eq(&tn_config::LibP2pConfig::worker_txn_topic()),
+                    WorkerNetworkError::InvalidTopic
+                );
                 if let Some(authority) = self.consensus_config.authority() {
                     let committee = self.consensus_config.committee();
                     let authorities = committee.authorities();
@@ -204,7 +212,10 @@ where
 {
     /// Publicly available for tests.
     /// See [Self::process_gossip].
-    pub async fn pub_process_gossip(&self, msg: &GossipMessage) -> WorkerNetworkResult<()> {
+    pub async fn pub_process_gossip_for_test(
+        &self,
+        msg: &GossipMessage,
+    ) -> WorkerNetworkResult<()> {
         self.process_gossip(msg).await
     }
 
