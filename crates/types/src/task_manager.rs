@@ -74,7 +74,7 @@ pub struct TaskManager {
     /// This is used to notify any spawned tasks to exit when task manager is dropped.
     /// Otherwise we will end up with orphaned tasks when epochs change.
     local_shutdown: Notifier,
-    /// How long to wait for joins to complete.  This will be sued twice (so double it).
+    /// How long to wait for joins to complete.  This will be used twice (so double it).
     join_wait_millis: u64,
 }
 
