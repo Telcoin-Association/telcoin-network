@@ -67,7 +67,6 @@ async fn test_epoch_boundary_inner(
     })
     .await?;
 
-    //tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     // submit txs to: issue NFT, stake, and activate new validator
     for tx in txs {
         let mut pending = provider.send_raw_transaction(&tx).await?;
