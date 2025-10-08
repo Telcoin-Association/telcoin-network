@@ -7,8 +7,8 @@ use std::{sync::Arc, time::Duration};
 
 use crate::{proposer::OurDigestMessage, state_sync::StateSynchronizer, ConsensusBus};
 use handler::RequestHandler;
-use message::{ConsensusResult, PrimaryGossip, PrimaryRPCError};
 pub use message::{MissingCertificatesRequest, PrimaryRequest, PrimaryResponse};
+use message::{PrimaryGossip, PrimaryRPCError};
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     error::NetworkError,
@@ -19,13 +19,14 @@ use tn_network_types::{WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerTo
 use tn_storage::PayloadStore;
 use tn_types::{
     encode, BlockHash, BlsPublicKey, BlsSignature, Certificate, CertificateDigest, ConsensusHeader,
-    Database, Epoch, EpochCertificate, EpochRecord, EpochVote, Header, TaskSpawner, TnReceiver,
-    TnSender, Vote,
+    Database, Epoch, EpochCertificate, EpochRecord, EpochVote, Header, Round, TaskSpawner,
+    TnReceiver, TnSender, Vote,
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 pub mod handler;
 mod message;
+pub use message::ConsensusResult;
 
 #[cfg(test)]
 #[path = "../tests/network_tests.rs"]
@@ -75,6 +76,7 @@ impl PrimaryNetworkHandle {
     pub async fn publish_consensus(
         &self,
         epoch: Epoch,
+        round: Round,
         consensus_block_num: u64,
         consensus_header_hash: BlockHash,
         key: BlsPublicKey,
@@ -82,6 +84,7 @@ impl PrimaryNetworkHandle {
     ) -> NetworkResult<()> {
         let data = encode(&PrimaryGossip::Consensus(Box::new(ConsensusResult {
             epoch,
+            round,
             number: consensus_block_num,
             hash: consensus_header_hash,
             validator: key,
@@ -261,10 +264,11 @@ impl PrimaryNetworkHandle {
     /// Notify peer manager of peer exchange information.
     pub(crate) async fn process_peer_exchange(
         &self,
+        peer: BlsPublicKey,
         peers: PeerExchangeMap,
         channel: ResponseChannel<PrimaryResponse>,
     ) {
-        if let Err(e) = self.handle.process_peer_exchange(peers, channel).await {
+        if let Err(e) = self.handle.process_peer_exchange(peer, peers, channel).await {
             warn!(target: "primary::network", ?e, "process peer exchange failed");
         }
     }
@@ -340,7 +344,7 @@ where
                     self.process_consensus_output_request(peer, number, hash, channel, cancel)
                 }
                 PrimaryRequest::PeerExchange { peers } => {
-                    self.process_peer_exchange(peers, channel)
+                    self.process_peer_exchange(peer, peers, channel)
                 }
                 PrimaryRequest::EpochRecord { epoch, hash } => {
                     self.process_epoch_record_request(peer, epoch, hash, channel, cancel)
@@ -495,13 +499,14 @@ where
     /// Process peer exchange.
     fn process_peer_exchange(
         &self,
+        peer: BlsPublicKey,
         peers: PeerExchangeMap,
         channel: ResponseChannel<PrimaryResponse>,
     ) {
         let network_handle = self.network_handle.clone();
         // notify peer manager and respond with ack
         self.task_spawner.spawn_task("ProcessPeerExchange", async move {
-            network_handle.process_peer_exchange(peers, channel).await;
+            network_handle.process_peer_exchange(peer, peers, channel).await;
         });
     }
 }

@@ -253,10 +253,11 @@ impl WorkerNetworkHandle {
     /// Notify peer manager of peer exchange information.
     pub(crate) async fn process_peer_exchange(
         &self,
+        peer: BlsPublicKey,
         peers: PeerExchangeMap,
         channel: ResponseChannel<WorkerResponse>,
     ) {
-        let _ = self.handle.process_peer_exchange(peers, channel).await;
+        let _ = self.handle.process_peer_exchange(peer, peers, channel).await;
     }
 
     /// Retrieve the count of connected peers.
@@ -328,7 +329,7 @@ where
                 }
                 WorkerRequest::PeerExchange { peers } => {
                     // notify peer manager
-                    self.process_peer_exchange(peers, channel);
+                    self.process_peer_exchange(peer, peers, channel);
                 }
             },
             NetworkEvent::Gossip(msg, propagation_source) => {
@@ -441,6 +442,7 @@ where
     /// Process peer exchange.
     fn process_peer_exchange(
         &self,
+        peer: BlsPublicKey,
         peers: PeerExchangeMap,
         channel: ResponseChannel<WorkerResponse>,
     ) {
@@ -448,7 +450,7 @@ where
 
         // notify peer manager and respond with ack
         self.network_handle.get_task_spawner().spawn_task("process-peer-exchange", async move {
-            network_handle.process_peer_exchange(peers, channel).await;
+            network_handle.process_peer_exchange(peer, peers, channel).await;
         });
     }
 }

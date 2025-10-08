@@ -11,16 +11,48 @@ use tn_network_libp2p::{types::IntoRpcError, PeerExchangeMap, TNMessage};
 use tn_types::{
     error::HeaderError, AuthorityIdentifier, BlockHash, BlsPublicKey, BlsSignature, Certificate,
     CertificateDigest, ConsensusHeader, Epoch, EpochCertificate, EpochRecord, EpochVote, Header,
-    Round, Vote,
+    Round, Vote, B256,
 };
 
+/// Info that is published (via gossip) by validators once they reach consensus.
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub struct ConsensusResult {
+    // epoch for this result (i.e. the current epoch)
     pub epoch: Epoch,
+    // reound for epoch that consensus was reached on
+    pub round: Round,
+    /// the consensus header block number
     pub number: u64,
+    /// hash of the consensus header that was reached
     pub hash: BlockHash,
+    /// the validator that produced this result
     pub validator: BlsPublicKey,
+    /// the signature of the validator publishing this record
+    /// see digest() below, this is a signature over the has of the epoch, round, number and hash
+    /// fields
     pub signature: BlsSignature,
+}
+
+impl ConsensusResult {
+    /// Return the digest of the data fields (epoch, round, number and hash).
+    /// This will be the same for all validadors and is what signature signs
+    /// (verifying all the data fields not just the hash).
+    pub fn digest(&self) -> BlockHash {
+        Self::digest_data(self.epoch, self.round, self.number, self.hash)
+    }
+
+    /// Return the digest of the data fields (epoch, round, number and hash).
+    /// Used for generating the signature of the raw data.
+    /// This will be the same for all validadors and is what signature signs
+    /// (verifying all the data fields not just the hash).
+    pub fn digest_data(epoch: Epoch, round: Round, number: u64, hash: BlockHash) -> BlockHash {
+        let mut hasher = tn_types::DefaultHashFunction::new();
+        hasher.update(&epoch.to_be_bytes());
+        hasher.update(&round.to_be_bytes());
+        hasher.update(&number.to_be_bytes());
+        hasher.update(hash.as_ref());
+        B256::from_slice(hasher.finalize().as_bytes())
+    }
 }
 
 /// Primary messages on the gossip network.

@@ -14,7 +14,9 @@ use std::{
 use tn_config::ConsensusConfig;
 use tn_network_types::{local::LocalNetwork, PrimaryToWorkerClient};
 use tn_primary::{
-    consensus::ConsensusRound, network::PrimaryNetworkHandle, ConsensusBus, NodeMode,
+    consensus::ConsensusRound,
+    network::{ConsensusResult, PrimaryNetworkHandle},
+    ConsensusBus, NodeMode,
 };
 use tn_storage::CertificateStore;
 use tn_types::{
@@ -255,9 +257,12 @@ impl<DB: Database> Subscriber<DB> {
                         error!(target: "subscriber", "error sending latest consensus header for authority {:?}: {}", self.inner.authority_id, e);
                         return Err(SubscriberError::ClosedChannel("failed to send last consensus header on bus".to_string()));
                     }
+                    let epoch = sub_dag.leader_epoch();
+                    let round = sub_dag.leader_round();
+                    let consensus_result_hash = ConsensusResult::digest_data(epoch, round, number, last_parent);
                     let sig =
-                        self.config.key_config().request_signature_direct(&encode(&to_intent_message(last_parent)));
-                    if let Err(e) = self.network_handle.publish_consensus(sub_dag.leader_epoch(), number, last_parent, self.config.key_config().public_key(), sig).await {
+                        self.config.key_config().request_signature_direct(&encode(&to_intent_message(consensus_result_hash)));
+                    if let Err(e) = self.network_handle.publish_consensus(epoch, round, number, last_parent, self.config.key_config().public_key(), sig).await {
                         error!(target: "subscriber", "error publishing latest consensus to network {:?}: {}", self.inner.authority_id, e);
                     }
                     last_number += 1;
