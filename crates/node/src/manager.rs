@@ -464,7 +464,9 @@ where
         if self.consensus_db.get_committee_keys(0).is_none() {
             let current_epoch = primary.current_committee().await.epoch();
             if current_epoch != 0 {
-                panic!("We have epoch 0 in our database if we are past epoch 0, on {current_epoch}")
+                return Err(eyre::eyre!(
+                    "We have epoch 0 in our database if we are past epoch 0, on {current_epoch}"
+                ));
             }
             // No keys for epoch 0, fix that.
             // We are on epoch 0 so load up that committee in Db as well.
@@ -557,6 +559,8 @@ where
             },
         }
 
+        // If the select exitted because of a join() then do not join() again- we are already
+        // shutting down.
         if need_join {
             consensus_shutdown.notify();
             // abort all epoch-related tasks
@@ -589,6 +593,12 @@ where
         let committee = primary.current_committee().await;
         let epoch = committee.epoch();
         if epoch == 0 {
+            // Epoch 0 will have a "dummy" epoch record to make the initial committee avaliable to
+            // code using these records. In this case there will not be a cert so we
+            // want to overwrite this with the correct record. That is why we need to
+            // use Some(_) (this means we have a certificate) instead of _ like in the general case.
+            // Without this we never overwrite the dummy epoch 0 record with the proper record and
+            // would break sync.
             if let Some((epoch_rec, Some(_))) = self.consensus_db.get_epoch_by_number(epoch) {
                 // We already have this record...
                 self.epoch_record = Some(epoch_rec);

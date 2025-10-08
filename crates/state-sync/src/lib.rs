@@ -35,14 +35,13 @@ pub async fn prime_consensus<DB: Database>(
     // check if the latest subdag is from the current epoch
     // this function is called at startup and at each epoch boundary
     let last_subdag = &last_executed_block.sub_dag;
-    let (_last_consensus_epoch, last_consensus_round) =
-        if last_subdag.leader_epoch() < current_epoch {
-            // new epoch
-            (current_epoch, 0)
-        } else {
-            // node recovery
-            (last_subdag.leader_epoch(), last_subdag.leader_round())
-        };
+    let last_consensus_round = if last_subdag.leader_epoch() < current_epoch {
+        // new epoch
+        0
+    } else {
+        // node recovery
+        last_subdag.leader_round()
+    };
 
     let _ = consensus_bus.update_consensus_rounds(ConsensusRound::new_with_gc_depth(
         last_consensus_round,

@@ -14,13 +14,22 @@ use tn_types::{
     Round, Vote, B256,
 };
 
+/// Info that is published (via gossip) by validators once they reach consensus.
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ConsensusResult {
+    // epoch for this result (i.e. the current epoch)
     pub epoch: Epoch,
+    // reound for epoch that consensus was reached on
     pub round: Round,
+    /// the consensus header block number
     pub number: u64,
+    /// hash of the consensus header that was reached
     pub hash: BlockHash,
+    /// the validator that produced this result
     pub validator: BlsPublicKey,
+    /// the signature of the validator publishing this record
+    /// see digest() below, this is a signature over the has of the epoch, round, number and hash
+    /// fields
     pub signature: BlsSignature,
 }
 
