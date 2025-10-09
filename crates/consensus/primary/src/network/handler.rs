@@ -420,8 +420,7 @@ where
                     &header,
                     self.consensus_config.authority_id().expect("only validators can vote"),
                     self.consensus_config.key_config(),
-                )
-                .await;
+                );
                 if vote.digest() != vote_info.vote_digest() {
                     warn!(
                         "Authority {} submitted different header {:?} for voting",
@@ -449,8 +448,7 @@ where
             &header,
             self.consensus_config.authority_id().expect("only validators can vote"),
             self.consensus_config.key_config(),
-        )
-        .await;
+        );
 
         debug!(target: "primary", "Created vote {vote:?} for {} at round {}", header, header.round());
 

@@ -28,16 +28,7 @@ pub struct Vote {
 
 impl Vote {
     /// Create a new instance of [Vote]
-    pub async fn new<BLS: BlsSigner>(
-        header: &Header,
-        author: AuthorityIdentifier,
-        signature_service: &BLS,
-    ) -> Self {
-        Self::new_sync(header, author, signature_service)
-    }
-
-    /// Create a new instance of [Vote], sync version.
-    pub fn new_sync<BLS: BlsSigner>(
+    pub fn new<BLS: BlsSigner>(
         header: &Header,
         author: AuthorityIdentifier,
         signature_service: &BLS,

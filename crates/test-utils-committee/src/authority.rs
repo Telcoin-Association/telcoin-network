@@ -87,7 +87,7 @@ impl<DB: Database> AuthorityFixture<DB> {
 
     /// Sign a [Header] and return a [Vote] with no additional validation.
     pub fn vote(&self, header: &Header) -> Vote {
-        Vote::new_sync(header, self.id(), self.consensus_config.key_config())
+        Vote::new(header, self.id(), self.consensus_config.key_config())
     }
 
     /// Return the consensus config.
