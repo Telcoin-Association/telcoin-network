@@ -247,8 +247,23 @@ impl<DB: Database> RecordStore for KadStore<DB> {
 
         let key = self.key_to_hash(&r.key);
         let kr: KadRecord = r.into();
-        if self.num_records >= self.config.max_records {
-            return Err(Error::MaxRecords);
+        // Are we adding a new record or replacing an existing?
+        let new_record = match self.kad_type {
+            KadStoreType::Primary => {
+                self.db.get::<KadRecords>(&key).map_err(|_| Error::ValueTooLarge)?.is_none()
+            }
+            KadStoreType::Worker => {
+                self.db.get::<KadWorkerRecords>(&key).map_err(|_| Error::ValueTooLarge)?.is_none()
+            }
+        };
+        // We have a new record so go ahead and inc num_records.
+        // Should be safe since a failure to insert indicates a fatal DB condition.
+        if new_record {
+            if self.num_records >= self.config.max_records {
+                return Err(Error::MaxRecords);
+            } else {
+                self.num_records += 1;
+            }
         }
         match self.kad_type {
             KadStoreType::Primary => self
@@ -260,8 +275,6 @@ impl<DB: Database> RecordStore for KadStore<DB> {
                 .insert::<KadWorkerRecords>(&key, &encode(&kr))
                 .map_err(|_| Error::ValueTooLarge)?,
         }
-        // Record went in so inc num_records.
-        self.num_records += 1;
         Ok(())
     }
 
@@ -690,5 +703,35 @@ mod test {
         assert_eq!(kad_store_worker.num_providers, 1);
         kad_store_worker.remove_provider(&provider_rec3.key, &provider_rec3.provider);
         assert_eq!(kad_store_worker.num_providers, 0);
+    }
+
+    /// Test that we do not count duplicate puts against our max records.
+    #[test]
+    fn test_kad_put_limit() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let db = open_db(tmp_dir.path());
+        let key_config =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
+        let mut kad_store = KadStore::new(db.clone(), &key_config, KadStoreType::Primary);
+        let mut kad_store_worker = KadStore::new(db, &key_config, KadStoreType::Worker);
+
+        let config = MemoryStoreConfig::default();
+
+        // Almost fill up the stores.
+        for _ in 0..config.max_records - 1 {
+            let rec = test_record(false);
+            kad_store.put(rec.clone()).expect("put record");
+            kad_store_worker.put(rec).expect("put record");
+        }
+        let rec = test_record(false);
+        // These should all work because they are overwrites not new records.
+        for _ in 0..10 {
+            kad_store.put(rec.clone()).expect("put record");
+            kad_store_worker.put(rec.clone()).expect("put record");
+        }
+        let rec = test_record(false);
+        // Should be full now so get max errors.
+        assert!(matches!(kad_store.put(rec.clone()), Err(Error::MaxRecords)));
+        assert!(matches!(kad_store_worker.put(rec.clone()), Err(Error::MaxRecords)));
     }
 }
