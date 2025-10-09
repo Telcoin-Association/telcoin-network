@@ -206,6 +206,7 @@ where
     }
 
     /// Create a new instance of Self.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         network_config: &NetworkConfig,
         event_stream: Events,
@@ -332,11 +333,9 @@ where
         key_config: &KeyConfig,
         network_pubkey: NetworkPublicKey,
     ) -> NodeRecord {
-        let node_record = NodeRecord::build(network_pubkey, external_addr, |data| {
+        NodeRecord::build(network_pubkey, external_addr, |data| {
             key_config.request_signature_direct(data)
-        });
-
-        node_record
+        })
     }
 
     /// Return a kademlia record keyed on our BlsPublicKey with our peer_id and network addresses.
