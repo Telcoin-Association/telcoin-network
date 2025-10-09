@@ -21,7 +21,6 @@ use libp2p::{
         TopicHash,
     },
     kad::{self, store::RecordStore, Mode, QueryId},
-    multiaddr::Protocol,
     request_response::{
         self, Codec, Event as ReqResEvent, InboundFailure as ReqResInboundFailure,
         InboundRequestId, OutboundRequestId,
@@ -147,8 +146,6 @@ where
     connected_peers: VecDeque<PeerId>,
     /// Key manager, provide the BLS public key and sign peer records published to kademlia.
     key_config: KeyConfig,
-    /// The public network key for this node.
-    network_pubkey: NetworkPublicKey,
     /// The type to spawn tasks.
     task_spawner: TaskSpawner,
     /// The signed [NodeRecord].
@@ -304,7 +301,7 @@ where
         let (handle, commands) = tokio::sync::mpsc::channel(100);
         let config = network_config.libp2p_config().clone();
         let pending_px_disconnects = HashMap::with_capacity(config.max_px_disconnects);
-        let node_record = Self::create_node_record(external_addr, &key_config, &network_pubkey);
+        let node_record = Self::create_node_record(external_addr, &key_config, network_pubkey);
 
         Ok(Self {
             swarm,
@@ -319,7 +316,6 @@ where
             connected_peers: VecDeque::new(),
             pending_px_disconnects,
             key_config,
-            network_pubkey,
             task_spawner,
             node_record,
         })
@@ -330,53 +326,17 @@ where
         NetworkHandle::new(self.handle.clone())
     }
 
-    /// Create this node's [NodeRecord].
-    ///
-    /// TODO: keep a cached version on `Self`. check the multiaddrs match, otherwise resign the
-    /// record
+    /// Create and sign this node's [NodeRecord].
     fn create_node_record(
         external_addr: Multiaddr,
         key_config: &KeyConfig,
-        network_pubkey: &NetworkPublicKey,
+        network_pubkey: NetworkPublicKey,
     ) -> NodeRecord {
-        // let mut multiaddrs: Vec<Multiaddr> = self.swarm.external_addresses().cloned().collect();
-
-        // if multiaddrs.is_empty() {
-        //     // fallback to listeners
-        //     multiaddrs = self.swarm.listeners().cloned().collect();
-        //     warn!(target: "network-kad", "call to create peer record, but external addresses are
-        // empty - using self-reported listeners {multiaddrs:?}"); } else {
-        //     info!(target: "network-kad", ?multiaddrs, "call to create peer record, using our
-        // confirmed external addresses"); }
-
-        // // use ipv4 or ipv6 multiaddr
-        // let multiaddr = multiaddrs
-        //     .iter()
-        //     .find(|addr| addr.iter().any(|p| matches!(p, Protocol::Ip4(_))))
-        //     .or_else(|| {
-        //         // If no IPv4 address found, try to find an IPv6 address
-        //         multiaddrs.iter().find(|addr| addr.iter().any(|p| matches!(p, Protocol::Ip6(_))))
-        //     })
-        //     .or_else(|| {
-        //         // Fallback to first address if neither IPv4 nor IPv6 found (shouldn't happen)
-        //         multiaddrs.first()
-        //     })
-        //     .cloned();
-        //
-
-        // TODO:
-        // make sure p2p protocol and PeerId is in Multiaddr
-
-        // if let Some(addr) = multiaddr {
-        let node_record = NodeRecord::build(network_pubkey.clone(), external_addr, |data| {
+        let node_record = NodeRecord::build(network_pubkey, external_addr, |data| {
             key_config.request_signature_direct(data)
         });
+
         node_record
-        // Some(node_record)
-        // } else {
-        //     warn!(target: "network-kad", "No suitable multiaddr found for get_peer_record");
-        //     None
-        // }
     }
 
     /// Return a kademlia record keyed on our BlsPublicKey with our peer_id and network addresses.
@@ -389,21 +349,6 @@ where
             publisher: Some(*self.swarm.local_peer_id()),
             expires: None, // never expire
         }
-        // todo!()
-
-        // // if let Some(node_record) = Self::create_node_record() {
-        // let node_record = Self::create_node_record(external_addr, key_config, network_pubkey);
-        // let peer_id = *self.swarm.local_peer_id();
-        // Some(kad::Record {
-        //     key: key.clone(),
-        //     value: encode(&node_record),
-        //     publisher: Some(peer_id),
-        //     expires: None, // never expire
-        // })
-        // } else {
-        //     warn!(target: "network-kad", "No suitable multiaddr found for get_peer_record");
-        //     None
-        // }
     }
 
     /// Verify the address list in Record was signed by the key.
