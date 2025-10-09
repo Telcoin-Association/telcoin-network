@@ -3,7 +3,7 @@
 use crate::args::clap_address_parser;
 use clap::{value_parser, Args, Subcommand};
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NodeInfo, TelcoinDirs};
-use tn_types::{get_available_udp_port, Address, Multiaddr};
+use tn_types::{get_available_udp_port, Address, Multiaddr, Protocol};
 use tracing::info;
 
 /// Generate keypairs and save them to a file.
@@ -60,19 +60,28 @@ pub struct KeygenArgs {
     )]
     pub address: Address,
 
-    /// The multiaddr for the primary p2p network.  Must be quic-v1 and udp.
+    /// The external multiaddr for the primary p2p network. Must be quic-v1 and udp. Recommended do
+    /// not include p2p protocol id - the CLI will add this.
     /// For example: /ip4/[HOST]/udp/[PORT]/quic-v1
+    ///
     /// If not set will default to /ip4/127.0.0.1/udp/[PORT]/quic-v1 with an unused port for PORT.
     /// This default is only useful for tests (including a local testnet).
-    #[arg(long, value_name = "MULTIADDR", env = "TN_PRIMARY_ADDR")]
-    pub primary_addr: Option<Multiaddr>,
+    #[arg(long, value_name = "MULTIADDR", env = "TN_EXTERNAL_PRIMARY_ADDR")]
+    pub external_primary_addr: Option<Multiaddr>,
 
-    /// List of multiaddrs for the workers p2p networks, comma seperated.  Must be quic-v1 and udp.
-    /// For example: /ip4/[HOST1]/udp/[PORT1]/quic-v1,/ip4/[HOST2]/udp/[PORT2]/quic-v1
+    /// List of external multiaddrs for the workers p2p networks, comma seperated. Must be quic-v1
+    /// and udp. Recommended do not include p2p protocol id - the CLI will add this.
+    /// For example: /ip4/[HOST1]/udp/[PORT1]/quic-v1,
+    ///
     /// If not set each worker will default to /ip4/127.0.0.1/udp/[PORT]/quic-v1 with an unused
     /// port for PORT. This default is only useful for tests (including a local testnet).
-    #[arg(long, value_name = "MULTIADDRS", env = "TN_WORKER_ADDRS", value_delimiter = ',')]
-    pub worker_addrs: Option<Vec<Multiaddr>>,
+    #[arg(
+        long,
+        value_name = "MULTIADDRS",
+        env = "TN_EXTERNAL_WORKER_ADDRS",
+        value_delimiter = ','
+    )]
+    pub external_worker_addrs: Option<Vec<Multiaddr>>,
 }
 
 impl KeygenArgs {
@@ -93,29 +102,45 @@ impl KeygenArgs {
 
         // network keypair for authority
         let network_publickey = key_config.primary_network_public_key();
-        node_info.p2p_info.primary.network_key = network_publickey;
-        node_info.p2p_info.primary.network_address = if let Some(primary_addr) = &self.primary_addr
-        {
-            primary_addr.clone()
-        } else {
-            let primary_udp_port = get_available_udp_port("127.0.0.1").unwrap_or(49584);
-            format!("/ip4/127.0.0.1/udp/{primary_udp_port}/quic-v1").parse()?
-        };
+        node_info.p2p_info.primary.network_key = network_publickey.clone();
+        node_info.p2p_info.primary.network_address =
+            if let Some(primary_addr) = &self.external_primary_addr {
+                primary_addr.clone().with_p2p(network_publickey.into()).map_err(|_| {
+                    eyre::eyre!("Primary address already contains a different P2P protocol")
+                })?
+            } else {
+                let primary_udp_port = get_available_udp_port("127.0.0.1").unwrap_or(49584);
+                let addr: Multiaddr =
+                    format!("/ip4/127.0.0.1/udp/{primary_udp_port}/quic-v1").parse()?;
+                addr.with(Protocol::P2p(network_publickey.into()))
+            };
+
+        info!(target: "tn::generate_keys", primary=?node_info.p2p_info.primary.network_address, "updating primary external network address");
 
         // network keypair for workers
         let network_publickey = key_config.worker_network_public_key();
-        node_info.p2p_info.worker.network_key = network_publickey;
-        node_info.p2p_info.worker.network_address = if let Some(worker_addrs) = &self.worker_addrs {
-            if let Some(worker_addr) = worker_addrs.first() {
-                worker_addr.clone()
+        node_info.p2p_info.worker.network_key = network_publickey.clone();
+        node_info.p2p_info.worker.network_address =
+            if let Some(worker_addrs) = &self.external_worker_addrs {
+                if let Some(worker_addr) = worker_addrs.first() {
+                    worker_addr.clone().with_p2p(network_publickey.into()).map_err(|_| {
+                        eyre::eyre!("worker address already contains a different P2P protocol")
+                    })?
+                } else {
+                    let worker_udp_port = get_available_udp_port("127.0.0.1").unwrap_or(49584);
+                    let addr: Multiaddr =
+                        format!("/ip4/127.0.0.1/udp/{worker_udp_port}/quic-v1").parse()?;
+                    addr.with(Protocol::P2p(network_publickey.into()))
+                }
             } else {
                 let worker_udp_port = get_available_udp_port("127.0.0.1").unwrap_or(49584);
-                format!("/ip4/127.0.0.1/udp/{worker_udp_port}/quic-v1").parse()?
-            }
-        } else {
-            let worker_udp_port = get_available_udp_port("127.0.0.1").unwrap_or(49584);
-            format!("/ip4/127.0.0.1/udp/{worker_udp_port}/quic-v1").parse()?
-        };
+                let addr: Multiaddr =
+                    format!("/ip4/127.0.0.1/udp/{worker_udp_port}/quic-v1").parse()?;
+                addr.with(Protocol::P2p(network_publickey.into()))
+            };
+
+        info!(target: "tn::generate_keys", worker=?node_info.p2p_info.worker.network_address, "updating worker external network address");
+
         Ok(())
     }
 

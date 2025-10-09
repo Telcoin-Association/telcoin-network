@@ -332,7 +332,8 @@ where
 
     /// Create this node's [NodeRecord].
     ///
-    /// TODO: keep a cached version on `Self`. check the multiaddrs match, otherwise resign the record
+    /// TODO: keep a cached version on `Self`. check the multiaddrs match, otherwise resign the
+    /// record
     fn create_node_record(
         external_addr: Multiaddr,
         key_config: &KeyConfig,
@@ -343,10 +344,10 @@ where
         // if multiaddrs.is_empty() {
         //     // fallback to listeners
         //     multiaddrs = self.swarm.listeners().cloned().collect();
-        //     warn!(target: "network-kad", "call to create peer record, but external addresses are empty - using self-reported listeners {multiaddrs:?}");
-        // } else {
-        //     info!(target: "network-kad", ?multiaddrs, "call to create peer record, using our confirmed external addresses");
-        // }
+        //     warn!(target: "network-kad", "call to create peer record, but external addresses are
+        // empty - using self-reported listeners {multiaddrs:?}"); } else {
+        //     info!(target: "network-kad", ?multiaddrs, "call to create peer record, using our
+        // confirmed external addresses"); }
 
         // // use ipv4 or ipv6 multiaddr
         // let multiaddr = multiaddrs
