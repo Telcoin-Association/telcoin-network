@@ -12,7 +12,7 @@ fn test_node_record() {
     let pubkey = *bls_keypair.public();
     let key_config = KeyConfig::new_with_testing_key(bls_keypair);
 
-    // build the node record
+    // build a valid node record
     let node_record =
         NodeRecord::build(key_config.primary_network_public_key(), multiaddr, |data| {
             key_config.request_signature_direct(data)

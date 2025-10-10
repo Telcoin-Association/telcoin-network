@@ -13,7 +13,7 @@ use libp2p::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use tn_types::{encode, BlsPublicKey, BlsSignature, NetworkPublicKey, P2pNode};
+use tn_types::{encode, now, BlsPublicKey, BlsSignature, NetworkPublicKey, P2pNode, TimestampSec};
 use tokio::sync::{mpsc, oneshot};
 
 #[cfg(test)]
@@ -581,7 +581,7 @@ impl NodeRecord {
     where
         F: FnOnce(&[u8]) -> BlsSignature,
     {
-        let info = NetworkInfo { pubkey, multiaddrs: vec![multiaddr] };
+        let info = NetworkInfo { pubkey, multiaddrs: vec![multiaddr], timestamp: now() };
         let data = encode(&info);
         let signature = signer(&data);
         Self { info, signature }
@@ -610,6 +610,9 @@ pub struct NetworkInfo {
     pub pubkey: NetworkPublicKey,
     /// Network address for node.
     pub multiaddrs: Vec<Multiaddr>,
+    /// The timestamps when this was published.
+    /// Useful for nodes to compare latest records.
+    pub timestamp: TimestampSec,
 }
 
 /// The request from the application layer to lookup a validator's network information

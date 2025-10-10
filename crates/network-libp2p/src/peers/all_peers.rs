@@ -833,7 +833,7 @@ impl AllPeers {
         self.current_committee_keys.clear();
 
         let mut actions = Vec::with_capacity(committee.len());
-        for (bls_key, NetworkInfo { pubkey, multiaddrs: addr }) in committee {
+        for (bls_key, NetworkInfo { pubkey, multiaddrs: addr, .. }) in committee {
             let peer_id: PeerId = pubkey.clone().into();
             self.current_committee.insert(peer_id);
             self.current_committee_keys.insert(bls_key, Some(peer_id));

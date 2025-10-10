@@ -22,7 +22,7 @@ use std::{
     task::Context,
 };
 use tn_config::PeerConfig;
-use tn_types::BlsPublicKey;
+use tn_types::{now, BlsPublicKey};
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, trace, warn};
 
@@ -545,7 +545,11 @@ impl PeerManager {
             if !self.known_peers.contains_key(&bls) {
                 self.add_known_peer(
                     bls,
-                    NetworkInfo { pubkey: net_key.clone(), multiaddrs: multiaddrs.clone() },
+                    NetworkInfo {
+                        pubkey: net_key.clone(),
+                        multiaddrs: multiaddrs.clone(),
+                        timestamp: now(),
+                    },
                 );
             }
 
@@ -577,7 +581,7 @@ impl PeerManager {
         // remove from temporary banned and warn if validator was banned
         let mut exp_committee = Vec::default();
         for bls_key in &committee {
-            if let Some(NetworkInfo { pubkey, multiaddrs: multiaddr }) =
+            if let Some(NetworkInfo { pubkey, multiaddrs: multiaddr, timestamp }) =
                 self.known_peers.get(bls_key)
             {
                 let peer_id: PeerId = pubkey.clone().into();
@@ -587,7 +591,11 @@ impl PeerManager {
                 }
                 exp_committee.push((
                     *bls_key,
-                    NetworkInfo { pubkey: pubkey.clone(), multiaddrs: multiaddr.clone() },
+                    NetworkInfo {
+                        pubkey: pubkey.clone(),
+                        multiaddrs: multiaddr.clone(),
+                        timestamp: *timestamp,
+                    },
                 ));
             } else {
                 warn!(target: "peer-manager", "unknown committee member with key {bls_key}");
@@ -634,7 +642,7 @@ impl PeerManager {
 
     /// Find the peer id for an authority.
     pub(crate) fn auth_to_peer(&self, bls_key: BlsPublicKey) -> Option<(PeerId, Vec<Multiaddr>)> {
-        if let Some(NetworkInfo { pubkey, multiaddrs }) = self.known_peers.get(&bls_key) {
+        if let Some(NetworkInfo { pubkey, multiaddrs, .. }) = self.known_peers.get(&bls_key) {
             Some((pubkey.clone().into(), multiaddrs.clone()))
         } else {
             None
