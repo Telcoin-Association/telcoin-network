@@ -35,7 +35,9 @@ impl TryFrom<u8> for IntentVersion {
 /// valid signature for any intent in app_2.
 #[derive(Serialize_repr, Deserialize_repr, Copy, Clone, PartialEq, Eq, Debug, Hash)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum AppId {
+    #[default]
     Telcoin = 0,
     Consensus = 1,
 }
@@ -47,11 +49,6 @@ impl TryFrom<u8> for AppId {
     }
 }
 
-impl Default for AppId {
-    fn default() -> Self {
-        Self::Telcoin
-    }
-}
 
 /// This enums specifies the intent scope.
 ///

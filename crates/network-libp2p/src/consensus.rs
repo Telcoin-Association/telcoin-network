@@ -20,9 +20,7 @@ use libp2p::{
         self, Event as GossipEvent, IdentTopic, Message as GossipMessage, MessageAcceptance, Topic,
         TopicHash,
     },
-    identify::{self, Event as IdentifyEvent, Info as IdentifyInfo},
     kad::{self, store::RecordStore, Mode, QueryId},
-    multiaddr::Protocol,
     request_response::{
         self, Codec, Event as ReqResEvent, InboundFailure as ReqResInboundFailure,
         InboundRequestId, OutboundRequestId,
@@ -59,8 +57,6 @@ pub(crate) struct TNBehavior<C, DB>
 where
     C: Codec + Send + Clone + 'static,
 {
-    /// The identify behavior used to confirm externally observed addresses.
-    pub(crate) identify: identify::Behaviour,
     /// The gossipsub network behavior.
     pub(crate) gossipsub: gossipsub::Behaviour,
     /// The request-response network behavior.
@@ -78,14 +74,13 @@ where
 {
     /// Create a new instance of Self.
     pub(crate) fn new(
-        identify: identify::Behaviour,
         gossipsub: gossipsub::Behaviour,
         req_res: request_response::Behaviour<C>,
         kademlia: kad::Behaviour<KadStore<DB>>,
         peer_config: &PeerConfig,
     ) -> Self {
         let peer_manager = PeerManager::new(peer_config);
-        Self { identify, gossipsub, req_res, peer_manager, kademlia }
+        Self { gossipsub, req_res, peer_manager, kademlia }
     }
 }
 
@@ -151,10 +146,12 @@ where
     connected_peers: VecDeque<PeerId>,
     /// Key manager, provide the BLS public key and sign peer records published to kademlia.
     key_config: KeyConfig,
-    /// The public network key for this node.
-    network_pubkey: NetworkPublicKey,
     /// The type to spawn tasks.
     task_spawner: TaskSpawner,
+    /// The signed [NodeRecord].
+    ///
+    /// The external address is self-reported and unconfirmed.
+    node_record: NodeRecord,
 }
 
 impl<Req, Res, DB, Events> ConsensusNetwork<Req, Res, DB, Events>
@@ -171,6 +168,7 @@ where
         key_config: KeyConfig,
         db: DB,
         task_manager: TaskSpawner,
+        external_addr: Multiaddr,
     ) -> NetworkResult<Self> {
         let network_key = key_config.primary_network_keypair().clone();
         Self::new(
@@ -181,6 +179,7 @@ where
             db,
             task_manager,
             KadStoreType::Primary,
+            external_addr,
         )
     }
 
@@ -191,6 +190,7 @@ where
         key_config: KeyConfig,
         db: DB,
         task_manager: TaskSpawner,
+        external_addr: Multiaddr,
     ) -> NetworkResult<Self> {
         let network_key = key_config.worker_network_keypair().clone();
         Self::new(
@@ -201,10 +201,12 @@ where
             db,
             task_manager,
             KadStoreType::Worker,
+            external_addr,
         )
     }
 
     /// Create a new instance of Self.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         network_config: &NetworkConfig,
         event_stream: Events,
@@ -213,16 +215,8 @@ where
         db: DB,
         task_spawner: TaskSpawner,
         kad_type: KadStoreType,
+        external_addr: Multiaddr,
     ) -> NetworkResult<Self> {
-        let identify_config = identify::Config::new(
-            network_config.libp2p_config().identify_protocol().to_string(),
-            keypair.public(),
-        )
-        // disable discovery to prevent auto redials to disconnected peers
-        .with_cache_size(0);
-
-        let identify = identify::Behaviour::new(identify_config);
-
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             // explicitly set default
             .heartbeat_interval(Duration::from_secs(1))
@@ -262,7 +256,7 @@ where
 
         // create custom behavior
         let mut behavior =
-            TNBehavior::new(identify, gossipsub, req_res, kademlia, network_config.peer_config());
+            TNBehavior::new(gossipsub, req_res, kademlia, network_config.peer_config());
 
         // Load the Kad records from DB into the local peer cache.
         for record in kad_store.records() {
@@ -281,7 +275,7 @@ where
         let network_pubkey = keypair.public().into();
 
         // create swarm
-        let swarm = SwarmBuilder::with_existing_identity(keypair)
+        let mut swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_quic_config(|mut config| {
                 config.handshake_timeout = network_config.quic_config().handshake_timeout;
@@ -302,9 +296,13 @@ where
             })
             .build();
 
+        // set external address
+        swarm.add_external_address(external_addr.clone());
+
         let (handle, commands) = tokio::sync::mpsc::channel(100);
         let config = network_config.libp2p_config().clone();
         let pending_px_disconnects = HashMap::with_capacity(config.max_px_disconnects);
+        let node_record = Self::create_node_record(external_addr, &key_config, network_pubkey);
 
         Ok(Self {
             swarm,
@@ -319,8 +317,8 @@ where
             connected_peers: VecDeque::new(),
             pending_px_disconnects,
             key_config,
-            network_pubkey,
             task_spawner,
+            node_record,
         })
     }
 
@@ -329,48 +327,26 @@ where
         NetworkHandle::new(self.handle.clone())
     }
 
+    /// Create and sign this node's [NodeRecord].
+    fn create_node_record(
+        external_addr: Multiaddr,
+        key_config: &KeyConfig,
+        network_pubkey: NetworkPublicKey,
+    ) -> NodeRecord {
+        NodeRecord::build(network_pubkey, external_addr, |data| {
+            key_config.request_signature_direct(data)
+        })
+    }
+
     /// Return a kademlia record keyed on our BlsPublicKey with our peer_id and network addresses.
     /// Return None if we don't have any confirmed external addresses yet.
-    fn get_peer_record(&self) -> Option<kad::Record> {
+    fn get_peer_record(&self) -> kad::Record {
         let key = kad::RecordKey::new(&self.key_config.primary_public_key());
-        let mut multiaddrs: Vec<Multiaddr> = self.swarm.external_addresses().cloned().collect();
-
-        if multiaddrs.is_empty() {
-            // fallback to listeners
-            multiaddrs = self.swarm.listeners().cloned().collect();
-            warn!(target: "network-kad", "call to create peer record, but external addresses are empty - using self-reported listeners {multiaddrs:?}");
-        } else {
-            info!(target: "network-kad", ?multiaddrs, "call to create peer record, using our confirmed external addresses");
-        }
-
-        // use ipv4 or ipv6 multiaddr
-        let multiaddr = multiaddrs
-            .iter()
-            .find(|addr| addr.iter().any(|p| matches!(p, Protocol::Ip4(_))))
-            .or_else(|| {
-                // If no IPv4 address found, try to find an IPv6 address
-                multiaddrs.iter().find(|addr| addr.iter().any(|p| matches!(p, Protocol::Ip6(_))))
-            })
-            .or_else(|| {
-                // Fallback to first address if neither IPv4 nor IPv6 found (shouldn't happen)
-                multiaddrs.first()
-            })
-            .cloned();
-
-        if let Some(addr) = multiaddr {
-            let peer_id = *self.swarm.local_peer_id();
-            let node_record = NodeRecord::build(self.network_pubkey.clone(), addr, |data| {
-                self.key_config.request_signature_direct(data)
-            });
-            Some(kad::Record {
-                key: key.clone(),
-                value: encode(&node_record),
-                publisher: Some(peer_id),
-                expires: None, // never expire
-            })
-        } else {
-            warn!(target: "network-kad", "No suitable multiaddr found for get_peer_record");
-            None
+        kad::Record {
+            key: key.clone(),
+            value: encode(&self.node_record),
+            publisher: Some(*self.swarm.local_peer_id()),
+            expires: None, // never expire
         }
     }
 
@@ -384,38 +360,32 @@ where
     /// Publish and provide our network addresses and peer id under our BLS public key for
     /// discovery.
     fn provide_our_data(&mut self) {
-        if let Some(record) = self.get_peer_record() {
-            info!(target: "network-kad", ?record, "Providing our record to kademlia for peer {:?}", self.swarm.local_peer_id());
-            let key = record.key.clone();
-            if let Err(err) =
-                self.swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One)
-            {
-                error!(target: "network-kad", "Failed to store record locally: {err}");
-            }
-            if let Err(err) = self.swarm.behaviour_mut().kademlia.start_providing(key) {
-                error!(target: "network-kad", "Failed to start providing key: {err}");
-            }
+        let record = self.get_peer_record();
+        info!(target: "network-kad", ?record, "Providing our record to kademlia for peer {:?}", self.swarm.local_peer_id());
+        let key = record.key.clone();
+        if let Err(err) = self.swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One) {
+            error!(target: "network-kad", "Failed to store record locally: {err}");
+        }
+        if let Err(err) = self.swarm.behaviour_mut().kademlia.start_providing(key) {
+            error!(target: "network-kad", "Failed to start providing key: {err}");
         }
     }
 
     /// Publish our network addresses and peer id AND to the network under our BLS public key for
     /// discovery.
     fn publish_our_data_to_peer(&mut self, peer: PeerId) {
-        if let Some(record) = self.get_peer_record() {
-            info!(target: "network-kad", "Publishing our record to kademlia");
-            // Publish to the specified peer.
-            let _ = self.swarm.behaviour_mut().kademlia.put_record_to(
-                record.clone(),
-                vec![peer].into_iter(),
-                kad::Quorum::One,
-            );
+        let record = self.get_peer_record();
+        info!(target: "network-kad", "Publishing our record to kademlia");
+        // Publish to the specified peer.
+        let _ = self.swarm.behaviour_mut().kademlia.put_record_to(
+            record.clone(),
+            vec![peer].into_iter(),
+            kad::Quorum::One,
+        );
 
-            // Also publish our record locally and to the network.
-            if let Err(err) =
-                self.swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One)
-            {
-                error!(target: "network-kad", "Failed to publish record: {err}");
-            }
+        // Also publish our record locally and to the network.
+        if let Err(err) = self.swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One) {
+            error!(target: "network-kad", "Failed to publish record: {err}");
         }
     }
 
@@ -451,7 +421,6 @@ where
     ) -> NetworkResult<()> {
         match event {
             SwarmEvent::Behaviour(behavior) => match behavior {
-                TNBehaviorEvent::Identify(event) => self.process_identify_event(event)?,
                 TNBehaviorEvent::Gossipsub(event) => self.process_gossip_event(event)?,
                 TNBehaviorEvent::ReqRes(event) => self.process_reqres_event(event)?,
                 TNBehaviorEvent::PeerManager(event) => self.process_peer_manager_event(event)?,
@@ -713,56 +682,6 @@ where
         Ok(())
     }
 
-    /// Process identify events.
-    fn process_identify_event(&mut self, event: IdentifyEvent) -> NetworkResult<()> {
-        match event {
-            IdentifyEvent::Received {
-                peer_id,
-                info:
-                    IdentifyInfo {
-                        public_key,
-                        protocol_version,
-                        agent_version,
-                        listen_addrs,
-                        protocols,
-                        observed_addr,
-                        signed_peer_record,
-                    },
-                .. // connection_id
-            } => {
-                debug!(
-                    target: "network",
-                    ?peer_id,
-                    ?public_key,
-                    ?protocol_version,
-                    ?agent_version,
-                    ?listen_addrs,
-                    ?protocols,
-                    ?observed_addr,
-                    ?signed_peer_record,
-                    "identify event received",
-                );
-
-                // received info from peer about this node
-                if !self.swarm.behaviour().peer_manager.peer_banned(&peer_id) {
-                    self.swarm.add_external_address(observed_addr);
-                }
-            }
-            IdentifyEvent::Sent { peer_id, .. } => {
-                debug!(target: "network", ?peer_id, "sent identify to peer:");
-            }
-            IdentifyEvent::Pushed { peer_id, info, .. } => {
-                debug!(target: "network", ?peer_id, ?info, "pushed identify to peer:");
-            }
-            IdentifyEvent::Error { peer_id, error, .. } => {
-                // errors appear when connection is closed
-                debug!(target: "network", ?peer_id, ?error, "identify error:");
-            }
-        }
-
-        Ok(())
-    }
-
     /// Process gossip events.
     fn process_gossip_event(&mut self, event: GossipEvent) -> NetworkResult<()> {
         match event {
@@ -994,7 +913,7 @@ where
             PeerEvent::DisconnectPeer(peer_id) => {
                 debug!(target: "network", ?peer_id, "peer manager: disconnect peer");
                 // remove from request-response
-                // NOTE: gossipsub/identify handle `FromSwarm::ConnectionClosed`
+                // NOTE: gossipsub handle `FromSwarm::ConnectionClosed`
                 let _ = self.swarm.disconnect_peer_id(peer_id);
 
                 // remove from kad routing table

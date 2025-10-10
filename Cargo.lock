@@ -5148,7 +5148,6 @@ dependencies = [
  "libp2p-core",
  "libp2p-dns",
  "libp2p-gossipsub",
- "libp2p-identify",
  "libp2p-identity",
  "libp2p-kad",
  "libp2p-mdns",
@@ -5254,26 +5253,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "libp2p-identify"
-version = "0.47.0"
-source = "git+https://github.com/Telcoin-Association/rust-libp2p?rev=7c2c28a186f6d22bcc4f21cfefc2b53122a53a47#7c2c28a186f6d22bcc4f21cfefc2b53122a53a47"
-dependencies = [
- "asynchronous-codec",
- "either",
- "futures",
- "futures-bounded",
- "futures-timer",
- "libp2p-core",
- "libp2p-identity",
- "libp2p-swarm",
- "quick-protobuf",
- "quick-protobuf-codec",
- "smallvec",
- "thiserror 2.0.12",
- "tracing",
-]
-
-[[package]]
 name = "libp2p-identity"
 version = "0.2.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5347,7 +5326,6 @@ dependencies = [
  "futures",
  "libp2p-core",
  "libp2p-gossipsub",
- "libp2p-identify",
  "libp2p-identity",
  "libp2p-kad",
  "libp2p-swarm",

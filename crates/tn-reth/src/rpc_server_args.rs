@@ -9,8 +9,7 @@ use std::{
 
 use alloy::rpc::types::engine::JwtSecret;
 use clap::{
-    builder::{PossibleValue, RangedU64ValueParser, TypedValueParser},
-    command, Arg, Args, Command,
+    builder::{PossibleValue, RangedU64ValueParser, TypedValueParser}, Arg, Args, Command,
 };
 use reth::{
     args::{

@@ -58,7 +58,7 @@ pub use alloy::{
     sol,
     sol_types::{SolType, SolValue},
 };
-pub use libp2p::Multiaddr;
+pub use libp2p::{multiaddr::Protocol, Multiaddr};
 pub use reth_primitives::{
     Block, BlockBody, EthPrimitives, NodePrimitives, PooledTransaction, Receipt, Recovered,
     RecoveredBlock, SealedBlock, SealedHeader, Transaction, TransactionSigned,
