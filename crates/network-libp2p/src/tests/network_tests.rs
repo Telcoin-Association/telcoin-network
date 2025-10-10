@@ -675,6 +675,7 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
 /// Test peer exchanges when too many peers connect
 #[tokio::test]
 async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
+    tn_types::test_utils::init_test_tracing();
     // Create a custom config with very low peer limits for testing
     let mut network_config = NetworkConfig::default();
     network_config.peer_config_mut().target_num_peers = 4;
@@ -782,9 +783,6 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     // connect to target which has too many peers
     nvv.dial_by_bls(target_peer_bls).await?;
 
-    // give time for connection to establish
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
-
     // wait for peer exchange event
     match timeout(Duration::from_secs(5), nvv_events.recv()).await {
         Ok(Some(NetworkEvent::Request {
@@ -848,7 +846,7 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_score_decay_and_reconnection() -> eyre::Result<()> {
     // Create a custom config with short halflife for quicker testing
     let mut network_config = NetworkConfig::default();
