@@ -80,9 +80,6 @@ pub trait CertificateStore {
     /// Deletes a single certificate by its digest.
     fn delete(&self, id: CertificateDigest) -> StoreResult<()>;
 
-    /// Deletes multiple certificates in an atomic way.
-    fn delete_all(&self, ids: impl IntoIterator<Item = CertificateDigest>) -> StoreResult<()>;
-
     /// Retrieves all the certificates with round >= the provided round.
     /// The result is returned with certificates sorted in round asc order
     fn after_round(&self, round: Round) -> StoreResult<Vec<Certificate>>;
@@ -275,7 +272,7 @@ impl<DB: Database> CertificateStore for DB {
         let mut txn = self.write_txn()?;
         // first read the certificate to get the round - we'll need in order
         // to delete the secondary index
-        let cert = match self.read(id)? {
+        let cert = match txn.get::<Certificates>(&id)? {
             Some(cert) => cert,
             None => return Ok(()),
         };
@@ -285,33 +282,11 @@ impl<DB: Database> CertificateStore for DB {
 
         // delete the certificate index by its round
         let key = (cert.round(), cert.origin().clone());
-
         txn.remove::<CertificateDigestByRound>(&key)?;
 
-        txn.commit()?;
-        fail_point!("certificate-store-after-write");
-        Ok(())
-    }
-
-    /// Deletes multiple certificates in an atomic way.
-    fn delete_all(&self, ids: impl IntoIterator<Item = CertificateDigest>) -> StoreResult<()> {
-        fail_point!("certificate-store-before-write");
-        let mut txn = self.write_txn()?;
-
-        for id in ids {
-            let mut del_certs = false;
-            // delete the certificates from the secondary index
-            if let Some(cert) = self.read(id)? {
-                del_certs = true;
-                txn.remove::<CertificateDigestByRound>(&(cert.round(), cert.origin().clone()))?;
-            }
-            if !del_certs {
-                return Ok(());
-            }
-
-            // delete the certificates by its ids
-            txn.remove::<Certificates>(&id)?;
-        }
+        // delete the certificate index by its authority
+        let key = (cert.origin().clone(), cert.round());
+        txn.remove::<CertificateDigestByOrigin>(&key)?;
 
         txn.commit()?;
         fail_point!("certificate-store-after-write");
@@ -480,4 +455,5 @@ impl<DB: Database> CertificateStore for DB {
     }
 }
 
-// NOTE: tests for this module are in test-utils storage_tests.rs to avoid circular dependancies.
+// NOTE: tests for this module are in primary/tests/it/storage_tests.rs to avoid circular
+// dependancies.

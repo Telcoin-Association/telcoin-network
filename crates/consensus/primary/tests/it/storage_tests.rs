@@ -9,11 +9,14 @@ use std::{
 use tempfile::TempDir;
 use tn_primary::test_utils::temp_dir;
 use tn_reth::test_utils::fixture_batch_with_transactions;
-use tn_storage::{mem_db::MemDatabase, open_db, CertificateStore, ConsensusStore, ProposerStore};
+use tn_storage::{
+    mem_db::MemDatabase, open_db, tables::CertificateDigestByOrigin, CertificateStore,
+    ConsensusStore, ProposerStore,
+};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Hash as _, Header,
-    HeaderBuilder, ReputationScores, Round,
+    AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Database, Hash as _,
+    Header, HeaderBuilder, ReputationScores, Round,
 };
 
 pub fn create_header_for_round(round: Round) -> Header {
@@ -450,31 +453,15 @@ async fn test_certificate_store_delete_store() {
     // WHEN now delete a couple of certificates
     let to_delete = certs.iter().take(2).map(|c| c.digest()).collect::<Vec<_>>();
 
+    let key_0 = (certs[0].origin().clone(), certs[0].round());
+    assert!(store.get::<CertificateDigestByOrigin>(&key_0).unwrap().is_some());
+
     store.delete(to_delete[0]).unwrap();
     store.delete(to_delete[1]).unwrap();
 
     // THEN
     assert!(store.read(to_delete[0]).unwrap().is_none());
     assert!(store.read(to_delete[1]).unwrap().is_none());
-}
 
-#[tokio::test]
-async fn test_certificate_store_delete_all_store() {
-    let db = temp_dir();
-    let store = open_db(db.path());
-    // GIVEN
-    // create certificates for 10 rounds
-    let certs = certificates(10);
-
-    // store them in both main and secondary index
-    store.write_all(certs.clone()).unwrap();
-
-    // WHEN now delete a couple of certificates
-    let to_delete = certs.iter().take(2).map(|c| c.digest()).collect::<Vec<_>>();
-
-    store.delete_all(to_delete.clone()).unwrap();
-
-    // THEN
-    assert!(store.read(to_delete[0]).unwrap().is_none());
-    assert!(store.read(to_delete[1]).unwrap().is_none());
+    assert!(store.get::<CertificateDigestByOrigin>(&key_0).unwrap().is_none());
 }
