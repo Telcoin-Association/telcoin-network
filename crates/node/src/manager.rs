@@ -758,7 +758,7 @@ where
                                         let _ = vote_tx.send(Err(HeaderError::InvalidHeaderDigest));
                                         break;
                                     }
-                                    alt_recs.insert(vote.epoch_hash, votes);
+                                    alt_recs.insert(vote.epoch_hash, votes + 1);
                                 }
                                 HeaderError::InvalidHeaderDigest
                             } else if epoch_rec.committee.contains(&vote.public_key) {
