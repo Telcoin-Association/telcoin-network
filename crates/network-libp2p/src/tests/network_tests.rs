@@ -1589,3 +1589,24 @@ async fn test_get_kad_records() -> eyre::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_node_record_validation() {
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let network = peer1.network;
+
+    // Create a kad::Record with correct publisher
+    let mut peer_record = network.get_peer_record();
+    assert!(network.peer_record_valid(&peer_record).is_some());
+    assert!(peer2.network.peer_record_valid(&peer_record).is_some());
+
+    // assert no publisher fails
+    peer_record.publisher = None;
+    // assert invalid peer record rejected with no publisher
+    assert!(network.peer_record_valid(&peer_record).is_none());
+
+    // assert publisher mismatch fails
+    peer_record.publisher = Some(peer2.network.swarm.local_peer_id().clone());
+    assert!(network.peer_record_valid(&peer_record).is_none());
+}

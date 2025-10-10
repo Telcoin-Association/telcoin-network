@@ -49,7 +49,6 @@ impl TryFrom<u8> for AppId {
     }
 }
 
-
 /// This enums specifies the intent scope.
 ///
 /// Two intents for different scope should

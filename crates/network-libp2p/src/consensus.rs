@@ -350,11 +350,28 @@ where
         }
     }
 
-    /// Verify the address list in Record was signed by the key.
+    /// Verify the address list in Record was signed by the key and the kad record's publisher
+    /// matches the network key.
     fn peer_record_valid(&self, record: &kad::Record) -> Option<(BlsPublicKey, NodeRecord)> {
         let key = BlsPublicKey::from_literal_bytes(record.key.as_ref()).ok()?;
         let node_record = try_decode::<NodeRecord>(record.value.as_ref()).ok()?;
-        node_record.verify(&key)
+
+        // verify bls signature
+        let verified = node_record.verify(&key)?;
+
+        // verify publisher matches the network public key in the record
+        // this prevents replay attacks where malicious nodes republish outdated records
+        let expected_peer_id: PeerId = verified.1.info.pubkey.clone().into();
+        if record.publisher != Some(expected_peer_id) {
+            warn!(
+                target: "network-kad",
+                "NodeRecord validation failed: publisher {:?} doesn't match network key (expected {:?})",
+                record.publisher, expected_peer_id
+            );
+            return None;
+        }
+
+        Some(verified)
     }
 
     /// Publish and provide our network addresses and peer id under our BLS public key for
@@ -1079,12 +1096,14 @@ where
                                     self.swarm
                                         .behaviour_mut()
                                         .peer_manager
-                                        .process_penalty(source, Penalty::Mild);
+                                        .process_penalty(source, Penalty::Fatal);
                                 }
 
                                 return Ok(());
                             }
 
+                            // verify record signature and ensure publisher matches record's network
+                            // key
                             if let Some((key, value)) = self.peer_record_valid(&record) {
                                 self.swarm
                                     .behaviour_mut()
@@ -1100,7 +1119,7 @@ where
                                     .peer_manager
                                     .add_known_peer(key, value.info);
                             } else {
-                                error!(target: "network-kad", "Received invalid peer record!");
+                                warn!(target: "network-kad", "Received invalid peer record!");
 
                                 // assess penalty for invalid peer record
                                 self.swarm
@@ -1148,7 +1167,7 @@ where
                                 self.swarm
                                     .behaviour_mut()
                                     .peer_manager
-                                    .process_penalty(peer_id, Penalty::Severe);
+                                    .process_penalty(peer_id, Penalty::Fatal);
                             }
 
                             // return an error to caller if this is the last response for the query
