@@ -52,6 +52,12 @@ impl LeaderSwapTable {
     ///
     /// The `bad_nodes_stake_threshold` should be in the range of [0 - 33].
     ///
+    /// Nodes should not be on the bad list unless they are underperfoming.  No more than 1/3 of our nodes should be
+    /// "bad" (less is fine).
+    ///
+    /// If we have bad nodes then we MUST have good nodes to swap with (an emply good list will lead to panics later).  We
+    /// want at least 1/3 of nodes on the good list if we have bad nodes (more is fine).
+    ///
     /// For now, we use 0.
     pub fn new(
         committee: &Committee,
@@ -62,24 +68,77 @@ impl LeaderSwapTable {
         assert!((0..=33).contains(&bad_nodes_stake_threshold), "The bad_nodes_stake_threshold should be in range [0 - 33], out of bounds parameter detected");
         assert!(reputation_scores.final_of_schedule, "Only reputation scores that have been calculated on the end of a schedule are accepted");
 
-        // calculating the good nodes
-        let good_nodes = Self::retrieve_first_nodes(
-            committee,
-            reputation_scores.authorities_by_score_desc().into_iter(),
-            bad_nodes_stake_threshold,
-        );
+        let auths_by_score = reputation_scores.authorities_by_score_desc();
+        // Most validators should have a rep near this highest value if they are honest and are partcipating.
+        let highest_rep = auths_by_score.first().map(|(_, rep)| *rep).unwrap_or(0);
+        // Do we have any validators that are not participating?  If so this will be a lot lower than highest_rep.
+        let lowest_rep = auths_by_score.last().map(|(_, rep)| *rep).unwrap_or(0);
+        let mean_rep: u64 = auths_by_score.iter().map(|(_, r)| r).sum();
+        let mut standard_dev: u64 = auths_by_score
+            .iter()
+            .map(|(_, r)| {
+                let v = *r as i64 - mean_rep as i64;
+                (v * v) as u64
+            })
+            .sum();
+        standard_dev /= auths_by_score.len() as u64;
+        standard_dev = (standard_dev as f64).sqrt() as u64;
+        // Generate the "good" and "bad" nodes.  We need to have a bad_nodes_stake_threshold > 0 AND
+        // we want a reasonable delta between the highest and lowest reputation otherwise we don't tag any
+        // node as "bad".  Telcoin network is running a closed validator set with high hardware and network
+        // requirements so this is really just to filter out down validators or nodes with a broken
+        // net connection etc so this should be OK.
+        let (good_nodes, bad_nodes) =
+            if lowest_rep >= mean_rep.saturating_sub(2 * standard_dev) {
+                (vec![], HashMap::default())
+            } else {
+                let third = (auths_by_score.len() / 3).max(1);
+                // calc bad nodes
+                let mut bad_ceil = mean_rep.saturating_sub(2 * standard_dev);
+                let bad_nodes = loop {
+                    let bad_nodes: Vec<Authority> =
+                        auths_by_score
+                            .iter()
+                            .rev()
+                            .filter_map(|(id, rep)| {
+                                if *rep <= bad_ceil {
+                                    committee.authority(id)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                    if bad_nodes.len() >= third {
+                        break bad_nodes;
+                    }
+                    bad_ceil = bad_ceil.saturating_sub(standard_dev);
+                };
+                // calculating the good nodes
+                let mut good_floor = highest_rep.saturating_sub(standard_dev);
+                let good_nodes = loop {
+                    let good_nodes: Vec<Authority> =
+                        auths_by_score
+                            .iter()
+                            .filter_map(|(id, rep)| {
+                                if *rep >= good_floor {
+                                    committee.authority(id)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                    if good_nodes.len() >= third {
+                        break good_nodes;
+                    }
+                    good_floor = good_floor.saturating_sub(standard_dev);
+                };
 
-        // calculating the bad nodes
-        // we revert the sorted authorities to score ascending so we get the first low scorers
-        // up to the dictated stake threshold.
-        let bad_nodes = Self::retrieve_first_nodes(
-            committee,
-            reputation_scores.authorities_by_score_desc().into_iter().rev(),
-            bad_nodes_stake_threshold,
-        )
-        .into_iter()
-        .map(|authority| (authority.id(), authority))
-        .collect::<HashMap<AuthorityIdentifier, Authority>>();
+                let bad_nodes = bad_nodes
+                    .into_iter()
+                    .map(|authority| (authority.id(), authority))
+                    .collect::<HashMap<AuthorityIdentifier, Authority>>();
+                (good_nodes, bad_nodes)
+            };
 
         good_nodes.iter().for_each(|good_node| {
             debug!(
@@ -147,10 +206,10 @@ impl LeaderSwapTable {
     /// percentage of stake that is considered the cutoff. Basically we keep adding to the
     /// response authorities until the sum of the stake reaches the `stake_threshold`. It's the
     /// caller's responsibility to ensure that the elements of the `authorities`
-    /// input is already sorted.
-    fn retrieve_first_nodes(
+    /// input is already sorted. XXXX
+    fn _retrieve_first_nodes<'a>(
         committee: &Committee,
-        authorities: impl Iterator<Item = (AuthorityIdentifier, u64)>,
+        authorities: impl Iterator<Item = &'a (AuthorityIdentifier, u64)>,
         voting_power_threshold: u64,
     ) -> Vec<Authority> {
         let mut filtered_authorities = Vec::new();
