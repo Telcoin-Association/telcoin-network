@@ -88,15 +88,11 @@ impl<DB: ConsensusStore> Bullshark<DB> {
         // update the score for the previous leader. If no previous leader exists,
         // then this is the first time we commit a leader, so no score update takes place
         if let Some(last_committed_sub_dag) = state.last_committed_sub_dag.as_ref() {
+            let leader_digest = last_committed_sub_dag.leader.digest();
             for certificate in committed_sequence {
                 // TODO: we could iterate only the certificates of the round above the previous
                 // leader's round
-                if certificate
-                    .header()
-                    .parents()
-                    .iter()
-                    .any(|digest| *digest == last_committed_sub_dag.leader.digest())
-                {
+                if certificate.header().parents().iter().any(|digest| *digest == leader_digest) {
                     reputation_score.add_score(certificate.origin(), 1);
                 }
             }
@@ -228,9 +224,6 @@ impl<DB: ConsensusStore> Bullshark<DB> {
             .map(|(_, x)| self.committee.voting_power_by_id(x.origin()))
             .sum();
 
-        // If it is the case, we can commit the leader. But first, we need to recursively go back to
-        // the last committed leader, and commit all preceding leaders in the right order.
-        // Committing a leader block means committing all its dependencies.
         if voting_power < self.committee.validity_threshold() {
             debug!("Leader {:?} does not have enough support", leader);
             return Ok((Outcome::NotEnoughSupportForLeader, vec![]));
@@ -239,6 +232,9 @@ impl<DB: ConsensusStore> Bullshark<DB> {
         // Get an ordered list of past leaders that are linked to the current leader.
         debug!("Leader {:?} has enough support", leader);
 
+        // If it is the case, we can commit the leader. But first, we need to recursively go back to
+        // the last committed leader, and commit all preceding leaders in the right order.
+        // Committing a leader block means committing all its dependencies.
         let mut committed_sub_dags = Vec::new();
         let mut leaders_to_commit = self.order_leaders(leader, state);
 
@@ -384,15 +380,15 @@ impl<DB: ConsensusStore> Bullshark<DB> {
                 &self.committee,
                 leader_round,
                 reputation_scores,
-                // self.protocol_config.consensus_bad_nodes_stake_threshold(),
                 self.bad_nodes_stake_threshold,
             ));
 
             self.metrics.num_of_bad_nodes.set(self.leader_schedule.num_of_bad_nodes() as i64);
 
-            return true;
+            true
+        } else {
+            false
         }
-        false
     }
 
     fn report_leader_on_time_metrics(&mut self, certificate_round: Round, state: &ConsensusState) {
