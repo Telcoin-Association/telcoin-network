@@ -12,9 +12,9 @@ pub trait EpochStore {
     fn save_epoch_record(&self, epoch_rec: &EpochRecord);
     /// Save an epoch record with it's certificate.
     fn save_epoch_record_with_cert(&self, epoch_rec: &EpochRecord, cert: &EpochCertificate);
-    /// Retrieve the consensus header by number.
+    /// Retrieve the epoch record and certificate (if available) by number.
     fn get_epoch_by_number(&self, epoch: Epoch) -> Option<(EpochRecord, Option<EpochCertificate>)>;
-    /// Retrieve the consensus header by hash
+    /// Retrieve the epoch record and certificate (if available) by hash.
     fn get_epoch_by_hash(&self, hash: BlockHash)
         -> Option<(EpochRecord, Option<EpochCertificate>)>;
 }
