@@ -748,7 +748,7 @@ where
                                     // If we got a valid vote on another epoch record track that and break if we get quorum...
                                     // This will cause us to query the record and cert from a peer.
                                     let votes = *alt_recs.get(&vote.epoch_hash).unwrap_or(&0);
-                                    if votes + 1 > quorum {
+                                    if votes + 1 >= quorum {
                                         error!(
                                             target: "epoch-manager",
                                             "Reached quorum on epoch record {} instead of {}.",
