@@ -1589,3 +1589,71 @@ async fn test_get_kad_records() -> eyre::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_node_record_validation() {
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let network = peer1.network;
+
+    // Create a kad::Record with correct publisher
+    let mut peer_record = network.get_peer_record();
+    assert!(network.peer_record_valid(&peer_record).is_some());
+    assert!(peer2.network.peer_record_valid(&peer_record).is_some());
+
+    // assert no publisher fails
+    peer_record.publisher = None;
+    // assert invalid peer record rejected with no publisher
+    assert!(network.peer_record_valid(&peer_record).is_none());
+
+    // assert publisher mismatch fails
+    peer_record.publisher = Some(peer2.network.swarm.local_peer_id().clone());
+    assert!(network.peer_record_valid(&peer_record).is_none());
+}
+
+#[tokio::test]
+async fn test_newer_kad_record_replaced() -> eyre::Result<()> {
+    let TestTypes { peer1, mut peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let peer2_new_record = peer2.network.get_peer_record();
+    // create valid peer2 record with old timestamp
+    let mut peer2_info = peer2.network.node_record.info.clone();
+    // timestamp in the past
+    peer2_info.timestamp = now() - 10_000;
+    // sign record
+    let signature = peer2.config.key_config().request_signature_direct(&encode(&peer2_info));
+    let old_record = NodeRecord { info: peer2_info, signature };
+    // assert old record is valid
+    let peer2_pubkey = peer2.config.key_config().primary_public_key();
+    assert!(old_record.clone().verify(&peer2_pubkey).is_some());
+    // store with peer2 to generate old kad record
+    peer2.network.node_record = old_record;
+    let old_kad_record = peer2.network.get_peer_record();
+    // put old record in store
+    network.swarm.behaviour_mut().kademlia.store_mut().put(old_kad_record.clone())?;
+    // assert kad store is old
+    let store_record = network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .get(&peer2_new_record.key)
+        .expect("peer2 record in local kad store");
+    assert_eq!(old_kad_record, *store_record);
+
+    // process new put request with newer record
+    network
+        .process_kad_put_request(*peer2.network.swarm.local_peer_id(), peer2_new_record.clone())?;
+    // assert kad store is updated
+    let store_record = network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .get(&peer2_new_record.key)
+        .expect("peer2 record in local kad store");
+    assert_eq!(*store_record, peer2_new_record);
+
+    Ok(())
+}
