@@ -9,8 +9,8 @@ use crate::{
     peers::{self, PeerEvent, PeerManager, Penalty},
     send_or_log_error,
     types::{
-        AuthorityInfoRequest, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo,
-        NetworkResult, NodeRecord,
+        KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo, NetworkResult,
+        NodeRecord,
     },
     PeerExchangeMap,
 };
@@ -133,10 +133,11 @@ where
     inbound_requests: HashMap<InboundRequestId, oneshot::Sender<()>>,
     /// The collection of kademlia record requests.
     ///
-    /// When the application layer makes a request, the swarm stores the kad::QueryId and the reply
-    /// channel to the caller. On the `Event::OutboundQueryProgressed`, the result is sent
-    /// through the oneshot channel.
-    kad_requests: HashMap<QueryId, oneshot::Sender<NetworkResult<(BlsPublicKey, NetworkInfo)>>>,
+    /// When the application layer makes a request, the swarm stores the kad::QueryId and the
+    /// the bls key associated with the desired authority's [NodeRecord]. The query runs until
+    /// the last step. During this time, results are tracked and compared to one another to
+    /// ensure the latest valid record is used for the peer's info.
+    kad_requests: HashMap<QueryId, KadQuery>,
     /// The configurables for the libp2p consensus network implementation.
     config: LibP2pConfig,
     /// Track peers we have a connection with.
@@ -699,9 +700,9 @@ where
                 // ensure that the next committee isn't banned
                 self.swarm.behaviour_mut().peer_manager.new_epoch(committee);
             }
-            NetworkCommand::FindAuthorities { requests } => {
+            NetworkCommand::FindAuthorities { bls_keys } => {
                 // this will trigger a PeerEvent to fetch records through kad if not in the peer map
-                self.swarm.behaviour_mut().peer_manager.find_authorities(requests);
+                self.swarm.behaviour_mut().peer_manager.find_authorities(bls_keys);
             }
         }
 
@@ -1048,10 +1049,10 @@ where
                 self.swarm.behaviour_mut().gossipsub.remove_blacklisted_peer(&peer_id);
             }
             PeerEvent::MissingAuthorities(missing) => {
-                for AuthorityInfoRequest { bls_key, reply } in missing {
+                for bls_key in missing {
                     let key = kad::RecordKey::new(&bls_key);
                     let query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
-                    self.kad_requests.insert(query_id, reply);
+                    self.kad_requests.insert(query_id, bls_key.into());
                 }
             }
             PeerEvent::Discovery => {
@@ -1118,6 +1119,11 @@ where
                         kad::PeerRecord { record, peer },
                     ))) => {
                         if let Some((key, value)) = self.peer_record_valid(&record) {
+                            // TODO:
+                            // - check if existing query value already exists
+                            // - compare NodeRecord timestamps
+                            // - update if newer
+                            // - if last step, tell PM (only one who tracks this)
                             trace!(target: "network-kad", "Got record {key} {value:?}");
                             self.return_kad_result(&query_id, Ok((key, value.info.clone())));
                         } else {
@@ -1235,10 +1241,6 @@ where
             // peer manager known peers.  This indicates it is a peer we care about (probably a
             // validator) so keep it handy.
             self.swarm.behaviour_mut().peer_manager.add_known_peer(*bls_key, info.clone());
-        }
-        // ignore multiple query results
-        if let Some(reply) = self.kad_requests.remove(query_id) {
-            send_or_log_error!(reply, result, "kad");
         }
     }
 

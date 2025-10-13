@@ -12,7 +12,7 @@ use crate::{
     error::NetworkError,
     peers::status::ConnectionStatus,
     send_or_log_error,
-    types::{AuthorityInfoRequest, NetworkInfo, NetworkResult},
+    types::{NetworkInfo, NetworkResult},
 };
 use libp2p::{core::ConnectedPoint, kad::PeerInfo, multiaddr::Protocol, Multiaddr, PeerId};
 use rand::seq::IteratorRandom as _;
@@ -621,19 +621,15 @@ impl PeerManager {
     }
 
     /// Find authorities for the epoch manager.
-    pub(crate) fn find_authorities(&mut self, authorities: Vec<AuthorityInfoRequest>) {
+    pub(crate) fn find_authorities(&mut self, authorities: Vec<BlsPublicKey>) {
         let mut missing = Vec::new();
 
         // check all peers for authority and track missing
-        for AuthorityInfoRequest { bls_key, reply } in authorities {
-            if let Some(info) = self.known_peers.get(&bls_key) {
-                // ignore errors bc node manager is the only caller for now and drops receivers
-                let _ = reply.send(Ok((bls_key, info.clone())));
-                continue;
+        for bls_key in authorities {
+            // identify missing authorities
+            if self.known_peers.get(&bls_key).is_none() {
+                missing.push(bls_key);
             }
-
-            // add to missing authorities
-            missing.push(AuthorityInfoRequest { bls_key, reply });
         }
 
         // emit event for kad to try to discover
