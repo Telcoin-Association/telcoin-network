@@ -627,7 +627,7 @@ impl PeerManager {
         // check all peers for authority and track missing
         for bls_key in authorities {
             // identify missing authorities
-            if !self.known_peers.contains(&bls_key) {
+            if !self.known_peers.contains_key(&bls_key) {
                 missing.push(bls_key);
             }
         }

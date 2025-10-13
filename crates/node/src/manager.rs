@@ -1002,16 +1002,12 @@ where
         );
         let primary_handle = primary.network_handle().await;
         let prefetches = preload_keys.clone();
-        epoch_task_manager.spawn_task("primary pre-load validators", async move {
-            // Attempt to pre-load the next couple of committee's network info.
-            let _ = primary_handle.inner_handle().find_authorities(prefetches).await;
-        });
+        // Attempt to pre-load the next couple of committee's network info.
+        let _ = primary_handle.inner_handle().find_authorities(prefetches).await;
         let worker_handle = worker.network_handle().await;
         let prefetches = preload_keys.clone();
-        epoch_task_manager.spawn_task("worker pre-load validators", async move {
-            // Attempt to pre-load the next couple of committee's network info.
-            let _ = worker_handle.inner_handle().find_authorities(prefetches).await;
-        });
+        // Attempt to pre-load the next couple of committee's network info.
+        let _ = worker_handle.inner_handle().find_authorities(prefetches).await;
         Ok((primary, worker))
     }
 

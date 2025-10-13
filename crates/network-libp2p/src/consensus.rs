@@ -1307,6 +1307,11 @@ where
     }
 
     /// Logic to process a kad record request.
+    ///
+    /// This method checks:
+    /// - the peer record is signed
+    /// - the returned key matches the request
+    /// - the latest node record is used
     fn process_kad_query_result(
         &mut self,
         query_id: &QueryId,
@@ -1316,12 +1321,6 @@ where
     ) {
         // ensure returned record is valid, otherwise assess penalty
         if let Some((key, new_record)) = self.peer_record_valid(&record) {
-            // TODO:
-            // - ensure value matches request
-            // - check if existing query value already exists
-            // - compare NodeRecord timestamps
-            // - update if newer
-            // - if last step, tell PM (only one who tracks this)
             trace!(target: "network-kad", "Got record {key} {new_record:?}");
             // return if query id unknown - should not happen
             let Some(query) = self.kad_record_queries.get_mut(query_id) else { return };
@@ -1336,7 +1335,7 @@ where
                     Some(_) => {} // keep existing record
                 }
             } else {
-                // assess penalty
+                // assess penalty for returning record that doesn't match key
                 if let Some(peer_id) = peer {
                     trace!(target: "network-kad", ?peer_id, "processing fatal penalty for query record key mismatch");
                     self.swarm

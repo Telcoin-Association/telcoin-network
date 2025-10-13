@@ -12,7 +12,7 @@ use tn_config::{ConsensusConfig, NetworkConfig};
 use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
-use tn_types::{test_utils::init_test_tracing, Certificate, Header, TaskManager};
+use tn_types::{Certificate, Header, TaskManager};
 use tokio::{sync::mpsc, time::timeout};
 
 /// Test topic for gossip.
@@ -675,7 +675,6 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
 /// Test peer exchanges when too many peers connect
 #[tokio::test]
 async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
-    tn_types::test_utils::init_test_tracing();
     // Create a custom config with very low peer limits for testing
     let mut network_config = NetworkConfig::default();
     network_config.peer_config_mut().target_num_peers = 4;
@@ -923,7 +922,6 @@ async fn test_score_decay_and_reconnection() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_banned_peer_reconnection_attempt() -> eyre::Result<()> {
-    init_test_tracing();
     let TestTypes { peer1, peer2, .. } =
         create_test_types::<TestWorkerRequest, TestWorkerResponse>();
 
