@@ -1299,7 +1299,8 @@ where
     /// Check the local kad store to compare record timestamps.
     ///
     /// This method compares timestamps for verified records to ensure the latest record
-    /// is stored (prevents replay attacks).
+    /// is stored (prevents replay attacks). Also returns `true` if the record is not found.
+    /// It is the caller's responsibility to ensure records are verified and valid.
     fn is_newer_record(&mut self, record: &kad::Record) -> bool {
         let store = self.swarm.behaviour_mut().kademlia.store_mut();
 
@@ -1315,7 +1316,8 @@ where
                 _ => false,
             }
         } else {
-            false
+            // return true if record is not in local store
+            true
         }
     }
 }
