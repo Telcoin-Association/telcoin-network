@@ -34,7 +34,7 @@ use std::{
 };
 use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig};
 use tn_types::{
-    decode, encode, try_decode, BlsPublicKey, BlsSigner, Database, NetworkKeypair,
+    decode, encode, now, try_decode, BlsPublicKey, BlsSigner, Database, NetworkKeypair,
     NetworkPublicKey, TaskSpawner, TnSender,
 };
 use tokio::sync::{
@@ -350,11 +350,28 @@ where
         }
     }
 
-    /// Verify the address list in Record was signed by the key.
+    /// Verify the address list in Record was signed by the key and the kad record's publisher
+    /// matches the network key.
     fn peer_record_valid(&self, record: &kad::Record) -> Option<(BlsPublicKey, NodeRecord)> {
         let key = BlsPublicKey::from_literal_bytes(record.key.as_ref()).ok()?;
         let node_record = try_decode::<NodeRecord>(record.value.as_ref()).ok()?;
-        node_record.verify(&key)
+
+        // verify bls signature
+        let verified = node_record.verify(&key)?;
+
+        // verify publisher matches the network public key in the record
+        // this prevents replay attacks where malicious nodes republish outdated records
+        let expected_peer_id: PeerId = verified.1.info.pubkey.clone().into();
+        if record.publisher != Some(expected_peer_id) {
+            warn!(
+                target: "network-kad",
+                "NodeRecord validation failed: publisher {:?} doesn't match network key (expected {:?})",
+                record.publisher, expected_peer_id
+            );
+            return None;
+        }
+
+        Some(verified)
     }
 
     /// Publish and provide our network addresses and peer id under our BLS public key for
@@ -484,7 +501,11 @@ where
                 // update peer manager
                 self.swarm.behaviour_mut().peer_manager.add_trusted_peer_and_dial(
                     bls_pubkey,
-                    NetworkInfo { pubkey: network_pubkey, multiaddrs: vec![addr] },
+                    NetworkInfo {
+                        pubkey: network_pubkey,
+                        multiaddrs: vec![addr],
+                        timestamp: now(),
+                    },
                     reply,
                 );
             }
@@ -492,7 +513,11 @@ where
                 // update peer manager
                 self.swarm.behaviour_mut().peer_manager.add_known_peer(
                     bls_pubkey,
-                    NetworkInfo { pubkey: network_pubkey, multiaddrs: vec![addr] },
+                    NetworkInfo {
+                        pubkey: network_pubkey,
+                        multiaddrs: vec![addr],
+                        timestamp: now(),
+                    },
                 );
                 let _ = reply.send(Ok(()));
             }
@@ -506,6 +531,7 @@ where
                             NetworkInfo {
                                 pubkey: info.network_key,
                                 multiaddrs: vec![info.network_address],
+                                timestamp: now(),
                             },
                         );
                     }
@@ -1061,53 +1087,7 @@ where
                     kad::InboundRequest::GetRecord { num_closer_peers: _, present_locally: _ } => {}
                     kad::InboundRequest::PutRecord { source, connection: _, record } => {
                         if let Some(record) = record {
-                            // check if source or publisher are banned
-                            let publisher_is_banned = record
-                                .publisher
-                                .map(|peer| self.swarm.behaviour().peer_manager.peer_banned(&peer))
-                                .unwrap_or(true); // reject records without publisher
-                            let source_is_banned =
-                                self.swarm.behaviour().peer_manager.peer_banned(&source);
-
-                            // reject record
-                            if publisher_is_banned || source_is_banned {
-                                // handle race condition with PM
-                                self.swarm.behaviour_mut().kademlia.remove_record(&record.key);
-
-                                // assess penalty for pushing record without publisher
-                                if record.publisher.is_none() {
-                                    self.swarm
-                                        .behaviour_mut()
-                                        .peer_manager
-                                        .process_penalty(source, Penalty::Mild);
-                                }
-
-                                return Ok(());
-                            }
-
-                            if let Some((key, value)) = self.peer_record_valid(&record) {
-                                self.swarm
-                                    .behaviour_mut()
-                                    .kademlia
-                                    .store_mut()
-                                    .put(record)
-                                    .map_err(|e| {
-                                        NetworkError::StoreKademliaRecord(e.to_string())
-                                    })?;
-                                trace!(target: "network-kad", "Got record {key} {value:?}");
-                                self.swarm
-                                    .behaviour_mut()
-                                    .peer_manager
-                                    .add_known_peer(key, value.info);
-                            } else {
-                                error!(target: "network-kad", "Received invalid peer record!");
-
-                                // assess penalty for invalid peer record
-                                self.swarm
-                                    .behaviour_mut()
-                                    .peer_manager
-                                    .process_penalty(source, Penalty::Fatal);
-                            }
+                            self.process_kad_put_request(source, record)?;
                         }
                     }
                 }
@@ -1148,7 +1128,7 @@ where
                                 self.swarm
                                     .behaviour_mut()
                                     .peer_manager
-                                    .process_penalty(peer_id, Penalty::Severe);
+                                    .process_penalty(peer_id, Penalty::Fatal);
                             }
 
                             // return an error to caller if this is the last response for the query
@@ -1259,6 +1239,85 @@ where
         // ignore multiple query results
         if let Some(reply) = self.kad_requests.remove(query_id) {
             send_or_log_error!(reply, result, "kad");
+        }
+    }
+
+    /// Process an inbound kad put request.
+    fn process_kad_put_request(
+        &mut self,
+        source: PeerId,
+        record: kad::Record,
+    ) -> NetworkResult<()> {
+        // check if source or publisher are banned
+        let publisher_is_banned = record
+            .publisher
+            .map(|peer| self.swarm.behaviour().peer_manager.peer_banned(&peer))
+            .unwrap_or(true); // reject records without publisher
+        let source_is_banned = self.swarm.behaviour().peer_manager.peer_banned(&source);
+
+        // reject record
+        if publisher_is_banned || source_is_banned {
+            // handle race condition with PM
+            self.swarm.behaviour_mut().kademlia.remove_record(&record.key);
+
+            // assess penalty for pushing record without publisher
+            if record.publisher.is_none() {
+                self.swarm.behaviour_mut().peer_manager.process_penalty(source, Penalty::Fatal);
+            }
+
+            // return early
+            return Ok(());
+        }
+
+        // verify record signature and ensure publisher matches record's network
+        // key
+        if let Some((key, value)) = self.peer_record_valid(&record) {
+            // store latest node records
+            if self.is_newer_record(&record) {
+                self.swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .store_mut()
+                    .put(record)
+                    .map_err(|e| NetworkError::StoreKademliaRecord(e.to_string()))?;
+                trace!(target: "network-kad", "Got record {key} {value:?}");
+                self.swarm.behaviour_mut().peer_manager.add_known_peer(key, value.info);
+            } else {
+                // mild punishment for old record
+                self.swarm.behaviour_mut().peer_manager.process_penalty(source, Penalty::Mild);
+            }
+        } else {
+            warn!(target: "network-kad", "Received invalid peer record!");
+
+            // assess penalty for invalid peer record
+            self.swarm.behaviour_mut().peer_manager.process_penalty(source, Penalty::Fatal);
+        }
+
+        Ok(())
+    }
+
+    /// Check the local kad store to compare record timestamps.
+    ///
+    /// This method compares timestamps for verified records to ensure the latest record
+    /// is stored (prevents replay attacks). Also returns `true` if the record is not found.
+    /// It is the caller's responsibility to ensure records are verified and valid.
+    fn is_newer_record(&mut self, record: &kad::Record) -> bool {
+        let store = self.swarm.behaviour_mut().kademlia.store_mut();
+
+        if let Some(existing) = store.get(&record.key) {
+            match (
+                try_decode::<NodeRecord>(&existing.value),
+                try_decode::<NodeRecord>(&record.value),
+            ) {
+                (Ok(existing_record), Ok(new_record)) => {
+                    // return true if the new record is newer
+                    existing_record.info.timestamp < new_record.info.timestamp
+                }
+                _ => false,
+            }
+        } else {
+            // return true if record is not in local store
+            true
         }
     }
 }

@@ -705,7 +705,7 @@ where
             }
             info!(
                 target: "epoch-manager",
-                "publising epoch record {epoch_hash}",
+                "publishing epoch record {epoch_hash}",
             );
             let _ = primary_network.publish_epoch_vote(epoch_vote).await;
             my_vote = Some(epoch_vote);
@@ -716,6 +716,7 @@ where
             let mut reached_quorum = false;
             let mut timeout = Duration::from_secs(5);
             let mut timeouts = 0;
+            let mut alt_recs: HashMap<B256, usize> = HashMap::default();
             loop {
                 match tokio::time::timeout(timeout, rx.recv()).await {
                     Ok(Some((vote, vote_tx))) => {
@@ -741,6 +742,24 @@ where
                         } else {
                             // Send an error back to punish the peer that sent a bad epoch vote.
                             let err = if vote.epoch_hash != epoch_hash {
+                                if epoch_rec.committee.contains(&vote.public_key)
+                                    && vote.check_signature()
+                                {
+                                    // If we got a valid vote on another epoch record track that and break if we get quorum...
+                                    // This will cause us to query the record and cert from a peer.
+                                    let votes = *alt_recs.get(&vote.epoch_hash).unwrap_or(&0);
+                                    if votes + 1 >= quorum {
+                                        error!(
+                                            target: "epoch-manager",
+                                            "Reached quorum on epoch record {} instead of {}.",
+                                            vote.epoch_hash,
+                                            epoch_hash,
+                                        );
+                                        let _ = vote_tx.send(Err(HeaderError::InvalidHeaderDigest));
+                                        break;
+                                    }
+                                    alt_recs.insert(vote.epoch_hash, votes + 1);
+                                }
                                 HeaderError::InvalidHeaderDigest
                             } else if epoch_rec.committee.contains(&vote.public_key) {
                                 HeaderError::UnknownAuthority(format!(
@@ -750,13 +769,14 @@ where
                             } else {
                                 HeaderError::PeerNotAuthor
                             };
-                            let _ = vote_tx.send(Err(err)); // If we lost this channel somehow then no big deal.
                             error!(
                                 target: "epoch-manager",
+                                ?err,
                                 "Received an invalid epoch cert from {} for {}.",
                                 vote.public_key,
                                 vote.epoch_hash,
                             );
+                            let _ = vote_tx.send(Err(err)); // If we lost this channel somehow then no big deal.
                         }
                     }
                     Ok(None) => break, // channel issues...
@@ -808,16 +828,24 @@ where
                 );
                 // Try to recover by downloading the epoch record and cert from a peer.
                 for _ in 0..3 {
-                    match primary_network.request_epoch_cert(None, Some(epoch_hash)).await {
-                        Ok((epoch_rec, cert)) => {
-                            if epoch_rec.digest() == epoch_hash
-                                && epoch_hash == cert.epoch_hash
-                                && epoch_rec.verify_with_cert(&cert)
-                            {
-                                let _ = consensus_db.insert::<EpochCerts>(&epoch_hash, &cert);
+                    // Request by epoch number in case we had a bad hash...
+                    match primary_network.request_epoch_cert(Some(epoch_rec.epoch), None).await {
+                        Ok((new_epoch_rec, cert)) => {
+                            if new_epoch_rec.verify_with_cert(&cert) {
+                                let new_epoch_hash = new_epoch_rec.digest();
+                                // Humm, we got another epoch record than the one we expected...
+                                // The network came to quorum on this one so lets go with it...
+                                if new_epoch_hash != epoch_hash {
+                                    warn!(
+                                        target: "epoch-manager",
+                                        "Over wrote expected epoch record with verified epoch record",
+                                    );
+                                    consensus_db.save_epoch_record(&epoch_rec);
+                                }
+                                let _ = consensus_db.insert::<EpochCerts>(&new_epoch_hash, &cert);
                                 info!(
                                     target: "epoch-manager",
-                                    "retrieved cert for epoch {epoch_hash} from a peer",
+                                    "retrieved cert for epoch {new_epoch_hash} from a peer",
                                 );
                                 break;
                             }
