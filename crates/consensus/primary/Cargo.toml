@@ -13,7 +13,6 @@ edition = "2021"
 [dependencies]
 eyre = { workspace = true }
 backoff = { workspace = true }
-cfg-if = { workspace = true }
 futures = { workspace = true }
 parking_lot = { workspace = true }
 rand = { workspace = true, features = ["small_rng"] }

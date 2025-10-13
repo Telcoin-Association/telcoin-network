@@ -52,11 +52,12 @@ impl LeaderSwapTable {
     ///
     /// The `bad_nodes_stake_threshold` should be in the range of [0 - 33].
     ///
-    /// Nodes should not be on the bad list unless they are underperfoming.  No more than 1/3 of our nodes should be
-    /// "bad" (less is fine).
+    /// Nodes should not be on the bad list unless they are underperfoming.  No more than 1/3 of our
+    /// nodes should be "bad" (less is fine).
     ///
-    /// If we have bad nodes then we MUST have good nodes to swap with (an emply good list will lead to panics later).  We
-    /// want at least 1/3 of nodes on the good list if we have bad nodes (more is fine).
+    /// If we have bad nodes then we MUST have good nodes to swap with (an emply good list will lead
+    /// to panics later).  We want at least 1/3 of nodes on the good list if we have bad nodes
+    /// (more is fine).
     ///
     /// For now, we use 0.
     pub fn new(
@@ -69,11 +70,18 @@ impl LeaderSwapTable {
         assert!(reputation_scores.final_of_schedule, "Only reputation scores that have been calculated on the end of a schedule are accepted");
 
         let auths_by_score = reputation_scores.authorities_by_score_desc();
-        // Most validators should have a rep near this highest value if they are honest and are partcipating.
+        // Most validators should have a rep near this highest value if they are honest and are
+        // partcipating.
         let highest_rep = auths_by_score.first().map(|(_, rep)| *rep).unwrap_or(0);
-        // Do we have any validators that are not participating?  If so this will be a lot lower than highest_rep.
+        // Do we have any validators that are not participating?  If so this will be a lot lower
+        // than highest_rep.
         let lowest_rep = auths_by_score.last().map(|(_, rep)| *rep).unwrap_or(0);
-        let mean_rep: u64 = auths_by_score.iter().map(|(_, r)| r).sum();
+        let mean_rep = if auths_by_score.is_empty() {
+            0
+        } else {
+            let mean_rep: u64 = auths_by_score.iter().map(|(_, r)| r).sum();
+            mean_rep / auths_by_score.len() as u64
+        };
         let mut standard_dev: u64 = auths_by_score
             .iter()
             .map(|(_, r)| {
@@ -84,17 +92,18 @@ impl LeaderSwapTable {
         standard_dev /= auths_by_score.len() as u64;
         standard_dev = (standard_dev as f64).sqrt() as u64;
         // Generate the "good" and "bad" nodes.  We need to have a bad_nodes_stake_threshold > 0 AND
-        // we want a reasonable delta between the highest and lowest reputation otherwise we don't tag any
-        // node as "bad".  Telcoin network is running a closed validator set with high hardware and network
-        // requirements so this is really just to filter out down validators or nodes with a broken
-        // net connection etc so this should be OK.
+        // we want a reasonable delta between the highest and lowest reputation otherwise we don't
+        // tag any node as "bad".  Telcoin network is running a closed validator set with
+        // high hardware and network requirements so this is really just to filter out down
+        // validators or nodes with a broken net connection etc so this should be OK.
         let (good_nodes, bad_nodes) =
-            if lowest_rep >= mean_rep.saturating_sub(2 * standard_dev) {
+            if standard_dev == 0 || lowest_rep > highest_rep.saturating_sub(2 * standard_dev) {
                 (vec![], HashMap::default())
             } else {
                 let third = (auths_by_score.len() / 3).max(1);
                 // calc bad nodes
-                let mut bad_ceil = mean_rep.saturating_sub(2 * standard_dev);
+                let mut bad_ceil = highest_rep.saturating_sub(2 * standard_dev);
+                let mut old_bad_ceil = bad_ceil;
                 let bad_nodes = loop {
                     let bad_nodes: Vec<Authority> =
                         auths_by_score
@@ -108,10 +117,16 @@ impl LeaderSwapTable {
                                 }
                             })
                             .collect();
-                    if bad_nodes.len() >= third {
+                    if bad_nodes.len() <= third {
                         break bad_nodes;
                     }
                     bad_ceil = bad_ceil.saturating_sub(standard_dev);
+                    if old_bad_ceil == bad_ceil {
+                        // If we have bottomed out the bad ceiling and still have more than 1/3
+                        // nodes. Something is wrong...
+                        break bad_nodes;
+                    }
+                    old_bad_ceil = bad_ceil;
                 };
                 // calculating the good nodes
                 let mut good_floor = highest_rep.saturating_sub(standard_dev);
@@ -200,38 +215,6 @@ impl LeaderSwapTable {
         }
         None
     }
-
-    /// Retrieves the first nodes provided by the iterator `authorities` until the `stake_threshold`
-    /// has been reached. The `stake_threshold` should be between [0, 100] and expresses the
-    /// percentage of stake that is considered the cutoff. Basically we keep adding to the
-    /// response authorities until the sum of the stake reaches the `stake_threshold`. It's the
-    /// caller's responsibility to ensure that the elements of the `authorities`
-    /// input is already sorted. XXXX
-    fn _retrieve_first_nodes<'a>(
-        committee: &Committee,
-        authorities: impl Iterator<Item = &'a (AuthorityIdentifier, u64)>,
-        voting_power_threshold: u64,
-    ) -> Vec<Authority> {
-        let mut filtered_authorities = Vec::new();
-
-        let mut voting_power = 0;
-        for (authority_id, _score) in authorities {
-            voting_power += committee.voting_power_by_id(&authority_id);
-
-            // if the total accumulated stake has surpassed the stake threshold then we omit this
-            // last authority and we exit the loop.
-            if voting_power
-                > (voting_power_threshold * committee.total_voting_power()) / 100 as VotingPower
-            {
-                break;
-            }
-            if let Some(auth) = committee.authority(&authority_id) {
-                filtered_authorities.push(auth.to_owned());
-            }
-        }
-
-        filtered_authorities
-    }
 }
 
 /// The LeaderSchedule is responsible for producing the leader schedule across an epoch.
@@ -286,28 +269,22 @@ impl LeaderSchedule {
     pub fn leader(&self, round: Round) -> Authority {
         assert_eq!(round % 2, 0, "We should never attempt to do a leader election for odd rounds");
 
-        // TODO: split the leader election logic for testing from the production code.
-        cfg_if::cfg_if! {
-            if #[cfg(test)] {
-                // We apply round robin in leader election. Since we expect round to be an even number,
-                // 2, 4, 6, 8... it can't work well for leader election as we'll omit leaders. Thus
-                // we can always divide by 2 to get a monotonically incremented sequence,
-                // 2/2 = 1, 4/2 = 2, 6/2 = 3, 8/2 = 4  etc, and then do minus 1 so we can always
-                // start with base zero 0.
-                let next_leader = (round as u64 / 2 + self.committee.size() as u64 - 1) as usize % self.committee.size();
+        // We apply round robin in leader election. Since we expect round to be an even number,
+        // 2, 4, 6, 8... it can't work well for leader election as we'll omit leaders. Thus
+        // we can always divide by 2 to get a monotonically incremented sequence,
+        // 2/2 = 1, 4/2 = 2, 6/2 = 3, 8/2 = 4  etc, and then do minus 1 so we can always
+        // start with base zero 0.
+        let next_leader = (round as usize / 2).saturating_sub(1) % self.committee.size();
 
-                let leader: Authority = self.committee.authorities().get(next_leader).expect("authority out of bounds!").clone();
-                let table = self.leader_swap_table.read();
+        let leader: Authority = self
+            .committee
+            .authorities()
+            .get(next_leader)
+            .expect("authority out of bounds!")
+            .clone();
+        let table = self.leader_swap_table.read();
 
-                table.swap(&leader.id(), round).unwrap_or(leader)
-            } else {
-                // Elect the leader in a stake-weighted choice seeded by the round
-                let leader = self.committee.leader(round as u64);
-
-                let table = self.leader_swap_table.read();
-                table.swap(&leader.id(), round).unwrap_or(leader)
-            }
-        }
+        table.swap(&leader.id(), round).unwrap_or(leader)
     }
 
     /// Returns the certificate originated by the leader of the specified round (if any). The

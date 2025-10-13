@@ -81,20 +81,16 @@ impl Header {
             return Err(HeaderError::InvalidHeaderDigest);
         }
 
-        // Ensure the authority has voting rights.
-        let voting_rights = committee.voting_power_by_id(&self.author);
-        if voting_rights == 0 {
-            return Err(HeaderError::UnknownAuthority(self.author.to_string()));
-        }
+        // Ensure authority is in the current committee.
+        committee
+            .authority(&self.author)
+            .ok_or(HeaderError::UnknownAuthority(self.author.to_string()))?;
 
         // Ensure all worker ids are correct.
         for (worker_id, _) in self.payload.values() {
             if *worker_id as usize >= committee.number_of_workers() {
                 return Err(HeaderError::UnkownWorkerId);
             }
-            committee
-                .authority(&self.author)
-                .ok_or(HeaderError::UnknownAuthority(self.author.to_string()))?;
         }
 
         Ok(())
