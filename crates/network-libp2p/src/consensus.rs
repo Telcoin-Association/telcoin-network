@@ -660,6 +660,8 @@ where
             NetworkCommand::ReportPenalty { peer, penalty } => {
                 if let Some((peer, _)) = self.swarm.behaviour().peer_manager.auth_to_peer(peer) {
                     self.swarm.behaviour_mut().peer_manager.process_penalty(peer, penalty);
+                } else {
+                    warn!(target: "peer-manager", ?peer, "unable to assess penalty for peer");
                 }
             }
             NetworkCommand::DisconnectPeer { peer_id, reply } => {
@@ -1242,6 +1244,7 @@ where
 
             // assess penalty for pushing record without publisher
             if record.publisher.is_none() {
+                trace!(target: "network-kad", ?source, "processing fatal penalty for missing publisher");
                 self.swarm.behaviour_mut().peer_manager.process_penalty(source, Penalty::Fatal);
             }
 
@@ -1264,12 +1267,14 @@ where
                 self.swarm.behaviour_mut().peer_manager.add_known_peer(key, value.info);
             } else {
                 // mild punishment for old record
+                trace!(target: "network-kad", ?source, "processing mild penalty for old record");
                 self.swarm.behaviour_mut().peer_manager.process_penalty(source, Penalty::Mild);
             }
         } else {
             warn!(target: "network-kad", "Received invalid peer record!");
 
             // assess penalty for invalid peer record
+            trace!(target: "network-kad", ?source, "processing fatal penalty for invalid peer record");
             self.swarm.behaviour_mut().peer_manager.process_penalty(source, Penalty::Fatal);
         }
 
@@ -1319,7 +1324,7 @@ where
             // - if last step, tell PM (only one who tracks this)
             trace!(target: "network-kad", "Got record {key} {new_record:?}");
             // return if query id unknown - should not happen
-            let Some(query) = self.kad_record_queries.get_mut(&query_id) else { return };
+            let Some(query) = self.kad_record_queries.get_mut(query_id) else { return };
 
             // ensure returned value matches request
             if query.request == key {
@@ -1333,6 +1338,7 @@ where
             } else {
                 // assess penalty
                 if let Some(peer_id) = peer {
+                    trace!(target: "network-kad", ?peer_id, "processing fatal penalty for query record key mismatch");
                     self.swarm
                         .behaviour_mut()
                         .peer_manager
@@ -1357,7 +1363,7 @@ where
 
     /// Cleanup kad record queries (called on last step).
     fn close_kad_query(&mut self, query_id: &QueryId) {
-        if let Some(query) = self.kad_record_queries.remove(&query_id) {
+        if let Some(query) = self.kad_record_queries.remove(query_id) {
             if let Some(node_record) = query.result {
                 self.swarm
                     .behaviour_mut()

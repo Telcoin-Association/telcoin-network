@@ -959,12 +959,12 @@ async fn test_banned_peer_reconnection_attempt() -> eyre::Result<()> {
     // Wait for connection to establish
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    warn!(target: "peer-manager", "assessing fatal penalty!!");
+    debug!(target: "peer-manager", ?malicious_id, ?malicious_bls, "assessing fatal penalty!!");
     // Report fatal penalty for malicious peer
     honest_peer.report_penalty(malicious_bls, Penalty::Fatal).await;
 
     // Wait for ban to take effect and disconnect
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 5)).await;
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
 
     // Verify malicious peer is disconnected
     let connected_peers = honest_peer.connected_peer_ids().await?;

@@ -627,12 +627,13 @@ impl PeerManager {
         // check all peers for authority and track missing
         for bls_key in authorities {
             // identify missing authorities
-            if self.known_peers.get(&bls_key).is_none() {
+            if !self.known_peers.contains(&bls_key) {
                 missing.push(bls_key);
             }
         }
 
         // emit event for kad to try to discover
+        trace!(target: "peer-manager", ?missing, "requesting kad records");
         self.events.push_back(PeerEvent::MissingAuthorities(missing));
     }
 
