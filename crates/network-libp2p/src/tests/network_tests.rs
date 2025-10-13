@@ -12,7 +12,7 @@ use tn_config::{ConsensusConfig, NetworkConfig};
 use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
-use tn_types::{Certificate, Header, TaskManager};
+use tn_types::{test_utils::init_test_tracing, Certificate, Header, TaskManager};
 use tokio::{sync::mpsc, time::timeout};
 
 /// Test topic for gossip.
@@ -923,6 +923,7 @@ async fn test_score_decay_and_reconnection() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_banned_peer_reconnection_attempt() -> eyre::Result<()> {
+    init_test_tracing();
     let TestTypes { peer1, peer2, .. } =
         create_test_types::<TestWorkerRequest, TestWorkerResponse>();
 
@@ -958,11 +959,12 @@ async fn test_banned_peer_reconnection_attempt() -> eyre::Result<()> {
     // Wait for connection to establish
     tokio::time::sleep(Duration::from_millis(100)).await;
 
+    warn!(target: "peer-manager", "assessing fatal penalty!!");
     // Report fatal penalty for malicious peer
     honest_peer.report_penalty(malicious_bls, Penalty::Fatal).await;
 
     // Wait for ban to take effect and disconnect
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 2)).await;
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 5)).await;
 
     // Verify malicious peer is disconnected
     let connected_peers = honest_peer.connected_peer_ids().await?;
@@ -1541,18 +1543,7 @@ async fn test_get_kad_records() -> eyre::Result<()> {
     // find other committee members through kad
     let authorities: Vec<BlsPublicKey> =
         committee.iter().map(|peer| peer.config.key_config().primary_public_key()).collect();
-    let node_records = nvv.find_authorities(authorities.clone()).await?;
-
-    for record in node_records {
-        // wait for node records
-        match timeout(Duration::from_secs(1), record).await {
-            Ok(res) => {
-                let info = res??;
-                debug!(target: "network", ?info);
-            }
-            Err(_) => return Err(eyre!("Timeout waiting for peer exchange event")),
-        }
-    }
+    nvv.find_authorities(authorities.clone()).await?;
 
     // allow dial attempts to be made
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 5)).await;

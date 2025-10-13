@@ -612,7 +612,7 @@ impl PeerManager {
     }
 
     /// Add a known peer to the known list.
-    /// Used for bootstrap servers or possibly committie members.
+    /// Used for bootstrap servers or possibly committee members.
     pub(crate) fn add_known_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
         self.peers.upsert_peer(bls_key, info.pubkey.clone(), info.multiaddrs.clone());
         self.known_peers.insert(bls_key, info.clone());
@@ -701,6 +701,7 @@ impl PeerManager {
     pub(crate) fn process_peers_for_discovery(&mut self, mut peers: Vec<PeerInfo>) {
         peers.retain(|peer| self.eligible_for_discovery(peer));
         let peers: HashSet<_> = peers.into_iter().map(|info| (info.peer_id, info.addrs)).collect();
+        trace!(target: "peer-manager", ?peers, "adding eligible peers to discovery map");
         self.discovery_peers.extend(peers);
     }
 

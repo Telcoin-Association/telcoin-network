@@ -137,7 +137,7 @@ where
     /// the bls key associated with the desired authority's [NodeRecord]. The query runs until
     /// the last step. During this time, results are tracked and compared to one another to
     /// ensure the latest valid record is used for the peer's info.
-    kad_requests: HashMap<QueryId, KadQuery>,
+    kad_record_queries: HashMap<QueryId, KadQuery>,
     /// The configurables for the libp2p consensus network implementation.
     config: LibP2pConfig,
     /// Track peers we have a connection with.
@@ -313,7 +313,7 @@ where
             authorized_publishers: Default::default(),
             outbound_requests: Default::default(),
             inbound_requests: Default::default(),
-            kad_requests: Default::default(),
+            kad_record_queries: Default::default(),
             config,
             connected_peers: VecDeque::new(),
             pending_px_disconnects,
@@ -1052,7 +1052,7 @@ where
                 for bls_key in missing {
                     let key = kad::RecordKey::new(&bls_key);
                     let query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
-                    self.kad_requests.insert(query_id, bls_key.into());
+                    self.kad_record_queries.insert(query_id, bls_key.into());
                 }
             }
             PeerEvent::Discovery => {
@@ -1099,19 +1099,14 @@ where
                         key,
                         providers,
                         ..
-                    })) => match BlsPublicKey::from_literal_bytes(key.as_ref()) {
-                        Ok(key) => {
-                            for peer in providers {
-                                debug!(target: "network-kad",
-                                    "Peer {peer:?} provides key {:?}",
-                                    key,
-                                );
-                            }
-                        }
-                        Err(err) => {
-                            error!(target: "network-kad", "Failed to decode a kad key: {err:?}")
-                        }
-                    },
+                    })) => {
+                        debug!(
+                            target: "network-kad",
+                            key = ?BlsPublicKey::from_literal_bytes(key.as_ref()),
+                            ?providers,
+                            "kad::GetProviders::Ok"
+                        );
+                    }
                     kad::QueryResult::GetProviders(Err(err)) => {
                         error!(target: "network-kad", "Failed to get providers: {err:?}");
                     }
@@ -1119,13 +1114,8 @@ where
                         kad::PeerRecord { record, peer },
                     ))) => {
                         if let Some((key, value)) = self.peer_record_valid(&record) {
-                            // TODO:
-                            // - check if existing query value already exists
-                            // - compare NodeRecord timestamps
-                            // - update if newer
-                            // - if last step, tell PM (only one who tracks this)
                             trace!(target: "network-kad", "Got record {key} {value:?}");
-                            self.return_kad_result(&query_id, Ok((key, value.info.clone())));
+                            self.process_kad_query_result(&query_id, record, peer, step.last);
                         } else {
                             error!(target: "network-kad", "Received invalid peer record!");
 
@@ -1137,12 +1127,9 @@ where
                                     .process_penalty(peer_id, Penalty::Fatal);
                             }
 
-                            // return an error to caller if this is the last response for the query
+                            // ensure query cleaned up
                             if step.last {
-                                self.return_kad_result(
-                                    &query_id,
-                                    Err(NetworkError::InvalidPeerRecord),
-                                );
+                                self.close_kad_query(&query_id);
                             }
                         }
                     }
@@ -1153,37 +1140,41 @@ where
                         // self.swarm.behaviour_mut().kademlia.put_record_to(record, peers, quorum);
 
                         debug!(target: "network-kad", ?cache_candidates, "FinishedWithNoAdditionalRecord - failed to find record");
+                        self.close_kad_query(&query_id);
                     }
                     kad::QueryResult::GetRecord(Err(err)) => {
-                        let key = BlsPublicKey::from_literal_bytes(err.key().as_ref());
-                        error!(target: "network-kad", ?key, "Failed to get record: {err:?}");
-                        self.return_kad_result(&query_id, Err(err.into()));
+                        debug!(
+                            target: "network-kad",
+                            key = ?BlsPublicKey::from_literal_bytes(err.key().as_ref()),
+                            ?err,
+                            "kad::GetRecord::Err"
+                        );
+                        self.close_kad_query(&query_id);
                     }
                     kad::QueryResult::PutRecord(Ok(kad::PutRecordOk { key })) => {
-                        match BlsPublicKey::from_literal_bytes(key.as_ref()) {
-                            Ok(key) => {
-                                debug!(target: "network-kad", "Successfully put record {key}");
-                            }
-                            Err(err) => {
-                                error!(target: "network-kad", "Failed to decode a kad Key: {err:?}")
-                            }
-                        }
+                        debug!(
+                            target: "network-kad",
+                            key = ?BlsPublicKey::from_literal_bytes(key.as_ref()),
+                            "kad::PutRecordOk"
+                        );
                     }
                     kad::QueryResult::PutRecord(Err(err)) => {
                         error!(target: "network-kad", "Failed to put record: {err:?}");
                     }
                     kad::QueryResult::StartProviding(Ok(kad::AddProviderOk { key })) => {
-                        match BlsPublicKey::from_literal_bytes(key.as_ref()) {
-                            Ok(key) => {
-                                debug!(target: "network-kad", "Successfully put provider record {:?}", key)
-                            }
-                            Err(err) => {
-                                error!(target: "network-kad", "Failed to decode a kad Key: {err:?}")
-                            }
-                        }
+                        debug!(
+                            target: "network-kad",
+                            key = ?BlsPublicKey::from_literal_bytes(key.as_ref()),
+                            "kad::StartProviding::Ok"
+                        );
                     }
                     kad::QueryResult::StartProviding(Err(err)) => {
-                        error!(target: "network-kad", "Failed to put provider record: {err:?}");
+                        warn!(
+                            target: "network-kad",
+                            key = ?BlsPublicKey::from_literal_bytes(err.key().as_ref()),
+                            ?err,
+                            "kad::StartProviding::Err"
+                        );
                     }
                     kad::QueryResult::GetClosestPeers(Ok(result)) => {
                         // process peers for potential discovery attempts
@@ -1230,20 +1221,6 @@ where
         Ok(())
     }
 
-    /// Return the kademlia result to application layer.
-    fn return_kad_result(
-        &mut self,
-        query_id: &QueryId,
-        result: NetworkResult<(BlsPublicKey, NetworkInfo)>,
-    ) {
-        if let Ok((bls_key, info)) = &result {
-            // If we got a response to a specific bls key request then store it in the
-            // peer manager known peers.  This indicates it is a peer we care about (probably a
-            // validator) so keep it handy.
-            self.swarm.behaviour_mut().peer_manager.add_known_peer(*bls_key, info.clone());
-        }
-    }
-
     /// Process an inbound kad put request.
     fn process_kad_put_request(
         &mut self,
@@ -1259,6 +1236,7 @@ where
 
         // reject record
         if publisher_is_banned || source_is_banned {
+            trace!(target: "network-kad", ?publisher_is_banned, ?source_is_banned, "rejecting put request for record");
             // handle race condition with PM
             self.swarm.behaviour_mut().kademlia.remove_record(&record.key);
 
@@ -1320,6 +1298,72 @@ where
         } else {
             // return true if record is not in local store
             true
+        }
+    }
+
+    /// Logic to process a kad record request.
+    fn process_kad_query_result(
+        &mut self,
+        query_id: &QueryId,
+        record: kad::Record,
+        peer: Option<PeerId>,
+        is_last_step: bool,
+    ) {
+        // ensure returned record is valid, otherwise assess penalty
+        if let Some((key, new_record)) = self.peer_record_valid(&record) {
+            // TODO:
+            // - ensure value matches request
+            // - check if existing query value already exists
+            // - compare NodeRecord timestamps
+            // - update if newer
+            // - if last step, tell PM (only one who tracks this)
+            trace!(target: "network-kad", "Got record {key} {new_record:?}");
+            // return if query id unknown - should not happen
+            let Some(query) = self.kad_record_queries.get_mut(&query_id) else { return };
+
+            // ensure returned value matches request
+            if query.request == key {
+                match &mut query.result {
+                    None => query.result = Some(new_record),
+                    Some(tracked) if tracked.info.timestamp < new_record.info.timestamp => {
+                        *tracked = new_record
+                    }
+                    Some(_) => {} // keep existing record
+                }
+            } else {
+                // assess penalty
+                if let Some(peer_id) = peer {
+                    self.swarm
+                        .behaviour_mut()
+                        .peer_manager
+                        .process_penalty(peer_id, Penalty::Fatal);
+                }
+            }
+        } else {
+            // record signature invalid
+            warn!(target: "network-kad", "Received invalid peer record!");
+
+            // assess penalty for invalid peer record
+            if let Some(peer_id) = peer {
+                self.swarm.behaviour_mut().peer_manager.process_penalty(peer_id, Penalty::Fatal);
+            }
+        }
+
+        // handle last step
+        if is_last_step {
+            self.close_kad_query(query_id);
+        }
+    }
+
+    /// Cleanup kad record queries (called on last step).
+    fn close_kad_query(&mut self, query_id: &QueryId) {
+        if let Some(query) = self.kad_record_queries.remove(&query_id) {
+            if let Some(node_record) = query.result {
+                self.swarm
+                    .behaviour_mut()
+                    .peer_manager
+                    .add_known_peer(query.request, node_record.info);
+            }
         }
     }
 }
