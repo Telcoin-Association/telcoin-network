@@ -1,7 +1,10 @@
 //! The state of consensus
 
 use crate::{
-    consensus::{bullshark::Bullshark, utils::gc_round, ConsensusError, ConsensusMetrics},
+    consensus::{
+        bullshark::Bullshark, utils::gc_round, weak_vote::WeakVoteTracker, ConsensusError,
+        ConsensusMetrics,
+    },
     ConsensusBus, NodeMode,
 };
 use consensus_metrics::monitored_future;
@@ -14,10 +17,10 @@ use std::{
 use tn_config::ConsensusConfig;
 use tn_storage::{CertificateStore, ConsensusStore};
 use tn_types::{
-    AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Committee, Database,
-    Hash as _, Noticer, Round, TaskManager, Timestamp, TnReceiver, TnSender,
+    Authority, AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Committee,
+    Database, Hash as _, Noticer, Round, TaskManager, Timestamp, TnReceiver, TnSender, WeakVote,
 };
-use tracing::{debug, info, instrument};
+use tracing::{debug, error, info, instrument};
 
 #[cfg(test)]
 #[path = "tests/consensus_tests.rs"]
@@ -41,6 +44,9 @@ pub struct ConsensusState {
     /// Keeps the latest committed certificate (and its parents) for every authority. Anything
     /// older must be regularly cleaned up through the function `update`.
     pub dag: Dag,
+    /// Tracks weak votes (uncertified proposals) per round per authority.
+    /// weak_votes[round][authority] = count of proposals that reference this authority's certificate
+    pub weak_votes: WeakVoteTracker,
     /// Metrics handler
     pub metrics: Arc<ConsensusMetrics>,
 }
@@ -53,6 +59,7 @@ impl ConsensusState {
             gc_depth,
             last_committed: Default::default(),
             dag: Default::default(),
+            weak_votes: WeakVoteTracker::new(),
             last_committed_sub_dag: None,
             metrics,
         }
@@ -92,6 +99,7 @@ impl ConsensusState {
             last_committed: recovered_last_committed,
             last_committed_sub_dag,
             dag,
+            weak_votes: WeakVoteTracker::new(), // initialize empty on recovery
             metrics,
         }
     }
@@ -198,6 +206,8 @@ impl ConsensusState {
 
         // Purge all certificates past the gc depth.
         self.dag.retain(|r, _| *r > self.last_round.gc_round);
+        // Also clean up weak votes for GC'd rounds
+        self.cleanup_weak_votes();
     }
 
     // Checks that the provided certificate's parents exist return an error if they do not.
@@ -228,6 +238,36 @@ impl ConsensusState {
             return Err(ConsensusError::MissingParentRound(Box::new(certificate.clone())));
         }
         Ok(())
+    }
+
+    /// Track weak votes from an uncertified proposal (header's parents).
+    ///
+    /// A weak vote occurs when a proposal (header - not yet certified) references a certificate as a parent.
+    /// These are tracked separately from strong votes (verified certificates).
+    pub fn track_weak_votes(&mut self, weak_vote: WeakVote) {
+        self.weak_votes.track_proposal(weak_vote, &self.dag);
+    }
+
+    /// Get the count of weak votes (from uncertified proposals) for a certificate.
+    pub fn get_weak_votes(&self, round: Round, authority: &AuthorityIdentifier) -> u32 {
+        self.weak_votes.get_votes(round, authority)
+    }
+
+    /// Check if a leader can be fast committed (has 2f+1 weak votes).
+    pub fn can_fast_commit(
+        &self,
+        leader_round: Round,
+        leader: &Authority,
+        committee: &Committee,
+    ) -> bool {
+        let weak_votes = self.get_weak_votes(leader_round, &leader.id());
+        debug!(?weak_votes, threshold = committee.quorum_threshold(), "can fast commit");
+        weak_votes as u64 >= committee.quorum_threshold()
+    }
+
+    // Clean up weak votes for rounds that are below GC.
+    pub fn cleanup_weak_votes(&mut self) {
+        self.weak_votes.cleanup(self.last_round.gc_round);
     }
 }
 
@@ -358,21 +398,27 @@ impl<DB: Database> Consensus<DB> {
     }
 
     async fn run(mut self) -> Result<(), ConsensusError> {
-        // Clone the bus or the borrow checker will yell at us...
-        let bus_clone = self.consensus_bus.clone();
-        let mut rx_new_certificates = bus_clone.new_certificates().subscribe();
-        self.active = bus_clone.node_mode().borrow().is_active_cvv();
+        let mut rx_new_certificates = self.consensus_bus.new_certificates().subscribe();
+        let mut rx_weak_votes = self.consensus_bus.header_proposals().subscribe();
+        self.active = self.consensus_bus.node_mode().borrow().is_active_cvv();
 
-        // Listen to incoming certificates.
+        // listen to incoming certificates and weak votes for fast commit rule
         loop {
             tokio::select! {
+                // listen for shutdown
                 _ = &self.rx_shutdown => {
                     return Ok(())
                 }
 
+                // process new certificates
                 Some(certificate) = rx_new_certificates.recv() => {
                     self.new_certificate(certificate).await?;
                 },
+
+                // process valid proposals as weak votes for fast-commit rule
+                Some(weak_vote) = rx_weak_votes.recv() => {
+                    self.process_header_proposal(weak_vote).await?;
+                }
             }
         }
     }
@@ -417,7 +463,7 @@ impl<DB: Database> Consensus<DB> {
                     committed_certificates.push(certificate.clone());
                 }
 
-                // NOTE: The size of the sub-dag can be arbitrarily large (depending on the network
+                // NOTE: the size of the sub-dag can be arbitrarily large (depending on the network
                 // condition and Byzantine leaders).
                 self.consensus_bus
                     .sequence()
@@ -453,6 +499,84 @@ impl<DB: Database> Consensus<DB> {
                 .with_label_values(&[])
                 .set(self.state.dag.len() as i64);
         }
+        Ok(())
+    }
+
+    /// Process valid header proposals as weak votes for the fast-commit rule.
+    ///
+    /// This is only called when the node is actively participating in committee.
+    async fn process_header_proposal(&mut self, weak_vote: WeakVote) -> Result<(), ConsensusError> {
+        // only process if node is active cvv
+        if !self.active {
+            debug!("consensus inactive - ignoring header proposal");
+            return Ok(());
+        }
+
+        // track weak votes for each parent
+        self.state.track_weak_votes(weak_vote);
+
+        // try fast commit after updating weak votes
+        let (_, committed_sub_dags) = self.protocol.try_fast_commit(&mut self.state)?;
+
+        debug!(?committed_sub_dags, "processed weak vote for header proposal");
+
+        if !committed_sub_dags.is_empty() {
+            self.process_commits(committed_sub_dags).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn process_commits(
+        &mut self,
+        committed_sub_dags: Vec<CommittedSubDag>,
+    ) -> Result<(), ConsensusError> {
+        // Extract the committed certificates
+        let mut committed_certificates = Vec::new();
+
+        for committed_sub_dag in &committed_sub_dags {
+            let base_execution_block = committed_sub_dag.leader.header.latest_execution_block;
+            if self.consensus_bus.wait_for_execution(base_execution_block).await.is_err() {
+                error!(target: "telcoin::consensus_state", "Got a bogus sub dag from bullshark, we are out of sync!");
+                self.consensus_bus.node_mode().send_modify(|v| *v = NodeMode::CvvInactive);
+                break;
+            }
+
+            debug!(target: "telcoin::consensus_state", "Commit in Sequence {:?}", committed_sub_dag.leader.nonce());
+
+            for certificate in &committed_sub_dag.certificates {
+                committed_certificates.push(certificate.clone());
+            }
+
+            self.consensus_bus
+                .sequence()
+                .send(committed_sub_dag.clone())
+                .await
+                .map_err(|_| ConsensusError::ShuttingDown)?;
+        }
+
+        if !committed_certificates.is_empty() {
+            let leader_commit_round = committed_certificates
+                .iter()
+                .map(|c| c.round())
+                .max()
+                .expect("committed_certificates isn't empty");
+
+            self.consensus_bus
+                .committed_certificates()
+                .send((leader_commit_round, committed_certificates))
+                .await
+                .map_err(|_| ConsensusError::ShuttingDown)?;
+
+            assert_eq!(self.state.last_round.committed_round, leader_commit_round);
+
+            self.consensus_bus
+                .update_consensus_rounds(self.state.last_round)
+                .map_err(|_| ConsensusError::ShuttingDown)?;
+        }
+
+        self.metrics.consensus_dag_rounds.with_label_values(&[]).set(self.state.dag.len() as i64);
+
         Ok(())
     }
 }

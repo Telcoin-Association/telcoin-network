@@ -14,7 +14,8 @@ use tn_network_libp2p::types::NetworkEvent;
 use tn_primary_metrics::{ChannelMetrics, ConsensusMetrics, ExecutorMetrics, Metrics};
 use tn_types::{
     error::HeaderError, BlockHash, BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader,
-    ConsensusOutput, Epoch, EpochVote, Header, Round, TnReceiver, TnSender, CHANNEL_CAPACITY,
+    ConsensusOutput, Epoch, EpochVote, Header, Round, TnReceiver, TnSender, WeakVote,
+    CHANNEL_CAPACITY,
 };
 use tokio::{
     sync::{
@@ -304,6 +305,8 @@ struct ConsensusBusEpochInner {
 
     /// Messages to the Certificate Manager.
     certificate_manager: MeteredMpscChannel<CertificateManagerCommand>,
+    /// Header proposals sent to consensus as weak votes for the fast-commit rule.
+    header_proposals: MeteredMpscChannel<WeakVote>,
 }
 
 impl ConsensusBusEpochInner {
@@ -355,6 +358,12 @@ impl ConsensusBusEpochInner {
             &app_inner.channel_metrics.tx_sequence,
         );
 
+        // TODO: update metrics here
+        let header_proposals = metered_channel::channel_sender(
+            CHANNEL_CAPACITY,
+            &app_inner.channel_metrics.tx_sequence,
+        );
+
         Self {
             new_certificates,
             committed_certificates,
@@ -365,6 +374,7 @@ impl ConsensusBusEpochInner {
             committed_own_headers,
             sequence,
             certificate_manager,
+            header_proposals,
         }
     }
 }
@@ -426,6 +436,13 @@ impl ConsensusBus {
     /// Can only be subscribed to once.
     pub fn new_certificates(&self) -> &impl TnSender<Certificate> {
         &self.inner_epoch.new_certificates
+    }
+
+    /// Valid headers this node has seen.
+    ///
+    /// This information is used as "weak votes" for the fast-commit rule.
+    pub fn header_proposals(&self) -> &impl TnSender<WeakVote> {
+        &self.inner_epoch.header_proposals
     }
 
     /// Outputs the sequence of ordered certificates to the primary (for cleanup and feedback).

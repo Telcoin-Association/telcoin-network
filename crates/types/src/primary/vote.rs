@@ -2,11 +2,11 @@
 
 use crate::{
     crypto::{self, to_intent_message, BlsSignature, IntentMessage, ProtocolSignature},
-    encode, AuthorityIdentifier, BlsSigner, Digest, Epoch, Hash, Header, HeaderDigest, Round,
-    Signer,
+    encode, AuthorityIdentifier, BlsSigner, CertificateDigest, Digest, Epoch, Hash, Header,
+    HeaderDigest, Round, Signer,
 };
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{collections::BTreeSet, fmt};
 
 /// A Vote on a Header is a claim by the voting authority that all payloads and the full history
 /// of Certificates included in the Header are available.
@@ -186,4 +186,15 @@ impl From<&Vote> for VoteInfo {
     fn from(vote: &Vote) -> Self {
         VoteInfo { epoch: vote.epoch(), round: vote.round(), vote_digest: vote.digest() }
     }
+}
+
+/// TODO
+#[derive(Debug)]
+pub struct WeakVote {
+    /// The authority that proposed the header used as the weak vote.
+    pub authority: AuthorityIdentifier,
+    /// The round for the proposed header.
+    pub round: Round,
+    /// The validated parents for the weak vote.
+    pub parents: BTreeSet<CertificateDigest>,
 }
