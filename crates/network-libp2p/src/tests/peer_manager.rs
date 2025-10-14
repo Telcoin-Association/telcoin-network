@@ -13,7 +13,7 @@ use std::{
 use tn_config::{KeyConfig, NetworkConfig, ScoreConfig};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
-use tn_types::{BlsKeypair, NetworkKeypair, NetworkPublicKey};
+use tn_types::{now, test_utils::init_test_tracing, BlsKeypair, NetworkKeypair, NetworkPublicKey};
 use tokio::time::{sleep, timeout};
 
 fn create_test_peer_manager(network_config: Option<NetworkConfig>) -> PeerManager {
@@ -452,6 +452,7 @@ async fn test_temporarily_banned_peer() {
 
 #[tokio::test]
 async fn test_process_peer_exchange() {
+    init_test_tracing();
     let mut peer_manager = create_test_peer_manager(None);
 
     // Create peer exchange data
@@ -466,6 +467,8 @@ async fn test_process_peer_exchange() {
     let bls2 = *BlsKeypair::generate(&mut rng).public();
     let net1: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().clone().into();
     let net2: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().clone().into();
+    let peer_id1 = net1.clone().into();
+    let peer_id2 = net2.clone().into();
     exchange_map.insert(bls1, (net1, multiaddrs1));
     exchange_map.insert(bls2, (net2, multiaddrs2));
 
@@ -474,11 +477,18 @@ async fn test_process_peer_exchange() {
     // Process the peer exchange
     peer_manager.process_peer_exchange(exchange);
 
-    // Verify dial requests were created for both peers
+    // verify peers were added to discovery
+    assert!(peer_manager.discovery_peers.contains_key(&peer_id1));
+    assert!(peer_manager.discovery_peers.contains_key(&peer_id2));
+
+    // discovery heartbeat to initiate dial requests
+    peer_manager.discovery_heartbeat();
+
+    // verify dial requests were created for both peers
     let _ = peer_manager.next_dial_request().expect("peer 1 exchange");
     let _ = peer_manager.next_dial_request().expect("peer 2 exchange");
 
-    // Verify no more dial requests
+    // verify no more dial requests
     assert!(peer_manager.next_dial_request().is_none());
 }
 

@@ -15,14 +15,14 @@ use crate::{
     types::{NetworkInfo, NetworkResult},
 };
 use libp2p::{core::ConnectedPoint, kad::PeerInfo, multiaddr::Protocol, Multiaddr, PeerId};
-use rand::seq::IteratorRandom as _;
+use rand::seq::{IteratorRandom as _, SliceRandom as _};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::IpAddr,
     task::Context,
 };
 use tn_config::PeerConfig;
-use tn_types::{now, BlsPublicKey};
+use tn_types::BlsPublicKey;
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, trace, warn};
 
@@ -537,25 +537,49 @@ impl PeerManager {
     /// many peers. The disconnecting peer shares information about other known peers to
     /// facilitate discovery.
     ///
-    /// Peers should be weary of these reported peers (eclipse attacks).
+    /// Peers should be weary of these reported peers (eclipse attacks). Peers discovered through
+    /// kademlia are prioritized over peer exchange by only processing up to the missing target
+    /// number of discovery peers from exchange map.
     pub(crate) fn process_peer_exchange(&mut self, peers: PeerExchangeMap) {
-        for (bls, (net_key, multiaddrs)) in peers.into_iter() {
-            let multiaddrs: Vec<Multiaddr> = multiaddrs.into_iter().collect();
-            let peer_id: PeerId = net_key.clone().into();
-            if !self.known_peers.contains_key(&bls) {
-                self.add_known_peer(
-                    bls,
-                    NetworkInfo {
-                        pubkey: net_key.clone(),
-                        multiaddrs: multiaddrs.clone(),
-                        timestamp: now(),
-                    },
-                );
-            }
+        // check if discovery peers needed
+        let max_discovery_peers = self.config.max_discovery_peers();
+        let current_count = self.discovery_peers.len();
 
-            // dial peers that are unknown or can be dialed
-            if self.peers.can_dial(&peer_id) {
-                self.dial_peer(peer_id, multiaddrs, None);
+        // seed discovery peers from peer exchange
+        if current_count < max_discovery_peers {
+            // convert eligible peers to `PeerInfo` for processing
+            let mut peers: Vec<_> = peers
+                .into_iter()
+                .filter_map(|(_, (net_key, addrs))| {
+                    let info =
+                        PeerInfo { peer_id: net_key.into(), addrs: addrs.into_iter().collect() };
+
+                    // filter out ineligible peers
+                    if self.eligible_for_discovery(&info) {
+                        debug!(target: "peer-manager", ?info, "peer exchange eligible");
+                        Some(info)
+                    } else {
+                        let ips = self.has_valid_unbanned_ips(&info.addrs);
+                        let can_dial = self.peers.can_dial(&info.peer_id);
+                        let peer = self.peers.get_peer(&info.peer_id);
+                        debug!(target: "peer-manager", ?peer, ?info, "peer exchange ineligible");
+                        None
+                    }
+                })
+                .collect();
+
+            debug!(target: "peer-manager", eligible=?peers, "processing peer exchange");
+
+            // shuffle all peers
+            let mut rng = rand::rng();
+            peers.shuffle(&mut rng);
+
+            // add target number of peers for discovery
+            let peers_to_take = max_discovery_peers - current_count;
+            for peer in peers.into_iter().take(peers_to_take) {
+                self.discovery_peers.insert(peer.peer_id, peer.addrs);
+
+                debug!(target: "peer-manager", discovery=?self.discovery_peers, "discovery peers");
             }
         }
     }
