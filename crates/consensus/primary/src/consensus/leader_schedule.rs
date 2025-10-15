@@ -70,6 +70,8 @@ impl LeaderSwapTable {
         assert!(reputation_scores.final_of_schedule, "Only reputation scores that have been calculated on the end of a schedule are accepted");
 
         let auths_by_score = reputation_scores.authorities_by_score_desc();
+        let list_threshhold =
+            ((auths_by_score.len() * bad_nodes_stake_threshold as usize) / 100).max(1);
         // Most validators should have a rep near this highest value if they are honest and are
         // partcipating.
         let highest_rep = auths_by_score.first().map(|(_, rep)| *rep).unwrap_or(0);
@@ -100,7 +102,6 @@ impl LeaderSwapTable {
             if standard_dev == 0 || lowest_rep > highest_rep.saturating_sub(2 * standard_dev) {
                 (vec![], HashMap::default())
             } else {
-                let third = (auths_by_score.len() / 3).max(1);
                 // calc bad nodes
                 let mut bad_ceil = highest_rep.saturating_sub(2 * standard_dev);
                 let mut old_bad_ceil = bad_ceil;
@@ -117,7 +118,7 @@ impl LeaderSwapTable {
                                 }
                             })
                             .collect();
-                    if bad_nodes.len() <= third {
+                    if bad_nodes.len() <= list_threshhold {
                         break bad_nodes;
                     }
                     bad_ceil = bad_ceil.saturating_sub(standard_dev);
@@ -143,7 +144,7 @@ impl LeaderSwapTable {
                                 }
                             })
                             .collect();
-                    if good_nodes.len() >= third {
+                    if good_nodes.len() >= list_threshhold {
                         break good_nodes;
                     }
                     good_floor = good_floor.saturating_sub(standard_dev).max(bad_ceil + 1);

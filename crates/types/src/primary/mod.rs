@@ -22,16 +22,14 @@ pub use vote::*;
 /// The default primary udp port for consensus messages.
 pub const DEFAULT_PRIMARY_PORT: u16 = 44894;
 
-/// For now, use 0 to prevent any removal of bad nodes since validator sets are static.
-///
-/// The following note is quoted from sui regarding a default of `20`:
-/// "Taking a baby step approach, we consider only 20% by stake as bad nodes so
-/// we have a 80% by stake of nodes participating in the
-/// leader committee. That allow us for more redundancy in
-/// case we have validators under performing - since the
-/// responsibility is shared amongst more nodes. We can increase that once we do
-/// have higher confidence."
-pub const DEFAULT_BAD_NODES_STAKE_THRESHOLD: u64 = 0;
+/// 33% of nodes can be labelled as "bad".  This means no more than 33% of the committee can be
+/// considered bad nodes and at least 33% of the committee should be considered "good" nodes.  This
+/// can be violated only in some extreme edge cases where scores/number of nodes require it.  Note
+/// that nodes will NOT be considered "bad" unless they actually have low reputation relative to the
+/// other nodes.  The bad list is expected to be empty except in the case of node(s) being down or
+/// having bad connectivity, etc.  Also note that nodes with the same reputation will wind up on the
+/// same list (good or bad) not unfairly be punished while another node is rewarded.
+pub const DEFAULT_BAD_NODES_STAKE_THRESHOLD: u64 = 33;
 
 /// The round number.
 /// Becomes the lower 32 bits of a nonce (with epoch the high bits).
