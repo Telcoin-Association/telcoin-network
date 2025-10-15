@@ -89,10 +89,9 @@ impl<DB: ConsensusStore> Bullshark<DB> {
         // then this is the first time we commit a leader, so no score update takes place
         if let Some(last_committed_sub_dag) = state.last_committed_sub_dag.as_ref() {
             let leader_digest = last_committed_sub_dag.leader.digest();
-            for certificate in committed_sequence {
-                // TODO: we could iterate only the certificates of the round above the previous
-                // leader's round
-                if certificate.header().parents().iter().any(|digest| *digest == leader_digest) {
+            let leader_round = last_committed_sub_dag.leader.round();
+            for certificate in committed_sequence.iter().filter(|c| c.round() == leader_round + 1) {
+                if certificate.header().parents().contains(&leader_digest) {
                     reputation_score.add_score(certificate.origin(), 1);
                 }
             }
@@ -215,12 +214,13 @@ impl<DB: ConsensusStore> Bullshark<DB> {
         };
 
         // Check if the leader has f+1 support from its children (ie. leader_round+1).
+        let leader_digest = leader.digest();
         let voting_power: VotingPower = state
             .dag
             .get(&(leader_round + 1))
             .expect("We should have the whole history by now")
             .values()
-            .filter(|(_, x)| x.header().parents().contains(&leader.digest()))
+            .filter(|(_, x)| x.header().parents().contains(&leader_digest))
             .map(|(_, x)| self.committee.voting_power_by_id(x.origin()))
             .sum();
 

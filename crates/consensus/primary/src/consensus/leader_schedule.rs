@@ -129,7 +129,8 @@ impl LeaderSwapTable {
                     old_bad_ceil = bad_ceil;
                 };
                 // calculating the good nodes
-                let mut good_floor = highest_rep.saturating_sub(standard_dev);
+                let mut good_floor = highest_rep.saturating_sub(standard_dev).max(bad_ceil + 1);
+                let mut old_good_floor = good_floor;
                 let good_nodes = loop {
                     let good_nodes: Vec<Authority> =
                         auths_by_score
@@ -145,7 +146,11 @@ impl LeaderSwapTable {
                     if good_nodes.len() >= third {
                         break good_nodes;
                     }
-                    good_floor = good_floor.saturating_sub(standard_dev);
+                    good_floor = good_floor.saturating_sub(standard_dev).max(bad_ceil + 1);
+                    if old_good_floor == good_floor {
+                        break good_nodes;
+                    }
+                    old_good_floor = good_floor;
                 };
 
                 let bad_nodes = bad_nodes

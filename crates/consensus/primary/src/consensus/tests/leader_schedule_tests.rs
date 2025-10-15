@@ -25,12 +25,9 @@ async fn test_leader_swap_table() {
         scores.add_score(id, score as u64);
     }
 
-    let table = LeaderSwapTable::new(
-        &committee, 2, &scores, // protocol_config.consensus_bad_nodes_stake_threshold(),
-        33,
-    );
+    let table = LeaderSwapTable::new(&committee, 2, &scores, 33);
 
-    // Only one bad authority should be calculated since all have equal stake
+    // Four nodes with spread scores will have one bad.
     assert_eq!(table.bad_nodes.len(), 1);
 
     // now first three should be swapped, whereas the others should not return anything
@@ -63,19 +60,15 @@ async fn test_leader_swap_table() {
     }
 
     // We expect the first 3 authorities (f) to be amongst the bad nodes
-    let table = LeaderSwapTable::new(
-        &committee, 2, &scores, // protocol_config.consensus_bad_nodes_stake_threshold(),
-        33,
-    );
+    let table = LeaderSwapTable::new(&committee, 2, &scores, 33);
 
-    assert_eq!(table.bad_nodes.len(), 3);
+    assert_eq!(table.bad_nodes.len(), 2);
     assert!(table.bad_nodes.contains_key(&authority_ids[0]));
     assert!(table.bad_nodes.contains_key(&authority_ids[1]));
-    assert!(table.bad_nodes.contains_key(&authority_ids[2]));
 
     // now first three should be swapped, whereas the others should not return anything
     for (index, id) in authority_ids.iter().enumerate() {
-        if index < 3 {
+        if index < 2 {
             let s = table.swap(id, index as Round).unwrap();
 
             // make sure that the returned node is amongst the good nodes
