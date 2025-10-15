@@ -130,6 +130,9 @@ impl LeaderSwapTable {
                     old_bad_ceil = bad_ceil;
                 };
                 // calculating the good nodes
+                // This good floor should guarentee that at least one node will always be on the
+                // good list. It is important to have a good list if we have a bad
+                // list.
                 let mut good_floor = highest_rep.saturating_sub(standard_dev).max(bad_ceil + 1);
                 let mut old_good_floor = good_floor;
                 let good_nodes = loop {
@@ -153,6 +156,12 @@ impl LeaderSwapTable {
                     }
                     old_good_floor = good_floor;
                 };
+
+                if !bad_nodes.is_empty() {
+                    // Make sure we have good nodes if we have bad nodes.
+                    // It should not be possible to get in this condition.
+                    assert!(!good_nodes.is_empty());
+                }
 
                 let bad_nodes = bad_nodes
                     .into_iter()
