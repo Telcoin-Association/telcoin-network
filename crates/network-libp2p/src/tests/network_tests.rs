@@ -675,7 +675,6 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
 /// Test peer exchanges when too many peers connect
 #[tokio::test]
 async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
-    tn_types::test_utils::init_test_tracing();
     // Create a custom config with very low peer limits for testing
     let mut network_config = NetworkConfig::default();
     network_config.peer_config_mut().target_num_peers = 4;
@@ -958,11 +957,12 @@ async fn test_banned_peer_reconnection_attempt() -> eyre::Result<()> {
     // Wait for connection to establish
     tokio::time::sleep(Duration::from_millis(100)).await;
 
+    debug!(target: "peer-manager", ?malicious_id, ?malicious_bls, "assessing fatal penalty!!");
     // Report fatal penalty for malicious peer
     honest_peer.report_penalty(malicious_bls, Penalty::Fatal).await;
 
     // Wait for ban to take effect and disconnect
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 2)).await;
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
 
     // Verify malicious peer is disconnected
     let connected_peers = honest_peer.connected_peer_ids().await?;
@@ -1541,18 +1541,7 @@ async fn test_get_kad_records() -> eyre::Result<()> {
     // find other committee members through kad
     let authorities: Vec<BlsPublicKey> =
         committee.iter().map(|peer| peer.config.key_config().primary_public_key()).collect();
-    let node_records = nvv.find_authorities(authorities.clone()).await?;
-
-    for record in node_records {
-        // wait for node records
-        match timeout(Duration::from_secs(1), record).await {
-            Ok(res) => {
-                let info = res??;
-                debug!(target: "network", ?info);
-            }
-            Err(_) => return Err(eyre!("Timeout waiting for peer exchange event")),
-        }
-    }
+    nvv.find_authorities(authorities.clone()).await?;
 
     // allow dial attempts to be made
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 5)).await;

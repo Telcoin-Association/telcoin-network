@@ -3,7 +3,6 @@
 use crate::{
     codec::TNMessage, error::NetworkError, peers::Penalty, GossipMessage, PeerExchangeMap,
 };
-use futures::stream::FuturesUnordered;
 pub use libp2p::gossipsub::MessageId;
 use libp2p::{
     core::transport::ListenerId,
@@ -292,8 +291,8 @@ where
     },
     /// Find authorities for a future committee by bls key and return to sender.
     FindAuthorities {
-        /// The collection of requests.
-        requests: Vec<AuthorityInfoRequest>,
+        /// The collection of bls public keys associated with authorities to find.
+        bls_keys: Vec<BlsPublicKey>,
     },
 }
 
@@ -539,25 +538,9 @@ where
     }
 
     /// Return network information for authorities by bls pubkey on kad.
-    pub async fn find_authorities(
-        &self,
-        bls_keys: Vec<BlsPublicKey>,
-    ) -> NetworkResult<
-        FuturesUnordered<oneshot::Receiver<NetworkResult<(BlsPublicKey, NetworkInfo)>>>,
-    > {
-        let results = FuturesUnordered::new();
-        let requests = bls_keys
-            .into_iter()
-            .map(|bls_key| {
-                let (reply, rx) = oneshot::channel();
-                results.push(rx);
-                // create the request
-                AuthorityInfoRequest { bls_key, reply }
-            })
-            .collect();
-
-        self.sender.send(NetworkCommand::FindAuthorities { requests }).await?;
-        Ok(results)
+    pub async fn find_authorities(&self, bls_keys: Vec<BlsPublicKey>) -> NetworkResult<()> {
+        self.sender.send(NetworkCommand::FindAuthorities { bls_keys }).await?;
+        Ok(())
     }
 }
 
@@ -615,14 +598,19 @@ pub struct NetworkInfo {
     pub timestamp: TimestampSec,
 }
 
-/// The request from the application layer to lookup a validator's network information
-/// using their BLS key.
+/// Outbound kad query from this node.
 #[derive(Debug)]
-pub struct AuthorityInfoRequest {
-    /// The [BlsPublicKey] for the authority (on-chain).
-    pub bls_key: BlsPublicKey,
-    /// The reply to requestor with authority information.
-    pub reply: oneshot::Sender<NetworkResult<(BlsPublicKey, NetworkInfo)>>,
+pub struct KadQuery {
+    /// The [BlsPublicKey] for the requested authority record.
+    pub request: BlsPublicKey,
+    /// The best result so far.
+    pub result: Option<NodeRecord>,
+}
+
+impl From<BlsPublicKey> for KadQuery {
+    fn from(request: BlsPublicKey) -> Self {
+        Self { request, result: None }
+    }
 }
 
 /// Helper macro for sending oneshot replies and logging errors.
