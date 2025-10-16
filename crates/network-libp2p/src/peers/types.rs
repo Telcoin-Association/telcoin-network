@@ -1,6 +1,6 @@
 //! Types for managing peers.
 
-use crate::types::{AuthorityInfoRequest, NetworkResult};
+use crate::types::NetworkResult;
 use libp2p::{Multiaddr, PeerId};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -27,8 +27,8 @@ pub(crate) enum PeerEvent {
     Banned(PeerId),
     /// Peer manager has unbanned a peer and associated ip addresses.
     Unbanned(PeerId),
-    /// Authorities are missing from the peer map. This triggers discovery attempts.
-    MissingAuthorities(Vec<AuthorityInfoRequest>),
+    /// Authorities are missing from the peer map. This triggers kad queries.
+    MissingAuthorities(Vec<BlsPublicKey>),
     /// Initiate a discovery attempt because discovery peer counts are low.
     Discovery,
 }
