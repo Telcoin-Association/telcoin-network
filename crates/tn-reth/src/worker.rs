@@ -130,6 +130,7 @@ impl NetworkInfo for WorkerNetwork {
                 head: Default::default(),
                 config: self.chain_spec.genesis().config.clone(),
             },
+            capabilities: vec![],
         })
     }
 

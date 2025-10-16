@@ -18,12 +18,13 @@ use std::{
     time::Instant,
 };
 use tn_types::{Noticer, TaskManager};
+use tokio::net::TcpListener;
 
 use once_cell::sync::OnceCell;
 use prometheus::{
     default_registry, register_int_gauge_vec_with_registry, IntGaugeVec, Registry, TextEncoder,
 };
-use tracing::warn;
+use tracing::{error, warn};
 
 pub use scopeguard;
 
@@ -260,13 +261,17 @@ pub fn start_prometheus_server(addr: SocketAddr, task_manager: &TaskManager, shu
     let app = Router::new().route(METRICS_ROUTE, get(metrics));
 
     task_manager.spawn_critical_task("ConsensusMetrics", async move {
-        if let Err(e) = axum::Server::bind(&addr)
-            .serve(app.into_make_service())
-            .with_graceful_shutdown(shutdown)
-            .await
-        {
-            tracing::error!(target: "prometheus", ?e, "server returned error");
-        }
+        // log error but don't crash
+        match TcpListener::bind(&addr).await {
+            Ok(listener) => {
+                if let Err(e) = axum::serve(listener, app).with_graceful_shutdown(shutdown).await {
+                    error!(target: "prometheus", ?e, "server returned error");
+                }
+            }
+            Err(e) => {
+                error!(target: "prometheus", ?e, "failed to bind to address");
+            }
+        };
     });
 }
 

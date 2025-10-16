@@ -36,11 +36,11 @@ use eyre::OptionExt;
 use jsonrpsee::Methods;
 use reth::{
     args::{
-        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, DiscoveryArgs, EngineArgs, NetworkArgs,
-        PayloadBuilderArgs, PruningArgs, TxPoolArgs,
+        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, DiscoveryArgs, EngineArgs, EraArgs,
+        EraSourceArgs, NetworkArgs, PayloadBuilderArgs, PruningArgs, TxPoolArgs,
     },
     builder::NodeConfig,
-    network::transactions::config::TransactionPropagationKind,
+    network::transactions::{config::TransactionPropagationKind, TransactionPropagationMode},
     rpc::{
         builder::{
             config::RethRpcServerConfig, RethRpcModule, RpcModuleBuilder, RpcModuleSelection,
@@ -319,6 +319,9 @@ impl RethConfig {
             max_capacity_cache_txns_pending_fetch: 0,
             net_if: None,
             tx_propagation_policy: TransactionPropagationKind::Trusted,
+            disable_tx_gossip: true,
+            propagation_mode: TransactionPropagationMode::Max(0),
+            required_block_hashes: vec![],
         };
 
         // Not using the Reth payload builder.
@@ -334,7 +337,7 @@ impl RethConfig {
             tip: None,
             max_block: None,
             etherscan: None,
-            rpc_consensus_ws: None,
+            rpc_consensus_url: None,
             skip_fcu: None,
             skip_new_payload: None,
             reorg_frequency: None,
@@ -342,6 +345,7 @@ impl RethConfig {
             engine_api_store: None,
             invalid_block_hook: None,
             healthy_node_rpc_url: None,
+            ethstats: None,
         };
         // No Reth dev options.
         let dev = DevArgs { dev: false, block_max_transactions: None, block_time: None };
@@ -365,24 +369,37 @@ impl RethConfig {
             storage_history_distance: None,
             storage_history_before: None,
             receipts_log_filter: None,
+            receipts_pre_merge: false,
+            bodies_pre_merge: false,
+            bodies_distance: None,
+            bodies_before: None,
         };
 
         // Parameters for configuring the engine driver.
+        #[allow(deprecated)] // last 3 fields are depracated
         let engine = EngineArgs {
             persistence_threshold: DEFAULT_PERSISTENCE_THRESHOLD,
             memory_block_buffer_target: DEFAULT_MEMORY_BLOCK_BUFFER_TARGET,
             legacy_state_root_task_enabled: false,
             state_root_task_compare_updates: false,
-            caching_and_prewarming_enabled: true,
             caching_and_prewarming_disabled: false,
             state_provider_metrics: false,
             cross_block_cache_size: DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB,
             accept_execution_requests_hash: false,
             max_proof_task_concurrency: DEFAULT_MAX_PROOF_TASK_CONCURRENCY,
             reserved_cpu_cores: DEFAULT_RESERVED_CPU_CORES,
-            precompile_cache_enabled: false,
             state_root_fallback: false,
+            parallel_sparse_trie_disabled: true,
+            precompile_cache_disabled: false,
+            always_process_payload_attributes_on_canonical_head: false,
+            allow_unwind_canonical_header: false,
+            caching_and_prewarming_enabled: true,
+            parallel_sparse_trie_enabled: false,
+            precompile_cache_enabled: true,
         };
+
+        // Parameters to configure block history syncing.
+        let era = EraArgs { enabled: false, source: EraSourceArgs { path: None, url: None } };
 
         let mut this = NodeConfig {
             config: None,
@@ -399,6 +416,7 @@ impl RethConfig {
             dev,
             pruning,
             engine,
+            era,
         };
         if with_unused_ports {
             this = this.with_unused_ports();
@@ -963,7 +981,7 @@ impl RethEnv {
         let blsg1_address = {
             let mut tn_evm = reth_env.evm_config.evm_factory().create_evm(
                 &mut db,
-                reth_env.evm_config.evm_env(&tmp_chain.sealed_genesis_header()),
+                reth_env.evm_config.evm_env(&tmp_chain.sealed_genesis_header())?,
             );
 
             let blsg1_initcode_binding =
@@ -1035,7 +1053,8 @@ impl RethEnv {
 
         // after adding bls proof of possession, registry precompile exceeds size limit so disable
         // it for tmp chain
-        let mut tmp_evm_no_eip170 = reth_env.evm_config.evm_env(&tmp_chain.sealed_genesis_header());
+        let mut tmp_evm_no_eip170 =
+            reth_env.evm_config.evm_env(&tmp_chain.sealed_genesis_header())?;
         tmp_evm_no_eip170.cfg_env.limit_contract_code_size = Some(0x12000000);
 
         // deploy registry now that it can use the previously deployed blsg1 lib
@@ -1189,7 +1208,7 @@ impl RethEnv {
         let mut tn_evm = self
             .evm_config
             .evm_factory()
-            .create_evm(&mut db, self.evm_config.evm_env(&canonical_tip));
+            .create_evm(&mut db, self.evm_config.evm_env(&canonical_tip)?);
 
         // current epoch number
         let epoch = self.get_current_epoch_number(&mut tn_evm)?;
@@ -1227,7 +1246,7 @@ impl RethEnv {
         let mut tn_evm = self
             .evm_config
             .evm_factory()
-            .create_evm(&mut db, self.evm_config.evm_env(&canonical_tip));
+            .create_evm(&mut db, self.evm_config.evm_env(&canonical_tip)?);
 
         self.get_committee_validators_by_epoch(epoch, &mut tn_evm)
     }
@@ -1597,7 +1616,7 @@ mod tests {
         let mut tn_evm = reth_env
             .evm_config
             .evm_factory()
-            .create_evm(&mut db, reth_env.evm_config.evm_env(canonical_header.header()));
+            .create_evm(&mut db, reth_env.evm_config.evm_env(canonical_header.header())?);
 
         // read new committee (always 2 epochs ahead)
         let calldata = ConsensusRegistry::getEpochInfoCall { epoch: epoch + 1 }.abi_encode().into();

@@ -1,10 +1,12 @@
 //! TN-specific context for evm.
+//!
+//! Source code in revm.
 
 use reth_evm::precompiles::PrecompilesMap;
 use reth_revm::{
-    context::{Block, BlockEnv, Cfg, CfgEnv, Evm, JournalTr, Transaction, TxEnv},
+    context::{Block, BlockEnv, Cfg, CfgEnv, Evm, FrameStack, JournalTr, Transaction, TxEnv},
     db::EmptyDB,
-    handler::{instructions::EthInstructions, EthPrecompiles},
+    handler::{instructions::EthInstructions, EthFrame, EthPrecompiles},
     interpreter::interpreter::EthInterpreter,
     primitives::hardfork::SpecId,
     Context, Database, Journal,
@@ -15,7 +17,7 @@ pub(crate) type TNEvmContext<DB> = Context<BlockEnv, TxEnv, CfgEnv, DB>;
 
 /// Convenience type for TN mainnet's EVM.
 pub(crate) type MainnetEvm<CTX, INSP = ()> =
-    Evm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, PrecompilesMap>;
+    Evm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, PrecompilesMap, EthFrame<EthInterpreter>>;
 
 /// Trait used to initialize Context with default mainnet types.
 pub(crate) trait TNContext {
@@ -58,6 +60,7 @@ where
             inspector: (),
             instruction: EthInstructions::default(),
             precompiles: PrecompilesMap::from(EthPrecompiles::default()),
+            frame_stack: FrameStack::new(),
         }
     }
 
@@ -67,6 +70,7 @@ where
             inspector,
             instruction: EthInstructions::default(),
             precompiles: PrecompilesMap::from(EthPrecompiles::default()),
+            frame_stack: FrameStack::new(),
         }
     }
 }

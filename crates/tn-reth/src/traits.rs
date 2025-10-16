@@ -13,13 +13,11 @@ pub use reth_consensus::{Consensus, ConsensusError};
 use reth_consensus::{FullConsensus, HeaderValidator};
 use reth_db::DatabaseEnv;
 use reth_engine_primitives::PayloadValidator;
-use reth_node_builder::{
-    BuiltPayload, EngineValidator, NewPayloadError, NodeTypes, NodeTypesWithDB, PayloadTypes,
-};
+use reth_engine_tree::tree::EngineValidator;
+use reth_node_builder::{BuiltPayload, NewPayloadError, NodeTypes, NodeTypesWithDB, PayloadTypes};
 use reth_node_ethereum::{engine::EthPayloadAttributes, EthEngineTypes};
 use reth_primitives_traits::Block;
 use reth_provider::{BlockExecutionResult, EthStorage};
-use reth_trie_db::MerklePatriciaTrie;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tn_types::{EthPrimitives, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader};
@@ -34,7 +32,6 @@ pub struct TelcoinNode {}
 impl NodeTypes for TelcoinNode {
     type Primitives = TNPrimitives;
     type ChainSpec = ChainSpec;
-    type StateCommitment = MerklePatriciaTrie;
     type Storage = EthStorage;
     type Payload = EthEngineTypes;
 }
@@ -94,9 +91,11 @@ impl<N: NodePrimitives> FullConsensus<N> for TNExecution {
 // Compatibility noop trait impl.
 // This is for the reth rpc build method.
 // NOTE: this should never be called because there is no beacon API
-impl PayloadValidator for TNExecution {
+impl<Types> PayloadValidator<Types> for TNExecution
+where
+    Types: PayloadTypes<ExecutionData = ExecutionData>,
+{
     type Block = tn_types::Block;
-    type ExecutionData = ExecutionData;
 
     fn ensure_well_formed_payload(
         &self,
@@ -106,30 +105,33 @@ impl PayloadValidator for TNExecution {
     }
 }
 
-impl<T> EngineValidator<T> for TNExecution
-where
-    T: PayloadTypes<PayloadAttributes = EthPayloadAttributes, ExecutionData = ExecutionData>,
-{
-    fn validate_version_specific_fields(
-        &self,
-        _version: reth_node_builder::EngineApiMessageVersion,
-        _payload_or_attrs: reth_node_builder::PayloadOrAttributes<
-            '_,
-            T::ExecutionData,
-            <T as PayloadTypes>::PayloadAttributes,
-        >,
-    ) -> Result<(), reth_node_builder::EngineObjectValidationError> {
-        Ok(())
-    }
+// TODO: still need this????
+//
+//
+// impl<T> EngineValidator<T> for TNExecution
+// where
+//     T: PayloadTypes<PayloadAttributes = EthPayloadAttributes, ExecutionData = ExecutionData>,
+// {
+//     fn validate_version_specific_fields(
+//         &self,
+//         _version: reth_node_builder::EngineApiMessageVersion,
+//         _payload_or_attrs: reth_node_builder::PayloadOrAttributes<
+//             '_,
+//             T::ExecutionData,
+//             <T as PayloadTypes>::PayloadAttributes,
+//         >,
+//     ) -> Result<(), reth_node_builder::EngineObjectValidationError> {
+//         Ok(())
+//     }
 
-    fn ensure_well_formed_attributes(
-        &self,
-        _version: reth_node_builder::EngineApiMessageVersion,
-        _attributes: &<T as PayloadTypes>::PayloadAttributes,
-    ) -> Result<(), reth_node_builder::EngineObjectValidationError> {
-        Ok(())
-    }
-}
+//     fn ensure_well_formed_attributes(
+//         &self,
+//         _version: reth_node_builder::EngineApiMessageVersion,
+//         _attributes: &<T as PayloadTypes>::PayloadAttributes,
+//     ) -> Result<(), reth_node_builder::EngineObjectValidationError> {
+//         Ok(())
+//     }
+// }
 
 /// A default payload type for [`EthEngineTypes`]
 ///
