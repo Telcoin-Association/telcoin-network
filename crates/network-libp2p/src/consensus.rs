@@ -244,6 +244,7 @@ where
         let mut kad_config = libp2p::kad::Config::new(DEFAULT_KAD_PROTO_NAME);
         // manually add peers
         kad_config.set_kbucket_inserts(kad::BucketInserts::Manual);
+        kad_config.set_kbucket_size(network_config.libp2p_config().k_bucket_size);
         let two_days = Some(Duration::from_secs(48 * 60 * 60));
         let twelve_hours = Some(Duration::from_secs(12 * 60 * 60));
         kad_config
