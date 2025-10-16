@@ -24,9 +24,7 @@ impl TNMessage for WorkerRequest {
 }
 impl TNMessage for WorkerResponse {
     fn peer_exchange_msg(&self) -> Option<PeerExchangeMap> {
-        match self {
-            _ => None,
-        }
+        None
     }
 }
 

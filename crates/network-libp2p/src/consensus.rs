@@ -548,6 +548,7 @@ where
                 );
             }
             NetworkCommand::DialBls { bls_key, reply } => {
+                debug!(target: "network", "command for dial bls {bls_key}");
                 if let Some((peer_id, peer_addr)) =
                     self.swarm.behaviour().peer_manager.auth_to_peer(bls_key)
                 {
@@ -619,6 +620,7 @@ where
                 send_or_log_error!(reply, collection, "MeshPeers");
             }
             NetworkCommand::SendRequest { peer, request, reply } => {
+                debug!(target: "network", "send request for bls {peer}");
                 if let Some((peer, addr)) = self.swarm.behaviour().peer_manager.auth_to_peer(peer) {
                     debug!(target: "network", "trying to send to {peer} at {addr:?}");
                     let request_id = self
@@ -659,6 +661,7 @@ where
                 send_or_log_error!(reply, count, "SendResponse");
             }
             NetworkCommand::ReportPenalty { peer, penalty } => {
+                debug!(target: "network", "penalty reported for peer {peer}");
                 if let Some((peer, _)) = self.swarm.behaviour().peer_manager.auth_to_peer(peer) {
                     self.swarm.behaviour_mut().peer_manager.process_penalty(peer, penalty);
                 } else {
@@ -679,7 +682,9 @@ where
 
                 // expect sender to temp ban this node
                 // initiate disconnect from this peer to prevent redial attempts
+                debug!(target: "network", "initiating disconnect for {peer}");
                 if let Some((peer_id, _)) = self.swarm.behaviour().peer_manager.auth_to_peer(peer) {
+                    debug!(target: "peer-manager", ?peer_id, "initiating reciprocal disconnect after px");
                     self.swarm.behaviour_mut().peer_manager.disconnect_peer(peer_id, false);
                 }
             }
@@ -1001,7 +1006,7 @@ where
                 }
             }
             PeerEvent::DisconnectPeerX(peer_id, peer_exchange) => {
-                debug!(target: "peer-manager", ?peer_id, "disconnecting from peer with exchange info");
+                debug!(target: "peer-manager", this_node=?self.swarm.local_peer_id(), ?peer_id, "disconnecting from peer with exchange info");
                 // attempt to exchange peer information if limits allow
                 if self.pending_px_disconnects.len() < self.config.max_px_disconnects {
                     let (reply, done) = oneshot::channel();
@@ -1133,7 +1138,7 @@ where
                             trace!(target: "network-kad", "Got record {key} {value:?}");
                             self.process_kad_query_result(&query_id, record, peer, step.last);
                         } else {
-                            error!(target: "network-kad", "Received invalid peer record!");
+                            trace!(target: "network-kad", "Received invalid peer record!");
 
                             // assess penalty for invalid peer record
                             if let Some(peer_id) = peer {
@@ -1252,7 +1257,7 @@ where
 
         // reject record
         if publisher_is_banned || source_is_banned {
-            trace!(target: "network-kad", ?publisher_is_banned, ?source_is_banned, "rejecting put request for record");
+            error!(target: "network-kad", ?publisher_is_banned, ?source_is_banned, ?source, publisher=?record.publisher, "rejecting put request for record");
             // handle race condition with PM
             self.swarm.behaviour_mut().kademlia.remove_record(&record.key);
 

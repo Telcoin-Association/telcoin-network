@@ -13,7 +13,7 @@ use std::{
 use tn_config::{KeyConfig, NetworkConfig, ScoreConfig};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
-use tn_types::{now, test_utils::init_test_tracing, BlsKeypair, NetworkKeypair, NetworkPublicKey};
+use tn_types::{now, BlsKeypair, NetworkKeypair, NetworkPublicKey};
 use tokio::time::{sleep, timeout};
 
 fn create_test_peer_manager(network_config: Option<NetworkConfig>) -> PeerManager {
@@ -452,7 +452,6 @@ async fn test_temporarily_banned_peer() {
 
 #[tokio::test]
 async fn test_process_peer_exchange() {
-    init_test_tracing();
     let mut peer_manager = create_test_peer_manager(None);
 
     // Create peer exchange data

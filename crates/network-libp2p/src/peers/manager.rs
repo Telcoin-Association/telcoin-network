@@ -345,6 +345,7 @@ impl PeerManager {
 
     /// Process new connection and return boolean indicating if the peer limit was reached.
     pub(super) fn peer_limit_reached(&self, endpoint: &ConnectedPoint) -> bool {
+        debug!(target: "peer-manager", connected_peers=?self.peers.connected_peer_ids().count(), "checking peer limits");
         if endpoint.is_dialer() {
             // this node dialed peer
             self.peers.connected_peer_ids().count() >= self.config.max_outbound_dialing_peers()
@@ -559,10 +560,7 @@ impl PeerManager {
                         debug!(target: "peer-manager", ?info, "peer exchange eligible");
                         Some(info)
                     } else {
-                        let ips = self.has_valid_unbanned_ips(&info.addrs);
-                        let can_dial = self.peers.can_dial(&info.peer_id);
-                        let peer = self.peers.get_peer(&info.peer_id);
-                        debug!(target: "peer-manager", ?peer, ?info, "peer exchange ineligible");
+                        debug!(target: "peer-manager", peer=?self.peers.get_peer(&info.peer_id), ?info, "peer exchange ineligible");
                         None
                     }
                 })
@@ -577,9 +575,8 @@ impl PeerManager {
             // add target number of peers for discovery
             let peers_to_take = max_discovery_peers - current_count;
             for peer in peers.into_iter().take(peers_to_take) {
+                debug!(target: "peer-manager", peer=?peer.peer_id, "added peer to discovery peers");
                 self.discovery_peers.insert(peer.peer_id, peer.addrs);
-
-                debug!(target: "peer-manager", discovery=?self.discovery_peers, "discovery peers");
             }
         }
     }
@@ -638,6 +635,7 @@ impl PeerManager {
     /// Add a known peer to the known list.
     /// Used for bootstrap servers or possibly committee members.
     pub(crate) fn add_known_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
+        trace!(target: "peer-manager", ?bls_key, "adding known peer");
         self.peers.upsert_peer(bls_key, info.pubkey.clone(), info.multiaddrs.clone());
         self.known_peers.insert(bls_key, info.clone());
         let peer_id: PeerId = info.pubkey.into();
@@ -666,6 +664,7 @@ impl PeerManager {
         if let Some(NetworkInfo { pubkey, multiaddrs, .. }) = self.known_peers.get(&bls_key) {
             Some((pubkey.clone().into(), multiaddrs.clone()))
         } else {
+            debug!(target: "peer-manager", ?bls_key, "unknown peer for bls key");
             None
         }
     }

@@ -30,10 +30,29 @@ pub(crate) fn ensure_score_config(config: Option<ScoreConfig>) {
 }
 
 // impl TNMessage trait for types
-impl TNMessage for TestWorkerRequest {}
-impl TNMessage for TestWorkerResponse {}
-impl TNMessage for TestPrimaryRequest {}
-impl TNMessage for TestPrimaryResponse {}
+impl TNMessage for TestWorkerRequest {
+    fn peer_exchange_msg(&self) -> Option<PeerExchangeMap> {
+        match self {
+            Self::PeerExchange(peers) => Some(peers.clone()),
+            _ => None,
+        }
+    }
+}
+impl TNMessage for TestWorkerResponse {
+    fn peer_exchange_msg(&self) -> Option<PeerExchangeMap> {
+        None
+    }
+}
+impl TNMessage for TestPrimaryRequest {
+    fn peer_exchange_msg(&self) -> Option<PeerExchangeMap> {
+        None
+    }
+}
+impl TNMessage for TestPrimaryResponse {
+    fn peer_exchange_msg(&self) -> Option<PeerExchangeMap> {
+        None
+    }
+}
 
 /// Requests between workers.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
