@@ -70,24 +70,16 @@ async fn order_leaders() {
 }
 
 #[tokio::test]
-async fn commit_one_with_leader_schedule_change() {
+async fn commit_one_with_leader() {
     struct TestCase {
         description: String,
         rounds: Round,
-        _expected_leaders: VecDeque<AuthorityIdentifier>,
     }
 
     let test_cases: Vec<TestCase> = vec![
         TestCase {
             description: "When schedule change is enabled, then authority 0 is bad node and swapped with authority 3".to_string(),
             rounds: 11,
-            _expected_leaders: VecDeque::from(vec![
-                AuthorityIdentifier::dummy_for_test(0),
-                AuthorityIdentifier::dummy_for_test(1),
-                AuthorityIdentifier::dummy_for_test(2),
-                AuthorityIdentifier::dummy_for_test(3),
-                AuthorityIdentifier::dummy_for_test(3),
-            ]),
         },
     ];
 
@@ -99,7 +91,7 @@ async fn commit_one_with_leader_schedule_change() {
         // Make certificates for rounds 1 to 9.
         let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
         let mut expected_leaders: VecDeque<AuthorityIdentifier> = ids.iter().cloned().collect();
-        expected_leaders.push_back(ids.last().unwrap().clone());
+        expected_leaders.push_back(ids.first().unwrap().clone());
         let genesis =
             Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
         let (certificates, _next_parents) =
@@ -259,13 +251,6 @@ async fn not_enough_support_with_leader_schedule_change() {
                 assert_eq!(committed_dag_10.leader_round(), 10);
                 assert_eq!(committed_dag_12.leader_round(), 12);
 
-                // Originally, as we do round robin the leaders in testing, we would expect the
-                // leader of round 10 to be the Authority 0. However, since a reputation scores
-                // update happened the leader schedule changed and now the Authority
-                // 0 is flagged as low score and it will be swapped with Authority
-                // 3.
-                assert_eq!(committed_dag_10.leader.origin(), ids.get(3).unwrap());
-
                 assert_eq!(outcome, Outcome::Commit);
             }
         }
@@ -326,7 +311,7 @@ async fn test_long_period_of_asynchrony_for_leader_schedule_change() {
 
     let (out, _parents) = make_certificates_with_leader_configuration(
         &committee,
-        1..=15,
+        1..=17,
         &genesis,
         &ids,
         leader_configs,
@@ -351,7 +336,8 @@ async fn test_long_period_of_asynchrony_for_leader_schedule_change() {
         bad_nodes_stake_threshold,
     );
 
-    let mut total = 0;
+    let mut total15 = 0;
+    let mut total17 = 0;
     for certificate in certificates {
         let (outcome, committed) =
             bullshark.process_certificate(&mut state, certificate.clone()).unwrap();
@@ -365,9 +351,9 @@ async fn test_long_period_of_asynchrony_for_leader_schedule_change() {
         }
 
         if certificate.round() == 15 {
-            total += 1;
+            total15 += 1;
 
-            if total == 2 {
+            if total15 == 2 {
                 assert_eq!(committed.len(), 5);
 
                 let committed_dag_6 = &committed[0];
@@ -386,28 +372,46 @@ async fn test_long_period_of_asynchrony_for_leader_schedule_change() {
                 assert!(committed_dag_6.reputation_score.final_of_schedule);
                 assert!(committed_dag_14.reputation_score.final_of_schedule);
 
-                // Originally, as we do round robin the leaders in testing, we would expect the
-                // leader of round 10 to be the Authority 0. However, since a reputation scores
-                // update happened the leader schedule changed and now the Authority
-                // 0 is flagged as low score and it will be swapped with Authority
-                // 3.
-                assert_eq!(committed_dag_10.leader.origin(), ids.get(3).unwrap());
+                //
+                // We are still using a swap table with no bad list...
+                assert_eq!(committed_dag_6.leader.origin(), ids.get(2).unwrap());
+                assert_eq!(committed_dag_8.leader.origin(), ids.get(3).unwrap());
+                assert_eq!(committed_dag_10.leader.origin(), ids.get(0).unwrap());
+                assert_eq!(committed_dag_12.leader.origin(), ids.get(1).unwrap());
+                assert_eq!(committed_dag_14.leader.origin(), ids.get(2).unwrap());
+                // Note that round 16 (when committed) would be auth 3 except it now has a bad rep.
 
                 // The leaders of round 12 & 14 shouldn't change from the "original" schedule
-                let schedule = LeaderSchedule::new(committee, LeaderSwapTable::default());
+                let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
 
                 assert_eq!(committed_dag_12.leader.origin(), &schedule.leader(12).id());
                 assert_eq!(committed_dag_14.leader.origin(), &schedule.leader(14).id());
 
                 assert_eq!(outcome, Outcome::Commit);
+            }
+        }
+        if certificate.round() == 17 {
+            total17 += 1;
 
+            if total17 == 2 {
+                assert_eq!(committed.len(), 1);
+                let committed_dag = &committed[0];
+                assert_eq!(committed_dag.leader_round(), 16);
+
+                // Originally, as we do round robin the leaders in testing, we would expect the
+                // leader of round 16 to be the Authority 3. However, since a reputation scores
+                // update happened the leader schedule changed and now the Authority
+                // 3 is flagged as low score and it will be swapped with Authority
+                // 0.
+                assert_eq!(committed_dag.leader.origin(), ids.get(0).unwrap());
                 break;
             }
         }
     }
 
-    // ensure that we actually reached the point of processing two certificates of round 15.
-    assert_eq!(total, 2);
+    // ensure that we actually reached the point of processing two certificates of round 19.
+    assert_eq!(total15, 4);
+    assert_eq!(total17, 2);
 }
 
 /// Run for 4 dag rounds in ideal conditions (all nodes reference all other nodes). We should commit

@@ -44,8 +44,6 @@ impl BatchValidation for BatchValidator {
             });
         }
 
-        // TODO: validate individual transactions against parent
-
         // obtain info for validation
         let transactions = batch.transactions();
 

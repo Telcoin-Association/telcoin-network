@@ -8,12 +8,12 @@ use tn_storage::{mem_db::MemDatabase, open_db, ConsensusStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{AuthorityIdentifier, Certificate, CommittedSubDag, ReputationScores, Round};
 
+/// Run a bunch of brute force swap table checks.
 #[tokio::test]
 async fn test_leader_swap_table() {
     // GIVEN
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
-    // protocol_config.set_consensus_bad_nodes_stake_threshold(33);
 
     // the authority ids
     let authority_ids: Vec<AuthorityIdentifier> = fixture.authorities().map(|a| a.id()).collect();
@@ -25,12 +25,9 @@ async fn test_leader_swap_table() {
         scores.add_score(id, score as u64);
     }
 
-    let table = LeaderSwapTable::new(
-        &committee, 2, &scores, // protocol_config.consensus_bad_nodes_stake_threshold(),
-        33,
-    );
+    let table = LeaderSwapTable::new(&committee, 2, &scores, 33);
 
-    // Only one bad authority should be calculated since all have equal stake
+    // Four nodes with spread scores will have one bad.
     assert_eq!(table.bad_nodes.len(), 1);
 
     // now first three should be swapped, whereas the others should not return anything
@@ -63,19 +60,15 @@ async fn test_leader_swap_table() {
     }
 
     // We expect the first 3 authorities (f) to be amongst the bad nodes
-    let table = LeaderSwapTable::new(
-        &committee, 2, &scores, // protocol_config.consensus_bad_nodes_stake_threshold(),
-        33,
-    );
+    let table = LeaderSwapTable::new(&committee, 2, &scores, 33);
 
-    assert_eq!(table.bad_nodes.len(), 3);
+    assert_eq!(table.bad_nodes.len(), 2);
     assert!(table.bad_nodes.contains_key(&authority_ids[0]));
     assert!(table.bad_nodes.contains_key(&authority_ids[1]));
-    assert!(table.bad_nodes.contains_key(&authority_ids[2]));
 
     // now first three should be swapped, whereas the others should not return anything
     for (index, id) in authority_ids.iter().enumerate() {
-        if index < 3 {
+        if index < 2 {
             let s = table.swap(id, index as Round).unwrap();
 
             // make sure that the returned node is amongst the good nodes
@@ -84,6 +77,270 @@ async fn test_leader_swap_table() {
             assert!(table.swap(id, index as Round).is_none());
         }
     }
+
+    // Adding some scores
+    // Add three bad nodes, make sure only bad nodes.
+    let mut scores = ReputationScores::new(&committee);
+    scores.final_of_schedule = true;
+    for (i, id) in authority_ids.iter().enumerate() {
+        scores.add_score(id, if i < 7 { 10 } else { 2 });
+    }
+
+    // We expect the 3 authorities (f) to be amongst the bad nodes
+    let table = LeaderSwapTable::new(&committee, 2, &scores, 33);
+
+    // All other nodes same score so all "good"
+    assert_eq!(table.good_nodes.len(), 7);
+    assert_eq!(table.bad_nodes.len(), 3);
+    assert!(table.bad_nodes.contains_key(&authority_ids[7]));
+    assert!(table.bad_nodes.contains_key(&authority_ids[8]));
+    assert!(table.bad_nodes.contains_key(&authority_ids[9]));
+
+    // now first three should be swapped, whereas the others should not return anything
+    for (index, id) in authority_ids.iter().enumerate() {
+        if index < 7 {
+            assert!(table.swap(id, index as Round).is_none());
+        } else {
+            let s = table.swap(id, index as Round).unwrap();
+
+            // make sure that the returned node is amongst the good nodes
+            assert!(table.good_nodes.contains(&s));
+        }
+    }
+
+    // Adding some scores
+    // Add one bad nodes, make sure only bad nodes.
+    let mut scores = ReputationScores::new(&committee);
+    scores.final_of_schedule = true;
+    for (i, id) in authority_ids.iter().enumerate() {
+        scores.add_score(id, if i < 9 { 10 } else { 0 });
+    }
+
+    // We expect the 3 authorities (f) to be amongst the bad nodes
+    let table = LeaderSwapTable::new(&committee, 2, &scores, 33);
+
+    // All other nodes same score so all "good"
+    assert_eq!(table.good_nodes.len(), 9);
+    assert_eq!(table.bad_nodes.len(), 1);
+    assert!(table.bad_nodes.contains_key(&authority_ids[9]));
+
+    // now first three should be swapped, whereas the others should not return anything
+    for (index, id) in authority_ids.iter().enumerate() {
+        if index < 9 {
+            assert!(table.swap(id, index as Round).is_none());
+        } else {
+            let s = table.swap(id, index as Round).unwrap();
+
+            // make sure that the returned node is amongst the good nodes
+            assert!(table.good_nodes.contains(&s));
+        }
+    }
+
+    // Adding some scores
+    // Add three bad nodes with varied scores, make sure only bad nodes.
+    let mut scores = ReputationScores::new(&committee);
+    scores.final_of_schedule = true;
+    let mut bad_score = 4;
+    for (i, id) in authority_ids.iter().enumerate() {
+        scores.add_score(
+            id,
+            if i < 7 {
+                10
+            } else {
+                bad_score -= 1;
+                bad_score
+            },
+        );
+    }
+
+    // We expect the 3 authorities (f) to be amongst the bad nodes
+    let table = LeaderSwapTable::new(&committee, 2, &scores, 33);
+
+    // All other nodes same score so all "good"
+    assert_eq!(table.good_nodes.len(), 7);
+    assert_eq!(table.bad_nodes.len(), 3);
+    assert!(table.bad_nodes.contains_key(&authority_ids[7]));
+    assert!(table.bad_nodes.contains_key(&authority_ids[8]));
+    assert!(table.bad_nodes.contains_key(&authority_ids[9]));
+
+    // now first three should be swapped, whereas the others should not return anything
+    for (index, id) in authority_ids.iter().enumerate() {
+        if index < 7 {
+            assert!(table.swap(id, index as Round).is_none());
+        } else {
+            let s = table.swap(id, index as Round).unwrap();
+
+            // make sure that the returned node is amongst the good nodes
+            assert!(table.good_nodes.contains(&s));
+        }
+    }
+
+    // Adding some scores
+    // Add three bad nodes with varied scores, varied good nodes.
+    let mut scores = ReputationScores::new(&committee);
+    scores.final_of_schedule = true;
+    let mut bad_score = 4;
+    for (i, id) in authority_ids.iter().enumerate() {
+        scores.add_score(
+            id,
+            if i < 7 {
+                match i {
+                    0 => 9,
+                    1 => 10,
+                    2 => 8,
+                    3 => 9,
+                    4 => 7,
+                    5 => 6,
+                    6 => 10,
+                    _ => panic!("invalid index"),
+                }
+            } else {
+                bad_score -= 1;
+                bad_score
+            },
+        );
+    }
+
+    // We expect the 3 authorities (f) to be amongst the bad nodes
+    let table = LeaderSwapTable::new(&committee, 2, &scores, 33);
+
+    // All other nodes excpet one are "good", the score 6 is Ok but not able to swap for a bad.
+    assert_eq!(table.good_nodes.len(), 6);
+    assert_eq!(table.bad_nodes.len(), 3);
+    assert!(table.bad_nodes.contains_key(&authority_ids[7]));
+    assert!(table.bad_nodes.contains_key(&authority_ids[8]));
+    assert!(table.bad_nodes.contains_key(&authority_ids[9]));
+
+    // now first three should be swapped, whereas the others should not return anything
+    for (index, id) in authority_ids.iter().enumerate() {
+        if index < 7 {
+            assert!(table.swap(id, index as Round).is_none());
+        } else {
+            let s = table.swap(id, index as Round).unwrap();
+
+            // make sure that the returned node is amongst the good nodes
+            assert!(table.good_nodes.contains(&s));
+        }
+    }
+
+    // Adding some scores
+    // Add two bad nodes with varied scores, varied good nodes.
+    let mut scores = ReputationScores::new(&committee);
+    scores.final_of_schedule = true;
+    let mut bad_score = 2;
+    for (i, id) in authority_ids.iter().enumerate() {
+        scores.add_score(
+            id,
+            if i < 8 {
+                match i {
+                    0 => 9,
+                    1 => 6,
+                    2 => 8,
+                    3 => 9,
+                    4 => 5,
+                    5 => 6,
+                    6 => 10,
+                    7 => 9,
+                    _ => panic!("invalid index"),
+                }
+            } else {
+                bad_score -= 1;
+                bad_score
+            },
+        );
+    }
+
+    // We expect the 3 authorities (f) to be amongst the bad nodes
+    let table = LeaderSwapTable::new(&committee, 2, &scores, 33);
+
+    // All other nodes except two are "good", the score 6 or less is Ok but not able to swap for a
+    // bad.
+    assert_eq!(table.good_nodes.len(), 5);
+    assert_eq!(table.bad_nodes.len(), 2);
+    assert!(table.bad_nodes.contains_key(&authority_ids[8]));
+    assert!(table.bad_nodes.contains_key(&authority_ids[9]));
+
+    // now first three should be swapped, whereas the others should not return anything
+    for (index, id) in authority_ids.iter().enumerate() {
+        if index < 8 {
+            assert!(table.swap(id, index as Round).is_none());
+        } else {
+            let s = table.swap(id, index as Round).unwrap();
+
+            // make sure that the returned node is amongst the good nodes
+            assert!(table.good_nodes.contains(&s));
+        }
+    }
+
+    // Adding some scores
+    // Add two bad nodes with varied scores, varied good nodes.
+    let mut scores = ReputationScores::new(&committee);
+    scores.final_of_schedule = true;
+    for (i, id) in authority_ids.iter().enumerate() {
+        scores.add_score(
+            id,
+            match i {
+                0 => 1,
+                1 => 0,
+                2 => 8,
+                3 => 9,
+                4 => 5,
+                5 => 2,
+                6 => 10,
+                7 => 9,
+                8 => 6,
+                9 => 6,
+                _ => panic!("invalid index"),
+            },
+        );
+    }
+
+    // We expect the 3 authorities (f) to be amongst the bad nodes
+    let table = LeaderSwapTable::new(&committee, 2, &scores, 33);
+
+    // All other nodes except two are "good", the score 6 or less is Ok but not able to swap for a
+    // bad.
+    assert_eq!(table.good_nodes.len(), 4);
+    assert_eq!(table.bad_nodes.len(), 3);
+    assert!(table.bad_nodes.contains_key(&authority_ids[0]));
+    assert!(table.bad_nodes.contains_key(&authority_ids[1]));
+    assert!(table.bad_nodes.contains_key(&authority_ids[5]));
+    // Tested the swap function a bunch already.
+
+    // Adding some scores
+    // Add two bad nodes with varied scores, varied good nodes.
+    let mut scores = ReputationScores::new(&committee);
+    scores.final_of_schedule = true;
+    for (i, id) in authority_ids.iter().enumerate() {
+        scores.add_score(
+            id,
+            match i {
+                0 => 3,
+                1 => 2,
+                2 => 8,
+                3 => 9,
+                4 => 5,
+                5 => 2,
+                6 => 10,
+                7 => 9,
+                8 => 6,
+                9 => 6,
+                _ => panic!("invalid index"),
+            },
+        );
+    }
+
+    // We expect the 3 authorities (f) to be amongst the bad nodes
+    let table = LeaderSwapTable::new(&committee, 2, &scores, 33);
+
+    // All other nodes except two are "good", the score 6 or less is Ok but not able to swap for a
+    // bad.
+    assert_eq!(table.good_nodes.len(), 4);
+    assert_eq!(table.bad_nodes.len(), 3);
+    assert!(table.bad_nodes.contains_key(&authority_ids[0]));
+    assert!(table.bad_nodes.contains_key(&authority_ids[1]));
+    assert!(table.bad_nodes.contains_key(&authority_ids[5]));
+    // Tested the swap function a bunch already.
 }
 
 #[tokio::test]

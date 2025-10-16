@@ -5,7 +5,6 @@ use crate::{
     Address, Multiaddr,
 };
 use parking_lot::RwLock;
-use rand::{rngs::StdRng, seq::IndexedRandom as _, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -397,25 +396,6 @@ impl Committee {
 
     pub fn total_voting_power(&self) -> VotingPower {
         self.inner.read().total_voting_power()
-    }
-
-    /// Returns a leader node as a weighted choice seeded by the provided integer
-    pub fn leader(&self, seed: u64) -> Authority {
-        let mut seed_bytes = [0u8; 32];
-        seed_bytes[32 - 8..].copy_from_slice(&seed.to_le_bytes());
-        let mut rng = StdRng::from_seed(seed_bytes);
-        let choices = self
-            .inner
-            .read()
-            .authorities
-            .values()
-            .map(|authority| (authority.clone(), authority.inner.voting_power as f32))
-            .collect::<Vec<_>>();
-        choices
-            .choose_weighted(&mut rng, |item| item.1)
-            .expect("Weighted choice error: stake values incorrect!")
-            .0
-            .clone()
     }
 
     /// Return all the network addresses in the committee.

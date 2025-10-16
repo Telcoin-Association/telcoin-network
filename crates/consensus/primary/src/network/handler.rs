@@ -235,10 +235,6 @@ where
             .inc_by(num_parents as u64);
 
         let committee_peer = header.author.clone();
-        ensure!(
-            self.consensus_config.in_committee(&committee_peer),
-            HeaderError::UnknownNetworkKey(Box::new(peer)).into()
-        );
         let auth_id: AuthorityIdentifier = peer.into();
         if let Some(auth) = self.consensus_config.committee().authority(&committee_peer) {
             // We err on the side of caution here, if auths peer id is not known fail but we
@@ -264,7 +260,7 @@ where
         debug!(target: "primary", ?header, round = header.round(), "Processing vote request from peer");
 
         // certifier optimistically sends header without parents
-        // however, peers may request missing certificates from the a proposer
+        // however, peers may request missing certificates from a proposer
         // when this happens, the proposer sends a new vote request with the missing parents
         // requested by this peer
         //
@@ -313,6 +309,10 @@ where
         let mut parent_authorities = BTreeSet::new();
         let mut stake = 0;
         for parent in parents.iter() {
+            ensure!(
+                parent.epoch() == header.epoch(),
+                HeaderError::InvalidEpoch { theirs: parent.epoch(), ours: header.epoch() }.into()
+            );
             ensure!(parent.round() + 1 == header.round(), HeaderError::InvalidParentRound.into());
 
             // @Steve - can you double check me here?

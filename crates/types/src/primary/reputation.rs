@@ -24,7 +24,7 @@ impl ReputationScores {
         let scores_per_authority =
             committee.authorities().iter().map(|a| (a.id(), 0_u64)).collect();
 
-        Self { scores_per_authority, ..Default::default() }
+        Self { scores_per_authority, final_of_schedule: false }
     }
     /// Adds the provided `score` to the existing score for the provided `authority`
     pub fn add_score(&mut self, authority: &AuthorityIdentifier, score: u64) {
