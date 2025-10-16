@@ -73,8 +73,21 @@ pub enum PrimaryGossip {
 }
 
 // impl TNMessage trait for types
-impl TNMessage for PrimaryRequest {}
-impl TNMessage for PrimaryResponse {}
+impl TNMessage for PrimaryRequest {
+    fn peer_exchange_msg(&self) -> Option<PeerExchangeMap> {
+        match self {
+            Self::PeerExchange { peers } => Some(peers.clone()),
+            _ => None,
+        }
+    }
+}
+impl TNMessage for PrimaryResponse {
+    fn peer_exchange_msg(&self) -> Option<PeerExchangeMap> {
+        match self {
+            _ => None,
+        }
+    }
+}
 
 /// Requests from Primary.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

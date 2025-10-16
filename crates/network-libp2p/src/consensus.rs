@@ -789,6 +789,19 @@ where
                 match message {
                     request_response::Message::Request { request_id, request, channel } => {
                         debug!(target: "network", ?peer, ?request, "request received");
+                        // intercept peer exchange messages
+                        if let Some(peers) = request.peer_exchange_msg() {
+                            let _ = self.process_command(NetworkCommand::PeerExchange {
+                                peer: BlsPublicKey::default(),
+                                peers,
+                                channel,
+                            });
+
+                            // manually disconnect peer to prevent unknown Bls->PeerId conversions
+                            self.swarm.behaviour_mut().peer_manager.disconnect_peer(peer, false);
+                            return Ok(());
+                        }
+
                         // We should not be able to recieve a message from an unknown peer so this
                         // should always work. It is possible (mostly in
                         // testing) to have a race where we don't know the requester YET.

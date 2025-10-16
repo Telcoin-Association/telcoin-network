@@ -14,8 +14,21 @@ pub enum WorkerGossip {
 }
 
 // impl TNMessage trait for types
-impl TNMessage for WorkerRequest {}
-impl TNMessage for WorkerResponse {}
+impl TNMessage for WorkerRequest {
+    fn peer_exchange_msg(&self) -> Option<PeerExchangeMap> {
+        match self {
+            Self::PeerExchange { peers } => Some(peers.clone()),
+            _ => None,
+        }
+    }
+}
+impl TNMessage for WorkerResponse {
+    fn peer_exchange_msg(&self) -> Option<PeerExchangeMap> {
+        match self {
+            _ => None,
+        }
+    }
+}
 
 /// Requests from Worker.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -21,6 +21,8 @@ mod codec_tests;
 pub trait TNMessage:
     Send + Serialize + DeserializeOwned + Clone + fmt::Debug + From<PeerExchangeMap> + 'static
 {
+    /// Function to intercept peer exchange messages at the network layer before passing to the application layer. Only the network layer needs peer exchange messages.
+    fn peer_exchange_msg(&self) -> Option<PeerExchangeMap>;
 }
 
 /// The Telcoin Network request/response codec for consensus messages between peers.
