@@ -22,11 +22,11 @@ mod leader_schedule_tests;
 pub struct LeaderSwapTable {
     /// The round on which the leader swap table get into effect.
     round: Round,
-    /// The list of `f` (by stake) authorities with best scores as those defined by the provided
+    /// The list of `f` authorities with best scores as those defined by the provided
     /// `ReputationScores`. Those authorities will be used in the position of the `bad_nodes`
     /// on the final leader schedule.
     good_nodes: Vec<Authority>,
-    /// The set of `f` (by stake) authorities with the worst scores as those defined by the
+    /// The set of `f` authorities with the worst scores as those defined by the
     /// provided `ReputationScores`. Every time where such authority is elected as leader on
     /// the schedule, it will swapped by one of the authorities of the `good_nodes`.
     bad_nodes: HashMap<AuthorityIdentifier, Authority>,
@@ -35,7 +35,7 @@ pub struct LeaderSwapTable {
 impl Debug for LeaderSwapTable {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.write_str(&format!(
-            "LeaderSwapTable round:{}, good_nodes:{:?} with stake:{}, bad_nodes:{:?} with stake:{}",
+            "LeaderSwapTable round:{}, good_nodes:{:?} with voting power:{}, bad_nodes:{:?} with voting power:{}",
             self.round,
             self.good_nodes.iter().map(|a| a.id()).collect::<Vec<AuthorityIdentifier>>(),
             self.good_nodes.iter().map(|a| a.voting_power()).sum::<VotingPower>(),
@@ -47,31 +47,30 @@ impl Debug for LeaderSwapTable {
 
 impl LeaderSwapTable {
     /// Constructs a new table based on the provided reputation scores. The
-    /// `bad_nodes_stake_threshold` designates the total (by stake) nodes that will be
+    /// `bad_nodes_percent_threshold` designates the total percent nodes that can be
     /// considered as "bad" based on their scores and will be replaced by good nodes.
     ///
-    /// The `bad_nodes_stake_threshold` should be in the range of [0 - 33].
+    /// The `bad_nodes_percent_threshold` should be in the range of [0 - 33].
     ///
-    /// Nodes should not be on the bad list unless they are underperfoming.  No more than 1/3 of our
-    /// nodes should be "bad" (less is fine).
+    /// Nodes should not be on the bad list unless they are underperfoming.
+    /// No more than `bad_nodes_percent_threshold` of our nodes should be
+    /// "bad" (less is fine).
     ///
-    /// If we have bad nodes then we MUST have good nodes to swap with (an emply good list will lead
-    /// to panics later).  We want at least 1/3 of nodes on the good list if we have bad nodes
-    /// (more is fine).
-    ///
-    /// For now, we use 0.
+    /// If we have bad nodes then we MUST have good nodes to swap with (an empty good list will lead
+    /// to panics later).  We want at least `bad_nodes_percent_threshold` of nodes on the good list
+    /// if we have bad nodes (more is fine).
     pub fn new(
         committee: &Committee,
         round: Round,
         reputation_scores: &ReputationScores,
-        bad_nodes_stake_threshold: u64,
+        bad_nodes_percent_threshold: u64,
     ) -> Self {
-        assert!((0..=33).contains(&bad_nodes_stake_threshold), "The bad_nodes_stake_threshold should be in range [0 - 33], out of bounds parameter detected");
+        assert!((0..=33).contains(&bad_nodes_percent_threshold), "The bad_nodes_percent_threshold should be in range [0 - 33], out of bounds parameter detected");
         assert!(reputation_scores.final_of_schedule, "Only reputation scores that have been calculated on the end of a schedule are accepted");
 
         let auths_by_score = reputation_scores.authorities_by_score_desc();
-        let list_threshhold =
-            ((auths_by_score.len() * bad_nodes_stake_threshold as usize) / 100).max(1);
+        let list_threshold =
+            ((auths_by_score.len() * bad_nodes_percent_threshold as usize) / 100).max(1);
         // Most validators should have a rep near this highest value if they are honest and are
         // partcipating.
         let highest_rep = auths_by_score.first().map(|(_, rep)| *rep).unwrap_or(0);
@@ -93,11 +92,12 @@ impl LeaderSwapTable {
             .sum();
         standard_dev /= auths_by_score.len() as u64;
         standard_dev = (standard_dev as f64).sqrt() as u64;
-        // Generate the "good" and "bad" nodes.  We need to have a bad_nodes_stake_threshold > 0 AND
-        // we want a reasonable delta between the highest and lowest reputation otherwise we don't
-        // tag any node as "bad".  Telcoin network is running a closed validator set with
-        // high hardware and network requirements so this is really just to filter out down
-        // validators or nodes with a broken net connection etc so this should be OK.
+        // Generate the "good" and "bad" nodes.  We need to have a bad_nodes_percent_threshold > 0
+        // AND we want a reasonable delta between the highest and lowest reputation
+        // otherwise we don't tag any node as "bad".  Telcoin network is running a closed
+        // validator set with high hardware and network requirements so this is really just
+        // to filter out down validators or nodes with a broken net connection etc so this
+        // should be OK.
         let (good_nodes, bad_nodes) =
             if standard_dev == 0 || lowest_rep > highest_rep.saturating_sub(2 * standard_dev) {
                 (vec![], HashMap::default())
@@ -118,7 +118,7 @@ impl LeaderSwapTable {
                                 }
                             })
                             .collect();
-                    if bad_nodes.len() <= list_threshhold {
+                    if bad_nodes.len() <= list_threshold {
                         break bad_nodes;
                     }
                     bad_ceil = bad_ceil.saturating_sub(standard_dev);
@@ -147,7 +147,7 @@ impl LeaderSwapTable {
                                 }
                             })
                             .collect();
-                    if good_nodes.len() >= list_threshhold {
+                    if good_nodes.len() >= list_threshold {
                         break good_nodes;
                     }
                     good_floor = good_floor.saturating_sub(standard_dev).max(bad_ceil + 1);
@@ -205,9 +205,7 @@ impl LeaderSwapTable {
     /// which the provided AuthorityIdentifier is a leader on and is used as a seed to random
     /// function in order to calculate the good node that will swap in that round with the bad
     /// node. We are intentionally not doing weighted randomness as we want to give to all the
-    /// good nodes equal opportunity to get swapped with bad nodes and not have one node with
-    /// enough stake end up swapping bad nodes more frequently than the others on
-    /// the final schedule.
+    /// good nodes equal opportunity to get swapped with bad nodes.
     pub fn swap(&self, leader: &AuthorityIdentifier, leader_round: Round) -> Option<Authority> {
         if self.bad_nodes.contains_key(leader) {
             let mut seed_bytes = [0u8; 32];
@@ -253,7 +251,7 @@ impl LeaderSchedule {
     pub fn from_store<DB: ConsensusStore>(
         committee: Committee,
         store: DB,
-        bad_nodes_stake_threshold: u64,
+        bad_nodes_percent_threshold: u64,
     ) -> Self {
         let table = store
             .read_latest_commit_with_final_reputation_scores(committee.epoch())
@@ -262,7 +260,7 @@ impl LeaderSchedule {
                     &committee,
                     subdag.leader_round(),
                     &subdag.reputation_score,
-                    bad_nodes_stake_threshold,
+                    bad_nodes_percent_threshold,
                 )
             });
         // create the schedule
