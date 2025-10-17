@@ -270,15 +270,6 @@ where
         /// Reply to caller.
         reply: oneshot::Sender<Result<(), ()>>,
     },
-    /// Process peer information and possibly discover new peers.
-    PeerExchange {
-        /// The peer that initiated the exchange and will be temporarily banned.
-        peer: BlsPublicKey,
-        /// Peers for discovery.
-        peers: PeerExchangeMap,
-        /// The libp2p response channel to send back an ack.
-        channel: ResponseChannel<Res>,
-    },
     /// Retrieve peers from peer manager to share with a requesting peer.
     PeersForExchange {
         /// The reply to caller.
@@ -503,20 +494,6 @@ where
         let (reply, res) = oneshot::channel();
         self.sender.send(NetworkCommand::DisconnectPeer { peer_id, reply }).await?;
         res.await?.map_err(|_| NetworkError::DisconnectPeer)
-    }
-
-    /// Process peer exchange message.
-    ///
-    /// This is a side-effect of generic `ConsensusNetwork`. Primary and Workers
-    /// receive peer exchange requests and pass them back to the peer manager.
-    pub async fn process_peer_exchange(
-        &self,
-        peer: BlsPublicKey,
-        peers: PeerExchangeMap,
-        channel: ResponseChannel<Res>,
-    ) -> NetworkResult<()> {
-        self.sender.send(NetworkCommand::PeerExchange { peer, peers, channel }).await?;
-        Ok(())
     }
 
     /// Report a penalty to the peer manager.

@@ -15,7 +15,6 @@ pub const CONSENSUS_REGISTRY_ADDRESS: Address =
 
 // ConsensusRegistry interface. See tn-contracts submodule.
 sol!(
-
     /// Consensus registry.
     #[sol(rpc)]
     contract ConsensusRegistry {
@@ -167,25 +166,16 @@ sol!(
             bytes memory blsPubkey,
             address validatorAddress
         ) external pure returns (bytes memory);
-
-        #[cfg(any(feature = "test-utils", test))]
         /// Mint an NFT for validator to stake.
         function mint(address validatorAddress) external override onlyOwner;
-
-        #[cfg(any(feature = "test-utils", test))]
         /// Stake to the consensus registry.
         function stake(bytes calldata blsPubkey, ProofOfPossession calldata proofOfPossession) external override onlyOwner;
-
-        #[cfg(any(feature = "test-utils", test))]
         /// Activate node for committee selection.
         /// Normally called by staker after node is synced.
         function activate() external override whenNotPaused;
-
-        #[cfg(any(feature = "test-utils", test))]
         /// Retrieve the claimable rewards accrued for a given validator address.
         function getRewards(address validatorAddress) public view virtual returns (uint256);
     }
-
 );
 
 /// The state of consensus retrieved from chain.

@@ -85,7 +85,7 @@ impl ConfigureEvm for TnEvmConfig {
         &self.block_assembler
     }
 
-    fn evm_env(&self, header: &HeaderTy<Self::Primitives>) -> EvmEnvFor<Self> {
+    fn evm_env(&self, header: &HeaderTy<Self::Primitives>) -> Result<EvmEnv, Self::Error> {
         let spec = reth_evm_ethereum::revm_spec(self.chain_spec(), header);
 
         // configure evm env based on parent block
@@ -94,7 +94,7 @@ impl ConfigureEvm for TnEvmConfig {
 
         let blob_params = self.chain_spec().blob_params_at_timestamp(header.timestamp);
         if let Some(blob_params) = &blob_params {
-            cfg_env.set_blob_max_count(blob_params.max_blob_count);
+            cfg_env.set_max_blobs_per_tx(blob_params.max_blob_count);
         }
 
         // derive the EIP-4844 blob fees from the header's `excess_blob_gas` and the current
@@ -108,17 +108,17 @@ impl ConfigureEvm for TnEvmConfig {
             });
 
         let block_env = BlockEnv {
-            number: header.number(),
+            number: U256::from(header.number()),
             beneficiary: header.beneficiary(),
-            timestamp: header.timestamp(),
-            difficulty: if spec >= SpecId::MERGE { U256::ZERO } else { header.difficulty() },
-            prevrandao: if spec >= SpecId::MERGE { header.mix_hash() } else { None },
+            timestamp: U256::from(header.timestamp()),
+            difficulty: U256::ZERO,
+            prevrandao: header.mix_hash(),
             gas_limit: header.gas_limit(),
             basefee: header.base_fee_per_gas().unwrap_or_default(),
             blob_excess_gas_and_price,
         };
 
-        EvmEnv { cfg_env, block_env }
+        Ok(EvmEnv { cfg_env, block_env })
     }
 
     fn next_evm_env(
@@ -139,13 +139,13 @@ impl ConfigureEvm for TnEvmConfig {
 
         let blob_params = self.chain_spec().blob_params_at_timestamp(payload.timestamp);
         if let Some(blob_params) = &blob_params {
-            cfg.set_blob_max_count(blob_params.max_blob_count);
+            cfg.set_max_blobs_per_tx(blob_params.max_blob_count);
         }
 
         let block_env = BlockEnv {
-            number: parent.number + 1,
+            number: U256::from(parent.number + 1),
             beneficiary: payload.beneficiary,
-            timestamp: payload.timestamp,
+            timestamp: U256::from(payload.timestamp),
             difficulty: U256::from(payload.batch_index),
             prevrandao: Some(payload.prev_randao()),
             gas_limit: payload.gas_limit,
@@ -164,7 +164,7 @@ impl ConfigureEvm for TnEvmConfig {
     fn context_for_block<'a>(
         &self,
         block: &'a SealedBlock<BlockTy<Self::Primitives>>,
-    ) -> ExecutionCtxFor<'a, Self> {
+    ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error> {
         // extra data is default otherwise it contains the hashed bls signature
         let close_epoch = if block.extra_data == Bytes::default() {
             None
@@ -172,7 +172,7 @@ impl ConfigureEvm for TnEvmConfig {
             Some(B256::from_slice(block.extra_data.as_ref()))
         };
 
-        TNBlockExecutionCtx {
+        Ok(TNBlockExecutionCtx {
             parent_hash: block.header().parent_hash,
             parent_beacon_block_root: block.header().parent_beacon_block_root,
             nonce: block.nonce.into(),
@@ -180,15 +180,15 @@ impl ConfigureEvm for TnEvmConfig {
             close_epoch,
             difficulty: block.difficulty,
             rewards_counter: self.rewards_counter.clone(),
-        }
+        })
     }
 
     fn context_for_next_block(
         &self,
         parent: &SealedHeader<HeaderTy<Self::Primitives>>,
         payload: Self::NextBlockEnvCtx,
-    ) -> ExecutionCtxFor<'_, Self> {
-        TNBlockExecutionCtx {
+    ) -> Result<ExecutionCtxFor<'_, Self>, Self::Error> {
+        Ok(TNBlockExecutionCtx {
             parent_hash: parent.hash(),
             parent_beacon_block_root: payload.parent_beacon_block_root(),
             nonce: payload.nonce,
@@ -196,6 +196,6 @@ impl ConfigureEvm for TnEvmConfig {
             close_epoch: payload.close_epoch,
             difficulty: U256::from(payload.batch_index << 16 | payload.worker_id as usize),
             rewards_counter: self.rewards_counter.clone(),
-        }
+        })
     }
 }

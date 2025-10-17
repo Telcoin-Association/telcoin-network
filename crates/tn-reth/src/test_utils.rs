@@ -74,7 +74,7 @@ impl RethEnv {
             .with_database(StateProviderDatabase::new(state))
             .with_bundle_update()
             .build();
-        Ok(self.evm_config.evm_factory().create_evm(db, self.evm_config.evm_env(&header)))
+        Ok(self.evm_config.evm_factory().create_evm(db, self.evm_config.evm_env(&header)?))
     }
 
     /// Test utility to execute batch and return execution outcome.
@@ -358,7 +358,7 @@ impl TransactionFactory {
         let pooled_tx = EthPooledTransaction::try_from_eip4844(recovered, sidecar)
             .expect("recovered into eth pooled tx");
         let hash = pool.add_transaction_local(pooled_tx).await.expect("recovered tx added to pool");
-        hash
+        hash.hash
     }
 
     /// Create and sign an EIP1559 transaction with all possible parameters passed.
@@ -446,7 +446,7 @@ impl TransactionFactory {
         let pooled_tx = EthPooledTransaction::try_from_consensus(recovered)
             .expect("recovered into eth pooled tx");
 
-        pool.add_transaction_local(pooled_tx).await.expect("recovered tx added to pool")
+        pool.add_transaction_local(pooled_tx).await.expect("recovered tx added to pool").hash
     }
 
     /// Submit a transaction to the provided pool.
@@ -455,7 +455,7 @@ impl TransactionFactory {
         let pooled_tx = EthPooledTransaction::try_from_consensus(recovered)
             .expect("recovered into eth pooled tx");
 
-        pool.add_transaction_local(pooled_tx).await.expect("recovered tx added to pool")
+        pool.add_transaction_local(pooled_tx).await.expect("recovered tx added to pool").hash
     }
 }
 

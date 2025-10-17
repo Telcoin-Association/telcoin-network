@@ -11,7 +11,7 @@ publish = false
 edition = "2021"
 
 [dependencies]
-axum = { workspace = true }
+axum = { workspace = true, default_features = false, features = ["tokio", "http2"] }
 tracing = { workspace = true }
 scopeguard = { workspace = true }
 prometheus = { workspace = true }
