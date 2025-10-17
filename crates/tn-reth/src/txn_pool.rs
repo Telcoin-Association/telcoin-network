@@ -17,9 +17,9 @@ use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_trans
 use reth_transaction_pool::{
     error::{Eip4844PoolTransactionError, InvalidPoolTransactionError, PoolError},
     identifier::TransactionId,
-    BestTransactions, CanonicalStateUpdate, EthPooledTransaction, PoolSize, PoolTransaction,
-    PoolUpdateKind, TransactionEvents, TransactionOrigin, TransactionPool as _,
-    TransactionPoolExt as _, ValidPoolTransaction,
+    AddedTransactionOutcome, BestTransactions, CanonicalStateUpdate, EthPooledTransaction,
+    PoolSize, PoolTransaction, PoolUpdateKind, TransactionEvents, TransactionOrigin,
+    TransactionPool as _, TransactionPoolExt as _, ValidPoolTransaction,
 };
 use std::{sync::Arc, time::Instant};
 use tn_types::{
@@ -234,7 +234,7 @@ impl WorkerTxPool {
     pub async fn add_transaction_local(
         &self,
         recovered: EthPooledTransaction,
-    ) -> Result<TxHash, crate::PoolError> {
+    ) -> Result<AddedTransactionOutcome, crate::PoolError> {
         self.0.add_transaction(TransactionOrigin::Local, recovered).await
     }
 
@@ -242,7 +242,7 @@ impl WorkerTxPool {
     pub async fn add_raw_transaction_external(
         &self,
         tx: TransactionSigned,
-    ) -> Result<TxHash, crate::PoolError> {
+    ) -> Result<AddedTransactionOutcome, crate::PoolError> {
         let hash = *tx.hash();
         let pooled_tx = tx
             .try_into_pooled()

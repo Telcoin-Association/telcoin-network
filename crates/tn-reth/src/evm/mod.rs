@@ -7,13 +7,13 @@ use reth_evm::{precompiles::PrecompilesMap, Evm, EvmEnv};
 use reth_revm::{
     context::{
         result::{EVMError, HaltReason, ResultAndState},
-        BlockEnv, Evm as RevmEvm, TxEnv,
+        BlockEnv, ContextSetters, ContextTr as _, Evm as RevmEvm, TxEnv,
     },
-    handler::{instructions::EthInstructions, Handler as _, PrecompileProvider},
+    handler::{instructions::EthInstructions, EthFrame, Handler as _, PrecompileProvider},
     inspector::{InspectorHandler, NoOpInspector},
     interpreter::{interpreter::EthInterpreter, InterpreterResult},
     primitives::hardfork::SpecId,
-    Context, ExecuteEvm as _, Inspector,
+    Context, Inspector,
 };
 use std::ops::{Deref, DerefMut};
 use tn_types::{Address, Bytes, TxKind, U256};
@@ -36,8 +36,14 @@ use crate::evm::handler::TNEvmHandler;
 /// [`RevmEvm`] type.
 #[expect(missing_debug_implementations)]
 pub struct TNEvm<DB: Database, I = NoOpInspector, PRECOMPILE = PrecompilesMap> {
-    inner:
-        RevmEvm<TNEvmContext<DB>, I, EthInstructions<EthInterpreter, TNEvmContext<DB>>, PRECOMPILE>,
+    inner: RevmEvm<
+        TNEvmContext<DB>,
+        I,
+        EthInstructions<EthInterpreter, TNEvmContext<DB>>,
+        PRECOMPILE,
+        EthFrame,
+    >,
+
     inspect: bool,
 }
 
@@ -52,6 +58,7 @@ impl<DB: Database, I, PRECOMPILE> TNEvm<DB, I, PRECOMPILE> {
             I,
             EthInstructions<EthInterpreter, TNEvmContext<DB>>,
             PRECOMPILE,
+            EthFrame,
         >,
         inspect: bool,
     ) -> Self {
@@ -61,8 +68,13 @@ impl<DB: Database, I, PRECOMPILE> TNEvm<DB, I, PRECOMPILE> {
     /// Consumes self and return the inner EVM instance.
     pub fn into_inner(
         self,
-    ) -> RevmEvm<TNEvmContext<DB>, I, EthInstructions<EthInterpreter, TNEvmContext<DB>>, PRECOMPILE>
-    {
+    ) -> RevmEvm<
+        TNEvmContext<DB>,
+        I,
+        EthInstructions<EthInterpreter, TNEvmContext<DB>>,
+        PRECOMPILE,
+        EthFrame,
+    > {
         self.inner
     }
 
@@ -116,14 +128,21 @@ where
         self.cfg.chain_id
     }
 
+    // revm v87
     fn transact_raw(&mut self, tx: Self::Tx) -> Result<ResultAndState, Self::Error> {
         let mut handler = TNEvmHandler::default();
         if self.inspect {
             self.inner.set_tx(tx);
-            handler.inspect_run(&mut self.inner)
+            handler.inspect_run(&mut self.inner).map(|result| {
+                let state = self.ctx_mut().journal_mut().finalize();
+                ResultAndState::new(result, state)
+            })
         } else {
             self.inner.set_tx(tx);
-            handler.run(&mut self.inner)
+            handler.run(&mut self.inner).map(|result| {
+                let state = self.ctx_mut().journal_mut().finalize();
+                ResultAndState::new(result, state)
+            })
         }
     }
 
@@ -212,6 +231,18 @@ where
 
     fn inspector_mut(&mut self) -> &mut Self::Inspector {
         &mut self.inner.inspector
+    }
+
+    fn components(&self) -> (&Self::DB, &Self::Inspector, &Self::Precompiles) {
+        (&self.inner.ctx.journaled_state.database, &self.inner.inspector, &self.inner.precompiles)
+    }
+
+    fn components_mut(&mut self) -> (&mut Self::DB, &mut Self::Inspector, &mut Self::Precompiles) {
+        (
+            &mut self.inner.ctx.journaled_state.database,
+            &mut self.inner.inspector,
+            &mut self.inner.precompiles,
+        )
     }
 }
 

@@ -91,7 +91,7 @@ fn assert_eip2935(reth_env: &RethEnv, block: &SealedBlock) -> eyre::Result<()> {
         .unwrap_or_default();
     assert_eq!(
         stored_value,
-        block.parent_hash.into(),
+        U256::from_be_bytes(*block.parent_hash),
         "Genesis header hash should be written to history roots contract at slot {parent_storage_slot}"
     );
     Ok(())

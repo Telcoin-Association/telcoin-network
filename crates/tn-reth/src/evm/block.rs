@@ -123,6 +123,7 @@ pub(crate) struct TNBlockExecutor<Evm, Spec, R: ReceiptBuilder> {
     gas_used: u64,
 }
 
+// alloy-evm
 impl<'db, Evm, Spec, R, DB> TNBlockExecutor<Evm, Spec, R>
 where
     DB: Database + 'db,
@@ -362,7 +363,7 @@ where
 
     /// Applies the pre-block call to the EIP-4788 consensus root contract (cancun).
     fn apply_consensus_root_contract_call(&mut self) -> Result<(), BlockExecutionError> {
-        if !self.spec.is_cancun_active_at_timestamp(self.evm.block().timestamp) {
+        if !self.spec.is_cancun_active_at_timestamp(self.evm.block().timestamp.saturating_to()) {
             return Ok(());
         }
 
@@ -371,7 +372,7 @@ where
             .parent_beacon_block_root
             .ok_or(BlockValidationError::MissingParentBeaconBlockRoot)?;
 
-        trace!(target: "engine", block_number=self.evm.block().number, ?parent_beacon_block_root, "evaluating parent root");
+        trace!(target: "engine", block_number=?self.evm.block().number, ?parent_beacon_block_root, "evaluating parent root");
 
         // if the block number is zero (genesis block) then the parent beacon block root must
         // be 0x0 and no system transaction may occur as per EIP-4788
@@ -417,7 +418,7 @@ where
     /// Applies the pre-block call to the EIP-2935 blockhashes contract (pectra).
     fn apply_blockhashes_contract_call(&mut self) -> Result<(), BlockExecutionError> {
         trace!(target: "engine", "applying blockhashes contract call");
-        if !self.spec.is_prague_active_at_timestamp(self.evm.block().timestamp) {
+        if !self.spec.is_prague_active_at_timestamp(self.evm.block().timestamp.saturating_to()) {
             return Ok(());
         }
 
@@ -473,7 +474,7 @@ where
     fn apply_pre_execution_changes(&mut self) -> Result<(), BlockExecutionError> {
         // Set state clear flag if the block is after the Spurious Dragon hardfork.
         let state_clear_flag =
-            self.spec.is_spurious_dragon_active_at_block(self.evm.block().number);
+            self.spec.is_spurious_dragon_active_at_block(self.evm.block().number.saturating_to());
         self.evm.db_mut().set_state_clear_flag(state_clear_flag);
 
         // apply system calls and cleanup state
@@ -508,7 +509,7 @@ where
         // Execute transaction.
         let ResultAndState { result, state } = self
             .evm
-            .transact(tx)
+            .transact(&tx)
             .map_err(|err| BlockExecutionError::evm(err, tx.tx().trie_hash()))?;
 
         if !f(&result).should_commit() {
@@ -574,6 +575,56 @@ where
     fn evm(&self) -> &Self::Evm {
         &self.evm
     }
+
+    fn execute_transaction_without_commit(
+        &mut self,
+        tx: impl ExecutableTx<Self>,
+    ) -> Result<ResultAndState<<Self::Evm as Evm>::HaltReason>, BlockExecutionError> {
+        // The sum of the transaction's gas limit, Tg, and the gas utilized in this block prior,
+        // must be no greater than the block's gasLimit.
+        let block_available_gas = self.evm.block().gas_limit - self.gas_used;
+
+        if tx.tx().gas_limit() > block_available_gas {
+            return Err(BlockValidationError::TransactionGasLimitMoreThanAvailableBlockGas {
+                transaction_gas_limit: tx.tx().gas_limit(),
+                block_available_gas,
+            }
+            .into());
+        }
+
+        // Execute transaction and return the result
+        self.evm.transact(&tx).map_err(|err| {
+            let hash = tx.tx().trie_hash();
+            BlockExecutionError::evm(err, hash)
+        })
+    }
+
+    fn commit_transaction(
+        &mut self,
+        output: ResultAndState<<Self::Evm as Evm>::HaltReason>,
+        tx: impl ExecutableTx<Self>,
+    ) -> Result<u64, BlockExecutionError> {
+        let ResultAndState { result, state } = output;
+
+        let gas_used = result.gas_used();
+
+        // append gas used
+        self.gas_used += gas_used;
+
+        // Push transaction changeset and calculate header bloom filter for receipt.
+        self.receipts.push(self.receipt_builder.build_receipt(ReceiptBuilderCtx {
+            tx: tx.tx(),
+            evm: &self.evm,
+            result,
+            state: &state,
+            cumulative_gas_used: self.gas_used,
+        }));
+
+        // Commit the state changes.
+        self.evm.db_mut().commit(state);
+
+        Ok(gas_used)
+    }
 }
 
 /// Block builder for TN.
@@ -590,6 +641,7 @@ impl<ChainSpec> TNBlockAssembler<ChainSpec> {
     }
 }
 
+// reth-evm
 impl<F, ChainSpec> BlockAssembler<F> for TNBlockAssembler<ChainSpec>
 where
     F: for<'a> BlockExecutorFactory<
@@ -614,7 +666,7 @@ where
             ..
         } = input;
 
-        let timestamp = evm_env.block_env.timestamp;
+        let timestamp = evm_env.block_env.timestamp.saturating_to();
         let transactions_root = proofs::calculate_transaction_root(&transactions);
         let receipts_root = Receipt::calculate_receipt_root_no_memo(receipts);
         let logs_bloom = logs_bloom(receipts.iter().flat_map(|r| r.logs()));
@@ -653,7 +705,7 @@ where
             mix_hash: evm_env.block_env.prevrandao.unwrap_or_default(),
             nonce,
             base_fee_per_gas: Some(evm_env.block_env.basefee),
-            number: evm_env.block_env.number,
+            number: evm_env.block_env.number.saturating_to(),
             gas_limit: evm_env.block_env.gas_limit,
             difficulty,
             gas_used: *gas_used,
