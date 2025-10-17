@@ -37,6 +37,7 @@ impl NetworkConfig {
     }
 
     /// Return a mutable reference to the [LibP2pConfig].
+    #[cfg(feature = "test-utils")]
     pub fn libp2p_config_mut(&mut self) -> &mut LibP2pConfig {
         &mut self.libp2p_config
     }
@@ -57,6 +58,7 @@ impl NetworkConfig {
     }
 
     /// Return a mutable reference to the [PeerConfig].
+    #[cfg(feature = "test-utils")]
     pub fn peer_config_mut(&mut self) -> &mut PeerConfig {
         &mut self.peer_config
     }

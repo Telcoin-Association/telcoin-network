@@ -538,7 +538,7 @@ impl PeerManager {
     /// many peers. The disconnecting peer shares information about other known peers to
     /// facilitate discovery.
     ///
-    /// Peers should be weary of these reported peers (eclipse attacks). Peers discovered through
+    /// Peers should be wary of these reported peers (eclipse attacks). Peers discovered through
     /// kademlia are prioritized over peer exchange by only processing up to the missing target
     /// number of discovery peers from exchange map.
     pub(crate) fn process_peer_exchange(&mut self, peers: PeerExchangeMap) {

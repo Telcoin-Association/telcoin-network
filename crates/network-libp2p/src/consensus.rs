@@ -673,21 +673,6 @@ where
                 let res = self.swarm.disconnect_peer_id(peer_id);
                 send_or_log_error!(reply, res, "DisconnectPeer");
             }
-            NetworkCommand::PeerExchange { peer, peers, channel } => {
-                debug!(target: "network", ?peers, "processing peer exchange");
-                self.swarm.behaviour_mut().peer_manager.process_peer_exchange(peers);
-                // send empty ack and ignore errors
-                let ack = PeerExchangeMap::default().into();
-                let _ = self.swarm.behaviour_mut().req_res.send_response(channel, ack);
-
-                // expect sender to temp ban this node
-                // initiate disconnect from this peer to prevent redial attempts
-                debug!(target: "network", "initiating disconnect for {peer}");
-                if let Some((peer_id, _)) = self.swarm.behaviour().peer_manager.auth_to_peer(peer) {
-                    debug!(target: "peer-manager", ?peer_id, "initiating reciprocal disconnect after px");
-                    self.swarm.behaviour_mut().peer_manager.disconnect_peer(peer_id, false);
-                }
-            }
             NetworkCommand::PeersForExchange { reply } => {
                 let peers = self.swarm.behaviour_mut().peer_manager.peers_for_exchange();
                 send_or_log_error!(reply, peers, "PeersForExchange");
@@ -796,14 +781,16 @@ where
                         debug!(target: "network", ?peer, ?request, "request received");
                         // intercept peer exchange messages
                         if let Some(peers) = request.peer_exchange_msg() {
-                            let _ = self.process_command(NetworkCommand::PeerExchange {
-                                peer: BlsPublicKey::default(),
-                                peers,
-                                channel,
-                            });
+                            debug!(target: "network", ?peers, "processing peer exchange");
+                            self.swarm.behaviour_mut().peer_manager.process_peer_exchange(peers);
+                            // send empty ack and ignore errors
+                            let ack = PeerExchangeMap::default().into();
+                            let _ = self.swarm.behaviour_mut().req_res.send_response(channel, ack);
 
-                            // manually disconnect peer to prevent unknown Bls->PeerId conversions
+                            // initiate disconnect from this peer to prevent redial attempts
+                            debug!(target: "peer-manager", ?peer, "initiating reciprocal disconnect after px");
                             self.swarm.behaviour_mut().peer_manager.disconnect_peer(peer, false);
+
                             return Ok(());
                         }
 

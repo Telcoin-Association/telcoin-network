@@ -13,7 +13,7 @@ use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     error::NetworkError,
     types::{IntoResponse as _, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResult},
-    GossipMessage, PeerExchangeMap, Penalty, ResponseChannel,
+    GossipMessage, Penalty, ResponseChannel,
 };
 use tn_network_types::{WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerToPrimaryClient};
 use tn_storage::PayloadStore;
@@ -261,18 +261,6 @@ impl PrimaryNetworkHandle {
         self.handle.report_penalty(peer, penalty).await;
     }
 
-    /// Notify peer manager of peer exchange information.
-    pub(crate) async fn process_peer_exchange(
-        &self,
-        peer: BlsPublicKey,
-        peers: PeerExchangeMap,
-        channel: ResponseChannel<PrimaryResponse>,
-    ) {
-        if let Err(e) = self.handle.process_peer_exchange(peer, peers, channel).await {
-            warn!(target: "primary::network", ?e, "process peer exchange failed");
-        }
-    }
-
     /// Retrieve the count of connected peers.
     pub async fn connected_peers_count(&self) -> NetworkResult<usize> {
         self.handle.connected_peer_count().await
@@ -343,8 +331,8 @@ where
                 PrimaryRequest::ConsensusHeader { number, hash } => {
                     self.process_consensus_output_request(peer, number, hash, channel, cancel)
                 }
-                PrimaryRequest::PeerExchange { peers } => {
-                    self.process_peer_exchange(peer, peers, channel)
+                PrimaryRequest::PeerExchange { .. } => {
+                    warn!(target: "primary::network", "primary application received unexpected peer exchange message");
                 }
                 PrimaryRequest::EpochRecord { epoch, hash } => {
                     self.process_epoch_record_request(peer, epoch, hash, channel, cancel)
@@ -493,20 +481,6 @@ where
                     network_handle.report_penalty(propagation_source, penalty).await;
                 }
             }
-        });
-    }
-
-    /// Process peer exchange.
-    fn process_peer_exchange(
-        &self,
-        peer: BlsPublicKey,
-        peers: PeerExchangeMap,
-        channel: ResponseChannel<PrimaryResponse>,
-    ) {
-        let network_handle = self.network_handle.clone();
-        // notify peer manager and respond with ack
-        self.task_spawner.spawn_task("ProcessPeerExchange", async move {
-            network_handle.process_peer_exchange(peer, peers, channel).await;
         });
     }
 }

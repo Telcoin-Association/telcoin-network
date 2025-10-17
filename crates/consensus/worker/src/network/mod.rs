@@ -11,7 +11,7 @@ use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     error::NetworkError,
     types::{NetworkEvent, NetworkHandle, NetworkResult},
-    GossipMessage, PeerExchangeMap, Penalty, ResponseChannel,
+    GossipMessage, Penalty, ResponseChannel,
 };
 use tn_network_types::{FetchBatchResponse, PrimaryToWorkerClient, WorkerSynchronizeMessage};
 use tn_storage::tables::Batches;
@@ -250,16 +250,6 @@ impl WorkerNetworkHandle {
         self.handle.report_penalty(peer, penalty).await;
     }
 
-    /// Notify peer manager of peer exchange information.
-    pub(crate) async fn process_peer_exchange(
-        &self,
-        peer: BlsPublicKey,
-        peers: PeerExchangeMap,
-        channel: ResponseChannel<WorkerResponse>,
-    ) {
-        let _ = self.handle.process_peer_exchange(peer, peers, channel).await;
-    }
-
     /// Retrieve the count of connected peers.
     pub async fn connected_peers_count(&self) -> NetworkResult<usize> {
         self.handle.connected_peer_count().await
@@ -327,9 +317,9 @@ where
                         cancel,
                     );
                 }
-                WorkerRequest::PeerExchange { peers } => {
-                    // notify peer manager
-                    self.process_peer_exchange(peer, peers, channel);
+                WorkerRequest::PeerExchange { .. } => {
+                    // expect this is intercepted by network layer
+                    warn!(target: "worker::network", "worker application received unexpected peer exchange message");
                 }
             },
             NetworkEvent::Gossip(msg, propagation_source) => {
@@ -436,21 +426,6 @@ where
                     }
                 }
             }
-        });
-    }
-
-    /// Process peer exchange.
-    fn process_peer_exchange(
-        &self,
-        peer: BlsPublicKey,
-        peers: PeerExchangeMap,
-        channel: ResponseChannel<WorkerResponse>,
-    ) {
-        let network_handle = self.network_handle.clone();
-
-        // notify peer manager and respond with ack
-        self.network_handle.get_task_spawner().spawn_task("process-peer-exchange", async move {
-            network_handle.process_peer_exchange(peer, peers, channel).await;
         });
     }
 }
