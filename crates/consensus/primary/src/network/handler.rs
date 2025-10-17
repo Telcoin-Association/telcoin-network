@@ -260,7 +260,6 @@ where
         // if peer is ahead, wait for execution to catch up
         // NOTE: this doesn't hurt since this node shouldn't vote until execution is caught up
         // ensure execution results match if this succeeds.
-        // XXXX- should we make sure block number is not crazy?
         if self.consensus_bus.wait_for_execution(header.latest_execution_block).await.is_err() {
             error!(
                 target: "primary",
