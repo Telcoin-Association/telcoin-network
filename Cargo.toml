@@ -264,7 +264,6 @@ backoff = { version = "0.4.0", features = [
     "tokio_1",
 ] }
 
-# patch from v0.55
-libp2p = { git = "https://github.com/Telcoin-Association/rust-libp2p", rev = "7c2c28a186f6d22bcc4f21cfefc2b53122a53a47" }
+libp2p = { version = "0.56.0" }
 bs58 = { version = "0.5.1" }
 blake3 = { version = "1.8.2" }
