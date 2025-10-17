@@ -13,7 +13,6 @@ pub use reth_consensus::{Consensus, ConsensusError};
 use reth_consensus::{FullConsensus, HeaderValidator};
 use reth_db::DatabaseEnv;
 use reth_engine_primitives::PayloadValidator;
-use reth_engine_tree::tree::EngineValidator;
 use reth_node_builder::{BuiltPayload, NewPayloadError, NodeTypes, NodeTypesWithDB, PayloadTypes};
 use reth_node_ethereum::{engine::EthPayloadAttributes, EthEngineTypes};
 use reth_primitives_traits::Block;
@@ -104,34 +103,6 @@ where
         Ok(Default::default())
     }
 }
-
-// TODO: still need this????
-//
-//
-// impl<T> EngineValidator<T> for TNExecution
-// where
-//     T: PayloadTypes<PayloadAttributes = EthPayloadAttributes, ExecutionData = ExecutionData>,
-// {
-//     fn validate_version_specific_fields(
-//         &self,
-//         _version: reth_node_builder::EngineApiMessageVersion,
-//         _payload_or_attrs: reth_node_builder::PayloadOrAttributes<
-//             '_,
-//             T::ExecutionData,
-//             <T as PayloadTypes>::PayloadAttributes,
-//         >,
-//     ) -> Result<(), reth_node_builder::EngineObjectValidationError> {
-//         Ok(())
-//     }
-
-//     fn ensure_well_formed_attributes(
-//         &self,
-//         _version: reth_node_builder::EngineApiMessageVersion,
-//         _attributes: &<T as PayloadTypes>::PayloadAttributes,
-//     ) -> Result<(), reth_node_builder::EngineObjectValidationError> {
-//         Ok(())
-//     }
-// }
 
 /// A default payload type for [`EthEngineTypes`]
 ///

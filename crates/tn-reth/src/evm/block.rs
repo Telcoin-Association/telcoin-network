@@ -24,7 +24,7 @@ use reth_errors::{BlockExecutionError, BlockValidationError};
 use reth_evm::{
     block::{
         BlockExecutor, BlockExecutorFactory, CommitChanges, ExecutableTx,
-        InternalBlockExecutionError, StateChangeSource,
+        InternalBlockExecutionError,
     },
     eth::receipt_builder::{ReceiptBuilder, ReceiptBuilderCtx},
     execute::{BlockAssembler, BlockAssemblerInput},
