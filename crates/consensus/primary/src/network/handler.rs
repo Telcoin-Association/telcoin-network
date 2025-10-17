@@ -221,6 +221,18 @@ where
 
         // validate header
         header.validate(committee)?;
+        let max_round = *self.consensus_bus.committed_round_updates().borrow()
+            + self.consensus_config.parameters().gc_depth;
+        // Make sure the header is not unreasonable in the future.
+        ensure!(
+            header.round() <= max_round,
+            HeaderError::TooNew {
+                digest: header.digest(),
+                header_round: header.round(),
+                max_round,
+            }
+            .into()
+        );
 
         // validate parents
         let num_parents = parents.len();
@@ -248,6 +260,7 @@ where
         // if peer is ahead, wait for execution to catch up
         // NOTE: this doesn't hurt since this node shouldn't vote until execution is caught up
         // ensure execution results match if this succeeds.
+        // XXXX- should we make sure block number is not crazy?
         if self.consensus_bus.wait_for_execution(header.latest_execution_block).await.is_err() {
             error!(
                 target: "primary",

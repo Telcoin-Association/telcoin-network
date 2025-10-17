@@ -244,6 +244,9 @@ pub enum HeaderError {
     /// The proposed header's round is too far behind.
     #[error("Header {digest} for round {header_round} is too old for max round {max_round}")]
     TooOld { digest: HeaderDigest, header_round: Round, max_round: Round },
+    /// The proposed header's round is too far ahead.
+    #[error("Header {digest} for round {header_round} is too new for max round {max_round}")]
+    TooNew { digest: HeaderDigest, header_round: Round, max_round: Round },
     /// The header contains a parent with an invalid aggregate BLS signature.
     #[error("Header's parent missing aggregate BLS signature")]
     ParentMissingSignature,
