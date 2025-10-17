@@ -309,19 +309,14 @@ pub struct Consensus<DB> {
     committee: Committee,
     /// The chanell "bus" for consensus (container for consesus channel and watches).
     consensus_bus: ConsensusBus,
-
     /// Receiver for shutdown.
     rx_shutdown: Noticer,
-
     /// The consensus protocol to run.
     protocol: Bullshark<DB>,
-
     /// Metrics handler
     metrics: Arc<ConsensusMetrics>,
-
     /// Inner state
     state: ConsensusState,
-
     /// Are we an active CVV?
     /// An active CVV is participating in consensus (not catching up or following as an NVV).
     active: bool,
@@ -397,6 +392,9 @@ impl<DB: Database> Consensus<DB> {
         }
     }
 
+    /// The main event loop for running consensus.
+    ///
+    /// Process new certificates and weak votes until shutdown.
     async fn run(mut self) -> Result<(), ConsensusError> {
         let mut rx_new_certificates = self.consensus_bus.new_certificates().subscribe();
         let mut rx_weak_votes = self.consensus_bus.weak_votes().subscribe();
@@ -425,6 +423,7 @@ impl<DB: Database> Consensus<DB> {
 
     /// Process a new certificate.
     async fn new_certificate(&mut self, certificate: Certificate) -> Result<(), ConsensusError> {
+        // ensure certificate is in same epoch
         match certificate.epoch().cmp(&self.committee.epoch()) {
             Ordering::Equal => {
                 // we can proceed.
@@ -434,71 +433,16 @@ impl<DB: Database> Consensus<DB> {
                 return Ok(());
             }
         }
+
         // Process the certificate using the selected consensus protocol.
         let (_, committed_sub_dags) =
             self.protocol.process_certificate(&mut self.state, certificate)?;
+
+        // only process if not syncing
         if self.active {
-            // We extract a list of headers from this specific validator that
-            // have been agreed upon, and signal this back to the narwhal sub-system
-            // to be used to re-send batches that have not made it to a commit.
-            let mut committed_certificates = Vec::new();
-
-            // Output the sequence in the right order.
-            for committed_sub_dag in committed_sub_dags {
-                // We need to make sure execution has caught up so we can verify we have not forked.
-                // This will force the follow function to not outrun execution...  this is probably
-                // fine. Also once we can follow gossiped consensus output this will not really be
-                // an issue (except during initial catch up).
-                let base_execution_block = committed_sub_dag.leader.header.latest_execution_block;
-                if self.consensus_bus.wait_for_execution(base_execution_block).await.is_err() {
-                    // This seems to be a bogus sub dag, we are out of sync...
-                    error!(target: "telcoin::consensus_state", "Got a bogus sub dag from bullshark, we are out of sync!");
-                    self.consensus_bus.node_mode().send_modify(|v| *v = NodeMode::CvvInactive);
-                    break;
-                }
-
-                debug!(target: "telcoin::consensus_state", "Commit in Sequence {:?}", committed_sub_dag.leader.nonce());
-
-                for certificate in &committed_sub_dag.certificates {
-                    committed_certificates.push(certificate.clone());
-                }
-
-                // NOTE: the size of the sub-dag can be arbitrarily large (depending on the network
-                // condition and Byzantine leaders).
-                self.consensus_bus
-                    .sequence()
-                    .send(committed_sub_dag)
-                    .await
-                    .map_err(|_| ConsensusError::ShuttingDown)?;
-            }
-
-            if !committed_certificates.is_empty() {
-                // Highest committed certificate round is the leader round / commit round
-                // expected by primary.
-                let leader_commit_round = committed_certificates
-                    .iter()
-                    .map(|c| c.round())
-                    .max()
-                    .expect("committed_certificates isn't empty");
-
-                self.consensus_bus
-                    .committed_certificates()
-                    .send((leader_commit_round, committed_certificates))
-                    .await
-                    .map_err(|_| ConsensusError::ShuttingDown)?;
-
-                assert_eq!(self.state.last_round.committed_round, leader_commit_round);
-
-                self.consensus_bus
-                    .update_consensus_rounds(self.state.last_round)
-                    .map_err(|_| ConsensusError::ShuttingDown)?;
-            }
-
-            self.metrics
-                .consensus_dag_rounds
-                .with_label_values(&[])
-                .set(self.state.dag.len() as i64);
+            self.process_commits(committed_sub_dags).await?;
         }
+
         Ok(())
     }
 
@@ -527,14 +471,21 @@ impl<DB: Database> Consensus<DB> {
         Ok(())
     }
 
+    /// Process committed subdags.
+    ///
+    /// This is called when processing a new certificate or a new weak vote triggers a commit.
     async fn process_commits(
         &mut self,
         committed_sub_dags: Vec<CommittedSubDag>,
     ) -> Result<(), ConsensusError> {
-        // Extract the committed certificates
+        // extract the committed certificates
         let mut committed_certificates = Vec::new();
 
         for committed_sub_dag in &committed_sub_dags {
+            // We need to make sure execution has caught up so we can verify we have not forked.
+            // This will force the follow function to not outrun execution...  this is probably
+            // fine. Also once we can follow gossiped consensus output this will not really be
+            // an issue (except during initial catch up).
             let base_execution_block = committed_sub_dag.leader.header.latest_execution_block;
             if self.consensus_bus.wait_for_execution(base_execution_block).await.is_err() {
                 error!(target: "telcoin::consensus_state", "Got a bogus sub dag from bullshark, we are out of sync!");
@@ -548,6 +499,8 @@ impl<DB: Database> Consensus<DB> {
                 committed_certificates.push(certificate.clone());
             }
 
+            // NOTE: the size of the sub-dag can be arbitrarily large (depending on the network
+            // condition and Byzantine leaders).
             self.consensus_bus
                 .sequence()
                 .send(committed_sub_dag.clone())
@@ -556,12 +509,19 @@ impl<DB: Database> Consensus<DB> {
         }
 
         if !committed_certificates.is_empty() {
+            // highest committed certificate round is the leader round / commit round
+            // expected by primary
             let leader_commit_round = committed_certificates
                 .iter()
                 .map(|c| c.round())
                 .max()
                 .expect("committed_certificates isn't empty");
 
+            // TODO: the receiver doesn't do much with this
+            // better to parse here instead?
+            // - this may affect tx recovery at epoch boundary
+            //
+            // filter own certificates and sends out on cb.committed_own_headers
             self.consensus_bus
                 .committed_certificates()
                 .send((leader_commit_round, committed_certificates))

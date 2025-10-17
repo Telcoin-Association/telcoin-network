@@ -8,16 +8,12 @@ use crate::{
     test_utils::{make_optimal_certificates, mock_certificate, temp_dir},
     ConsensusBus, NodeMode,
 };
-use std::{
-    collections::{BTreeSet, HashSet},
-    sync::Arc,
-};
+use std::{collections::BTreeSet, sync::Arc};
 use tn_storage::{mem_db::MemDatabase, open_db};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    test_utils::init_test_tracing, AuthorityIdentifier, Certificate, CertificateDigest, Committee,
-    ExecHeader, Hash as _, Round, SealedHeader, TaskManager, TnReceiver as _, TnSender as _, B256,
-    DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    test_utils::init_test_tracing, Certificate, ExecHeader, Hash as _, Round, SealedHeader,
+    TaskManager, TnReceiver as _, TnSender as _, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 
 /// Test that fast commit works when we have 2f+1 weak votes
@@ -398,7 +394,7 @@ async fn fast_commit_integration_test() {
     let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
     let genesis =
         Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
-    let (certificates, parents) = make_optimal_certificates(&committee, 1..=2, &genesis, &ids);
+    let (certificates, _parents) = make_optimal_certificates(&committee, 1..=2, &genesis, &ids);
 
     for certificate in &certificates {
         cb.new_certificates().send(certificate.clone()).await.unwrap();
