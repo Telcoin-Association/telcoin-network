@@ -3,7 +3,7 @@
 use crate::{ConfigFmt, ConfigTrait, TelcoinDirs};
 use libp2p::{kad::K_VALUE, request_response::ProtocolSupport, StreamProtocol};
 use serde::{Deserialize, Serialize};
-use std::{sync::OnceLock, time::Duration};
+use std::{num::NonZeroUsize, sync::OnceLock, time::Duration};
 use tn_types::Round;
 
 impl ConfigTrait for NetworkConfig {}
@@ -36,6 +36,12 @@ impl NetworkConfig {
         &self.libp2p_config
     }
 
+    /// Return a mutable reference to the [LibP2pConfig].
+    #[cfg(feature = "test-utils")]
+    pub fn libp2p_config_mut(&mut self) -> &mut LibP2pConfig {
+        &mut self.libp2p_config
+    }
+
     /// Return a reference to the [QuicConfig].
     pub fn quic_config(&self) -> &QuicConfig {
         &self.quic_config
@@ -52,6 +58,7 @@ impl NetworkConfig {
     }
 
     /// Return a mutable reference to the [PeerConfig].
+    #[cfg(feature = "test-utils")]
     pub fn peer_config_mut(&mut self) -> &mut PeerConfig {
         &mut self.peer_config
     }
@@ -110,6 +117,8 @@ pub struct LibP2pConfig {
     /// The maximum amount of time to wait for a peer's ack during a px_disconnect before forcing
     /// the disconnect.
     pub px_disconnect_timeout: Duration,
+    /// The k-bucket size for kademlia.
+    pub k_bucket_size: NonZeroUsize,
 }
 
 impl LibP2pConfig {
@@ -161,6 +170,7 @@ impl Default for LibP2pConfig {
             max_idle_connection_timeout: Duration::from_secs(65), // same as quic handshake
             max_px_disconnects: 10,
             px_disconnect_timeout: Duration::from_secs(3),
+            k_bucket_size: K_VALUE,
         }
     }
 }
