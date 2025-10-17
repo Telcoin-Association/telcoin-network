@@ -27,7 +27,7 @@ impl WeakVoteTracker {
     }
 
     ///
-    pub fn track_proposal(&mut self, weak_vote: WeakVote, dag: &Dag) {
+    pub fn process_vote(&mut self, weak_vote: WeakVote, dag: &Dag) {
         // check if authority has already proposed a weak vote for this round
         let seen = self.proposers_seen.entry(weak_vote.round).or_insert_with(HashSet::new);
 

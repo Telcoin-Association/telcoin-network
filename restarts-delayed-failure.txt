@@ -1,0 +1,1279 @@
+2025-10-16T19:31:27.992230Z  INFO execute: telcoin-network 0.1.0 (43879458) starting
+2025-10-16T19:31:27.992453Z  INFO execute: telcoin-network 0.1.0 (43879458) starting
+2025-10-16T19:31:27.992452Z  INFO execute: telcoin-network 0.1.0 (43879458) starting
+2025-10-16T19:31:27.992479Z  INFO execute: telcoin-network 0.1.0 (43879458) starting
+2025-10-16T19:31:27.992523Z  INFO execute: Loading configuration path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-1/node-info.yaml"
+2025-10-16T19:31:27.992797Z  INFO execute: Loading configuration path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-4/node-info.yaml"
+2025-10-16T19:31:27.992799Z  INFO execute: Loading configuration path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-2/node-info.yaml"
+2025-10-16T19:31:27.992815Z  INFO execute: Loading configuration path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-3/node-info.yaml"
+2025-10-16T19:31:27.993007Z  INFO execute: Loading configuration path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-1/parameters.yaml"
+2025-10-16T19:31:27.993223Z  INFO execute: Loading configuration path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-2/parameters.yaml"
+2025-10-16T19:31:27.993229Z  INFO execute: Loading configuration path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-3/parameters.yaml"
+2025-10-16T19:31:27.993229Z  INFO execute: Loading configuration path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-4/parameters.yaml"
+2025-10-16T19:31:27.993246Z  INFO execute: Loading configuration path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-1/genesis/genesis.yaml"
+2025-10-16T19:31:27.993431Z  INFO execute: Loading configuration path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-3/genesis/genesis.yaml"
+2025-10-16T19:31:27.993434Z  INFO execute: Loading configuration path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-2/genesis/genesis.yaml"
+2025-10-16T19:31:27.993456Z  INFO execute: Loading configuration path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-4/genesis/genesis.yaml"
+2025-10-16T19:31:28.016278Z  INFO execute: config loaded validator="node-Wu92EiRUowP"
+2025-10-16T19:31:28.016405Z  INFO execute: config loaded validator="node-NaxSUducDnw"
+2025-10-16T19:31:28.016754Z  INFO execute: config loaded validator="node-Ri2jWnU5YEL"
+2025-10-16T19:31:28.017167Z  INFO execute: config loaded validator="node-XuNw9RpwZuf"
+2025-10-16T19:31:28.046348Z  INFO Starting MDBX metrics thread
+2025-10-16T19:31:28.046361Z  INFO Starting MDBX metrics thread
+2025-10-16T19:31:28.046361Z  INFO Starting MDBX metrics thread
+2025-10-16T19:31:28.046446Z  INFO Starting MDBX metrics thread
+2025-10-16T19:31:28.049912Z  INFO Starting MemDB metrics thread
+2025-10-16T19:31:28.049939Z  INFO Starting MemDB metrics thread
+2025-10-16T19:31:28.050004Z  INFO Starting MemDB metrics thread
+2025-10-16T19:31:28.050190Z  INFO Starting MemDB metrics thread
+2025-10-16T19:31:28.050685Z  INFO execute:launch_node: opened consensus storage consensus_db_path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-4/consensus-db"
+2025-10-16T19:31:28.050687Z  INFO execute:launch_node: opened consensus storage consensus_db_path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-1/consensus-db"
+2025-10-16T19:31:28.050704Z  INFO execute:launch_node: opened consensus storage consensus_db_path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-3/consensus-db"
+2025-10-16T19:31:28.050737Z  INFO execute:launch_node: loading validator keys at "/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-4/node-keys"
+2025-10-16T19:31:28.050738Z  INFO execute:launch_node: loading validator keys at "/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-1/node-keys"
+2025-10-16T19:31:28.050749Z  INFO execute:launch_node: loading validator keys at "/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-3/node-keys"
+2025-10-16T19:31:28.050901Z  INFO execute:launch_node: opened consensus storage consensus_db_path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-2/consensus-db"
+2025-10-16T19:31:28.050948Z  INFO execute:launch_node: loading validator keys at "/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-2/node-keys"
+2025-10-16T19:31:28.053739Z  INFO execute:launch_node: opening database path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-4/db"
+2025-10-16T19:31:28.053845Z  INFO execute:launch_node: opening database path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-2/db"
+2025-10-16T19:31:28.053881Z  INFO execute:launch_node: opening database path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-1/db"
+2025-10-16T19:31:28.053881Z  INFO execute:launch_node: opening database path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-3/db"
+2025-10-16T19:31:28.056850Z  INFO execute:launch_node: starting node and launching first epoch
+2025-10-16T19:31:28.057028Z  INFO execute:launch_node: starting node and launching first epoch
+2025-10-16T19:31:28.057130Z  INFO execute:launch_node: starting node and launching first epoch
+2025-10-16T19:31:28.057136Z  INFO execute:launch_node: starting node and launching first epoch
+2025-10-16T19:31:28.452891Z  INFO execute:launch_node: Loading configuration path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-1/network-config"
+2025-10-16T19:31:28.460972Z  INFO execute:launch_node: local_peer_id=12D3KooWGxD3zjGtUQ1h58vamLtTUvSj1AoJvK1ydsSFbdstvfVG
+2025-10-16T19:31:28.462899Z  INFO Providing our record to kademlia for peer PeerId("12D3KooWGxD3zjGtUQ1h58vamLtTUvSj1AoJvK1ydsSFbdstvfVG") record=Record { key: Key(b"\xb2\xc1\n\x13\xc3\xda\x9a\xe2\x91\xea\xb1\x80iX\x0c\xffQ\xc3\x183&\\\xca\xe7\\\x97\xd3\xfd\xf4\xaa\xc8\xb9\xb7\xbfiy \xd9\xe4\x14\xb1\xe0\xeb\x9c\xc8\xa9\x95\r\x08\xe0?\xa4\x0e\x99d\x81\\%Q\xcc@\xfed\x04W\x95\xc7\xd4\x8c{r\xca\xee\xc8ui\xdf\xf9\x94|\xd1\xe5\x80A\xe7\xe0\x01\xfc>\x03u\x7f\xec\xb1\xc6c"), value: [36, 8, 1, 18, 32, 106, 4, 37, 166, 48, 166, 32, 186, 221, 125, 198, 178, 75, 242, 218, 194, 73, 72, 98, 150, 35, 83, 235, 92, 172, 160, 90, 151, 173, 100, 157, 119, 1, 52, 4, 127, 0, 0, 1, 145, 2, 250, 218, 205, 3, 165, 3, 38, 0, 36, 8, 1, 18, 32, 106, 4, 37, 166, 48, 166, 32, 186, 221, 125, 198, 178, 75, 242, 218, 194, 73, 72, 98, 150, 35, 83, 235, 92, 172, 160, 90, 151, 173, 100, 157, 119, 16, 72, 241, 104, 0, 0, 0, 0, 48, 138, 208, 197, 112, 52, 76, 67, 137, 139, 37, 202, 139, 209, 172, 123, 13, 59, 193, 15, 23, 236, 153, 188, 45, 56, 151, 226, 83, 141, 47, 202, 57, 10, 172, 62, 28, 47, 46, 80, 0, 155, 254, 227, 170, 118, 110, 74, 48], publisher: Some(PeerId("12D3KooWGxD3zjGtUQ1h58vamLtTUvSj1AoJvK1ydsSFbdstvfVG")), expires: None }
+2025-10-16T19:31:28.465216Z  INFO execute:launch_node: local_peer_id=12D3KooWAX6JFCep5FgtXN6cnjU1nebq7cigAJChrCh1FjER5m38
+2025-10-16T19:31:28.466647Z  INFO Providing our record to kademlia for peer PeerId("12D3KooWAX6JFCep5FgtXN6cnjU1nebq7cigAJChrCh1FjER5m38") record=Record { key: Key(b"\xb2\xc1\n\x13\xc3\xda\x9a\xe2\x91\xea\xb1\x80iX\x0c\xffQ\xc3\x183&\\\xca\xe7\\\x97\xd3\xfd\xf4\xaa\xc8\xb9\xb7\xbfiy \xd9\xe4\x14\xb1\xe0\xeb\x9c\xc8\xa9\x95\r\x08\xe0?\xa4\x0e\x99d\x81\\%Q\xcc@\xfed\x04W\x95\xc7\xd4\x8c{r\xca\xee\xc8ui\xdf\xf9\x94|\xd1\xe5\x80A\xe7\xe0\x01\xfc>\x03u\x7f\xec\xb1\xc6c"), value: [36, 8, 1, 18, 32, 10, 110, 222, 63, 14, 111, 245, 177, 69, 178, 61, 229, 71, 19, 254, 193, 137, 9, 57, 192, 126, 28, 131, 178, 22, 126, 12, 233, 96, 63, 155, 107, 1, 52, 4, 127, 0, 0, 1, 145, 2, 216, 104, 205, 3, 165, 3, 38, 0, 36, 8, 1, 18, 32, 10, 110, 222, 63, 14, 111, 245, 177, 69, 178, 61, 229, 71, 19, 254, 193, 137, 9, 57, 192, 126, 28, 131, 178, 22, 126, 12, 233, 96, 63, 155, 107, 16, 72, 241, 104, 0, 0, 0, 0, 48, 128, 131, 80, 19, 157, 124, 56, 22, 100, 255, 245, 147, 235, 140, 102, 112, 228, 81, 137, 185, 187, 28, 4, 254, 59, 212, 156, 211, 228, 129, 128, 198, 46, 220, 46, 225, 180, 24, 151, 81, 90, 96, 124, 63, 32, 7, 240, 239], publisher: Some(PeerId("12D3KooWAX6JFCep5FgtXN6cnjU1nebq7cigAJChrCh1FjER5m38")), expires: None }
+2025-10-16T19:31:28.467196Z ERROR Failed to put record: QuorumFailed { key: Key(b"\xb2\xc1\n\x13\xc3\xda\x9a\xe2\x91\xea\xb1\x80iX\x0c\xffQ\xc3\x183&\\\xca\xe7\\\x97\xd3\xfd\xf4\xaa\xc8\xb9\xb7\xbfiy \xd9\xe4\x14\xb1\xe0\xeb\x9c\xc8\xa9\x95\r\x08\xe0?\xa4\x0e\x99d\x81\\%Q\xcc@\xfed\x04W\x95\xc7\xd4\x8c{r\xca\xee\xc8ui\xdf\xf9\x94|\xd1\xe5\x80A\xe7\xe0\x01\xfc>\x03u\x7f\xec\xb1\xc6c"), success: [], quorum: 1 }
+2025-10-16T19:31:28.467502Z  INFO execute:launch_node: NODE TASKS
+ tasks=Node Task Manager
+Task: Epoch Record Collector (critical)
+Task: Worker Network (critical)
+Task: Primary Network (critical)
+++++++++++++++++++++++++++++++++++++++++++++++++++++
+Engine Task Manager
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+2025-10-16T19:31:28.467808Z  INFO execute:launch_node: Starting epoch
+2025-10-16T19:31:28.469619Z ERROR Failed to put record: QuorumFailed { key: Key(b"\xb2\xc1\n\x13\xc3\xda\x9a\xe2\x91\xea\xb1\x80iX\x0c\xffQ\xc3\x183&\\\xca\xe7\\\x97\xd3\xfd\xf4\xaa\xc8\xb9\xb7\xbfiy \xd9\xe4\x14\xb1\xe0\xeb\x9c\xc8\xa9\x95\r\x08\xe0?\xa4\x0e\x99d\x81\\%Q\xcc@\xfed\x04W\x95\xc7\xd4\x8c{r\xca\xee\xc8ui\xdf\xf9\x94|\xd1\xe5\x80A\xe7\xe0\x01\xfc>\x03u\x7f\xec\xb1\xc6c"), success: [], quorum: 1 }
+2025-10-16T19:31:28.474861Z  INFO execute:launch_node: creating committee from state
+2025-10-16T19:31:28.474924Z  INFO execute:launch_node: Loading configuration path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-1/genesis/committee.yaml"
+2025-10-16T19:31:28.489239Z  INFO network update for next committee - ensuring no committee members are banned this_node=PeerId("12D3KooWGxD3zjGtUQ1h58vamLtTUvSj1AoJvK1ydsSFbdstvfVG")
+2025-10-16T19:31:28.489268Z  INFO execute:launch_node: listening to /ip4/127.0.0.1/udp/64218/quic-v1/p2p/12D3KooWGxD3zjGtUQ1h58vamLtTUvSj1AoJvK1ydsSFbdstvfVG primary_address=/ip4/127.0.0.1/udp/64218/quic-v1/p2p/12D3KooWGxD3zjGtUQ1h58vamLtTUvSj1AoJvK1ydsSFbdstvfVG
+2025-10-16T19:31:28.489341Z  INFO adding committee member 26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C/12D3KooWSN7p81RZ3HvyF5JhCoaQyTw6E9wExnzosS5HZ5ji46te
+2025-10-16T19:31:28.489649Z  INFO adding committee member 24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ/12D3KooWGxD3zjGtUQ1h58vamLtTUvSj1AoJvK1ydsSFbdstvfVG
+2025-10-16T19:31:28.489948Z  INFO adding committee member mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK/12D3KooWQPBt5rpTN3T5aJpLgS7BB9E2iuQ1xXUQfN38g2tMk77z
+2025-10-16T19:31:28.490244Z  INFO adding committee member stJFEW71tVG7k1yAjEqRsR6FoZxYVR68P6NBuZ5eEmkYWz1dqXvLQXRiMDYYN69WQCprxuuUwDh7kwJkYA3XUVbH48PgEYahtJyoNS6VMHCEhBBgYbihU69XZUEtDPj2okB/12D3KooWAJ3EGADh2sbbWwTfnXS4foz9UwRbsjPaygZwKX6bJu7Z
+2025-10-16T19:31:28.508994Z  INFO execute:launch_node: Loading configuration path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-2/network-config"
+2025-10-16T19:31:28.512469Z  INFO execute:launch_node: local_peer_id=12D3KooWSN7p81RZ3HvyF5JhCoaQyTw6E9wExnzosS5HZ5ji46te
+2025-10-16T19:31:28.512985Z  INFO Providing our record to kademlia for peer PeerId("12D3KooWSN7p81RZ3HvyF5JhCoaQyTw6E9wExnzosS5HZ5ji46te") record=Record { key: Key(b"\xb8\xc1\xe4\x9de\x99\x9f\xce/\x07+w\xf5!\xed% \x98\x8e\x1a\xa5\x95>\x07\x8d\xc7\x14\xec\x1f\xe4\xebi\xbc2r4\x15\xbf\xb0\xcd`\x1a\xdf\xcf\xc8\x92jj\0n>%`\xaf\xac\xec\x8e\x0fb\xfaZR2\xa6\x18\xf9O\x17\x1b#\xbf\xdd\x02{\x82\xa9\xb1\xb7\x13\x1e@\x917\xfe\x8c\xd8\xe8\x9b\x16m\x9b\xd5lB'\x81"), value: [36, 8, 1, 18, 32, 245, 221, 88, 70, 65, 134, 6, 52, 56, 48, 83, 113, 5, 92, 196, 175, 147, 32, 93, 196, 179, 206, 203, 149, 19, 167, 161, 44, 84, 87, 180, 175, 1, 52, 4, 127, 0, 0, 1, 145, 2, 199, 12, 205, 3, 165, 3, 38, 0, 36, 8, 1, 18, 32, 245, 221, 88, 70, 65, 134, 6, 52, 56, 48, 83, 113, 5, 92, 196, 175, 147, 32, 93, 196, 179, 206, 203, 149, 19, 167, 161, 44, 84, 87, 180, 175, 16, 72, 241, 104, 0, 0, 0, 0, 48, 132, 99, 65, 95, 100, 11, 112, 187, 90, 22, 52, 64, 48, 168, 113, 41, 250, 6, 224, 242, 127, 123, 204, 4, 67, 164, 87, 84, 32, 93, 241, 229, 65, 67, 46, 163, 165, 1, 176, 48, 69, 166, 237, 59, 40, 78, 243, 200], publisher: Some(PeerId("12D3KooWSN7p81RZ3HvyF5JhCoaQyTw6E9wExnzosS5HZ5ji46te")), expires: None }
+2025-10-16T19:31:28.513611Z  INFO execute:launch_node: Loading configuration path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-4/network-config"
+2025-10-16T19:31:28.513635Z  INFO execute:launch_node: local_peer_id=12D3KooWALnu8ZwipoJRs2QLp1VeS3HcfXT44Ciyu7SsRJ49iQvd
+2025-10-16T19:31:28.513993Z  INFO Providing our record to kademlia for peer PeerId("12D3KooWALnu8ZwipoJRs2QLp1VeS3HcfXT44Ciyu7SsRJ49iQvd") record=Record { key: Key(b"\xb8\xc1\xe4\x9de\x99\x9f\xce/\x07+w\xf5!\xed% \x98\x8e\x1a\xa5\x95>\x07\x8d\xc7\x14\xec\x1f\xe4\xebi\xbc2r4\x15\xbf\xb0\xcd`\x1a\xdf\xcf\xc8\x92jj\0n>%`\xaf\xac\xec\x8e\x0fb\xfaZR2\xa6\x18\xf9O\x17\x1b#\xbf\xdd\x02{\x82\xa9\xb1\xb7\x13\x1e@\x917\xfe\x8c\xd8\xe8\x9b\x16m\x9b\xd5lB'\x81"), value: [36, 8, 1, 18, 32, 7, 203, 99, 50, 67, 182, 140, 116, 57, 24, 170, 140, 6, 198, 206, 221, 98, 65, 172, 159, 76, 112, 239, 255, 105, 26, 195, 156, 70, 245, 142, 106, 1, 52, 4, 127, 0, 0, 1, 145, 2, 223, 223, 205, 3, 165, 3, 38, 0, 36, 8, 1, 18, 32, 7, 203, 99, 50, 67, 182, 140, 116, 57, 24, 170, 140, 6, 198, 206, 221, 98, 65, 172, 159, 76, 112, 239, 255, 105, 26, 195, 156, 70, 245, 142, 106, 16, 72, 241, 104, 0, 0, 0, 0, 48, 177, 154, 232, 145, 177, 151, 251, 46, 200, 33, 237, 112, 170, 203, 170, 24, 95, 174, 56, 215, 142, 110, 79, 129, 188, 167, 225, 167, 175, 133, 144, 194, 64, 114, 6, 23, 230, 21, 99, 137, 144, 179, 96, 8, 69, 95, 109, 7], publisher: Some(PeerId("12D3KooWALnu8ZwipoJRs2QLp1VeS3HcfXT44Ciyu7SsRJ49iQvd")), expires: None }
+2025-10-16T19:31:28.514473Z ERROR Failed to put record: QuorumFailed { key: Key(b"\xb8\xc1\xe4\x9de\x99\x9f\xce/\x07+w\xf5!\xed% \x98\x8e\x1a\xa5\x95>\x07\x8d\xc7\x14\xec\x1f\xe4\xebi\xbc2r4\x15\xbf\xb0\xcd`\x1a\xdf\xcf\xc8\x92jj\0n>%`\xaf\xac\xec\x8e\x0fb\xfaZR2\xa6\x18\xf9O\x17\x1b#\xbf\xdd\x02{\x82\xa9\xb1\xb7\x13\x1e@\x917\xfe\x8c\xd8\xe8\x9b\x16m\x9b\xd5lB'\x81"), success: [], quorum: 1 }
+2025-10-16T19:31:28.514499Z  INFO execute:launch_node: NODE TASKS
+ tasks=Node Task Manager
+Task: Epoch Record Collector (critical)
+Task: Worker Network (critical)
+Task: Primary Network (critical)
+++++++++++++++++++++++++++++++++++++++++++++++++++++
+Engine Task Manager
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+2025-10-16T19:31:28.514641Z  INFO execute:launch_node: Starting epoch
+2025-10-16T19:31:28.515066Z ERROR Failed to put record: QuorumFailed { key: Key(b"\xb8\xc1\xe4\x9de\x99\x9f\xce/\x07+w\xf5!\xed% \x98\x8e\x1a\xa5\x95>\x07\x8d\xc7\x14\xec\x1f\xe4\xebi\xbc2r4\x15\xbf\xb0\xcd`\x1a\xdf\xcf\xc8\x92jj\0n>%`\xaf\xac\xec\x8e\x0fb\xfaZR2\xa6\x18\xf9O\x17\x1b#\xbf\xdd\x02{\x82\xa9\xb1\xb7\x13\x1e@\x917\xfe\x8c\xd8\xe8\x9b\x16m\x9b\xd5lB'\x81"), success: [], quorum: 1 }
+2025-10-16T19:31:28.516525Z  INFO execute:launch_node: local_peer_id=12D3KooWQPBt5rpTN3T5aJpLgS7BB9E2iuQ1xXUQfN38g2tMk77z
+2025-10-16T19:31:28.516957Z  INFO Providing our record to kademlia for peer PeerId("12D3KooWQPBt5rpTN3T5aJpLgS7BB9E2iuQ1xXUQfN38g2tMk77z") record=Record { key: Key(b"\x81\r\n\xe9\xb5/\x01\x90(\x034\xe9-\x10\x13\xf5\xcb \x83\x05}\xa5\xee\x84\xb1\xa2@\x87\r\xb4H/\x85\x18\x0f\x0b\x9f\xcex<\x9a\xe1_,\x15fF\x84\x0c@\x0e\xb0n\xe9\xef\x02n\x9c\x1c\x14\xf3\x1a\x96V\x15#\x89\x04\xdf/\xee\n\xcd\x9dq\xe8i\xbe\xa9@\x9c\xed2\x98\x15\x89\xad,WT\xa5\xf9\x99\xfa\xa1\xf2"), value: [36, 8, 1, 18, 32, 216, 108, 38, 223, 168, 170, 199, 35, 166, 198, 134, 222, 191, 207, 191, 129, 234, 177, 52, 183, 252, 230, 103, 164, 100, 181, 222, 64, 178, 186, 184, 5, 1, 52, 4, 127, 0, 0, 1, 145, 2, 214, 199, 205, 3, 165, 3, 38, 0, 36, 8, 1, 18, 32, 216, 108, 38, 223, 168, 170, 199, 35, 166, 198, 134, 222, 191, 207, 191, 129, 234, 177, 52, 183, 252, 230, 103, 164, 100, 181, 222, 64, 178, 186, 184, 5, 16, 72, 241, 104, 0, 0, 0, 0, 48, 151, 188, 37, 199, 167, 117, 91, 234, 207, 226, 75, 24, 200, 16, 51, 134, 105, 78, 54, 172, 107, 227, 136, 31, 134, 191, 15, 51, 110, 126, 69, 29, 61, 174, 82, 145, 74, 233, 7, 200, 22, 7, 172, 8, 251, 128, 127, 241], publisher: Some(PeerId("12D3KooWQPBt5rpTN3T5aJpLgS7BB9E2iuQ1xXUQfN38g2tMk77z")), expires: None }
+2025-10-16T19:31:28.517293Z  INFO execute:launch_node: creating committee from state
+2025-10-16T19:31:28.517321Z  INFO execute:launch_node: Loading configuration path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-2/genesis/committee.yaml"
+2025-10-16T19:31:28.517635Z  INFO execute:launch_node: local_peer_id=12D3KooWB8BDt5vENyFthwJzPid1sECHJxxHPLA6uqwKSphT7pXq
+2025-10-16T19:31:28.518009Z  INFO Providing our record to kademlia for peer PeerId("12D3KooWB8BDt5vENyFthwJzPid1sECHJxxHPLA6uqwKSphT7pXq") record=Record { key: Key(b"\x81\r\n\xe9\xb5/\x01\x90(\x034\xe9-\x10\x13\xf5\xcb \x83\x05}\xa5\xee\x84\xb1\xa2@\x87\r\xb4H/\x85\x18\x0f\x0b\x9f\xcex<\x9a\xe1_,\x15fF\x84\x0c@\x0e\xb0n\xe9\xef\x02n\x9c\x1c\x14\xf3\x1a\x96V\x15#\x89\x04\xdf/\xee\n\xcd\x9dq\xe8i\xbe\xa9@\x9c\xed2\x98\x15\x89\xad,WT\xa5\xf9\x99\xfa\xa1\xf2"), value: [36, 8, 1, 18, 32, 19, 107, 195, 209, 6, 175, 164, 8, 135, 34, 248, 13, 179, 193, 175, 44, 111, 7, 80, 191, 102, 0, 163, 170, 28, 224, 155, 75, 114, 141, 140, 104, 1, 52, 4, 127, 0, 0, 1, 145, 2, 237, 2, 205, 3, 165, 3, 38, 0, 36, 8, 1, 18, 32, 19, 107, 195, 209, 6, 175, 164, 8, 135, 34, 248, 13, 179, 193, 175, 44, 111, 7, 80, 191, 102, 0, 163, 170, 28, 224, 155, 75, 114, 141, 140, 104, 16, 72, 241, 104, 0, 0, 0, 0, 48, 182, 255, 128, 212, 137, 114, 178, 150, 160, 3, 244, 253, 72, 222, 94, 29, 85, 194, 183, 16, 92, 240, 205, 58, 174, 146, 155, 12, 12, 245, 225, 249, 136, 102, 103, 69, 164, 145, 244, 37, 76, 4, 238, 103, 79, 235, 214, 121], publisher: Some(PeerId("12D3KooWB8BDt5vENyFthwJzPid1sECHJxxHPLA6uqwKSphT7pXq")), expires: None }
+2025-10-16T19:31:28.518091Z ERROR Failed to put record: QuorumFailed { key: Key(b"\x81\r\n\xe9\xb5/\x01\x90(\x034\xe9-\x10\x13\xf5\xcb \x83\x05}\xa5\xee\x84\xb1\xa2@\x87\r\xb4H/\x85\x18\x0f\x0b\x9f\xcex<\x9a\xe1_,\x15fF\x84\x0c@\x0e\xb0n\xe9\xef\x02n\x9c\x1c\x14\xf3\x1a\x96V\x15#\x89\x04\xdf/\xee\n\xcd\x9dq\xe8i\xbe\xa9@\x9c\xed2\x98\x15\x89\xad,WT\xa5\xf9\x99\xfa\xa1\xf2"), success: [], quorum: 1 }
+2025-10-16T19:31:28.518324Z  INFO execute:launch_node: NODE TASKS
+ tasks=Node Task Manager
+Task: Epoch Record Collector (critical)
+Task: Worker Network (critical)
+Task: Primary Network (critical)
+++++++++++++++++++++++++++++++++++++++++++++++++++++
+Engine Task Manager
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+2025-10-16T19:31:28.518361Z  INFO execute:launch_node: Starting epoch
+2025-10-16T19:31:28.519120Z ERROR Failed to put record: QuorumFailed { key: Key(b"\x81\r\n\xe9\xb5/\x01\x90(\x034\xe9-\x10\x13\xf5\xcb \x83\x05}\xa5\xee\x84\xb1\xa2@\x87\r\xb4H/\x85\x18\x0f\x0b\x9f\xcex<\x9a\xe1_,\x15fF\x84\x0c@\x0e\xb0n\xe9\xef\x02n\x9c\x1c\x14\xf3\x1a\x96V\x15#\x89\x04\xdf/\xee\n\xcd\x9dq\xe8i\xbe\xa9@\x9c\xed2\x98\x15\x89\xad,WT\xa5\xf9\x99\xfa\xa1\xf2"), success: [], quorum: 1 }
+2025-10-16T19:31:28.520796Z  INFO execute:launch_node: creating committee from state
+2025-10-16T19:31:28.520826Z  INFO execute:launch_node: Loading configuration path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-4/genesis/committee.yaml"
+2025-10-16T19:31:28.523649Z  INFO network update for next committee - ensuring no committee members are banned this_node=PeerId("12D3KooWSN7p81RZ3HvyF5JhCoaQyTw6E9wExnzosS5HZ5ji46te")
+2025-10-16T19:31:28.523673Z  INFO execute:launch_node: listening to /ip4/127.0.0.1/udp/50956/quic-v1/p2p/12D3KooWSN7p81RZ3HvyF5JhCoaQyTw6E9wExnzosS5HZ5ji46te primary_address=/ip4/127.0.0.1/udp/50956/quic-v1/p2p/12D3KooWSN7p81RZ3HvyF5JhCoaQyTw6E9wExnzosS5HZ5ji46te
+2025-10-16T19:31:28.523713Z  INFO adding committee member stJFEW71tVG7k1yAjEqRsR6FoZxYVR68P6NBuZ5eEmkYWz1dqXvLQXRiMDYYN69WQCprxuuUwDh7kwJkYA3XUVbH48PgEYahtJyoNS6VMHCEhBBgYbihU69XZUEtDPj2okB/12D3KooWAJ3EGADh2sbbWwTfnXS4foz9UwRbsjPaygZwKX6bJu7Z
+2025-10-16T19:31:28.523878Z  INFO adding committee member mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK/12D3KooWQPBt5rpTN3T5aJpLgS7BB9E2iuQ1xXUQfN38g2tMk77z
+2025-10-16T19:31:28.524079Z  INFO execute:launch_node: Loading configuration path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-3/network-config"
+2025-10-16T19:31:28.524039Z  INFO adding committee member 24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ/12D3KooWGxD3zjGtUQ1h58vamLtTUvSj1AoJvK1ydsSFbdstvfVG
+2025-10-16T19:31:28.524194Z  INFO adding committee member 26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C/12D3KooWSN7p81RZ3HvyF5JhCoaQyTw6E9wExnzosS5HZ5ji46te
+2025-10-16T19:31:28.525455Z  INFO execute:launch_node: Header number of batches threshold set to 5
+2025-10-16T19:31:28.525482Z  INFO execute:launch_node: Header max number of batches set to 10
+2025-10-16T19:31:28.525499Z  INFO execute:launch_node: Max header delay set to 1000 ms
+2025-10-16T19:31:28.525514Z  INFO execute:launch_node: Min header delay set to 500 ms
+2025-10-16T19:31:28.525529Z  INFO execute:launch_node: Garbage collection depth set to 50 rounds
+2025-10-16T19:31:28.525546Z  INFO execute:launch_node: Sync retry delay set to 5000 ms
+2025-10-16T19:31:28.525560Z  INFO execute:launch_node: Sync retry nodes set to 3 nodes
+2025-10-16T19:31:28.525576Z  INFO execute:launch_node: Max batch delay set to 1000 ms
+2025-10-16T19:31:28.525589Z  INFO execute:launch_node: Max concurrent requests set to 500000
+2025-10-16T19:31:28.525664Z  INFO execute:launch_node: Boot primary node with public key Some("26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C")
+2025-10-16T19:31:28.525783Z  INFO execute:launch_node: local_peer_id=12D3KooWAJ3EGADh2sbbWwTfnXS4foz9UwRbsjPaygZwKX6bJu7Z
+2025-10-16T19:31:28.526096Z  INFO execute:launch_node: Transaction pool initialized
+2025-10-16T19:31:28.526165Z  INFO Providing our record to kademlia for peer PeerId("12D3KooWAJ3EGADh2sbbWwTfnXS4foz9UwRbsjPaygZwKX6bJu7Z") record=Record { key: Key(b"\x93\xb7I\\\x8c\xdc\n\x11\xffA\xd8%\xb3\xa0\xbd\xb9\x10pRK\xbe\xb8\xd7p\xf2\xd9\xfc\x9b9Q{:\x0f\xf3\xdf\xf6\x91\xe4-\xad_\0O\xb0\xbc\x88\xfe\xfb\x15H#\xde\xa2\xd0}\x0b\0\xa8\xd3i\x9f\xbe\xc1u\xe5W\x18\x17]\xe4c#\xbc^g\x03\xde\r\x14\x03f\x9au\x06\t\x04I!\x9b\xd8\x846\xeb\xa4\xbeH"), value: [36, 8, 1, 18, 32, 7, 22, 217, 13, 146, 74, 239, 25, 155, 146, 11, 182, 128, 213, 31, 113, 105, 224, 120, 71, 20, 86, 7, 100, 1, 65, 136, 117, 113, 3, 12, 52, 1, 52, 4, 127, 0, 0, 1, 145, 2, 242, 113, 205, 3, 165, 3, 38, 0, 36, 8, 1, 18, 32, 7, 22, 217, 13, 146, 74, 239, 25, 155, 146, 11, 182, 128, 213, 31, 113, 105, 224, 120, 71, 20, 86, 7, 100, 1, 65, 136, 117, 113, 3, 12, 52, 16, 72, 241, 104, 0, 0, 0, 0, 48, 145, 126, 90, 243, 123, 210, 46, 230, 48, 227, 181, 224, 70, 175, 13, 138, 255, 234, 8, 149, 108, 139, 55, 247, 140, 89, 254, 243, 116, 233, 118, 150, 46, 117, 48, 135, 124, 204, 195, 205, 57, 180, 183, 132, 64, 27, 240, 212], publisher: Some(PeerId("12D3KooWAJ3EGADh2sbbWwTfnXS4foz9UwRbsjPaygZwKX6bJu7Z")), expires: None }
+2025-10-16T19:31:28.526754Z  INFO execute:launch_node: local_peer_id=12D3KooWQ7ES5uqT1R93hQ3iQXMs4ua4NaLDHDw8xc96A5Wsht8d
+2025-10-16T19:31:28.526891Z  INFO network update for next committee - ensuring no committee members are banned this_node=PeerId("12D3KooWQPBt5rpTN3T5aJpLgS7BB9E2iuQ1xXUQfN38g2tMk77z")
+2025-10-16T19:31:28.526923Z  INFO execute:launch_node: listening to /ip4/127.0.0.1/udp/54983/quic-v1/p2p/12D3KooWQPBt5rpTN3T5aJpLgS7BB9E2iuQ1xXUQfN38g2tMk77z primary_address=/ip4/127.0.0.1/udp/54983/quic-v1/p2p/12D3KooWQPBt5rpTN3T5aJpLgS7BB9E2iuQ1xXUQfN38g2tMk77z
+2025-10-16T19:31:28.526934Z  INFO adding committee member 26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C/12D3KooWSN7p81RZ3HvyF5JhCoaQyTw6E9wExnzosS5HZ5ji46te
+2025-10-16T19:31:28.527092Z  INFO Providing our record to kademlia for peer PeerId("12D3KooWQ7ES5uqT1R93hQ3iQXMs4ua4NaLDHDw8xc96A5Wsht8d") record=Record { key: Key(b"\x93\xb7I\\\x8c\xdc\n\x11\xffA\xd8%\xb3\xa0\xbd\xb9\x10pRK\xbe\xb8\xd7p\xf2\xd9\xfc\x9b9Q{:\x0f\xf3\xdf\xf6\x91\xe4-\xad_\0O\xb0\xbc\x88\xfe\xfb\x15H#\xde\xa2\xd0}\x0b\0\xa8\xd3i\x9f\xbe\xc1u\xe5W\x18\x17]\xe4c#\xbc^g\x03\xde\r\x14\x03f\x9au\x06\t\x04I!\x9b\xd8\x846\xeb\xa4\xbeH"), value: [36, 8, 1, 18, 32, 212, 85, 190, 129, 173, 142, 19, 192, 159, 100, 65, 1, 191, 173, 222, 142, 105, 18, 18, 195, 66, 219, 228, 96, 18, 238, 160, 141, 114, 43, 86, 230, 1, 52, 4, 127, 0, 0, 1, 145, 2, 197, 173, 205, 3, 165, 3, 38, 0, 36, 8, 1, 18, 32, 212, 85, 190, 129, 173, 142, 19, 192, 159, 100, 65, 1, 191, 173, 222, 142, 105, 18, 18, 195, 66, 219, 228, 96, 18, 238, 160, 141, 114, 43, 86, 230, 16, 72, 241, 104, 0, 0, 0, 0, 48, 153, 24, 152, 198, 22, 49, 9, 101, 119, 253, 112, 177, 186, 123, 52, 164, 32, 130, 14, 95, 238, 254, 64, 242, 228, 26, 60, 229, 144, 73, 21, 6, 96, 145, 34, 61, 33, 51, 251, 76, 43, 45, 108, 220, 14, 246, 175, 242], publisher: Some(PeerId("12D3KooWQ7ES5uqT1R93hQ3iQXMs4ua4NaLDHDw8xc96A5Wsht8d")), expires: None }
+2025-10-16T19:31:28.527089Z  INFO adding committee member 24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ/12D3KooWGxD3zjGtUQ1h58vamLtTUvSj1AoJvK1ydsSFbdstvfVG
+2025-10-16T19:31:28.527277Z  INFO execute:launch_node: tn rpc extension successfully merged
+2025-10-16T19:31:28.527242Z  INFO adding committee member stJFEW71tVG7k1yAjEqRsR6FoZxYVR68P6NBuZ5eEmkYWz1dqXvLQXRiMDYYN69WQCprxuuUwDh7kwJkYA3XUVbH48PgEYahtJyoNS6VMHCEhBBgYbihU69XZUEtDPj2okB/12D3KooWAJ3EGADh2sbbWwTfnXS4foz9UwRbsjPaygZwKX6bJu7Z
+2025-10-16T19:31:28.527397Z  INFO adding committee member mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK/12D3KooWQPBt5rpTN3T5aJpLgS7BB9E2iuQ1xXUQfN38g2tMk77z
+2025-10-16T19:31:28.527497Z ERROR Failed to put record: QuorumFailed { key: Key(b"\x93\xb7I\\\x8c\xdc\n\x11\xffA\xd8%\xb3\xa0\xbd\xb9\x10pRK\xbe\xb8\xd7p\xf2\xd9\xfc\x9b9Q{:\x0f\xf3\xdf\xf6\x91\xe4-\xad_\0O\xb0\xbc\x88\xfe\xfb\x15H#\xde\xa2\xd0}\x0b\0\xa8\xd3i\x9f\xbe\xc1u\xe5W\x18\x17]\xe4c#\xbc^g\x03\xde\r\x14\x03f\x9au\x06\t\x04I!\x9b\xd8\x846\xeb\xa4\xbeH"), success: [], quorum: 1 }
+2025-10-16T19:31:28.527545Z  INFO execute:launch_node: NODE TASKS
+ tasks=Node Task Manager
+Task: Epoch Record Collector (critical)
+Task: Worker Network (critical)
+Task: Primary Network (critical)
+++++++++++++++++++++++++++++++++++++++++++++++++++++
+Engine Task Manager
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+2025-10-16T19:31:28.527583Z  INFO execute:launch_node: Starting epoch
+2025-10-16T19:31:28.528021Z ERROR Failed to put record: QuorumFailed { key: Key(b"\x93\xb7I\\\x8c\xdc\n\x11\xffA\xd8%\xb3\xa0\xbd\xb9\x10pRK\xbe\xb8\xd7p\xf2\xd9\xfc\x9b9Q{:\x0f\xf3\xdf\xf6\x91\xe4-\xad_\0O\xb0\xbc\x88\xfe\xfb\x15H#\xde\xa2\xd0}\x0b\0\xa8\xd3i\x9f\xbe\xc1u\xe5W\x18\x17]\xe4c#\xbc^g\x03\xde\r\x14\x03f\x9au\x06\t\x04I!\x9b\xd8\x846\xeb\xa4\xbeH"), success: [], quorum: 1 }
+2025-10-16T19:31:28.528527Z  INFO network update for next committee - ensuring no committee members are banned this_node=PeerId("12D3KooWALnu8ZwipoJRs2QLp1VeS3HcfXT44Ciyu7SsRJ49iQvd")
+2025-10-16T19:31:28.528578Z  WARN unknown committee member with key 26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C
+2025-10-16T19:31:28.528709Z  WARN unknown committee member with key 24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ
+2025-10-16T19:31:28.528842Z  WARN unknown committee member with key mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK
+2025-10-16T19:31:28.528971Z  WARN unknown committee member with key stJFEW71tVG7k1yAjEqRsR6FoZxYVR68P6NBuZ5eEmkYWz1dqXvLQXRiMDYYN69WQCprxuuUwDh7kwJkYA3XUVbH48PgEYahtJyoNS6VMHCEhBBgYbihU69XZUEtDPj2okB
+2025-10-16T19:31:28.529660Z  INFO execute:launch_node: creating committee from state
+2025-10-16T19:31:28.529685Z  INFO execute:launch_node: Loading configuration path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-3/genesis/committee.yaml"
+2025-10-16T19:31:28.530791Z  INFO execute:launch_node: Boot worker node with id 0 key 26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C
+2025-10-16T19:31:28.530925Z  INFO execute:launch_node: Starting handler for transactions
+2025-10-16T19:31:28.530953Z  INFO execute:launch_node: Worker 0 successfully booted on /ip4/127.0.0.1/udp/57311/quic-v1/p2p/12D3KooWALnu8ZwipoJRs2QLp1VeS3HcfXT44Ciyu7SsRJ49iQvd
+2025-10-16T19:31:28.531109Z  INFO execute:launch_node:construct_dag_from_cert_store: Recreating dag from last GC round: 0
+2025-10-16T19:31:28.531138Z  INFO execute:launch_node:construct_dag_from_cert_store: Dag is restored and contains 0 certs for 0 rounds
+2025-10-16T19:31:28.531198Z  INFO execute:launch_node: Consensus subscriber successfully started
+2025-10-16T19:31:28.531211Z  INFO Starting subscriber: CVV
+2025-10-16T19:31:28.531414Z  INFO restoring last executed consensus for constucting the next ConsensusHeader: last_executed_block=ConsensusHeader { parent_hash: 0x0000000000000000000000000000000000000000000000000000000000000000, sub_dag: CommittedSubDag { certificates: [], leader: 4BYTgRpuXSyKguvm: C0(11111111111111111111111111111111, 4BYTgRpuXSyKguvm, E0), reputation_score: ReputationScores { scores_per_authority: {}, final_of_schedule: false }, commit_timestamp: 0 }, number: 0, extra: 0x0000000000000000000000000000000000000000000000000000000000000000 }
+2025-10-16T19:31:28.532785Z  INFO Certifier on node 5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj has started successfully.
+2025-10-16T19:31:28.532822Z  INFO Certifier on node 5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj has started successfully.
+2025-10-16T19:31:28.532830Z  INFO Starting proposer
+2025-10-16T19:31:28.532844Z  INFO StateHandler on node 5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj has started successfully.
+2025-10-16T19:31:28.532837Z  INFO execute:launch_node: Primary Some(5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj) successfully booted on /ip4/127.0.0.1/udp/50956/quic-v1/p2p/12D3KooWSN7p81RZ3HvyF5JhCoaQyTw6E9wExnzosS5HZ5ji46te
+2025-10-16T19:31:28.533111Z  INFO execute:launch_node: EPOCH TASKS
+ tasks=Epoch Task Manager
+Task: batch builder (critical)
+Task: worker network events (not critical)
+Task: DialPeer 24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ (not critical)
+Task: DialPeer stJFEW71tVG7k1yAjEqRsR6FoZxYVR68P6NBuZ5eEmkYWz1dqXvLQXRiMDYYN69WQCprxuuUwDh7kwJkYA3XUVbH48PgEYahtJyoNS6VMHCEhBBgYbihU69XZUEtDPj2okB (not critical)
+Task: DialPeer mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK (not critical)
+Task: Worker Network Peers (not critical)
+Task: primary network events (critical)
+Task: DialPeer 24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ (not critical)
+Task: DialPeer stJFEW71tVG7k1yAjEqRsR6FoZxYVR68P6NBuZ5eEmkYWz1dqXvLQXRiMDYYN69WQCprxuuUwDh7kwJkYA3XUVbH48PgEYahtJyoNS6VMHCEhBBgYbihU69XZUEtDPj2okB (not critical)
+Task: DialPeer mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK (not critical)
+Task: Worker Task - 0 batch-builder (critical)
+Task: state handler task (critical)
+Task: proposer task (critical)
+Task: certificate fetcher task (critical)
+Task: certifier task (critical)
+Task: broadcast certificates to 5Worq4rsJP9ozQVo4anZQYvTjBkEwSsNWkZ9MpiAKNEh (not critical)
+Task: broadcast certificates to EUzKUKnhhXBdZ5zBqHHHx7mZqcRCvT1buHAeXZALuPqP (not critical)
+Task: broadcast certificates to 3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3 (not critical)
+Task: certificate-manager (critical)
+Task: subscriber consensus (critical)
+Task: consensus (critical)
+Task: latest execution block (critical)
+
+2025-10-16T19:31:28.534281Z  WARN max delay interval expired for round 0 interval=1s
+2025-10-16T19:31:28.534918Z  INFO network update for next committee - ensuring no committee members are banned this_node=PeerId("12D3KooWAJ3EGADh2sbbWwTfnXS4foz9UwRbsjPaygZwKX6bJu7Z")
+2025-10-16T19:31:28.534933Z  INFO execute:launch_node: listening to /ip4/127.0.0.1/udp/62065/quic-v1/p2p/12D3KooWAJ3EGADh2sbbWwTfnXS4foz9UwRbsjPaygZwKX6bJu7Z primary_address=/ip4/127.0.0.1/udp/62065/quic-v1/p2p/12D3KooWAJ3EGADh2sbbWwTfnXS4foz9UwRbsjPaygZwKX6bJu7Z
+2025-10-16T19:31:28.534960Z  INFO adding committee member mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK/12D3KooWQPBt5rpTN3T5aJpLgS7BB9E2iuQ1xXUQfN38g2tMk77z
+2025-10-16T19:31:28.535104Z  INFO adding committee member stJFEW71tVG7k1yAjEqRsR6FoZxYVR68P6NBuZ5eEmkYWz1dqXvLQXRiMDYYN69WQCprxuuUwDh7kwJkYA3XUVbH48PgEYahtJyoNS6VMHCEhBBgYbihU69XZUEtDPj2okB/12D3KooWAJ3EGADh2sbbWwTfnXS4foz9UwRbsjPaygZwKX6bJu7Z
+2025-10-16T19:31:28.535262Z  INFO adding committee member 24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ/12D3KooWGxD3zjGtUQ1h58vamLtTUvSj1AoJvK1ydsSFbdstvfVG
+2025-10-16T19:31:28.535412Z  INFO adding committee member 26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C/12D3KooWSN7p81RZ3HvyF5JhCoaQyTw6E9wExnzosS5HZ5ji46te
+2025-10-16T19:31:28.536244Z  WARN failed to dial mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK: dial attempt timedout
+2025-10-16T19:31:28.536304Z  WARN failed to dial stJFEW71tVG7k1yAjEqRsR6FoZxYVR68P6NBuZ5eEmkYWz1dqXvLQXRiMDYYN69WQCprxuuUwDh7kwJkYA3XUVbH48PgEYahtJyoNS6VMHCEhBBgYbihU69XZUEtDPj2okB: dial attempt timedout
+2025-10-16T19:31:28.536323Z  WARN failed to dial 24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ: dial attempt timedout
+2025-10-16T19:31:28.548990Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/62065/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/50956/quic-v1 }
+2025-10-16T19:31:28.549098Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:28.550717Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/62065/quic-v1/p2p/12D3KooWAJ3EGADh2sbbWwTfnXS4foz9UwRbsjPaygZwKX6bJu7Z, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:31:28.550801Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:28.553627Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/54983/quic-v1/p2p/12D3KooWQPBt5rpTN3T5aJpLgS7BB9E2iuQ1xXUQfN38g2tMk77z, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:31:28.553798Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:28.554603Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/64218/quic-v1/p2p/12D3KooWGxD3zjGtUQ1h58vamLtTUvSj1AoJvK1ydsSFbdstvfVG, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:31:28.554678Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:28.555150Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/64218/quic-v1/p2p/12D3KooWGxD3zjGtUQ1h58vamLtTUvSj1AoJvK1ydsSFbdstvfVG, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:31:28.555241Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:28.556645Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/54983/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/50956/quic-v1 }
+2025-10-16T19:31:28.556720Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:28.557607Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/64218/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/54983/quic-v1 }
+2025-10-16T19:31:28.557703Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:28.557983Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/50956/quic-v1/p2p/12D3KooWSN7p81RZ3HvyF5JhCoaQyTw6E9wExnzosS5HZ5ji46te, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:31:28.558046Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:28.558762Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/54983/quic-v1/p2p/12D3KooWQPBt5rpTN3T5aJpLgS7BB9E2iuQ1xXUQfN38g2tMk77z, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:31:28.558832Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:28.558957Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/64218/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/50956/quic-v1 }
+2025-10-16T19:31:28.559036Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:28.559717Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/54983/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/62065/quic-v1 }
+2025-10-16T19:31:28.559791Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:28.560504Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/64218/quic-v1/p2p/12D3KooWGxD3zjGtUQ1h58vamLtTUvSj1AoJvK1ydsSFbdstvfVG, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:31:28.560576Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:28.561468Z  WARN failed to dial stJFEW71tVG7k1yAjEqRsR6FoZxYVR68P6NBuZ5eEmkYWz1dqXvLQXRiMDYYN69WQCprxuuUwDh7kwJkYA3XUVbH48PgEYahtJyoNS6VMHCEhBBgYbihU69XZUEtDPj2okB: dial attempt timedout
+2025-10-16T19:31:28.561954Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/64218/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/62065/quic-v1 }
+2025-10-16T19:31:28.562024Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:28.567293Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/50956/quic-v1/p2p/12D3KooWSN7p81RZ3HvyF5JhCoaQyTw6E9wExnzosS5HZ5ji46te, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:31:28.567352Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:28.579569Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/50956/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/54983/quic-v1 }
+2025-10-16T19:31:28.579631Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:28.581184Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/50956/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/62065/quic-v1 }
+2025-10-16T19:31:28.581247Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:28.994159Z  INFO execute:launch_node: Header number of batches threshold set to 5
+2025-10-16T19:31:28.994302Z  INFO execute:launch_node: Header max number of batches set to 10
+2025-10-16T19:31:28.994386Z  INFO execute:launch_node: Max header delay set to 1000 ms
+2025-10-16T19:31:28.994462Z  INFO execute:launch_node: Min header delay set to 500 ms
+2025-10-16T19:31:28.994535Z  INFO execute:launch_node: Garbage collection depth set to 50 rounds
+2025-10-16T19:31:28.994608Z  INFO execute:launch_node: Sync retry delay set to 5000 ms
+2025-10-16T19:31:28.994676Z  INFO execute:launch_node: Sync retry nodes set to 3 nodes
+2025-10-16T19:31:28.994745Z  INFO execute:launch_node: Max batch delay set to 1000 ms
+2025-10-16T19:31:28.994832Z  INFO execute:launch_node: Max concurrent requests set to 500000
+2025-10-16T19:31:28.995315Z  INFO execute:launch_node: Boot primary node with public key Some("24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ")
+2025-10-16T19:31:28.997166Z  INFO execute:launch_node: Transaction pool initialized
+2025-10-16T19:31:29.002166Z  INFO execute:launch_node: tn rpc extension successfully merged
+2025-10-16T19:31:29.007202Z  INFO network update for next committee - ensuring no committee members are banned this_node=PeerId("12D3KooWAX6JFCep5FgtXN6cnjU1nebq7cigAJChrCh1FjER5m38")
+2025-10-16T19:31:29.007415Z  WARN unknown committee member with key 24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ
+2025-10-16T19:31:29.007996Z  WARN unknown committee member with key stJFEW71tVG7k1yAjEqRsR6FoZxYVR68P6NBuZ5eEmkYWz1dqXvLQXRiMDYYN69WQCprxuuUwDh7kwJkYA3XUVbH48PgEYahtJyoNS6VMHCEhBBgYbihU69XZUEtDPj2okB
+2025-10-16T19:31:29.008567Z  WARN unknown committee member with key mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK
+2025-10-16T19:31:29.009112Z  WARN unknown committee member with key 26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C
+2025-10-16T19:31:29.015809Z  INFO execute:launch_node: Boot worker node with id 0 key 24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ
+2025-10-16T19:31:29.016213Z  INFO execute:launch_node: Starting handler for transactions
+2025-10-16T19:31:29.016287Z  INFO execute:launch_node: Worker 0 successfully booted on /ip4/127.0.0.1/udp/55400/quic-v1/p2p/12D3KooWAX6JFCep5FgtXN6cnjU1nebq7cigAJChrCh1FjER5m38
+2025-10-16T19:31:29.016883Z  INFO execute:launch_node:construct_dag_from_cert_store: Recreating dag from last GC round: 0
+2025-10-16T19:31:29.016960Z  INFO execute:launch_node:construct_dag_from_cert_store: Dag is restored and contains 0 certs for 0 rounds
+2025-10-16T19:31:29.017096Z  INFO execute:launch_node: Consensus subscriber successfully started
+2025-10-16T19:31:29.017167Z  INFO Starting subscriber: CVV
+2025-10-16T19:31:29.017887Z  INFO restoring last executed consensus for constucting the next ConsensusHeader: last_executed_block=ConsensusHeader { parent_hash: 0x0000000000000000000000000000000000000000000000000000000000000000, sub_dag: CommittedSubDag { certificates: [], leader: 4BYTgRpuXSyKguvm: C0(11111111111111111111111111111111, 4BYTgRpuXSyKguvm, E0), reputation_score: ReputationScores { scores_per_authority: {}, final_of_schedule: false }, commit_timestamp: 0 }, number: 0, extra: 0x0000000000000000000000000000000000000000000000000000000000000000 }
+2025-10-16T19:31:29.021890Z  INFO Certifier on node 5Worq4rsJP9ozQVo4anZQYvTjBkEwSsNWkZ9MpiAKNEh has started successfully.
+2025-10-16T19:31:29.021987Z  INFO Starting proposer
+2025-10-16T19:31:29.021969Z  INFO Certifier on node 5Worq4rsJP9ozQVo4anZQYvTjBkEwSsNWkZ9MpiAKNEh has started successfully.
+2025-10-16T19:31:29.022040Z  INFO StateHandler on node 5Worq4rsJP9ozQVo4anZQYvTjBkEwSsNWkZ9MpiAKNEh has started successfully.
+2025-10-16T19:31:29.022007Z  INFO execute:launch_node: Primary Some(5Worq4rsJP9ozQVo4anZQYvTjBkEwSsNWkZ9MpiAKNEh) successfully booted on /ip4/127.0.0.1/udp/64218/quic-v1/p2p/12D3KooWGxD3zjGtUQ1h58vamLtTUvSj1AoJvK1ydsSFbdstvfVG
+2025-10-16T19:31:29.022761Z  INFO execute:launch_node: EPOCH TASKS
+ tasks=Epoch Task Manager
+Task: batch builder (critical)
+Task: worker network events (not critical)
+Task: DialPeer 26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C (not critical)
+Task: DialPeer stJFEW71tVG7k1yAjEqRsR6FoZxYVR68P6NBuZ5eEmkYWz1dqXvLQXRiMDYYN69WQCprxuuUwDh7kwJkYA3XUVbH48PgEYahtJyoNS6VMHCEhBBgYbihU69XZUEtDPj2okB (not critical)
+Task: DialPeer mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK (not critical)
+Task: Worker Network Peers (not critical)
+Task: VoteRequest-7etZV6cScnx1J4mw (not critical)
+Task: primary network events (critical)
+Task: DialPeer 26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C (not critical)
+Task: DialPeer stJFEW71tVG7k1yAjEqRsR6FoZxYVR68P6NBuZ5eEmkYWz1dqXvLQXRiMDYYN69WQCprxuuUwDh7kwJkYA3XUVbH48PgEYahtJyoNS6VMHCEhBBgYbihU69XZUEtDPj2okB (not critical)
+Task: DialPeer mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK (not critical)
+Task: Worker Task - 0 batch-builder (critical)
+Task: state handler task (critical)
+Task: proposer task (critical)
+Task: certificate fetcher task (critical)
+Task: certifier task (critical)
+Task: broadcast certificates to 5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj (not critical)
+Task: broadcast certificates to EUzKUKnhhXBdZ5zBqHHHx7mZqcRCvT1buHAeXZALuPqP (not critical)
+Task: broadcast certificates to 3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3 (not critical)
+Task: certificate-manager (critical)
+Task: subscriber consensus (critical)
+Task: consensus (critical)
+Task: latest execution block (critical)
+
+2025-10-16T19:31:29.024014Z  WARN max delay interval expired for round 0 interval=1s
+2025-10-16T19:31:29.029616Z  INFO execute:launch_node: Header number of batches threshold set to 5
+2025-10-16T19:31:29.029667Z  INFO execute:launch_node: Header max number of batches set to 10
+2025-10-16T19:31:29.029694Z  INFO execute:launch_node: Max header delay set to 1000 ms
+2025-10-16T19:31:29.029719Z  INFO execute:launch_node: Min header delay set to 500 ms
+2025-10-16T19:31:29.029746Z  INFO execute:launch_node: Garbage collection depth set to 50 rounds
+2025-10-16T19:31:29.029771Z  INFO execute:launch_node: Sync retry delay set to 5000 ms
+2025-10-16T19:31:29.029796Z  INFO execute:launch_node: Sync retry nodes set to 3 nodes
+2025-10-16T19:31:29.029802Z  WARN Failed to trigger bootstrap: No known peers.
+2025-10-16T19:31:29.029821Z  INFO execute:launch_node: Max batch delay set to 1000 ms
+2025-10-16T19:31:29.029851Z  INFO execute:launch_node: Max concurrent requests set to 500000
+2025-10-16T19:31:29.029978Z  INFO execute:launch_node: Boot primary node with public key Some("mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK")
+2025-10-16T19:31:29.030846Z  INFO execute:launch_node: Transaction pool initialized
+2025-10-16T19:31:29.032811Z  INFO execute:launch_node: tn rpc extension successfully merged
+2025-10-16T19:31:29.034843Z  INFO network update for next committee - ensuring no committee members are banned this_node=PeerId("12D3KooWB8BDt5vENyFthwJzPid1sECHJxxHPLA6uqwKSphT7pXq")
+2025-10-16T19:31:29.034926Z  WARN unknown committee member with key stJFEW71tVG7k1yAjEqRsR6FoZxYVR68P6NBuZ5eEmkYWz1dqXvLQXRiMDYYN69WQCprxuuUwDh7kwJkYA3XUVbH48PgEYahtJyoNS6VMHCEhBBgYbihU69XZUEtDPj2okB
+2025-10-16T19:31:29.035115Z  WARN unknown committee member with key 26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C
+2025-10-16T19:31:29.035304Z  WARN unknown committee member with key mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK
+2025-10-16T19:31:29.035517Z  WARN unknown committee member with key 24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ
+2025-10-16T19:31:29.038132Z  INFO execute:launch_node: Boot worker node with id 0 key mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK
+2025-10-16T19:31:29.038342Z  INFO execute:launch_node: Starting handler for transactions
+2025-10-16T19:31:29.038389Z  INFO execute:launch_node: Worker 0 successfully booted on /ip4/127.0.0.1/udp/60674/quic-v1/p2p/12D3KooWB8BDt5vENyFthwJzPid1sECHJxxHPLA6uqwKSphT7pXq
+2025-10-16T19:31:29.038600Z  INFO execute:launch_node:construct_dag_from_cert_store: Recreating dag from last GC round: 0
+2025-10-16T19:31:29.038638Z  INFO execute:launch_node:construct_dag_from_cert_store: Dag is restored and contains 0 certs for 0 rounds
+2025-10-16T19:31:29.038741Z  INFO Starting subscriber: CVV
+2025-10-16T19:31:29.038746Z  INFO execute:launch_node: Consensus subscriber successfully started
+2025-10-16T19:31:29.038932Z  INFO restoring last executed consensus for constucting the next ConsensusHeader: last_executed_block=ConsensusHeader { parent_hash: 0x0000000000000000000000000000000000000000000000000000000000000000, sub_dag: CommittedSubDag { certificates: [], leader: 4BYTgRpuXSyKguvm: C0(11111111111111111111111111111111, 4BYTgRpuXSyKguvm, E0), reputation_score: ReputationScores { scores_per_authority: {}, final_of_schedule: false }, commit_timestamp: 0 }, number: 0, extra: 0x0000000000000000000000000000000000000000000000000000000000000000 }
+2025-10-16T19:31:29.041311Z  INFO Certifier on node 3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3 has started successfully.
+2025-10-16T19:31:29.041374Z  INFO Certifier on node 3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3 has started successfully.
+2025-10-16T19:31:29.041407Z  INFO Starting proposer
+2025-10-16T19:31:29.041403Z  INFO execute:launch_node: Primary Some(3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3) successfully booted on /ip4/127.0.0.1/udp/54983/quic-v1/p2p/12D3KooWQPBt5rpTN3T5aJpLgS7BB9E2iuQ1xXUQfN38g2tMk77z
+2025-10-16T19:31:29.041436Z  INFO StateHandler on node 3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3 has started successfully.
+2025-10-16T19:31:29.041869Z  INFO execute:launch_node: EPOCH TASKS
+ tasks=Epoch Task Manager
+Task: batch builder (critical)
+Task: worker network events (not critical)
+Task: DialPeer 26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C (not critical)
+Task: DialPeer 24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ (not critical)
+Task: DialPeer stJFEW71tVG7k1yAjEqRsR6FoZxYVR68P6NBuZ5eEmkYWz1dqXvLQXRiMDYYN69WQCprxuuUwDh7kwJkYA3XUVbH48PgEYahtJyoNS6VMHCEhBBgYbihU69XZUEtDPj2okB (not critical)
+Task: Worker Network Peers (not critical)
+Task: VoteRequest-AJYNyFbZVUkMKb68 (not critical)
+Task: VoteRequest-7etZV6cScnx1J4mw (not critical)
+Task: primary network events (critical)
+Task: DialPeer 26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C (not critical)
+Task: DialPeer 24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ (not critical)
+Task: DialPeer stJFEW71tVG7k1yAjEqRsR6FoZxYVR68P6NBuZ5eEmkYWz1dqXvLQXRiMDYYN69WQCprxuuUwDh7kwJkYA3XUVbH48PgEYahtJyoNS6VMHCEhBBgYbihU69XZUEtDPj2okB (not critical)
+Task: Worker Task - 0 batch-builder (critical)
+Task: state handler task (critical)
+Task: proposer task (critical)
+Task: certificate fetcher task (critical)
+Task: certifier task (critical)
+Task: broadcast certificates to 5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj (not critical)
+Task: broadcast certificates to 5Worq4rsJP9ozQVo4anZQYvTjBkEwSsNWkZ9MpiAKNEh (not critical)
+Task: broadcast certificates to EUzKUKnhhXBdZ5zBqHHHx7mZqcRCvT1buHAeXZALuPqP (not critical)
+Task: certificate-manager (critical)
+Task: subscriber consensus (critical)
+Task: consensus (critical)
+Task: latest execution block (critical)
+
+2025-10-16T19:31:29.042216Z  WARN max delay interval expired for round 0 interval=1s
+2025-10-16T19:31:29.044759Z  INFO execute:launch_node: Header number of batches threshold set to 5
+2025-10-16T19:31:29.044816Z  INFO execute:launch_node: Header max number of batches set to 10
+2025-10-16T19:31:29.044846Z  INFO execute:launch_node: Max header delay set to 1000 ms
+2025-10-16T19:31:29.045062Z  INFO execute:launch_node: Min header delay set to 500 ms
+2025-10-16T19:31:29.045103Z  INFO execute:launch_node: Garbage collection depth set to 50 rounds
+2025-10-16T19:31:29.045124Z  INFO execute:launch_node: Sync retry delay set to 5000 ms
+2025-10-16T19:31:29.045143Z  INFO execute:launch_node: Sync retry nodes set to 3 nodes
+2025-10-16T19:31:29.045162Z  INFO execute:launch_node: Max batch delay set to 1000 ms
+2025-10-16T19:31:29.045181Z  INFO execute:launch_node: Max concurrent requests set to 500000
+2025-10-16T19:31:29.045278Z  INFO execute:launch_node: Boot primary node with public key Some("stJFEW71tVG7k1yAjEqRsR6FoZxYVR68P6NBuZ5eEmkYWz1dqXvLQXRiMDYYN69WQCprxuuUwDh7kwJkYA3XUVbH48PgEYahtJyoNS6VMHCEhBBgYbihU69XZUEtDPj2okB")
+2025-10-16T19:31:29.046011Z  INFO execute:launch_node: Transaction pool initialized
+2025-10-16T19:31:29.047598Z  INFO execute:launch_node: tn rpc extension successfully merged
+2025-10-16T19:31:29.049545Z  INFO network update for next committee - ensuring no committee members are banned this_node=PeerId("12D3KooWQ7ES5uqT1R93hQ3iQXMs4ua4NaLDHDw8xc96A5Wsht8d")
+2025-10-16T19:31:29.049695Z  WARN unknown committee member with key mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK
+2025-10-16T19:31:29.050127Z  WARN unknown committee member with key 24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ
+2025-10-16T19:31:29.050445Z  WARN unknown committee member with key 26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C
+2025-10-16T19:31:29.050612Z  WARN unknown committee member with key stJFEW71tVG7k1yAjEqRsR6FoZxYVR68P6NBuZ5eEmkYWz1dqXvLQXRiMDYYN69WQCprxuuUwDh7kwJkYA3XUVbH48PgEYahtJyoNS6VMHCEhBBgYbihU69XZUEtDPj2okB
+2025-10-16T19:31:29.053716Z  INFO execute:launch_node: Boot worker node with id 0 key stJFEW71tVG7k1yAjEqRsR6FoZxYVR68P6NBuZ5eEmkYWz1dqXvLQXRiMDYYN69WQCprxuuUwDh7kwJkYA3XUVbH48PgEYahtJyoNS6VMHCEhBBgYbihU69XZUEtDPj2okB
+2025-10-16T19:31:29.053894Z  INFO execute:launch_node: Starting handler for transactions
+2025-10-16T19:31:29.053932Z  INFO execute:launch_node: Worker 0 successfully booted on /ip4/127.0.0.1/udp/50605/quic-v1/p2p/12D3KooWQ7ES5uqT1R93hQ3iQXMs4ua4NaLDHDw8xc96A5Wsht8d
+2025-10-16T19:31:29.054114Z  INFO execute:launch_node:construct_dag_from_cert_store: Recreating dag from last GC round: 0
+2025-10-16T19:31:29.054147Z  INFO execute:launch_node:construct_dag_from_cert_store: Dag is restored and contains 0 certs for 0 rounds
+2025-10-16T19:31:29.054202Z  INFO execute:launch_node: Consensus subscriber successfully started
+2025-10-16T19:31:29.054227Z  INFO Starting subscriber: CVV
+2025-10-16T19:31:29.054380Z  INFO restoring last executed consensus for constucting the next ConsensusHeader: last_executed_block=ConsensusHeader { parent_hash: 0x0000000000000000000000000000000000000000000000000000000000000000, sub_dag: CommittedSubDag { certificates: [], leader: 4BYTgRpuXSyKguvm: C0(11111111111111111111111111111111, 4BYTgRpuXSyKguvm, E0), reputation_score: ReputationScores { scores_per_authority: {}, final_of_schedule: false }, commit_timestamp: 0 }, number: 0, extra: 0x0000000000000000000000000000000000000000000000000000000000000000 }
+2025-10-16T19:31:29.056104Z  INFO Certifier on node EUzKUKnhhXBdZ5zBqHHHx7mZqcRCvT1buHAeXZALuPqP has started successfully.
+2025-10-16T19:31:29.056122Z  INFO execute:launch_node: Primary Some(EUzKUKnhhXBdZ5zBqHHHx7mZqcRCvT1buHAeXZALuPqP) successfully booted on /ip4/127.0.0.1/udp/62065/quic-v1/p2p/12D3KooWAJ3EGADh2sbbWwTfnXS4foz9UwRbsjPaygZwKX6bJu7Z
+2025-10-16T19:31:29.056192Z  INFO Starting proposer
+2025-10-16T19:31:29.056204Z  INFO StateHandler on node EUzKUKnhhXBdZ5zBqHHHx7mZqcRCvT1buHAeXZALuPqP has started successfully.
+2025-10-16T19:31:29.056145Z  INFO Certifier on node EUzKUKnhhXBdZ5zBqHHHx7mZqcRCvT1buHAeXZALuPqP has started successfully.
+2025-10-16T19:31:29.056486Z  INFO execute:launch_node: EPOCH TASKS
+ tasks=Epoch Task Manager
+Task: batch builder (critical)
+Task: worker network events (not critical)
+Task: DialPeer 26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C (not critical)
+Task: DialPeer 24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ (not critical)
+Task: DialPeer mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK (not critical)
+Task: VoteRequest-iJMr3gDkwwNBji5G (not critical)
+Task: sync header batches (not critical)
+Task: sync header batches (not critical)
+Task: sync header batches (not critical)
+Task: sync header batches (not critical)
+Task: sync header batches (not critical)
+Task: sync header batches (not critical)
+Task: ProcessGossip-tn-primary-26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C (not critical)
+Task: ProcessGossip-tn-primary-24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ (not critical)
+Task: ProcessGossip-tn-primary-26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C (not critical)
+Task: ProcessGossip-tn-primary-24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ (not critical)
+Task: ProcessGossip-tn-primary-26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C (not critical)
+Task: ProcessGossip-tn-primary-24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ (not critical)
+Task: VoteRequest-AJYNyFbZVUkMKb68 (not critical)
+Task: VoteRequest-7etZV6cScnx1J4mw (not critical)
+Task: Worker Network Peers (not critical)
+Task: primary network events (critical)
+Task: DialPeer 26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C (not critical)
+Task: DialPeer 24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ (not critical)
+Task: DialPeer mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK (not critical)
+Task: Worker Task - 0 batch-builder (critical)
+Task: state handler task (critical)
+Task: proposer task (critical)
+Task: certificate fetcher task (critical)
+Task: certifier task (critical)
+Task: broadcast certificates to 5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj (not critical)
+Task: broadcast certificates to 5Worq4rsJP9ozQVo4anZQYvTjBkEwSsNWkZ9MpiAKNEh (not critical)
+Task: broadcast certificates to 3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3 (not critical)
+Task: certificate-manager (critical)
+Task: subscriber consensus (critical)
+Task: consensus (critical)
+Task: latest execution block (critical)
+
+2025-10-16T19:31:29.057218Z  WARN max delay interval expired for round 0 interval=1s
+2025-10-16T19:31:29.058662Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/57311/quic-v1/p2p/12D3KooWALnu8ZwipoJRs2QLp1VeS3HcfXT44Ciyu7SsRJ49iQvd, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:31:29.058773Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:29.062425Z  WARN canceling Header proposal B1(EUzKUKnhhXBdZ5zBqHHHx7mZqcRCvT1buHAeXZALuPqP) for round 1 authority_id=EUzKUKnhhXBdZ5zBqHHHx7mZqcRCvT1buHAeXZALuPqP
+2025-10-16T19:31:29.065785Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/57311/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/55400/quic-v1 }
+2025-10-16T19:31:29.065880Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:29.072270Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/57311/quic-v1/p2p/12D3KooWALnu8ZwipoJRs2QLp1VeS3HcfXT44Ciyu7SsRJ49iQvd, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:31:29.072364Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:29.073002Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/55400/quic-v1/p2p/12D3KooWAX6JFCep5FgtXN6cnjU1nebq7cigAJChrCh1FjER5m38, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:31:29.073075Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:29.074643Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/55400/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/60674/quic-v1 }
+2025-10-16T19:31:29.074735Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:29.076645Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/60674/quic-v1/p2p/12D3KooWB8BDt5vENyFthwJzPid1sECHJxxHPLA6uqwKSphT7pXq, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:31:29.076723Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:29.078251Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/57311/quic-v1/p2p/12D3KooWALnu8ZwipoJRs2QLp1VeS3HcfXT44Ciyu7SsRJ49iQvd, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:31:29.078535Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:29.080086Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/60674/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/50605/quic-v1 }
+2025-10-16T19:31:29.080172Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:29.082115Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/57311/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/60674/quic-v1 }
+2025-10-16T19:31:29.084520Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:29.085298Z  WARN failed to dial 24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ: dial attempt timedout
+2025-10-16T19:31:29.086019Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/55400/quic-v1/p2p/12D3KooWAX6JFCep5FgtXN6cnjU1nebq7cigAJChrCh1FjER5m38, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:31:29.086220Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:29.086874Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/55400/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/50605/quic-v1 }
+2025-10-16T19:31:29.086948Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:29.087575Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/57311/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/50605/quic-v1 }
+2025-10-16T19:31:29.087644Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:29.538283Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/54983/quic-v1/p2p/12D3KooWQPBt5rpTN3T5aJpLgS7BB9E2iuQ1xXUQfN38g2tMk77z, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:31:29.538429Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:29.539665Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/54983/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/64218/quic-v1 }
+2025-10-16T19:31:29.539765Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:29.540524Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/62065/quic-v1/p2p/12D3KooWAJ3EGADh2sbbWwTfnXS4foz9UwRbsjPaygZwKX6bJu7Z, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:31:29.540627Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:29.541686Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/50956/quic-v1/p2p/12D3KooWSN7p81RZ3HvyF5JhCoaQyTw6E9wExnzosS5HZ5ji46te, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:31:29.541777Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:29.545843Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/50956/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/64218/quic-v1 }
+2025-10-16T19:31:29.545950Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:29.550015Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/62065/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/64218/quic-v1 }
+2025-10-16T19:31:29.550109Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:29.552452Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/60674/quic-v1/p2p/12D3KooWB8BDt5vENyFthwJzPid1sECHJxxHPLA6uqwKSphT7pXq, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:31:29.552544Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:29.553998Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/60674/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/57311/quic-v1 }
+2025-10-16T19:31:29.554050Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:29.555728Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/62065/quic-v1/p2p/12D3KooWAJ3EGADh2sbbWwTfnXS4foz9UwRbsjPaygZwKX6bJu7Z, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:31:29.555803Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:29.557819Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/55400/quic-v1/p2p/12D3KooWAX6JFCep5FgtXN6cnjU1nebq7cigAJChrCh1FjER5m38, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:31:29.557877Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:29.559210Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/50605/quic-v1/p2p/12D3KooWQ7ES5uqT1R93hQ3iQXMs4ua4NaLDHDw8xc96A5Wsht8d, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:31:29.559265Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:29.560607Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/50605/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/57311/quic-v1 }
+2025-10-16T19:31:29.560654Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:29.561645Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/62065/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/54983/quic-v1 }
+2025-10-16T19:31:29.561694Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:29.563845Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/55400/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/57311/quic-v1 }
+2025-10-16T19:31:29.563912Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:29.571047Z  WARN Repropose 0 batches in undelivered headers [1] at commit round 2, remaining headers 1
+2025-10-16T19:31:29.726147Z  INFO canonical head for epoch 0 round 2: 1 - 0x78fd901c78efe13e44e7d0ebeab625175df680083300dbb72b1d7e23973841f1
+2025-10-16T19:31:29.744603Z  INFO canonical head for epoch 0 round 2: 1 - 0x78fd901c78efe13e44e7d0ebeab625175df680083300dbb72b1d7e23973841f1
+2025-10-16T19:31:29.744837Z  INFO canonical head for epoch 0 round 2: 1 - 0x78fd901c78efe13e44e7d0ebeab625175df680083300dbb72b1d7e23973841f1
+2025-10-16T19:31:29.745021Z  INFO canonical head for epoch 0 round 2: 1 - 0x78fd901c78efe13e44e7d0ebeab625175df680083300dbb72b1d7e23973841f1
+2025-10-16T19:31:30.063083Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/60674/quic-v1/p2p/12D3KooWB8BDt5vENyFthwJzPid1sECHJxxHPLA6uqwKSphT7pXq, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:31:30.063237Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:30.064853Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/60674/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/55400/quic-v1 }
+2025-10-16T19:31:30.064952Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:30.067347Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/50605/quic-v1/p2p/12D3KooWQ7ES5uqT1R93hQ3iQXMs4ua4NaLDHDw8xc96A5Wsht8d, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:31:30.067464Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:30.073336Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/50605/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/55400/quic-v1 }
+2025-10-16T19:31:30.073435Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:30.074654Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/50605/quic-v1/p2p/12D3KooWQ7ES5uqT1R93hQ3iQXMs4ua4NaLDHDw8xc96A5Wsht8d, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:31:30.074722Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:30.083764Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/50605/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/60674/quic-v1 }
+2025-10-16T19:31:30.083843Z  INFO Publishing our record to kademlia
+2025-10-16T19:31:30.232506Z  INFO canonical head for epoch 0 round 4: 2 - 0x429bef200389ff5cf911ba3653ca8ba94ee232c6e4cf130ca04992c84dcf039f
+2025-10-16T19:31:30.242020Z  INFO canonical head for epoch 0 round 4: 2 - 0x429bef200389ff5cf911ba3653ca8ba94ee232c6e4cf130ca04992c84dcf039f
+2025-10-16T19:31:30.249281Z  INFO canonical head for epoch 0 round 4: 2 - 0x429bef200389ff5cf911ba3653ca8ba94ee232c6e4cf130ca04992c84dcf039f
+2025-10-16T19:31:30.250133Z  INFO canonical head for epoch 0 round 4: 2 - 0x429bef200389ff5cf911ba3653ca8ba94ee232c6e4cf130ca04992c84dcf039f
+2025-10-16T19:31:30.749556Z  INFO canonical head for epoch 0 round 6: 3 - 0xe13291d0de5b2ca0bd847c37bc3cd2893c38d57cf66eae4f009418d70b55599d
+2025-10-16T19:31:30.755556Z  INFO canonical head for epoch 0 round 6: 3 - 0xe13291d0de5b2ca0bd847c37bc3cd2893c38d57cf66eae4f009418d70b55599d
+2025-10-16T19:31:30.769554Z  INFO canonical head for epoch 0 round 6: 3 - 0xe13291d0de5b2ca0bd847c37bc3cd2893c38d57cf66eae4f009418d70b55599d
+2025-10-16T19:31:30.775478Z  INFO canonical head for epoch 0 round 6: 3 - 0xe13291d0de5b2ca0bd847c37bc3cd2893c38d57cf66eae4f009418d70b55599d
+2025-10-16T19:31:31.296043Z  INFO canonical head for epoch 0 round 8: 4 - 0x83a52b4b071e6c63a87617e36ed20eadb25ac08778aa2a5059f5524e71b18ef3
+2025-10-16T19:31:31.312362Z  INFO canonical head for epoch 0 round 8: 4 - 0x83a52b4b071e6c63a87617e36ed20eadb25ac08778aa2a5059f5524e71b18ef3
+2025-10-16T19:31:31.320583Z  INFO canonical head for epoch 0 round 8: 4 - 0x83a52b4b071e6c63a87617e36ed20eadb25ac08778aa2a5059f5524e71b18ef3
+2025-10-16T19:31:31.328450Z  INFO canonical head for epoch 0 round 8: 4 - 0x83a52b4b071e6c63a87617e36ed20eadb25ac08778aa2a5059f5524e71b18ef3
+2025-10-16T19:31:31.657233Z  WARN re-proposing last header after max delay interval expired for round 9 interval=1s
+2025-10-16T19:31:31.666747Z  WARN canceling Header proposal B9(5Worq4rsJP9ozQVo4anZQYvTjBkEwSsNWkZ9MpiAKNEh) for round 9 authority_id=5Worq4rsJP9ozQVo4anZQYvTjBkEwSsNWkZ9MpiAKNEh
+2025-10-16T19:31:32.311883Z  INFO canonical head for epoch 0 round 10: 5 - 0x681f65928fdc1df39903d77440c86e0dba77b5f37af54ac1bc8c3adfcc2c834d
+2025-10-16T19:31:32.318905Z  INFO canonical head for epoch 0 round 10: 5 - 0x681f65928fdc1df39903d77440c86e0dba77b5f37af54ac1bc8c3adfcc2c834d
+2025-10-16T19:31:32.335564Z  INFO canonical head for epoch 0 round 10: 5 - 0x681f65928fdc1df39903d77440c86e0dba77b5f37af54ac1bc8c3adfcc2c834d
+2025-10-16T19:31:32.341128Z  INFO canonical head for epoch 0 round 10: 5 - 0x681f65928fdc1df39903d77440c86e0dba77b5f37af54ac1bc8c3adfcc2c834d
+2025-10-16T19:31:32.846133Z  INFO canonical head for epoch 0 round 12: 6 - 0x543cfdbd30bb000cd2f9a146000879ceb1d0cae1a40313a9387b1bf253d29a10
+2025-10-16T19:31:32.856856Z  INFO canonical head for epoch 0 round 12: 6 - 0x543cfdbd30bb000cd2f9a146000879ceb1d0cae1a40313a9387b1bf253d29a10
+2025-10-16T19:31:32.868126Z  INFO canonical head for epoch 0 round 12: 6 - 0x543cfdbd30bb000cd2f9a146000879ceb1d0cae1a40313a9387b1bf253d29a10
+2025-10-16T19:31:32.873883Z  INFO canonical head for epoch 0 round 12: 6 - 0x543cfdbd30bb000cd2f9a146000879ceb1d0cae1a40313a9387b1bf253d29a10
+2025-10-16T19:31:33.404336Z  INFO canonical head for epoch 0 round 14: 7 - 0x286c4ba2897cac059e95e10b68e948ef49caf8760b0bda1cde264c718234e458
+2025-10-16T19:31:33.415460Z  INFO canonical head for epoch 0 round 14: 7 - 0x286c4ba2897cac059e95e10b68e948ef49caf8760b0bda1cde264c718234e458
+2025-10-16T19:31:33.422105Z  INFO canonical head for epoch 0 round 14: 7 - 0x286c4ba2897cac059e95e10b68e948ef49caf8760b0bda1cde264c718234e458
+2025-10-16T19:31:33.431762Z  INFO canonical head for epoch 0 round 14: 7 - 0x286c4ba2897cac059e95e10b68e948ef49caf8760b0bda1cde264c718234e458
+2025-10-16T19:31:33.921307Z  INFO canonical head for epoch 0 round 16: 8 - 0x43669d7c8d657a6b137ca03f7192eebd12f56012541e5037fd10bc12e0a76ad8
+2025-10-16T19:31:33.929014Z  INFO canonical head for epoch 0 round 16: 8 - 0x43669d7c8d657a6b137ca03f7192eebd12f56012541e5037fd10bc12e0a76ad8
+2025-10-16T19:31:33.940130Z  INFO canonical head for epoch 0 round 16: 8 - 0x43669d7c8d657a6b137ca03f7192eebd12f56012541e5037fd10bc12e0a76ad8
+2025-10-16T19:31:33.947591Z  INFO canonical head for epoch 0 round 16: 8 - 0x43669d7c8d657a6b137ca03f7192eebd12f56012541e5037fd10bc12e0a76ad8
+2025-10-16T19:31:34.328428Z  WARN Repropose 0 batches in undelivered headers [16] at commit round 18, remaining headers 1
+2025-10-16T19:31:34.539692Z  INFO canonical head for epoch 0 round 18: 9 - 0x8020eab39bb5862df5d4cb2c6c34e924cdf64d8116423d048a1726a236ea3aa8
+2025-10-16T19:31:34.539783Z  INFO canonical head for epoch 0 round 18: 9 - 0x8020eab39bb5862df5d4cb2c6c34e924cdf64d8116423d048a1726a236ea3aa8
+2025-10-16T19:31:34.547242Z  INFO canonical head for epoch 0 round 18: 9 - 0x8020eab39bb5862df5d4cb2c6c34e924cdf64d8116423d048a1726a236ea3aa8
+2025-10-16T19:31:34.547608Z  INFO canonical head for epoch 0 round 18: 9 - 0x8020eab39bb5862df5d4cb2c6c34e924cdf64d8116423d048a1726a236ea3aa8
+2025-10-16T19:31:34.983452Z  INFO canonical head for epoch 0 round 20: 10 - 0x64e7d23e5bd752307aaccf6e7c1892885f3da33dff1f4cee9fc6f685d9cfb5ee
+2025-10-16T19:31:34.989241Z  INFO canonical head for epoch 0 round 20: 10 - 0x64e7d23e5bd752307aaccf6e7c1892885f3da33dff1f4cee9fc6f685d9cfb5ee
+2025-10-16T19:31:35.003127Z  INFO canonical head for epoch 0 round 20: 10 - 0x64e7d23e5bd752307aaccf6e7c1892885f3da33dff1f4cee9fc6f685d9cfb5ee
+2025-10-16T19:31:35.013254Z  INFO canonical head for epoch 0 round 20: 10 - 0x64e7d23e5bd752307aaccf6e7c1892885f3da33dff1f4cee9fc6f685d9cfb5ee
+2025-10-16T19:31:35.267937Z  INFO execute:launch_node: Received SIGTERM
+2025-10-16T19:31:35.268142Z  INFO execute:launch_node: Node Task Manager: Node exiting
+2025-10-16T19:31:35.268295Z  INFO received shutdown signal...
+2025-10-16T19:31:35.268395Z  INFO TN Engine exited gracefully
+2025-10-16T19:31:35.268880Z  INFO received shutdown from consensus to stop updating consensus bus recent blocks
+2025-10-16T19:31:35.269088Z  INFO execute:launch_node: Epoch Task Manager: latest execution block returned Ok, node exiting
+2025-10-16T19:31:35.269382Z  INFO execute:launch_node: Node Task Manager: Epoch Record Collector shutdown successfully
+2025-10-16T19:31:35.269474Z  INFO execute:launch_node: Node Task Manager: Worker Network shutdown successfully
+2025-10-16T19:31:35.269559Z  INFO execute:launch_node: Epoch Task Manager: consensus shutdown successfully
+2025-10-16T19:31:35.269645Z  INFO execute:launch_node: Epoch Task Manager: subscriber consensus was cancelled
+2025-10-16T19:31:35.269729Z  INFO execute:launch_node: Epoch Task Manager: certifier task was cancelled
+2025-10-16T19:31:35.270975Z  INFO execute:launch_node: Epoch Task Manager: certificate-manager was cancelled
+2025-10-16T19:31:35.271074Z  INFO execute:launch_node: Epoch Task Manager: certificate fetcher task was cancelled
+2025-10-16T19:31:35.271138Z  INFO execute:launch_node: Epoch Task Manager: proposer task was cancelled
+2025-10-16T19:31:35.271199Z  INFO execute:launch_node: Epoch Task Manager: state handler task was cancelled
+2025-10-16T19:31:35.271260Z  INFO execute:launch_node: Epoch Task Manager: batch builder was cancelled
+2025-10-16T19:31:35.271318Z  INFO execute:launch_node: Epoch Task Manager: worker network events was cancelled
+2025-10-16T19:31:35.276343Z  INFO execute:launch_node: Epoch Task Manager: Worker Network Peers was cancelled
+2025-10-16T19:31:35.276428Z  INFO execute:launch_node: Epoch Task Manager: primary network events was cancelled
+2025-10-16T19:31:35.276496Z  INFO execute:launch_node: Epoch Task Manager: Worker Task - 0 batch-builder was cancelled
+2025-10-16T19:31:35.276568Z  INFO execute:launch_node: Epoch Task Manager: broadcast certificates to 5Worq4rsJP9ozQVo4anZQYvTjBkEwSsNWkZ9MpiAKNEh was cancelled
+2025-10-16T19:31:35.276639Z  INFO execute:launch_node: Epoch Task Manager: broadcast certificates to 5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj was cancelled
+2025-10-16T19:31:35.276710Z  INFO execute:launch_node: Epoch Task Manager: broadcast certificates to 3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3 was cancelled
+2025-10-16T19:31:35.276788Z  INFO execute:launch_node: Epoch Task Manager: All tasks shutdown
+2025-10-16T19:31:35.276856Z  INFO execute:launch_node: Epoch Task Manager: All tasks managers shutdown
+2025-10-16T19:31:35.277871Z  INFO execute:launch_node: looping run epoch
+2025-10-16T19:31:35.279248Z  INFO LayeredDatabase Dropping, shutting down DB thread
+2025-10-16T19:31:35.279327Z  INFO Layerd DB thread Shutdown complete
+2025-10-16T19:31:35.279444Z  INFO LayeredDatabase Dropped, DB thread is shutdown
+2025-10-16T19:31:35.279483Z  INFO MemDatabase Dropping, shutting down metrics thread
+2025-10-16T19:31:35.279531Z  INFO MDBX Dropping, shutting down metrics thread
+2025-10-16T19:31:35.279580Z  INFO Ending MDBX metrics thread
+2025-10-16T19:31:35.279575Z  INFO Ending MemDB metrics thread
+2025-10-16T19:31:35.994340Z  INFO canonical head for epoch 0 round 22: 11 - 0xfba44e0cbab105e190d5f8d445d4c837a7c9519d4f474dfe8df549139982102e
+2025-10-16T19:31:36.006153Z  INFO canonical head for epoch 0 round 22: 11 - 0xfba44e0cbab105e190d5f8d445d4c837a7c9519d4f474dfe8df549139982102e
+2025-10-16T19:31:36.013088Z  INFO canonical head for epoch 0 round 22: 11 - 0xfba44e0cbab105e190d5f8d445d4c837a7c9519d4f474dfe8df549139982102e
+2025-10-16T19:31:36.995506Z  INFO canonical head for epoch 0 round 24: 12 - 0x66f5a91c5fa1fae8a845acbd8368d04e8930d6fe7cc3e820a9e9290bb2946acb
+2025-10-16T19:31:37.003193Z  INFO canonical head for epoch 0 round 24: 12 - 0x66f5a91c5fa1fae8a845acbd8368d04e8930d6fe7cc3e820a9e9290bb2946acb
+2025-10-16T19:31:37.013853Z  INFO canonical head for epoch 0 round 24: 12 - 0x66f5a91c5fa1fae8a845acbd8368d04e8930d6fe7cc3e820a9e9290bb2946acb
+2025-10-16T19:31:38.365601Z  WARN max delay interval expired for round 26 interval=1s
+2025-10-16T19:31:38.366542Z  WARN max delay interval expired for round 26 interval=1s
+2025-10-16T19:31:38.833838Z  WARN max delay interval expired for round 26 interval=1s
+2025-10-16T19:31:39.387886Z  WARN re-proposing last header after max delay interval expired for round 29 interval=1s
+2025-10-16T19:31:39.403295Z  WARN canceling Header proposal B29(5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj) for round 29 authority_id=5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj
+2025-10-16T19:31:39.530343Z  INFO canonical head for epoch 0 round 28: 13 - 0x6f1257df18fa2c8f0d71ed51c0f874027f424f4d93c9f350d9c7e08f26bba5a4
+2025-10-16T19:31:39.543336Z  INFO canonical head for epoch 0 round 28: 13 - 0x6f1257df18fa2c8f0d71ed51c0f874027f424f4d93c9f350d9c7e08f26bba5a4
+2025-10-16T19:31:39.551942Z  INFO canonical head for epoch 0 round 28: 13 - 0x6f1257df18fa2c8f0d71ed51c0f874027f424f4d93c9f350d9c7e08f26bba5a4
+2025-10-16T19:31:40.043060Z  INFO canonical head for epoch 0 round 30: 14 - 0xe27d468097a9ed9c27c9ddde3ccecc16e6c235df908e18394a61411cfdfcfdf2
+2025-10-16T19:31:40.060070Z  INFO canonical head for epoch 0 round 30: 14 - 0xe27d468097a9ed9c27c9ddde3ccecc16e6c235df908e18394a61411cfdfcfdf2
+2025-10-16T19:31:40.066939Z  INFO canonical head for epoch 0 round 30: 14 - 0xe27d468097a9ed9c27c9ddde3ccecc16e6c235df908e18394a61411cfdfcfdf2
+2025-10-16T19:31:40.411510Z  WARN re-proposing last header after max delay interval expired for round 31 interval=1s
+2025-10-16T19:31:40.415491Z  WARN canceling Header proposal B31(5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj) for round 31 authority_id=5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj
+2025-10-16T19:31:41.059554Z  INFO canonical head for epoch 0 round 32: 15 - 0x3b8c32c237778e3d1f79ac9f19790e86535e90b33d34c71d78a6556dea11b545
+2025-10-16T19:31:41.070376Z  INFO canonical head for epoch 0 round 32: 15 - 0x3b8c32c237778e3d1f79ac9f19790e86535e90b33d34c71d78a6556dea11b545
+2025-10-16T19:31:41.077457Z  INFO canonical head for epoch 0 round 32: 15 - 0x3b8c32c237778e3d1f79ac9f19790e86535e90b33d34c71d78a6556dea11b545
+2025-10-16T19:31:41.941672Z  WARN re-proposing last header after max delay interval expired for round 35 interval=1s
+2025-10-16T19:31:42.080663Z  INFO canonical head for epoch 0 round 34: 16 - 0x20d262ce569aad9919726bc43ad98b7410400707100f6e88c16941952aef5abe
+2025-10-16T19:31:42.097338Z  INFO canonical head for epoch 0 round 34: 16 - 0x20d262ce569aad9919726bc43ad98b7410400707100f6e88c16941952aef5abe
+2025-10-16T19:31:42.105038Z  INFO canonical head for epoch 0 round 34: 16 - 0x20d262ce569aad9919726bc43ad98b7410400707100f6e88c16941952aef5abe
+2025-10-16T19:31:42.586677Z  INFO canonical head for epoch 0 round 36: 17 - 0x362fd20aee0c0c31562eba4c0ee5c89e35a48862faceca34b148be479922321a
+2025-10-16T19:31:42.603865Z  INFO canonical head for epoch 0 round 36: 17 - 0x362fd20aee0c0c31562eba4c0ee5c89e35a48862faceca34b148be479922321a
+2025-10-16T19:31:42.616484Z  INFO canonical head for epoch 0 round 36: 17 - 0x362fd20aee0c0c31562eba4c0ee5c89e35a48862faceca34b148be479922321a
+2025-10-16T19:31:43.618939Z  INFO canonical head for epoch 0 round 38: 18 - 0xaa1b067cd96ffb044678ce7044ce9f645ead847c208ee35df42d15fa64f9468a
+2025-10-16T19:31:43.625816Z  INFO canonical head for epoch 0 round 38: 18 - 0xaa1b067cd96ffb044678ce7044ce9f645ead847c208ee35df42d15fa64f9468a
+2025-10-16T19:31:43.639289Z  INFO canonical head for epoch 0 round 38: 18 - 0xaa1b067cd96ffb044678ce7044ce9f645ead847c208ee35df42d15fa64f9468a
+2025-10-16T19:31:44.635691Z  INFO canonical head for epoch 0 round 40: 19 - 0x09553d237811549787a4a447460ffd62016b097e4a664cfeff26d151f76001d1
+2025-10-16T19:31:44.643743Z  INFO canonical head for epoch 0 round 40: 19 - 0x09553d237811549787a4a447460ffd62016b097e4a664cfeff26d151f76001d1
+2025-10-16T19:31:44.651081Z  INFO canonical head for epoch 0 round 40: 19 - 0x09553d237811549787a4a447460ffd62016b097e4a664cfeff26d151f76001d1
+2025-10-16T19:31:45.127487Z  INFO canonical head for epoch 0 round 42: 20 - 0x884dbfa0e5f4a9d13f6a574554ca8e1d6d760677bc2649ca9b70c7b6b909240e
+2025-10-16T19:31:45.141434Z  INFO canonical head for epoch 0 round 42: 20 - 0x884dbfa0e5f4a9d13f6a574554ca8e1d6d760677bc2649ca9b70c7b6b909240e
+2025-10-16T19:31:45.149156Z  INFO canonical head for epoch 0 round 42: 20 - 0x884dbfa0e5f4a9d13f6a574554ca8e1d6d760677bc2649ca9b70c7b6b909240e
+2025-10-16T19:31:46.035507Z  WARN re-proposing last header after max delay interval expired for round 45 interval=1s
+2025-10-16T19:31:46.172372Z  INFO canonical head for epoch 0 round 44: 21 - 0x70342c7864e68cbf7a99f43051b331add0aa0332714402461f8a3d1d8cf875c3
+2025-10-16T19:31:46.183672Z  INFO canonical head for epoch 0 round 44: 21 - 0x70342c7864e68cbf7a99f43051b331add0aa0332714402461f8a3d1d8cf875c3
+2025-10-16T19:31:46.192192Z  INFO canonical head for epoch 0 round 44: 21 - 0x70342c7864e68cbf7a99f43051b331add0aa0332714402461f8a3d1d8cf875c3
+2025-10-16T19:31:47.052361Z  WARN re-proposing last header after max delay interval expired for round 47 interval=1s
+2025-10-16T19:31:47.058261Z  WARN canceling Header proposal B47(3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3) for round 47 authority_id=3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3
+2025-10-16T19:31:47.180882Z  INFO canonical head for epoch 0 round 46: 22 - 0x4fa92edbf5579f275800b7ce7559e9b9df19767749b7b8b5d60ffcd21fd759e5
+2025-10-16T19:31:47.193275Z  INFO canonical head for epoch 0 round 46: 22 - 0x4fa92edbf5579f275800b7ce7559e9b9df19767749b7b8b5d60ffcd21fd759e5
+2025-10-16T19:31:47.201561Z  INFO canonical head for epoch 0 round 46: 22 - 0x4fa92edbf5579f275800b7ce7559e9b9df19767749b7b8b5d60ffcd21fd759e5
+2025-10-16T19:31:48.061158Z  WARN re-proposing last header after max delay interval expired for round 49 interval=1s
+2025-10-16T19:31:48.068042Z  WARN canceling Header proposal B49(3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3) for round 49 authority_id=3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3
+2025-10-16T19:31:48.169073Z  INFO canonical head for epoch 0 round 48: 23 - 0xef21696d001cdcb97e6c39789176ede92665b860b59fc08898dea23414aab54f
+2025-10-16T19:31:48.184867Z  INFO canonical head for epoch 0 round 48: 23 - 0xef21696d001cdcb97e6c39789176ede92665b860b59fc08898dea23414aab54f
+2025-10-16T19:31:48.193053Z  INFO canonical head for epoch 0 round 48: 23 - 0xef21696d001cdcb97e6c39789176ede92665b860b59fc08898dea23414aab54f
+2025-10-16T19:31:48.708827Z  INFO canonical head for epoch 0 round 50: 24 - 0x0c7363c18cd93dcbdf061aa803c6f0db04c4775cfb694e425419abaf54f23f51
+2025-10-16T19:31:48.716405Z  INFO canonical head for epoch 0 round 50: 24 - 0x0c7363c18cd93dcbdf061aa803c6f0db04c4775cfb694e425419abaf54f23f51
+2025-10-16T19:31:48.722238Z  INFO canonical head for epoch 0 round 50: 24 - 0x0c7363c18cd93dcbdf061aa803c6f0db04c4775cfb694e425419abaf54f23f51
+2025-10-16T19:31:49.709822Z  INFO canonical head for epoch 0 round 52: 25 - 0xd3d7a4a0134113fe2b651c8919ed68b7b5c17546f8c1db212d8b327186548692
+2025-10-16T19:31:49.721524Z  INFO canonical head for epoch 0 round 52: 25 - 0xd3d7a4a0134113fe2b651c8919ed68b7b5c17546f8c1db212d8b327186548692
+2025-10-16T19:31:49.727460Z  INFO canonical head for epoch 0 round 52: 25 - 0xd3d7a4a0134113fe2b651c8919ed68b7b5c17546f8c1db212d8b327186548692
+2025-10-16T19:31:50.079895Z  WARN re-proposing last header after max delay interval expired for round 53 interval=1s
+2025-10-16T19:31:50.082379Z  WARN canceling Header proposal B53(3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3) for round 53 authority_id=3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3
+2025-10-16T19:31:50.716863Z  INFO canonical head for epoch 0 round 54: 26 - 0xf26967bfe76f0dcd2d7d8a7fef97054026ac3f0680f0fe9d336070810b18b280
+2025-10-16T19:31:50.724457Z  INFO canonical head for epoch 0 round 54: 26 - 0xf26967bfe76f0dcd2d7d8a7fef97054026ac3f0680f0fe9d336070810b18b280
+2025-10-16T19:31:50.730567Z  INFO canonical head for epoch 0 round 54: 26 - 0xf26967bfe76f0dcd2d7d8a7fef97054026ac3f0680f0fe9d336070810b18b280
+2025-10-16T19:31:51.091947Z  WARN re-proposing last header after max delay interval expired for round 55 interval=1s
+2025-10-16T19:31:51.094485Z  WARN canceling Header proposal B55(3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3) for round 55 authority_id=3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3
+2025-10-16T19:31:51.722563Z  INFO canonical head for epoch 0 round 56: 27 - 0x4b6e23a8d5c0f8f75d95cabbafda3e4ab4f5960aa9dbe8ab352b1bea61545973
+2025-10-16T19:31:51.738241Z  INFO canonical head for epoch 0 round 56: 27 - 0x4b6e23a8d5c0f8f75d95cabbafda3e4ab4f5960aa9dbe8ab352b1bea61545973
+2025-10-16T19:31:51.744250Z  INFO canonical head for epoch 0 round 56: 27 - 0x4b6e23a8d5c0f8f75d95cabbafda3e4ab4f5960aa9dbe8ab352b1bea61545973
+2025-10-16T19:31:52.752799Z  INFO canonical head for epoch 0 round 58: 28 - 0x78ffaaa5c7b87b77b68a7044e460cc9e3af10f6e6b4594be6adb4f8a0e80e7ea
+2025-10-16T19:31:52.764617Z  INFO canonical head for epoch 0 round 58: 28 - 0x78ffaaa5c7b87b77b68a7044e460cc9e3af10f6e6b4594be6adb4f8a0e80e7ea
+2025-10-16T19:31:52.772100Z  INFO canonical head for epoch 0 round 58: 28 - 0x78ffaaa5c7b87b77b68a7044e460cc9e3af10f6e6b4594be6adb4f8a0e80e7ea
+2025-10-16T19:31:53.748578Z  INFO canonical head for epoch 0 round 60: 29 - 0x43a6dda4879673b953ba399141d1a802c6f4746ff9c59f8168de6baca3765f52
+2025-10-16T19:31:53.765690Z  INFO canonical head for epoch 0 round 60: 29 - 0x43a6dda4879673b953ba399141d1a802c6f4746ff9c59f8168de6baca3765f52
+2025-10-16T19:31:53.773083Z  INFO canonical head for epoch 0 round 60: 29 - 0x43a6dda4879673b953ba399141d1a802c6f4746ff9c59f8168de6baca3765f52
+2025-10-16T19:31:54.280551Z  INFO canonical head for epoch 0 round 62: 30 - 0x226bcf928037496416e4eb63fe6a02811fa36e7775787302a4ea598d25e4c6ec
+2025-10-16T19:31:54.291601Z  INFO canonical head for epoch 0 round 62: 30 - 0x226bcf928037496416e4eb63fe6a02811fa36e7775787302a4ea598d25e4c6ec
+2025-10-16T19:31:54.300588Z  INFO canonical head for epoch 0 round 62: 30 - 0x226bcf928037496416e4eb63fe6a02811fa36e7775787302a4ea598d25e4c6ec
+2025-10-16T19:31:55.654262Z  WARN max delay interval expired for round 64 interval=1s
+2025-10-16T19:31:55.655469Z  WARN max delay interval expired for round 64 interval=1s
+2025-10-16T19:31:56.125373Z  WARN max delay interval expired for round 64 interval=1s
+2025-10-16T19:31:56.680759Z  WARN re-proposing last header after max delay interval expired for round 67 interval=1s
+2025-10-16T19:31:56.833848Z  INFO canonical head for epoch 0 round 66: 31 - 0xa51a33fd38e2df9f2e07b17e53c185ec8dee1e17b6376e07725edc3ee3dc7c07
+2025-10-16T19:31:56.842175Z  INFO canonical head for epoch 0 round 66: 31 - 0xa51a33fd38e2df9f2e07b17e53c185ec8dee1e17b6376e07725edc3ee3dc7c07
+2025-10-16T19:31:56.850822Z  INFO canonical head for epoch 0 round 66: 31 - 0xa51a33fd38e2df9f2e07b17e53c185ec8dee1e17b6376e07725edc3ee3dc7c07
+2025-10-16T19:31:57.821887Z  INFO canonical head for epoch 0 round 68: 32 - 0x783c252f18e88bd491b9b02cdfabd59526da6b0dab0705b9c9b6db1b1f68179e
+2025-10-16T19:31:57.829760Z  INFO canonical head for epoch 0 round 68: 32 - 0x783c252f18e88bd491b9b02cdfabd59526da6b0dab0705b9c9b6db1b1f68179e
+2025-10-16T19:31:57.837688Z  INFO canonical head for epoch 0 round 68: 32 - 0x783c252f18e88bd491b9b02cdfabd59526da6b0dab0705b9c9b6db1b1f68179e
+2025-10-16T19:31:58.324542Z  INFO canonical head for epoch 0 round 70: 33 - 0x16163dbffeca89a7a5e28f6a5bc9c93a4f7944be5f81a61528a3f552acce9877
+2025-10-16T19:31:58.338595Z  INFO canonical head for epoch 0 round 70: 33 - 0x16163dbffeca89a7a5e28f6a5bc9c93a4f7944be5f81a61528a3f552acce9877
+2025-10-16T19:31:58.344338Z  INFO canonical head for epoch 0 round 70: 33 - 0x16163dbffeca89a7a5e28f6a5bc9c93a4f7944be5f81a61528a3f552acce9877
+2025-10-16T19:31:58.876340Z  INFO canonical head for epoch 0 round 72: 34 - 0xd7c0a2edd9136d783cda2f7b35acdef547efbd407f3cd901c9701bb21e9761fc
+2025-10-16T19:31:58.886309Z  INFO canonical head for epoch 0 round 72: 34 - 0xd7c0a2edd9136d783cda2f7b35acdef547efbd407f3cd901c9701bb21e9761fc
+2025-10-16T19:31:58.893341Z  INFO canonical head for epoch 0 round 72: 34 - 0xd7c0a2edd9136d783cda2f7b35acdef547efbd407f3cd901c9701bb21e9761fc
+2025-10-16T19:31:59.913400Z  INFO canonical head for epoch 0 round 74: 35 - 0xd4bdd4c6db5f33703824b1818d23d01a25ee380df87cd9d2206078d030faf63c
+2025-10-16T19:31:59.921484Z  INFO canonical head for epoch 0 round 74: 35 - 0xd4bdd4c6db5f33703824b1818d23d01a25ee380df87cd9d2206078d030faf63c
+2025-10-16T19:31:59.927839Z  INFO canonical head for epoch 0 round 74: 35 - 0xd4bdd4c6db5f33703824b1818d23d01a25ee380df87cd9d2206078d030faf63c
+2025-10-16T19:32:00.406110Z  INFO canonical head for epoch 0 round 76: 36 - 0x617aa9fcc38ac7e1fc1d33e489a73600b984a7bc98d27c6cfdead7479e37c723
+2025-10-16T19:32:00.413946Z  INFO canonical head for epoch 0 round 76: 36 - 0x617aa9fcc38ac7e1fc1d33e489a73600b984a7bc98d27c6cfdead7479e37c723
+2025-10-16T19:32:00.423765Z  INFO canonical head for epoch 0 round 76: 36 - 0x617aa9fcc38ac7e1fc1d33e489a73600b984a7bc98d27c6cfdead7479e37c723
+2025-10-16T19:32:01.798923Z  WARN max delay interval expired for round 78 interval=1s
+2025-10-16T19:32:01.798990Z  WARN max delay interval expired for round 78 interval=1s
+2025-10-16T19:32:02.268451Z  WARN max delay interval expired for round 78 interval=1s
+2025-10-16T19:32:02.303196Z  WARN re-proposing last header after max delay interval expired for round 79 interval=1s
+2025-10-16T19:32:02.305434Z  WARN canceling Header proposal B79(3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3) for round 79 authority_id=3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3
+2025-10-16T19:32:02.822218Z  WARN re-proposing last header after max delay interval expired for round 81 interval=1s
+2025-10-16T19:32:02.831957Z  WARN canceling Header proposal B81(5Worq4rsJP9ozQVo4anZQYvTjBkEwSsNWkZ9MpiAKNEh) for round 81 authority_id=5Worq4rsJP9ozQVo4anZQYvTjBkEwSsNWkZ9MpiAKNEh
+2025-10-16T19:32:02.947170Z  INFO canonical head for epoch 0 round 80: 37 - 0xbba55856327241510059505aed3f59553e9a1f553d5bb10b26a9f1546682f529
+2025-10-16T19:32:02.954900Z  INFO canonical head for epoch 0 round 80: 37 - 0xbba55856327241510059505aed3f59553e9a1f553d5bb10b26a9f1546682f529
+2025-10-16T19:32:02.968191Z  INFO canonical head for epoch 0 round 80: 37 - 0xbba55856327241510059505aed3f59553e9a1f553d5bb10b26a9f1546682f529
+2025-10-16T19:32:03.454218Z  INFO canonical head for epoch 0 round 82: 38 - 0x0a9776903be2206957c666a8388abba0865924643a1d21bb61dc7c6e0e378e57
+2025-10-16T19:32:03.464499Z  INFO canonical head for epoch 0 round 82: 38 - 0x0a9776903be2206957c666a8388abba0865924643a1d21bb61dc7c6e0e378e57
+2025-10-16T19:32:03.470219Z  INFO canonical head for epoch 0 round 82: 38 - 0x0a9776903be2206957c666a8388abba0865924643a1d21bb61dc7c6e0e378e57
+2025-10-16T19:32:04.839801Z  WARN max delay interval expired for round 84 interval=1s
+2025-10-16T19:32:04.842144Z  WARN max delay interval expired for round 84 interval=1s
+2025-10-16T19:32:05.309055Z  WARN max delay interval expired for round 84 interval=1s
+2025-10-16T19:32:06.005533Z  INFO canonical head for epoch 0 round 86: 39 - 0x046950f71098ea5d0644dad52c61a8561bfa1293b6ada4061318107778b5a0fa
+2025-10-16T19:32:06.016551Z  INFO canonical head for epoch 0 round 86: 39 - 0x046950f71098ea5d0644dad52c61a8561bfa1293b6ada4061318107778b5a0fa
+2025-10-16T19:32:06.022666Z  INFO canonical head for epoch 0 round 86: 39 - 0x046950f71098ea5d0644dad52c61a8561bfa1293b6ada4061318107778b5a0fa
+2025-10-16T19:32:06.525948Z  INFO canonical head for epoch 0 round 88: 40 - 0x1ba22414ce34ecd8536b311c94e7d7f1228288a45cdbb13fa5eb219a9454326d
+2025-10-16T19:32:06.541726Z  INFO canonical head for epoch 0 round 88: 40 - 0x1ba22414ce34ecd8536b311c94e7d7f1228288a45cdbb13fa5eb219a9454326d
+2025-10-16T19:32:06.548734Z  INFO canonical head for epoch 0 round 88: 40 - 0x1ba22414ce34ecd8536b311c94e7d7f1228288a45cdbb13fa5eb219a9454326d
+2025-10-16T19:32:07.528252Z  INFO canonical head for epoch 0 round 90: 41 - 0x6dd0feff27ec9bb6ff4b15ac67ea6bb527c9fe25b7b1138c921f5e18d9cf20fd
+2025-10-16T19:32:07.533962Z  INFO canonical head for epoch 0 round 90: 41 - 0x6dd0feff27ec9bb6ff4b15ac67ea6bb527c9fe25b7b1138c921f5e18d9cf20fd
+2025-10-16T19:32:07.539958Z  INFO canonical head for epoch 0 round 90: 41 - 0x6dd0feff27ec9bb6ff4b15ac67ea6bb527c9fe25b7b1138c921f5e18d9cf20fd
+2025-10-16T19:32:07.898810Z  WARN re-proposing last header after max delay interval expired for round 91 interval=1s
+2025-10-16T19:32:07.907855Z  WARN canceling Header proposal B91(3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3) for round 91 authority_id=3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3
+2025-10-16T19:32:08.540278Z  INFO canonical head for epoch 0 round 92: 42 - 0xc9966c94836b8ab8f93b020a5c62e4be7d356e8c91ad3713bde06a8db7cd2245
+2025-10-16T19:32:08.554034Z  INFO canonical head for epoch 0 round 92: 42 - 0xc9966c94836b8ab8f93b020a5c62e4be7d356e8c91ad3713bde06a8db7cd2245
+2025-10-16T19:32:08.560191Z  INFO canonical head for epoch 0 round 92: 42 - 0xc9966c94836b8ab8f93b020a5c62e4be7d356e8c91ad3713bde06a8db7cd2245
+2025-10-16T19:32:08.908388Z  WARN re-proposing last header after max delay interval expired for round 93 interval=1s
+2025-10-16T19:32:08.911882Z  WARN canceling Header proposal B93(3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3) for round 93 authority_id=3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3
+2025-10-16T19:32:09.542395Z  INFO canonical head for epoch 0 round 94: 43 - 0xddb0b813a5da69381d0a0639816e6e3fa6798a38e33dd5068aa954ec5f46d392
+2025-10-16T19:32:09.552431Z  INFO canonical head for epoch 0 round 94: 43 - 0xddb0b813a5da69381d0a0639816e6e3fa6798a38e33dd5068aa954ec5f46d392
+2025-10-16T19:32:09.557143Z  INFO canonical head for epoch 0 round 94: 43 - 0xddb0b813a5da69381d0a0639816e6e3fa6798a38e33dd5068aa954ec5f46d392
+2025-10-16T19:32:09.920722Z  WARN re-proposing last header after max delay interval expired for round 95 interval=1s
+2025-10-16T19:32:10.555373Z  INFO canonical head for epoch 0 round 96: 44 - 0xac175130f8bd09bb796f8d424441b962cdd65576ece8d87cdbddb4e741d12266
+2025-10-16T19:32:10.562784Z  INFO canonical head for epoch 0 round 96: 44 - 0xac175130f8bd09bb796f8d424441b962cdd65576ece8d87cdbddb4e741d12266
+2025-10-16T19:32:10.568668Z  INFO canonical head for epoch 0 round 96: 44 - 0xac175130f8bd09bb796f8d424441b962cdd65576ece8d87cdbddb4e741d12266
+2025-10-16T19:32:10.926383Z  WARN re-proposing last header after max delay interval expired for round 97 interval=1s
+2025-10-16T19:32:10.928753Z  WARN canceling Header proposal B97(5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj) for round 97 authority_id=5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj
+2025-10-16T19:32:11.576465Z  INFO canonical head for epoch 0 round 98: 45 - 0x869f611d6339f90c1cf3622ca4545e71c2b854db73b69c6bf2e18a17c7512562
+2025-10-16T19:32:11.582626Z  INFO canonical head for epoch 0 round 98: 45 - 0x869f611d6339f90c1cf3622ca4545e71c2b854db73b69c6bf2e18a17c7512562
+2025-10-16T19:32:11.593624Z  INFO canonical head for epoch 0 round 98: 45 - 0x869f611d6339f90c1cf3622ca4545e71c2b854db73b69c6bf2e18a17c7512562
+2025-10-16T19:32:12.587982Z  INFO canonical head for epoch 0 round 100: 46 - 0xf3d68200598ba01a00bda392d45ca0676e3a62fbcc8d3247f98497db7e392da5
+2025-10-16T19:32:12.601512Z  INFO canonical head for epoch 0 round 100: 46 - 0xf3d68200598ba01a00bda392d45ca0676e3a62fbcc8d3247f98497db7e392da5
+2025-10-16T19:32:12.608237Z  INFO canonical head for epoch 0 round 100: 46 - 0xf3d68200598ba01a00bda392d45ca0676e3a62fbcc8d3247f98497db7e392da5
+2025-10-16T19:32:13.110583Z  INFO canonical head for epoch 0 round 102: 47 - 0x8c3bc848c02a3984cd87ec5a853b2075c11dd5a9b119fe23dfc9584dde255e43
+2025-10-16T19:32:13.122736Z  INFO canonical head for epoch 0 round 102: 47 - 0x8c3bc848c02a3984cd87ec5a853b2075c11dd5a9b119fe23dfc9584dde255e43
+2025-10-16T19:32:13.130937Z  INFO canonical head for epoch 0 round 102: 47 - 0x8c3bc848c02a3984cd87ec5a853b2075c11dd5a9b119fe23dfc9584dde255e43
+2025-10-16T19:32:14.115454Z  INFO canonical head for epoch 0 round 104: 48 - 0x130c337c420e07087882cdf40be332ae0ca168b905670f1cbf18b99103ee50ff
+2025-10-16T19:32:14.129557Z  INFO canonical head for epoch 0 round 104: 48 - 0x130c337c420e07087882cdf40be332ae0ca168b905670f1cbf18b99103ee50ff
+2025-10-16T19:32:14.135347Z  INFO canonical head for epoch 0 round 104: 48 - 0x130c337c420e07087882cdf40be332ae0ca168b905670f1cbf18b99103ee50ff
+2025-10-16T19:32:15.136665Z  INFO canonical head for epoch 0 round 106: 49 - 0x21b22cfc29fd8d6f93e8f1af43ecc7dfb2d0b5e47f569751b3ccc4f846bed5e9
+2025-10-16T19:32:15.143967Z  INFO canonical head for epoch 0 round 106: 49 - 0x21b22cfc29fd8d6f93e8f1af43ecc7dfb2d0b5e47f569751b3ccc4f846bed5e9
+2025-10-16T19:32:15.157151Z  INFO canonical head for epoch 0 round 106: 49 - 0x21b22cfc29fd8d6f93e8f1af43ecc7dfb2d0b5e47f569751b3ccc4f846bed5e9
+2025-10-16T19:32:15.632281Z  INFO canonical head for epoch 0 round 108: 50 - 0xe736b39edeed96e370e2a3d3fa48bd5039d93231cd1b82016500ebe780b1ac3c
+2025-10-16T19:32:15.647817Z  INFO canonical head for epoch 0 round 108: 50 - 0xe736b39edeed96e370e2a3d3fa48bd5039d93231cd1b82016500ebe780b1ac3c
+2025-10-16T19:32:15.655337Z  INFO canonical head for epoch 0 round 108: 50 - 0xe736b39edeed96e370e2a3d3fa48bd5039d93231cd1b82016500ebe780b1ac3c
+2025-10-16T19:32:16.531536Z  WARN max delay interval expired for round 110 interval=1s
+2025-10-16T19:32:17.022665Z  WARN max delay interval expired for round 110 interval=1s
+2025-10-16T19:32:17.024698Z  WARN max delay interval expired for round 110 interval=1s
+2025-10-16T19:32:18.063890Z  WARN max delay interval expired for round 112 interval=1s
+2025-10-16T19:32:18.065781Z  WARN max delay interval expired for round 112 interval=1s
+2025-10-16T19:32:18.530837Z  WARN max delay interval expired for round 112 interval=1s
+2025-10-16T19:32:19.214440Z  INFO canonical head for epoch 0 round 114: 51 - 0x4bf9cfbdb2d77eae0550a689357d287735c99a7fcd142013af15ad6caebce9a0
+2025-10-16T19:32:19.221245Z  INFO canonical head for epoch 0 round 114: 51 - 0x4bf9cfbdb2d77eae0550a689357d287735c99a7fcd142013af15ad6caebce9a0
+2025-10-16T19:32:19.227947Z  INFO canonical head for epoch 0 round 114: 51 - 0x4bf9cfbdb2d77eae0550a689357d287735c99a7fcd142013af15ad6caebce9a0
+2025-10-16T19:32:20.100749Z  WARN max delay interval expired for round 116 interval=1s
+2025-10-16T19:32:20.564403Z  WARN max delay interval expired for round 116 interval=1s
+2025-10-16T19:32:20.575043Z  WARN max delay interval expired for round 116 interval=1s
+2025-10-16T19:32:21.250332Z  INFO canonical head for epoch 0 round 118: 52 - 0xefa463197e87210cdd87a1a030748ea016219bba542b33c32879ccb591ab92b0
+2025-10-16T19:32:21.250332Z  INFO canonical head for epoch 0 round 118: 52 - 0xefa463197e87210cdd87a1a030748ea016219bba542b33c32879ccb591ab92b0
+2025-10-16T19:32:21.258258Z  INFO canonical head for epoch 0 round 118: 52 - 0xefa463197e87210cdd87a1a030748ea016219bba542b33c32879ccb591ab92b0
+2025-10-16T19:32:22.257451Z  INFO canonical head for epoch 0 round 120: 53 - 0x7dc90cac9b246f1728cc43d4ba127270c417be704920b31888be5c041c3e2322
+2025-10-16T19:32:22.270027Z  INFO canonical head for epoch 0 round 120: 53 - 0x7dc90cac9b246f1728cc43d4ba127270c417be704920b31888be5c041c3e2322
+2025-10-16T19:32:22.276585Z  INFO canonical head for epoch 0 round 120: 53 - 0x7dc90cac9b246f1728cc43d4ba127270c417be704920b31888be5c041c3e2322
+2025-10-16T19:32:22.772874Z  INFO canonical head for epoch 0 round 122: 54 - 0x9aff9cfa7174af9f00196bc0ad85eb26dafa530f58050d0bb6263931a00e66d4
+2025-10-16T19:32:22.778798Z  INFO canonical head for epoch 0 round 122: 54 - 0x9aff9cfa7174af9f00196bc0ad85eb26dafa530f58050d0bb6263931a00e66d4
+2025-10-16T19:32:22.788743Z  INFO canonical head for epoch 0 round 122: 54 - 0x9aff9cfa7174af9f00196bc0ad85eb26dafa530f58050d0bb6263931a00e66d4
+2025-10-16T19:32:23.147843Z  WARN re-proposing last header after max delay interval expired for round 124 interval=1s
+2025-10-16T19:32:23.149528Z  WARN canceling Header proposal B124(5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj) for round 124 authority_id=5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj
+2025-10-16T19:32:23.779407Z  INFO canonical head for epoch 0 round 124: 55 - 0x15746198469f1b275d43059705bdbaa571258a38c6a99059730b85492509c758
+2025-10-16T19:32:23.779974Z  INFO canonical head for epoch 0 round 124: 55 - 0x15746198469f1b275d43059705bdbaa571258a38c6a99059730b85492509c758
+2025-10-16T19:32:23.787556Z  INFO canonical head for epoch 0 round 124: 55 - 0x15746198469f1b275d43059705bdbaa571258a38c6a99059730b85492509c758
+2025-10-16T19:32:25.145067Z  WARN max delay interval expired for round 126 interval=1s
+2025-10-16T19:32:25.154021Z  WARN max delay interval expired for round 126 interval=1s
+2025-10-16T19:32:25.155725Z  WARN max delay interval expired for round 126 interval=1s
+2025-10-16T19:32:25.848799Z  INFO canonical head for epoch 0 round 128: 56 - 0xc92b7fbc4cc4bfad444e673eef312e46da72621208cff02f83834907cada5de2
+2025-10-16T19:32:25.865441Z  INFO canonical head for epoch 0 round 128: 56 - 0xc92b7fbc4cc4bfad444e673eef312e46da72621208cff02f83834907cada5de2
+2025-10-16T19:32:25.874448Z  INFO canonical head for epoch 0 round 128: 56 - 0xc92b7fbc4cc4bfad444e673eef312e46da72621208cff02f83834907cada5de2
+2025-10-16T19:32:26.366437Z  INFO canonical head for epoch 0 round 130: 57 - 0xb22a8ae51ebe0b414fc96f486c7f898c8846dcff930c37a0521e39c187b75a68
+2025-10-16T19:32:26.374969Z  INFO canonical head for epoch 0 round 130: 57 - 0xb22a8ae51ebe0b414fc96f486c7f898c8846dcff930c37a0521e39c187b75a68
+2025-10-16T19:32:26.382220Z  INFO canonical head for epoch 0 round 130: 57 - 0xb22a8ae51ebe0b414fc96f486c7f898c8846dcff930c37a0521e39c187b75a68
+2025-10-16T19:32:27.363832Z  INFO canonical head for epoch 0 round 132: 58 - 0x3ff927503e84ef0dcd113a285939a8d8f2040dd2b36c78193dab9b8b433245ee
+2025-10-16T19:32:27.369534Z  INFO canonical head for epoch 0 round 132: 58 - 0x3ff927503e84ef0dcd113a285939a8d8f2040dd2b36c78193dab9b8b433245ee
+2025-10-16T19:32:27.375408Z  INFO canonical head for epoch 0 round 132: 58 - 0x3ff927503e84ef0dcd113a285939a8d8f2040dd2b36c78193dab9b8b433245ee
+2025-10-16T19:32:27.733962Z  WARN re-proposing last header after max delay interval expired for round 133 interval=1s
+2025-10-16T19:32:28.370252Z  INFO canonical head for epoch 0 round 134: 59 - 0x068c838ac1229b4058193e7c6bc1eec31effa059ba0c2670679dbb0c39781c0d
+2025-10-16T19:32:28.378219Z  INFO canonical head for epoch 0 round 134: 59 - 0x068c838ac1229b4058193e7c6bc1eec31effa059ba0c2670679dbb0c39781c0d
+2025-10-16T19:32:28.390962Z  INFO canonical head for epoch 0 round 134: 59 - 0x068c838ac1229b4058193e7c6bc1eec31effa059ba0c2670679dbb0c39781c0d
+2025-10-16T19:32:28.740717Z  WARN re-proposing last header after max delay interval expired for round 135 interval=1s
+2025-10-16T19:32:28.742465Z  WARN canceling Header proposal B135(5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj) for round 135 authority_id=5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj
+2025-10-16T19:32:29.369740Z  INFO canonical head for epoch 0 round 136: 60 - 0xaf8de8a22a457ec8305ff0ed1a1a8cbde0ca58174f928e36e5a9e57eee72f4e1
+2025-10-16T19:32:29.377786Z  INFO canonical head for epoch 0 round 136: 60 - 0xaf8de8a22a457ec8305ff0ed1a1a8cbde0ca58174f928e36e5a9e57eee72f4e1
+2025-10-16T19:32:29.386184Z  INFO canonical head for epoch 0 round 136: 60 - 0xaf8de8a22a457ec8305ff0ed1a1a8cbde0ca58174f928e36e5a9e57eee72f4e1
+2025-10-16T19:32:29.746783Z  WARN re-proposing last header after max delay interval expired for round 137 interval=1s
+2025-10-16T19:32:29.749972Z  WARN canceling Header proposal B137(5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj) for round 137 authority_id=5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj
+2025-10-16T19:32:30.380545Z  INFO canonical head for epoch 0 round 138: 61 - 0x9cdbe8f5447b4cc1bb81c68f873eb39d319a0daa96c461be9abcac1e0ddc57e0
+2025-10-16T19:32:30.395627Z  INFO canonical head for epoch 0 round 138: 61 - 0x9cdbe8f5447b4cc1bb81c68f873eb39d319a0daa96c461be9abcac1e0ddc57e0
+2025-10-16T19:32:30.403537Z  INFO canonical head for epoch 0 round 138: 61 - 0x9cdbe8f5447b4cc1bb81c68f873eb39d319a0daa96c461be9abcac1e0ddc57e0
+2025-10-16T19:32:31.281007Z  WARN re-proposing last header after max delay interval expired for round 141 interval=1s
+2025-10-16T19:32:31.287748Z  WARN canceling Header proposal B141(5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj) for round 141 authority_id=5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj
+2025-10-16T19:32:31.395872Z  INFO canonical head for epoch 0 round 140: 62 - 0x1a43c43355da5cba232184bcdab014d20985a183cfd38dae1c37bcbf644045d8
+2025-10-16T19:32:31.405800Z  INFO canonical head for epoch 0 round 140: 62 - 0x1a43c43355da5cba232184bcdab014d20985a183cfd38dae1c37bcbf644045d8
+2025-10-16T19:32:31.412255Z  INFO canonical head for epoch 0 round 140: 62 - 0x1a43c43355da5cba232184bcdab014d20985a183cfd38dae1c37bcbf644045d8
+2025-10-16T19:32:32.418160Z  INFO canonical head for epoch 0 round 142: 63 - 0x488ce54d7c12069a55763fc12c7d01ecd002e1499f56f7620a0d6daca8f3d05e
+2025-10-16T19:32:32.426130Z  INFO canonical head for epoch 0 round 142: 63 - 0x488ce54d7c12069a55763fc12c7d01ecd002e1499f56f7620a0d6daca8f3d05e
+2025-10-16T19:32:32.437401Z  INFO canonical head for epoch 0 round 142: 63 - 0x488ce54d7c12069a55763fc12c7d01ecd002e1499f56f7620a0d6daca8f3d05e
+2025-10-16T19:32:32.934191Z  INFO canonical head for epoch 0 round 144: 64 - 0xe1354debbe6c4c8f8bbb31ae89c36489e6be802d5d5a979fcf1ae0889b3aafe0
+2025-10-16T19:32:32.940281Z  INFO canonical head for epoch 0 round 144: 64 - 0xe1354debbe6c4c8f8bbb31ae89c36489e6be802d5d5a979fcf1ae0889b3aafe0
+2025-10-16T19:32:32.946434Z  INFO canonical head for epoch 0 round 144: 64 - 0xe1354debbe6c4c8f8bbb31ae89c36489e6be802d5d5a979fcf1ae0889b3aafe0
+2025-10-16T19:32:33.297756Z  WARN re-proposing last header after max delay interval expired for round 146 interval=1s
+2025-10-16T19:32:33.299466Z  WARN canceling Header proposal B146(5Worq4rsJP9ozQVo4anZQYvTjBkEwSsNWkZ9MpiAKNEh) for round 146 authority_id=5Worq4rsJP9ozQVo4anZQYvTjBkEwSsNWkZ9MpiAKNEh
+2025-10-16T19:32:33.936725Z  INFO canonical head for epoch 0 round 146: 65 - 0x8bec31e7e24e177c983fc0e7c14433102aefb53086b7e668f6d113d0a380b261
+2025-10-16T19:32:33.942999Z  INFO canonical head for epoch 0 round 146: 65 - 0x8bec31e7e24e177c983fc0e7c14433102aefb53086b7e668f6d113d0a380b261
+2025-10-16T19:32:33.948710Z  INFO canonical head for epoch 0 round 146: 65 - 0x8bec31e7e24e177c983fc0e7c14433102aefb53086b7e668f6d113d0a380b261
+2025-10-16T19:32:35.305208Z  WARN max delay interval expired for round 148 interval=1s
+2025-10-16T19:32:35.308551Z  WARN max delay interval expired for round 148 interval=1s
+2025-10-16T19:32:35.779445Z  WARN max delay interval expired for round 148 interval=1s
+2025-10-16T19:32:35.959256Z  INFO canonical head for epoch 0 round 150: 66 - 0x1b0a84ed92250b65d3f81ad1a4e46671b9774cd1011cc67ae3f01e1e4d7262ef
+2025-10-16T19:32:35.969327Z  INFO canonical head for epoch 0 round 150: 66 - 0x1b0a84ed92250b65d3f81ad1a4e46671b9774cd1011cc67ae3f01e1e4d7262ef
+2025-10-16T19:32:35.975237Z  INFO canonical head for epoch 0 round 150: 66 - 0x1b0a84ed92250b65d3f81ad1a4e46671b9774cd1011cc67ae3f01e1e4d7262ef
+2025-10-16T19:32:36.332048Z  WARN re-proposing last header after max delay interval expired for round 151 interval=1s
+2025-10-16T19:32:36.996366Z  INFO canonical head for epoch 0 round 152: 67 - 0x128a42fc4f0528376f4732daf85484f7135bda2de72247850a95fee7ce9d1602
+2025-10-16T19:32:37.004142Z  INFO canonical head for epoch 0 round 152: 67 - 0x128a42fc4f0528376f4732daf85484f7135bda2de72247850a95fee7ce9d1602
+2025-10-16T19:32:37.004142Z  INFO canonical head for epoch 0 round 152: 67 - 0x128a42fc4f0528376f4732daf85484f7135bda2de72247850a95fee7ce9d1602
+2025-10-16T19:32:38.366566Z  WARN max delay interval expired for round 154 interval=1s
+2025-10-16T19:32:38.368906Z  WARN max delay interval expired for round 154 interval=1s
+2025-10-16T19:32:38.833707Z  WARN max delay interval expired for round 154 interval=1s
+2025-10-16T19:32:39.514209Z  INFO canonical head for epoch 0 round 156: 68 - 0x31338077868ef9edda9d38409fbcc0b5a1fd5187a9c2c1e2df861e63959efaa8
+2025-10-16T19:32:39.524469Z  INFO canonical head for epoch 0 round 156: 68 - 0x31338077868ef9edda9d38409fbcc0b5a1fd5187a9c2c1e2df861e63959efaa8
+2025-10-16T19:32:39.532110Z  INFO canonical head for epoch 0 round 156: 68 - 0x31338077868ef9edda9d38409fbcc0b5a1fd5187a9c2c1e2df861e63959efaa8
+2025-10-16T19:32:40.520008Z  INFO canonical head for epoch 0 round 158: 69 - 0xe8ef441f770846807558b12a85bfc83a13d866a09860aae9cf8b70f3e6c95b7c
+2025-10-16T19:32:40.531919Z  INFO canonical head for epoch 0 round 158: 69 - 0xe8ef441f770846807558b12a85bfc83a13d866a09860aae9cf8b70f3e6c95b7c
+2025-10-16T19:32:40.539761Z  INFO canonical head for epoch 0 round 158: 69 - 0xe8ef441f770846807558b12a85bfc83a13d866a09860aae9cf8b70f3e6c95b7c
+2025-10-16T19:32:41.410439Z  WARN max delay interval expired for round 160 interval=1s
+2025-10-16T19:32:41.877230Z  WARN max delay interval expired for round 160 interval=1s
+2025-10-16T19:32:41.884783Z  WARN max delay interval expired for round 160 interval=1s
+2025-10-16T19:32:42.569737Z  INFO canonical head for epoch 0 round 162: 70 - 0x4b8d798fb38fe3737799ee5ad29d4b24e9c562ae59b2e1ca7e1007bb0630b754
+2025-10-16T19:32:42.587073Z  INFO canonical head for epoch 0 round 162: 70 - 0x4b8d798fb38fe3737799ee5ad29d4b24e9c562ae59b2e1ca7e1007bb0630b754
+2025-10-16T19:32:42.594437Z  INFO canonical head for epoch 0 round 162: 70 - 0x4b8d798fb38fe3737799ee5ad29d4b24e9c562ae59b2e1ca7e1007bb0630b754
+2025-10-16T19:32:43.447837Z  WARN max delay interval expired for round 164 interval=1s
+2025-10-16T19:32:43.919513Z  WARN max delay interval expired for round 164 interval=1s
+2025-10-16T19:32:43.919513Z  WARN max delay interval expired for round 164 interval=1s
+2025-10-16T19:32:43.952596Z  WARN re-proposing last header after max delay interval expired for round 165 interval=1s
+2025-10-16T19:32:43.957033Z  WARN canceling Header proposal B165(5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj) for round 165 authority_id=5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj
+2025-10-16T19:32:44.587445Z  INFO canonical head for epoch 0 round 166: 71 - 0xa8752139ff6f341bf7eb42443f774bba4612839f4638b3c1723457ed277a4596
+2025-10-16T19:32:44.592978Z  INFO canonical head for epoch 0 round 166: 71 - 0xa8752139ff6f341bf7eb42443f774bba4612839f4638b3c1723457ed277a4596
+2025-10-16T19:32:44.604456Z  INFO canonical head for epoch 0 round 166: 71 - 0xa8752139ff6f341bf7eb42443f774bba4612839f4638b3c1723457ed277a4596
+2025-10-16T19:32:45.118745Z  INFO canonical head for epoch 0 round 168: 72 - 0xd59a1dfaafb736281a75a3d1e3f237b3a1e89846bcd126f30af630bb527dd449
+2025-10-16T19:32:45.134066Z  INFO canonical head for epoch 0 round 168: 72 - 0xd59a1dfaafb736281a75a3d1e3f237b3a1e89846bcd126f30af630bb527dd449
+2025-10-16T19:32:45.141424Z  INFO canonical head for epoch 0 round 168: 72 - 0xd59a1dfaafb736281a75a3d1e3f237b3a1e89846bcd126f30af630bb527dd449
+2025-10-16T19:32:46.138696Z  INFO canonical head for epoch 0 round 170: 73 - 0xbbcd19e3d11223a0b38566465c2d1229f3659ebfc1e86cd733e4d3eb12bfa9b4
+2025-10-16T19:32:46.150427Z  INFO canonical head for epoch 0 round 170: 73 - 0xbbcd19e3d11223a0b38566465c2d1229f3659ebfc1e86cd733e4d3eb12bfa9b4
+2025-10-16T19:32:46.156525Z  INFO canonical head for epoch 0 round 170: 73 - 0xbbcd19e3d11223a0b38566465c2d1229f3659ebfc1e86cd733e4d3eb12bfa9b4
+2025-10-16T19:32:47.514196Z  WARN max delay interval expired for round 172 interval=1s
+2025-10-16T19:32:47.514555Z  WARN max delay interval expired for round 172 interval=1s
+2025-10-16T19:32:47.979665Z  WARN max delay interval expired for round 172 interval=1s
+2025-10-16T19:32:48.157146Z  INFO canonical head for epoch 0 round 174: 74 - 0xcfa9b153788e863793f426d5d7902345d86655a71af9962887a643e4d26c346d
+2025-10-16T19:32:48.168381Z  INFO canonical head for epoch 0 round 174: 74 - 0xcfa9b153788e863793f426d5d7902345d86655a71af9962887a643e4d26c346d
+2025-10-16T19:32:48.174283Z  INFO canonical head for epoch 0 round 174: 74 - 0xcfa9b153788e863793f426d5d7902345d86655a71af9962887a643e4d26c346d
+2025-10-16T19:32:49.202890Z  INFO canonical head for epoch 0 round 176: 75 - 0x61a7f0da7964268e83f05b796e4ce86c8249e5f55a1ea9f248a555ba8105a689
+2025-10-16T19:32:49.210050Z  INFO canonical head for epoch 0 round 176: 75 - 0x61a7f0da7964268e83f05b796e4ce86c8249e5f55a1ea9f248a555ba8105a689
+2025-10-16T19:32:49.215566Z  INFO canonical head for epoch 0 round 176: 75 - 0x61a7f0da7964268e83f05b796e4ce86c8249e5f55a1ea9f248a555ba8105a689
+2025-10-16T19:32:49.726137Z  INFO canonical head for epoch 0 round 178: 76 - 0x785b53f1043b4bdc524ee28647a0efba5b65c1954b287d5f7148a8dc5d0cf05c
+2025-10-16T19:32:49.737952Z  INFO canonical head for epoch 0 round 178: 76 - 0x785b53f1043b4bdc524ee28647a0efba5b65c1954b287d5f7148a8dc5d0cf05c
+2025-10-16T19:32:49.743899Z  INFO canonical head for epoch 0 round 178: 76 - 0x785b53f1043b4bdc524ee28647a0efba5b65c1954b287d5f7148a8dc5d0cf05c
+2025-10-16T19:32:50.098029Z  WARN re-proposing last header after max delay interval expired for round 179 interval=1s
+2025-10-16T19:32:50.100776Z  WARN canceling Header proposal B179(5Worq4rsJP9ozQVo4anZQYvTjBkEwSsNWkZ9MpiAKNEh) for round 179 authority_id=5Worq4rsJP9ozQVo4anZQYvTjBkEwSsNWkZ9MpiAKNEh
+2025-10-16T19:32:50.733149Z  INFO canonical head for epoch 0 round 180: 77 - 0x56e161bc79e36c149b0b24bae5772ed05b924b4ff0529ba2935b8d3859128a63
+2025-10-16T19:32:50.739006Z  INFO canonical head for epoch 0 round 180: 77 - 0x56e161bc79e36c149b0b24bae5772ed05b924b4ff0529ba2935b8d3859128a63
+2025-10-16T19:32:50.739006Z  INFO canonical head for epoch 0 round 180: 77 - 0x56e161bc79e36c149b0b24bae5772ed05b924b4ff0529ba2935b8d3859128a63
+2025-10-16T19:32:51.268433Z  INFO canonical head for epoch 0 round 182: 78 - 0xe046f0b1d2ec75e53fb9c32b672a0044dadd0c95f2895dda679d380738c1e29a
+2025-10-16T19:32:51.274456Z  INFO canonical head for epoch 0 round 182: 78 - 0xe046f0b1d2ec75e53fb9c32b672a0044dadd0c95f2895dda679d380738c1e29a
+2025-10-16T19:32:51.280137Z  INFO canonical head for epoch 0 round 182: 78 - 0xe046f0b1d2ec75e53fb9c32b672a0044dadd0c95f2895dda679d380738c1e29a
+2025-10-16T19:32:51.530573Z  INFO execute: telcoin-network 0.1.0 (43879458) starting
+2025-10-16T19:32:51.531172Z  INFO execute: Loading configuration path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-3/node-info.yaml"
+2025-10-16T19:32:51.532223Z  INFO execute: Loading configuration path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-3/parameters.yaml"
+2025-10-16T19:32:51.532622Z  INFO execute: Loading configuration path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-3/genesis/genesis.yaml"
+2025-10-16T19:32:51.560548Z  INFO execute: config loaded validator="node-Ri2jWnU5YEL"
+2025-10-16T19:32:51.601549Z  INFO Starting MDBX metrics thread
+2025-10-16T19:32:51.602003Z  INFO Starting MemDB metrics thread
+2025-10-16T19:32:51.606590Z  INFO execute:launch_node: opened consensus storage consensus_db_path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-3/consensus-db"
+2025-10-16T19:32:51.606638Z  INFO execute:launch_node: loading validator keys at "/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-3/node-keys"
+2025-10-16T19:32:51.609362Z  INFO execute:launch_node: opening database path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-3/db"
+2025-10-16T19:32:51.616747Z  INFO execute:launch_node: starting node and launching first epoch
+2025-10-16T19:32:51.622459Z  INFO execute:launch_node: Loading configuration path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-3/network-config"
+2025-10-16T19:32:51.624172Z  INFO execute:launch_node: local_peer_id=12D3KooWAJ3EGADh2sbbWwTfnXS4foz9UwRbsjPaygZwKX6bJu7Z
+2025-10-16T19:32:51.624663Z  INFO Providing our record to kademlia for peer PeerId("12D3KooWAJ3EGADh2sbbWwTfnXS4foz9UwRbsjPaygZwKX6bJu7Z") record=Record { key: Key(b"\x93\xb7I\\\x8c\xdc\n\x11\xffA\xd8%\xb3\xa0\xbd\xb9\x10pRK\xbe\xb8\xd7p\xf2\xd9\xfc\x9b9Q{:\x0f\xf3\xdf\xf6\x91\xe4-\xad_\0O\xb0\xbc\x88\xfe\xfb\x15H#\xde\xa2\xd0}\x0b\0\xa8\xd3i\x9f\xbe\xc1u\xe5W\x18\x17]\xe4c#\xbc^g\x03\xde\r\x14\x03f\x9au\x06\t\x04I!\x9b\xd8\x846\xeb\xa4\xbeH"), value: [36, 8, 1, 18, 32, 7, 22, 217, 13, 146, 74, 239, 25, 155, 146, 11, 182, 128, 213, 31, 113, 105, 224, 120, 71, 20, 86, 7, 100, 1, 65, 136, 117, 113, 3, 12, 52, 1, 52, 4, 127, 0, 0, 1, 145, 2, 242, 113, 205, 3, 165, 3, 38, 0, 36, 8, 1, 18, 32, 7, 22, 217, 13, 146, 74, 239, 25, 155, 146, 11, 182, 128, 213, 31, 113, 105, 224, 120, 71, 20, 86, 7, 100, 1, 65, 136, 117, 113, 3, 12, 52, 99, 72, 241, 104, 0, 0, 0, 0, 48, 150, 255, 229, 202, 80, 51, 249, 86, 33, 215, 148, 80, 217, 137, 42, 78, 117, 203, 120, 155, 231, 254, 70, 152, 34, 154, 35, 5, 68, 89, 18, 111, 226, 122, 210, 188, 55, 56, 185, 208, 250, 13, 209, 45, 92, 153, 73, 47], publisher: Some(PeerId("12D3KooWAJ3EGADh2sbbWwTfnXS4foz9UwRbsjPaygZwKX6bJu7Z")), expires: None }
+2025-10-16T19:32:51.625295Z  INFO execute:launch_node: local_peer_id=12D3KooWQ7ES5uqT1R93hQ3iQXMs4ua4NaLDHDw8xc96A5Wsht8d
+2025-10-16T19:32:51.625595Z  INFO Providing our record to kademlia for peer PeerId("12D3KooWQ7ES5uqT1R93hQ3iQXMs4ua4NaLDHDw8xc96A5Wsht8d") record=Record { key: Key(b"\x93\xb7I\\\x8c\xdc\n\x11\xffA\xd8%\xb3\xa0\xbd\xb9\x10pRK\xbe\xb8\xd7p\xf2\xd9\xfc\x9b9Q{:\x0f\xf3\xdf\xf6\x91\xe4-\xad_\0O\xb0\xbc\x88\xfe\xfb\x15H#\xde\xa2\xd0}\x0b\0\xa8\xd3i\x9f\xbe\xc1u\xe5W\x18\x17]\xe4c#\xbc^g\x03\xde\r\x14\x03f\x9au\x06\t\x04I!\x9b\xd8\x846\xeb\xa4\xbeH"), value: [36, 8, 1, 18, 32, 212, 85, 190, 129, 173, 142, 19, 192, 159, 100, 65, 1, 191, 173, 222, 142, 105, 18, 18, 195, 66, 219, 228, 96, 18, 238, 160, 141, 114, 43, 86, 230, 1, 52, 4, 127, 0, 0, 1, 145, 2, 197, 173, 205, 3, 165, 3, 38, 0, 36, 8, 1, 18, 32, 212, 85, 190, 129, 173, 142, 19, 192, 159, 100, 65, 1, 191, 173, 222, 142, 105, 18, 18, 195, 66, 219, 228, 96, 18, 238, 160, 141, 114, 43, 86, 230, 99, 72, 241, 104, 0, 0, 0, 0, 48, 166, 182, 28, 146, 240, 42, 183, 230, 79, 10, 190, 126, 123, 106, 14, 202, 186, 43, 214, 133, 146, 245, 81, 34, 80, 120, 117, 133, 90, 78, 48, 151, 165, 143, 123, 246, 117, 60, 113, 179, 175, 228, 43, 16, 226, 38, 208, 202], publisher: Some(PeerId("12D3KooWQ7ES5uqT1R93hQ3iQXMs4ua4NaLDHDw8xc96A5Wsht8d")), expires: None }
+2025-10-16T19:32:51.625795Z ERROR Failed to put record: QuorumFailed { key: Key(b"\x93\xb7I\\\x8c\xdc\n\x11\xffA\xd8%\xb3\xa0\xbd\xb9\x10pRK\xbe\xb8\xd7p\xf2\xd9\xfc\x9b9Q{:\x0f\xf3\xdf\xf6\x91\xe4-\xad_\0O\xb0\xbc\x88\xfe\xfb\x15H#\xde\xa2\xd0}\x0b\0\xa8\xd3i\x9f\xbe\xc1u\xe5W\x18\x17]\xe4c#\xbc^g\x03\xde\r\x14\x03f\x9au\x06\t\x04I!\x9b\xd8\x846\xeb\xa4\xbeH"), success: [], quorum: 1 }
+2025-10-16T19:32:51.625811Z  INFO execute:launch_node: NODE TASKS
+ tasks=Node Task Manager
+Task: Epoch Record Collector (critical)
+Task: Worker Network (critical)
+Task: Primary Network (critical)
+++++++++++++++++++++++++++++++++++++++++++++++++++++
+Engine Task Manager
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+2025-10-16T19:32:51.625848Z  INFO execute:launch_node: Starting epoch
+2025-10-16T19:32:51.626422Z ERROR Failed to put record: QuorumFailed { key: Key(b"\x93\xb7I\\\x8c\xdc\n\x11\xffA\xd8%\xb3\xa0\xbd\xb9\x10pRK\xbe\xb8\xd7p\xf2\xd9\xfc\x9b9Q{:\x0f\xf3\xdf\xf6\x91\xe4-\xad_\0O\xb0\xbc\x88\xfe\xfb\x15H#\xde\xa2\xd0}\x0b\0\xa8\xd3i\x9f\xbe\xc1u\xe5W\x18\x17]\xe4c#\xbc^g\x03\xde\r\x14\x03f\x9au\x06\t\x04I!\x9b\xd8\x846\xeb\xa4\xbeH"), success: [], quorum: 1 }
+2025-10-16T19:32:51.627668Z  INFO execute:launch_node: creating committee from state
+2025-10-16T19:32:51.627685Z  INFO execute:launch_node: Loading configuration path="/var/folders/lc/wlc1jmq10z7_lvywhnt1lc7w0000gn/T/.tmpUXltMh/validator-3/genesis/committee.yaml"
+2025-10-16T19:32:51.631774Z  INFO network update for next committee - ensuring no committee members are banned this_node=PeerId("12D3KooWAJ3EGADh2sbbWwTfnXS4foz9UwRbsjPaygZwKX6bJu7Z")
+2025-10-16T19:32:51.631772Z  INFO execute:launch_node: listening to /ip4/127.0.0.1/udp/62065/quic-v1/p2p/12D3KooWAJ3EGADh2sbbWwTfnXS4foz9UwRbsjPaygZwKX6bJu7Z primary_address=/ip4/127.0.0.1/udp/62065/quic-v1/p2p/12D3KooWAJ3EGADh2sbbWwTfnXS4foz9UwRbsjPaygZwKX6bJu7Z
+2025-10-16T19:32:51.631812Z  INFO adding committee member 24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ/12D3KooWGxD3zjGtUQ1h58vamLtTUvSj1AoJvK1ydsSFbdstvfVG
+2025-10-16T19:32:51.631953Z  INFO adding committee member mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK/12D3KooWQPBt5rpTN3T5aJpLgS7BB9E2iuQ1xXUQfN38g2tMk77z
+2025-10-16T19:32:51.632081Z  INFO adding committee member stJFEW71tVG7k1yAjEqRsR6FoZxYVR68P6NBuZ5eEmkYWz1dqXvLQXRiMDYYN69WQCprxuuUwDh7kwJkYA3XUVbH48PgEYahtJyoNS6VMHCEhBBgYbihU69XZUEtDPj2okB/12D3KooWAJ3EGADh2sbbWwTfnXS4foz9UwRbsjPaygZwKX6bJu7Z
+2025-10-16T19:32:51.632213Z  INFO adding committee member 26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C/12D3KooWSN7p81RZ3HvyF5JhCoaQyTw6E9wExnzosS5HZ5ji46te
+2025-10-16T19:32:51.649296Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/54983/quic-v1/p2p/12D3KooWQPBt5rpTN3T5aJpLgS7BB9E2iuQ1xXUQfN38g2tMk77z, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:32:51.649384Z  INFO Publishing our record to kademlia
+2025-10-16T19:32:51.650110Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/54983/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/62065/quic-v1 }
+2025-10-16T19:32:51.650165Z  INFO Publishing our record to kademlia
+2025-10-16T19:32:51.650773Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/64218/quic-v1/p2p/12D3KooWGxD3zjGtUQ1h58vamLtTUvSj1AoJvK1ydsSFbdstvfVG, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:32:51.650867Z  INFO Publishing our record to kademlia
+2025-10-16T19:32:51.651578Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/64218/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/62065/quic-v1 }
+2025-10-16T19:32:51.651629Z  INFO Publishing our record to kademlia
+2025-10-16T19:32:51.656130Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/50956/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/62065/quic-v1 }
+2025-10-16T19:32:51.656185Z  INFO Publishing our record to kademlia
+2025-10-16T19:32:51.656163Z  WARN failed to dial 26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C: dial attempt timedout
+2025-10-16T19:32:51.661328Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/50956/quic-v1/p2p/12D3KooWSN7p81RZ3HvyF5JhCoaQyTw6E9wExnzosS5HZ5ji46te, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:32:51.661422Z  INFO Publishing our record to kademlia
+2025-10-16T19:32:52.135318Z  INFO execute:launch_node: Header number of batches threshold set to 5
+2025-10-16T19:32:52.135428Z  INFO execute:launch_node: Header max number of batches set to 10
+2025-10-16T19:32:52.135478Z  INFO execute:launch_node: Max header delay set to 1000 ms
+2025-10-16T19:32:52.135522Z  INFO execute:launch_node: Min header delay set to 500 ms
+2025-10-16T19:32:52.135562Z  INFO execute:launch_node: Garbage collection depth set to 50 rounds
+2025-10-16T19:32:52.135603Z  INFO execute:launch_node: Sync retry delay set to 5000 ms
+2025-10-16T19:32:52.135642Z  INFO execute:launch_node: Sync retry nodes set to 3 nodes
+2025-10-16T19:32:52.135682Z  INFO execute:launch_node: Max batch delay set to 1000 ms
+2025-10-16T19:32:52.135720Z  INFO execute:launch_node: Max concurrent requests set to 500000
+2025-10-16T19:32:52.136541Z  INFO execute:launch_node: Boot primary node with public key Some("stJFEW71tVG7k1yAjEqRsR6FoZxYVR68P6NBuZ5eEmkYWz1dqXvLQXRiMDYYN69WQCprxuuUwDh7kwJkYA3XUVbH48PgEYahtJyoNS6VMHCEhBBgYbihU69XZUEtDPj2okB")
+2025-10-16T19:32:52.139043Z  INFO execute:launch_node: Transaction pool initialized
+2025-10-16T19:32:52.145499Z  INFO execute:launch_node: tn rpc extension successfully merged
+2025-10-16T19:32:52.148515Z  INFO network update for next committee - ensuring no committee members are banned this_node=PeerId("12D3KooWQ7ES5uqT1R93hQ3iQXMs4ua4NaLDHDw8xc96A5Wsht8d")
+2025-10-16T19:32:52.148616Z  INFO adding committee member 26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C/12D3KooWALnu8ZwipoJRs2QLp1VeS3HcfXT44Ciyu7SsRJ49iQvd
+2025-10-16T19:32:52.148860Z  INFO adding committee member mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK/12D3KooWB8BDt5vENyFthwJzPid1sECHJxxHPLA6uqwKSphT7pXq
+2025-10-16T19:32:52.148999Z  INFO adding committee member stJFEW71tVG7k1yAjEqRsR6FoZxYVR68P6NBuZ5eEmkYWz1dqXvLQXRiMDYYN69WQCprxuuUwDh7kwJkYA3XUVbH48PgEYahtJyoNS6VMHCEhBBgYbihU69XZUEtDPj2okB/12D3KooWQ7ES5uqT1R93hQ3iQXMs4ua4NaLDHDw8xc96A5Wsht8d
+2025-10-16T19:32:52.149137Z  INFO adding committee member 24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ/12D3KooWAX6JFCep5FgtXN6cnjU1nebq7cigAJChrCh1FjER5m38
+2025-10-16T19:32:52.156699Z  INFO execute:launch_node: Boot worker node with id 0 key stJFEW71tVG7k1yAjEqRsR6FoZxYVR68P6NBuZ5eEmkYWz1dqXvLQXRiMDYYN69WQCprxuuUwDh7kwJkYA3XUVbH48PgEYahtJyoNS6VMHCEhBBgYbihU69XZUEtDPj2okB
+2025-10-16T19:32:52.156876Z  INFO execute:launch_node: Starting handler for transactions
+2025-10-16T19:32:52.156911Z  INFO execute:launch_node: Worker 0 successfully booted on /ip4/127.0.0.1/udp/50605/quic-v1/p2p/12D3KooWQ7ES5uqT1R93hQ3iQXMs4ua4NaLDHDw8xc96A5Wsht8d
+2025-10-16T19:32:52.161759Z  INFO execute:launch_node:construct_dag_from_cert_store: Recreating dag from last GC round: 0
+2025-10-16T19:32:52.164671Z  INFO execute:launch_node:construct_dag_from_cert_store: Inserted certificate: 3kkgt95omWArxmHs: C19(EUzKUKnhhXBdZ5zBqHHHx7mZqcRCvT1buHAeXZALuPqP, 3kkgt95omWArxmHs, E0)
+2025-10-16T19:32:52.164776Z  INFO execute:launch_node:construct_dag_from_cert_store: Inserted certificate: EviqQy6jZgB2ZM4o: C20(5Worq4rsJP9ozQVo4anZQYvTjBkEwSsNWkZ9MpiAKNEh, EviqQy6jZgB2ZM4o, E0)
+2025-10-16T19:32:52.164869Z  INFO execute:launch_node:construct_dag_from_cert_store: Inserted certificate: 5RrPTmXzaWzFGUaR: C20(5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj, 5RrPTmXzaWzFGUaR, E0)
+2025-10-16T19:32:52.164963Z  INFO execute:launch_node:construct_dag_from_cert_store: Inserted certificate: HRB5S2ZaaZAfFSNC: C21(5Worq4rsJP9ozQVo4anZQYvTjBkEwSsNWkZ9MpiAKNEh, HRB5S2ZaaZAfFSNC, E0)
+2025-10-16T19:32:52.165032Z  INFO received shutdown from consensus to stop updating consensus bus recent blocks
+2025-10-16T19:32:52.165907Z  INFO execute:launch_node:construct_dag_from_cert_store: Inserted certificate: HdjWikesGvUVhjqp: C21(EUzKUKnhhXBdZ5zBqHHHx7mZqcRCvT1buHAeXZALuPqP, HdjWikesGvUVhjqp, E0)
+2025-10-16T19:32:52.166003Z  INFO execute:launch_node:construct_dag_from_cert_store: Dag is restored and contains 5 certs for 21 rounds
+2025-10-16T19:32:52.166186Z  INFO execute:launch_node: Consensus subscriber successfully started
+2025-10-16T19:32:52.166208Z  INFO Starting subscriber: Catch up and rejoin
+2025-10-16T19:32:52.166704Z  WARN process_gossip e=Certificate(Pending(3aU7WyT4T7g3twrCodQBWH4Cn4GNxLXPhkBFhSgUtytx))
+2025-10-16T19:32:52.166710Z  WARN process_gossip e=Certificate(Pending(3aU7WyT4T7g3twrCodQBWH4Cn4GNxLXPhkBFhSgUtytx))
+2025-10-16T19:32:52.166780Z  WARN process_gossip e=Certificate(Pending(3aU7WyT4T7g3twrCodQBWH4Cn4GNxLXPhkBFhSgUtytx))
+2025-10-16T19:32:52.166843Z  WARN process_gossip e=Certificate(Pending(wc3exdmgLeGRUXXui23NDBSEqoT28DyQAtThQNEkpd1))
+2025-10-16T19:32:52.166822Z  WARN process_gossip e=Certificate(Pending(wc3exdmgLeGRUXXui23NDBSEqoT28DyQAtThQNEkpd1))
+2025-10-16T19:32:52.166881Z  WARN process_gossip e=Certificate(Pending(wc3exdmgLeGRUXXui23NDBSEqoT28DyQAtThQNEkpd1))
+2025-10-16T19:32:52.166954Z  WARN process_gossip e=Certificate(Pending(BASFa4n4hZFqfKPnnd57KDdWthfrHJJLQCQWcVswAZ9H))
+2025-10-16T19:32:52.166967Z  WARN process_gossip e=Certificate(Pending(BASFa4n4hZFqfKPnnd57KDdWthfrHJJLQCQWcVswAZ9H))
+2025-10-16T19:32:52.167000Z  WARN process_gossip e=Certificate(Pending(BMonbgDhNsnq4YQwaCF3XoSKfmyTHx46wJFTxTzEMPC4))
+2025-10-16T19:32:52.167003Z  WARN process_gossip e=Certificate(Pending(BMonbgDhNsnq4YQwaCF3XoSKfmyTHx46wJFTxTzEMPC4))
+2025-10-16T19:32:52.167012Z  WARN process_gossip e=Certificate(Pending(BASFa4n4hZFqfKPnnd57KDdWthfrHJJLQCQWcVswAZ9H))
+2025-10-16T19:32:52.167001Z  WARN process_gossip e=Certificate(Pending(BMonbgDhNsnq4YQwaCF3XoSKfmyTHx46wJFTxTzEMPC4))
+2025-10-16T19:32:52.167807Z  INFO Starting state sync: track latest consensus header from peers
+2025-10-16T19:32:52.167808Z  INFO Starting state sync: stream consensus header from peers
+2025-10-16T19:32:52.168435Z  INFO Certifier on node EUzKUKnhhXBdZ5zBqHHHx7mZqcRCvT1buHAeXZALuPqP has started successfully.
+2025-10-16T19:32:52.168478Z  INFO Certifier on node EUzKUKnhhXBdZ5zBqHHHx7mZqcRCvT1buHAeXZALuPqP has started successfully.
+2025-10-16T19:32:52.168479Z  INFO execute:launch_node: Primary Some(EUzKUKnhhXBdZ5zBqHHHx7mZqcRCvT1buHAeXZALuPqP) successfully booted on /ip4/127.0.0.1/udp/62065/quic-v1/p2p/12D3KooWAJ3EGADh2sbbWwTfnXS4foz9UwRbsjPaygZwKX6bJu7Z
+2025-10-16T19:32:52.168518Z  INFO StateHandler on node EUzKUKnhhXBdZ5zBqHHHx7mZqcRCvT1buHAeXZALuPqP has started successfully.
+2025-10-16T19:32:52.168911Z  INFO execute:launch_node: EPOCH TASKS
+ tasks=Epoch Task Manager
+Task: batch builder (critical)
+Task: state sync: stream consensus headers (not critical)
+Task: state sync: track latest consensus header from peers (not critical)
+Task: sync header batches (not critical)
+Task: sync header batches (not critical)
+Task: sync header batches (not critical)
+Task: ProcessGossip-tn-consensus-output-24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ (not critical)
+Task: sync header batches (not critical)
+Task: sync header batches (not critical)
+Task: ProcessGossip-tn-consensus-output-mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK (not critical)
+Task: ProcessGossip-tn-consensus-output-26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C (not critical)
+Task: ProcessGossip-tn-primary-26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C (not critical)
+Task: ProcessGossip-tn-primary-mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK (not critical)
+Task: ProcessGossip-tn-primary-26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C (not critical)
+Task: ProcessGossip-tn-primary-mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK (not critical)
+Task: ProcessGossip-tn-primary-26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C (not critical)
+Task: sync header batches (not critical)
+Task: worker network events (not critical)
+Task: ProcessGossip-tn-primary-mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK (not critical)
+Task: VoteRequest-BMonbgDhNsnq4YQw (not critical)
+Task: VoteRequest-BASFa4n4hZFqfKPn (not critical)
+Task: DialPeer 26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C (not critical)
+Task: DialPeer 24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ (not critical)
+Task: DialPeer mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK (not critical)
+Task: sync header batches (not critical)
+Task: sync header batches (not critical)
+Task: sync header batches (not critical)
+Task: sync header batches (not critical)
+Task: ProcessGossip-tn-primary-24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ (not critical)
+Task: ProcessGossip-tn-primary-24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ (not critical)
+Task: sync header batches (not critical)
+Task: sync header batches (not critical)
+Task: ProcessGossip-tn-primary-24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ (not critical)
+Task: Worker Network Peers (not critical)
+Task: VoteRequest-wc3exdmgLeGRUXXu (not critical)
+Task: VoteRequest-65NvpRqpu1tqDpxx (not critical)
+Task: VoteRequest-5DdM8MrxkbwPMuGk (not critical)
+Task: VoteRequest-BCrdmFpk31dTbgF8 (not critical)
+Task: VoteRequest-21DrDfBHTjUQrKu1 (not critical)
+Task: VoteRequest-6YibZ3K4e7JGD7Ny (not critical)
+Task: VoteRequest-J9xWEsKEB2ZYJrm2 (not critical)
+Task: VoteRequest-FNi1fnKUeXfXr9pj (not critical)
+Task: VoteRequest-EFLTge5f3GEZP4CA (not critical)
+Task: VoteRequest-CRb6rMCcF69pUh46 (not critical)
+Task: VoteRequest-41ZQLPnAS4TgXQFE (not critical)
+Task: VoteRequest-CbXoCHsu2UjFZWRr (not critical)
+Task: VoteRequest-98g93ZARGa9Gb6Rw (not critical)
+Task: VoteRequest-EXBxktv5CEhV1QPu (not critical)
+Task: VoteRequest-EpdkDLUHMSZPzfbu (not critical)
+Task: VoteRequest-G6jFxk2gBPbUorME (not critical)
+Task: VoteRequest-76Gx6osJT5iS6kBn (not critical)
+Task: VoteRequest-53PqfKg91tFBshKY (not critical)
+Task: VoteRequest-53PqfKg91tFBshKY (not critical)
+Task: VoteRequest-3aU7WyT4T7g3twrC (not critical)
+Task: VoteRequest-3FisRdDQCrBQYyn4 (not critical)
+Task: VoteRequest-7R4KUaYxXE5EKwxo (not critical)
+Task: VoteRequest-4EoA8c6Qd2ueHuwn (not critical)
+Task: VoteRequest-CB8GqTgEeoF3sdKJ (not critical)
+Task: VoteRequest-2WzAN7VbDH8kSAuX (not critical)
+Task: ProcessGossip-tn-primary-mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK (not critical)
+Task: VoteRequest-BGr3cogr5yAknpSK (not critical)
+Task: ProcessGossip-tn-primary-mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK (not critical)
+Task: VoteRequest-7P2aprtt2H6aB9yd (not critical)
+Task: ProcessGossip-tn-primary-mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK (not critical)
+Task: VoteRequest-HTmaPSpRoUcp6xjU (not critical)
+Task: VoteRequest-5XXptbSJ1s8Upc1P (not critical)
+Task: VoteRequest-HrfN4bWmhx52pMXz (not critical)
+Task: VoteRequest-5Dw9wAWSHUGhpePP (not critical)
+Task: VoteRequest-7X7kqw7ntdDk8Kcj (not critical)
+Task: VoteRequest-7cda66AxgKUCqVE9 (not critical)
+Task: VoteRequest-AUgPDSfPsLD2TPe6 (not critical)
+Task: VoteRequest-GUVKbBDLQFnojy13 (not critical)
+Task: VoteRequest-qK3XCtP7QQPtAuh6 (not critical)
+Task: VoteRequest-DLjj8rxmf97FVGnN (not critical)
+Task: VoteRequest-4Pyy63vHnsm57uG7 (not critical)
+Task: VoteRequest-3EtUuNQTsaG9Txth (not critical)
+Task: primary network events (critical)
+Task: DialPeer 26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C (not critical)
+Task: DialPeer 24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ (not critical)
+Task: DialPeer mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK (not critical)
+Task: Worker Task - 0 batch-builder (critical)
+Task: state handler task (critical)
+Task: certificate fetcher task (critical)
+Task: certifier task (critical)
+Task: broadcast certificates to 5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj (not critical)
+Task: broadcast certificates to 5Worq4rsJP9ozQVo4anZQYvTjBkEwSsNWkZ9MpiAKNEh (not critical)
+Task: broadcast certificates to 3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3 (not critical)
+Task: certificate-manager (critical)
+Task: subscriber catch up and rejoin consensus (critical)
+Task: latest execution block (critical)
+
+2025-10-16T19:32:52.169288Z  INFO execute:launch_node: Epoch Task Manager: latest execution block returned Ok, node exiting
+2025-10-16T19:32:52.169402Z  INFO Certifier on node EUzKUKnhhXBdZ5zBqHHHx7mZqcRCvT1buHAeXZALuPqP has shutdown.
+2025-10-16T19:32:52.169510Z  INFO Certificate sender 5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj is shutting down!
+2025-10-16T19:32:52.169531Z  INFO execute:launch_node: Epoch Task Manager: certificate-manager shutdown successfully
+2025-10-16T19:32:52.169559Z  INFO execute:launch_node: Epoch Task Manager: certifier task shutdown successfully
+2025-10-16T19:32:52.169584Z  INFO execute:launch_node: Epoch Task Manager: certificate fetcher task shutdown successfully
+2025-10-16T19:32:52.169513Z  INFO Certificate sender 5Worq4rsJP9ozQVo4anZQYvTjBkEwSsNWkZ9MpiAKNEh is shutting down!
+2025-10-16T19:32:52.169604Z  INFO execute:launch_node: Epoch Task Manager: state handler task shutdown successfully
+2025-10-16T19:32:52.169625Z  INFO execute:launch_node: Epoch Task Manager: DialPeer mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK shutdown successfully
+2025-10-16T19:32:52.169650Z  INFO execute:launch_node: Epoch Task Manager: DialPeer 24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ shutdown successfully
+2025-10-16T19:32:52.169635Z  INFO Certificate sender 3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3 is shutting down!
+2025-10-16T19:32:52.169723Z  INFO execute:launch_node: Epoch Task Manager: ProcessGossip-tn-primary-mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK shutdown successfully
+2025-10-16T19:32:52.169754Z  INFO execute:launch_node: Epoch Task Manager: ProcessGossip-tn-primary-mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK shutdown successfully
+2025-10-16T19:32:52.169781Z  INFO execute:launch_node: Epoch Task Manager: ProcessGossip-tn-primary-mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK shutdown successfully
+2025-10-16T19:32:52.169818Z  INFO execute:launch_node: Epoch Task Manager: ProcessGossip-tn-primary-24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ shutdown successfully
+2025-10-16T19:32:52.169824Z  WARN process_gossip e=Certificate(Certificate(TooOld(HdjWikesGvUVhjqpqhLNDc7AndjJPkU7GHWh4ZFNBKSd, 21, 134)))
+2025-10-16T19:32:52.169844Z  INFO execute:launch_node: Epoch Task Manager: sync header batches shutdown successfully
+2025-10-16T19:32:52.169867Z  INFO execute:launch_node: Epoch Task Manager: sync header batches shutdown successfully
+2025-10-16T19:32:52.169889Z  INFO execute:launch_node: Epoch Task Manager: ProcessGossip-tn-primary-24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ shutdown successfully
+2025-10-16T19:32:52.169916Z  INFO execute:launch_node: Epoch Task Manager: ProcessGossip-tn-primary-24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ shutdown successfully
+2025-10-16T19:32:52.169941Z  INFO execute:launch_node: Epoch Task Manager: sync header batches shutdown successfully
+2025-10-16T19:32:52.169962Z  INFO execute:launch_node: Epoch Task Manager: sync header batches shutdown successfully
+2025-10-16T19:32:52.169981Z  INFO execute:launch_node: Epoch Task Manager: sync header batches shutdown successfully
+2025-10-16T19:32:52.170001Z  INFO execute:launch_node: Epoch Task Manager: sync header batches shutdown successfully
+2025-10-16T19:32:52.170022Z  INFO execute:launch_node: Epoch Task Manager: ProcessGossip-tn-primary-mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK shutdown successfully
+2025-10-16T19:32:52.170050Z  INFO execute:launch_node: Epoch Task Manager: sync header batches shutdown successfully
+2025-10-16T19:32:52.170070Z  INFO execute:launch_node: Epoch Task Manager: ProcessGossip-tn-primary-26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C shutdown successfully
+2025-10-16T19:32:52.170096Z  INFO execute:launch_node: Epoch Task Manager: ProcessGossip-tn-primary-mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK shutdown successfully
+2025-10-16T19:32:52.170122Z  INFO execute:launch_node: Epoch Task Manager: ProcessGossip-tn-primary-26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C shutdown successfully
+2025-10-16T19:32:52.170148Z  INFO execute:launch_node: Epoch Task Manager: ProcessGossip-tn-primary-mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK shutdown successfully
+2025-10-16T19:32:52.170174Z  INFO execute:launch_node: Epoch Task Manager: ProcessGossip-tn-primary-26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C shutdown successfully
+2025-10-16T19:32:52.170202Z  INFO execute:launch_node: Epoch Task Manager: ProcessGossip-tn-consensus-output-26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C shutdown successfully
+2025-10-16T19:32:52.170229Z  INFO execute:launch_node: Epoch Task Manager: ProcessGossip-tn-consensus-output-mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK shutdown successfully
+2025-10-16T19:32:52.170256Z  INFO execute:launch_node: Epoch Task Manager: sync header batches shutdown successfully
+2025-10-16T19:32:52.170275Z  INFO execute:launch_node: Epoch Task Manager: sync header batches shutdown successfully
+2025-10-16T19:32:52.170294Z  INFO execute:launch_node: Epoch Task Manager: ProcessGossip-tn-consensus-output-24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ shutdown successfully
+2025-10-16T19:32:52.170322Z  INFO execute:launch_node: Epoch Task Manager: sync header batches shutdown successfully
+2025-10-16T19:32:52.170341Z  INFO execute:launch_node: Epoch Task Manager: sync header batches shutdown successfully
+2025-10-16T19:32:52.170360Z  INFO execute:launch_node: Epoch Task Manager: sync header batches shutdown successfully
+2025-10-16T19:32:52.170380Z  INFO execute:launch_node: Epoch Task Manager: state sync: track latest consensus header from peers shutdown successfully
+2025-10-16T19:32:52.170403Z  INFO execute:launch_node: Epoch Task Manager: state sync: stream consensus headers shutdown successfully
+2025-10-16T19:32:52.170425Z  INFO execute:launch_node: Epoch Task Manager: broadcast certificates to 5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj shutdown successfully
+2025-10-16T19:32:52.170445Z  INFO execute:launch_node: Epoch Task Manager: broadcast certificates to 5Worq4rsJP9ozQVo4anZQYvTjBkEwSsNWkZ9MpiAKNEh shutdown successfully
+2025-10-16T19:32:52.170465Z  INFO execute:launch_node: Epoch Task Manager: broadcast certificates to 3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3 shutdown successfully
+2025-10-16T19:32:52.170857Z  WARN process_gossip e=Certificate(Certificate(TooOld(HdjWikesGvUVhjqpqhLNDc7AndjJPkU7GHWh4ZFNBKSd, 21, 134)))
+2025-10-16T19:32:52.170864Z  WARN process_gossip e=Certificate(Certificate(TooOld(HdjWikesGvUVhjqpqhLNDc7AndjJPkU7GHWh4ZFNBKSd, 21, 134)))
+2025-10-16T19:32:52.170992Z  WARN process_gossip e=Certificate(Certificate(TooOld(HdjWikesGvUVhjqpqhLNDc7AndjJPkU7GHWh4ZFNBKSd, 21, 134)))
+2025-10-16T19:32:52.171025Z  WARN process_gossip e=Certificate(Certificate(TooOld(HdjWikesGvUVhjqpqhLNDc7AndjJPkU7GHWh4ZFNBKSd, 21, 134)))
+2025-10-16T19:32:52.171087Z  WARN process_gossip e=Certificate(Certificate(TooOld(HdjWikesGvUVhjqpqhLNDc7AndjJPkU7GHWh4ZFNBKSd, 21, 134)))
+2025-10-16T19:32:52.171094Z  WARN process_gossip e=Certificate(Certificate(TooOld(HdjWikesGvUVhjqpqhLNDc7AndjJPkU7GHWh4ZFNBKSd2025-10-16T19:32:52.171192Z  WARN process_gossip e=Certificate(Certificate(TooOld(HdjWikesGvUVhjqpqhLNDc7AndjJPkU7GHWh4ZFNBKSd, 21, 134)))
+, 21, 134)))
+2025-10-16T19:32:52.171205Z  WARN process_gossip e=Certificate(Certificate(TooOld(HdjWikesGvUVhjqpqhLNDc7AndjJPkU7GHWh4ZFNBKSd, 21, 134)))
+2025-10-16T19:32:52.173137Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/60674/quic-v1/p2p/12D3KooWB8BDt5vENyFthwJzPid1sECHJxxHPLA6uqwKSphT7pXq, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:32:52.173165Z  INFO execute:launch_node: Epoch Task Manager: DialPeer mTNyX3zpSbNk4CVKwTmed1XxByUbNaFrDhBCbrCbb5mQ1bSt4vpJujPnfqJi42UwK9QCsiTgScEuhou1bwJdbLzEBqGos4LqxwMQ7q29DjAMAcnobAAc1SdfFEWaiVBVcbK shutdown successfully
+2025-10-16T19:32:52.173249Z  INFO Publishing our record to kademlia
+2025-10-16T19:32:52.174446Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/60674/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/50605/quic-v1 }
+2025-10-16T19:32:52.174516Z  INFO Publishing our record to kademlia
+2025-10-16T19:32:52.175271Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/55400/quic-v1/p2p/12D3KooWAX6JFCep5FgtXN6cnjU1nebq7cigAJChrCh1FjER5m38, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:32:52.175284Z  INFO execute:launch_node: Epoch Task Manager: DialPeer 24aRcMhPWphtzodKyxvMbdNmyfZNf2YM8mfEFo4B5Sg2Lf5XokY77WPXK818tAwSjt31feLZtK3dFJd2Bm2ce78DXUxhD1Ts6ujvPDW7i1bNNeEBYMvKYzafYoxcG7eywkQJ shutdown successfully
+2025-10-16T19:32:52.175375Z  INFO Publishing our record to kademlia
+2025-10-16T19:32:52.176431Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/55400/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/50605/quic-v1 }
+2025-10-16T19:32:52.176491Z  INFO Publishing our record to kademlia
+2025-10-16T19:32:52.177526Z  WARN GRAFT: ignoring request from direct peer peer=12D3KooWB8BDt5vENyFthwJzPid1sECHJxxHPLA6uqwKSphT7pXq
+2025-10-16T19:32:52.177948Z  WARN GRAFT: ignoring request from direct peer peer=12D3KooWB8BDt5vENyFthwJzPid1sECHJxxHPLA6uqwKSphT7pXq
+2025-10-16T19:32:52.178186Z  WARN failed to dial 26eNMZchvSnR3MvRi6Dv6kxrdP2oiFSmXRtVFTEW8X1arzoVF2xdFS2zEd8yJav38KpirtzU5mrgLomend4ArrUdMAPEFV4ZXv7ynNNybwTaQmFtfsYnjv1yHg6buqQjy98C: dial attempt timedout
+2025-10-16T19:32:52.179053Z  WARN GRAFT: ignoring request from direct peer peer=12D3KooWAX6JFCep5FgtXN6cnjU1nebq7cigAJChrCh1FjER5m38
+2025-10-16T19:32:52.179175Z  WARN GRAFT: ignoring request from direct peer peer=12D3KooWAX6JFCep5FgtXN6cnjU1nebq7cigAJChrCh1FjER5m38
+2025-10-16T19:32:52.182730Z  INFO new connection established endpoint=Listener { local_addr: /ip4/127.0.0.1/udp/57311/quic-v1, send_back_addr: /ip4/127.0.0.1/udp/50605/quic-v1 }
+2025-10-16T19:32:52.182792Z  INFO Publishing our record to kademlia
+2025-10-16T19:32:52.183307Z  INFO new connection established endpoint=Dialer { address: /ip4/127.0.0.1/udp/57311/quic-v1/p2p/12D3KooWALnu8ZwipoJRs2QLp1VeS3HcfXT44Ciyu7SsRJ49iQvd, role_override: Dialer, port_use: Reuse }
+2025-10-16T19:32:52.183409Z  INFO Publishing our record to kademlia
+2025-10-16T19:32:52.185611Z  WARN GRAFT: ignoring request from direct peer peer=12D3KooWALnu8ZwipoJRs2QLp1VeS3HcfXT44Ciyu7SsRJ49iQvd
+2025-10-16T19:32:52.185731Z  WARN GRAFT: ignoring request from direct peer peer=12D3KooWALnu8ZwipoJRs2QLp1VeS3HcfXT44Ciyu7SsRJ49iQvd
+2025-10-16T19:32:52.277361Z  INFO canonical head for epoch 0 round 184: 79 - 0xe7e579de34be26d46dd2d1265f85f12305e6fcceac66aacfcd7bbecc0ccc26f8
+2025-10-16T19:32:52.288477Z  INFO canonical head for epoch 0 round 184: 79 - 0xe7e579de34be26d46dd2d1265f85f12305e6fcceac66aacfcd7bbecc0ccc26f8
+2025-10-16T19:32:52.295339Z  INFO canonical head for epoch 0 round 184: 79 - 0xe7e579de34be26d46dd2d1265f85f12305e6fcceac66aacfcd7bbecc0ccc26f8
+2025-10-16T19:32:52.371178Z ERROR execute:launch_node: Epoch Task Manager: All tasks NOT shutdown
+2025-10-16T19:32:52.371236Z  INFO execute:launch_node: Epoch Task Manager: All tasks managers shutdown
+2025-10-16T19:32:52.371283Z ERROR execute:launch_node: failed to reach epoch boundary e=CriticalExitOk("latest execution block")
+2025-10-16T19:32:52.371519Z ERROR execute:launch_node: epoch returned error e=Critical task latest execution block has exited unexpectedly: OK
+
+Location:
+    /Users/grant/coding/telcoin/telcoin-network/crates/node/src/manager.rs:553:17
+2025-10-16T19:32:52.371651Z ERROR ConsensusOutput channel closed. Shutting down...
+2025-10-16T19:32:52.371709Z ERROR TN Engine error e=ConsensusOutputStreamClosed
+2025-10-16T19:32:52.372906Z  INFO LayeredDatabase Dropping, shutting down DB thread
+2025-10-16T19:32:52.372957Z  INFO Layerd DB thread Shutdown complete
+2025-10-16T19:32:52.373068Z  INFO LayeredDatabase Dropped, DB thread is shutdown
+2025-10-16T19:32:52.373102Z  INFO MemDatabase Dropping, shutting down metrics thread
+2025-10-16T19:32:52.373135Z  INFO MDBX Dropping, shutting down metrics thread
+2025-10-16T19:32:52.373148Z  INFO Ending MemDB metrics thread
+2025-10-16T19:32:52.373176Z  INFO Ending MDBX metrics thread
+Error: Critical task latest execution block has exited unexpectedly: OK
+
+Location:
+    /Users/grant/coding/telcoin/telcoin-network/crates/node/src/manager.rs:553:17
+2025-10-16T19:32:52.649114Z  WARN re-proposing last header after max delay interval expired for round 185 interval=1s
+2025-10-16T19:32:52.651229Z  WARN canceling Header proposal B185(3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3) for round 185 authority_id=3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3
+2025-10-16T19:32:53.299355Z  INFO canonical head for epoch 0 round 186: 80 - 0x0cbf7fa77c47c8cf4eb5120e0929fbd13232b350b99858edccb711f9b7b3cc24
+2025-10-16T19:32:53.306507Z  INFO canonical head for epoch 0 round 186: 80 - 0x0cbf7fa77c47c8cf4eb5120e0929fbd13232b350b99858edccb711f9b7b3cc24
+2025-10-16T19:32:53.306505Z  INFO canonical head for epoch 0 round 186: 80 - 0x0cbf7fa77c47c8cf4eb5120e0929fbd13232b350b99858edccb711f9b7b3cc24
+2025-10-16T19:32:53.656505Z  WARN re-proposing last header after max delay interval expired for round 187 interval=1s
+2025-10-16T19:32:53.661903Z  WARN canceling Header proposal B187(3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3) for round 187 authority_id=3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3
+2025-10-16T19:32:54.295663Z  INFO canonical head for epoch 0 round 188: 81 - 0xb2af8dc4bd8c29d7cab2ddb7edd05feb91a381f953d44a52a10cef52abfd56d1
+2025-10-16T19:32:54.307750Z  INFO canonical head for epoch 0 round 188: 81 - 0xb2af8dc4bd8c29d7cab2ddb7edd05feb91a381f953d44a52a10cef52abfd56d1
+2025-10-16T19:32:54.314672Z  INFO canonical head for epoch 0 round 188: 81 - 0xb2af8dc4bd8c29d7cab2ddb7edd05feb91a381f953d44a52a10cef52abfd56d1
+2025-10-16T19:32:55.323058Z  INFO canonical head for epoch 0 round 190: 82 - 0xd92d1e5903bbcad8f1c7b6e1ea85918f502e313f7f7675cb61eddf4f86f3472b
+2025-10-16T19:32:55.334562Z  INFO canonical head for epoch 0 round 190: 82 - 0xd92d1e5903bbcad8f1c7b6e1ea85918f502e313f7f7675cb61eddf4f86f3472b
+2025-10-16T19:32:55.335114Z  INFO canonical head for epoch 0 round 190: 82 - 0xd92d1e5903bbcad8f1c7b6e1ea85918f502e313f7f7675cb61eddf4f86f3472b
+2025-10-16T19:32:56.209608Z  WARN max delay interval expired for round 192 interval=1s
+2025-10-16T19:32:56.516132Z ERROR restart-test: failed to get positive balance with retry in restart_tests1 e=client error (Connect)
+
+Caused by:
+   0: tcp connect error
+   1: Connection refused (os error 61)
+
+Location:
+    bin/telcoin-network/tests/it/restarts.rs:674:8
+2025-10-16T19:32:56.516464Z ERROR restart-test: Got error: client error (Connect)
+2025-10-16T19:32:56.516943Z  INFO execute:launch_node: Received SIGTERM
+2025-10-16T19:32:56.516928Z  INFO execute:launch_node: Received SIGTERM
+2025-10-16T19:32:56.516928Z  INFO execute:launch_node: Received SIGTERM
+2025-10-16T19:32:56.517134Z  INFO execute:launch_node: Node Task Manager: Node exiting
+2025-10-16T19:32:56.517163Z  INFO execute:launch_node: Node Task Manager: Node exiting
+2025-10-16T19:32:56.517205Z  INFO execute:launch_node: Node Task Manager: Node exiting
+2025-10-16T19:32:56.518140Z  INFO received shutdown signal...
+2025-10-16T19:32:56.518141Z  INFO received shutdown signal...
+2025-10-16T19:32:56.518136Z  INFO received shutdown signal...
+2025-10-16T19:32:56.518239Z  INFO TN Engine exited gracefully
+2025-10-16T19:32:56.518240Z  INFO TN Engine exited gracefully
+2025-10-16T19:32:56.518239Z  INFO TN Engine exited gracefully
+2025-10-16T19:32:56.525105Z ERROR execute:launch_node: Epoch Task Manager: latest execution block returned error task 62 was cancelled, node exiting
+2025-10-16T19:32:56.525372Z  INFO execute:launch_node: Epoch Task Manager: subscriber consensus was cancelled
+2025-10-16T19:32:56.525459Z  INFO execute:launch_node: Epoch Task Manager: consensus was cancelled
+2025-10-16T19:32:56.525538Z 2025-10-16T19:32:56.525811Z ERROR execute:launch_node: Epoch Task Manager: latest execution block returned error task 62 was cancelled, node exiting
+2025-10-16T19:32:56.525842Z  INFO execute:launch_node: Node Task Manager: Worker Network shutdown successfully
+ INFO execute:launch_node: Epoch Task Manager: certificate-manager was cancelled
+2025-10-16T19:32:56.528126Z  INFO execute:launch_node: Node Task Manager: Epoch Record Collector shutdown successfully
+2025-10-16T19:32:56.528141Z  INFO execute:launch_node: Epoch Task Manager: certifier task was cancelled
+2025-10-16T19:32:56.528173Z  INFO execute:launch_node: Node Task Manager: Primary Network shutdown successfully
+2025-10-16T19:32:56.528182Z  INFO execute:launch_node: Epoch Task Manager: certificate fetcher task was cancelled
+2025-10-16T19:32:56.528191Z  INFO execute:launch_node: Epoch Task Manager: subscriber consensus was cancelled
+2025-10-16T19:32:56.528215Z  INFO execute:launch_node: Node Task Manager: All tasks shutdown
+2025-10-16T19:32:56.528220Z  INFO execute:launch_node: Epoch Task Manager: proposer task was cancelled
+2025-10-16T19:32:56.528230Z  INFO execute:launch_node: Epoch Task Manager: certifier task was cancelled
+2025-10-16T19:32:56.528256Z  INFO execute:launch_node: Epoch Task Manager: state handler task was cancelled
+2025-10-16T19:32:56.528262Z  INFO execute:launch_node: Epoch Task Manager: consensus was cancelled
+2025-10-16T19:32:56.528267Z  INFO execute:launch_node: Engine Task Manager: consensus engine returned Ok, node exiting
+2025-10-16T19:32:56.528360Z  INFO execute:launch_node: Epoch Task Manager: batch builder was cancelled
+2025-10-16T19:32:56.528360Z  INFO execute:launch_node: Epoch Task Manager: certificate-manager was cancelled
+2025-10-16T19:32:56.528400Z  INFO execute:launch_node: Epoch Task Manager: certificate fetcher task was cancelled
+2025-10-16T19:32:56.528401Z  INFO execute:launch_node: Epoch Task Manager: worker network events was cancelled
+2025-10-16T19:32:56.528403Z ERROR execute:launch_node: Epoch Task Manager: consensus returned error task 51 was cancelled, node exiting
+2025-10-16T19:32:56.528432Z  INFO execute:launch_node: Epoch Task Manager: proposer task was cancelled
+2025-10-16T19:32:56.528438Z  INFO execute:launch_node: Epoch Task Manager: Worker Network Peers was cancelled
+2025-10-16T19:32:56.528464Z  INFO execute:launch_node: Epoch Task Manager: state handler task was cancelled
+2025-10-16T19:32:56.528472Z  INFO execute:launch_node: Epoch Task Manager: primary network events was cancelled
+2025-10-16T19:32:56.528496Z  INFO execute:launch_node: Epoch Task Manager: batch builder was cancelled
+2025-10-16T19:32:56.528496Z  INFO execute:launch_node: Epoch Task Manager: latest execution block was cancelled
+2025-10-16T19:32:56.528506Z  INFO execute:launch_node: Epoch Task Manager: Worker Task - 0 batch-builder was cancelled
+2025-10-16T19:32:56.528532Z  INFO execute:launch_node: Epoch Task Manager: worker network events was cancelled
+2025-10-16T19:32:56.528536Z  INFO execute:launch_node: Epoch Task Manager: subscriber consensus was cancelled
+2025-10-16T19:32:56.528540Z  INFO execute:launch_node: Epoch Task Manager: broadcast certificates to 5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj was cancelled
+2025-10-16T19:32:56.528563Z  INFO execute:launch_node: Epoch Task Manager: Worker Network Peers was cancelled
+2025-10-16T19:32:56.528567Z  INFO execute:launch_node: Epoch Task Manager: certifier task was cancelled
+2025-10-16T19:32:56.528570Z  INFO execute:launch_node: Epoch Task Manager: broadcast certificates to 5Worq4rsJP9ozQVo4anZQYvTjBkEwSsNWkZ9MpiAKNEh was cancelled
+2025-10-16T19:32:56.528593Z  INFO execute:launch_node: Epoch Task Manager: primary network events was cancelled
+2025-10-16T19:32:56.528597Z  INFO execute:launch_node: Epoch Task Manager: certificate-manager was cancelled
+2025-10-16T19:32:56.528603Z  INFO execute:launch_node: Epoch Task Manager: broadcast certificates to EUzKUKnhhXBdZ5zBqHHHx7mZqcRCvT1buHAeXZALuPqP was cancelled
+2025-10-16T19:32:56.528623Z  INFO execute:launch_node: Epoch Task Manager: Worker Task - 0 batch-builder was cancelled
+2025-10-16T19:32:56.528627Z  INFO execute:launch_node: Epoch Task Manager: certificate fetcher task was cancelled
+2025-10-16T19:32:56.528636Z  INFO execute:launch_node: Epoch Task Manager: All tasks shutdown
+2025-10-16T19:32:56.528655Z  INFO execute:launch_node: Epoch Task Manager: proposer task was cancelled
+2025-10-16T19:32:56.528654Z  INFO execute:launch_node: Epoch Task Manager: broadcast certificates to 5uGKzhc2KyJq4PP84P5GA3F9fU8LW6p28E7bFP22m2zj was cancelled
+2025-10-16T19:32:56.528670Z  INFO execute:launch_node: Epoch Task Manager: All tasks managers shutdown
+2025-10-16T19:32:56.528688Z  INFO execute:launch_node: Epoch Task Manager: state handler task was cancelled
+2025-10-16T19:32:56.528690Z  INFO execute:launch_node: Epoch Task Manager: broadcast certificates to EUzKUKnhhXBdZ5zBqHHHx7mZqcRCvT1buHAeXZALuPqP was cancelled
+2025-10-16T19:32:56.528717Z  INFO execute:launch_node: Epoch Task Manager: batch builder was cancelled
+2025-10-16T19:32:56.528726Z  INFO execute:launch_node: Epoch Task Manager: broadcast certificates to 3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3 was cancelled
+2025-10-16T19:32:56.528744Z  INFO execute:launch_node: Epoch Task Manager: worker network events was cancelled
+2025-10-16T19:32:56.528761Z  INFO execute:launch_node: Epoch Task Manager: All tasks shutdown
+2025-10-16T19:32:56.528776Z  INFO execute:launch_node: Epoch Task Manager: Worker Network Peers was cancelled
+2025-10-16T19:32:56.528791Z  INFO execute:launch_node: Epoch Task Manager: All tasks managers shutdown
+2025-10-16T19:32:56.528814Z  INFO execute:launch_node: Epoch Task Manager: primary network events was cancelled
+2025-10-16T19:32:56.528851Z  INFO execute:launch_node: Epoch Task Manager: Worker Task - 0 batch-builder was cancelled
+2025-10-16T19:32:56.528887Z  INFO execute:launch_node: Epoch Task Manager: broadcast certificates to 5Worq4rsJP9ozQVo4anZQYvTjBkEwSsNWkZ9MpiAKNEh was cancelled
+2025-10-16T19:32:56.528928Z  INFO execute:launch_node: Epoch Task Manager: broadcast certificates to EUzKUKnhhXBdZ5zBqHHHx7mZqcRCvT1buHAeXZALuPqP was cancelled
+2025-10-16T19:32:56.528968Z  INFO execute:launch_node: Epoch Task Manager: broadcast certificates to 3g3MKqMdZhXX5aLKrRwE6W856kqQtgZbvk6d5oFtLgh3 was cancelled
+2025-10-16T19:32:56.529008Z  INFO execute:launch_node: Epoch Task Manager: All tasks shutdown
+2025-10-16T19:32:56.529040Z  INFO execute:launch_node: Epoch Task Manager: All tasks managers shutdown
+2025-10-16T19:32:56.530363Z  INFO execute:launch_node: looping run epoch
+2025-10-16T19:32:56.530413Z  INFO execute:launch_node: looping run epoch
+2025-10-16T19:32:56.530641Z  INFO execute:launch_node: looping run epoch
+2025-10-16T19:32:56.531871Z  INFO LayeredDatabase Dropping, shutting down DB thread
+2025-10-16T19:32:56.531871Z  INFO LayeredDatabase Dropping, shutting down DB thread
+2025-10-16T19:32:56.531963Z  INFO Layerd DB thread Shutdown complete
+2025-10-16T19:32:56.531964Z  INFO Layerd DB thread Shutdown complete
+2025-10-16T19:32:56.532363Z  INFO LayeredDatabase Dropped, DB thread is shutdown
+2025-10-16T19:32:56.532392Z  INFO MemDatabase Dropping, shutting down metrics thread
+2025-10-16T19:32:56.532426Z  INFO MDBX Dropping, shutting down metrics thread
+2025-10-16T19:32:56.534196Z  INFO LayeredDatabase Dropped, DB thread is shutdown
+2025-10-16T19:32:56.534269Z  INFO MemDatabase Dropping, shutting down metrics thread
+2025-10-16T19:32:56.534307Z  INFO MDBX Dropping, shutting down metrics thread
+2025-10-16T19:32:56.534683Z  INFO Ending MemDB metrics thread
+2025-10-16T19:32:56.534777Z  INFO LayeredDatabase Dropping, shutting down DB thread
+2025-10-16T19:32:56.535574Z  INFO Layerd DB thread Shutdown complete
+2025-10-16T19:32:56.534823Z  INFO Ending MemDB metrics thread
+2025-10-16T19:32:56.534710Z  INFO Ending MDBX metrics thread
+2025-10-16T19:32:56.534846Z  INFO Ending MDBX metrics thread
+2025-10-16T19:32:56.536198Z  INFO LayeredDatabase Dropped, DB thread is shutdown
+2025-10-16T19:32:56.536230Z  INFO MemDatabase Dropping, shutting down metrics thread
+2025-10-16T19:32:56.536262Z  INFO MDBX Dropping, shutting down metrics thread
+2025-10-16T19:32:56.536296Z  INFO Ending MemDB metrics thread
+2025-10-16T19:32:56.536887Z  INFO Ending MDBX metrics thread
+test restarts::test_restarts_delayed ... FAILED
+
+failures:
+
+---- restarts::test_restarts_delayed stdout ----
+
+thread 'restarts::test_restarts_delayed' panicked at bin/telcoin-network/tests/it/restarts.rs:293:5:
+client error (Connect)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    restarts::test_restarts_delayed
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 151.68s
+
+error: test failed, to rerun pass `-p telcoin-network --test it`
+make: *** [attest] Error 101
+grant@Mac telcoin-network %

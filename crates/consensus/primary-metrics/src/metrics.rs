@@ -82,6 +82,8 @@ pub struct PrimaryChannelMetrics {
     pub tx_certificate_acceptor: IntGauge,
     /// occupancy of the channel from the primary for epoch certs
     pub tx_new_epoch_certificates: IntGauge,
+    /// Total for weak votes towards fast-commit rule.
+    pub tx_weak_votes: IntGauge,
 
     // totals
     /// total received on channel from the `primary::WorkerReceiverHandler` to the
@@ -194,6 +196,11 @@ impl PrimaryChannelMetrics {
             tx_new_epoch_certificates: register_int_gauge_with_registry!(
                 "tx_new_epoch_certicates",
                 "new epoch certs as recieved",
+                registry
+            )?,
+            tx_weak_votes: register_int_gauge_with_registry!(
+                "tx_weak_votes",
+                "weak votes for anchors in dag",
                 registry
             )?,
 

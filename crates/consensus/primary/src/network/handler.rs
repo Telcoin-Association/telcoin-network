@@ -455,6 +455,9 @@ where
         // Update the vote digest store with the vote we just sent.
         self.consensus_config.node_storage().write_vote(&vote)?;
 
+        // process parents as weak votes for fast-commit rule
+        let _ = self.consensus_bus.weak_votes().send(header.into()).await;
+
         Ok(PrimaryResponse::Vote(vote))
     }
 
