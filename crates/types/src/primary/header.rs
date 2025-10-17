@@ -76,6 +76,11 @@ impl Header {
             return Err(HeaderError::InvalidEpoch { theirs: self.epoch, ours: committee.epoch() });
         }
 
+        // Ensure we don't have too many parents.
+        if self.parents.len() > committee.size() {
+            return Err(HeaderError::TooManyParents(self.parents.len(), committee.size()));
+        }
+
         // Ensure the header digest is well formed.
         if Hash::digest(self) != self.digest() {
             return Err(HeaderError::InvalidHeaderDigest);

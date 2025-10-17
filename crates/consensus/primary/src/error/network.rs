@@ -128,6 +128,7 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
     match error {
         // mild
         HeaderError::SyncBatches(_)
+        | HeaderError::TooNew { .. }
         | HeaderError::Storage(_)
         | HeaderError::UnknownExecutionResult(_) => Some(Penalty::Mild),
         // medium

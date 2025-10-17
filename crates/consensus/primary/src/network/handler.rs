@@ -221,6 +221,18 @@ where
 
         // validate header
         header.validate(committee)?;
+        let max_round = *self.consensus_bus.committed_round_updates().borrow()
+            + self.consensus_config.parameters().gc_depth;
+        // Make sure the header is not unreasonable in the future.
+        ensure!(
+            header.round() <= max_round,
+            HeaderError::TooNew {
+                digest: header.digest(),
+                header_round: header.round(),
+                max_round,
+            }
+            .into()
+        );
 
         // validate parents
         let num_parents = parents.len();
