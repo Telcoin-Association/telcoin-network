@@ -197,7 +197,7 @@ impl ConsensusState {
             .observe(certificate.created_at().elapsed().as_secs_f64());
 
         // NOTE: This log entry is used to compute performance.
-        tracing::debug!(target: "telcoin::consensus_state",
+        debug!(target: "telcoin::consensus_state",
             "Certificate {:?} took {} seconds to be committed at round {}",
             certificate.digest(),
             elapsed,
@@ -210,7 +210,7 @@ impl ConsensusState {
         self.cleanup_weak_votes();
     }
 
-    // Checks that the provided certificate's parents exist return an error if they do not.
+    /// Checks that the provided certificate's parents exist return an error if they do not.
     fn check_parents(
         certificate: &Certificate,
         dag: &Dag,
@@ -234,7 +234,7 @@ impl ConsensusState {
                 }
             }
         } else {
-            tracing::error!(target: "telcoin::consensus_state", "Parent round not found in DAG for {certificate:?}!");
+            error!(target: "telcoin::consensus_state", "Parent round not found in DAG for {certificate:?}!");
             return Err(ConsensusError::MissingParentRound(Box::new(certificate.clone())));
         }
         Ok(())
@@ -245,7 +245,7 @@ impl ConsensusState {
     /// A weak vote occurs when a proposal (header - not yet certified) references a certificate as a parent.
     /// These are tracked separately from strong votes (verified certificates).
     pub fn track_weak_votes(&mut self, weak_vote: WeakVote) {
-        self.weak_votes.track_proposal(weak_vote, &self.dag);
+        self.weak_votes.process_vote(weak_vote, &self.dag);
     }
 
     /// Get the count of weak votes (from uncertified proposals) for a certificate.
@@ -265,7 +265,7 @@ impl ConsensusState {
         weak_votes as u64 >= committee.quorum_threshold()
     }
 
-    // Clean up weak votes for rounds that are below GC.
+    /// Clean up weak votes for rounds that are below GC.
     pub fn cleanup_weak_votes(&mut self) {
         self.weak_votes.cleanup(self.last_round.gc_round);
     }
@@ -399,7 +399,7 @@ impl<DB: Database> Consensus<DB> {
 
     async fn run(mut self) -> Result<(), ConsensusError> {
         let mut rx_new_certificates = self.consensus_bus.new_certificates().subscribe();
-        let mut rx_weak_votes = self.consensus_bus.header_proposals().subscribe();
+        let mut rx_weak_votes = self.consensus_bus.weak_votes().subscribe();
         self.active = self.consensus_bus.node_mode().borrow().is_active_cvv();
 
         // listen to incoming certificates and weak votes for fast commit rule
@@ -417,7 +417,7 @@ impl<DB: Database> Consensus<DB> {
 
                 // process valid proposals as weak votes for fast-commit rule
                 Some(weak_vote) = rx_weak_votes.recv() => {
-                    self.process_header_proposal(weak_vote).await?;
+                    self.process_weak_vote(weak_vote).await?;
                 }
             }
         }
@@ -430,7 +430,7 @@ impl<DB: Database> Consensus<DB> {
                 // we can proceed.
             }
             _ => {
-                tracing::debug!(target: "telcoin::consensus_state", "Already moved to the next epoch");
+                debug!(target: "telcoin::consensus_state", "Already moved to the next epoch");
                 return Ok(());
             }
         }
@@ -452,12 +452,12 @@ impl<DB: Database> Consensus<DB> {
                 let base_execution_block = committed_sub_dag.leader.header.latest_execution_block;
                 if self.consensus_bus.wait_for_execution(base_execution_block).await.is_err() {
                     // This seems to be a bogus sub dag, we are out of sync...
-                    tracing::error!(target: "telcoin::consensus_state", "Got a bogus sub dag from bullshark, we are out of sync!");
+                    error!(target: "telcoin::consensus_state", "Got a bogus sub dag from bullshark, we are out of sync!");
                     self.consensus_bus.node_mode().send_modify(|v| *v = NodeMode::CvvInactive);
                     break;
                 }
 
-                tracing::debug!(target: "telcoin::consensus_state", "Commit in Sequence {:?}", committed_sub_dag.leader.nonce());
+                debug!(target: "telcoin::consensus_state", "Commit in Sequence {:?}", committed_sub_dag.leader.nonce());
 
                 for certificate in &committed_sub_dag.certificates {
                     committed_certificates.push(certificate.clone());
@@ -505,7 +505,7 @@ impl<DB: Database> Consensus<DB> {
     /// Process valid header proposals as weak votes for the fast-commit rule.
     ///
     /// This is only called when the node is actively participating in committee.
-    async fn process_header_proposal(&mut self, weak_vote: WeakVote) -> Result<(), ConsensusError> {
+    async fn process_weak_vote(&mut self, weak_vote: WeakVote) -> Result<(), ConsensusError> {
         // only process if node is active cvv
         if !self.active {
             debug!("consensus inactive - ignoring header proposal");

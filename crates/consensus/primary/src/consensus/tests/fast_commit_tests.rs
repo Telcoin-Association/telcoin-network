@@ -429,7 +429,7 @@ async fn fast_commit_integration_test() {
         }
 
         let weak_vote = WeakVote { authority: proposer, round: 3, parents: proposal_parents };
-        cb.header_proposals().send(weak_vote).await.unwrap();
+        cb.weak_votes().send(weak_vote).await.unwrap();
     }
 
     // should trigger fast commit before receiving certificates
@@ -480,7 +480,7 @@ async fn test_weak_vote_tracker() {
         round: 3,
         parents: vec![digest_0, digest_1].into_iter().collect(),
     };
-    tracker.track_proposal(weak_vote1, &dag);
+    tracker.process_vote(weak_vote1, &dag);
     assert_eq!(tracker.get_votes(2, &ids[0]), 1);
     assert_eq!(tracker.get_votes(2, &ids[1]), 1);
     assert_eq!(tracker.get_votes(2, &ids[2]), 0);
@@ -491,23 +491,23 @@ async fn test_weak_vote_tracker() {
         round: 3,
         parents: vec![digest_1, digest_2].into_iter().collect(),
     };
-    tracker.track_proposal(weak_vote2, &dag);
+    tracker.process_vote(weak_vote2, &dag);
     assert_eq!(tracker.get_votes(2, &ids[0]), 1);
     assert_eq!(tracker.get_votes(2, &ids[1]), 2);
     assert_eq!(tracker.get_votes(2, &ids[2]), 1);
 
-    // Try to track duplicate from proposer1 - should not increase counts
+    // try to track duplicate from proposer1 - should not increase counts
     let weak_vote3 = WeakVote {
         authority: proposer1,
         round: 3,
         parents: vec![digest_0, digest_1, digest_2].into_iter().collect(),
     };
-    tracker.track_proposal(weak_vote3, &dag);
+    tracker.process_vote(weak_vote3, &dag);
     assert_eq!(tracker.get_votes(2, &ids[0]), 1); // Still 1
     assert_eq!(tracker.get_votes(2, &ids[1]), 2); // Still 2
     assert_eq!(tracker.get_votes(2, &ids[2]), 1); // Still 1
 
-    // Test cleanup
+    // test cleanup
     tracker.cleanup(1);
     assert!(tracker.vote_counts.contains_key(&2)); // round 2 still there
 

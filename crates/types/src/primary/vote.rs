@@ -188,7 +188,9 @@ impl From<&Vote> for VoteInfo {
     }
 }
 
-/// TODO
+/// TODO:
+///
+///
 #[derive(Debug)]
 pub struct WeakVote {
     /// The authority that proposed the header used as the weak vote.
@@ -197,4 +199,10 @@ pub struct WeakVote {
     pub round: Round,
     /// The validated parents for the weak vote.
     pub parents: BTreeSet<CertificateDigest>,
+}
+
+impl From<Header> for WeakVote {
+    fn from(value: Header) -> Self {
+        Self { authority: value.author, round: value.round, parents: value.parents }
+    }
 }

@@ -305,6 +305,7 @@ struct ConsensusBusEpochInner {
 
     /// Messages to the Certificate Manager.
     certificate_manager: MeteredMpscChannel<CertificateManagerCommand>,
+
     /// Header proposals sent to consensus as weak votes for the fast-commit rule.
     header_proposals: MeteredMpscChannel<WeakVote>,
 }
@@ -358,10 +359,9 @@ impl ConsensusBusEpochInner {
             &app_inner.channel_metrics.tx_sequence,
         );
 
-        // TODO: update metrics here
         let header_proposals = metered_channel::channel_sender(
             CHANNEL_CAPACITY,
-            &app_inner.channel_metrics.tx_sequence,
+            &app_inner.primary_metrics.primary_channel_metrics.tx_weak_votes,
         );
 
         Self {
@@ -441,7 +441,7 @@ impl ConsensusBus {
     /// Valid headers this node has seen.
     ///
     /// This information is used as "weak votes" for the fast-commit rule.
-    pub fn header_proposals(&self) -> &impl TnSender<WeakVote> {
+    pub fn weak_votes(&self) -> &impl TnSender<WeakVote> {
         &self.inner_epoch.header_proposals
     }
 
