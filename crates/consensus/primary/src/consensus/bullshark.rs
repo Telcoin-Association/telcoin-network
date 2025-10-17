@@ -128,6 +128,17 @@ impl<DB: ConsensusStore> Bullshark<DB> {
 
         self.report_leader_on_time_metrics(round, state);
 
+        // try fast commit for any eligible leaders
+        let (fast_outcome, mut committed_sub_dags) = self.try_fast_commit(state)?;
+
+        // if fast commit succeeded, we might be done
+        if fast_outcome == Outcome::Commit && !committed_sub_dags.is_empty() {
+            // Record success metrics
+            self.last_successful_leader_election_timestamp = Instant::now();
+            self.metrics.leader_commits.with_label_values(&["fast"]).inc();
+            return Ok((Outcome::Commit, committed_sub_dags));
+        }
+
         // Try to order the dag to commit. Start from the highest round for which we have at least
         // f+1 certificates. This is because we need them to provide
         // enough support to the leader.
@@ -425,5 +436,117 @@ impl<DB: ConsensusStore> Bullshark<DB> {
 
         self.max_inserted_certificate_round =
             self.max_inserted_certificate_round.max(certificate_round);
+    }
+
+    /// Try to commit leaders using the Fast Direct Commit rule (2f+1 weak votes)
+    pub fn try_fast_commit(
+        &mut self,
+        state: &mut ConsensusState,
+    ) -> Result<(Outcome, Vec<CommittedSubDag>), ConsensusError> {
+        // Get max round from the DAG directly
+        let max_round = state.dag.keys().max().copied().unwrap_or(0);
+
+        // check each potential leader round starting from last committed + 2
+        let start_round = state.last_round.committed_round + 2;
+
+        for leader_round in (start_round..=max_round).step_by(2) {
+            if leader_round % 2 != 0 {
+                continue; // leaders are only on even rounds
+            }
+
+            // get the leader for this round
+            let leader = self.leader_schedule.leader(leader_round);
+
+            // check if we have enough weak votes for fast commit
+            if state.can_fast_commit(leader_round, &leader, &self.committee) {
+                debug!(leader_round, ?leader, "Enough weak votes to fast commit");
+                // try to get the leader's certificate
+                let leader_certificate =
+                    match self.leader_schedule.leader_certificate(leader_round, &state.dag) {
+                        (_authority, Some(certificate)) => Some(certificate.clone()), // Clone the certificate
+                        (_authority, None) => None,
+                    };
+
+                if let Some(certificate) = leader_certificate {
+                    debug!("Fast committing leader at round {} with 2f+1 weak votes", leader_round);
+
+                    // Record fast commit in metrics
+                    self.metrics
+                        .leader_election
+                        .with_label_values(&["fast_commit", &leader.id().to_string()])
+                        .inc();
+
+                    // Fast commit this leader - now state can be borrowed mutably
+                    let (outcome, sub_dags) = self.fast_commit_leader(&certificate, state)?;
+
+                    if outcome == Outcome::Commit {
+                        // Update metrics for successful fast commit
+                        self.last_successful_leader_election_timestamp = Instant::now();
+                        return Ok((outcome, sub_dags));
+                    }
+                } else {
+                    // Leader certificate not yet in DAG, can't commit yet
+                    debug!(
+                        "Leader at round {} has weak votes but certificate not in DAG yet",
+                        leader_round
+                    );
+                }
+            }
+        }
+
+        Ok((Outcome::NoLeaderElectedForOddRound, Vec::new()))
+    }
+
+    /// Fast commit a leader that has 2f+1 weak votes.
+    /// This bypasses the f+1 certificate check since we already have 2f+1 weak votes.
+    fn fast_commit_leader(
+        &mut self,
+        leader: &Certificate,
+        state: &mut ConsensusState,
+    ) -> Result<(Outcome, Vec<CommittedSubDag>), ConsensusError> {
+        // We already verified 2f+1 weak votes, so we can skip the f+1 certificate check
+        debug!("Fast committing leader {:?} with 2f+1 weak votes", leader);
+
+        let mut committed_sub_dags = Vec::new();
+        let mut leaders_to_commit = self.order_leaders(leader, state);
+
+        while let Some(leader) = leaders_to_commit.pop_front() {
+            let sub_dag_index = leader.nonce();
+            let _span = error_span!("bullshark_fast_commit_sub_dag", sub_dag_index);
+
+            let mut min_round = leader.round();
+            let mut sequence = Vec::new();
+
+            // Flatten the sub-dag referenced by the leader
+            for x in utils::order_dag(&leader, state) {
+                state.update(&x);
+                min_round = min_round.min(x.round());
+                sequence.push(x);
+            }
+
+            debug!(min_round, "Fast commit subdag has {} certificates", sequence.len());
+
+            // Resolve reputation score
+            let reputation_score = self.resolve_reputation_score(state, &sequence, sub_dag_index);
+
+            let sub_dag = CommittedSubDag::new(
+                sequence,
+                leader.clone(),
+                sub_dag_index,
+                reputation_score.clone(),
+                state.last_committed_sub_dag.as_ref(),
+            );
+
+            state.last_committed_sub_dag = Some(sub_dag.clone());
+            committed_sub_dags.push(sub_dag);
+
+            if self.update_leader_schedule(leader.round(), &reputation_score) {
+                if !leaders_to_commit.is_empty() {
+                    return Ok((Outcome::ScheduleChanged, committed_sub_dags));
+                }
+            }
+        }
+
+        Ok((Outcome::Commit, committed_sub_dags))
     }
 }
