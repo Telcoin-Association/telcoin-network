@@ -65,7 +65,7 @@ impl<DB: ConsensusStore> Bullshark<DB> {
     }
 
     /// Calculates the reputation score for the current commit by taking into account the reputation
-    /// scores from the previous commit (assuming that exists). It returns the updated reputation
+    /// scores from the previous rounds. It returns the updated reputation
     /// score.
     fn resolve_reputation_score(
         &self,
@@ -75,10 +75,9 @@ impl<DB: ConsensusStore> Bullshark<DB> {
     ) -> ReputationScores {
         // we reset the scores for every schedule change window, or initialise when it's the first
         // sub dag we are going to create.
-        // TODO: when schedule change is implemented we should probably change a little bit
-        // this logic here.
-        // sub_dag_index is based on epoch and round so / 2 so this check works on commit rounds
-        // (every other one).
+        //
+        // sub_dag_index is based on epoch and round so / 2 so this check works on consensus rounds
+        // (every other one) - not commits
         let mut reputation_score =
             if (sub_dag_index / 2) % self.num_sub_dags_per_schedule as u64 == 0 {
                 ReputationScores::new(&self.committee)
@@ -101,15 +100,16 @@ impl<DB: ConsensusStore> Bullshark<DB> {
         }
 
         // we check if this is the last sub dag of the current schedule. If yes then we mark the
-        // scores as final_of_schedule = true so any downstream user can now that those are the last
+        // scores as final_of_schedule = true so any downstream user knows that these are the last
         // ones calculated for the current schedule.
-        // sub_dag_index is based on epoch and round so / 2 so this check works on commit rounds
+        //
+        // sub_dag_index is based on epoch and round so / 2 so this check works on consensus rounds
         // (every other one).
         reputation_score.final_of_schedule =
             ((sub_dag_index / 2) + 1) % self.num_sub_dags_per_schedule as u64 == 0;
 
-        // Always ensure that all the authorities are present in the reputation scores - even
-        // when score is zero.
+        // always ensure that all the authorities are present in the reputation scores
+        // even when score is zero.
         assert_eq!(reputation_score.total_authorities() as usize, self.committee.size());
 
         reputation_score
@@ -124,7 +124,7 @@ impl<DB: ConsensusStore> Bullshark<DB> {
         debug!("Processing {:?}", certificate);
         let round = certificate.round();
 
-        // Add the new certificate to the local storage.
+        // add the new certificate to the local storage
         if !state.try_insert(&certificate)? {
             // Certificate has not been added to the dag since it's below commit round
             return Ok((Outcome::CertificateBelowCommitRound, vec![]));
@@ -137,7 +137,7 @@ impl<DB: ConsensusStore> Bullshark<DB> {
         // enough support to the leader.
         let r = round - 1;
 
-        // We only elect leaders for even round numbers.
+        // we only elect leaders for even round numbers
         if r % 2 != 0 || r < 2 {
             return Ok((Outcome::NoLeaderElectedForOddRound, Vec::new()));
         }
@@ -380,63 +380,65 @@ impl<DB: ConsensusStore> Bullshark<DB> {
         // get max round from the DAG directly
         let max_round = state.dag.keys().max().copied().unwrap_or(0);
 
-        // check each potential leader round starting from last committed + 2
+        // Find the HIGHEST leader round that has enough weak votes
         let start_round = state.last_round.committed_round + 2;
+        let mut highest_committable_round = None;
 
         for leader_round in (start_round..=max_round).step_by(2) {
             if leader_round % 2 != 0 {
-                continue; // leaders are only on even rounds
+                continue;
             }
 
-            // get the leader for this round
             let leader = self.leader_schedule.leader(leader_round);
 
-            // check if we have enough weak votes for fast commit
+            // Check if we have enough weak votes AND the certificate exists
             if state.can_fast_commit(leader_round, &leader, &self.committee) {
-                debug!(leader_round, ?leader, "Enough weak votes to fast commit");
-                // try to get the leader's certificate
-                let leader_certificate =
-                    match self.leader_schedule.leader_certificate(leader_round, &state.dag) {
-                        (_authority, Some(certificate)) => Some(certificate.clone()), // Clone the certificate
-                        (_authority, None) => None,
-                    };
-
-                if let Some(certificate) = leader_certificate {
-                    debug!("Fast committing leader at round {} with 2f+1 weak votes", leader_round);
-
-                    // record fast commit in metrics
-                    self.metrics
-                        .leader_election
-                        .with_label_values(&["fast_commit", &leader.id().to_string()])
-                        .inc();
-
-                    // TODO: should this be in a loop as well like `process_leader_round`?
-                    // fast commit this leader
-                    // We already verified 2f+1 weak votes, so we can skip the f+1 certificate check
-                    debug!("Fast committing leader {:?} with 2f+1 weak votes", leader);
-                    let (outcome, sub_dags) = self.commit_leader(&certificate, state)?;
-
-                    if outcome == Outcome::Commit {
-                        // Update metrics for successful fast commit
-                        self.last_successful_leader_election_timestamp = Instant::now();
-                        return Ok((outcome, sub_dags));
+                match self.leader_schedule.leader_certificate(leader_round, &state.dag) {
+                    (_authority, Some(_certificate)) => {
+                        highest_committable_round = Some(leader_round);
+                        // Keep looking for higher rounds
                     }
-                } else {
-                    // leader certificate not yet in dag, can't commit yet
-                    debug!(
-                        "Leader at round {} has weak votes but certificate not in DAG yet",
-                        leader_round
-                    );
+                    (_authority, None) => {
+                        // Certificate not in DAG, can't use this round
+                    }
                 }
+            }
+        }
+
+        // If we found a committable leader, commit it (and all previous uncommitted leaders)
+        if let Some(leader_round) = highest_committable_round {
+            let leader = self.leader_schedule.leader(leader_round);
+            let (_authority, certificate) =
+                self.leader_schedule.leader_certificate(leader_round, &state.dag);
+            let certificate = certificate.unwrap().clone();
+
+            debug!("Fast committing highest leader at round {} with 2f+1 weak votes", leader_round);
+
+            // Record fast commit in metrics
+            self.metrics
+                .leader_election
+                .with_label_values(&["fast_commit", &leader.id().to_string()])
+                .inc();
+
+            let mut committed_sub_dags = Vec::new();
+            let outcome = loop {
+                let (outcome, committed) = self.commit_leader(&certificate, state)?;
+                committed_sub_dags.extend(committed);
+
+                if outcome != Outcome::ScheduleChanged {
+                    break outcome;
+                }
+            };
+
+            if outcome == Outcome::Commit {
+                self.last_successful_leader_election_timestamp = Instant::now();
+                return Ok((outcome, committed_sub_dags));
             }
         }
 
         Ok((Outcome::NoLeaderElectedForOddRound, Vec::new()))
     }
 
-    // 214
-    // 313
-    // 460
     /// Commit the leader that either has f+1 certificates or 2f+1 weak votes.
     fn commit_leader(
         &mut self,
@@ -475,10 +477,10 @@ impl<DB: ConsensusStore> Bullshark<DB> {
             state.last_committed_sub_dag = Some(sub_dag.clone());
             committed_sub_dags.push(sub_dag);
 
-            if self.update_leader_schedule(leader_round, &reputation_score) {
-                if !leaders_to_commit.is_empty() {
-                    return Ok((Outcome::ScheduleChanged, committed_sub_dags));
-                }
+            if self.update_leader_schedule(leader_round, &reputation_score)
+                && !leaders_to_commit.is_empty()
+            {
+                return Ok((Outcome::ScheduleChanged, committed_sub_dags));
             }
         }
 

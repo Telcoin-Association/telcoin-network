@@ -190,7 +190,6 @@ impl From<&Vote> for VoteInfo {
 
 /// TODO:
 ///
-///
 #[derive(Debug)]
 pub struct WeakVote {
     /// The authority that proposed the header used as the weak vote.

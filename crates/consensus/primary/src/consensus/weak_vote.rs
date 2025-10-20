@@ -26,10 +26,10 @@ impl WeakVoteTracker {
         Self { proposers_seen: BTreeMap::new(), vote_counts: BTreeMap::new() }
     }
 
-    ///
+    /// Process the weak vote.
     pub fn process_vote(&mut self, weak_vote: WeakVote, dag: &Dag) {
         // check if authority has already proposed a weak vote for this round
-        let seen = self.proposers_seen.entry(weak_vote.round).or_insert_with(HashSet::new);
+        let seen = self.proposers_seen.entry(weak_vote.round).or_default();
 
         if !seen.insert(weak_vote.authority) {
             // already processed a proposal from this proposer for this round
@@ -47,8 +47,7 @@ impl WeakVoteTracker {
             for parent_digest in &weak_vote.parents {
                 for (authority, (digest, _)) in dag_round {
                     if digest == parent_digest {
-                        let votes =
-                            self.vote_counts.entry(parent_round).or_insert_with(HashMap::new);
+                        let votes = self.vote_counts.entry(parent_round).or_default();
                         *votes.entry(authority.clone()).or_insert(0) += 1;
                         break;
                     }

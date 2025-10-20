@@ -45,7 +45,8 @@ pub struct ConsensusState {
     /// older must be regularly cleaned up through the function `update`.
     pub dag: Dag,
     /// Tracks weak votes (uncertified proposals) per round per authority.
-    /// weak_votes[round][authority] = count of proposals that reference this authority's certificate
+    /// weak_votes[round][authority] = count of proposals that reference this authority's
+    /// certificate
     pub weak_votes: WeakVoteTracker,
     /// Metrics handler
     pub metrics: Arc<ConsensusMetrics>,
@@ -242,8 +243,8 @@ impl ConsensusState {
 
     /// Track weak votes from an uncertified proposal (header's parents).
     ///
-    /// A weak vote occurs when a proposal (header - not yet certified) references a certificate as a parent.
-    /// These are tracked separately from strong votes (verified certificates).
+    /// A weak vote occurs when a proposal (header - not yet certified) references a certificate as
+    /// a parent. These are tracked separately from strong votes (verified certificates).
     pub fn track_weak_votes(&mut self, weak_vote: WeakVote) {
         self.weak_votes.process_vote(weak_vote, &self.dag);
     }

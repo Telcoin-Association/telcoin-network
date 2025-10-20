@@ -12,8 +12,9 @@ use std::{collections::BTreeSet, sync::Arc};
 use tn_storage::{mem_db::MemDatabase, open_db};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    test_utils::init_test_tracing, Certificate, ExecHeader, Hash as _, Round, SealedHeader,
-    TaskManager, TnReceiver as _, TnSender as _, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    test_utils::init_test_tracing, Certificate, CommittedSubDag, ExecHeader, Hash as _,
+    ReputationScores, Round, SealedHeader, TaskManager, TnReceiver as _, TnSender as _, B256,
+    DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 
 /// Test that fast commit works when we have 2f+1 weak votes
@@ -509,4 +510,113 @@ async fn test_weak_vote_tracker() {
 
     tracker.cleanup(2);
     assert!(!tracker.vote_counts.contains_key(&2)); // round 2 cleaned up
+}
+
+/// Test that fast commit handles schedule changes correctly
+#[tokio::test]
+async fn fast_commit_with_schedule_change() {
+    // GIVEN: Configure with a small schedule window to trigger schedule changes
+    const NUM_SUB_DAGS_PER_SCHEDULE: u32 = 2; // Schedule changes every 2 commits
+
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+
+    // Create certificates for rounds 1-8 (leaders at rounds 2, 4, 6, 8)
+    let genesis =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
+    let (certificates, _) = make_optimal_certificates(&committee, 1..=8, &genesis, &ids);
+
+    let metrics = Arc::new(ConsensusMetrics::default());
+    let gc_depth = 50;
+    let mut state = ConsensusState::new(metrics.clone(), gc_depth);
+
+    // Insert all certificates into the DAG
+    for certificate in &certificates {
+        state.try_insert(certificate).unwrap();
+    }
+
+    // Set up Bullshark with small schedule window
+    let db = temp_dir();
+    let store = open_db(db.path());
+    let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
+    let mut bullshark = Bullshark::new(
+        committee.clone(),
+        store,
+        metrics,
+        NUM_SUB_DAGS_PER_SCHEDULE, // Small window to trigger schedule changes
+        schedule.clone(),
+        DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    );
+
+    // Simulate that we've already committed 1 leader (so next commit triggers schedule change)
+    // Create a dummy committed subdag to set up the state
+    let leader_2 = certificates.iter().find(|c| c.round() == 2).unwrap();
+    let dummy_subdag = CommittedSubDag::new(
+        vec![leader_2.clone()],
+        leader_2.clone(),
+        leader_2.nonce(),
+        ReputationScores::new(&committee),
+        None,
+    );
+    state.last_committed_sub_dag = Some(dummy_subdag);
+    state.last_round.committed_round = 2;
+
+    // Track weak votes for leaders at rounds 4, 6, and 8
+    // Simulate 2f+1 weak votes for each leader
+    let quorum_size = committee.quorum_threshold();
+
+    for leader_round in vec![4, 6, 8] {
+        let leader = schedule.leader(leader_round);
+        let leader_digest = state
+            .dag
+            .get(&leader_round)
+            .and_then(|round| round.get(&leader.id()))
+            .map(|(digest, _)| *digest)
+            .expect("Leader should be in DAG");
+
+        // Simulate weak votes from quorum_size proposers
+        for i in 0..quorum_size {
+            let proposer = ids[(i as usize) % ids.len()].clone();
+            let mut parents = BTreeSet::new();
+            parents.insert(leader_digest);
+
+            // Add other parents
+            for (auth_id, (digest, _)) in state.dag.get(&leader_round).unwrap() {
+                if auth_id != &leader.id() && parents.len() < 3 {
+                    parents.insert(*digest);
+                }
+            }
+
+            let weak_vote = WeakVote { authority: proposer, round: leader_round + 1, parents };
+            state.track_weak_votes(weak_vote);
+        }
+    }
+
+    // Verify all three leaders have enough weak votes
+    assert!(state.can_fast_commit(4, &schedule.leader(4), &committee));
+    assert!(state.can_fast_commit(6, &schedule.leader(6), &committee));
+    assert!(state.can_fast_commit(8, &schedule.leader(8), &committee));
+
+    // WHEN: Call try_fast_commit
+    let (outcome, committed_sub_dags) = bullshark.try_fast_commit(&mut state).unwrap();
+
+    // THEN: Without proper schedule change handling, we might only get 1 commit
+    // (the test would fail here if schedule change isn't handled)
+
+    // With proper handling, we should get all 3 leaders committed:
+    // - Leader 4 (triggers schedule change as it's the 2nd commit)
+    // - Leader 6 (with new schedule)
+    // - Leader 8 (with new schedule)
+
+    assert_eq!(outcome, Outcome::Commit);
+    assert_eq!(committed_sub_dags.len(), 3, "Should commit all 3 leaders despite schedule change");
+
+    // verify the committed rounds
+    assert_eq!(committed_sub_dags[0].leader.round(), 4);
+    assert_eq!(committed_sub_dags[1].leader.round(), 6);
+    assert_eq!(committed_sub_dags[2].leader.round(), 8);
+
+    // verify state is properly updated
+    assert_eq!(state.last_round.committed_round, 8);
 }
