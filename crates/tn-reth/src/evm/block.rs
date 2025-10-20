@@ -293,7 +293,7 @@ where
         // 3) if missing, randomly select from the pending validators
         let (pending_exit, mut active_validators): (Vec<_>, Vec<_>) = all_active_validators
             .into_iter()
-            .partition(|v| v.currentStatus == ValidatorStatus::PendingExit.into());
+            .partition(|v| v.currentStatus == ValidatorStatus::PendingExit);
 
         let active_validator_count = active_validators.len();
         let mut validators_for_shuffle = if active_validator_count >= new_committee_size {

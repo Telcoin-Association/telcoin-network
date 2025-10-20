@@ -1410,7 +1410,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_close_epochs() -> eyre::Result<()> {
-        tn_types::test_utils::init_test_tracing();
         let validator_1 = Address::from_slice(&[0x11; 20]);
         let validator_3 = Address::from_slice(&[0x33; 20]);
         let validator_4 = Address::from_slice(&[0x44; 20]);
@@ -1796,14 +1795,13 @@ mod tests {
 
         assert_eq!(eligible_validators.len(), 5);
 
-        // check for pending exit status
+        // ensure validator 2 has fully exited
         let (pending_exit, active_validators): (Vec<_>, Vec<_>) = eligible_validators
             .into_iter()
             .partition(|v| v.currentStatus == ValidatorStatus::PendingExit.into());
 
         assert_eq!(pending_exit.len(), 0);
         assert_eq!(active_validators.len(), 5);
-        // assert validator 2 is missing
         for v in active_validators {
             assert!(v.validatorAddress != validator_2_address);
         }
