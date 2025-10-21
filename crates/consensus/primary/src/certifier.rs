@@ -7,21 +7,18 @@ use crate::{
     ConsensusBus,
 };
 use consensus_metrics::monitored_future;
-use futures::{stream::FuturesOrdered, StreamExt};
-use std::{cmp::min, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 use tn_config::{ConsensusConfig, KeyConfig};
-use tn_network_libp2p::{error::NetworkError, types::NetworkResult};
+use tn_network_libp2p::error::NetworkError;
 use tn_primary_metrics::PrimaryMetrics;
 use tn_storage::CertificateStore;
 use tn_types::{
     ensure,
     error::{DagError, DagResult},
-    AuthorityIdentifier, BlsPublicKey, Certificate, CertificateDigest, Committee, Database,
-    Hash as _, Header, Noticer, TaskManager, TaskSpawner, TnReceiver, TnSender, Vote,
-    CHANNEL_CAPACITY,
+    AuthorityIdentifier, BlsPublicKey, Certificate, CertificateDigest, Committee, Database, Header,
+    Noticer, TaskManager, TaskSpawner, TnReceiver, TnSender, Vote,
 };
-use tokio::sync::broadcast;
-use tracing::{debug, enabled, error, info, trace, warn};
+use tracing::{debug, enabled, error, info, warn};
 
 #[cfg(test)]
 #[path = "tests/certifier_tests.rs"]
@@ -51,26 +48,13 @@ pub struct Certifier<DB> {
     network: PrimaryNetworkHandle,
     /// Metrics handler
     metrics: Arc<PrimaryMetrics>,
-    /// Send own certificates to be broadcasted to all other peers.
-    tx_own_certificate_broadcast: broadcast::Sender<Certificate>,
+    /// The config for shutdown subscriptions.
+    config: ConsensusConfig<DB>,
     /// Spawn epoch-related tasks.
     task_spawner: TaskSpawner,
 }
 
 impl<DB: Database> Certifier<DB> {
-    /// The highest certified header (by round).
-    ///
-    /// This is a only used by CVVs on startup.
-    fn highest_created_certificate(config: &ConsensusConfig<DB>) -> Option<Certificate> {
-        if let Some(id) = config.authority_id() {
-            debug!(target: "epoch-manager", ?id, "reading last round for authority id");
-            config.node_storage().last_round(&id).expect("certificate store available")
-        } else {
-            debug!(target: "epoch-manager", "node is not an authority - returning `None` for highest created certificate");
-            None
-        }
-    }
-
     /// Spawn the long-running certifier task.
     pub fn spawn(
         config: ConsensusConfig<DB>,
@@ -79,61 +63,37 @@ impl<DB: Database> Certifier<DB> {
         primary_network: PrimaryNetworkHandle,
         task_manager: &TaskManager,
     ) {
+        // return early if not CVV
         let Some(authority_id) = config.authority_id() else {
             // If we don't have an authority id then we are not a validator and should not be
             // proposing anything...
             return;
         };
+
         let rx_shutdown = config.shutdown().subscribe();
         let primary_metrics = consensus_bus.primary_metrics().node_metrics.clone();
-        // These channels are used internally to this module (file) and don't need to go in the
-        // consensus bus. If this changes they can move.  Note there can be issues receiving
-        // certs over the broadcast if not subscribed early.
-        let (tx_own_certificate_broadcast, _rx_own_certificate_broadcast) =
-            broadcast::channel(CHANNEL_CAPACITY);
 
-        // prevents race condition during startup when first proposed header fails during
-        // tx_own_certificate_broadcast.send()
-        let broadcast_targets: Vec<(_, _)> = config
-            .committee()
-            .others_primaries_by_id(Some(&authority_id))
-            .into_iter()
-            .map(|(name, _bls_key)| (name, tx_own_certificate_broadcast.subscribe()))
-            .collect();
-
-        let highest_created_certificate = Self::highest_created_certificate(&config);
-        debug!(
-            target: "epoch-manager",
-            ?highest_created_certificate,
-            "restoring certifier with highest created certificate for epoch {}",
-            config.epoch(),
-        );
-
+        // spawn long-running task to gossip own certificates
         let task_spawner = task_manager.get_spawner();
-        for (name, rx_own_certificate_broadcast) in broadcast_targets.into_iter() {
-            trace!(target: "primary::synchronizer::broadcast_certificates", ?name, "spawning sender for peer");
-            task_manager.spawn_task(
-                format!("broadcast certificates to {name}"),
-                Self::push_certificates(
-                    primary_network.clone(),
-                    name,
-                    rx_own_certificate_broadcast,
-                    task_spawner.clone(),
-                    config.shutdown().subscribe(),
-                ),
-            );
-        }
-
-        if let Some(cert) = highest_created_certificate {
-            // Error can be ignored.
-            if let Err(e) = tx_own_certificate_broadcast.send(cert) {
-                error!(target: "primary::certifier", ?e, "failed to broadcast highest created certificate during startup");
-            }
-        }
-
         task_manager.spawn_critical_task("certifier task", monitored_future!(
             async move {
+                let highest_created_certificate = config.node_storage().last_round(&authority_id).expect("certificate store available");
+                debug!(
+                    target: "epoch-manager",
+                    ?highest_created_certificate,
+                    "restoring certifier with highest created certificate for epoch {}",
+                    config.epoch(),
+                );
+
+                // publish last certificate on startup
+                if let Some(cert) = highest_created_certificate {
+                    if let Err(e) = primary_network.publish_certificate(cert).await {
+                        error!(target: "primary::certifier", ?e, "failed to publish highest created certificate gossip during startup");
+                    }
+                }
+
                 info!(target: "primary::certifier", "Certifier on node {:?} has started successfully.", authority_id);
+
                 Self {
                     authority_id: authority_id.clone(),
                     committee: config.committee().clone(),
@@ -144,7 +104,7 @@ impl<DB: Database> Certifier<DB> {
                     consensus_bus,
                     network: primary_network,
                     metrics: primary_metrics,
-                    tx_own_certificate_broadcast: tx_own_certificate_broadcast.clone(),
+                    config,
                     task_spawner,
                 }
                 .run()
@@ -329,6 +289,7 @@ impl<DB: Database> Certifier<DB> {
             let network = self.network.clone();
             let certificate_store = self.certificate_store.clone();
             let committee = self.committee.clone();
+            let rx_shutdown = self.config.shutdown().subscribe();
 
             let task_name = format!("vote-{header:?}-{name}");
             self.task_spawner.spawn_task(task_name, async move {
@@ -340,7 +301,7 @@ impl<DB: Database> Certifier<DB> {
                         certificate_store,
                         network,
                         committee,
-                        self.config.shutdown().subscribe(),
+                        rx_shutdown,
                     )
                     .await,
                 )
@@ -352,11 +313,12 @@ impl<DB: Database> Certifier<DB> {
 
         // loop through requests until complete or cancelled
         loop {
+            // certificate created - no more votes needed
             if certificate.is_some() {
                 break;
             }
-            // let mut next_request = requests.next();
-            // let mut next_request = rx_votes.recv().await;
+
+            // receive votes or replace header
             tokio::select! {
                 result = rx_votes.recv() => {
                     debug!(target: "primary::certifier", ?authority_id, ?result, "next request in unordered futures");
@@ -386,6 +348,7 @@ impl<DB: Database> Certifier<DB> {
                         }
                     }
                 },
+
                 Some(new_header) = rx_headers.recv() => {
                     warn!(target: "primary::certifier", ?authority_id, "canceling Header proposal {header} for round {}", header.round());
                     // This allows us to interupt the propose_header future- just put it back on the headers channel to get picked up in outer select.
@@ -395,8 +358,8 @@ impl<DB: Database> Certifier<DB> {
             }
         }
 
+        // log detailed header info if we failed to form a certificate
         let certificate = certificate.ok_or_else(|| {
-            // log detailed header info if we failed to form a certificate
             if enabled!(tracing::Level::WARN) {
                 let mut msg = format!(
                     "Failed to form certificate from header {header:#?} with parent certificates:"
@@ -423,58 +386,6 @@ impl<DB: Database> Certifier<DB> {
         Ok(certificate)
     }
 
-    /// Pushes new certificates received from the rx_own_certificate_broadcast channel
-    /// to the target peer continuously. Only exits when the primary is shutting down.
-    async fn push_certificates(
-        network: PrimaryNetworkHandle,
-        authority_id: AuthorityIdentifier,
-        mut rx_own_certificate_broadcast: broadcast::Receiver<Certificate>,
-        task_spawner: TaskSpawner,
-        rx_shutdown: Noticer,
-    ) {
-        // infinite loop to receive and gossip own certificates
-        loop {
-            trace!(target: "primary::certifier", authority=?authority_id, "start loop for push certificate");
-            tokio::select! {
-                // process own certificate result
-                result = rx_own_certificate_broadcast.recv() => {
-                    trace!(target: "primary::certifier", authority=?authority_id, "rx_own_certificate_broadcast received");
-                    let cert = match result {
-                        Ok(cert) => cert,
-                        Err(broadcast::error::RecvError::Closed) => {
-                            info!(target: "primary::certifier", "Certificate sender {authority_id} is shutting down!");
-                            return;
-                        }
-                        Err(broadcast::error::RecvError::Lagged(e)) => {
-                            warn!(target: "primary::certifier", "Certificate broadcaster {authority_id} lagging! {e}");
-                            // loop to try and catchup
-                            // NOTE: peers will request missing parents
-                            continue;
-                        }
-                    };
-                    trace!(target: "primary::certifier", authority=?authority_id, ?cert, "successfully received own cert broadcast");
-
-                    // spawn task to publish certificate gossip
-                    let network = network.clone();
-                    task_spawner.spawn_task(
-                        format!("push-cert-{}-{}", authority_id, cert.digest()),
-                        async move {
-                            if let Err(e) = network.publish_certificate(cert.clone()).await {
-                                error!(target: "primary::certifier", ?e, ?cert, "failed to gossip certificate");
-                            }
-                        }
-                    );
-                }
-
-                // shutdown signal received
-                _ = &rx_shutdown => {
-                    debug!(target: "primary::certifier", "Certifier received shutdown signal");
-                    break;
-                }
-            };
-        }
-    }
-
     /// Execute the main certification task.  Will run until shutdown is signalled.
     /// If this exits outside of shutdown it will log an error and this will trigger a node
     /// shutdown.
@@ -494,15 +405,15 @@ impl<DB: Database> Certifier<DB> {
                                 return;
                             }
 
-                            // broadcast the certificate once the synchronizer is ok
-                            if let Err(e) = self.tx_own_certificate_broadcast.send(certificate.clone()) {
-                                error!(target: "primary::certifier", ?certificate, ?e, "failed to broadcast certificate to self!");
-                                return;
+                            // try to publish the certificate on gossip network
+                            if let Err(e) = self.network.publish_certificate(certificate).await {
+                                error!(target: "primary::certifier", ?e, "failed to gossip certificate");
                             }
                         }
+
                         Err(e) => {
                             match e {
-                                // ignore errors when the propsal is cancelled - this is expected
+                                // ignore errors when the proposal is cancelled - this is expected
                                 DagError::Canceled => debug!(target: "primary::certifier", authority=?self.authority_id, "Certifier error on proposed header task: {e}"),
                                 // log other errors
                                 e =>  error!(target: "primary::certifier", authority=?self.authority_id, "Certifier error on proposed header task: {e}"),
