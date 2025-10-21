@@ -13,7 +13,8 @@ pub use redb::database::ReDB;
 use tables::{
     Batches, CertificateDigestByOrigin, CertificateDigestByRound, Certificates,
     ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache, KadProviderRecords,
-    KadRecords, KadWorkerProviderRecords, KadWorkerRecords, LastProposed, Payload, Votes,
+    KadRecords, KadWorkerProviderRecords, KadWorkerRecords, LastProposed, NodeBatchesCache,
+    Payload, Votes,
 };
 // Always build redb, we use it as the default for persistant consensus data.
 pub mod layered_db;
@@ -48,6 +49,7 @@ const BATCHES_CF: &str = "batches";
 const CONSENSUS_BLOCK_CF: &str = "consensus_block";
 const CONSENSUS_BLOCK_NUMBER_BY_DIGEST_CF: &str = "consensus_block_number_by_digest";
 const CONSENSUS_BLOCK_CACHE_CF: &str = "consensus_block_cache";
+const NODE_BATCHES_CACHE_CF: &str = "node_batches_cache";
 const EPOCH_RECORDS_CF: &str = "epoch_record_by_number";
 const EPOCH_CERTS_CF: &str = "epoch_cert_by_number";
 const EPOCH_RECORDS_INDEX_CF: &str = "epoch_records_index";
@@ -93,6 +95,8 @@ pub mod tables {
         ConsensusBlockNumbersByDigest;crate::CONSENSUS_BLOCK_NUMBER_BY_DIGEST_CF;<BlockHash, u64>,
         // This is a cache to store verified but unprocessed consensus headers, remove once processed.
         ConsensusBlocksCache;crate::CONSENSUS_BLOCK_CACHE_CF;<u64, ConsensusHeader>,
+        // This is a cache to store this nodes batches before consensus, remove once in a ConsensusHeader.
+        NodeBatchesCache;crate::NODE_BATCHES_CACHE_CF;<BlockHash, Batch>,
         // These tables are for the epoch chain not the normal consensus.
         EpochRecords;crate::EPOCH_RECORDS_CF;<Epoch, EpochRecord>,
         EpochCerts;crate::EPOCH_CERTS_CF;<B256, EpochCertificate>,
@@ -142,6 +146,7 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<ConsensusBlocks>().expect("failed to open table!");
     db.open_table::<ConsensusBlockNumbersByDigest>().expect("failed to open table!");
     db.open_table::<ConsensusBlocksCache>().expect("failed to open table!");
+    db.open_table::<NodeBatchesCache>().expect("failed to open table!");
     db.open_table::<EpochRecords>().expect("failed to open table!");
     db.open_table::<EpochCerts>().expect("failed to open table!");
     db.open_table::<EpochRecordsIndex>().expect("failed to open table!");
@@ -162,6 +167,7 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<ConsensusBlocks>();
     db.open_table::<ConsensusBlockNumbersByDigest>();
     db.open_table::<ConsensusBlocksCache>();
+    db.open_table::<NodeBatchesCache>();
     db.open_table::<EpochRecords>();
     db.open_table::<EpochCerts>();
     db.open_table::<EpochRecordsIndex>();
@@ -177,6 +183,8 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
 fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabase<ReDB> {
     use tables::{EpochCerts, EpochRecords, EpochRecordsIndex};
 
+    use crate::tables::NodeBatchesCache;
+
     let db = ReDB::open(store_path).expect("Cannot open database");
     db.open_table::<LastProposed>().expect("failed to open table!");
     db.open_table::<Votes>().expect("failed to open table!");
@@ -188,6 +196,7 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<ConsensusBlocks>().expect("failed to open table!");
     db.open_table::<ConsensusBlockNumbersByDigest>().expect("failed to open table!");
     db.open_table::<ConsensusBlocksCache>().expect("failed to open table!");
+    db.open_table::<NodeBatchesCache>().expect("failed to open table!");
     db.open_table::<EpochRecords>().expect("failed to open table!");
     db.open_table::<EpochCerts>().expect("failed to open table!");
     db.open_table::<EpochRecordsIndex>().expect("failed to open table!");
@@ -207,6 +216,7 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<ConsensusBlocks>();
     db.open_table::<ConsensusBlockNumbersByDigest>();
     db.open_table::<ConsensusBlocksCache>();
+    db.open_table::<NodeBatchesCache>();
     db.open_table::<EpochRecords>();
     db.open_table::<EpochCerts>();
     db.open_table::<EpochRecordsIndex>();

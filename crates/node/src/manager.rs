@@ -29,6 +29,7 @@ use tn_primary::{
     ConsensusBus, NodeMode, QueChannel, StateSynchronizer,
 };
 use tn_reth::{
+    bytes_to_txn,
     system_calls::{ConsensusRegistry, EpochState},
     CanonStateNotificationStream, RethDb, RethEnv,
 };
@@ -36,7 +37,7 @@ use tn_storage::{
     open_db,
     tables::{
         CertificateDigestByOrigin, CertificateDigestByRound, Certificates, ConsensusBlocks,
-        EpochCerts, EpochRecords, LastProposed, Payload, Votes,
+        EpochCerts, EpochRecords, LastProposed, NodeBatchesCache, Payload, Votes,
     },
     ConsensusStore, DatabaseType, EpochStore as _,
 };
@@ -510,6 +511,27 @@ where
 
         // update tasks
         epoch_task_manager.update_tasks();
+
+        for (digest, batch) in self.consensus_db.iter::<NodeBatchesCache>() {
+            // Loop through any orphaned batches and resubmit it's transactions.
+            // This is most likely because of epoch changes but could be caused by a restart as
+            // well.
+            if matches!(*self.consensus_bus.node_mode().borrow(), NodeMode::CvvActive) {
+                for tx_bytes in batch.transactions() {
+                    // Put txn back into the mem pool.
+                    if let Ok(tx) = bytes_to_txn(tx_bytes) {
+                        let _ = engine
+                            .get_worker_transaction_pool(&batch.worker_id)
+                            .await?
+                            .add_raw_transaction_external(tx)
+                            .await;
+                    }
+                }
+            } else {
+                let _ = worker.disburse_txns(batch.seal(digest)).await;
+            }
+        }
+        self.consensus_db.clear_table::<NodeBatchesCache>()?;
 
         info!(target: "epoch-manager", tasks=?epoch_task_manager, "EPOCH TASKS\n");
 

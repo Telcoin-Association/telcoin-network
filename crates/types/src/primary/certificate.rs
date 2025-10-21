@@ -319,7 +319,6 @@ impl Certificate {
         }
     }
 
-    /// TODO: better docs
     /// State of the Signature verification
     pub fn signature_verification_state(&self) -> &SignatureVerificationState {
         &self.signature_verification_state
@@ -332,7 +331,6 @@ impl Certificate {
         &self.created_at
     }
 
-    /// TODO: better docs
     /// Set the state of the Signature verification.
     pub fn set_signature_verification_state(&mut self, state: SignatureVerificationState) {
         self.signature_verification_state = state;
