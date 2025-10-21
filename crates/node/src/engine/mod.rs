@@ -174,6 +174,12 @@ impl ExecutionNode {
         guard.get_worker_transaction_pool(worker_id)
     }
 
+    /// Return an owned instance of all the worker's transaction pools.
+    pub async fn get_worker_transaction_pools(&self) -> Vec<WorkerTxPool> {
+        let guard = self.internal.read().await;
+        guard.get_worker_transaction_pools()
+    }
+
     /// Return an HTTP local address for submitting transactions to the RPC.
     pub async fn worker_http_local_address(
         &self,
