@@ -10,7 +10,7 @@ use tn_types::{
     Certificate, CommittedSubDag, Committee, Hash as _, ReputationScores, Round, VotingPower,
 };
 use tokio::time::Instant;
-use tracing::{debug, error_span};
+use tracing::debug;
 
 #[cfg(test)]
 #[path = "tests/bullshark_tests.rs"]
@@ -20,6 +20,9 @@ pub mod bullshark_tests;
 #[path = "tests/randomized_tests.rs"]
 pub mod randomized_tests;
 
+/// The consensus protocol for ordering transactions.
+///
+/// This implements bullshark, but also tracks weak votes for a fast-commit (based on Shoal++).
 pub struct Bullshark<DB> {
     /// The committee information.
     pub committee: Committee,
@@ -62,7 +65,7 @@ impl<DB: ConsensusStore> Bullshark<DB> {
     }
 
     /// Calculates the reputation score for the current commit by taking into account the reputation
-    /// scores from the previous commit (assuming that exists). It returns the updated reputation
+    /// scores from the previous rounds. It returns the updated reputation
     /// score.
     fn resolve_reputation_score(
         &self,
@@ -72,10 +75,9 @@ impl<DB: ConsensusStore> Bullshark<DB> {
     ) -> ReputationScores {
         // we reset the scores for every schedule change window, or initialise when it's the first
         // sub dag we are going to create.
-        // TODO: when schedule change is implemented we should probably change a little bit
-        // this logic here.
-        // sub_dag_index is based on epoch and round so / 2 so this check works on commit rounds
-        // (every other one).
+        //
+        // sub_dag_index is based on epoch and round so / 2 so this check works on consensus rounds
+        // (every other one) - not commits
         let mut reputation_score =
             if (sub_dag_index / 2) % self.num_sub_dags_per_schedule as u64 == 0 {
                 ReputationScores::new(&self.committee)
@@ -98,20 +100,22 @@ impl<DB: ConsensusStore> Bullshark<DB> {
         }
 
         // we check if this is the last sub dag of the current schedule. If yes then we mark the
-        // scores as final_of_schedule = true so any downstream user can now that those are the last
+        // scores as final_of_schedule = true so any downstream user knows that these are the last
         // ones calculated for the current schedule.
-        // sub_dag_index is based on epoch and round so / 2 so this check works on commit rounds
+        //
+        // sub_dag_index is based on epoch and round so / 2 so this check works on consensus rounds
         // (every other one).
         reputation_score.final_of_schedule =
             ((sub_dag_index / 2) + 1) % self.num_sub_dags_per_schedule as u64 == 0;
 
-        // Always ensure that all the authorities are present in the reputation scores - even
-        // when score is zero.
+        // always ensure that all the authorities are present in the reputation scores
+        // even when score is zero.
         assert_eq!(reputation_score.total_authorities() as usize, self.committee.size());
 
         reputation_score
     }
 
+    /// Process a new certificate.
     pub fn process_certificate(
         &mut self,
         state: &mut ConsensusState,
@@ -120,7 +124,7 @@ impl<DB: ConsensusStore> Bullshark<DB> {
         debug!("Processing {:?}", certificate);
         let round = certificate.round();
 
-        // Add the new certificate to the local storage.
+        // add the new certificate to the local storage
         if !state.try_insert(&certificate)? {
             // Certificate has not been added to the dag since it's below commit round
             return Ok((Outcome::CertificateBelowCommitRound, vec![]));
@@ -133,7 +137,7 @@ impl<DB: ConsensusStore> Bullshark<DB> {
         // enough support to the leader.
         let r = round - 1;
 
-        // We only elect leaders for even round numbers.
+        // we only elect leaders for even round numbers
         if r % 2 != 0 || r < 2 {
             return Ok((Outcome::NoLeaderElectedForOddRound, Vec::new()));
         }
@@ -147,7 +151,7 @@ impl<DB: ConsensusStore> Bullshark<DB> {
 
         let mut committed_sub_dags = Vec::new();
         let outcome = loop {
-            let (outcome, committed) = self.commit_leader(leader_round, state)?;
+            let (outcome, committed) = self.process_leader_round(leader_round, state)?;
 
             // always extend the returned sub dags
             committed_sub_dags.extend(committed);
@@ -200,15 +204,15 @@ impl<DB: ConsensusStore> Bullshark<DB> {
     /// If the schedule has changed due to a commit and there are more leaders to commit, then this
     /// method will return the enum `ScheduleChanged` so the caller will know to retry for the
     /// uncommitted leaders with the updated schedule now.
-    fn commit_leader(
+    fn process_leader_round(
         &mut self,
         leader_round: Round,
         state: &mut ConsensusState,
     ) -> Result<(Outcome, Vec<CommittedSubDag>), ConsensusError> {
         let leader = match self.leader_schedule.leader_certificate(leader_round, &state.dag) {
-            (_leader_authority, Some(certificate)) => certificate,
+            (_leader_authority, Some(certificate)) => certificate.clone(),
             (_leader_authority, None) => {
-                // leader has not been found - we don't have any certificate
+                // leader has not been found
                 return Ok((Outcome::LeaderNotFound, vec![]));
             }
         };
@@ -232,69 +236,10 @@ impl<DB: ConsensusStore> Bullshark<DB> {
         // Get an ordered list of past leaders that are linked to the current leader.
         debug!("Leader {:?} has enough support", leader);
 
-        // If it is the case, we can commit the leader. But first, we need to recursively go back to
-        // the last committed leader, and commit all preceding leaders in the right order.
-        // Committing a leader block means committing all its dependencies.
-        let mut committed_sub_dags = Vec::new();
-        let mut leaders_to_commit = self.order_leaders(leader, state);
-
-        while let Some(leader) = leaders_to_commit.pop_front() {
-            let sub_dag_index = leader.nonce();
-            let _span = error_span!("bullshark_process_sub_dag", sub_dag_index);
-
-            debug!("Leader {:?} has enough support", leader);
-
-            let mut min_round = leader.round();
-            let mut sequence = Vec::new();
-
-            // Starting from the oldest leader, flatten the sub-dag referenced by the leader.
-            for x in utils::order_dag(&leader, state) {
-                // Update and clean up internal state.
-                state.update(&x);
-
-                // For logging.
-                min_round = min_round.min(x.round());
-
-                // Add the certificate to the sequence.
-                sequence.push(x);
-            }
-            debug!(min_round, "Subdag has {} certificates", sequence.len());
-
-            // We resolve the reputation score that should be stored alongside with this sub dag.
-            let reputation_score = self.resolve_reputation_score(state, &sequence, sub_dag_index);
-
-            let sub_dag = CommittedSubDag::new(
-                sequence,
-                leader.clone(),
-                sub_dag_index,
-                reputation_score.clone(),
-                state.last_committed_sub_dag.as_ref(),
-            );
-
-            // Update the last sub dag
-            state.last_committed_sub_dag = Some(sub_dag.clone());
-
-            committed_sub_dags.push(sub_dag);
-
-            // If the leader schedule has been updated, then we'll need to recalculate any upcoming
-            // leaders for the rest of the recursive commits. We do that by repeating the leader
-            // election for the round that triggered the original commit
-            if self.update_leader_schedule(leader.round(), &reputation_score) {
-                // return that schedule has changed only when there are more leaders to commit
-                // until, the `leader_round`, otherwise we have committed everything
-                // we could and practically the leader of `leader_round` is the one
-                // that changed the schedule.
-                if !leaders_to_commit.is_empty() {
-                    return Ok((Outcome::ScheduleChanged, committed_sub_dags));
-                }
-            }
-        }
-
-        Ok((Outcome::Commit, committed_sub_dags))
+        self.commit_leader(&leader, state)
     }
 
-    /// Order the past leaders that we didn't already commit. It orders the leaders from the one
-    /// of the older (smaller) round to the newest round.
+    /// Order the uncommitted leaders from the oldest to newest round.
     fn order_leaders(&self, leader: &Certificate, state: &ConsensusState) -> VecDeque<Certificate> {
         let mut to_commit = VecDeque::new();
         to_commit.push_front(leader.clone());
@@ -366,9 +311,9 @@ impl<DB: ConsensusStore> Bullshark<DB> {
         parents.contains(&prev_leader)
     }
 
-    // When the provided `reputation_scores` are "final" for the current schedule window, then we
-    // create the new leader swap table and update the leader schedule to use it. Otherwise we do
-    // nothing. If the schedule has been updated then true is returned.
+    /// When the provided `reputation_scores` are "final" for the current schedule window, then we
+    /// create the new leader swap table and update the leader schedule to use it. Otherwise we do
+    /// nothing. If the schedule has been updated then true is returned.
     fn update_leader_schedule(
         &mut self,
         leader_round: Round,
@@ -425,5 +370,120 @@ impl<DB: ConsensusStore> Bullshark<DB> {
 
         self.max_inserted_certificate_round =
             self.max_inserted_certificate_round.max(certificate_round);
+    }
+
+    /// Try to commit leaders using the Fast Direct Commit rule (2f+1 weak votes)
+    pub fn try_fast_commit(
+        &mut self,
+        state: &mut ConsensusState,
+    ) -> Result<(Outcome, Vec<CommittedSubDag>), ConsensusError> {
+        // get max round from the DAG directly
+        let max_round = state.dag.keys().max().copied().unwrap_or(0);
+
+        // Find the HIGHEST leader round that has enough weak votes
+        let start_round = state.last_round.committed_round + 2;
+        let mut highest_committable_round = None;
+
+        for leader_round in (start_round..=max_round).step_by(2) {
+            if leader_round % 2 != 0 {
+                continue;
+            }
+
+            let leader = self.leader_schedule.leader(leader_round);
+
+            // Check if we have enough weak votes AND the certificate exists
+            if state.can_fast_commit(leader_round, &leader, &self.committee) {
+                match self.leader_schedule.leader_certificate(leader_round, &state.dag) {
+                    (_authority, Some(_certificate)) => {
+                        highest_committable_round = Some(leader_round);
+                        // Keep looking for higher rounds
+                    }
+                    (_authority, None) => {
+                        // Certificate not in DAG, can't use this round
+                    }
+                }
+            }
+        }
+
+        // If we found a committable leader, commit it (and all previous uncommitted leaders)
+        if let Some(leader_round) = highest_committable_round {
+            let leader = self.leader_schedule.leader(leader_round);
+            let (_authority, certificate) =
+                self.leader_schedule.leader_certificate(leader_round, &state.dag);
+            let certificate = certificate.unwrap().clone();
+
+            debug!("Fast committing highest leader at round {} with 2f+1 weak votes", leader_round);
+
+            // Record fast commit in metrics
+            self.metrics
+                .leader_election
+                .with_label_values(&["fast_commit", &leader.id().to_string()])
+                .inc();
+
+            let mut committed_sub_dags = Vec::new();
+            let outcome = loop {
+                let (outcome, committed) = self.commit_leader(&certificate, state)?;
+                committed_sub_dags.extend(committed);
+
+                if outcome != Outcome::ScheduleChanged {
+                    break outcome;
+                }
+            };
+
+            if outcome == Outcome::Commit {
+                self.last_successful_leader_election_timestamp = Instant::now();
+                return Ok((outcome, committed_sub_dags));
+            }
+        }
+
+        Ok((Outcome::NoLeaderElectedForOddRound, Vec::new()))
+    }
+
+    /// Commit the leader that either has f+1 certificates or 2f+1 weak votes.
+    fn commit_leader(
+        &mut self,
+        leader: &Certificate,
+        state: &mut ConsensusState,
+    ) -> Result<(Outcome, Vec<CommittedSubDag>), ConsensusError> {
+        let mut committed_sub_dags = Vec::new();
+        let mut leaders_to_commit = self.order_leaders(leader, state);
+
+        while let Some(leader) = leaders_to_commit.pop_front() {
+            let sub_dag_index = leader.nonce();
+            let mut min_round = leader.round();
+            let mut sequence = Vec::new();
+
+            // flatten the sub-dag referenced by the leader
+            for x in utils::order_dag(&leader, state) {
+                state.update(&x);
+                min_round = min_round.min(x.round());
+                sequence.push(x);
+            }
+
+            debug!(min_round, "Fast commit subdag has {} certificates", sequence.len());
+
+            // resolve reputation score
+            let reputation_score = self.resolve_reputation_score(state, &sequence, sub_dag_index);
+
+            let leader_round = leader.round();
+            let sub_dag = CommittedSubDag::new(
+                sequence,
+                leader,
+                sub_dag_index,
+                reputation_score.clone(),
+                state.last_committed_sub_dag.as_ref(),
+            );
+
+            state.last_committed_sub_dag = Some(sub_dag.clone());
+            committed_sub_dags.push(sub_dag);
+
+            if self.update_leader_schedule(leader_round, &reputation_score)
+                && !leaders_to_commit.is_empty()
+            {
+                return Ok((Outcome::ScheduleChanged, committed_sub_dags));
+            }
+        }
+
+        Ok((Outcome::Commit, committed_sub_dags))
     }
 }

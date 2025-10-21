@@ -1,12 +1,10 @@
 //! Consensus
 
 mod bullshark;
-#[cfg(test)]
-#[path = "tests/consensus_utils.rs"]
-mod consensus_utils;
 mod leader_schedule;
 mod state;
 mod utils;
+mod weak_vote;
 pub use crate::consensus::{
     bullshark::Bullshark,
     leader_schedule::{LeaderSchedule, LeaderSwapTable},
@@ -17,6 +15,9 @@ use thiserror::Error;
 pub use tn_primary_metrics::consensus::{ChannelMetrics, ConsensusMetrics};
 use tn_storage::StoreError;
 use tn_types::{Certificate, CertificateDigest};
+#[cfg(test)]
+#[path = "tests/consensus_utils.rs"]
+mod consensus_utils;
 
 /// The default channel size used in the consensus and subscriber logic.
 pub const DEFAULT_CHANNEL_SIZE: usize = 1_000;
