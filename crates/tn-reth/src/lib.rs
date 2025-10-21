@@ -1349,7 +1349,7 @@ impl RethEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::TransactionFactory;
+    use crate::{system_calls::ConsensusRegistry::ValidatorStatus, test_utils::TransactionFactory};
     use alloy::primitives::utils::parse_ether;
     use rand::{rngs::StdRng, SeedableRng as _};
     use tempfile::TempDir;
@@ -1360,22 +1360,22 @@ mod tests {
     };
 
     /// Helper function for creating a consensus output for tests.
-    fn consensus_output_for_tests() -> ConsensusOutput {
+    fn consensus_output_for_tests(round: u32, epoch: u32, subdag_index: u64) -> ConsensusOutput {
         let mut leader = Certificate::default();
         // set signature for deterministic test results
         leader.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
             BlsSignature::default(),
         ));
         leader.header_mut_for_test().created_at = tn_types::now();
-        let sub_dag_index = 0;
-        leader.header.round = sub_dag_index as u32;
+        leader.header.round = round;
+        leader.header.epoch = epoch;
         let reputation_scores = ReputationScores::default();
         let previous_sub_dag = None;
         ConsensusOutput {
             sub_dag: CommittedSubDag::new(
                 vec![leader.clone(), Certificate::default()],
                 leader,
-                sub_dag_index,
+                subdag_index,
                 reputation_scores,
                 previous_sub_dag,
             )
@@ -1384,7 +1384,7 @@ mod tests {
             batches: Default::default(),       // empty
             batch_digests: Default::default(), // empty
             parent_hash: ConsensusHeader::default().digest(),
-            number: 0,
+            number: subdag_index,
             extra: Default::default(),
             early_finalize: false,
         }
@@ -1411,7 +1411,6 @@ mod tests {
     #[tokio::test]
     async fn test_close_epochs() -> eyre::Result<()> {
         let validator_1 = Address::from_slice(&[0x11; 20]);
-        let validator_2 = Address::from_slice(&[0x22; 20]);
         let validator_3 = Address::from_slice(&[0x33; 20]);
         let validator_4 = Address::from_slice(&[0x44; 20]);
         let validator_5 = Address::from_slice(&[0x55; 20]);
@@ -1420,10 +1419,15 @@ mod tests {
         let mut new_validator_eoa =
             TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(6));
 
+        // create validator wallet for exiting later
+        let mut validator_2_eoa =
+            TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(2));
+        let validator_2_address = validator_2_eoa.address();
+
         // create initial validators for testing
         let all_validators = [
             validator_1,
-            validator_2,
+            validator_2_address,
             validator_3,
             validator_4,
             validator_5,
@@ -1474,6 +1478,11 @@ mod tests {
             ),
             (
                 new_validator_eoa.address(),
+                GenesisAccount::default()
+                    .with_balance(initial_stake_config.stakeAmount.saturating_mul(U256::from(2))), // double stake
+            ),
+            (
+                validator_2_address,
                 GenesisAccount::default()
                     .with_balance(initial_stake_config.stakeAmount.saturating_mul(U256::from(2))), // double stake
             ),
@@ -1572,7 +1581,7 @@ mod tests {
 
         // close epoch with deterministic signature as source of randomness
         // and execute the first block with txs for new validator to stake
-        let mut consensus_output = consensus_output_for_tests();
+        let mut consensus_output = consensus_output_for_tests(2, expected_epoch, 1);
         consensus_output.close_epoch = false;
         let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
         let block1 = execute_payload_and_update_canonical_chain(
@@ -1584,13 +1593,14 @@ mod tests {
 
         // now close the first epoch
         expected_epoch += 1;
-        let consensus_output = consensus_output_for_tests();
+        let consensus_output = consensus_output_for_tests(2, expected_epoch, 2);
         let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
         let block2 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
         let canonical_header = block2.recovered_block.clone_sealed_header();
 
         // now close the second epoch so the new validator is active
-        let consensus_output = consensus_output_for_tests();
+        expected_epoch += 1;
+        let consensus_output = consensus_output_for_tests(2, expected_epoch, 3);
         let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
         let block3 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
         let canonical_header = block3.recovered_block.clone_sealed_header();
@@ -1598,9 +1608,8 @@ mod tests {
         // read new epoch state
         let EpochState { epoch, epoch_info, validators: committee, epoch_start } =
             reth_env.epoch_state_from_canonical_tip()?;
-        debug!(target:"evm", ?epoch, ?epoch_info, ?committee, ?epoch, "new epoch state from canonical tip");
+        debug!(target: "evm", ?epoch, ?epoch_info, ?committee, ?epoch, "new epoch state from canonical tip");
         // assert epoch info updated
-        expected_epoch += 1;
         expected_epoch_info.blockHeight = 4;
         assert_eq!(expected_epoch, epoch);
         assert_eq!(epoch_start, canonical_header.timestamp);
@@ -1626,9 +1635,9 @@ mod tests {
         // ensure validators in increasing order by address
         let expected_new_committee = vec![
             validator_1,
-            validator_2,
             validator_3,
             validator_4,
+            validator_2_address,
             new_validator.execution_address,
         ];
 
@@ -1658,6 +1667,143 @@ mod tests {
             assert!(!on_chain.isRetired);
             assert!(!on_chain.isDelegated);
             assert_eq!(on_chain.stakeVersion, 0);
+        }
+
+        // submit validator 2 exit request
+        let calldata = ConsensusRegistry::beginExitCall {}.abi_encode().into();
+        let begin_exit_tx = validator_2_eoa.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            Some(CONSENSUS_REGISTRY_ADDRESS),
+            U256::ZERO,
+            calldata,
+        );
+        expected_epoch += 1;
+        let mut consensus_output = consensus_output_for_tests(2, expected_epoch, 4);
+        consensus_output.close_epoch = false;
+        let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
+        let block4 =
+            execute_payload_and_update_canonical_chain(&reth_env, payload, vec![begin_exit_tx])?;
+        let canonical_header = block4.recovered_block.clone_sealed_header();
+
+        // close epoch
+        expected_epoch += 1;
+        let consensus_output = consensus_output_for_tests(2, expected_epoch, 5);
+        let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
+        let block5 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+        let canonical_header = block5.recovered_block.clone_sealed_header();
+
+        // create evm to read latest state
+        let state = StateProviderDatabase::new(reth_env.latest()?);
+        let mut cached_reads = CachedReads::default();
+        let mut db = State::builder()
+            .with_database(cached_reads.as_db_mut(state))
+            .with_bundle_update()
+            .build();
+        let mut tn_evm = reth_env
+            .evm_config
+            .evm_factory()
+            .create_evm(&mut db, reth_env.evm_config.evm_env(canonical_header.header())?);
+
+        // assert validator 2 is pending exit
+        let calldata =
+            ConsensusRegistry::getValidatorCall { validatorAddress: validator_2_address }
+                .abi_encode()
+                .into();
+        let validator_2_info = reth_env
+            .call_consensus_registry::<_, ConsensusRegistry::ValidatorInfo>(
+                &mut tn_evm,
+                calldata,
+            )?;
+        debug!(target: "engine", ?validator_2_info, "getting validator 2 info");
+        assert_eq!(validator_2_info.currentStatus, ValidatorStatus::PendingExit);
+
+        // read all active validators from consensus registry
+        let calldata =
+            ConsensusRegistry::getValidatorsCall { status: ValidatorStatus::Active.into() }
+                .abi_encode()
+                .into();
+        let eligible_validators = reth_env
+            .call_consensus_registry::<_, Vec<ConsensusRegistry::ValidatorInfo>>(
+                &mut tn_evm,
+                calldata,
+            )?;
+
+        assert_eq!(eligible_validators.len(), 6);
+
+        // check for pending exit status
+        let (pending_exit, active_validators): (Vec<_>, Vec<_>) = eligible_validators
+            .into_iter()
+            .partition(|v| v.currentStatus == ValidatorStatus::PendingExit.into());
+
+        assert_eq!(pending_exit.len(), 1);
+        assert_eq!(active_validators.len(), 5);
+        assert_eq!(
+            pending_exit.first().expect("one pending validator").validatorAddress,
+            validator_2_address
+        );
+
+        // close epoch again to exit validator
+        expected_epoch += 1;
+        let consensus_output = consensus_output_for_tests(2, expected_epoch, 6);
+        let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
+        let block6 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+        let canonical_header = block6.recovered_block.clone_sealed_header();
+        // close epoch again
+        expected_epoch += 1;
+        let consensus_output = consensus_output_for_tests(2, expected_epoch, 7);
+        let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
+        let block7 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+        let canonical_header = block7.recovered_block.clone_sealed_header();
+
+        // create evm to read latest state
+        let state = StateProviderDatabase::new(reth_env.latest()?);
+        let mut cached_reads = CachedReads::default();
+        let mut db = State::builder()
+            .with_database(cached_reads.as_db_mut(state))
+            .with_bundle_update()
+            .build();
+        let mut tn_evm = reth_env
+            .evm_config
+            .evm_factory()
+            .create_evm(&mut db, reth_env.evm_config.evm_env(canonical_header.header())?);
+
+        // assert validator 2 is pending exit
+        let calldata =
+            ConsensusRegistry::getValidatorCall { validatorAddress: validator_2_address }
+                .abi_encode()
+                .into();
+        let validator_2_info = reth_env
+            .call_consensus_registry::<_, ConsensusRegistry::ValidatorInfo>(
+                &mut tn_evm,
+                calldata,
+            )?;
+        debug!(target: "engine", ?validator_2_info, "getting validator 2 info");
+        assert_eq!(validator_2_info.currentStatus, ValidatorStatus::Exited);
+
+        // read all active validators from consensus registry
+        let calldata =
+            ConsensusRegistry::getValidatorsCall { status: ValidatorStatus::Active.into() }
+                .abi_encode()
+                .into();
+        let eligible_validators = reth_env
+            .call_consensus_registry::<_, Vec<ConsensusRegistry::ValidatorInfo>>(
+                &mut tn_evm,
+                calldata,
+            )?;
+
+        assert_eq!(eligible_validators.len(), 5);
+
+        // ensure validator 2 has fully exited
+        let (pending_exit, active_validators): (Vec<_>, Vec<_>) = eligible_validators
+            .into_iter()
+            .partition(|v| v.currentStatus == ValidatorStatus::PendingExit.into());
+
+        assert_eq!(pending_exit.len(), 0);
+        assert_eq!(active_validators.len(), 5);
+        for v in active_validators {
+            assert!(v.validatorAddress != validator_2_address);
         }
 
         Ok(())
