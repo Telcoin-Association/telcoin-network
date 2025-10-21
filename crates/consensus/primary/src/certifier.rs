@@ -7,10 +7,7 @@ use crate::{
     ConsensusBus,
 };
 use consensus_metrics::monitored_future;
-use futures::{
-    stream::{FuturesOrdered, FuturesUnordered},
-    StreamExt,
-};
+use futures::{stream::FuturesOrdered, StreamExt};
 use std::{cmp::min, sync::Arc, time::Duration};
 use tn_config::{ConsensusConfig, KeyConfig};
 use tn_network_libp2p::{error::NetworkError, types::NetworkResult};
@@ -19,11 +16,12 @@ use tn_storage::CertificateStore;
 use tn_types::{
     ensure,
     error::{DagError, DagResult},
-    AuthorityIdentifier, BlsPublicKey, Certificate, CertificateDigest, Committee, Database, Header,
-    Noticer, TaskManager, TnReceiver, TnSender, Vote, CHANNEL_CAPACITY,
+    AuthorityIdentifier, BlsPublicKey, Certificate, CertificateDigest, Committee, Database,
+    Hash as _, Header, Noticer, TaskManager, TaskSpawner, TnReceiver, TnSender, Vote,
+    CHANNEL_CAPACITY,
 };
 use tokio::sync::broadcast;
-use tracing::{debug, enabled, error, info, instrument, trace, warn};
+use tracing::{debug, enabled, error, info, trace, warn};
 
 #[cfg(test)]
 #[path = "tests/certifier_tests.rs"]
@@ -55,9 +53,14 @@ pub struct Certifier<DB> {
     metrics: Arc<PrimaryMetrics>,
     /// Send own certificates to be broadcasted to all other peers.
     tx_own_certificate_broadcast: broadcast::Sender<Certificate>,
+    /// Spawn epoch-related tasks.
+    task_spawner: TaskSpawner,
 }
 
 impl<DB: Database> Certifier<DB> {
+    /// The highest certified header (by round).
+    ///
+    /// This is a only used by CVVs on startup.
     fn highest_created_certificate(config: &ConsensusConfig<DB>) -> Option<Certificate> {
         if let Some(id) = config.authority_id() {
             debug!(target: "epoch-manager", ?id, "reading last round for authority id");
@@ -68,6 +71,7 @@ impl<DB: Database> Certifier<DB> {
         }
     }
 
+    /// Spawn the long-running certifier task.
     pub fn spawn(
         config: ConsensusConfig<DB>,
         consensus_bus: ConsensusBus,
@@ -105,6 +109,7 @@ impl<DB: Database> Certifier<DB> {
             config.epoch(),
         );
 
+        let task_spawner = task_manager.get_spawner();
         for (name, rx_own_certificate_broadcast) in broadcast_targets.into_iter() {
             trace!(target: "primary::synchronizer::broadcast_certificates", ?name, "spawning sender for peer");
             task_manager.spawn_task(
@@ -113,6 +118,8 @@ impl<DB: Database> Certifier<DB> {
                     primary_network.clone(),
                     name,
                     rx_own_certificate_broadcast,
+                    task_spawner.clone(),
+                    config.shutdown().subscribe(),
                 ),
             );
         }
@@ -138,6 +145,7 @@ impl<DB: Database> Certifier<DB> {
                     network: primary_network,
                     metrics: primary_metrics,
                     tx_own_certificate_broadcast: tx_own_certificate_broadcast.clone(),
+                    task_spawner,
                 }
                 .run()
                 .await;
@@ -149,61 +157,86 @@ impl<DB: Database> Certifier<DB> {
 
     /// Requests a vote for a Header from the given peer. Retries indefinitely until either a
     /// vote is received, or a permanent error is returned.
-    #[instrument(level = "debug", skip_all, fields(header_digest = ?header.digest()))]
     async fn request_vote(
-        &self,
         authority: AuthorityIdentifier,
         header: Header,
         peer_id: BlsPublicKey,
+        certificate_store: DB,
+        network: PrimaryNetworkHandle,
+        committee: Committee,
+        rx_shutdown: Noticer,
     ) -> DagResult<Vote> {
-        debug!(target: "primary::certifier", ?authority, ?header, "requesting vote for header...");
-
         let mut missing_parents: Vec<CertificateDigest> = Vec::new();
         let mut attempt: u32 = 0;
+        debug!(target: "primary::certifier", ?authority, ?header, "requesting vote for header...");
+
+        // loop until vote received
         let vote: Vote = loop {
+            // increase attempt count
             attempt += 1;
 
+            // peers may respond to a vote requesting missing parents
             let parents = if missing_parents.is_empty() {
                 Vec::new()
             } else {
+                // collect missing parents requested by peer in order to vote for this header
                 let expected_count = missing_parents.len();
-                let parents: Vec<_> = self
-                    .certificate_store
+                let parents: Vec<_> = certificate_store
                     .read_all(
                         missing_parents
                             .into_iter()
-                            // Only provide certs that are parents for the requested vote.
+                            // only provide certs that are parents for the requested vote
                             .filter(|parent| header.parents().contains(parent)),
                     )?
                     .into_iter()
                     .flatten()
                     .collect();
+
+                // sanity check for missing parents
                 if parents.len() != expected_count {
-                    error!("tried to read {expected_count} missing certificates requested by remote primary for vote request, but only found {}", parents.len());
+                    error!(
+                        target: "primary::certifier",
+                        "tried to read {expected_count} missing certificates requested by remote primary for vote request, but only found {}",
+                        parents.len()
+                    );
                     return Err(DagError::ProposedHeaderMissingCertificates);
                 }
+
                 parents
             };
 
-            match self.network.request_vote(peer_id, header.clone(), parents).await {
-                Ok(RequestVoteResult::Vote(vote)) => {
-                    debug!(target: "primary::certifier", ?authority, ?vote, "Ok response received after request vote");
-                    break vote;
-                }
-                Ok(RequestVoteResult::MissingParents(parents)) => {
-                    debug!(target: "primary::certifier", ?authority, ?parents, "Ok missing parents response received after request vote");
-                    missing_parents = parents;
-                }
-                Err(error) => {
-                    if let NetworkError::RPCError(error) = error {
-                        error!(target: "primary::certifier", ?authority, ?error, ?header, "fatal request for requested vote");
-                        return Err(DagError::NetworkError(format!(
-                            "irrecoverable error requesting vote for {header}: {error}"
-                        )));
-                    } else {
-                        error!(target: "primary::certifier", ?authority, ?error, ?header, "network error requesting vote");
+            tokio::select! {
+                vote_result = network.request_vote(peer_id, header.clone(), parents) => {
+                    // match peer's response for vote request
+                    match vote_result {
+                        Ok(RequestVoteResult::Vote(vote)) => {
+                            debug!(target: "primary::certifier", ?authority, ?vote, "Ok response received after request vote");
+                            // happy path - vote recieved
+                            break vote;
+                        }
+                        Ok(RequestVoteResult::MissingParents(parents)) => {
+                            debug!(target: "primary::certifier", ?authority, ?parents, "Ok missing parents response received after request vote");
+                            // retrieve missing parents so peer can vote
+                            missing_parents = parents;
+                        }
+                        Err(error) => {
+                            if let NetworkError::RPCError(error) = error {
+                                error!(target: "primary::certifier", ?authority, ?error, ?header, "fatal request for requested vote");
+                                return Err(DagError::NetworkError(format!(
+                                    "irrecoverable error requesting vote for {header}: {error}"
+                                )));
+                            } else {
+                                error!(target: "primary::certifier", ?authority, ?error, ?header, "network error requesting vote");
+                            }
+
+                            missing_parents = Vec::new();
+                        }
                     }
-                    missing_parents = Vec::new();
+                }
+
+                // shutdown received
+                _ = &rx_shutdown => {
+                    return Err(DagError::ShuttingDown);
                 }
             }
 
@@ -222,14 +255,15 @@ impl<DB: Database> Certifier<DB> {
             .await;
         };
 
-        // Verify the vote. Note that only the header digest is signed by the vote.
+        // verify the vote (bls signature over header digest)
         ensure!(
             vote.header_digest() == header.digest()
                 && vote.origin() == header.author()
                 && vote.author() == &authority,
             DagError::UnexpectedVote(vote.header_digest())
         );
-        // Possible equivocations.
+
+        // possible equivocations
         ensure!(
             header.epoch() == vote.epoch(),
             DagError::InvalidEpoch { expected: header.epoch(), received: vote.epoch() }
@@ -239,22 +273,22 @@ impl<DB: Database> Certifier<DB> {
             DagError::InvalidRound { expected: header.round(), received: vote.round() }
         );
 
-        // Ensure the header is from the correct epoch.
+        // ensure the vote is from the correct epoch
         ensure!(
-            vote.epoch() == self.committee.epoch(),
-            DagError::InvalidEpoch { expected: self.committee.epoch(), received: vote.epoch() }
+            vote.epoch() == committee.epoch(),
+            DagError::InvalidEpoch { expected: committee.epoch(), received: vote.epoch() }
         );
 
-        // Ensure the authority has voting rights.
+        // ensure the authority has voting rights
         ensure!(
-            self.committee.voting_power_by_id(vote.author()) > 0,
+            committee.voting_power_by_id(vote.author()) > 0,
             DagError::UnknownAuthority(vote.author().to_string())
         );
 
         Ok(vote)
     }
 
-    #[instrument(level = "debug", skip_all, fields(header_digest = ?header.digest()))]
+    /// Propose a header produced by this authority.
     async fn propose_header<RXH: TnReceiver<Header>>(
         &self,
         header: Header,
@@ -262,6 +296,8 @@ impl<DB: Database> Certifier<DB> {
     ) -> DagResult<Certificate> {
         let authority_id = &self.authority_id;
         debug!(target: "primary::certifier", ?authority_id, "proposing header");
+
+        // only propose headers in current epoch
         if header.epoch() != self.committee.epoch() {
             error!(
                 target: "primary::certifier",
@@ -277,26 +313,52 @@ impl<DB: Database> Certifier<DB> {
 
         self.metrics.proposed_header_round.set(header.round() as i64);
 
-        // Reset the votes aggregator and sign our own header.
+        // reset the votes aggregator and sign own header
         let mut votes_aggregator = VotesAggregator::new(self.metrics.clone());
         let vote = Vote::new(&header, self.authority_id.clone(), &self.signature_service);
         let mut certificate = votes_aggregator.append(vote, &self.committee, &header)?;
 
-        // Trigger vote requests.
+        // create a channel for receiving votes from peers
+        let (tx_votes, mut rx_votes) = tokio::sync::mpsc::unbounded_channel();
+
+        // create network requests for votes from peers
         let peers = self.committee.others_primaries_by_id(Some(&self.authority_id)).into_iter();
-        let mut requests: FuturesUnordered<_> = peers
-            .map(|(name, target)| {
-                let header = header.clone();
-                self.request_vote(name, header, target)
-            })
-            .collect();
+        for (name, target) in peers {
+            let header_clone = header.clone();
+            let tx_votes = tx_votes.clone();
+            let network = self.network.clone();
+            let certificate_store = self.certificate_store.clone();
+            let committee = self.committee.clone();
+
+            let task_name = format!("vote-{header:?}-{name}");
+            self.task_spawner.spawn_task(task_name, async move {
+                tx_votes.send(
+                    Self::request_vote(
+                        name,
+                        header_clone,
+                        target,
+                        certificate_store,
+                        network,
+                        committee,
+                        self.config.shutdown().subscribe(),
+                    )
+                    .await,
+                )
+            });
+        }
+
+        // drop sender so channel closes when all vote tasks complete
+        drop(tx_votes);
+
+        // loop through requests until complete or cancelled
         loop {
             if certificate.is_some() {
                 break;
             }
-            let mut next_request = requests.next();
+            // let mut next_request = requests.next();
+            // let mut next_request = rx_votes.recv().await;
             tokio::select! {
-                result = &mut next_request => {
+                result = rx_votes.recv() => {
                     debug!(target: "primary::certifier", ?authority_id, ?result, "next request in unordered futures");
 
                     match result {
@@ -319,6 +381,7 @@ impl<DB: Database> Certifier<DB> {
                             error!(target: "primary::certifier", ?authority_id, "failed to get vote for header {header:?}: {e:?}");
                         }
                         None => {
+                            // all sending channels have dropped
                             break;
                         }
                     }
@@ -333,7 +396,7 @@ impl<DB: Database> Certifier<DB> {
         }
 
         let certificate = certificate.ok_or_else(|| {
-            // Log detailed header info if we failed to form a certificate.
+            // log detailed header info if we failed to form a certificate
             if enabled!(tracing::Level::WARN) {
                 let mut msg = format!(
                     "Failed to form certificate from header {header:#?} with parent certificates:"
@@ -354,6 +417,7 @@ impl<DB: Database> Certifier<DB> {
             }
             DagError::CouldNotFormCertificate(header.digest())
         })?;
+
         debug!(target: "primary::certifier", ?authority_id, "Assembled {certificate:?}");
 
         Ok(certificate)
@@ -365,27 +429,14 @@ impl<DB: Database> Certifier<DB> {
         network: PrimaryNetworkHandle,
         authority_id: AuthorityIdentifier,
         mut rx_own_certificate_broadcast: broadcast::Receiver<Certificate>,
+        task_spawner: TaskSpawner,
+        rx_shutdown: Noticer,
     ) {
-        // Older broadcasts return early, so the last broadcast must be the latest certificate.
-        // This will contain at most certificates created within the last PUSH_TIMEOUT.
-        let mut requests = FuturesOrdered::new();
-        // Back off and retry only happen when there is only one certificate to be broadcasted.
-        // Otherwise no retry happens.
-        const BACKOFF_INTERVAL: Duration = Duration::from_millis(100);
-        const MAX_BACKOFF_MULTIPLIER: u32 = 100;
-        let mut backoff_multiplier: u32 = 0;
-
-        async fn send_certificate(
-            network: &PrimaryNetworkHandle,
-            cert: Certificate,
-        ) -> (Certificate, NetworkResult<()>) {
-            let resp = network.publish_certificate(cert.clone()).await;
-            (cert, resp)
-        }
-
+        // infinite loop to receive and gossip own certificates
         loop {
             trace!(target: "primary::certifier", authority=?authority_id, "start loop for push certificate");
             tokio::select! {
+                // process own certificate result
                 result = rx_own_certificate_broadcast.recv() => {
                     trace!(target: "primary::certifier", authority=?authority_id, "rx_own_certificate_broadcast received");
                     let cert = match result {
@@ -396,33 +447,29 @@ impl<DB: Database> Certifier<DB> {
                         }
                         Err(broadcast::error::RecvError::Lagged(e)) => {
                             warn!(target: "primary::certifier", "Certificate broadcaster {authority_id} lagging! {e}");
-                            // Re-run the loop to receive again.
+                            // loop to try and catchup
+                            // NOTE: peers will request missing parents
                             continue;
                         }
                     };
                     trace!(target: "primary::certifier", authority=?authority_id, ?cert, "successfully received own cert broadcast");
-                    requests.push_back(send_certificate(&network, cert));
-                }
-                Some((cert, resp)) = requests.next() => {
-                    trace!(target: "primary::certifier", authority=?authority_id, ?resp, ?cert, "next cert request");
-                    backoff_multiplier = match resp {
-                        Ok(_) => {
-                            0
-                        },
-                        Err(_) => {
-                            if requests.is_empty() {
-                                // Retry broadcasting the latest certificate, to help the network stay alive.
-                                requests.push_back(send_certificate(&network, cert));
-                                min(backoff_multiplier * 2 + 1, MAX_BACKOFF_MULTIPLIER)
-                            } else {
-                                // TODO: add backoff and retries for transient & retriable errors.
-                                0
+
+                    // spawn task to publish certificate gossip
+                    let network = network.clone();
+                    task_spawner.spawn_task(
+                        format!("push-cert-{}-{}", authority_id, cert.digest()),
+                        async move {
+                            if let Err(e) = network.publish_certificate(cert.clone()).await {
+                                error!(target: "primary::certifier", ?e, ?cert, "failed to gossip certificate");
                             }
-                        },
-                    };
-                    if backoff_multiplier > 0 {
-                        tokio::time::sleep(BACKOFF_INTERVAL * backoff_multiplier).await;
-                    }
+                        }
+                    );
+                }
+
+                // shutdown signal received
+                _ = &rx_shutdown => {
+                    debug!(target: "primary::certifier", "Certifier received shutdown signal");
+                    break;
                 }
             };
         }
@@ -441,16 +488,14 @@ impl<DB: Database> Certifier<DB> {
 
                     match self.propose_header(header, &mut rx_headers).await {
                         Ok(certificate) => {
-                            let state_sync = self.state_sync.clone();
-                            let tx_own_certificate_broadcast = self.tx_own_certificate_broadcast.clone();
                             // pass to state_sync for internal processing
-                            if let Err(e) = state_sync.process_own_certificate(certificate.clone()).await {
+                            if let Err(e) = self.state_sync.process_own_certificate(certificate.clone()).await {
                                 error!(target: "primary::certifier", "error accepting own certificate: {e}");
                                 return;
                             }
 
-                            // Broadcast the certificate once the synchronizer is ok
-                            if let Err(e) = tx_own_certificate_broadcast.send(certificate.clone()) {
+                            // broadcast the certificate once the synchronizer is ok
+                            if let Err(e) = self.tx_own_certificate_broadcast.send(certificate.clone()) {
                                 error!(target: "primary::certifier", ?certificate, ?e, "failed to broadcast certificate to self!");
                                 return;
                             }
