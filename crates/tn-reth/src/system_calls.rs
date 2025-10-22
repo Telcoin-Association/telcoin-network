@@ -20,7 +20,7 @@ sol!(
     contract ConsensusRegistry {
         /// The validator's eligibility status for being
         /// considered in the next committee.
-        #[derive(Debug)]
+        #[derive(Debug, PartialEq)]
         enum ValidatorStatus {
             /// Undefined status - default value.
             Undefined,
@@ -173,6 +173,8 @@ sol!(
         /// Activate node for committee selection.
         /// Normally called by staker after node is synced.
         function activate() external override whenNotPaused;
+        /// Initiate exit from protocol.
+        function beginExit() external override whenNotPaused;
         /// Retrieve the claimable rewards accrued for a given validator address.
         function getRewards(address validatorAddress) public view virtual returns (uint256);
     }

@@ -298,7 +298,6 @@ impl<DB: Database> CertificateStore for DB {
     fn after_round(&self, round: Round) -> StoreResult<Vec<Certificate>> {
         let txn = self.read_txn()?;
         // Skip to a row at or before the requested round.
-        // TODO: Add a more efficient seek method to typed store.
         let iter = if round > 0 {
             self.skip_to::<CertificateDigestByRound>(&(round - 1, AuthorityIdentifier::default()))?
         } else {
@@ -333,7 +332,6 @@ impl<DB: Database> CertificateStore for DB {
         round: Round,
     ) -> StoreResult<BTreeMap<Round, Vec<AuthorityIdentifier>>> {
         // Skip to a row at or before the requested round.
-        // TODO: Add a more efficient seek method to typed store.
         let iter = if round > 0 {
             self.skip_to::<CertificateDigestByRound>(&(round - 1, AuthorityIdentifier::default()))?
         } else {

@@ -87,7 +87,8 @@ impl BatchValidation for BatchValidator {
                 let mut bytes = [0_u8; 8];
                 let hash = tx.hash();
                 bytes.copy_from_slice(&hash[0..8]);
-                if (u64::from_ne_bytes(bytes) % committee_size) == committee_slot {
+                // Make sure use fixed (not native) endian bytes here.
+                if (u64::from_le_bytes(bytes) % committee_size) == committee_slot {
                     let task_name = format!("submit-tx-{hash}");
                     self.reth_env.get_task_spawner().spawn_task(task_name, async move {
                         let _ = tx_pool.add_raw_transaction_external(tx).await;

@@ -29,6 +29,7 @@ use tn_primary::{
     ConsensusBus, NodeMode, QueChannel, StateSynchronizer,
 };
 use tn_reth::{
+    bytes_to_txn,
     system_calls::{ConsensusRegistry, EpochState},
     CanonStateNotificationStream, RethDb, RethEnv,
 };
@@ -36,17 +37,21 @@ use tn_storage::{
     open_db,
     tables::{
         CertificateDigestByOrigin, CertificateDigestByRound, Certificates, ConsensusBlocks,
-        EpochCerts, EpochRecords, LastProposed, Payload, Votes,
+        EpochCerts, EpochRecords, LastProposed, NodeBatchesCache, Payload, Votes,
     },
     ConsensusStore, DatabaseType, EpochStore as _,
 };
 use tn_types::{
-    error::HeaderError, gas_accumulator::GasAccumulator, BatchValidation, BlsAggregateSignature,
-    BlsPublicKey, BlsSignature, Committee, CommitteeBuilder, ConsensusHeader, ConsensusOutput,
-    Database as TNDatabase, Epoch, EpochCertificate, EpochRecord, EpochVote, Noticer, Notifier,
-    TaskManager, TaskSpawner, TimestampSec, TnReceiver, TnSender, B256, MIN_PROTOCOL_BASE_FEE,
+    error::HeaderError, gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash,
+    BlsAggregateSignature, BlsPublicKey, BlsSignature, Committee, CommitteeBuilder,
+    ConsensusHeader, ConsensusOutput, Database as TNDatabase, Epoch, EpochCertificate, EpochRecord,
+    EpochVote, Noticer, Notifier, TaskManager, TaskSpawner, TimestampSec, TnReceiver, TnSender,
+    B256, MIN_PROTOCOL_BASE_FEE,
 };
-use tn_worker::{WorkerNetwork, WorkerNetworkHandle, WorkerRequest, WorkerResponse};
+use tn_worker::{
+    quorum_waiter::QuorumWaiterTrait, Worker, WorkerNetwork, WorkerNetworkHandle, WorkerRequest,
+    WorkerResponse,
+};
 use tokio::sync::mpsc::{self};
 use tokio_stream::StreamExt;
 use tracing::{debug, error, info, warn};
@@ -426,6 +431,48 @@ where
         }
     }
 
+    /// Collect any batches that never got into consensus (at epoch change or node restart) and
+    /// Re-introduce them into the mempool for inclusion in future batches.
+    fn orphan_batches<QuorumWaiter: QuorumWaiterTrait>(
+        &self,
+        epoch_task_manager: &TaskManager,
+        engine: ExecutionNode,
+        worker: Worker<DB, QuorumWaiter>,
+    ) -> eyre::Result<()> {
+        let mut orphan_batches: Vec<(BlockHash, Batch)> =
+            self.consensus_db.iter::<NodeBatchesCache>().collect();
+        if !orphan_batches.is_empty() {
+            self.consensus_db.clear_table::<NodeBatchesCache>()?;
+            let consensus_bus = self.consensus_bus.clone();
+            epoch_task_manager.spawn_task("Orphaned Batches", async move {
+                info!(target: "epoch-manager", "Re-introducing orphaned batchs {} transactions", orphan_batches.len());
+                let pools = engine.get_all_worker_transaction_pools().await;
+                let is_cvv = consensus_bus.node_mode().borrow().is_active_cvv();
+                for (digest, batch) in orphan_batches.drain(..) {
+                    // Loop through any orphaned batches and resubmit it's transactions.
+                    // This is most likely because of epoch changes but could be caused by a restart as
+                    // well.
+                    if is_cvv {
+                        for tx_bytes in batch.transactions() {
+                            // Put txn back into the mem pool.
+                            if let Ok(tx) = bytes_to_txn(tx_bytes) {
+                                if let Some(pool) = pools.get(batch.worker_id as usize) {
+                                    let _ = pool.add_raw_transaction_external(tx).await;
+                                }
+                            }
+                        }
+                    } else {
+                        // If we are not a CVV then go ahead and disburse the txns from the batch directly.
+                        let _ = worker.disburse_txns(batch.seal(digest)).await;
+                    }
+                }
+            });
+        } else {
+            info!(target: "epoch-manager", "No batches leftover");
+        }
+        Ok(())
+    }
+
     /// Run a single epoch.
     async fn run_epoch(
         &mut self,
@@ -507,6 +554,8 @@ where
                 gas_accumulator.base_fee(worker.id()),
             )
             .await?;
+
+        self.orphan_batches(&epoch_task_manager, engine.clone(), worker.clone())?;
 
         // update tasks
         epoch_task_manager.update_tasks();
@@ -827,6 +876,7 @@ where
                     "failed to reach quorum on epoch close for {epoch_hash} {epoch_rec:?}",
                 );
                 // Try to recover by downloading the epoch record and cert from a peer.
+                let mut got_epoch_record = false;
                 for _ in 0..3 {
                     // Request by epoch number in case we had a bad hash...
                     match primary_network.request_epoch_cert(Some(epoch_rec.epoch), None).await {
@@ -838,15 +888,17 @@ where
                                 if new_epoch_hash != epoch_hash {
                                     warn!(
                                         target: "epoch-manager",
-                                        "Over wrote expected epoch record with verified epoch record",
+                                        "Over wrote expected epoch record {epoch_hash} with verified epoch record {new_epoch_hash}",
                                     );
-                                    consensus_db.save_epoch_record(&epoch_rec);
+                                    consensus_db.save_epoch_record_with_cert(&new_epoch_rec, &cert);
+                                } else {
+                                    info!(
+                                        target: "epoch-manager",
+                                        "retrieved cert for epoch {new_epoch_hash} from a peer",
+                                    );
+                                    let _ = consensus_db.insert::<EpochCerts>(&new_epoch_hash, &cert);
                                 }
-                                let _ = consensus_db.insert::<EpochCerts>(&new_epoch_hash, &cert);
-                                info!(
-                                    target: "epoch-manager",
-                                    "retrieved cert for epoch {new_epoch_hash} from a peer",
-                                );
+                                got_epoch_record = true;
                                 break;
                             }
                         }
@@ -855,6 +907,12 @@ where
                             "failed to retrieve epoch from a peer {epoch_hash}: {err}",
                         ),
                     }
+                }
+                if !got_epoch_record {
+                    error!(
+                        target: "epoch-manager",
+                        "Failed to retrieve an epoch record for epoch {}", epoch_rec.epoch,
+                    );
                 }
             }
         });

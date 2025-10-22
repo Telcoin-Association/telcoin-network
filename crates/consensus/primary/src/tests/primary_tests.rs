@@ -1,6 +1,7 @@
 //! Primary tests
 
 use crate::{
+    error::PrimaryNetworkError,
     network::{handler::RequestHandler, MissingCertificatesRequest, PrimaryResponse},
     state_sync::StateSynchronizer,
     ConsensusBus,
@@ -17,10 +18,62 @@ use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_storage::{mem_db::MemDatabase, CertificateStore, PayloadStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    now, AuthorityIdentifier, BlockNumHash, Certificate, Committee, ExecHeader, Hash as _,
-    SealedHeader, SignatureVerificationState, TaskManager,
+    error::HeaderError, now, AuthorityIdentifier, BlockNumHash, Certificate, Committee, ExecHeader,
+    Hash as _, SealedHeader, SignatureVerificationState, TaskManager,
 };
 use tokio::time::timeout;
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_request_vote_too_new() {
+    const NUM_PARENTS: usize = 10;
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .committee_size(NonZeroUsize::new(NUM_PARENTS).unwrap())
+        .build();
+    let target = fixture.authorities().next().unwrap();
+    let author = fixture.authorities().nth(2).unwrap();
+    let author_id = author.id();
+    let author_peer = *author.authority().protocol_key();
+
+    let cb = ConsensusBus::new();
+    // Need a dummy parent so we can request a vote.
+    let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
+    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(target.consensus_config(), cb.clone(), task_manager.get_spawner());
+    synchronizer.spawn(&task_manager);
+    let handler = RequestHandler::new(target.consensus_config(), cb.clone(), synchronizer.clone());
+
+    // Make some mock certificates that are parents of our new header.
+    let committee: Committee = fixture.committee();
+    let genesis =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
+    let ids: Vec<_> = fixture.authorities().map(|a| (a.id(), a.keypair().copy())).collect();
+    let (certificates, _next_parents) =
+        make_optimal_signed_certificates(1..=3, &genesis, &committee, ids.as_slice());
+    let all_certificates = certificates.into_iter().collect::<Vec<_>>();
+    let round_2_certs = all_certificates[NUM_PARENTS..(NUM_PARENTS * 2)].to_vec();
+
+    // Create a test header.
+    let test_header = author
+        .header_builder(&fixture.committee())
+        .author(author_id)
+        .round(100) // Need to be bigger than the gc window
+        .latest_execution_block(BlockNumHash::default()) // dummy_hash would be correct here but this is the test...
+        .parents(round_2_certs.iter().map(|c| c.digest()).collect())
+        .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)
+        .build();
+
+    // Trying to build on off of a missing execution block, will be an error.
+    let result =
+        timeout(Duration::from_secs(5), handler.vote(author_peer, test_header, Vec::new())).await;
+    let result = result.unwrap();
+    assert!(
+        matches!(result, Err(PrimaryNetworkError::InvalidHeader(HeaderError::TooNew { .. }))),
+        "{result:?}"
+    );
+}
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_request_vote_has_missing_execution_block() {
@@ -148,6 +201,7 @@ async fn test_request_vote_older_execution_block() {
         certificate_store.write(cert.clone()).unwrap();
     }
 
+    let _ = cb.committed_round_updates().send(2);
     // Trying to build on off of a missing execution block, will be an error.
     let result =
         timeout(Duration::from_secs(5), handler.vote(author_peer, test_header, Vec::new())).await;
@@ -197,7 +251,7 @@ async fn test_request_vote_has_missing_parents() {
     let test_header = author
         .header_builder(&fixture.committee())
         .author(author_id)
-        .round(3)
+        .round(2)
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
         .parents(round_2_certs.iter().map(|c| c.digest()).collect())
         .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)
@@ -213,6 +267,7 @@ async fn test_request_vote_has_missing_parents() {
         certificate_store.write(cert.clone()).unwrap();
     }
 
+    let _ = cb.committed_round_updates().send(1);
     // TEST PHASE 1: Handler should report missing parent certificates to caller.
     let missing = if let PrimaryResponse::MissingParents(missing) =
         handler.vote(author_peer, test_header.clone(), Vec::new()).await.unwrap()
@@ -231,7 +286,13 @@ async fn test_request_vote_has_missing_parents() {
     let result =
         timeout(Duration::from_secs(5), handler.vote(author_peer, test_header.clone(), Vec::new()))
             .await;
-    assert!(result.is_err(), "{result:?}");
+    assert!(
+        matches!(
+            result,
+            Ok(Err(PrimaryNetworkError::InvalidHeader(HeaderError::WrongNumberOfParents(5, 0))))
+        ),
+        "{result:?}"
+    );
 
     // TEST PHASE 3: Handler should return error if header is too old.
     // Increase round threshold.
@@ -314,6 +375,7 @@ async fn test_request_vote_accept_missing_parents() {
         payload_store.write_payload(digest, worker_id).unwrap();
     }
 
+    let _ = cb.committed_round_updates().send(2);
     // TEST PHASE 1: Handler should report missing parent certificates to caller.
     let missing = if let PrimaryResponse::MissingParents(missing) =
         handler.vote(author_peer, test_header.clone(), Vec::new()).await.unwrap()
@@ -391,6 +453,7 @@ async fn test_request_vote_missing_batches() {
 
     client.set_primary_to_worker_local_handler(Arc::new(mock_server));
 
+    let _ = cb.committed_round_updates().send(1);
     // Verify Handler synchronizes missing batches and generates a Vote.
     let _vote = timeout(Duration::from_secs(5), handler.vote(author_peer, test_header, Vec::new()))
         .await
@@ -456,6 +519,7 @@ async fn test_request_vote_already_voted() {
         .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)
         .build();
 
+    let _ = cb.committed_round_updates().send(1);
     let vote = if let PrimaryResponse::Vote(vote) = tokio::time::timeout(
         Duration::from_secs(10),
         handler.vote(author_peer, test_header.clone(), Vec::new()),
@@ -690,18 +754,39 @@ async fn test_request_vote_created_at_in_future() {
 
     // Verify Handler generates a Vote.
 
+    // Make some mock certificates that are parents of our new header.
+    // New certs for a new header
+    let mut certificates = HashMap::new();
+    for primary in fixture.authorities().filter(|a| a.id() != id) {
+        let header = primary
+            .header_builder(&fixture.committee())
+            .round(2)
+            .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)
+            .build();
+
+        let certificate = fixture.certificate(&header);
+        let digest = certificate.clone().digest();
+
+        certificates.insert(digest, certificate.clone());
+        certificate_store.write(certificate.clone()).unwrap();
+        for (digest, (worker_id, _)) in certificate.header().payload() {
+            payload_store.write_payload(digest, worker_id).unwrap();
+        }
+    }
+
     // Set the creation time to be a bit in the future (1s)
     let created_at = now() + 1;
 
     let test_header = author
         .header_builder(&fixture.committee())
-        .round(2)
+        .round(3)
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
         .parents(certificates.keys().cloned().collect())
         .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)
         .created_at(created_at)
         .build();
 
+    let _ = cb.committed_round_updates().send(1);
     let _vote = if let PrimaryResponse::Vote(vote) =
         handler.vote(author_peer, test_header, Vec::new()).await.unwrap()
     {

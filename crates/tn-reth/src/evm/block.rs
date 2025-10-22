@@ -18,7 +18,7 @@ use alloy::{
     sol_types::SolCall as _,
 };
 use alloy_evm::{Database, Evm};
-use rand::{rngs::StdRng, Rng as _, SeedableRng as _};
+use rand::{rngs::StdRng, seq::IteratorRandom, Rng as _, SeedableRng as _};
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_errors::{BlockExecutionError, BlockValidationError};
 use reth_evm::{
@@ -275,28 +275,50 @@ where
 
         trace!(target: "engine", "get validators call:\n{:?}", state);
 
-        let mut eligible_validators: Vec<ConsensusRegistry::ValidatorInfo> =
+        let all_active_validators: Vec<ConsensusRegistry::ValidatorInfo> =
             alloy::sol_types::SolValue::abi_decode(&state)?;
 
-        debug!(target: "engine",  "validators pre-shuffle {:?}", eligible_validators);
+        debug!(target: "engine",  "validators pre-shuffle {:?}", all_active_validators);
 
-        // simple Fisher-Yates shuffle
-        //
         // create seed from hashed bls agg signature
         let mut seed = [0; 32];
         seed.copy_from_slice(randomness.as_slice());
         trace!(target: "engine", ?seed, "seed after");
 
+        // used as deterministic randomness
         let mut rng = StdRng::from_seed(seed);
-        for i in (1..eligible_validators.len()).rev() {
+
+        // 1) separate active and pending validators
+        // 2) check if active length is sufficient
+        // 3) if missing, randomly select from the pending validators
+        let (pending_exit, mut active_validators): (Vec<_>, Vec<_>) = all_active_validators
+            .into_iter()
+            .partition(|v| v.currentStatus == ValidatorStatus::PendingExit);
+
+        let active_validator_count = active_validators.len();
+        let mut validators_for_shuffle = if active_validator_count >= new_committee_size {
+            // enough active validators for next committee
+            active_validators
+        } else {
+            // NOTE: already checked if active_validator_count >= new_committee_size above
+            let num_missing = new_committee_size - active_validator_count;
+
+            // randomly take enough pending exit validators to reach new committee size
+            let random_pending = pending_exit.into_iter().choose_multiple(&mut rng, num_missing);
+            active_validators.extend(random_pending);
+            active_validators
+        };
+
+        // simple Fisher-Yates shuffle
+        for i in (1..validators_for_shuffle.len()).rev() {
             let j = rng.random_range(0..=i);
-            eligible_validators.swap(i, j);
+            validators_for_shuffle.swap(i, j);
         }
 
-        debug!(target: "engine",  "validators post-shuffle {:?}", eligible_validators);
+        debug!(target: "engine",  "validators post-shuffle {:?}", validators_for_shuffle);
 
         let mut new_committee =
-            eligible_validators.into_iter().map(|v| v.validatorAddress).collect::<Vec<_>>();
+            validators_for_shuffle.into_iter().map(|v| v.validatorAddress).collect::<Vec<_>>();
 
         // trim the shuffled committee to maintain correct size
         new_committee.truncate(new_committee_size);

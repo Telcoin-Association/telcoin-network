@@ -30,9 +30,12 @@ pub struct TNPayload {
     /// The authority responsible for producing the batch.
     /// This is used for block's coinbase where priority fees are sent.
     pub beneficiary: Address,
-    /// The index of the subdag, which equates to the round of consensus.
-    ///
     /// Used as the executed block header's `nonce`.
+    ///
+    /// The result of the leader's epoch and round:
+    /// `((self.epoch as u64) << 32) | self.round as u64`
+    ///
+    /// See ConsensusOutput::nonce()
     pub nonce: u64,
     /// The index of the block within the entire output from consensus.
     ///

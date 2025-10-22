@@ -119,18 +119,18 @@ impl BatchBuilder {
         }
     }
 
-    /// Spawns a task to build the batch and proposer to peers.
+    /// Spawns a task to build the batch and propose to peers.
     ///
-    /// This approach allows the block builder to yield back to the runtime while mining blocks.
+    /// This approach allows the batch builder to yield back to the runtime while mining batches.
     ///
     /// The task performs the following actions:
-    /// - create a block
-    /// - send the block to worker's block proposer
+    /// - create a batch
+    /// - send the batch to worker's batch proposer
     /// - wait for ack that quorum was reached
     /// - convert result to fatal/non-fatal
     /// - return result
     ///
-    /// Workers only propose one block at a time.
+    /// Workers only propose one batch at a time.
     fn spawn_execution_task(&self) -> BuildResult {
         let pool = self.pool.clone();
         let to_worker = self.to_worker.clone();
@@ -257,7 +257,7 @@ impl Future for BatchBuilder {
                     break;
                 }
 
-                // start building the next block
+                // start building the next batch
                 this.pending_task = Some(this.spawn_execution_task());
 
                 // don't break so pending_task receiver gets polled
@@ -269,8 +269,6 @@ impl Future for BatchBuilder {
                 match receiver.poll_unpin(cx) {
                     Poll::Ready(res) => {
                         debug!(target: "block-builder", ?res, "pending task complete");
-                        // TODO: update tree's pending block?
-
                         // ensure no fatal errors
                         let mined_transactions = res??;
 

@@ -69,22 +69,13 @@ async fn test_epoch_boundary_inner(
 
     // submit txs to: issue NFT, stake, and activate new validator
     for tx in txs {
-        let mut pending = provider.send_raw_transaction(&tx).await?;
-        // Currently submitting a txn on an epoch boundary can be lost.
-        // Once that is no longer true then should remove this retry loop.
-        loop {
-            debug!(target: "epoch-test", "pending tx: {pending:?}");
-            match timeout(Duration::from_secs(5), pending.watch()).await {
-                Err(_) => {
-                    pending = provider.send_raw_transaction(&tx).await?;
-                    continue;
-                }
-                Ok(res) => {
-                    res?;
-                }
-            }
-            break;
-        }
+        let pending = provider.send_raw_transaction(&tx).await?;
+        // Some txns will likely be submitted as epochs switch.
+        // This is handled now so we can just submit and wait for the watch
+        // no need to re-submit, etc.  If that becomes needed then the
+        // missed txns may not be getting re-injected into the mempool.
+        debug!(target: "epoch-test", "pending tx: {pending:?}");
+        timeout(Duration::from_secs(5), pending.watch()).await??;
     }
 
     // retrieve current committee
@@ -248,7 +239,13 @@ async fn test_epoch_sync_inner(
         for epoch in 0..=latest_epoch {
             let (epoch_rec, cert): (EpochRecord, EpochCertificate) =
                 provider.raw_request("tn_epochRecord".into(), (epoch,)).await?;
-            assert!(epoch_rec.verify_with_cert(&cert), "invalid epoch record!");
+            assert!(
+                epoch_rec.verify_with_cert(&cert),
+                "invalid epoch record: {p} {}/{} {}!",
+                epoch_rec.epoch,
+                epoch_rec.digest(),
+                cert.epoch_hash
+            );
         }
     }
 

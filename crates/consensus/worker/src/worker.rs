@@ -13,7 +13,7 @@ use crate::{
 use std::{sync::Arc, time::Duration};
 use tn_config::ConsensusConfig;
 use tn_network_types::{local::LocalNetwork, WorkerOwnBatchMessage, WorkerToPrimaryClient};
-use tn_storage::tables::Batches;
+use tn_storage::tables::{Batches, NodeBatchesCache};
 use tn_types::{
     error::BlockSealError, BatchReceiver, BatchSender, BatchValidation, Database, SealedBatch,
     TaskManager, WorkerId,
@@ -199,11 +199,14 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         self.network_handle.clone()
     }
 
+    /// The sender end of the batch submit channel.
     pub fn batches_tx(&self) -> BatchSender {
         self.tx_batches.clone()
     }
 
-    async fn disburse_txns(&self, sealed_batch: SealedBatch) -> Result<(), BlockSealError> {
+    /// Send all the txns in sealed_batch to CVVs so they can be included in blocks.
+    /// Use this when not a CVV so that transactions you accept can be included in a block.
+    pub async fn disburse_txns(&self, sealed_batch: SealedBatch) -> Result<(), BlockSealError> {
         for txn in sealed_batch.batch.transactions {
             if let Err(err) = self.network_handle.publish_txn(txn).await {
                 error!(target: "worker::batch_provider", "Error publishing transaction: {err}");
@@ -231,6 +234,14 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
             self.network_handle.get_task_spawner(),
         );
 
+        let (batch, digest) = sealed_batch.split();
+        if let Err(e) = self.store.insert::<NodeBatchesCache>(&digest, &batch) {
+            // Cache the batch early, avoid race conditions.
+            // Note the cache should be cleared every epoch after processing.
+            error!(target: "worker::batch_provider", "Store failed (batch cache) with error: {:?}", e);
+            return Err(BlockSealError::FatalDBFailure);
+        }
+
         // Wait for our batch to reach quorum or fail to do so.
         match batch_attest_handle.await {
             Ok(res) => {
@@ -241,7 +252,7 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
                         // members). Note, ignore error- this should not
                         // happen and should not cause an issue (except the
                         // underlying p2p network may be in trouble but that will manifest quickly).
-                        let _ = self.network_handle.publish_batch(sealed_batch.digest()).await;
+                        let _ = self.network_handle.publish_batch(digest).await;
                     }
                     Err(e) => {
                         return Err(match e {
@@ -259,7 +270,7 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
                             | crate::quorum_waiter::QuorumWaiterError::Rpc(_) => {
                                 BlockSealError::FailedQuorum
                             }
-                        })
+                        });
                     }
                 }
             }
@@ -269,9 +280,7 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
             }
         }
 
-        // Now save it to disk
-        let (batch, digest) = sealed_batch.split();
-
+        // Now save it to permenant storage
         if let Err(e) = self.store.insert::<Batches>(&digest, &batch) {
             error!(target: "worker::batch_provider", "Store failed with error: {:?}", e);
             return Err(BlockSealError::FatalDBFailure);

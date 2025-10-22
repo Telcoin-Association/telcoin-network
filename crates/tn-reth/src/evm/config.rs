@@ -11,7 +11,6 @@ use reth_primitives::{BlockTy, HeaderTy};
 use reth_revm::{
     context::{BlockEnv, CfgEnv},
     context_interface::block::BlobExcessGasAndPrice,
-    primitives::hardfork::SpecId,
 };
 use std::sync::Arc;
 use tn_types::{
@@ -46,21 +45,6 @@ impl TnEvmConfig {
     /// Returns the chain spec associated with this configuration.
     pub const fn chain_spec(&self) -> &Arc<ChainSpec> {
         self.executor_factory.spec()
-    }
-
-    // TODO: remove this after compile
-    //
-    /// Returns blob params by hard fork as specified in chain spec.
-    /// Blob params are in format `(spec id, target blob count, max blob count)`.
-    pub fn blob_max_and_target_count_by_hardfork(&self) -> Vec<(SpecId, u64, u64)> {
-        let cancun = self.chain_spec().blob_params.cancun();
-        let prague = self.chain_spec().blob_params.prague();
-        let osaka = self.chain_spec().blob_params.osaka();
-        Vec::from([
-            (SpecId::CANCUN, cancun.target_blob_count, cancun.max_blob_count),
-            (SpecId::PRAGUE, prague.target_blob_count, prague.max_blob_count),
-            (SpecId::OSAKA, osaka.target_blob_count, osaka.max_blob_count),
-        ])
     }
 }
 
