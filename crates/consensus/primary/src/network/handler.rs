@@ -321,7 +321,6 @@ where
     /// Evaluate request to possibly issue a vote in support of peer's header.
     async fn vote_inner(
         &self,
-        //peer: BlsPublicKey,
         header: Header,
         parents: Vec<Certificate>,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
