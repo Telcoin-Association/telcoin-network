@@ -223,6 +223,12 @@ pub enum HeaderError {
     /// Vote request includes too many parents.
     #[error("Too many parents in vote request: {0} > {1}")]
     TooManyParents(usize, usize),
+    /// Vote request includes parent(s) that were not requested.
+    #[error("Got parents we did not request")]
+    InvalidParents,
+    /// Vote request includes wrong number of parents.
+    #[error("Wrong number of parents in vote request: expected {0} got {1}")]
+    WrongNumberOfParents(usize, usize),
     /// Authority network key is missing from committee.
     #[error("Failed to find author in committee by network key: {0}")]
     UnknownNetworkKey(Box<BlsPublicKey>),
@@ -244,6 +250,9 @@ pub enum HeaderError {
     /// The proposed header's round is too far behind.
     #[error("Header {digest} for round {header_round} is too old for max round {max_round}")]
     TooOld { digest: HeaderDigest, header_round: Round, max_round: Round },
+    /// The proposed header's round is too far ahead.
+    #[error("Header {digest} for round {header_round} is too new for max round {max_round}")]
+    TooNew { digest: HeaderDigest, header_round: Round, max_round: Round },
     /// The header contains a parent with an invalid aggregate BLS signature.
     #[error("Header's parent missing aggregate BLS signature")]
     ParentMissingSignature,

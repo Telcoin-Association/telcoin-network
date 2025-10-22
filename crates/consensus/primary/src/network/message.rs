@@ -247,13 +247,11 @@ impl PrimaryResponse {
     pub fn is_err(&self) -> bool {
         matches!(self, PrimaryResponse::Error(_))
     }
-}
 
-impl IntoRpcError<PrimaryNetworkError> for PrimaryResponse {
-    fn into_error(error: PrimaryNetworkError) -> Self {
+    pub(crate) fn into_error_ref(error: &PrimaryNetworkError) -> Self {
         match error {
             PrimaryNetworkError::InvalidHeader(HeaderError::InvalidEpoch { ours, theirs })
-                if theirs == ours + 1 =>
+                if *theirs == ours + 1 =>
             {
                 // This is a common race condition on epoch restart so report as recoverable.
                 Self::RecoverableError(PrimaryRPCError(error.to_string()))
@@ -276,6 +274,12 @@ impl IntoRpcError<PrimaryNetworkError> for PrimaryResponse {
                 Self::Error(PrimaryRPCError(error.to_string()))
             }
         }
+    }
+}
+
+impl IntoRpcError<PrimaryNetworkError> for PrimaryResponse {
+    fn into_error(error: PrimaryNetworkError) -> Self {
+        Self::into_error_ref(&error)
     }
 }
 
