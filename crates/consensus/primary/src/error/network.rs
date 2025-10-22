@@ -132,7 +132,9 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         | HeaderError::Storage(_)
         | HeaderError::UnknownExecutionResult(_) => Some(Penalty::Mild),
         // medium
-        HeaderError::TooOld { .. } => Some(Penalty::Medium),
+        HeaderError::InvalidParents
+        | HeaderError::WrongNumberOfParents(_, _)
+        | HeaderError::TooOld { .. } => Some(Penalty::Medium),
         // severe
         HeaderError::InvalidTimestamp { .. } | HeaderError::InvalidParentRound => {
             Some(Penalty::Severe)

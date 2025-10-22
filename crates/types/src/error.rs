@@ -223,6 +223,12 @@ pub enum HeaderError {
     /// Vote request includes too many parents.
     #[error("Too many parents in vote request: {0} > {1}")]
     TooManyParents(usize, usize),
+    /// Vote request includes parent(s) that were not requested.
+    #[error("Got parents we did not request")]
+    InvalidParents,
+    /// Vote request includes wrong number of parents.
+    #[error("Wrong number of parents in vote request: expected {0} got {1}")]
+    WrongNumberOfParents(usize, usize),
     /// Authority network key is missing from committee.
     #[error("Failed to find author in committee by network key: {0}")]
     UnknownNetworkKey(Box<BlsPublicKey>),

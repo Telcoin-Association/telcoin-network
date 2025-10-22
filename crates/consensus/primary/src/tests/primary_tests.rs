@@ -286,7 +286,13 @@ async fn test_request_vote_has_missing_parents() {
     let result =
         timeout(Duration::from_secs(5), handler.vote(author_peer, test_header.clone(), Vec::new()))
             .await;
-    assert!(result.is_err(), "{result:?}");
+    assert!(
+        matches!(
+            result,
+            Ok(Err(PrimaryNetworkError::InvalidHeader(HeaderError::WrongNumberOfParents(5, 0))))
+        ),
+        "{result:?}"
+    );
 
     // TEST PHASE 3: Handler should return error if header is too old.
     // Increase round threshold.

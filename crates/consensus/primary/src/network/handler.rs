@@ -30,7 +30,10 @@ use tn_types::{
 use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
 
-type AuthEquivocationMap = BTreeMap<AuthorityIdentifier, (Epoch, Round, HeaderDigest)>;
+/// Map to hold vote info to detect invalid votes, equivocation and cache responses in case of
+/// rerequests.
+type AuthEquivocationMap =
+    BTreeMap<AuthorityIdentifier, (Epoch, Round, HeaderDigest, Option<PrimaryResponse>)>;
 
 /// The type that handles requests from peers.
 #[derive(Clone)]
@@ -223,25 +226,105 @@ where
         header: Header,
         parents: Vec<Certificate>,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
+        // Sanity check the peer is the author and bounce quick if not.
+        // This should keep a malicious validator from corrupting another
+        // nodes vote cache.
+        // This relies on libp2p to manage peer ids that are used to get the bls key.
+        let committee_peer = header.author.clone();
+        let auth_id: AuthorityIdentifier = peer.into();
+        if let Some(auth) = self.consensus_config.committee().authority(&committee_peer) {
+            // We err on the side of caution here, if auths peer id is not known fail but we
+            // should know it (got a vote request from them).
+            ensure!(auth_id == auth.id(), HeaderError::PeerNotAuthor.into());
+        } else {
+            return Err(HeaderError::UnknownAuthority(committee_peer.to_string()).into());
+        }
         {
             // Check for validator equivocation early and reject if so
             let mut auth_last_vote = self.auth_last_vote.lock();
-            let (last_epoch, last_round, last_digest) =
-                *auth_last_vote.get(&header.author).unwrap_or(&(0, 0, HeaderDigest::default()));
-            if last_digest != header.digest()  // can ask for the same vote again
-                && (header.epoch() < last_epoch
-                    || (last_epoch == header.epoch() && last_round >= header.round()))
+            if let Some((last_epoch, last_round, last_digest, last_response)) =
+                auth_last_vote.remove(&header.author)
             {
-                return Err(HeaderError::AlreadyVotedForLaterRound {
-                    theirs: header.round(),
-                    ours: last_round,
+                if last_digest == header.digest() {
+                    match last_response {
+                        None | Some(PrimaryResponse::RecoverableError(_)) => {}
+                        Some(PrimaryResponse::MissingParents(missing)) => {
+                            // A proper response to missing parents will include exactly the missing
+                            // parents.
+                            if parents.len() == missing.len() {
+                                for parent in parents.iter().map(|p| p.digest()) {
+                                    if !missing.contains(&parent) {
+                                        auth_last_vote.insert(
+                                            header.author().clone(),
+                                            (
+                                                last_epoch,
+                                                last_round,
+                                                last_digest,
+                                                Some(PrimaryResponse::MissingParents(missing)),
+                                            ),
+                                        );
+                                        return Err(HeaderError::InvalidParents.into());
+                                    }
+                                }
+                            } else {
+                                let missing_len = missing.len();
+                                auth_last_vote.insert(
+                                    header.author().clone(),
+                                    (
+                                        last_epoch,
+                                        last_round,
+                                        last_digest,
+                                        Some(PrimaryResponse::MissingParents(missing)),
+                                    ),
+                                );
+                                return Err(HeaderError::WrongNumberOfParents(
+                                    missing_len,
+                                    parents.len(),
+                                )
+                                .into());
+                            }
+                        }
+                        Some(res) => return Ok(res),
+                    }
+                } else if header.epoch() < last_epoch
+                    || (last_epoch == header.epoch() && last_round >= header.round())
+                {
+                    auth_last_vote.insert(
+                        header.author().clone(),
+                        (last_epoch, last_round, last_digest, None),
+                    );
+                    return Err(HeaderError::AlreadyVotedForLaterRound {
+                        theirs: header.round(),
+                        ours: last_round,
+                    }
+                    .into());
                 }
-                .into());
             }
-            auth_last_vote
-                .insert(header.author.clone(), (header.epoch(), header.round(), header.digest()));
         }
+        let author = header.author().clone();
+        let epoch = header.epoch();
+        let round = header.round();
+        let digest = header.digest();
+        let res = self.vote_inner(header, parents).await;
+        // Do this to cache the "full" response.
+        // If pulling from the cache it is fine to already be converted
+        // but sometimes we want the full error (basically tests) so return
+        // res when we have a non-converted error.
+        let cached_res: PrimaryResponse = match &res {
+            Ok(msg) => msg.clone(),
+            Err(e) => PrimaryResponse::into_error_ref(e),
+        };
+        self.auth_last_vote.lock().insert(author, (epoch, round, digest, Some(cached_res)));
+        res
+    }
 
+    /// Evaluate request to possibly issue a vote in support of peer's header.
+    async fn vote_inner(
+        &self,
+        //peer: BlsPublicKey,
+        header: Header,
+        parents: Vec<Certificate>,
+    ) -> PrimaryNetworkResult<PrimaryResponse> {
         // current committee
         let committee = self.consensus_config.committee();
 
@@ -271,17 +354,6 @@ where
             .node_metrics
             .certificates_in_votes
             .inc_by(num_parents as u64);
-
-        let committee_peer = header.author.clone();
-        let auth_id: AuthorityIdentifier = peer.into();
-        if let Some(auth) = self.consensus_config.committee().authority(&committee_peer) {
-            // We err on the side of caution here, if auths peer id is not known fail but we
-            // should know it (got a vote request from them).
-            ensure!(auth_id == auth.id(), HeaderError::PeerNotAuthor.into());
-        } else {
-            // The committee check above passed so this should not happen, but just in case.
-            return Err(HeaderError::UnknownNetworkKey(Box::new(peer)).into());
-        }
 
         // if peer is ahead, wait for execution to catch up
         // NOTE: this doesn't hurt since this node shouldn't vote until execution is caught up
