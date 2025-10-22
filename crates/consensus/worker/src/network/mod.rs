@@ -291,11 +291,9 @@ where
 
     /// Run the network for the epoch.
     pub fn spawn(mut self, epoch_task_spawner: &TaskSpawner) {
-        epoch_task_spawner.spawn_task("worker network events", async move {
-            loop {
-                while let Some(event) = self.network_events.recv().await {
-                    self.process_network_event(event);
-                }
+        epoch_task_spawner.spawn_critical_task("worker network events", async move {
+            while let Some(event) = self.network_events.recv().await {
+                self.process_network_event(event);
             }
         });
     }
