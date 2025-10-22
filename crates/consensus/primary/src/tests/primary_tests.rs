@@ -540,7 +540,7 @@ async fn test_request_vote_already_voted() {
     // Verify a different request for the same round receives an error.
     let test_header = author
         .header_builder(&fixture.committee())
-        .round(1)
+        .round(2)
         .parents(certificates.keys().cloned().collect())
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
         .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)
@@ -748,12 +748,32 @@ async fn test_request_vote_created_at_in_future() {
 
     // Verify Handler generates a Vote.
 
+    // Make some mock certificates that are parents of our new header.
+    // New certs for a new header
+    let mut certificates = HashMap::new();
+    for primary in fixture.authorities().filter(|a| a.id() != id) {
+        let header = primary
+            .header_builder(&fixture.committee())
+            .round(2)
+            .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)
+            .build();
+
+        let certificate = fixture.certificate(&header);
+        let digest = certificate.clone().digest();
+
+        certificates.insert(digest, certificate.clone());
+        certificate_store.write(certificate.clone()).unwrap();
+        for (digest, (worker_id, _)) in certificate.header().payload() {
+            payload_store.write_payload(digest, worker_id).unwrap();
+        }
+    }
+
     // Set the creation time to be a bit in the future (1s)
     let created_at = now() + 1;
 
     let test_header = author
         .header_builder(&fixture.committee())
-        .round(2)
+        .round(3)
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
         .parents(certificates.keys().cloned().collect())
         .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)

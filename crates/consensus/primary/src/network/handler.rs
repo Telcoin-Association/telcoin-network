@@ -24,10 +24,13 @@ use tn_types::{
     error::{CertificateError, HeaderError, HeaderResult},
     now, to_intent_message, try_decode, AuthorityIdentifier, BlockHash, BlsPublicKey, Certificate,
     CertificateDigest, ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord, Hash as _,
-    Header, ProtocolSignature, Round, SignatureVerificationState, TnSender as _, Vote,
+    Header, HeaderDigest, ProtocolSignature, Round, SignatureVerificationState, TnSender as _,
+    Vote,
 };
 use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
+
+type AuthEquivocationMap = BTreeMap<AuthorityIdentifier, (Epoch, Round, HeaderDigest)>;
 
 /// The type that handles requests from peers.
 #[derive(Clone)]
@@ -45,6 +48,9 @@ pub(crate) struct RequestHandler<DB> {
     /// header with these parents. The node keeps track of requested Certificates to prevent
     /// unsolicited certificate attacks.
     requested_parents: Arc<Mutex<BTreeMap<(Round, CertificateDigest), AuthorityIdentifier>>>,
+    /// Map of the last epoch and round each authority requested a vote for.
+    /// Used to stop validator equivocation early.
+    auth_last_vote: Arc<Mutex<AuthEquivocationMap>>,
     /// Track consensus headers until we hit a simple quorum then send on.
     consensus_certs: Arc<Mutex<HashMap<BlockHash, u32>>>,
 }
@@ -64,6 +70,7 @@ where
             consensus_bus,
             state_sync,
             requested_parents: Default::default(),
+            auth_last_vote: Default::default(),
             consensus_certs: Default::default(),
         }
     }
@@ -216,6 +223,25 @@ where
         header: Header,
         parents: Vec<Certificate>,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
+        {
+            // Check for validator equivocation early and reject if so
+            let mut auth_last_vote = self.auth_last_vote.lock();
+            let (last_epoch, last_round, last_digest) =
+                *auth_last_vote.get(&header.author).unwrap_or(&(0, 0, HeaderDigest::default()));
+            if last_digest != header.digest()  // can ask for the same vote again
+                && (header.epoch() < last_epoch
+                    || (last_epoch == header.epoch() && last_round >= header.round()))
+            {
+                return Err(HeaderError::AlreadyVotedForLaterRound {
+                    theirs: header.round(),
+                    ours: last_round,
+                }
+                .into());
+            }
+            auth_last_vote
+                .insert(header.author.clone(), (header.epoch(), header.round(), header.digest()));
+        }
+
         // current committee
         let committee = self.consensus_config.committee();
 
@@ -327,8 +353,6 @@ where
             );
             ensure!(parent.round() + 1 == header.round(), HeaderError::InvalidParentRound.into());
 
-            // @Steve - can you double check me here?
-            //
             // confirm header created_at must always be larger than parent
             //
             // this deviates from original:
