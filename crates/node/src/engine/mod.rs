@@ -175,7 +175,7 @@ impl ExecutionNode {
     }
 
     /// Return an owned instance of all the worker's transaction pools.
-    pub async fn get_worker_transaction_pools(&self) -> Vec<WorkerTxPool> {
+    pub async fn get_all_worker_transaction_pools(&self) -> Vec<WorkerTxPool> {
         let guard = self.internal.read().await;
         guard.get_worker_transaction_pools()
     }

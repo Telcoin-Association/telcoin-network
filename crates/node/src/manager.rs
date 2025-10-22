@@ -432,7 +432,7 @@ where
     }
 
     /// Collect any batches that never got into consensus (at epoch change or node restart) and
-    /// Re-introduce them into the mempool for incusion in future batches.
+    /// Re-introduce them into the mempool for inclusion in future batches.
     fn orphan_batches<QuorumWaiter: QuorumWaiterTrait>(
         &self,
         epoch_task_manager: &TaskManager,
@@ -445,9 +445,9 @@ where
             self.consensus_db.clear_table::<NodeBatchesCache>()?;
             let consensus_bus = self.consensus_bus.clone();
             epoch_task_manager.spawn_task("Orphaned Batches", async move {
-                info!(target: "epoch-manager", "Re-introducing orpahned batchs {} transactions", orphan_batches.len());
-                let pools = engine.get_worker_transaction_pools().await;
-                let is_cvv = matches!(*consensus_bus.node_mode().borrow(), NodeMode::CvvActive);
+                info!(target: "epoch-manager", "Re-introducing orphaned batchs {} transactions", orphan_batches.len());
+                let pools = engine.get_all_worker_transaction_pools().await;
+                let is_cvv = consensus_bus.node_mode().borrow().is_active_cvv();
                 for (digest, batch) in orphan_batches.drain(..) {
                     // Loop through any orphaned batches and resubmit it's transactions.
                     // This is most likely because of epoch changes but could be caused by a restart as
@@ -462,7 +462,7 @@ where
                             }
                         }
                     } else {
-                        // If we are not a CVV then go ahead and disburse the txns frome the batch directly.
+                        // If we are not a CVV then go ahead and disburse the txns from the batch directly.
                         let _ = worker.disburse_txns(batch.seal(digest)).await;
                     }
                 }
