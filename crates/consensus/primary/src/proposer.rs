@@ -600,7 +600,6 @@ impl<DB: Database> Proposer<DB> {
                 self.proposed_headers.remove(round);
             }
 
-            // TODO: observe this warning and possibly reduce it to a debug
             warn!(
                 target: "primary::proposer",
                 "Repropose {num_digests_to_resend} batches in undelivered headers {retransmit_rounds:?} at commit round {commit_round:?}, remaining headers {}",
@@ -769,8 +768,6 @@ impl<DB: Database> Proposer<DB> {
             );
         }
         // If not an active CVV then don't propose anything.
-        // TODO- send txns to a committee member.
-        // Sleep in case we become active later.
     }
 
     /// Wrapper async function to either query the pending header or never resolve.

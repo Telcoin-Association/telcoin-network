@@ -139,7 +139,11 @@ impl<DB: Database> Subscriber<DB> {
                 consensus_header.number,
             )
             .await?;
-        save_consensus(self.config.node_storage(), consensus_output.clone())?;
+        save_consensus(
+            self.config.node_storage(),
+            consensus_output.clone(),
+            &self.inner.authority_id,
+        )?;
 
         // If we want to rejoin consensus eventually then save certs.
         let _ = self.config.node_storage().write(consensus_output.sub_dag.leader.clone());
@@ -277,7 +281,7 @@ impl<DB: Database> Subscriber<DB> {
                     match output {
                         Ok(output) => {
                             debug!(target: "subscriber", output=?output.digest(), "saving next output");
-                            save_consensus(self.config.node_storage(), output.clone())?;
+                            save_consensus(self.config.node_storage(), output.clone(), &self.inner.authority_id)?;
                             debug!(target: "subscriber", "broadcasting output...");
                             if let Err(e) = self.consensus_bus.consensus_output().send(output).await {
                                 error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self.inner.authority_id, e);
