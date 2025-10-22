@@ -73,7 +73,7 @@ impl WorkerNetworkHandle {
     /// Publish a batch digest to the worker network.
     pub(crate) async fn publish_batch(&self, batch_digest: BlockHash) -> NetworkResult<()> {
         let data = encode(&WorkerGossip::Batch(batch_digest));
-        self.handle.publish("tn-worker".into(), data).await?;
+        self.handle.publish(tn_config::LibP2pConfig::worker_batch_topic(), data).await?;
         Ok(())
     }
 
