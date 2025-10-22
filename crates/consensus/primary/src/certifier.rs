@@ -51,7 +51,7 @@ pub struct Certifier<DB> {
     metrics: Arc<PrimaryMetrics>,
     /// Spawn epoch-related tasks.
     task_spawner: TaskSpawner,
-    /// Notifier to cancel pending vote requests if proposer sends new header.
+    /// Notifier to cancel pending proposals and vote requests if new header is received.
     new_proposal: Notifier,
 }
 
@@ -126,7 +126,7 @@ impl<DB: Database> Certifier<DB> {
         committee: Committee,
         cancel_proposal: Noticer,
     ) -> DagResult<Vote> {
-        let mut missing_parents: Vec<CertificateDigest> = Vec::new();
+        let mut missing_parents: Option<Vec<CertificateDigest>> = None;
         let mut attempt: u32 = 0;
         debug!(target: "primary::certifier", ?authority, ?header, "requesting vote for header...");
 
@@ -136,9 +136,7 @@ impl<DB: Database> Certifier<DB> {
             attempt += 1;
 
             // peers may respond to a vote requesting missing parents
-            let parents = if missing_parents.is_empty() {
-                Vec::new()
-            } else {
+            let parents = missing_parents.map(|missing_parents| {
                 // collect missing parents requested by peer in order to vote for this header
                 let expected_count = missing_parents.len();
                 let parents: Vec<_> = certificate_store
@@ -162,12 +160,13 @@ impl<DB: Database> Certifier<DB> {
                     return Err(DagError::ProposedHeaderMissingCertificates);
                 }
 
-                parents
-            };
+                Ok(parents)
+            }).unwrap_or(Ok(vec![]))?;
 
+            // listen for requests from peers
             tokio::select! {
                 vote_result = network.request_vote(peer_id, header.clone(), parents) => {
-                    // match peer's response for vote request
+                    // process response from peer
                     match vote_result {
                         Ok(RequestVoteResult::Vote(vote)) => {
                             debug!(target: "primary::certifier", ?authority, ?vote, "Ok response received after request vote");
@@ -177,7 +176,7 @@ impl<DB: Database> Certifier<DB> {
                         Ok(RequestVoteResult::MissingParents(parents)) => {
                             debug!(target: "primary::certifier", ?authority, ?parents, "Ok missing parents response received after request vote");
                             // retrieve missing parents so peer can vote
-                            missing_parents = parents;
+                            missing_parents = Some(parents);
                         }
                         Err(error) => {
                             if let NetworkError::RPCError(error) = error {
@@ -189,12 +188,12 @@ impl<DB: Database> Certifier<DB> {
                                 error!(target: "primary::certifier", ?authority, ?error, ?header, "network error requesting vote");
                             }
 
-                            missing_parents = Vec::new();
+                            missing_parents = None;
                         }
                     }
                 }
 
-                // cancel proposal
+                // cancel vote request
                 _ = &cancel_proposal => {
                     return Err(DagError::Canceled);
                 }
@@ -268,6 +267,9 @@ impl<DB: Database> Certifier<DB> {
 
         self.metrics.proposed_header_round.set(header.round() as i64);
 
+        // subscribe early for shutdown notifications
+        let cancel_proposal = self.new_proposal.subscribe();
+
         // reset the votes aggregator and sign own header
         let mut votes_aggregator = VotesAggregator::new(self.metrics.clone());
         let vote = Vote::new(&header, self.authority_id.clone(), &self.signature_service);
@@ -323,7 +325,7 @@ impl<DB: Database> Certifier<DB> {
                         // happy path
                         Some(Ok(vote)) => {
                             let authority_id = vote.author.clone();
-                            // Make sure not to let an error here stop certification (else a crafted vote could break consensus).
+                            // prevent invalid votes from derailing certification process
                             certificate = match votes_aggregator.append(
                                 vote,
                                 &self.committee,
@@ -331,7 +333,7 @@ impl<DB: Database> Certifier<DB> {
                             ) {
                                 Ok(cert) => cert,
                                 Err(e) => {
-                                    error!(target: "primary::certifier", ?authority_id, "received an invalid vote: {e:?}");
+                                    error!(target: "primary::certifier", "received an invalid vote from {authority_id:?}: {e:?}");
                                     None
                                 }
                             }
@@ -339,7 +341,11 @@ impl<DB: Database> Certifier<DB> {
 
                         // handle vote error
                         Some(Err(e)) => {
-                            error!(target: "primary::certifier", auth=?self.authority_id, "failed to get vote for header {header:?}: {e:?}");
+                            error!(
+                                target: "primary::certifier",
+                                auth=?self.authority_id,
+                                "failed to get vote for header {header:?}: {e:?}"
+                            );
                         }
 
                         // all sending channels have dropped
@@ -349,9 +355,10 @@ impl<DB: Database> Certifier<DB> {
                     }
                 },
 
-                // exit early when new proposal arrives
-                _ = self.new_proposal.subscribe() => {
+                // exit early when cancel notification received
+                _ = &cancel_proposal => {
                     debug!(target: "primary::certifier", "new proposal received - aborting proposal...");
+                    return Err(DagError::Canceled);
                 }
             }
         }
@@ -384,12 +391,67 @@ impl<DB: Database> Certifier<DB> {
         Ok(certificate)
     }
 
+    /// The method to spawn tasks related to a header proposal.
+    ///
+    /// This listens for new proposal notifications to exit early.
+    /// The method returns once enough votes are processed to certify the proposal,
+    /// or if a new proposal arrives.
+    async fn spawn_header_proposal(self, header: Header) {
+        tokio::select! {
+            // listen for new_proposal notification to exit
+            // NOTE: sub here is okay bc no loop
+            _ = self.new_proposal.subscribe() => {
+                debug!(target: "primary::certifier", "new proposal notification received");
+            },
+
+            // receive enough votes for certification (or exit early)
+            proposal_result = self.propose_header(header) => {
+                match proposal_result {
+                    Ok(certificate) => {
+                        // pass to state_sync for internal processing
+                        if let Err(e) = self.state_sync.process_own_certificate(certificate.clone()).await {
+                            error!(target: "primary::certifier", "error accepting own certificate: {e}");
+                            return;
+                        }
+
+                        // try to publish the certificate on gossip network
+                        if let Err(e) = self.network.publish_certificate(certificate).await {
+                            error!(target: "primary::certifier", ?e, "failed to gossip certificate");
+                        }
+                    }
+
+                    Err(e) => {
+                        match e {
+                            // ignore cancelled proposal errors
+                            DagError::Canceled => {
+                                debug!(
+                                    target: "primary::certifier",
+                                    auth=?self.authority_id,
+                                    "certifier cancelled proposed header task"
+                                );
+                            }
+                            // log other errors loudly
+                            e =>  {
+                                error!(
+                                    target: "primary::certifier",
+                                    auth=?self.authority_id,
+                                    "Certifier error on proposed header task: {e}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Execute the main certification task.  Will run until shutdown is signalled.
     /// If this exits outside of shutdown it will log an error and this will trigger a node
     /// shutdown.
     async fn run(self) {
         info!(target: "primary::certifier", "Certifier on node {} has started successfully.", &self.authority_id);
         let mut rx_headers = self.consensus_bus.headers().subscribe();
+        let shutdown = &self.config.shutdown().subscribe();
         loop {
             tokio::select! {
                 // receive headers from proposer
@@ -399,49 +461,20 @@ impl<DB: Database> Certifier<DB> {
                     // cancel any outstanding proposals and vote requests
                     self.new_proposal.notify();
 
-                    // spawn certifier task that is cancelled when a new header is received
+                    // spawn certifier task so new proposals can cancel
                     let certifier = self.clone();
                     self.task_spawner.spawn_task(
                         format!("propose-header-{:?}", header),
-                        async move {
-                            tokio::select!{
-                                // listen for new_proposal notification to exit
-                                _ = certifier.new_proposal.subscribe() => {},
-
-                                // receive enough votes for certification (or exit early)
-                                proposal_result = certifier.propose_header(header) => {
-                                    match proposal_result {
-                                        Ok(certificate) => {
-                                            // pass to state_sync for internal processing
-                                            if let Err(e) = certifier.state_sync.process_own_certificate(certificate.clone()).await {
-                                                error!(target: "primary::certifier", "error accepting own certificate: {e}");
-                                                return;
-                                            }
-
-                                            // try to publish the certificate on gossip network
-                                            if let Err(e) = certifier.network.publish_certificate(certificate).await {
-                                                error!(target: "primary::certifier", ?e, "failed to gossip certificate");
-                                            }
-                                        }
-
-                                        Err(e) => {
-                                            match e {
-                                                // ignore errors when the proposal is cancelled
-                                                DagError::Canceled => debug!(target: "primary::certifier", auth=?certifier.authority_id, "certifier cancelled proposed header task"),
-                                                // log other errors
-                                                e =>  error!(target: "primary::certifier", auth=?certifier.authority_id, "Certifier error on proposed header task: {e}"),
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        certifier.spawn_header_proposal(header)
                     );
                 },
 
                 // listen for consensus shutdown
-                _ = &self.config.shutdown().subscribe() => {
+                _ = shutdown => {
                     debug!(target: "primary::certifier", "Certifier received shutdown signal");
+                    // cancel any outstanding proposals and vote requests
+                    // NOTE: this isn't strictly necessary but may help shutdown
+                    self.new_proposal.notify();
                     break;
                 }
             }

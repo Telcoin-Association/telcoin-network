@@ -13,7 +13,7 @@ use std::{
 use tn_network_libp2p::types::{NetworkCommand, NetworkHandle};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils_committee::CommitteeFixture;
-use tn_types::{BlsKeypair, BlsSigner, Notifier, SignatureVerificationState, TnSender};
+use tn_types::{BlsKeypair, BlsSigner, SignatureVerificationState, TnSender};
 use tokio::sync::mpsc;
 
 #[tokio::test(flavor = "current_thread")]
@@ -245,7 +245,7 @@ async fn run_vote_aggregator_with_param(
 async fn test_shutdown_core() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let primary = fixture.authorities().next().unwrap();
-
+    let config = primary.consensus_config();
     let cb = ConsensusBus::new();
     // Make a synchronizer for the core.
     let mut task_manager = TaskManager::default();
@@ -255,16 +255,23 @@ async fn test_shutdown_core() {
     // Spawn the core.
     synchronizer.spawn(&task_manager);
     Certifier::spawn(
-        primary.consensus_config(),
+        config.clone(),
         cb.clone(),
         synchronizer.clone(),
         NetworkHandle::new_for_test().into(),
         &task_manager,
     );
 
-    // Shutdown the core.
-    fixture.notify_shutdown();
-    let _ = task_manager.join(Notifier::default()).await;
+    // send request to spawn voting sub-tasks
+    cb.headers().send(Header::default()).await.expect("send header for proposal");
+
+    // sleep briefly so certifier has time to subscribe then shutdown the core
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    config.shutdown().notify();
+    let _ =
+        tokio::time::timeout(Duration::from_secs(3), task_manager.join(config.shutdown().clone()))
+            .await
+            .expect("timeout");
 }
 
 /// One vote request will produce an error, make sure the certificate is still formed with the good
