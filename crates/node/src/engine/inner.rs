@@ -326,6 +326,11 @@ impl ExecutionNodeInner {
         Ok(tx_pool)
     }
 
+    /// Return all worker's transaction pools.
+    pub(super) fn get_worker_transaction_pools(&self) -> Vec<WorkerTxPool> {
+        self.workers.iter().map(|w| w.pool()).collect()
+    }
+
     /// Return a worker's local Http address if the RpcServer exists.
     pub(super) fn worker_http_local_address(
         &self,

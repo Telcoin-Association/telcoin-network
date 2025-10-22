@@ -27,9 +27,9 @@ struct PrimaryNodeInner<CDB> {
 impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
     /// The window where the schedule change takes place in consensus. It represents number
     /// of committed sub dags.
-    /// TODO: move this to node properties
     /// 60 should rotate the reputations about every 10 minutes with 10 second commits (based on 5
     /// second round times).
+    /// NOTE: Changing this value WILL REQUIRE A FORK.  All nodes must agree on the schedule change.
     const CONSENSUS_SCHEDULE_CHANGE_SUB_DAGS: u32 = 60;
 
     /// Starts the primary node with the provided info. If the node is already running then this

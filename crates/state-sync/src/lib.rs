@@ -8,10 +8,15 @@ use tn_primary::{
     consensus::ConsensusRound, network::PrimaryNetworkHandle, ConsensusBus, NodeMode,
 };
 use tn_storage::{
-    tables::{Batches, ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache},
+    tables::{
+        Batches, ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache,
+        NodeBatchesCache,
+    },
     ConsensusStore,
 };
-use tn_types::{ConsensusHeader, ConsensusOutput, Database, DbTxMut, TaskSpawner, TnSender};
+use tn_types::{
+    AuthorityIdentifier, ConsensusHeader, ConsensusOutput, Database, DbTxMut, TaskSpawner, TnSender,
+};
 use tracing::{debug, error, info};
 
 mod epoch;
@@ -99,6 +104,7 @@ pub fn spawn_state_sync<DB: Database>(
 pub fn save_consensus<DB: Database>(
     db: &DB,
     consensus_output: ConsensusOutput,
+    authority_id: &Option<AuthorityIdentifier>,
 ) -> eyre::Result<()> {
     match db.write_txn() {
         Ok(mut txn) => {
@@ -123,6 +129,17 @@ pub fn save_consensus<DB: Database>(
             }
             // In case this was cached remove it.
             let _ = txn.remove::<ConsensusBlocksCache>(&header.number);
+            if let Some(authority_id) = authority_id {
+                // If we are a validator we need to clear any of our batches from our cache that are
+                // now part of consesnus.
+                for cert in &header.sub_dag.certificates {
+                    if cert.header().author() == authority_id {
+                        for batch_hash in cert.header().payload().keys() {
+                            let _ = txn.remove::<NodeBatchesCache>(batch_hash);
+                        }
+                    }
+                }
+            }
             if let Err(e) = txn.commit() {
                 error!(target: "state-sync", ?e, "error saving committing to persistant storage!");
                 return Err(e);
