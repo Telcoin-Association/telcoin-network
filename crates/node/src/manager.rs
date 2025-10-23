@@ -1472,7 +1472,7 @@ where
         network_handle
             .inner_handle()
             .subscribe_with_publishers(
-                tn_config::LibP2pConfig::worker_topic(),
+                tn_config::LibP2pConfig::worker_batch_topic(),
                 committee_keys.into_iter().collect(),
             )
             .await?;

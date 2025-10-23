@@ -64,7 +64,7 @@ where
         match gossip {
             WorkerGossip::Batch(batch_hash) => {
                 ensure!(
-                    topic.to_string().eq(&tn_config::LibP2pConfig::worker_topic()),
+                    topic.to_string().eq(&tn_config::LibP2pConfig::worker_batch_topic()),
                     WorkerNetworkError::InvalidTopic
                 );
                 // Retrieve the block...
