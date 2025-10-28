@@ -97,7 +97,7 @@ impl ConsensusState {
     }
 
     #[instrument(level = "info", skip_all)]
-    pub fn construct_dag_from_cert_store<DB: CertificateStore>(
+    fn construct_dag_from_cert_store<DB: CertificateStore>(
         cert_store: &DB,
         last_committed: &HashMap<AuthorityIdentifier, Round>,
         gc_round: Round,
@@ -269,6 +269,8 @@ pub struct Consensus<DB> {
     committee: Committee,
     /// The chanell "bus" for consensus (container for consesus channel and watches).
     consensus_bus: ConsensusBus,
+    /// Consensus config for the app, used to shutdown an epoch for mode switching.
+    consensus_config: ConsensusConfig<DB>,
 
     /// Receiver for shutdown.
     rx_shutdown: Noticer,
@@ -342,6 +344,7 @@ impl<DB: Database> Consensus<DB> {
         let s = Self {
             committee: consensus_config.committee().clone(),
             consensus_bus: consensus_bus.clone(),
+            consensus_config: consensus_config.clone(),
             rx_shutdown,
             protocol,
             metrics,
@@ -389,7 +392,7 @@ impl<DB: Database> Consensus<DB> {
             }
         }
         // Process the certificate using the selected consensus protocol.
-        let (_, committed_sub_dags) =
+        let (outcome, committed_sub_dags) =
             self.protocol.process_certificate(&mut self.state, certificate)?;
         if self.active {
             // We extract a list of headers from this specific validator that
@@ -398,7 +401,8 @@ impl<DB: Database> Consensus<DB> {
             let mut committed_certificates = Vec::new();
 
             // Output the sequence in the right order.
-            for committed_sub_dag in committed_sub_dags {
+            let csd_len = committed_sub_dags.len();
+            for (i, committed_sub_dag) in committed_sub_dags.into_iter().enumerate() {
                 // We need to make sure execution has caught up so we can verify we have not forked.
                 // This will force the follow function to not outrun execution...  this is probably
                 // fine. Also once we can follow gossiped consensus output this will not really be
@@ -406,9 +410,12 @@ impl<DB: Database> Consensus<DB> {
                 let base_execution_block = committed_sub_dag.leader.header.latest_execution_block;
                 if self.consensus_bus.wait_for_execution(base_execution_block).await.is_err() {
                     // This seems to be a bogus sub dag, we are out of sync...
-                    tracing::error!(target: "telcoin::consensus_state", "Got a bogus sub dag from bullshark, we are out of sync!");
+                    tracing::error!(target: "telcoin::consensus_state", "Got a bogus sub dag from bullshark, we are out of sync and probably can not recover!");
+                    // Going inactive will probably not help us at this point....
                     self.consensus_bus.node_mode().send_modify(|v| *v = NodeMode::CvvInactive);
-                    break;
+                    self.consensus_config.shutdown().notify();
+                    tracing::error!(target: "telcoin::consensus_state", ?base_execution_block, ?outcome, "commit {i} of {csd_len} subdags");
+                    return Ok(());
                 }
 
                 tracing::debug!(target: "telcoin::consensus_state", "Commit in Sequence {:?}", committed_sub_dag.leader.nonce());

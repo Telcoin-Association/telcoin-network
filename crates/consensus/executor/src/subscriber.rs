@@ -139,18 +139,23 @@ impl<DB: Database> Subscriber<DB> {
                 consensus_header.number,
             )
             .await?;
+
+        // If we want to rejoin consensus eventually then save certs.
+        let _ = self.config.node_storage().write(consensus_output.sub_dag.leader.clone());
+        let _ = self.config.node_storage().write_all(consensus_output.sub_dag.certificates.clone());
+
+        // This save will essentially mark this consensus output as written in stone (added to the
+        // consensus chain). This does NOT imply execution although it will be sent off for
+        // execution.
         save_consensus(
             self.config.node_storage(),
             consensus_output.clone(),
             &self.inner.authority_id,
         )?;
 
-        // If we want to rejoin consensus eventually then save certs.
-        let _ = self.config.node_storage().write(consensus_output.sub_dag.leader.clone());
-        let _ = self.config.node_storage().write_all(consensus_output.sub_dag.certificates.clone());
-
         let last_round = consensus_output.leader_round();
 
+        // XXXX - confirm these are primed on app start correctly.
         // We aren't doing consensus now but still need to update these watches before
         // we send the consensus output.
         let _ = self.consensus_bus.update_consensus_rounds(ConsensusRound::new_with_gc_depth(
@@ -227,9 +232,25 @@ impl<DB: Database> Subscriber<DB> {
     /// Main loop connecting to the consensus to listen to sequence messages.
     async fn run(self, rx_shutdown: Noticer) -> SubscriberResult<()> {
         // Make sure any old consensus that was not executed gets executed.
+        // Note, "missing" in this context is consensus that was reached but not executed
+        // before the last shutdown.  We need to execute it now so that everything will be
+        // in sync, otherwise we could get out of order execution racing with Bullshark.
         let missing = get_missing_consensus(&self.config, &self.consensus_bus).await?;
         for consensus_header in missing.into_iter() {
-            self.handle_consensus_header(consensus_header).await?;
+            let consensus_output = self
+                .fetch_batches(
+                    consensus_header.sub_dag.clone(),
+                    consensus_header.parent_hash,
+                    consensus_header.number,
+                )
+                .await?;
+            if let Err(e) = self.consensus_bus.consensus_output().send(consensus_output).await {
+                error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self.inner.authority_id, e);
+                return Err(SubscriberError::ClosedChannel("consensus_output".to_string()));
+            }
+            // We should be the only thing happening and we need to wait for these blocks to execute
+            // otherwise we could race with bullshark, which would be BAD.  XXXX, true?
+            let _ = self.consensus_bus.recent_blocks().subscribe().changed().await;
         }
         // It's important to have the futures in ordered fashion as we want
         // to guarantee that will deliver to the executor the certificates
@@ -340,8 +361,6 @@ impl<DB: Database> Subscriber<DB> {
     ) -> SubscriberResult<ConsensusOutput> {
         let num_blocks = deliver.num_primary_blocks();
         let num_certs = deliver.len();
-        // active cvvs always finalize early bc they are the authorities
-        let early_finalize = self.consensus_bus.node_mode().borrow().is_active_cvv();
 
         if num_blocks == 0 {
             debug!(target: "subscriber", "No blocks to fetch, payload is empty");
@@ -349,7 +368,6 @@ impl<DB: Database> Subscriber<DB> {
                 sub_dag: Arc::new(deliver),
                 parent_hash,
                 number,
-                early_finalize,
                 ..Default::default()
             });
         }
@@ -360,7 +378,6 @@ impl<DB: Database> Subscriber<DB> {
             batches: Vec::with_capacity(num_certs),
             parent_hash,
             number,
-            early_finalize,
             ..Default::default()
         };
 

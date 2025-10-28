@@ -12,8 +12,8 @@ use crate::{
     error::{CertificateError, CertificateResult, DagError, DagResult, HeaderError},
     now,
     serde::RoaringBitmapSerde,
-    AuthorityIdentifier, BlockHash, Committee, Digest, Epoch, Hash, Header, Round, TimestampSec,
-    VotingPower,
+    Authority, AuthorityIdentifier, BlockHash, Committee, Digest, Epoch, Hash, Header, Round,
+    TimestampSec, VotingPower,
 };
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
@@ -60,7 +60,15 @@ impl Certificate {
         header: Header,
         votes: Vec<(AuthorityIdentifier, BlsSignature)>,
     ) -> DagResult<Certificate> {
-        Self::new_internal(committee, header, votes.into_iter().collect(), true)
+        Self::new_internal(
+            committee,
+            header,
+            votes
+                .into_iter()
+                .filter_map(|(a, sig)| committee.authority(&a).map(|a| (*a.protocol_key(), sig)))
+                .collect(),
+            true,
+        )
     }
 
     /// Create a new, unsafe certificate that does not check stake.
@@ -69,7 +77,15 @@ impl Certificate {
         header: Header,
         votes: Vec<(AuthorityIdentifier, BlsSignature)>,
     ) -> DagResult<Certificate> {
-        Self::new_internal(committee, header, votes.into_iter().collect(), false)
+        Self::new_internal(
+            committee,
+            header,
+            votes
+                .into_iter()
+                .filter_map(|(a, sig)| committee.authority(&a).map(|a| (*a.protocol_key(), sig)))
+                .collect(),
+            false,
+        )
     }
 
     /// Create a new certificate without verifying authority signatures.
@@ -77,19 +93,19 @@ impl Certificate {
         committee: &Committee,
         header: Header,
         // We need votes to be a BTreeMap to force authorities to be in the expected order.
-        mut votes: BTreeMap<AuthorityIdentifier, BlsSignature>,
+        mut votes: BTreeMap<BlsPublicKey, BlsSignature>,
         check_stake: bool,
     ) -> DagResult<Certificate> {
         let mut weight = 0;
         let mut sigs = Vec::new();
 
-        let auths = committee.authorities();
+        let auths: BTreeMap<BlsPublicKey, Authority> =
+            committee.authorities().into_iter().map(|a| (*a.protocol_key(), a)).collect();
         let filtered_votes = auths
             .iter()
             .enumerate()
-            .filter(|(_, authority)| {
-                if !votes.is_empty()
-                    && &authority.id() == votes.first_key_value().expect("votes not empty").0
+            .filter(|(_, (key, authority))| {
+                if !votes.is_empty() && *key == votes.first_key_value().expect("votes not empty").0
                 {
                     sigs.push(votes.pop_first().expect("votes not empty"));
                     weight += authority.voting_power();
@@ -153,31 +169,30 @@ impl Certificate {
     /// This function requires that certificate was verified against given committee
     pub fn signed_authorities_with_committee(&self, committee: &Committee) -> Vec<BlsPublicKey> {
         assert_eq!(committee.epoch(), self.epoch());
-        let (_stake, pks) = self.signed_by(committee);
+        let (_stake, pks) = self.signed_by(&committee.bls_keys());
         pks
     }
 
     /// Return the total stake and group of authorities that formed the committee for this
     /// certificate.
-    pub fn signed_by(&self, committee: &Committee) -> (VotingPower, Vec<BlsPublicKey>) {
+    pub fn signed_by(&self, committee: &[BlsPublicKey]) -> (VotingPower, Vec<BlsPublicKey>) {
         // Ensure the certificate has a quorum.
         let mut weight = 0;
 
         let auth_indexes = self.signed_authorities.iter().collect::<Vec<_>>();
         let mut auth_iter = 0;
         let pks = committee
-            .authorities()
+            //.authorities()
             .iter()
             .enumerate()
-            .filter(|(i, authority)| match auth_indexes.get(auth_iter) {
-                Some(index) if *index == *i as u32 => {
-                    weight += authority.voting_power();
+            .filter_map(|(i, key)| match auth_indexes.get(auth_iter) {
+                Some(index) if *index == i as u32 => {
+                    weight += 1; // All validators have a voting weight of 1.
                     auth_iter += 1;
-                    true
+                    Some(*key)
                 }
-                _ => false,
+                _ => None,
             })
-            .map(|(_, authority)| *authority.protocol_key())
             .collect();
         (weight, pks)
     }
@@ -206,7 +221,7 @@ impl Certificate {
     /// While storing signatures in both places uses more memory, the strong correctness guarantees
     /// outweigh the storage cost for certificate verification where maintaining cryptographic
     /// integrity is critical.
-    pub fn verify(self, committee: &Committee) -> CertificateResult<Certificate> {
+    pub fn validate_and_verify(self, committee: &Committee) -> CertificateResult<Certificate> {
         // ensure the header is from the correct epoch
         ensure!(
             self.epoch() == committee.epoch(),
@@ -224,7 +239,7 @@ impl Certificate {
         // Save signature verifications when the header is invalid.
         self.header.validate(committee)?;
 
-        let (weight, pks) = self.signed_by(committee);
+        let (weight, pks) = self.signed_by(&committee.bls_keys());
 
         let threshold = committee.quorum_threshold();
         ensure!(weight >= threshold, CertificateError::Inquorate { stake: weight, threshold });
@@ -236,11 +251,13 @@ impl Certificate {
 
     /// Performs a signature verification of a certificate against committee.
     /// Will clear the state first and revalidate even if it appears to be valid.
-    pub fn verify_cert(mut self, committee: &Committee) -> CertificateResult<Certificate> {
+    pub fn verify_cert(mut self, committee: &[BlsPublicKey]) -> CertificateResult<Certificate> {
+        self = self.validate_received()?;
         self = self.validate_received()?;
         let (weight, pks) = self.signed_by(committee);
 
-        let threshold = committee.quorum_threshold();
+        // All validator have a vote weight of 1.
+        let threshold = 2 * committee.len() as u64 / 3 + 1;
         ensure!(weight >= threshold, CertificateError::Inquorate { stake: weight, threshold });
 
         let verified_cert = self.verify_signature(pks)?;

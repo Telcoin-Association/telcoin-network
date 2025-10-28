@@ -229,7 +229,7 @@ impl Default for TaskManager {
 impl TaskManager {
     /// Create a new empty TaskManager.
     pub fn new<S: ToString>(name: S) -> Self {
-        let (new_task_tx, new_task_rx) = mpsc::channel(100);
+        let (new_task_tx, new_task_rx) = mpsc::channel(1000);
         Self {
             tasks: FuturesUnordered::new(),
             submanagers: HashMap::new(),

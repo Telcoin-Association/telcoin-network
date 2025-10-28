@@ -145,7 +145,6 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
             previous_sub_dag,
         )
         .into(),
-        early_finalize: true,
         ..Default::default()
     };
     let consensus_output_hash = consensus_output.consensus_header_hash();
@@ -305,7 +304,6 @@ async fn test_empty_output_executes_late_finalize() -> eyre::Result<()> {
             previous_sub_dag,
         )
         .into(),
-        early_finalize: false,
         ..Default::default()
     };
 
@@ -555,7 +553,6 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         sub_dag: subdag_1.clone(),
         batches: vec![CertifiedBatch { address: batch_producer, batches: batches_1 }],
         batch_digests: batch_digests_1.clone(),
-        early_finalize: true,
         ..Default::default()
     };
 
@@ -583,7 +580,6 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         batch_digests: batch_digests_2.clone(),
         parent_hash: consensus_output_1.consensus_header_hash(),
         number: 1,
-        early_finalize: true,
         close_epoch: true, // close epoch after 2nd output
         ..Default::default()
     };
@@ -1039,7 +1035,6 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         sub_dag: subdag_1.clone(),
         batches: vec![CertifiedBatch { address: batch_producer_1, batches: batches_1 }],
         batch_digests: batch_digests_1.clone(),
-        early_finalize: true,
         ..Default::default()
     };
 
@@ -1069,7 +1064,6 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         batch_digests: batch_digests_2.clone(),
         parent_hash: consensus_output_1.consensus_header_hash(),
         number: 1,
-        early_finalize: true,
         close_epoch: true,
         ..Default::default()
     };
@@ -1424,7 +1418,6 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         sub_dag: subdag_1.clone(),
         batches: vec![CertifiedBatch { address: Address::random(), batches: batches_1 }],
         batch_digests: batch_digests_1,
-        early_finalize: true,
         ..Default::default()
     };
     let consensus_output_1_hash = consensus_output_1.consensus_header_hash();
@@ -1452,7 +1445,6 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         batch_digests: batch_digests_2,
         parent_hash: consensus_output_1.consensus_header_hash(),
         number: 1,
-        early_finalize: true,
         ..Default::default()
     };
 

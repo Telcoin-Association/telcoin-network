@@ -56,7 +56,7 @@ async fn test_certificate_signers_are_ordered() {
     // Create a certificate
     let certificate = Certificate::new_unverified(&committee, header, votes).unwrap();
 
-    let (stake, signers) = certificate.signed_by(&committee);
+    let (stake, signers) = certificate.signed_by(&committee.bls_keys());
 
     // THEN
     assert_eq!(signers.len(), 3);

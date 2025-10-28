@@ -519,13 +519,7 @@ where
             }
             // No keys for epoch 0, fix that.
             // We are on epoch 0 so load up that committee in Db as well.
-            let committee: Vec<BlsPublicKey> = primary
-                .current_committee()
-                .await
-                .authorities()
-                .iter()
-                .map(|authority| *authority.protocol_key())
-                .collect();
+            let committee: Vec<BlsPublicKey> = primary.current_committee().await.bls_keys();
             let next_committee = committee.clone();
             let epoch_rec =
                 EpochRecord { epoch: 0, committee, next_committee, ..Default::default() };

@@ -24,7 +24,7 @@ pub struct Bullshark<DB> {
     /// The committee information.
     pub committee: Committee,
     /// Persistent storage to safe ensure crash-recovery.
-    pub store: DB,
+    pub store: DB, // XXXX Need?  Looks like no.
     /// The most recent round of inserted certificate
     pub max_inserted_certificate_round: Round,
     pub metrics: Arc<ConsensusMetrics>,
@@ -72,8 +72,6 @@ impl<DB: ConsensusStore> Bullshark<DB> {
     ) -> ReputationScores {
         // we reset the scores for every schedule change window, or initialise when it's the first
         // sub dag we are going to create.
-        // TODO: when schedule change is implemented we should probably change a little bit
-        // this logic here.
         // sub_dag_index is based on epoch and round so / 2 so this check works on commit rounds
         // (every other one).
         let mut reputation_score =

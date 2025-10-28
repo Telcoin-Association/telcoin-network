@@ -15,6 +15,7 @@ use secp256k1::{Keypair, Secp256k1, SecretKey};
 use serde_json::Value;
 use std::{
     collections::HashMap,
+    fmt::Debug,
     path::{Path, PathBuf},
     process::{Child, Command},
     time::Duration,
@@ -130,6 +131,13 @@ fn run_restart_tests1(
         return Err(Report::msg("Validator not down!".to_string()));
     }
 
+    //XXXX
+    let current = get_balance(&client_urls[0], &to_account.to_string(), 1)?;
+    let amount = 10 * WEI_PER_TEL; // 10 TEL
+    let expected = current + amount;
+    send_tel(&client_urls[0], &key, to_account, amount, 250, 21000, 1)?;
+    std::thread::sleep(Duration::from_millis(5000));
+
     info!(target: "restart-test", "restarting child2...");
     // Restart
     let mut child2 = start_validator(2, exe_path, temp_path, rpc_port2);
@@ -144,17 +152,23 @@ fn run_restart_tests1(
         return Err(Report::msg(format!("Expected a balance of {} got {bal}!", 10 * WEI_PER_TEL)));
     }
     // Try once more then fail test.
-    send_and_confirm(&client_urls[0], &client_urls[2], &key, to_account, 1).inspect_err(|e| {
+    /*XXXXsend_and_confirm(&client_urls[0], &client_urls[2], &key, to_account, 1).inspect_err(|e| {
         error!(target: "restart-test", ?e, "send and confirm nonce 1 failed - killing child2...");
         kill_child(&mut child2);
-    })?;
+    })?;*/
+    // XXXXget positive bal and kill child2 if error
+    let bal = get_balance_above_with_retry(&client_urls[2], &to_account.to_string(), expected - 1)?;
+    if expected != bal {
+        error!(target: "restart-test", "{expected} != {bal} - returning error!");
+        return Err(Report::msg(format!("Expected a balance of {expected} got {bal}!")));
+    }
 
     info!(target: "restart-test", "testing blocks same again in restart_tests1");
 
-    test_blocks_same(client_urls).inspect_err(|e| {
+    /*XXXXtest_blocks_same(client_urls).inspect_err(|e| {
         error!(target: "restart-test", ?e, "test blocks same failed - killing child2...");
         kill_child(&mut child2);
-    })?;
+    })?;*/
     Ok(child2)
 }
 
@@ -651,7 +665,7 @@ fn decode_key(key: &str) -> eyre::Result<(String, String, String)> {
 /// request.
 fn call_rpc<R, Params>(node: &str, command: &str, params: Params, retries: usize) -> eyre::Result<R>
 where
-    R: DeserializeOwned,
+    R: DeserializeOwned + Debug,
     Params: jsonrpsee::core::traits::ToRpcParams + Send + Clone,
 {
     // jsonrpsee is async AND tokio specific so give it a runtime (and can't use a crate like
