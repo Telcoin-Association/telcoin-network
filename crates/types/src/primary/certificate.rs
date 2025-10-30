@@ -182,7 +182,6 @@ impl Certificate {
         let auth_indexes = self.signed_authorities.iter().collect::<Vec<_>>();
         let mut auth_iter = 0;
         let pks = committee
-            //.authorities()
             .iter()
             .enumerate()
             .filter_map(|(i, key)| match auth_indexes.get(auth_iter) {
