@@ -131,7 +131,73 @@ fn run_restart_tests1(
         return Err(Report::msg("Validator not down!".to_string()));
     }
 
-    //XXXX
+    info!(target: "restart-test", "restarting child2...");
+    // Restart
+    let mut child2 = start_validator(2, exe_path, temp_path, rpc_port2);
+    let bal = get_positive_balance_with_retry(&client_urls[2], &to_account.to_string())
+        .inspect_err(|e| {
+            kill_child(&mut child2);
+            error!(target: "restart-test", ?e, "failed to get positive balance with retry in restart_tests1");
+        })?;
+    if 10 * WEI_PER_TEL != bal {
+        error!(target: "restart-test", "tests1 after restart: 10 * WEI_PER_TEL != bal - returning error!");
+        kill_child(&mut child2);
+        return Err(Report::msg(format!("Expected a balance of {} got {bal}!", 10 * WEI_PER_TEL)));
+    }
+    // Try once more then fail test.
+    send_and_confirm(&client_urls[0], &client_urls[2], &key, to_account, 1).inspect_err(|e| {
+        error!(target: "restart-test", ?e, "send and confirm nonce 1 failed - killing child2...");
+        kill_child(&mut child2);
+    })?;
+
+    info!(target: "restart-test", "testing blocks same again in restart_tests1");
+
+    test_blocks_same(client_urls).inspect_err(|e| {
+        error!(target: "restart-test", ?e, "test blocks same failed - killing child2...");
+        kill_child(&mut child2);
+    })?;
+    Ok(child2)
+}
+
+/// Run the first part tests, broken up like this to allow more robust node shutdown.
+/// This versoin is intended to leave the restarted node in a lagged (not caught up state)
+/// in order to exercise more restart code.
+fn run_restart_tests_lagged1(
+    client_urls: &[String; 4],
+    child2: &mut Child,
+    exe_path: &Path,
+    temp_path: &Path,
+    rpc_port2: u16,
+    delay_secs: u64,
+) -> eyre::Result<Child> {
+    network_advancing(client_urls).inspect_err(|e| {
+        kill_child(child2);
+        error!(target: "restart-test", ?e, "failed to advance network in restart_tests1");
+    })?;
+    std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will fail if a node is lagging.
+
+    let key = get_key("test-source");
+    let to_account = address_from_word("testing");
+
+    info!(target: "restart-test", "testing blocks same first time in restart_tests1");
+    test_blocks_same(client_urls)?;
+    // Try once more then fail test.
+    send_and_confirm(&client_urls[1], &client_urls[2], &key, to_account, 0).inspect_err(|e| {
+        kill_child(child2);
+        error!(target: "restart-test", ?e, "failed to send and confirm in restart_tests1");
+    })?;
+
+    info!(target: "restart-test", "killing child2...");
+    kill_child(child2);
+    info!(target: "restart-test", "child2 dead :D sleeping...");
+    std::thread::sleep(Duration::from_secs(delay_secs));
+
+    // This validator should be down now, confirm.
+    if get_balance(&client_urls[2], &to_account.to_string(), 5).is_ok() {
+        error!(target: "restart-test", "tests1: get_balancer worked for shutdown validator - returning error!");
+        return Err(Report::msg("Validator not down!".to_string()));
+    }
+
     let current = get_balance(&client_urls[0], &to_account.to_string(), 1)?;
     let amount = 10 * WEI_PER_TEL; // 10 TEL
     let expected = current + amount;
@@ -151,12 +217,6 @@ fn run_restart_tests1(
         kill_child(&mut child2);
         return Err(Report::msg(format!("Expected a balance of {} got {bal}!", 10 * WEI_PER_TEL)));
     }
-    // Try once more then fail test.
-    /*XXXXsend_and_confirm(&client_urls[0], &client_urls[2], &key, to_account, 1).inspect_err(|e| {
-        error!(target: "restart-test", ?e, "send and confirm nonce 1 failed - killing child2...");
-        kill_child(&mut child2);
-    })?;*/
-    // XXXXget positive bal and kill child2 if error
     let bal = get_balance_above_with_retry(&client_urls[2], &to_account.to_string(), expected - 1)?;
     if expected != bal {
         error!(target: "restart-test", "{expected} != {bal} - returning error!");
@@ -165,10 +225,6 @@ fn run_restart_tests1(
 
     info!(target: "restart-test", "testing blocks same again in restart_tests1");
 
-    /*XXXXtest_blocks_same(client_urls).inspect_err(|e| {
-        error!(target: "restart-test", ?e, "test blocks same failed - killing child2...");
-        kill_child(&mut child2);
-    })?;*/
     Ok(child2)
 }
 
@@ -230,7 +286,7 @@ fn network_advancing(client_urls: &[String; 4]) -> eyre::Result<()> {
     Ok(())
 }
 
-fn do_restarts(delay: u64) -> eyre::Result<()> {
+fn do_restarts(delay: u64, lagged: bool) -> eyre::Result<()> {
     let _guard = IT_TEST_MUTEX.lock();
     init_test_tracing();
     info!(target: "restart-test", "do_restarts, delay: {delay}");
@@ -266,8 +322,18 @@ fn do_restarts(delay: u64) -> eyre::Result<()> {
 
     info!(target: "restart-test", "Running restart tests 1");
     // run restart tests1
-    let res1 =
-        run_restart_tests1(&client_urls, &mut child2, &exe_path, &temp_path, rpc_ports[2], delay);
+    let res1 = if lagged {
+        run_restart_tests_lagged1(
+            &client_urls,
+            &mut child2,
+            &exe_path,
+            &temp_path,
+            rpc_ports[2],
+            delay,
+        )
+    } else {
+        run_restart_tests1(&client_urls, &mut child2, &exe_path, &temp_path, rpc_ports[2], delay)
+    };
     info!(target: "restart-test", "Ran restart tests 1: {res1:?}");
     let is_ok = res1.is_ok();
 
@@ -341,7 +407,7 @@ fn do_restarts(delay: u64) -> eyre::Result<()> {
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restartstt() -> eyre::Result<()> {
-    do_restarts(2)
+    do_restarts(2, false)
 }
 
 /// Run some test to make sure an observer is participating in the network.
@@ -426,7 +492,15 @@ fn test_restarts_observer() -> eyre::Result<()> {
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restarts_delayed() -> eyre::Result<()> {
-    do_restarts(70)
+    do_restarts(70, false)
+}
+
+/// Test a restart case with a long delay, the stopped node should not rejoin consensus but follow
+/// the consensus chain.  Lag the restarted validator.
+#[test]
+#[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
+fn test_restarts_lagged_delayed() -> eyre::Result<()> {
+    do_restarts(70, true)
 }
 
 /// Start a process running a validator node.
