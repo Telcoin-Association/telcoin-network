@@ -90,11 +90,12 @@ where
             .last_record::<ConsensusBlocks>()
             .map(|(n, h)| (n, h.sub_dag.leader_epoch(), h.sub_dag.leader_round()))
             .unwrap_or((0, 0, 0));
-        // Use GC depth to estimate how many blocks we can be behind (roughly
-        // one block every two rounds).
-        // Add 2 here so if we are right on the GC depth we will still go inactive (small safety
-        // buffer).
-        let gc_depth = self.consensus_config.parameters().gc_depth + 2;
+        // Use GC depth to estimate how many rounds we can be behind.
+        // Subtract ten here so if we are right on the GC depth we will still go inactive (small
+        // safety buffer).  Ten is arbitrary but should make sure we are comfortably within
+        // the current DAG. Trying to ride the GC window exactly can lead to subtle races
+        // (allow some time to get going).
+        let gc_depth = self.consensus_config.parameters().gc_depth.saturating_sub(10);
         let active_cvv = self.consensus_bus.node_mode().borrow().is_active_cvv();
         // is our round outside the GC window
         // Will be false when not the same epoch (can't compare rounds) but
@@ -105,8 +106,14 @@ where
         // we can get false positives
         let epoch_behind = if let Some(number) = number {
             epoch > exec_epoch && exec_number + 1 < number
-        } else if epoch + 1 == exec_epoch {
-            round > 1
+        } else if exec_epoch + 1 == epoch {
+            // This check is a little hand-wavy, basically if we don't have the number (i.e.
+            // checking a cert) then we let the next epoch early rounds through (this
+            // allows two attempts to commit a leader). Having the number is better,
+            // this could allow for a race but we only use signed (quorate) certs
+            // for this data so will not allow crafted attacks.
+            // Also, these checks for certs are probably not 100% needed anyway...
+            round > 4
         } else {
             epoch > exec_epoch
         };
@@ -159,6 +166,7 @@ where
                     match unverified_cert.verify_cert(&committee) {
                         Ok(cert) => {
                             if self.behind_consensus(epoch, cert.header().round, None).await {
+                                warn!(target: "primary", "certificate indicates we are behind, go to catchup mode!", );
                                 return Ok(());
                             }
                             self.state_sync.process_peer_certificate(cert).await?;

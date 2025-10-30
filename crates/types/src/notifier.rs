@@ -43,17 +43,19 @@ impl Notifier {
 
     /// Resolve all the subscribed Noticers.
     pub fn notify(&self) {
+        let mut wakers = vec![];
         let mut noticers = self.noticers.lock();
-        for n in noticers.iter_mut() {
+        for n in noticers.drain(..) {
             let mut guard = n.lock.lock();
-            let wake = guard.1.take();
-            guard.0 = true;
-            if let Some(wake) = wake {
-                wake.wake();
+            if let Some(wake) = guard.1.take() {
+                wakers.push(wake);
             }
+            guard.0 = true;
         }
-        // Done with these, they can all resolve now.
-        noticers.clear();
+        // Wake everyone up after all flags set to true to avoid races in noticiers.
+        for wake in wakers {
+            wake.wake();
+        }
     }
 }
 

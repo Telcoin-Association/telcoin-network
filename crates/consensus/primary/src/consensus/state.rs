@@ -276,7 +276,7 @@ pub struct Consensus<DB> {
     rx_shutdown: Noticer,
 
     /// The consensus protocol to run.
-    protocol: Bullshark<DB>,
+    protocol: Bullshark,
 
     /// Metrics handler
     metrics: Arc<ConsensusMetrics>,
@@ -293,7 +293,7 @@ impl<DB: Database> Consensus<DB> {
     pub fn spawn(
         consensus_config: ConsensusConfig<DB>,
         consensus_bus: &ConsensusBus,
-        protocol: Bullshark<DB>,
+        protocol: Bullshark,
         task_manager: &TaskManager,
     ) {
         let metrics = consensus_bus.consensus_metrics();

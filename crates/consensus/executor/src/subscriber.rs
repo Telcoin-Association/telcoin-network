@@ -155,7 +155,6 @@ impl<DB: Database> Subscriber<DB> {
 
         let last_round = consensus_output.leader_round();
 
-        // XXXX - confirm these are primed on app start correctly.
         // We aren't doing consensus now but still need to update these watches before
         // we send the consensus output.
         let _ = self.consensus_bus.update_consensus_rounds(ConsensusRound::new_with_gc_depth(
@@ -248,8 +247,9 @@ impl<DB: Database> Subscriber<DB> {
                 error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self.inner.authority_id, e);
                 return Err(SubscriberError::ClosedChannel("consensus_output".to_string()));
             }
-            // We should be the only thing happening and we need to wait for these blocks to execute
-            // otherwise we could race with bullshark, which would be BAD.  XXXX, true?
+            // Go ahead and wait for execution to happen.  This may not be strictly required but
+            // will hurt nothing, only happen on startup (for a small amount blocks) so
+            // do it.
             let _ = self.consensus_bus.recent_blocks().subscribe().changed().await;
         }
         // It's important to have the futures in ordered fashion as we want

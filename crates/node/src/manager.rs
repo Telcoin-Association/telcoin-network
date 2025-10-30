@@ -45,8 +45,8 @@ use tn_types::{
     error::HeaderError, gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash,
     BlsAggregateSignature, BlsPublicKey, BlsSignature, Committee, CommitteeBuilder,
     ConsensusHeader, ConsensusOutput, Database as TNDatabase, Epoch, EpochCertificate, EpochRecord,
-    EpochVote, Noticer, Notifier, TaskManager, TaskSpawner, TimestampSec, TnReceiver, TnSender,
-    B256, MIN_PROTOCOL_BASE_FEE,
+    EpochVote, Notifier, TaskJoinError, TaskManager, TaskSpawner, TimestampSec, TnReceiver,
+    TnSender, B256, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{
     quorum_waiter::QuorumWaiterTrait, Worker, WorkerNetwork, WorkerNetworkHandle, WorkerRequest,
@@ -404,6 +404,14 @@ where
         // initialize long-running components for node startup
         let mut initial_epoch = true;
 
+        // This is a bit of a hack but clear old votes on node startup.
+        // It is possible on a full network restart (mainly tests) to get
+        // in a race with old votes being rejected for other reasons and then
+        // tripping over the equivocation logic.  This allows a tiny window
+        // for equication on node startup but would require forcing a node
+        // to restart among other things to exploit in order to change a vote.
+        self.consensus_db.clear_table::<Votes>()?;
+
         let node_ended_sub = self.node_shutdown.subscribe();
         // loop through epochs
         loop {
@@ -504,6 +512,9 @@ where
                 gas_accumulator.clone(),
             )
             .await?;
+        // consensus config for shutdown subscribers
+        let consensus_shutdown = primary.shutdown_signal().await;
+        let epoch_shutdown_rx = consensus_shutdown.subscribe();
 
         // This needs to be created early so required machinery for other tasks exists when needed.
         let mut worker = worker_node.new_worker().await?;
@@ -535,9 +546,6 @@ where
         let worker_task_manager_name = worker_task_manager_name(worker_node.id().await);
         // start batch builder
         worker.spawn_batch_builder(&worker_task_manager_name, &epoch_task_manager);
-
-        // consensus config for shutdown subscribers
-        let consensus_shutdown = primary.shutdown_signal().await;
 
         let batch_builder_task_spawner = epoch_task_manager.get_spawner();
         engine
@@ -593,10 +601,25 @@ where
 
             // return any errors
             res = epoch_task_manager.join(consensus_shutdown_clone) => {
-                res.inspect_err(|e| {
-                    error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
-                })?;
-                info!(target: "epoch-manager", "epoch task manager exited - likely syncing with committee");
+                match res {
+                    Ok(()) => info!(target: "epoch-manager", "epoch task manager exited - likely syncing with committee"),
+                    // There are times when the epoch task manager can exit with Ok...
+                    Err(TaskJoinError::CriticalExitOk(task)) => {
+                        // It is possible for the epoch to get a shutdown signal before the join.
+                        // In that case it will not reconize the Ok task exit so we double check it here
+                        // with a noticer that was aquired much earlier on epoch startup.
+                        if epoch_shutdown_rx.noticed() {
+                            info!(target: "epoch-manager", "epoch task manager exited - likely syncing with committee");
+                        } else {
+                            error!(target: "epoch-manager", ?task, "failed to reach epoch boundary");
+                            return Err(TaskJoinError::CriticalExitOk(task).into());
+                        }
+                    }
+                    Err(e) => {
+                        error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
+                        return Err(e.into());
+                    }
+                }
             },
         }
 
@@ -1076,7 +1099,7 @@ where
         //
         // NOTE: this should live and die with epochs because it updates the consensus bus
         self.spawn_engine_update_task(
-            consensus_config.shutdown().subscribe(),
+            consensus_config.shutdown().clone(),
             engine.canonical_block_stream().await,
             epoch_task_manager,
         );
@@ -1545,16 +1568,17 @@ where
     /// final block.
     fn spawn_engine_update_task(
         &self,
-        shutdown: Noticer,
+        shutdown: Notifier,
         mut engine_state: CanonStateNotificationStream,
         epoch_task_manager: &TaskManager,
     ) {
         // spawn epoch-specific task to forward blocks from the engine to consensus
         let consensus_bus = self.consensus_bus.clone();
+        let shutdown_rx = shutdown.subscribe();
         epoch_task_manager.spawn_critical_task("latest execution block", async move {
             loop {
                 tokio::select!(
-                    _ = &shutdown => {
+                    _ = &shutdown_rx => {
                         info!(target: "engine", "received shutdown from consensus to stop updating consensus bus recent blocks");
                         break;
                     }
@@ -1562,6 +1586,7 @@ where
                         if let Some(latest) = latest {
                             consensus_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(latest.tip().clone_sealed_header()));
                         } else {
+                            error!(target: "engine", "engine state stream ended, node will exit");
                             break;
                         }
                     }
