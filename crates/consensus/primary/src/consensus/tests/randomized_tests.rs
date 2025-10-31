@@ -2,7 +2,7 @@
 
 use crate::{
     consensus::{Bullshark, ConsensusMetrics, ConsensusState, LeaderSchedule, LeaderSwapTable},
-    test_utils::{temp_dir, this_cert_parents_with_slow_nodes},
+    test_utils::this_cert_parents_with_slow_nodes,
 };
 use futures::{stream::FuturesUnordered, StreamExt};
 use rand::{
@@ -18,7 +18,7 @@ use std::{
     sync::Arc,
 };
 use tn_primary::test_utils::mock_certificate_with_rand;
-use tn_storage::{mem_db::MemDatabase, open_db, ConsensusStore};
+use tn_storage::mem_db::MemDatabase;
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     Authority, AuthorityIdentifier, Certificate, CertificateDigest, Committee, Hash as _, Round,
@@ -157,11 +157,6 @@ async fn bullshark_randomised_tests() {
         }
     });
 
-    // Create a single store to be re-used across Bullshark instances to avoid hitting
-    // a "too many files open" issue.
-    let db = temp_dir();
-    let store = open_db(db.path());
-
     // Run the actual tests via separate tasks
     loop {
         tokio::select! {
@@ -173,8 +168,6 @@ async fn bullshark_randomised_tests() {
                     committee_size,
                     mode
                 } = data;
-
-                let consensus_store = store.clone();
 
                 // let config = config.clone();
 
@@ -193,8 +186,6 @@ async fn bullshark_randomised_tests() {
                         dag_rounds,
                         run_id,
                         mode,
-                        consensus_store,
-                        // &config
                     );
                 });
 
@@ -452,7 +443,7 @@ pub fn make_certificates_with_parameters(
 /// Creates various execution plans (`test_iterations` in total) by permuting the order we feed the
 /// DAG certificates to consensus and compare the output to ensure is the same.
 #[allow(clippy::too_many_arguments)]
-fn generate_and_run_execution_plans<DB: ConsensusStore>(
+fn generate_and_run_execution_plans(
     original_certificates: VecDeque<Certificate>,
     test_iterations: u64,
     committee: Committee,
@@ -460,7 +451,6 @@ fn generate_and_run_execution_plans<DB: ConsensusStore>(
     dag_rounds: Round,
     run_id: u64,
     modes: FailureModes,
-    store: DB,
 ) {
     let mut executed_plans = HashSet::new();
     let mut committed_certificates = Vec::new();
@@ -482,7 +472,6 @@ fn generate_and_run_execution_plans<DB: ConsensusStore>(
         let bad_nodes_stake_threshold = 0;
         let mut bullshark = Bullshark::new(
             committee.clone(),
-            store.clone(),
             metrics.clone(),
             SUB_DAGS_PER_SCHEDULE,
             LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),

@@ -64,7 +64,6 @@ async fn test_output_to_header() -> eyre::Result<()> {
     );
     let bullshark = Bullshark::new(
         committee.clone(),
-        consensus_store.clone(),
         // metrics.clone(),
         Arc::new(Default::default()),
         num_sub_dags_per_schedule,

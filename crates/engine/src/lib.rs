@@ -127,7 +127,7 @@ impl ExecutorEngine {
                     error!(target: "engine", ?e, "error executing consensus output");
                 });
                 if let Err(e) = tx.send(result) {
-                    error!(target: "engine", ?e, "error sending result from execute_consensus_output")
+                    warn!(target: "engine", ?e, "error sending result from execute_consensus_output")
                 }
             });
         } else {

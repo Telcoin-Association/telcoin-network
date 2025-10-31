@@ -206,8 +206,8 @@ pub async fn stream_missing_consensus<DB: Database>(
     Ok(())
 }
 
-/// Collect and return any consensus headers that were not executed before last shutdown to the
-/// consensus header channel.
+/// Collect and return any consensus headers that were not executed before last shutdown.
+/// This will be consensus that was reached but had not executed before a shutdown.
 pub async fn get_missing_consensus<DB: Database>(
     config: &ConsensusConfig<DB>,
     consensus_bus: &ConsensusBus,

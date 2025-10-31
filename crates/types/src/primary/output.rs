@@ -56,11 +56,6 @@ pub struct ConsensusOutput {
     /// Temporary extra data field - currently unused.
     /// This is included for now for testnet purposes only.
     pub extra: B256,
-    /// If true then finalize blocks as soon as they are executed.
-    /// This is safe to do for a CVV (participating committe members) but otherwise should
-    /// be false unless running a node with the potential to advertise a forked block or
-    /// two before quitting.
-    pub early_finalize: bool,
     /// Boolean indicating if this is the last output for the epoch.
     ///
     /// The engine should make a system call to consensus registry contract to close the epoch.
@@ -246,7 +241,7 @@ impl CommittedSubDag {
     /// Verify that all of the contained certificates are valid and signed by a quorum of committee.
     pub fn verify_certificates(self, committee: &Committee) -> CertificateResult<Self> {
         let Self { mut certificates, leader, reputation_score, commit_timestamp } = self;
-        let leader = leader.verify_cert(committee)?;
+        let leader = leader.verify_cert(&committee.bls_keys())?;
         let mut verified_certs: HashSet<CertificateDigest> =
             leader.header.parents().iter().copied().collect();
         let mut new_certs = Vec::new();
@@ -267,7 +262,7 @@ impl CommittedSubDag {
                 );
                 new_certs.push(cert);
             } else {
-                let cert = cert.verify_cert(committee)?;
+                let cert = cert.verify_cert(&committee.bls_keys())?;
                 verified_certs.insert(cert.digest());
                 new_certs.push(cert);
             }

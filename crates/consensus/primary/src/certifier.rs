@@ -464,7 +464,7 @@ impl<DB: Database> Certifier<DB> {
                     // spawn certifier task so new proposals can cancel
                     let certifier = self.clone();
                     self.task_spawner.spawn_task(
-                        format!("propose-header-{:?}", header),
+                        format!("propose-header-{:?}", header.digest()),
                         certifier.spawn_header_proposal(header)
                     );
                 },

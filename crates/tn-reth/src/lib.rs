@@ -1386,7 +1386,6 @@ mod tests {
             parent_hash: ConsensusHeader::default().digest(),
             number: subdag_index,
             extra: Default::default(),
-            early_finalize: false,
         }
     }
 

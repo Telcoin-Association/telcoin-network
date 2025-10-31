@@ -2,7 +2,10 @@
 
 use indexmap::IndexMap;
 use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
-use std::{collections::BTreeSet, num::NonZeroUsize};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    num::NonZeroUsize,
+};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils_committee::{AuthorityFixture, CommitteeFixture};
 use tn_types::{
@@ -15,13 +18,17 @@ async fn test_certificate_signers_are_ordered() {
     // GIVEN
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .committee_size(NonZeroUsize::new(4).unwrap())
-        .voting_power_distribution(vec![3, 3, 4, 4].into() /* (1..=4).collect() */) // provide some non-uniform stake
+        .voting_power_distribution(vec![1, 1, 1, 1].into()) // all validators are equal.
         .build();
     let committee: Committee = fixture.committee();
 
-    let authorities = fixture.authorities().collect::<Vec<&AuthorityFixture<MemDatabase>>>();
+    // Need to sort validator by there BlsPublicKeys.
+    let authorities: BTreeMap<BlsPublicKey, &AuthorityFixture<MemDatabase>> =
+        fixture.authorities().map(|a| (a.primary_public_key(), a)).collect();
+    let authorities: Vec<&AuthorityFixture<MemDatabase>> =
+        authorities.values().map(|v| *v).collect();
     let total_stake: u64 = authorities.iter().map(|a| a.authority().voting_power()).sum();
-    assert_eq!(total_stake, 14);
+    assert_eq!(total_stake, 4);
     // authorities are ordered by keys so the stake may not be 1, 2, 3, 4...
     let last_three_stake: u64 = authorities[1..].iter().map(|a| a.authority().voting_power()).sum();
 
@@ -56,7 +63,7 @@ async fn test_certificate_signers_are_ordered() {
     // Create a certificate
     let certificate = Certificate::new_unverified(&committee, header, votes).unwrap();
 
-    let (stake, signers) = certificate.signed_by(&committee);
+    let (stake, signers) = certificate.signed_by(&committee.bls_keys());
 
     // THEN
     assert_eq!(signers.len(), 3);

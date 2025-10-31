@@ -45,8 +45,7 @@ where
         let mut parents = Vec::new();
         // Round 1 (first round) of any epoch will be built off of "dummy" genesis certificates.
         // For epoch 0 this is obvious, for later epochs we have to start "clean" not reference
-        // previous epoch certs. Note this will leave some batches from previous epoch
-        // unexecuted- will need to deal with them.
+        // previous epoch certs.
         if header.round() == 1 {
             for digest in header.parents() {
                 match self.config.genesis().get(digest) {

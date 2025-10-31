@@ -52,7 +52,6 @@ async fn test_consensus_recovery_with_bullshark() {
     );
     let bullshark = Bullshark::new(
         committee.clone(),
-        consensus_store.clone(),
         metrics.clone(),
         num_sub_dags_per_schedule,
         leader_schedule.clone(),
@@ -138,7 +137,6 @@ async fn test_consensus_recovery_with_bullshark() {
     );
     let bullshark = Bullshark::new(
         committee.clone(),
-        consensus_store.clone(),
         metrics.clone(),
         num_sub_dags_per_schedule,
         leader_schedule,
@@ -197,7 +195,6 @@ async fn test_consensus_recovery_with_bullshark() {
     let bad_nodes_stake_threshold = 0;
     let bullshark = Bullshark::new(
         committee.clone(),
-        consensus_store.clone(),
         metrics.clone(),
         num_sub_dags_per_schedule,
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),

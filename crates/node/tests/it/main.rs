@@ -201,7 +201,6 @@ fn spawn_consensus(
     );
     let bullshark = Bullshark::new(
         committee.clone(),
-        consensus_store,
         Arc::new(Default::default()),
         3,
         leader_schedule.clone(),

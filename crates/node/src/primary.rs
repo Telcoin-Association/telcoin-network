@@ -72,7 +72,6 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
         // Spawn the consensus core who only sequences transactions.
         let ordering_engine = Bullshark::new(
             self.consensus_config.committee().clone(),
-            self.consensus_config.node_storage().clone(),
             self.consensus_bus.consensus_metrics().clone(),
             Self::CONSENSUS_SCHEDULE_CHANGE_SUB_DAGS,
             leader_schedule.clone(),

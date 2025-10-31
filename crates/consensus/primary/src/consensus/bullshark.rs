@@ -5,7 +5,6 @@ use crate::consensus::{
     Outcome,
 };
 use std::{collections::VecDeque, sync::Arc};
-use tn_storage::ConsensusStore;
 use tn_types::{
     Certificate, CommittedSubDag, Committee, Hash as _, ReputationScores, Round, VotingPower,
 };
@@ -20,13 +19,12 @@ pub mod bullshark_tests;
 #[path = "tests/randomized_tests.rs"]
 pub mod randomized_tests;
 
-pub struct Bullshark<DB> {
+pub struct Bullshark {
     /// The committee information.
     pub committee: Committee,
-    /// Persistent storage to safe ensure crash-recovery.
-    pub store: DB,
     /// The most recent round of inserted certificate
     pub max_inserted_certificate_round: Round,
+    /// Track consensus related metrics (prometheus)
     pub metrics: Arc<ConsensusMetrics>,
     /// The last time we had a successful leader election
     pub last_successful_leader_election_timestamp: Instant,
@@ -39,11 +37,10 @@ pub struct Bullshark<DB> {
     pub bad_nodes_stake_threshold: u64,
 }
 
-impl<DB: ConsensusStore> Bullshark<DB> {
+impl Bullshark {
     /// Create a new Bullshark consensus instance.
     pub fn new(
         committee: Committee,
-        store: DB,
         metrics: Arc<ConsensusMetrics>,
         num_sub_dags_per_schedule: u32,
         leader_schedule: LeaderSchedule,
@@ -51,7 +48,6 @@ impl<DB: ConsensusStore> Bullshark<DB> {
     ) -> Self {
         Self {
             committee,
-            store,
             last_successful_leader_election_timestamp: Instant::now(),
             max_inserted_certificate_round: 0,
             metrics,
@@ -72,8 +68,6 @@ impl<DB: ConsensusStore> Bullshark<DB> {
     ) -> ReputationScores {
         // we reset the scores for every schedule change window, or initialise when it's the first
         // sub dag we are going to create.
-        // TODO: when schedule change is implemented we should probably change a little bit
-        // this logic here.
         // sub_dag_index is based on epoch and round so / 2 so this check works on commit rounds
         // (every other one).
         let mut reputation_score =

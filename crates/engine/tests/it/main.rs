@@ -145,7 +145,6 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
             previous_sub_dag,
         )
         .into(),
-        early_finalize: true,
         ..Default::default()
     };
     let consensus_output_hash = consensus_output.consensus_header_hash();
@@ -278,91 +277,6 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
     // assert parent root is written to HISTORY_STORAGE_ADDRESS (pectra - eip2935)
     assert_eip2935(&reth_env, &expected_block)?;
 
-    Ok(())
-}
-
-/// This tests that a single block is NOT executed if the output from consensus contains no
-/// transactions and we are not setting early finalize.
-#[tokio::test]
-async fn test_empty_output_executes_late_finalize() -> eyre::Result<()> {
-    //=== Consensus
-    //
-    // create consensus output bc transactions in batches
-    // are randomly generated
-    //
-    // for each tx, seed address with funds in genesis
-    let mut leader = Certificate::default();
-    let sub_dag_index = 0;
-    leader.header.round = sub_dag_index as u32;
-    let reputation_scores = ReputationScores::default();
-    let previous_sub_dag = None;
-    let consensus_output = ConsensusOutput {
-        sub_dag: CommittedSubDag::new(
-            vec![Certificate::default()],
-            leader,
-            sub_dag_index,
-            reputation_scores,
-            previous_sub_dag,
-        )
-        .into(),
-        early_finalize: false,
-        ..Default::default()
-    };
-
-    let chain = test_chain_spec_arc();
-
-    let tmp_dir = TempDir::new().expect("temp dir");
-    // execution node components
-    let execution_node =
-        default_test_execution_node(Some(chain.clone()), None, tmp_dir.path(), None)?;
-
-    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
-    let reth_env = execution_node.get_reth_env().await;
-    let max_round = None;
-    let genesis_header = chain.sealed_genesis_header();
-
-    let shutdown = Notifier::default();
-    let task_manager = TaskManager::default();
-    let engine = ExecutorEngine::new(
-        reth_env.clone(),
-        max_round,
-        from_consensus,
-        genesis_header.clone(),
-        shutdown.subscribe(),
-        task_manager.get_spawner(),
-        GasAccumulator::default(),
-    );
-
-    // send output
-    let broadcast_result = to_engine.send(consensus_output.clone()).await;
-    assert!(broadcast_result.is_ok());
-
-    // drop sending channel to shut engine down
-    drop(to_engine);
-
-    let (tx, rx) = oneshot::channel();
-
-    // spawn engine task
-    task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
-        let _ = tx.send(res);
-    });
-
-    let engine_task = timeout(Duration::from_secs(10), rx).await?;
-    assert!(engine_task.is_ok());
-
-    let last_block_num = reth_env.last_block_number()?;
-    let canonical_tip = reth_env.canonical_tip();
-    let final_block = reth_env.finalized_block_num_hash()?;
-    assert!(final_block.is_none());
-
-    let expected_block_height = 1;
-    // assert 1 empty block was executed for consensus
-    assert_eq!(last_block_num, expected_block_height);
-    assert_eq!(canonical_tip.number, expected_block_height);
-    // assert last executed output is not finalized
-    let last_output = execution_node.last_executed_output().await?;
-    assert_eq!(last_output, BlockHash::default());
     Ok(())
 }
 
@@ -555,7 +469,6 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         sub_dag: subdag_1.clone(),
         batches: vec![CertifiedBatch { address: batch_producer, batches: batches_1 }],
         batch_digests: batch_digests_1.clone(),
-        early_finalize: true,
         ..Default::default()
     };
 
@@ -583,7 +496,6 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         batch_digests: batch_digests_2.clone(),
         parent_hash: consensus_output_1.consensus_header_hash(),
         number: 1,
-        early_finalize: true,
         close_epoch: true, // close epoch after 2nd output
         ..Default::default()
     };
@@ -1039,7 +951,6 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         sub_dag: subdag_1.clone(),
         batches: vec![CertifiedBatch { address: batch_producer_1, batches: batches_1 }],
         batch_digests: batch_digests_1.clone(),
-        early_finalize: true,
         ..Default::default()
     };
 
@@ -1069,7 +980,6 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         batch_digests: batch_digests_2.clone(),
         parent_hash: consensus_output_1.consensus_header_hash(),
         number: 1,
-        early_finalize: true,
         close_epoch: true,
         ..Default::default()
     };
@@ -1424,7 +1334,6 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         sub_dag: subdag_1.clone(),
         batches: vec![CertifiedBatch { address: Address::random(), batches: batches_1 }],
         batch_digests: batch_digests_1,
-        early_finalize: true,
         ..Default::default()
     };
     let consensus_output_1_hash = consensus_output_1.consensus_header_hash();
@@ -1452,7 +1361,6 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         batch_digests: batch_digests_2,
         parent_hash: consensus_output_1.consensus_header_hash(),
         number: 1,
-        early_finalize: true,
         ..Default::default()
     };
 

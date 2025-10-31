@@ -6,13 +6,13 @@ use crate::{
     test_utils::{
         make_certificates_with_epoch, make_certificates_with_leader_configuration,
         make_certificates_with_slow_nodes, make_optimal_certificates, mock_certificate,
-        mock_certificate_with_epoch, temp_dir, TestLeaderConfiguration, TestLeaderSupport,
+        mock_certificate_with_epoch, TestLeaderConfiguration, TestLeaderSupport,
     },
     ConsensusBus,
 };
 use std::collections::{BTreeSet, HashMap};
 use tn_config::{ConsensusConfig, NetworkConfig};
-use tn_storage::{mem_db::MemDatabase, open_db, CertificateStore};
+use tn_storage::{mem_db::MemDatabase, CertificateStore, ConsensusStore as _};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     AuthorityIdentifier, ExecHeader, Notifier, SealedHeader, TaskManager, TnReceiver, TnSender,
@@ -40,12 +40,9 @@ async fn order_leaders() {
         state.try_insert(&certificate).unwrap();
     }
 
-    let db = temp_dir();
-    let store = open_db(db.path());
     let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
     let bullshark = Bullshark::new(
         committee,
-        store,
         metrics,
         NUM_SUB_DAGS_PER_SCHEDULE,
         schedule.clone(),
@@ -101,13 +98,10 @@ async fn commit_one_with_leader() {
         let gc_depth = 50;
         let sub_dags_per_schedule = 3;
         let mut state = ConsensusState::new(metrics.clone(), gc_depth);
-        let db = temp_dir();
-        let store = open_db(db.path());
         let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
         let bad_nodes_stake_threshold = 33;
         let mut bullshark = Bullshark::new(
             committee,
-            store,
             metrics,
             sub_dags_per_schedule,
             schedule.clone(),
@@ -209,14 +203,11 @@ async fn not_enough_support_with_leader_schedule_change() {
     let gc_depth = 50;
     let sub_dags_per_schedule = 4;
     let mut state = ConsensusState::new(metrics.clone(), gc_depth);
-    let db = temp_dir();
-    let store = open_db(db.path());
     let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
 
     let bad_nodes_stake_threshold = 33;
     let mut bullshark = Bullshark::new(
         committee,
-        store,
         metrics,
         sub_dags_per_schedule,
         schedule,
@@ -322,14 +313,11 @@ async fn test_long_period_of_asynchrony_for_leader_schedule_change() {
     let gc_depth = 50;
     let sub_dags_per_schedule = 4;
     let mut state = ConsensusState::new(metrics.clone(), gc_depth);
-    let db = temp_dir();
-    let store = open_db(db.path());
     let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
 
     let bad_nodes_stake_threshold = 33;
     let mut bullshark = Bullshark::new(
         committee.clone(),
-        store,
         metrics,
         sub_dags_per_schedule,
         schedule,
@@ -436,12 +424,10 @@ async fn commit_one() {
     certificates.push_back(certificate);
 
     let config = fixture.authorities().next().unwrap().consensus_config();
-    let store = config.node_storage().clone();
     let metrics = Arc::new(ConsensusMetrics::default());
 
     let bullshark = Bullshark::new(
         committee.clone(),
-        store.clone(),
         metrics.clone(),
         NUM_SUB_DAGS_PER_SCHEDULE,
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
@@ -501,12 +487,10 @@ async fn dead_node() {
     let (mut certificates, _) = make_optimal_certificates(&committee, 1..=11, &genesis, &ids);
 
     let config = fixture.authorities().next().unwrap().consensus_config();
-    let store = config.node_storage().clone();
     let metrics = Arc::new(ConsensusMetrics::default());
 
     let bullshark = Bullshark::new(
         committee.clone(),
-        store.clone(),
         metrics.clone(),
         NUM_SUB_DAGS_PER_SCHEDULE,
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
@@ -637,12 +621,10 @@ async fn not_enough_support() {
     certificates.push_back(certificate);
 
     let config = fixture.authorities().next().unwrap().consensus_config();
-    let store = config.node_storage().clone();
     let metrics = Arc::new(ConsensusMetrics::default());
 
     let bullshark = Bullshark::new(
         committee.clone(),
-        store.clone(),
         metrics.clone(),
         NUM_SUB_DAGS_PER_SCHEDULE,
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
@@ -740,11 +722,9 @@ async fn missing_leader() {
     certificates.push_back(certificate);
 
     let config = fixture.authorities().next().unwrap().consensus_config();
-    let store = config.node_storage().clone();
     let metrics = Arc::new(ConsensusMetrics::default());
     let bullshark = Bullshark::new(
         committee.clone(),
-        store.clone(),
         metrics.clone(),
         NUM_SUB_DAGS_PER_SCHEDULE,
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
@@ -813,7 +793,6 @@ async fn committed_round_after_restart() {
 
         let bullshark = Bullshark::new(
             committee.clone(),
-            store.clone(),
             metrics.clone(),
             NUM_SUB_DAGS_PER_SCHEDULE,
             LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
@@ -881,13 +860,10 @@ async fn delayed_certificates_are_rejected() {
     let metrics = Arc::new(ConsensusMetrics::default());
     let (certificates, _) = make_certificates_with_epoch(&committee, 1..=5, epoch, &genesis, &ids);
 
-    let db = temp_dir();
-    let store = open_db(db.path());
     let mut state = ConsensusState::new(metrics.clone(), gc_depth);
 
     let mut bullshark = Bullshark::new(
         committee.clone(),
-        store,
         metrics,
         NUM_SUB_DAGS_PER_SCHEDULE,
         LeaderSchedule::new(committee, LeaderSwapTable::default()),
@@ -930,12 +906,9 @@ async fn submitting_equivocating_certificate_should_error() {
     let metrics = Arc::new(ConsensusMetrics::default());
     let (certificates, _) = make_certificates_with_epoch(&committee, 1..=1, epoch, &genesis, &ids);
 
-    let db = temp_dir();
-    let store = open_db(db.path());
     let mut state = ConsensusState::new(metrics.clone(), gc_depth);
     let mut bullshark = Bullshark::new(
         committee.clone(),
-        store,
         metrics,
         NUM_SUB_DAGS_PER_SCHEDULE,
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
@@ -985,12 +958,9 @@ async fn reset_consensus_scores_on_every_schedule_change() {
     let metrics = Arc::new(ConsensusMetrics::default());
     let (certificates, _) = make_certificates_with_epoch(&committee, 1..=50, epoch, &genesis, &ids);
 
-    let db = temp_dir();
-    let store = open_db(db.path());
     let mut state = ConsensusState::new(metrics.clone(), gc_depth);
     let mut bullshark = Bullshark::new(
         committee.clone(),
-        store,
         metrics,
         NUM_SUB_DAGS_PER_SCHEDULE,
         LeaderSchedule::new(committee, LeaderSwapTable::default()),
@@ -1060,7 +1030,6 @@ async fn restart_with_new_committee() {
         let metrics = Arc::new(ConsensusMetrics::default());
         let bullshark = Bullshark::new(
             committee.clone(),
-            store.clone(),
             metrics.clone(),
             NUM_SUB_DAGS_PER_SCHEDULE,
             LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
@@ -1161,14 +1130,11 @@ async fn garbage_collection_basic() {
         make_certificates_with_slow_nodes(&committee, 1..=7, genesis, &ids, slow_nodes.as_slice());
 
     // Create Bullshark consensus engine
-    let db = temp_dir();
-    let store = open_db(db.path());
 
     let metrics = Arc::new(ConsensusMetrics::default());
     let mut state = ConsensusState::new(metrics.clone(), GC_DEPTH);
     let mut bullshark = Bullshark::new(
         committee.clone(),
-        store,
         metrics,
         NUM_SUB_DAGS_PER_SCHEDULE,
         LeaderSchedule::new(committee, LeaderSwapTable::default()),
@@ -1251,13 +1217,10 @@ async fn slow_node() {
     });
 
     // Create Bullshark consensus engine
-    let db = temp_dir();
-    let store = open_db(db.path());
     let metrics = Arc::new(ConsensusMetrics::default());
     let mut state = ConsensusState::new(metrics.clone(), GC_DEPTH);
     let mut bullshark = Bullshark::new(
         committee.clone(),
-        store,
         metrics,
         NUM_SUB_DAGS_PER_SCHEDULE,
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
@@ -1410,13 +1373,10 @@ async fn not_enough_support_and_missing_leaders_and_gc() {
     certificates.extend(certificates_5_to_7);
 
     // Create Bullshark consensus engine
-    let db = temp_dir();
-    let store = open_db(db.path());
     let metrics = Arc::new(ConsensusMetrics::default());
     let mut state = ConsensusState::new(metrics.clone(), GC_DEPTH);
     let mut bullshark = Bullshark::new(
         committee.clone(),
-        store,
         metrics,
         NUM_SUB_DAGS_PER_SCHEDULE,
         LeaderSchedule::new(committee, LeaderSwapTable::default()),

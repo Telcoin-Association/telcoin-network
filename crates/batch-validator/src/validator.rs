@@ -62,7 +62,7 @@ impl BatchValidation for BatchValidator {
         self.validate_against_parent_timestamp(batch.timestamp, &parent)?;
 
         // validate batch size (bytes)
-        // Use the parent timestamp for consintency with the batch builder.
+        // Use the parent timestamp for consistency with the batch builder.
         self.validate_batch_size_bytes(transactions, parent.timestamp)?;
 
         // validate txs decode
@@ -72,7 +72,7 @@ impl BatchValidation for BatchValidator {
         self.validate_no_blob_txs(&decoded_txs)?;
 
         // validate gas limit
-        // Use the parent timestamp for consintency with the batch builder.
+        // Use the parent timestamp for consistency with the batch builder.
         self.validate_batch_gas(&decoded_txs, parent.timestamp)?;
 
         // validate base fee- all batches for a worker and epoch have the same base fee.

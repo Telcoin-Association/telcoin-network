@@ -8,38 +8,9 @@ use tn_reth::{
     CanonicalInMemoryState, ExecutedBlockWithTrieUpdates, NewCanonicalChain, RethEnv,
 };
 use tn_types::{
-    gas_accumulator::GasAccumulator, max_batch_gas, Address, ConsensusOutput, Hash as _,
-    SealedHeader, B256,
+    gas_accumulator::GasAccumulator, max_batch_gas, Address, Hash as _, SealedHeader, B256,
 };
-use tracing::{debug, error};
-
-/// Set the latest sealed header that was signed by a quorum of validators as `finalized`.
-fn finalize_signed_blocks(
-    reth_env: &RethEnv,
-    output: &ConsensusOutput,
-    canonical_header: &SealedHeader,
-) -> EngineResult<()> {
-    let mut last_executed = output.sub_dag.leader.header.latest_execution_block;
-
-    // Find the latest block that was signed off by the committee.
-    for cert in &output.sub_dag.certificates {
-        if cert.header.latest_execution_block.number > last_executed.number {
-            last_executed = cert.header.latest_execution_block;
-        }
-    }
-
-    if last_executed.number <= canonical_header.number {
-        if let Some(block) = reth_env.sealed_header_by_hash(last_executed.hash)? {
-            // remove blocks from memory and stores them in the database
-            reth_env.finalize_block(block)?;
-        } else {
-            error!(target: "engine", ?output, "missing the block to finalize!");
-            return Err(TnEngineError::MissingFinalBlock);
-        }
-    }
-
-    Ok(())
-}
+use tracing::debug;
 
 /// Execute output from consensus to extend the canonical chain.
 ///
@@ -144,14 +115,8 @@ pub fn execute_consensus_output(
     } // end block execution for round
 
     reth_env.finish_executing_output(executed_blocks)?;
-
-    if output.early_finalize {
-        // remove blocks from memory and stores them in the database
-        reth_env.finalize_block(canonical_header.clone())?;
-    } else {
-        // wait until the block appears in a signed certificate before finalizing
-        finalize_signed_blocks(&reth_env, &output, &canonical_header)?;
-    }
+    // remove blocks from memory and stores them in the database
+    reth_env.finalize_block(canonical_header.clone())?;
 
     // return new canonical header for next engine task
     Ok(canonical_header)
