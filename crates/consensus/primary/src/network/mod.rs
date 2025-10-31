@@ -509,7 +509,6 @@ impl<DB: Database> WorkerToPrimaryClient for WorkerReceiverHandler<DB> {
             .send(OurDigestMessage {
                 digest: message.digest,
                 worker_id: message.worker_id,
-                timestamp: message.timestamp,
                 ack_channel: tx_ack,
             })
             .await?;

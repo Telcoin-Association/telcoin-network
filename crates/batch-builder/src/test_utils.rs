@@ -10,25 +10,20 @@ use tn_reth::{
     SenderIdentifiers, TxPool,
 };
 use tn_types::{
-    Batch, BatchBuilderArgs, BlockBody, PendingBatchConfig, Recovered, SealedBlock, SealedHeader,
-    TransactionTrait as _, TxHash, MIN_PROTOCOL_BASE_FEE,
+    Batch, BatchBuilderArgs, Recovered, TransactionTrait as _, TxHash, MIN_PROTOCOL_BASE_FEE,
 };
 
 /// Attempt to update batch with accurate header information.
 ///
 /// NOTE: this is loosely based on reth's auto-seal consensus
 /// NOTE2: this assumes worker 0.
-pub fn execute_test_batch(test_batch: &mut Batch, parent: &SealedHeader) {
+pub fn execute_test_batch(test_batch: &mut Batch) {
     let pool = TestPool::new(&test_batch.transactions);
 
-    let parent_info = SealedBlock::from_sealed_parts(parent.clone(), BlockBody::default());
-
-    let batch_config = PendingBatchConfig::new(test_batch.beneficiary, parent_info);
-    let args = BatchBuilderArgs { pool, batch_config };
+    let args =
+        BatchBuilderArgs { pool, beneficiary: test_batch.beneficiary, epoch: test_batch.epoch };
     let BatchBuilderOutput { batch, .. } = build_batch(args, 0, test_batch.base_fee_per_gas);
-    test_batch.parent_hash = batch.parent_hash;
     test_batch.beneficiary = batch.beneficiary;
-    test_batch.timestamp = batch.timestamp;
     // Don't reset base_fee_per_gas, some tests need that value to remain.
 }
 

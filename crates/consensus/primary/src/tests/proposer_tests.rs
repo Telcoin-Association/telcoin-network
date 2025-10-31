@@ -63,10 +63,9 @@ async fn test_equivocation_protection_after_restart() {
     // Send enough digests for the header payload.
     let digest = B256::random();
     let worker_id = 0;
-    let created_at_ts = 0;
     let (tx_ack, rx_ack) = tokio::sync::oneshot::channel();
     cb.our_digests()
-        .send(OurDigestMessage { digest, worker_id, timestamp: created_at_ts, ack_channel: tx_ack })
+        .send(OurDigestMessage { digest, worker_id, ack_channel: tx_ack })
         .await
         .unwrap();
 
@@ -80,7 +79,7 @@ async fn test_equivocation_protection_after_restart() {
 
     // Ensure the proposer makes a correct header from the provided payload.
     let header = rx_headers.recv().await.unwrap();
-    assert_eq!(header.payload().get(&digest), Some(&(worker_id, created_at_ts)));
+    assert_eq!(header.payload().get(&digest), Some(&worker_id));
     assert!(header.validate(&committee).is_ok());
 
     // TODO: assert header el state present
@@ -113,7 +112,7 @@ async fn test_equivocation_protection_after_restart() {
     let worker_id = 0;
     let (tx_ack, rx_ack) = tokio::sync::oneshot::channel();
     cb.our_digests()
-        .send(OurDigestMessage { digest, worker_id, timestamp: 0, ack_channel: tx_ack })
+        .send(OurDigestMessage { digest, worker_id, ack_channel: tx_ack })
         .await
         .unwrap();
 

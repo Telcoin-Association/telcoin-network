@@ -45,7 +45,8 @@ impl From<WorkerNetworkError> for Option<Penalty> {
                     // mild
                     BatchValidationError::CanonicalChain { .. } => Some(Penalty::Mild),
                     // medium
-                    BatchValidationError::InvalidTx4844(_) => Some(Penalty::Medium),
+                    BatchValidationError::InvalidEpoch { .. }
+                    | BatchValidationError::InvalidTx4844(_) => Some(Penalty::Medium),
                     // severe
                     BatchValidationError::RecoverTransaction(_, _) => Some(Penalty::Severe),
                     // fatal
@@ -54,7 +55,6 @@ impl From<WorkerNetworkError> for Option<Penalty> {
                     | BatchValidationError::InvalidWorkerId { .. }
                     | BatchValidationError::InvalidDigest
                     | BatchValidationError::GasOverflow
-                    | BatchValidationError::TimestampIsInPast { .. }
                     | BatchValidationError::CalculateMaxPossibleGas
                     | BatchValidationError::HeaderMaxGasExceedsGasLimit { .. }
                     | BatchValidationError::HeaderTransactionBytesExceedsMax(_) => {

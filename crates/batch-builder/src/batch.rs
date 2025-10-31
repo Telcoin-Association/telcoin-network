@@ -8,10 +8,10 @@
 
 use tn_reth::{TxPool, TxnSize};
 use tn_types::{
-    max_batch_gas, max_batch_size, now, Batch, BatchBuilderArgs, Encodable2718 as _,
-    PendingBatchConfig, TransactionTrait as _, TxHash, WorkerId,
+    max_batch_gas, max_batch_size, Batch, BatchBuilderArgs, Encodable2718 as _,
+    TransactionTrait as _, TxHash, WorkerId,
 };
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// The output from building the next block.
 ///
@@ -48,18 +48,16 @@ pub fn build_batch<P: TxPool>(
     worker_id: WorkerId,
     base_fee: u64,
 ) -> BatchBuilderOutput {
-    let BatchBuilderArgs { mut pool, batch_config } = args;
-    let gas_limit = max_batch_gas(batch_config.parent_info.timestamp);
-    let max_size = max_batch_size(batch_config.parent_info.timestamp);
+    let BatchBuilderArgs { mut pool, beneficiary, epoch } = args;
+    let gas_limit = max_batch_gas(epoch);
+    let max_size = max_batch_size(epoch);
     let base_fee_per_gas = base_fee;
-    let PendingBatchConfig { beneficiary, parent_info } = batch_config;
 
     // NOTE: this obtains a `read` lock on the tx pool
     // pull best transactions and rely on watch channel to ensure basefee is current
     let mut best_txs = pool.best_transactions();
 
     // NOTE: batches always build off the latest finalized block
-    let parent_hash = parent_info.hash();
 
     // collect data for successful transactions
     // let mut sum_blob_gas_used = 0;
@@ -116,27 +114,9 @@ pub fn build_batch<P: TxPool>(
         transactions.push(tx.into_inner().encoded_2718());
     }
 
-    // sometimes batch are produced too quickly in certain configs (<1s diff)
-    // resulting in batch timestamp == parent timestamp
-    //
-    // Make sure the batch timestamp is not less than it's parent.
-    // Should not happen but would be invalid so let's not produce it...
-    let mut timestamp = now();
-    if timestamp == parent_info.timestamp {
-        warn!(target: "worker::batch_builder", "new block timestamp same as parent - setting offset by 1sec");
-        timestamp = parent_info.timestamp + 1;
-    }
-
     // batch
-    let batch = Batch {
-        transactions,
-        parent_hash,
-        beneficiary,
-        timestamp,
-        base_fee_per_gas,
-        worker_id,
-        received_at: None,
-    };
+    let batch =
+        Batch { transactions, epoch, beneficiary, base_fee_per_gas, worker_id, received_at: None };
 
     // remove any blob transactions that were submitted
     pool.remove_eip4844_txs(blob_transactions);
