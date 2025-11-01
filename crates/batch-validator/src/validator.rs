@@ -549,10 +549,10 @@ mod tests {
         let invalid_txs = vec![too_big];
         block.transactions = invalid_txs;
         // ensure size method correctly accounts for struct+txs
-        assert_eq!(block.size(), 1_000_202);
+        assert_eq!(block.size(), 1_000_170);
         let invalid_batch = block.seal_slow();
         // ensure size method correct accounts for struct+txs+digest
-        assert_eq!(invalid_batch.size(), 1_000_234);
+        assert_eq!(invalid_batch.size(), 1_000_202);
         assert_matches!(
             validator.validate_batch(invalid_batch),
             Err(BatchValidationError::HeaderTransactionBytesExceedsMax(wrong)) if wrong == expected_len
