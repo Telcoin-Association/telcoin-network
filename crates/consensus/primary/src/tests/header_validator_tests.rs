@@ -27,13 +27,13 @@ async fn test_sync_batches_drops_old_rounds() -> eyre::Result<()> {
         .map(|a| {
             let header = a
                 .header_builder(&committee)
-                .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)
+                .with_payload_batch(fixture_batch_with_transactions(10), 0)
                 .build();
             let cert = fixture.certificate(&header);
             let digest = cert.digest();
             certificate_store.write(cert.clone()).expect("write cert to storage");
             // write to payload store
-            for (digest, (worker_id, _)) in cert.header().payload() {
+            for (digest, worker_id) in cert.header().payload() {
                 payload_store.write_payload(digest, worker_id).unwrap();
             }
             (digest, cert)
@@ -44,7 +44,7 @@ async fn test_sync_batches_drops_old_rounds() -> eyre::Result<()> {
         .header_builder(&fixture.committee())
         .round(2)
         .parents(certs.keys().cloned().collect())
-        .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)
+        .with_payload_batch(fixture_batch_with_transactions(10), 0)
         .build();
 
     // update round

@@ -521,7 +521,7 @@ pub fn batch_with_transactions(
         transactions.push(transaction(chain.clone()));
     }
 
-    Batch::new_for_test(transactions, ExecHeader::default(), worker_id)
+    Batch::new_for_test(transactions, ExecHeader::default(), worker_id, 0)
 }
 
 /// Helper function to seed an instance of Genesis with accounts from a random batch.

@@ -19,8 +19,7 @@ use tn_reth::{
 use tn_types::{
     test_chain_spec_arc, test_genesis, to_intent_message, Address, AuthorityIdentifier, Batch,
     BlockHash, BlsKeypair, BlsSignature, Bytes, Certificate, CertificateDigest, Committee, Epoch,
-    ExecHeader, Hash as _, HeaderBuilder, ProtocolSignature, Round, TimestampSec, VotingPower,
-    WorkerId, U256,
+    ExecHeader, Hash as _, HeaderBuilder, ProtocolSignature, Round, VotingPower, WorkerId, U256,
 };
 
 pub fn temp_dir() -> TempDir {
@@ -38,14 +37,14 @@ pub fn random_key() -> BlsKeypair {
 ////////////////////////////////////////////////////////////////
 // Headers, Votes, Certificates
 ////////////////////////////////////////////////////////////////
-pub fn fixture_payload(number_of_batches: u8) -> IndexMap<BlockHash, (WorkerId, TimestampSec)> {
-    let mut payload: IndexMap<BlockHash, (WorkerId, TimestampSec)> = IndexMap::new();
+pub fn fixture_payload(number_of_batches: u8) -> IndexMap<BlockHash, WorkerId> {
+    let mut payload: IndexMap<BlockHash, WorkerId> = IndexMap::new();
 
     let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
     for _ in 0..number_of_batches {
         let batch_digest = batch(chain.clone()).digest();
 
-        payload.insert(batch_digest, (0, 0));
+        payload.insert(batch_digest, 0);
     }
 
     payload
@@ -54,13 +53,13 @@ pub fn fixture_payload(number_of_batches: u8) -> IndexMap<BlockHash, (WorkerId, 
 pub fn fixture_payload_with_rand<R: Rng + ?Sized>(
     number_of_batches: u8,
     rand: &mut R,
-) -> IndexMap<BlockHash, (WorkerId, TimestampSec)> {
-    let mut payload: IndexMap<BlockHash, (WorkerId, TimestampSec)> = IndexMap::new();
+) -> IndexMap<BlockHash, WorkerId> {
+    let mut payload: IndexMap<BlockHash, WorkerId> = IndexMap::new();
 
     for _ in 0..number_of_batches {
         let batch_digest = batch_with_rand(rand, 0).digest();
 
-        payload.insert(batch_digest, (0, 0));
+        payload.insert(batch_digest, 0);
     }
 
     payload
@@ -90,6 +89,7 @@ pub fn batch_with_rand<R: Rng + ?Sized>(rand: &mut R, worker_id: WorkerId) -> Ba
         vec![transaction_with_rand(rand), transaction_with_rand(rand)],
         ExecHeader::default(),
         worker_id,
+        0,
     )
 }
 

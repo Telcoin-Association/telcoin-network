@@ -3,7 +3,7 @@
 //! These messages are passed as unreliable send and
 //! don't expect a response.
 use serde::{Deserialize, Serialize};
-use tn_types::{AuthorityIdentifier, BlockHash, SealedBatch, SealedHeader, TimestampSec, WorkerId};
+use tn_types::{AuthorityIdentifier, BlockHash, SealedBatch, SealedHeader, WorkerId};
 
 /// Used by the primary to request that the worker sync the target missing batches.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -25,8 +25,6 @@ pub struct WorkerOwnBatchMessage {
     pub worker_id: WorkerId,
     /// The digest for the batch that reached quorum.
     pub digest: BlockHash,
-    /// The timestamp for the batch.
-    pub timestamp: TimestampSec,
 }
 
 /// Used by worker to inform primary it received a batch from another authority.

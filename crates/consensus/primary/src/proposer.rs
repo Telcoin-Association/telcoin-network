@@ -49,8 +49,6 @@ pub struct OurDigestMessage {
     pub digest: BlockHash,
     /// The worker that produced this block.
     pub worker_id: WorkerId,
-    /// The timestamp for when the block was created.
-    pub timestamp: TimestampSec,
     /// A channel to send an () as an ack after this digest is processed by the primary.
     pub ack_channel: oneshot::Sender<()>,
 }
@@ -60,8 +58,8 @@ impl OurDigestMessage {
     ///
     /// Splits the message into components required for processing the batch.
     fn process(self) -> (oneshot::Sender<()>, ProposerDigest) {
-        let OurDigestMessage { digest, worker_id, timestamp, ack_channel } = self;
-        let digest = ProposerDigest { digest, worker_id, timestamp };
+        let OurDigestMessage { digest, worker_id, ack_channel } = self;
+        let digest = ProposerDigest { digest, worker_id };
         (ack_channel, digest)
     }
 }
@@ -75,8 +73,6 @@ struct ProposerDigest {
     pub digest: BlockHash,
     /// The worker that produced this block.
     pub worker_id: WorkerId,
-    /// The timestamp for when the block was created.
-    pub timestamp: TimestampSec,
 }
 
 #[cfg(test)]
@@ -224,7 +220,7 @@ impl<DB: Database> Proposer<DB> {
             authority_id,
             current_round,
             current_epoch,
-            digests.iter().map(|m| (m.digest, (m.worker_id, m.timestamp))).collect(),
+            digests.iter().map(|m| (m.digest, m.worker_id)).collect(),
             parents.iter().map(|x| x.digest()).collect(),
             consensus_bus.recent_blocks().borrow().latest_block_num_hash(),
         );
@@ -247,8 +243,7 @@ impl<DB: Database> Proposer<DB> {
         let mut total_inclusion_secs = 0.0;
         for digest in &digests {
             let batch_inclusion_secs =
-                Duration::from_secs(header.created_at().saturating_sub(digest.timestamp))
-                    .as_secs_f64();
+                Duration::from_secs(header.created_at().saturating_sub(now())).as_secs_f64();
             total_inclusion_secs += batch_inclusion_secs;
 
             // NOTE: this log entry is used to measure performance
@@ -262,10 +257,9 @@ impl<DB: Database> Proposer<DB> {
         }
 
         // NOTE: this log entry is used to measure performance
-        let (header_creation_secs, avg_inclusion_secs) = if let Some(digest) = digests.front() {
+        let (header_creation_secs, avg_inclusion_secs) = if !digests.is_empty() {
             (
-                Duration::from_secs(header.created_at().saturating_sub(digest.timestamp))
-                    .as_secs_f64(),
+                Duration::from_secs(header.created_at().saturating_sub(now())).as_secs_f64(),
                 total_inclusion_secs / digests.len() as f64,
             )
         } else {
@@ -578,7 +572,7 @@ impl<DB: Database> Proposer<DB> {
             let mut digests = header
                 .payload()
                 .into_iter()
-                .map(|(k, v)| ProposerDigest { digest: *k, worker_id: v.0, timestamp: v.1 })
+                .map(|(k, v)| ProposerDigest { digest: *k, worker_id: *v })
                 .collect();
 
             // add payloads and system messages from oldest to newest

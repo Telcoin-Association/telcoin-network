@@ -326,6 +326,7 @@ async fn test_with_creds_faucet_transfers_tel_with_google_kms() -> eyre::Result<
             batch_provider.batches_tx(),
             &spawner,
             BaseFeeContainer::default(),
+            0, // epoch
         )
         .await?;
 
@@ -662,7 +663,13 @@ async fn test_with_creds_faucet_transfers_stablecoin_with_google_kms() -> eyre::
         )
         .await?;
     execution_node
-        .start_batch_builder(worker_id, to_worker, &spawner, BaseFeeContainer::default())
+        .start_batch_builder(
+            worker_id,
+            to_worker,
+            &spawner,
+            BaseFeeContainer::default(),
+            0, // epoch
+        )
         .await?;
 
     let user_address = Address::random();

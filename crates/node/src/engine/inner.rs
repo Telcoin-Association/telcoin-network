@@ -19,8 +19,8 @@ use tn_reth::{
 use tn_rpc::{EngineToPrimary, TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator},
-    Address, BatchSender, BatchValidation, BlsPublicKey, ConsensusOutput, ExecHeader, Noticer,
-    SealedHeader, TaskSpawner, WorkerId, B256, MIN_PROTOCOL_BASE_FEE,
+    Address, BatchSender, BatchValidation, BlsPublicKey, ConsensusOutput, Epoch, ExecHeader,
+    Noticer, SealedHeader, TaskSpawner, WorkerId, B256, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::mpsc;
@@ -88,6 +88,7 @@ impl ExecutionNodeInner {
         block_provider_sender: BatchSender,
         epoch_task_spawner: &TaskSpawner,
         base_fee: BaseFeeContainer,
+        epoch: Epoch,
     ) -> eyre::Result<()> {
         // check for worker components and initialize if they're missing
         let transaction_pool = self
@@ -106,6 +107,7 @@ impl ExecutionNodeInner {
             epoch_task_spawner.clone(),
             worker_id,
             base_fee,
+            epoch,
         );
 
         // spawn block builder task
@@ -197,11 +199,12 @@ impl ExecutionNodeInner {
         &self,
         worker_id: &WorkerId,
         base_fee: BaseFeeContainer,
+        epoch: Epoch,
     ) -> Arc<dyn BatchValidation> {
         // retrieve handle to transaction pool to submit gossip transactions to validators
         let tx_pool = self.workers.get(*worker_id as usize).map(|w| w.pool());
 
-        Arc::new(BatchValidator::new(self.reth_env.clone(), tx_pool, *worker_id, base_fee))
+        Arc::new(BatchValidator::new(self.reth_env.clone(), tx_pool, *worker_id, base_fee, epoch))
     }
 
     /// Fetch the last executed state from the database.

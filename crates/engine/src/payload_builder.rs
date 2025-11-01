@@ -26,6 +26,7 @@ pub fn execute_consensus_output(
     // output digest returns the `ConsensusHeader` digest
     let output_digest: B256 = output.digest().into();
     let batches = output.flatten_batches();
+    let epoch = output.leader().epoch();
 
     // assert vecs match
     debug_assert_eq!(
@@ -80,7 +81,7 @@ pub fn execute_consensus_output(
 
             // use batch's base fee, gas limit, and withdrawals
             let base_fee_per_gas = batch.base_fee_per_gas;
-            let gas_limit = max_batch_gas(batch.timestamp);
+            let gas_limit = max_batch_gas(epoch);
 
             // apply XOR bitwise operator with worker's digest to ensure unique mixed hash per batch
             // for round

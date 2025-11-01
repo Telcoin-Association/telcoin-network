@@ -34,7 +34,7 @@ use std::{
 use tn_reth::{CanonStateNotificationStream, RethEnv, TxPool as _, WorkerTxPool};
 use tn_types::{
     error::BlockSealError, gas_accumulator::BaseFeeContainer, Address, BatchBuilderArgs,
-    BatchSender, PendingBatchConfig, SealedBlock, TaskSpawner, TxHash, WorkerId,
+    BatchSender, Epoch, SealedBlock, TaskSpawner, TxHash, WorkerId,
 };
 use tokio::{sync::oneshot, time::Interval};
 use tracing::{debug, error, warn};
@@ -87,6 +87,8 @@ pub struct BatchBuilder {
     worker_id: WorkerId,
     /// The current base fee for this worker.
     base_fee: BaseFeeContainer,
+    /// The epoch we are building batches for.
+    epoch: Epoch,
 }
 
 impl BatchBuilder {
@@ -101,6 +103,7 @@ impl BatchBuilder {
         task_spawner: TaskSpawner,
         worker_id: WorkerId,
         base_fee: BaseFeeContainer,
+        epoch: Epoch,
     ) -> Self {
         let max_delay_interval = tokio::time::interval(max_delay);
         let state_changed = reth_env.canonical_block_stream();
@@ -116,6 +119,7 @@ impl BatchBuilder {
             task_spawner,
             worker_id,
             base_fee,
+            epoch,
         }
     }
 
@@ -136,8 +140,7 @@ impl BatchBuilder {
         let to_worker = self.to_worker.clone();
 
         // configure params for next building the next batch
-        let config = PendingBatchConfig::new(self.address, self.last_canonical_update.clone());
-        let build_args = BatchBuilderArgs::new(pool.clone(), config);
+        let build_args = BatchBuilderArgs::new(pool.clone(), self.address, self.epoch);
         let (result, done) = oneshot::channel();
         let worker_id = self.worker_id;
         let base_fee = self.base_fee.base_fee();
@@ -397,6 +400,7 @@ mod tests {
             task_manager.get_spawner(),
             0,
             BaseFeeContainer::default(),
+            0,
         );
 
         let gas_price = reth_env.get_gas_price().unwrap();
@@ -550,6 +554,7 @@ mod tests {
             task_manager.get_spawner(),
             0,
             BaseFeeContainer::default(),
+            0,
         );
 
         // expected to be 7 wei for first block
@@ -697,6 +702,7 @@ mod tests {
             task_manager.get_spawner(),
             0,
             BaseFeeContainer::default(),
+            0,
         );
 
         // expected to be 7 wei for first block

@@ -4,14 +4,18 @@ use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 use tn_reth::{bytes_to_txn, recover_signed_transaction, RethEnv, WorkerTxPool};
 use tn_types::{
     gas_accumulator::BaseFeeContainer, max_batch_gas, max_batch_size, BatchValidation,
-    BatchValidationError, BlockHash, ExecHeader, SealedBatch, TransactionSigned,
-    TransactionTrait as _, WorkerId,
+    BatchValidationError, BlockHash, Epoch, SealedBatch, TransactionSigned, TransactionTrait as _,
+    WorkerId,
 };
 
 /// Type convenience for implementing block validation errors.
 type BatchValidationResult<T> = Result<T, BatchValidationError>;
 
-/// Block validator
+/// Batch validator
+/// Important note about batch validation, we rely on libp2p to verify that
+/// batches came from a committee member.  This means we do not generate or
+/// check our own signatures for batches since they all came from current
+/// committee members.
 #[derive(Clone, Debug)]
 pub struct BatchValidator {
     /// Database provider to encompass tree and provider factory.
@@ -22,6 +26,8 @@ pub struct BatchValidator {
     worker_id: WorkerId,
     /// Current base fee for this validators worker.
     base_fee: BaseFeeContainer,
+    /// Epoch we are validating for.
+    epoch: Epoch,
 }
 
 impl BatchValidation for BatchValidator {
@@ -44,26 +50,19 @@ impl BatchValidation for BatchValidator {
             });
         }
 
+        if batch.epoch != self.epoch {
+            return Err(BatchValidationError::InvalidEpoch {
+                expected: self.epoch,
+                found: batch.epoch,
+            });
+        }
+
         // obtain info for validation
         let transactions = batch.transactions();
 
-        // first step towards validating parent's header
-        // Note this is really a "best effort" check.  If we have not
-        // executed parent_hash yet then it will use the last executed batch if
-        // available.  Making it manditory would require waiting to see
-        // if we execute it soon to avoid false failures.
-        // The primary header should get checked so this should be ok.
-        let parent =
-            self.reth_env.header(batch.parent_hash).unwrap_or_default().unwrap_or_else(|| {
-                self.reth_env.finalized_header().unwrap_or_default().unwrap_or_default()
-            });
-
-        // validate timestamp vs parent
-        self.validate_against_parent_timestamp(batch.timestamp, &parent)?;
-
         // validate batch size (bytes)
         // Use the parent timestamp for consistency with the batch builder.
-        self.validate_batch_size_bytes(transactions, parent.timestamp)?;
+        self.validate_batch_size_bytes(transactions, batch.epoch)?;
 
         // validate txs decode
         let decoded_txs = self.decode_transactions(transactions, digest)?;
@@ -73,7 +72,7 @@ impl BatchValidation for BatchValidator {
 
         // validate gas limit
         // Use the parent timestamp for consistency with the batch builder.
-        self.validate_batch_gas(&decoded_txs, parent.timestamp)?;
+        self.validate_batch_gas(&decoded_txs, batch.epoch)?;
 
         // validate base fee- all batches for a worker and epoch have the same base fee.
         self.validate_basefee(batch.base_fee_per_gas)?;
@@ -108,31 +107,16 @@ impl BatchValidator {
         tx_pool: Option<WorkerTxPool>,
         worker_id: WorkerId,
         base_fee: BaseFeeContainer,
+        epoch: Epoch,
     ) -> Self {
-        Self { reth_env, tx_pool, worker_id, base_fee }
-    }
-
-    /// Validates the timestamp against the parent to make sure it is in the past.
-    #[inline]
-    fn validate_against_parent_timestamp(
-        &self,
-        timestamp: u64,
-        parent: &ExecHeader,
-    ) -> BatchValidationResult<()> {
-        if timestamp <= parent.timestamp {
-            return Err(BatchValidationError::TimestampIsInPast {
-                parent_timestamp: parent.timestamp,
-                timestamp,
-            });
-        }
-        Ok(())
+        Self { reth_env, tx_pool, worker_id, base_fee, epoch }
     }
 
     /// Validate the size of transactions (in bytes).
     fn validate_batch_size_bytes(
         &self,
         transactions: &[Vec<u8>],
-        timestamp: u64,
+        epoch: Epoch,
     ) -> BatchValidationResult<()> {
         // calculate size (in bytes) of included transactions
         let total_bytes = transactions
@@ -140,7 +124,7 @@ impl BatchValidator {
             .map(|tx| tx.len())
             .reduce(|total, size| total + size)
             .ok_or(BatchValidationError::EmptyBatch)?;
-        let max_tx_bytes = max_batch_size(timestamp);
+        let max_tx_bytes = max_batch_size(epoch);
 
         // allow txs that equal max tx bytes
         if total_bytes > max_tx_bytes {
@@ -172,7 +156,7 @@ impl BatchValidator {
     fn validate_batch_gas(
         &self,
         transactions: &[TransactionSigned],
-        timestamp: u64,
+        epoch: Epoch,
     ) -> BatchValidationResult<()> {
         // `Self::validate_batch_size_bytes` checks for empty batch
         //
@@ -183,7 +167,7 @@ impl BatchValidator {
             })?;
 
         // ensure total tx gas limit fits into block's gas limit
-        let max_tx_gas = max_batch_gas(timestamp);
+        let max_tx_gas = max_batch_gas(epoch);
         if total_possible_gas > max_tx_gas {
             return Err(BatchValidationError::HeaderMaxGasExceedsGasLimit {
                 total_possible_gas,
@@ -253,12 +237,10 @@ mod tests {
 
     /// Return the next valid sealed batch
     fn next_valid_sealed_batch(chain: Arc<RethChainSpec>) -> SealedBatch {
-        let timestamp = chain.genesis_timestamp() + 1;
         // create valid transactions
         let mut tx_factory = TransactionFactory::new();
         let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
         let gas_price = 7;
-        let genesis_hash = chain.genesis_hash();
 
         // create 3 transactions
         let transaction1 = tx_factory.create_eip1559_encoded(
@@ -291,9 +273,8 @@ mod tests {
         let valid_txs = vec![transaction1, transaction2, transaction3];
         let batch = Batch {
             transactions: valid_txs,
-            parent_hash: genesis_hash,
+            epoch: 0,
             beneficiary: Address::ZERO,
-            timestamp,
             base_fee_per_gas: MIN_PROTOCOL_BASE_FEE,
             worker_id: 0,
             received_at: None,
@@ -318,7 +299,7 @@ mod tests {
             RethEnv::new_for_temp_chain(chain.clone(), path, task_manager, None).unwrap();
         let tx_pool = reth_env.init_txn_pool().unwrap();
         let validator =
-            BatchValidator::new(reth_env, Some(tx_pool), 0, BaseFeeContainer::default());
+            BatchValidator::new(reth_env, Some(tx_pool), 0, BaseFeeContainer::default(), 0);
         let valid_batch = next_valid_sealed_batch(chain);
 
         // block validator
@@ -351,14 +332,12 @@ mod tests {
         let task_manager = TaskManager::default();
         let TestTools { valid_batch, validator } = test_tools(tmp_dir.path(), &task_manager).await;
         let (batch, _) = valid_batch.split();
-        let Batch { transactions, beneficiary, timestamp, base_fee_per_gas, received_at, .. } =
-            batch;
+        let Batch { transactions, beneficiary, base_fee_per_gas, received_at, .. } = batch;
         let wrong_parent_hash = B256::random();
         let invalid_batch = Batch {
             transactions,
-            parent_hash: wrong_parent_hash,
+            epoch: 0,
             beneficiary,
-            timestamp,
             base_fee_per_gas,
             worker_id: 0,
             received_at,
@@ -370,27 +349,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_invalid_batch_wrong_timestamp() {
+    async fn test_invalid_batch_wrong_epoch() {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
         let TestTools { valid_batch, validator } = test_tools(tmp_dir.path(), &task_manager).await;
         let (mut batch, _) = valid_batch.split();
 
-        // test batch timestamp same as parent
-        let wrong_timestamp = validator.reth_env.chainspec().genesis().timestamp;
-        batch.timestamp = wrong_timestamp;
+        batch.epoch += 1;
 
         assert_matches!(
             validator.validate_batch(batch.clone().seal_slow()),
-            Err(BatchValidationError::TimestampIsInPast{parent_timestamp, timestamp}) if parent_timestamp == wrong_timestamp && timestamp == wrong_timestamp
-        );
-
-        // test header timestamp before parent
-        batch.timestamp = wrong_timestamp - 1;
-
-        assert_matches!(
-            validator.validate_batch(batch.seal_slow()),
-            Err(BatchValidationError::TimestampIsInPast{parent_timestamp, timestamp}) if parent_timestamp == wrong_timestamp && timestamp == wrong_timestamp - 1
+            Err(BatchValidationError::InvalidEpoch{expected, found}) if expected == 0 && found == 1
         );
     }
 
@@ -411,20 +380,18 @@ mod tests {
         // create transaction with max gas limit above the max allowed
         let invalid_transaction = tx_factory.create_eip1559_encoded(
             chain.clone(),
-            Some(max_batch_gas(batch.timestamp) + 1),
+            Some(max_batch_gas(batch.epoch) + 1),
             gas_price,
             Some(Address::ZERO),
             value, // 1 TEL
             Bytes::new(),
         );
 
-        let Batch { beneficiary, timestamp, base_fee_per_gas, received_at, parent_hash, .. } =
-            batch;
+        let Batch { beneficiary, epoch, base_fee_per_gas, received_at, .. } = batch;
         let invalid_batch = Batch {
             transactions: vec![invalid_transaction],
-            parent_hash,
+            epoch,
             beneficiary,
-            timestamp,
             base_fee_per_gas,
             worker_id: 0,
             received_at,
@@ -435,7 +402,7 @@ mod tests {
             .expect("txs decode correctly");
 
         assert_matches!(
-            validator.validate_batch_gas(&decoded_txs, invalid_batch.timestamp),
+            validator.validate_batch_gas(&decoded_txs, invalid_batch.epoch),
             Err(BatchValidationError::HeaderMaxGasExceedsGasLimit {
                 total_possible_gas: _,
                 gas_limit: _
@@ -476,13 +443,11 @@ mod tests {
             Bytes::new(),
         );
 
-        let Batch { beneficiary, timestamp, base_fee_per_gas, received_at, parent_hash, .. } =
-            batch;
+        let Batch { beneficiary, epoch, base_fee_per_gas, received_at, .. } = batch;
         let invalid_batch = Batch {
             transactions: vec![u64_max_transaction, overflow_transaction],
-            parent_hash,
             beneficiary,
-            timestamp,
+            epoch,
             base_fee_per_gas,
             worker_id: 0,
             received_at,
@@ -493,7 +458,7 @@ mod tests {
             .expect("txs decode correctly");
 
         assert_matches!(
-            validator.validate_batch_gas(&decoded_txs, invalid_batch.timestamp),
+            validator.validate_batch_gas(&decoded_txs, invalid_batch.epoch),
             Err(BatchValidationError::GasOverflow)
         );
     }
@@ -584,10 +549,10 @@ mod tests {
         let invalid_txs = vec![too_big];
         block.transactions = invalid_txs;
         // ensure size method correctly accounts for struct+txs
-        assert_eq!(block.size(), 1_000_202);
+        assert_eq!(block.size(), 1_000_170);
         let invalid_batch = block.seal_slow();
         // ensure size method correct accounts for struct+txs+digest
-        assert_eq!(invalid_batch.size(), 1_000_234);
+        assert_eq!(invalid_batch.size(), 1_000_202);
         assert_matches!(
             validator.validate_batch(invalid_batch),
             Err(BatchValidationError::HeaderTransactionBytesExceedsMax(wrong)) if wrong == expected_len

@@ -122,7 +122,7 @@ impl<DB: Database> CommitteeFixture<DB> {
                     .round(round)
                     .epoch(0)
                     .parents(parents.clone())
-                    .with_payload_batch(fixture_batch_with_transactions(10), 0, 0)
+                    .with_payload_batch(fixture_batch_with_transactions(10), 0)
                     .build()
             })
             .collect();

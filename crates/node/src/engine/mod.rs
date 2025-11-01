@@ -21,8 +21,8 @@ use tn_reth::{
 use tn_rpc::EngineToPrimary;
 use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator},
-    BatchSender, BatchValidation, BlsPublicKey, ConsensusOutput, ExecHeader, Noticer, SealedHeader,
-    TaskSpawner, WorkerId, B256,
+    BatchSender, BatchValidation, BlsPublicKey, ConsensusOutput, Epoch, ExecHeader, Noticer,
+    SealedHeader, TaskSpawner, WorkerId, B256,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::{mpsc, RwLock};
@@ -105,9 +105,12 @@ impl ExecutionNode {
         block_provider_sender: BatchSender,
         task_spawner: &TaskSpawner,
         base_fee: BaseFeeContainer,
+        epoch: Epoch,
     ) -> eyre::Result<()> {
         let mut guard = self.internal.write().await;
-        guard.start_batch_builder(worker_id, block_provider_sender, task_spawner, base_fee).await
+        guard
+            .start_batch_builder(worker_id, block_provider_sender, task_spawner, base_fee, epoch)
+            .await
     }
 
     /// Batch validator
@@ -115,9 +118,10 @@ impl ExecutionNode {
         &self,
         worker_id: &WorkerId,
         base_fee: BaseFeeContainer,
+        epoch: Epoch,
     ) -> Arc<dyn BatchValidation> {
         let guard = self.internal.read().await;
-        guard.new_batch_validator(worker_id, base_fee)
+        guard.new_batch_validator(worker_id, base_fee, epoch)
     }
 
     /// Retrieve the last executed block from the database to restore consensus.

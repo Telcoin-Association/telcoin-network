@@ -287,8 +287,7 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         }
 
         // Send the batch to the primary.
-        let message =
-            WorkerOwnBatchMessage { worker_id: self.id, digest, timestamp: batch.created_at() };
+        let message = WorkerOwnBatchMessage { worker_id: self.id, digest };
         if let Err(err) = self.client.report_own_batch(message).await {
             error!(target: "worker::batch_provider", "Failed to report our batch: {err:?}");
             // Should we return an error here?  Doing so complicates some tests but also the batch

@@ -8,16 +8,15 @@ use std::{
 };
 use tn_types::{
     now, test_chain_spec_arc, AuthorityIdentifier, Batch, BlockHash, Certificate,
-    CertificateDigest, Database, Hash as _, HeaderBuilder, Round, TimestampSec, WorkerId,
+    CertificateDigest, Database, Hash as _, HeaderBuilder, Round, WorkerId,
 };
 
 /// Create a random number of batches with signed transactions.
 /// Caller's responsibility to ensure random accounts have balances.
 fn random_batches(
     number_of_batches: usize,
-) -> (IndexMap<BlockHash, (WorkerId, TimestampSec)>, HashMap<BlockHash, Batch>) {
-    let mut payload: IndexMap<BlockHash, (WorkerId, TimestampSec)> =
-        IndexMap::with_capacity(number_of_batches);
+) -> (IndexMap<BlockHash, WorkerId>, HashMap<BlockHash, Batch>) {
+    let mut payload: IndexMap<BlockHash, WorkerId> = IndexMap::with_capacity(number_of_batches);
     let mut batches = HashMap::with_capacity(number_of_batches);
 
     let chain = test_chain_spec_arc();
@@ -25,7 +24,7 @@ fn random_batches(
         let batch = tn_reth::test_utils::batch(chain.clone());
         let batch_digest = batch.digest();
 
-        payload.insert(batch_digest, (0, 0));
+        payload.insert(batch_digest, 0);
         batches.insert(batch_digest, batch);
     }
 

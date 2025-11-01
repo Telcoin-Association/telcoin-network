@@ -129,7 +129,7 @@ async fn fetch_certificates_basic() {
     }
 
     // Avoid any sort of missing payload by pre-populating the batch
-    for (digest, (worker_id, _)) in headers.iter().flat_map(|h| h.payload().iter()) {
+    for (digest, worker_id) in headers.iter().flat_map(|h| h.payload().iter()) {
         payload_store.write_payload(digest, worker_id).unwrap();
     }
 
