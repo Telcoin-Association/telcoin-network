@@ -45,8 +45,8 @@ use tn_types::{
     error::HeaderError, gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash,
     BlsAggregateSignature, BlsPublicKey, BlsSignature, Committee, CommitteeBuilder,
     ConsensusHeader, ConsensusOutput, Database as TNDatabase, Epoch, EpochCertificate, EpochRecord,
-    EpochVote, Notifier, TaskJoinError, TaskManager, TaskSpawner, TimestampSec, TnReceiver,
-    TnSender, B256, MIN_PROTOCOL_BASE_FEE,
+    EpochVote, Noticer, Notifier, TaskJoinError, TaskManager, TaskSpawner, TimestampSec,
+    TnReceiver, TnSender, B256, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{
     quorum_waiter::QuorumWaiterTrait, Worker, WorkerNetwork, WorkerNetworkHandle, WorkerRequest,
@@ -1099,7 +1099,7 @@ where
         //
         // NOTE: this should live and die with epochs because it updates the consensus bus
         self.spawn_engine_update_task(
-            consensus_config.shutdown().clone(),
+            consensus_config.shutdown().subscribe(),
             engine.canonical_block_stream().await,
             epoch_task_manager,
         );
@@ -1568,13 +1568,12 @@ where
     /// final block.
     fn spawn_engine_update_task(
         &self,
-        shutdown: Notifier,
+        shutdown_rx: Noticer,
         mut engine_state: CanonStateNotificationStream,
         epoch_task_manager: &TaskManager,
     ) {
         // spawn epoch-specific task to forward blocks from the engine to consensus
         let consensus_bus = self.consensus_bus.clone();
-        let shutdown_rx = shutdown.subscribe();
         epoch_task_manager.spawn_critical_task("latest execution block", async move {
             loop {
                 tokio::select!(

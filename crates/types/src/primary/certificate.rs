@@ -4,6 +4,7 @@
 //! of peers.
 
 use crate::{
+    committee::quorum_threshold,
     crypto::{
         self, to_intent_message, BlsAggregateSignature, BlsPublicKey, BlsSignature,
         ValidatorAggregateSignature,
@@ -252,11 +253,10 @@ impl Certificate {
     /// Will clear the state first and revalidate even if it appears to be valid.
     pub fn verify_cert(mut self, committee: &[BlsPublicKey]) -> CertificateResult<Certificate> {
         self = self.validate_received()?;
-        self = self.validate_received()?;
         let (weight, pks) = self.signed_by(committee);
 
         // All validator have a vote weight of 1.
-        let threshold = 2 * committee.len() as u64 / 3 + 1;
+        let threshold = quorum_threshold(committee.len() as u64);
         ensure!(weight >= threshold, CertificateError::Inquorate { stake: weight, threshold });
 
         let verified_cert = self.verify_signature(pks)?;
