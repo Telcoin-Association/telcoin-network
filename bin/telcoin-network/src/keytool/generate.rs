@@ -66,6 +66,9 @@ pub struct KeygenArgs {
     ///
     /// If not set will default to /ip4/127.0.0.1/udp/[PORT]/quic-v1 with an unused port for PORT.
     /// This default is only useful for tests (including a local testnet).
+    ///
+    /// NOTE: the node's [Protocol::P2p] is automatically added to the Multiaddr and does not need
+    /// to be provided.
     #[arg(long, value_name = "MULTIADDR", env = "TN_EXTERNAL_PRIMARY_ADDR")]
     pub external_primary_addr: Option<Multiaddr>,
 
@@ -75,6 +78,9 @@ pub struct KeygenArgs {
     ///
     /// If not set each worker will default to /ip4/127.0.0.1/udp/[PORT]/quic-v1 with an unused
     /// port for PORT. This default is only useful for tests (including a local testnet).
+    ///
+    /// NOTE: the node's [Protocol::P2p] is automatically added to the Multiaddr and does not need
+    /// to be provided.
     #[arg(
         long,
         value_name = "MULTIADDRS",
