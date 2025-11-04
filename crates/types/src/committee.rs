@@ -550,6 +550,12 @@ impl CommitteeBuilder {
     }
 }
 
+/// The quorum threshold (2f+1)
+/// This assumes all committee members have the same voting power of 1.
+pub fn quorum_threshold(committee_members: u64) -> u64 {
+    ((2 * committee_members) / 3) + 1
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
