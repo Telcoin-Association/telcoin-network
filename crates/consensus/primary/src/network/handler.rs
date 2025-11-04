@@ -79,7 +79,7 @@ where
     }
 
     /// Detect if we are too far behind the given epoch, round and switch to CVV inactive if we are
-    /// active. This will put us in a "catch up" mode until we have caught up enogh to rejoin
+    /// active. This will put us in a "catch up" mode until we have caught up enough to rejoin
     /// consensus.
     async fn behind_consensus(&self, epoch: Epoch, round: Round, number: Option<u64>) -> bool {
         // Last consensus block we have executed, us this to determine if we are
@@ -102,7 +102,7 @@ where
         // epoch_behind will work in that case.
         let outside_gc_window = epoch == exec_epoch && (exec_round + gc_depth) < round;
         // are we on older epoch?
-        // note, we need to make wure we are not at the epoch boundary otherwise
+        // note, we need to make sure we are not at the epoch boundary otherwise
         // we can get false positives
         let epoch_behind = if let Some(number) = number {
             epoch > exec_epoch && exec_number + 1 < number
@@ -164,7 +164,7 @@ where
                     match unverified_cert.verify_cert(&committee) {
                         Ok(cert) => {
                             if self.behind_consensus(epoch, cert.header().round, None).await {
-                                warn!(target: "primary", "certificate indicates we are behind, go to catchup mode!", );
+                                warn!(target: "primary", "certificate indicates we are behind, go to catchup mode!");
                                 return Ok(());
                             }
                             self.state_sync.process_peer_certificate(cert).await?;
@@ -172,12 +172,12 @@ where
                         Err(e) => warn!(target: "primary", "Recieved invalid cert {e}"),
                     }
                 } else {
+                    // If we can't find this cert's committee then it's bogus or we are
+                    // catching up. Ignore for now otherwise if we go inactive that could open
+                    // an attack surface since we can not verify the cert without the
+                    // committee.
                     warn!(target: "primary", "failed to get committee for epoch {epoch}, ignoring certificate!", );
                 }
-                // If we can't find this cert's committee then it's bogus or we are should be
-                // catching up. Ignore for now.  If we go inactive that could open
-                // an attack surface since we can not verify the cert without the
-                // committee.
             }
             PrimaryGossip::Consensus(result) => {
                 ensure!(
