@@ -436,6 +436,11 @@ impl Committee {
             .collect()
     }
 
+    /// Returns all the bls keys of all members.
+    pub fn bls_keys(&self) -> Vec<BlsPublicKey> {
+        self.inner.read().authorities.values().map(|authority| *authority.protocol_key()).collect()
+    }
+
     /// Return the bootstrap record for key if it exists.
     pub fn get_bootstrap(&self, key: &BlsPublicKey) -> Option<BootstrapServer> {
         self.inner.read().bootstrap_servers.get(key).cloned()
@@ -543,6 +548,12 @@ impl CommitteeBuilder {
     pub fn build(self) -> Committee {
         Committee::new(self.authorities, self.epoch, self.bootstrap_server)
     }
+}
+
+/// The quorum threshold (2f+1)
+/// This assumes all committee members have the same voting power of 1.
+pub fn quorum_threshold(committee_members: u64) -> u64 {
+    ((2 * committee_members) / 3) + 1
 }
 
 #[cfg(test)]
