@@ -119,7 +119,8 @@ pub fn build_batch<P: TxPool>(
     // sometimes batch are produced too quickly in certain configs (<1s diff)
     // resulting in batch timestamp == parent timestamp
     //
-    // TODO: check for this error at the quorum waiter level?
+    // Make sure the batch timestamp is not less than it's parent.
+    // Should not happen but would be invalid so let's not produce it...
     let mut timestamp = now();
     if timestamp == parent_info.timestamp {
         warn!(target: "worker::batch_builder", "new block timestamp same as parent - setting offset by 1sec");

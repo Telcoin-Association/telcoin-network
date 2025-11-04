@@ -78,6 +78,66 @@ where
         }
     }
 
+    /// Detect if we are too far behind the given epoch, round and switch to CVV inactive if we are
+    /// active. This will put us in a "catch up" mode until we have caught up enough to rejoin
+    /// consensus.
+    async fn behind_consensus(&self, epoch: Epoch, round: Round, number: Option<u64>) -> bool {
+        // Last consensus block we have executed, us this to determine if we are
+        // too far behind.
+        let (exec_number, exec_epoch, exec_round) = self
+            .consensus_config
+            .node_storage()
+            .last_record::<ConsensusBlocks>()
+            .map(|(n, h)| (n, h.sub_dag.leader_epoch(), h.sub_dag.leader_round()))
+            .unwrap_or((0, 0, 0));
+        // Use GC depth to estimate how many rounds we can be behind.
+        // Subtract ten here so if we are right on the GC depth we will still go inactive (small
+        // safety buffer).  Ten is arbitrary but should make sure we are comfortably within
+        // the current DAG. Trying to ride the GC window exactly can lead to subtle races
+        // (allow some time to get going).
+        let gc_depth = self.consensus_config.parameters().gc_depth.saturating_sub(10);
+        let active_cvv = self.consensus_bus.node_mode().borrow().is_active_cvv();
+        // is our round outside the GC window
+        // Will be false when not the same epoch (can't compare rounds) but
+        // epoch_behind will work in that case.
+        let outside_gc_window = epoch == exec_epoch && (exec_round + gc_depth) < round;
+        // are we on older epoch?
+        // note, we need to make sure we are not at the epoch boundary otherwise
+        // we can get false positives
+        let epoch_behind = if let Some(number) = number {
+            epoch > exec_epoch && exec_number + 1 < number
+        } else if exec_epoch + 1 == epoch {
+            // This check is a little hand-wavy, basically if we don't have the number (i.e.
+            // checking a cert) then we let the next epoch early rounds through (this
+            // allows two attempts to commit a leader). Having the number is better,
+            // this could allow for a race but we only use signed (quorate) certs
+            // for this data so will not allow crafted attacks.
+            // Also, these checks for certs are probably not 100% needed anyway...
+            round > 4
+        } else {
+            epoch > exec_epoch
+        };
+        // check if this node is inactive cvv and should be inactive (it is not
+        // caught up enough to be a CVV)
+        if active_cvv && (outside_gc_window || epoch_behind) {
+            // We seem to be too far behind to be an active CVV, try to go
+            // inactive to catch up.
+            let _ = self.consensus_bus.node_mode().send(NodeMode::CvvInactive);
+            self.consensus_config.shutdown().notify();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn get_committee(&self, epoch: Epoch) -> Option<Vec<BlsPublicKey>> {
+        if epoch == self.consensus_config.committee().epoch() {
+            Some(self.consensus_config.committee().bls_keys())
+        } else {
+            self.consensus_config.node_storage().get_committee_keys(epoch)
+        }
+    }
+
     /// Process gossip from the committee.
     ///
     /// Peers gossip the CertificateDigest so peers can request the Certificate. This waits until
@@ -98,7 +158,28 @@ where
                 );
                 // process certificate
                 let unverified_cert = cert.validate_received().map_err(CertManagerError::from)?;
-                self.state_sync.process_peer_certificate(unverified_cert).await?;
+
+                let epoch = unverified_cert.header().epoch;
+                // Early verify so we can detect we are behind.
+                // The verification is cached in the cert so this should not be too expensive.
+                if let Some(committee) = self.get_committee(epoch) {
+                    match unverified_cert.verify_cert(&committee) {
+                        Ok(cert) => {
+                            if self.behind_consensus(epoch, cert.header().round, None).await {
+                                warn!(target: "primary", "certificate indicates we are behind, go to catchup mode!");
+                                return Ok(());
+                            }
+                            self.state_sync.process_peer_certificate(cert).await?;
+                        }
+                        Err(e) => warn!(target: "primary", "Recieved invalid cert {e}"),
+                    }
+                } else {
+                    // If we can't find this cert's committee then it's bogus or we are
+                    // catching up. Ignore for now otherwise if we go inactive that could open
+                    // an attack surface since we can not verify the cert without the
+                    // committee.
+                    warn!(target: "primary", "failed to get committee for epoch {epoch}, ignoring certificate!", );
+                }
             }
             PrimaryGossip::Consensus(result) => {
                 ensure!(
@@ -134,46 +215,14 @@ where
                     // Once we have seen 1/3 + 1 committe members have signed this it should be
                     // valid.
                     let enough_sigs = (committee.len() / 3) + 1;
-                    let mut consensus_certs = self.consensus_certs.lock();
-                    let sigs = consensus_certs.get(&consensus_result_hash).copied();
+                    let sigs = self.consensus_certs.lock().get(&consensus_result_hash).copied();
                     if let Some(sigs) = sigs {
                         if (sigs + 1) as usize >= enough_sigs {
-                            // Last consensus block we have executed, us this to determine if we are
-                            // too far behind.
-                            let (exec_number, exec_epoch, exec_round) = self
-                                .consensus_config
-                                .node_storage()
-                                .last_record::<ConsensusBlocks>()
-                                .map(|(n, h)| {
-                                    (n, h.sub_dag.leader_epoch(), h.sub_dag.leader_round())
-                                })
-                                .unwrap_or((0, 0, 0));
-                            // Use GC depth to estimate how many blocks we can be behind (roughly
-                            // one block every two rounds).
-                            let gc_depth = self.consensus_config.parameters().gc_depth;
-                            let active_cvv = matches!(
-                                *self.consensus_bus.node_mode().borrow(),
-                                NodeMode::CvvActive
-                            );
-                            // is our round outside the GC window
-                            // Will be false when not the same epoch (can't compare rounds) but
-                            // epoch_behind will work in that case.
-                            let outside_gc_window =
-                                epoch == exec_epoch && (exec_round + gc_depth) < round;
-                            // are we on older epoch?
-                            // note, we need to make wure we are not at the epoch boundary otherwise
-                            // we can get false positives
-                            let epoch_behind = epoch > exec_epoch && exec_number + 1 < number;
-                            // check if this node is inactive cvv and should be inactive (it is not
-                            // caught up enough to be a CVV)
-                            if active_cvv && (outside_gc_window || epoch_behind) {
-                                // We seem to be too far behind to be an active CVV, try to go
-                                // inactive to catch up.
-                                let _ = self.consensus_bus.node_mode().send(NodeMode::CvvInactive);
-                                self.consensus_config.shutdown().notify();
-                                consensus_certs.clear();
+                            if self.behind_consensus(epoch, round, Some(number)).await {
+                                self.consensus_certs.lock().clear();
                                 return Ok(());
                             }
+
                             // Make sure we don't get old gossip and go backwards.
                             // number has to be greater than old_number due to an early check so
                             // this is safe Only send this when we are
@@ -183,12 +232,12 @@ where
                                 .consensus_bus
                                 .last_published_consensus_num_hash()
                                 .send((number, hash));
-                            consensus_certs.clear();
+                            self.consensus_certs.lock().clear();
                         } else {
-                            consensus_certs.insert(consensus_result_hash, sigs + 1);
+                            self.consensus_certs.lock().insert(consensus_result_hash, sigs + 1);
                         }
                     } else {
-                        consensus_certs.insert(consensus_result_hash, 1);
+                        self.consensus_certs.lock().insert(consensus_result_hash, 1);
                     }
                 } else {
                     let latest_missing = *self.consensus_bus.requested_missing_epoch().borrow();
