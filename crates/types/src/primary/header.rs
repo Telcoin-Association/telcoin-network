@@ -24,7 +24,7 @@ pub struct Header {
     pub created_at: TimestampSec,
     /// IndexMap of the [BatchDigest] to the [WorkerId] and [TimestampSec]
     #[serde(with = "indexmap::map::serde_seq")]
-    pub payload: IndexMap<BlockHash, (WorkerId, TimestampSec)>,
+    pub payload: IndexMap<BlockHash, WorkerId>,
     /// Parent certificates for this Header.
     pub parents: BTreeSet<CertificateDigest>,
     /// Hash and number of the latest known execution block when this Header was build.
@@ -43,7 +43,7 @@ impl Header {
         author: AuthorityIdentifier,
         round: Round,
         epoch: Epoch,
-        payload: IndexMap<BlockHash, (WorkerId, TimestampSec)>,
+        payload: IndexMap<BlockHash, WorkerId>,
         parents: BTreeSet<CertificateDigest>,
         latest_execution_block: BlockNumHash,
     ) -> Self {
@@ -92,7 +92,7 @@ impl Header {
             .ok_or(HeaderError::UnknownAuthority(self.author.to_string()))?;
 
         // Ensure all worker ids are correct.
-        for (worker_id, _) in self.payload.values() {
+        for worker_id in self.payload.values() {
             if *worker_id as usize >= committee.number_of_workers() {
                 return Err(HeaderError::UnkownWorkerId);
             }
@@ -118,7 +118,7 @@ impl Header {
         &self.created_at
     }
     /// The payload for the header.
-    pub fn payload(&self) -> &IndexMap<BlockHash, (WorkerId, TimestampSec)> {
+    pub fn payload(&self) -> &IndexMap<BlockHash, WorkerId> {
         &self.payload
     }
     /// The parents for the header.
@@ -131,10 +131,7 @@ impl Header {
     /// Replace the header's payload with a new one.
     ///
     /// Only used for testing.
-    pub fn update_payload_for_test(
-        &mut self,
-        new_payload: IndexMap<BlockHash, (WorkerId, TimestampSec)>,
-    ) {
+    pub fn update_payload_for_test(&mut self, new_payload: IndexMap<BlockHash, WorkerId>) {
         self.payload = new_payload;
     }
 
@@ -184,18 +181,13 @@ impl HeaderBuilder {
     }
 
     /// Helper method to directly set values of the payload
-    pub fn with_payload_batch(
-        mut self,
-        batch: Batch,
-        worker_id: WorkerId,
-        created_at: TimestampSec,
-    ) -> Self {
+    pub fn with_payload_batch(mut self, batch: Batch, worker_id: WorkerId) -> Self {
         if self.payload.is_none() {
             self.payload = Some(Default::default());
         }
         let payload = self.payload.as_mut().unwrap();
 
-        payload.insert(batch.digest(), (worker_id, created_at));
+        payload.insert(batch.digest(), worker_id);
 
         self
     }

@@ -81,6 +81,7 @@ async fn test_make_batch_el_to_cl() {
         task_manager.get_spawner(),
         0,
         BaseFeeContainer::default(),
+        0,
     );
 
     let gas_price = reth_env.get_gas_price().unwrap();
@@ -152,8 +153,13 @@ async fn test_make_batch_el_to_cl() {
     let sealed_batch = sealed_batch.unwrap();
 
     // ensure batch validator succeeds
-    let batch_validator =
-        BatchValidator::new(reth_env.clone(), Some(txpool.clone()), 0, BaseFeeContainer::default());
+    let batch_validator = BatchValidator::new(
+        reth_env.clone(),
+        Some(txpool.clone()),
+        0,
+        BaseFeeContainer::default(),
+        0,
+    );
 
     let valid_batch_result = batch_validator.validate_batch(sealed_batch.clone());
     assert!(valid_batch_result.is_ok());
@@ -234,6 +240,7 @@ async fn test_batch_builder_produces_valid_batches() {
         task_manager.get_spawner(),
         0,
         BaseFeeContainer::default(),
+        0,
     );
 
     let gas_price = reth_env.get_gas_price().unwrap();
@@ -324,8 +331,13 @@ async fn test_batch_builder_produces_valid_batches() {
     let _ = ack.send(Ok(()));
 
     // validate first batch
-    let batch_validator =
-        BatchValidator::new(reth_env.clone(), Some(txpool.clone()), 0, BaseFeeContainer::default());
+    let batch_validator = BatchValidator::new(
+        reth_env.clone(),
+        Some(txpool.clone()),
+        0,
+        BaseFeeContainer::default(),
+        0,
+    );
 
     let valid_batch_result = batch_validator.validate_batch(first_batch.clone());
     assert!(valid_batch_result.is_ok());
@@ -405,6 +417,7 @@ async fn test_canonical_notification_updates_pool() {
         task_manager.get_spawner(),
         0,
         BaseFeeContainer::default(),
+        0,
     );
 
     let gas_price = reth_env.get_gas_price().unwrap();
@@ -476,7 +489,7 @@ async fn test_canonical_notification_updates_pool() {
         ..Default::default()
     };
 
-    execute_test_batch(&mut first_batch, &chain.sealed_genesis_header());
+    execute_test_batch(&mut first_batch);
 
     // execute batch - create output for consistency
     let batch_digests = VecDeque::from([first_batch.digest()]);
@@ -520,8 +533,13 @@ async fn test_canonical_notification_updates_pool() {
     let _ = ack.send(Ok(()));
 
     // validate batch
-    let batch_validator =
-        BatchValidator::new(reth_env.clone(), Some(txpool.clone()), 0, BaseFeeContainer::default());
+    let batch_validator = BatchValidator::new(
+        reth_env.clone(),
+        Some(txpool.clone()),
+        0,
+        BaseFeeContainer::default(),
+        0,
+    );
 
     let valid_batch_result = batch_validator.validate_batch(first_batch.clone());
     assert!(valid_batch_result.is_ok());

@@ -413,7 +413,7 @@ impl<DB: Database> Subscriber<DB> {
                 .observe(cert.created_at().elapsed().as_secs_f64());
 
             // retrieve fetched batch by digest
-            for (digest, (_, _)) in cert.header().payload().iter() {
+            for digest in cert.header().payload().keys() {
                 self.consensus_bus.executor_metrics().subscriber_processed_blocks.inc();
                 let batch = fetched_batches.remove(digest).ok_or(SubscriberError::MissingFetchedBatch(*digest)).inspect_err(|_| {
                     error!(target: "subscriber", "[Protocol violation] Batch not found in fetched batches from workers of certificate signers");
@@ -472,27 +472,14 @@ impl<DB: Database> Subscriber<DB> {
                 .block_execution_local_latency
                 .with_label_values(&["other"])
                 .observe(remote_duration);
-        } else {
-            let local_duration = batch.created_at().elapsed().as_secs_f64();
+
+            self.consensus_bus.executor_metrics().block_execution_latency.observe(remote_duration);
             debug!(
                 target: "subscriber",
-                "Batch was fetched for execution after being created locally {}s ago.",
-                local_duration
+                "Block {:?} took {} seconds since it has been created to when it has been fetched for execution",
+                digest,
+                remote_duration,
             );
-            self.consensus_bus
-                .executor_metrics()
-                .block_execution_local_latency
-                .with_label_values(&["own"])
-                .observe(local_duration);
         };
-
-        let block_fetch_duration = batch.created_at().elapsed().as_secs_f64();
-        self.consensus_bus.executor_metrics().block_execution_latency.observe(block_fetch_duration);
-        debug!(
-            target: "subscriber",
-            "Block {:?} took {} seconds since it has been created to when it has been fetched for execution",
-            digest,
-            block_fetch_duration,
-        );
     }
 }

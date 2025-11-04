@@ -108,12 +108,10 @@ where
             epoch > exec_epoch && exec_number + 1 < number
         } else if exec_epoch + 1 == epoch {
             // This check is a little hand-wavy, basically if we don't have the number (i.e.
-            // checking a cert) then we let the next epoch early rounds through (this
-            // allows two attempts to commit a leader). Having the number is better,
-            // this could allow for a race but we only use signed (quorate) certs
-            // for this data so will not allow crafted attacks.
+            // checking a cert) then we let the next epoch early rounds through. Having the
+            // number is better.  Note we will seen 1/3 + 1 (min) certs to here.
             // Also, these checks for certs are probably not 100% needed anyway...
-            round > 4
+            round > gc_depth.max(6)
         } else {
             epoch > exec_epoch
         };

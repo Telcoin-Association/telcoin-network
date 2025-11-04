@@ -4,7 +4,7 @@
 //! have reached quorum.
 
 use crate::{
-    crypto, encode, now, Address, BlockHash, ExecHeader, TimestampSec, MIN_PROTOCOL_BASE_FEE,
+    crypto, encode, Address, BlockHash, Epoch, ExecHeader, TimestampSec, MIN_PROTOCOL_BASE_FEE,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -62,15 +62,11 @@ impl SealedBatch {
 pub struct Batch {
     /// The collection of transactions in this batch as bytes.
     pub transactions: Vec<Vec<u8>>,
-    /// The Keccak 256-bit hash of the parent
-    /// batch’s header, in its entirety; formally Hp.
-    pub parent_hash: BlockHash,
+    /// The epoch that this batch belongs to.
+    pub epoch: Epoch,
     /// The 160-bit address to which all fees collected from the successful mining of this batch
     /// be transferred; formally Hc.
     pub beneficiary: Address,
-    /// A scalar value equal to the reasonable output of Unix’s time() at this batch’s inception;
-    /// formally Hs.
-    pub timestamp: u64,
     /// A scalar representing EIP1559 base fee which can move up or down each batch according
     /// to a formula which is a function of gas used in parent batch and gas target
     /// (batch gas limit divided by elasticity multiplier) of parent batch.
@@ -99,12 +95,12 @@ impl Batch {
         transactions: Vec<Vec<u8>>,
         header: ExecHeader,
         worker_id: WorkerId,
+        epoch: Epoch,
     ) -> Self {
         Self {
             transactions,
-            parent_hash: header.parent_hash,
+            epoch,
             beneficiary: header.beneficiary,
-            timestamp: header.timestamp,
             base_fee_per_gas: header.base_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE),
             worker_id,
             received_at: None,
@@ -124,11 +120,6 @@ impl Batch {
         hasher.update(encode(self).as_ref());
         // finalize
         BlockHash::from_slice(hasher.finalize().as_bytes())
-    }
-
-    /// Timestamp of this batch header.
-    pub fn created_at(&self) -> TimestampSec {
-        self.timestamp
     }
 
     /// Pass a reference to a collection of transaction bytes;
@@ -175,9 +166,8 @@ impl Default for Batch {
         Self {
             transactions: vec![],
             received_at: None,
-            parent_hash: BlockHash::default(),
+            epoch: Epoch::default(),
             beneficiary: Address::ZERO,
-            timestamp: now(),
             worker_id: 0,
             base_fee_per_gas: MIN_PROTOCOL_BASE_FEE,
         }
@@ -198,13 +188,13 @@ impl From<&[u8]> for SealedBatch {
 
 /// Return the max gas per batch in effect at timestamp.
 /// Currently allways 30,000,000 but can change in the future at a fork.
-pub fn max_batch_gas(_timestamp: u64) -> u64 {
+pub fn max_batch_gas(_epoch: Epoch) -> u64 {
     30_000_000
 }
 
 /// Max batch size in effect at a timestamp.  Measured in bytes.
 /// Currently allways 1,000,000 but can change in the future at a fork.
-pub fn max_batch_size(_timestamp: u64) -> usize {
+pub fn max_batch_size(_epoch: Epoch) -> usize {
     1_000_000
 }
 
@@ -227,14 +217,6 @@ pub enum BatchValidationError {
     /// The sealed batch hash does not match this worker's calculated digest.
     #[error("Invalid digest for sealed batch.")]
     InvalidDigest,
-    /// Ensure proposed batch is after parent.
-    #[error("Peer's header proposed before parent batch timestamp.")]
-    TimestampIsInPast {
-        /// The parent batch's timestamp.
-        parent_timestamp: u64,
-        /// The batch's timestamp.
-        timestamp: u64,
-    },
     /// Canonical chain header cannot be found.
     #[error("Canonical chain header {block_hash} can't be found for peer batch's parent")]
     CanonicalChain {
@@ -275,4 +257,7 @@ pub enum BatchValidationError {
     /// The total allowable gas in the batch exceeds `u64::MAX`.
     #[error("Overflow calculating max possible gas.")]
     GasOverflow,
+    /// Error, wrong epoch.
+    #[error("Invalid epoch, expected epoch {expected} got epoch {found}")]
+    InvalidEpoch { expected: Epoch, found: Epoch },
 }

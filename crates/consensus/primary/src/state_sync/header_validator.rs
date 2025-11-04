@@ -97,7 +97,7 @@ where
         }
 
         let mut missing = HashMap::new();
-        for (digest, (worker_id, _)) in header.payload().iter() {
+        for (digest, worker_id) in header.payload().iter() {
             // The primary must verify that batches come from the correct worker IDs by storing
             // (digest, worker_id) pairs. This prevents a critical attack vector where malicious
             // nodes can cause synchronization deadlocks:

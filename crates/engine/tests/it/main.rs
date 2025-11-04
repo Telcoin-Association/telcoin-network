@@ -357,7 +357,6 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         &tmp_dir.path().join("exc-node"),
         Some(gas_accumulator.rewards_counter()),
     )?;
-    let parent = chain.sealed_genesis_header();
 
     // create committee from genesis state
     let committee = create_committee_from_state(&execution_node).await?;
@@ -390,7 +389,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         batch.base_fee_per_gas = inc_base_fee;
 
         // actually execute the batch now
-        execute_test_batch(batch, &parent);
+        execute_test_batch(batch);
 
         // all txs in test batches are EOA->EOA native token transfers
         // which costs 21_000 gas
@@ -421,7 +420,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         batch.base_fee_per_gas = inc_base_fee;
 
         // actually execute the block now
-        execute_test_batch(batch, &parent);
+        execute_test_batch(batch);
         // all txs in test batches are EOA->EOA native token transfers
         // 21_000 gas
         let batch_basefees = U256::from(
@@ -474,6 +473,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
 
     // create second output
     let mut leader_2 = Certificate::default();
+    let leader_2_epoch = leader_2.epoch();
     // update cert
     leader_2.update_created_at_for_test(timestamp + 2);
     leader_2.header_mut_for_test().author = authority_2;
@@ -701,7 +701,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         // ie) no duplicates, etc.
         assert_eq!(block.logs_bloom, Bloom::default());
         // gas limit should come from batch
-        assert_eq!(block.gas_limit, max_batch_gas(block.number));
+        assert_eq!(block.gas_limit, max_batch_gas(leader_2_epoch));
         // difficulty should match the batch's index within consensus output
         // and default worker id 0
         assert_eq!(block.difficulty, U256::from(expected_batch_index << 16));
@@ -815,7 +815,6 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         &tmp_dir.path().join("exc-node"),
         Some(gas_accumulator.rewards_counter()),
     )?;
-    let parent = chain.sealed_genesis_header();
 
     // create committee from genesis state
     let committee = create_committee_from_state(&execution_node).await?;
@@ -848,7 +847,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         batch.base_fee_per_gas = inc_base_fee;
 
         // actually execute the batch now
-        execute_test_batch(batch, &parent);
+        execute_test_batch(batch);
 
         // skip duplicate batch, otherwise calculate expected basefees
         if idx != DUPLICATE_BATCH_INDEX {
@@ -882,7 +881,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         batch.base_fee_per_gas = inc_base_fee;
 
         // actually execute the block now
-        execute_test_batch(batch, &parent);
+        execute_test_batch(batch);
 
         // skip duplicate batch, otherwise calculate expected basefees
         if idx != DUPLICATE_BATCH_INDEX {
@@ -956,6 +955,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
 
     // create second output
     let mut leader_2 = Certificate::default();
+    let leader_2_epoch = leader_2.epoch();
     // update timestamp
     leader_2.update_created_at_for_test(timestamp + 2);
     leader_2.header_mut_for_test().author = authority_2;
@@ -1144,7 +1144,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
             assert!(block.senders().is_empty());
             assert!(block.body().transactions.is_empty());
             // gas used should NOT be the same as bc duplicate transaction are ignored
-            assert_ne!(block.gas_used, max_batch_gas(block.number));
+            assert_ne!(block.gas_used, max_batch_gas(leader_2_epoch));
             // gas used should be zero bc all transactions were duplicates
             assert_eq!(block.gas_used, 0);
         } else {
@@ -1215,7 +1215,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         // ie) no duplicates, etc.
         assert_eq!(block.logs_bloom, Bloom::default());
         // gas limit should come from batch
-        assert_eq!(block.gas_limit, max_batch_gas(block.number));
+        assert_eq!(block.gas_limit, max_batch_gas(leader_2_epoch));
         // difficulty should match the batch's index within consensus output
         // and default worker id 0
         assert_eq!(block.difficulty, U256::from(expected_batch_index << 16));
@@ -1270,7 +1270,6 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         &tmp_dir.path().join("exc-node"),
         None,
     )?;
-    let parent = chain.sealed_genesis_header();
 
     // execute batches to update headers with valid data
     let mut inc_base_fee = MIN_PROTOCOL_BASE_FEE;
@@ -1288,7 +1287,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         batch.base_fee_per_gas = inc_base_fee;
 
         // actually execute the block now
-        execute_test_batch(batch, &parent);
+        execute_test_batch(batch);
         debug!("{idx}\n{:?}\n", batch);
     }
 
@@ -1304,7 +1303,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         batch.base_fee_per_gas = inc_base_fee;
 
         // actually execute the block now
-        execute_test_batch(batch, &parent);
+        execute_test_batch(batch);
         debug!("{idx}\n{:?}\n", batch);
     }
 

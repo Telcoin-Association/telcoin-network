@@ -518,11 +518,11 @@ where
 
         // This needs to be created early so required machinery for other tasks exists when needed.
         let mut worker = worker_node.new_worker().await?;
+        let current_epoch = primary.current_committee().await.epoch();
 
         // Produce a "dummy" epoch 0 EpochRecord if missing.
         // This will let us use simple code to find any epoch including 0 at startup.
         if self.consensus_db.get_committee_keys(0).is_none() {
-            let current_epoch = primary.current_committee().await.epoch();
             if current_epoch != 0 {
                 return Err(eyre::eyre!(
                     "We have epoch 0 in our database if we are past epoch 0, on {current_epoch}"
@@ -554,6 +554,7 @@ where
                 worker.batches_tx(),
                 &batch_builder_task_spawner,
                 gas_accumulator.base_fee(worker.id()),
+                current_epoch,
             )
             .await?;
 
@@ -1283,7 +1284,9 @@ where
             .ok_or_eyre("worker network handle missing from epoch manager")?
             .clone();
 
-        let validator = engine.new_batch_validator(&worker_id, base_fee).await;
+        let validator = engine
+            .new_batch_validator(&worker_id, base_fee, consensus_config.committee().epoch())
+            .await;
         self.spawn_worker_network_for_epoch(
             consensus_config,
             &worker_id,
