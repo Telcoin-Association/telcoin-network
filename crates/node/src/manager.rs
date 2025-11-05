@@ -45,8 +45,8 @@ use tn_types::{
     error::HeaderError, gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash,
     BlsAggregateSignature, BlsPublicKey, BlsSignature, Committee, CommitteeBuilder,
     ConsensusHeader, ConsensusOutput, Database as TNDatabase, Epoch, EpochCertificate, EpochRecord,
-    EpochVote, Noticer, Notifier, TaskJoinError, TaskManager, TaskSpawner, TimestampSec,
-    TnReceiver, TnSender, B256, MIN_PROTOCOL_BASE_FEE,
+    EpochVote, Multiaddr, NetworkPublicKey, Noticer, Notifier, TaskJoinError, TaskManager,
+    TaskSpawner, TimestampSec, TnReceiver, TnSender, B256, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{
     quorum_waiter::QuorumWaiterTrait, Worker, WorkerNetwork, WorkerNetworkHandle, WorkerRequest,
@@ -1348,7 +1348,11 @@ where
         // start listening if the network needs to be initialized
         if *initial_epoch {
             // start listening for p2p messages
-            let primary_address = consensus_config.primary_address();
+            let primary_address = Self::parse_listener_address_for_swarm(
+                "PRIMARY_LISTENER_MULTIADDR",
+                consensus_config.primary_networkkey(),
+                consensus_config.primary_address(),
+            )?;
             info!(target: "epoch-manager", ?primary_address, "listening to {primary_address}");
             network_handle.inner_handle().start_listening(primary_address).await?;
         }
@@ -1449,7 +1453,11 @@ where
 
         // start listening if the network needs to be initialized
         if *initial_epoch {
-            let worker_address = consensus_config.worker_address();
+            let worker_address = Self::parse_listener_address_for_swarm(
+                "WORKER_LISTENER_MULTIADDR",
+                consensus_config.primary_networkkey(),
+                consensus_config.worker_address(),
+            )?;
             network_handle.inner_handle().start_listening(worker_address).await?;
             // Make sure we at least hove bootstrap peers on first epoch.
             network_handle
@@ -1609,5 +1617,34 @@ where
         self.consensus_db.clear_table::<CertificateDigestByOrigin>()?;
         self.consensus_db.clear_table::<Payload>()?;
         Ok(())
+    }
+
+    /// Helper method for parsing provided env var with fallback [Multiaddr]. This is useful to
+    /// override the primary/worker swarm listner address for cloud deployments.
+    fn parse_listener_address_for_swarm(
+        env_var: &str,
+        network_pubkey: NetworkPublicKey,
+        fallback: Multiaddr,
+    ) -> eyre::Result<Multiaddr> {
+        std::env::var(env_var)
+            .map(|addr| {
+                addr.parse()
+                    .map_err(|e| {
+                        eyre::eyre!(
+                            "Failed to parse listener multiaddr from env {env_var} ({addr})\n{e}"
+                        )
+                    })
+                    // add Protocol::P2p to multiaddr to maintain consistency with
+                    // bin/telcoin-network/src/keytool/generate.rs
+                    .and_then(|multi: Multiaddr| {
+                        multi.with_p2p(network_pubkey.into()).map_err(|_| {
+                            eyre::eyre!(
+                                "{env_var} multiaddr contains a different P2P protocol {:?}",
+                                std::env::var(env_var)
+                            )
+                        })
+                    })
+            })
+            .unwrap_or(Ok(fallback))
     }
 }
