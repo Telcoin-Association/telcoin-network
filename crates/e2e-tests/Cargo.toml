@@ -19,6 +19,13 @@ tn-node = { workspace = true }
 tn-types = { workspace = true, features = ["test-utils"] }
 tracing = { workspace = true }
 tn-faucet = { workspace = true, optional = true }
+jsonrpsee = { workspace = true }
+tokio = { workspace = true, features = [
+    "sync",
+    "macros",
+    "time",
+    "rt-multi-thread",
+] }
 
 [dev-dependencies]
 tn-reth = { workspace = true, features = ["test-utils"] }
@@ -27,12 +34,6 @@ serde_json = { workspace = true }
 rand_chacha = { workspace = true }
 alloy = { workspace = true }
 rand = { workspace = true }
-tokio = { workspace = true, features = [
-    "sync",
-    "macros",
-    "time",
-    "rt-multi-thread",
-] }
 
 # Used for integration testing.
 ethereum-tx-sign = "6.1.3"
@@ -43,7 +44,6 @@ gcloud-sdk = { version = "=0.24.6", default-features = false, features = [
     "google-cloud-kms-v1",
     "tls-webpki-roots",
 ] }
-jsonrpsee = { workspace = true }
 k256 = "0.13.3"
 tonic = { workspace = true }
 nix = { version = "0.29", features = ["signal"] }
@@ -57,7 +57,7 @@ secp256k1 = { workspace = true, features = [
 
 [features]
 default = []
-faucet = ["dep:tn-faucet", "telcoin-network-cli/faucet"]
+faucet = ["dep:tn-faucet"]
 
 [lints]
 workspace = true
