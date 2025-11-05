@@ -1,5 +1,5 @@
-use crate::util::{config_local_testnet, IT_TEST_MUTEX};
 use alloy::primitives::address;
+use e2e_tests::{config_local_testnet, IT_TEST_MUTEX};
 use ethereum_tx_sign::{LegacyTransaction, Transaction};
 use eyre::Report;
 use jsonrpsee::{

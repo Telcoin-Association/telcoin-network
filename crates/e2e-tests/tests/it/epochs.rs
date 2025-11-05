@@ -1,12 +1,12 @@
 //! Test the epoch boundary and validator shuffles.
 
-use crate::util::create_validator_info;
 use alloy::{
     primitives::utils::parse_ether,
     providers::{Provider, ProviderBuilder},
     sol_types::SolCall,
 };
 use clap::Parser as _;
+use e2e_tests::{create_validator_info, IT_TEST_MUTEX};
 use nix::{
     sys::signal::{self, Signal},
     unistd::Pid,
@@ -273,6 +273,7 @@ fn send_term(child: &mut Child) {
 #[tokio::test]
 /// Test a new node joining the network and being shuffled into the committee.
 async fn test_epoch_boundary() -> eyre::Result<()> {
+    let _guard = IT_TEST_MUTEX.lock();
     tn_types::test_utils::init_test_tracing();
     // create validator and governance wallets for adding new validator later
     let mut new_validator = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(6));
@@ -320,6 +321,7 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
 #[tokio::test]
 /// Test that sync works to fill in missing epochs.
 async fn test_epoch_sync() -> eyre::Result<()> {
+    let _guard = IT_TEST_MUTEX.lock();
     tn_types::test_utils::init_test_tracing();
     // create validator and governance wallets for adding new validator later
     let new_validator = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(6));

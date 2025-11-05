@@ -1,3 +1,6 @@
+//! Main binary for TN CLI
+#![warn(unused_crate_dependencies)]
+
 use clap::Parser as _;
 use telcoin_network::cli::{Commands, PassSource};
 #[cfg(feature = "faucet")]

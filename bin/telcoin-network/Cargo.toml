@@ -28,7 +28,6 @@ tokio = { workspace = true, features = [
     "rt-multi-thread",
 ] }
 tracing = { workspace = true }
-rand = { workspace = true }
 tn-types = { workspace = true }
 tn-node = { workspace = true }
 tn-faucet = { workspace = true, optional = true }

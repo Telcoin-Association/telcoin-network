@@ -3123,6 +3123,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c7a8fb8a9fbf66c1f703fe16184d10ca0ee9d23be5b4436400408ba54a95005"
 
 [[package]]
+name = "e2e-tests"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "cfg-if",
+ "clap",
+ "const-hex",
+ "ethereum-tx-sign",
+ "eyre",
+ "futures",
+ "gcloud-sdk",
+ "jsonrpsee",
+ "k256",
+ "nix 0.29.0",
+ "rand 0.9.1",
+ "rand_chacha 0.9.0",
+ "secp256k1 0.31.0",
+ "serde_json",
+ "telcoin-network",
+ "tempfile",
+ "tn-config",
+ "tn-faucet",
+ "tn-node",
+ "tn-reth",
+ "tn-types",
+ "tokio",
+ "tonic 0.13.1",
+ "tracing",
+]
+
+[[package]]
 name = "ecdsa"
 version = "0.16.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11419,7 +11450,6 @@ dependencies = [
  "jsonrpsee",
  "k256",
  "nix 0.29.0",
- "rand 0.9.1",
  "rand_chacha 0.9.0",
  "rayon",
  "rpassword",

@@ -14,6 +14,7 @@ members = [
     "crates/network-libp2p",
     "crates/state-sync",
     "crates/tn-reth",
+    "crates/e2e-tests",
 
     # consensus
     "crates/consensus/consensus-metrics",

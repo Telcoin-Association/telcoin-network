@@ -5,6 +5,5 @@ mod epochs;
 mod faucet;
 mod genesis_tests;
 mod restarts;
-mod util;
 
 fn main() {}
