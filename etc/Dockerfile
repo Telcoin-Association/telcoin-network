@@ -1,4 +1,4 @@
-FROM rust:1.86-slim-bookworm AS builder
+FROM rust:1.91-slim-bookworm AS builder
 
 WORKDIR /usr/src/telcoin-network
 
@@ -24,7 +24,7 @@ COPY tn-contracts/ ./tn-contracts/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=./target \
-    cargo build --bin telcoin-network --release \
+    cargo build --bin telcoin-network --release --features faucet \
     && mv ./target/release/telcoin-network /tmp/
 
 # production image

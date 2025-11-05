@@ -17,7 +17,7 @@ help:
 	@echo "make udeps" ;
 	@echo "    :::> Check unused dependencies in the entire project by package." ;
 	@echo "    :::> Dev needs 'cargo-udeps' installed." ;
-	@echo "    :::> Dev also needs rust nightly and protobuf (on mac). ";
+	@echo "    :::> Dev also needs rust nightly-2025-11-04 and protobuf (on mac). ";
 	@echo "    :::> To install run: 'cargo install cargo-udeps --locked'." ;
 	@echo ;
 	@echo "make check" ;
@@ -33,10 +33,10 @@ help:
 	@echo "    :::> Test restart integration tests." ;
 	@echo ;
 	@echo "make fmt" ;
-	@echo "    :::> cargo +nightly fmt" ;
+	@echo "    :::> cargo +nightly-2025-11-04 fmt" ;
 	@echo ;
 	@echo "make clippy" ;
-	@echo "    :::> Cargo +nightly clippy for all features with fix enabled." ;
+	@echo "    :::> Cargo +nightly-2025-11-04 clippy for all features with fix enabled." ;
 	@echo ;
 	@echo "make docker-login" ;
 	@echo "    :::> Setup docker registry using gcloud artifacts." ;
@@ -69,7 +69,7 @@ attest:
 
 # check for unused dependencies
 udeps:
-	find . -type f -name Cargo.toml -exec sed -rne 's/^name = "(.*)"/\1/p' {} + | xargs -I {} sh -c "echo '\n\n{}:' && cargo +nightly udeps --package {}" ;
+	find . -type f -name Cargo.toml -exec sed -rne 's/^name = "(.*)"/\1/p' {} + | xargs -I {} sh -c "echo '\n\n{}:' && cargo +nightly-2025-11-04 udeps --package {}" ;
 
 check:
 	cargo check --workspace --all-features --all-targets ;
@@ -86,13 +86,13 @@ test-faucet:
 test-restarts:
 	cargo test test_restarts -- --ignored ;
 
-# format using +nightly toolchain
+# format using +nightly-2025-11-04 toolchain
 fmt:
-	cargo +nightly fmt ;
+	cargo +nightly-2025-11-04 fmt ;
 
 # clippy formatter + try to fix problems
 clippy:
-	cargo +nightly clippy --workspace --all-features --fix ;
+	cargo +nightly-2025-11-04 clippy --workspace --all-features --fix ;
 
 # login to gcloud artifact registry for managing docker images
 docker-login:
