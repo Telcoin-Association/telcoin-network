@@ -406,7 +406,7 @@ where
                     //
                     // calculate v based on EIP-155
                     let v = recovery_id as u64 + chain_id * 2 + 35;
-                    let y_odd_parity = v % 2 == 0;
+                    let y_odd_parity = v.is_multiple_of(2);
                     return Ok(y_odd_parity);
                 }
             }
