@@ -13,7 +13,7 @@
 
 use clap::Parser;
 use std::path::{Path, PathBuf};
-use telcoin_network::{genesis::GenesisArgs, keytool::KeyArgs, node::NodeCommand};
+use telcoin_network_cli::{genesis::GenesisArgs, keytool::KeyArgs, node::NodeCommand};
 use tn_config::{Config, ConfigFmt, ConfigTrait};
 use tn_node::launch_node;
 use tn_types::{test_utils::CommandParser, Address, Genesis, GenesisAccount};

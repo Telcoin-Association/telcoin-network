@@ -11,7 +11,7 @@ description.workspace = true
 exclude.workspace = true
 
 [dependencies]
-telcoin-network = { path = "../../bin/telcoin-network" }
+telcoin-network-cli = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 eyre = { workspace = true }
 tn-config = { workspace = true, features = ["test-utils"]}
@@ -57,7 +57,7 @@ secp256k1 = { workspace = true, features = [
 
 [features]
 default = []
-faucet = ["dep:tn-faucet", "telcoin-network/faucet"]
+faucet = ["dep:tn-faucet", "telcoin-network-cli/faucet"]
 
 [lints]
 workspace = true

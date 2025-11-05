@@ -15,6 +15,7 @@ members = [
     "crates/state-sync",
     "crates/tn-reth",
     "crates/e2e-tests",
+    "crates/telcoin-network-cli",
 
     # consensus
     "crates/consensus/consensus-metrics",
@@ -142,6 +143,7 @@ tn-network-types = { path = "./crates/network-types" }
 tn-rpc = { path = "./crates/execution/tn-rpc" }
 state-sync = { path = "./crates/state-sync" }
 tn-utils = { path = "./crates/tn-utils" }
+telcoin-network-cli = { path = "./crates/telcoin-network-cli" }
 
 # optional
 tn-faucet = { path = "./crates/execution/faucet" }

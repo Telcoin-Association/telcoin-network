@@ -1,0 +1,71 @@
+[package]
+name = "telcoin-network-cli"
+version.workspace = true
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/telcoin/telcoin-network"
+readme = "README.md"
+authors = [
+    "Grant Kee <grant@telcoin.org>",
+    "Steven Stanfield <steve@telcoin.org>",
+    "Markus Osterlund <markus@telcoin.org>",
+]
+
+[dependencies]
+clap = { workspace = true, features = ["derive", "env"] }
+eyre = { workspace = true }
+const-str = "0.5.6"
+fdlimit = { workspace = true }
+secp256k1 = { workspace = true, features = [
+    "global-context",
+    "rand",
+    "recovery",
+] }
+tokio = { workspace = true, features = [
+    "sync",
+    "macros",
+    "time",
+    "rt-multi-thread",
+] }
+tracing = { workspace = true }
+tn-types = { workspace = true }
+tn-node = { workspace = true }
+tn-faucet = { workspace = true, optional = true }
+alloy = { workspace = true }
+tn-reth = { workspace = true }
+tn-config = { workspace = true }
+rayon = { workspace = true }
+dirs-next = { workspace = true }
+bs58 = { workspace = true }
+serde_yaml = { workspace = true }
+
+[dev-dependencies]
+tn-types = { workspace = true, features = ["test-utils"] }
+tn-reth = { workspace = true, features = ["test-utils"] }
+tn-config = { workspace = true, features = ["test-utils"]}
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+rand_chacha = { workspace = true }
+
+# Used for integration testing.
+ethereum-tx-sign = "6.1.3"
+const-hex = "1.12.0"
+
+# faucet-specific
+gcloud-sdk = { version = "=0.24.6", default-features = false, features = [
+    "google-cloud-kms-v1",
+    "tls-webpki-roots",
+] }
+jsonrpsee = { workspace = true }
+k256 = "0.13.3"
+tonic = { workspace = true }
+nix = { version = "0.29", features = ["signal"] }
+cfg-if = { workspace = true }
+futures = { workspace = true }
+
+[features]
+default = []
+faucet = ["tn-faucet"]
+
+[build-dependencies]
+vergen = { version = "8.0.0", features = ["build", "cargo", "git", "gitcl"] }

@@ -10,7 +10,7 @@ use eyre::OptionExt;
 use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_params};
 use serde_json::Value;
 use std::time::Duration;
-use telcoin_network::args::clap_u256_parser_to_18_decimals;
+use telcoin_network_cli::args::clap_u256_parser_to_18_decimals;
 use tn_config::{
     NetworkGenesis, BLSG1_JSON, CONSENSUS_REGISTRY_JSON, DEPLOYMENTS_JSON, ISSUANCE_ADDRESS,
     ISSUANCE_JSON,

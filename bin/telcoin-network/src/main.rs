@@ -1,8 +1,7 @@
 //! Main binary for TN CLI
-#![warn(unused_crate_dependencies)]
 
 use clap::Parser as _;
-use telcoin_network::cli::{Commands, PassSource};
+use telcoin_network_cli::cli::{Commands, PassSource};
 #[cfg(feature = "faucet")]
 use tn_faucet::FaucetArgs;
 use tn_node::launch_node;
@@ -58,9 +57,9 @@ fn main() {
     // Access the environment befor we do anything else, even use CLAP.
     let mut passphrase = get_bls_passphrase_from_env();
     #[cfg(not(feature = "faucet"))]
-    let cli = telcoin_network::cli::Cli::<telcoin_network::NoArgs>::parse();
+    let cli = telcoin_network_cli::cli::Cli::<telcoin_network_cli::NoArgs>::parse();
     #[cfg(feature = "faucet")]
-    let cli = telcoin_network::cli::Cli::<FaucetArgs>::parse();
+    let cli = telcoin_network_cli::cli::Cli::<FaucetArgs>::parse();
 
     // Sort out the BLS key passphrase depending on the command run.
     match cli.bls_passphrase_source {

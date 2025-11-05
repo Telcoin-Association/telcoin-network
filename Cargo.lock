@@ -3040,7 +3040,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.0",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3141,7 +3141,7 @@ dependencies = [
  "rand_chacha 0.9.0",
  "secp256k1 0.31.0",
  "serde_json",
- "telcoin-network",
+ "telcoin-network-cli",
  "tempfile",
  "tn-config",
  "tn-faucet",
@@ -5179,7 +5179,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07033963ba89ebaf1584d767badaa2e8fcec21aedea6b8c0346d487d49c28667"
 dependencies = [
  "cfg-if",
- "windows-targets 0.52.6",
+ "windows-targets 0.53.5",
 ]
 
 [[package]]
@@ -11435,6 +11435,17 @@ dependencies = [
 name = "telcoin-network"
 version = "0.1.0"
 dependencies = [
+ "clap",
+ "rpassword",
+ "telcoin-network-cli",
+ "tn-faucet",
+ "tn-node",
+]
+
+[[package]]
+name = "telcoin-network-cli"
+version = "0.1.0"
+dependencies = [
  "alloy",
  "bs58",
  "cfg-if",
@@ -11452,7 +11463,6 @@ dependencies = [
  "nix 0.29.0",
  "rand_chacha 0.9.0",
  "rayon",
- "rpassword",
  "secp256k1 0.31.0",
  "serde_json",
  "serde_yaml",
@@ -11992,7 +12002,7 @@ dependencies = [
  "clap",
  "eyre",
  "indexmap 2.9.0",
- "telcoin-network",
+ "telcoin-network-cli",
  "tempfile",
  "tn-config",
  "tn-faucet",

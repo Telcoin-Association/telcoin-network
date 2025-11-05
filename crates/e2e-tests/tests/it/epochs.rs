@@ -19,7 +19,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use telcoin_network::genesis::GenesisArgs;
+use telcoin_network_cli::genesis::GenesisArgs;
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, NodeInfo};
 use tn_reth::{
     system_calls::{ConsensusRegistry, CONSENSUS_REGISTRY_ADDRESS},

@@ -21,4 +21,4 @@ tn-types = { workspace = true }
 tn-faucet = { workspace = true }
 tn-config = { workspace = true }
 tn-test-utils-committee = { workspace = true }
-telcoin-network = { path = "../../bin/telcoin-network" }
+telcoin-network-cli = { workspace = true }
