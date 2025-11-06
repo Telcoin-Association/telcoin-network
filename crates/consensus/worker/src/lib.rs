@@ -11,12 +11,14 @@ pub mod quorum_waiter;
 
 pub mod metrics;
 
-pub use crate::network::{
-    error::WorkerNetworkError,
-    handler::RequestHandler,
-    message::{WorkerGossip, WorkerRPCError},
+pub use crate::{
+    network::{
+        error::WorkerNetworkError,
+        handler::RequestHandler,
+        message::{WorkerGossip, WorkerRPCError},
+    },
+    worker::{new_worker, Worker, CHANNEL_CAPACITY},
 };
-pub use crate::worker::{new_worker, Worker, CHANNEL_CAPACITY};
 
 /// The number of shutdown receivers to create on startup. We need one per component loop.
 pub const NUM_SHUTDOWN_RECEIVERS: u64 = 26;
