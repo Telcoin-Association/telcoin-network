@@ -1387,7 +1387,7 @@ where
             if retries > 240 {
                 // If we could not get on the network in about 2 minutes then trigger node exit.
                 // This indicates a fundemental problem (maybe no network access?) that should be
-                // addressed. Since this is a blockchain there is nothing useful a
+                // addressed. Since this is a blockchain there is nothing useful for a
                 // node to do without being on the network.
                 return Err(eyre::eyre!(
                     "Unable to join telcoin network, can not connect to any peers!"
