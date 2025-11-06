@@ -85,13 +85,10 @@ echo "clippy for workspace: default and all features passed"
 cargo test --workspace --no-fail-fast -- --show-output
 # Run tests that require credentials.
 cargo test test_with_creds -- --ignored
+# run the e2e restart and epoch tests, they are seperate to avoid any port/node confusion
+cargo test -p e2e-tests -- --ignored
 # faucet it test
-cargo test -p telcoin-network --test it --features faucet --no-fail-fast -- --ignored faucet --show-output
-# run epoch boundary tests separately
-cargo test -p telcoin-network --test it test_epoch_boundary -- --ignored
-cargo test -p telcoin-network --test it test_epoch_sync -- --ignored
-# run the restart tests, they are seperate to avoid any port/node confusion
-cargo test test_restarts -- --ignored
+cargo test -p e2e-tests --test it --features faucet --no-fail-fast -- --ignored faucet
 
 echo "default tests and specific faucet it test passing"
 
