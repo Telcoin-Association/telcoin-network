@@ -64,7 +64,7 @@ if [ -n "$MODIFIED_TRACKED_FILES" ]; then
 fi
 
 # check cargo fmt first
-cargo +nightly fmt -- --check
+cargo +nightly-2025-11-04 fmt -- --check
 
 echo "fmt passed"
 
@@ -72,9 +72,9 @@ echo "fmt passed"
 # check clippy
 #
 # default features
-cargo +nightly clippy --workspace -- -D warnings
+cargo +nightly-2025-11-04 clippy --workspace -- -D warnings
 # all features
-cargo +nightly clippy --workspace --all-features -- -D warnings
+cargo +nightly-2025-11-04 clippy --workspace --all-features -- -D warnings
 
 echo "clippy for workspace: default and all features passed"
 

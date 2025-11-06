@@ -73,7 +73,7 @@ impl Bullshark {
         // sub_dag_index is based on epoch and round so / 2 so this check works on commit rounds
         // (every other one).
         let mut reputation_score =
-            if (sub_dag_index / 2) % self.num_sub_dags_per_schedule as u64 == 0 {
+            if (sub_dag_index / 2).is_multiple_of(self.num_sub_dags_per_schedule as u64) {
                 ReputationScores::new(&self.committee)
             } else if let Some(last) = state.last_committed_sub_dag.as_ref() {
                 last.reputation_score.clone()
@@ -99,7 +99,7 @@ impl Bullshark {
         // sub_dag_index is based on epoch and round so / 2 so this check works on commit rounds
         // (every other one).
         reputation_score.final_of_schedule =
-            ((sub_dag_index / 2) + 1) % self.num_sub_dags_per_schedule as u64 == 0;
+            ((sub_dag_index / 2) + 1).is_multiple_of(self.num_sub_dags_per_schedule as u64);
 
         // Always ensure that all the authorities are present in the reputation scores - even
         // when score is zero.
@@ -130,7 +130,7 @@ impl Bullshark {
         let r = round - 1;
 
         // We only elect leaders for even round numbers.
-        if r % 2 != 0 || r < 2 {
+        if !r.is_multiple_of(2) || r < 2 {
             return Ok((Outcome::NoLeaderElectedForOddRound, Vec::new()));
         }
 
@@ -389,7 +389,7 @@ impl Bullshark {
 
     fn report_leader_on_time_metrics(&mut self, certificate_round: Round, state: &ConsensusState) {
         if certificate_round > self.max_inserted_certificate_round
-            && certificate_round % 2 == 0
+            && certificate_round.is_multiple_of(2)
             && certificate_round > 2
         {
             let previous_leader_round = certificate_round - 2;

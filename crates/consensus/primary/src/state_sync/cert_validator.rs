@@ -373,9 +373,9 @@ where
         all_parents: &HashSet<CertificateDigest>,
     ) -> bool {
         !all_parents.contains(&cert.digest())
-            || cert.header().round()
-                % self.config.network_config().sync_config().certificate_verification_round_interval
-                == 0
+            || cert.header().round().is_multiple_of(
+                self.config.network_config().sync_config().certificate_verification_round_interval,
+            )
     }
 
     /// Marks a certificate as indirectly verified.

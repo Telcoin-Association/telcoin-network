@@ -42,7 +42,7 @@ edition = "2021"
 # - .clippy.toml
 # - README.md
 # - Dockerfile
-rust-version = "1.86" # see note
+rust-version = "1.91" # see note
 license = "MIT OR Apache-2.0"
 homepage = "https://telcoin.network"
 repository = "https://github.com/telcoin/telcoin-network"
