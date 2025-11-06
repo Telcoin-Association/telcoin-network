@@ -12,13 +12,7 @@ use nix::{
     unistd::Pid,
 };
 use rand::{rngs::StdRng, SeedableRng as _};
-use std::{
-    panic,
-    path::{Path, PathBuf},
-    process::{Child, Command},
-    sync::Arc,
-    time::Duration,
-};
+use std::{panic, path::Path, process::Child, sync::Arc, time::Duration};
 use telcoin_network_cli::genesis::GenesisArgs;
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, NodeInfo};
 use tn_reth::{
@@ -509,6 +503,8 @@ fn config_committee(
 
 /// Start the network using the node cli command.
 fn start_nodes(temp_path: &Path, validators: &[(&str, Address)]) -> eyre::Result<Vec<Child>> {
+    let bin = e2e_tests::get_telcoin_network_binary();
+
     let mut children = Vec::new();
     for (v, _) in validators.iter() {
         let dir = temp_path.join(v);
@@ -519,13 +515,12 @@ fn start_nodes(temp_path: &Path, validators: &[(&str, Address)]) -> eyre::Result
             instance = "6".to_string();
             info!(target: "epoch-test", ?v, "starting new validator");
         }
-        let mut exe_path = PathBuf::from(
-            std::env::var("CARGO_MANIFEST_DIR").expect("Missing CARGO_MANIFEST_DIR!"),
-        );
-        exe_path.push("../../target/debug/telcoin-network");
-        let mut command = Command::new(exe_path);
+
+        let mut command = bin.command();
         command
             .env("TN_BLS_PASSPHRASE", NODE_PASSWORD)
+            .arg("--bls-passphrase-source")
+            .arg("env")
             .arg("node")
             .arg("--datadir")
             .arg(&*dir.to_string_lossy())

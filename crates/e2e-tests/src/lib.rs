@@ -6,16 +6,22 @@
 #![allow(unused_crate_dependencies)]
 
 use clap::Parser;
-use std::path::{Path, PathBuf};
+use escargot::{CargoBuild, CargoRun};
+use std::{
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
 use telcoin_network_cli::{genesis::GenesisArgs, keytool::KeyArgs, node::NodeCommand};
 use tn_config::{Config, ConfigFmt, ConfigTrait};
 use tn_node::launch_node;
 use tn_types::{test_utils::CommandParser, Address, Genesis, GenesisAccount};
-use tracing::error;
+use tracing::{error, info};
 // unused deps warnings
 
 /// Limit potential for port collisions.
 pub static IT_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Only compile main bin once for all tests.
+pub static TELCOIN_BINARY: OnceLock<CargoRun> = OnceLock::new();
 
 /// Execute genesis ceremony inside tempdir
 pub fn create_validator_info(
@@ -171,6 +177,25 @@ pub fn spawn_local_testnet(
     }
 
     Ok(())
+}
+
+/// Helper to retrieve and build the main project binary.
+pub fn get_telcoin_network_binary() -> &'static CargoRun {
+    info!("building main binary for e2e tests");
+    TELCOIN_BINARY.get_or_init(|| {
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+        let path = PathBuf::from(manifest_dir);
+        let workspace_root =
+            path.parent().and_then(|p| p.parent()).expect("Cannot find workspace root");
+
+        CargoBuild::new()
+            .bin("telcoin-network")
+            .manifest_path(workspace_root.join("Cargo.toml"))
+            .target_dir(workspace_root.join("target"))
+            .current_target()
+            .run()
+            .expect("Failed to build telcoin-network binary")
+    })
 }
 
 // imports for traits used in faucet tests only

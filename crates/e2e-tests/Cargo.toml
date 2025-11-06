@@ -27,6 +27,7 @@ tokio = { workspace = true, features = [
     "rt-multi-thread",
 ] }
 futures = { workspace = true, optional = true }
+escargot = { workspace = true }
 
 [dev-dependencies]
 tn-reth = { workspace = true, features = ["test-utils"] }
