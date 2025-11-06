@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-
-#![warn(unused_crate_dependencies)]
+#![allow(missing_docs)]
 
 mod codec;
 #[allow(clippy::mutable_key_type)]

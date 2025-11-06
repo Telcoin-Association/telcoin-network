@@ -14,6 +14,8 @@ members = [
     "crates/network-libp2p",
     "crates/state-sync",
     "crates/tn-reth",
+    "crates/e2e-tests",
+    "crates/telcoin-network-cli",
 
     # consensus
     "crates/consensus/consensus-metrics",
@@ -53,7 +55,16 @@ authors = [
 description = "Telcoin Network protocol."
 exclude = [".github/"]
 
-[workspace.lints]
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+unreachable_pub = "warn"
+unused_crate_dependencies = "warn"
+unused_must_use = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 } # includes unused_crate_dependencies
+
+[workspace.lints.rustdoc]
+all = "warn"
 
 [workspace.dependencies]
 # misc
@@ -141,6 +152,7 @@ tn-network-types = { path = "./crates/network-types" }
 tn-rpc = { path = "./crates/execution/tn-rpc" }
 state-sync = { path = "./crates/state-sync" }
 tn-utils = { path = "./crates/tn-utils" }
+telcoin-network-cli = { path = "./crates/telcoin-network-cli" }
 
 # optional
 tn-faucet = { path = "./crates/execution/faucet" }
@@ -195,7 +207,7 @@ humantime = "2.1.0"
 blst = "0.3.14"
 hex = "0.4.3"
 dirs-next = "2.0.0"
-
+escargot = "0.5"
 reqwest = { version = "0.12", default-features = false, features = [
     "blocking",
     "json",

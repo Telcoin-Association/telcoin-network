@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 //! Persistent storage types
 
-#![warn(future_incompatible, nonstandard_style, rust_2018_idioms, rust_2021_compatibility)]
+#![allow(missing_docs)]
 
 mod stores;
 use layered_db::LayeredDatabase;
@@ -232,7 +232,7 @@ mod test {
     use tn_types::{Database, DbTxMut};
 
     #[derive(Debug)]
-    pub struct TestTable {}
+    pub(crate) struct TestTable {}
     impl tn_types::Table for TestTable {
         type Key = u64;
         type Value = String;
@@ -243,7 +243,7 @@ mod test {
     /// Runs a simple bench/test for the provided DB.  Can use it for larger dataset tests as well
     /// as comparing backends. For example run ```cargo test dbsimpbench --features redb --
     /// --nocapture --test-threads 1``` to run each backend through the bench one at a time.
-    pub fn db_simp_bench<DB: Database>(db: DB, name: &str) {
+    pub(crate) fn db_simp_bench<DB: Database>(db: DB, name: &str) {
         use tn_types::{DbTx, DbTxMut};
 
         println!("\nDBBENCH [{name}] starting simpdbbench");
@@ -333,13 +333,13 @@ mod test {
         println!("DBBENCH [{name}] Total Runtime: {}", total.elapsed().as_secs_f64());
     }
 
-    pub fn test_contains_key<DB: Database>(db: DB) {
+    pub(crate) fn test_contains_key<DB: Database>(db: DB) {
         db.insert::<TestTable>(&123456789, &"123456789".to_string()).expect("Failed to insert");
         assert!(db.contains_key::<TestTable>(&123456789).expect("Failed to call contains key"));
         assert!(!db.contains_key::<TestTable>(&000000000).expect("Failed to call contains key"));
     }
 
-    pub fn test_get<DB: Database>(db: DB) {
+    pub(crate) fn test_get<DB: Database>(db: DB) {
         db.insert::<TestTable>(&123456789, &"123456789".to_string()).expect("Failed to insert");
         assert_eq!(
             Some("123456789".to_string()),
@@ -348,7 +348,7 @@ mod test {
         assert_eq!(None, db.get::<TestTable>(&000000000).expect("Failed to get"));
     }
 
-    pub fn test_multi_get<DB: Database>(db: DB) {
+    pub(crate) fn test_multi_get<DB: Database>(db: DB) {
         db.insert::<TestTable>(&123, &"123".to_string()).expect("Failed to insert");
         db.insert::<TestTable>(&456, &"456".to_string()).expect("Failed to insert");
 
@@ -360,7 +360,7 @@ mod test {
         assert_eq!(result[2], None);
     }
 
-    pub fn test_skip<DB: Database>(db: DB) {
+    pub(crate) fn test_skip<DB: Database>(db: DB) {
         db.insert::<TestTable>(&123, &"123".to_string()).expect("Failed to insert");
         db.insert::<TestTable>(&456, &"456".to_string()).expect("Failed to insert");
         db.insert::<TestTable>(&789, &"789".to_string()).expect("Failed to insert");
@@ -381,7 +381,7 @@ mod test {
         assert_eq!(db.skip_to::<TestTable>(&000).expect("Skip failed").count(), 3);
     }
 
-    pub fn test_skip_to_previous_simple<DB: Database>(db: DB) {
+    pub(crate) fn test_skip_to_previous_simple<DB: Database>(db: DB) {
         let mut txn = db.write_txn().unwrap();
         txn.insert::<TestTable>(&123, &"123".to_string()).expect("Failed to insert");
         txn.insert::<TestTable>(&456, &"456".to_string()).expect("Failed to insert");
@@ -397,7 +397,7 @@ mod test {
         assert!(db.record_prior_to::<TestTable>(&000).is_none());
     }
 
-    pub fn test_iter_skip_to_previous_gap<DB: Database>(db: DB) {
+    pub(crate) fn test_iter_skip_to_previous_gap<DB: Database>(db: DB) {
         let mut txn = db.write_txn().unwrap();
         for i in 1..100 {
             if i != 50 {
@@ -412,7 +412,7 @@ mod test {
         assert_eq!(49, val);
     }
 
-    pub fn test_remove<DB: Database>(db: DB) {
+    pub(crate) fn test_remove<DB: Database>(db: DB) {
         db.insert::<TestTable>(&123456789, &"123456789".to_string()).expect("Failed to insert");
         assert!(db.get::<TestTable>(&123456789).expect("Failed to get").is_some());
 
@@ -420,7 +420,7 @@ mod test {
         assert!(db.get::<TestTable>(&123456789).expect("Failed to get").is_none());
     }
 
-    pub fn test_iter<DB: Database>(db: DB) {
+    pub(crate) fn test_iter<DB: Database>(db: DB) {
         db.insert::<TestTable>(&123456789, &"123456789".to_string()).expect("Failed to insert");
 
         let mut iter = db.iter::<TestTable>();
@@ -428,7 +428,7 @@ mod test {
         assert_eq!(None, iter.next());
     }
 
-    pub fn test_iter_reverse<DB: Database>(db: DB) {
+    pub(crate) fn test_iter_reverse<DB: Database>(db: DB) {
         db.insert::<TestTable>(&1, &"1".to_string()).expect("Failed to insert");
         db.insert::<TestTable>(&2, &"2".to_string()).expect("Failed to insert");
         db.insert::<TestTable>(&3, &"3".to_string()).expect("Failed to insert");
@@ -440,7 +440,7 @@ mod test {
         assert_eq!(None, iter.next());
     }
 
-    pub fn test_clear<DB: Database>(db: DB) {
+    pub(crate) fn test_clear<DB: Database>(db: DB) {
         // Test clear of empty map
         let _ = db.clear_table::<TestTable>();
 
@@ -464,7 +464,7 @@ mod test {
         assert_eq!(db.iter::<TestTable>().count(), 0);
     }
 
-    pub fn test_is_empty<DB: Database>(db: DB) {
+    pub(crate) fn test_is_empty<DB: Database>(db: DB) {
         // Test empty map is truly empty
         assert!(db.is_empty::<TestTable>());
         let _ = db.clear_table::<TestTable>();
@@ -486,7 +486,7 @@ mod test {
         assert!(db.is_empty::<TestTable>());
     }
 
-    pub fn test_multi_insert<DB: Database>(db: DB) {
+    pub(crate) fn test_multi_insert<DB: Database>(db: DB) {
         let mut txn = db.write_txn().unwrap();
         for (key, val) in (0..101).map(|i| (i, i.to_string())) {
             txn.insert::<TestTable>(&key, &val).expect("Failed to batch insert");
@@ -499,7 +499,7 @@ mod test {
         }
     }
 
-    pub fn test_multi_remove<DB: Database>(db: DB) {
+    pub(crate) fn test_multi_remove<DB: Database>(db: DB) {
         // Create kv pairs
         let mut txn = db.write_txn().unwrap();
         for (key, val) in (0..101).map(|i| (i, i.to_string())) {

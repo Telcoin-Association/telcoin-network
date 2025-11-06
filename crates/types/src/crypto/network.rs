@@ -68,7 +68,7 @@ impl<'de> Deserialize<'de> for NetworkPublicKey {
         impl Visitor<'_> for NetworkPublicKeyVisitor {
             type Value = NetworkPublicKey;
 
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 write!(f, "valid network public key")
             }
 

@@ -55,3 +55,6 @@ tn-test-utils-committee = { workspace = true }
 [features]
 default = []
 test-utils = ["tn-reth", "indexmap", "tempfile"]
+
+[lints]
+workspace = true

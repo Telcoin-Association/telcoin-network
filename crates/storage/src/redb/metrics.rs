@@ -3,7 +3,7 @@
 use prometheus::{default_registry, register_int_gauge_with_registry, IntGauge, Registry};
 
 #[derive(Debug)]
-pub struct ReDbMetrics {
+pub(super) struct ReDbMetrics {
     pub tree_height: IntGauge,
     pub allocated_pages: IntGauge,
     pub leaf_pages: IntGauge,

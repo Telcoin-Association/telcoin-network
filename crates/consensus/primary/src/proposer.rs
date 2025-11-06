@@ -77,11 +77,11 @@ struct ProposerDigest {
 
 #[cfg(test)]
 #[path = "tests/proposer_tests.rs"]
-pub mod proposer_tests;
+mod proposer_tests;
 
 /// The proposer creates new headers and send them to the core for broadcasting and further
 /// processing.
-pub struct Proposer<DB: ProposerStore> {
+pub(crate) struct Proposer<DB: ProposerStore> {
     /// The id of this primary.
     authority_id: AuthorityIdentifier,
     /// The committee information.
@@ -139,7 +139,7 @@ impl<DB: Database> Proposer<DB> {
     ///
     /// The proposer's intervals and genesis certificate are created in this function.
     /// Also set `advance_round` to true.
-    pub fn new(
+    pub(crate) fn new(
         config: ConsensusConfig<DB>,
         authority_id: AuthorityIdentifier, // We need to be a validator so must have an id.
         consensus_bus: ConsensusBus,
@@ -748,7 +748,7 @@ impl<DB: Database> Proposer<DB> {
         Ok(())
     }
 
-    pub fn spawn(mut self, task_manager: &TaskManager) {
+    pub(crate) fn spawn(mut self, task_manager: &TaskManager) {
         if self.consensus_bus.node_mode().borrow().is_active_cvv() {
             task_manager.spawn_critical_task(
                 "proposer task",

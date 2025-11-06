@@ -41,3 +41,6 @@ assert_matches = { workspace = true }
 [features]
 default = []
 test-utils = ["dep:rand"]
+
+[lints]
+workspace = true

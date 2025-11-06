@@ -1,7 +1,7 @@
+//! Utilities for consensus.
 // SPDX-License-Identifier: Apache-2.0
 
-#![warn(unused_crate_dependencies)]
+#![allow(missing_docs)]
 
-mod macros;
-pub mod sync;
-pub use macros::*;
+mod notify_read;
+pub use notify_read::*;

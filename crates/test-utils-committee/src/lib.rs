@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#![warn(unused_crate_dependencies)]
+#![allow(missing_docs)]
 
 mod authority;
 pub use authority::*;

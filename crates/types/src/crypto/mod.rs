@@ -61,7 +61,7 @@ impl<'de, const DIGEST_LEN: usize> Deserialize<'de> for Digest<DIGEST_LEN> {
         impl<const DIGEST_LEN: usize> Visitor<'_> for DigestVisitor<DIGEST_LEN> {
             type Value = Digest<DIGEST_LEN>;
 
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 write!(f, "valid digest bytes")
             }
 

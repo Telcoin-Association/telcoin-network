@@ -1,3 +1,4 @@
+//! Utilities for async notifications.
 use parking_lot::{Mutex, MutexGuard};
 use std::{
     collections::{hash_map::DefaultHasher, HashMap},
@@ -12,12 +13,15 @@ use tokio::sync::oneshot;
 
 type Registrations<V> = Vec<oneshot::Sender<V>>;
 
+/// A thread-safe pub/sub notification system for asynchronously waiting on key-value pairs.
+#[derive(Debug)]
 pub struct NotifyRead<K, V> {
     pending: Vec<Mutex<HashMap<K, Registrations<V>>>>,
     count_pending: AtomicUsize,
 }
 
 impl<K: Eq + Hash + Clone, V: Clone> NotifyRead<K, V> {
+    /// Create a new instance of `Self`.
     pub fn new() -> Self {
         let pending = (0..255).map(|_| Default::default()).collect();
         let count_pending = Default::default();
@@ -96,6 +100,7 @@ impl<K: Eq + Hash + Clone, V: Clone> NotifyRead<K, V> {
 
 /// Registration resolves to the value but also provides safe cancellation
 /// When Registration is dropped before it is resolved, we de-register from the pending list
+#[derive(Debug)]
 pub struct Registration<'a, K: Eq + Hash + Clone, V: Clone> {
     this: &'a NotifyRead<K, V>,
     registration: Option<(K, oneshot::Receiver<V>)>,
@@ -140,7 +145,7 @@ mod tests {
     use futures::future::join_all;
 
     #[tokio::test]
-    pub async fn test_notify_read() {
+    async fn test_notify_read() {
         let notify_read = NotifyRead::<u64, u64>::new();
         let mut registrations = notify_read.register_all(vec![1, 2, 3]);
         assert_eq!(3, notify_read.count_pending.load(Ordering::Relaxed));

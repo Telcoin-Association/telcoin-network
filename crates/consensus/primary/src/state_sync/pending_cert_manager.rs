@@ -37,7 +37,7 @@ impl PendingCertificate {
 ///
 /// NOTE: all pending certificates must be verified.
 #[derive(Debug)]
-pub struct PendingCertificateManager {
+pub(super) struct PendingCertificateManager {
     /// Each certificate entry tracks both the certificate itself and its dependency state
     ///
     /// Pending certificates that cannot be accepted yet.
@@ -53,14 +53,14 @@ pub struct PendingCertificateManager {
 
 impl PendingCertificateManager {
     /// Create a new instance of Self.
-    pub fn new(consensus_bus: ConsensusBus) -> Self {
+    pub(super) fn new(consensus_bus: ConsensusBus) -> Self {
         Self { pending: Default::default(), missing_for_pending: Default::default(), consensus_bus }
     }
 
     /// Attempts to insert a new pending certificate.
     ///
     /// Callers must ensure certificates are verified before inserting into pending state.
-    pub fn insert_pending(
+    pub(super) fn insert_pending(
         &mut self,
         certificate: Certificate,
         missing_parents: HashSet<CertificateDigest>,

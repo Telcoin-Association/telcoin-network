@@ -3,7 +3,7 @@ use tn_types::{BatchValidationError, BcsError};
 use tokio::time::error::Elapsed;
 
 /// Result alias for results that possibly return [`WorkerNetworkError`].
-pub type WorkerNetworkResult<T> = Result<T, WorkerNetworkError>;
+pub(crate) type WorkerNetworkResult<T> = Result<T, WorkerNetworkError>;
 
 /// Core error variants when executing the output from consensus and extending the canonical block.
 #[derive(Debug, thiserror::Error)]
@@ -23,7 +23,7 @@ pub enum WorkerNetworkError {
     /// A network request timed out.
     #[error("Network request timed out")]
     Timeout(#[from] Elapsed),
-    // Network error.
+    /// Network error.
     #[error("Network error occured: {0}")]
     Network(#[from] NetworkError),
     /// The peer's request is invalid.

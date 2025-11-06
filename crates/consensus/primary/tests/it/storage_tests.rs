@@ -19,7 +19,7 @@ use tn_types::{
     Header, HeaderBuilder, ReputationScores, Round,
 };
 
-pub fn create_header_for_round(round: Round) -> Header {
+fn create_header_for_round(round: Round) -> Header {
     let builder = HeaderBuilder::default();
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let primary = fixture.authorities().next().unwrap();

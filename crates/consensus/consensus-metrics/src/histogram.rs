@@ -29,12 +29,13 @@ pub struct Histogram {
     channel: mpsc::Sender<HistogramMessage>,
 }
 
+#[derive(Debug)]
 pub struct HistogramTimerGuard<'a> {
     histogram: &'a Histogram,
     start: Instant,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct HistogramVec {
     channel: mpsc::Sender<HistogramMessage>,
 }
@@ -147,7 +148,7 @@ impl HistogramVec {
 }
 
 impl HistogramLabelsInner {
-    pub fn new(labels: Vec<String>) -> HistogramLabels {
+    fn new(labels: Vec<String>) -> HistogramLabels {
         // Not a crypto hash
         let mut hasher = DefaultHasher::new();
         labels.hash(&mut hasher);
@@ -195,7 +196,7 @@ impl Histogram {
 }
 
 impl HistogramCollector {
-    pub async fn run(mut self) {
+    async fn run(mut self) {
         let mut deadline = Instant::now();
         loop {
             // We calculate deadline here instead of just using sleep inside cycle to avoid
@@ -251,7 +252,7 @@ impl HistogramCollector {
 }
 
 impl HistogramReporter {
-    pub fn report(&mut self, labeled_data: HashMap<HistogramLabels, Vec<Point>>) {
+    fn report(&mut self, labeled_data: HashMap<HistogramLabels, Vec<Point>>) {
         let _scope = monitored_scope("HistogramReporter::report");
         let mut reset_labels = self.known_labels.clone();
         for (label, mut data) in labeled_data {

@@ -57,8 +57,8 @@ impl WorkerNetworkHandle {
         &self.task_spawner
     }
 
-    //// Convenience method for creating a new Self for tests- sends events no-where and does
-    //// nothing.
+    /// Convenience method for creating a new Self for tests- sends events no-where and does
+    /// nothing.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn new_for_test(task_spawner: TaskSpawner) -> Self {
         let (tx, _rx) = tokio::sync::mpsc::channel(5);
@@ -262,6 +262,7 @@ impl WorkerNetworkHandle {
 }
 
 /// Handle inter-node communication between primaries.
+#[derive(Debug)]
 pub struct WorkerNetwork<DB, Events> {
     /// Receiver for network events.
     network_events: Events,
@@ -429,7 +430,8 @@ where
 }
 
 /// Defines how the network receiver handles incoming primary messages.
-pub struct PrimaryReceiverHandler<DB> {
+#[derive(Debug)]
+pub(super) struct PrimaryReceiverHandler<DB> {
     /// The batch store
     pub store: DB,
     /// Timeout on RequestBatches RPC.

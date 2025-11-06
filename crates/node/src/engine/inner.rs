@@ -188,7 +188,7 @@ impl ExecutionNodeInner {
     ///
     /// This method should be called on epoch rollover.
     /// Will take care of all workers.
-    pub async fn respawn_worker_network_tasks(&self, network_handle: WorkerNetworkHandle) {
+    pub(super) async fn respawn_worker_network_tasks(&self, network_handle: WorkerNetworkHandle) {
         for worker in &self.workers {
             worker.worker_network().respawn_peer_count(network_handle.clone());
         }
@@ -344,12 +344,12 @@ impl ExecutionNodeInner {
     }
 
     /// Read [EpochState] from the canonical tip.
-    pub fn epoch_state_from_canonical_tip(&self) -> eyre::Result<EpochState> {
+    pub(super) fn epoch_state_from_canonical_tip(&self) -> eyre::Result<EpochState> {
         self.reth_env.epoch_state_from_canonical_tip()
     }
 
     /// Read committee validator keys for epoch.
-    pub fn validators_for_epoch(&self, epoch: u32) -> eyre::Result<Vec<BlsPublicKey>> {
+    pub(super) fn validators_for_epoch(&self, epoch: u32) -> eyre::Result<Vec<BlsPublicKey>> {
         Ok(self
             .reth_env
             .validators_for_epoch(epoch)?

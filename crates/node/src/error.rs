@@ -6,7 +6,7 @@ use tn_types::WorkerId;
 
 /// Error types when spawning the ExecutionNode
 #[derive(Debug, Error)]
-pub enum ExecutionError {
+pub(crate) enum ExecutionError {
     /// Error creating temp db
     #[error(transparent)]
     Tempdb(#[from] std::io::Error),

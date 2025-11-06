@@ -209,6 +209,7 @@ where
         &self.inner.network_config
     }
 
+    /// The current epoch for [Committee].
     pub fn epoch(&self) -> Epoch {
         self.inner.committee.epoch()
     }

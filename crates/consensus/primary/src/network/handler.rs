@@ -36,7 +36,7 @@ type AuthEquivocationMap =
     BTreeMap<AuthorityIdentifier, (Epoch, Round, HeaderDigest, Option<PrimaryResponse>)>;
 
 /// The type that handles requests from peers.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct RequestHandler<DB> {
     /// Consensus config with access to database.
     consensus_config: ConsensusConfig<DB>,

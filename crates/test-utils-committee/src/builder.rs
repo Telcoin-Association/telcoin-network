@@ -17,6 +17,7 @@ use tn_types::{
 };
 
 /// The committee builder for tests.
+#[derive(Debug)]
 pub struct Builder<DB, F, R = StdRng> {
     rng: R,
     committee_size: NonZeroUsize,

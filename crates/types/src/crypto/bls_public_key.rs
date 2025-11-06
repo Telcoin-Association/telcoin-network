@@ -221,7 +221,7 @@ impl<'de> Deserialize<'de> for BlsPublicKeyBytes {
         impl Visitor<'_> for BlsPublicKeyBytesVisitor {
             type Value = BlsPublicKeyBytes;
 
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 write!(f, "valid bls public key bytes")
             }
 

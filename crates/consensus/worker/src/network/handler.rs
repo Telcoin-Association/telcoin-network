@@ -24,7 +24,7 @@ static MESSAGE_OVERHEAD: LazyLock<usize> =
     LazyLock::new(|| tn_types::encode(&WorkerResponse::RequestBatches(vec![])).len());
 
 /// The type that handles requests from peers.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RequestHandler<DB> {
     /// This worker's id.
     id: WorkerId,

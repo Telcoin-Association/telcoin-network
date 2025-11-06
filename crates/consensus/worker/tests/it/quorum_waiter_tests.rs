@@ -10,8 +10,7 @@ use tn_types::{test_chain_spec_arc, TaskManager};
 use tn_worker::{
     metrics::WorkerMetrics,
     quorum_waiter::{QuorumWaiter, QuorumWaiterError, QuorumWaiterTrait as _},
-    test_utils::WorkerRPCError,
-    WorkerNetworkHandle, WorkerRequest, WorkerResponse,
+    WorkerNetworkHandle, WorkerRPCError, WorkerRequest, WorkerResponse,
 };
 use tokio::sync::mpsc;
 

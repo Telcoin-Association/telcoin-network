@@ -242,6 +242,8 @@ pub enum TestLeaderSupport {
     NoSupport,
 }
 
+/// Test struct for configuring leader.
+#[derive(Debug)]
 pub struct TestLeaderConfiguration {
     /// The round of the leader
     pub round: Round,

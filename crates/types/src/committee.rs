@@ -493,6 +493,7 @@ impl std::fmt::Display for Committee {
 }
 
 /// Type for building committees.
+#[derive(Debug)]
 pub struct CommitteeBuilder {
     /// The epoch for the committee.
     epoch: Epoch,

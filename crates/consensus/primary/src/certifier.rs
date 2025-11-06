@@ -22,7 +22,7 @@ use tracing::{debug, enabled, error, info};
 
 #[cfg(test)]
 #[path = "tests/certifier_tests.rs"]
-pub mod certifier_tests;
+mod certifier_tests;
 
 /// This component is responisble for proposing headers to peers, collecting votes on headers,
 /// and certifying headers into certificates.
@@ -30,7 +30,7 @@ pub mod certifier_tests;
 /// It receives headers to propose from Proposer via `rx_headers`, and publishes certificates to
 /// gossip network.
 #[derive(Clone)]
-pub struct Certifier<DB> {
+pub(crate) struct Certifier<DB> {
     /// The identifier of this primary.
     authority_id: AuthorityIdentifier,
     /// The committee information.
@@ -57,7 +57,7 @@ pub struct Certifier<DB> {
 
 impl<DB: Database> Certifier<DB> {
     /// Spawn the long-running certifier task.
-    pub fn spawn(
+    pub(crate) fn spawn(
         config: ConsensusConfig<DB>,
         consensus_bus: ConsensusBus,
         state_sync: StateSynchronizer<DB>,

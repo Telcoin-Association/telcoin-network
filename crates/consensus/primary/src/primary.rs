@@ -16,7 +16,7 @@ use tracing::info;
 
 #[cfg(test)]
 #[path = "tests/primary_tests.rs"]
-pub mod primary_tests;
+mod primary_tests;
 
 #[derive(Debug)]
 /// The main `Primary` struct.

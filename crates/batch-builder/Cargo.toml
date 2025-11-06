@@ -36,3 +36,6 @@ tn-batch-builder = { workspace = true, features = ["test-utils"] }
 [features]
 default = []
 test-utils = []
+
+[lints]
+workspace = true

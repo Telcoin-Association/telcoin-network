@@ -13,16 +13,10 @@ publish = false
 [dependencies]
 tokio = { workspace = true, features = ["sync"] }
 parking_lot = { workspace = true }
-once_cell = { workspace = true }
-futures = { workspace = true }
-tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "test-util"] }
+futures = { workspace = true }
 
-
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(msim)',
-    'cfg(fail_points)',
-] }
+[lints]
+workspace = true

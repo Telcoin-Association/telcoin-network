@@ -268,6 +268,7 @@ impl PrimaryNetworkHandle {
 }
 
 /// Handle inter-node communication between primaries.
+#[derive(Debug)]
 pub struct PrimaryNetwork<DB, Events> {
     /// Receiver for network events.
     network_events: Events,
@@ -494,7 +495,7 @@ pub(super) struct WorkerReceiverHandler<DB> {
 
 impl<DB: PayloadStore> WorkerReceiverHandler<DB> {
     /// Create a new instance of Self.
-    pub fn new(consensus_bus: ConsensusBus, payload_store: DB) -> Self {
+    pub(crate) fn new(consensus_bus: ConsensusBus, payload_store: DB) -> Self {
         Self { consensus_bus, payload_store }
     }
 }

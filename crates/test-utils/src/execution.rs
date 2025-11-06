@@ -3,7 +3,7 @@
 use clap::Parser as _;
 use core::fmt;
 use std::{path::Path, str::FromStr, sync::Arc};
-use telcoin_network::{node::NodeCommand, NoArgs};
+use telcoin_network_cli::{node::NodeCommand, NoArgs};
 use tn_config::Config;
 use tn_faucet::FaucetArgs;
 use tn_node::engine::{ExecutionNode, TnBuilder};

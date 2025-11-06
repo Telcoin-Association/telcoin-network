@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::{
-    consensus::{consensus_utils::NUM_SUB_DAGS_PER_SCHEDULE, Consensus},
+    consensus::Consensus,
     test_utils::{
         make_certificates_with_epoch, make_certificates_with_leader_configuration,
         make_certificates_with_slow_nodes, make_optimal_certificates, mock_certificate,
@@ -19,6 +19,8 @@ use tn_types::{
     B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tracing::info;
+
+const NUM_SUB_DAGS_PER_SCHEDULE: u32 = 100;
 
 #[tokio::test]
 async fn order_leaders() {

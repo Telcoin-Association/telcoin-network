@@ -1,25 +1,19 @@
 //! Test the epoch boundary and validator shuffles.
 
-use crate::util::create_validator_info;
 use alloy::{
     primitives::utils::parse_ether,
     providers::{Provider, ProviderBuilder},
     sol_types::SolCall,
 };
 use clap::Parser as _;
+use e2e_tests::{create_validator_info, IT_TEST_MUTEX};
 use nix::{
     sys::signal::{self, Signal},
     unistd::Pid,
 };
 use rand::{rngs::StdRng, SeedableRng as _};
-use std::{
-    panic,
-    path::{Path, PathBuf},
-    process::{Child, Command},
-    sync::Arc,
-    time::Duration,
-};
-use telcoin_network::genesis::GenesisArgs;
+use std::{panic, path::Path, process::Child, sync::Arc, time::Duration};
+use telcoin_network_cli::genesis::GenesisArgs;
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, NodeInfo};
 use tn_reth::{
     system_calls::{ConsensusRegistry, CONSENSUS_REGISTRY_ADDRESS},
@@ -273,6 +267,7 @@ fn send_term(child: &mut Child) {
 #[tokio::test]
 /// Test a new node joining the network and being shuffled into the committee.
 async fn test_epoch_boundary() -> eyre::Result<()> {
+    let _guard = IT_TEST_MUTEX.lock();
     tn_types::test_utils::init_test_tracing();
     // create validator and governance wallets for adding new validator later
     let mut new_validator = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(6));
@@ -320,6 +315,7 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
 #[tokio::test]
 /// Test that sync works to fill in missing epochs.
 async fn test_epoch_sync() -> eyre::Result<()> {
+    let _guard = IT_TEST_MUTEX.lock();
     tn_types::test_utils::init_test_tracing();
     // create validator and governance wallets for adding new validator later
     let new_validator = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(6));
@@ -507,6 +503,8 @@ fn config_committee(
 
 /// Start the network using the node cli command.
 fn start_nodes(temp_path: &Path, validators: &[(&str, Address)]) -> eyre::Result<Vec<Child>> {
+    let bin = e2e_tests::get_telcoin_network_binary();
+
     let mut children = Vec::new();
     for (v, _) in validators.iter() {
         let dir = temp_path.join(v);
@@ -517,13 +515,12 @@ fn start_nodes(temp_path: &Path, validators: &[(&str, Address)]) -> eyre::Result
             instance = "6".to_string();
             info!(target: "epoch-test", ?v, "starting new validator");
         }
-        let mut exe_path = PathBuf::from(
-            std::env::var("CARGO_MANIFEST_DIR").expect("Missing CARGO_MANIFEST_DIR!"),
-        );
-        exe_path.push("../../target/debug/telcoin-network");
-        let mut command = Command::new(exe_path);
+
+        let mut command = bin.command();
         command
             .env("TN_BLS_PASSPHRASE", NODE_PASSWORD)
+            .arg("--bls-passphrase-source")
+            .arg("env")
             .arg("node")
             .arg("--datadir")
             .arg(&*dir.to_string_lossy())

@@ -1,6 +1,5 @@
 use crate::tables::Votes;
 use tn_types::{AuthorityIdentifier, Database, Vote, VoteInfo};
-use tn_utils::fail_point;
 
 /// The impl for the last votes digests per authority
 pub trait VoteDigestStore {
@@ -16,13 +15,8 @@ pub trait VoteDigestStore {
 impl<DB: Database> VoteDigestStore for DB {
     /// Insert the vote's basic details into the database for the corresponding
     /// header author key.
-    #[allow(clippy::let_and_return)]
     fn write_vote(&self, vote: &Vote) -> eyre::Result<()> {
-        fail_point!("vote-digest-store-before-write");
-
         let result = self.insert::<Votes>(vote.origin(), &vote.into());
-
-        fail_point!("vote-digest-store-after-write");
         result
     }
 

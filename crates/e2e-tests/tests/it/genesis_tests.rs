@@ -3,14 +3,14 @@
 //! NOTE: this test contains code for executing a proxy/impl pre-genesis
 //! however, the RPC calls don't work. The beginning of the test is left
 //! because the proxy version may be re-prioritized later.
-use crate::util::{spawn_local_testnet, IT_TEST_MUTEX};
 use alloy::{network::EthereumWallet, primitives::utils::parse_ether, providers::ProviderBuilder};
 use core::panic;
+use e2e_tests::{spawn_local_testnet, IT_TEST_MUTEX};
 use eyre::OptionExt;
 use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_params};
 use serde_json::Value;
 use std::time::Duration;
-use telcoin_network::args::clap_u256_parser_to_18_decimals;
+use telcoin_network_cli::args::clap_u256_parser_to_18_decimals;
 use tn_config::{
     NetworkGenesis, BLSG1_JSON, CONSENSUS_REGISTRY_JSON, DEPLOYMENTS_JSON, ISSUANCE_ADDRESS,
     ISSUANCE_JSON,

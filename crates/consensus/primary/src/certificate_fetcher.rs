@@ -30,7 +30,7 @@ use tracing::{debug, error, instrument, trace};
 
 #[cfg(test)]
 #[path = "tests/certificate_fetcher_tests.rs"]
-pub mod certificate_fetcher_tests;
+mod certificate_fetcher_tests;
 
 /// Seconds to wait for a response before issuing another parallel fetch request.
 const PARALLEL_FETCH_REQUEST_INTERVAL_SECS: Duration = Duration::from_secs(5);
@@ -89,7 +89,7 @@ struct CertificateFetcherState<DB> {
 }
 
 impl<DB: Database> CertificateFetcher<DB> {
-    pub fn spawn(
+    pub(crate) fn spawn(
         config: ConsensusConfig<DB>,
         network: PrimaryNetworkHandle,
         consensus_bus: ConsensusBus,

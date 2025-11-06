@@ -13,16 +13,12 @@ use std::{
 use tn_network_libp2p::types::{NetworkCommand, NetworkHandle};
 use tn_types::{Batch, BlockHash, BlsKeypair, BlsPublicKey, SealedBatch, TaskManager, TaskSpawner};
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
-// quorum waiter tests
-pub use crate::network::{
-    error::WorkerNetworkError,
-    handler::RequestHandler,
-    message::{WorkerGossip, WorkerRPCError},
-};
 
 #[derive(Clone, Debug)]
+/// Test quorum waiter.
 pub struct TestMakeBlockQuorumWaiter(pub Arc<Mutex<Option<SealedBatch>>>);
 impl TestMakeBlockQuorumWaiter {
+    /// New `Self` for test.
     pub fn new_test() -> Self {
         Self(Arc::new(Mutex::new(None)))
     }
@@ -46,7 +42,7 @@ impl QuorumWaiterTrait for TestMakeBlockQuorumWaiter {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TestRequestBatchesNetwork {
     // Worker name -> batch digests it has -> batches.
     data: Arc<TokioMutex<HashMap<BlsPublicKey, HashMap<BlockHash, Batch>>>>,

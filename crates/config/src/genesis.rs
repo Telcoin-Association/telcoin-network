@@ -14,18 +14,26 @@ pub const GENESIS_VALIDATORS_DIR: &str = "validators";
 /// Precompile info for genesis, read from current submodule commit
 pub const DEPLOYMENTS_JSON: &str =
     include_str!("../../../tn-contracts/deployments/deployments.json");
+/// The path to consensus registry json (tn-contracts submodule).
 pub const CONSENSUS_REGISTRY_JSON: &str =
     include_str!("../../../tn-contracts/artifacts/ConsensusRegistry.json");
+/// The path to issuance json (tn-contracts submodule).
 pub const ISSUANCE_JSON: &str = include_str!("../../../tn-contracts/artifacts/Issuance.json");
+/// The path to erc1967proxy json (tn-contracts submodule).
 pub const ERC1967PROXY_JSON: &str =
     include_str!("../../../tn-contracts/artifacts/ERC1967Proxy.json");
+/// The path to blsg1 json (tn-contracts submodule).
 pub const BLSG1_JSON: &str = include_str!("../../../tn-contracts/artifacts/BlsG1.json");
+/// The path to its cfg yaml json (tn-contracts submodule).
 pub const ITS_CFG_YAML: &str =
     include_str!("../../../tn-contracts/deployments/genesis/precompile-config.yaml");
+/// The default governance safe address.
 pub const GOVERNANCE_SAFE_ADDRESS: Address = address!("00000000000000000000000000000000000007a0");
+/// The default issuance address.
 pub const ISSUANCE_ADDRESS: Address = address!("07a07a07a07a07a07a07a07a07a07a07a07a07a0");
 
 /// The struct for starting a network at genesis.
+#[derive(Debug)]
 pub struct NetworkGenesis {
     /// Execution data
     genesis: Genesis,

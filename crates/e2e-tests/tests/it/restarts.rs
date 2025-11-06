@@ -1,5 +1,6 @@
-use crate::util::{config_local_testnet, IT_TEST_MUTEX};
 use alloy::primitives::address;
+use e2e_tests::{config_local_testnet, IT_TEST_MUTEX};
+use escargot::CargoRun;
 use ethereum_tx_sign::{LegacyTransaction, Transaction};
 use eyre::Report;
 use jsonrpsee::{
@@ -13,13 +14,7 @@ use nix::{
 };
 use secp256k1::{Keypair, Secp256k1, SecretKey};
 use serde_json::Value;
-use std::{
-    collections::HashMap,
-    fmt::Debug,
-    path::{Path, PathBuf},
-    process::{Child, Command},
-    time::Duration,
-};
+use std::{collections::HashMap, fmt::Debug, path::Path, process::Child, time::Duration};
 use tn_types::{get_available_tcp_port, keccak256, test_utils::init_test_tracing, Address};
 use tokio::runtime::Builder;
 use tracing::{error, info};
@@ -98,7 +93,7 @@ fn send_and_confirm(
 fn run_restart_tests1(
     client_urls: &[String; 4],
     child2: &mut Child,
-    exe_path: &Path,
+    bin: &'static CargoRun,
     temp_path: &Path,
     rpc_port2: u16,
     delay_secs: u64,
@@ -133,7 +128,7 @@ fn run_restart_tests1(
 
     info!(target: "restart-test", "restarting child2...");
     // Restart
-    let mut child2 = start_validator(2, exe_path, temp_path, rpc_port2);
+    let mut child2 = start_validator(2, bin, temp_path, rpc_port2);
     let bal = get_positive_balance_with_retry(&client_urls[2], &to_account.to_string())
         .inspect_err(|e| {
             kill_child(&mut child2);
@@ -165,7 +160,7 @@ fn run_restart_tests1(
 fn run_restart_tests_lagged1(
     client_urls: &[String; 4],
     child2: &mut Child,
-    exe_path: &Path,
+    bin: &'static CargoRun,
     temp_path: &Path,
     rpc_port2: u16,
     delay_secs: u64,
@@ -206,7 +201,7 @@ fn run_restart_tests_lagged1(
 
     info!(target: "restart-test", "restarting child2...");
     // Restart
-    let mut child2 = start_validator(2, exe_path, temp_path, rpc_port2);
+    let mut child2 = start_validator(2, bin, temp_path, rpc_port2);
     let bal = get_positive_balance_with_retry(&client_urls[2], &to_account.to_string())
         .inspect_err(|e| {
             kill_child(&mut child2);
@@ -298,9 +293,7 @@ fn do_restarts(delay: u64, lagged: bool) -> eyre::Result<()> {
         config_local_testnet(&temp_path, Some("restart_test".to_string()), None)
             .expect("failed to config");
     }
-    let mut exe_path =
-        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("Missing CARGO_MANIFEST_DIR!"));
-    exe_path.push("../../target/debug/telcoin-network");
+    let bin = e2e_tests::get_telcoin_network_binary();
     let mut children: [Option<Child>; 4] = [None, None, None, None];
     let mut client_urls = [
         "http://127.0.0.1".to_string(),
@@ -314,7 +307,7 @@ fn do_restarts(delay: u64, lagged: bool) -> eyre::Result<()> {
             .expect("Failed to get an ephemeral rpc port for child!");
         rpc_ports[i] = rpc_port;
         client_urls[i].push_str(&format!(":{rpc_port}"));
-        *child = Some(start_validator(i, &exe_path, &temp_path, rpc_port));
+        *child = Some(start_validator(i, &bin, &temp_path, rpc_port));
     }
 
     // pass &mut to `run_restart_tests1` to shutdown child in case of error
@@ -323,16 +316,9 @@ fn do_restarts(delay: u64, lagged: bool) -> eyre::Result<()> {
     info!(target: "restart-test", "Running restart tests 1");
     // run restart tests1
     let res1 = if lagged {
-        run_restart_tests_lagged1(
-            &client_urls,
-            &mut child2,
-            &exe_path,
-            &temp_path,
-            rpc_ports[2],
-            delay,
-        )
+        run_restart_tests_lagged1(&client_urls, &mut child2, &bin, &temp_path, rpc_ports[2], delay)
     } else {
-        run_restart_tests1(&client_urls, &mut child2, &exe_path, &temp_path, rpc_ports[2], delay)
+        run_restart_tests1(&client_urls, &mut child2, &bin, &temp_path, rpc_ports[2], delay)
     };
     info!(target: "restart-test", "Ran restart tests 1: {res1:?}");
     let is_ok = res1.is_ok();
@@ -381,7 +367,7 @@ fn do_restarts(delay: u64, lagged: bool) -> eyre::Result<()> {
     info!(target: "restart-test", "all nodes shutdown...restarting network");
     // Restart network
     for (i, child) in children.iter_mut().enumerate() {
-        *child = Some(start_validator(i, &exe_path, &temp_path, rpc_ports[i]));
+        *child = Some(start_validator(i, &bin, &temp_path, rpc_ports[i]));
     }
 
     info!(target: "restart-test", "Running restart tests 2");
@@ -446,9 +432,7 @@ fn test_restarts_observer() -> eyre::Result<()> {
         config_local_testnet(&temp_path, Some("restart_test".to_string()), None)
             .expect("failed to config");
     }
-    let mut exe_path =
-        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("Missing CARGO_MANIFEST_DIR!"));
-    exe_path.push("../../target/debug/telcoin-network");
+    let bin = e2e_tests::get_telcoin_network_binary();
     let mut children: [Option<Child>; 4] = [None, None, None, None];
     let mut client_urls = [
         "http://127.0.0.1".to_string(),
@@ -462,12 +446,12 @@ fn test_restarts_observer() -> eyre::Result<()> {
             .expect("Failed to get an ephemeral rpc port for child!");
         rpc_ports[i] = rpc_port;
         client_urls[i].push_str(&format!(":{rpc_port}"));
-        *child = Some(start_validator(i, &exe_path, &temp_path, rpc_port));
+        *child = Some(start_validator(i, &bin, &temp_path, rpc_port));
     }
     let obs_rpc_port = get_available_tcp_port("127.0.0.1")
         .expect("Failed to get an ephemeral rpc port for child!");
     let obs_url = format!("http://127.0.0.1:{obs_rpc_port}");
-    let mut obs_child = start_observer(4, &exe_path, &temp_path, obs_rpc_port);
+    let mut obs_child = start_observer(4, &bin, &temp_path, obs_rpc_port);
     let res = run_observer_tests(&client_urls, &obs_url);
 
     // SIGTERM children so they can shutdown in parrellel.
@@ -504,11 +488,16 @@ fn test_restarts_lagged_delayed() -> eyre::Result<()> {
 }
 
 /// Start a process running a validator node.
-fn start_validator(instance: usize, exe_path: &Path, base_dir: &Path, mut rpc_port: u16) -> Child {
+fn start_validator(
+    instance: usize,
+    bin: &'static CargoRun,
+    base_dir: &Path,
+    mut rpc_port: u16,
+) -> Child {
     let data_dir = base_dir.join(format!("validator-{}", instance + 1));
     // The instance option will still change a set port so account for that.
     rpc_port += instance as u16;
-    let mut command = Command::new(exe_path);
+    let mut command = bin.command();
 
     command
         .env("TN_BLS_PASSPHRASE", "restart_test")
@@ -530,11 +519,16 @@ fn start_validator(instance: usize, exe_path: &Path, base_dir: &Path, mut rpc_po
 }
 
 /// Start a process running an observer node.
-fn start_observer(instance: usize, exe_path: &Path, base_dir: &Path, mut rpc_port: u16) -> Child {
+fn start_observer(
+    instance: usize,
+    bin: &'static CargoRun,
+    base_dir: &Path,
+    mut rpc_port: u16,
+) -> Child {
     let data_dir = base_dir.join("observer");
     // The instance option will still change a set port so account for that.
     rpc_port += instance as u16;
-    let mut command = Command::new(exe_path);
+    let mut command = bin.command();
     command
         .env("TN_BLS_PASSPHRASE", "restart_test")
         .arg("node")
@@ -740,7 +734,7 @@ fn decode_key(key: &str) -> eyre::Result<(String, String, String)> {
 fn call_rpc<R, Params>(node: &str, command: &str, params: Params, retries: usize) -> eyre::Result<R>
 where
     R: DeserializeOwned + Debug,
-    Params: jsonrpsee::core::traits::ToRpcParams + Send + Clone,
+    Params: jsonrpsee::core::traits::ToRpcParams + Send + Clone + Debug,
 {
     // jsonrpsee is async AND tokio specific so give it a runtime (and can't use a crate like
     // pollster)...
@@ -757,7 +751,10 @@ where
             resp = client.request(command, params.clone()).await;
             i += 1;
         }
-        resp
+        resp.inspect_err(|_| {
+            error!(target: "restart-tests", ?command, ?node, ?params, "rpc call failed");
+        })
     });
+
     Ok(resp?)
 }

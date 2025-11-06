@@ -3040,7 +3040,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.0",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3121,6 +3121,37 @@ name = "dyn-clone"
 version = "1.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c7a8fb8a9fbf66c1f703fe16184d10ca0ee9d23be5b4436400408ba54a95005"
+
+[[package]]
+name = "e2e-tests"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "clap",
+ "const-hex",
+ "escargot",
+ "ethereum-tx-sign",
+ "eyre",
+ "futures",
+ "gcloud-sdk",
+ "jsonrpsee",
+ "k256",
+ "nix 0.29.0",
+ "rand 0.9.1",
+ "rand_chacha 0.9.0",
+ "secp256k1 0.31.0",
+ "serde_json",
+ "telcoin-network-cli",
+ "tempfile",
+ "tn-config",
+ "tn-faucet",
+ "tn-node",
+ "tn-reth",
+ "tn-types",
+ "tokio",
+ "tonic 0.13.1",
+ "tracing",
+]
 
 [[package]]
 name = "ecdsa"
@@ -3288,6 +3319,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d2f06b9cac1506ece98fe3231e3cc9c4410ec3d5b1f24ae1c8946f0742cdefc"
 dependencies = [
  "version_check",
+]
+
+[[package]]
+name = "escargot"
+version = "0.5.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11c3aea32bc97b500c9ca6a72b768a26e558264303d101d3409cf6d57a9ed0cf"
+dependencies = [
+ "log",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -5148,7 +5190,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07033963ba89ebaf1584d767badaa2e8fcec21aedea6b8c0346d487d49c28667"
 dependencies = [
  "cfg-if",
- "windows-targets 0.52.6",
+ "windows-targets 0.53.5",
 ]
 
 [[package]]
@@ -11184,9 +11226,7 @@ version = "0.1.0"
 dependencies = [
  "consensus-metrics",
  "eyre",
- "futures",
  "tn-config",
- "tn-network-libp2p",
  "tn-primary",
  "tn-storage",
  "tn-types",
@@ -11404,36 +11444,32 @@ dependencies = [
 name = "telcoin-network"
 version = "0.1.0"
 dependencies = [
- "alloy",
- "bs58",
- "cfg-if",
  "clap",
- "const-hex",
+ "rpassword",
+ "telcoin-network-cli",
+ "tn-faucet",
+ "tn-node",
+]
+
+[[package]]
+name = "telcoin-network-cli"
+version = "0.1.0"
+dependencies = [
+ "bs58",
+ "clap",
  "const-str",
  "dirs-next",
- "ethereum-tx-sign",
  "eyre",
  "fdlimit",
- "futures",
- "gcloud-sdk",
- "jsonrpsee",
- "k256",
- "nix 0.29.0",
- "rand 0.9.1",
- "rand_chacha 0.9.0",
  "rayon",
- "rpassword",
  "secp256k1 0.31.0",
- "serde_json",
  "serde_yaml",
  "tempfile",
  "tn-config",
- "tn-faucet",
  "tn-node",
  "tn-reth",
  "tn-types",
  "tokio",
- "tonic 0.13.1",
  "tracing",
  "vergen 8.3.2",
 ]
@@ -11926,8 +11962,6 @@ dependencies = [
  "async-trait",
  "jsonrpsee",
  "jsonrpsee-types",
- "rand 0.9.1",
- "serde",
  "thiserror 1.0.69",
  "tn-reth",
  "tn-types",
@@ -11939,19 +11973,15 @@ version = "0.1.0"
 dependencies = [
  "dashmap 6.1.0",
  "eyre",
- "futures",
  "ouroboros",
  "page_size",
  "parking_lot",
  "prometheus",
  "redb",
  "reth-libmdbx",
- "serde",
  "tempfile",
- "tn-test-utils",
  "tn-types",
  "tn-utils",
- "tokio",
  "tracing",
 ]
 
@@ -11962,7 +11992,7 @@ dependencies = [
  "clap",
  "eyre",
  "indexmap 2.9.0",
- "telcoin-network",
+ "telcoin-network-cli",
  "tempfile",
  "tn-config",
  "tn-faucet",
@@ -12012,7 +12042,6 @@ dependencies = [
  "serde_with 2.3.3",
  "serde_yaml",
  "thiserror 1.0.69",
- "tn-utils",
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.20",
@@ -12023,10 +12052,8 @@ name = "tn-utils"
 version = "0.1.0"
 dependencies = [
  "futures",
- "once_cell",
  "parking_lot",
  "tokio",
- "tracing",
 ]
 
 [[package]]

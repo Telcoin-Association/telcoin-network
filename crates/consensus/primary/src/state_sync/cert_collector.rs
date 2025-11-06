@@ -113,7 +113,7 @@ where
     }
 
     /// Reference to the collector's start time.
-    pub fn start_time(&self) -> &Instant {
+    pub(crate) fn start_time(&self) -> &Instant {
         &self.start_time
     }
 
