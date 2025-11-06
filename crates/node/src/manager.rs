@@ -1366,21 +1366,41 @@ where
             )
             .await?;
 
-        // always dial peers for the new epoch
-        for (_authority_id, bls_pubkey) in consensus_config
-            .committee()
-            .others_primaries_by_id(consensus_config.authority_id().as_ref())
-        {
-            self.dial_peer_bls(
-                network_handle.inner_handle().clone(),
-                bls_pubkey,
-                epoch_task_spawner.clone(),
-            );
+        let mut peers = network_handle.connected_peers_count().await.unwrap_or(0);
+        if peers == 0 || self.consensus_bus.node_mode().borrow().is_cvv() {
+            // always dial peers for the new epoch
+            // do this if a CVV (may need to connect to the other CVVs) or if we don't have any
+            // peers if we are not a committee member and have peers then do not pester
+            // the committee
+            for (_authority_id, bls_pubkey) in consensus_config
+                .committee()
+                .others_primaries_by_id(consensus_config.authority_id().as_ref())
+            {
+                self.dial_peer_bls(
+                    network_handle.inner_handle().clone(),
+                    bls_pubkey,
+                    epoch_task_spawner.clone(),
+                );
+            }
         }
 
         // wait until the primary has connected with at least 1 peer
-        let mut peers = network_handle.connected_peers_count().await.unwrap_or(0);
+        let mut retries = 0;
         while peers == 0 {
+            retries += 1;
+            if retries > 240 {
+                // If we could not get on the network in about 2 minutes then trigger node exit.
+                // This indicates a fundemental problem (maybe no network access?) that should be
+                // addressed. Since this is a blockchain there is nothing useful for a
+                // node to do without being on the network.
+                return Err(eyre::eyre!(
+                    "Unable to join telcoin network, can not connect to any peers!"
+                ));
+            }
+            if retries % 10 == 0 {
+                // Log error about every 5 seconds.
+                error!(target: "epoch-manager", "failed to join the network!")
+            }
             tokio::time::sleep(Duration::from_millis(500)).await;
             peers = network_handle.connected_peers_count().await.unwrap_or(0);
         }
@@ -1410,6 +1430,7 @@ where
         let task_name = format!("DialPeer {bls_pubkey}");
         node_task_spawner.spawn_task(task_name, async move {
             let mut backoff = 1;
+            let mut retries = 0;
 
             debug!(target: "epoch-manager", ?bls_pubkey, "dialing peer");
             while let Err(e) = handle.dial_by_bls(bls_pubkey).await {
@@ -1419,11 +1440,19 @@ where
                 {
                     return;
                 }
+                retries += 1;
 
                 warn!(target: "epoch-manager", "failed to dial {bls_pubkey}: {e}");
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
                 if backoff < 120 {
                     backoff += backoff;
+                }
+                let peers = handle.connected_peer_count().await.unwrap_or(0);
+                // We have been trying for a while (at least two max backoffs at 120 secs), if we
+                // have any other peers give up.
+                if retries > 10 && peers > 0 {
+                    error!(target = "dial_peer", "failed to reach peer {bls_pubkey}, giving up");
+                    return;
                 }
             }
         });
