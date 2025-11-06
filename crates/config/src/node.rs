@@ -13,7 +13,7 @@ use tracing::info;
 
 /// The filename to use when reading/writing the validator's BlsKey.
 pub const BLS_KEYFILE: &str = "bls.key";
-// The filename to use when reading/writing a wrapped (encypted) validator BlsKey.
+/// The filename to use when reading/writing a wrapped (encypted) validator BlsKey.
 pub const BLS_WRAPPED_KEYFILE: &str = "bls.kw";
 /// The filename to use when reading/writing the primary's network keys seed.
 pub const PRIMARY_NETWORK_SEED_FILE: &str = "primary.seed";
@@ -261,6 +261,7 @@ impl Parameters {
         Duration::from_secs(5)
     }
 
+    /// The default gc depth for consensus.
     pub fn default_gc_depth() -> u32 {
         50
     }

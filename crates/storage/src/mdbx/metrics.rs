@@ -3,7 +3,7 @@
 use prometheus::{default_registry, register_int_gauge_with_registry, IntGauge, Registry};
 
 #[derive(Debug)]
-pub struct MdbxMetrics {
+pub(super) struct MdbxMetrics {
     pub page_size: IntGauge,
     pub depth: IntGauge,
     pub branch_pages: IntGauge,

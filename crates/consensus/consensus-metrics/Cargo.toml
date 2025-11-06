@@ -21,5 +21,5 @@ parking_lot = { workspace = true }
 futures = { workspace = true }
 tn-types = { workspace = true }
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(msim)'] }
+[lints]
+workspace = true

@@ -6,7 +6,7 @@ use thiserror::Error;
 use tn_types::hex::encode_prefixed;
 
 /// The result type for TN RPC namespace.
-pub type TelcoinNetworkRpcResult<T> = Result<T, TNRpcError>;
+pub(crate) type TelcoinNetworkRpcResult<T> = Result<T, TNRpcError>;
 
 /// Error type for public RPC endpoints in the `tn` namespace.
 #[derive(Debug, Error)]
@@ -29,7 +29,7 @@ impl From<TNRpcError> for jsonrpsee_types::ErrorObject<'static> {
 }
 
 /// Constructs a JSON-RPC error for jsonrpsee compatibility.
-pub fn rpc_error(
+pub(crate) fn rpc_error(
     code: i32,
     msg: impl Into<String>,
     data: Option<&[u8]>,

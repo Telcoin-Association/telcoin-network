@@ -6,7 +6,6 @@ use std::{
     future::Future,
     sync::LazyLock,
 };
-use tn_utils::fail_point;
 
 use crate::{
     tables::{CertificateDigestByOrigin, CertificateDigestByRound, Certificates},
@@ -15,7 +14,7 @@ use crate::{
 use tn_types::{
     AuthorityIdentifier, Certificate, CertificateDigest, Database, DbTx, DbTxMut, Hash, Round,
 };
-use tn_utils::sync::notify_read::NotifyRead;
+use tn_utils::NotifyRead;
 
 static NOTIFY_SUBSCRIBERS: LazyLock<NotifyRead<CertificateDigest, Certificate>> =
     LazyLock::new(NotifyRead::new);
@@ -59,8 +58,10 @@ pub trait CertificateStore {
         round: Round,
     ) -> StoreResult<Option<Certificate>>;
 
+    /// Check database for certificate.
     fn contains(&self, digest: &CertificateDigest) -> StoreResult<bool>;
 
+    /// Check database for multiple certificates.
     fn multi_contains<'a>(
         &self,
         digests: impl Iterator<Item = &'a CertificateDigest>,
@@ -170,7 +171,6 @@ fn gc_rounds<DB: Database>(db: &DB, target_round: Round) -> StoreResult<()> {
 impl<DB: Database> CertificateStore for DB {
     /// Inserts a certificate to the store
     fn write(&self, certificate: Certificate) -> StoreResult<()> {
-        fail_point!("certificate-store-before-write");
         let mut txn = self.write_txn()?;
 
         let id = certificate.digest();
@@ -178,7 +178,6 @@ impl<DB: Database> CertificateStore for DB {
         save_cert(&mut txn, id, certificate)?;
 
         txn.commit()?;
-        fail_point!("certificate-store-after-write");
         gc_rounds(self, round)?;
         Ok(())
     }
@@ -187,8 +186,6 @@ impl<DB: Database> CertificateStore for DB {
     /// In the end it notifies any subscribers that are waiting to hear for the
     /// value.
     fn write_all(&self, certificates: impl IntoIterator<Item = Certificate>) -> StoreResult<()> {
-        fail_point!("certificate-store-before-write");
-
         let mut txn = self.write_txn()?;
         let mut round = 0;
         for certificate in certificates {
@@ -202,7 +199,6 @@ impl<DB: Database> CertificateStore for DB {
 
         txn.commit()?;
         gc_rounds(self, round)?;
-        fail_point!("certificate-store-after-write");
         Ok(())
     }
 
@@ -268,7 +264,6 @@ impl<DB: Database> CertificateStore for DB {
 
     /// Deletes a single certificate by its digest.
     fn delete(&self, id: CertificateDigest) -> StoreResult<()> {
-        fail_point!("certificate-store-before-write");
         let mut txn = self.write_txn()?;
         // first read the certificate to get the round - we'll need in order
         // to delete the secondary index
@@ -289,7 +284,6 @@ impl<DB: Database> CertificateStore for DB {
         txn.remove::<CertificateDigestByOrigin>(&key)?;
 
         txn.commit()?;
-        fail_point!("certificate-store-after-write");
         Ok(())
     }
 
@@ -434,7 +428,6 @@ impl<DB: Database> CertificateStore for DB {
 
     /// Clears both the main storage of the certificates and the secondary index
     fn clear(&self) -> StoreResult<()> {
-        fail_point!("certificate-store-before-write");
         let mut txn = self.write_txn()?;
 
         txn.clear_table::<Certificates>()?;
@@ -442,7 +435,6 @@ impl<DB: Database> CertificateStore for DB {
         txn.clear_table::<CertificateDigestByOrigin>()?;
 
         txn.commit()?;
-        fail_point!("certificate-store-after-write");
         Ok(())
     }
 

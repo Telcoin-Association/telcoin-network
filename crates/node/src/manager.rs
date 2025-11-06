@@ -70,7 +70,7 @@ pub(super) const WORKER_TASK_BASE: &str = "Worker Task";
 
 /// The long-running type that oversees epoch transitions.
 #[derive(Debug)]
-pub struct EpochManager<P, DB> {
+pub(crate) struct EpochManager<P, DB> {
     /// The builder for node configuration
     builder: TnBuilder,
     /// The data directory
@@ -187,7 +187,7 @@ where
     DB: TNDatabase,
 {
     /// Create a new instance of [Self].
-    pub fn new(
+    pub(crate) fn new(
         builder: TnBuilder,
         tn_datadir: P,
         passphrase: Option<String>,
@@ -231,7 +231,7 @@ where
     }
 
     /// Run the node, handling epoch transitions.
-    pub async fn run(&mut self) -> eyre::Result<()> {
+    pub(crate) async fn run(&mut self) -> eyre::Result<()> {
         // Main task manager that manages tasks across epochs.
         // Long-running tasks for the lifetime of the node.
         let mut node_task_manager = TaskManager::new(NODE_TASK_MANAGER);

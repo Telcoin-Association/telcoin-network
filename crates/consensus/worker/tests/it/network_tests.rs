@@ -11,8 +11,8 @@ use tn_storage::{mem_db::MemDatabase, tables::Batches};
 use tn_test_utils::CommitteeFixture;
 use tn_types::{Batch, BlsPublicKey, Database, SealedBatch, TaskManager, B256};
 use tn_worker::{
-    test_utils::{RequestHandler, WorkerGossip, WorkerNetworkError},
-    WorkerNetworkHandle, WorkerRequest, WorkerResponse,
+    RequestHandler, WorkerGossip, WorkerNetworkError, WorkerNetworkHandle, WorkerRequest,
+    WorkerResponse,
 };
 use tokio::sync::mpsc;
 

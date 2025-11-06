@@ -32,7 +32,6 @@ tokio = { workspace = true, features = ["sync", "rt", "macros", "signal"] }
 tracing = { workspace = true }
 eyre = { workspace = true }
 once_cell = { workspace = true }
-tn-utils = { workspace = true }
 parking_lot = { workspace = true }
 secp256k1 = { workspace = true }
 libp2p = { workspace = true, features = ["serde"] }
@@ -49,3 +48,6 @@ clap = { workspace = true, optional = true }
 [features]
 default = []
 test-utils = ["tracing-subscriber", "clap"]
+
+[lints]
+workspace = true

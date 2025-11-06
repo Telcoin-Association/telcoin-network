@@ -4,9 +4,7 @@ use crate::{
     crypto, BlockNumHash, BlsPublicKey, CertificateDigest, Digest, Epoch, HeaderDigest, Round,
     SendError, TimestampSec, VoteDigest, WorkerId,
 };
-use std::sync::Arc;
 use thiserror::Error;
-use tn_utils::sync::notify_once::NotifyOnce;
 
 /// Return an error if the condition is false.
 #[macro_export(local_inner_macros)]
@@ -19,9 +17,6 @@ macro_rules! ensure {
 }
 
 pub type DagResult<T> = Result<T, DagError>;
-
-// Notification for certificate accepted.
-pub type AcceptNotification = Arc<NotifyOnce>;
 
 pub type StoreError = eyre::Report;
 
@@ -132,9 +127,6 @@ pub enum DagError {
 
     #[error("Network error: {0}")]
     NetworkError(String),
-
-    #[error("Processing was suspended to retrieve parent certificates")]
-    Suspended(AcceptNotification),
 
     #[error("System shutting down")]
     ShuttingDown,

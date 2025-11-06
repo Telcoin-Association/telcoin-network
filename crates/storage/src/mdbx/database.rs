@@ -297,6 +297,7 @@ impl Database for MdbxDatabase {
     }
 }
 
+#[derive(Debug)]
 pub struct MdbxIter<K, V>
 where
     K: KeyT,
@@ -323,6 +324,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub struct MdbxRevIter<K, V>
 where
     K: KeyT,

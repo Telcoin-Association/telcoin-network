@@ -9,7 +9,7 @@ use serde::{
 use serde_with::{DeserializeAs, SerializeAs};
 
 /// Serde interface to RoaringBitmap according to the roaring bitmap on-disk standard.
-pub struct RoaringBitmapSerde;
+pub(crate) struct RoaringBitmapSerde;
 
 impl SerializeAs<roaring::RoaringBitmap> for RoaringBitmapSerde {
     fn serialize_as<S>(source: &roaring::RoaringBitmap, serializer: S) -> Result<S::Ok, S::Error>
@@ -41,7 +41,7 @@ impl<'de> DeserializeAs<'de, roaring::RoaringBitmap> for RoaringBitmapSerde {
         impl Visitor<'_> for RBVisitor {
             type Value = roaring::RoaringBitmap;
 
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 write!(f, "valid roaring bitmap bytes")
             }
 

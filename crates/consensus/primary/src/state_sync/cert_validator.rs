@@ -22,7 +22,7 @@ use tracing::{debug, error, trace};
 #[path = "../tests/cert_validator_tests.rs"]
 mod cert_validator_tests;
 
-pub fn certificate_source<DB: Database>(
+pub(super) fn certificate_source<DB: Database>(
     config: &ConsensusConfig<DB>,
     certificate: &Certificate,
 ) -> &'static str {

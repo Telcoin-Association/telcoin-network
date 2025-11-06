@@ -26,6 +26,7 @@ tokio = { workspace = true, features = [
     "time",
     "rt-multi-thread",
 ] }
+futures = { workspace = true, optional = true }
 
 [dev-dependencies]
 tn-reth = { workspace = true, features = ["test-utils"] }
@@ -47,8 +48,6 @@ gcloud-sdk = { version = "=0.24.6", default-features = false, features = [
 k256 = "0.13.3"
 tonic = { workspace = true }
 nix = { version = "0.29", features = ["signal"] }
-cfg-if = { workspace = true }
-futures = { workspace = true }
 secp256k1 = { workspace = true, features = [
     "global-context",
     "rand",
@@ -57,7 +56,7 @@ secp256k1 = { workspace = true, features = [
 
 [features]
 default = []
-faucet = ["dep:tn-faucet"]
+faucet = ["dep:tn-faucet", "dep:futures"]
 
 [lints]
 workspace = true

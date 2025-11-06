@@ -234,9 +234,11 @@ impl LeaderSwapTable {
 ///
 /// It provides methods to derive the leader of a round based on the provided leader swap table.
 /// This struct can be cloned and shared freely as the internal parts are atomically updated.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct LeaderSchedule {
+    /// The committee for this schedule.
     pub committee: Committee,
+    /// The leader swap table.
     pub leader_swap_table: Arc<RwLock<LeaderSwapTable>>,
 }
 

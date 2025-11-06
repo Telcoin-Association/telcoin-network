@@ -15,3 +15,6 @@ tn-reth = { workspace = true, features = ["test-utils"] }
 tn-types = { workspace = true }
 tn-config = { workspace = true }
 rand = { workspace = true }
+
+[lints]
+workspace = true

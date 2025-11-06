@@ -2,6 +2,8 @@
 //!
 //! Grant takes full responsibility for maintaining this madness.
 
+#![allow(unused_crate_dependencies)]
+
 use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,

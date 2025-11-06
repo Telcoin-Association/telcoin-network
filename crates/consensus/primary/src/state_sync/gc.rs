@@ -20,7 +20,7 @@ use tracing::{error, warn};
 /// When the DAG advances the GC round, this task updates the [AtomicRound] and notifies
 /// subscribers.
 #[derive(Debug)]
-pub struct GarbageCollector<DB> {
+pub(super) struct GarbageCollector<DB> {
     /// The consensus configuration.
     config: ConsensusConfig<DB>,
     /// Consensus message channels.
@@ -135,7 +135,7 @@ struct InnerAtomicRound {
 
 impl AtomicRound {
     /// Create a new instance of Self.
-    pub fn new(num: u32) -> Self {
+    pub(super) fn new(num: u32) -> Self {
         Self { inner: Arc::new(InnerAtomicRound { atomic: AtomicU32::new(num) }) }
     }
 

@@ -9,7 +9,7 @@ use tn_types::{
 };
 
 /// Result alias for results that possibly return [`PrimaryNetworkError`].
-pub type PrimaryNetworkResult<T> = Result<T, PrimaryNetworkError>;
+pub(crate) type PrimaryNetworkResult<T> = Result<T, PrimaryNetworkError>;
 
 /// Core error variants when executing the output from consensus and extending the canonical block.
 #[derive(Debug, thiserror::Error)]

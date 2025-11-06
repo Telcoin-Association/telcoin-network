@@ -1,5 +1,8 @@
 //! Node IT tests
 
+// unused deps lint confusion
+#![allow(unused_crate_dependencies)]
+
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -35,7 +38,6 @@ use tracing::debug;
 
 #[tokio::test]
 async fn test_catchup_accumulator() -> eyre::Result<()> {
-    tn_types::test_utils::init_test_tracing();
     let tmp = temp_dir();
     // create deterministic committee fixture and use first authority's components
     let fixture = CommitteeFixture::builder(MemDatabase::default)

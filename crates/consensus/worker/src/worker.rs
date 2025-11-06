@@ -152,6 +152,7 @@ impl<DB, QW> std::fmt::Debug for Worker<DB, QW> {
 
 impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
     #[allow(clippy::too_many_arguments)]
+    /// Create an instance of `Self`.
     pub fn new(
         id: WorkerId,
         quorum_waiter: Option<QW>,
@@ -190,6 +191,7 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         });
     }
 
+    /// Return worker's ID.
     pub fn id(&self) -> WorkerId {
         self.id
     }

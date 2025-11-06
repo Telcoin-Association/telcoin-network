@@ -16,22 +16,27 @@ use tracing::debug;
 
 #[cfg(test)]
 #[path = "tests/batch_fetcher.rs"]
-pub mod batch_fetcher_tests;
+mod batch_fetcher_tests;
 
-pub struct BatchFetcher<DB> {
+#[derive(Debug)]
+pub(crate) struct BatchFetcher<DB> {
     network: Arc<dyn RequestBatchesNetwork>,
     batch_store: DB,
     metrics: Arc<WorkerMetrics>,
 }
 
 impl<DB: Database> BatchFetcher<DB> {
-    pub fn new(network: WorkerNetworkHandle, batch_store: DB, metrics: Arc<WorkerMetrics>) -> Self {
+    pub(crate) fn new(
+        network: WorkerNetworkHandle,
+        batch_store: DB,
+        metrics: Arc<WorkerMetrics>,
+    ) -> Self {
         Self { network: Arc::new(network), batch_store, metrics }
     }
 
     /// Bulk fetches payload from local storage and remote workers.
     /// This function performs infinite retries and until all batches are available.
-    pub async fn fetch(&self, digests: HashSet<BlockHash>) -> HashMap<BlockHash, Batch> {
+    pub(crate) async fn fetch(&self, digests: HashSet<BlockHash>) -> HashMap<BlockHash, Batch> {
         debug!(target: "batch_fetcher", "Attempting to fetch {} digests from peers", digests.len(),);
 
         let mut remaining_digests = digests;
@@ -144,7 +149,7 @@ enum RequestBatchesNetworkError {
 
 // Utility trait to add a timeout to a batch request.
 #[async_trait]
-trait RequestBatchesNetwork: Send + Sync {
+trait RequestBatchesNetwork: Send + Sync + std::fmt::Debug {
     async fn request_batches_from_all(
         &self,
         batch_digests: Vec<BlockHash>,

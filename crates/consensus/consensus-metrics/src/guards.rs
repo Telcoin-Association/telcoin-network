@@ -8,6 +8,7 @@ use std::{
 };
 
 /// Increments gauge when acquired, decrements when guard drops
+#[derive(Debug)]
 pub struct GaugeGuard<'a>(&'a IntGauge);
 
 impl<'a> GaugeGuard<'a> {
@@ -34,6 +35,7 @@ impl<F: Future> GaugeGuardFutureExt for F {
     }
 }
 
+#[derive(Debug)]
 pub struct GaugeGuardFuture<'a, F: Sized> {
     f: Pin<Box<F>>,
     _guard: GaugeGuard<'a>,

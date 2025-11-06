@@ -8,7 +8,7 @@ use tn_types::{
 use tracing::{debug, error, info};
 
 /// Updates Narwhal system state based on certificates received from consensus.
-pub struct StateHandler {
+pub(crate) struct StateHandler {
     authority_id: AuthorityIdentifier,
 
     /// Used for Receives the ordered certificates from consensus.
@@ -18,7 +18,7 @@ pub struct StateHandler {
 }
 
 impl StateHandler {
-    pub fn spawn(
+    pub(crate) fn spawn(
         authority_id: AuthorityIdentifier,
         consensus_bus: &ConsensusBus,
         rx_shutdown: Noticer,

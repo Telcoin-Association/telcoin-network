@@ -35,6 +35,7 @@ pub trait TelcoinNetworkRpcExtApi {
 }
 
 /// The type that implements `tn` namespace trait.
+#[derive(Debug)]
 pub struct TelcoinNetworkRpcExt<N: EngineToPrimary> {
     /// The chain id for this node.
     chain: ChainSpec,

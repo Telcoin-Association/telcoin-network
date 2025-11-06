@@ -29,3 +29,6 @@ tn-test-utils = { workspace = true }
 tn-primary = { workspace = true, features = ["test-utils"] }
 tn-network-libp2p = { workspace = true }
 tn-reth = { workspace = true, features = ["test-utils"] }
+
+[lints]
+workspace = true

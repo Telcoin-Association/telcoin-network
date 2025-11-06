@@ -97,7 +97,7 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
     ///
     /// ```no_run
     /// use clap::Parser;
-    /// use telcoin_network::cli::Cli;
+    /// use telcoin_network_cli::cli::Cli;
     /// use tn_node::launch_node;
     ///
     /// #[derive(Debug, Parser)]
@@ -105,7 +105,7 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
     ///     pub enable: bool,
     /// }
     ///
-    /// if let Err(err) = telcoin_network::cli::Cli::<MyArgs>::parse()
+    /// if let Err(err) = telcoin_network_cli::cli::Cli::<MyArgs>::parse()
     ///     .run(None, |builder, _, tn_datadir, passphrase| {
     ///         launch_node(builder, tn_datadir, passphrase)
     ///     })

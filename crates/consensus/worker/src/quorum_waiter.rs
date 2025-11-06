@@ -35,6 +35,7 @@ pub trait QuorumWaiterTrait: Send + Sync + Clone + Unpin + 'static {
     ) -> oneshot::Receiver<Result<(), QuorumWaiterError>>;
 }
 
+#[derive(Debug)]
 struct QuorumWaiterInner {
     /// This authority.
     authority: Authority,
@@ -47,7 +48,7 @@ struct QuorumWaiterInner {
 }
 
 /// The QuorumWaiter waits for 2f authorities to acknowledge reception of a batch.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct QuorumWaiter {
     inner: Arc<QuorumWaiterInner>,
 }

@@ -13,12 +13,14 @@ use tracing::{debug, error_span};
 
 #[cfg(test)]
 #[path = "tests/bullshark_tests.rs"]
-pub mod bullshark_tests;
+mod bullshark_tests;
 
 #[cfg(test)]
 #[path = "tests/randomized_tests.rs"]
-pub mod randomized_tests;
+mod randomized_tests;
 
+/// Bullshark implementation.
+#[derive(Debug)]
 pub struct Bullshark {
     /// The committee information.
     pub committee: Committee,

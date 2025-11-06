@@ -72,7 +72,7 @@ udeps:
 	find . -type f -name Cargo.toml -exec sed -rne 's/^name = "(.*)"/\1/p' {} + | xargs -I {} sh -c "echo '\n\n{}:' && cargo +nightly udeps --package {}" ;
 
 check:
-	cargo check --workspace --features faucet ;
+	cargo check --workspace --all-features --all-targets ;
 
 # run workspace unit tests
 test:

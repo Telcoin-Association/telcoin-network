@@ -13,14 +13,8 @@
 //! tip and basefee calculated for the round. Only the engine's canonical updates affect the pool's
 //! tracked `tip`, basefee, and blob fees sorting transactions into sub-pools.
 
-#![doc(
-    html_logo_url = "https://www.telco.in/logos/TEL.svg",
-    html_favicon_url = "https://www.telco.in/logos/TEL.svg",
-    issue_tracker_base_url = "https://github.com/telcoin-association/telcoin-network/issues/"
-)]
-#![warn(missing_debug_implementations, missing_docs, unreachable_pub, rustdoc::all)]
-#![deny(unused_must_use, rust_2018_idioms)]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+// it tests
+#![allow(unused_crate_dependencies)]
 
 pub use batch::{build_batch, BatchBuilderOutput};
 use error::{BatchBuilderError, BatchBuilderResult};
@@ -37,7 +31,7 @@ use tn_types::{
     BatchSender, Epoch, SealedBlock, TaskSpawner, TxHash, WorkerId,
 };
 use tokio::{sync::oneshot, time::Interval};
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 mod batch;
 mod error;

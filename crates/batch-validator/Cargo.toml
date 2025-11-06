@@ -25,3 +25,6 @@ tokio = { workspace = true, features = ["sync", "time"] }
 [features]
 default = []
 test-utils = []
+
+[lints]
+workspace = true

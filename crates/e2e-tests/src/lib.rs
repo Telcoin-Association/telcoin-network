@@ -2,14 +2,8 @@
 //!
 //! Utilities for it tests.
 
-#![doc(
-    html_logo_url = "https://www.telco.in/logos/TEL.svg",
-    html_favicon_url = "https://www.telco.in/logos/TEL.svg",
-    issue_tracker_base_url = "https://github.com/telcoin-association/telcoin-network/issues/"
-)]
-#![warn(missing_docs, unreachable_pub, rustdoc::all)]
-#![deny(unused_must_use, rust_2018_idioms)]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+// ignore for IT test
+#![allow(unused_crate_dependencies)]
 
 use clap::Parser;
 use std::path::{Path, PathBuf};
@@ -18,6 +12,7 @@ use tn_config::{Config, ConfigFmt, ConfigTrait};
 use tn_node::launch_node;
 use tn_types::{test_utils::CommandParser, Address, Genesis, GenesisAccount};
 use tracing::error;
+// unused deps warnings
 
 /// Limit potential for port collisions.
 pub static IT_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());

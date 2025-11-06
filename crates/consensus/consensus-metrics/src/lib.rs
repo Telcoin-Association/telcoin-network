@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Consensus metrics are used throughout consensus to capture metrics while using async channels.
 
-#![warn(
-    future_incompatible,
-    nonstandard_style,
-    rust_2018_idioms,
-    rust_2021_compatibility,
-    unused_crate_dependencies
-)]
+#![allow(missing_docs)]
 
 use axum::{http::StatusCode, routing::get, Router};
+use once_cell::sync::OnceCell;
+use prometheus::{
+    default_registry, register_int_gauge_vec_with_registry, IntGaugeVec, Registry, TextEncoder,
+};
+pub use scopeguard;
 use std::{
     future::Future,
     net::SocketAddr,
@@ -19,14 +18,7 @@ use std::{
 };
 use tn_types::{Noticer, TaskManager};
 use tokio::net::TcpListener;
-
-use once_cell::sync::OnceCell;
-use prometheus::{
-    default_registry, register_int_gauge_vec_with_registry, IntGaugeVec, Registry, TextEncoder,
-};
 use tracing::{error, warn};
-
-pub use scopeguard;
 
 mod guards;
 pub mod histogram;
@@ -186,6 +178,7 @@ macro_rules! spawn_logged_monitored_task {
     };
 }
 
+#[derive(Debug)]
 pub struct MonitoredScopeGuard {
     metrics: &'static Metrics,
     name: &'static str,
@@ -231,6 +224,7 @@ impl<F: Future> MonitoredFutureExt for F {
     }
 }
 
+#[derive(Debug)]
 pub struct MonitoredScopeFuture<F: Sized> {
     f: Pin<Box<F>>,
     _scope: Option<MonitoredScopeGuard>,
@@ -246,18 +240,11 @@ impl<F: Future> Future for MonitoredScopeFuture<F> {
 
 pub const METRICS_ROUTE: &str = "/metrics";
 
-// Creates a new http server that has as a sole purpose to expose
-// and endpoint that prometheus agent can use to poll for the metrics.
-// A RegistryService is returned that can be used to get access in prometheus Registries.
+/// Creates a new http server that has as a sole purpose to expose
+/// and endpoint that prometheus agent can use to poll for the metrics.
+/// A RegistryService is returned that can be used to get access in prometheus Registries.
 pub fn start_prometheus_server(addr: SocketAddr, task_manager: &TaskManager, shutdown: Noticer) {
     init_metrics();
-    if cfg!(msim) {
-        // prometheus uses difficult-to-support features such as TcpSocket::from_raw_fd(), so we
-        // can't yet run it in the simulator.
-        warn!("not starting prometheus server in simulator");
-        return;
-    }
-
     let app = Router::new().route(METRICS_ROUTE, get(metrics));
 
     task_manager.spawn_critical_task("ConsensusMetrics", async move {

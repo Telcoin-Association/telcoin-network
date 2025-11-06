@@ -33,7 +33,7 @@ mod cert_manager_tests;
 ///
 /// Long-running task to manage pending certificate requests and accept verified certificates.
 #[derive(Debug)]
-pub struct CertificateManager<DB> {
+pub(super) struct CertificateManager<DB> {
     /// Consensus channels.
     consensus_bus: ConsensusBus,
     /// The configuration for consensus.
@@ -59,7 +59,7 @@ where
     DB: Database,
 {
     /// Create a new instance of Self.
-    pub fn new(
+    pub(super) fn new(
         config: ConsensusConfig<DB>,
         consensus_bus: ConsensusBus,
         gc_round: AtomicRound,

@@ -8,7 +8,7 @@ use tn_storage::open_db;
 use tn_types::test_chain_spec_arc;
 
 #[tokio::test]
-pub async fn test_fetchertt() {
+async fn test_fetchertt() {
     let mut network = TestRequestBatchesNetwork::new();
     let temp_dir = TempDir::new().unwrap();
     let batch_store = open_db(temp_dir.path());
@@ -49,7 +49,7 @@ pub async fn test_fetchertt() {
 }
 
 #[tokio::test]
-pub async fn test_fetcher_locally_with_remaining() {
+async fn test_fetcher_locally_with_remaining() {
     // Limit is set to two batches in test request_batches(). Request 3 batches
     // and ensure another request is sent to get the remaining batches.
     let mut network = TestRequestBatchesNetwork::new();
@@ -81,7 +81,7 @@ pub async fn test_fetcher_locally_with_remaining() {
 }
 
 #[tokio::test]
-pub async fn test_fetcher_remote_with_remaining() {
+async fn test_fetcher_remote_with_remaining() {
     // Limit is set to two batches in test request_batches(). Request 3 batches
     // and ensure another request is sent to get the remaining batches.
     let mut network = TestRequestBatchesNetwork::new();
@@ -121,7 +121,7 @@ pub async fn test_fetcher_remote_with_remaining() {
 }
 
 #[tokio::test]
-pub async fn test_fetcher_local_and_remote() {
+async fn test_fetcher_local_and_remote() {
     let mut network = TestRequestBatchesNetwork::new();
     let temp_dir = TempDir::new().unwrap();
     let batch_store = open_db(temp_dir.path());
@@ -164,7 +164,7 @@ pub async fn test_fetcher_local_and_remote() {
 }
 
 #[tokio::test]
-pub async fn test_fetcher_response_size_limit() {
+async fn test_fetcher_response_size_limit() {
     let mut network = TestRequestBatchesNetwork::new();
     let temp_dir = TempDir::new().unwrap();
     let batch_store = open_db(temp_dir.path());

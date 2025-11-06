@@ -456,7 +456,7 @@ mod protocol_vec {
     use super::*;
     use serde::{de::Error, Deserialize, Deserializer, Serialize, Serializer};
 
-    pub fn serialize<S>(
+    pub(crate) fn serialize<S>(
         protocols: &[(StreamProtocol, ProtocolSupport)],
         serializer: S,
     ) -> Result<S::Ok, S::Error>
@@ -479,7 +479,7 @@ mod protocol_vec {
         string_tuples.serialize(serializer)
     }
 
-    pub fn deserialize<'de, D>(
+    pub(crate) fn deserialize<'de, D>(
         deserializer: D,
     ) -> Result<Vec<(StreamProtocol, ProtocolSupport)>, D::Error>
     where

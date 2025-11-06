@@ -57,7 +57,7 @@ impl ConsensusResult {
 
 /// Primary messages on the gossip network.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
-pub enum PrimaryGossip {
+pub(super) enum PrimaryGossip {
     /// A new certificate broadcast from peer.
     ///
     /// Certificates are small and okay to gossip uncompressed:

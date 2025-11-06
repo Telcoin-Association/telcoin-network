@@ -3127,7 +3127,6 @@ name = "e2e-tests"
 version = "0.1.0"
 dependencies = [
  "alloy",
- "cfg-if",
  "clap",
  "const-hex",
  "ethereum-tx-sign",
@@ -11215,9 +11214,7 @@ version = "0.1.0"
 dependencies = [
  "consensus-metrics",
  "eyre",
- "futures",
  "tn-config",
- "tn-network-libp2p",
  "tn-primary",
  "tn-storage",
  "tn-types",
@@ -11953,8 +11950,6 @@ dependencies = [
  "async-trait",
  "jsonrpsee",
  "jsonrpsee-types",
- "rand 0.9.1",
- "serde",
  "thiserror 1.0.69",
  "tn-reth",
  "tn-types",
@@ -11966,19 +11961,15 @@ version = "0.1.0"
 dependencies = [
  "dashmap 6.1.0",
  "eyre",
- "futures",
  "ouroboros",
  "page_size",
  "parking_lot",
  "prometheus",
  "redb",
  "reth-libmdbx",
- "serde",
  "tempfile",
- "tn-test-utils",
  "tn-types",
  "tn-utils",
- "tokio",
  "tracing",
 ]
 
@@ -12039,7 +12030,6 @@ dependencies = [
  "serde_with 2.3.3",
  "serde_yaml",
  "thiserror 1.0.69",
- "tn-utils",
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.20",
@@ -12050,10 +12040,8 @@ name = "tn-utils"
 version = "0.1.0"
 dependencies = [
  "futures",
- "once_cell",
  "parking_lot",
  "tokio",
- "tracing",
 ]
 
 [[package]]

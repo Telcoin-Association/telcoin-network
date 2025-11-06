@@ -7,7 +7,8 @@ use tn_reth::RethEnv;
 
 /// A builder that handles component initialization for the execution node.
 /// Separates initialization concerns from runtime behavior.
-pub struct ExecutionNodeBuilder {
+#[derive(Debug)]
+pub(super) struct ExecutionNodeBuilder {
     /// The protocol configuration.
     tn_config: Config,
 
@@ -20,14 +21,14 @@ pub struct ExecutionNodeBuilder {
 
 impl ExecutionNodeBuilder {
     /// Start the builder with required components
-    pub fn new(tn_builder: &TnBuilder, reth_env: RethEnv) -> Self {
+    pub(super) fn new(tn_builder: &TnBuilder, reth_env: RethEnv) -> Self {
         let TnBuilder { node_config: _, tn_config, opt_faucet_args, metrics: _ } = tn_builder;
 
         Self { reth_env, tn_config: tn_config.clone(), opt_faucet_args: opt_faucet_args.clone() }
     }
 
     /// Build the final ExecutionNodeInner
-    pub fn build(self) -> eyre::Result<ExecutionNodeInner> {
+    pub(super) fn build(self) -> eyre::Result<ExecutionNodeInner> {
         // Ensure all required components are initialized
 
         Ok(ExecutionNodeInner {

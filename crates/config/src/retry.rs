@@ -55,11 +55,11 @@ impl RetryConfig {
     /// Default for [`RetryConfig::retrying_max_elapsed_time`] (30 s).
     pub const DEFAULT_RETRYING_MAX_ELAPSED_TIME: Duration = Duration::from_secs(30);
 
-    // Perform `op` and retry on errors as specified by this configuration.
-    //
-    // Note that `backoff::Error<E>` implements `From<E>` for any `E` by creating a
-    // `backoff::Error::Transient`, meaning that errors will be retried unless explicitly returning
-    // `backoff::Error::Permanent`.
+    /// Perform `op` and retry on errors as specified by this configuration.
+    ///
+    /// Note that `backoff::Error<E>` implements `From<E>` for any `E` by creating a
+    /// `backoff::Error::Transient`, meaning that errors will be retried unless explicitly returning
+    /// `backoff::Error::Permanent`.
     pub fn retry<R, E, Fn, Fut>(self, op: Fn) -> impl Future<Output = Result<R, E>>
     where
         Fn: FnMut() -> Fut,

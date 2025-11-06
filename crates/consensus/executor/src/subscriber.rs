@@ -29,7 +29,7 @@ use tracing::{debug, error, info};
 /// The `Subscriber` receives certificates sequenced by the consensus and waits until the
 /// downloaded all the transactions references by the certificates; it then
 /// forward the certificates to the Executor.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Subscriber<DB> {
     /// Used to get the sequence receiver
     consensus_bus: ConsensusBus,
@@ -42,6 +42,7 @@ pub struct Subscriber<DB> {
 }
 
 /// Inner subscriber type.
+#[derive(Debug)]
 struct Inner {
     /// The identifier for the authority.
     ///

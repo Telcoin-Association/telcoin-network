@@ -1,6 +1,8 @@
+//! Create metadata for cli build.
 use std::error::Error;
 use vergen::EmitBuilder;
 
+/// Metadata for current build.
 fn main() -> Result<(), Box<dyn Error>> {
     // Emit the instructions
     EmitBuilder::builder()

@@ -27,6 +27,7 @@ mod consensus_tests;
 pub type Dag = BTreeMap<Round, HashMap<AuthorityIdentifier, (CertificateDigest, Certificate)>>;
 
 /// The state that needs to be persisted for crash-recovery.
+#[derive(Debug)]
 pub struct ConsensusState {
     /// The information about the last committed round and corresponding GC round.
     pub last_round: ConsensusRound,
@@ -264,6 +265,8 @@ impl ConsensusRound {
     }
 }
 
+/// Telcoin Network consensus.
+#[derive(Debug)]
 pub struct Consensus<DB> {
     /// The committee information.
     committee: Committee,

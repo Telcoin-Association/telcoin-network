@@ -14,7 +14,7 @@ const LATENCY_SEC_BUCKETS: &[f64] = &[
     12.5, 15., 17.5, 20., 25., 30., 60., 90., 120., 180., 300.,
 ];
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Metrics {
     pub worker_metrics: Arc<WorkerMetrics>,
     pub channel_metrics: Arc<WorkerChannelMetrics>,
@@ -31,6 +31,7 @@ impl Metrics {
         Ok(Metrics { worker_metrics, channel_metrics })
     }
 
+    /// Create a new instance of `Self` with provided registry.
     pub fn new_with_registry(registry: &Registry) -> Self {
         Self::try_new(registry).expect("Prometheus error, are you using it wrong?")
     }
@@ -56,7 +57,7 @@ impl Default for Metrics {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct WorkerMetrics {
     /// Number of created batches from the batch_maker
     pub created_batch_size: HistogramVec,
@@ -160,7 +161,7 @@ impl Default for WorkerMetrics {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct WorkerChannelMetrics {
     /// occupancy of the channel from the `worker::TxReceiverhandler` to the
     /// `worker::BatchProvider`

@@ -32,15 +32,26 @@ impl TNMessage for WorkerResponse {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum WorkerRequest {
     /// Send a new batch to a peer.
-    ReportBatch { sealed_batch: SealedBatch },
+    ReportBatch {
+        /// The sealed batch that this worker is reporting.
+        sealed_batch: SealedBatch,
+    },
     /// Request batches by digest from a peer.
-    RequestBatches { batch_digests: Vec<BlockHash>, max_response_size: usize },
+    RequestBatches {
+        /// The requests batches by digests.
+        batch_digests: Vec<BlockHash>,
+        /// Maximum expected response size.
+        max_response_size: usize,
+    },
     /// Exchange peer information.
     ///
     /// This "request" is sent to peers when this node disconnects
     /// due to excess peers. The peer exchange is intended to support
     /// discovery.
-    PeerExchange { peers: PeerExchangeMap },
+    PeerExchange {
+        /// The peer information being exchanged.
+        peers: PeerExchangeMap,
+    },
 }
 
 impl From<PeerExchangeMap> for WorkerRequest {
@@ -63,7 +74,10 @@ pub enum WorkerResponse {
     /// Provided the requested batches.
     RequestBatches(Vec<Batch>),
     /// Exchange peer information.
-    PeerExchange { peers: PeerExchangeMap },
+    PeerExchange {
+        /// The peer information being exchanged.
+        peers: PeerExchangeMap,
+    },
     /// RPC error while handling request.
     ///
     /// This is an application-layer error response.

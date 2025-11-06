@@ -55,7 +55,16 @@ authors = [
 description = "Telcoin Network protocol."
 exclude = [".github/"]
 
-[workspace.lints]
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+unreachable_pub = "warn"
+unused_crate_dependencies = "warn"
+unused_must_use = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 } # includes unused_crate_dependencies
+
+[workspace.lints.rustdoc]
+all = "warn"
 
 [workspace.dependencies]
 # misc

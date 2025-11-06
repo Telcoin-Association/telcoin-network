@@ -295,7 +295,7 @@ impl<'de> Deserialize<'de> for BlsSignature {
         impl Visitor<'_> for BlsSignatureVisitor {
             type Value = BlsSignature;
 
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 write!(f, "valid bls public key bytes")
             }
 

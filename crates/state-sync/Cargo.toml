@@ -10,17 +10,14 @@ authors = [
 publish = false
 
 [dependencies]
-futures.workspace = true
 eyre = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 tn-storage = { workspace = true }
-
 tn-types = { workspace = true }
 tn-config = { workspace = true }
-tn-network-libp2p = { workspace = true }
-
-consensus-metrics.workspace = true
 tn-primary = { workspace = true }
+consensus-metrics.workspace = true
 
-[dev-dependencies]
+[lints]
+workspace = true

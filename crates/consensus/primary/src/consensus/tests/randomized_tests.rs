@@ -27,7 +27,8 @@ use tn_types::{
 use tokio::sync::mpsc::channel;
 
 #[derive(Copy, Clone, Debug)]
-pub struct FailureModes {
+/// Used in randomized tests.
+struct FailureModes {
     // The probability of having failures per round. As a failure is defined a node that does not
     // produce a certificate for a round (because is crashed, temporary failure or has just
     // been slow). The failures should be <=f , otherwise no DAG could be created. The provided
@@ -271,7 +272,7 @@ fn generate_randomised_dag(
 /// * leaders that don't get enough support (f+1) for their immediate round
 /// * slow nodes - nodes that create certificates but might not be referenced by nodes of subsequent
 ///   rounds.
-pub fn make_certificates_with_parameters(
+fn make_certificates_with_parameters(
     seed: u64,
     committee: &Committee,
     range: RangeInclusive<Round>,

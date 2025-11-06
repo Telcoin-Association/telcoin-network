@@ -7,7 +7,7 @@ use tracing::debug;
 
 /// Flatten the dag referenced by the input certificate. This is a classic depth-first search
 /// (pre-order): <https://en.wikipedia.org/wiki/Tree_traversal#Pre-order>
-pub fn order_dag(leader: &Certificate, state: &ConsensusState) -> Vec<Certificate> {
+pub(crate) fn order_dag(leader: &Certificate, state: &ConsensusState) -> Vec<Certificate> {
     debug!("Processing sub-dag of {:?}", leader);
     assert!(leader.round() > 0);
     let gc_round = leader.round().saturating_sub(state.gc_depth);

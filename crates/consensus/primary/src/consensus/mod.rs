@@ -1,9 +1,6 @@
 //! Consensus
 
 mod bullshark;
-#[cfg(test)]
-#[path = "tests/consensus_utils.rs"]
-mod consensus_utils;
 mod leader_schedule;
 mod state;
 mod utils;

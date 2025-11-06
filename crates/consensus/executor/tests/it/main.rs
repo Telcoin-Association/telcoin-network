@@ -1,5 +1,7 @@
 //! Subscriber IT tests
 
+#![allow(unused_crate_dependencies)]
+
 use std::sync::Arc;
 use tn_executor::subscriber::spawn_subscriber;
 use tn_network_libp2p::types::{MessageId, NetworkCommand};

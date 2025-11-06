@@ -20,10 +20,10 @@ tn-reth = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
 tokio-stream = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
+eyre = { workspace = true, optional = true }
 
 [dev-dependencies]
 # unit tests
-eyre = { workspace = true }
 tn-test-utils = { workspace = true }
 tn-batch-builder = { workspace = true, features = ["test-utils"] }
 tn-types = { workspace = true, features = ["test-utils"] }
@@ -35,4 +35,7 @@ tn-primary = { workspace = true, features = ["test-utils"] }
 
 [features]
 default = []
-test-utils = []
+test-utils = ["dep:eyre"]
+
+[lints]
+workspace = true
