@@ -4,10 +4,7 @@
 //! tasks run for one epoch. Other resources are shared across epochs.
 
 use crate::{
-    engine::{ExecutionNode, TnBuilder},
-    primary::PrimaryNode,
-    worker::{worker_task_manager_name, WorkerNode},
-    EngineToPrimaryRpc,
+    EngineToPrimaryRpc, engine::{ExecutionNode, TnBuilder}, health::HealthcheckServer, primary::PrimaryNode, worker::{WorkerNode, worker_task_manager_name}
 };
 use consensus_metrics::start_prometheus_server;
 use eyre::{eyre, OptionExt};
@@ -296,6 +293,9 @@ where
         node_task_manager.update_tasks();
 
         info!(target: "epoch-manager", tasks=?node_task_manager, "NODE TASKS\n");
+
+        // spawn node healthcheck service if enabled
+        let _ = HealthcheckServer::spawn(node_task_manager.get_spawner()).await;
 
         // await all tasks on epoch-task-manager or node shutdown
         let result = tokio::select! {
