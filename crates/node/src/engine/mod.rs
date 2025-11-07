@@ -47,6 +47,8 @@ pub struct TnBuilder {
     ///
     /// The metrics will be served at the given interface and port.
     pub metrics: Option<SocketAddr>,
+    /// Bool if the http healthcheck endpoint should be disabled.
+    pub disable_healthcheck: bool,
 }
 
 /// Wrapper for the inner execution node components.

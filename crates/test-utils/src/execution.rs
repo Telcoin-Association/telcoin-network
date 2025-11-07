@@ -68,7 +68,7 @@ fn execution_builder<CliExt: clap::Args + fmt::Debug>(
     // use same approach as telcoin-network binary
     let command = NodeCommand::<CliExt>::try_parse_from(cli_args)?;
 
-    let NodeCommand { instance, ext, reth, .. } = command;
+    let NodeCommand { instance, ext, reth, disable_healthcheck, .. } = command;
     let RethCommand { rpc, txpool, db, .. } = reth;
 
     let reth_command = RethCommand { rpc, txpool, db };
@@ -100,6 +100,7 @@ fn execution_builder<CliExt: clap::Args + fmt::Debug>(
         tn_config,
         opt_faucet_args,
         metrics: None,
+        disable_healthcheck,
     };
 
     Ok((builder, ext))
@@ -132,12 +133,13 @@ pub fn faucet_test_execution_node(
         execution_builder::<FaucetArgs>(opt_chain.clone(), opt_address, extended_args, tmp_dir)?;
 
     // replace default builder's faucet args
-    let TnBuilder { node_config, tn_config, .. } = builder;
+    let TnBuilder { node_config, tn_config, disable_healthcheck, .. } = builder;
     let builder = TnBuilder {
         node_config: node_config.clone(),
         tn_config,
         opt_faucet_args: Some(faucet),
         metrics: None,
+        disable_healthcheck,
     };
 
     // create engine node

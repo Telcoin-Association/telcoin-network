@@ -5,7 +5,7 @@
 
 use std::net::SocketAddr;
 
-use tn_types::{TaskSpawner};
+use tn_types::TaskSpawner;
 use tokio::{io::AsyncWriteExt, net::TcpListener};
 use tracing::info;
 
@@ -22,6 +22,9 @@ use tracing::info;
 /// Each connection is handled synchronously in the main accept loop.
 /// No connection limits or rate limiting are implemented.
 /// Connections are immediately closed after sending response.
+///
+/// To disable on node startup, use `telcoin-network node --disable-healthcheck`.
+/// See `telcoin-network-cli::node` for more info.
 #[derive(Debug)]
 pub(crate) struct HealthcheckServer;
 
@@ -45,9 +48,7 @@ impl HealthcheckServer {
     /// - No custom headers to avoid information disclosure
     pub(crate) async fn spawn(task_spawner: TaskSpawner) -> eyre::Result<SocketAddr> {
         // IMPORTANT: use firewall to protect this endpoint
-        let port = std::env::var("HEALTHCHECK_PORT")
-            .map(|str| str.parse())
-            .unwrap_or(Ok(0))?; // default assigned by OS
+        let port = std::env::var("HEALTHCHECK_PORT").map(|str| str.parse()).unwrap_or(Ok(0))?; // default assigned by OS
         let addr: SocketAddr = ([0, 0, 0, 0], port).into();
         let listener = TcpListener::bind(addr).await?;
         let listen_on = listener.local_addr()?;
@@ -75,12 +76,11 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
-    use tn_types::{TaskManager, test_utils::init_test_tracing};
     use crate::health::HealthcheckServer;
+    use tn_types::TaskManager;
 
     #[tokio::test]
     async fn test_tcp_healthcheck() -> eyre::Result<()> {
-        init_test_tracing();
         let task_manager = TaskManager::default();
         let task_spawner = task_manager.get_spawner();
 
@@ -104,16 +104,20 @@ mod tests {
             let response_str = String::from_utf8_lossy(&response);
 
             // verify http status line
-            assert!(response_str.starts_with("HTTP/1.1 200 OK"),
-                    "Expected 200 OK, got: {}", response_str);
+            assert!(
+                response_str.starts_with("HTTP/1.1 200 OK"),
+                "Expected 200 OK, got: {}",
+                response_str
+            );
 
             // verify body
-            assert!(response_str.ends_with("OK"),
-                    "Expected body 'OK', got: {}", response_str);
+            assert!(response_str.ends_with("OK"), "Expected body 'OK', got: {}", response_str);
 
             // verify content-length header
-            assert!(response_str.contains("Content-Length: 2"),
-                    "Missing or incorrect Content-Length header");
+            assert!(
+                response_str.contains("Content-Length: 2"),
+                "Missing or incorrect Content-Length header"
+            );
 
             Ok::<(), eyre::Error>(())
         })
