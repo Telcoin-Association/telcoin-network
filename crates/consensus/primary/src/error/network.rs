@@ -104,6 +104,7 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
                 | CertManagerError::RequestBounds(_)
                 | CertManagerError::Timeout
                 | CertManagerError::Network(_)
+                | CertManagerError::ChannelClosed
                 | CertManagerError::TNSend(_) => None,
             },
             PrimaryNetworkError::UnknownConsensusHeaderNumber(_)

@@ -65,6 +65,9 @@ pub(crate) enum CertManagerError {
     /// Timeout waiting for response from peer for requested certificates.
     #[error("Timeout waiting for requested certs from all peers")]
     Timeout,
+    /// The oneshot channel closed while awaiting fetch requests.
+    #[error("Pending fetch task oneshot channel closed")]
+    ChannelClosed,
 }
 
 impl<T: std::fmt::Debug> From<SendError<T>> for CertManagerError {

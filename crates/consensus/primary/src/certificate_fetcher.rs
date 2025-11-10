@@ -11,7 +11,10 @@ use futures::{stream::FuturesUnordered, StreamExt};
 use rand::{rngs::ThreadRng, seq::SliceRandom};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
     time::Duration,
 };
 use tn_config::ConsensusConfig;
@@ -23,6 +26,7 @@ use tn_types::{
     Database, Header, Noticer, Notifier, Round, TaskManager, TaskSpawner, TnReceiver, TnSender,
 };
 use tokio::{
+    sync::oneshot,
     task::JoinSet,
     time::{sleep, timeout, Instant},
 };
@@ -70,12 +74,13 @@ pub(crate) struct CertificateFetcher<DB> {
     /// Map of validator to target rounds that local store must catch up to.
     targets: BTreeMap<AuthorityIdentifier, Round>,
     /// Handle to the current fetch task (at most one runs at a time).
-    fetch_task: JoinSet<()>,
+    fetch_task: FetchTask,
     /// The max allowable RPC message size shared with peers (in bytes).
     max_rpc_message_size: usize,
 }
 
 impl<DB: Database> CertificateFetcher<DB> {
+    /// Spawn the long-running certificate fetcher.
     pub(crate) fn spawn(
         config: ConsensusConfig<DB>,
         network: PrimaryNetworkHandle,
@@ -106,7 +111,7 @@ impl<DB: Database> CertificateFetcher<DB> {
                         metrics,
                         task_spawner,
                         targets: BTreeMap::new(),
-                        fetch_task: JoinSet::new(),
+                        fetch_task: FetchTask::new(),
                         max_rpc_message_size,
                     }
                     .run()
@@ -127,7 +132,7 @@ impl<DB: Database> CertificateFetcher<DB> {
                     self.handle_command(command);
                 },
 
-                Some(result) = self.fetch_task.join_next(), if !self.fetch_task.is_empty() => {
+                result = &mut self.fetch_task => {
                     self.handle_fetch_completion(result);
                 },
 
@@ -143,8 +148,8 @@ impl<DB: Database> CertificateFetcher<DB> {
         let certificate = match command {
             CertificateFetcherCommand::Ancestors(certificate) => certificate,
             CertificateFetcherCommand::Kick => {
-                // Start fetch if no task is running and we have targets
-                if self.fetch_task.is_empty() && !self.targets.is_empty() {
+                // start fetch if no task is running and there are pending targets
+                if self.fetch_task.is_none() && !self.targets.is_empty() {
                     self.start_fetch_task();
                 }
                 return;
@@ -167,7 +172,7 @@ impl<DB: Database> CertificateFetcher<DB> {
         self.targets.insert(header.author().clone(), header.round());
 
         // start fetching if available space
-        if self.fetch_task.is_empty() {
+        if self.fetch_task.is_none() {
             self.start_fetch_task();
         }
     }
@@ -194,56 +199,27 @@ impl<DB: Database> CertificateFetcher<DB> {
     }
 
     /// Handle completion of a fetch task and start another if needed.
-    ///
-    ///
-    ///
-    /// TODO: does this need to return error and force shutdown?
-    ///
-    ///
-    ///
-    ///
-    ///
-    ///
-    ///
-    ///
-    ///
-    ///
-    ///
-    /// @@@@!!!!!!!!!!!!! ! ! ! ! ! !!!!
-    ///
-    ///
-    ///
-    ///
-    ///
-    ///
-    ///
-    /// TOODOODODODODODOOOOOOOO
-    fn handle_fetch_completion(&mut self, result: Result<(), tokio::task::JoinError>) {
+    fn handle_fetch_completion(&mut self, result: CertManagerResult<()>) {
         if let Err(e) = result {
-            if !e.is_cancelled() {
-                error!(target: "primary::cert_fetcher", "Fetch task failed: {e}");
-            }
+            // if !e.is_cancelled() {
+            error!(target: "primary::cert_fetcher", "Fetch task failed: {e}");
+            // }
         }
 
+        // NOTE: self.fetch_task.poll sets `Option` to `None` once result it received
+
         // start next fetch if more targets
-        if self.fetch_task.is_empty() && !self.targets.is_empty() {
+        if !self.targets.is_empty() {
             self.start_fetch_task();
         }
     }
 
     /// Start a new task to fetch missing certificates.
     fn start_fetch_task(&mut self) {
-        // Update targets - remove any that are already satisfied
+        // update targets - remove any that are already satisfied
         let gc_round = self.gc_round();
-        self.update_targets(gc_round);
 
-        // nothing to fetch
-        if self.targets.is_empty() {
-            debug!(target: "primary::cert_fetcher", "All targets satisfied, skipping fetch");
-            return;
-        }
-
-        // prepare request with current state of local certificates
+        // prepare request based on latest certs in local storage
         let written_rounds = match self.get_written_rounds(gc_round) {
             Ok(rounds) => rounds,
             Err(e) => {
@@ -251,6 +227,15 @@ impl<DB: Database> CertificateFetcher<DB> {
                 return;
             }
         };
+
+        // update targets - remove any that are already in storage
+        self.update_targets(gc_round, &written_rounds);
+
+        // nothing to fetch
+        if self.targets.is_empty() {
+            debug!(target: "primary::cert_fetcher", "Current targets empty - nothing to fetch");
+            return;
+        }
 
         // create the fetch request
         let request = match MissingCertificatesRequest::default()
@@ -260,63 +245,72 @@ impl<DB: Database> CertificateFetcher<DB> {
         {
             Ok(req) => req,
             Err(e) => {
-                error!(target: "primary::cert_fetcher", ?e, "Failed to create fetch request");
+                error!(target: "primary::cert_fetcher", ?e, "Failed to create missing cert request");
                 return;
             }
         };
 
-        // Spawn the fetch task
+        // spawn the fetch task
         let network = self.network.clone();
         let committee = self.committee.clone();
         let state_sync = self.state_sync.clone();
         let metrics = self.metrics.clone();
         let task_spawner = self.task_spawner.clone();
         let authority_id = self.authority_id.clone();
+        let (tx, rx) = oneshot::channel();
 
-        self.fetch_task.spawn(monitored_future!(async move {
-            let _scope = monitored_scope("CertificatesFetching");
-            metrics.certificate_fetcher_inflight_fetch.inc();
+        // store receiver for polling in `Self::run`
+        self.fetch_task.set_task(rx);
 
-            let result = fetch_and_process_certificates(
-                authority_id,
-                network,
-                committee,
-                request,
-                state_sync,
-                task_spawner,
-            )
-            .await;
+        // spawn task and hold receiver
+        self.task_spawner.spawn_task(
+            format!("fetch-certs-{}", request.exclusive_lower_bound),
+            monitored_future!(async move {
+                let _scope = monitored_scope("CertificatesFetching");
+                metrics.certificate_fetcher_inflight_fetch.inc();
 
-            if let Err(e) = result {
-                debug!(target: "primary::cert_fetcher", ?e, "Fetch task completed with error");
-            }
+                let result = fetch_and_process_certificates(
+                    authority_id,
+                    network,
+                    committee,
+                    request,
+                    state_sync,
+                    task_spawner,
+                )
+                .await;
 
-            metrics.certificate_fetcher_inflight_fetch.dec();
-        }));
+                let _ = tx.send(result);
+                metrics.certificate_fetcher_inflight_fetch.dec();
+            }),
+        );
     }
 
     /// Update targets by removing any that have already been satisfied.
-    fn update_targets(&mut self, gc_round: Round) {
+    fn update_targets(
+        &mut self,
+        gc_round: Round,
+        written_rounds: &BTreeMap<AuthorityIdentifier, BTreeSet<Round>>,
+    ) {
         self.targets.retain(|origin, target_round| {
-            // Skip fetching anything at or below GC round
-            if *target_round <= gc_round {
-                return false;
-            }
+            let last_written_round = written_rounds
+                .get(origin)
+                .and_then(|rounds| rounds.last())
+                .copied()
+                .unwrap_or(gc_round);
 
-            // check if we already have this round or later in storage
-            match self.certificate_store.last_round_number(origin) {
-                Ok(Some(last_round)) => last_round < *target_round,
-                Ok(None) => *target_round > gc_round,
-                Err(e) => {
-                    error!(target: "primary::cert_fetcher",
-                        "Failed to check last round for {origin}: {e}");
-                    false
-                }
-            }
+            // Drop sync target when cert store already has an equal or higher round for the origin.
+            // This applies GC to targets as well.
+            //
+            // NOTE: even if the store actually does not have target_round for the origin,
+            // it is ok to stop fetching without this certificate.
+            //
+            // If this certificate becomes a parent of other certificates, another
+            // fetch will be triggered eventually because of missing certificates.
+            last_written_round < *target_round
         });
     }
 
-    /// Get the current set of written rounds for each authority.
+    /// Get the current set of written rounds in storage for each authority.
     fn get_written_rounds(
         &self,
         gc_round: Round,
@@ -499,4 +493,70 @@ fn spawn_peer_fetch(
             }
         }
     });
+}
+
+/// A future wrapper for managing at most one pending certificate fetch task.
+///
+/// This struct implements `Future` to enable polling in `tokio::select!` without
+/// requiring complex Option handling. When no task is present, it returns `Poll::Pending`
+/// indefinitely, allowing the select! to skip this branch. When a task completes,
+/// it automatically clears the internal receiver and returns the result.
+struct FetchTask {
+    /// The receiver for a fetch task. Optional if a task has spawned to fetch certificates from peers.
+    fetch_task: Option<oneshot::Receiver<CertManagerResult<()>>>,
+}
+
+impl FetchTask {
+    /// Creates a new `FetchTask` with no pending operation.
+    ///
+    /// The future will return `Poll::Pending` until a task is set via `set_task`.
+    fn new() -> Self {
+        Self { fetch_task: None }
+    }
+
+    /// Sets a new fetch task, replacing any existing incomplete task.
+    ///
+    /// If a previous task was pending, it will be dropped and its sender will
+    /// receive a cancellation error. This ensures only one fetch operation
+    /// runs at a time.
+    fn set_task(&mut self, receiver: oneshot::Receiver<CertManagerResult<()>>) {
+        self.fetch_task = Some(receiver);
+    }
+
+    /// Checks whether a fetch task is currently pending.
+    ///
+    /// Returns `false` if a task is set and hasn't completed yet, `true` if there is no pending task.
+    /// Used to prevent spawning duplicate fetch operations.
+    fn is_none(&self) -> bool {
+        self.fetch_task.is_none()
+    }
+}
+
+impl Future for FetchTask {
+    type Output = CertManagerResult<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match &mut self.fetch_task {
+            Some(rx) => {
+                // poll the inner receiver
+                match Pin::new(rx).poll(cx) {
+                    Poll::Ready(Ok(result)) => {
+                        // clear the receiver since it's consumed
+                        self.fetch_task = None;
+                        Poll::Ready(result)
+                    }
+                    Poll::Ready(Err(_)) => {
+                        // sender was dropped
+                        self.fetch_task = None;
+                        Poll::Ready(Err(CertManagerError::ChannelClosed))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+            None => {
+                // no task to poll - return pending
+                Poll::Pending
+            }
+        }
+    }
 }

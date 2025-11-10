@@ -1,23 +1,24 @@
 //! Certificate fetcher tests
 
 use crate::{
-    certificate_fetcher::CertificateFetcher,
+    certificate_fetcher::{CertificateFetcher, CertificateFetcherCommand},
     error::CertManagerError,
     network::{PrimaryRequest, PrimaryResponse},
     state_sync::StateSynchronizer,
     ConsensusBus,
 };
 use assert_matches::assert_matches;
-use std::{collections::BTreeSet, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use tn_network_libp2p::types::{NetworkCommand, NetworkHandle};
 use tn_storage::{mem_db::MemDatabase, CertificateStore, PayloadStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     BlsSignature, Certificate, Hash as _, Header, SignatureVerificationState, TaskManager,
+    TnSender as _,
 };
 use tokio::{
     sync::mpsc::{self, error::TryRecvError},
-    time::sleep,
+    time::{sleep, timeout},
 };
 
 async fn verify_certificates_in_store<DB: CertificateStore>(
@@ -83,7 +84,7 @@ fn verify_certificates_not_in_store<DB: CertificateStore>(
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn fetch_certificates_basic() {
+async fn test_fetch_certificates_basic() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let primary = fixture.authorities().next().unwrap();
 
