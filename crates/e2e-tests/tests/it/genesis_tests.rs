@@ -24,14 +24,11 @@ use tn_reth::{
     test_utils::TransactionFactory,
     RethEnv,
 };
-use tn_types::{
-    address, test_utils::init_test_tracing, Address, Bytes, FromHex, GenesisAccount, U256,
-};
+use tn_types::{address, Address, Bytes, FromHex, GenesisAccount, U256};
 use tracing::debug;
 
 #[tokio::test]
 async fn test_genesis_with_its() -> eyre::Result<()> {
-    init_test_tracing();
     let _guard = IT_TEST_MUTEX.lock();
     // sleep for other tests to cleanup
     std::thread::sleep(std::time::Duration::from_secs(5));
