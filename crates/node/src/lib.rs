@@ -15,8 +15,8 @@ use tracing::{instrument, warn};
 
 pub mod engine;
 mod error;
-mod manager;
 mod health;
+mod manager;
 pub mod primary;
 pub mod worker;
 pub use manager::catchup_accumulator;

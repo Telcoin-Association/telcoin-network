@@ -299,8 +299,8 @@ where
         info!(target: "epoch-manager", tasks=?node_task_manager, "NODE TASKS\n");
 
         // spawn node healthcheck service if enabled
-        if !self.builder.disable_healthcheck {
-            let _ = HealthcheckServer::spawn(node_task_manager.get_spawner()).await;
+        if let Some(port) = self.builder.healthcheck {
+            let _ = HealthcheckServer::spawn(node_task_manager.get_spawner(), port).await;
         }
 
         // await all tasks on epoch-task-manager or node shutdown

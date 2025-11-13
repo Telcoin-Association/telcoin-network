@@ -47,8 +47,14 @@ pub struct TnBuilder {
     ///
     /// The metrics will be served at the given interface and port.
     pub metrics: Option<SocketAddr>,
-    /// Bool if the http healthcheck endpoint should be disabled.
-    pub disable_healthcheck: bool,
+    /// Optional TCP port to start healthcheck service.
+    /// If a port is provided, the healthcheck service will spawn. Otherwise, no healthcheck
+    /// service starts.
+    ///
+    /// IMPORTANT: only enable healthcheck if the endpoint is protected by a firewall. The
+    /// healthcheck service responds unconditionally. This reads from `HEALTHCHECK_TCP_PORT` env
+    /// var.
+    pub healthcheck: Option<u16>,
 }
 
 /// Wrapper for the inner execution node components.

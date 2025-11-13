@@ -68,13 +68,20 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     #[clap(flatten)]
     pub reth: RethCommand,
 
-    /// Disable the health check endpoint.
+    /// TCP health check endpoint port.
     ///
-    /// When set, the node will not spawn a TCP health check service.
-    /// The health check endpoint is useful for load balancers and monitoring systems
-    /// to verify that the node process is running.
-    #[arg(long, value_name = "DISABLE_HEALTHCHECK", global = true, default_value_t = false)]
-    pub disable_healthcheck: bool,
+    /// When a port is specified, the node will spawn a TCP health check service
+    /// on that port. The health check endpoint is useful for load balancers and
+    /// monitoring systems to verify that the node process is running.
+    ///
+    /// If not specified, the health check service will not be started.
+    ///
+    /// WARNING: ensure the health endpoint is behind a firewall.
+    /// Each connection is handled synchronously in the main accept loop.
+    /// No connection limits or rate limiting are implemented.
+    /// Connections are immediately closed after sending response.
+    #[arg(long, value_name = "HEALTHCHECK_TCP_PORT", global = true, env = "HEALTHCHECK_TCP_PORT")]
+    pub healthcheck: Option<u16>,
 
     /// Additional cli arguments
     #[clap(flatten)]
@@ -137,7 +144,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             instance,
             with_unused_ports,
             reth,
-            disable_healthcheck,
+            healthcheck,
             ext,
         } = self;
 
@@ -152,7 +159,8 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             Arc::new(tn_config.chain_spec()),
         );
 
-        let builder = TnBuilder { node_config, tn_config, opt_faucet_args: None, metrics, disable_healthcheck };
+        let builder =
+            TnBuilder { node_config, tn_config, opt_faucet_args: None, metrics, healthcheck };
 
         launcher(builder, ext, tn_datadir, passphrase)
     }
