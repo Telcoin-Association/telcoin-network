@@ -23,7 +23,7 @@ use tn_types::{
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Span};
 
 /// Type alias for the blocking task that executes consensus output and returns the finalized
 /// `SealedHeader`.
@@ -65,6 +65,8 @@ pub struct ExecutorEngine {
     task_spawner: TaskSpawner,
     /// Accumulator for epoch gas usage.
     gas_accumulator: GasAccumulator,
+    /// Tracing span that recieves execution events.
+    span: Option<Span>,
 }
 
 impl ExecutorEngine {
@@ -95,7 +97,13 @@ impl ExecutorEngine {
             rx_shutdown,
             task_spawner,
             gas_accumulator,
+            span: None,
         }
+    }
+
+    /// Set the span to log events too for this execution engine.
+    pub fn set_span(&mut self, span: Span) {
+        self.span = Some(span);
     }
 
     /// Spawns a blocking task to execute consensus output.
@@ -114,7 +122,9 @@ impl ExecutorEngine {
 
             let gas_accumulator = self.gas_accumulator.clone();
             // spawn blocking task and return future
+            let span = self.span.clone();
             self.task_spawner.spawn_blocking_task(task_name, move || {
+                let _guard = span.map(|s| s.clone().entered());
                 // this is safe to call on blocking thread without a semaphore bc it's held in
                 // Self::pending_tesk as a single `Option`
                 let result = execute_consensus_output(build_args, gas_accumulator).inspect_err(|e| {

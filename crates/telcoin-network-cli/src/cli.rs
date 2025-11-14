@@ -140,8 +140,14 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
     /// If file logging is enabled, this function returns a guard that must be kept alive to ensure
     /// that all logs are flushed to disk.
     pub fn init_tracing(&self) -> eyre::Result<Option<FileWorkerGuard>> {
-        let guard = self.logs.init_tracing()?;
-        Ok(guard)
+        // XXXX
+        if let Commands::Node(_) = self.command {
+            // XXXX- we may want to use opentracing but also need tokio to do so...
+            Ok(None)
+        } else {
+            let guard = self.logs.init_tracing()?;
+            Ok(guard)
+        }
     }
 }
 

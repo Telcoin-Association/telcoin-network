@@ -55,6 +55,13 @@ impl From<BlsPublicKeyBytes> for [u8; 96] {
     }
 }
 
+impl BlsPublicKeyBytes {
+    /// Take the first 8 bytes and convert to a base58 rep String.
+    fn to_short_string(&self) -> String {
+        bs58::encode(&self.0[0..8]).into_string()
+    }
+}
+
 // Validator's main protocol public key.
 #[derive(Copy, Clone)]
 pub struct BlsPublicKey {
@@ -91,6 +98,11 @@ impl BlsPublicKey {
     /// This method is only used to convert the literal bytes for the pubkey.
     pub fn from_literal_bytes(bytes: &[u8]) -> Result<Self, BLST_ERROR> {
         CorePublicKey::from_bytes(bytes).map(|key| key.into())
+    }
+
+    /// Take the first 8 bytes and convert to a base58 rep String.
+    pub fn to_short_string(&self) -> String {
+        self.bytes.to_short_string()
     }
 }
 

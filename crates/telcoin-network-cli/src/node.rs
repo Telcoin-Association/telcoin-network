@@ -85,7 +85,9 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
     where
         L: FnOnce(TnBuilder, Ext, PathBuf, Option<String>) -> eyre::Result<()>,
     {
-        info!(target: "tn::cli", "telcoin-network {} starting", SHORT_VERSION);
+        // Note we do NOT have tracing initialized yet (launcher will do that for a node).
+        // So do not use tracing/log macros yet.
+        println!("telcoin-network {} starting", SHORT_VERSION);
 
         // Raise the fd limit of the process.
         // Does not do anything on windows.
@@ -101,12 +103,12 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             .thread_name(|i| format!("tn-rayon-{i}"))
             .build_global()
         {
-            error!("Failed to initialize global thread pool for rayon: {}", err)
+            eprintln!("Error: Failed to initialize global thread pool for rayon: {err}");
         }
 
         // overwrite all genesis if `genesis` was passed to CLI
         let tn_config = if let Some(chain) = self.chain.take() {
-            info!(target: "cli", "Overwriting TN config with named chain: {chain:?}");
+            //XXXXinfo!(target: "cli", "Overwriting TN config with named chain: {chain:?}");
             match chain {
                 NamedChain::Adiri | NamedChain::TestNet => {
                     Config::load_adiri(&tn_datadir, self.observer, SHORT_VERSION)?
@@ -118,8 +120,9 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         } else {
             Config::load(&tn_datadir, self.observer, SHORT_VERSION)?
         };
-        debug!(target: "cli", validator = ?tn_config.node_info.name, "tn datadir for node command: {tn_datadir:?}");
-        info!(target: "cli", validator = ?tn_config.node_info.name, "config loaded");
+        //XXXXdebug!(target: "cli", validator = ?tn_config.node_info.name, "tn datadir for node
+        // command: {tn_datadir:?}"); XXXXinfo!(target: "cli", validator =
+        // ?tn_config.node_info.name, "config loaded");
 
         // get the worker's transaction address from the config
         let Self {
@@ -131,8 +134,6 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             reth,
             ext,
         } = self;
-
-        debug!(target: "cli", "node command genesis: {:#?}", tn_config.genesis());
 
         // set up reth node config for engine components
         let node_config = RethConfig::new(

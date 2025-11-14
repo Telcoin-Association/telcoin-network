@@ -190,21 +190,9 @@ where
     pub(crate) fn new(
         builder: TnBuilder,
         tn_datadir: P,
-        passphrase: Option<String>,
         consensus_db: DB,
+        key_config: KeyConfig,
     ) -> eyre::Result<Self> {
-        let passphrase =
-            if std::fs::exists(tn_datadir.node_keys_path().join(tn_config::BLS_WRAPPED_KEYFILE))
-                .unwrap_or(false)
-            {
-                passphrase
-            } else {
-                None
-            };
-
-        // create key config for lifetime of the app
-        let key_config = KeyConfig::read_config(&tn_datadir, passphrase)?;
-
         // shutdown long-running node components
         let node_shutdown = Notifier::new();
 
@@ -430,12 +418,12 @@ where
                 error!(target: "epoch-manager", ?e, "epoch returned error");
             })?;
 
-            info!(target: "epoch-manager", "looping run epoch");
             self.consensus_bus.reset_for_epoch();
             // Make sure we don't start a new epoch when we are shutting down.
             if node_ended_sub.noticed() {
                 break Ok(());
             }
+            info!(target: "epoch-manager", "looping run epoch");
         }
     }
 
@@ -482,6 +470,7 @@ where
     }
 
     /// Run a single epoch.
+    #[tracing::instrument(skip(self, engine, to_engine), level = "info")]
     async fn run_epoch(
         &mut self,
         engine: &ExecutionNode,
