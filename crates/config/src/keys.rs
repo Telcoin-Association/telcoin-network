@@ -104,8 +104,6 @@ impl KeyConfig {
         passphrase: Option<String>,
     ) -> eyre::Result<Self> {
         // load keys to start the primary
-        let validator_keypath = tn_datadir.node_keys_path();
-        tracing::info!(target: "telcoin::consensus_config", "loading validator keys at {:?}", validator_keypath);
         let contents = if passphrase.is_some() {
             std::fs::read_to_string(tn_datadir.node_keys_path().join(BLS_WRAPPED_KEYFILE))?
         } else {

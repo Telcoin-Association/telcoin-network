@@ -14,7 +14,14 @@ use nix::{
 };
 use secp256k1::{Keypair, Secp256k1, SecretKey};
 use serde_json::Value;
-use std::{collections::HashMap, fmt::Debug, path::Path, process::Child, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    fs::File,
+    path::Path,
+    process::{Child, Command, Stdio},
+    time::Duration,
+};
 use tn_types::{get_available_tcp_port, keccak256, test_utils::init_test_tracing, Address};
 use tokio::runtime::Builder;
 use tracing::{error, info};
@@ -97,6 +104,7 @@ fn run_restart_tests1(
     temp_path: &Path,
     rpc_port2: u16,
     delay_secs: u64,
+    test: &str,
 ) -> eyre::Result<Child> {
     network_advancing(client_urls).inspect_err(|e| {
         kill_child(child2);
@@ -128,7 +136,7 @@ fn run_restart_tests1(
 
     info!(target: "restart-test", "restarting child2...");
     // Restart
-    let mut child2 = start_validator(2, bin, temp_path, rpc_port2);
+    let mut child2 = start_validator(2, bin, temp_path, rpc_port2, test);
     let bal = get_positive_balance_with_retry(&client_urls[2], &to_account.to_string())
         .inspect_err(|e| {
             kill_child(&mut child2);
@@ -164,6 +172,7 @@ fn run_restart_tests_lagged1(
     temp_path: &Path,
     rpc_port2: u16,
     delay_secs: u64,
+    test: &str,
 ) -> eyre::Result<Child> {
     network_advancing(client_urls).inspect_err(|e| {
         kill_child(child2);
@@ -201,7 +210,7 @@ fn run_restart_tests_lagged1(
 
     info!(target: "restart-test", "restarting child2...");
     // Restart
-    let mut child2 = start_validator(2, bin, temp_path, rpc_port2);
+    let mut child2 = start_validator(2, bin, temp_path, rpc_port2, test);
     let bal = get_positive_balance_with_retry(&client_urls[2], &to_account.to_string())
         .inspect_err(|e| {
             kill_child(&mut child2);
@@ -281,7 +290,7 @@ fn network_advancing(client_urls: &[String; 4]) -> eyre::Result<()> {
     Ok(())
 }
 
-fn do_restarts(delay: u64, lagged: bool) -> eyre::Result<()> {
+fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
     let _guard = IT_TEST_MUTEX.lock();
     init_test_tracing();
     info!(target: "restart-test", "do_restarts, delay: {delay}");
@@ -307,7 +316,7 @@ fn do_restarts(delay: u64, lagged: bool) -> eyre::Result<()> {
             .expect("Failed to get an ephemeral rpc port for child!");
         rpc_ports[i] = rpc_port;
         client_urls[i].push_str(&format!(":{rpc_port}"));
-        *child = Some(start_validator(i, &bin, &temp_path, rpc_port));
+        *child = Some(start_validator(i, &bin, &temp_path, rpc_port, test));
     }
 
     // pass &mut to `run_restart_tests1` to shutdown child in case of error
@@ -316,9 +325,17 @@ fn do_restarts(delay: u64, lagged: bool) -> eyre::Result<()> {
     info!(target: "restart-test", "Running restart tests 1");
     // run restart tests1
     let res1 = if lagged {
-        run_restart_tests_lagged1(&client_urls, &mut child2, &bin, &temp_path, rpc_ports[2], delay)
+        run_restart_tests_lagged1(
+            &client_urls,
+            &mut child2,
+            &bin,
+            &temp_path,
+            rpc_ports[2],
+            delay,
+            test,
+        )
     } else {
-        run_restart_tests1(&client_urls, &mut child2, &bin, &temp_path, rpc_ports[2], delay)
+        run_restart_tests1(&client_urls, &mut child2, &bin, &temp_path, rpc_ports[2], delay, test)
     };
     info!(target: "restart-test", "Ran restart tests 1: {res1:?}");
     let is_ok = res1.is_ok();
@@ -367,7 +384,7 @@ fn do_restarts(delay: u64, lagged: bool) -> eyre::Result<()> {
     info!(target: "restart-test", "all nodes shutdown...restarting network");
     // Restart network
     for (i, child) in children.iter_mut().enumerate() {
-        *child = Some(start_validator(i, &bin, &temp_path, rpc_ports[i]));
+        *child = Some(start_validator(i, &bin, &temp_path, rpc_ports[i], test));
     }
 
     info!(target: "restart-test", "Running restart tests 2");
@@ -393,7 +410,7 @@ fn do_restarts(delay: u64, lagged: bool) -> eyre::Result<()> {
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restartstt() -> eyre::Result<()> {
-    do_restarts(2, false)
+    do_restarts(2, false, "restarts")
 }
 
 /// Run some test to make sure an observer is participating in the network.
@@ -446,12 +463,12 @@ fn test_restarts_observer() -> eyre::Result<()> {
             .expect("Failed to get an ephemeral rpc port for child!");
         rpc_ports[i] = rpc_port;
         client_urls[i].push_str(&format!(":{rpc_port}"));
-        *child = Some(start_validator(i, &bin, &temp_path, rpc_port));
+        *child = Some(start_validator(i, &bin, &temp_path, rpc_port, "observer"));
     }
     let obs_rpc_port = get_available_tcp_port("127.0.0.1")
         .expect("Failed to get an ephemeral rpc port for child!");
     let obs_url = format!("http://127.0.0.1:{obs_rpc_port}");
-    let mut obs_child = start_observer(4, &bin, &temp_path, obs_rpc_port);
+    let mut obs_child = start_observer(4, &bin, &temp_path, obs_rpc_port, "observer");
     let res = run_observer_tests(&client_urls, &obs_url);
 
     // SIGTERM children so they can shutdown in parrellel.
@@ -476,7 +493,7 @@ fn test_restarts_observer() -> eyre::Result<()> {
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restarts_delayed() -> eyre::Result<()> {
-    do_restarts(70, false)
+    do_restarts(70, false, "restarts_delayed")
 }
 
 /// Test a restart case with a long delay, the stopped node should not rejoin consensus but follow
@@ -484,7 +501,18 @@ fn test_restarts_delayed() -> eyre::Result<()> {
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restarts_lagged_delayed() -> eyre::Result<()> {
-    do_restarts(70, true)
+    do_restarts(70, true, "restarts_lagged_delayed")
+}
+
+fn setup_log_dir(command: &mut Command, instance: usize, test: &str) {
+    if let Ok(log_dir) = std::env::var("TEST_RESTARTS_LOG") {
+        let _ = std::fs::create_dir(format!("{}/", log_dir));
+        let _ = std::fs::create_dir(format!("{}/{}/", log_dir, test));
+        let out_file = File::create(format!("{}/{}/node{}.log", log_dir, test, instance))
+            .expect("valid log file");
+        let stdout: Stdio = out_file.into();
+        command.stdout(stdout);
+    }
 }
 
 /// Start a process running a validator node.
@@ -493,6 +521,7 @@ fn start_validator(
     bin: &'static CargoRun,
     base_dir: &Path,
     mut rpc_port: u16,
+    test: &str,
 ) -> Child {
     let data_dir = base_dir.join(format!("validator-{}", instance + 1));
     // The instance option will still change a set port so account for that.
@@ -510,6 +539,8 @@ fn start_validator(
         .arg("--http.port")
         .arg(format!("{rpc_port}"));
 
+    setup_log_dir(&mut command, instance, test);
+
     #[cfg(feature = "faucet")]
     command
         .arg("--public-key") // If the binary is built with the faucet need this to start...
@@ -524,6 +555,7 @@ fn start_observer(
     bin: &'static CargoRun,
     base_dir: &Path,
     mut rpc_port: u16,
+    test: &str,
 ) -> Child {
     let data_dir = base_dir.join("observer");
     // The instance option will still change a set port so account for that.
@@ -540,6 +572,9 @@ fn start_observer(
         .arg("--http")
         .arg("--http.port")
         .arg(format!("{rpc_port}"));
+
+    setup_log_dir(&mut command, instance, test);
+
     command.spawn().expect("failed to execute")
 }
 
