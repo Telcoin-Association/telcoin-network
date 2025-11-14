@@ -110,6 +110,7 @@ impl Config {
         // If the default committee file does not exist then save it.
         let committee_path = tn_datadir.committee_path();
         if !committee_path.exists() {
+            std::fs::create_dir_all(tn_datadir.genesis_path())?;
             File::create_new(committee_path)?.write_all(TESTNET_COMMITTEE.as_bytes())?
         }
 
@@ -131,6 +132,7 @@ impl Config {
         // If the default committee file does not exist then save it.
         let committee_path = tn_datadir.committee_path();
         if !committee_path.exists() {
+            std::fs::create_dir_all(tn_datadir.genesis_path())?;
             File::create_new(committee_path)?.write_all(MAINNET_COMMITTEE.as_bytes())?
         }
 
