@@ -32,7 +32,7 @@ pub(crate) struct HealthcheckServer;
 impl HealthcheckServer {
     /// Spawns the health check server task and returns the bound address.
     ///
-    /// Binds to port specified by `HEALTHCHECK_PORT` environment variable,
+    /// Binds to port specified by `HEALTHCHECK_TCP_PORT` environment variable,
     /// or lets the OS assign a port if unset or set to 0.
     ///
     /// # Network Binding
