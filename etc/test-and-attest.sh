@@ -90,7 +90,7 @@ cargo test -p e2e-tests -- --ignored
 # faucet it test
 cargo test -p e2e-tests --test it --features faucet --no-fail-fast -- --ignored faucet
 
-echo "default tests and specific faucet it test passing"
+echo "all checks passed - submitting attestation on-chain..."
 
 #
 # If we've reached this point, all checks have passed

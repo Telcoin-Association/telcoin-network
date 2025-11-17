@@ -256,11 +256,11 @@ impl Parameters {
     }
 
     fn default_max_header_delay() -> Duration {
-        Duration::from_secs(10)
+        Duration::from_millis(2500)
     }
 
     fn default_min_header_delay() -> Duration {
-        Duration::from_secs(5)
+        Duration::from_millis(1000)
     }
 
     /// The default gc depth for consensus.

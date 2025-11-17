@@ -2,7 +2,12 @@
 use crate::TelcoinDirs;
 use eyre::Context;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, ffi::OsStr, fs, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    ffi::OsStr,
+    fs,
+    path::Path,
+};
 use tn_types::{
     address, test_genesis, verify_proof_of_possession_bls, Address, BlsPublicKey, BlsSignature,
     Committee, CommitteeBuilder, Genesis, GenesisAccount, Multiaddr, NetworkPublicKey, NodeP2pInfo,
@@ -24,8 +29,8 @@ pub const ERC1967PROXY_JSON: &str =
     include_str!("../../../tn-contracts/artifacts/ERC1967Proxy.json");
 /// The path to blsg1 json (tn-contracts submodule).
 pub const BLSG1_JSON: &str = include_str!("../../../tn-contracts/artifacts/BlsG1.json");
-/// The path to its cfg yaml json (tn-contracts submodule).
-pub const ITS_CFG_YAML: &str =
+/// The path to the configuration yaml for genesis accounts (tn-contracts submodule).
+pub const GENESIS_ACCOUNT_STATE_YAML: &str =
     include_str!("../../../tn-contracts/deployments/genesis/precompile-config.yaml");
 /// The default governance safe address.
 pub const GOVERNANCE_SAFE_ADDRESS: Address = address!("00000000000000000000000000000000000007a0");
@@ -159,31 +164,29 @@ impl NetworkGenesis {
     /// Returns configurations for precompiles as genesis accounts
     /// Precompiles configs yamls are generated using foundry in `tn-contracts` submodule.
     ///
-    /// Overrides InterchainTEL genesis balance to reflect genesis validator stake
+    /// Overrides InterchainTEL genesis balance to reflect genesis validator stake.
+    /// Other accounts in genesis include:
+    /// - historic block hashes
+    /// - consensus block roots
     pub fn fetch_precompile_genesis_accounts(
         itel_address: Address,
         itel_balance: tn_types::U256,
     ) -> eyre::Result<Vec<(Address, GenesisAccount)>> {
-        let yaml_content = ITS_CFG_YAML;
-        let config: std::collections::HashMap<Address, GenesisAccount> =
-            serde_yaml::from_str(yaml_content).expect("yaml parsing failure");
+        let config: HashMap<Address, GenesisAccount> =
+            serde_yaml::from_str(GENESIS_ACCOUNT_STATE_YAML).expect("yaml parsing failure");
         let governance_balance = config
             .get(&GOVERNANCE_SAFE_ADDRESS)
             .expect("base fee recipient governance safe missing")
             .balance;
         let final_itel_balance = itel_balance - governance_balance;
         let mut accounts = Vec::new();
-        for (address, precompile_config) in config {
-            let bal = if address == itel_address {
-                final_itel_balance
-            } else {
-                precompile_config.balance
-            };
+        for (address, account) in config {
+            let bal = if address == itel_address { final_itel_balance } else { account.balance };
             let account = GenesisAccount::default()
-                .with_nonce(precompile_config.nonce)
+                .with_nonce(account.nonce)
                 .with_balance(bal)
-                .with_code(precompile_config.code)
-                .with_storage(precompile_config.storage);
+                .with_code(account.code)
+                .with_storage(account.storage);
 
             accounts.push((address, account));
         }

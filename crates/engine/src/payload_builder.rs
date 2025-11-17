@@ -133,7 +133,7 @@ fn execute_payload(
 ) -> EngineResult<SealedHeader> {
     // execute
     let next_canonical_block = reth_env.build_block_from_batch_payload(payload, transactions)?;
-    debug!(target: "engine", ?next_canonical_block, "worker's block executed");
+    debug!(target: "engine", ?next_canonical_block, "block executed");
 
     // update header for next block execution in loop
     let canonical_header = next_canonical_block.recovered_block.clone_sealed_header();
