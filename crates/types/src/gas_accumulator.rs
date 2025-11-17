@@ -1,6 +1,13 @@
-//! Implement an accumilator to tatal gas and blocks for an epoch.
+//! Implement an accumulator to tatal gas and blocks for an epoch.
 //! This can be used to adjust per worker base fees on the next epoch.
 
+use crate::{AuthorityIdentifier, Committee, WorkerId};
+use alloy::{
+    eips::eip1559::MIN_PROTOCOL_BASE_FEE,
+    primitives::Address,
+    rpc::types::{Withdrawal, Withdrawals},
+};
+use parking_lot::{Mutex, RwLock};
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{
@@ -8,15 +15,6 @@ use std::{
         Arc,
     },
 };
-
-use alloy::{
-    eips::eip1559::MIN_PROTOCOL_BASE_FEE,
-    primitives::Address,
-    rpc::types::{Withdrawal, Withdrawals},
-};
-use parking_lot::{Mutex, RwLock};
-
-use crate::{AuthorityIdentifier, Committee, WorkerId};
 
 /// Maintains a counter of each leader's execution address for an epoch for calculating rewards.
 #[derive(Clone, Debug)]
@@ -84,6 +82,13 @@ impl RewardsCounter {
                 })
                 .collect(),
         )
+    }
+
+    /// Use the authority's identifier to return an execution address for beneficiary address.
+    pub fn get_authority_address(&self, authority_id: &AuthorityIdentifier) -> Option<Address> {
+        self.committee.read().as_ref().and_then(|committee| {
+            committee.authority(authority_id).map(|authority| authority.execution_address())
+        })
     }
 }
 
@@ -220,6 +225,11 @@ impl GasAccumulator {
     /// Return a copy of the rewards counter object.
     pub fn rewards_counter(&self) -> RewardsCounter {
         self.rewards_counter.clone()
+    }
+
+    /// Use the authority's identifier to return an execution address for beneficiary address.
+    pub fn get_authority_address(&self, authority_id: &AuthorityIdentifier) -> Option<Address> {
+        self.rewards_counter.get_authority_address(authority_id)
     }
 }
 
