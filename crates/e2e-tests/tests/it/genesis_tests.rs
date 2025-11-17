@@ -7,7 +7,11 @@ use alloy::{network::EthereumWallet, primitives::utils::parse_ether, providers::
 use core::panic;
 use e2e_tests::{spawn_local_testnet, IT_TEST_MUTEX};
 use eyre::OptionExt;
-use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_params};
+use jsonrpsee::{
+    core::client::ClientT,
+    http_client::{HttpClient, HttpClientBuilder},
+    rpc_params,
+};
 use serde_json::Value;
 use std::time::Duration;
 use telcoin_network_cli::args::clap_u256_parser_to_18_decimals;
@@ -20,7 +24,7 @@ use tn_reth::{
     test_utils::TransactionFactory,
     RethEnv,
 };
-use tn_types::{Address, Bytes, FromHex, GenesisAccount, U256};
+use tn_types::{address, Address, Bytes, FromHex, GenesisAccount, U256};
 use tracing::debug;
 
 #[tokio::test]
@@ -55,29 +59,21 @@ async fn test_genesis_with_its() -> eyre::Result<()> {
     let itel_bal = tel_supply - initial_stake - governance_balance;
     let precompiles = NetworkGenesis::fetch_precompile_genesis_accounts(itel_address, itel_bal)
         .expect("its precompiles not found");
+    // precompiles to prevent replay attacks for historic block hashes and consensus block roots
+    // contract deployments
+    let deployer_addrs = vec![
+        address!("0x0B799C86a49DEeb90402691F1041aa3AF2d3C875"),
+        address!("0x3462413Af4609098e1E27A490f554f260213D685"),
+    ];
     for (address, genesis_account) in precompiles {
-        let returned_code: String = client
-            .request("eth_getCode", rpc_params!(address))
-            .await
-            .expect("Failed to fetch runtime code");
-        assert_eq!(Bytes::from_hex(returned_code), Ok(genesis_account.code.unwrap()));
-
-        if address == itel_address {
-            let returned_bal: String = client
-                .request("eth_getBalance", rpc_params!(address))
-                .await
-                .expect("Failed to fetch iTEL balance");
-            let returned_bal = returned_bal.trim_start_matches("0x");
-            assert_eq!(U256::from_str_radix(returned_bal, 16)?, itel_bal);
-        }
-        if genesis_account.storage.is_some() {
-            for (slot, value) in genesis_account.storage.unwrap().iter() {
-                let returned_storage: String = client
-                    .request("eth_getStorageAt", rpc_params!(address, slot.to_string(), "latest"))
-                    .await
-                    .expect("Failed to fetch storage slot");
-                assert_eq!(returned_storage, value.to_string());
-            }
+        // check account storage or nonce
+        //
+        // see https://github.com/Telcoin-Association/tn-contracts/pull/57
+        if deployer_addrs.contains(&address) {
+            check_account_nonce(&client, address).await?;
+        } else {
+            check_account_storage(&client, address, genesis_account, itel_address, itel_bal)
+                .await?;
         }
     }
 
@@ -237,7 +233,7 @@ async fn test_genesis_with_consensus_registry_accounts() -> eyre::Result<()> {
         consensus_registry.getCurrentEpochInfo().call().await.expect("get current epoch result");
     let expected_epoch_issuance = clap_u256_parser_to_18_decimals("25_806")?; // CLI default
 
-    debug!(target: "bundle", "consensus_registry: {:#?}", current_epoch_info);
+    debug!(target: "genesis-test", "consensus_registry: {:#?}", current_epoch_info);
     let ConsensusRegistry::EpochInfo {
         committee,
         epochIssuance,
@@ -258,7 +254,49 @@ async fn test_genesis_with_consensus_registry_accounts() -> eyre::Result<()> {
 
     let validator_addresses: Vec<_> = validators.iter().map(|v| v.validatorAddress).collect();
     assert_eq!(committee, validator_addresses);
-    debug!(target: "bundle", "active validators??\n{:?}", validators);
+    debug!(target: "genesis-test", "active validators??\n{:?}", validators);
 
+    Ok(())
+}
+
+/// Helper function to assert expected account code.
+async fn check_account_storage(
+    client: &HttpClient,
+    address: Address,
+    genesis_account: GenesisAccount,
+    itel_address: Address,
+    itel_bal: U256,
+) -> eyre::Result<()> {
+    debug!(target: "genesis-test", ?address, ?genesis_account, "checking account storage for");
+    let returned_code: String = client.request("eth_getCode", rpc_params!(address)).await?;
+    assert_eq!(Bytes::from_hex(returned_code), Ok(genesis_account.code.unwrap()));
+
+    if address == itel_address {
+        let returned_bal: String = client.request("eth_getBalance", rpc_params!(address)).await?;
+        let returned_bal = returned_bal.trim_start_matches("0x");
+        assert_eq!(U256::from_str_radix(returned_bal, 16)?, itel_bal);
+    }
+
+    if genesis_account.storage.is_some() {
+        for (slot, value) in genesis_account.storage.unwrap().iter() {
+            let returned_storage: String = client
+                .request("eth_getStorageAt", rpc_params!(address, slot.to_string(), "latest"))
+                .await?;
+            assert_eq!(returned_storage, value.to_string());
+        }
+    }
+
+    Ok(())
+}
+
+/// Helper function to assert expected account nonce.
+async fn check_account_nonce(client: &HttpClient, address: Address) -> eyre::Result<()> {
+    debug!(target: "genesis-test", ?address, "checking account nonce for");
+    let account_nonce: String =
+        client.request("eth_getTransactionCount", rpc_params!(address)).await?;
+
+    let returned_nonce = account_nonce.trim_start_matches("0x");
+    // assert first nonce spent
+    assert_eq!(u64::from_str_radix(returned_nonce, 16), Ok(1));
     Ok(())
 }

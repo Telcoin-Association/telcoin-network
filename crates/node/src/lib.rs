@@ -15,6 +15,7 @@ use tracing::{error_span, instrument, warn, Instrument as _};
 
 pub mod engine;
 mod error;
+mod health;
 mod manager;
 pub mod primary;
 pub mod worker;

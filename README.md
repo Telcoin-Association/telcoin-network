@@ -3,7 +3,7 @@
 Consensus layer (CL) is an implementation of Narwhal and Bullshark.
 Execution layer (EL) produces EVM blocks compatible with Ethereum.
 
-Requires Rust 1.86
+Requires Rust 1.91
 
 ### Supported Platforms
 
@@ -13,6 +13,23 @@ The Telcoin Network protocol client supports Linux and MacOS operating systems. 
 
 Check out the repo and update the submodules:
 `make init-submodules` or `git submodule update --init --recursive`
+
+### Run an observer against testnet
+
+Build a release version of the node software:
+`cargo build --bin telcoin-network --release`
+
+Generate a config and keys for your observer node:
+`target/release/telcoin-network keytool generate observer --datadir DATADIR --address 0x4444444444444444444444444444444444444444 --bls-passphrase-source ask`
+
+This will use DATADIR for storage and set your "execution" address to 0x4444444444444444444444444444444444444444.  Note an observer does not recieve credit for execution but this option needs to be set anyway (at time of writing).  Use an address you control or a dummy like above.  This will also ask for the password for your nodes BLS key, this will need to be entered when started (or it can be put in an ENV var for injection).
+
+Start your observer node:
+`target/release/telcoin-network node -vvv --http --observer --chain adiri --bls-passphrase-source ask --datadir DATADIR`
+
+Make sure DATADIR matches the config command above and use the same password for reading the key.
+
+### Start a local development network
 
 Run the test network script to start four local validators and begin advancing the chain:
 `etc/local-testnet.sh --start --dev-funds 0xADDRESS`

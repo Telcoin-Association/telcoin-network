@@ -59,14 +59,14 @@ jobs:
             ~/.rustup/toolchains
             ~/.rustup/update-hashes
             ~/.rustup/settings.toml
-          key: rust-toolchain-${{ runner.os }}-nightly-2025-01-19
+          key: rust-toolchain-${{ runner.os }}-nightly-2025-11-04
 
       # install rust
       - name: Install nightly toolchain # pin nightly version
         if: steps.toolchain-cache.outputs.cache-hit != 'true'
         run: |
-          rustup toolchain install nightly-2025-01-19 --component rustfmt rust-src clippy
-          rustup default nightly-2025-01-19
+          rustup toolchain install nightly-2025-11-04 --component rustfmt rust-src clippy
+          rustup default nightly-2025-11-04
 
       # v2.7.7 - cahe deps for faster reruns
       - name: Cache dependencies
@@ -100,8 +100,8 @@ jobs:
         # Combine format and clippy checks
       - name: run format and clippy checks
         run: |
-          cargo +nightly-2025-01-19 fmt --verbose -- --check
-          cargo +nightly-2025-01-19 clippy --verbose --all --all-features -- -D warnings
+          cargo +nightly-2025-11-04 fmt --verbose -- --check
+          cargo +nightly-2025-11-04 clippy --verbose --all --all-features -- -D warnings
 
       - name: Run tests
         if: matrix.os == 'ubuntu-latest' || github.event_name == 'push'

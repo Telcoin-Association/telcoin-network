@@ -334,7 +334,7 @@ impl<DB: Database> Proposer<DB> {
         // check next round
         let next_round = self.round + 1;
 
-        if next_round % 2 == 0
+        if next_round.is_multiple_of(2)
             && self.leader_schedule.leader(self.round + 1).id() == self.authority_id
         {
             self.max_header_delay / 2
@@ -361,7 +361,7 @@ impl<DB: Database> Proposer<DB> {
         // - entire committee for odd rounds
         //
         // NOTE: committee size is asserted >1 during Committee::load()
-        if !(next_round % 2 == 0
+        if !(next_round.is_multiple_of(2)
             && self.leader_schedule.leader(next_round).id() != self.authority_id)
         {
             Duration::ZERO
@@ -522,7 +522,7 @@ impl<DB: Database> Proposer<DB> {
         debug!(target: "primary::proposer", authority=?self.authority_id, advance_round=self.advance_round, round=self.round, "parents");
 
         // update metrics
-        let round_type = if self.round % 2 == 0 { "even" } else { "odd" };
+        let round_type = if self.round.is_multiple_of(2) { "even" } else { "odd" };
         self.consensus_bus
             .primary_metrics()
             .node_metrics
@@ -682,7 +682,7 @@ impl<DB: Database> Proposer<DB> {
                 let parents = std::mem::take(&mut self.last_parents);
                 let authority_id = self.authority_id.clone();
                 let min_delay = self.min_header_delay; // copy
-                let leader_and_support = if current_round % 2 == 0 {
+                let leader_and_support = if current_round.is_multiple_of(2) {
                     let authority = self.leader_schedule.leader(current_round);
                     if self.authority_id == authority.id() {
                         "even_round_is_leader"
