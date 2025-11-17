@@ -72,10 +72,12 @@ services:
       - ./setup_validator.sh:/setup_validator.sh
       - validator4-data:/home/nonroot/data
 
-  # create and distribute committee / worker cache files
+  # create and distribute genesis files
   comittee:
     image: local-telcoin-network:latest
+    container_name: genesis
     environment:
+      - RUST_LOG=info,genesis=debug,engine=debug
       - TN_BLS_PASSPHRASE=local
     user: "root"
     command:
@@ -96,12 +98,12 @@ services:
 
   # start nodes
   validator1:
-    image: local-telcoin-network:latest
     container_name: validator1
+    image: local-telcoin-network:latest
     depends_on:
       - comittee
     environment:
-      - RUST_LOG=info,execution=debug
+      - RUST_LOG=info
       - TN_BLS_PASSPHRASE=local # must match value used in setup1 service
     user: "1101:1101"
     command: >
@@ -119,12 +121,12 @@ services:
       validators:
         ipv4_address: 10.10.0.21
   validator2:
-    image: local-telcoin-network:latest
     container_name: validator2
+    image: local-telcoin-network:latest
     depends_on:
       - comittee
     environment:
-      - RUST_LOG=info,execution=debug
+      - RUST_LOG=info
       - TN_BLS_PASSPHRASE=local # must match value used in setup2 service
     user: "1101:1101"
     command: >
@@ -142,12 +144,12 @@ services:
       validators:
         ipv4_address: 10.10.0.22
   validator3:
-    image: local-telcoin-network:latest
     container_name: validator3
+    image: local-telcoin-network:latest
     depends_on:
       - comittee
     environment:
-      - RUST_LOG=info,execution=debug
+      - RUST_LOG=info
       - TN_BLS_PASSPHRASE=local # must match value used in setup3 service
     user: "1101:1101"
     command: >
@@ -165,12 +167,12 @@ services:
       validators:
         ipv4_address: 10.10.0.23
   validator4:
-    image: local-telcoin-network:latest
     container_name: validator4
+    image: local-telcoin-network:latest
     depends_on:
       - comittee
     environment:
-      - RUST_LOG=info,execution=debug
+      - RUST_LOG=info
       - TN_BLS_PASSPHRASE=local # must match value used in setup4 service
     user: "1101:1101"
     command: >

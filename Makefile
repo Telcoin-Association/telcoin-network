@@ -101,7 +101,7 @@ docker-login:
 
 # build and push latest adiri image for amd64 and arm64
 docker-adiri:
-	docker buildx build -f ./etc/Dockerfile --platform linux/amd64,linux/arm64 -t us-docker.pkg.dev/telcoin-network/tn-public/adiri:$(TAG) . --push ;
+	docker buildx build -f ./etc/Dockerfile --platform linux/amd64,linux/arm64 --no-cache -t us-docker.pkg.dev/telcoin-network/tn-public/adiri:$(TAG) . --push ;
 
 # push local adiri:latest to the gcloud artifact registry
 docker-push:

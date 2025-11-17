@@ -59,8 +59,6 @@ where
             Config::load_from_path_or_default(tn_datadir.committee_path(), ConfigFmt::YAML)?;
         committee.load();
         info!(target: "telcoin", "committee loaded");
-
-        info!(target: "telcoin", "worker cache loaded");
         Self::new_with_committee(config, node_storage, key_config, committee, network_config)
     }
 
