@@ -4,6 +4,7 @@
 
 #![allow(unused_crate_dependencies)]
 
+use assert_matches::assert_matches;
 use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
@@ -12,7 +13,7 @@ use std::{
 use tempfile::TempDir;
 use tn_batch_builder::test_utils::execute_test_batch;
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
-use tn_engine::ExecutorEngine;
+use tn_engine::{ExecutorEngine, TnEngineError};
 use tn_reth::{
     system_calls::EpochState,
     test_utils::{
@@ -124,6 +125,23 @@ async fn create_committee_from_state(engine: &TestExecutionNode) -> eyre::Result
 /// transactions.
 #[tokio::test]
 async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
+    let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+    let tmp_dir = TempDir::new().expect("temp dir");
+    // execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.rewards_counter()),
+    )?;
+    // update rewards counter so execution address is visible
+    let committee = create_committee_from_state(&execution_node).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+    let expected_beneficiary =
+        committee.authority(&leader_id).expect("leader in committee").execution_address();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
     //=== Consensus
     //
     // create consensus output bc transactions in batches
@@ -138,9 +156,11 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
     leader.header.created_at = timestamp;
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
+    leader.header_mut_for_test().author = leader_id;
+
     let consensus_output = ConsensusOutput {
         sub_dag: CommittedSubDag::new(
-            vec![Certificate::default()],
+            vec![leader.clone()],
             leader,
             sub_dag_index,
             reputation_scores,
@@ -150,12 +170,6 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
         ..Default::default()
     };
     let consensus_output_hash = consensus_output.consensus_header_hash();
-
-    let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
-    let tmp_dir = TempDir::new().expect("temp dir");
-    // execution node components
-    let execution_node =
-        default_test_execution_node(Some(chain.clone()), None, tmp_dir.path(), None)?;
 
     let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
     let reth_env = execution_node.get_reth_env().await;
@@ -170,7 +184,7 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
         genesis_header.clone(),
         shutdown.subscribe(),
         task_manager.get_spawner(),
-        GasAccumulator::default(),
+        gas_accumulator,
     );
 
     // send output
@@ -191,8 +205,9 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
         let _ = tx.send(res);
     });
 
-    let engine_task = timeout(Duration::from_secs(10), rx).await?;
-    assert!(engine_task.is_ok());
+    let engine_task = timeout(Duration::from_secs(10), rx).await??;
+    // consensus output stream closed
+    assert_matches!(engine_task, Err(TnEngineError::ConsensusOutputStreamClosed));
 
     // assert memory is clean after execution
     assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
@@ -229,8 +244,8 @@ async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
 
     // assert basefee is same as worker's block
     assert_eq!(expected_block.base_fee_per_gas, Some(expected_base_fee));
-    // zero address used for empty blocks
-    assert_eq!(expected_block.beneficiary, Address::ZERO);
+    // leader address used for empty blocks
+    assert_eq!(expected_block.beneficiary, expected_beneficiary);
     // nonce matches subdag index and method all match
     assert_eq!(<FixedBytes<8> as Into<u64>>::into(expected_block.nonce), sub_dag_index);
     assert_eq!(<FixedBytes<8> as Into<u64>>::into(expected_block.nonce), consensus_output.nonce());
@@ -562,8 +577,9 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         let _ = tx.send(res);
     });
 
-    let engine_task = timeout(Duration::from_secs(10), rx).await?;
-    assert!(engine_task.is_ok());
+    let engine_task = timeout(Duration::from_secs(10), rx).await??;
+    // consensus stream is closed
+    assert_matches!(engine_task, Err(TnEngineError::ConsensusOutputStreamClosed));
 
     let last_block_num = reth_env.last_block_number()?;
     let canonical_tip = reth_env.canonical_tip();
@@ -1041,8 +1057,9 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         let _ = tx.send(res);
     });
 
-    let engine_task = timeout(Duration::from_secs(10), rx).await?;
-    assert!(engine_task.is_ok());
+    let engine_task = timeout(Duration::from_secs(10), rx).await??;
+    // consensus output stream closed
+    assert_matches!(engine_task, Err(TnEngineError::ConsensusOutputStreamClosed));
 
     let last_block_num = reth_env.last_block_number()?;
     let canonical_tip = reth_env.canonical_tip();
@@ -1403,8 +1420,8 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         let _ = tx.send(res);
     });
 
-    let engine_task = timeout(Duration::from_secs(10), rx).await?;
-    assert!(engine_task.is_ok());
+    let engine_task = timeout(Duration::from_secs(10), rx).await??;
+    assert!(engine_task.is_ok(), "{:?}", engine_task);
 
     let last_block_num = reth_env.last_block_number()?;
     let canonical_tip = reth_env.canonical_tip();

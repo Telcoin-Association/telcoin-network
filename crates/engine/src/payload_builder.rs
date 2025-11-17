@@ -8,7 +8,7 @@ use tn_reth::{
     CanonicalInMemoryState, ExecutedBlockWithTrieUpdates, NewCanonicalChain, RethEnv,
 };
 use tn_types::{gas_accumulator::GasAccumulator, max_batch_gas, Hash as _, SealedHeader, B256};
-use tracing::debug;
+use tracing::{debug, error};
 
 /// Execute output from consensus to extend the canonical chain.
 ///
@@ -48,7 +48,8 @@ pub fn execute_consensus_output(
         let leader = output.leader().origin();
         let beneficiary = gas_accumulator
             .get_authority_address(leader)
-            .ok_or(TnEngineError::UnknownAuthority(leader.clone()))?;
+            .ok_or(TnEngineError::UnknownAuthority(leader.clone()))
+            .inspect_err(|e| error!(target: "engine", ?e, "failed to find leader's execution address for empty output"))?;
 
         let payload = TNPayload::new(
             canonical_header,
