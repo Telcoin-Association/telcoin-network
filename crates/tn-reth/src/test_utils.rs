@@ -1,7 +1,10 @@
 //! Transaction factory to create legit transactions for execution.
 
 use crate::{
-    error::TnRethResult, evm::TNEvm, recover_raw_transaction, system_calls::ConsensusRegistry,
+    error::TnRethResult,
+    evm::TNEvm,
+    recover_raw_transaction,
+    system_calls::{ConsensusRegistry, EpochState},
     RethEnv, WorkerTxPool,
 };
 use alloy::{
@@ -26,15 +29,15 @@ use secp256k1::{
     rand::{rngs::StdRng, Rng, SeedableRng as _},
     Secp256k1,
 };
-use std::{path::Path, str::FromStr, sync::Arc};
+use std::{collections::HashMap, path::Path, str::FromStr, sync::Arc};
 use tn_types::{
     address, calculate_transaction_root, gas_accumulator::RewardsCounter, keccak256, now,
     test_chain_spec_arc, test_genesis, AccessList, Address, Batch, BlobTransactionSidecar, Block,
-    BlockBody, BlockHash, Bytes, Encodable2718, EthSignature, ExecHeader, ExecutionKeypair,
-    Genesis, GenesisAccount, RecoveredBlock, SealedHeader, TaskManager, Transaction,
-    TransactionSigned, TxEip1559, TxHash, TxKind, WorkerId, B256, EMPTY_OMMER_ROOT_HASH,
-    EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT_30M, MIN_PROTOCOL_BASE_FEE,
-    U256,
+    BlockBody, BlockHash, BlsPublicKey, Bytes, Committee, CommitteeBuilder, Encodable2718,
+    EthSignature, ExecHeader, ExecutionKeypair, Genesis, GenesisAccount, RecoveredBlock,
+    SealedHeader, TaskManager, Transaction, TransactionSigned, TxEip1559, TxHash, TxKind, WorkerId,
+    B256, EMPTY_OMMER_ROOT_HASH, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS,
+    ETHEREUM_BLOCK_GAS_LIMIT_30M, MIN_PROTOCOL_BASE_FEE, U256,
 };
 // re-exports for engine tests
 pub use alloy::eips::{
@@ -571,4 +574,25 @@ pub fn seeded_genesis_from_random_batches<'a>(
         senders.push(s);
     }
     (genesis, txs, senders)
+}
+
+/// Helper function to create a committee for tests from on-chain data.
+pub async fn create_committee_from_state(epoch_state: EpochState) -> eyre::Result<Committee> {
+    // deconstruct epoch information
+    let EpochState { epoch, validators, .. } = epoch_state;
+    let validators = validators
+        .iter()
+        .map(|v| {
+            let decoded_bls = BlsPublicKey::from_literal_bytes(v.blsPubkey.as_ref());
+            decoded_bls.map(|decoded| (decoded, v))
+        })
+        .collect::<Result<HashMap<_, _>, _>>()
+        .map_err(|err| eyre::eyre!("failed to create bls key from on-chain bytes: {err:?}"))?;
+    let mut committee_builder = CommitteeBuilder::new(epoch);
+    for (bls_key, info) in validators {
+        committee_builder.add_authority(bls_key, 1, info.validatorAddress);
+    }
+    let committee = committee_builder.build();
+    committee.load();
+    Ok(committee)
 }

@@ -23,7 +23,6 @@ tracing = { workspace = true }
 eyre = { workspace = true, optional = true }
 
 [dev-dependencies]
-# unit tests
 tn-test-utils = { workspace = true }
 tn-batch-builder = { workspace = true, features = ["test-utils"] }
 tn-types = { workspace = true, features = ["test-utils"] }
@@ -32,6 +31,7 @@ tempfile = { workspace = true }
 tn-config = { workspace = true }
 tn-reth = { workspace = true, features = ["test-utils"] }
 tn-primary = { workspace = true, features = ["test-utils"] }
+assert_matches = { workspace = true }
 
 [features]
 default = []

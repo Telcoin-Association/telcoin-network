@@ -11720,6 +11720,7 @@ dependencies = [
 name = "tn-engine"
 version = "0.1.0"
 dependencies = [
+ "assert_matches",
  "eyre",
  "futures",
  "futures-util",
