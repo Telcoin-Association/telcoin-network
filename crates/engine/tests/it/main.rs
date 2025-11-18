@@ -17,18 +17,18 @@ use tn_engine::{ExecutorEngine, TnEngineError};
 use tn_reth::{
     system_calls::EpochState,
     test_utils::{
-        calculate_withdrawals_root, seeded_genesis_from_random_batches, TransactionFactory,
-        BEACON_ROOTS_ADDRESS, EMPTY_REQUESTS_HASH, HISTORY_STORAGE_ADDRESS,
+        calculate_withdrawals_root, create_committee_from_state,
+        seeded_genesis_from_random_batches, TransactionFactory, BEACON_ROOTS_ADDRESS,
+        EMPTY_REQUESTS_HASH, HISTORY_STORAGE_ADDRESS,
     },
     FixedBytes, RethChainSpec, RethEnv,
 };
-use tn_test_utils::{default_test_execution_node, TestExecutionNode};
+use tn_test_utils::default_test_execution_node;
 use tn_types::{
     gas_accumulator::GasAccumulator, max_batch_gas, now, test_chain_spec_arc, test_genesis,
-    Address, BlockHash, Bloom, BlsPublicKey, Bytes, Certificate, CertifiedBatch, CommittedSubDag,
-    Committee, CommitteeBuilder, ConsensusOutput, Encodable2718, Hash as _, Notifier,
-    ReputationScores, SealedBlock, TaskManager, B256, EMPTY_WITHDRAWALS, MIN_PROTOCOL_BASE_FEE,
-    U256,
+    Address, BlockHash, Bloom, Bytes, Certificate, CertifiedBatch, CommittedSubDag,
+    ConsensusOutput, Encodable2718, Hash as _, Notifier, ReputationScores, SealedBlock,
+    TaskManager, B256, EMPTY_WITHDRAWALS, MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tokio::{sync::oneshot, time::timeout};
 use tracing::debug;
@@ -100,27 +100,6 @@ fn assert_eip2935(reth_env: &RethEnv, block: &SealedBlock) -> eyre::Result<()> {
     Ok(())
 }
 
-/// Helper function to create a committee for tests from on-chain data.
-async fn create_committee_from_state(engine: &TestExecutionNode) -> eyre::Result<Committee> {
-    // retrieve epoch information from canonical tip
-    let EpochState { epoch, validators, .. } = engine.epoch_state_from_canonical_tip().await?;
-    let validators = validators
-        .iter()
-        .map(|v| {
-            let decoded_bls = BlsPublicKey::from_literal_bytes(v.blsPubkey.as_ref());
-            decoded_bls.map(|decoded| (decoded, v))
-        })
-        .collect::<Result<HashMap<_, _>, _>>()
-        .map_err(|err| eyre::eyre!("failed to create bls key from on-chain bytes: {err:?}"))?;
-    let mut committee_builder = CommitteeBuilder::new(epoch);
-    for (bls_key, info) in validators {
-        committee_builder.add_authority(bls_key, 1, info.validatorAddress);
-    }
-    let committee = committee_builder.build();
-    committee.load();
-    Ok(committee)
-}
-
 /// This tests that a single block is executed if the output from consensus contains no
 /// transactions.
 #[tokio::test]
@@ -136,7 +115,8 @@ async fn test_empty_output_executes() -> eyre::Result<()> {
         Some(gas_accumulator.rewards_counter()),
     )?;
     // update rewards counter so execution address is visible
-    let committee = create_committee_from_state(&execution_node).await?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
     let leader_id = committee.authorities().first().expect("first authority").id();
     let expected_beneficiary =
         committee.authority(&leader_id).expect("leader in committee").execution_address();
@@ -376,7 +356,8 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     )?;
 
     // create committee from genesis state
-    let committee = create_committee_from_state(&execution_node).await?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
     let authority_1 =
         committee.authorities().first().expect("first in 4 auth committee for tests").id();
     let authority_2 =
@@ -835,7 +816,8 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     )?;
 
     // create committee from genesis state
-    let committee = create_committee_from_state(&execution_node).await?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
     let authority_1 =
         committee.authorities().first().expect("first in 4 auth committee for tests").id();
     let authority_2 =
