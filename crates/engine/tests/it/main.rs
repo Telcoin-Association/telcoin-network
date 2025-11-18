@@ -124,7 +124,7 @@ async fn create_committee_from_state(engine: &TestExecutionNode) -> eyre::Result
 /// This tests that a single block is executed if the output from consensus contains no
 /// transactions.
 #[tokio::test]
-async fn test_empty_output_executes_early_finalize() -> eyre::Result<()> {
+async fn test_empty_output_executes() -> eyre::Result<()> {
     let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
     let tmp_dir = TempDir::new().expect("temp dir");
     // execution node components
