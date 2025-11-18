@@ -11575,6 +11575,11 @@ dependencies = [
  "dirs-next",
  "eyre",
  "fdlimit",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry-semantic-conventions",
+ "opentelemetry-stdout",
+ "opentelemetry_sdk",
  "rayon",
  "secp256k1 0.31.0",
  "serde_yaml",
@@ -11585,6 +11590,8 @@ dependencies = [
  "tn-types",
  "tokio",
  "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber 0.3.20",
  "vergen 8.3.2",
 ]
 
@@ -11952,11 +11959,6 @@ dependencies = [
  "consensus-metrics",
  "eyre",
  "jsonrpsee",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry-semantic-conventions",
- "opentelemetry-stdout",
- "opentelemetry_sdk",
  "rand 0.9.1",
  "roaring",
  "state-sync",
@@ -11980,9 +11982,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
- "tracing-core",
- "tracing-opentelemetry",
- "tracing-subscriber 0.3.20",
 ]
 
 [[package]]

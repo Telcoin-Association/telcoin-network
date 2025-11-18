@@ -220,6 +220,7 @@ where
     }
 
     /// Run the node, handling epoch transitions.
+    #[tracing::instrument(name = "tn-run-node", skip(self), level = "info")]
     pub(crate) async fn run(&mut self) -> eyre::Result<()> {
         // Main task manager that manages tasks across epochs.
         // Long-running tasks for the lifetime of the node.

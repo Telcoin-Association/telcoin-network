@@ -57,7 +57,7 @@ impl From<BlsPublicKeyBytes> for [u8; 96] {
 
 impl BlsPublicKeyBytes {
     /// Take the first 8 bytes and convert to a base58 rep String.
-    fn to_short_string(&self) -> String {
+    fn to_short_string(self) -> String {
         bs58::encode(&self.0[0..8]).into_string()
     }
 }

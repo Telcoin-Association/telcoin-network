@@ -134,7 +134,7 @@ pub use reth_node_core::{
 pub use reth_primitives_traits::crypto::secp256k1::sign_message;
 pub use reth_provider::{CanonStateNotificationStream, ExecutionOutcome};
 pub use reth_rpc_eth_types::EthApiError;
-pub use reth_tracing::FileWorkerGuard;
+pub use reth_tracing::{FileWorkerGuard, Layers};
 pub use reth_transaction_pool::{
     error::{InvalidPoolTransactionError, PoolError, PoolTransactionError},
     identifier::SenderIdentifiers,

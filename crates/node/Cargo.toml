@@ -39,22 +39,6 @@ roaring = { workspace = true }
 # TODO: temporary solution until reth supports public rpc hooks
 tn-faucet = { workspace = true }
 
-opentelemetry = { version = "0.31.0", default-features = false, features = [
-    "trace", "metrics",
-] }
-opentelemetry_sdk = { version = "0.31.0", default-features = false, features = [
-    "trace", "metrics",
-] }
-opentelemetry-otlp = { version = "0.31.0", features = ["trace", "metrics", "grpc-tonic"] }
-opentelemetry-stdout = "0.31.0"
-opentelemetry-semantic-conventions = "0.31.0"
-tracing-core = "0.1.28"
-tracing-subscriber = { version = "0.3.0", default-features = false, features = [
-    "registry",
-    "std",
-] }
-tracing-opentelemetry = "0.32"
-
 [dev-dependencies]
 rand = { workspace = true }
 tn-primary = { workspace = true, features = ["test-utils"] }

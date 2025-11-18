@@ -10,7 +10,8 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, thread::available_paralleli
 use tn_config::Config;
 use tn_node::engine::TnBuilder;
 use tn_reth::{parse_socket_address, RethCommand, RethConfig};
-use tracing::*;
+use tokio::task::JoinHandle;
+use tracing::{debug, info};
 
 /// Avaliable "named" chains.
 /// These will have embedded config files and can be joined after gereating keys.
@@ -90,19 +91,16 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
 
 impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
     /// Execute `node` command
-    #[instrument(level = "info", skip_all)]
     pub fn execute<L>(
         mut self,
         tn_datadir: PathBuf,
         passphrase: Option<String>,
         launcher: L,
-    ) -> eyre::Result<()>
+    ) -> eyre::Result<JoinHandle<eyre::Result<()>>>
     where
-        L: FnOnce(TnBuilder, Ext, PathBuf, Option<String>) -> eyre::Result<()>,
+        L: FnOnce(TnBuilder, Ext, PathBuf, Option<String>) -> JoinHandle<eyre::Result<()>>,
     {
-        // Note we do NOT have tracing initialized yet (launcher will do that for a node).
-        // So do not use tracing/log macros yet.
-        println!("telcoin-network {} starting", SHORT_VERSION);
+        info!(target: "cli", "telcoin-network {} starting", SHORT_VERSION);
 
         // Raise the fd limit of the process.
         // Does not do anything on windows.
@@ -123,7 +121,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
 
         // overwrite all genesis if `genesis` was passed to CLI
         let tn_config = if let Some(chain) = self.chain.take() {
-            //XXXXinfo!(target: "cli", "Overwriting TN config with named chain: {chain:?}");
+            info!(target: "cli", "Overwriting TN config with named chain: {chain:?}");
             match chain {
                 NamedChain::Adiri | NamedChain::TestNet => {
                     Config::load_adiri(&tn_datadir, self.observer, SHORT_VERSION)?
@@ -135,9 +133,8 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         } else {
             Config::load(&tn_datadir, self.observer, SHORT_VERSION)?
         };
-        //XXXXdebug!(target: "cli", validator = ?tn_config.node_info.name, "tn datadir for node
-        // command: {tn_datadir:?}"); XXXXinfo!(target: "cli", validator =
-        // ?tn_config.node_info.name, "config loaded");
+        debug!(target: "cli", validator = ?tn_config.node_info.name, "tn datadir for node command: {tn_datadir:?}");
+        info!(target: "cli", validator = ?tn_config.node_info.name, "config loaded");
 
         // get the worker's transaction address from the config
         let Self {
@@ -163,6 +160,6 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         let builder =
             TnBuilder { node_config, tn_config, opt_faucet_args: None, metrics, healthcheck };
 
-        launcher(builder, ext, tn_datadir, passphrase)
+        Ok(launcher(builder, ext, tn_datadir, passphrase))
     }
 }
