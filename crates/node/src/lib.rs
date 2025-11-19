@@ -29,34 +29,19 @@ pub use manager::catchup_accumulator;
 pub fn launch_node<P>(
     builder: TnBuilder,
     tn_datadir: P,
-    passphrase: Option<String>,
+    key_config: KeyConfig,
 ) -> JoinHandle<eyre::Result<()>>
 where
     P: TelcoinDirs + Clone + 'static,
 {
+    let consensus_db = manager::open_consensus_db(&tn_datadir);
+
+    // create the epoch manager
+    let mut epoch_manager = EpochManager::new(builder, tn_datadir, consensus_db, key_config);
     // run the node
     // Note this is the "entry task" for the node and the caller needs to wait on the JoinHandle
     // then exit.
-    tokio::spawn(async move {
-        let passphrase =
-            if std::fs::exists(tn_datadir.node_keys_path().join(tn_config::BLS_WRAPPED_KEYFILE))
-                .unwrap_or(false)
-            {
-                passphrase
-            } else {
-                None
-            };
-
-        // create key config for lifetime of the app
-        // We DO NOT have tracing initialized at this point.
-        let key_config = KeyConfig::read_config(&tn_datadir, passphrase)?;
-
-        tracing::info!(target: "telcoin::consensus_config", "loaded validator keys at {:?}", tn_datadir.node_keys_path());
-        let consensus_db = manager::open_consensus_db(&tn_datadir)?;
-        // create the epoch manager
-        let mut epoch_manager = EpochManager::new(builder, tn_datadir, consensus_db, key_config)?;
-        epoch_manager.run().await
-    })
+    tokio::spawn(async move { epoch_manager.run().await })
 }
 
 #[derive(Debug)]

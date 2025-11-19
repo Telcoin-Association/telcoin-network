@@ -108,17 +108,21 @@ pub(crate) fn init_opentracing_subscriber(
     let env_filter = tracing_subscriber::EnvFilter::builder()
         .with_default_directive(span_level.into())
         .from_env_lossy();
+    let otel_filter = tracing_subscriber::filter::filter_fn(|metadata| {
+        !metadata.is_span() || metadata.target().starts_with("telcoin")
+    });
     let resource = Resource::builder()
         .with_service_name(service.to_string())
         .with_schema_url([KeyValue::new(SERVICE_VERSION, env!("CARGO_PKG_VERSION"))], SCHEMA_URL)
         .build();
-    let mut env_filter_layer: Option<BoxedLayer<Registry>> = Some(Box::new(env_filter));
     let mut meter_provider = None;
     if let Some(meter_url) = meter_url {
         meter_provider = init_meter_provider(resource.clone(), &meter_url);
         if let Some(meter_provider) = meter_provider.as_ref() {
-            let layer: BoxedLayer<Registry> = Box::new(MetricsLayer::new(meter_provider.clone()));
-            layers.add_layer(env_filter_layer.take().expect("env filter"));
+            let metrics_layer = MetricsLayer::new(meter_provider.clone())
+                .with_filter(otel_filter.clone())
+                .with_filter(env_filter.clone());
+            let layer: BoxedLayer<Registry> = Box::new(metrics_layer);
             layers.add_layer(layer);
         }
     }
@@ -127,10 +131,10 @@ pub(crate) fn init_opentracing_subscriber(
         tracer_provider = init_tracer_provider(resource, &tracing_url);
         if let Some(tracer_provider) = tracer_provider.as_ref() {
             let tracer = tracer_provider.tracer("tracing-otel-subscriber");
-            let layer: BoxedLayer<Registry> = Box::new(OpenTelemetryLayer::new(tracer));
-            if let Some(env_filter_layer) = env_filter_layer.take() {
-                layers.add_layer(env_filter_layer);
-            }
+            // filter only `tn` targets
+            let tracer =
+                OpenTelemetryLayer::new(tracer).with_filter(otel_filter).with_filter(env_filter);
+            let layer: BoxedLayer<Registry> = Box::new(tracer);
             layers.add_layer(layer);
         }
     }

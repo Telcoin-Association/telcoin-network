@@ -60,7 +60,7 @@ impl ExecutionNodeInner {
 
         let block_num = parent_header.number();
         let block_hash = parent_header.hash();
-        let span = info_span!("engine-execution");
+        let span = info_span!(target: "telcoin", "engine-execution");
         // spawn execution engine to extend canonical tip
         let mut tn_engine = ExecutorEngine::new(
             self.reth_env.clone(),
@@ -116,7 +116,7 @@ impl ExecutionNodeInner {
             epoch,
         );
 
-        let span = info_span!("batch-builder", epoch = field::Empty, base_fee = field::Empty);
+        let span = info_span!(target: "telcoin", "batch-builder", epoch = field::Empty, base_fee = field::Empty);
         // spawn batch builder task
         epoch_task_spawner.spawn_critical_task("batch builder", async move {
             span.record("epoch", epoch.to_string());

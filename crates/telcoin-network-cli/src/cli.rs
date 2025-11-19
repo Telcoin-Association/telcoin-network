@@ -7,10 +7,11 @@ use crate::{
 };
 use clap::{Parser, Subcommand};
 use std::{ffi::OsString, fmt, path::PathBuf, str::FromStr};
+use tn_config::KeyConfig;
 use tn_node::engine::TnBuilder;
 use tn_reth::{dirs::DEFAULT_ROOT_DIR, LogArgs};
 use tokio::{runtime::Builder, task::JoinHandle};
-use tracing::{error_span, level_filters::LevelFilter, Instrument as _};
+use tracing::{info_span, level_filters::LevelFilter};
 
 /// How do we want to get the BLS key passphrase?
 #[derive(Debug, Copy, Clone, clap::ValueEnum)]
@@ -119,7 +120,7 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
     /// ```
     pub fn run<L>(mut self, passphrase: Option<String>, launcher: L) -> eyre::Result<()>
     where
-        L: FnOnce(TnBuilder, Ext, PathBuf, Option<String>) -> JoinHandle<eyre::Result<()>>,
+        L: FnOnce(TnBuilder, Ext, PathBuf, KeyConfig) -> JoinHandle<eyre::Result<()>>,
     {
         let datadir: PathBuf = self.datadir.take().unwrap_or_else(|| {
             dirs_next::data_dir().map(|root| root.join(DEFAULT_ROOT_DIR)).unwrap_or_else(|| {
@@ -135,6 +136,10 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
                 command.execute(datadir)
             }
             Commands::Node(command) => {
+                // create key config for lifetime of the app
+                // We DO NOT have tracing initialized at this point.
+                let key_config = KeyConfig::read_config(&datadir, passphrase)?;
+
                 let runtime = Builder::new_multi_thread()
                     .thread_name("telcoin-network")
                     .enable_io()
@@ -149,20 +154,23 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
                             instance
                         )
                     } else {
-                        format!("unknown-{}", if command.observer { "observer" } else { "node" })
+                        format!("node-{}", key_config.primary_public_key().to_short_string())
                     };
                     let mut layers_guard = init_opentracing_subscriber(
                         &name,
                         LevelFilter::INFO, // XXXX replace with a level from cli
                         None,              // XXXX Replace with a meter url from cli
                         std::env::var("TN_TRACING_URL").ok(), /* XXXX replace with a tracing url
-                                                               * from cli */
+                                            * from cli */
                     );
                     let layers = layers_guard.take_layers();
                     let _guard = self.logs.init_tracing_with_layers(layers)?;
-                    let span = error_span!("node-running");
-                    let _span_enter = span.enter();
-                    command.execute(datadir, passphrase, launcher)?.instrument(span.clone()).await?
+                    let node_join = {
+                        let span = info_span!(target: "telcoin", "node-startup");
+                        let _span_enter = span.enter();
+                        command.execute(datadir, key_config, launcher)?
+                    };
+                    node_join.await?
                 });
                 res
             }
@@ -235,9 +243,26 @@ mod tests {
         assert!(log_dir.as_ref().ends_with(end), "{log_dir:?}");
     }
 
-    #[tokio::test]
-    async fn parse_env_filter_directives() {
+    #[test]
+    fn parse_env_filter_directives() {
         let temp_dir = tempfile::tempdir().unwrap();
+
+        // Create a key file or the tested command will fail.
+        let temp_path = temp_dir.path();
+        let tn = Cli::<NoArgs>::try_parse_from([
+            "telcoin-network",
+            "keytool",
+            "generate",
+            "validator",
+            "--workers",
+            "1",
+            "--datadir",
+            temp_path.to_str().expect("tempdir path clean"),
+            "--address",
+            "0",
+        ])
+        .expect("cli parsed");
+        tn.run(None, |_, _, _, _| tokio::spawn(async { Ok(()) })).expect("generate keys command");
 
         // Create config files or the run() below will fail.
         Config::load_or_default(&temp_dir.path().to_path_buf(), true, "test").unwrap();
@@ -251,6 +276,8 @@ mod tests {
             "debug,net=trace",
         ])
         .unwrap();
+        // run() will create a tokio runtime so we can use tokio::spawn but need to use a normal
+        // (non-tokio) test
         assert!(tn.run(None, |_, _, _, _| { tokio::spawn(async { Ok(()) }) }).is_ok());
     }
 }

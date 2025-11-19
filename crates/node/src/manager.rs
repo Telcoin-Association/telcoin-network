@@ -168,9 +168,7 @@ pub fn catchup_accumulator<DB: TNDatabase>(
 }
 
 /// Create a consensus DB that lives for program lifetime.
-pub(crate) fn open_consensus_db<P: TelcoinDirs + 'static>(
-    tn_datadir: &P,
-) -> eyre::Result<DatabaseType> {
+pub(crate) fn open_consensus_db<P: TelcoinDirs + 'static>(tn_datadir: &P) -> DatabaseType {
     let consensus_db_path = tn_datadir.consensus_db_path();
 
     // ensure dir exists
@@ -179,7 +177,7 @@ pub(crate) fn open_consensus_db<P: TelcoinDirs + 'static>(
 
     info!(target: "epoch-manager", ?consensus_db_path, "opened consensus storage");
 
-    Ok(db)
+    db
 }
 
 impl<P, DB> EpochManager<P, DB>
@@ -193,17 +191,16 @@ where
         tn_datadir: P,
         consensus_db: DB,
         key_config: KeyConfig,
-    ) -> eyre::Result<Self> {
+    ) -> Self {
         // shutdown long-running node components
         let node_shutdown = Notifier::new();
+
+        let reth_db = builder.reth_db.clone();
 
         let consensus_bus = ConsensusBus::new_with_args(builder.tn_config.parameters.gc_depth);
         let worker_event_stream = QueChannel::new();
 
-        // create dbs to survive between sync state transitions
-        let reth_db = RethEnv::new_database(&builder.node_config, tn_datadir.reth_db_path())?;
-
-        Ok(Self {
+        Self {
             builder,
             tn_datadir,
             primary_network_handle: None,
@@ -216,11 +213,11 @@ where
             consensus_bus,
             worker_event_stream,
             epoch_record: None,
-        })
+        }
     }
 
     /// Run the node, handling epoch transitions.
-    #[tracing::instrument(name = "tn-run-node", skip(self), level = "info")]
+    #[tracing::instrument(target = "telcoin", name = "tn-run-node", skip(self), level = "info")]
     pub(crate) async fn run(&mut self) -> eyre::Result<()> {
         // Main task manager that manages tasks across epochs.
         // Long-running tasks for the lifetime of the node.
@@ -477,7 +474,7 @@ where
     }
 
     /// Run a single epoch.
-    #[tracing::instrument(skip(self, engine, to_engine), level = "info")]
+    #[tracing::instrument(target = "telcoin", skip(self, engine, to_engine), level = "info")]
     async fn run_epoch(
         &mut self,
         engine: &ExecutionNode,

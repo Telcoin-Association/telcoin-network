@@ -12,7 +12,7 @@ use std::{
     sync::OnceLock,
 };
 use telcoin_network_cli::{genesis::GenesisArgs, keytool::KeyArgs, node::NodeCommand};
-use tn_config::{Config, ConfigFmt, ConfigTrait};
+use tn_config::{Config, ConfigFmt, ConfigTrait, KeyConfig};
 use tn_node::launch_node;
 use tn_types::{test_utils::CommandParser, Address, Genesis, GenesisAccount};
 use tracing::{error, info};
@@ -163,16 +163,25 @@ pub fn spawn_local_testnet(
         #[cfg(not(feature = "faucet"))]
         let command = NodeCommand::parse_from(["tn", "--http", "--instance", &instance]);
 
+        let key_config = KeyConfig::read_config(&dir, Some("it_test_pass".to_string()))?;
         std::thread::spawn(|| {
-            let err = command.execute(
-                dir,
-                Some("it_test_pass".to_string()),
-                |mut builder, faucet_args, tn_datadir, passphrase| {
-                    builder.opt_faucet_args = Some(faucet_args);
-                    launch_node(builder, tn_datadir, passphrase)
-                },
-            );
-            error!("{:?}", err);
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .thread_name("telcoin-network")
+                .enable_io()
+                .enable_time()
+                .build()
+                .expect("can build tokio runtime");
+
+            runtime.block_on(async move {
+                let err = command
+                    .execute(dir, key_config, |mut builder, faucet_args, tn_datadir, passphrase| {
+                        builder.opt_faucet_args = Some(faucet_args);
+                        launch_node(builder, tn_datadir, passphrase)
+                    })
+                    .expect("execute to succeed")
+                    .await;
+                error!("{:?}", err);
+            });
         });
     }
 

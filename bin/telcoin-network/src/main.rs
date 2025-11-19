@@ -96,17 +96,17 @@ fn main() {
     }
 
     #[cfg(not(feature = "faucet"))]
-    if let Err(err) = cli.run(passphrase, |builder, _, tn_datadir, passphrase| {
-        launch_node(builder, tn_datadir, passphrase)
+    if let Err(err) = cli.run(passphrase, |builder, _, tn_datadir, key_config| {
+        launch_node(builder, tn_datadir, key_config)
     }) {
         eprintln!("Error: {err:?}");
         std::process::exit(1);
     }
 
     #[cfg(feature = "faucet")]
-    if let Err(err) = cli.run(passphrase, |mut builder, faucet, tn_datadir, passphrase| {
+    if let Err(err) = cli.run(passphrase, |mut builder, faucet, tn_datadir, key_config| {
         builder.opt_faucet_args = Some(faucet);
-        launch_node(builder, tn_datadir, passphrase)
+        launch_node(builder, tn_datadir, key_config)
     }) {
         eprintln!("Error: {err:?}");
         std::process::exit(1);

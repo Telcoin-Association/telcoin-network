@@ -7,11 +7,11 @@ use core::fmt;
 use fdlimit::raise_fd_limit;
 use rayon::ThreadPoolBuilder;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, thread::available_parallelism};
-use tn_config::Config;
+use tn_config::{Config, KeyConfig, TelcoinDirs as _};
 use tn_node::engine::TnBuilder;
 use tn_reth::{parse_socket_address, RethCommand, RethConfig};
 use tokio::task::JoinHandle;
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 /// Avaliable "named" chains.
 /// These will have embedded config files and can be joined after gereating keys.
@@ -94,11 +94,11 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
     pub fn execute<L>(
         mut self,
         tn_datadir: PathBuf,
-        passphrase: Option<String>,
+        key_config: KeyConfig,
         launcher: L,
     ) -> eyre::Result<JoinHandle<eyre::Result<()>>>
     where
-        L: FnOnce(TnBuilder, Ext, PathBuf, Option<String>) -> JoinHandle<eyre::Result<()>>,
+        L: FnOnce(TnBuilder, Ext, PathBuf, KeyConfig) -> JoinHandle<eyre::Result<()>>,
     {
         info!(target: "cli", "telcoin-network {} starting", SHORT_VERSION);
 
@@ -116,7 +116,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             .thread_name(|i| format!("tn-rayon-{i}"))
             .build_global()
         {
-            eprintln!("Error: Failed to initialize global thread pool for rayon: {err}");
+            error!(target: "cli", "Error: Failed to initialize global thread pool for rayon: {err}");
         }
 
         // overwrite all genesis if `genesis` was passed to CLI
@@ -157,9 +157,17 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             Arc::new(tn_config.chain_spec()),
         );
 
-        let builder =
-            TnBuilder { node_config, tn_config, opt_faucet_args: None, metrics, healthcheck };
+        // create dbs to survive between sync state transitions
+        let reth_db = tn_reth::RethEnv::new_database(&node_config, tn_datadir.reth_db_path())?;
+        let builder = TnBuilder {
+            node_config,
+            tn_config,
+            opt_faucet_args: None,
+            metrics,
+            healthcheck,
+            reth_db,
+        };
 
-        Ok(launcher(builder, ext, tn_datadir, passphrase))
+        Ok(launcher(builder, ext, tn_datadir, key_config))
     }
 }
