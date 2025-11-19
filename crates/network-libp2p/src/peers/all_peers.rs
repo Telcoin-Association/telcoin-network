@@ -471,7 +471,7 @@ impl AllPeers {
             self.banned_peers.add_banned_peer(peer);
             let banned_ips = peer
                 .known_ip_addresses()
-                .filter(|ip| already_banned_ips.contains(ip))
+                .filter(|ip| !already_banned_ips.contains(ip))
                 .collect::<Vec<_>>();
             PeerAction::Ban(banned_ips)
         } else {

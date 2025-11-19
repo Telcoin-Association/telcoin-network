@@ -263,7 +263,7 @@ impl Peer {
         &self,
         already_banned_ips: &HashSet<IpAddr>,
     ) -> Vec<IpAddr> {
-        self.known_ip_addresses().filter(|ip| already_banned_ips.contains(ip)).collect::<Vec<_>>()
+        self.known_ip_addresses().filter(|ip| !already_banned_ips.contains(ip)).collect::<Vec<_>>()
     }
 
     /// Heartbeat maintenance applies decaying penalty rates to a non-trusted peer's score.
