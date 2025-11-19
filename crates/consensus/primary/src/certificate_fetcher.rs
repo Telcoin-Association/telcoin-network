@@ -247,7 +247,7 @@ impl<DB: Database> CertificateFetcher<DB> {
         let request = match MissingCertificatesRequest::default()
             .set_bounds(gc_round, written_rounds)
             .map_err(|e| CertManagerError::RequestBounds(e.to_string()))
-            .and_then(|r| Ok(r.set_max_response_size(self.max_rpc_message_size)))
+            .map(|r| r.set_max_response_size(self.max_rpc_message_size))
         {
             Ok(req) => req,
             Err(e) => {
@@ -528,7 +528,8 @@ fn spawn_peer_fetch(
 /// indefinitely, allowing the select! to skip this branch. When a task completes,
 /// it automatically clears the internal receiver and returns the result.
 struct FetchTask {
-    /// The receiver for a fetch task. Optional if a task has spawned to fetch certificates from peers.
+    /// The receiver for a fetch task. Optional if a task has spawned to fetch certificates from
+    /// peers.
     fetch_task: Option<oneshot::Receiver<CertManagerResult<()>>>,
 }
 
@@ -551,8 +552,8 @@ impl FetchTask {
 
     /// Checks whether a fetch task is currently pending.
     ///
-    /// Returns `false` if a task is set and hasn't completed yet, `true` if there is no pending task.
-    /// Used to prevent spawning duplicate fetch operations.
+    /// Returns `false` if a task is set and hasn't completed yet, `true` if there is no pending
+    /// task. Used to prevent spawning duplicate fetch operations.
     fn is_none(&self) -> bool {
         self.fetch_task.is_none()
     }

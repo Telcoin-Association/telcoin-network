@@ -244,7 +244,8 @@ pub struct Parameters {
     pub batch_vote_timeout: Duration,
     /// If set the Address that will recieve basefees.
     pub basefee_address: Option<Address>,
-    /// The default duration between parallel/fallback fetch requests to peers for missing certificates.
+    /// The default duration between parallel/fallback fetch requests to peers for missing
+    /// certificates.
     #[serde(default = "Parameters::default_parallel_fetch_request_delay_interval")]
     pub parallel_fetch_request_delay_interval: Duration,
 }
