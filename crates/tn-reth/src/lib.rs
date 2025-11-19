@@ -22,7 +22,6 @@ use crate::{
     traits::{DefaultEthPayloadTypes, TNExecution},
 };
 use alloy::{
-    consensus::Transaction as _,
     hex::{self, ToHexExt},
     primitives::{Bytes, ChainId},
     sol_types::{SolCall, SolConstructor},
@@ -597,9 +596,6 @@ impl RethEnv {
             "building new payload"
         );
 
-        // collect these totals to report at the end
-        let mut total_fees = U256::ZERO;
-
         // copy in case of error
         let batch_digest = payload.batch_digest;
 
@@ -609,8 +605,6 @@ impl RethEnv {
         builder.apply_pre_execution_changes().inspect_err(|err| {
             warn!(target: "engine", %err, "failed to apply pre-execution changes");
         })?;
-
-        let basefee = builder.evm_mut().block().basefee;
 
         for tx_bytes in transactions {
             let recovered = reth_recover_raw_transaction::<TransactionSigned>(tx_bytes)
@@ -623,7 +617,8 @@ impl RethEnv {
                     )
                 })?;
 
-            let gas_used = match builder.execute_transaction(recovered.clone()) {
+            // forks are impossible
+            let _gas_used = match builder.execute_transaction(recovered.clone()) {
                 Ok(gas_used) => gas_used,
                 Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
                     error,
@@ -638,12 +633,6 @@ impl RethEnv {
                 // this is an error that we should treat as fatal for this attempt
                 Err(err) => return Err(err.into()),
             };
-
-            // update add to total fees
-            let miner_fee = recovered
-                .effective_tip_per_gas(basefee)
-                .expect("fee is always valid; execution succeeded");
-            total_fees += U256::from(miner_fee) * U256::from(gas_used);
         }
 
         let BlockBuilderOutcome { execution_result, block, hashed_state, trie_updates } =
