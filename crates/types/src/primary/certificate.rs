@@ -453,8 +453,8 @@ impl Default for SignatureVerificationState {
 /// Process certificate received by setting the verification state.
 ///
 /// Recover signature bytes from the aggregated signature and set the signature verification state
-/// to unverified.
-pub fn validate_received_certificate(
+/// to unverified. This rejects genesis certificates (only called when certificate is fetched from peer).
+pub fn validate_fetched_certificate(
     mut certificate: Certificate,
 ) -> CertificateResult<Certificate> {
     certificate.set_signature_verification_state(SignatureVerificationState::Unverified(

@@ -7,7 +7,6 @@ use crate::{
     ConsensusBus,
 };
 use consensus_metrics::{monitored_future, monitored_scope};
-use futures::{stream::FuturesUnordered, StreamExt};
 use rand::{rngs::ThreadRng, seq::SliceRandom};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -18,29 +17,21 @@ use std::{
     time::Duration,
 };
 use tn_config::ConsensusConfig;
-use tn_network_types::FetchCertificatesResponse;
 use tn_primary_metrics::PrimaryMetrics;
 use tn_storage::CertificateStore;
 use tn_types::{
-    validate_received_certificate, AuthorityIdentifier, BlsPublicKey, Certificate, Committee,
+    validate_fetched_certificate, AuthorityIdentifier, BlsPublicKey, Certificate, Committee,
     Database, Header, Noticer, Notifier, Round, TaskManager, TaskSpawner, TnReceiver, TnSender,
 };
 use tokio::{
     sync::oneshot,
-    task::JoinSet,
-    time::{sleep, timeout, Instant},
+    time::{sleep, timeout},
 };
-use tracing::{debug, error, instrument, trace};
+use tracing::{debug, error, warn};
 
 #[cfg(test)]
 #[path = "tests/certificate_fetcher_tests.rs"]
 mod certificate_fetcher_tests;
-
-/// Seconds to wait for a response before issuing another parallel fetch request.
-const PARALLEL_FETCH_REQUEST_INTERVAL_SECS: Duration = Duration::from_secs(5);
-/// The timeout for an iteration of parallel fetch requests over all peers would be
-/// num peers * PARALLEL_FETCH_REQUEST_INTERVAL_SECS + PARALLEL_FETCH_REQUEST_ADDITIONAL_TIMEOUT
-const PARALLEL_FETCH_REQUEST_ADDITIONAL_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug)]
 pub enum CertificateFetcherCommand {
@@ -77,6 +68,8 @@ pub(crate) struct CertificateFetcher<DB> {
     fetch_task: FetchTask,
     /// The max allowable RPC message size shared with peers (in bytes).
     max_rpc_message_size: usize,
+    /// Delay duration before issuing another parallel fetch request for missing certs.
+    parallel_fetch_request_delay_interval: Duration,
 }
 
 impl<DB: Database> CertificateFetcher<DB> {
@@ -95,6 +88,8 @@ impl<DB: Database> CertificateFetcher<DB> {
         let metrics = consensus_bus.primary_metrics().node_metrics.clone();
         let max_rpc_message_size = config.network_config().libp2p_config().max_rpc_message_size;
         let task_spawner = task_manager.get_spawner();
+        let parallel_fetch_request_delay_interval =
+            config.parameters().parallel_fetch_request_delay_interval;
 
         task_manager.spawn_critical_task(
             "certificate fetcher task",
@@ -113,9 +108,13 @@ impl<DB: Database> CertificateFetcher<DB> {
                         targets: BTreeMap::new(),
                         fetch_task: FetchTask::new(),
                         max_rpc_message_size,
+                        parallel_fetch_request_delay_interval,
                     }
                     .run()
                     .await
+                    .map_err(|e| {
+                        error!(target: "primary::cert_fetcher", ?e, "cert fetcher shutting down");
+                    })
                 },
                 "CertificateFetcherTask"
             ),
@@ -123,36 +122,42 @@ impl<DB: Database> CertificateFetcher<DB> {
     }
 
     /// Receive messages on async channels until shutdown.
-    async fn run(&mut self) {
+    async fn run(&mut self) -> CertManagerResult<()> {
         let mut rx_certificate_fetcher = self.consensus_bus.certificate_fetcher().subscribe();
 
         loop {
             tokio::select! {
                 Some(command) = rx_certificate_fetcher.recv() => {
-                    self.handle_command(command);
+                    debug!(target: "primary::cert_fetcher", ?command, "received next command");
+                    self.handle_command(command)?;
                 },
 
                 result = &mut self.fetch_task => {
-                    self.handle_fetch_completion(result);
+                    self.handle_fetch_completion(result)?;
                 },
 
                 _ = &self.rx_shutdown => {
-                    return;
+                    break;
                 }
             }
         }
+
+        Ok(())
     }
 
     /// Process a certificate fetcher command and potentially start a new fetch task.
-    fn handle_command(&mut self, command: CertificateFetcherCommand) {
+    fn handle_command(&mut self, command: CertificateFetcherCommand) -> CertManagerResult<()> {
         let certificate = match command {
             CertificateFetcherCommand::Ancestors(certificate) => certificate,
             CertificateFetcherCommand::Kick => {
                 // start fetch if no task is running and there are pending targets
+                debug!(target: "primary::cert_fetcher", fetch_task_empty=self.fetch_task.is_none(), empty_target=self.targets.is_empty(), "received kick command");
                 if self.fetch_task.is_none() && !self.targets.is_empty() {
-                    self.start_fetch_task();
+                    debug!(target: "primary::cert_fetcher", "spawning next fetch task");
+                    self.start_fetch_task()?;
                 }
-                return;
+
+                return Ok(());
             }
         };
 
@@ -160,12 +165,18 @@ impl<DB: Database> CertificateFetcher<DB> {
 
         // skip certificates from wrong epoch
         if header.epoch() != self.committee.epoch() {
-            return;
+            warn!(
+                target: "primary::cert_fetcher",
+                requested_epoch=?header.epoch(),
+                "ignoring request to fetch ancestor outside of current epoch"
+            );
+
+            return Ok(());
         }
 
         // skip if later certificate already received from this authority
-        if !self.should_fetch_certificate(header) {
-            return;
+        if !self.should_fetch_certificate(header)? {
+            return Ok(());
         }
 
         // update targets and start fetching if needed
@@ -173,60 +184,55 @@ impl<DB: Database> CertificateFetcher<DB> {
 
         // start fetching if available space
         if self.fetch_task.is_none() {
-            self.start_fetch_task();
+            self.start_fetch_task()?;
         }
+
+        Ok(())
     }
 
     /// Check if we need to fetch ancestors for this certificate.
-    fn should_fetch_certificate(&self, header: &Header) -> bool {
+    fn should_fetch_certificate(&self, header: &Header) -> CertManagerResult<bool> {
         // skip if a later round is already being fetched from this authority
         if let Some(target_round) = self.targets.get(header.author()) {
             if header.round() <= *target_round {
-                return false;
+                return Ok(false);
             }
         }
 
         // skip if this round or later is already in storage
-        match self.certificate_store.last_round_number(header.author()) {
-            Ok(Some(last_round)) if header.round() <= last_round => false,
-            Ok(_) => true,
-            Err(e) => {
-                error!(target: "primary::cert_fetcher",
-                    "Failed to read latest round for {}: {}", header.author(), e);
-                false
-            }
-        }
+        let header_is_newer = self
+            .certificate_store
+            .last_round_number(header.author())?
+            .map(|last_round| header.round() > last_round)
+            .unwrap_or(true); // true if missing
+
+        Ok(header_is_newer)
     }
 
     /// Handle completion of a fetch task and start another if needed.
-    fn handle_fetch_completion(&mut self, result: CertManagerResult<()>) {
+    fn handle_fetch_completion(&mut self, result: CertManagerResult<()>) -> CertManagerResult<()> {
+        // log error
         if let Err(e) = result {
-            // if !e.is_cancelled() {
             error!(target: "primary::cert_fetcher", "Fetch task failed: {e}");
-            // }
         }
 
         // NOTE: self.fetch_task.poll sets `Option` to `None` once result it received
-
+        //
         // start next fetch if more targets
         if !self.targets.is_empty() {
-            self.start_fetch_task();
+            self.start_fetch_task()?;
         }
+
+        Ok(())
     }
 
     /// Start a new task to fetch missing certificates.
-    fn start_fetch_task(&mut self) {
+    fn start_fetch_task(&mut self) -> CertManagerResult<()> {
         // update targets - remove any that are already satisfied
         let gc_round = self.gc_round();
 
         // prepare request based on latest certs in local storage
-        let written_rounds = match self.get_written_rounds(gc_round) {
-            Ok(rounds) => rounds,
-            Err(e) => {
-                error!(target: "primary::cert_fetcher", ?e, "Failed to read certificate store");
-                return;
-            }
-        };
+        let written_rounds = self.get_written_rounds(gc_round)?;
 
         // update targets - remove any that are already in storage
         self.update_targets(gc_round, &written_rounds);
@@ -234,7 +240,7 @@ impl<DB: Database> CertificateFetcher<DB> {
         // nothing to fetch
         if self.targets.is_empty() {
             debug!(target: "primary::cert_fetcher", "Current targets empty - nothing to fetch");
-            return;
+            return Ok(());
         }
 
         // create the fetch request
@@ -246,7 +252,7 @@ impl<DB: Database> CertificateFetcher<DB> {
             Ok(req) => req,
             Err(e) => {
                 error!(target: "primary::cert_fetcher", ?e, "Failed to create missing cert request");
-                return;
+                return Ok(());
             }
         };
 
@@ -257,10 +263,12 @@ impl<DB: Database> CertificateFetcher<DB> {
         let metrics = self.metrics.clone();
         let task_spawner = self.task_spawner.clone();
         let authority_id = self.authority_id.clone();
+        let fallback_delay = self.parallel_fetch_request_delay_interval;
         let (tx, rx) = oneshot::channel();
 
         // store receiver for polling in `Self::run`
         self.fetch_task.set_task(rx);
+        debug!(target: "primary::cert_fetcher", ?gc_round, ?request, "spawning fetch task");
 
         // spawn task and hold receiver
         self.task_spawner.spawn_task(
@@ -276,6 +284,7 @@ impl<DB: Database> CertificateFetcher<DB> {
                     request,
                     state_sync,
                     task_spawner,
+                    fallback_delay,
                 )
                 .await;
 
@@ -283,6 +292,8 @@ impl<DB: Database> CertificateFetcher<DB> {
                 metrics.certificate_fetcher_inflight_fetch.dec();
             }),
         );
+
+        Ok(())
     }
 
     /// Update targets by removing any that have already been satisfied.
@@ -314,7 +325,7 @@ impl<DB: Database> CertificateFetcher<DB> {
     fn get_written_rounds(
         &self,
         gc_round: Round,
-    ) -> Result<BTreeMap<AuthorityIdentifier, BTreeSet<Round>>, CertManagerError> {
+    ) -> CertManagerResult<BTreeMap<AuthorityIdentifier, BTreeSet<Round>>> {
         let mut written_rounds = BTreeMap::new();
 
         // initialize for all authorities
@@ -324,10 +335,7 @@ impl<DB: Database> CertificateFetcher<DB> {
 
         // populate with actual written rounds
         // NOTE: origins_after_round() is inclusive.
-        let origins = self
-            .certificate_store
-            .origins_after_round(gc_round + 1)
-            .map_err(|e| CertManagerError::Storage(e))?;
+        let origins = self.certificate_store.origins_after_round(gc_round + 1)?;
 
         for (round, origins_at_round) in origins {
             for origin in origins_at_round {
@@ -353,6 +361,7 @@ async fn fetch_and_process_certificates<DB: Database>(
     request: MissingCertificatesRequest,
     state_sync: StateSynchronizer<DB>,
     task_spawner: TaskSpawner,
+    fallback_delay: Duration,
 ) -> CertManagerResult<()> {
     // get randomized list of peers
     let mut peers: Vec<_> = committee
@@ -362,18 +371,20 @@ async fn fetch_and_process_certificates<DB: Database>(
         .collect();
     peers.shuffle(&mut ThreadRng::default());
 
-    // calculate timeout based on number of peers
-    let timeout_duration = PARALLEL_FETCH_REQUEST_INTERVAL_SECS * peers.len() as u32
-        + PARALLEL_FETCH_REQUEST_ADDITIONAL_TIMEOUT;
+    // calculate timeout based on number of peers + twice the fallback delay
+    // NOTE: fallback_delay is set to 5s by default and should be plenty of time
+    let timeout_duration = fallback_delay * peers.len() as u32 + fallback_delay * 2;
 
     // try fetching from peers with staggered parallel requests
-    let certificates =
-        timeout(timeout_duration, fetch_from_peers(network, peers, request, task_spawner))
-            .await
-            .map_err(|_| {
-            debug!(target: "primary::cert_fetcher", "Certificate fetch timed out");
-            CertManagerError::Timeout
-        })??;
+    let certificates = timeout(
+        timeout_duration,
+        fetch_from_peers(network, peers, request, task_spawner, fallback_delay),
+    )
+    .await
+    .map_err(|_| {
+        debug!(target: "primary::cert_fetcher", "Certificate fetch timed out");
+        CertManagerError::Timeout
+    })??;
 
     // process the certificates
     state_sync.process_fetched_certificates_in_parallel(certificates).await?;
@@ -389,11 +400,10 @@ async fn fetch_from_peers(
     peers: Vec<BlsPublicKey>,
     request: MissingCertificatesRequest,
     task_spawner: TaskSpawner,
+    fallback_delay: Duration,
 ) -> CertManagerResult<Vec<Certificate>> {
     let (tx_results, mut rx_results) = tokio::sync::mpsc::unbounded_channel();
     let cancel_signal = Arc::new(Notifier::new());
-
-    const STAGGER_INTERVAL: Duration = Duration::from_secs(5);
 
     // track requests per peer
     let mut peer_index = 0;
@@ -414,7 +424,7 @@ async fn fetch_from_peers(
     }
 
     // timer for spawning next peer request
-    let mut spawn_timer = Box::pin(sleep(STAGGER_INTERVAL));
+    let mut spawn_timer = Box::pin(sleep(fallback_delay));
 
     loop {
         tokio::select! {
@@ -422,11 +432,29 @@ async fn fetch_from_peers(
                 if let Ok(certificates) = result {
                     if !certificates.is_empty() {
                         debug!(target: "primary::cert_fetcher",
-                            "Fetched {} certificates successfully", certificates.len());
+                            "Fetched {} certificates", certificates.len());
+                        // all certs should have valid sigs, otherwise treat entire response as malicious
+                        let certificates = certificates.into_iter().map(|cert| {
+                            // set cert as `unverified` and reject genesis certificates
+                            // cert signature is verified later
+                            validate_fetched_certificate(cert).map_err(|e| {
+                                error!(
+                                    target: "primary::cert_fetcher",
+                                    peer=?peers[peer_index],
+                                    "cert fetch received invalid genesis cert from peer"
+                                );
+                                e.into()
+                            })
+                        }).collect::<CertManagerResult<Vec<_>>>();
+
                         // success - cancel all other fetch tasks
-                        cancel_signal.notify();
-                        return Ok(certificates);
+                        if certificates.is_ok() {
+                            // only cancel on success - use timeout as fallback
+                            cancel_signal.notify();
+                            return certificates;
+                        }
                     }
+
                     // empty response - continue with other peers
                     debug!(target: "primary::cert_fetcher",
                         "Received empty certificate response, continuing with other peers");
@@ -436,8 +464,6 @@ async fn fetch_from_peers(
                 if peer_index >= peers.len() && tx_results.is_closed() {
                     debug!(target: "primary::cert_fetcher",
                         "All peers tried without success");
-                    // wait a bit before returning to avoid immediate retry
-                    sleep(STAGGER_INTERVAL).await;
                     return Err(CertManagerError::NoCertificateFetched);
                 }
             }
@@ -457,7 +483,7 @@ async fn fetch_from_peers(
                 peer_index += 1;
 
                 // reset timer for next spawn
-                spawn_timer = Box::pin(sleep(STAGGER_INTERVAL));
+                spawn_timer = Box::pin(sleep(fallback_delay));
             }
 
             else => {
@@ -465,7 +491,7 @@ async fn fetch_from_peers(
                 if tx_results.is_closed() {
                     debug!(target: "primary::cert_fetcher",
                         "No peer could provide certificates");
-                    sleep(STAGGER_INTERVAL).await;
+                    sleep(fallback_delay).await;
                     return Err(CertManagerError::NoCertificateFetched);
                 }
                 // continue waiting for results
@@ -489,7 +515,7 @@ fn spawn_peer_fetch(
                 let _ = tx_results.send(result.map_err(Into::into));
             }
             _ = cancel_signal => {
-                // Cancelled - another peer succeeded
+                // cancelled - another peer succeeded
             }
         }
     });
