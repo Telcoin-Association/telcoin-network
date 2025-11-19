@@ -362,25 +362,15 @@ where
     ///
     /// This is isolated into a function and requires a fork to change.
     fn next_committee_size(&mut self) -> TnRethResult<usize> {
-        // retrieve the current committee size
-        let epoch = self.extract_epoch_from_nonce(self.ctx.nonce);
-        let calldata = ConsensusRegistry::getCommitteeValidatorsCall { epoch }.abi_encode().into();
+        let calldata = ConsensusRegistry::getNextCommitteeSizeCall.abi_encode().into();
         let state =
             self.read_state_on_chain(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)?;
-        let current_committee: Vec<ConsensusRegistry::ValidatorInfo> =
-            alloy::sol_types::SolValue::abi_decode(&state)?;
-
-        trace!(target: "engine",  ?current_committee, "read current committee to get the next committee size");
+        let next_committee_size: u16 = alloy::sol_types::SolValue::abi_decode(&state)?;
+        trace!(target: "engine",  ?next_committee_size, "read next committee size from state");
 
         // this will fail on-chain if incorrect
-        Ok(current_committee.len())
-    }
-
-    /// Extract the epoch number from a header's nonce.
-    fn extract_epoch_from_nonce(&self, nonce: u64) -> u32 {
-        // epochs are packed into nonce as 32 bits
-        let epoch = nonce >> 32;
-        epoch as u32
+        // NOTE: u16 -> u32/u64 safe
+        Ok(next_committee_size as usize)
     }
 
     /// Applies the pre-block call to the EIP-4788 consensus root contract (cancun).
