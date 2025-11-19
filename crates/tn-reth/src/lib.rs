@@ -618,8 +618,8 @@ impl RethEnv {
                 })?;
 
             // forks are impossible
-            let _gas_used = match builder.execute_transaction(recovered.clone()) {
-                Ok(gas_used) => gas_used,
+            match builder.execute_transaction(recovered.clone()) {
+                Ok(_gas_used) => (),
                 Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
                     error,
                     ..
@@ -632,7 +632,7 @@ impl RethEnv {
                 }
                 // this is an error that we should treat as fatal for this attempt
                 Err(err) => return Err(err.into()),
-            };
+            }
         }
 
         let BlockBuilderOutcome { execution_result, block, hashed_state, trie_updates } =
