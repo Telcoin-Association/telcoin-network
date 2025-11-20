@@ -574,7 +574,7 @@ fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
 /// Note, balance is in wei and must fit in an u128.
 fn get_balance(node: &str, address: &str, retries: usize) -> eyre::Result<u128> {
     let res_str: String =
-        call_rpc(node, "eth_getBalance", rpc_params!(address, "latest"), retries)?;
+        call_rpc(node, "eth_getBalance", rpc_params!(address, "latest"), retries, address)?;
     info!(target: "restart-test", "get_balance for {node}: parsing string {res_str}");
     let tel = u128::from_str_radix(&res_str[2..], 16)?;
     info!(target: "restart-test", "get_balance for {node}: {tel:?}");
@@ -616,12 +616,14 @@ fn get_key(key: &str) -> String {
 }
 
 fn get_block(node: &str, block_number: Option<u64>) -> eyre::Result<HashMap<String, Value>> {
-    let params = if let Some(block_number) = block_number {
-        rpc_params!(format!("0x{block_number:x}"), true)
+    let debug_params = if let Some(block_number) = block_number {
+        format!("0x{block_number:x}")
     } else {
-        rpc_params!("latest", true)
+        "latest".to_string()
     };
-    call_rpc(node, "eth_getBlockByNumber", params.clone(), 10)
+
+    let params = rpc_params!(&debug_params, true);
+    call_rpc(node, "eth_getBlockByNumber", params, 10, debug_params)
 }
 
 fn get_block_number(node: &str) -> eyre::Result<u64> {
@@ -692,8 +694,9 @@ fn send_tel(
     let res_str: String = call_rpc(
         node,
         "eth_sendRawTransaction",
-        rpc_params!(const_hex::encode(transaction_bytes)),
+        rpc_params!(const_hex::encode(&transaction_bytes)),
         1,
+        transaction_bytes,
     )?;
     info!(target: "restart-test", "Submitted TEL transfer from {from_account} to {to_account} for {amount}: {res_str}");
     Ok(())
@@ -731,10 +734,17 @@ fn decode_key(key: &str) -> eyre::Result<(String, String, String)> {
 /// Wraps any Eyre otherwise returns the result as a String.
 /// This is for testing and will try up to retries times at one second intervals to send the
 /// request.
-fn call_rpc<R, Params>(node: &str, command: &str, params: Params, retries: usize) -> eyre::Result<R>
+fn call_rpc<R, Params, DebugParams>(
+    node: &str,
+    command: &str,
+    params: Params,
+    retries: usize,
+    debug_params: DebugParams,
+) -> eyre::Result<R>
 where
     R: DeserializeOwned + Debug,
     Params: jsonrpsee::core::traits::ToRpcParams + Send + Clone + Debug,
+    DebugParams: Debug,
 {
     // jsonrpsee is async AND tokio specific so give it a runtime (and can't use a crate like
     // pollster)...
@@ -752,7 +762,7 @@ where
             i += 1;
         }
         resp.inspect_err(|_| {
-            error!(target: "restart-tests", ?command, ?node, ?params, "rpc call failed");
+            error!(target: "restart-tests", ?command, ?node, ?debug_params, "rpc call failed");
         })
     });
 
