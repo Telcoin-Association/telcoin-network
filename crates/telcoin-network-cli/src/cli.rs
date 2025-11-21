@@ -1,13 +1,17 @@
 //! CLI definition and entrypoint to executable
 use crate::{
     genesis, keytool, node,
+    open_telemetry::init_opentracing_subscriber,
     version::{LONG_VERSION, SHORT_VERSION},
     NoArgs,
 };
 use clap::{Parser, Subcommand};
 use std::{ffi::OsString, fmt, path::PathBuf, str::FromStr};
+use tn_config::KeyConfig;
 use tn_node::engine::TnBuilder;
-use tn_reth::{dirs::DEFAULT_ROOT_DIR, FileWorkerGuard, LogArgs};
+use tn_reth::{dirs::DEFAULT_ROOT_DIR, LogArgs};
+use tokio::{runtime::Builder, task::JoinHandle};
+use tracing::info_span;
 
 /// How do we want to get the BLS key passphrase?
 #[derive(Debug, Copy, Clone, clap::ValueEnum)]
@@ -116,7 +120,7 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
     /// ```
     pub fn run<L>(mut self, passphrase: Option<String>, launcher: L) -> eyre::Result<()>
     where
-        L: FnOnce(TnBuilder, Ext, PathBuf, Option<String>) -> eyre::Result<()>,
+        L: FnOnce(TnBuilder, Ext, PathBuf, KeyConfig) -> JoinHandle<eyre::Result<()>>,
     {
         let datadir: PathBuf = self.datadir.take().unwrap_or_else(|| {
             dirs_next::data_dir().map(|root| root.join(DEFAULT_ROOT_DIR)).unwrap_or_else(|| {
@@ -126,22 +130,58 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
         // add network name to logs dir
         self.logs.log_file_directory = self.logs.log_file_directory.join("telcoin-network-logs");
 
-        let _guard = self.init_tracing()?;
-
         match self.command {
-            Commands::Genesis(command) => command.execute(datadir),
-            Commands::Node(command) => command.execute(datadir, passphrase, launcher),
-            Commands::Keytool(command) => command.execute(datadir, passphrase),
-        }
-    }
+            Commands::Genesis(command) => {
+                let _guard = self.logs.init_tracing()?;
+                command.execute(datadir)
+            }
+            Commands::Node(command) => {
+                // create key config for lifetime of the app
+                // We DO NOT have tracing initialized at this point.
+                let key_config = KeyConfig::read_config(&datadir, passphrase)?;
 
-    /// Initializes tracing with the configured options.
-    ///
-    /// If file logging is enabled, this function returns a guard that must be kept alive to ensure
-    /// that all logs are flushed to disk.
-    pub fn init_tracing(&self) -> eyre::Result<Option<FileWorkerGuard>> {
-        let guard = self.logs.init_tracing()?;
-        Ok(guard)
+                let runtime = Builder::new_multi_thread()
+                    .thread_name("telcoin-network")
+                    .enable_io()
+                    .enable_time()
+                    .build()?;
+
+                let res = runtime.block_on(async move {
+                    let name = if let Some(name) = &command.node_name {
+                        format!("{}-{}", name, key_config.primary_public_key().to_short_string())
+                    } else if let Some(instance) = command.instance {
+                        format!(
+                            "{}-{}-{}",
+                            if command.observer { "observer" } else { "node" },
+                            instance,
+                            key_config.primary_public_key().to_short_string()
+                        )
+                    } else {
+                        format!("node-{}", key_config.primary_public_key().to_short_string())
+                    };
+                    let mut layers_guard = init_opentracing_subscriber(
+                        &name,
+                        self.logs.verbosity.directive(),
+                        None, /* Replace with a meter url from cli- leave off until we propertly
+                               * test/implement. */
+                        command.tracing_url.clone(),
+                    );
+                    let layers = layers_guard.take_layers();
+                    let _guard = self.logs.init_tracing_with_layers(layers)?;
+                    let node_join = {
+                        let span = info_span!(target: "telcoin", "node-startup");
+                        let _span_enter = span.enter();
+                        command.execute(datadir, key_config, launcher)?
+                    };
+                    node_join.await?
+                });
+                res
+            }
+            Commands::Keytool(command) => {
+                let _guard = self.logs.init_tracing()?;
+                command.execute(datadir, passphrase)
+            }
+        }
     }
 }
 
@@ -206,9 +246,26 @@ mod tests {
         assert!(log_dir.as_ref().ends_with(end), "{log_dir:?}");
     }
 
-    #[tokio::test]
-    async fn parse_env_filter_directives() {
+    #[test]
+    fn parse_env_filter_directives() {
         let temp_dir = tempfile::tempdir().unwrap();
+
+        // Create a key file or the tested command will fail.
+        let temp_path = temp_dir.path();
+        let tn = Cli::<NoArgs>::try_parse_from([
+            "telcoin-network",
+            "keytool",
+            "generate",
+            "validator",
+            "--workers",
+            "1",
+            "--datadir",
+            temp_path.to_str().expect("tempdir path clean"),
+            "--address",
+            "0",
+        ])
+        .expect("cli parsed");
+        tn.run(None, |_, _, _, _| tokio::spawn(async { Ok(()) })).expect("generate keys command");
 
         // Create config files or the run() below will fail.
         Config::load_or_default(&temp_dir.path().to_path_buf(), true, "test").unwrap();
@@ -222,6 +279,8 @@ mod tests {
             "debug,net=trace",
         ])
         .unwrap();
-        assert!(tn.run(None, |_, _, _, _| { Ok(()) }).is_ok());
+        // run() will create a tokio runtime so we can use tokio::spawn but need to use a normal
+        // (non-tokio) test
+        assert!(tn.run(None, |_, _, _, _| { tokio::spawn(async { Ok(()) }) }).is_ok());
     }
 }

@@ -55,7 +55,7 @@ use tn_worker::{
 };
 use tokio::sync::mpsc::{self};
 use tokio_stream::StreamExt;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, info_span, warn, Instrument};
 
 /// The long-running task manager name.
 const NODE_TASK_MANAGER: &str = "Node Task Manager";
@@ -168,9 +168,7 @@ pub fn catchup_accumulator<DB: TNDatabase>(
 }
 
 /// Create a consensus DB that lives for program lifetime.
-pub(crate) fn open_consensus_db<P: TelcoinDirs + 'static>(
-    tn_datadir: &P,
-) -> eyre::Result<DatabaseType> {
+pub(crate) fn open_consensus_db<P: TelcoinDirs + 'static>(tn_datadir: &P) -> DatabaseType {
     let consensus_db_path = tn_datadir.consensus_db_path();
 
     // ensure dir exists
@@ -179,7 +177,7 @@ pub(crate) fn open_consensus_db<P: TelcoinDirs + 'static>(
 
     info!(target: "epoch-manager", ?consensus_db_path, "opened consensus storage");
 
-    Ok(db)
+    db
 }
 
 impl<P, DB> EpochManager<P, DB>
@@ -191,31 +189,18 @@ where
     pub(crate) fn new(
         builder: TnBuilder,
         tn_datadir: P,
-        passphrase: Option<String>,
         consensus_db: DB,
-    ) -> eyre::Result<Self> {
-        let passphrase =
-            if std::fs::exists(tn_datadir.node_keys_path().join(tn_config::BLS_WRAPPED_KEYFILE))
-                .unwrap_or(false)
-            {
-                passphrase
-            } else {
-                None
-            };
-
-        // create key config for lifetime of the app
-        let key_config = KeyConfig::read_config(&tn_datadir, passphrase)?;
-
+        key_config: KeyConfig,
+    ) -> Self {
         // shutdown long-running node components
         let node_shutdown = Notifier::new();
+
+        let reth_db = builder.reth_db.clone();
 
         let consensus_bus = ConsensusBus::new_with_args(builder.tn_config.parameters.gc_depth);
         let worker_event_stream = QueChannel::new();
 
-        // create dbs to survive between sync state transitions
-        let reth_db = RethEnv::new_database(&builder.node_config, tn_datadir.reth_db_path())?;
-
-        Ok(Self {
+        Self {
             builder,
             tn_datadir,
             primary_network_handle: None,
@@ -228,7 +213,7 @@ where
             consensus_bus,
             worker_event_stream,
             epoch_record: None,
-        })
+        }
     }
 
     /// Run the node, handling epoch transitions.
@@ -436,12 +421,12 @@ where
                 error!(target: "epoch-manager", ?e, "epoch returned error");
             })?;
 
-            info!(target: "epoch-manager", "looping run epoch");
             self.consensus_bus.reset_for_epoch();
             // Make sure we don't start a new epoch when we are shutting down.
             if node_ended_sub.noticed() {
                 break Ok(());
             }
+            info!(target: "epoch-manager", "looping run epoch");
         }
     }
 
@@ -452,12 +437,16 @@ where
         epoch_task_manager: &TaskManager,
         engine: ExecutionNode,
         worker: Worker<DB, QuorumWaiter>,
+        epoch: Epoch,
     ) -> eyre::Result<()> {
         let mut orphan_batches: Vec<(BlockHash, Batch)> =
             self.consensus_db.iter::<NodeBatchesCache>().collect();
         if !orphan_batches.is_empty() {
             self.consensus_db.clear_table::<NodeBatchesCache>()?;
             let consensus_bus = self.consensus_bus.clone();
+            let span =
+                info_span!(target: "telcoin", "orphan-batches", epoch = tracing::field::Empty);
+            span.record("epoch", epoch.to_string());
             epoch_task_manager.spawn_task("Orphaned Batches", async move {
                 info!(target: "epoch-manager", "Re-introducing orphaned batchs {} transactions", orphan_batches.len());
                 let pools = engine.get_all_worker_transaction_pools().await;
@@ -480,7 +469,7 @@ where
                         let _ = worker.disburse_txns(batch.seal(digest)).await;
                     }
                 }
-            });
+            }.instrument(span));
         } else {
             info!(target: "epoch-manager", "No batches leftover");
         }
@@ -564,7 +553,7 @@ where
             )
             .await?;
 
-        self.orphan_batches(&epoch_task_manager, engine.clone(), worker.clone())?;
+        self.orphan_batches(&epoch_task_manager, engine.clone(), worker.clone(), current_epoch)?;
 
         // update tasks
         epoch_task_manager.update_tasks();
@@ -742,6 +731,11 @@ where
     /// Start a task to collect the epoch record votes previous epochs record.
     /// This should run quickly at epoch start and make epoch records/certs available to syncing
     /// nodes.
+    #[tracing::instrument(
+        target = "telcoin",
+        skip(self, primary, epoch_task_manager),
+        level = "info"
+    )]
     async fn collect_epoch_votes(
         &self,
         primary: &PrimaryNode<DB>,

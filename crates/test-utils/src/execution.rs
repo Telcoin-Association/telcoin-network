@@ -87,21 +87,14 @@ fn execution_builder<CliExt: clap::Args + fmt::Debug>(
     // update execution address
     tn_config.node_info.execution_address = address;
 
+    let node_config =
+        RethConfig::new(reth_command, instance, tmp_dir, true, Arc::new(tn_config.chain_spec()));
+    // create engine node
+    let reth_db = RethEnv::new_database(&node_config, tmp_dir.join("db"))?;
     // TODO: this a temporary approach until upstream reth supports public rpc hooks
     let opt_faucet_args = None;
-    let builder = TnBuilder {
-        node_config: RethConfig::new(
-            reth_command,
-            instance,
-            tmp_dir,
-            true,
-            Arc::new(tn_config.chain_spec()),
-        ),
-        tn_config,
-        opt_faucet_args,
-        metrics: None,
-        healthcheck,
-    };
+    let builder =
+        TnBuilder { node_config, tn_config, opt_faucet_args, metrics: None, healthcheck, reth_db };
 
     Ok((builder, ext))
 }
@@ -133,17 +126,16 @@ pub fn faucet_test_execution_node(
         execution_builder::<FaucetArgs>(opt_chain.clone(), opt_address, extended_args, tmp_dir)?;
 
     // replace default builder's faucet args
-    let TnBuilder { node_config, tn_config, healthcheck, .. } = builder;
+    let TnBuilder { node_config, tn_config, healthcheck, reth_db, .. } = builder;
     let builder = TnBuilder {
         node_config: node_config.clone(),
         tn_config,
         opt_faucet_args: Some(faucet),
         metrics: None,
         healthcheck,
+        reth_db: reth_db.clone(),
     };
 
-    // create engine node
-    let reth_db = RethEnv::new_database(&node_config, tmp_dir.join("db"))?;
     let engine = ExecutionNode::new(
         &builder,
         RethEnv::new(

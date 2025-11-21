@@ -27,7 +27,24 @@ tokio = { workspace = true, features = [
     "time",
     "rt-multi-thread",
 ] }
+
+
+opentelemetry = { version = "0.31.0", default-features = false, features = [
+    "trace", "metrics",
+] }
+opentelemetry_sdk = { version = "0.31.0", default-features = false, features = [
+    "trace", "metrics",
+] }
+opentelemetry-otlp = { version = "0.31.0", features = ["trace", "metrics", "grpc-tonic"] }
+opentelemetry-stdout = "0.31.0"
+opentelemetry-semantic-conventions = "0.31.0"
 tracing = { workspace = true }
+tracing-subscriber = { version = "0.3.0", default-features = false, features = [
+    "registry",
+    "std",
+] }
+tracing-opentelemetry = "0.32"
+
 tn-types = { workspace = true }
 tn-node = { workspace = true }
 tn-reth = { workspace = true }

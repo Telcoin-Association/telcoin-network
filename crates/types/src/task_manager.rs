@@ -379,7 +379,7 @@ impl TaskManager {
                     break;
                 },
                 _ = &rx_shutdown => {
-                    tracing::info!(target: "tn::tasks", "{}: Node exiting, received shutdown notification", self.name);
+                    tracing::info!(target: "tn::tasks", "{}: exiting, received shutdown notification", self.name);
                     break;
                 },
                 Some(task) = self.new_task_rx.recv() => {
@@ -396,7 +396,7 @@ impl TaskManager {
                             if !info.critical {
                                 continue;
                             }
-                            tracing::info!(target: "tn::tasks", "{}: {} returned Ok, node exiting", self.name, info.name);
+                            tracing::info!(target: "tn::tasks", "{}: {} returned Ok, exiting", self.name, info.name);
                             // Ok exit is fine if we are shutting down.
                             if !rx_shutdown.noticed() {
                                 result = Err(TaskJoinError::CriticalExitOk(info.name));
@@ -409,7 +409,7 @@ impl TaskManager {
                             }
                             // Ok exit is fine if we are shutting down.
                             if !rx_shutdown.noticed() {
-                                tracing::error!(target: "tn::tasks", "{}: {} returned error {join_err}, node exiting", self.name, info.name);
+                                tracing::error!(target: "tn::tasks", "{}: {} returned error {join_err}, exiting", self.name, info.name);
                                 result = Err(TaskJoinError::CriticalExitError(info.name, join_err));
                             }
                         }
@@ -418,7 +418,7 @@ impl TaskManager {
                 }
                 Some((res, name)) = future_managers.next() => {
                     if !rx_shutdown.noticed() {
-                        tracing::error!(target: "tn::tasks", "{}: Sub-Task Manager {name} returned exited, node exiting", self.name);
+                        tracing::error!(target: "tn::tasks", "{}: Sub-Task Manager {name} returned exited, exiting", self.name);
                     }
                     result = res;
                     break;

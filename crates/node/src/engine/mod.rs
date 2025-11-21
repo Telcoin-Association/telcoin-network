@@ -16,7 +16,8 @@ use std::{net::SocketAddr, sync::Arc};
 use tn_config::Config;
 use tn_faucet::FaucetArgs;
 use tn_reth::{
-    system_calls::EpochState, CanonStateNotificationStream, RethConfig, RethEnv, WorkerTxPool,
+    system_calls::EpochState, CanonStateNotificationStream, RethConfig, RethDb, RethEnv,
+    WorkerTxPool,
 };
 use tn_rpc::EngineToPrimary;
 use tn_types::{
@@ -55,6 +56,8 @@ pub struct TnBuilder {
     /// healthcheck service responds unconditionally. This reads from `HEALTHCHECK_TCP_PORT` env
     /// var.
     pub healthcheck: Option<u16>,
+    /// A reference to the long lived reth DB for the node.
+    pub reth_db: RethDb,
 }
 
 /// Wrapper for the inner execution node components.
