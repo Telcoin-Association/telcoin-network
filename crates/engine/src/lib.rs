@@ -8,7 +8,8 @@
 
 mod error;
 mod payload_builder;
-use error::{EngineResult, TnEngineError};
+use error::EngineResult;
+pub use error::TnEngineError;
 use futures::{Future, StreamExt};
 use futures_util::FutureExt;
 pub use payload_builder::execute_consensus_output;

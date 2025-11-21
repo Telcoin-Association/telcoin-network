@@ -1,6 +1,7 @@
 //! Error types for Telcoin Network Engine.
 
 use tn_reth::error::TnRethError;
+use tn_types::AuthorityIdentifier;
 use tokio::sync::oneshot;
 
 /// Result alias for [`TNEngineError`].
@@ -33,6 +34,9 @@ pub enum TnEngineError {
     /// The consensus stream has closed.
     #[error("Consensus output stream closed.")]
     ConsensusOutputStreamClosed,
+    /// The output's leader is unknown.
+    #[error("Unknown authority for block rewards {0}")]
+    UnknownAuthority(AuthorityIdentifier),
 }
 
 impl From<oneshot::error::RecvError> for TnEngineError {

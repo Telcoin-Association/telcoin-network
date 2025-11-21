@@ -331,13 +331,15 @@ mod tests {
     use tn_engine::execute_consensus_output;
     use tn_network_types::{local::LocalNetwork, MockWorkerToPrimaryHang};
     use tn_reth::{
-        payload::BuildArguments, recover_raw_transaction, test_utils::TransactionFactory,
+        payload::BuildArguments,
+        recover_raw_transaction,
+        test_utils::{create_committee_from_state, TransactionFactory},
         RethChainSpec,
     };
     use tn_storage::{open_db, tables::Batches};
     use tn_types::{
-        gas_accumulator::GasAccumulator, test_genesis, Bytes, ConsensusOutput, Database,
-        GenesisAccount, TaskManager, U160, U256,
+        gas_accumulator::GasAccumulator, test_genesis, Bytes, Certificate, CommittedSubDag,
+        ConsensusOutput, Database, GenesisAccount, TaskManager, U160, U256,
     };
     use tn_worker::{
         metrics::WorkerMetrics, test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle,
@@ -616,6 +618,22 @@ mod tests {
             BlockSealError::FailedQuorum,
         ];
 
+        let committee = create_committee_from_state(
+            reth_env.epoch_state_from_canonical_tip().expect("epoch state from canonical tip"),
+        )
+        .await
+        .expect("committee from state");
+        let gas_accumulator = GasAccumulator::new(1); // 1 worker
+        let leader = committee.authorities().first().expect("first authority").id();
+        gas_accumulator.rewards_counter().set_committee(committee);
+        // specify leader for consensus output
+        let mut leader_cert = Certificate::default();
+        leader_cert.header_mut_for_test().author = leader;
+        let mut subdag = CommittedSubDag::default();
+        subdag.leader = leader_cert;
+        let mut output = ConsensusOutput::default();
+        output.sub_dag = Arc::new(subdag);
+
         // receive new blocks and return non-fatal errors
         // non-fatal errors cause the loop to break and wait for txpool updates
         // submitting a new pending transaction is one of the ways this task wakes up
@@ -643,11 +661,10 @@ mod tests {
                 .await;
 
             // canonical update to wake up task
-            let output = ConsensusOutput::default();
             // execute output to trigger canonical update
-            let args = BuildArguments::new(reth_env.clone(), output, parent);
+            let args = BuildArguments::new(reth_env.clone(), output.clone(), parent);
             let final_header =
-                execute_consensus_output(args, GasAccumulator::default()).expect("output executed");
+                execute_consensus_output(args, gas_accumulator.clone()).expect("output executed");
 
             // update values for next loop
             parent = final_header;

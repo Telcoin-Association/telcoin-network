@@ -244,7 +244,7 @@ impl GenesisArgs {
         )?;
         Config::write_to_path(data_dir.node_config_parameters_path(), parameters, ConfigFmt::YAML)?;
 
-        // generate committee and worker cache
+        // generate initial committee for genesis
         let committee = network_genesis.create_committee()?;
 
         // write to file

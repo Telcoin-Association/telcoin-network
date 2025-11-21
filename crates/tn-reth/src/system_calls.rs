@@ -177,6 +177,9 @@ sol!(
         function beginExit() external override whenNotPaused;
         /// Retrieve the claimable rewards accrued for a given validator address.
         function getRewards(address validatorAddress) public view virtual returns (uint256);
+        /// Returns the next committee size
+        function getNextCommitteeSize() external view returns (uint16);
+
     }
 );
 

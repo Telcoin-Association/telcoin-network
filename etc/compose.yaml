@@ -12,8 +12,8 @@ services:
     depends_on:
       - telcoin-base
     environment:
-      - TN_PRIMARY_ADDR=/ip4/10.10.0.21/udp/49590/quic-v1
-      - TN_WORKER_ADDR=/ip4/10.10.0.21/udp/49595/quic-v1
+      - PRIMARY_LISTENER_MULTIADDR=/ip4/10.10.0.21/udp/49590/quic-v1
+      - WORKER_LISTENER_MULTIADDR=/ip4/10.10.0.21/udp/49595/quic-v1
       - EXECUTION_ADDRESS=0x1111111111111111111111111111111111111111
       - TN_BLS_PASSPHRASE=local
     user: "root"
@@ -28,8 +28,8 @@ services:
     depends_on:
       - telcoin-base
     environment:
-      - TN_PRIMARY_ADDR=/ip4/10.10.0.22/udp/49590/quic-v1
-      - TN_WORKER_ADDR=/ip4/10.10.0.22/udp/49595/quic-v1
+      - PRIMARY_LISTENER_MULTIADDR=/ip4/10.10.0.22/udp/49590/quic-v1
+      - WORKER_LISTENER_MULTIADDR=/ip4/10.10.0.22/udp/49595/quic-v1
       - EXECUTION_ADDRESS=0x2222222222222222222222222222222222222222
       - TN_BLS_PASSPHRASE=local
     user: "root"
@@ -44,8 +44,8 @@ services:
     depends_on:
       - telcoin-base
     environment:
-      - TN_PRIMARY_ADDR=/ip4/10.10.0.23/udp/49590/quic-v1
-      - TN_WORKER_ADDR=/ip4/10.10.0.23/udp/49595/quic-v1
+      - PRIMARY_LISTENER_MULTIADDR=/ip4/10.10.0.23/udp/49590/quic-v1
+      - WORKER_LISTENER_MULTIADDR=/ip4/10.10.0.23/udp/49595/quic-v1
       - EXECUTION_ADDRESS=0x3333333333333333333333333333333333333333
       - TN_BLS_PASSPHRASE=local
     user: "root"
@@ -60,8 +60,8 @@ services:
     depends_on:
       - telcoin-base
     environment:
-      - TN_PRIMARY_ADDR=/ip4/10.10.0.24/udp/49590/quic-v1
-      - TN_WORKER_ADDR=/ip4/10.10.0.24/udp/49595/quic-v1
+      - PRIMARY_LISTENER_MULTIADDR=/ip4/10.10.0.24/udp/49590/quic-v1
+      - WORKER_LISTENER_MULTIADDR=/ip4/10.10.0.24/udp/49595/quic-v1
       - EXECUTION_ADDRESS=0x4444444444444444444444444444444444444444
       - TN_BLS_PASSPHRASE=local
     user: "root"
@@ -72,10 +72,12 @@ services:
       - ./setup_validator.sh:/setup_validator.sh
       - validator4-data:/home/nonroot/data
 
-  # create and distribute committee / worker cache files
+  # create and distribute genesis files
   comittee:
     image: local-telcoin-network:latest
+    container_name: genesis
     environment:
+      - RUST_LOG=info,genesis=debug,engine=debug
       - TN_BLS_PASSPHRASE=local
     user: "root"
     command:
@@ -96,16 +98,18 @@ services:
 
   # start nodes
   validator1:
+    container_name: validator1
     image: local-telcoin-network:latest
     depends_on:
       - comittee
     environment:
-      - RUST_LOG=info,execution=debug
+      - RUST_LOG=info
       - TN_BLS_PASSPHRASE=local # must match value used in setup1 service
     user: "1101:1101"
     command: >
       /usr/local/bin/telcoin node
       --datadir /home/nonroot/data
+      --http
       --http.addr 0.0.0.0
       --http.port 8545
       --metrics 127.0.0.1:9101
@@ -117,16 +121,18 @@ services:
       validators:
         ipv4_address: 10.10.0.21
   validator2:
+    container_name: validator2
     image: local-telcoin-network:latest
     depends_on:
       - comittee
     environment:
-      - RUST_LOG=info,execution=debug
+      - RUST_LOG=info
       - TN_BLS_PASSPHRASE=local # must match value used in setup2 service
     user: "1101:1101"
     command: >
       /usr/local/bin/telcoin node
       --datadir /home/nonroot/data
+      --http
       --http.addr 0.0.0.0
       --http.port 8545
       --metrics 127.0.0.1:9101
@@ -138,16 +144,18 @@ services:
       validators:
         ipv4_address: 10.10.0.22
   validator3:
+    container_name: validator3
     image: local-telcoin-network:latest
     depends_on:
       - comittee
     environment:
-      - RUST_LOG=info,execution=debug
+      - RUST_LOG=info
       - TN_BLS_PASSPHRASE=local # must match value used in setup3 service
     user: "1101:1101"
     command: >
       /usr/local/bin/telcoin node
       --datadir /home/nonroot/data
+      --http
       --http.addr 0.0.0.0
       --http.port 8545
       --metrics 127.0.0.1:9101
@@ -159,16 +167,18 @@ services:
       validators:
         ipv4_address: 10.10.0.23
   validator4:
+    container_name: validator4
     image: local-telcoin-network:latest
     depends_on:
       - comittee
     environment:
-      - RUST_LOG=info,execution=debug
+      - RUST_LOG=info
       - TN_BLS_PASSPHRASE=local # must match value used in setup4 service
     user: "1101:1101"
     command: >
       /usr/local/bin/telcoin node
       --datadir /home/nonroot/data
+      --http
       --http.addr 0.0.0.0
       --http.port 8545
       --metrics 127.0.0.1:9101
