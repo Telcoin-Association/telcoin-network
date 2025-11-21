@@ -407,6 +407,9 @@ fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
 }
 
 /// Test a restart case with a short delay, the stopped node should rejoin consensus.
+/// Note set the TEST_RESTARTS_LOG env variable to a directory when running this test
+/// in order to get each nodes logs broken out by test/node/run.  This can make debugging
+/// restart tests easier vs having all the logs jumbled together.
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restartstt() -> eyre::Result<()> {
@@ -435,6 +438,9 @@ fn run_observer_tests(client_urls: &[String; 4], obs_url: &str) -> eyre::Result<
 }
 
 /// Test an observer node can submit txns.
+/// Note set the TEST_RESTARTS_LOG env variable to a directory when running this test
+/// in order to get each nodes logs broken out by test/node/run.  This can make debugging
+/// restart tests easier vs having all the logs jumbled together.
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restarts_observer() -> eyre::Result<()> {
@@ -490,6 +496,9 @@ fn test_restarts_observer() -> eyre::Result<()> {
 
 /// Test a restart case with a long delay, the stopped node should not rejoin consensus but follow
 /// the consensus chain.
+/// Note set the TEST_RESTARTS_LOG env variable to a directory when running this test
+/// in order to get each nodes logs broken out by test/node/run.  This can make debugging
+/// restart tests easier vs having all the logs jumbled together.
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restarts_delayed() -> eyre::Result<()> {
@@ -498,6 +507,9 @@ fn test_restarts_delayed() -> eyre::Result<()> {
 
 /// Test a restart case with a long delay, the stopped node should not rejoin consensus but follow
 /// the consensus chain.  Lag the restarted validator.
+/// Note set the TEST_RESTARTS_LOG env variable to a directory when running this test
+/// in order to get each nodes logs broken out by test/node/run.  This can make debugging
+/// restart tests easier vs having all the logs jumbled together.
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restarts_lagged_delayed() -> eyre::Result<()> {
