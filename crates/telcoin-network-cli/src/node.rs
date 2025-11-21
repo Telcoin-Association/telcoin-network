@@ -84,6 +84,14 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     #[arg(long, value_name = "HEALTHCHECK_TCP_PORT", global = true, env = "HEALTHCHECK_TCP_PORT")]
     pub healthcheck: Option<u16>,
 
+    /// Assign this name to node.  Currently used to name it's opentracing service.
+    #[arg(long, value_name = "NODE_NAME", global = true)]
+    pub node_name: Option<String>,
+
+    /// URL of an opentracing service (like jaeger) to send tracing data to (for example http://192.168.1.2:4317).
+    #[arg(long, value_name = "URL", global = true, env = "TN_TRACING_URL")]
+    pub tracing_url: Option<String>,
+
     /// Additional cli arguments
     #[clap(flatten)]
     pub ext: Ext,
@@ -146,6 +154,8 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             reth,
             healthcheck,
             ext,
+            node_name: _,
+            tracing_url: _,
         } = self;
 
         // set up reth node config for engine components

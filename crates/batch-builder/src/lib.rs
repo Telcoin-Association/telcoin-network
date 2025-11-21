@@ -31,7 +31,7 @@ use tn_types::{
     BatchSender, Epoch, SealedBlock, TaskSpawner, TxHash, WorkerId,
 };
 use tokio::{sync::oneshot, time::Interval};
-use tracing::{debug, error};
+use tracing::{debug, error, field, info_span, Instrument};
 
 mod batch;
 mod error;
@@ -139,6 +139,8 @@ impl BatchBuilder {
         let worker_id = self.worker_id;
         let base_fee = self.base_fee.base_fee();
 
+        let span = info_span!(target: "telcoin", "propose-batch", batch = field::Empty, worker_id, base_fee, epoch = self.epoch);
+        let span_clone = span.clone();
         // spawn block building task and forward to worker
         self.task_spawner.spawn_task("next-batch", async move {
             // ack once worker reaches quorum
@@ -146,9 +148,11 @@ impl BatchBuilder {
 
             // this is safe to call without a semaphore bc it's held as a single `Option`
             let BatchBuilderOutput { batch, mined_transactions } = build_batch(build_args, worker_id, base_fee);
+            let batch = batch.seal_slow();
+            span.record("batch", batch.digest().to_string());
 
             // forward to worker and wait for ack that quorum was reached
-            if let Err(e) = to_worker.send((batch.seal_slow(), ack)).await {
+            if let Err(e) = to_worker.send((batch, ack)).await {
                 error!(target: "worker::batch_builder", ?e, "failed to send next batch to worker");
                 // try to return error if worker channel closed
                 let _ = result.send(Err(e.into()));
@@ -160,7 +164,7 @@ impl BatchBuilder {
                 Ok(res) => {
                     match res {
                         Ok(_) => {
-                            debug!(target: "block-builder", ?res, "received ack");
+                            debug!(target: "worker::batch-builder", ?res, "received ack");
                             // signal to Self that this task is complete
                             if let Err(e) = result.send(Ok(mined_transactions)) {
                                 error!(target: "worker::batch_builder", ?e, "failed to send block builder result to block builder task");
@@ -199,7 +203,7 @@ impl BatchBuilder {
                     }
                 }
             }
-        });
+        }.instrument(span_clone));
 
         // return oneshot channel for receiving completion status
         done

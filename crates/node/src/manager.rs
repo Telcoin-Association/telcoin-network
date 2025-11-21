@@ -55,7 +55,7 @@ use tn_worker::{
 };
 use tokio::sync::mpsc::{self};
 use tokio_stream::StreamExt;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, info_span, warn, Instrument};
 
 /// The long-running task manager name.
 const NODE_TASK_MANAGER: &str = "Node Task Manager";
@@ -217,7 +217,6 @@ where
     }
 
     /// Run the node, handling epoch transitions.
-    #[tracing::instrument(target = "telcoin", name = "tn-run-node", skip(self), level = "info")]
     pub(crate) async fn run(&mut self) -> eyre::Result<()> {
         // Main task manager that manages tasks across epochs.
         // Long-running tasks for the lifetime of the node.
@@ -438,12 +437,16 @@ where
         epoch_task_manager: &TaskManager,
         engine: ExecutionNode,
         worker: Worker<DB, QuorumWaiter>,
+        epoch: Epoch,
     ) -> eyre::Result<()> {
         let mut orphan_batches: Vec<(BlockHash, Batch)> =
             self.consensus_db.iter::<NodeBatchesCache>().collect();
         if !orphan_batches.is_empty() {
             self.consensus_db.clear_table::<NodeBatchesCache>()?;
             let consensus_bus = self.consensus_bus.clone();
+            let span =
+                info_span!(target: "telcoin", "orphan-batches", epoch = tracing::field::Empty);
+            span.record("epoch", epoch.to_string());
             epoch_task_manager.spawn_task("Orphaned Batches", async move {
                 info!(target: "epoch-manager", "Re-introducing orphaned batchs {} transactions", orphan_batches.len());
                 let pools = engine.get_all_worker_transaction_pools().await;
@@ -466,7 +469,7 @@ where
                         let _ = worker.disburse_txns(batch.seal(digest)).await;
                     }
                 }
-            });
+            }.instrument(span));
         } else {
             info!(target: "epoch-manager", "No batches leftover");
         }
@@ -474,7 +477,6 @@ where
     }
 
     /// Run a single epoch.
-    #[tracing::instrument(target = "telcoin", skip(self, engine, to_engine), level = "info")]
     async fn run_epoch(
         &mut self,
         engine: &ExecutionNode,
@@ -551,7 +553,7 @@ where
             )
             .await?;
 
-        self.orphan_batches(&epoch_task_manager, engine.clone(), worker.clone())?;
+        self.orphan_batches(&epoch_task_manager, engine.clone(), worker.clone(), current_epoch)?;
 
         // update tasks
         epoch_task_manager.update_tasks();
@@ -729,6 +731,11 @@ where
     /// Start a task to collect the epoch record votes previous epochs record.
     /// This should run quickly at epoch start and make epoch records/certs available to syncing
     /// nodes.
+    #[tracing::instrument(
+        target = "telcoin",
+        skip(self, primary, epoch_task_manager),
+        level = "info"
+    )]
     async fn collect_epoch_votes(
         &self,
         primary: &PrimaryNode<DB>,

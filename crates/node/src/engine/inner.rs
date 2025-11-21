@@ -24,7 +24,7 @@ use tn_types::{
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::mpsc;
-use tracing::{debug, error, field, info, info_span, Instrument as _};
+use tracing::{debug, error, info};
 
 /// Inner type for holding execution layer types.
 #[derive(Debug)]
@@ -60,9 +60,8 @@ impl ExecutionNodeInner {
 
         let block_num = parent_header.number();
         let block_hash = parent_header.hash();
-        let span = info_span!(target: "telcoin", "engine-execution");
         // spawn execution engine to extend canonical tip
-        let mut tn_engine = ExecutorEngine::new(
+        let tn_engine = ExecutorEngine::new(
             self.reth_env.clone(),
             self.reth_env.get_debug_max_round(),
             rx_output,
@@ -71,12 +70,11 @@ impl ExecutionNodeInner {
             self.reth_env.get_task_spawner().clone(),
             gas_accumulator,
         );
-        tn_engine.set_span(span.clone());
 
         // spawn tn engine
         self.reth_env.get_task_spawner().spawn_critical_task("consensus engine", async move {
             info!("Engine stated from block {}/{}", block_num, block_hash);
-            let res = tn_engine.instrument(span).await;
+            let res = tn_engine.await;
             match res {
                 Ok(_) => info!(target: "engine", "TN Engine exited gracefully"),
                 Err(e) => error!(target: "engine", ?e, "TN Engine error"),
@@ -95,7 +93,6 @@ impl ExecutionNodeInner {
         base_fee: BaseFeeContainer,
         epoch: Epoch,
     ) -> eyre::Result<()> {
-        let base_fee_val = base_fee.base_fee();
         // check for worker components and initialize if they're missing
         let transaction_pool = self
             .workers
@@ -116,12 +113,9 @@ impl ExecutionNodeInner {
             epoch,
         );
 
-        let span = info_span!(target: "telcoin", "batch-builder", epoch = field::Empty, base_fee = field::Empty);
         // spawn batch builder task
         epoch_task_spawner.spawn_critical_task("batch builder", async move {
-            span.record("epoch", epoch.to_string());
-            span.record("base_fee", base_fee_val.to_string());
-            let res = batch_builder.instrument(span).await;
+            let res = batch_builder.await;
             info!(target: "tn::execution", ?res, "batch builder task exited");
         });
 

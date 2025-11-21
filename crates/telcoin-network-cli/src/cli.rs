@@ -11,7 +11,7 @@ use tn_config::KeyConfig;
 use tn_node::engine::TnBuilder;
 use tn_reth::{dirs::DEFAULT_ROOT_DIR, LogArgs};
 use tokio::{runtime::Builder, task::JoinHandle};
-use tracing::{info_span, level_filters::LevelFilter};
+use tracing::info_span;
 
 /// How do we want to get the BLS key passphrase?
 #[derive(Debug, Copy, Clone, clap::ValueEnum)]
@@ -147,21 +147,24 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
                     .build()?;
 
                 let res = runtime.block_on(async move {
-                    let name = if let Some(instance) = command.instance {
+                    let name = if let Some(name) = &command.node_name {
+                        format!("{}-{}", name, key_config.primary_public_key().to_short_string())
+                    } else if let Some(instance) = command.instance {
                         format!(
-                            "{}-{}",
+                            "{}-{}-{}",
                             if command.observer { "observer" } else { "node" },
-                            instance
+                            instance,
+                            key_config.primary_public_key().to_short_string()
                         )
                     } else {
                         format!("node-{}", key_config.primary_public_key().to_short_string())
                     };
                     let mut layers_guard = init_opentracing_subscriber(
                         &name,
-                        LevelFilter::INFO, // XXXX replace with a level from cli
-                        None,              // XXXX Replace with a meter url from cli
-                        std::env::var("TN_TRACING_URL").ok(), /* XXXX replace with a tracing url
-                                            * from cli */
+                        self.logs.verbosity.directive(),
+                        None, /* Replace with a meter url from cli- leave off until we propertly
+                               * test/implement. */
+                        command.tracing_url.clone(),
                     );
                     let layers = layers_guard.take_layers();
                     let _guard = self.logs.init_tracing_with_layers(layers)?;

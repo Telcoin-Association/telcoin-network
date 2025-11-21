@@ -136,7 +136,7 @@ fn run_restart_tests1(
 
     info!(target: "restart-test", "restarting child2...");
     // Restart
-    let mut child2 = start_validator(2, bin, temp_path, rpc_port2, test);
+    let mut child2 = start_validator(2, bin, temp_path, rpc_port2, test, 2);
     let bal = get_positive_balance_with_retry(&client_urls[2], &to_account.to_string())
         .inspect_err(|e| {
             kill_child(&mut child2);
@@ -210,7 +210,7 @@ fn run_restart_tests_lagged1(
 
     info!(target: "restart-test", "restarting child2...");
     // Restart
-    let mut child2 = start_validator(2, bin, temp_path, rpc_port2, test);
+    let mut child2 = start_validator(2, bin, temp_path, rpc_port2, test, 2);
     let bal = get_positive_balance_with_retry(&client_urls[2], &to_account.to_string())
         .inspect_err(|e| {
             kill_child(&mut child2);
@@ -316,7 +316,7 @@ fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
             .expect("Failed to get an ephemeral rpc port for child!");
         rpc_ports[i] = rpc_port;
         client_urls[i].push_str(&format!(":{rpc_port}"));
-        *child = Some(start_validator(i, &bin, &temp_path, rpc_port, test));
+        *child = Some(start_validator(i, &bin, &temp_path, rpc_port, test, 0));
     }
 
     // pass &mut to `run_restart_tests1` to shutdown child in case of error
@@ -384,7 +384,7 @@ fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
     info!(target: "restart-test", "all nodes shutdown...restarting network");
     // Restart network
     for (i, child) in children.iter_mut().enumerate() {
-        *child = Some(start_validator(i, &bin, &temp_path, rpc_ports[i], test));
+        *child = Some(start_validator(i, &bin, &temp_path, rpc_ports[i], test, 3));
     }
 
     info!(target: "restart-test", "Running restart tests 2");
@@ -463,12 +463,12 @@ fn test_restarts_observer() -> eyre::Result<()> {
             .expect("Failed to get an ephemeral rpc port for child!");
         rpc_ports[i] = rpc_port;
         client_urls[i].push_str(&format!(":{rpc_port}"));
-        *child = Some(start_validator(i, &bin, &temp_path, rpc_port, "observer"));
+        *child = Some(start_validator(i, &bin, &temp_path, rpc_port, "observer", 0));
     }
     let obs_rpc_port = get_available_tcp_port("127.0.0.1")
         .expect("Failed to get an ephemeral rpc port for child!");
     let obs_url = format!("http://127.0.0.1:{obs_rpc_port}");
-    let mut obs_child = start_observer(4, &bin, &temp_path, obs_rpc_port, "observer");
+    let mut obs_child = start_observer(4, &bin, &temp_path, obs_rpc_port, "observer", 0);
     let res = run_observer_tests(&client_urls, &obs_url);
 
     // SIGTERM children so they can shutdown in parrellel.
@@ -504,11 +504,11 @@ fn test_restarts_lagged_delayed() -> eyre::Result<()> {
     do_restarts(70, true, "restarts_lagged_delayed")
 }
 
-fn setup_log_dir(command: &mut Command, instance: usize, test: &str) {
+fn setup_log_dir(command: &mut Command, instance: usize, test: &str, run: u32) {
     if let Ok(log_dir) = std::env::var("TEST_RESTARTS_LOG") {
-        let _ = std::fs::create_dir(format!("{}/", log_dir));
-        let _ = std::fs::create_dir(format!("{}/{}/", log_dir, test));
-        let out_file = File::create(format!("{}/{}/node{}.log", log_dir, test, instance))
+        let _ = std::fs::create_dir(format!("{log_dir}/"));
+        let _ = std::fs::create_dir(format!("{log_dir}/{test}/"));
+        let out_file = File::create(format!("{log_dir}/{test}/node{instance}-run{run}.log"))
             .expect("valid log file");
         let stdout: Stdio = out_file.into();
         command.stdout(stdout);
@@ -522,6 +522,7 @@ fn start_validator(
     base_dir: &Path,
     mut rpc_port: u16,
     test: &str,
+    run: u32,
 ) -> Child {
     let data_dir = base_dir.join(format!("validator-{}", instance + 1));
     // The instance option will still change a set port so account for that.
@@ -537,9 +538,11 @@ fn start_validator(
         .arg(format!("{}", instance + 1))
         .arg("--http")
         .arg("--http.port")
-        .arg(format!("{rpc_port}"));
+        .arg(format!("{rpc_port}"))
+        .arg("--node-name")
+        .arg(format!("{test}-node{instance}"));
 
-    setup_log_dir(&mut command, instance, test);
+    setup_log_dir(&mut command, instance, test, run);
 
     #[cfg(feature = "faucet")]
     command
@@ -556,6 +559,7 @@ fn start_observer(
     base_dir: &Path,
     mut rpc_port: u16,
     test: &str,
+    run: u32,
 ) -> Child {
     let data_dir = base_dir.join("observer");
     // The instance option will still change a set port so account for that.
@@ -571,9 +575,11 @@ fn start_observer(
         .arg(format!("{}", instance + 1))
         .arg("--http")
         .arg("--http.port")
-        .arg(format!("{rpc_port}"));
+        .arg(format!("{rpc_port}"))
+        .arg("--node-name")
+        .arg(format!("{test}-node{instance}"));
 
-    setup_log_dir(&mut command, instance, test);
+    setup_log_dir(&mut command, instance, test, run);
 
     command.spawn().expect("failed to execute")
 }
@@ -585,20 +591,26 @@ fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
     info!(target: "restart-test", ?number, "success - now calling get_block for {:?}", &client_urls[1]);
     let block = get_block(&client_urls[1], Some(number))?;
     if block0["hash"] != block["hash"] {
-        return Err(Report::msg("Blocks between validators not the same!".to_string()));
+        return Err(Report::msg(format!(
+            "Blocks between validators not the same (node 0 and 1)! block {number}: {:?} - block: {:?}",
+            block0["hash"], block["hash"]
+        )));
     }
     info!(target: "restart-test", ?number, "success - now calling get_block for {:?}", &client_urls[2]);
     let block = get_block(&client_urls[2], Some(number))?;
     if block0["hash"] != block["hash"] {
         return Err(Report::msg(format!(
-            "Blocks between validators not the same! block0: {:?} - block: {:?}",
+            "Blocks between validators not the same (node 0 and 2)! block {number}: {:?} - block: {:?}",
             block0["hash"], block["hash"]
         )));
     }
     info!(target: "restart-test", ?number, "success - now calling get_block for {:?}", &client_urls[3]);
     let block = get_block(&client_urls[3], Some(number))?;
     if block0["hash"] != block["hash"] {
-        return Err(Report::msg("Blocks between validators not the same!".to_string()));
+        return Err(Report::msg(format!(
+            "Blocks between validators not the same (node 0 and 3)! block {number}: {:?} - block: {:?}",
+            block0["hash"], block["hash"]
+        )));
     }
     info!(target: "restart-test", "all rpcs returned same block hash");
     Ok(())

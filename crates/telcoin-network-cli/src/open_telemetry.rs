@@ -7,9 +7,8 @@ use opentelemetry_sdk::{
 };
 use opentelemetry_semantic_conventions::{attribute::SERVICE_VERSION, SCHEMA_URL};
 use tn_reth::Layers;
-use tracing::level_filters::LevelFilter;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
-use tracing_subscriber::{Layer, Registry};
+use tracing_subscriber::{filter::Directive, Layer, Registry};
 
 // Construct MeterProvider for MetricsLayer
 fn init_meter_provider(resource: Resource, url: &str) -> Option<SdkMeterProvider> {
@@ -97,7 +96,7 @@ impl Drop for LayersGuard {
 /// Add the meter and opentracing layers for the reth tracing API.
 pub(crate) fn init_opentracing_subscriber(
     service: &str,
-    span_level: LevelFilter,
+    filter_directive: Directive,
     meter_url: Option<String>,
     tracing_url: Option<String>,
 ) -> LayersGuard {
@@ -106,7 +105,7 @@ pub(crate) fn init_opentracing_subscriber(
         return LayersGuard { layers: Some(layers), tracer_provider: None, meter_provider: None };
     }
     let env_filter = tracing_subscriber::EnvFilter::builder()
-        .with_default_directive(span_level.into())
+        .with_default_directive(filter_directive)
         .from_env_lossy();
     let otel_filter = tracing_subscriber::filter::filter_fn(|metadata| {
         !metadata.is_span() || metadata.target().starts_with("telcoin")

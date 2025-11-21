@@ -10,7 +10,7 @@ use tn_reth::{
 use tn_types::{
     gas_accumulator::GasAccumulator, max_batch_gas, Address, Hash as _, SealedHeader, B256,
 };
-use tracing::debug;
+use tracing::{debug, field, info, info_span};
 
 /// Execute output from consensus to extend the canonical chain.
 ///
@@ -21,12 +21,20 @@ pub fn execute_consensus_output(
 ) -> EngineResult<SealedHeader> {
     // rename canonical header for clarity
     let BuildArguments { reth_env, mut output, parent_header: mut canonical_header } = args;
-    debug!(target: "engine", ?output, "executing output");
-
+    let epoch = output.leader().epoch();
     // output digest returns the `ConsensusHeader` digest
     let output_digest: B256 = output.digest().into();
     let batches = output.flatten_batches();
-    let epoch = output.leader().epoch();
+
+    let span = info_span!(target: "telcoin", "execute-consensus", epoch,
+        consensus_hash = output_digest.to_string(),
+        parent_number = canonical_header.number,
+        parent_hash = canonical_header.hash().to_string(),
+        executed_blocks = field::Empty,
+        batches = batches.len(),
+    );
+    let _guard = span.enter();
+    debug!(target: "engine", ?output, "executing output");
 
     // assert vecs match
     debug_assert_eq!(
@@ -115,6 +123,7 @@ pub fn execute_consensus_output(
         }
     } // end block execution for round
 
+    span.record("executed_blocks", executed_blocks.len().to_string());
     reth_env.finish_executing_output(executed_blocks)?;
     // remove blocks from memory and stores them in the database
     reth_env.finalize_block(canonical_header.clone())?;
@@ -137,6 +146,7 @@ fn execute_payload(
 
     // update header for next block execution in loop
     let canonical_header = next_canonical_block.recovered_block.clone_sealed_header();
+    info!(target: "engine", hash = canonical_header.hash().to_string(), number = canonical_header.number, "next block executed");
     canonical_in_memory_state.set_pending_block(next_canonical_block.clone());
     canonical_in_memory_state
         .update_chain(NewCanonicalChain::Commit { new: vec![next_canonical_block.clone()] });
