@@ -550,3 +550,80 @@ fn test_connected_to_banned_transition() {
     assert!(matches!(peer.connection_status(), ConnectionStatus::Disconnecting { banned }
             if *banned));
 }
+
+#[test]
+fn test_ban_action_returns_only_unbanned_ips() {
+    let mut all_peers = create_all_peers(None);
+
+    // create IPs
+    let ip1 = IpAddr::V4("192.168.1.1".parse().unwrap());
+    let ip2 = IpAddr::V4("192.168.1.2".parse().unwrap());
+
+    // first peer with ip1
+    let peer1 = PeerId::random();
+    let addr1 = create_multiaddr(Some(ip1));
+    all_peers.update_connection_status(
+        &peer1,
+        NewConnectionStatus::Connected {
+            multiaddr: addr1.clone(),
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+    all_peers.update_connection_status(&peer1, NewConnectionStatus::Disconnecting { banned: true });
+    all_peers.update_connection_status(&peer1, NewConnectionStatus::Disconnected);
+
+    // second peer also from ip1 - this should trigger IP ban
+    let peer2 = PeerId::random();
+    all_peers.update_connection_status(
+        &peer2,
+        NewConnectionStatus::Connected {
+            multiaddr: addr1.clone(),
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+    all_peers.update_connection_status(&peer2, NewConnectionStatus::Disconnecting { banned: true });
+    all_peers.update_connection_status(&peer2, NewConnectionStatus::Disconnected);
+
+    // at this point, ip1 should be banned (2 peers banned from this IP)
+    assert!(all_peers.ip_banned(&ip1), "ip1 should be IP-banned after 2 peers banned");
+
+    // now create a NEW peer that connects from ip2 but also has ip1 in its known addresses
+    // NOTE: this should not happen in production, but this test is to ensure only new IP addresses
+    // are returned from ban list
+    let peer3 = PeerId::random();
+
+    // connect from ip2
+    let addr2 = create_multiaddr(Some(ip2));
+    all_peers.update_connection_status(
+        &peer3,
+        NewConnectionStatus::Connected {
+            multiaddr: addr2.clone(),
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+
+    // disconnect and reconnect from ip1 to add it to known addresses
+    all_peers
+        .update_connection_status(&peer3, NewConnectionStatus::Disconnecting { banned: false });
+    all_peers.update_connection_status(&peer3, NewConnectionStatus::Disconnected);
+    all_peers.update_connection_status(
+        &peer3,
+        NewConnectionStatus::Connected {
+            multiaddr: addr1.clone(), // connect from the already-banned IP
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+
+    // now peer3 has both ip1 (banned) and ip2 (not banned) in its history
+    // ban peer3
+    all_peers.update_connection_status(&peer3, NewConnectionStatus::Disconnecting { banned: true });
+    let action = all_peers.update_connection_status(&peer3, NewConnectionStatus::Disconnected);
+
+    if let PeerAction::Ban(ips) = action {
+        assert_eq!(ips.len(), 1, "Should only ban ip2 since ip1 is already IP-banned");
+        assert!(ips.contains(&ip2), "Should ban ip2");
+        assert!(!ips.contains(&ip1), "Should NOT include ip1 as it's already IP-banned");
+    } else {
+        panic!("Expected Ban action for peer3");
+    }
+}
