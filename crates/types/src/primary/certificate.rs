@@ -18,7 +18,10 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 /// Certificates are the output of consensus.
 /// The certificate issued after a successful round of consensus.
@@ -176,7 +179,10 @@ impl Certificate {
 
     /// Return the total stake and group of authorities that formed the committee for this
     /// certificate.
-    pub fn signed_by(&self, committee: &[BlsPublicKey]) -> (VotingPower, Vec<BlsPublicKey>) {
+    pub fn signed_by(
+        &self,
+        committee: &BTreeSet<BlsPublicKey>,
+    ) -> (VotingPower, Vec<BlsPublicKey>) {
         // Ensure the certificate has a quorum.
         let mut weight = 0;
 
@@ -251,7 +257,10 @@ impl Certificate {
 
     /// Performs a signature verification of a certificate against committee.
     /// Will clear the state first and revalidate even if it appears to be valid.
-    pub fn verify_cert(mut self, committee: &[BlsPublicKey]) -> CertificateResult<Certificate> {
+    pub fn verify_cert(
+        mut self,
+        committee: &BTreeSet<BlsPublicKey>,
+    ) -> CertificateResult<Certificate> {
         self = self.validate_received()?;
         let (weight, pks) = self.signed_by(committee);
 

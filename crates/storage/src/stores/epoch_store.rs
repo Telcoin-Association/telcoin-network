@@ -1,5 +1,7 @@
 //! Trait and helpers for accessing Epoch data in the consensus DB.
 
+use std::collections::BTreeSet;
+
 use tn_types::{BlockHash, BlsPublicKey, Database, DbTxMut, Epoch, EpochCertificate, EpochRecord};
 
 use crate::tables::{EpochCerts, EpochRecords, EpochRecordsIndex};
@@ -7,7 +9,8 @@ use crate::tables::{EpochCerts, EpochRecords, EpochRecordsIndex};
 /// Helpers for Epoch DB access.
 pub trait EpochStore {
     /// Retrieve the committee keys for epoch if available in the DB.
-    fn get_committee_keys(&self, epoch: Epoch) -> Option<Vec<BlsPublicKey>>;
+    /// Return as a BTreeSet to inforce an order.
+    fn get_committee_keys(&self, epoch: Epoch) -> Option<BTreeSet<BlsPublicKey>>;
     /// Save epoch_rec to the DB.
     fn save_epoch_record(&self, epoch_rec: &EpochRecord);
     /// Save an epoch record with it's certificate.
@@ -20,15 +23,15 @@ pub trait EpochStore {
 }
 
 impl<DB: Database> EpochStore for DB {
-    fn get_committee_keys(&self, epoch: Epoch) -> Option<Vec<BlsPublicKey>> {
+    fn get_committee_keys(&self, epoch: Epoch) -> Option<BTreeSet<BlsPublicKey>> {
         if let Ok(Some(epoch)) = self.get::<EpochRecords>(&epoch) {
             // Try the exact epoch first for freshest committee (only would matter in rare cases of
             // a validator being removed).
-            Some(epoch.committee)
+            Some(epoch.committee).map(|c| c.into_iter().collect())
         } else if let Ok(Some(epoch)) = self.get::<EpochRecords>(&(epoch.saturating_sub(1))) {
             // If we don't have that epoch then try the previous and use it's next.
             // When using the latest epoch this could be triggered.
-            Some(epoch.next_committee)
+            Some(epoch.next_committee).map(|c| c.into_iter().collect())
         } else {
             None
         }
