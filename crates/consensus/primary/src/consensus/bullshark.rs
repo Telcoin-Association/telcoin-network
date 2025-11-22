@@ -35,6 +35,8 @@ pub struct Bullshark<DB> {
     pub last_successful_leader_election_timestamp: Instant,
     /// The number of committed subdags that will trigger the schedule change and reputation
     /// score reset.
+    ///
+    /// TODO: rename this num_rounds
     pub num_sub_dags_per_schedule: u32,
     /// The leader election schedule to be used when need to find a round's leader
     pub leader_schedule: LeaderSchedule,

@@ -1,9 +1,8 @@
-//! TODO:
-//! TODO
-//! TODO
-//! TODO
+//! Weak votes are used to track DAG proposals that link to an anchor.
 //!
-//! update this comment
+//!  if sufficiently many DAG proposals link to the anchor, the anchors
+//! fate is already set in stone, and we need not wait for round
+//! certification to complete
 
 use crate::consensus::Dag;
 use std::collections::{BTreeMap, HashMap, HashSet};
