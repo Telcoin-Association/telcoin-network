@@ -1,5 +1,6 @@
 //! Errors encountered during long-running certificate manager task.
 
+use tn_network_libp2p::error::NetworkError;
 use tn_storage::StoreError;
 use tn_types::{error::CertificateError, CertificateDigest, SendError};
 
@@ -55,9 +56,18 @@ pub(crate) enum CertManagerError {
     /// Fetch certificates failed.
     #[error("No peer can be reached for fetching certificates! Check if network is healthy.")]
     NoCertificateFetched,
-    /// Network error.
+    /// Failed to set the request bounds (in bytes).
     #[error("Failed to set the bounds for MissingCertificatesRequest: {0}")]
     RequestBounds(String),
+    /// Network error while fetching certificates from peers.
+    #[error(transparent)]
+    Network(#[from] NetworkError),
+    /// Timeout waiting for response from peer for requested certificates.
+    #[error("Timeout waiting for requested certs from all peers")]
+    Timeout,
+    /// The oneshot channel closed while awaiting fetch requests.
+    #[error("Pending fetch task oneshot channel closed")]
+    ChannelClosed,
 }
 
 impl<T: std::fmt::Debug> From<SendError<T>> for CertManagerError {

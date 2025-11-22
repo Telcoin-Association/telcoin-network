@@ -9,7 +9,7 @@ use std::{
     marker::PhantomData,
     num::NonZeroUsize,
 };
-use tn_config::{KeyConfig, NetworkConfig};
+use tn_config::{KeyConfig, NetworkConfig, Parameters};
 use tn_types::{
     get_available_udp_port, test_genesis, Address, Authority, AuthorityIdentifier, BlsKeypair,
     BootstrapServer, Committee, Database, Epoch, Multiaddr, TimestampSec, VotingPower,
@@ -28,6 +28,7 @@ pub struct Builder<DB, F, R = StdRng> {
     network_config: Option<NetworkConfig>,
     epoch_boundary: Option<TimestampSec>,
     new_db: F,
+    consensus_parameters: Option<Parameters>,
     _phantom_data: PhantomData<DB>,
 }
 
@@ -47,6 +48,7 @@ where
             network_config: None,
             epoch_boundary: None,
             new_db,
+            consensus_parameters: None,
             _phantom_data: PhantomData::<DB>,
         }
     }
@@ -88,6 +90,12 @@ where
         self
     }
 
+    /// Overwrite the default consensus parameters.
+    pub fn with_consensus_parameters(mut self, parameters: Parameters) -> Self {
+        self.consensus_parameters = Some(parameters);
+        self
+    }
+
     /// Use a provided rng. This is useful for deterministic testing.
     pub fn with_rng<RNG: rand::RngCore + rand::CryptoRng>(self, rng: RNG) -> Builder<DB, F, RNG> {
         Builder {
@@ -100,6 +108,7 @@ where
             network_config: None,
             epoch_boundary: None,
             new_db: self.new_db,
+            consensus_parameters: self.consensus_parameters,
             _phantom_data: PhantomData::<DB>,
         }
     }
@@ -192,6 +201,7 @@ where
                         worker,
                         network_config,
                         genesis.clone(),
+                        &self.consensus_parameters,
                     ),
                 )
             })
