@@ -152,6 +152,7 @@ mod evm;
 pub mod rpc_server_args;
 pub mod system_calls;
 pub mod worker;
+pub use evm::calculate_gas_penalty;
 
 #[cfg(any(feature = "test-utils", test))]
 pub mod test_utils;

@@ -8,7 +8,7 @@ use crate::{
     RethEnv, WorkerTxPool,
 };
 use alloy::{
-    consensus::{SignableTransaction as _, TxEip4844, TxEip4844Variant},
+    consensus::{SignableTransaction as _, TxEip4844, TxEip4844Variant, TxLegacy},
     eips::eip7594::BlobTransactionSidecarVariant,
     hex,
     primitives::ChainId,
@@ -409,6 +409,57 @@ impl TransactionFactory {
             }),
             input: input.unwrap_or_default(),
             access_list: access_list.unwrap_or_default(),
+        });
+
+        let tx_signature_hash = transaction.signature_hash();
+        let signature = self.sign_hash(tx_signature_hash);
+
+        // increase nonce for self
+        self.inc_nonce();
+
+        TransactionSigned::new_unhashed(transaction, signature)
+    }
+
+    /// Create and sign an LEGACY transaction with all possible parameters passed.
+    ///
+    /// All arguments are optional and default to:
+    /// - chain_id: 2017 (adiri testnet)
+    /// - nonce: `Self::nonce` (correctly incremented)
+    /// - gas_price: basefee minimum (7 wei)
+    /// - gas_limit: 1_000_000 wei
+    /// - to: None (results in `TxKind::Create`)
+    /// - value: 1TEL (1^10*18 wei)
+    /// - input: empty bytes (`Bytes::default()`)
+    /// - access_list: None
+    ///
+    /// NOTE: the nonce is still incremented to track the number of signed transactions for `Self`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_explicit_legacy_tx(
+        &mut self,
+        chain_id: Option<u64>,
+        nonce: Option<u64>,
+        gas_price: Option<u128>,
+        gas_limit: Option<u64>,
+        to: Option<Address>,
+        value: Option<U256>,
+        input: Option<Bytes>,
+    ) -> TransactionSigned {
+        let tx_kind = match to {
+            Some(address) => TxKind::Call(address),
+            None => TxKind::Create,
+        };
+
+        // legacy
+        let transaction = Transaction::Legacy(TxLegacy {
+            chain_id: Some(chain_id.unwrap_or(2017)),
+            nonce: nonce.unwrap_or(self.nonce),
+            gas_price: gas_price.unwrap_or(MIN_PROTOCOL_BASE_FEE.into()),
+            gas_limit: gas_limit.unwrap_or(1_000_000),
+            to: tx_kind,
+            value: value.unwrap_or_else(|| {
+                U256::from(10).checked_pow(U256::from(18)).expect("1x10^18 does not overflow")
+            }),
+            input: input.unwrap_or_default(),
         });
 
         let tx_signature_hash = transaction.signature_hash();
