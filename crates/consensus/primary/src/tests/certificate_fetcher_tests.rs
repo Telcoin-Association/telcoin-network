@@ -87,7 +87,7 @@ fn verify_certificates_not_in_store<DB: CertificateStore>(
     assert_eq!(found_count, 0, "Found {found_count} certificates in the store");
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[tokio::test(flavor = "current_thread")]
 async fn test_fetch_certificates_basic() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let primary = fixture.authorities().next().unwrap();
@@ -409,7 +409,7 @@ async fn test_fetch_certificates_basic() {
     .await;
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[tokio::test(flavor = "current_thread")]
 async fn test_fetch_cancellation_on_success() {
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .with_consensus_parameters(Parameters {
@@ -503,7 +503,7 @@ async fn test_fetch_cancellation_on_success() {
     }
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[tokio::test(flavor = "current_thread")]
 async fn test_timeout_scenario() {
     init_test_tracing();
     let parallel_fetch_request_delay_interval = Duration::from_millis(100);
@@ -620,7 +620,7 @@ async fn test_timeout_scenario() {
     }
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[tokio::test(flavor = "current_thread")]
 async fn test_gc_round_update_during_fetch() {
     init_test_tracing();
     // overwrite parallel fetch request delay interval for tests
@@ -739,7 +739,7 @@ async fn test_gc_round_update_during_fetch() {
     }
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[tokio::test(flavor = "current_thread")]
 async fn test_network_failure_keeps_trying() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let primary = fixture.authorities().next().unwrap();
@@ -825,7 +825,7 @@ async fn test_network_failure_keeps_trying() {
     }
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[tokio::test(flavor = "current_thread")]
 async fn test_partial_response_handling_rejects_invalid_cert() {
     init_test_tracing();
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
@@ -906,7 +906,7 @@ async fn test_partial_response_handling_rejects_invalid_cert() {
     verify_certificates_not_in_store(&certificate_store, &vec![bad_cert]);
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[tokio::test(flavor = "current_thread")]
 async fn test_bad_cert_in_fetch_rejects_all() {
     init_test_tracing();
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
@@ -982,7 +982,7 @@ async fn test_bad_cert_in_fetch_rejects_all() {
     verify_certificates_not_in_store(&certificate_store, &all_certificates);
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[tokio::test(flavor = "current_thread")]
 async fn test_fetch_task_replacement() {
     init_test_tracing();
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
