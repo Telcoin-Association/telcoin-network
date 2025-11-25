@@ -85,10 +85,9 @@ where
         // Last consensus block we have executed, use this to determine if we are
         // too far behind.
         let (exec_number, exec_epoch, exec_round) = self
-            .consensus_config
-            .node_storage()
-            .last_record::<ConsensusBlocks>()
-            .map(|(n, h)| (n, h.sub_dag.leader_epoch(), h.sub_dag.leader_round()))
+            .consensus_bus
+            .last_executed_consensus_block(self.consensus_config.node_storage())
+            .map(|h| (h.number, h.sub_dag.leader_epoch(), h.sub_dag.leader_round()))
             .unwrap_or((0, 0, 0));
         // Use GC depth to estimate how many rounds we can be behind.
         // Subtract ten here so if we are right on the GC depth we will still go inactive (small

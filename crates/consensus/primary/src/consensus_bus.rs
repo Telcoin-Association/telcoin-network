@@ -630,6 +630,25 @@ impl ConsensusBus {
             Err(WaitForExecutionElapsed())
         }
     }
+
+    /// Returns the ConsensusHeader that created the last executed block if it can be found.
+    /// If we are not starting at genesis or a new epoch, then not finding this indicates a database
+    /// issue.
+    pub fn last_executed_consensus_block<DB: tn_types::Database>(
+        &self,
+        db: &DB,
+    ) -> Option<ConsensusHeader> {
+        use tn_storage::ConsensusStore as _;
+        let last = self
+            .recent_blocks()
+            .borrow()
+            .latest_block()
+            .header()
+            .parent_beacon_block_root
+            .and_then(|hash| db.get_consensus_by_hash(hash));
+
+        last
+    }
 }
 
 /// Error for wait_for_execution().

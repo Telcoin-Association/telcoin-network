@@ -161,17 +161,8 @@ pub fn last_executed_consensus_block<DB: Database>(
     consensus_bus: &ConsensusBus,
     config: &ConsensusConfig<DB>,
 ) -> Option<ConsensusHeader> {
-    let db = config.node_storage();
-    let last = consensus_bus
-        .recent_blocks()
-        .borrow()
-        .latest_block()
-        .header()
-        .parent_beacon_block_root
-        .and_then(|hash| db.get_consensus_by_hash(hash));
-
+    let last = consensus_bus.last_executed_consensus_block(config.node_storage());
     debug!(target: "state-sync", ?last, epoch=?config.epoch(), "last executed consensus block");
-
     last
 }
 
@@ -252,9 +243,8 @@ async fn spawn_stream_consensus_headers<DB: Database>(
     let rx_shutdown = config.shutdown().subscribe();
 
     let mut rx_last_consensus_header = consensus_bus.last_consensus_header().subscribe();
-    let db = config.node_storage();
-    let (_, mut last_consensus_header) =
-        db.last_record::<ConsensusBlocks>().unwrap_or_else(|| (0, ConsensusHeader::default()));
+    let mut last_consensus_header =
+        last_executed_consensus_block(&consensus_bus, &config).unwrap_or_default();
     let mut last_consensus_height = last_consensus_header.number;
 
     // infinite loop over consensus output

@@ -25,7 +25,7 @@ async fn get_consensus_header<DB: TNDatabase>(
 ) -> Option<(Epoch, u64, B256)> {
     let db = config.node_storage();
     if let Some(number) = number {
-        // If we have already executed consensus block number then stop.
+        // If we have already processed consensus block number then stop.
         if let Ok(Some(_block)) = db.get::<ConsensusBlocks>(&number) {
             return None;
         }
@@ -85,11 +85,12 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
     let (tx, mut rx) = tokio::sync::mpsc::channel(10_000);
     let db = config.node_storage().clone();
     // Get the epoch of our last executed consensus.
-    let mut current_fetch_epoch = if let Some((_, block)) = db.last_record::<ConsensusBlocks>() {
-        block.sub_dag.leader_epoch()
-    } else {
-        0
-    };
+    let mut current_fetch_epoch =
+        if let Some(block) = consensus_bus.last_executed_consensus_block(&db) {
+            block.sub_dag.leader_epoch()
+        } else {
+            0
+        };
     let (epochs_tx, epochs_rx) = tokio::sync::mpsc::channel(10_000);
     let epoch_queue = Arc::new(Mutex::new(epochs_rx));
     // spawn four critical workers that will fetch consensus outputs from an epoch work queue.
