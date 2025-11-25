@@ -60,6 +60,7 @@ impl ExecutionNodeInner {
 
         let block_num = parent_header.number();
         let block_hash = parent_header.hash();
+        let consensus_header = parent_header.parent_beacon_block_root();
         // spawn execution engine to extend canonical tip
         let tn_engine = ExecutorEngine::new(
             self.reth_env.clone(),
@@ -73,7 +74,7 @@ impl ExecutionNodeInner {
 
         // spawn tn engine
         self.reth_env.get_task_spawner().spawn_critical_task("consensus engine", async move {
-            info!("Engine stated from block {}/{}", block_num, block_hash);
+            info!("Engine stated from block {block_num}/{block_hash}, consensus output {consensus_header:?}");
             let res = tn_engine.await;
             match res {
                 Ok(_) => info!(target: "engine", "TN Engine exited gracefully"),

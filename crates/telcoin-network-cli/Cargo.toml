@@ -14,7 +14,7 @@ authors = [
 [dependencies]
 clap = { workspace = true, features = ["derive", "env"] }
 eyre = { workspace = true }
-const-str = "0.5.6"
+const-str = { workspace = true }
 fdlimit = { workspace = true }
 secp256k1 = { workspace = true, features = [
     "global-context",
@@ -28,22 +28,20 @@ tokio = { workspace = true, features = [
     "rt-multi-thread",
 ] }
 
-
-opentelemetry = { version = "0.31.0", default-features = false, features = [
+opentelemetry = { workspace = true, default-features = false, features = [
     "trace", "metrics",
 ] }
-opentelemetry_sdk = { version = "0.31.0", default-features = false, features = [
+opentelemetry_sdk = { workspace = true, default-features = false, features = [
     "trace", "metrics",
 ] }
-opentelemetry-otlp = { version = "0.31.0", features = ["trace", "metrics", "grpc-tonic"] }
-opentelemetry-stdout = "0.31.0"
-opentelemetry-semantic-conventions = "0.31.0"
+opentelemetry-otlp = { workspace = true, features = ["trace", "metrics", "grpc-tonic"] }
+opentelemetry-semantic-conventions = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { version = "0.3.0", default-features = false, features = [
+tracing-subscriber = { workspace = true, default-features = false, features = [
     "registry",
     "std",
 ] }
-tracing-opentelemetry = "0.32"
+tracing-opentelemetry = { workspace = true }
 
 tn-types = { workspace = true }
 tn-node = { workspace = true }

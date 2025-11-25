@@ -1,3 +1,6 @@
+//! Code to add open telemetry to the tracing system.
+//! This is used to add the required layers without changing other existing logging/tracing.
+
 use opentelemetry::{global, trace::TracerProvider as _, KeyValue};
 use opentelemetry_otlp::WithExportConfig as _;
 use opentelemetry_sdk::{
@@ -10,7 +13,7 @@ use tn_reth::Layers;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
 use tracing_subscriber::{filter::Directive, Layer, Registry};
 
-// Construct MeterProvider for MetricsLayer
+/// Construct MeterProvider for MetricsLayer
 fn init_meter_provider(resource: Resource, url: &str) -> Option<SdkMeterProvider> {
     let exporter = match opentelemetry_otlp::MetricExporter::builder()
         .with_tonic()
@@ -28,22 +31,15 @@ fn init_meter_provider(resource: Resource, url: &str) -> Option<SdkMeterProvider
     let reader =
         PeriodicReader::builder(exporter).with_interval(std::time::Duration::from_secs(30)).build();
 
-    // For debugging in development
-    let stdout_reader =
-        PeriodicReader::builder(opentelemetry_stdout::MetricExporter::default()).build();
-
-    let meter_provider = MeterProviderBuilder::default()
-        .with_resource(resource)
-        .with_reader(reader)
-        .with_reader(stdout_reader)
-        .build();
+    let meter_provider =
+        MeterProviderBuilder::default().with_resource(resource).with_reader(reader).build();
 
     global::set_meter_provider(meter_provider.clone());
 
     Some(meter_provider)
 }
 
-// Construct TracerProvider for OpenTelemetryLayer
+/// Construct TracerProvider for OpenTelemetryLayer
 fn init_tracer_provider(resource: Resource, url: &str) -> Option<SdkTracerProvider> {
     let exporter =
         opentelemetry_otlp::SpanExporter::builder().with_tonic().with_endpoint(url).build().ok()?;
@@ -51,6 +47,8 @@ fn init_tracer_provider(resource: Resource, url: &str) -> Option<SdkTracerProvid
     Some(
         SdkTracerProvider::builder()
             // Customize sampling strategy
+            // Default is always on which this effectively is.
+            // Leave it for now, will need to evaluate this once more robust traces exist.
             .with_sampler(Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(1.0))))
             // If export trace to AWS X-Ray, you can use XrayIdGenerator
             .with_id_generator(RandomIdGenerator::default())
