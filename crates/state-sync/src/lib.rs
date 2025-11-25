@@ -60,7 +60,7 @@ pub fn spawn_state_sync<DB: Database>(
     config: ConsensusConfig<DB>,
     consensus_bus: ConsensusBus,
     network: PrimaryNetworkHandle,
-    task_manager: TaskSpawner,
+    task_spawner: TaskSpawner,
 ) {
     let mode = *consensus_bus.node_mode().borrow();
     match mode {
@@ -69,19 +69,20 @@ pub fn spawn_state_sync<DB: Database>(
         NodeMode::CvvInactive | NodeMode::Observer => {
             // If we are not an active CVV then follow latest consensus from peers.
             let (config_clone, consensus_bus_clone) = (config.clone(), consensus_bus.clone());
-            task_manager.spawn_task(
+            let task_spawner_clone = task_spawner.clone();
+            task_spawner.spawn_task(
                 "state sync: track latest consensus header from peers",
                 monitored_future!(
                     async move {
                         info!(target: "state-sync", "Starting state sync: track latest consensus header from peers");
-                        if let Err(e) = spawn_track_recent_consensus(config_clone, consensus_bus_clone, network).await {
+                        if let Err(e) = spawn_track_recent_consensus(config_clone, consensus_bus_clone, network, task_spawner_clone).await {
                             error!(target: "state-sync", "Error tracking latest consensus headers: {e}");
                         }
                     },
                     "StateSyncLatestConsensus"
                 ),
             );
-            task_manager.spawn_task(
+            task_spawner.spawn_task(
                 "state sync: stream consensus headers",
                 monitored_future!(
                     async move {
