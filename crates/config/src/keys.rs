@@ -103,9 +103,16 @@ impl KeyConfig {
         tn_datadir: &TND,
         passphrase: Option<String>,
     ) -> eyre::Result<Self> {
+        // If we don't have a wrapped file then try an unencrypted file before failure.
+        let passphrase = if std::fs::exists(tn_datadir.node_keys_path().join(BLS_WRAPPED_KEYFILE))
+            .unwrap_or(false)
+        {
+            passphrase
+        } else {
+            None
+        };
+
         // load keys to start the primary
-        let validator_keypath = tn_datadir.node_keys_path();
-        tracing::info!(target: "telcoin::consensus_config", "loading validator keys at {:?}", validator_keypath);
         let contents = if passphrase.is_some() {
             std::fs::read_to_string(tn_datadir.node_keys_path().join(BLS_WRAPPED_KEYFILE))?
         } else {
@@ -282,10 +289,12 @@ mod tests {
         let kc2 =
             KeyConfig::read_config(&tmp_dir.path().to_path_buf(), pp.clone()).expect("load config");
         assert_eq!(kc.inner.primary_keypair.to_bytes(), kc2.inner.primary_keypair.to_bytes());
+        // Note this is Ok and not an Err because since we don't have a passphrase the wrong one is
+        // just ignored.
         assert!(KeyConfig::read_config(
             &tmp_dir.path().to_path_buf(),
             Some("not_passphrase".to_string())
         )
-        .is_err());
+        .is_ok());
     }
 }

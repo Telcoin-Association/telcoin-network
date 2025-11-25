@@ -112,7 +112,7 @@ mod tests {
         ])
         .expect("cli parsed");
 
-        tn.run(Some("gen_keys_test".to_string()), |_, _, _, _| Ok(()))
+        tn.run(Some("gen_keys_test".to_string()), |_, _, _, _| tokio::spawn(async { Ok(()) }))
             .expect("generate keys command");
 
         Config::load_from_path_or_default::<NodeInfo>(

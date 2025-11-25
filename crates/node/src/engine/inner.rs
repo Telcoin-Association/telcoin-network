@@ -19,8 +19,8 @@ use tn_reth::{
 use tn_rpc::{EngineToPrimary, TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator},
-    Address, BatchSender, BatchValidation, BlsPublicKey, ConsensusOutput, Epoch, ExecHeader,
-    Noticer, SealedHeader, TaskSpawner, WorkerId, B256, MIN_PROTOCOL_BASE_FEE,
+    Address, BatchSender, BatchValidation, BlockHeader, BlsPublicKey, ConsensusOutput, Epoch,
+    ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId, B256, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::mpsc;
@@ -58,6 +58,9 @@ impl ExecutionNodeInner {
     ) -> eyre::Result<()> {
         let parent_header = self.reth_env.lookup_head()?;
 
+        let block_num = parent_header.number();
+        let block_hash = parent_header.hash();
+        let consensus_header = parent_header.parent_beacon_block_root();
         // spawn execution engine to extend canonical tip
         let tn_engine = ExecutorEngine::new(
             self.reth_env.clone(),
@@ -71,6 +74,7 @@ impl ExecutionNodeInner {
 
         // spawn tn engine
         self.reth_env.get_task_spawner().spawn_critical_task("consensus engine", async move {
+            info!("Engine stated from block {block_num}/{block_hash}, consensus output {consensus_header:?}");
             let res = tn_engine.await;
             match res {
                 Ok(_) => info!(target: "engine", "TN Engine exited gracefully"),
@@ -110,7 +114,7 @@ impl ExecutionNodeInner {
             epoch,
         );
 
-        // spawn block builder task
+        // spawn batch builder task
         epoch_task_spawner.spawn_critical_task("batch builder", async move {
             let res = batch_builder.await;
             info!(target: "tn::execution", ?res, "batch builder task exited");
