@@ -2,7 +2,7 @@
 
 use crate::WorkerFixture;
 use std::num::NonZeroUsize;
-use tn_config::{Config, ConsensusConfig, KeyConfig, NetworkConfig};
+use tn_config::{Config, ConsensusConfig, KeyConfig, NetworkConfig, Parameters};
 use tn_types::{
     Address, Authority, AuthorityIdentifier, BlsKeypair, BlsPublicKey, Certificate, Committee,
     Database, Genesis, Hash as _, Header, HeaderBuilder, NetworkKeypair, NetworkPublicKey, Round,
@@ -106,6 +106,7 @@ impl<DB: Database> AuthorityFixture<DB> {
         worker: WorkerFixture,
         network_config: NetworkConfig,
         genesis: Genesis,
+        parameters: &Option<Parameters>,
     ) -> Self {
         let (primary_keypair, key_config) = keys;
         // Make sure our keys are correct.
@@ -115,6 +116,10 @@ impl<DB: Database> AuthorityFixture<DB> {
         // If/when this is relaxed then the key_config below will need to change.
         assert_eq!(number_of_workers.get(), 1);
         let mut config = Config::default_for_test_with_genesis(genesis);
+        // overwrite default parameters if provided
+        if let Some(overwrite) = parameters {
+            config.parameters = overwrite.clone();
+        }
         // These key updates don't return errors...
         let _ = config.update_protocol_key(key_config.primary_public_key());
         let _ = config.update_primary_network_key(key_config.primary_network_public_key());
