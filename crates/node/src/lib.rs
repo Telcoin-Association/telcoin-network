@@ -5,13 +5,12 @@
 
 use engine::TnBuilder;
 use manager::EpochManager;
-use tn_config::TelcoinDirs;
+use tn_config::{KeyConfig, TelcoinDirs};
 use tn_primary::ConsensusBus;
 use tn_rpc::EngineToPrimary;
 use tn_storage::{ConsensusStore, EpochStore};
 use tn_types::{BlockHash, ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord};
-use tokio::runtime::Builder;
-use tracing::{instrument, warn};
+use tokio::task::JoinHandle;
 
 pub mod engine;
 mod error;
@@ -27,31 +26,22 @@ pub use manager::catchup_accumulator;
 /// This will possibly "loop" to launch multiple times in response to
 /// a nodes mode changes.  This ensures a clean state and fresh tasks
 /// when switching modes.
-#[instrument(level = "info", skip_all)]
 pub fn launch_node<P>(
     builder: TnBuilder,
     tn_datadir: P,
-    passphrase: Option<String>,
-) -> eyre::Result<()>
+    key_config: KeyConfig,
+) -> JoinHandle<eyre::Result<()>>
 where
     P: TelcoinDirs + Clone + 'static,
 {
-    let runtime = Builder::new_multi_thread()
-        .thread_name("telcoin-network")
-        .enable_io()
-        .enable_time()
-        .build()?;
+    let consensus_db = manager::open_consensus_db(&tn_datadir);
 
+    // create the epoch manager
+    let mut epoch_manager = EpochManager::new(builder, tn_datadir, consensus_db, key_config);
     // run the node
-    let res = runtime.block_on(async move {
-        let consensus_db = manager::open_consensus_db(&tn_datadir)?;
-        // create the epoch manager
-        let mut epoch_manager = EpochManager::new(builder, tn_datadir, passphrase, consensus_db)?;
-        epoch_manager.run().await
-    });
-
-    // return result after shutdown
-    res
+    // Note this is the "entry task" for the node and the caller needs to wait on the JoinHandle
+    // then exit.
+    tokio::spawn(async move { epoch_manager.run().await })
 }
 
 #[derive(Debug)]

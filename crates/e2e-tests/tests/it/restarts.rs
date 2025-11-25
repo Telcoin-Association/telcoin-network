@@ -14,7 +14,14 @@ use nix::{
 };
 use secp256k1::{Keypair, Secp256k1, SecretKey};
 use serde_json::Value;
-use std::{collections::HashMap, fmt::Debug, path::Path, process::Child, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    fs::File,
+    path::Path,
+    process::{Child, Command, Stdio},
+    time::Duration,
+};
 use tn_types::{get_available_tcp_port, keccak256, test_utils::init_test_tracing, Address};
 use tokio::runtime::Builder;
 use tracing::{error, info};
@@ -97,6 +104,7 @@ fn run_restart_tests1(
     temp_path: &Path,
     rpc_port2: u16,
     delay_secs: u64,
+    test: &str,
 ) -> eyre::Result<Child> {
     network_advancing(client_urls).inspect_err(|e| {
         kill_child(child2);
@@ -128,7 +136,7 @@ fn run_restart_tests1(
 
     info!(target: "restart-test", "restarting child2...");
     // Restart
-    let mut child2 = start_validator(2, bin, temp_path, rpc_port2);
+    let mut child2 = start_validator(2, bin, temp_path, rpc_port2, test, 2);
     let bal = get_positive_balance_with_retry(&client_urls[2], &to_account.to_string())
         .inspect_err(|e| {
             kill_child(&mut child2);
@@ -164,6 +172,7 @@ fn run_restart_tests_lagged1(
     temp_path: &Path,
     rpc_port2: u16,
     delay_secs: u64,
+    test: &str,
 ) -> eyre::Result<Child> {
     network_advancing(client_urls).inspect_err(|e| {
         kill_child(child2);
@@ -201,7 +210,7 @@ fn run_restart_tests_lagged1(
 
     info!(target: "restart-test", "restarting child2...");
     // Restart
-    let mut child2 = start_validator(2, bin, temp_path, rpc_port2);
+    let mut child2 = start_validator(2, bin, temp_path, rpc_port2, test, 2);
     let bal = get_positive_balance_with_retry(&client_urls[2], &to_account.to_string())
         .inspect_err(|e| {
             kill_child(&mut child2);
@@ -281,7 +290,7 @@ fn network_advancing(client_urls: &[String; 4]) -> eyre::Result<()> {
     Ok(())
 }
 
-fn do_restarts(delay: u64, lagged: bool) -> eyre::Result<()> {
+fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
     let _guard = IT_TEST_MUTEX.lock();
     init_test_tracing();
     info!(target: "restart-test", "do_restarts, delay: {delay}");
@@ -307,7 +316,7 @@ fn do_restarts(delay: u64, lagged: bool) -> eyre::Result<()> {
             .expect("Failed to get an ephemeral rpc port for child!");
         rpc_ports[i] = rpc_port;
         client_urls[i].push_str(&format!(":{rpc_port}"));
-        *child = Some(start_validator(i, &bin, &temp_path, rpc_port));
+        *child = Some(start_validator(i, &bin, &temp_path, rpc_port, test, 0));
     }
 
     // pass &mut to `run_restart_tests1` to shutdown child in case of error
@@ -316,9 +325,17 @@ fn do_restarts(delay: u64, lagged: bool) -> eyre::Result<()> {
     info!(target: "restart-test", "Running restart tests 1");
     // run restart tests1
     let res1 = if lagged {
-        run_restart_tests_lagged1(&client_urls, &mut child2, &bin, &temp_path, rpc_ports[2], delay)
+        run_restart_tests_lagged1(
+            &client_urls,
+            &mut child2,
+            &bin,
+            &temp_path,
+            rpc_ports[2],
+            delay,
+            test,
+        )
     } else {
-        run_restart_tests1(&client_urls, &mut child2, &bin, &temp_path, rpc_ports[2], delay)
+        run_restart_tests1(&client_urls, &mut child2, &bin, &temp_path, rpc_ports[2], delay, test)
     };
     info!(target: "restart-test", "Ran restart tests 1: {res1:?}");
     let is_ok = res1.is_ok();
@@ -367,7 +384,7 @@ fn do_restarts(delay: u64, lagged: bool) -> eyre::Result<()> {
     info!(target: "restart-test", "all nodes shutdown...restarting network");
     // Restart network
     for (i, child) in children.iter_mut().enumerate() {
-        *child = Some(start_validator(i, &bin, &temp_path, rpc_ports[i]));
+        *child = Some(start_validator(i, &bin, &temp_path, rpc_ports[i], test, 3));
     }
 
     info!(target: "restart-test", "Running restart tests 2");
@@ -390,10 +407,13 @@ fn do_restarts(delay: u64, lagged: bool) -> eyre::Result<()> {
 }
 
 /// Test a restart case with a short delay, the stopped node should rejoin consensus.
+/// Note set the TEST_RESTARTS_LOG env variable to a directory when running this test
+/// in order to get each nodes logs broken out by test/node/run.  This can make debugging
+/// restart tests easier vs having all the logs jumbled together.
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restartstt() -> eyre::Result<()> {
-    do_restarts(2, false)
+    do_restarts(2, false, "restarts")
 }
 
 /// Run some test to make sure an observer is participating in the network.
@@ -418,6 +438,9 @@ fn run_observer_tests(client_urls: &[String; 4], obs_url: &str) -> eyre::Result<
 }
 
 /// Test an observer node can submit txns.
+/// Note set the TEST_RESTARTS_LOG env variable to a directory when running this test
+/// in order to get each nodes logs broken out by test/node/run.  This can make debugging
+/// restart tests easier vs having all the logs jumbled together.
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restarts_observer() -> eyre::Result<()> {
@@ -446,12 +469,12 @@ fn test_restarts_observer() -> eyre::Result<()> {
             .expect("Failed to get an ephemeral rpc port for child!");
         rpc_ports[i] = rpc_port;
         client_urls[i].push_str(&format!(":{rpc_port}"));
-        *child = Some(start_validator(i, &bin, &temp_path, rpc_port));
+        *child = Some(start_validator(i, &bin, &temp_path, rpc_port, "observer", 0));
     }
     let obs_rpc_port = get_available_tcp_port("127.0.0.1")
         .expect("Failed to get an ephemeral rpc port for child!");
     let obs_url = format!("http://127.0.0.1:{obs_rpc_port}");
-    let mut obs_child = start_observer(4, &bin, &temp_path, obs_rpc_port);
+    let mut obs_child = start_observer(4, &bin, &temp_path, obs_rpc_port, "observer", 0);
     let res = run_observer_tests(&client_urls, &obs_url);
 
     // SIGTERM children so they can shutdown in parrellel.
@@ -473,18 +496,35 @@ fn test_restarts_observer() -> eyre::Result<()> {
 
 /// Test a restart case with a long delay, the stopped node should not rejoin consensus but follow
 /// the consensus chain.
+/// Note set the TEST_RESTARTS_LOG env variable to a directory when running this test
+/// in order to get each nodes logs broken out by test/node/run.  This can make debugging
+/// restart tests easier vs having all the logs jumbled together.
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restarts_delayed() -> eyre::Result<()> {
-    do_restarts(70, false)
+    do_restarts(70, false, "restarts_delayed")
 }
 
 /// Test a restart case with a long delay, the stopped node should not rejoin consensus but follow
 /// the consensus chain.  Lag the restarted validator.
+/// Note set the TEST_RESTARTS_LOG env variable to a directory when running this test
+/// in order to get each nodes logs broken out by test/node/run.  This can make debugging
+/// restart tests easier vs having all the logs jumbled together.
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restarts_lagged_delayed() -> eyre::Result<()> {
-    do_restarts(70, true)
+    do_restarts(70, true, "restarts_lagged_delayed")
+}
+
+fn setup_log_dir(command: &mut Command, instance: usize, test: &str, run: u32) {
+    if let Ok(log_dir) = std::env::var("TEST_RESTARTS_LOG") {
+        let _ = std::fs::create_dir(format!("{log_dir}/"));
+        let _ = std::fs::create_dir(format!("{log_dir}/{test}/"));
+        let out_file = File::create(format!("{log_dir}/{test}/node{instance}-run{run}.log"))
+            .expect("valid log file");
+        let stdout: Stdio = out_file.into();
+        command.stdout(stdout);
+    }
 }
 
 /// Start a process running a validator node.
@@ -493,6 +533,8 @@ fn start_validator(
     bin: &'static CargoRun,
     base_dir: &Path,
     mut rpc_port: u16,
+    test: &str,
+    run: u32,
 ) -> Child {
     let data_dir = base_dir.join(format!("validator-{}", instance + 1));
     // The instance option will still change a set port so account for that.
@@ -508,7 +550,11 @@ fn start_validator(
         .arg(format!("{}", instance + 1))
         .arg("--http")
         .arg("--http.port")
-        .arg(format!("{rpc_port}"));
+        .arg(format!("{rpc_port}"))
+        .arg("--node-name")
+        .arg(format!("{test}-node{instance}"));
+
+    setup_log_dir(&mut command, instance, test, run);
 
     #[cfg(feature = "faucet")]
     command
@@ -524,6 +570,8 @@ fn start_observer(
     bin: &'static CargoRun,
     base_dir: &Path,
     mut rpc_port: u16,
+    test: &str,
+    run: u32,
 ) -> Child {
     let data_dir = base_dir.join("observer");
     // The instance option will still change a set port so account for that.
@@ -539,7 +587,12 @@ fn start_observer(
         .arg(format!("{}", instance + 1))
         .arg("--http")
         .arg("--http.port")
-        .arg(format!("{rpc_port}"));
+        .arg(format!("{rpc_port}"))
+        .arg("--node-name")
+        .arg(format!("{test}-node{instance}"));
+
+    setup_log_dir(&mut command, instance, test, run);
+
     command.spawn().expect("failed to execute")
 }
 
@@ -550,20 +603,26 @@ fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
     info!(target: "restart-test", ?number, "success - now calling get_block for {:?}", &client_urls[1]);
     let block = get_block(&client_urls[1], Some(number))?;
     if block0["hash"] != block["hash"] {
-        return Err(Report::msg("Blocks between validators not the same!".to_string()));
+        return Err(Report::msg(format!(
+            "Blocks between validators not the same (node 0 and 1)! block {number}: {:?} - block: {:?}",
+            block0["hash"], block["hash"]
+        )));
     }
     info!(target: "restart-test", ?number, "success - now calling get_block for {:?}", &client_urls[2]);
     let block = get_block(&client_urls[2], Some(number))?;
     if block0["hash"] != block["hash"] {
         return Err(Report::msg(format!(
-            "Blocks between validators not the same! block0: {:?} - block: {:?}",
+            "Blocks between validators not the same (node 0 and 2)! block {number}: {:?} - block: {:?}",
             block0["hash"], block["hash"]
         )));
     }
     info!(target: "restart-test", ?number, "success - now calling get_block for {:?}", &client_urls[3]);
     let block = get_block(&client_urls[3], Some(number))?;
     if block0["hash"] != block["hash"] {
-        return Err(Report::msg("Blocks between validators not the same!".to_string()));
+        return Err(Report::msg(format!(
+            "Blocks between validators not the same (node 0 and 3)! block {number}: {:?} - block: {:?}",
+            block0["hash"], block["hash"]
+        )));
     }
     info!(target: "restart-test", "all rpcs returned same block hash");
     Ok(())
@@ -574,7 +633,7 @@ fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
 /// Note, balance is in wei and must fit in an u128.
 fn get_balance(node: &str, address: &str, retries: usize) -> eyre::Result<u128> {
     let res_str: String =
-        call_rpc(node, "eth_getBalance", rpc_params!(address, "latest"), retries)?;
+        call_rpc(node, "eth_getBalance", rpc_params!(address, "latest"), retries, address)?;
     info!(target: "restart-test", "get_balance for {node}: parsing string {res_str}");
     let tel = u128::from_str_radix(&res_str[2..], 16)?;
     info!(target: "restart-test", "get_balance for {node}: {tel:?}");
@@ -616,12 +675,14 @@ fn get_key(key: &str) -> String {
 }
 
 fn get_block(node: &str, block_number: Option<u64>) -> eyre::Result<HashMap<String, Value>> {
-    let params = if let Some(block_number) = block_number {
-        rpc_params!(format!("0x{block_number:x}"), true)
+    let debug_params = if let Some(block_number) = block_number {
+        format!("0x{block_number:x}")
     } else {
-        rpc_params!("latest", true)
+        "latest".to_string()
     };
-    call_rpc(node, "eth_getBlockByNumber", params.clone(), 10)
+
+    let params = rpc_params!(&debug_params, true);
+    call_rpc(node, "eth_getBlockByNumber", params, 10, debug_params)
 }
 
 fn get_block_number(node: &str) -> eyre::Result<u64> {
@@ -692,8 +753,9 @@ fn send_tel(
     let res_str: String = call_rpc(
         node,
         "eth_sendRawTransaction",
-        rpc_params!(const_hex::encode(transaction_bytes)),
+        rpc_params!(const_hex::encode(&transaction_bytes)),
         1,
+        transaction_bytes,
     )?;
     info!(target: "restart-test", "Submitted TEL transfer from {from_account} to {to_account} for {amount}: {res_str}");
     Ok(())
@@ -731,10 +793,17 @@ fn decode_key(key: &str) -> eyre::Result<(String, String, String)> {
 /// Wraps any Eyre otherwise returns the result as a String.
 /// This is for testing and will try up to retries times at one second intervals to send the
 /// request.
-fn call_rpc<R, Params>(node: &str, command: &str, params: Params, retries: usize) -> eyre::Result<R>
+fn call_rpc<R, Params, DebugParams>(
+    node: &str,
+    command: &str,
+    params: Params,
+    retries: usize,
+    debug_params: DebugParams,
+) -> eyre::Result<R>
 where
     R: DeserializeOwned + Debug,
     Params: jsonrpsee::core::traits::ToRpcParams + Send + Clone + Debug,
+    DebugParams: Debug,
 {
     // jsonrpsee is async AND tokio specific so give it a runtime (and can't use a crate like
     // pollster)...
@@ -752,7 +821,7 @@ where
             i += 1;
         }
         resp.inspect_err(|_| {
-            error!(target: "restart-tests", ?command, ?node, ?params, "rpc call failed");
+            error!(target: "restart-tests", ?command, ?node, ?debug_params, "rpc call failed");
         })
     });
 

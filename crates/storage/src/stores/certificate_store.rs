@@ -321,6 +321,8 @@ impl<DB: Database> CertificateStore for DB {
     }
 
     /// Retrieves origins with certificates in each round >= the provided round.
+    ///
+    /// NOTE: caller assumes this is inclusive
     fn origins_after_round(
         &self,
         round: Round,
