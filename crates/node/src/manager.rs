@@ -1569,7 +1569,6 @@ where
             .unwrap_or_else(|| (0, ConsensusHeader::default()));
         // prime the watch channel with data from the db this will be updated by state-sync if this
         // node can_cvv
-        // XXXX
         self.consensus_bus.last_consensus_header().send(last_db_block)?;
 
         Ok(())

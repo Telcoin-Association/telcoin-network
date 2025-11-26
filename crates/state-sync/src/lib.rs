@@ -295,8 +295,7 @@ async fn catch_up_consensus_from_to<DB: Database>(
     for number in last_consensus_height + 1..=max_consensus_height {
         debug!(target: "state-sync", "trying to get consensus block {number}");
         // Check if we already have this consensus output in our local DB.
-        // This will also allow us to pre load other consensus blocks as a future
-        // optimization.
+        // We will be verifying and loading these records elsewhere.
         let consensus_header = if number == max_consensus_height {
             max_consensus.clone()
         } else if let Some(block) = db.get_consensus_by_number(number) {
