@@ -201,6 +201,8 @@ impl<DB: Database> Subscriber<DB> {
     async fn follow_consensus(&self, tasks: TaskSpawner) -> SubscriberResult<()> {
         // Get a receiver then stream any missing headers so we don't miss them.
         let mut rx_consensus_headers = self.consensus_bus.consensus_header().subscribe();
+        // this could be an issue with await vs spawning, if we somehow had to stream a LOT of
+        // output it could deadlock since the code below reads the channel.
         stream_missing_consensus(&self.config, &self.consensus_bus).await?;
         spawn_state_sync(
             self.config.clone(),

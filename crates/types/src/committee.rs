@@ -7,7 +7,7 @@ use crate::{
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt::{Display, Formatter},
     num::NonZeroU64,
     sync::Arc,
@@ -437,7 +437,8 @@ impl Committee {
     }
 
     /// Returns all the bls keys of all members.
-    pub fn bls_keys(&self) -> Vec<BlsPublicKey> {
+    /// Return as a BTreeSet to inforce an order.
+    pub fn bls_keys(&self) -> BTreeSet<BlsPublicKey> {
         self.inner.read().authorities.values().map(|authority| *authority.protocol_key()).collect()
     }
 

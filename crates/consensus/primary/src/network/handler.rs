@@ -28,7 +28,7 @@ use tn_types::{
     Vote,
 };
 use tokio::sync::oneshot;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 /// Map to hold vote info to detect invalid votes, equivocation and cache responses in case of
 /// rerequests.
@@ -82,13 +82,12 @@ where
     /// active. This will put us in a "catch up" mode until we have caught up enough to rejoin
     /// consensus.
     async fn behind_consensus(&self, epoch: Epoch, round: Round, number: Option<u64>) -> bool {
-        // Last consensus block we have executed, us this to determine if we are
+        // Last consensus block we have executed, use this to determine if we are
         // too far behind.
         let (exec_number, exec_epoch, exec_round) = self
-            .consensus_config
-            .node_storage()
-            .last_record::<ConsensusBlocks>()
-            .map(|(n, h)| (n, h.sub_dag.leader_epoch(), h.sub_dag.leader_round()))
+            .consensus_bus
+            .last_executed_consensus_block(self.consensus_config.node_storage())
+            .map(|h| (h.number, h.sub_dag.leader_epoch(), h.sub_dag.leader_round()))
             .unwrap_or((0, 0, 0));
         // Use GC depth to estimate how many rounds we can be behind.
         // Subtract ten here so if we are right on the GC depth we will still go inactive (small
@@ -128,7 +127,7 @@ where
         }
     }
 
-    fn get_committee(&self, epoch: Epoch) -> Option<Vec<BlsPublicKey>> {
+    fn get_committee(&self, epoch: Epoch) -> Option<BTreeSet<BlsPublicKey>> {
         if epoch == self.consensus_config.committee().epoch() {
             Some(self.consensus_config.committee().bls_keys())
         } else {
@@ -163,11 +162,13 @@ where
                 if let Some(committee) = self.get_committee(epoch) {
                     match unverified_cert.verify_cert(&committee) {
                         Ok(cert) => {
-                            if self.behind_consensus(epoch, cert.header().round, None).await {
-                                warn!(target: "primary", "certificate indicates we are behind, go to catchup mode!");
-                                return Ok(());
+                            if !self.consensus_bus.node_mode().borrow().is_observer() {
+                                if self.behind_consensus(epoch, cert.header().round, None).await {
+                                    warn!(target: "primary", "certificate indicates we are behind, go to catchup mode!");
+                                    return Ok(());
+                                }
+                                self.state_sync.process_peer_certificate(cert).await?;
                             }
-                            self.state_sync.process_peer_certificate(cert).await?;
                         }
                         Err(e) => warn!(target: "primary", "Recieved invalid cert {e}"),
                     }
@@ -196,9 +197,7 @@ where
                     // We have already dealt with this hash or we are past this output.
                     return Ok(());
                 }
-                if let Some(committee) =
-                    self.consensus_config.node_storage().get_committee_keys(epoch)
-                {
+                if let Some(committee) = self.get_committee(epoch) {
                     // If we do not have the committee to verify this message then just ignore for
                     // now. Another one will be along soon and we should be
                     // syncing epochs in the background.
@@ -226,6 +225,7 @@ where
                             // this is safe Only send this when we are
                             // sure it is valid. Receivers will count on
                             // this being verified.
+                            info!(target: "primary", "got new consensus {number}/{hash}");
                             let _ = self
                                 .consensus_bus
                                 .last_published_consensus_num_hash()

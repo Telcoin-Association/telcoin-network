@@ -1,5 +1,7 @@
 //! Tasks and helpers for collecting epoch records trustlessly.
 
+use std::collections::BTreeSet;
+
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus};
 use tn_storage::{tables::EpochRecords, EpochStore as _};
 use tn_types::{
@@ -11,12 +13,13 @@ use tracing::info;
 /// These will usually be equal but it is possible for a validator to be
 /// booted and still in committee but not in epoch_rec.committee.
 /// This is very unlikely, but check for it just in case.
-fn epoch_committee_valid(epoch_rec: &EpochRecord, committee: &[BlsPublicKey]) -> bool {
+fn epoch_committee_valid(epoch_rec: &EpochRecord, committee: &BTreeSet<BlsPublicKey>) -> bool {
     let epoch_len = epoch_rec.committee.len();
     let committee_len = committee.len();
+    let epoch_committee: BTreeSet<BlsPublicKey> = epoch_rec.committee.iter().copied().collect();
     match committee_len.cmp(&epoch_len) {
         std::cmp::Ordering::Less => false,
-        std::cmp::Ordering::Equal => committee == epoch_rec.committee,
+        std::cmp::Ordering::Equal => committee == &epoch_committee,
         std::cmp::Ordering::Greater => {
             if epoch_len < 4 || epoch_len < ((committee_len / 3) * 2) {
                 // Make sure we have a reasonable committe size, i.e. don't let
@@ -59,7 +62,7 @@ where
                         db.get_committee_keys(0).expect("always can retreive epoch 0 committee");
                     (B256::default(), committee)
                 } else if let Ok(Some(prev)) = db.get::<EpochRecords>(&(epoch - 1)) {
-                    (prev.digest(), prev.next_committee.clone())
+                    (prev.digest(), prev.next_committee.iter().copied().collect())
                 } else {
                     // We are missing epoch records.
                     // Should not be here but if so just skipping won't really help...

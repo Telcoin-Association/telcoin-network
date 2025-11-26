@@ -60,7 +60,7 @@ pub fn spawn_state_sync<DB: Database>(
     config: ConsensusConfig<DB>,
     consensus_bus: ConsensusBus,
     network: PrimaryNetworkHandle,
-    task_manager: TaskSpawner,
+    task_spawner: TaskSpawner,
 ) {
     let mode = *consensus_bus.node_mode().borrow();
     match mode {
@@ -69,19 +69,20 @@ pub fn spawn_state_sync<DB: Database>(
         NodeMode::CvvInactive | NodeMode::Observer => {
             // If we are not an active CVV then follow latest consensus from peers.
             let (config_clone, consensus_bus_clone) = (config.clone(), consensus_bus.clone());
-            task_manager.spawn_task(
+            let task_spawner_clone = task_spawner.clone();
+            task_spawner.spawn_task(
                 "state sync: track latest consensus header from peers",
                 monitored_future!(
                     async move {
                         info!(target: "state-sync", "Starting state sync: track latest consensus header from peers");
-                        if let Err(e) = spawn_track_recent_consensus(config_clone, consensus_bus_clone, network).await {
+                        if let Err(e) = spawn_track_recent_consensus(config_clone, consensus_bus_clone, network, task_spawner_clone).await {
                             error!(target: "state-sync", "Error tracking latest consensus headers: {e}");
                         }
                     },
                     "StateSyncLatestConsensus"
                 ),
             );
-            task_manager.spawn_task(
+            task_spawner.spawn_task(
                 "state sync: stream consensus headers",
                 monitored_future!(
                     async move {
@@ -160,17 +161,8 @@ pub fn last_executed_consensus_block<DB: Database>(
     consensus_bus: &ConsensusBus,
     config: &ConsensusConfig<DB>,
 ) -> Option<ConsensusHeader> {
-    let db = config.node_storage();
-    let last = consensus_bus
-        .recent_blocks()
-        .borrow()
-        .latest_block()
-        .header()
-        .parent_beacon_block_root
-        .and_then(|hash| db.get_consensus_by_hash(hash));
-
+    let last = consensus_bus.last_executed_consensus_block(config.node_storage());
     debug!(target: "state-sync", ?last, epoch=?config.epoch(), "last executed consensus block");
-
     last
 }
 
@@ -251,9 +243,8 @@ async fn spawn_stream_consensus_headers<DB: Database>(
     let rx_shutdown = config.shutdown().subscribe();
 
     let mut rx_last_consensus_header = consensus_bus.last_consensus_header().subscribe();
-    let db = config.node_storage();
-    let (_, mut last_consensus_header) =
-        db.last_record::<ConsensusBlocks>().unwrap_or_else(|| (0, ConsensusHeader::default()));
+    let mut last_consensus_header =
+        last_executed_consensus_block(&consensus_bus, &config).unwrap_or_default();
     let mut last_consensus_height = last_consensus_header.number;
 
     // infinite loop over consensus output
@@ -304,8 +295,7 @@ async fn catch_up_consensus_from_to<DB: Database>(
     for number in last_consensus_height + 1..=max_consensus_height {
         debug!(target: "state-sync", "trying to get consensus block {number}");
         // Check if we already have this consensus output in our local DB.
-        // This will also allow us to pre load other consensus blocks as a future
-        // optimization.
+        // We will be verifying and loading these records elsewhere.
         let consensus_header = if number == max_consensus_height {
             max_consensus.clone()
         } else if let Some(block) = db.get_consensus_by_number(number) {

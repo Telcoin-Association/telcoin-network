@@ -198,6 +198,10 @@ where
         let reth_db = builder.reth_db.clone();
 
         let consensus_bus = ConsensusBus::new_with_args(builder.tn_config.parameters.gc_depth);
+        if builder.tn_config.observer {
+            // Don't risk keeping the default CVV active mode...
+            let _ = consensus_bus.node_mode().send(NodeMode::Observer);
+        }
         let worker_event_stream = QueChannel::new();
 
         Self {
@@ -525,7 +529,8 @@ where
             }
             // No keys for epoch 0, fix that.
             // We are on epoch 0 so load up that committee in Db as well.
-            let committee: Vec<BlsPublicKey> = primary.current_committee().await.bls_keys();
+            let committee: Vec<BlsPublicKey> =
+                primary.current_committee().await.bls_keys().iter().copied().collect();
             let next_committee = committee.clone();
             let epoch_rec =
                 EpochRecord { epoch: 0, committee, next_committee, ..Default::default() };
@@ -1065,6 +1070,7 @@ where
         // create config for consensus
         let (consensus_config, preload_keys) =
             self.configure_consensus(engine, network_config).await?;
+        let _mode = self.identify_node_mode(&consensus_config).await?;
 
         let primary = self
             .create_primary_node_components(
@@ -1093,8 +1099,6 @@ where
 
         // set execution state for consensus
         self.try_restore_state(engine).await?;
-
-        let _mode = self.identify_node_mode(&consensus_config).await?;
 
         // spawn task to update the latest execution results for consensus
         //
