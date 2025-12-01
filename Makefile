@@ -1,4 +1,4 @@
-.PHONY: help attest udeps check test test-faucet fmt clippy docker-login docker-adiri docker-push docker-builder docker-builder-init up down validators pr init-submodules update-tn-contracts revert-submodule
+.PHONY: help attest udeps check test test-faucet fmt clippy docker-login docker-adiri docker-push docker-builder docker-builder-init up down validators pr init-submodules update-tn-contracts revert-submodule jaeger
 
 # full path for the Makefile
 ROOT_DIR:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
@@ -61,6 +61,9 @@ help:
 	@echo ;
 	@echo "make validators" ;
 	@echo "    :::> Run 4 validators locally (outside of docker)." ;
+	@echo ;
+	@echo "make jaeger" ;
+	@echo "    :::> Run a local jaeger instance in docker." ;
 	@echo ;
 
 # run CI locally and submit attestation githash to on-chain program
@@ -153,3 +156,10 @@ pr:
 	make fmt && \
 	make clippy && \
 	make public-tests
+
+# start a local jaeger instance
+#
+# use with `TN_TRACING_URL=http://localhost:4317`
+# see logs at localhost:16686
+jaeger:
+	docker run -d -p 4317:4317 -p 16686:16686 jaegertracing/all-in-one:latest ;
