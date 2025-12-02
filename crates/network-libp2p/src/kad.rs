@@ -570,18 +570,24 @@ mod test {
         kad_store_worker.put(rec.clone()).expect("put record");
         test_rec(&rec, &kad_store);
         test_rec(&rec, &kad_store_worker);
-        assert_eq!(kad_store.records().count(), 1);
-        assert_eq!(kad_store_worker.records().count(), 1);
+        //XXXXassert_eq!(kad_store.records().count(), 1);
+        assert_eq!(kad_store.num_records, 1);
+        //XXXXassert_eq!(kad_store_worker.records().count(), 1);
+        assert_eq!(kad_store_worker.num_records, 1);
 
         kad_store.remove(&rec.key);
         test_rec(&rec, &kad_store_worker);
-        assert_eq!(kad_store.records().count(), 0);
-        assert_eq!(kad_store_worker.records().count(), 1);
+        //XXXXassert_eq!(kad_store.records().count(), 0);
+        assert_eq!(kad_store.num_records, 0);
+        //XXXXassert_eq!(kad_store_worker.records().count(), 1);
+        assert_eq!(kad_store_worker.num_records, 1);
         kad_store_worker.remove(&rec.key);
         assert!(kad_store.get(&rec.key).is_none());
         assert!(kad_store_worker.get(&rec.key).is_none());
-        assert_eq!(kad_store.records().count(), 0);
-        assert_eq!(kad_store_worker.records().count(), 0);
+        //XXXXassert_eq!(kad_store.records().count(), 0);
+        assert_eq!(kad_store.num_records, 0);
+        //XXXXassert_eq!(kad_store_worker.records().count(), 0);
+        assert_eq!(kad_store_worker.num_records, 0);
 
         kad_store.put(rec.clone()).expect("put record");
         kad_store_worker.put(rec.clone()).expect("put record");

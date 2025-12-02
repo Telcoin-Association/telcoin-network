@@ -109,7 +109,7 @@ pub mod tables {
     );
 }
 
-// mdbx is  the default, if redb is set then is used (so proirity is mdbx -> redb)
+// mdbx is the default, if redb is set then is used (so priority is mdbx -> redb)
 #[cfg(all(feature = "reth-libmdbx", not(feature = "redb")))]
 pub type DatabaseType = LayeredDatabase<MdbxDatabase>;
 #[cfg(feature = "redb")]
@@ -155,9 +155,9 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<KadWorkerRecords>().expect("failed to open table!");
     db.open_table::<KadWorkerProviderRecords>().expect("failed to open table!");
 
-    // Don't forget to add a new table to MemDatabase...
+    // XXXXDon't forget to add a new table to MemDatabase...
     let db = LayeredDatabase::open(db);
-    db.open_table::<LastProposed>();
+    /*XXXX    db.open_table::<LastProposed>();
     db.open_table::<Votes>();
     db.open_table::<Certificates>();
     db.open_table::<CertificateDigestByRound>();
@@ -174,7 +174,7 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<KadRecords>();
     db.open_table::<KadProviderRecords>();
     db.open_table::<KadWorkerRecords>();
-    db.open_table::<KadWorkerProviderRecords>();
+    db.open_table::<KadWorkerProviderRecords>();*/
     db
 }
 
@@ -206,7 +206,7 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<KadWorkerProviderRecords>().expect("failed to open table!");
 
     let db = LayeredDatabase::open(db);
-    db.open_table::<LastProposed>();
+    /*XXXXdb.open_table::<LastProposed>();
     db.open_table::<Votes>();
     db.open_table::<Certificates>();
     db.open_table::<CertificateDigestByRound>();
@@ -223,7 +223,7 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<KadRecords>();
     db.open_table::<KadProviderRecords>();
     db.open_table::<KadWorkerRecords>();
-    db.open_table::<KadWorkerProviderRecords>();
+    db.open_table::<KadWorkerProviderRecords>();*/
     db
 }
 
