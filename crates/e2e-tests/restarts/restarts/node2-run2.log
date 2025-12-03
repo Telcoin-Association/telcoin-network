@@ -1,0 +1,369 @@
+[2m2025-12-03T16:51:01.765708Z[0m [32m INFO[0m [1mnode-startup[0m[2m:[0m telcoin-network 0.1.0 (5c54166a) starting
+[2m2025-12-03T16:51:01.766747Z[0m [32m INFO[0m [1mnode-startup[0m[2m:[0m Loading configuration [3mpath[0m[2m=[0m"/var/folders/nj/h1qvq72s7kj5lzt9skgtys7r0000gn/T/.tmpAmFHBG/validator-3/node-info.yaml"
+[2m2025-12-03T16:51:01.767529Z[0m [32m INFO[0m [1mnode-startup[0m[2m:[0m Loading configuration [3mpath[0m[2m=[0m"/var/folders/nj/h1qvq72s7kj5lzt9skgtys7r0000gn/T/.tmpAmFHBG/validator-3/parameters.yaml"
+[2m2025-12-03T16:51:01.767865Z[0m [32m INFO[0m [1mnode-startup[0m[2m:[0m Loading configuration [3mpath[0m[2m=[0m"/var/folders/nj/h1qvq72s7kj5lzt9skgtys7r0000gn/T/.tmpAmFHBG/validator-3/genesis/genesis.yaml"
+[2m2025-12-03T16:51:01.811320Z[0m [32m INFO[0m [1mnode-startup[0m[2m:[0m config loaded [3mvalidator[0m[2m=[0m"node-PVXE43KJ5Wm"
+[2m2025-12-03T16:51:01.834339Z[0m [32m INFO[0m [1mnode-startup[0m[2m:[0m opening database [3mpath[0m[2m=[0m"/var/folders/nj/h1qvq72s7kj5lzt9skgtys7r0000gn/T/.tmpAmFHBG/validator-3/db"
+[2m2025-12-03T16:51:01.851167Z[0m [32m INFO[0m Starting MDBX metrics thread
+[2m2025-12-03T16:51:01.851516Z[0m [32m INFO[0m Starting MemDB metrics thread
+[2m2025-12-03T16:51:01.872740Z[0m [32m INFO[0m [1mnode-startup[0m[2m:[0m opened consensus storage [3mconsensus_db_path[0m[2m=[0m"/var/folders/nj/h1qvq72s7kj5lzt9skgtys7r0000gn/T/.tmpAmFHBG/validator-3/consensus-db"
+[2m2025-12-03T16:51:01.875337Z[0m [32m INFO[0m starting node and launching first epoch
+[2m2025-12-03T16:51:02.083148Z[0m [32m INFO[0m Loading configuration [3mpath[0m[2m=[0m"/var/folders/nj/h1qvq72s7kj5lzt9skgtys7r0000gn/T/.tmpAmFHBG/validator-3/network-config"
+[2m2025-12-03T16:51:02.085321Z[0m [32m INFO[0m [3mlocal_peer_id[0m[2m=[0m12D3KooWEapsGcccRiH4TbbNL5Z3C4yCLUL9FGyndH7Cw91nufDC
+[2m2025-12-03T16:51:02.085725Z[0m [32m INFO[0m Engine stated from block 13/0x05d7111a0bfe3783f18615f661227e0c31b1a41004c5cd2b6e676ec5294232f0, consensus output Some(0x3247eca7532a8df00043af9106ee89ec89039e1882acba8ec109fee84bc8e4e0)
+[2m2025-12-03T16:51:02.086714Z[0m [32m INFO[0m [3mlocal_peer_id[0m[2m=[0m12D3KooWRtDAaH8J26EVT7zUtrVcyrmuARRy1QbQX6EJSSAAZZfz
+[2m2025-12-03T16:51:02.087037Z[0m [32m INFO[0m Providing our record to kademlia for peer PeerId("12D3KooWRtDAaH8J26EVT7zUtrVcyrmuARRy1QbQX6EJSSAAZZfz") [3mrecord[0m[2m=[0mRecord { key: Key(b"\x86x'5_\x04\xd7\x96\\6y\xf9aw\x92d \xf3\xc3\xea\xc8\x9d\0\xbb\x03y\xb3y\xb8\xb14\x88\x84[2TT|\x01\xcc\x94\xef\xae\xb5\xf7\xb9\x1c\xf8\x14\xdb\x92y\xca#'\xcd\x94\x813\xf8\xe4K\xb5\xae\\\x02\xe2\x7fl\xf3\x1dE2\x1fZ\xf7\xa4|\xa9[\xb8\xecL\xf3\x17\x81KA]Z\xb8\xa9<\xa7#\xae"), value: [36, 8, 1, 18, 32, 238, 183, 34, 104, 241, 196, 108, 153, 12, 84, 155, 247, 163, 37, 177, 190, 133, 158, 183, 199, 108, 22, 114, 6, 251, 88, 165, 23, 236, 151, 132, 69, 1, 52, 4, 127, 0, 0, 1, 145, 2, 248, 159, 205, 3, 165, 3, 38, 0, 36, 8, 1, 18, 32, 238, 183, 34, 104, 241, 196, 108, 153, 12, 84, 155, 247, 163, 37, 177, 190, 133, 158, 183, 199, 108, 22, 114, 6, 251, 88, 165, 23, 236, 151, 132, 69, 118, 106, 48, 105, 0, 0, 0, 0, 48, 130, 75, 110, 228, 233, 30, 224, 54, 80, 208, 64, 206, 207, 198, 249, 73, 105, 171, 252, 146, 245, 215, 186, 82, 83, 191, 217, 108, 25, 112, 3, 195, 203, 167, 1, 165, 81, 22, 42, 169, 211, 208, 104, 238, 136, 112, 32, 99], publisher: Some(PeerId("12D3KooWRtDAaH8J26EVT7zUtrVcyrmuARRy1QbQX6EJSSAAZZfz")), expires: None }
+[2m2025-12-03T16:51:02.087038Z[0m [32m INFO[0m Providing our record to kademlia for peer PeerId("12D3KooWEapsGcccRiH4TbbNL5Z3C4yCLUL9FGyndH7Cw91nufDC") [3mrecord[0m[2m=[0mRecord { key: Key(b"\x86x'5_\x04\xd7\x96\\6y\xf9aw\x92d \xf3\xc3\xea\xc8\x9d\0\xbb\x03y\xb3y\xb8\xb14\x88\x84[2TT|\x01\xcc\x94\xef\xae\xb5\xf7\xb9\x1c\xf8\x14\xdb\x92y\xca#'\xcd\x94\x813\xf8\xe4K\xb5\xae\\\x02\xe2\x7fl\xf3\x1dE2\x1fZ\xf7\xa4|\xa9[\xb8\xecL\xf3\x17\x81KA]Z\xb8\xa9<\xa7#\xae"), value: [36, 8, 1, 18, 32, 70, 210, 125, 220, 31, 45, 76, 23, 203, 37, 253, 105, 233, 218, 64, 65, 221, 124, 102, 107, 189, 248, 232, 158, 164, 165, 155, 140, 120, 47, 146, 11, 1, 52, 4, 127, 0, 0, 1, 145, 2, 238, 163, 205, 3, 165, 3, 38, 0, 36, 8, 1, 18, 32, 70, 210, 125, 220, 31, 45, 76, 23, 203, 37, 253, 105, 233, 218, 64, 65, 221, 124, 102, 107, 189, 248, 232, 158, 164, 165, 155, 140, 120, 47, 146, 11, 118, 106, 48, 105, 0, 0, 0, 0, 48, 160, 225, 213, 52, 135, 90, 25, 128, 97, 148, 129, 86, 197, 30, 120, 121, 149, 59, 228, 65, 251, 238, 174, 171, 75, 207, 27, 112, 205, 184, 79, 202, 35, 169, 149, 43, 179, 1, 216, 184, 35, 120, 91, 239, 42, 191, 1, 33], publisher: Some(PeerId("12D3KooWEapsGcccRiH4TbbNL5Z3C4yCLUL9FGyndH7Cw91nufDC")), expires: None }
+[2m2025-12-03T16:51:02.088104Z[0m [31mERROR[0m Failed to put record: QuorumFailed { key: Key(b"\x86x'5_\x04\xd7\x96\\6y\xf9aw\x92d \xf3\xc3\xea\xc8\x9d\0\xbb\x03y\xb3y\xb8\xb14\x88\x84[2TT|\x01\xcc\x94\xef\xae\xb5\xf7\xb9\x1c\xf8\x14\xdb\x92y\xca#'\xcd\x94\x813\xf8\xe4K\xb5\xae\\\x02\xe2\x7fl\xf3\x1dE2\x1fZ\xf7\xa4|\xa9[\xb8\xecL\xf3\x17\x81KA]Z\xb8\xa9<\xa7#\xae"), success: [], quorum: 1 }
+[2m2025-12-03T16:51:02.088121Z[0m [31mERROR[0m Failed to put record: QuorumFailed { key: Key(b"\x86x'5_\x04\xd7\x96\\6y\xf9aw\x92d \xf3\xc3\xea\xc8\x9d\0\xbb\x03y\xb3y\xb8\xb14\x88\x84[2TT|\x01\xcc\x94\xef\xae\xb5\xf7\xb9\x1c\xf8\x14\xdb\x92y\xca#'\xcd\x94\x813\xf8\xe4K\xb5\xae\\\x02\xe2\x7fl\xf3\x1dE2\x1fZ\xf7\xa4|\xa9[\xb8\xecL\xf3\x17\x81KA]Z\xb8\xa9<\xa7#\xae"), success: [], quorum: 1 }
+[2m2025-12-03T16:51:02.088320Z[0m [32m INFO[0m NODE TASKS
+ [3mtasks[0m[2m=[0mNode Task Manager
+Task: Epoch Record Collector (critical)
+Task: Worker Network (critical)
+Task: Primary Network (critical)
+++++++++++++++++++++++++++++++++++++++++++++++++++++
+Engine Task Manager
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+[2m2025-12-03T16:51:02.088422Z[0m [32m INFO[0m Starting epoch
+[2m2025-12-03T16:51:02.090367Z[0m [32m INFO[0m creating committee from state
+[2m2025-12-03T16:51:02.090380Z[0m [32m INFO[0m Loading configuration [3mpath[0m[2m=[0m"/var/folders/nj/h1qvq72s7kj5lzt9skgtys7r0000gn/T/.tmpAmFHBG/validator-3/genesis/committee.yaml"
+[2m2025-12-03T16:51:02.095403Z[0m [32m INFO[0m listening to /ip4/127.0.0.1/udp/61091/quic-v1/p2p/12D3KooWEapsGcccRiH4TbbNL5Z3C4yCLUL9FGyndH7Cw91nufDC [3mprimary_address[0m[2m=[0m/ip4/127.0.0.1/udp/61091/quic-v1/p2p/12D3KooWEapsGcccRiH4TbbNL5Z3C4yCLUL9FGyndH7Cw91nufDC
+[2m2025-12-03T16:51:02.095460Z[0m [32m INFO[0m network update for next committee - ensuring no committee members are banned [3mthis_node[0m[2m=[0mPeerId("12D3KooWEapsGcccRiH4TbbNL5Z3C4yCLUL9FGyndH7Cw91nufDC")
+[2m2025-12-03T16:51:02.095502Z[0m [32m INFO[0m adding committee member tuACYrAXriSjfaGkBu9TnjK969sxwErP8mvv6ETpbmnfjJQf2JLMhFtM2dKZU63BCVM1BGrypNP9uaeLtiTa2R8Qf9pGWcNVC6ddX2HvyXfx2tEq2TfaaJRgihUH5myNHqa/12D3KooWGy4QMF1BoyY123rV8cDaYG6ps3saBc3uZFREbCPVJnPW
+[2m2025-12-03T16:51:02.095643Z[0m [32m INFO[0m adding committee member 24iQkpopNyvH2NrF82P8pW6fABxCm7c9ukZpdPMnS89EKpETFh8toTkK7mBBj1roeKWXz5FQdZZ4C4eS21MjqPYZ2xWZFYAXYSrqP4ck3kSm6fL4TuPasEenNqp2nht4wfT4/12D3KooWFo3FGdZwxPAmHxL7shD7RMMwUcv4gcjJsF9cwKHQFfGY
+[2m2025-12-03T16:51:02.095779Z[0m [32m INFO[0m adding committee member oKdtcTz6bxsuAsPfTpmHSVcvamJtsHvKHjuAQBppgn7aNjzb92RpRozE97jQHhYYbVLANSo41GEDCUvyJUZPHEufoqhMsyQwy5nibT1eX4ZaMoub5SKqh8F9pK18TDEfKuX/12D3KooWEapsGcccRiH4TbbNL5Z3C4yCLUL9FGyndH7Cw91nufDC
+[2m2025-12-03T16:51:02.095917Z[0m [32m INFO[0m adding committee member zyyqiaibVtni6xpo4WwDpxtLjL6wgov6psJGCiJB17QJxkxuXHJwyihNDm8fAezop1aRcPfVVaBRGaQogE8fDgqiHnEXJgrmw7UzoJHHM14F4KLtGUsGXr7GHTeeb6T91jb/12D3KooWJXcAMr4v7XSLoK8FfAwzma53eDaWmJYQ83gXPLSSmpQG
+[2m2025-12-03T16:51:02.116267Z[0m [32m INFO[0m new connection established [3mendpoint[0m[2m=[0mDialer { address: /ip4/127.0.0.1/udp/52772/quic-v1/p2p/12D3KooWGy4QMF1BoyY123rV8cDaYG6ps3saBc3uZFREbCPVJnPW, role_override: Dialer, port_use: Reuse }
+[2m2025-12-03T16:51:02.116376Z[0m [32m INFO[0m Publishing our record to kademlia
+[2m2025-12-03T16:51:02.118020Z[0m [32m INFO[0m new connection established [3mendpoint[0m[2m=[0mDialer { address: /ip4/127.0.0.1/udp/55878/quic-v1/p2p/12D3KooWJXcAMr4v7XSLoK8FfAwzma53eDaWmJYQ83gXPLSSmpQG, role_override: Dialer, port_use: Reuse }
+[2m2025-12-03T16:51:02.118126Z[0m [32m INFO[0m Publishing our record to kademlia
+[2m2025-12-03T16:51:02.125235Z[0m [33m WARN[0m failed to dial 24iQkpopNyvH2NrF82P8pW6fABxCm7c9ukZpdPMnS89EKpETFh8toTkK7mBBj1roeKWXz5FQdZZ4C4eS21MjqPYZ2xWZFYAXYSrqP4ck3kSm6fL4TuPasEenNqp2nht4wfT4: dial attempt timedout
+[2m2025-12-03T16:51:02.131982Z[0m [32m INFO[0m new connection established [3mendpoint[0m[2m=[0mDialer { address: /ip4/127.0.0.1/udp/60557/quic-v1/p2p/12D3KooWFo3FGdZwxPAmHxL7shD7RMMwUcv4gcjJsF9cwKHQFfGY, role_override: Dialer, port_use: Reuse }
+[2m2025-12-03T16:51:02.132067Z[0m [32m INFO[0m Publishing our record to kademlia
+[2m2025-12-03T16:51:02.598544Z[0m [32m INFO[0m Header number of batches threshold set to 5
+[2m2025-12-03T16:51:02.598704Z[0m [32m INFO[0m Header max number of batches set to 10
+[2m2025-12-03T16:51:02.598752Z[0m [32m INFO[0m Max header delay set to 1000 ms
+[2m2025-12-03T16:51:02.598794Z[0m [32m INFO[0m Min header delay set to 500 ms
+[2m2025-12-03T16:51:02.598830Z[0m [32m INFO[0m Garbage collection depth set to 50 rounds
+[2m2025-12-03T16:51:02.598869Z[0m [32m INFO[0m Sync retry delay set to 5000 ms
+[2m2025-12-03T16:51:02.598907Z[0m [32m INFO[0m Sync retry nodes set to 3 nodes
+[2m2025-12-03T16:51:02.598944Z[0m [32m INFO[0m Max batch delay set to 1000 ms
+[2m2025-12-03T16:51:02.598980Z[0m [32m INFO[0m Max concurrent requests set to 500000
+[2m2025-12-03T16:51:02.599298Z[0m [32m INFO[0m Boot primary node with public key Some("oKdtcTz6bxsuAsPfTpmHSVcvamJtsHvKHjuAQBppgn7aNjzb92RpRozE97jQHhYYbVLANSo41GEDCUvyJUZPHEufoqhMsyQwy5nibT1eX4ZaMoub5SKqh8F9pK18TDEfKuX")
+[2m2025-12-03T16:51:02.602150Z[0m [32m INFO[0m Transaction pool initialized
+[2m2025-12-03T16:51:02.607121Z[0m [32m INFO[0m tn rpc extension successfully merged
+[2m2025-12-03T16:51:02.611668Z[0m [33m WARN[0m certificate indicates we are behind, go to catchup mode!
+[2m2025-12-03T16:51:02.613348Z[0m [32m INFO[0m network update for next committee - ensuring no committee members are banned [3mthis_node[0m[2m=[0mPeerId("12D3KooWRtDAaH8J26EVT7zUtrVcyrmuARRy1QbQX6EJSSAAZZfz")
+[2m2025-12-03T16:51:02.613719Z[0m [32m INFO[0m adding committee member zyyqiaibVtni6xpo4WwDpxtLjL6wgov6psJGCiJB17QJxkxuXHJwyihNDm8fAezop1aRcPfVVaBRGaQogE8fDgqiHnEXJgrmw7UzoJHHM14F4KLtGUsGXr7GHTeeb6T91jb/12D3KooWED9vK5JxUfP9Cw7UeSxpQAebNbwxTCmjMKEcQrQmnRbW
+[2m2025-12-03T16:51:02.614290Z[0m [32m INFO[0m adding committee member 24iQkpopNyvH2NrF82P8pW6fABxCm7c9ukZpdPMnS89EKpETFh8toTkK7mBBj1roeKWXz5FQdZZ4C4eS21MjqPYZ2xWZFYAXYSrqP4ck3kSm6fL4TuPasEenNqp2nht4wfT4/12D3KooWMcPW3FQatxeCxP4u8cpEdhc51uVQfYbqzhXfTcggaZB9
+[2m2025-12-03T16:51:02.614846Z[0m [32m INFO[0m adding committee member oKdtcTz6bxsuAsPfTpmHSVcvamJtsHvKHjuAQBppgn7aNjzb92RpRozE97jQHhYYbVLANSo41GEDCUvyJUZPHEufoqhMsyQwy5nibT1eX4ZaMoub5SKqh8F9pK18TDEfKuX/12D3KooWRtDAaH8J26EVT7zUtrVcyrmuARRy1QbQX6EJSSAAZZfz
+[2m2025-12-03T16:51:02.615408Z[0m [32m INFO[0m adding committee member tuACYrAXriSjfaGkBu9TnjK969sxwErP8mvv6ETpbmnfjJQf2JLMhFtM2dKZU63BCVM1BGrypNP9uaeLtiTa2R8Qf9pGWcNVC6ddX2HvyXfx2tEq2TfaaJRgihUH5myNHqa/12D3KooWNu14NapHAVFG9mKkueXmZwzZP1MjhmvM9Cc2r6p4BhJo
+[2m2025-12-03T16:51:02.616405Z[0m [32m INFO[0m got new consensus 22/0xe006605d8067437c8a7c4df81f27a74c39b056e32707a000dec128053f14d15d
+[2m2025-12-03T16:51:02.643892Z[0m [32m INFO[0m Boot worker node with id 0 key oKdtcTz6bxsuAsPfTpmHSVcvamJtsHvKHjuAQBppgn7aNjzb92RpRozE97jQHhYYbVLANSo41GEDCUvyJUZPHEufoqhMsyQwy5nibT1eX4ZaMoub5SKqh8F9pK18TDEfKuX
+[2m2025-12-03T16:51:02.644119Z[0m [32m INFO[0m Starting handler for transactions
+[2m2025-12-03T16:51:02.644166Z[0m [32m INFO[0m Worker 0 successfully booted on /ip4/127.0.0.1/udp/63647/quic-v1/p2p/12D3KooWRtDAaH8J26EVT7zUtrVcyrmuARRy1QbQX6EJSSAAZZfz
+[2m2025-12-03T16:51:02.652741Z[0m [32m INFO[0m [1mconstruct_dag_from_cert_store[0m[2m:[0m Recreating dag from last GC round: 0
+[2m2025-12-03T16:51:02.657718Z[0m [32m INFO[0m [1mconstruct_dag_from_cert_store[0m[2m:[0m Inserted certificate: 77Gb8H5XhmsT69cX: C25(5L2c7YsF8FkVDjVUDKzEiARLQKwhjshdrDbVPkhNEmzG, 77Gb8H5XhmsT69cX, E0)
+[2m2025-12-03T16:51:02.657879Z[0m [32m INFO[0m [1mconstruct_dag_from_cert_store[0m[2m:[0m Inserted certificate: EkfUep2DY2UxrG2W: C26(2QzsKb88N9WgZMTDzB4R4wNRE1zCy7kNk2Y331fy3mFi, EkfUep2DY2UxrG2W, E0)
+[2m2025-12-03T16:51:02.657991Z[0m [32m INFO[0m [1mconstruct_dag_from_cert_store[0m[2m:[0m Inserted certificate: 7tgYmeURUNqaRUxK: C26(3ZFkLuYyEoj93HnJYynj7XgfBAKYao8bDU2B3V5HuhJe, 7tgYmeURUNqaRUxK, E0)
+[2m2025-12-03T16:51:02.658100Z[0m [32m INFO[0m [1mconstruct_dag_from_cert_store[0m[2m:[0m Inserted certificate: DztspoRB8JFYRVqr: C26(5L2c7YsF8FkVDjVUDKzEiARLQKwhjshdrDbVPkhNEmzG, DztspoRB8JFYRVqr, E0)
+[2m2025-12-03T16:51:02.658204Z[0m [32m INFO[0m [1mconstruct_dag_from_cert_store[0m[2m:[0m Inserted certificate: 3w9gBV9sppNh4iua: C27(bpD912cjYX8DSZXuLJB3AFM3JgoVz7LTj9MZXAbtJCJ, 3w9gBV9sppNh4iua, E0)
+[2m2025-12-03T16:51:02.658302Z[0m [32m INFO[0m [1mconstruct_dag_from_cert_store[0m[2m:[0m Inserted certificate: 7rrepTng5GmPr7C1: C27(2QzsKb88N9WgZMTDzB4R4wNRE1zCy7kNk2Y331fy3mFi, 7rrepTng5GmPr7C1, E0)
+[2m2025-12-03T16:51:02.658401Z[0m [32m INFO[0m [1mconstruct_dag_from_cert_store[0m[2m:[0m Inserted certificate: 5bvt8NrrJ8FE6kpC: C27(3ZFkLuYyEoj93HnJYynj7XgfBAKYao8bDU2B3V5HuhJe, 5bvt8NrrJ8FE6kpC, E0)
+[2m2025-12-03T16:51:02.658507Z[0m [32m INFO[0m [1mconstruct_dag_from_cert_store[0m[2m:[0m Inserted certificate: HhTwjQTgxbhpiu8C: C27(5L2c7YsF8FkVDjVUDKzEiARLQKwhjshdrDbVPkhNEmzG, HhTwjQTgxbhpiu8C, E0)
+[2m2025-12-03T16:51:02.658598Z[0m [32m INFO[0m [1mconstruct_dag_from_cert_store[0m[2m:[0m Dag is restored and contains 8 certs for 27 rounds
+[2m2025-12-03T16:51:02.658828Z[0m [32m INFO[0m Consensus subscriber successfully started
+[2m2025-12-03T16:51:02.658894Z[0m [32m INFO[0m Starting subscriber: Catch up and rejoin
+[2m2025-12-03T16:51:02.658986Z[0m [32m INFO[0m Primary Some(5L2c7YsF8FkVDjVUDKzEiARLQKwhjshdrDbVPkhNEmzG) successfully booted on /ip4/127.0.0.1/udp/61091/quic-v1/p2p/12D3KooWEapsGcccRiH4TbbNL5Z3C4yCLUL9FGyndH7Cw91nufDC
+[2m2025-12-03T16:51:02.659116Z[0m [32m INFO[0m StateHandler on node 5L2c7YsF8FkVDjVUDKzEiARLQKwhjshdrDbVPkhNEmzG has started successfully.
+[2m2025-12-03T16:51:02.659411Z[0m [32m INFO[0m No batches leftover
+[2m2025-12-03T16:51:02.659431Z[0m [32m INFO[0m new connection established [3mendpoint[0m[2m=[0mDialer { address: /ip4/127.0.0.1/udp/60352/quic-v1/p2p/12D3KooWNu14NapHAVFG9mKkueXmZwzZP1MjhmvM9Cc2r6p4BhJo, role_override: Dialer, port_use: Reuse }
+[2m2025-12-03T16:51:02.659447Z[0m [32m INFO[0m Certifier on node 5L2c7YsF8FkVDjVUDKzEiARLQKwhjshdrDbVPkhNEmzG has started successfully.
+[2m2025-12-03T16:51:02.659497Z[0m [32m INFO[0m EPOCH TASKS
+ [3mtasks[0m[2m=[0mEpoch Task Manager
+Task: batch builder (critical)
+Task: worker network events (critical)
+Task: DialPeer 24iQkpopNyvH2NrF82P8pW6fABxCm7c9ukZpdPMnS89EKpETFh8toTkK7mBBj1roeKWXz5FQdZZ4C4eS21MjqPYZ2xWZFYAXYSrqP4ck3kSm6fL4TuPasEenNqp2nht4wfT4 (not critical)
+Task: DialPeer zyyqiaibVtni6xpo4WwDpxtLjL6wgov6psJGCiJB17QJxkxuXHJwyihNDm8fAezop1aRcPfVVaBRGaQogE8fDgqiHnEXJgrmw7UzoJHHM14F4KLtGUsGXr7GHTeeb6T91jb (not critical)
+Task: DialPeer tuACYrAXriSjfaGkBu9TnjK969sxwErP8mvv6ETpbmnfjJQf2JLMhFtM2dKZU63BCVM1BGrypNP9uaeLtiTa2R8Qf9pGWcNVC6ddX2HvyXfx2tEq2TfaaJRgihUH5myNHqa (not critical)
+Task: sync header batches (not critical)
+Task: sync header batches (not critical)
+Task: sync header batches (not critical)
+Task: sync header batches (not critical)
+Task: sync header batches (not critical)
+Task: sync header batches (not critical)
+Task: ProcessGossip-tn-primary-24iQkpopNyvH2NrF82P8pW6fABxCm7c9ukZpdPMnS89EKpETFh8toTkK7mBBj1roeKWXz5FQdZZ4C4eS21MjqPYZ2xWZFYAXYSrqP4ck3kSm6fL4TuPasEenNqp2nht4wfT4 (not critical)
+Task: ProcessGossip-tn-primary-tuACYrAXriSjfaGkBu9TnjK969sxwErP8mvv6ETpbmnfjJQf2JLMhFtM2dKZU63BCVM1BGrypNP9uaeLtiTa2R8Qf9pGWcNVC6ddX2HvyXfx2tEq2TfaaJRgihUH5myNHqa (not critical)
+Task: VoteRequest-725SNWtEKrrcYJXQ (not critical)
+Task: VoteRequest-ANpKU8f8beP8AcRv (not critical)
+Task: ProcessGossip-tn-consensus-output-zyyqiaibVtni6xpo4WwDpxtLjL6wgov6psJGCiJB17QJxkxuXHJwyihNDm8fAezop1aRcPfVVaBRGaQogE8fDgqiHnEXJgrmw7UzoJHHM14F4KLtGUsGXr7GHTeeb6T91jb (not critical)
+Task: ProcessGossip-tn-consensus-output-tuACYrAXriSjfaGkBu9TnjK969sxwErP8mvv6ETpbmnfjJQf2JLMhFtM2dKZU63BCVM1BGrypNP9uaeLtiTa2R8Qf9pGWcNVC6ddX2HvyXfx2tEq2TfaaJRgihUH5myNHqa (not critical)
+Task: ProcessGossip-tn-consensus-output-24iQkpopNyvH2NrF82P8pW6fABxCm7c9ukZpdPMnS89EKpETFh8toTkK7mBBj1roeKWXz5FQdZZ4C4eS21MjqPYZ2xWZFYAXYSrqP4ck3kSm6fL4TuPasEenNqp2nht4wfT4 (not critical)
+Task: ProcessGossip-tn-primary-tuACYrAXriSjfaGkBu9TnjK969sxwErP8mvv6ETpbmnfjJQf2JLMhFtM2dKZU63BCVM1BGrypNP9uaeLtiTa2R8Qf9pGWcNVC6ddX2HvyXfx2tEq2TfaaJRgihUH5myNHqa (not critical)
+Task: ProcessGossip-tn-primary-24iQkpopNyvH2NrF82P8pW6fABxCm7c9ukZpdPMnS89EKpETFh8toTkK7mBBj1roeKWXz5FQdZZ4C4eS21MjqPYZ2xWZFYAXYSrqP4ck3kSm6fL4TuPasEenNqp2nht4wfT4 (not critical)
+Task: ProcessGossip-tn-primary-zyyqiaibVtni6xpo4WwDpxtLjL6wgov6psJGCiJB17QJxkxuXHJwyihNDm8fAezop1aRcPfVVaBRGaQogE8fDgqiHnEXJgrmw7UzoJHHM14F4KLtGUsGXr7GHTeeb6T91jb (not critical)
+Task: VoteRequest-DwwuTGA9r9x3gs4C (not critical)
+Task: VoteRequest-2qT2Vsv3LXLnCz1Y (not critical)
+Task: VoteRequest-2ec9MAPswQq18Pad (not critical)
+Task: ProcessGossip-tn-primary-zyyqiaibVtni6xpo4WwDpxtLjL6wgov6psJGCiJB17QJxkxuXHJwyihNDm8fAezop1aRcPfVVaBRGaQogE8fDgqiHnEXJgrmw7UzoJHHM14F4KLtGUsGXr7GHTeeb6T91jb (not critical)
+Task: ProcessGossip-tn-primary-24iQkpopNyvH2NrF82P8pW6fABxCm7c9ukZpdPMnS89EKpETFh8toTkK7mBBj1roeKWXz5FQdZZ4C4eS21MjqPYZ2xWZFYAXYSrqP4ck3kSm6fL4TuPasEenNqp2nht4wfT4 (not critical)
+Task: VoteRequest-As44jzN9pwfNv2Qm (not critical)
+Task: VoteRequest-vAjHZBncEq2h5M4E (not critical)
+Task: VoteRequest-GyNKAhrZTvKHjzX3 (not critical)
+Task: VoteRequest-2ciTBjGXpAksw7ua (not critical)
+Task: VoteRequest-G4Ny3jWQVweYjxpN (not critical)
+Task: VoteRequest-6pTUg6F9ekGpz67y (not critical)
+Task: VoteRequest-3Gk3naFJCW3xoiKd (not critical)
+Task: VoteRequest-Cb8isLTwx8LomSB7 (not critical)
+Task: VoteRequest-962bMy7xXqGYniBM (not critical)
+Task: VoteRequest-6Mnb5AnyHzqvDB6p (not critical)
+Task: VoteRequest-6VzbRiUzxTpPBXXT (not critical)
+Task: VoteRequest-8TWUDbSGdrbAtSdf (not critical)
+Task: VoteRequest-CuA9ATY8AJ3KCtwg (not critical)
+Task: VoteRequest-CXwTVRipqxwT2tp9 (not critical)
+Task: VoteRequest-9TgjMWgv2y2Vpuqb (not critical)
+Task: VoteRequest-8aQJZU6E9CP5qcPS (not critical)
+Task: VoteRequest-FBUSDh9nPsDaLWsa (not critical)
+Task: VoteRequest-96GsZNbofySzSVEP (not critical)
+Task: VoteRequest-43AsAFrUEfogBSGs (not critical)
+Task: VoteRequest-7iEk9dYykrTTWkqX (not critical)
+Task: VoteRequest-EpjF2VUr4UMu2ey6 (not critical)
+Task: VoteRequest-EW6hDEH8uZPdNdJg (not critical)
+Task: VoteRequest-56LKNdX51qz9NVCK (not critical)
+Task: VoteRequest-4gB9XNJaVtkiKzHm (not critical)
+Task: VoteRequest-CnQUjHyJtAERb3U5 (not critical)
+Task: VoteRequest-6tAz7PyKK5MSgkP4 (not critical)
+Task: VoteRequest-FpqcKrHmF42L6yLP (not critical)
+Task: VoteRequest-4nbvgavHjNahFpyj (not critical)
+Task: VoteRequest-4mMQj5WiUQ8uBvmf (not critical)
+Task: VoteRequest-HtpJPeHSmmFVpsJB (not critical)
+Task: VoteRequest-9k6k5hUiamd8pm19 (not critical)
+Task: VoteRequest-C6GXmVoXX6hbSbHf (not critical)
+Task: VoteRequest-GSfT25nwhtg1Mc2q (not critical)
+Task: VoteRequest-7ZivLuGhxdvgxBYm (not critical)
+Task: VoteRequest-FVQ4RXM3tDLckvsX (not critical)
+Task: VoteRequest-58AWQTWo3Qe5fCb2 (not critical)
+Task: VoteRequest-4sKhRrwD2c4Jp9hX (not critical)
+Task: VoteRequest-HRNNnHsBvXnvtLKU (not critical)
+Task: VoteRequest-8xzTfMfZdXpEwMMG (not critical)
+Task: VoteRequest-Bw8vnujDGyMnjYcV (not critical)
+Task: VoteRequest-7Xd7YHh78T3xrDu9 (not critical)
+Task: VoteRequest-DZsEgWJtiarAm6x7 (not critical)
+Task: VoteRequest-8oakXydvWWNCYbcd (not critical)
+Task: VoteRequest-Hj8QyQaCr6PB5TH1 (not critical)
+Task: VoteRequest-2AJVWFfdtAhivqWy (not critical)
+Task: VoteRequest-DFJbuar93Khe8tBW (not critical)
+Task: VoteRequest-367TUJ6ikuadY84p (not critical)
+Task: VoteRequest-GEyJGQLXafZXEjBa (not critical)
+Task: VoteRequest-G5qS7ivPsg5BkNFy (not critical)
+Task: VoteRequest-DRKYn4mWWrBkmEJa (not critical)
+Task: VoteRequest-FzJBPfrN3JN6wmLj (not critical)
+Task: VoteRequest-AfUNnsLSiiTnd738 (not critical)
+Task: VoteRequest-681TUQt7CiidshoT (not critical)
+Task: VoteRequest-4k9K2aZJGLfxP5JY (not critical)
+Task: VoteRequest-9fvv4GY4xrLpv4Hc (not critical)
+Task: VoteRequest-BmTFXbqiUDwXngqC (not critical)
+Task: VoteRequest-5PyaDTh2j38XjxBK (not critical)
+Task: VoteRequest-8UaiEW8mn6FRwZ93 (not critical)
+Task: VoteRequest-Hd4ATGFHiJ7D2zJY (not critical)
+Task: VoteRequest-2ERLzj5NAPG5Mb8u (not critical)
+Task: VoteRequest-G6BS8NLBMphmHTho (not critical)
+Task: Worker Network Peers (not critical)
+Task: VoteRequest-5sbHitzoScjio2Nv (not critical)
+Task: VoteRequest-6icifesnibdgMJdp (not critical)
+Task: VoteRequest-EURJaAUGfGqhTQMo (not critical)
+Task: VoteRequest-8AUnHTBy6e9pcrZa (not critical)
+Task: VoteRequest-DVaaRU3VMZUkvD2x (not critical)
+Task: VoteRequest-5yQ7PrPvWHpbQuvX (not critical)
+Task: primary network events (critical)
+Task: DialPeer 24iQkpopNyvH2NrF82P8pW6fABxCm7c9ukZpdPMnS89EKpETFh8toTkK7mBBj1roeKWXz5FQdZZ4C4eS21MjqPYZ2xWZFYAXYSrqP4ck3kSm6fL4TuPasEenNqp2nht4wfT4 (not critical)
+Task: DialPeer zyyqiaibVtni6xpo4WwDpxtLjL6wgov6psJGCiJB17QJxkxuXHJwyihNDm8fAezop1aRcPfVVaBRGaQogE8fDgqiHnEXJgrmw7UzoJHHM14F4KLtGUsGXr7GHTeeb6T91jb (not critical)
+Task: DialPeer tuACYrAXriSjfaGkBu9TnjK969sxwErP8mvv6ETpbmnfjJQf2JLMhFtM2dKZU63BCVM1BGrypNP9uaeLtiTa2R8Qf9pGWcNVC6ddX2HvyXfx2tEq2TfaaJRgihUH5myNHqa (not critical)
+Task: Worker Task - 0 batch-builder (critical)
+Task: state handler task (critical)
+Task: certificate fetcher task (critical)
+Task: certifier task (critical)
+Task: certificate-manager (critical)
+Task: subscriber catch up and rejoin consensus (critical)
+Task: latest execution block (critical)
+
+[2m2025-12-03T16:51:02.659511Z[0m [32m INFO[0m Certifier on node 5L2c7YsF8FkVDjVUDKzEiARLQKwhjshdrDbVPkhNEmzG has started successfully.
+[2m2025-12-03T16:51:02.659571Z[0m [32m INFO[0m Publishing our record to kademlia
+[2m2025-12-03T16:51:02.659561Z[0m [33m WARN[0m process_gossip [3me[0m[2m=[0mCertificate(Pending(2ec9MAPswQq18Pad9CsdEBNG8hp8vXyFarNX7JX7vDqi))
+[2m2025-12-03T16:51:02.659734Z[0m [33m WARN[0m process_gossip [3me[0m[2m=[0mCertificate(Pending(vAjHZBncEq2h5M4ENxEmUyVZkFQBmEt8WHrv8cru6yw))
+[2m2025-12-03T16:51:02.659799Z[0m [33m WARN[0m process_gossip [3me[0m[2m=[0mCertificate(Pending(ANpKU8f8beP8AcRvyJixHCFQ4YigTMCqFNxD1DcGuMM7))
+[2m2025-12-03T16:51:02.659869Z[0m [33m WARN[0m process_gossip [3me[0m[2m=[0mCertificate(Pending(DwwuTGA9r9x3gs4C7foGRrEkxmtg2kK1UmPX3G59V5B8))
+[2m2025-12-03T16:51:02.659962Z[0m [33m WARN[0m process_gossip [3me[0m[2m=[0mCertificate(Pending(2qT2Vsv3LXLnCz1Y2UMhtfZ22EPV3CN9SuxyRp37qFKD))
+[2m2025-12-03T16:51:02.660097Z[0m [33m WARN[0m process_gossip [3me[0m[2m=[0mCertificate(Pending(725SNWtEKrrcYJXQW77vUSnu4EYtop6N3Efrhd8FTToj))
+[2m2025-12-03T16:51:02.660576Z[0m [32m INFO[0m new connection established [3mendpoint[0m[2m=[0mDialer { address: /ip4/127.0.0.1/udp/56825/quic-v1/p2p/12D3KooWED9vK5JxUfP9Cw7UeSxpQAebNbwxTCmjMKEcQrQmnRbW, role_override: Dialer, port_use: Reuse }
+[2m2025-12-03T16:51:02.660673Z[0m [32m INFO[0m Starting state sync: stream consensus header from peers
+[2m2025-12-03T16:51:02.660687Z[0m [32m INFO[0m Publishing our record to kademlia
+[2m2025-12-03T16:51:02.660774Z[0m [32m INFO[0m Starting state sync: track latest consensus header from peers
+[2m2025-12-03T16:51:02.663136Z[0m [33m WARN[0m GRAFT: ignoring request from direct peer [3mpeer[0m[2m=[0m12D3KooWNu14NapHAVFG9mKkueXmZwzZP1MjhmvM9Cc2r6p4BhJo
+[2m2025-12-03T16:51:02.663407Z[0m [33m WARN[0m GRAFT: ignoring request from direct peer [3mpeer[0m[2m=[0m12D3KooWNu14NapHAVFG9mKkueXmZwzZP1MjhmvM9Cc2r6p4BhJo
+[2m2025-12-03T16:51:02.663777Z[0m [33m WARN[0m failed to dial 24iQkpopNyvH2NrF82P8pW6fABxCm7c9ukZpdPMnS89EKpETFh8toTkK7mBBj1roeKWXz5FQdZZ4C4eS21MjqPYZ2xWZFYAXYSrqP4ck3kSm6fL4TuPasEenNqp2nht4wfT4: dial attempt timedout
+[2m2025-12-03T16:51:02.666815Z[0m [33m WARN[0m GRAFT: ignoring request from direct peer [3mpeer[0m[2m=[0m12D3KooWED9vK5JxUfP9Cw7UeSxpQAebNbwxTCmjMKEcQrQmnRbW
+[2m2025-12-03T16:51:02.667148Z[0m [33m WARN[0m GRAFT: ignoring request from direct peer [3mpeer[0m[2m=[0m12D3KooWED9vK5JxUfP9Cw7UeSxpQAebNbwxTCmjMKEcQrQmnRbW
+[2m2025-12-03T16:51:02.667908Z[0m [32m INFO[0m new connection established [3mendpoint[0m[2m=[0mDialer { address: /ip4/127.0.0.1/udp/54455/quic-v1/p2p/12D3KooWMcPW3FQatxeCxP4u8cpEdhc51uVQfYbqzhXfTcggaZB9, role_override: Dialer, port_use: Reuse }
+[2m2025-12-03T16:51:02.668023Z[0m [32m INFO[0m Publishing our record to kademlia
+[2m2025-12-03T16:51:02.671488Z[0m [33m WARN[0m GRAFT: ignoring request from direct peer [3mpeer[0m[2m=[0m12D3KooWMcPW3FQatxeCxP4u8cpEdhc51uVQfYbqzhXfTcggaZB9
+[2m2025-12-03T16:51:02.671632Z[0m [33m WARN[0m GRAFT: ignoring request from direct peer [3mpeer[0m[2m=[0m12D3KooWMcPW3FQatxeCxP4u8cpEdhc51uVQfYbqzhXfTcggaZB9
+[2m2025-12-03T16:51:02.787026Z[0m [32m INFO[0m got new consensus 23/0x50ea6be89dd74491870430c22e930697901b08abddb5d449bbf56725c464912a
+[2m2025-12-03T16:51:03.334021Z[0m [32m INFO[0m got new consensus 24/0x71fa4867d3d0cd98b86379adfb1c5d0503bfd958e7849fc573bfacfae2623564
+[2m2025-12-03T16:51:03.334045Z[0m [32m INFO[0m got new consensus 24/0x71fa4867d3d0cd98b86379adfb1c5d0503bfd958e7849fc573bfacfae2623564
+[2m2025-12-03T16:51:03.348946Z[0m [32m INFO[0m [1mexecute-consensus[0m[1m{[0m[3mepoch[0m[2m=[0m0 [3mconsensus_hash[0m[2m=[0m"0xa4bcd07362e054e39aa5193c9d660bbd12d5531521f24c6a7f47b9e027afdc7b" [3mparent_number[0m[2m=[0m13 [3mparent_hash[0m[2m=[0m"0x05d7111a0bfe3783f18615f661227e0c31b1a41004c5cd2b6e676ec5294232f0" [3mbatches[0m[2m=[0m0[1m}[0m[2m:[0m next block executed [3mhash[0m[2m=[0m"0xd7e1334fd8a679a0df72b934c049230669275cbc2aafa9beafad9bb73da5f424" [3mnumber[0m[2m=[0m14
+[2m2025-12-03T16:51:03.602976Z[0m [32m INFO[0m [1mexecute-consensus[0m[1m{[0m[3mepoch[0m[2m=[0m0 [3mconsensus_hash[0m[2m=[0m"0xa4bcd07362e054e39aa5193c9d660bbd12d5531521f24c6a7f47b9e027afdc7b" [3mparent_number[0m[2m=[0m13 [3mparent_hash[0m[2m=[0m"0x05d7111a0bfe3783f18615f661227e0c31b1a41004c5cd2b6e676ec5294232f0" [3mbatches[0m[2m=[0m0 [3mexecuted_blocks[0m[2m=[0m"1" [3mexecuted_blocks[0m[2m=[0m"1"[1m}[0m[2m:[0m canonical head for epoch 0 round 28: 14 - 0xd7e1334fd8a679a0df72b934c049230669275cbc2aafa9beafad9bb73da5f424
+[2m2025-12-03T16:51:03.625791Z[0m [32m INFO[0m [1mexecute-consensus[0m[1m{[0m[3mepoch[0m[2m=[0m0 [3mconsensus_hash[0m[2m=[0m"0x644f2883cf4184a20e1461a85bde9f777c5f632d18fb3cc02f1f011b3c098bbb" [3mparent_number[0m[2m=[0m14 [3mparent_hash[0m[2m=[0m"0xd7e1334fd8a679a0df72b934c049230669275cbc2aafa9beafad9bb73da5f424" [3mbatches[0m[2m=[0m0[1m}[0m[2m:[0m next block executed [3mhash[0m[2m=[0m"0x64b4859f1c139bf880145db0ebe3cf01cb5782267e8ba5081fb05b76f6ad353a" [3mnumber[0m[2m=[0m15
+[2m2025-12-03T16:51:03.676347Z[0m [32m INFO[0m [1mexecute-consensus[0m[1m{[0m[3mepoch[0m[2m=[0m0 [3mconsensus_hash[0m[2m=[0m"0x644f2883cf4184a20e1461a85bde9f777c5f632d18fb3cc02f1f011b3c098bbb" [3mparent_number[0m[2m=[0m14 [3mparent_hash[0m[2m=[0m"0xd7e1334fd8a679a0df72b934c049230669275cbc2aafa9beafad9bb73da5f424" [3mbatches[0m[2m=[0m0 [3mexecuted_blocks[0m[2m=[0m"1" [3mexecuted_blocks[0m[2m=[0m"1"[1m}[0m[2m:[0m canonical head for epoch 0 round 30: 15 - 0x64b4859f1c139bf880145db0ebe3cf01cb5782267e8ba5081fb05b76f6ad353a
+[2m2025-12-03T16:51:03.700008Z[0m [32m INFO[0m [1mexecute-consensus[0m[1m{[0m[3mepoch[0m[2m=[0m0 [3mconsensus_hash[0m[2m=[0m"0xc7cf143947317f279c526baa2ef3631a0a5973c256b665417370d2fc6f25d01a" [3mparent_number[0m[2m=[0m15 [3mparent_hash[0m[2m=[0m"0x64b4859f1c139bf880145db0ebe3cf01cb5782267e8ba5081fb05b76f6ad353a" [3mbatches[0m[2m=[0m0[1m}[0m[2m:[0m next block executed [3mhash[0m[2m=[0m"0x2ff87020b21cd6656b3225407d5ca48b17547de8659112e6b2f0024d246e99c0" [3mnumber[0m[2m=[0m16
+[2m2025-12-03T16:51:03.752939Z[0m [32m INFO[0m [1mexecute-consensus[0m[1m{[0m[3mepoch[0m[2m=[0m0 [3mconsensus_hash[0m[2m=[0m"0xc7cf143947317f279c526baa2ef3631a0a5973c256b665417370d2fc6f25d01a" [3mparent_number[0m[2m=[0m15 [3mparent_hash[0m[2m=[0m"0x64b4859f1c139bf880145db0ebe3cf01cb5782267e8ba5081fb05b76f6ad353a" [3mbatches[0m[2m=[0m0 [3mexecuted_blocks[0m[2m=[0m"1" [3mexecuted_blocks[0m[2m=[0m"1"[1m}[0m[2m:[0m canonical head for epoch 0 round 34: 16 - 0x2ff87020b21cd6656b3225407d5ca48b17547de8659112e6b2f0024d246e99c0
+[2m2025-12-03T16:51:03.769671Z[0m [32m INFO[0m [1mexecute-consensus[0m[1m{[0m[3mepoch[0m[2m=[0m0 [3mconsensus_hash[0m[2m=[0m"0xdbe05aeee1f2a48e06f5461fdff05ea73c5ee746b1a6624da5d08a993e297f7a" [3mparent_number[0m[2m=[0m16 [3mparent_hash[0m[2m=[0m"0x2ff87020b21cd6656b3225407d5ca48b17547de8659112e6b2f0024d246e99c0" [3mbatches[0m[2m=[0m0[1m}[0m[2m:[0m next block executed [3mhash[0m[2m=[0m"0xf79c695eb54675592f948be4d829bb3d03da9713f01a8c758a7e0a14bf07909c" [3mnumber[0m[2m=[0m17
+[2m2025-12-03T16:51:03.823388Z[0m [32m INFO[0m [1mexecute-consensus[0m[1m{[0m[3mepoch[0m[2m=[0m0 [3mconsensus_hash[0m[2m=[0m"0xdbe05aeee1f2a48e06f5461fdff05ea73c5ee746b1a6624da5d08a993e297f7a" [3mparent_number[0m[2m=[0m16 [3mparent_hash[0m[2m=[0m"0x2ff87020b21cd6656b3225407d5ca48b17547de8659112e6b2f0024d246e99c0" [3mbatches[0m[2m=[0m0 [3mexecuted_blocks[0m[2m=[0m"1" [3mexecuted_blocks[0m[2m=[0m"1"[1m}[0m[2m:[0m canonical head for epoch 0 round 36: 17 - 0xf79c695eb54675592f948be4d829bb3d03da9713f01a8c758a7e0a14bf07909c
+[2m2025-12-03T16:51:03.837844Z[0m [32m INFO[0m [1mexecute-consensus[0m[1m{[0m[3mepoch[0m[2m=[0m0 [3mconsensus_hash[0m[2m=[0m"0x20f58d695690be8d80f923a68723e08072b31e69b80f1ab8f296d78044ce082a" [3mparent_number[0m[2m=[0m17 [3mparent_hash[0m[2m=[0m"0xf79c695eb54675592f948be4d829bb3d03da9713f01a8c758a7e0a14bf07909c" [3mbatches[0m[2m=[0m0[1m}[0m[2m:[0m next block executed [3mhash[0m[2m=[0m"0x40eccfaeac7fe7a70438ba060563063e3b38fcf567095f51268679367ced7033" [3mnumber[0m[2m=[0m18
+[2m2025-12-03T16:51:03.889148Z[0m [32m INFO[0m [1mexecute-consensus[0m[1m{[0m[3mepoch[0m[2m=[0m0 [3mconsensus_hash[0m[2m=[0m"0x20f58d695690be8d80f923a68723e08072b31e69b80f1ab8f296d78044ce082a" [3mparent_number[0m[2m=[0m17 [3mparent_hash[0m[2m=[0m"0xf79c695eb54675592f948be4d829bb3d03da9713f01a8c758a7e0a14bf07909c" [3mbatches[0m[2m=[0m0 [3mexecuted_blocks[0m[2m=[0m"1" [3mexecuted_blocks[0m[2m=[0m"1"[1m}[0m[2m:[0m canonical head for epoch 0 round 38: 18 - 0x40eccfaeac7fe7a70438ba060563063e3b38fcf567095f51268679367ced7033
+[2m2025-12-03T16:51:03.907798Z[0m [32m INFO[0m [1mexecute-consensus[0m[1m{[0m[3mepoch[0m[2m=[0m0 [3mconsensus_hash[0m[2m=[0m"0x53aeafb62f06136765ad195bd3690c77835c175da9f71356c475175f6b23c695" [3mparent_number[0m[2m=[0m18 [3mparent_hash[0m[2m=[0m"0x40eccfaeac7fe7a70438ba060563063e3b38fcf567095f51268679367ced7033" [3mbatches[0m[2m=[0m0[1m}[0m[2m:[0m next block executed [3mhash[0m[2m=[0m"0x53dd59a1c60bb95b258ada144f49c24b31e5df84f936770198085da2ab6d03fd" [3mnumber[0m[2m=[0m19
+[2m2025-12-03T16:51:03.957998Z[0m [32m INFO[0m [1mexecute-consensus[0m[1m{[0m[3mepoch[0m[2m=[0m0 [3mconsensus_hash[0m[2m=[0m"0x53aeafb62f06136765ad195bd3690c77835c175da9f71356c475175f6b23c695" [3mparent_number[0m[2m=[0m18 [3mparent_hash[0m[2m=[0m"0x40eccfaeac7fe7a70438ba060563063e3b38fcf567095f51268679367ced7033" [3mbatches[0m[2m=[0m0 [3mexecuted_blocks[0m[2m=[0m"1" [3mexecuted_blocks[0m[2m=[0m"1"[1m}[0m[2m:[0m canonical head for epoch 0 round 42: 19 - 0x53dd59a1c60bb95b258ada144f49c24b31e5df84f936770198085da2ab6d03fd
+[2m2025-12-03T16:51:03.973022Z[0m [32m INFO[0m [1mexecute-consensus[0m[1m{[0m[3mepoch[0m[2m=[0m0 [3mconsensus_hash[0m[2m=[0m"0x2dc8733ae7970daecff762fc9c174ff4ec22834d725d0eafa01ce8ce3948a8bc" [3mparent_number[0m[2m=[0m19 [3mparent_hash[0m[2m=[0m"0x53dd59a1c60bb95b258ada144f49c24b31e5df84f936770198085da2ab6d03fd" [3mbatches[0m[2m=[0m0[1m}[0m[2m:[0m next block executed [3mhash[0m[2m=[0m"0xfe2fe10e88466820655363f7187a88db670c35a0764fac43d4aa3be2d61e7964" [3mnumber[0m[2m=[0m20
+[2m2025-12-03T16:51:04.027097Z[0m [32m INFO[0m [1mexecute-consensus[0m[1m{[0m[3mepoch[0m[2m=[0m0 [3mconsensus_hash[0m[2m=[0m"0x2dc8733ae7970daecff762fc9c174ff4ec22834d725d0eafa01ce8ce3948a8bc" [3mparent_number[0m[2m=[0m19 [3mparent_hash[0m[2m=[0m"0x53dd59a1c60bb95b258ada144f49c24b31e5df84f936770198085da2ab6d03fd" [3mbatches[0m[2m=[0m0 [3mexecuted_blocks[0m[2m=[0m"1" [3mexecuted_blocks[0m[2m=[0m"1"[1m}[0m[2m:[0m canonical head for epoch 0 round 44: 20 - 0xfe2fe10e88466820655363f7187a88db670c35a0764fac43d4aa3be2d61e7964
+[2m2025-12-03T16:51:04.036529Z[0m [32m INFO[0m [1mexecute-consensus[0m[1m{[0m[3mepoch[0m[2m=[0m0 [3mconsensus_hash[0m[2m=[0m"0x8c5c33917a184f4da6ab69afafd0bd1336878e8ce4d895cf23470cb46ca1c671" [3mparent_number[0m[2m=[0m20 [3mparent_hash[0m[2m=[0m"0xfe2fe10e88466820655363f7187a88db670c35a0764fac43d4aa3be2d61e7964" [3mbatches[0m[2m=[0m0[1m}[0m[2m:[0m next block executed [3mhash[0m[2m=[0m"0x6da54f8aecf06ec0d7d1e2e375de73299377fbe4eab4072f1449b208a84d8a50" [3mnumber[0m[2m=[0m21
+[2m2025-12-03T16:51:04.084663Z[0m [32m INFO[0m [1mexecute-consensus[0m[1m{[0m[3mepoch[0m[2m=[0m0 [3mconsensus_hash[0m[2m=[0m"0x8c5c33917a184f4da6ab69afafd0bd1336878e8ce4d895cf23470cb46ca1c671" [3mparent_number[0m[2m=[0m20 [3mparent_hash[0m[2m=[0m"0xfe2fe10e88466820655363f7187a88db670c35a0764fac43d4aa3be2d61e7964" [3mbatches[0m[2m=[0m0 [3mexecuted_blocks[0m[2m=[0m"1" [3mexecuted_blocks[0m[2m=[0m"1"[1m}[0m[2m:[0m canonical head for epoch 0 round 46: 21 - 0x6da54f8aecf06ec0d7d1e2e375de73299377fbe4eab4072f1449b208a84d8a50
+[2m2025-12-03T16:51:04.095209Z[0m [32m INFO[0m [1mexecute-consensus[0m[1m{[0m[3mepoch[0m[2m=[0m0 [3mconsensus_hash[0m[2m=[0m"0xe006605d8067437c8a7c4df81f27a74c39b056e32707a000dec128053f14d15d" [3mparent_number[0m[2m=[0m21 [3mparent_hash[0m[2m=[0m"0x6da54f8aecf06ec0d7d1e2e375de73299377fbe4eab4072f1449b208a84d8a50" [3mbatches[0m[2m=[0m0[1m}[0m[2m:[0m next block executed [3mhash[0m[2m=[0m"0x7b2edc024acfed47f56866389b4ff0b1adc6b5338051cd7a18ab96276a79e76b" [3mnumber[0m[2m=[0m22
+[2m2025-12-03T16:51:04.142913Z[0m [32m INFO[0m [1mexecute-consensus[0m[1m{[0m[3mepoch[0m[2m=[0m0 [3mconsensus_hash[0m[2m=[0m"0xe006605d8067437c8a7c4df81f27a74c39b056e32707a000dec128053f14d15d" [3mparent_number[0m[2m=[0m21 [3mparent_hash[0m[2m=[0m"0x6da54f8aecf06ec0d7d1e2e375de73299377fbe4eab4072f1449b208a84d8a50" [3mbatches[0m[2m=[0m0 [3mexecuted_blocks[0m[2m=[0m"1" [3mexecuted_blocks[0m[2m=[0m"1"[1m}[0m[2m:[0m canonical head for epoch 0 round 50: 22 - 0x7b2edc024acfed47f56866389b4ff0b1adc6b5338051cd7a18ab96276a79e76b
+[2m2025-12-03T16:51:04.143671Z[0m [32m INFO[0m attempting to rejoin consensus, consensus block height 24
+[2m2025-12-03T16:51:04.143759Z[0m [32m INFO[0m Certifier on node 5L2c7YsF8FkVDjVUDKzEiARLQKwhjshdrDbVPkhNEmzG has shutdown.
+[2m2025-12-03T16:51:04.143807Z[0m [32m INFO[0m Epoch Task Manager: exiting, received shutdown notification
+[2m2025-12-03T16:51:04.143829Z[0m [32m INFO[0m received shutdown from consensus to stop updating consensus bus recent blocks
+[2m2025-12-03T16:51:04.143912Z[0m [32m INFO[0m Epoch Task Manager: subscriber catch up and rejoin consensus shutdown successfully
+[2m2025-12-03T16:51:04.143941Z[0m [32m INFO[0m Epoch Task Manager: epoch-consensus-worker-0 shutdown successfully
+[2m2025-12-03T16:51:04.143960Z[0m [32m INFO[0m Epoch Task Manager: epoch-consensus-worker-3 shutdown successfully
+[2m2025-12-03T16:51:04.143978Z[0m [32m INFO[0m Epoch Task Manager: epoch-consensus-worker-1 shutdown successfully
+[2m2025-12-03T16:51:04.143999Z[0m [32m INFO[0m Epoch Task Manager: epoch-consensus-worker-2 shutdown successfully
+[2m2025-12-03T16:51:04.144020Z[0m [32m INFO[0m Epoch Task Manager: VoteRequest-EXhJGkoaRPL7kfFh shutdown successfully
+[2m2025-12-03T16:51:04.144061Z[0m [32m INFO[0m Epoch Task Manager: state sync: stream consensus headers shutdown successfully
+[2m2025-12-03T16:51:04.144084Z[0m [32m INFO[0m Epoch Task Manager: state handler task shutdown successfully
+[2m2025-12-03T16:51:04.144107Z[0m [32m INFO[0m Epoch Task Manager: certificate fetcher task shutdown successfully
+[2m2025-12-03T16:51:04.144128Z[0m [32m INFO[0m Epoch Task Manager: certifier task shutdown successfully
+[2m2025-12-03T16:51:04.144147Z[0m [32m INFO[0m Epoch Task Manager: certificate-manager shutdown successfully
+[2m2025-12-03T16:51:04.144167Z[0m [32m INFO[0m Epoch Task Manager: state sync: track latest consensus header from peers shutdown successfully
+[2m2025-12-03T16:51:04.144198Z[0m [32m INFO[0m Epoch Task Manager: latest execution block shutdown successfully
+[2m2025-12-03T16:51:04.144219Z[0m [32m INFO[0m Epoch Task Manager: VoteRequest-87vwVD1zcdygrArG shutdown successfully
+[2m2025-12-03T16:51:04.144241Z[0m [32m INFO[0m Epoch Task Manager: VoteRequest-92YazdTVKmSoZezH shutdown successfully
+[2m2025-12-03T16:51:04.144267Z[0m [32m INFO[0m Epoch Task Manager: VoteRequest-FP6fZU7rYNoveoNU shutdown successfully
+[2m2025-12-03T16:51:04.144287Z[0m [32m INFO[0m Epoch Task Manager: VoteRequest-7xqB7koHDdt2zhYx shutdown successfully
+[2m2025-12-03T16:51:04.153536Z[0m [32m INFO[0m [1mexecute-consensus[0m[1m{[0m[3mepoch[0m[2m=[0m0 [3mconsensus_hash[0m[2m=[0m"0x50ea6be89dd74491870430c22e930697901b08abddb5d449bbf56725c464912a" [3mparent_number[0m[2m=[0m22 [3mparent_hash[0m[2m=[0m"0x7b2edc024acfed47f56866389b4ff0b1adc6b5338051cd7a18ab96276a79e76b" [3mbatches[0m[2m=[0m0[1m}[0m[2m:[0m next block executed [3mhash[0m[2m=[0m"0x375d3b9005c4ddaf8563d473566a75161ec51f4748d074fcb7e97b3ea787adc4" [3mnumber[0m[2m=[0m23
+[2m2025-12-03T16:51:04.199731Z[0m [32m INFO[0m [1mexecute-consensus[0m[1m{[0m[3mepoch[0m[2m=[0m0 [3mconsensus_hash[0m[2m=[0m"0x50ea6be89dd74491870430c22e930697901b08abddb5d449bbf56725c464912a" [3mparent_number[0m[2m=[0m22 [3mparent_hash[0m[2m=[0m"0x7b2edc024acfed47f56866389b4ff0b1adc6b5338051cd7a18ab96276a79e76b" [3mbatches[0m[2m=[0m0 [3mexecuted_blocks[0m[2m=[0m"1" [3mexecuted_blocks[0m[2m=[0m"1"[1m}[0m[2m:[0m canonical head for epoch 0 round 52: 23 - 0x375d3b9005c4ddaf8563d473566a75161ec51f4748d074fcb7e97b3ea787adc4
+[2m2025-12-03T16:51:04.211523Z[0m [32m INFO[0m [1mexecute-consensus[0m[1m{[0m[3mepoch[0m[2m=[0m0 [3mconsensus_hash[0m[2m=[0m"0x71fa4867d3d0cd98b86379adfb1c5d0503bfd958e7849fc573bfacfae2623564" [3mparent_number[0m[2m=[0m23 [3mparent_hash[0m[2m=[0m"0x375d3b9005c4ddaf8563d473566a75161ec51f4748d074fcb7e97b3ea787adc4" [3mbatches[0m[2m=[0m0[1m}[0m[2m:[0m next block executed [3mhash[0m[2m=[0m"0x76518480e782fcd4560cad9c3f1c84703e3701442cc78d1b699ec31d58da27c4" [3mnumber[0m[2m=[0m24
+[2m2025-12-03T16:51:04.259814Z[0m [32m INFO[0m [1mexecute-consensus[0m[1m{[0m[3mepoch[0m[2m=[0m0 [3mconsensus_hash[0m[2m=[0m"0x71fa4867d3d0cd98b86379adfb1c5d0503bfd958e7849fc573bfacfae2623564" [3mparent_number[0m[2m=[0m23 [3mparent_hash[0m[2m=[0m"0x375d3b9005c4ddaf8563d473566a75161ec51f4748d074fcb7e97b3ea787adc4" [3mbatches[0m[2m=[0m0 [3mexecuted_blocks[0m[2m=[0m"1" [3mexecuted_blocks[0m[2m=[0m"1"[1m}[0m[2m:[0m canonical head for epoch 0 round 54: 24 - 0x76518480e782fcd4560cad9c3f1c84703e3701442cc78d1b699ec31d58da27c4
+[2m2025-12-03T16:51:04.344183Z[0m [31mERROR[0m Epoch Task Manager: All tasks NOT shutdown
+[2m2025-12-03T16:51:04.344373Z[0m [32m INFO[0m Epoch Task Manager: All tasks managers shutdown
+[2m2025-12-03T16:51:04.344481Z[0m [32m INFO[0m epoch task manager exited - likely syncing with committee
+[2m2025-12-03T16:51:04.345549Z[0m [32m INFO[0m looping run epoch
+[2m2025-12-03T16:51:04.345616Z[0m [32m INFO[0m Starting epoch
+[2m2025-12-03T16:51:04.354698Z[0m [32m INFO[0m creating committee from state
+[2m2025-12-03T16:51:04.354749Z[0m [32m INFO[0m Loading configuration [3mpath[0m[2m=[0m"/var/folders/nj/h1qvq72s7kj5lzt9skgtys7r0000gn/T/.tmpAmFHBG/validator-3/genesis/committee.yaml"
+[2m2025-12-03T16:51:04.370631Z[0m [32m INFO[0m network update for next committee - ensuring no committee members are banned [3mthis_node[0m[2m=[0mPeerId("12D3KooWEapsGcccRiH4TbbNL5Z3C4yCLUL9FGyndH7Cw91nufDC")
+[2m2025-12-03T16:51:04.370734Z[0m [32m INFO[0m adding committee member tuACYrAXriSjfaGkBu9TnjK969sxwErP8mvv6ETpbmnfjJQf2JLMhFtM2dKZU63BCVM1BGrypNP9uaeLtiTa2R8Qf9pGWcNVC6ddX2HvyXfx2tEq2TfaaJRgihUH5myNHqa/12D3KooWGy4QMF1BoyY123rV8cDaYG6ps3saBc3uZFREbCPVJnPW
+[2m2025-12-03T16:51:04.371061Z[0m [32m INFO[0m adding committee member zyyqiaibVtni6xpo4WwDpxtLjL6wgov6psJGCiJB17QJxkxuXHJwyihNDm8fAezop1aRcPfVVaBRGaQogE8fDgqiHnEXJgrmw7UzoJHHM14F4KLtGUsGXr7GHTeeb6T91jb/12D3KooWJXcAMr4v7XSLoK8FfAwzma53eDaWmJYQ83gXPLSSmpQG
+[2m2025-12-03T16:51:04.371391Z[0m [32m INFO[0m adding committee member oKdtcTz6bxsuAsPfTpmHSVcvamJtsHvKHjuAQBppgn7aNjzb92RpRozE97jQHhYYbVLANSo41GEDCUvyJUZPHEufoqhMsyQwy5nibT1eX4ZaMoub5SKqh8F9pK18TDEfKuX/12D3KooWEapsGcccRiH4TbbNL5Z3C4yCLUL9FGyndH7Cw91nufDC
+[2m2025-12-03T16:51:04.371708Z[0m [32m INFO[0m adding committee member 24iQkpopNyvH2NrF82P8pW6fABxCm7c9ukZpdPMnS89EKpETFh8toTkK7mBBj1roeKWXz5FQdZZ4C4eS21MjqPYZ2xWZFYAXYSrqP4ck3kSm6fL4TuPasEenNqp2nht4wfT4/12D3KooWFo3FGdZwxPAmHxL7shD7RMMwUcv4gcjJsF9cwKHQFfGY
+[2m2025-12-03T16:51:04.373074Z[0m [32m INFO[0m Header number of batches threshold set to 5
+[2m2025-12-03T16:51:04.373097Z[0m [32m INFO[0m Header max number of batches set to 10
+[2m2025-12-03T16:51:04.373116Z[0m [32m INFO[0m Max header delay set to 1000 ms
+[2m2025-12-03T16:51:04.373140Z[0m [32m INFO[0m Min header delay set to 500 ms
+[2m2025-12-03T16:51:04.373166Z[0m [32m INFO[0m Garbage collection depth set to 50 rounds
+[2m2025-12-03T16:51:04.373188Z[0m [32m INFO[0m Sync retry delay set to 5000 ms
+[2m2025-12-03T16:51:04.373212Z[0m [32m INFO[0m Sync retry nodes set to 3 nodes
+[2m2025-12-03T16:51:04.373235Z[0m [32m INFO[0m Max batch delay set to 1000 ms
+[2m2025-12-03T16:51:04.373257Z[0m [32m INFO[0m Max concurrent requests set to 500000
+[2m2025-12-03T16:51:04.373398Z[0m [32m INFO[0m Boot primary node with public key Some("oKdtcTz6bxsuAsPfTpmHSVcvamJtsHvKHjuAQBppgn7aNjzb92RpRozE97jQHhYYbVLANSo41GEDCUvyJUZPHEufoqhMsyQwy5nibT1eX4ZaMoub5SKqh8F9pK18TDEfKuX")
+[2m2025-12-03T16:51:04.373829Z[0m [32m INFO[0m network update for next committee - ensuring no committee members are banned [3mthis_node[0m[2m=[0mPeerId("12D3KooWRtDAaH8J26EVT7zUtrVcyrmuARRy1QbQX6EJSSAAZZfz")
+[2m2025-12-03T16:51:04.373919Z[0m [32m INFO[0m adding committee member 24iQkpopNyvH2NrF82P8pW6fABxCm7c9ukZpdPMnS89EKpETFh8toTkK7mBBj1roeKWXz5FQdZZ4C4eS21MjqPYZ2xWZFYAXYSrqP4ck3kSm6fL4TuPasEenNqp2nht4wfT4/12D3KooWMcPW3FQatxeCxP4u8cpEdhc51uVQfYbqzhXfTcggaZB9
+[2m2025-12-03T16:51:04.374246Z[0m [32m INFO[0m adding committee member zyyqiaibVtni6xpo4WwDpxtLjL6wgov6psJGCiJB17QJxkxuXHJwyihNDm8fAezop1aRcPfVVaBRGaQogE8fDgqiHnEXJgrmw7UzoJHHM14F4KLtGUsGXr7GHTeeb6T91jb/12D3KooWED9vK5JxUfP9Cw7UeSxpQAebNbwxTCmjMKEcQrQmnRbW
+[2m2025-12-03T16:51:04.374526Z[0m [32m INFO[0m adding committee member tuACYrAXriSjfaGkBu9TnjK969sxwErP8mvv6ETpbmnfjJQf2JLMhFtM2dKZU63BCVM1BGrypNP9uaeLtiTa2R8Qf9pGWcNVC6ddX2HvyXfx2tEq2TfaaJRgihUH5myNHqa/12D3KooWNu14NapHAVFG9mKkueXmZwzZP1MjhmvM9Cc2r6p4BhJo
+[2m2025-12-03T16:51:04.374802Z[0m [32m INFO[0m adding committee member oKdtcTz6bxsuAsPfTpmHSVcvamJtsHvKHjuAQBppgn7aNjzb92RpRozE97jQHhYYbVLANSo41GEDCUvyJUZPHEufoqhMsyQwy5nibT1eX4ZaMoub5SKqh8F9pK18TDEfKuX/12D3KooWRtDAaH8J26EVT7zUtrVcyrmuARRy1QbQX6EJSSAAZZfz
+[2m2025-12-03T16:51:04.380493Z[0m [32m INFO[0m Boot worker node with id 0 key oKdtcTz6bxsuAsPfTpmHSVcvamJtsHvKHjuAQBppgn7aNjzb92RpRozE97jQHhYYbVLANSo41GEDCUvyJUZPHEufoqhMsyQwy5nibT1eX4ZaMoub5SKqh8F9pK18TDEfKuX
+[2m2025-12-03T16:51:04.380725Z[0m [32m INFO[0m Starting handler for transactions
+[2m2025-12-03T16:51:04.380746Z[0m [32m INFO[0m Worker 0 successfully booted on /ip4/127.0.0.1/udp/63647/quic-v1/p2p/12D3KooWRtDAaH8J26EVT7zUtrVcyrmuARRy1QbQX6EJSSAAZZfz
+[2m2025-12-03T16:51:04.395675Z[0m [32m INFO[0m [1mconstruct_dag_from_cert_store[0m[2m:[0m Recreating dag from last GC round: 4
+[2m2025-12-03T16:51:04.403813Z[0m [32m INFO[0m [1mconstruct_dag_from_cert_store[0m[2m:[0m Inserted certificate: EZAjQCCDSjc2hSXG: C54(bpD912cjYX8DSZXuLJB3AFM3JgoVz7LTj9MZXAbtJCJ, EZAjQCCDSjc2hSXG, E0)
+[2m2025-12-03T16:51:04.403922Z[0m [32m INFO[0m [1mconstruct_dag_from_cert_store[0m[2m:[0m Inserted certificate: 6v15Db7zf8KPQrfd: C54(2QzsKb88N9WgZMTDzB4R4wNRE1zCy7kNk2Y331fy3mFi, 6v15Db7zf8KPQrfd, E0)
+[2m2025-12-03T16:51:04.404032Z[0m [32m INFO[0m [1mconstruct_dag_from_cert_store[0m[2m:[0m Inserted certificate: 29MmPgFk95pyVPdo: C55(bpD912cjYX8DSZXuLJB3AFM3JgoVz7LTj9MZXAbtJCJ, 29MmPgFk95pyVPdo, E0)
+[2m2025-12-03T16:51:04.404126Z[0m [32m INFO[0m [1mconstruct_dag_from_cert_store[0m[2m:[0m Inserted certificate: A91qYs1sdT1PgNqv: C55(2QzsKb88N9WgZMTDzB4R4wNRE1zCy7kNk2Y331fy3mFi, A91qYs1sdT1PgNqv, E0)
+[2m2025-12-03T16:51:04.404231Z[0m [32m INFO[0m [1mconstruct_dag_from_cert_store[0m[2m:[0m Inserted certificate: 6B298oBjJTHDusXo: C55(3ZFkLuYyEoj93HnJYynj7XgfBAKYao8bDU2B3V5HuhJe, 6B298oBjJTHDusXo, E0)
+[2m2025-12-03T16:51:04.404331Z[0m [32m INFO[0m [1mconstruct_dag_from_cert_store[0m[2m:[0m Inserted certificate: B1QU8BZqZQrfSp9b: C56(bpD912cjYX8DSZXuLJB3AFM3JgoVz7LTj9MZXAbtJCJ, B1QU8BZqZQrfSp9b, E0)
+[2m2025-12-03T16:51:04.404427Z[0m [32m INFO[0m [1mconstruct_dag_from_cert_store[0m[2m:[0m Inserted certificate: HeTDL9U5s2cPG3ej: C56(2QzsKb88N9WgZMTDzB4R4wNRE1zCy7kNk2Y331fy3mFi, HeTDL9U5s2cPG3ej, E0)
+[2m2025-12-03T16:51:04.404523Z[0m [32m INFO[0m [1mconstruct_dag_from_cert_store[0m[2m:[0m Inserted certificate: EZ93GPsjeCDWMumG: C56(3ZFkLuYyEoj93HnJYynj7XgfBAKYao8bDU2B3V5HuhJe, EZ93GPsjeCDWMumG, E0)
+[2m2025-12-03T16:51:04.404609Z[0m [32m INFO[0m [1mconstruct_dag_from_cert_store[0m[2m:[0m Dag is restored and contains 8 certs for 52 rounds
+[2m2025-12-03T16:51:04.404766Z[0m [32m INFO[0m Consensus subscriber successfully started
+[2m2025-12-03T16:51:04.404811Z[0m [32m INFO[0m Starting subscriber: CVV
+[2m2025-12-03T16:51:04.404885Z[0m [32m INFO[0m Primary Some(5L2c7YsF8FkVDjVUDKzEiARLQKwhjshdrDbVPkhNEmzG) successfully booted on /ip4/127.0.0.1/udp/61091/quic-v1/p2p/12D3KooWEapsGcccRiH4TbbNL5Z3C4yCLUL9FGyndH7Cw91nufDC
+[2m2025-12-03T16:51:04.404937Z[0m [32m INFO[0m Starting proposer
+[2m2025-12-03T16:51:04.404984Z[0m [32m INFO[0m StateHandler on node 5L2c7YsF8FkVDjVUDKzEiARLQKwhjshdrDbVPkhNEmzG has started successfully.
+[2m2025-12-03T16:51:04.405225Z[0m [32m INFO[0m No batches leftover
+[2m2025-12-03T16:51:04.405257Z[0m [32m INFO[0m EPOCH TASKS
+ [3mtasks[0m[2m=[0mEpoch Task Manager
+Task: batch builder (critical)
+Task: worker network events (critical)
+Task: sync header batches (not critical)
+Task: VoteRequest-EZ93GPsjeCDWMumG (not critical)
+Task: DialPeer 24iQkpopNyvH2NrF82P8pW6fABxCm7c9ukZpdPMnS89EKpETFh8toTkK7mBBj1roeKWXz5FQdZZ4C4eS21MjqPYZ2xWZFYAXYSrqP4ck3kSm6fL4TuPasEenNqp2nht4wfT4 (not critical)
+Task: DialPeer zyyqiaibVtni6xpo4WwDpxtLjL6wgov6psJGCiJB17QJxkxuXHJwyihNDm8fAezop1aRcPfVVaBRGaQogE8fDgqiHnEXJgrmw7UzoJHHM14F4KLtGUsGXr7GHTeeb6T91jb (not critical)
+Task: DialPeer tuACYrAXriSjfaGkBu9TnjK969sxwErP8mvv6ETpbmnfjJQf2JLMhFtM2dKZU63BCVM1BGrypNP9uaeLtiTa2R8Qf9pGWcNVC6ddX2HvyXfx2tEq2TfaaJRgihUH5myNHqa (not critical)
+Task: ProcessGossip-tn-primary-24iQkpopNyvH2NrF82P8pW6fABxCm7c9ukZpdPMnS89EKpETFh8toTkK7mBBj1roeKWXz5FQdZZ4C4eS21MjqPYZ2xWZFYAXYSrqP4ck3kSm6fL4TuPasEenNqp2nht4wfT4 (not critical)
+Task: VoteRequest-B1QU8BZqZQrfSp9b (not critical)
+Task: VoteRequest-6wj2PWYzxMZw5usa (not critical)
+Task: Worker Network Peers (not critical)
+Task: primary network events (critical)
+Task: DialPeer 24iQkpopNyvH2NrF82P8pW6fABxCm7c9ukZpdPMnS89EKpETFh8toTkK7mBBj1roeKWXz5FQdZZ4C4eS21MjqPYZ2xWZFYAXYSrqP4ck3kSm6fL4TuPasEenNqp2nht4wfT4 (not critical)
+Task: DialPeer zyyqiaibVtni6xpo4WwDpxtLjL6wgov6psJGCiJB17QJxkxuXHJwyihNDm8fAezop1aRcPfVVaBRGaQogE8fDgqiHnEXJgrmw7UzoJHHM14F4KLtGUsGXr7GHTeeb6T91jb (not critical)
+Task: DialPeer tuACYrAXriSjfaGkBu9TnjK969sxwErP8mvv6ETpbmnfjJQf2JLMhFtM2dKZU63BCVM1BGrypNP9uaeLtiTa2R8Qf9pGWcNVC6ddX2HvyXfx2tEq2TfaaJRgihUH5myNHqa (not critical)
+Task: Worker Task - 0 batch-builder (critical)
+Task: state handler task (critical)
+Task: proposer task (critical)
+Task: certificate fetcher task (critical)
+Task: certifier task (critical)
+Task: certificate-manager (critical)
+Task: subscriber consensus (critical)
+Task: consensus (critical)
+Task: latest execution block (critical)
+
+[2m2025-12-03T16:51:04.405350Z[0m [32m INFO[0m Certifier on node 5L2c7YsF8FkVDjVUDKzEiARLQKwhjshdrDbVPkhNEmzG has started successfully.
+[2m2025-12-03T16:51:04.405400Z[0m [32m INFO[0m Certifier on node 5L2c7YsF8FkVDjVUDKzEiARLQKwhjshdrDbVPkhNEmzG has started successfully.
+[2m2025-12-03T16:51:04.406731Z[0m [32m INFO[0m restoring last executed consensus for constucting the next ConsensusHeader: [3mlast_executed_block[0m[2m=[0mConsensusHeader { parent_hash: 0x50ea6be89dd74491870430c22e930697901b08abddb5d449bbf56725c464912a, sub_dag: CommittedSubDag { certificates: [87vwVD1zcdygrArG: C52(3ZFkLuYyEoj93HnJYynj7XgfBAKYao8bDU2B3V5HuhJe, 87vwVD1zcdygrArG, E0), 725SNWtEKrrcYJXQ: C52(bpD912cjYX8DSZXuLJB3AFM3JgoVz7LTj9MZXAbtJCJ, 725SNWtEKrrcYJXQ, E0), FP6fZU7rYNoveoNU: C53(2QzsKb88N9WgZMTDzB4R4wNRE1zCy7kNk2Y331fy3mFi, FP6fZU7rYNoveoNU, E0), 92YazdTVKmSoZezH: C53(bpD912cjYX8DSZXuLJB3AFM3JgoVz7LTj9MZXAbtJCJ, 92YazdTVKmSoZezH, E0), 7xqB7koHDdt2zhYx: C53(3ZFkLuYyEoj93HnJYynj7XgfBAKYao8bDU2B3V5HuhJe, 7xqB7koHDdt2zhYx, E0), EXhJGkoaRPL7kfFh: C54(3ZFkLuYyEoj93HnJYynj7XgfBAKYao8bDU2B3V5HuhJe, EXhJGkoaRPL7kfFh, E0)], leader: EXhJGkoaRPL7kfFh: C54(3ZFkLuYyEoj93HnJYynj7XgfBAKYao8bDU2B3V5HuhJe, EXhJGkoaRPL7kfFh, E0), reputation_score: ReputationScores { scores_per_authority: {5L2c7YsF8FkVDjVUDKzEiARLQKwhjshdrDbVPkhNEmzG: 8, 2QzsKb88N9WgZMTDzB4R4wNRE1zCy7kNk2Y331fy3mFi: 19, bpD912cjYX8DSZXuLJB3AFM3JgoVz7LTj9MZXAbtJCJ: 21, 3ZFkLuYyEoj93HnJYynj7XgfBAKYao8bDU2B3V5HuhJe: 21}, final_of_schedule: false }, commit_timestamp: 1764780662 }, number: 24, extra: 0x0000000000000000000000000000000000000000000000000000000000000000 }
+[2m2025-12-03T16:51:04.884264Z[0m [32m INFO[0m got new consensus 25/0xb8c327cf4ae0556afb4ea4b2a8d4b123dd7d62d70764bdec4c9bdd5d862986f4
+[2m2025-12-03T16:51:04.891703Z[0m [32m INFO[0m [1mexecute-consensus[0m[1m{[0m[3mepoch[0m[2m=[0m0 [3mconsensus_hash[0m[2m=[0m"0xb8c327cf4ae0556afb4ea4b2a8d4b123dd7d62d70764bdec4c9bdd5d862986f4" [3mparent_number[0m[2m=[0m24 [3mparent_hash[0m[2m=[0m"0x76518480e782fcd4560cad9c3f1c84703e3701442cc78d1b699ec31d58da27c4" [3mbatches[0m[2m=[0m1[1m}[0m[2m:[0m next block executed [3mhash[0m[2m=[0m"0x38761680b745fd1385eaea71b5c8a25f33aad03ec51a5927442bdaaeae7e1864" [3mnumber[0m[2m=[0m25
+[2m2025-12-03T16:51:04.955937Z[0m [32m INFO[0m Received SIGTERM
+[2m2025-12-03T16:51:04.958419Z[0m [32m INFO[0m Node Task Manager: Node exiting
+[2m2025-12-03T16:51:04.963493Z[0m [32m INFO[0m received shutdown signal...
+[2m2025-12-03T16:51:04.963561Z[0m [32m INFO[0m received shutdown from consensus to stop updating consensus bus recent blocks
+[2m2025-12-03T16:51:04.963623Z[0m [32m INFO[0m Epoch Task Manager: subscriber consensus returned Ok, exiting
+[2m2025-12-03T16:51:04.968578Z[0m [32m INFO[0m Epoch Task Manager: certifier task was cancelled
+[2m2025-12-03T16:51:04.973330Z[0m [32m INFO[0m Epoch Task Manager: proposer task was cancelled
+[2m2025-12-03T16:51:04.973371Z[0m [32m INFO[0m Epoch Task Manager: worker network events was cancelled
+[2m2025-12-03T16:51:04.978494Z[0m [32m INFO[0m Epoch Task Manager: state handler task was cancelled
+[2m2025-12-03T16:51:04.983317Z[0m [32m INFO[0m Epoch Task Manager: Worker Network Peers was cancelled
+[2m2025-12-03T16:51:04.988354Z[0m [32m INFO[0m Epoch Task Manager: certificate-manager was cancelled
+[2m2025-12-03T16:51:04.993312Z[0m [32m INFO[0m Epoch Task Manager: batch builder was cancelled
+[2m2025-12-03T16:51:04.993374Z[0m [32m INFO[0m Epoch Task Manager: primary network events was cancelled
+[2m2025-12-03T16:51:04.993641Z[0m [32m INFO[0m Epoch Task Manager: certificate fetcher task was cancelled
+[2m2025-12-03T16:51:04.993673Z[0m [32m INFO[0m Epoch Task Manager: consensus shutdown successfully
+[2m2025-12-03T16:51:04.993725Z[0m [32m INFO[0m Epoch Task Manager: latest execution block shutdown successfully
+[2m2025-12-03T16:51:04.993798Z[0m [32m INFO[0m Node Task Manager: Epoch Record Collector shutdown successfully
+[2m2025-12-03T16:51:04.993835Z[0m [32m INFO[0m Node Task Manager: Primary Network shutdown successfully
+[2m2025-12-03T16:51:04.998342Z[0m [32m INFO[0m Node Task Manager: Worker Network shutdown successfully
+[2m2025-12-03T16:51:04.998384Z[0m [32m INFO[0m Node Task Manager: All tasks shutdown
+[2m2025-12-03T16:51:04.998423Z[0m [32m INFO[0m Engine Task Manager: exiting, received shutdown notification
+[2m2025-12-03T16:51:04.998514Z[0m [32m INFO[0m Epoch Task Manager: Worker Task - 0 batch-builder was cancelled
+[2m2025-12-03T16:51:04.998549Z[0m [32m INFO[0m Epoch Task Manager: All tasks shutdown
+[2m2025-12-03T16:51:04.998572Z[0m [32m INFO[0m Epoch Task Manager: All tasks managers shutdown
+[2m2025-12-03T16:51:05.004134Z[0m [32m INFO[0m LayeredDatabase Dropping, shutting down DB thread
+[2m2025-12-03T16:51:05.007377Z[0m [32m INFO[0m Layerd DB thread Shutdown complete
+[2m2025-12-03T16:51:05.007482Z[0m [32m INFO[0m LayeredDatabase Dropped, DB thread is shutdown
+[2m2025-12-03T16:51:05.012216Z[0m [32m INFO[0m MemDatabase Dropping, shutting down metrics thread
+[2m2025-12-03T16:51:05.012253Z[0m [32m INFO[0m MDBX Dropping, shutting down metrics thread
+[2m2025-12-03T16:51:05.012264Z[0m [32m INFO[0m Ending MemDB metrics thread
+[2m2025-12-03T16:51:05.012303Z[0m [32m INFO[0m Ending MDBX metrics thread
+[2m2025-12-03T16:51:05.100544Z[0m [32m INFO[0m [1mexecute-consensus[0m[1m{[0m[3mepoch[0m[2m=[0m0 [3mconsensus_hash[0m[2m=[0m"0xb8c327cf4ae0556afb4ea4b2a8d4b123dd7d62d70764bdec4c9bdd5d862986f4" [3mparent_number[0m[2m=[0m24 [3mparent_hash[0m[2m=[0m"0x76518480e782fcd4560cad9c3f1c84703e3701442cc78d1b699ec31d58da27c4" [3mbatches[0m[2m=[0m1 [3mexecuted_blocks[0m[2m=[0m"1" [3mexecuted_blocks[0m[2m=[0m"1"[1m}[0m[2m:[0m canonical head for epoch 0 round 58: 25 - 0x38761680b745fd1385eaea71b5c8a25f33aad03ec51a5927442bdaaeae7e1864
+[2m2025-12-03T16:51:05.117071Z[0m [33m WARN[0m error sending result from execute_consensus_output [3me[0m[2m=[0mOk(SealedHeader { hash: OnceLock(0x38761680b745fd1385eaea71b5c8a25f33aad03ec51a5927442bdaaeae7e1864), header: Header { parent_hash: 0x76518480e782fcd4560cad9c3f1c84703e3701442cc78d1b699ec31d58da27c4, ommers_hash: 0x5693ef6270521f298ee359d27c720dda17a3e22d6bf6f69afee5c9a677b4d5dc, beneficiary: 0x1111111111111111111111111111111111111111, state_root: 0xf24cfabfc797ad4e496ed9e43444a86d54d062652b42330eea405572292a35ae, transactions_root: 0x50877e0c6ff6e28e5f7a92abfde4c4e655604ed2681054a66311ee458504fb91, receipts_root: 0x056b23fbba480696b65fe5a59b8f2148a1299103c4f57df839233af2cf4ca2d2, logs_bloom: 0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000, difficulty: 0, number: 25, gas_limit: 30000000, gas_used: 21000, timestamp: 1764780664, extra_data: 0x, mix_hash: 0xee50c8ad3ab24a4375adfd60d4a6bcf9cade80fa6c924b76b27e14fbf19d5328, nonce: 0x000000000000003a, base_fee_per_gas: Some(7), withdrawals_root: Some(0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421), blob_gas_used: Some(0), excess_blob_gas: Some(0), parent_beacon_block_root: Some(0xb8c327cf4ae0556afb4ea4b2a8d4b123dd7d62d70764bdec4c9bdd5d862986f4), requests_hash: Some(0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) } })
