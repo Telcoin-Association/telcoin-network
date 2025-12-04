@@ -1,5 +1,6 @@
 use std::{
     fmt::Debug,
+    future::Future,
     marker::PhantomData,
     sync::{
         mpsc::{self, Receiver, Sender},
@@ -11,21 +12,34 @@ use std::{
 
 use crate::mem_db::MemDatabase;
 use tn_types::{DBIter, Database, DbTx, DbTxMut, Table};
+use tokio::sync::oneshot::{self, error::TryRecvError};
 
-#[derive(Clone, Debug)]
-pub struct LayeredDbTx {
+#[derive(Clone)]
+pub struct LayeredDbTx<DB: Database> {
     mem_db: MemDatabase,
+    db: DB,
 }
 
-impl DbTx for LayeredDbTx {
+impl<DB: Database> Debug for LayeredDbTx<DB> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LayeredDbTx")
+    }
+}
+
+impl<DB: Database> DbTx for LayeredDbTx<DB> {
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
-        self.mem_db.get::<T>(key)
+        if let Some(val) = self.mem_db.get::<T>(key)? {
+            Ok(Some(val))
+        } else {
+            self.db.get::<T>(key)
+        }
     }
 }
 
 #[derive(Clone)]
 pub struct LayeredDbTxMut<DB: Database> {
     mem_db: MemDatabase,
+    db: DB,
     tx: Sender<DBMessage<DB>>,
 }
 
@@ -37,7 +51,11 @@ impl<DB: Database> Debug for LayeredDbTxMut<DB> {
 
 impl<DB: Database> DbTx for LayeredDbTxMut<DB> {
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
-        self.mem_db.get::<T>(key)
+        if let Some(val) = self.mem_db.get::<T>(key)? {
+            Ok(Some(val))
+        } else {
+            self.db.get::<T>(key)
+        }
     }
 }
 
@@ -71,9 +89,12 @@ impl<DB: Database> DbTxMut for LayeredDbTxMut<DB> {
 
 /// Run the thread to manage the persistant DB in the background.
 /// If DB needs compaction this thread will compact on startup and once a day after that.
-fn db_run<DB: Database>(db: DB, rx: Receiver<DBMessage<DB>>) {
+fn db_run<DB: Database>(db: DB, mem_db: MemDatabase, rx: Receiver<DBMessage<DB>>) {
     let mut txn = None;
     let mut last_compact = Instant::now();
+    //let mut last_memclear = Instant::now();
+    //let mut inserts = Vec::with_capacity(10_000);
+    let mut committed_inserts: Vec<Box<dyn InsertTrait<DB>>> = Vec::with_capacity(1000);
     if let Err(e) = db.compact() {
         tracing::error!(target: "layered_db_runner", "DB ERROR compacting DB on startup (background): {e}");
     }
@@ -97,6 +118,9 @@ fn db_run<DB: Database>(db: DB, rx: Receiver<DBMessage<DB>>) {
                         if let Err(e) = current_txn.commit() {
                             tracing::error!(target: "layered_db_runner", "DB TXN Commit: {e}")
                         }
+                        for insert in committed_inserts.drain(..) {
+                            insert.clear_insert_mem(&mem_db);
+                        }
                     } else {
                         txn = Some((current_txn, count - 1));
                     }
@@ -107,8 +131,12 @@ fn db_run<DB: Database>(db: DB, rx: Receiver<DBMessage<DB>>) {
                     if let Err(e) = ins.insert_txn(txn) {
                         tracing::error!(target: "layered_db_runner", "DB TXN Insert: {e}")
                     }
-                } else if let Err(e) = ins.insert(&db) {
-                    tracing::error!(target: "layered_db_runner", "DB Insert: {e}")
+                    committed_inserts.push(ins);
+                } else {
+                    if let Err(e) = ins.insert(&db) {
+                        tracing::error!(target: "layered_db_runner", "DB Insert: {e}");
+                    }
+                    ins.clear_insert_mem(&mem_db);
                 }
             }
             DBMessage::Remove(rm) => {
@@ -128,6 +156,9 @@ fn db_run<DB: Database>(db: DB, rx: Receiver<DBMessage<DB>>) {
                 } else if let Err(e) = clr.clear_table(&db) {
                     tracing::error!(target: "layered_db_runner", "DB Clear: {e}")
                 }
+            }
+            DBMessage::CaughtUp(tx) => {
+                let _ = tx.send(());
             }
             DBMessage::Shutdown => break,
         }
@@ -151,7 +182,7 @@ pub struct LayeredDatabase<DB: Database> {
     mem_db: MemDatabase,
     db: DB,
     tx: Sender<DBMessage<DB>>,
-    thread: Option<Arc<JoinHandle<()>>>, /* Use as a ref count for shuting down the background
+    thread: Option<Arc<JoinHandle<()>>>, /* Use as a ref count for shutting down the background
                                           * thread and it's handle. */
 }
 
@@ -181,22 +212,21 @@ impl<DB: Database> LayeredDatabase<DB> {
     pub fn open(db: DB) -> Self {
         let (tx, rx) = mpsc::channel();
         let db_cloned = db.clone();
-        let thread = Some(Arc::new(std::thread::spawn(move || db_run(db_cloned, rx))));
-        Self { mem_db: MemDatabase::new(), db, tx, thread }
+        let mem_db = MemDatabase::default();
+        let mem_db_clone = mem_db.clone();
+        let thread =
+            Some(Arc::new(std::thread::spawn(move || db_run(db_cloned, mem_db_clone, rx))));
+        Self { mem_db, db, tx, thread }
     }
 
     pub fn open_table<T: Table>(&self) {
         self.mem_db.open_table::<T>();
-        for (key, value) in self.db.iter::<T>() {
-            // mem db insert should not fail.
-            let _ = self.mem_db.insert::<T>(&key, &value);
-        }
     }
 }
 
 impl<DB: Database> Database for LayeredDatabase<DB> {
     type TX<'txn>
-        = LayeredDbTx
+        = LayeredDbTx<DB>
     where
         Self: 'txn;
 
@@ -206,7 +236,7 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
         Self: 'txn;
 
     fn read_txn(&self) -> eyre::Result<Self::TX<'_>> {
-        Ok(LayeredDbTx { mem_db: self.mem_db.clone() })
+        Ok(LayeredDbTx { mem_db: self.mem_db.clone(), db: self.db.clone() })
     }
 
     /// Note that write transactions for the layerd DB will be "overlapped" and committed when the
@@ -214,15 +244,19 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
     /// thread for persistance in the background so operations will return quickly.
     fn write_txn(&self) -> eyre::Result<Self::TXMut<'_>> {
         self.tx.send(DBMessage::StartTxn).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
-        Ok(LayeredDbTxMut { mem_db: self.mem_db.clone(), tx: self.tx.clone() })
+        Ok(LayeredDbTxMut { mem_db: self.mem_db.clone(), db: self.db.clone(), tx: self.tx.clone() })
     }
 
     fn contains_key<T: Table>(&self, key: &T::Key) -> eyre::Result<bool> {
-        self.mem_db.contains_key::<T>(key)
+        Ok(self.mem_db.contains_key::<T>(key)? || self.db.contains_key::<T>(key)?)
     }
 
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
-        self.mem_db.get::<T>(key)
+        if let Some(val) = self.mem_db.get::<T>(key)? {
+            Ok(Some(val))
+        } else {
+            self.db.get::<T>(key)
+        }
     }
 
     fn insert<T: Table>(&self, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
@@ -247,33 +281,73 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
     }
 
     fn is_empty<T: Table>(&self) -> bool {
-        self.mem_db.is_empty::<T>()
+        self.mem_db.is_empty::<T>() && self.db.is_empty::<T>()
     }
 
+    /// Layered db will return all inserted elements even if some are duplicates while writes occur.
     fn iter<T: Table>(&self) -> DBIter<'_, T> {
-        self.mem_db.iter::<T>()
+        Box::new(self.db.iter::<T>().chain(self.mem_db.iter::<T>()))
     }
 
     fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
-        self.mem_db.skip_to::<T>(key)
+        self.db.skip_to::<T>(key)
     }
 
     fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
-        self.mem_db.reverse_iter::<T>()
+        self.db.reverse_iter::<T>()
     }
 
     fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
-        self.mem_db.record_prior_to::<T>(key)
+        self.db.record_prior_to::<T>(key)
     }
 
     fn last_record<T: Table>(&self) -> Option<(T::Key, T::Value)> {
-        self.mem_db.last_record::<T>()
+        self.db.last_record::<T>()
+    }
+
+    fn persist(&self) -> impl Future<Output = ()> + Send {
+        let (tx, rx) = oneshot::channel();
+        let r = self
+            .tx
+            .send(DBMessage::CaughtUp(tx))
+            .map_err(|_| eyre::eyre!("DB thread gone, FATAL!"));
+        async move {
+            if r.is_ok() {
+                let _ = rx.await;
+            }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// This function panics if called within an asynchronous execution
+    /// context.
+    fn sync_persist(&self) {
+        let (tx, mut rx) = oneshot::channel();
+        let r = self
+            .tx
+            .send(DBMessage::CaughtUp(tx))
+            .map_err(|_| eyre::eyre!("DB thread gone, FATAL!"));
+
+        if r.is_ok() {
+            // Wait for rx to not be empty.
+            loop {
+                match rx.try_recv() {
+                    Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(100)),
+                    Err(TryRecvError::Closed) => break,
+                    _ => break,
+                }
+            }
+            //let _ = rx.blocking_recv();
+        }
     }
 }
 
 trait InsertTrait<DB: Database>: Send + 'static {
     fn insert(&self, db: &DB) -> eyre::Result<()>;
     fn insert_txn(&self, txn: &mut DB::TXMut<'_>) -> eyre::Result<()>;
+    /// Clear the inserted data from the memdb if present.
+    fn clear_insert_mem(&self, mem_db: &MemDatabase);
 }
 
 trait RemoveTrait<DB: Database>: Send + 'static {
@@ -306,6 +380,10 @@ impl<T: Table, DB: Database> InsertTrait<DB> for KeyValueInsert<T> {
     fn insert_txn(&self, txn: &mut DB::TXMut<'_>) -> eyre::Result<()> {
         txn.insert::<T>(&self.key, &self.value)
     }
+    fn clear_insert_mem(&self, mem_db: &MemDatabase) {
+        // Best effort to avoid memory growing forever.
+        let _ = mem_db.remove::<T>(&self.key);
+    }
 }
 
 impl<T: Table, DB: Database> RemoveTrait<DB> for KeyRemove<T> {
@@ -334,6 +412,7 @@ enum DBMessage<DB: Database> {
     Insert(Box<dyn InsertTrait<DB>>),
     Remove(Box<dyn RemoveTrait<DB>>),
     Clear(Box<dyn ClearTrait<DB>>),
+    CaughtUp(tokio::sync::oneshot::Sender<()>),
     Shutdown,
 }
 
@@ -345,6 +424,7 @@ impl<DB: Database> Debug for DBMessage<DB> {
             DBMessage::Insert(_) => write!(f, "Insert"),
             DBMessage::Remove(_) => write!(f, "Remove"),
             DBMessage::Clear(_) => write!(f, "Clear"),
+            DBMessage::CaughtUp(_) => write!(f, "CaughtUp"),
             DBMessage::Shutdown => write!(f, "Shutdown"),
         }
     }

@@ -167,6 +167,11 @@ impl Default for MemDatabase {
         db.open_table::<crate::tables::Batches>();
         db.open_table::<crate::tables::ConsensusBlocks>();
         db.open_table::<crate::tables::ConsensusBlockNumbersByDigest>();
+        db.open_table::<crate::tables::ConsensusBlocksCache>();
+        db.open_table::<crate::tables::NodeBatchesCache>();
+        db.open_table::<crate::tables::EpochRecords>();
+        db.open_table::<crate::tables::EpochCerts>();
+        db.open_table::<crate::tables::EpochRecordsIndex>();
         db.open_table::<crate::tables::KadRecords>();
         db.open_table::<crate::tables::KadProviderRecords>();
         db.open_table::<crate::tables::KadWorkerRecords>();
