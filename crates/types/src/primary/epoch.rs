@@ -38,7 +38,7 @@ pub struct EpochRecord {
 }
 
 impl EpochRecord {
-    /// Return the digest for this ConsensusHeader.
+    /// Return the digest for this EpochRecord.
     pub fn digest(&self) -> B256 {
         let mut hasher = crypto::DefaultHashFunction::new();
         hasher.update(&encode(self));
