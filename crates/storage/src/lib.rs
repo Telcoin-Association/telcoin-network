@@ -81,14 +81,14 @@ pub mod tables {
     };
 
     tables!(
-        LastProposed;crate::LAST_PROPOSED_CF;<ProposerKey, Header>,
-        Votes;crate::VOTES_CF;<AuthorityIdentifier, VoteInfo>,
-        Certificates;crate::CERTIFICATES_CF;<CertificateDigest, Certificate>,
-        CertificateDigestByRound;crate::CERTIFICATE_DIGEST_BY_ROUND_CF;<(Round, AuthorityIdentifier), CertificateDigest>,
-        CertificateDigestByOrigin;crate::CERTIFICATE_DIGEST_BY_ORIGIN_CF;<(AuthorityIdentifier, Round), CertificateDigest>,
-        Payload;crate::PAYLOAD_CF;<(BlockHash, WorkerId), PayloadToken>,
+        LastProposed;crate::LAST_PROPOSED_CF;<ProposerKey, Header>,  // Cleared every epoch
+        Votes;crate::VOTES_CF;<AuthorityIdentifier, VoteInfo>,  // Cleared every epoch
+        Certificates;crate::CERTIFICATES_CF;<CertificateDigest, Certificate>,  // Cleared every epoch
+        CertificateDigestByRound;crate::CERTIFICATE_DIGEST_BY_ROUND_CF;<(Round, AuthorityIdentifier), CertificateDigest>,  // Cleared every epoch
+        CertificateDigestByOrigin;crate::CERTIFICATE_DIGEST_BY_ORIGIN_CF;<(AuthorityIdentifier, Round), CertificateDigest>,  // Cleared every epoch
+        Payload;crate::PAYLOAD_CF;<(BlockHash, WorkerId), PayloadToken>,  // Cleared every epoch
         // Table is used for "normal" consensus as well as for the consensus chain.
-        Batches;crate::BATCHES_CF;<BlockHash, Batch>,
+        Batches;crate::BATCHES_CF;<BlockHash, Batch>,  // Long lived
         // These tables are for the consensus chain not the normal consensus.
         ConsensusBlocks;crate::CONSENSUS_BLOCK_CF;<u64, ConsensusHeader>,
         // This can contain mappings for confirmed but not executed blocks (block might be ConsensusBlocks OR ConsensusBlocksCache).
@@ -155,27 +155,7 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<KadWorkerRecords>().expect("failed to open table!");
     db.open_table::<KadWorkerProviderRecords>().expect("failed to open table!");
 
-    // XXXXDon't forget to add a new table to MemDatabase...
-    let db = LayeredDatabase::open(db);
-    /*XXXX    db.open_table::<LastProposed>();
-    db.open_table::<Votes>();
-    db.open_table::<Certificates>();
-    db.open_table::<CertificateDigestByRound>();
-    db.open_table::<CertificateDigestByOrigin>();
-    db.open_table::<Payload>();
-    db.open_table::<Batches>();
-    db.open_table::<ConsensusBlocks>();
-    db.open_table::<ConsensusBlockNumbersByDigest>();
-    db.open_table::<ConsensusBlocksCache>();
-    db.open_table::<NodeBatchesCache>();
-    db.open_table::<EpochRecords>();
-    db.open_table::<EpochCerts>();
-    db.open_table::<EpochRecordsIndex>();
-    db.open_table::<KadRecords>();
-    db.open_table::<KadProviderRecords>();
-    db.open_table::<KadWorkerRecords>();
-    db.open_table::<KadWorkerProviderRecords>();*/
-    db
+    LayeredDatabase::open(db)
 }
 
 /// Open or reopen all the storage of the node backed by ReDB.
@@ -205,26 +185,7 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db.open_table::<KadWorkerRecords>().expect("failed to open table!");
     db.open_table::<KadWorkerProviderRecords>().expect("failed to open table!");
 
-    let db = LayeredDatabase::open(db);
-    /*XXXXdb.open_table::<LastProposed>();
-    db.open_table::<Votes>();
-    db.open_table::<Certificates>();
-    db.open_table::<CertificateDigestByRound>();
-    db.open_table::<CertificateDigestByOrigin>();
-    db.open_table::<Payload>();
-    db.open_table::<Batches>();
-    db.open_table::<ConsensusBlocks>();
-    db.open_table::<ConsensusBlockNumbersByDigest>();
-    db.open_table::<ConsensusBlocksCache>();
-    db.open_table::<NodeBatchesCache>();
-    db.open_table::<EpochRecords>();
-    db.open_table::<EpochCerts>();
-    db.open_table::<EpochRecordsIndex>();
-    db.open_table::<KadRecords>();
-    db.open_table::<KadProviderRecords>();
-    db.open_table::<KadWorkerRecords>();
-    db.open_table::<KadWorkerProviderRecords>();*/
-    db
+    LayeredDatabase::open(db)
 }
 
 #[cfg(test)]
@@ -364,6 +325,7 @@ mod test {
         db.insert::<TestTable>(&123, &"123".to_string()).expect("Failed to insert");
         db.insert::<TestTable>(&456, &"456".to_string()).expect("Failed to insert");
         db.insert::<TestTable>(&789, &"789".to_string()).expect("Failed to insert");
+        db.sync_persist(); // Either a no-op or a chance for write ops to catch up.
 
         // Skip all smaller
         let key_vals: Vec<_> = db.skip_to::<TestTable>(&456).expect("Seek failed").collect();
@@ -387,6 +349,7 @@ mod test {
         txn.insert::<TestTable>(&456, &"456".to_string()).expect("Failed to insert");
         txn.insert::<TestTable>(&789, &"789".to_string()).expect("Failed to insert");
         txn.commit().unwrap();
+        db.sync_persist(); // Either a no-op or a chance for write ops to catch up.
 
         // Skip to the one before the end
         let key_val = db.record_prior_to::<TestTable>(&999).expect("Seek failed");
@@ -405,6 +368,7 @@ mod test {
             }
         }
         txn.commit().unwrap();
+        db.sync_persist(); // Either a no-op or a chance for write ops to catch up.
 
         // Skip prior to will return an iterator starting with an "unexpected" key if the sought one
         // is not in the table
@@ -423,6 +387,9 @@ mod test {
     pub(crate) fn test_iter<DB: Database>(db: DB) {
         db.insert::<TestTable>(&123456789, &"123456789".to_string()).expect("Failed to insert");
 
+        // Note that inserts "show up" immediadly but there could be a race where they are
+        // iterated over twice while being persisted.
+        db.sync_persist(); // Either a no-op or a chance for write ops to catch up.
         let mut iter = db.iter::<TestTable>();
         assert_eq!(Some((123456789, "123456789".to_string())), iter.next());
         assert_eq!(None, iter.next());
@@ -432,6 +399,9 @@ mod test {
         db.insert::<TestTable>(&1, &"1".to_string()).expect("Failed to insert");
         db.insert::<TestTable>(&2, &"2".to_string()).expect("Failed to insert");
         db.insert::<TestTable>(&3, &"3".to_string()).expect("Failed to insert");
+        // Note that inserts "show up" immediadly but there could be a race where they are
+        // iterated over twice while being persisted.
+        db.sync_persist(); // Either a no-op or a chance for write ops to catch up.
         let mut iter = db.iter::<TestTable>();
 
         assert_eq!(Some((1, "1".to_string())), iter.next());
@@ -449,10 +419,12 @@ mod test {
             txn.insert::<TestTable>(&key, &val).expect("Failed to batch insert");
         }
         txn.commit().unwrap();
+        db.sync_persist(); // Either a no-op or a chance for write ops to catch up.
 
         // Check we have multiple entries
         assert!(db.iter::<TestTable>().count() > 1);
         let _ = db.clear_table::<TestTable>();
+        db.sync_persist(); // Either a no-op or a chance for write ops to catch up.
         assert_eq!(db.iter::<TestTable>().count(), 0);
         // Clear again to ensure safety when clearing empty map
         let _ = db.clear_table::<TestTable>();
@@ -461,6 +433,7 @@ mod test {
         let _ = db.insert::<TestTable>(&1, &"e".to_string());
         assert_eq!(db.iter::<TestTable>().count(), 1);
         let _ = db.clear_table::<TestTable>();
+        db.sync_persist(); // Either a no-op or a chance for write ops to catch up.
         assert_eq!(db.iter::<TestTable>().count(), 0);
     }
 
@@ -482,6 +455,7 @@ mod test {
 
         // Clear again to ensure empty works after clearing
         let _ = db.clear_table::<TestTable>();
+        db.sync_persist(); // Either a no-op or a chance for write ops to catch up.
         assert_eq!(db.iter::<TestTable>().count(), 0);
         assert!(db.is_empty::<TestTable>());
     }
@@ -519,6 +493,7 @@ mod test {
             txn.remove::<TestTable>(&key).expect("Failed to batch remove");
         }
         txn.commit().unwrap();
+        db.sync_persist(); // Either a no-op or a chance for write ops to catch up.
         assert_eq!(db.iter::<TestTable>().count(), 101 - 50);
 
         // Check that the remaining are present

@@ -22,7 +22,7 @@ pub struct Header {
     pub epoch: Epoch,
     /// The timestamp for when the header was requested to be created.
     pub created_at: TimestampSec,
-    /// IndexMap of the [BatchDigest] to the [WorkerId] and [TimestampSec]
+    /// IndexMap of the [BatchDigest] to the [WorkerId]
     #[serde(with = "indexmap::map::serde_seq")]
     pub payload: IndexMap<BlockHash, WorkerId>,
     /// Parent certificates for this Header.

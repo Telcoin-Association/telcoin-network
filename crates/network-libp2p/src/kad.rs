@@ -563,36 +563,42 @@ mod test {
         let rec = test_record(false);
         let rec2 = test_record(false);
         let rec3 = test_record(false);
+        kad_store.db.sync_persist();
 
         assert!(kad_store.get(&rec.key).is_none());
         assert_eq!(kad_store.records().count(), 0);
         kad_store.put(rec.clone()).expect("put record");
         kad_store_worker.put(rec.clone()).expect("put record");
+        kad_store.db.sync_persist();
+        //sleep(Duration::from_secs(3));
         test_rec(&rec, &kad_store);
         test_rec(&rec, &kad_store_worker);
-        //XXXXassert_eq!(kad_store.records().count(), 1);
         assert_eq!(kad_store.num_records, 1);
-        //XXXXassert_eq!(kad_store_worker.records().count(), 1);
+        assert_eq!(kad_store.records().count(), 1);
         assert_eq!(kad_store_worker.num_records, 1);
+        assert_eq!(kad_store_worker.records().count(), 1);
 
         kad_store.remove(&rec.key);
+        kad_store.db.sync_persist();
         test_rec(&rec, &kad_store_worker);
-        //XXXXassert_eq!(kad_store.records().count(), 0);
+        assert_eq!(kad_store.records().count(), 0);
         assert_eq!(kad_store.num_records, 0);
-        //XXXXassert_eq!(kad_store_worker.records().count(), 1);
+        assert_eq!(kad_store_worker.records().count(), 1);
         assert_eq!(kad_store_worker.num_records, 1);
         kad_store_worker.remove(&rec.key);
+        kad_store.db.sync_persist();
         assert!(kad_store.get(&rec.key).is_none());
         assert!(kad_store_worker.get(&rec.key).is_none());
-        //XXXXassert_eq!(kad_store.records().count(), 0);
+        assert_eq!(kad_store.records().count(), 0);
         assert_eq!(kad_store.num_records, 0);
-        //XXXXassert_eq!(kad_store_worker.records().count(), 0);
+        assert_eq!(kad_store_worker.records().count(), 0);
         assert_eq!(kad_store_worker.num_records, 0);
 
         kad_store.put(rec.clone()).expect("put record");
         kad_store_worker.put(rec.clone()).expect("put record");
         kad_store.put(rec2.clone()).expect("put record");
         kad_store.put(rec3.clone()).expect("put record");
+        kad_store.db.sync_persist();
         assert_eq!(kad_store.num_records, 3);
         assert_eq!(kad_store_worker.num_records, 1);
         assert_eq!(kad_store.records().count(), 3);
@@ -617,14 +623,17 @@ mod test {
             ProviderRecord { key: provider_rec1.key.clone(), provider, expires, addresses: vec![] };
         let provider_rec2 = test_provider_record();
         let provider_rec3 = test_provider_record();
+        kad_store.db.sync_persist();
         assert_eq!(kad_store.provided().count(), 0);
         kad_store.add_provider(provider_rec1.clone()).expect("add provider");
         kad_store.add_provider(provider_rec2.clone()).expect("add provider");
         kad_store.add_provider(provider_rec3.clone()).expect("add provider");
+        kad_store.db.sync_persist();
         assert_eq!(kad_store.num_providers, 3);
         assert_eq!(kad_store.provided().count(), 1);
         kad_store.add_provider(provider_rec1_1.clone()).expect("add provider");
         kad_store.add_provider(provider_rec1_2.clone()).expect("add provider");
+        kad_store.db.sync_persist();
         assert_eq!(kad_store.num_providers, 3);
         assert_eq!(kad_store.provided().count(), 3);
         assert_eq!(kad_store.providers(&provider_rec1.key).len(), 3);
@@ -636,10 +645,12 @@ mod test {
         kad_store_worker.add_provider(provider_rec1.clone()).expect("add provider");
         kad_store_worker.add_provider(provider_rec2.clone()).expect("add provider");
         kad_store_worker.add_provider(provider_rec3.clone()).expect("add provider");
+        kad_store.db.sync_persist();
         assert_eq!(kad_store_worker.num_providers, 3);
         assert_eq!(kad_store_worker.provided().count(), 1);
         kad_store_worker.add_provider(provider_rec1_1.clone()).expect("add provider");
         kad_store_worker.add_provider(provider_rec1_2.clone()).expect("add provider");
+        kad_store.db.sync_persist();
         assert_eq!(kad_store_worker.num_providers, 3);
         assert_eq!(kad_store_worker.provided().count(), 3);
         assert_eq!(kad_store_worker.providers(&provider_rec1.key).len(), 3);
@@ -653,25 +664,31 @@ mod test {
         assert_eq!(recs_1[2], provider_rec1_2);
 
         kad_store.remove_provider(&provider_rec1_1.key, &provider_rec1_1.provider);
+        kad_store.db.sync_persist();
         assert_eq!(kad_store.num_providers, 3);
         assert_eq!(kad_store.provided().count(), 2);
         assert_eq!(kad_store.providers(&provider_rec1.key).len(), 2);
         kad_store.add_provider(provider_rec1_1.clone()).expect("add provider");
+        kad_store.db.sync_persist();
         assert_eq!(kad_store.provided().count(), 3);
         assert_eq!(kad_store.providers(&provider_rec1.key).len(), 3);
         kad_store.add_provider(provider_rec1_1.clone()).expect("add provider");
+        kad_store.db.sync_persist();
         assert_eq!(kad_store.num_providers, 3);
         assert_eq!(kad_store.provided().count(), 3);
         assert_eq!(kad_store.providers(&provider_rec1.key).len(), 3);
 
         kad_store_worker.remove_provider(&provider_rec1_1.key, &provider_rec1_1.provider);
+        kad_store.db.sync_persist();
         assert_eq!(kad_store_worker.num_providers, 3);
         assert_eq!(kad_store_worker.provided().count(), 2);
         assert_eq!(kad_store_worker.providers(&provider_rec1.key).len(), 2);
         kad_store_worker.add_provider(provider_rec1_1.clone()).expect("add provider");
+        kad_store.db.sync_persist();
         assert_eq!(kad_store_worker.provided().count(), 3);
         assert_eq!(kad_store_worker.providers(&provider_rec1.key).len(), 3);
         kad_store_worker.add_provider(provider_rec1_1.clone()).expect("add provider");
+        kad_store.db.sync_persist();
         assert_eq!(kad_store_worker.num_providers, 3);
         assert_eq!(kad_store_worker.provided().count(), 3);
         assert_eq!(kad_store_worker.providers(&provider_rec1.key).len(), 3);
@@ -681,10 +698,12 @@ mod test {
         kad_store.remove_provider(&provider_rec1_1.key, &provider_rec1_1.provider);
         assert_eq!(kad_store.num_providers, 3);
         kad_store.remove_provider(&provider_rec1_2.key, &provider_rec1_2.provider);
+        kad_store.db.sync_persist();
         assert_eq!(kad_store.num_providers, 2);
         assert_eq!(kad_store.provided().count(), 0);
         assert_eq!(kad_store.providers(&provider_rec1.key).len(), 0);
         kad_store.remove_provider(&provider_rec2.key, &provider_rec2.provider);
+        kad_store.db.sync_persist();
         assert_eq!(kad_store.num_providers, 1);
         assert_eq!(kad_store.providers(&provider_rec2.key).len(), 0);
 
@@ -693,10 +712,12 @@ mod test {
         kad_store_worker.remove_provider(&provider_rec1_1.key, &provider_rec1_1.provider);
         assert_eq!(kad_store_worker.num_providers, 3);
         kad_store_worker.remove_provider(&provider_rec1_2.key, &provider_rec1_2.provider);
+        kad_store.db.sync_persist();
         assert_eq!(kad_store_worker.num_providers, 2);
         assert_eq!(kad_store_worker.provided().count(), 0);
         assert_eq!(kad_store_worker.providers(&provider_rec1.key).len(), 0);
         kad_store_worker.remove_provider(&provider_rec2.key, &provider_rec2.provider);
+        kad_store.db.sync_persist();
         assert_eq!(kad_store_worker.num_providers, 1);
         assert_eq!(kad_store_worker.providers(&provider_rec2.key).len(), 0);
 

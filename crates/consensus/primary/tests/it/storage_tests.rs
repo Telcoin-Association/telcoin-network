@@ -132,6 +132,7 @@ async fn test_consensus_store_read_latest_final_reputation_scores() {
 
         store.write_subdag_for_test(sequence_number, sub_dag);
     }
+    store.persist().await;
 
     // WHEN we try to read the final schedule. The one of sub dag sequence 20 should be returned
     let commit = store.read_latest_commit_with_final_reputation_scores(committee.epoch()).unwrap();
@@ -252,6 +253,7 @@ async fn test_certificate_store_last_two_rounds() {
 
     // store them in both main and secondary index
     store.write_all(certs).unwrap();
+    store.persist().await;
 
     // WHEN
     let result = store.last_two_rounds_certs().unwrap();
@@ -458,6 +460,7 @@ async fn test_certificate_store_delete_store() {
 
     store.delete(to_delete[0]).unwrap();
     store.delete(to_delete[1]).unwrap();
+    store.persist().await; // Make sure the deletes are complete...
 
     // THEN
     assert!(store.read(to_delete[0]).unwrap().is_none());

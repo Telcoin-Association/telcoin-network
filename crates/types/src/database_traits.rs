@@ -1,7 +1,7 @@
 //! Database traits for compatibility.
 
 use serde::{de::DeserializeOwned, Serialize};
-use std::{borrow::Borrow, fmt::Debug};
+use std::{borrow::Borrow, fmt::Debug, future::Future};
 
 pub trait KeyT: Serialize + DeserializeOwned + Send + Sync + Ord + Clone + Debug + 'static {}
 pub trait ValueT: Serialize + DeserializeOwned + Send + Sync + Clone + Debug + 'static {}
@@ -116,4 +116,14 @@ pub trait Database: Send + Sync + Clone + Unpin + 'static {
     fn compact(&self) -> eyre::Result<()> {
         Ok(())
     }
+
+    /// Some implementations may perform perstance operations in the background.
+    /// If so they can return a future that will resolve when they are complete.
+    /// This allows us to use a mostly sync DB interface but still allow async
+    /// "catch-up".
+    fn persist(&self) -> impl Future<Output = ()> + Send {
+        std::future::ready(())
+    }
+    /// Sync version of persist- useful for test not for prod code.
+    fn sync_persist(&self) {}
 }
