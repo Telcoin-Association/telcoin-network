@@ -12,11 +12,12 @@ pub use stores::*;
 pub use redb::database::ReDB;
 use tables::{
     Batches, CertificateDigestByOrigin, CertificateDigestByRound, Certificates,
-    ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache, KadProviderRecords,
-    KadRecords, KadWorkerProviderRecords, KadWorkerRecords, LastProposed, NodeBatchesCache,
-    Payload, Votes,
+    ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache, EpochCerts, EpochRecords,
+    EpochRecordsIndex, KadProviderRecords, KadRecords, KadWorkerProviderRecords, KadWorkerRecords,
+    LastProposed, NodeBatchesCache, Payload, Votes,
 };
 // Always build redb, we use it as the default for persistant consensus data.
+pub mod composite_db;
 pub mod layered_db;
 #[cfg(feature = "reth-libmdbx")]
 pub mod mdbx;
@@ -24,6 +25,8 @@ pub mod mem_db;
 pub mod redb;
 
 pub use tn_types::error::StoreError;
+
+use crate::composite_db::CompositeDatabase;
 
 pub type ProposerKey = u32;
 // A type alias marking the "payload" tokens sent by workers to their primary as batch
@@ -59,7 +62,7 @@ const KAD_WORKER_RECORD_CF: &str = "kad_worker_record";
 const KAD_WORKER_PROVIDER_RECORD_CF: &str = "kad_worker_provider_record";
 
 macro_rules! tables {
-    ( $($table:ident;$name:expr;<$K:ty, $V:ty>),*) => {
+    ( $($table:ident;$name:expr;$hint:expr;<$K:ty, $V:ty>),*) => {
             $(
                 #[derive(Debug)]
                 pub struct $table {}
@@ -68,6 +71,7 @@ macro_rules! tables {
                     type Value = $V;
 
                     const NAME: &'static str = $name;
+                    const HINT: tn_types::TableHint = $hint;
                 }
             )*
     };
@@ -77,43 +81,43 @@ pub mod tables {
     use super::{PayloadToken, ProposerKey};
     use tn_types::{
         AuthorityIdentifier, Batch, BlockHash, Certificate, CertificateDigest, ConsensusHeader,
-        Epoch, EpochCertificate, EpochRecord, Header, Round, VoteInfo, WorkerId, B256,
+        Epoch, EpochCertificate, EpochRecord, Header, Round, TableHint, VoteInfo, WorkerId, B256,
     };
 
     tables!(
-        LastProposed;crate::LAST_PROPOSED_CF;<ProposerKey, Header>,  // Cleared every epoch
-        Votes;crate::VOTES_CF;<AuthorityIdentifier, VoteInfo>,  // Cleared every epoch
-        Certificates;crate::CERTIFICATES_CF;<CertificateDigest, Certificate>,  // Cleared every epoch
-        CertificateDigestByRound;crate::CERTIFICATE_DIGEST_BY_ROUND_CF;<(Round, AuthorityIdentifier), CertificateDigest>,  // Cleared every epoch
-        CertificateDigestByOrigin;crate::CERTIFICATE_DIGEST_BY_ORIGIN_CF;<(AuthorityIdentifier, Round), CertificateDigest>,  // Cleared every epoch
-        Payload;crate::PAYLOAD_CF;<(BlockHash, WorkerId), PayloadToken>,  // Cleared every epoch
+        LastProposed;crate::LAST_PROPOSED_CF;TableHint::Epoch;<ProposerKey, Header>,  // Cleared every epoch
+        Votes;crate::VOTES_CF;TableHint::Epoch;<AuthorityIdentifier, VoteInfo>,  // Cleared every epoch
+        Certificates;crate::CERTIFICATES_CF;TableHint::Epoch;<CertificateDigest, Certificate>,  // Cleared every epoch
+        CertificateDigestByRound;crate::CERTIFICATE_DIGEST_BY_ROUND_CF;TableHint::Epoch;<(Round, AuthorityIdentifier), CertificateDigest>,  // Cleared every epoch
+        CertificateDigestByOrigin;crate::CERTIFICATE_DIGEST_BY_ORIGIN_CF;TableHint::Epoch;<(AuthorityIdentifier, Round), CertificateDigest>,  // Cleared every epoch
+        Payload;crate::PAYLOAD_CF;TableHint::Epoch;<(BlockHash, WorkerId), PayloadToken>,  // Cleared every epoch
         // Table is used for "normal" consensus as well as for the consensus chain.
-        Batches;crate::BATCHES_CF;<BlockHash, Batch>,  // Long lived
+        Batches;crate::BATCHES_CF;TableHint::Batch;<BlockHash, Batch>,  // Long lived
         // These tables are for the consensus chain not the normal consensus.
-        ConsensusBlocks;crate::CONSENSUS_BLOCK_CF;<u64, ConsensusHeader>,
+        ConsensusBlocks;crate::CONSENSUS_BLOCK_CF;TableHint::ConsensusChain;<u64, ConsensusHeader>,
         // This can contain mappings for confirmed but not executed blocks (block might be ConsensusBlocks OR ConsensusBlocksCache).
-        ConsensusBlockNumbersByDigest;crate::CONSENSUS_BLOCK_NUMBER_BY_DIGEST_CF;<BlockHash, u64>,
+        ConsensusBlockNumbersByDigest;crate::CONSENSUS_BLOCK_NUMBER_BY_DIGEST_CF;TableHint::ConsensusChain;<BlockHash, u64>,
         // This is a cache to store verified but unprocessed consensus headers, remove once processed.
-        ConsensusBlocksCache;crate::CONSENSUS_BLOCK_CACHE_CF;<u64, ConsensusHeader>,
+        ConsensusBlocksCache;crate::CONSENSUS_BLOCK_CACHE_CF;TableHint::Cache;<u64, ConsensusHeader>,
         // This is a cache to store this nodes batches before consensus, remove once in a ConsensusHeader.
-        NodeBatchesCache;crate::NODE_BATCHES_CACHE_CF;<BlockHash, Batch>,
+        NodeBatchesCache;crate::NODE_BATCHES_CACHE_CF;TableHint::Cache;<BlockHash, Batch>,
         // These tables are for the epoch chain not the normal consensus.
-        EpochRecords;crate::EPOCH_RECORDS_CF;<Epoch, EpochRecord>,
-        EpochCerts;crate::EPOCH_CERTS_CF;<B256, EpochCertificate>,
-        EpochRecordsIndex;crate::EPOCH_RECORDS_INDEX_CF;<B256, Epoch>,
+        EpochRecords;crate::EPOCH_RECORDS_CF;TableHint::EpochChain;<Epoch, EpochRecord>,
+        EpochCerts;crate::EPOCH_CERTS_CF;TableHint::EpochChain;<B256, EpochCertificate>,
+        EpochRecordsIndex;crate::EPOCH_RECORDS_INDEX_CF;TableHint::EpochChain;<B256, Epoch>,
         // These are used for network storage and separate from consensus
-        KadRecords;crate::KAD_RECORD_CF;<BlockHash, Vec<u8>>,
-        KadProviderRecords;crate::KAD_PROVIDER_RECORD_CF;<BlockHash, Vec<u8>>,
-        KadWorkerRecords;crate::KAD_WORKER_RECORD_CF;<BlockHash, Vec<u8>>,
-        KadWorkerProviderRecords;crate::KAD_WORKER_PROVIDER_RECORD_CF;<BlockHash, Vec<u8>>
+        KadRecords;crate::KAD_RECORD_CF;TableHint::Kad;<BlockHash, Vec<u8>>,
+        KadProviderRecords;crate::KAD_PROVIDER_RECORD_CF;TableHint::Kad;<BlockHash, Vec<u8>>,
+        KadWorkerRecords;crate::KAD_WORKER_RECORD_CF;TableHint::Kad;<BlockHash, Vec<u8>>,
+        KadWorkerProviderRecords;crate::KAD_WORKER_PROVIDER_RECORD_CF;TableHint::Kad;<BlockHash, Vec<u8>>
     );
 }
 
 // mdbx is the default, if redb is set then is used (so priority is mdbx -> redb)
 #[cfg(all(feature = "reth-libmdbx", not(feature = "redb")))]
-pub type DatabaseType = LayeredDatabase<MdbxDatabase>;
+pub type DatabaseType = CompositeDatabase<MdbxDatabase>;
 #[cfg(feature = "redb")]
-pub type DatabaseType = LayeredDatabase<ReDB>;
+pub type DatabaseType = CompositeDatabase<ReDB>;
 
 /// Open the configured DB with the required tables.
 /// This will return a concrete type for the currently configured Database.
@@ -132,60 +136,123 @@ pub fn open_db<Path: AsRef<std::path::Path> + Send>(store_path: Path) -> Databas
 
 /// Open or reopen all the storage of the node backed by MDBX.
 #[cfg(feature = "reth-libmdbx")]
-fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabase<MdbxDatabase> {
-    use tables::{EpochCerts, EpochRecords, EpochRecordsIndex};
+fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatabase<MdbxDatabase> {
+    let store_path = store_path.as_ref();
+    let epoch_db =
+        MdbxDatabase::open(store_path.join("epoch")).expect("Cannot open database (epoch)");
+    epoch_db.open_table::<LastProposed>().expect("failed to open table!");
+    epoch_db.open_table::<Votes>().expect("failed to open table!");
+    epoch_db.open_table::<Certificates>().expect("failed to open table!");
+    epoch_db.open_table::<CertificateDigestByRound>().expect("failed to open table!");
+    epoch_db.open_table::<CertificateDigestByOrigin>().expect("failed to open table!");
+    epoch_db.open_table::<Payload>().expect("failed to open table!");
+    let epoch_db = LayeredDatabase::open(epoch_db, true);
+    epoch_db.open_table::<LastProposed>();
+    epoch_db.open_table::<Votes>();
+    epoch_db.open_table::<Certificates>();
+    epoch_db.open_table::<CertificateDigestByRound>();
+    epoch_db.open_table::<CertificateDigestByOrigin>();
+    epoch_db.open_table::<Payload>();
 
-    let db = MdbxDatabase::open(store_path).expect("Cannot open database");
-    db.open_table::<LastProposed>().expect("failed to open table!");
-    db.open_table::<Votes>().expect("failed to open table!");
-    db.open_table::<Certificates>().expect("failed to open table!");
-    db.open_table::<CertificateDigestByRound>().expect("failed to open table!");
-    db.open_table::<CertificateDigestByOrigin>().expect("failed to open table!");
-    db.open_table::<Payload>().expect("failed to open table!");
+    let db = MdbxDatabase::open(store_path.join("consensus_chain"))
+        .expect("Cannot open database (consensus_chain)");
     db.open_table::<Batches>().expect("failed to open table!");
     db.open_table::<ConsensusBlocks>().expect("failed to open table!");
     db.open_table::<ConsensusBlockNumbersByDigest>().expect("failed to open table!");
-    db.open_table::<ConsensusBlocksCache>().expect("failed to open table!");
-    db.open_table::<NodeBatchesCache>().expect("failed to open table!");
+    let consensus_chain_db = LayeredDatabase::open(db, false);
+    consensus_chain_db.open_table::<Batches>();
+    consensus_chain_db.open_table::<ConsensusBlocks>();
+    consensus_chain_db.open_table::<ConsensusBlockNumbersByDigest>();
+
+    let db = MdbxDatabase::open(store_path.join("epoch_chain"))
+        .expect("Cannot open database (epoch chain)");
     db.open_table::<EpochRecords>().expect("failed to open table!");
     db.open_table::<EpochCerts>().expect("failed to open table!");
     db.open_table::<EpochRecordsIndex>().expect("failed to open table!");
+    let epoch_chain_db = LayeredDatabase::open(db, false);
+    epoch_chain_db.open_table::<EpochRecords>();
+    epoch_chain_db.open_table::<EpochCerts>();
+    epoch_chain_db.open_table::<EpochRecordsIndex>();
+
+    let db = MdbxDatabase::open(store_path.join("kad")).expect("Cannot open database (kad)");
     db.open_table::<KadRecords>().expect("failed to open table!");
     db.open_table::<KadProviderRecords>().expect("failed to open table!");
     db.open_table::<KadWorkerRecords>().expect("failed to open table!");
     db.open_table::<KadWorkerProviderRecords>().expect("failed to open table!");
+    let kad_db = LayeredDatabase::open(db, true);
+    kad_db.open_table::<KadRecords>();
+    kad_db.open_table::<KadProviderRecords>();
+    kad_db.open_table::<KadWorkerRecords>();
+    kad_db.open_table::<KadWorkerProviderRecords>();
 
-    LayeredDatabase::open(db)
+    let db = MdbxDatabase::open(store_path.join("cache")).expect("Cannot open database (cache)");
+    db.open_table::<ConsensusBlocksCache>().expect("failed to open table!");
+    db.open_table::<NodeBatchesCache>().expect("failed to open table!");
+    let cache_db = LayeredDatabase::open(db, true);
+    cache_db.open_table::<ConsensusBlocksCache>();
+    cache_db.open_table::<NodeBatchesCache>();
+
+    CompositeDatabase::open(epoch_db, consensus_chain_db, epoch_chain_db, kad_db, cache_db)
 }
 
 /// Open or reopen all the storage of the node backed by ReDB.
 #[cfg(feature = "redb")]
-fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabase<ReDB> {
-    use tables::{EpochCerts, EpochRecords, EpochRecordsIndex};
+fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatabase<ReDB> {
+    let store_path = store_path.as_ref();
+    let epoch_db = ReDB::open(store_path.join("epoch")).expect("Cannot open database (epoch)");
+    epoch_db.open_table::<LastProposed>().expect("failed to open table!");
+    epoch_db.open_table::<Votes>().expect("failed to open table!");
+    epoch_db.open_table::<Certificates>().expect("failed to open table!");
+    epoch_db.open_table::<CertificateDigestByRound>().expect("failed to open table!");
+    epoch_db.open_table::<CertificateDigestByOrigin>().expect("failed to open table!");
+    epoch_db.open_table::<Payload>().expect("failed to open table!");
+    let epoch_db = LayeredDatabase::open(epoch_db, true);
+    epoch_db.open_table::<LastProposed>();
+    epoch_db.open_table::<Votes>();
+    epoch_db.open_table::<Certificates>();
+    epoch_db.open_table::<CertificateDigestByRound>();
+    epoch_db.open_table::<CertificateDigestByOrigin>();
+    epoch_db.open_table::<Payload>();
 
-    use crate::tables::NodeBatchesCache;
-
-    let db = ReDB::open(store_path).expect("Cannot open database");
-    db.open_table::<LastProposed>().expect("failed to open table!");
-    db.open_table::<Votes>().expect("failed to open table!");
-    db.open_table::<Certificates>().expect("failed to open table!");
-    db.open_table::<CertificateDigestByRound>().expect("failed to open table!");
-    db.open_table::<CertificateDigestByOrigin>().expect("failed to open table!");
-    db.open_table::<Payload>().expect("failed to open table!");
+    let db = ReDB::open(store_path.join("consensus_chain"))
+        .expect("Cannot open database (consensus_chain)");
     db.open_table::<Batches>().expect("failed to open table!");
     db.open_table::<ConsensusBlocks>().expect("failed to open table!");
     db.open_table::<ConsensusBlockNumbersByDigest>().expect("failed to open table!");
-    db.open_table::<ConsensusBlocksCache>().expect("failed to open table!");
-    db.open_table::<NodeBatchesCache>().expect("failed to open table!");
+    let consensus_chain_db = LayeredDatabase::open(db, false);
+    consensus_chain_db.open_table::<Batches>();
+    consensus_chain_db.open_table::<ConsensusBlocks>();
+    consensus_chain_db.open_table::<ConsensusBlockNumbersByDigest>();
+
+    let db =
+        ReDB::open(store_path.join("epoch_chain")).expect("Cannot open database (epoch chain)");
     db.open_table::<EpochRecords>().expect("failed to open table!");
     db.open_table::<EpochCerts>().expect("failed to open table!");
     db.open_table::<EpochRecordsIndex>().expect("failed to open table!");
+    let epoch_chain_db = LayeredDatabase::open(db, false);
+    epoch_chain_db.open_table::<EpochRecords>();
+    epoch_chain_db.open_table::<EpochCerts>();
+    epoch_chain_db.open_table::<EpochRecordsIndex>();
+
+    let db = ReDB::open(store_path.join("kad")).expect("Cannot open database (kad)");
     db.open_table::<KadRecords>().expect("failed to open table!");
     db.open_table::<KadProviderRecords>().expect("failed to open table!");
     db.open_table::<KadWorkerRecords>().expect("failed to open table!");
     db.open_table::<KadWorkerProviderRecords>().expect("failed to open table!");
+    let kad_db = LayeredDatabase::open(db, true);
+    kad_db.open_table::<KadRecords>();
+    kad_db.open_table::<KadProviderRecords>();
+    kad_db.open_table::<KadWorkerRecords>();
+    kad_db.open_table::<KadWorkerProviderRecords>();
 
-    LayeredDatabase::open(db)
+    let db = ReDB::open(store_path.join("cache")).expect("Cannot open database (cache)");
+    db.open_table::<ConsensusBlocksCache>().expect("failed to open table!");
+    db.open_table::<NodeBatchesCache>().expect("failed to open table!");
+    let cache_db = LayeredDatabase::open(db, true);
+    cache_db.open_table::<ConsensusBlocksCache>();
+    cache_db.open_table::<NodeBatchesCache>();
+
+    CompositeDatabase::open(epoch_db, consensus_chain_db, epoch_chain_db, kad_db, cache_db)
 }
 
 #[cfg(test)]
@@ -199,6 +266,7 @@ mod test {
         type Value = String;
 
         const NAME: &'static str = "TestTable";
+        const HINT: tn_types::TableHint = tn_types::TableHint::Cache;
     }
 
     /// Runs a simple bench/test for the provided DB.  Can use it for larger dataset tests as well
