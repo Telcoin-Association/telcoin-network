@@ -89,7 +89,7 @@ impl<DB: Database> DbTxMut for LayeredDbTxMut<DB> {
 
 /// Run the thread to manage the persistant DB in the background.
 /// If DB needs compaction this thread will compact on startup and once a day after that.
-fn db_run<DB: Database>(db: DB, mem_db: MemDatabase, rx: Receiver<DBMessage<DB>>) {
+fn db_run<DB: Database>(db: DB, mem_db: Option<MemDatabase>, rx: Receiver<DBMessage<DB>>) {
     let mut txn = None;
     let mut last_compact = Instant::now();
     //let mut last_memclear = Instant::now();
@@ -118,8 +118,10 @@ fn db_run<DB: Database>(db: DB, mem_db: MemDatabase, rx: Receiver<DBMessage<DB>>
                         if let Err(e) = current_txn.commit() {
                             tracing::error!(target: "layered_db_runner", "DB TXN Commit: {e}")
                         }
-                        for insert in committed_inserts.drain(..) {
-                            insert.clear_insert_mem(&mem_db);
+                        if let Some(mem_db) = mem_db.as_ref() {
+                            for insert in committed_inserts.drain(..) {
+                                insert.clear_insert_mem(mem_db);
+                            }
                         }
                     } else {
                         txn = Some((current_txn, count - 1));
@@ -136,7 +138,9 @@ fn db_run<DB: Database>(db: DB, mem_db: MemDatabase, rx: Receiver<DBMessage<DB>>
                     if let Err(e) = ins.insert(&db) {
                         tracing::error!(target: "layered_db_runner", "DB Insert: {e}");
                     }
-                    ins.clear_insert_mem(&mem_db);
+                    if let Some(mem_db) = mem_db.as_ref() {
+                        ins.clear_insert_mem(mem_db);
+                    }
                 }
             }
             DBMessage::Remove(rm) => {
@@ -184,6 +188,8 @@ pub struct LayeredDatabase<DB: Database> {
     tx: Sender<DBMessage<DB>>,
     thread: Option<Arc<JoinHandle<()>>>, /* Use as a ref count for shutting down the background
                                           * thread and it's handle. */
+    full_memory: bool, /* If true then keep all the data in memory otherwise only keep it until
+                        * written to disk. */
 }
 
 impl<DB: Database> Drop for LayeredDatabase<DB> {
@@ -209,18 +215,23 @@ impl<DB: Database> Drop for LayeredDatabase<DB> {
 }
 
 impl<DB: Database> LayeredDatabase<DB> {
-    pub fn open(db: DB) -> Self {
+    pub fn open(db: DB, full_memory: bool) -> Self {
         let (tx, rx) = mpsc::channel();
         let db_cloned = db.clone();
-        let mem_db = MemDatabase::default();
-        let mem_db_clone = mem_db.clone();
+        let mem_db = MemDatabase::new();
+        let mem_db_clone = if full_memory { None } else { Some(mem_db.clone()) };
         let thread =
             Some(Arc::new(std::thread::spawn(move || db_run(db_cloned, mem_db_clone, rx))));
-        Self { mem_db, db, tx, thread }
+        Self { mem_db, db, tx, thread, full_memory }
     }
 
     pub fn open_table<T: Table>(&self) {
         self.mem_db.open_table::<T>();
+        if self.full_memory {
+            for (k, v) in self.db.iter::<T>() {
+                let _ = self.mem_db.insert::<T>(&k, &v);
+            }
+        }
     }
 }
 
@@ -286,26 +297,46 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
 
     /// Layered db will return all inserted elements even if some are duplicates while writes occur.
     fn iter<T: Table>(&self) -> DBIter<'_, T> {
-        Box::new(self.db.iter::<T>().chain(self.mem_db.iter::<T>()))
+        if self.full_memory {
+            Box::new(self.mem_db.iter::<T>())
+        } else {
+            Box::new(self.db.iter::<T>().chain(self.mem_db.iter::<T>()))
+        }
     }
 
     fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
-        self.db.skip_to::<T>(key)
+        if self.full_memory {
+            self.mem_db.skip_to::<T>(key)
+        } else {
+            self.db.skip_to::<T>(key)
+        }
     }
 
     fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
-        self.db.reverse_iter::<T>()
+        if self.full_memory {
+            self.mem_db.reverse_iter::<T>()
+        } else {
+            self.db.reverse_iter::<T>()
+        }
     }
 
     fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
-        self.db.record_prior_to::<T>(key)
+        if self.full_memory {
+            self.mem_db.record_prior_to::<T>(key)
+        } else {
+            self.db.record_prior_to::<T>(key)
+        }
     }
 
     fn last_record<T: Table>(&self) -> Option<(T::Key, T::Value)> {
-        self.db.last_record::<T>()
+        if self.full_memory {
+            self.mem_db.last_record::<T>()
+        } else {
+            self.db.last_record::<T>()
+        }
     }
 
-    fn persist(&self) -> impl Future<Output = ()> + Send {
+    fn persist<T: Table>(&self) -> impl Future<Output = ()> + Send {
         let (tx, rx) = oneshot::channel();
         let r = self
             .tx
@@ -318,10 +349,6 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
         }
     }
 
-    /// # Panics
-    ///
-    /// This function panics if called within an asynchronous execution
-    /// context.
     fn sync_persist(&self) {
         let (tx, mut rx) = oneshot::channel();
         let r = self
@@ -338,7 +365,6 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
                     _ => break,
                 }
             }
-            //let _ = rx.blocking_recv();
         }
     }
 }
@@ -443,7 +469,7 @@ mod test {
     fn open_redb(path: &Path) -> LayeredDatabase<ReDB> {
         let db = ReDB::open(path).expect("Cannot open database");
         db.open_table::<TestTable>().expect("failed to open table!");
-        let db = LayeredDatabase::open(db);
+        let db = LayeredDatabase::open(db, false);
         db.open_table::<TestTable>();
         db
     }
@@ -451,7 +477,7 @@ mod test {
     fn open_mdbx(path: &Path) -> LayeredDatabase<MdbxDatabase> {
         let db = MdbxDatabase::open(path).expect("Cannot open database");
         db.open_table::<TestTable>().expect("failed to open table!");
-        let db = LayeredDatabase::open(db);
+        let db = LayeredDatabase::open(db, false);
         db.open_table::<TestTable>();
         db
     }

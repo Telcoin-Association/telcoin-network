@@ -13,8 +13,8 @@ use std::{
 use ouroboros::self_referencing;
 use parking_lot::{RwLock, RwLockReadGuard};
 use redb::{
-    Database as ReDatabase, ReadOnlyTable, ReadTransaction, ReadableTable, ReadableTableMetadata,
-    TableDefinition, WriteTransaction,
+    Database as ReDatabase, ReadOnlyTable, ReadTransaction, ReadableDatabase as _, ReadableTable,
+    ReadableTableMetadata, TableDefinition, WriteTransaction,
 };
 
 use tn_types::{DBIter, Database, DbTx, DbTxMut, KeyT, Table, ValueT};
@@ -103,7 +103,8 @@ impl Drop for ReDB {
 
 impl ReDB {
     pub fn open<P: AsRef<Path>>(path: P) -> eyre::Result<ReDB> {
-        let db = Arc::new(RwLock::new(ReDatabase::create(path.as_ref().join("redb"))?));
+        let db_path = path.as_ref().join("redb");
+        let db = Arc::new(RwLock::new(ReDatabase::create(db_path)?));
         let db_cloned = Arc::clone(&db);
         let (shutdown_tx, rx) = mpsc::sync_channel::<()>(0);
 

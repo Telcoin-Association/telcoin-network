@@ -36,7 +36,9 @@ async fn test_make_batch_el_to_cl() {
     //
 
     let network_client = LocalNetwork::new_with_empty_id();
-    let store = open_db(tmp_dir.path().join("c-db"));
+    let db_path = tmp_dir.path().join("c-db");
+    let _ = std::fs::create_dir_all(&db_path);
+    let store = open_db(db_path);
     let node_metrics = WorkerMetrics::default();
 
     // Mock the primary client to always succeed.

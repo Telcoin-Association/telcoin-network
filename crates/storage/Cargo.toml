@@ -23,7 +23,7 @@ dashmap = { workspace = true }
 tokio = { workspace = true, features = [ "sync" ] }
 
 # redb backend
-redb = { version = "2.1.1", optional = false }
+redb = { version = "3.1.0", optional = false }
 
 # mdbx backend- default
 reth-libmdbx = { workspace = true, optional = true, features = [
@@ -39,6 +39,7 @@ tempfile = { workspace = true }
 redb = []
 reth-libmdbx = ["dep:reth-libmdbx", "dep:page_size"]
 default = ["reth-libmdbx"]
+# XXXX default = ["reth-libmdbx", "redb"]
 
 [lints]
 workspace = true
