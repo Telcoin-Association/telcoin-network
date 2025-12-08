@@ -103,7 +103,7 @@ impl Drop for ReDB {
 
 impl ReDB {
     pub fn open<P: AsRef<Path>>(path: P) -> eyre::Result<ReDB> {
-        let db_path = path.as_ref().join("redb");
+        let db_path = path.as_ref();
         let db = Arc::new(RwLock::new(ReDatabase::create(db_path)?));
         let db_cloned = Arc::clone(&db);
         let (shutdown_tx, rx) = mpsc::sync_channel::<()>(0);
@@ -370,7 +370,7 @@ mod test {
     use super::ReDB;
 
     fn open_db(path: &Path) -> ReDB {
-        let db = ReDB::open(path).expect("Cannot open database");
+        let db = ReDB::open(path.join("redb")).expect("Cannot open database");
         db.open_table::<TestTable>().expect("failed to open table!");
         db
     }

@@ -470,10 +470,10 @@ mod test {
 
     #[cfg(feature = "redb")]
     fn open_redb(path: &Path) -> LayeredDatabase<ReDB> {
-        let db = ReDB::open(path).expect("Cannot open database");
+        let db = ReDB::open(path.join("redb")).expect("Cannot open database");
         db.open_table::<TestTable>().expect("failed to open table!");
         let db = LayeredDatabase::open(db, false);
-        db.open_table::<TestTable>();
+        db.open_table::<TestTable>().expect("failed to open table!");
         db
     }
 
