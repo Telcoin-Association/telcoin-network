@@ -144,10 +144,10 @@ impl MdbxDatabase {
             .set_max_dbs(32)
             .write_map()
             .set_geometry(Geometry {
-                // Maximum database size of 4 terabytes
-                size: Some(0..(4 * TERABYTE)),
-                // We grow the database in increments of 4 gigabytes
-                growth_step: Some(4 * GIGABYTE as isize),
+                // Maximum database size of a terabyte
+                size: Some(0..TERABYTE),
+                // We grow the database in increments of 1 gigabyte
+                growth_step: Some(GIGABYTE as isize),
                 // The database never shrinks
                 shrink_threshold: Some(0),
                 page_size: Some(PageSize::Set(default_page_size())),
@@ -185,13 +185,6 @@ impl MdbxDatabase {
 
         Ok(MdbxDatabase { inner: env, shutdown_tx: Arc::new(shutdown_tx) })
     }
-
-    pub fn open_table<T: Table>(&self) -> eyre::Result<()> {
-        let txn = self.inner.begin_rw_txn()?;
-        txn.create_db(Some(T::NAME), DatabaseFlags::default())?;
-        txn.commit()?;
-        Ok(())
-    }
 }
 
 impl Database for MdbxDatabase {
@@ -204,6 +197,13 @@ impl Database for MdbxDatabase {
         = MdbxTxMut
     where
         Self: 'txn;
+
+    fn open_table<T: Table>(&self) -> eyre::Result<()> {
+        let txn = self.inner.begin_rw_txn()?;
+        txn.create_db(Some(T::NAME), DatabaseFlags::default())?;
+        txn.commit()?;
+        Ok(())
+    }
 
     fn read_txn(&self) -> eyre::Result<Self::TX<'_>> {
         Ok(MdbxTx { inner: self.inner.begin_ro_txn()? })
@@ -366,6 +366,7 @@ mod test {
     use crate::test::*;
     use std::path::Path;
     use tempfile::tempdir;
+    use tn_types::Database as _;
 
     fn open_db(path: &Path) -> MdbxDatabase {
         let db = MdbxDatabase::open(path).expect("Cannot open database");

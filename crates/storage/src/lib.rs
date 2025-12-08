@@ -4,7 +4,6 @@
 #![allow(missing_docs)]
 
 mod stores;
-use layered_db::LayeredDatabase;
 #[cfg(feature = "reth-libmdbx")]
 use mdbx::MdbxDatabase;
 pub use stores::*;
@@ -137,122 +136,86 @@ pub fn open_db<Path: AsRef<std::path::Path> + Send>(store_path: Path) -> Databas
 /// Open or reopen all the storage of the node backed by MDBX.
 #[cfg(feature = "reth-libmdbx")]
 fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatabase<MdbxDatabase> {
+    use tn_types::Database as _;
+
     let store_path = store_path.as_ref();
     let epoch_db =
         MdbxDatabase::open(store_path.join("epoch")).expect("Cannot open database (epoch)");
-    epoch_db.open_table::<LastProposed>().expect("failed to open table!");
-    epoch_db.open_table::<Votes>().expect("failed to open table!");
-    epoch_db.open_table::<Certificates>().expect("failed to open table!");
-    epoch_db.open_table::<CertificateDigestByRound>().expect("failed to open table!");
-    epoch_db.open_table::<CertificateDigestByOrigin>().expect("failed to open table!");
-    epoch_db.open_table::<Payload>().expect("failed to open table!");
-    let epoch_db = LayeredDatabase::open(epoch_db, true);
-    epoch_db.open_table::<LastProposed>();
-    epoch_db.open_table::<Votes>();
-    epoch_db.open_table::<Certificates>();
-    epoch_db.open_table::<CertificateDigestByRound>();
-    epoch_db.open_table::<CertificateDigestByOrigin>();
-    epoch_db.open_table::<Payload>();
-
-    let db = MdbxDatabase::open(store_path.join("consensus_chain"))
+    let consensus_chain_db = MdbxDatabase::open(store_path.join("consensus_chain"))
         .expect("Cannot open database (consensus_chain)");
+    let epoch_chain_db = MdbxDatabase::open(store_path.join("epoch_chain"))
+        .expect("Cannot open database (epoch chain)");
+    let kad_db = MdbxDatabase::open(store_path.join("kad")).expect("Cannot open database (kad)");
+    let cache_db =
+        MdbxDatabase::open(store_path.join("cache")).expect("Cannot open database (cache)");
+
+    let db =
+        CompositeDatabase::open(epoch_db, consensus_chain_db, epoch_chain_db, kad_db, cache_db);
+    // Epoch tables
+    db.open_table::<LastProposed>().expect("failed to open table!");
+    db.open_table::<Votes>().expect("failed to open table!");
+    db.open_table::<Certificates>().expect("failed to open table!");
+    db.open_table::<CertificateDigestByRound>().expect("failed to open table!");
+    db.open_table::<CertificateDigestByOrigin>().expect("failed to open table!");
+    db.open_table::<Payload>().expect("failed to open table!");
+    // Consensus chain tables
     db.open_table::<Batches>().expect("failed to open table!");
     db.open_table::<ConsensusBlocks>().expect("failed to open table!");
     db.open_table::<ConsensusBlockNumbersByDigest>().expect("failed to open table!");
-    let consensus_chain_db = LayeredDatabase::open(db, false);
-    consensus_chain_db.open_table::<Batches>();
-    consensus_chain_db.open_table::<ConsensusBlocks>();
-    consensus_chain_db.open_table::<ConsensusBlockNumbersByDigest>();
-
-    let db = MdbxDatabase::open(store_path.join("epoch_chain"))
-        .expect("Cannot open database (epoch chain)");
+    // Epoch chain tables
     db.open_table::<EpochRecords>().expect("failed to open table!");
     db.open_table::<EpochCerts>().expect("failed to open table!");
     db.open_table::<EpochRecordsIndex>().expect("failed to open table!");
-    let epoch_chain_db = LayeredDatabase::open(db, false);
-    epoch_chain_db.open_table::<EpochRecords>();
-    epoch_chain_db.open_table::<EpochCerts>();
-    epoch_chain_db.open_table::<EpochRecordsIndex>();
-
-    let db = MdbxDatabase::open(store_path.join("kad")).expect("Cannot open database (kad)");
+    // Kad tables
     db.open_table::<KadRecords>().expect("failed to open table!");
     db.open_table::<KadProviderRecords>().expect("failed to open table!");
     db.open_table::<KadWorkerRecords>().expect("failed to open table!");
     db.open_table::<KadWorkerProviderRecords>().expect("failed to open table!");
-    let kad_db = LayeredDatabase::open(db, true);
-    kad_db.open_table::<KadRecords>();
-    kad_db.open_table::<KadProviderRecords>();
-    kad_db.open_table::<KadWorkerRecords>();
-    kad_db.open_table::<KadWorkerProviderRecords>();
-
-    let db = MdbxDatabase::open(store_path.join("cache")).expect("Cannot open database (cache)");
+    // Cache tables
     db.open_table::<ConsensusBlocksCache>().expect("failed to open table!");
     db.open_table::<NodeBatchesCache>().expect("failed to open table!");
-    let cache_db = LayeredDatabase::open(db, true);
-    cache_db.open_table::<ConsensusBlocksCache>();
-    cache_db.open_table::<NodeBatchesCache>();
-
-    CompositeDatabase::open(epoch_db, consensus_chain_db, epoch_chain_db, kad_db, cache_db)
+    db
 }
 
 /// Open or reopen all the storage of the node backed by ReDB.
 #[cfg(feature = "redb")]
 fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatabase<ReDB> {
+    use tn_types::Database as _;
+
     let store_path = store_path.as_ref();
     let epoch_db = ReDB::open(store_path.join("epoch")).expect("Cannot open database (epoch)");
-    epoch_db.open_table::<LastProposed>().expect("failed to open table!");
-    epoch_db.open_table::<Votes>().expect("failed to open table!");
-    epoch_db.open_table::<Certificates>().expect("failed to open table!");
-    epoch_db.open_table::<CertificateDigestByRound>().expect("failed to open table!");
-    epoch_db.open_table::<CertificateDigestByOrigin>().expect("failed to open table!");
-    epoch_db.open_table::<Payload>().expect("failed to open table!");
-    let epoch_db = LayeredDatabase::open(epoch_db, true);
-    epoch_db.open_table::<LastProposed>();
-    epoch_db.open_table::<Votes>();
-    epoch_db.open_table::<Certificates>();
-    epoch_db.open_table::<CertificateDigestByRound>();
-    epoch_db.open_table::<CertificateDigestByOrigin>();
-    epoch_db.open_table::<Payload>();
-
-    let db = ReDB::open(store_path.join("consensus_chain"))
+    let consensus_chain_db = ReDB::open(store_path.join("consensus_chain"))
         .expect("Cannot open database (consensus_chain)");
+    let epoch_chain_db =
+        ReDB::open(store_path.join("epoch_chain")).expect("Cannot open database (epoch chain)");
+    let kad_db = ReDB::open(store_path.join("kad")).expect("Cannot open database (kad)");
+    let cache_db = ReDB::open(store_path.join("cache")).expect("Cannot open database (cache)");
+    let db =
+        CompositeDatabase::open(epoch_db, consensus_chain_db, epoch_chain_db, kad_db, cache_db);
+    // Epoch tables
+    db.open_table::<LastProposed>().expect("failed to open table!");
+    db.open_table::<Votes>().expect("failed to open table!");
+    db.open_table::<Certificates>().expect("failed to open table!");
+    db.open_table::<CertificateDigestByRound>().expect("failed to open table!");
+    db.open_table::<CertificateDigestByOrigin>().expect("failed to open table!");
+    db.open_table::<Payload>().expect("failed to open table!");
+    // Consensus chain tables
     db.open_table::<Batches>().expect("failed to open table!");
     db.open_table::<ConsensusBlocks>().expect("failed to open table!");
     db.open_table::<ConsensusBlockNumbersByDigest>().expect("failed to open table!");
-    let consensus_chain_db = LayeredDatabase::open(db, false);
-    consensus_chain_db.open_table::<Batches>();
-    consensus_chain_db.open_table::<ConsensusBlocks>();
-    consensus_chain_db.open_table::<ConsensusBlockNumbersByDigest>();
-
-    let db =
-        ReDB::open(store_path.join("epoch_chain")).expect("Cannot open database (epoch chain)");
+    // Epoch chain tables
     db.open_table::<EpochRecords>().expect("failed to open table!");
     db.open_table::<EpochCerts>().expect("failed to open table!");
     db.open_table::<EpochRecordsIndex>().expect("failed to open table!");
-    let epoch_chain_db = LayeredDatabase::open(db, false);
-    epoch_chain_db.open_table::<EpochRecords>();
-    epoch_chain_db.open_table::<EpochCerts>();
-    epoch_chain_db.open_table::<EpochRecordsIndex>();
-
-    let db = ReDB::open(store_path.join("kad")).expect("Cannot open database (kad)");
+    // Kad tables
     db.open_table::<KadRecords>().expect("failed to open table!");
     db.open_table::<KadProviderRecords>().expect("failed to open table!");
     db.open_table::<KadWorkerRecords>().expect("failed to open table!");
     db.open_table::<KadWorkerProviderRecords>().expect("failed to open table!");
-    let kad_db = LayeredDatabase::open(db, true);
-    kad_db.open_table::<KadRecords>();
-    kad_db.open_table::<KadProviderRecords>();
-    kad_db.open_table::<KadWorkerRecords>();
-    kad_db.open_table::<KadWorkerProviderRecords>();
-
-    let db = ReDB::open(store_path.join("cache")).expect("Cannot open database (cache)");
+    // Cache tables
     db.open_table::<ConsensusBlocksCache>().expect("failed to open table!");
     db.open_table::<NodeBatchesCache>().expect("failed to open table!");
-    let cache_db = LayeredDatabase::open(db, true);
-    cache_db.open_table::<ConsensusBlocksCache>();
-    cache_db.open_table::<NodeBatchesCache>();
-
-    CompositeDatabase::open(epoch_db, consensus_chain_db, epoch_chain_db, kad_db, cache_db)
+    db
 }
 
 #[cfg(test)]

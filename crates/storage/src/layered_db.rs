@@ -224,15 +224,6 @@ impl<DB: Database> LayeredDatabase<DB> {
             Some(Arc::new(std::thread::spawn(move || db_run(db_cloned, mem_db_clone, rx))));
         Self { mem_db, db, tx, thread, full_memory }
     }
-
-    pub fn open_table<T: Table>(&self) {
-        self.mem_db.open_table::<T>();
-        if self.full_memory {
-            for (k, v) in self.db.iter::<T>() {
-                let _ = self.mem_db.insert::<T>(&k, &v);
-            }
-        }
-    }
 }
 
 impl<DB: Database> Database for LayeredDatabase<DB> {
@@ -245,6 +236,17 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
         = LayeredDbTxMut<DB>
     where
         Self: 'txn;
+
+    fn open_table<T: Table>(&self) -> eyre::Result<()> {
+        self.db.open_table::<T>()?;
+        self.mem_db.open_table::<T>()?;
+        if self.full_memory {
+            for (k, v) in self.db.iter::<T>() {
+                let _ = self.mem_db.insert::<T>(&k, &v);
+            }
+        }
+        Ok(())
+    }
 
     fn read_txn(&self) -> eyre::Result<Self::TX<'_>> {
         Ok(LayeredDbTx { mem_db: self.mem_db.clone(), db: self.db.clone() })
@@ -464,6 +466,7 @@ mod test {
     use crate::{mdbx::MdbxDatabase, test::*};
     use std::path::Path;
     use tempfile::tempdir;
+    use tn_types::Database as _;
 
     #[cfg(feature = "redb")]
     fn open_redb(path: &Path) -> LayeredDatabase<ReDB> {
@@ -478,7 +481,7 @@ mod test {
         let db = MdbxDatabase::open(path).expect("Cannot open database");
         db.open_table::<TestTable>().expect("failed to open table!");
         let db = LayeredDatabase::open(db, false);
-        db.open_table::<TestTable>();
+        db.open_table::<TestTable>().expect("failed to open table!");
         db
     }
 

@@ -151,19 +151,19 @@ impl ReDB {
 
         Ok(ReDB { db, shutdown_tx })
     }
+}
 
-    pub fn open_table<T: Table>(&self) -> eyre::Result<()> {
+impl Database for ReDB {
+    type TX<'txn> = ReDbTx;
+    type TXMut<'txn> = ReDbTxMut;
+
+    fn open_table<T: Table>(&self) -> eyre::Result<()> {
         let txn = self.db.read().begin_write()?;
         let td = TableDefinition::<KeyWrap<T::Key>, ValWrap<T::Value>>::new(T::NAME);
         txn.open_table(td)?;
         txn.commit()?;
         Ok(())
     }
-}
-
-impl Database for ReDB {
-    type TX<'txn> = ReDbTx;
-    type TXMut<'txn> = ReDbTxMut;
 
     fn read_txn(&self) -> eyre::Result<Self::TX<'_>> {
         let tx = self.db.read().begin_read()?;

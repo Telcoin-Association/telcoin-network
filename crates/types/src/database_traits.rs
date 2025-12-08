@@ -64,6 +64,9 @@ pub trait Database: Send + Sync + Clone + Unpin + 'static {
     where
         Self: 'txn;
 
+    /// Open a new database table.
+    fn open_table<T: Table>(&self) -> eyre::Result<()>;
+
     /// Return a read txn object.
     fn read_txn(&self) -> eyre::Result<Self::TX<'_>>;
 

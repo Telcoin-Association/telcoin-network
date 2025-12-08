@@ -24,12 +24,17 @@ pub struct CompositeDatabase<DB: Database> {
 
 impl<DB: Database> CompositeDatabase<DB> {
     pub fn open(
-        epoch_db: LayeredDatabase<DB>,
-        consensus_chain_db: LayeredDatabase<DB>,
-        epoch_chain_db: LayeredDatabase<DB>,
-        kad_db: LayeredDatabase<DB>,
-        cache_db: LayeredDatabase<DB>,
+        epoch_db: DB,
+        consensus_chain_db: DB,
+        epoch_chain_db: DB,
+        kad_db: DB,
+        cache_db: DB,
     ) -> Self {
+        let epoch_db = LayeredDatabase::open(epoch_db, true);
+        let consensus_chain_db = LayeredDatabase::open(consensus_chain_db, false);
+        let epoch_chain_db = LayeredDatabase::open(epoch_chain_db, false);
+        let kad_db = LayeredDatabase::open(kad_db, true);
+        let cache_db = LayeredDatabase::open(cache_db, true);
         Self {
             inner: Arc::new(Inner {
                 epoch_db,
@@ -62,6 +67,10 @@ impl<DB: Database> Database for CompositeDatabase<DB> {
         = CompositeDbTxMut<DB>
     where
         Self: 'txn;
+
+    fn open_table<T: Table>(&self) -> eyre::Result<()> {
+        self.get_db(T::HINT).open_table::<T>()
+    }
 
     fn read_txn(&self) -> eyre::Result<Self::TX<'_>> {
         Ok(CompositeDbTx { inner: self.inner.clone() })
