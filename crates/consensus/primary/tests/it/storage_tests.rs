@@ -10,8 +10,10 @@ use tempfile::TempDir;
 use tn_primary::test_utils::temp_dir;
 use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_storage::{
-    mem_db::MemDatabase, open_db, tables::CertificateDigestByOrigin, CertificateStore,
-    ConsensusStore, ProposerStore,
+    mem_db::MemDatabase,
+    open_db,
+    tables::{CertificateDigestByOrigin, CertificateDigestByRound, Certificates, ConsensusBlocks},
+    CertificateStore, ConsensusStore, ProposerStore,
 };
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
@@ -132,7 +134,7 @@ async fn test_consensus_store_read_latest_final_reputation_scores() {
 
         store.write_subdag_for_test(sequence_number, sub_dag);
     }
-    store.persist().await;
+    store.persist::<ConsensusBlocks>().await;
 
     // WHEN we try to read the final schedule. The one of sub dag sequence 20 should be returned
     let commit = store.read_latest_commit_with_final_reputation_scores(committee.epoch()).unwrap();
@@ -253,7 +255,7 @@ async fn test_certificate_store_last_two_rounds() {
 
     // store them in both main and secondary index
     store.write_all(certs).unwrap();
-    store.persist().await;
+    store.persist::<CertificateDigestByRound>().await;
 
     // WHEN
     let result = store.last_two_rounds_certs().unwrap();
@@ -313,6 +315,7 @@ async fn test_certificate_store_after_round() {
 
     // store them in both main and secondary index
     store.write_all(certs.clone()).unwrap();
+    store.persist::<CertificateDigestByRound>().await; // Let the writes settle
 
     tracing::debug!("Stored certificates: {} seconds", now.elapsed().as_secs_f32());
 
@@ -460,7 +463,7 @@ async fn test_certificate_store_delete_store() {
 
     store.delete(to_delete[0]).unwrap();
     store.delete(to_delete[1]).unwrap();
-    store.persist().await; // Make sure the deletes are complete...
+    store.persist::<Certificates>().await; // Make sure the deletes are complete...
 
     // THEN
     assert!(store.read(to_delete[0]).unwrap().is_none());

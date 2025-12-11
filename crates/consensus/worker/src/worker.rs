@@ -287,6 +287,8 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
             error!(target: "worker::batch_provider", "Store failed with error: {:?}", e);
             return Err(BlockSealError::FatalDBFailure);
         }
+        // Make sure we have persisted the batch before we report it to other nodes.
+        self.store.persist::<Batches>().await;
 
         // Send the batch to the primary.
         let message = WorkerOwnBatchMessage { worker_id: self.id, digest };

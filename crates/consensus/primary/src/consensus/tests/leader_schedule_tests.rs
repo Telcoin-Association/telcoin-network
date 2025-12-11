@@ -4,7 +4,7 @@ use crate::consensus::{Dag, LeaderSchedule, LeaderSwapTable};
 use std::{collections::BTreeSet, num::NonZeroUsize};
 use tempfile::TempDir;
 use tn_primary::test_utils::mock_certificate;
-use tn_storage::{mem_db::MemDatabase, open_db, ConsensusStore};
+use tn_storage::{mem_db::MemDatabase, open_db, tables::ConsensusBlocks, ConsensusStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     AuthorityIdentifier, Certificate, CommittedSubDag, Database as _, ReputationScores, Round,
@@ -435,7 +435,7 @@ async fn test_leader_schedule_from_store() {
     let sub_dag = CommittedSubDag::new(vec![], Certificate::default(), 0, scores, None);
 
     store.write_subdag_for_test(0, sub_dag);
-    store.persist().await;
+    store.persist::<ConsensusBlocks>().await;
 
     // WHEN
     let schedule = LeaderSchedule::from_store(committee, store, 33);
