@@ -58,9 +58,15 @@ async fn get_consensus_header<DB: TNDatabase>(
             }
             let parent_number = header.number - 1;
             let epoch = header.sub_dag.leader_epoch();
-            if header.number > consensus_bus.last_consensus_header().borrow().number {
+            let last_seen_header_number = consensus_bus
+                .last_consensus_header()
+                .borrow()
+                .as_ref()
+                .map(|h| h.number)
+                .unwrap_or_default();
+            if header.number > last_seen_header_number {
                 // Update our last seen valid consensus header if it is newer.
-                let _ = consensus_bus.last_consensus_header().send(header);
+                let _ = consensus_bus.last_consensus_header().send(Some(header));
             }
             Some((epoch, parent_number, parent))
         }

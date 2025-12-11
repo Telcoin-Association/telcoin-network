@@ -45,9 +45,9 @@ use tn_storage::{
 use tn_types::{
     error::HeaderError, gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash,
     BlsAggregateSignature, BlsPublicKey, BlsSignature, Committee, CommitteeBuilder,
-    ConsensusHeader, ConsensusOutput, Database as TNDatabase, Epoch, EpochCertificate, EpochRecord,
-    EpochVote, Multiaddr, NetworkPublicKey, Noticer, Notifier, TaskJoinError, TaskManager,
-    TaskSpawner, TimestampSec, TnReceiver, TnSender, B256, MIN_PROTOCOL_BASE_FEE,
+    ConsensusOutput, Database as TNDatabase, Epoch, EpochCertificate, EpochRecord, EpochVote,
+    Multiaddr, NetworkPublicKey, Notifier, TaskJoinError, TaskManager, TaskSpawner, TimestampSec,
+    TnReceiver, TnSender, B256, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{
     quorum_waiter::QuorumWaiterTrait, Worker, WorkerNetwork, WorkerNetworkHandle, WorkerRequest,
@@ -281,6 +281,10 @@ where
             );
         }
 
+        self.try_restore_state(&engine).await?;
+        // spawn task to update the latest execution results for consensus
+        self.spawn_engine_update_task(engine.canonical_block_stream().await, &node_task_manager);
+
         // add engine task manager
         node_task_manager.add_task_manager(engine_task_manager);
         node_task_manager.update_tasks();
@@ -408,6 +412,7 @@ where
         self.consensus_db.clear_table::<Votes>()?;
 
         let node_ended_sub = self.node_shutdown.subscribe();
+
         // loop through epochs
         loop {
             let epoch_result = self
@@ -490,6 +495,20 @@ where
         gas_accumulator: GasAccumulator,
     ) -> eyre::Result<()> {
         info!(target: "epoch-manager", "Starting epoch");
+
+        if !*initial_epoch {
+            // If we are restarting the epoch not on a boundary
+            // and we sent some consensus output to the engine
+            // then we need to pause for the engine to execute.
+            // If we don't we can have races when the epoch restarts
+            // that will send consensus to the engine more than once.
+            if let Some(last_consensus) =
+                self.consensus_db.last_record::<ConsensusBlocks>().map(|(_, block)| block.digest())
+            {
+                self.consensus_bus.wait_for_consensus_execution(last_consensus).await?;
+            }
+        }
+
         let node_ended = self.node_shutdown.subscribe();
 
         // The task manager that resets every epoch and manages
@@ -590,7 +609,7 @@ where
                 let target_hash = res.inspect_err(|e| {
                     error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
                 })?;
-                self.close_epoch(engine, consensus_shutdown.clone(), gas_accumulator, target_hash)
+                self.close_epoch(consensus_shutdown.clone(), gas_accumulator, target_hash)
                     .await?;
 
                 // Write the epoch record to DB and save in manager for next epoch.
@@ -699,7 +718,13 @@ where
             );
             return Err(eyre!("failed to find previous epoch record when starting epoch"));
         };
-        let target_hash = self.consensus_bus.last_consensus_header().borrow().clone().digest();
+        let target_hash = self
+            .consensus_bus
+            .last_consensus_header()
+            .borrow()
+            .clone()
+            .unwrap_or_default()
+            .digest();
         let parent_state = self.consensus_bus.recent_blocks().borrow().latest_block_num_hash();
 
         let epoch_rec = EpochRecord {
@@ -999,41 +1024,16 @@ where
     /// in the run_epoch() select.
     async fn close_epoch(
         &self,
-        engine: &ExecutionNode,
         shutdown_consensus: Notifier,
         gas_accumulator: GasAccumulator,
         target_hash: B256,
     ) -> eyre::Result<()> {
-        // subscribe to engine blocks to confirm epoch closed on-chain
-        let mut executed_output = engine.canonical_block_stream().await;
         // begin consensus shutdown while engine executes
         shutdown_consensus.notify();
-
-        let latest_exec =
-            self.consensus_bus.recent_blocks().borrow().latest_block().parent_beacon_block_root;
-        // If we have already caught up execution then we are good, skip below loop (and hanging
-        // up...).
-        if Some(target_hash) == latest_exec {
-            self.adjust_base_fees(&gas_accumulator);
-            gas_accumulator.clear(); // Clear the accumlated values for next epoch.
-            return Ok(());
-        }
-        // wait for execution result before proceeding
-        while let Some(output) = executed_output.next().await {
-            // ensure canonical tip is updated with closing epoch info
-            if output.tip().sealed_header().parent_beacon_block_root == Some(target_hash) {
-                self.adjust_base_fees(&gas_accumulator);
-                gas_accumulator.clear(); // Clear the accumlated values for next epoch.
-                return Ok(());
-            }
-        }
-
-        // `None` indicates all senders have dropped
-        error!(
-            target: "epoch-manager",
-            "canon state notifications dropped while awaiting engine execution for closing epoch",
-        );
-        Err(eyre!("engine failed to report output for closing epoch"))
+        self.consensus_bus.wait_for_consensus_execution(target_hash).await?;
+        self.adjust_base_fees(&gas_accumulator);
+        gas_accumulator.clear(); // Clear the accumlated values for next epoch.
+        Ok(())
     }
 
     /// Helper method to create all engine components.
@@ -1097,17 +1097,6 @@ where
         // ensure initialized networks is false after the first run
         *initial_epoch = false;
 
-        // set execution state for consensus
-        self.try_restore_state(engine).await?;
-
-        // spawn task to update the latest execution results for consensus
-        //
-        // NOTE: this should live and die with epochs because it updates the consensus bus
-        self.spawn_engine_update_task(
-            consensus_config.shutdown().subscribe(),
-            engine.canonical_block_stream().await,
-            epoch_task_manager,
-        );
         let primary_handle = primary.network_handle().await;
         let prefetches = preload_keys.clone();
         // Attempt to pre-load the next couple of committee's network info.
@@ -1562,15 +1551,6 @@ where
                 .send_modify(|blocks| blocks.push_latest(recent_block));
         }
 
-        // prime the last consensus header from the DB
-        let (_, last_db_block) = self
-            .consensus_db
-            .last_record::<ConsensusBlocks>()
-            .unwrap_or_else(|| (0, ConsensusHeader::default()));
-        // prime the watch channel with data from the db this will be updated by state-sync if this
-        // node can_cvv
-        self.consensus_bus.last_consensus_header().send(last_db_block)?;
-
         Ok(())
     }
 
@@ -1612,29 +1592,18 @@ where
     /// final block.
     fn spawn_engine_update_task(
         &self,
-        shutdown_rx: Noticer,
         mut engine_state: CanonStateNotificationStream,
-        epoch_task_manager: &TaskManager,
+        task_manager: &TaskManager,
     ) {
         // spawn epoch-specific task to forward blocks from the engine to consensus
         let consensus_bus = self.consensus_bus.clone();
-        epoch_task_manager.spawn_critical_task("latest execution block", async move {
-            loop {
-                tokio::select!(
-                    _ = &shutdown_rx => {
-                        info!(target: "engine", "received shutdown from consensus to stop updating consensus bus recent blocks");
-                        break;
-                    }
-                    latest = engine_state.next() => {
-                        if let Some(latest) = latest {
-                            consensus_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(latest.tip().clone_sealed_header()));
-                        } else {
-                            error!(target: "engine", "engine state stream ended, node will exit");
-                            break;
-                        }
-                    }
-                )
+        task_manager.spawn_critical_task("latest execution block", async move {
+            while let Some(latest) = engine_state.next().await {
+                consensus_bus
+                    .recent_blocks()
+                    .send_modify(|blocks| blocks.push_latest(latest.tip().clone_sealed_header()));
             }
+            error!(target: "engine", "engine state stream ended, node will exit");
         });
     }
 

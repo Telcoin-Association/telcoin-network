@@ -162,7 +162,7 @@ where
                 if let Some(committee) = self.get_committee(epoch) {
                     match unverified_cert.verify_cert(&committee) {
                         Ok(cert) => {
-                            if !self.consensus_bus.node_mode().borrow().is_observer() {
+                            if self.consensus_bus.node_mode().borrow().is_active_cvv() {
                                 if self.behind_consensus(epoch, cert.header().round, None).await {
                                     warn!(target: "primary", "certificate indicates we are behind, go to catchup mode!");
                                     return Ok(());

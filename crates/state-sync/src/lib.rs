@@ -33,7 +33,7 @@ pub async fn prime_consensus<DB: Database>(
     // Get the DB and load our last executed consensus block (note there may be unexecuted
     // blocks, catch up will execute them).
     let last_executed_block =
-        last_executed_consensus_block(consensus_bus, config).unwrap_or_default();
+        last_executed_consensus_block(consensus_bus, config.node_storage()).unwrap_or_default();
 
     let current_epoch = config.epoch();
 
@@ -159,10 +159,10 @@ pub fn save_consensus<DB: Database>(
 /// issue.
 pub fn last_executed_consensus_block<DB: Database>(
     consensus_bus: &ConsensusBus,
-    config: &ConsensusConfig<DB>,
+    db: &DB,
 ) -> Option<ConsensusHeader> {
-    let last = consensus_bus.last_executed_consensus_block(config.node_storage());
-    debug!(target: "state-sync", ?last, epoch=?config.epoch(), "last executed consensus block");
+    let last = consensus_bus.last_executed_consensus_block(db);
+    debug!(target: "state-sync", ?last, "last executed consensus block");
     last
 }
 
@@ -174,7 +174,7 @@ pub async fn stream_missing_consensus<DB: Database>(
 ) -> eyre::Result<()> {
     // Get the DB and load our last executed consensus block.
     let last_executed_block =
-        last_executed_consensus_block(consensus_bus, config).unwrap_or_default();
+        last_executed_consensus_block(consensus_bus, config.node_storage()).unwrap_or_default();
     // Edge case, in case we don't hear from peers but have un-executed blocks...
     // Not sure we should handle this, but it hurts nothing.
     let db = config.node_storage();
@@ -201,22 +201,20 @@ pub async fn stream_missing_consensus<DB: Database>(
 /// Collect and return any consensus headers that were not executed before last shutdown.
 /// This will be consensus that was reached but had not executed before a shutdown.
 pub async fn get_missing_consensus<DB: Database>(
-    config: &ConsensusConfig<DB>,
+    db: &DB,
     consensus_bus: &ConsensusBus,
 ) -> eyre::Result<Vec<ConsensusHeader>> {
     let mut result = Vec::new();
     // Get the DB and load our last executed consensus block.
-    let last_executed_block =
-        last_executed_consensus_block(consensus_bus, config).unwrap_or_default();
+    let last_executed_block = last_executed_consensus_block(consensus_bus, db).unwrap_or_default();
 
     // Edge case, in case we don't hear from peers but have un-executed blocks...
     // Not sure we should handle this, but it hurts nothing.
-    let db = config.node_storage();
     let (_, last_db_block) = db
         .last_record::<ConsensusBlocks>()
         .unwrap_or_else(|| (last_executed_block.number, last_executed_block.clone()));
 
-    debug!(target: "state-sync", ?last_executed_block, ?last_db_block, "comparing last executed block and last recorded consensus block");
+    info!(target: "state-sync", ?last_executed_block, ?last_db_block, "comparing last executed block and last recorded consensus block");
 
     // if the last recorded consensus block is larger than the last executed block,
     // forward the stored consensus block to engine for execution
@@ -229,7 +227,7 @@ pub async fn get_missing_consensus<DB: Database>(
         }
     }
 
-    debug!(target: "state-sync", ?result, "missing consensus headers that need execution:");
+    info!(target: "state-sync", ?result, "missing consensus headers that need execution:");
     Ok(result)
 }
 
@@ -244,14 +242,15 @@ async fn spawn_stream_consensus_headers<DB: Database>(
 
     let mut rx_last_consensus_header = consensus_bus.last_consensus_header().subscribe();
     let mut last_consensus_header =
-        last_executed_consensus_block(&consensus_bus, &config).unwrap_or_default();
+        last_executed_consensus_block(&consensus_bus, config.node_storage()).unwrap_or_default();
     let mut last_consensus_height = last_consensus_header.number;
 
     // infinite loop over consensus output
     loop {
         tokio::select! {
             _ = rx_last_consensus_header.changed() => {
-                let header = rx_last_consensus_header.borrow_and_update().clone();
+                // If this changes it should not be None...
+                let header = rx_last_consensus_header.borrow().clone().unwrap_or_default();
                 debug!(target: "state-sync", rx_last_consensus_header=?header.number, ?last_consensus_height, "streaming consensus headers detected change");
 
                 if header.number > last_consensus_height {

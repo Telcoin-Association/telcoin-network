@@ -53,6 +53,16 @@ impl RecentBlocks {
         false
     }
 
+    /// Is hash (consensus output) in a recent block we have executed?
+    pub fn contains_consensus(&self, hash: BlockHash) -> bool {
+        for block in &self.blocks {
+            if block.parent_beacon_block_root == Some(hash) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Number of blocks actually stored.
     pub fn len(&self) -> usize {
         self.blocks.len()

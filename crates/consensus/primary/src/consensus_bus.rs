@@ -169,9 +169,9 @@ struct ConsensusBusAppInner {
     _rx_recent_blocks: watch::Receiver<RecentBlocks>,
 
     /// Watch tracking most recently seen consensus header.
-    tx_last_consensus_header: watch::Sender<ConsensusHeader>,
+    tx_last_consensus_header: watch::Sender<Option<ConsensusHeader>>,
     /// Hold onto the consensus header watch to keep it "open"
-    _rx_last_consensus_header: watch::Receiver<ConsensusHeader>,
+    _rx_last_consensus_header: watch::Receiver<Option<ConsensusHeader>>,
     /// Watch tracking the last gossipped consensus block number and hash.
     tx_last_published_consensus_num_hash: watch::Sender<(u64, BlockHash)>,
     /// Hold onto the published consensus header watch to keep it "open"
@@ -216,8 +216,7 @@ impl ConsensusBusAppInner {
             watch::channel(Epoch::default());
 
         let (tx_primary_round_updates, _rx_primary_round_updates) = watch::channel(0u32);
-        let (tx_last_consensus_header, _rx_last_consensus_header) =
-            watch::channel(ConsensusHeader::default());
+        let (tx_last_consensus_header, _rx_last_consensus_header) = watch::channel(None);
         let (tx_last_published_consensus_num_hash, _rx_last_published_consensus_num_hash) =
             watch::channel((0, BlockHash::default()));
 
@@ -263,12 +262,6 @@ impl ConsensusBusAppInner {
         let _ = self.tx_committed_round_updates.send(Round::default());
         let _ = self.tx_gc_round_updates.send(Round::default());
         let _ = self.tx_primary_round_updates.send(0u32);
-        let recent_blocks = self.tx_recent_blocks.borrow().block_capacity();
-        // Hang onto the last block of the previous epoch, clear the rest.
-        let latest = self.tx_recent_blocks.borrow().latest_block();
-        let mut recent_blocks = RecentBlocks::new(recent_blocks as usize);
-        recent_blocks.push_latest(latest);
-        let _ = self.tx_recent_blocks.send(recent_blocks);
     }
 }
 
@@ -514,7 +507,7 @@ impl ConsensusBus {
 
     /// Track the latest consensus header we have seen.
     /// Note, this should be a valid header (authenticated by it's epoch's committee).
-    pub fn last_consensus_header(&self) -> &watch::Sender<ConsensusHeader> {
+    pub fn last_consensus_header(&self) -> &watch::Sender<Option<ConsensusHeader>> {
         &self.inner_app.tx_last_consensus_header
     }
 
@@ -629,6 +622,25 @@ impl ConsensusBus {
             // Failed to find our block at it's number.
             Err(WaitForExecutionElapsed())
         }
+    }
+
+    /// Will resolve once we have executed the consensus for hash.
+    ///
+    /// Note if the chain is not advancing this may never return.
+    pub async fn wait_for_consensus_execution(
+        &self,
+        hash: BlockHash,
+    ) -> Result<(), WaitForExecutionElapsed> {
+        let mut watch_execution_result = self.recent_blocks().subscribe();
+        if self.recent_blocks().borrow().contains_consensus(hash) {
+            return Ok(());
+        }
+        while watch_execution_result.changed().await.is_ok() {
+            if self.recent_blocks().borrow().contains_consensus(hash) {
+                return Ok(());
+            }
+        }
+        Err(WaitForExecutionElapsed())
     }
 
     /// Returns the ConsensusHeader that created the last executed block if it can be found.
