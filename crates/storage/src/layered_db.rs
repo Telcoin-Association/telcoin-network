@@ -463,7 +463,10 @@ mod test {
     use super::LayeredDatabase;
     #[cfg(feature = "redb")]
     use crate::redb::ReDB;
-    use crate::{mdbx::MdbxDatabase, test::*};
+    use crate::{
+        mdbx::{database::MEGABYTE, MdbxDatabase},
+        test::*,
+    };
     use std::path::Path;
     use tempfile::tempdir;
     use tn_types::Database as _;
@@ -478,7 +481,8 @@ mod test {
     }
 
     fn open_mdbx(path: &Path) -> LayeredDatabase<MdbxDatabase> {
-        let db = MdbxDatabase::open(path).expect("Cannot open database");
+        let db =
+            MdbxDatabase::open(path, 4, 16 * MEGABYTE, 8 * MEGABYTE).expect("Cannot open database");
         db.open_table::<TestTable>().expect("failed to open table!");
         let db = LayeredDatabase::open(db, false);
         db.open_table::<TestTable>().expect("failed to open table!");

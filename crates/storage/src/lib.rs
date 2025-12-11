@@ -138,19 +138,32 @@ pub fn open_db<Path: AsRef<std::path::Path> + Send>(store_path: Path) -> Databas
 fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatabase<MdbxDatabase> {
     use tn_types::Database as _;
 
-    let store_path = store_path.as_ref();
-    let epoch_db =
-        MdbxDatabase::open(store_path.join("epoch")).expect("Cannot open database (epoch)");
-    let consensus_chain_db = MdbxDatabase::open(store_path.join("consensus_chain"))
-        .expect("Cannot open database (consensus_chain)");
-    let epoch_chain_db = MdbxDatabase::open(store_path.join("epoch_chain"))
-        .expect("Cannot open database (epoch chain)");
-    let kad_db = MdbxDatabase::open(store_path.join("kad")).expect("Cannot open database (kad)");
-    let cache_db =
-        MdbxDatabase::open(store_path.join("cache")).expect("Cannot open database (cache)");
+    use crate::mdbx::database::{MEGABYTE, TERABYTE};
 
-    let db =
-        CompositeDatabase::open(epoch_db, consensus_chain_db, epoch_chain_db, kad_db, cache_db);
+    let store_path = store_path.as_ref();
+    let epoch_db = MdbxDatabase::open(store_path.join("epoch"), 8, 128 * MEGABYTE, 8 * MEGABYTE)
+        .expect("Cannot open database (epoch)");
+    let batch_db = MdbxDatabase::open(store_path.join("batch"), 4, 2 * TERABYTE, 512 * MEGABYTE)
+        .expect("Cannot open database (batch)");
+    let consensus_chain_db =
+        MdbxDatabase::open(store_path.join("consensus_chain"), 4, TERABYTE, 512 * MEGABYTE)
+            .expect("Cannot open database (consensus_chain)");
+    let epoch_chain_db =
+        MdbxDatabase::open(store_path.join("epoch_chain"), 4, TERABYTE, 512 * MEGABYTE)
+            .expect("Cannot open database (epoch chain)");
+    let kad_db = MdbxDatabase::open(store_path.join("kad"), 8, 64 * MEGABYTE, 8 * MEGABYTE)
+        .expect("Cannot open database (kad)");
+    let cache_db = MdbxDatabase::open(store_path.join("cache"), 4, 512 * MEGABYTE, 64 * MEGABYTE)
+        .expect("Cannot open database (cache)");
+
+    let db = CompositeDatabase::open(
+        epoch_db,
+        batch_db,
+        consensus_chain_db,
+        epoch_chain_db,
+        kad_db,
+        cache_db,
+    );
     // Epoch tables
     db.open_table::<LastProposed>().expect("failed to open table!");
     db.open_table::<Votes>().expect("failed to open table!");
@@ -158,8 +171,9 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatab
     db.open_table::<CertificateDigestByRound>().expect("failed to open table!");
     db.open_table::<CertificateDigestByOrigin>().expect("failed to open table!");
     db.open_table::<Payload>().expect("failed to open table!");
-    // Consensus chain tables
+    // Batch table (seperate, used for CVV and consensus chain)
     db.open_table::<Batches>().expect("failed to open table!");
+    // Consensus chain tables
     db.open_table::<ConsensusBlocks>().expect("failed to open table!");
     db.open_table::<ConsensusBlockNumbersByDigest>().expect("failed to open table!");
     // Epoch chain tables
@@ -184,14 +198,21 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatab
 
     let store_path = store_path.as_ref();
     let epoch_db = ReDB::open(store_path.join("epoch")).expect("Cannot open database (epoch)");
+    let batch_db = ReDB::open(store_path.join("batch")).expect("Cannot open database (batch)");
     let consensus_chain_db = ReDB::open(store_path.join("consensus_chain"))
         .expect("Cannot open database (consensus_chain)");
     let epoch_chain_db =
         ReDB::open(store_path.join("epoch_chain")).expect("Cannot open database (epoch chain)");
     let kad_db = ReDB::open(store_path.join("kad")).expect("Cannot open database (kad)");
     let cache_db = ReDB::open(store_path.join("cache")).expect("Cannot open database (cache)");
-    let db =
-        CompositeDatabase::open(epoch_db, consensus_chain_db, epoch_chain_db, kad_db, cache_db);
+    let db = CompositeDatabase::open(
+        epoch_db,
+        batch_db,
+        consensus_chain_db,
+        epoch_chain_db,
+        kad_db,
+        cache_db,
+    );
     // Epoch tables
     db.open_table::<LastProposed>().expect("failed to open table!");
     db.open_table::<Votes>().expect("failed to open table!");
