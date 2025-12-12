@@ -477,6 +477,38 @@ where
         Ok(())
     }
 
+    /*XXXX/// Look for consensus that was not executed (after a restart for instance) and send to the engine if found.
+    async fn replay_consensus(
+        &self,
+        to_engine: &mpsc::Sender<ConsensusOutput>,
+    ) -> eyre::Result<()> {
+        // Make sure any old consensus that was not executed gets executed.
+        // Note, "missing" in this context is consensus that was reached but not executed
+        // before the last shutdown.  We need to execute it now so that everything will be
+        // in sync, otherwise we could get out of order execution racing with Bullshark.
+        let missing =
+            state_sync::get_missing_consensus(&self.consensus_db, &self.consensus_bus).await?;
+        let mut last_digest = None;
+        for consensus_header in missing.into_iter() {
+            let output = self_clone
+                .fetch_batches(
+                    consensus_header.sub_dag.clone(),
+                    consensus_header.parent_hash,
+                    consensus_header.number,
+                )
+                .await?;
+            to_engine.send(output).await?;
+            last_digest = Some(consensus_header.digest());
+        }
+        if let Some(last_digest) = last_digest {
+            // Go ahead and wait for execution to happen.  This may not be strictly required but
+            // will hurt nothing, only happen on startup (for a small amount blocks) so
+            // do it.
+            let _ = self.consensus_bus.wait_for_consensus_execution(last_digest).await;
+        }
+        Ok(())
+    }*/
+
     /// Run a single epoch.
     async fn run_epoch(
         &mut self,
@@ -592,12 +624,13 @@ where
         }
 
         let mut need_join = false;
+        let mut last_consensus_sent = None;
         tokio::select! {
             _ = node_ended => {
                 need_join = true;
             },
             // wait for epoch boundary to transition
-            res = self.wait_for_epoch_boundary(to_engine, &gas_accumulator, &mut consensus_output) => {
+            res = self.wait_for_epoch_boundary(to_engine, &gas_accumulator, &mut consensus_output, &mut last_consensus_sent) => {
                 // toggle bool to clear tables
                 clear_tables_for_next_epoch = true;
                 let target_hash = res.inspect_err(|e| {
@@ -664,14 +697,13 @@ where
                 }
             }
         } else {
-            // We stopped waiting on the epoch boundary so lets make sure that the consensus queue
-            // is sent to the engine. If we don't do this it is possible that a quick
-            // exit could orphan output (for instance a CVV that is behind).
-            while let Ok(output) = consensus_output.try_recv() {
-                gas_accumulator.rewards_counter().inc_leader_count(output.leader().origin());
-                // only forward the output to the engine
-                to_engine.send(output).await?;
-            }
+            self.send_leftover_consensus_output_to_engine(
+                last_consensus_sent,
+                gas_accumulator,
+                &mut consensus_output,
+                to_engine,
+            )
+            .await;
         }
 
         // clear tables
@@ -680,6 +712,40 @@ where
         }
 
         Ok(())
+    }
+
+    // If we stopped waiting on the epoch boundary so lets make sure that the consensus queue
+    // is sent to the engine. If we don't do this it is possible that a quick
+    // exit could orphan output (for instance a CVV that is behind).
+    // We need to go until all the consensus output in DB has been sent to the engine (if it was
+    // saved it should have been sent).
+    async fn send_leftover_consensus_output_to_engine(
+        &self,
+        last_consensus_sent: Option<BlockHash>,
+        gas_accumulator: GasAccumulator,
+        consensus_output: &mut impl TnReceiver<ConsensusOutput>,
+        to_engine: &mpsc::Sender<ConsensusOutput>,
+    ) {
+        if let Some(last_db_consensus) =
+            self.consensus_db.last_record::<ConsensusBlocks>().map(|(_, block)| block.digest())
+        {
+            if Some(last_db_consensus) != last_consensus_sent {
+                loop {
+                    //self.consensus_bus.wait_for_consensus_execution(last_consensus).await?;
+                    while let Ok(output) = consensus_output.try_recv() {
+                        gas_accumulator
+                            .rewards_counter()
+                            .inc_leader_count(output.leader().origin());
+                        let last_consensus_sent: BlockHash = output.digest().into();
+                        // only forward the output to the engine
+                        let _ = to_engine.send(output).await;
+                        if last_db_consensus == last_consensus_sent {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Record the epoch record for just completed epoch in our DB.
@@ -991,6 +1057,7 @@ where
         to_engine: &mpsc::Sender<ConsensusOutput>,
         gas_accumulator: &GasAccumulator,
         consensus_output: &mut impl TnReceiver<ConsensusOutput>,
+        last_engine_sent: &mut Option<BlockHash>,
     ) -> eyre::Result<B256> {
         // receive output from consensus and forward to engine
         while let Some(mut output) = consensus_output.recv().await {
@@ -1010,11 +1077,13 @@ where
                 let target_hash = output.consensus_header_hash();
 
                 gas_accumulator.rewards_counter().inc_leader_count(output.leader().origin());
+                *last_engine_sent = Some(output.digest().into());
                 // forward the output to the engine
                 to_engine.send(output).await?;
                 return Ok(target_hash);
             } else {
                 gas_accumulator.rewards_counter().inc_leader_count(output.leader().origin());
+                *last_engine_sent = Some(output.digest().into());
                 // only forward the output to the engine
                 to_engine.send(output).await?;
             }
