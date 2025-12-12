@@ -78,7 +78,7 @@ impl<DB: Database> EngineToPrimaryRpc<DB> {
 
 impl<DB: Database> EngineToPrimary for EngineToPrimaryRpc<DB> {
     fn get_latest_consensus_block(&self) -> ConsensusHeader {
-        self.consensus_bus.last_consensus_header().borrow().clone()
+        self.consensus_bus.last_consensus_header().borrow().clone().unwrap_or_default()
     }
 
     fn consensus_block_by_number(&self, number: u64) -> Option<ConsensusHeader> {

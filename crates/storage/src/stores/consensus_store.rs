@@ -44,6 +44,10 @@ pub trait ConsensusStore: Clone {
 
     /// Get a ConsensusHeader by number.
     fn get_consensus_by_number(&self, number: u64) -> Option<ConsensusHeader>;
+
+    /// If there is consensus for hash in the consensus chain remove it.
+    /// This is used in case output is added after epoch end.
+    fn remove_consensus_by_hash(&self, hash: BlockHash);
 }
 
 impl<DB: Database> ConsensusStore for DB {
@@ -140,6 +144,13 @@ impl<DB: Database> ConsensusStore for DB {
             Some(block)
         } else {
             None
+        }
+    }
+
+    fn remove_consensus_by_hash(&self, hash: BlockHash) {
+        if let Ok(Some(number)) = self.get::<ConsensusBlockNumbersByDigest>(&hash) {
+            let _ = self.remove::<ConsensusBlockNumbersByDigest>(&hash);
+            let _ = self.remove::<ConsensusBlocks>(&number);
         }
     }
 }

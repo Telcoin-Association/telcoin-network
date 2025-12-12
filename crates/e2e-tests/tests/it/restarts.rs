@@ -820,8 +820,8 @@ where
             resp = client.request(command, params.clone()).await;
             i += 1;
         }
-        resp.inspect_err(|_| {
-            error!(target: "restart-tests", ?command, ?node, ?debug_params, "rpc call failed");
+        resp.inspect_err(|error| {
+            error!(target: "restart-tests", ?error, ?command, ?node, ?debug_params, "rpc call failed");
         })
     });
 

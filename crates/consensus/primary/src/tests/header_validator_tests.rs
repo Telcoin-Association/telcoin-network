@@ -49,8 +49,7 @@ async fn test_sync_batches_drops_old_rounds() -> eyre::Result<()> {
 
     // update round
     let committed_round = 30;
-    cb.update_consensus_rounds(ConsensusRound::new(committed_round, 0))
-        .expect("update consensus rounds");
+    cb.update_consensus_rounds(ConsensusRound::new(committed_round, 0));
 
     let expected_digest = test_header.digest();
     let expected_round = test_header.round();
