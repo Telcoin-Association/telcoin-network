@@ -587,11 +587,10 @@ impl ConsensusBus {
     ///
     /// This sends both the gc round and the committed round to the respective watch channels after
     /// consensus updates.
-    pub fn update_consensus_rounds(&self, update: ConsensusRound) -> eyre::Result<()> {
+    pub fn update_consensus_rounds(&self, update: ConsensusRound) {
         let ConsensusRound { committed_round, gc_round } = update;
-        self.gc_round_updates().send(gc_round)?;
-        self.committed_round_updates().send(committed_round)?;
-        Ok(())
+        self.gc_round_updates().send_replace(gc_round);
+        self.committed_round_updates().send_replace(committed_round);
     }
 
     /// Will resolve once we have executed block.

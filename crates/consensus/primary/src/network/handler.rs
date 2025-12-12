@@ -286,6 +286,19 @@ where
         } else {
             return Err(HeaderError::UnknownAuthority(committee_peer.to_string()).into());
         }
+        if let Ok(Some(vote_info)) = self.consensus_config.node_storage().read_vote_info(&auth_id) {
+            // If we have already cast a vote for this header then just recast it quickly.
+            if vote_info.vote_digest == header.digest().into() {
+                let vote = Vote::new(
+                    &header,
+                    self.consensus_config.authority_id().expect("only validators can vote"),
+                    self.consensus_config.key_config(),
+                );
+
+                info!(target: "primary", "Recast vote {vote:?} for {} at round {}", header, header.round());
+                return Ok(PrimaryResponse::Vote(vote));
+            }
+        }
         {
             // Check for validator equivocation early and reject if so
             let mut auth_last_vote = self.auth_last_vote.lock();

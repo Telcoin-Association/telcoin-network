@@ -45,7 +45,7 @@ use tn_storage::{
 use tn_types::{
     error::HeaderError, gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash,
     BlsAggregateSignature, BlsPublicKey, BlsSignature, Committee, CommitteeBuilder,
-    ConsensusOutput, Database as TNDatabase, Epoch, EpochCertificate, EpochRecord, EpochVote,
+    ConsensusOutput, Database as TNDatabase, Epoch, EpochCertificate, EpochRecord, EpochVote, Hash,
     Multiaddr, NetworkPublicKey, Notifier, TaskJoinError, TaskManager, TaskSpawner, TimestampSec,
     TnReceiver, TnSender, B256, MIN_PROTOCOL_BASE_FEE,
 };
@@ -403,14 +403,6 @@ where
         // initialize long-running components for node startup
         let mut initial_epoch = true;
 
-        // This is a bit of a hack but clear old votes on node startup.
-        // It is possible on a full network restart (mainly tests) to get
-        // in a race with old votes being rejected for other reasons and then
-        // tripping over the equivocation logic.  This allows a tiny window
-        // for equication on node startup but would require forcing a node
-        // to restart among other things to exploit in order to change a vote.
-        self.consensus_db.clear_table::<Votes>()?;
-
         let node_ended_sub = self.node_shutdown.subscribe();
 
         // loop through epochs
@@ -505,7 +497,9 @@ where
             if let Some(last_consensus) =
                 self.consensus_db.last_record::<ConsensusBlocks>().map(|(_, block)| block.digest())
             {
+                info!(target: "epoch-manager", "Waiting for execution of consensus {last_consensus}");
                 self.consensus_bus.wait_for_consensus_execution(last_consensus).await?;
+                info!(target: "epoch-manager", "Confirmed execution of consensus {last_consensus}");
             }
         }
 
@@ -518,7 +512,7 @@ where
         epoch_task_manager.set_join_wait(200);
 
         // subscribe to output early to prevent missed messages
-        let consensus_output = self.consensus_bus.consensus_output().subscribe();
+        let mut consensus_output = self.consensus_bus.consensus_output().subscribe();
 
         // create primary and worker nodes
         let (primary, worker_node) = self
@@ -603,13 +597,13 @@ where
                 need_join = true;
             },
             // wait for epoch boundary to transition
-            res = self.wait_for_epoch_boundary(to_engine, gas_accumulator.clone(), consensus_output) => {
+            res = self.wait_for_epoch_boundary(to_engine, &gas_accumulator, &mut consensus_output) => {
                 // toggle bool to clear tables
                 clear_tables_for_next_epoch = true;
                 let target_hash = res.inspect_err(|e| {
                     error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
                 })?;
-                self.close_epoch(consensus_shutdown.clone(), gas_accumulator, target_hash)
+                self.close_epoch(consensus_shutdown.clone(), &gas_accumulator, target_hash)
                     .await?;
 
                 // Write the epoch record to DB and save in manager for next epoch.
@@ -657,6 +651,27 @@ where
                 epoch_task_manager.join(consensus_shutdown),
             )
             .await?;
+            // The epoch is over now and consensus should be shutdown.
+            // Do a sanity check that no "extra" consensus was produced
+            // past the epoch end and clean the DB if so otherwise we
+            // could produce invalid blocks with it and fork later.
+            // This should not really happen but it is dificult to guarentee
+            // it so deal with it.
+            while let Ok(output) = consensus_output.try_recv() {
+                if current_epoch == output.sub_dag.leader_epoch() {
+                    // Found some extra output...
+                    self.consensus_db.remove_consensus_by_hash(output.digest().into());
+                }
+            }
+        } else {
+            // We stopped waiting on the epoch boundary so lets make sure that the consensus queue
+            // is sent to the engine. If we don't do this it is possible that a quick
+            // exit could orphan output (for instance a CVV that is behind).
+            while let Ok(output) = consensus_output.try_recv() {
+                gas_accumulator.rewards_counter().inc_leader_count(output.leader().origin());
+                // only forward the output to the engine
+                to_engine.send(output).await?;
+            }
         }
 
         // clear tables
@@ -974,8 +989,8 @@ where
     async fn wait_for_epoch_boundary(
         &self,
         to_engine: &mpsc::Sender<ConsensusOutput>,
-        gas_accumulator: GasAccumulator,
-        mut consensus_output: impl TnReceiver<ConsensusOutput>,
+        gas_accumulator: &GasAccumulator,
+        consensus_output: &mut impl TnReceiver<ConsensusOutput>,
     ) -> eyre::Result<B256> {
         // receive output from consensus and forward to engine
         while let Some(mut output) = consensus_output.recv().await {
@@ -1025,13 +1040,13 @@ where
     async fn close_epoch(
         &self,
         shutdown_consensus: Notifier,
-        gas_accumulator: GasAccumulator,
+        gas_accumulator: &GasAccumulator,
         target_hash: B256,
     ) -> eyre::Result<()> {
         // begin consensus shutdown while engine executes
         shutdown_consensus.notify();
         self.consensus_bus.wait_for_consensus_execution(target_hash).await?;
-        self.adjust_base_fees(&gas_accumulator);
+        self.adjust_base_fees(gas_accumulator);
         gas_accumulator.clear(); // Clear the accumlated values for next epoch.
         Ok(())
     }

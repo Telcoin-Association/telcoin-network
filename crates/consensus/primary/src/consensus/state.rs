@@ -17,7 +17,7 @@ use tn_types::{
     AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Committee, Database,
     Hash as _, Noticer, Round, TaskManager, Timestamp, TnReceiver, TnSender,
 };
-use tracing::{debug, info, instrument};
+use tracing::{debug, error, info, instrument};
 
 #[cfg(test)]
 #[path = "tests/consensus_tests.rs"]
@@ -340,9 +340,7 @@ impl<DB: Database> Consensus<DB> {
             consensus_config.node_storage().clone(),
         );
 
-        consensus_bus
-            .update_consensus_rounds(state.last_round)
-            .expect("Failed to send last_committed_round on initialization!");
+        consensus_bus.update_consensus_rounds(state.last_round);
 
         let s = Self {
             committee: consensus_config.committee().clone(),
@@ -358,8 +356,10 @@ impl<DB: Database> Consensus<DB> {
         // Only run the consensus task if we are an active CVV.
         // Active means we are participating in consensus.
         if consensus_bus.node_mode().borrow().is_active_cvv() {
-            task_manager
-                .spawn_critical_task("consensus", monitored_future!(s.run(), "Consensus", INFO));
+            task_manager.spawn_critical_task(
+                "consensus task",
+                monitored_future!(s.run(), "Consensus", INFO),
+            );
         }
     }
 
@@ -377,7 +377,10 @@ impl<DB: Database> Consensus<DB> {
                 }
 
                 Some(certificate) = rx_new_certificates.recv() => {
-                    self.new_certificate(certificate).await?;
+                    self.new_certificate(certificate).await.map_err(|e| {
+                        error!(target: "epoch-manager", ?e, "new certificate failed");
+                        e
+                    })?;
                 },
             }
         }
@@ -453,9 +456,7 @@ impl<DB: Database> Consensus<DB> {
 
                 assert_eq!(self.state.last_round.committed_round, leader_commit_round);
 
-                self.consensus_bus
-                    .update_consensus_rounds(self.state.last_round)
-                    .map_err(|_| ConsensusError::ShuttingDown)?;
+                self.consensus_bus.update_consensus_rounds(self.state.last_round);
             }
 
             self.metrics

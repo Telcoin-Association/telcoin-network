@@ -257,10 +257,7 @@ async fn test_gc_pending_certs() -> eyre::Result<()> {
     // update consensus rounds
     // commit at round 8, so round 3 becomes the GC round
     let commit_round = 8;
-    cb.update_consensus_rounds(ConsensusRound::new(
-        commit_round,
-        gc_round(commit_round, GC_DEPTH),
-    ))?;
+    cb.update_consensus_rounds(ConsensusRound::new(commit_round, gc_round(commit_round, GC_DEPTH)));
 
     // wait for certs to storage
     timeout(Duration::from_secs(3), certificate_store.notify_read(last_digest)).await??;
