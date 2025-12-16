@@ -166,38 +166,6 @@ pub fn last_executed_consensus_block<DB: Database>(
     last
 }
 
-/// Send any consensus headers that were not executed before last shutdown to the consensus header
-/// channel.
-pub async fn stream_missing_consensus<DB: Database>(
-    config: &ConsensusConfig<DB>,
-    consensus_bus: &ConsensusBus,
-) -> eyre::Result<()> {
-    // Get the DB and load our last executed consensus block.
-    let last_executed_block =
-        last_executed_consensus_block(consensus_bus, config.node_storage()).unwrap_or_default();
-    // Edge case, in case we don't hear from peers but have un-executed blocks...
-    // Not sure we should handle this, but it hurts nothing.
-    let db = config.node_storage();
-    let (_, last_db_block) = db
-        .last_record::<ConsensusBlocks>()
-        .unwrap_or_else(|| (last_executed_block.number, last_executed_block.clone()));
-
-    debug!(target: "state-sync", ?last_executed_block, ?last_db_block, "comparing last executed block and last recorded consensus block");
-
-    // if the last recorded consensus block is larger than the last executed block,
-    // forward the stored consensus block to engine for execution
-    if last_db_block.number > last_executed_block.number {
-        for consensus_block_number in last_executed_block.number + 1..=last_db_block.number {
-            if let Some(consensus_header) = db.get_consensus_by_number(consensus_block_number) {
-                debug!(target: "state-sync", ?consensus_header, "sending missed consensus block through consensus bus");
-                consensus_bus.consensus_header().send(consensus_header).await?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
 /// Collect and return any consensus headers that were not executed before last shutdown.
 /// This will be consensus that was reached but had not executed before a shutdown.
 pub async fn get_missing_consensus<DB: Database>(

@@ -608,19 +608,18 @@ where
             // If we are starting up then make sure that any consensus we previously validated goes
             // to the engine and is executed.  Otherwise we could miss consensus execution.
             self.replay_missed_consensus(engine, to_engine, &gas_accumulator).await?;
-        } else {
-            // If we are restarting the epoch not on a boundary
-            // and we sent some consensus output to the engine
-            // then we need to pause for the engine to execute.
-            // If we don't we can have races when the epoch restarts
-            // that will send consensus to the engine more than once.
-            if let Some(last_consensus) =
-                self.consensus_db.last_record::<ConsensusBlocks>().map(|(_, block)| block.digest())
-            {
-                info!(target: "epoch-manager", "Waiting for execution of consensus {last_consensus}");
-                self.consensus_bus.wait_for_consensus_execution(last_consensus).await?;
-                info!(target: "epoch-manager", "Confirmed execution of consensus {last_consensus}");
-            }
+        }
+        // If we are restarting the epoch not on a boundary
+        // and we sent some consensus output to the engine
+        // then we need to pause for the engine to execute.
+        // If we don't we can have races when the epoch restarts
+        // that will send consensus to the engine more than once.
+        if let Some(last_consensus) =
+            self.consensus_db.last_record::<ConsensusBlocks>().map(|(_, block)| block.digest())
+        {
+            info!(target: "epoch-manager", "Waiting for execution of consensus {last_consensus}");
+            self.consensus_bus.wait_for_consensus_execution(last_consensus).await?;
+            info!(target: "epoch-manager", "Confirmed execution of consensus {last_consensus}");
         }
 
         let node_ended = self.node_shutdown.subscribe();
