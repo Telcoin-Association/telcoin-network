@@ -177,11 +177,11 @@ struct ConsensusBusAppInner {
     /// Hold onto the published consensus header watch to keep it "open"
     _rx_last_published_consensus_num_hash: watch::Receiver<(u64, BlockHash)>,
 
-    /// Consensus output with a consensus header.
-    consensus_output: broadcast::Sender<ConsensusOutput>,
     /// Consensus header.  Note this can be used to create consensus output to execute for non
     /// validators.
     consensus_header: broadcast::Sender<ConsensusHeader>,
+    /// Consensus output with a consensus header.
+    consensus_output: broadcast::Sender<ConsensusOutput>,
     /// Status of sync?
     tx_sync_status: watch::Sender<NodeMode>,
     /// Hold onto the recent sync_status to keep it "open"
@@ -243,8 +243,8 @@ impl ConsensusBusAppInner {
             _rx_last_consensus_header,
             tx_last_published_consensus_num_hash,
             _rx_last_published_consensus_num_hash,
-            consensus_output,
             consensus_header,
+            consensus_output,
             tx_sync_status,
             _rx_sync_status,
             new_epoch_votes: QueChannel::new(),
@@ -522,13 +522,6 @@ impl ConsensusBus {
     /// This also provides the ConsesusHeader, use this for block execution.
     pub fn consensus_output(&self) -> &impl TnSender<ConsensusOutput> {
         &self.inner_app.consensus_output
-    }
-
-    /// Broadcast subscriber with consensus output.
-    /// This breaks the trait pattern in order to return a concrete receiver to pass to the
-    /// execution module.
-    pub fn subscribe_consensus_output(&self) -> broadcast::Receiver<ConsensusOutput> {
-        self.inner_app.consensus_output.subscribe()
     }
 
     /// Broadcast channel with consensus header.

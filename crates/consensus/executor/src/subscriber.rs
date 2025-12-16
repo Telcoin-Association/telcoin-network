@@ -4,8 +4,7 @@ use crate::{errors::SubscriberResult, SubscriberError};
 use consensus_metrics::monitored_future;
 use futures::{stream::FuturesOrdered, StreamExt};
 use state_sync::{
-    get_missing_consensus, last_executed_consensus_block, save_consensus, spawn_state_sync,
-    stream_missing_consensus,
+    last_executed_consensus_block, save_consensus, spawn_state_sync, stream_missing_consensus,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -238,42 +237,6 @@ impl<DB: Database> Subscriber<DB> {
 
     /// Main loop connecting to the consensus to listen to sequence messages.
     async fn run(self, rx_shutdown: Noticer) -> SubscriberResult<()> {
-        // We need this to finish even if this run's future is dropped quickly.
-        // This can happen when we are a behind CVV and go inactive.
-        // This will make sure we actually submit all the old consensus which we
-        // check for at epoch startup and that can hang if this does not happen.
-        let self_clone = self.clone();
-        tokio::spawn(async move {
-            // Make sure any old consensus that was not executed gets executed.
-            // Note, "missing" in this context is consensus that was reached but not executed
-            // before the last shutdown.  We need to execute it now so that everything will be
-            // in sync, otherwise we could get out of order execution racing with Bullshark.
-            let missing =
-                get_missing_consensus(self_clone.config.node_storage(), &self_clone.consensus_bus).await?;
-            let mut last_digest = None;
-            for consensus_header in missing.into_iter() {
-                let consensus_output = self_clone
-                    .fetch_batches(
-                        consensus_header.sub_dag.clone(),
-                        consensus_header.parent_hash,
-                        consensus_header.number,
-                    )
-                    .await?;
-                if let Err(e) = self_clone.consensus_bus.consensus_output().send(consensus_output).await {
-                    error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self_clone.inner.authority_id, e);
-                    return Err(SubscriberError::ClosedChannel("consensus_output".to_string()));
-                }
-                last_digest = Some(consensus_header.digest());
-            }
-            if let Some(last_digest) = last_digest {
-                // Go ahead and wait for execution to happen.  This may not be strictly required but
-                // will hurt nothing, only happen on startup (for a small amount blocks) so
-                // do it.
-                let _ =
-                    self_clone.consensus_bus.wait_for_consensus_execution(last_digest).await;
-            }
-            Ok(())
-        }).await.unwrap_or_else(|e| Err(SubscriberError::NodeExecutionError(format!("failed to join the missing consensus task: {e}"))))?;
         // It's important to have the futures in ordered fashion as we want
         // to guarantee that will deliver to the executor the certificates
         // in the same order we received from rx_sequence. So it doesn't

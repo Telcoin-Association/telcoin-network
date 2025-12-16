@@ -37,17 +37,17 @@ use tn_reth::{
 use tn_storage::{
     open_db,
     tables::{
-        CertificateDigestByOrigin, CertificateDigestByRound, Certificates, ConsensusBlocks,
-        EpochCerts, EpochRecords, LastProposed, NodeBatchesCache, Payload, Votes,
+        Batches, CertificateDigestByOrigin, CertificateDigestByRound, Certificates,
+        ConsensusBlocks, EpochCerts, EpochRecords, LastProposed, NodeBatchesCache, Payload, Votes,
     },
     ConsensusStore, DatabaseType, EpochStore as _,
 };
 use tn_types::{
     error::HeaderError, gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash,
-    BlsAggregateSignature, BlsPublicKey, BlsSignature, Committee, CommitteeBuilder,
-    ConsensusOutput, Database as TNDatabase, Epoch, EpochCertificate, EpochRecord, EpochVote, Hash,
-    Multiaddr, NetworkPublicKey, Notifier, TaskJoinError, TaskManager, TaskSpawner, TimestampSec,
-    TnReceiver, TnSender, B256, MIN_PROTOCOL_BASE_FEE,
+    BlsAggregateSignature, BlsPublicKey, BlsSignature, CertifiedBatch, CommittedSubDag, Committee,
+    CommitteeBuilder, ConsensusOutput, Database as TNDatabase, Epoch, EpochCertificate,
+    EpochRecord, EpochVote, Hash, Multiaddr, NetworkPublicKey, Notifier, TaskJoinError,
+    TaskManager, TaskSpawner, TimestampSec, TnReceiver, TnSender, B256, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{
     quorum_waiter::QuorumWaiterTrait, Worker, WorkerNetwork, WorkerNetworkHandle, WorkerRequest,
@@ -477,37 +477,121 @@ where
         Ok(())
     }
 
-    /*XXXX/// Look for consensus that was not executed (after a restart for instance) and send to the engine if found.
-    async fn replay_consensus(
+    /// Turn a CommittedSubDag with consensus header info into ConsensusOutput.
+    /// It will retrieve any missing Batches so the ConsensusOutput will be ready
+    /// to execute.
+    /// Note, an error here is BAD and will most likely cause node shutdown (clean).  Do
+    /// not provide a bogus sub dag...
+    async fn fetch_local_batches(
         &self,
+        deliver: CommittedSubDag,
+        parent_hash: B256,
+        number: u64,
+        committee: &Committee,
+    ) -> eyre::Result<ConsensusOutput> {
+        let num_blocks = deliver.num_primary_blocks();
+        let num_certs = deliver.len();
+
+        if num_blocks == 0 {
+            debug!(target: "epoch-manager", "No blocks to fetch, payload is empty");
+            return Ok(ConsensusOutput {
+                sub_dag: Arc::new(deliver),
+                parent_hash,
+                number,
+                ..Default::default()
+            });
+        }
+
+        let sub_dag = Arc::new(deliver);
+        let mut consensus_output = ConsensusOutput {
+            sub_dag: sub_dag.clone(),
+            batches: Vec::with_capacity(num_certs),
+            parent_hash,
+            number,
+            ..Default::default()
+        };
+
+        let mut batch_set: HashSet<BlockHash> = HashSet::new();
+
+        for cert in &sub_dag.certificates {
+            for (digest, _) in cert.header().payload().iter() {
+                batch_set.insert(*digest);
+                consensus_output.batch_digests.push_back(*digest);
+            }
+        }
+
+        // map all fetched batches to their respective certificates for applying block rewards
+        for cert in &sub_dag.certificates {
+            // create collection of batches to execute for this certificate
+            let mut cert_batches = Vec::with_capacity(cert.header().payload().len());
+
+            // retrieve fetched batch by digest
+            for digest in cert.header().payload().keys() {
+                if let Some(batch) = self.consensus_db.get::<Batches>(digest)? {
+                    cert_batches.push(batch);
+                } else {
+                    return Err(eyre::eyre!("Failed to find required batch {digest}"));
+                }
+            }
+
+            let address = committee.authority(cert.origin()).map(|a| a.execution_address());
+            if let Some(address) = address {
+                //gas_accumulator.get_authority_address(cert.origin()) {
+                // main collection for execution
+                consensus_output.batches.push(CertifiedBatch { address, batches: cert_batches });
+            } else {
+                return Err(eyre::eyre!("Unknown authority address {}", cert.origin()));
+            }
+        }
+        debug!(target: "epoch-manager", "returning output to subscriber");
+        Ok(consensus_output)
+    }
+
+    async fn replay_missed_consensus(
+        &self,
+        engine: &ExecutionNode,
         to_engine: &mpsc::Sender<ConsensusOutput>,
+        gas_accumulator: &GasAccumulator,
     ) -> eyre::Result<()> {
+        // We have not created this epoch's primary yet (no committee) so get it from chain
+        // ourselves... Note, any consensus output to replay should be in the same epoch...
+        let EpochState { epoch, epoch_info: _, validators, epoch_start: _ } =
+            engine.epoch_state_from_canonical_tip().await?;
+        let validators = validators
+            .iter()
+            .map(|v| {
+                let decoded_bls = BlsPublicKey::from_literal_bytes(v.blsPubkey.as_ref());
+                decoded_bls.map(|decoded| (decoded, v))
+            })
+            .collect::<Result<HashMap<_, _>, _>>()
+            .map_err(|err| eyre!("failed to create bls key from on-chain bytes: {err:?}"))?;
+
+        let committee = self.create_committee_from_state(epoch, validators).await?;
+        // Need to set the committee early or we will get failures to execute...
+        gas_accumulator.rewards_counter().set_committee(committee.clone());
+
         // Make sure any old consensus that was not executed gets executed.
         // Note, "missing" in this context is consensus that was reached but not executed
         // before the last shutdown.  We need to execute it now so that everything will be
         // in sync, otherwise we could get out of order execution racing with Bullshark.
         let missing =
             state_sync::get_missing_consensus(&self.consensus_db, &self.consensus_bus).await?;
-        let mut last_digest = None;
         for consensus_header in missing.into_iter() {
-            let output = self_clone
-                .fetch_batches(
+            let consensus_output = self
+                .fetch_local_batches(
                     consensus_header.sub_dag.clone(),
                     consensus_header.parent_hash,
                     consensus_header.number,
+                    &committee,
                 )
                 .await?;
-            to_engine.send(output).await?;
-            last_digest = Some(consensus_header.digest());
-        }
-        if let Some(last_digest) = last_digest {
-            // Go ahead and wait for execution to happen.  This may not be strictly required but
-            // will hurt nothing, only happen on startup (for a small amount blocks) so
-            // do it.
-            let _ = self.consensus_bus.wait_for_consensus_execution(last_digest).await;
+            if let Err(e) = to_engine.send(consensus_output).await {
+                error!(target: "epoch-manager", "error sending consensus output to engine: {}", e);
+                return Err(e.into());
+            }
         }
         Ok(())
-    }*/
+    }
 
     /// Run a single epoch.
     async fn run_epoch(
@@ -520,7 +604,11 @@ where
     ) -> eyre::Result<()> {
         info!(target: "epoch-manager", "Starting epoch");
 
-        if !*initial_epoch {
+        if *initial_epoch {
+            // If we are starting up then make sure that any consensus we previously validated goes
+            // to the engine and is executed.  Otherwise we could miss consensus execution.
+            self.replay_missed_consensus(engine, to_engine, &gas_accumulator).await?;
+        } else {
             // If we are restarting the epoch not on a boundary
             // and we sent some consensus output to the engine
             // then we need to pause for the engine to execute.
@@ -624,13 +712,12 @@ where
         }
 
         let mut need_join = false;
-        let mut last_consensus_sent = None;
         tokio::select! {
             _ = node_ended => {
                 need_join = true;
             },
             // wait for epoch boundary to transition
-            res = self.wait_for_epoch_boundary(to_engine, &gas_accumulator, &mut consensus_output, &mut last_consensus_sent) => {
+            res = self.wait_for_epoch_boundary(to_engine, &gas_accumulator, &mut consensus_output) => {
                 // toggle bool to clear tables
                 clear_tables_for_next_epoch = true;
                 let target_hash = res.inspect_err(|e| {
@@ -698,7 +785,6 @@ where
             }
         } else {
             self.send_leftover_consensus_output_to_engine(
-                last_consensus_sent,
                 gas_accumulator,
                 &mut consensus_output,
                 to_engine,
@@ -720,31 +806,15 @@ where
     // We need to go until all the consensus output in DB has been sent to the engine (if it was
     // saved it should have been sent).
     async fn send_leftover_consensus_output_to_engine(
-        &self,
-        last_consensus_sent: Option<BlockHash>,
+        &mut self,
         gas_accumulator: GasAccumulator,
         consensus_output: &mut impl TnReceiver<ConsensusOutput>,
         to_engine: &mpsc::Sender<ConsensusOutput>,
     ) {
-        if let Some(last_db_consensus) =
-            self.consensus_db.last_record::<ConsensusBlocks>().map(|(_, block)| block.digest())
-        {
-            if Some(last_db_consensus) != last_consensus_sent {
-                loop {
-                    //self.consensus_bus.wait_for_consensus_execution(last_consensus).await?;
-                    while let Ok(output) = consensus_output.try_recv() {
-                        gas_accumulator
-                            .rewards_counter()
-                            .inc_leader_count(output.leader().origin());
-                        let last_consensus_sent: BlockHash = output.digest().into();
-                        // only forward the output to the engine
-                        let _ = to_engine.send(output).await;
-                        if last_db_consensus == last_consensus_sent {
-                            break;
-                        }
-                    }
-                }
-            }
+        while let Ok(output) = consensus_output.try_recv() {
+            gas_accumulator.rewards_counter().inc_leader_count(output.leader().origin());
+            // only forward the output to the engine
+            let _ = to_engine.send(output).await;
         }
     }
 
@@ -1057,7 +1127,6 @@ where
         to_engine: &mpsc::Sender<ConsensusOutput>,
         gas_accumulator: &GasAccumulator,
         consensus_output: &mut impl TnReceiver<ConsensusOutput>,
-        last_engine_sent: &mut Option<BlockHash>,
     ) -> eyre::Result<B256> {
         // receive output from consensus and forward to engine
         while let Some(mut output) = consensus_output.recv().await {
@@ -1077,13 +1146,11 @@ where
                 let target_hash = output.consensus_header_hash();
 
                 gas_accumulator.rewards_counter().inc_leader_count(output.leader().origin());
-                *last_engine_sent = Some(output.digest().into());
                 // forward the output to the engine
                 to_engine.send(output).await?;
                 return Ok(target_hash);
             } else {
                 gas_accumulator.rewards_counter().inc_leader_count(output.leader().origin());
-                *last_engine_sent = Some(output.digest().into());
                 // only forward the output to the engine
                 to_engine.send(output).await?;
             }
