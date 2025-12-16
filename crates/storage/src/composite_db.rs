@@ -326,3 +326,208 @@ impl<DB: Database> DbTxMut for CompositeDbTxMut<DB> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod test {
+    #[cfg(feature = "redb")]
+    use crate::redb::ReDB;
+    use crate::{
+        composite_db::CompositeDatabase,
+        mdbx::{database::MEGABYTE, MdbxDatabase},
+        test::*,
+    };
+    use std::path::Path;
+    use tempfile::tempdir;
+    use tn_types::Database as _;
+
+    #[cfg(feature = "redb")]
+    fn open_redb(path: &Path) -> CompositeDatabase<ReDB> {
+        let db = ReDB::open(path.join("redb")).expect("Cannot open database");
+
+        let db =
+            CompositeDatabase::open(db.clone(), db.clone(), db.clone(), db.clone(), db.clone(), db);
+        db.open_table::<TestTable>().expect("failed to open table!");
+        db
+    }
+
+    fn open_mdbx(path: &Path) -> CompositeDatabase<MdbxDatabase> {
+        let db =
+            MdbxDatabase::open(path, 4, 16 * MEGABYTE, 8 * MEGABYTE).expect("Cannot open database");
+
+        let db =
+            CompositeDatabase::open(db.clone(), db.clone(), db.clone(), db.clone(), db.clone(), db);
+        db.open_table::<TestTable>().expect("failed to open table!");
+        db
+    }
+
+    #[test]
+    fn test_compositedb_contains_key() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        #[cfg(feature = "redb")]
+        {
+            let db = open_redb(temp_dir.path());
+            test_contains_key(db);
+        }
+        let db = open_mdbx(temp_dir.path());
+        test_contains_key(db);
+    }
+
+    #[test]
+    fn test_compositedb_get() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        #[cfg(feature = "redb")]
+        {
+            let db = open_redb(temp_dir.path());
+            test_get(db);
+        }
+        let db = open_mdbx(temp_dir.path());
+        test_get(db);
+    }
+
+    #[test]
+    fn test_compositedb_multi_get() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        #[cfg(feature = "redb")]
+        {
+            let db = open_redb(temp_dir.path());
+            test_multi_get(db);
+        }
+        let db = open_mdbx(temp_dir.path());
+        test_multi_get(db);
+    }
+
+    #[test]
+    fn test_compositedb_skip() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        #[cfg(feature = "redb")]
+        {
+            let db = open_redb(temp_dir.path());
+            test_skip(db);
+        }
+        let db = open_mdbx(temp_dir.path());
+        test_skip(db);
+    }
+
+    #[test]
+    fn test_compositedb_skip_to_previous_simple() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        #[cfg(feature = "redb")]
+        {
+            let db = open_redb(temp_dir.path());
+            test_skip_to_previous_simple(db);
+        }
+        let db = open_mdbx(temp_dir.path());
+        test_skip_to_previous_simple(db);
+    }
+
+    #[test]
+    fn test_compositedb_iter_skip_to_previous_gap() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        #[cfg(feature = "redb")]
+        {
+            let db = open_redb(temp_dir.path());
+            test_iter_skip_to_previous_gap(db);
+        }
+        let db = open_mdbx(temp_dir.path());
+        test_iter_skip_to_previous_gap(db);
+    }
+
+    #[test]
+    fn test_compositedb_remove() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        #[cfg(feature = "redb")]
+        {
+            let db = open_redb(temp_dir.path());
+            test_remove(db);
+        }
+        let db = open_mdbx(temp_dir.path());
+        test_remove(db);
+    }
+
+    #[test]
+    fn test_compositedb_iter() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        #[cfg(feature = "redb")]
+        {
+            let db = open_redb(temp_dir.path());
+            test_iter(db);
+        }
+        let db = open_mdbx(temp_dir.path());
+        test_iter(db);
+    }
+
+    #[test]
+    fn test_compositedb_iter_reverse() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        #[cfg(feature = "redb")]
+        {
+            let db = open_redb(temp_dir.path());
+            test_iter_reverse(db);
+        }
+        let db = open_mdbx(temp_dir.path());
+        test_iter_reverse(db);
+    }
+
+    #[test]
+    fn test_compositedb_clear() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        #[cfg(feature = "redb")]
+        {
+            let db = open_redb(temp_dir.path());
+            test_clear(db);
+        }
+        let db = open_mdbx(temp_dir.path());
+        test_clear(db);
+    }
+
+    #[test]
+    fn test_compositedb_is_empty() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        #[cfg(feature = "redb")]
+        {
+            let db = open_redb(temp_dir.path());
+            test_is_empty(db);
+        }
+        let db = open_mdbx(temp_dir.path());
+        test_is_empty(db);
+    }
+
+    #[test]
+    fn test_compositedb_multi_insert() {
+        // Init a DB
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        #[cfg(feature = "redb")]
+        {
+            let db = open_redb(temp_dir.path());
+            test_multi_insert(db);
+        }
+        let db = open_mdbx(temp_dir.path());
+        test_multi_insert(db);
+    }
+
+    #[test]
+    fn test_compositedb_multi_remove() {
+        // Init a DB
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        #[cfg(feature = "redb")]
+        {
+            let db = open_redb(temp_dir.path());
+            test_multi_remove(db);
+        }
+        let db = open_mdbx(temp_dir.path());
+        test_multi_remove(db);
+    }
+
+    #[test]
+    fn test_compositedb_dbsimpbench() {
+        // Init a DB
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        #[cfg(feature = "redb")]
+        {
+            let db = open_redb(temp_dir.path());
+            db_simp_bench(db, "LayeredDB<ReDB>");
+        }
+        let db = open_mdbx(temp_dir.path());
+        db_simp_bench(db, "LayeredDB<MdbxDatabase>");
+    }
+}
