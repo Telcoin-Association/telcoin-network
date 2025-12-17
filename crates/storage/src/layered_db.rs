@@ -294,7 +294,11 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
     }
 
     fn is_empty<T: Table>(&self) -> bool {
-        self.mem_db.is_empty::<T>() && self.db.is_empty::<T>()
+        if self.full_memory {
+            self.mem_db.is_empty::<T>()
+        } else {
+            self.mem_db.is_empty::<T>() && self.db.is_empty::<T>()
+        }
     }
 
     /// Layered db will return all inserted elements even if some are duplicates while writes occur.
