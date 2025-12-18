@@ -377,9 +377,8 @@ impl<DB: Database> Consensus<DB> {
                 }
 
                 Some(certificate) = rx_new_certificates.recv() => {
-                    self.new_certificate(certificate).await.map_err(|e| {
+                    self.new_certificate(certificate).await.inspect_err(|e| {
                         error!(target: "epoch-manager", ?e, "new certificate failed");
-                        e
                     })?;
                 },
             }

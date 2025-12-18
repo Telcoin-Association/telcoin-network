@@ -180,7 +180,8 @@ struct ConsensusBusAppInner {
     /// Consensus header.  Note this can be used to create consensus output to execute for non
     /// validators.
     consensus_header: broadcast::Sender<ConsensusHeader>,
-    /// Consensus output with a consensus header.
+    /// Broadcast the latest output from consensus after committing to the subdag.
+    /// Engine consumes and executes to extend canonical chain.
     consensus_output: broadcast::Sender<ConsensusOutput>,
     /// Status of sync?
     tx_sync_status: watch::Sender<NodeMode>,

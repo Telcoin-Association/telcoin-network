@@ -556,7 +556,6 @@ where
 
             let address = committee.authority(cert.origin()).map(|a| a.execution_address());
             if let Some(address) = address {
-                //gas_accumulator.get_authority_address(cert.origin()) {
                 // main collection for execution
                 consensus_output.batches.push(CertifiedBatch { address, batches: cert_batches });
             } else {
@@ -567,6 +566,9 @@ where
         Ok(consensus_output)
     }
 
+    /// If we have any consensus that made it into the consensus chain but was not executed
+    /// then make sure we submit it to the engine for execution now.
+    /// Note, this has to be called correctly or it can lead to double execution.
     async fn replay_missed_consensus(
         &self,
         engine: &ExecutionNode,
@@ -893,6 +895,10 @@ where
             );
             return Err(eyre!("failed to find previous epoch record when starting epoch"));
         };
+        // Note on the unwrap_or_default(), if we are here then consensus was produced or followed
+        // so this watch would have to have a value.
+        // If somehow this is not true then this will produce an invalid epoch record which
+        // will not get signed so will not pollute the network.
         let target_hash = self
             .consensus_bus
             .last_consensus_header()
