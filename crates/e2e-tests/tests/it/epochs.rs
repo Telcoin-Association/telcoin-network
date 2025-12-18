@@ -12,7 +12,14 @@ use nix::{
     unistd::Pid,
 };
 use rand::{rngs::StdRng, SeedableRng as _};
-use std::{panic, path::Path, process::Child, sync::Arc, time::Duration};
+use std::{
+    fs::File,
+    panic,
+    path::Path,
+    process::{Child, Command, Stdio},
+    sync::Arc,
+    time::Duration,
+};
 use telcoin_network_cli::genesis::GenesisArgs;
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, NodeInfo};
 use tn_reth::{
@@ -217,7 +224,7 @@ async fn test_epoch_sync_inner(
 
     loop_epochs(5, 5).await?;
     // Restart the node
-    let new_child = start_nodes(temp_path, nodes_to_start)?.pop().expect("child");
+    let new_child = start_nodes(temp_path, nodes_to_start, "epoch_sync", 2)?.pop().expect("child");
     *child.lock().expect("poison") = new_child;
     loop_epochs(10, 5).await?;
 
@@ -294,7 +301,7 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
 
     // start nodes (committee + new validator)
     committee.push((NEW_VALIDATOR, new_validator.address()));
-    let procs = start_nodes(temp_path, &committee)?;
+    let procs = start_nodes(temp_path, &committee, "epoch_boundary", 1)?;
     let procs: Vec<Arc<std::sync::Mutex<Child>>> =
         procs.into_iter().map(|c| Arc::new(std::sync::Mutex::new(c))).collect();
     let procs_clone = procs.clone();
@@ -342,7 +349,7 @@ async fn test_epoch_sync() -> eyre::Result<()> {
 
     // start nodes (committee + new validator)
     committee.push((NEW_VALIDATOR, new_validator.address()));
-    let procs = start_nodes(temp_path, &committee)?;
+    let procs = start_nodes(temp_path, &committee, "epoch_sync", 1)?;
     let procs: Vec<Arc<std::sync::Mutex<Child>>> =
         procs.into_iter().map(|c| Arc::new(std::sync::Mutex::new(c))).collect();
     let procs_clone = procs.clone();
@@ -501,8 +508,24 @@ fn config_committee(
     Ok(genesis)
 }
 
+fn setup_log_dir(command: &mut Command, instance: &str, test: &str, run: u32) {
+    if let Ok(log_dir) = std::env::var("TEST_RESTARTS_LOG") {
+        let _ = std::fs::create_dir(format!("{log_dir}/"));
+        let _ = std::fs::create_dir(format!("{log_dir}/{test}/"));
+        let out_file = File::create(format!("{log_dir}/{test}/node{instance}-run{run}.log"))
+            .expect("valid log file");
+        let stdout: Stdio = out_file.into();
+        command.stdout(stdout);
+    }
+}
+
 /// Start the network using the node cli command.
-fn start_nodes(temp_path: &Path, validators: &[(&str, Address)]) -> eyre::Result<Vec<Child>> {
+fn start_nodes(
+    temp_path: &Path,
+    validators: &[(&str, Address)],
+    test: &str,
+    run: u32,
+) -> eyre::Result<Vec<Child>> {
     let bin = e2e_tests::get_telcoin_network_binary();
 
     let mut children = Vec::new();
@@ -527,6 +550,8 @@ fn start_nodes(temp_path: &Path, validators: &[(&str, Address)]) -> eyre::Result
             .arg("--instance")
             .arg(&instance)
             .arg("--http");
+
+        setup_log_dir(&mut command, &instance, test, run);
 
         #[cfg(feature = "faucet")]
         command

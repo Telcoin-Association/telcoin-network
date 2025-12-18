@@ -69,6 +69,26 @@ const ENGINE_TASK_MANAGER: &str = "Engine Task Manager";
 /// The worker's base task manager name. This is used by `fn worker_task_manager_name(id)`.
 pub(super) const WORKER_TASK_BASE: &str = "Worker Task";
 
+#[derive(Debug, Copy, Clone)]
+enum RunEpochMode {
+    Initial,
+    ModeChange,
+    NewEpoch,
+}
+
+impl RunEpochMode {
+    fn replay_consensus(&self) -> bool {
+        match self {
+            RunEpochMode::ModeChange => false,
+            RunEpochMode::Initial | RunEpochMode::NewEpoch => true,
+        }
+    }
+
+    fn initial_epoch(&self) -> bool {
+        matches!(self, RunEpochMode::Initial)
+    }
+}
+
 /// The long-running type that oversees epoch transitions.
 #[derive(Debug)]
 pub(crate) struct EpochManager<P, DB> {
@@ -401,7 +421,7 @@ where
         gas_accumulator: GasAccumulator,
     ) -> eyre::Result<()> {
         // initialize long-running components for node startup
-        let mut initial_epoch = true;
+        let mut run_epoch_mode = RunEpochMode::Initial;
 
         let node_ended_sub = self.node_shutdown.subscribe();
 
@@ -412,13 +432,13 @@ where
                     engine,
                     &network_config,
                     &to_engine,
-                    &mut initial_epoch,
+                    run_epoch_mode,
                     gas_accumulator.clone(),
                 )
                 .await;
 
             // ensure no errors
-            epoch_result.inspect_err(|e| {
+            run_epoch_mode = epoch_result.inspect_err(|e| {
                 error!(target: "epoch-manager", ?e, "epoch returned error");
             })?;
 
@@ -599,12 +619,14 @@ where
         engine: &ExecutionNode,
         network_config: &NetworkConfig,
         to_engine: &mpsc::Sender<ConsensusOutput>,
-        initial_epoch: &mut bool,
+        epoch_mode: RunEpochMode,
         gas_accumulator: GasAccumulator,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<RunEpochMode> {
         info!(target: "epoch-manager", "Starting epoch");
 
-        if *initial_epoch {
+        // Lets make sure our consesus db has a clear write queue and is ready to go.
+        self.consensus_db.persist::<ConsensusBlocks>().await;
+        if epoch_mode.replay_consensus() {
             // If we are starting up then make sure that any consensus we previously validated goes
             // to the engine and is executed.  Otherwise we could miss consensus execution.
             self.replay_missed_consensus(engine, to_engine, &gas_accumulator).await?;
@@ -639,7 +661,7 @@ where
                 engine,
                 &epoch_task_manager,
                 network_config,
-                initial_epoch,
+                epoch_mode.initial_epoch(),
                 gas_accumulator.clone(),
             )
             .await?;
@@ -756,6 +778,7 @@ where
             },
         }
 
+        let mut res = RunEpochMode::NewEpoch;
         // If the select exitted because of a join() then do not join() again- we are already
         // shutting down.
         if need_join {
@@ -779,16 +802,18 @@ where
             while let Ok(output) = consensus_output.try_recv() {
                 if current_epoch == output.sub_dag.leader_epoch() {
                     // Found some extra output...
+                    // Anything from the epoch we closed should be garbage.
                     self.consensus_db.remove_consensus_by_hash(output.digest().into());
                 }
             }
         } else {
             self.send_leftover_consensus_output_to_engine(
-                gas_accumulator,
+                &gas_accumulator,
                 &mut consensus_output,
                 to_engine,
             )
             .await;
+            res = RunEpochMode::ModeChange;
         }
 
         // clear tables
@@ -796,7 +821,7 @@ where
             self.clear_consensus_db_for_next_epoch()?;
         }
 
-        Ok(())
+        Ok(res)
     }
 
     // If we stopped waiting on the epoch boundary so lets make sure that the consensus queue
@@ -806,7 +831,7 @@ where
     // saved it should have been sent).
     async fn send_leftover_consensus_output_to_engine(
         &mut self,
-        gas_accumulator: GasAccumulator,
+        gas_accumulator: &GasAccumulator,
         consensus_output: &mut impl TnReceiver<ConsensusOutput>,
         to_engine: &mpsc::Sender<ConsensusOutput>,
     ) {
@@ -1214,7 +1239,7 @@ where
         engine: &ExecutionNode,
         epoch_task_manager: &TaskManager,
         network_config: &NetworkConfig,
-        initial_epoch: &mut bool,
+        initial_epoch: bool,
         gas_accumulator: GasAccumulator,
     ) -> eyre::Result<(PrimaryNode<DB>, WorkerNode<DB>)> {
         // create config for consensus
@@ -1243,9 +1268,6 @@ where
                 gas_accumulator,
             )
             .await?;
-
-        // ensure initialized networks is false after the first run
-        *initial_epoch = false;
 
         let primary_handle = primary.network_handle().await;
         let prefetches = preload_keys.clone();
@@ -1348,7 +1370,7 @@ where
         &mut self,
         consensus_config: &ConsensusConfig<DB>,
         epoch_task_spawner: TaskSpawner,
-        initial_epoch: &bool,
+        initial_epoch: bool,
     ) -> eyre::Result<PrimaryNode<DB>> {
         let state_sync = StateSynchronizer::new(
             consensus_config.clone(),
@@ -1388,7 +1410,7 @@ where
         consensus_config: &ConsensusConfig<DB>,
         engine: &ExecutionNode,
         epoch_task_spawner: TaskSpawner,
-        initial_epoch: &bool,
+        initial_epoch: bool,
         engine_to_primary: EngineToPrimaryRpc<DB>,
         gas_accumulator: GasAccumulator,
     ) -> eyre::Result<WorkerNode<DB>> {
@@ -1406,7 +1428,7 @@ where
             network_handle.update_task_spawner(epoch_task_spawner.clone());
             // initialize worker components on startup
             // This will use the new epoch_task_spawner on network_handle.
-            if *initial_epoch {
+            if initial_epoch {
                 engine
                     .initialize_worker_components(
                         worker_id,
@@ -1455,7 +1477,7 @@ where
         state_sync: StateSynchronizer<DB>,
         epoch_task_spawner: TaskSpawner,
         network_handle: &PrimaryNetworkHandle,
-        initial_epoch: &bool,
+        initial_epoch: bool,
     ) -> eyre::Result<()> {
         // get event streams for the primary network handler
         let event_stream = self.consensus_bus.primary_network_events().clone();
@@ -1470,7 +1492,7 @@ where
             .map(|a| *a.protocol_key())
             .collect();
 
-        if *initial_epoch {
+        if initial_epoch {
             // Make sure we at least hove bootstrap peers on first epoch.
             network_handle
                 .inner_handle()
@@ -1489,7 +1511,7 @@ where
         debug!(target: "epoch-manager", auth=?consensus_config.authority_id(), "event stream updated!");
 
         // start listening if the network needs to be initialized
-        if *initial_epoch {
+        if initial_epoch {
             // start listening for p2p messages
             let primary_address = Self::parse_listener_address_for_swarm(
                 "PRIMARY_LISTENER_MULTIADDR",
@@ -1609,7 +1631,7 @@ where
         validator: Arc<dyn BatchValidation>,
         epoch_task_spawner: TaskSpawner,
         network_handle: &WorkerNetworkHandle,
-        initial_epoch: &bool,
+        initial_epoch: bool,
     ) -> eyre::Result<()> {
         // get event streams for the worker network handler
         let rx_event_stream = self.worker_event_stream.subscribe();
@@ -1624,7 +1646,7 @@ where
         network_handle.inner_handle().new_epoch(committee_keys.clone()).await?;
 
         // start listening if the network needs to be initialized
-        if *initial_epoch {
+        if initial_epoch {
             let worker_address = Self::parse_listener_address_for_swarm(
                 "WORKER_LISTENER_MULTIADDR",
                 consensus_config.primary_networkkey(),
