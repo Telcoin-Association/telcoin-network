@@ -3,8 +3,8 @@
 //! arguments.
 
 use crate::{
-    certificate_fetcher::CertificateFetcherCommand, consensus::ConsensusRound,
-    proposer::OurDigestMessage, state_sync::CertificateManagerCommand, RecentBlocks,
+    certificate_fetcher::CertificateFetcherCommand, proposer::OurDigestMessage,
+    state_sync::CertificateManagerCommand, RecentBlocks,
 };
 use consensus_metrics::metered_channel::{self, channel_with_total_sender, MeteredMpscChannel};
 use parking_lot::Mutex;
@@ -148,11 +148,6 @@ struct ConsensusBusAppInner {
     /// Hold onto a receiver to keep it "open".
     _rx_committed_round_updates: watch::Receiver<Round>,
 
-    /// Outputs the highest gc_round from the consensus.
-    tx_gc_round_updates: watch::Sender<Round>,
-    /// Hold onto a receiver to keep it "open".
-    _rx_gc_round_updates: watch::Receiver<Round>,
-
     /// An epoch we need an epoch record for.
     tx_requested_missing_epoch: watch::Sender<Epoch>,
     /// Hold onto a receiver to keep it "open".
@@ -212,7 +207,6 @@ impl ConsensusBusAppInner {
         let (tx_committed_round_updates, _rx_committed_round_updates) =
             watch::channel(Round::default());
 
-        let (tx_gc_round_updates, _rx_gc_round_updates) = watch::channel(Round::default());
         let (tx_requested_missing_epoch, _rx_requested_missing_epoch) =
             watch::channel(Epoch::default());
 
@@ -231,8 +225,6 @@ impl ConsensusBusAppInner {
         Self {
             tx_committed_round_updates,
             _rx_committed_round_updates,
-            tx_gc_round_updates,
-            _rx_gc_round_updates,
             tx_requested_missing_epoch,
             _rx_requested_missing_epoch,
 
@@ -261,7 +253,6 @@ impl ConsensusBusAppInner {
     /// This is primarily so we can resubscribe to "one-time" subscription channels.
     fn reset_for_epoch(&self) {
         let _ = self.tx_committed_round_updates.send(Round::default());
-        let _ = self.tx_gc_round_updates.send(Round::default());
         let _ = self.tx_primary_round_updates.send(0u32);
     }
 }
@@ -452,11 +443,6 @@ impl ConsensusBus {
         &self.inner_app.tx_committed_round_updates
     }
 
-    /// Contains the highest gc_round for consensus.
-    pub fn gc_round_updates(&self) -> &watch::Sender<Round> {
-        &self.inner_app.tx_gc_round_updates
-    }
-
     /// Contains the last requested epoch to retrieve a record.
     pub fn requested_missing_epoch(&self) -> &watch::Sender<Epoch> {
         &self.inner_app.tx_requested_missing_epoch
@@ -575,16 +561,6 @@ impl ConsensusBus {
         &self,
     ) -> &impl TnSender<(EpochVote, oneshot::Sender<Result<(), HeaderError>>)> {
         &self.inner_app.new_epoch_votes
-    }
-
-    /// Update consensus round watch channels.
-    ///
-    /// This sends both the gc round and the committed round to the respective watch channels after
-    /// consensus updates.
-    pub fn update_consensus_rounds(&self, update: ConsensusRound) {
-        let ConsensusRound { committed_round, gc_round } = update;
-        self.gc_round_updates().send_replace(gc_round);
-        self.committed_round_updates().send_replace(committed_round);
     }
 
     /// Will resolve once we have executed block.

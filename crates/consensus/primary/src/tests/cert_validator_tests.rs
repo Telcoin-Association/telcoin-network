@@ -1,10 +1,7 @@
 //! Certificate validator tests
 
 use super::CertificateValidator;
-use crate::{
-    state_sync::{AtomicRound, CertificateManagerCommand},
-    ConsensusBus,
-};
+use crate::{state_sync::CertificateManagerCommand, ConsensusBus};
 use std::collections::BTreeSet;
 use tn_primary::test_utils::make_optimal_signed_certificates;
 use tn_storage::mem_db::MemDatabase;
@@ -32,19 +29,9 @@ fn create_test_types() -> TestTypes<MemDatabase> {
 
     // for validator
     let config = primary.consensus_config();
-    let gc_round = AtomicRound::new(0);
-    let highest_processed_round = AtomicRound::new(0);
-    let highest_received_round = AtomicRound::new(0);
 
     let task_manager = TaskManager::default();
-    let validator = CertificateValidator::new(
-        config,
-        cb.clone(),
-        gc_round,
-        highest_processed_round,
-        highest_received_round,
-        task_manager.get_spawner(),
-    );
+    let validator = CertificateValidator::new(config, cb.clone(), task_manager.get_spawner());
 
     TestTypes { validator, cb, fixture, task_manager }
 }

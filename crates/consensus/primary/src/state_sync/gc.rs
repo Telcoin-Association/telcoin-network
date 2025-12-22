@@ -5,11 +5,6 @@ use crate::{
     error::{GarbageCollectorError, GarbageCollectorResult},
     ConsensusBus,
 };
-use consensus_metrics::monitored_scope;
-use std::sync::{
-    atomic::{AtomicU32, Ordering},
-    Arc,
-};
 use tn_config::ConsensusConfig;
 use tn_types::{Database, TnSender as _};
 use tokio::{sync::watch, time::interval};
@@ -26,11 +21,7 @@ pub(super) struct GarbageCollector<DB> {
     /// Consensus message channels.
     consensus_bus: ConsensusBus,
     /// Watch channel for gc updates.
-    rx_gc_round_updates: watch::Receiver<u32>,
-    /// The atomic gc round.
-    ///
-    /// This is managed by `Self` and is read by CertificateValidator and CertificateManager.
-    gc_round: AtomicRound,
+    rx_committed_round_updates: watch::Receiver<u32>,
 }
 
 impl<DB> GarbageCollector<DB>
@@ -38,24 +29,9 @@ where
     DB: Database,
 {
     /// Create a new instance of Self.
-    pub(super) fn new(
-        config: ConsensusConfig<DB>,
-        consensus_bus: ConsensusBus,
-        gc_round: AtomicRound,
-    ) -> Self {
-        let rx_gc_round_updates = consensus_bus.gc_round_updates().subscribe();
-        Self { config, consensus_bus, rx_gc_round_updates, gc_round }
-    }
-
-    /// The round advanced within time. Process the round
-    async fn process_next_round(&mut self) -> GarbageCollectorResult<()> {
-        let _scope = monitored_scope("primary::gc");
-
-        // update gc round
-        let new_round = *self.rx_gc_round_updates.borrow_and_update();
-        self.gc_round.store(new_round);
-
-        Ok(())
+    pub(super) fn new(config: ConsensusConfig<DB>, consensus_bus: ConsensusBus) -> Self {
+        let rx_committed_round_updates = consensus_bus.committed_round_updates().subscribe();
+        Self { config, consensus_bus, rx_committed_round_updates }
     }
 
     /// Request the certificate fetcher to request certificates from peers.
@@ -103,13 +79,11 @@ where
             }
 
             // round update watch channel
-            update = self.rx_gc_round_updates.changed() => {
+            update = self.rx_committed_round_updates.changed() => {
                 // ensure change notification isn't an error
                 update.map_err(GarbageCollectorError::ConsensusRoundWatchChannel).inspect_err(|e| {
                     error!(target: "primary::gc", ?e, "rx_consensus_round_updates watch error. shutting down...");
                 })?;
-
-                self.process_next_round().await?;
 
                 // reset timer - the happy path
                 max_round_timeout.reset();
@@ -117,54 +91,5 @@ where
         }
 
         Ok(())
-    }
-}
-
-/// Holds the atomic round.
-#[derive(Clone)]
-pub(super) struct AtomicRound {
-    /// The inner type.
-    inner: Arc<InnerAtomicRound>,
-}
-
-/// The inner type for [AtomicRound]
-struct InnerAtomicRound {
-    /// The atomic gc round.
-    atomic: AtomicU32,
-}
-
-impl AtomicRound {
-    /// Create a new instance of Self.
-    pub(super) fn new(num: u32) -> Self {
-        Self { inner: Arc::new(InnerAtomicRound { atomic: AtomicU32::new(num) }) }
-    }
-
-    /// Load the atomic round.
-    pub(super) fn load(&self) -> u32 {
-        self.inner.atomic.load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// Fetch the max.
-    pub(super) fn fetch_max(&self, val: u32) -> u32 {
-        self.inner.atomic.fetch_max(val, Ordering::AcqRel)
-    }
-
-    /// Store the new atomic round.
-    ///
-    /// NOTE: private so only GC can call this
-    fn store(&mut self, new: u32) {
-        self.inner.atomic.store(new, std::sync::atomic::Ordering::Release);
-    }
-}
-
-impl std::fmt::Debug for AtomicRound {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.inner.atomic)
-    }
-}
-
-impl std::default::Default for AtomicRound {
-    fn default() -> Self {
-        Self { inner: Arc::new(InnerAtomicRound { atomic: AtomicU32::new(0) }) }
     }
 }
