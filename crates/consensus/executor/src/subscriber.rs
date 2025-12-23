@@ -3,10 +3,7 @@
 use crate::{errors::SubscriberResult, SubscriberError};
 use consensus_metrics::monitored_future;
 use futures::{stream::FuturesOrdered, StreamExt};
-use state_sync::{
-    get_missing_consensus, last_executed_consensus_block, save_consensus, spawn_state_sync,
-    stream_missing_consensus,
-};
+use state_sync::{last_executed_consensus_block, save_consensus, spawn_state_sync};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -18,7 +15,7 @@ use tn_primary::{
     network::{ConsensusResult, PrimaryNetworkHandle},
     ConsensusBus, NodeMode,
 };
-use tn_storage::{tables::ConsensusBlocks, CertificateStore};
+use tn_storage::CertificateStore;
 use tn_types::{
     encode, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash, BlsSigner as _,
     CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput, Database,
@@ -152,19 +149,18 @@ impl<DB: Database> Subscriber<DB> {
             self.config.node_storage(),
             consensus_output.clone(),
             &self.inner.authority_id,
-        )?;
+        )
+        .await?;
 
         let last_round = consensus_output.leader_round();
 
         // We aren't doing consensus now but still need to update these watches before
         // we send the consensus output.
-        let _ = self.consensus_bus.update_consensus_rounds(ConsensusRound::new_with_gc_depth(
+        self.consensus_bus.update_consensus_rounds(ConsensusRound::new_with_gc_depth(
             last_round,
             self.config.parameters().gc_depth,
         ));
         let _ = self.consensus_bus.primary_round_updates().send(last_round);
-        // Make sure we have persisted the consensus output before we execute.
-        self.config.node_storage().persist::<ConsensusBlocks>().await;
 
         if let Err(e) = self.consensus_bus.consensus_output().send(consensus_output).await {
             error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self.inner.authority_id, e);
@@ -177,7 +173,6 @@ impl<DB: Database> Subscriber<DB> {
     async fn catch_up_rejoin_consensus(&self, tasks: TaskSpawner) -> SubscriberResult<()> {
         // Get a receiver and then stream any missing headers so we don't miss them.
         let mut rx_consensus_headers = self.consensus_bus.consensus_header().subscribe();
-        stream_missing_consensus(&self.config, &self.consensus_bus).await?;
         spawn_state_sync(
             self.config.clone(),
             self.consensus_bus.clone(),
@@ -187,13 +182,16 @@ impl<DB: Database> Subscriber<DB> {
         while let Some(consensus_header) = rx_consensus_headers.recv().await {
             let consensus_header_number = consensus_header.number;
             self.handle_consensus_header(consensus_header).await?;
-            if consensus_header_number == self.consensus_bus.last_consensus_header().borrow().number
+            if let Some(last_consensus_header) =
+                self.consensus_bus.last_consensus_header().borrow().as_ref()
             {
-                // We are caught up enough so try to jump back into consensus
-                info!(target: "subscriber", "attempting to rejoin consensus, consensus block height {consensus_header_number}");
-                let _ = self.consensus_bus.node_mode().send(NodeMode::CvvActive);
-                self.config.shutdown().notify();
-                return Ok(());
+                if consensus_header_number == last_consensus_header.number {
+                    // We are caught up enough so try to jump back into consensus
+                    info!(target: "subscriber", "attempting to rejoin consensus, consensus block height {consensus_header_number}");
+                    let _ = self.consensus_bus.node_mode().send(NodeMode::CvvActive);
+                    self.config.shutdown().notify();
+                    return Ok(());
+                }
             }
         }
         Ok(())
@@ -203,9 +201,6 @@ impl<DB: Database> Subscriber<DB> {
     async fn follow_consensus(&self, tasks: TaskSpawner) -> SubscriberResult<()> {
         // Get a receiver then stream any missing headers so we don't miss them.
         let mut rx_consensus_headers = self.consensus_bus.consensus_header().subscribe();
-        // this could be an issue with await vs spawning, if we somehow had to stream a LOT of
-        // output it could deadlock since the code below reads the channel.
-        stream_missing_consensus(&self.config, &self.consensus_bus).await?;
         spawn_state_sync(
             self.config.clone(),
             self.consensus_bus.clone(),
@@ -226,7 +221,8 @@ impl<DB: Database> Subscriber<DB> {
         // Get the DB and load our last executed consensus block (note there may be unexecuted
         // blocks, catch up will execute them).
         let last_executed_block =
-            last_executed_consensus_block(&self.consensus_bus, &self.config).unwrap_or_default();
+            last_executed_consensus_block(&self.consensus_bus, self.config.node_storage())
+                .unwrap_or_default();
 
         info!(target: "subscriber", ?last_executed_block, "restoring last executed consensus for constucting the next ConsensusHeader:");
 
@@ -235,28 +231,6 @@ impl<DB: Database> Subscriber<DB> {
 
     /// Main loop connecting to the consensus to listen to sequence messages.
     async fn run(self, rx_shutdown: Noticer) -> SubscriberResult<()> {
-        // Make sure any old consensus that was not executed gets executed.
-        // Note, "missing" in this context is consensus that was reached but not executed
-        // before the last shutdown.  We need to execute it now so that everything will be
-        // in sync, otherwise we could get out of order execution racing with Bullshark.
-        let missing = get_missing_consensus(&self.config, &self.consensus_bus).await?;
-        for consensus_header in missing.into_iter() {
-            let consensus_output = self
-                .fetch_batches(
-                    consensus_header.sub_dag.clone(),
-                    consensus_header.parent_hash,
-                    consensus_header.number,
-                )
-                .await?;
-            if let Err(e) = self.consensus_bus.consensus_output().send(consensus_output).await {
-                error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self.inner.authority_id, e);
-                return Err(SubscriberError::ClosedChannel("consensus_output".to_string()));
-            }
-            // Go ahead and wait for execution to happen.  This may not be strictly required but
-            // will hurt nothing, only happen on startup (for a small amount blocks) so
-            // do it.
-            let _ = self.consensus_bus.recent_blocks().subscribe().changed().await;
-        }
         // It's important to have the futures in ordered fashion as we want
         // to guarantee that will deliver to the executor the certificates
         // in the same order we received from rx_sequence. So it doesn't
@@ -283,7 +257,7 @@ impl<DB: Database> Subscriber<DB> {
 
                     // Record the latest ConsensusHeader, we probably don't need this in this mode but keep it up to date anyway.
                     // Note we don't bother sending this to the consensus header channel since not needed when an active CVV.
-                    if let Err(e) = self.consensus_bus.last_consensus_header().send(ConsensusHeader { parent_hash, sub_dag: sub_dag.clone(), number, extra: B256::default() }) {
+                    if let Err(e) = self.consensus_bus.last_consensus_header().send(Some(ConsensusHeader { parent_hash, sub_dag: sub_dag.clone(), number, extra: B256::default() })) {
                         error!(target: "subscriber", "error sending latest consensus header for authority {:?}: {}", self.inner.authority_id, e);
                         return Err(SubscriberError::ClosedChannel("failed to send last consensus header on bus".to_string()));
                     }
@@ -307,10 +281,8 @@ impl<DB: Database> Subscriber<DB> {
                     match output {
                         Ok(output) => {
                             debug!(target: "subscriber", output=?output.digest(), "saving next output");
-                            save_consensus(self.config.node_storage(), output.clone(), &self.inner.authority_id)?;
+                            save_consensus(self.config.node_storage(), output.clone(), &self.inner.authority_id).await?;
                             debug!(target: "subscriber", "broadcasting output...");
-                            // Make sure we have persisted the consensus output before we execute.
-                            self.config.node_storage().persist::<ConsensusBlocks>().await;
                             if let Err(e) = self.consensus_bus.consensus_output().send(output).await {
                                 error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self.inner.authority_id, e);
                                 return Err(SubscriberError::ClosedChannel("failed to broadcast consensus output".to_string()));

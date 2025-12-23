@@ -493,6 +493,7 @@ mod test {
         // Test empty map is truly empty
         assert!(db.is_empty::<TestTable>());
         let _ = db.clear_table::<TestTable>();
+        db.sync_persist(); // Either a no-op or a chance for write ops to catch up.
         assert!(db.is_empty::<TestTable>());
 
         let mut txn = db.write_txn().unwrap();
@@ -500,6 +501,7 @@ mod test {
             txn.insert::<TestTable>(&key, &val).expect("Failed to batch insert");
         }
         txn.commit().unwrap();
+        db.sync_persist(); // Either a no-op or a chance for write ops to catch up.
 
         // Check we have multiple entries and not empty
         assert!(db.iter::<TestTable>().count() > 1);

@@ -100,7 +100,7 @@ async fn test_output_to_header() -> eyre::Result<()> {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
-    let last_header = rx_consensus_headers.borrow().clone();
+    let last_header = rx_consensus_headers.borrow().clone().unwrap_or_default();
     assert!(last_header.number == expected_num as u64);
 
     // NOTE: output.consensus_header() creates the consensus header and should be the same
