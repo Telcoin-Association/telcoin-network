@@ -92,8 +92,6 @@ impl<DB: Database> DbTxMut for LayeredDbTxMut<DB> {
 fn db_run<DB: Database>(db: DB, mem_db: Option<MemDatabase>, rx: Receiver<DBMessage<DB>>) {
     let mut txn = None;
     let mut last_compact = Instant::now();
-    //let mut last_memclear = Instant::now();
-    //let mut inserts = Vec::with_capacity(10_000);
     let mut committed_inserts: Vec<Box<dyn InsertTrait<DB>>> = Vec::with_capacity(1000);
     if let Err(e) = db.compact() {
         tracing::error!(target: "layered_db_runner", "DB ERROR compacting DB on startup (background): {e}");
@@ -358,6 +356,7 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
             .send(DBMessage::CaughtUp(tx))
             .map_err(|_| eyre::eyre!("DB thread gone, FATAL!"));
 
+        // Can not use rx.blocking_recv() because it will be called from some tokio tests and that will panic.
         if r.is_ok() {
             // Wait for rx to not be empty.
             loop {
