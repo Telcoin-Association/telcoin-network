@@ -33,7 +33,7 @@ pub async fn prime_consensus<DB: Database>(
     // Get the DB and load our last executed consensus block (note there may be unexecuted
     // blocks, catch up will execute them).
     let last_executed_block =
-        last_executed_consensus_block(consensus_bus, config).unwrap_or_default();
+        last_executed_consensus_block(consensus_bus, config.node_storage()).unwrap_or_default();
 
     let current_epoch = config.epoch();
 
@@ -48,11 +48,11 @@ pub async fn prime_consensus<DB: Database>(
         last_subdag.leader_round()
     };
 
-    let _ = consensus_bus.update_consensus_rounds(ConsensusRound::new_with_gc_depth(
+    consensus_bus.update_consensus_rounds(ConsensusRound::new_with_gc_depth(
         last_consensus_round,
         config.parameters().gc_depth,
     ));
-    let _ = consensus_bus.primary_round_updates().send(last_consensus_round);
+    consensus_bus.primary_round_updates().send_replace(last_consensus_round);
 }
 
 /// Spawn the state sync tasks.
@@ -102,21 +102,16 @@ pub fn spawn_state_sync<DB: Database>(
 ///
 /// An error here indicates a critical node failure.
 /// Note, if this returns an error then the DB could not be written to- this is probably fatal.
-pub fn save_consensus<DB: Database>(
+pub async fn save_consensus<DB: Database>(
     db: &DB,
     consensus_output: ConsensusOutput,
     authority_id: &Option<AuthorityIdentifier>,
 ) -> eyre::Result<()> {
+    // Make sure we have all the batches we need before writing the consensus header.
+    db.persist::<Batches>().await;
     match db.write_txn() {
         Ok(mut txn) => {
-            for certified_batches in consensus_output.batches.iter() {
-                for batch in certified_batches.batches.iter() {
-                    if let Err(e) = txn.insert::<Batches>(&batch.digest(), batch) {
-                        error!(target: "state-sync", ?e, "error saving a batch to persistant storage!");
-                        return Err(e);
-                    }
-                }
-            }
+            // We should have all the batches saved at this point so no need to do so again.
             let header: ConsensusHeader = consensus_output.into();
             if let Err(e) = txn.insert::<ConsensusBlocks>(&header.number, &header) {
                 error!(target: "state-sync", ?e, "error saving a consensus header to persistant storage!");
@@ -145,6 +140,8 @@ pub fn save_consensus<DB: Database>(
                 error!(target: "state-sync", ?e, "error saving committing to persistant storage!");
                 return Err(e);
             }
+            // Make sure we have persisted the consensus output before we execute.
+            db.persist::<ConsensusBlocks>().await;
         }
         Err(e) => {
             error!(target: "state-sync", ?e, "error getting a transaction on persistant storage!");
@@ -159,64 +156,30 @@ pub fn save_consensus<DB: Database>(
 /// issue.
 pub fn last_executed_consensus_block<DB: Database>(
     consensus_bus: &ConsensusBus,
-    config: &ConsensusConfig<DB>,
+    db: &DB,
 ) -> Option<ConsensusHeader> {
-    let last = consensus_bus.last_executed_consensus_block(config.node_storage());
-    debug!(target: "state-sync", ?last, epoch=?config.epoch(), "last executed consensus block");
+    let last = consensus_bus.last_executed_consensus_block(db);
+    debug!(target: "state-sync", ?last, "last executed consensus block");
     last
-}
-
-/// Send any consensus headers that were not executed before last shutdown to the consensus header
-/// channel.
-pub async fn stream_missing_consensus<DB: Database>(
-    config: &ConsensusConfig<DB>,
-    consensus_bus: &ConsensusBus,
-) -> eyre::Result<()> {
-    // Get the DB and load our last executed consensus block.
-    let last_executed_block =
-        last_executed_consensus_block(consensus_bus, config).unwrap_or_default();
-    // Edge case, in case we don't hear from peers but have un-executed blocks...
-    // Not sure we should handle this, but it hurts nothing.
-    let db = config.node_storage();
-    let (_, last_db_block) = db
-        .last_record::<ConsensusBlocks>()
-        .unwrap_or_else(|| (last_executed_block.number, last_executed_block.clone()));
-
-    debug!(target: "state-sync", ?last_executed_block, ?last_db_block, "comparing last executed block and last recorded consensus block");
-
-    // if the last recorded consensus block is larger than the last executed block,
-    // forward the stored consensus block to engine for execution
-    if last_db_block.number > last_executed_block.number {
-        for consensus_block_number in last_executed_block.number + 1..=last_db_block.number {
-            if let Some(consensus_header) = db.get_consensus_by_number(consensus_block_number) {
-                debug!(target: "state-sync", ?consensus_header, "sending missed consensus block through consensus bus");
-                consensus_bus.consensus_header().send(consensus_header).await?;
-            }
-        }
-    }
-
-    Ok(())
 }
 
 /// Collect and return any consensus headers that were not executed before last shutdown.
 /// This will be consensus that was reached but had not executed before a shutdown.
 pub async fn get_missing_consensus<DB: Database>(
-    config: &ConsensusConfig<DB>,
+    db: &DB,
     consensus_bus: &ConsensusBus,
 ) -> eyre::Result<Vec<ConsensusHeader>> {
     let mut result = Vec::new();
     // Get the DB and load our last executed consensus block.
-    let last_executed_block =
-        last_executed_consensus_block(consensus_bus, config).unwrap_or_default();
+    let last_executed_block = last_executed_consensus_block(consensus_bus, db).unwrap_or_default();
 
     // Edge case, in case we don't hear from peers but have un-executed blocks...
     // Not sure we should handle this, but it hurts nothing.
-    let db = config.node_storage();
     let (_, last_db_block) = db
         .last_record::<ConsensusBlocks>()
         .unwrap_or_else(|| (last_executed_block.number, last_executed_block.clone()));
 
-    debug!(target: "state-sync", ?last_executed_block, ?last_db_block, "comparing last executed block and last recorded consensus block");
+    info!(target: "state-sync", ?last_executed_block, ?last_db_block, "comparing last executed block and last recorded consensus block");
 
     // if the last recorded consensus block is larger than the last executed block,
     // forward the stored consensus block to engine for execution
@@ -229,7 +192,7 @@ pub async fn get_missing_consensus<DB: Database>(
         }
     }
 
-    debug!(target: "state-sync", ?result, "missing consensus headers that need execution:");
+    info!(target: "state-sync", ?result, "missing consensus headers that need execution:");
     Ok(result)
 }
 
@@ -244,14 +207,15 @@ async fn spawn_stream_consensus_headers<DB: Database>(
 
     let mut rx_last_consensus_header = consensus_bus.last_consensus_header().subscribe();
     let mut last_consensus_header =
-        last_executed_consensus_block(&consensus_bus, &config).unwrap_or_default();
+        last_executed_consensus_block(&consensus_bus, config.node_storage()).unwrap_or_default();
     let mut last_consensus_height = last_consensus_header.number;
 
     // infinite loop over consensus output
     loop {
         tokio::select! {
             _ = rx_last_consensus_header.changed() => {
-                let header = rx_last_consensus_header.borrow_and_update().clone();
+                // If this changes it should not be None...
+                let header = rx_last_consensus_header.borrow().clone().unwrap_or_default();
                 debug!(target: "state-sync", rx_last_consensus_header=?header.number, ?last_consensus_height, "streaming consensus headers detected change");
 
                 if header.number > last_consensus_height {

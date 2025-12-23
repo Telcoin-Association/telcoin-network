@@ -89,8 +89,9 @@ fn send_and_confirm(
     }
     let bal =
         get_balance_above_with_retry(node_test, &basefee_address.to_string(), current_basefee)?;
-    if nonce > 0 && bal != current_basefee + (current_basefee / (nonce)) {
-        error!(target: "restart-test", "basefee error!");
+    let expected_bal = if nonce > 0 { current_basefee + (current_basefee / (nonce)) } else { 0 };
+    if nonce > 0 && bal != expected_bal {
+        error!(target: "restart-test", ?bal, ?expected_bal, "basefee error!");
         return Err(Report::msg("Expected a basefee increment!".to_string()));
     }
     Ok(())
@@ -820,8 +821,8 @@ where
             resp = client.request(command, params.clone()).await;
             i += 1;
         }
-        resp.inspect_err(|_| {
-            error!(target: "restart-tests", ?command, ?node, ?debug_params, "rpc call failed");
+        resp.inspect_err(|error| {
+            error!(target: "restart-tests", ?error, ?command, ?node, ?debug_params, "rpc call failed");
         })
     });
 

@@ -89,7 +89,7 @@ impl<DB: Database> DbTxMut for LayeredDbTxMut<DB> {
 
 /// Run the thread to manage the persistant DB in the background.
 /// If DB needs compaction this thread will compact on startup and once a day after that.
-fn db_run<DB: Database>(db: DB, mem_db: MemDatabase, rx: Receiver<DBMessage<DB>>) {
+fn db_run<DB: Database>(db: DB, mem_db: Option<MemDatabase>, rx: Receiver<DBMessage<DB>>) {
     let mut txn = None;
     let mut last_compact = Instant::now();
     let mut committed_inserts: Vec<Box<dyn InsertTrait<DB>>> = Vec::with_capacity(1000);
@@ -116,8 +116,10 @@ fn db_run<DB: Database>(db: DB, mem_db: MemDatabase, rx: Receiver<DBMessage<DB>>
                         if let Err(e) = current_txn.commit() {
                             tracing::error!(target: "layered_db_runner", "DB TXN Commit: {e}")
                         }
-                        for insert in committed_inserts.drain(..) {
-                            insert.clear_insert_mem(&mem_db);
+                        if let Some(mem_db) = mem_db.as_ref() {
+                            for insert in committed_inserts.drain(..) {
+                                insert.clear_insert_mem(mem_db);
+                            }
                         }
                     } else {
                         txn = Some((current_txn, count - 1));
@@ -134,7 +136,9 @@ fn db_run<DB: Database>(db: DB, mem_db: MemDatabase, rx: Receiver<DBMessage<DB>>
                     if let Err(e) = ins.insert(&db) {
                         tracing::error!(target: "layered_db_runner", "DB Insert: {e}");
                     }
-                    ins.clear_insert_mem(&mem_db);
+                    if let Some(mem_db) = mem_db.as_ref() {
+                        ins.clear_insert_mem(mem_db);
+                    }
                 }
             }
             DBMessage::Remove(rm) => {
@@ -182,6 +186,8 @@ pub struct LayeredDatabase<DB: Database> {
     tx: Sender<DBMessage<DB>>,
     thread: Option<Arc<JoinHandle<()>>>, /* Use as a ref count for shutting down the background
                                           * thread and it's handle. */
+    full_memory: bool, /* If true then keep all the data in memory otherwise only keep it until
+                        * written to disk. */
 }
 
 impl<DB: Database> Drop for LayeredDatabase<DB> {
@@ -207,18 +213,14 @@ impl<DB: Database> Drop for LayeredDatabase<DB> {
 }
 
 impl<DB: Database> LayeredDatabase<DB> {
-    pub fn open(db: DB) -> Self {
+    pub fn open(db: DB, full_memory: bool) -> Self {
         let (tx, rx) = mpsc::channel();
         let db_cloned = db.clone();
-        let mem_db = MemDatabase::default();
-        let mem_db_clone = mem_db.clone();
+        let mem_db = MemDatabase::new();
+        let mem_db_clone = if full_memory { None } else { Some(mem_db.clone()) };
         let thread =
             Some(Arc::new(std::thread::spawn(move || db_run(db_cloned, mem_db_clone, rx))));
-        Self { mem_db, db, tx, thread }
-    }
-
-    pub fn open_table<T: Table>(&self) {
-        self.mem_db.open_table::<T>();
+        Self { mem_db, db, tx, thread, full_memory }
     }
 }
 
@@ -232,6 +234,17 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
         = LayeredDbTxMut<DB>
     where
         Self: 'txn;
+
+    fn open_table<T: Table>(&self) -> eyre::Result<()> {
+        self.db.open_table::<T>()?;
+        self.mem_db.open_table::<T>()?;
+        if self.full_memory {
+            for (k, v) in self.db.iter::<T>() {
+                let _ = self.mem_db.insert::<T>(&k, &v);
+            }
+        }
+        Ok(())
+    }
 
     fn read_txn(&self) -> eyre::Result<Self::TX<'_>> {
         Ok(LayeredDbTx { mem_db: self.mem_db.clone(), db: self.db.clone() })
@@ -279,31 +292,57 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
     }
 
     fn is_empty<T: Table>(&self) -> bool {
-        self.mem_db.is_empty::<T>() && self.db.is_empty::<T>()
+        if self.full_memory {
+            self.mem_db.is_empty::<T>()
+        } else {
+            self.mem_db.is_empty::<T>() && self.db.is_empty::<T>()
+        }
     }
 
-    /// Layered db will return all inserted elements even if some are duplicates while writes occur.
+    /// This iterator will be acurate for a full memory DB however
+    /// a layered db will return all inserted elements even if some
+    /// are duplicates while writes occur if this is not full memory.
     fn iter<T: Table>(&self) -> DBIter<'_, T> {
-        Box::new(self.db.iter::<T>().chain(self.mem_db.iter::<T>()))
+        if self.full_memory {
+            Box::new(self.mem_db.iter::<T>())
+        } else {
+            Box::new(self.db.iter::<T>().chain(self.mem_db.iter::<T>()))
+        }
     }
 
     fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
-        self.db.skip_to::<T>(key)
+        if self.full_memory {
+            self.mem_db.skip_to::<T>(key)
+        } else {
+            self.db.skip_to::<T>(key)
+        }
     }
 
     fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
-        self.db.reverse_iter::<T>()
+        if self.full_memory {
+            self.mem_db.reverse_iter::<T>()
+        } else {
+            self.db.reverse_iter::<T>()
+        }
     }
 
     fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
-        self.db.record_prior_to::<T>(key)
+        if self.full_memory {
+            self.mem_db.record_prior_to::<T>(key)
+        } else {
+            self.db.record_prior_to::<T>(key)
+        }
     }
 
     fn last_record<T: Table>(&self) -> Option<(T::Key, T::Value)> {
-        self.db.last_record::<T>()
+        if self.full_memory {
+            self.mem_db.last_record::<T>()
+        } else {
+            self.db.last_record::<T>()
+        }
     }
 
-    fn persist(&self) -> impl Future<Output = ()> + Send {
+    fn persist<T: Table>(&self) -> impl Future<Output = ()> + Send {
         let (tx, rx) = oneshot::channel();
         let r = self
             .tx
@@ -323,7 +362,8 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
             .send(DBMessage::CaughtUp(tx))
             .map_err(|_| eyre::eyre!("DB thread gone, FATAL!"));
 
-        // Can not use rx.blocking_recv() because it will be called from some tokio tests and that will panic.
+        // Can not use rx.blocking_recv() because it will be called from some tokio tests and that
+        // will panic.
         if r.is_ok() {
             // Wait for rx to not be empty.
             loop {
@@ -429,24 +469,29 @@ mod test {
     use super::LayeredDatabase;
     #[cfg(feature = "redb")]
     use crate::redb::ReDB;
-    use crate::{mdbx::MdbxDatabase, test::*};
+    use crate::{
+        mdbx::{database::MEGABYTE, MdbxDatabase},
+        test::*,
+    };
     use std::path::Path;
     use tempfile::tempdir;
+    use tn_types::Database as _;
 
     #[cfg(feature = "redb")]
-    fn open_redb(path: &Path) -> LayeredDatabase<ReDB> {
-        let db = ReDB::open(path).expect("Cannot open database");
+    fn open_redb(path: &Path, full_memory: bool) -> LayeredDatabase<ReDB> {
+        let db = ReDB::open(path.join("redb")).expect("Cannot open database");
         db.open_table::<TestTable>().expect("failed to open table!");
-        let db = LayeredDatabase::open(db);
-        db.open_table::<TestTable>();
+        let db = LayeredDatabase::open(db, full_memory);
+        db.open_table::<TestTable>().expect("failed to open table!");
         db
     }
 
-    fn open_mdbx(path: &Path) -> LayeredDatabase<MdbxDatabase> {
-        let db = MdbxDatabase::open(path).expect("Cannot open database");
+    fn open_mdbx(path: &Path, full_memory: bool) -> LayeredDatabase<MdbxDatabase> {
+        let db =
+            MdbxDatabase::open(path, 4, 16 * MEGABYTE, 8 * MEGABYTE).expect("Cannot open database");
         db.open_table::<TestTable>().expect("failed to open table!");
-        let db = LayeredDatabase::open(db);
-        db.open_table::<TestTable>();
+        let db = LayeredDatabase::open(db, full_memory);
+        db.open_table::<TestTable>().expect("failed to open table!");
         db
     }
 
@@ -455,10 +500,14 @@ mod test {
         let temp_dir = tempdir().expect("failed to create temp dir");
         #[cfg(feature = "redb")]
         {
-            let db = open_redb(temp_dir.path());
+            let db = open_redb(temp_dir.path(), true);
+            test_contains_key(db);
+            let db = open_redb(temp_dir.path(), false);
             test_contains_key(db);
         }
-        let db = open_mdbx(temp_dir.path());
+        let db = open_mdbx(temp_dir.path(), true);
+        test_contains_key(db);
+        let db = open_mdbx(temp_dir.path(), false);
         test_contains_key(db);
     }
 
@@ -467,10 +516,14 @@ mod test {
         let temp_dir = tempdir().expect("failed to create temp dir");
         #[cfg(feature = "redb")]
         {
-            let db = open_redb(temp_dir.path());
+            let db = open_redb(temp_dir.path(), true);
+            test_get(db);
+            let db = open_redb(temp_dir.path(), false);
             test_get(db);
         }
-        let db = open_mdbx(temp_dir.path());
+        let db = open_mdbx(temp_dir.path(), true);
+        test_get(db);
+        let db = open_mdbx(temp_dir.path(), false);
         test_get(db);
     }
 
@@ -479,10 +532,14 @@ mod test {
         let temp_dir = tempdir().expect("failed to create temp dir");
         #[cfg(feature = "redb")]
         {
-            let db = open_redb(temp_dir.path());
+            let db = open_redb(temp_dir.path(), true);
+            test_multi_get(db);
+            let db = open_redb(temp_dir.path(), false);
             test_multi_get(db);
         }
-        let db = open_mdbx(temp_dir.path());
+        let db = open_mdbx(temp_dir.path(), true);
+        test_multi_get(db);
+        let db = open_mdbx(temp_dir.path(), false);
         test_multi_get(db);
     }
 
@@ -491,10 +548,14 @@ mod test {
         let temp_dir = tempdir().expect("failed to create temp dir");
         #[cfg(feature = "redb")]
         {
-            let db = open_redb(temp_dir.path());
+            let db = open_redb(temp_dir.path(), true);
+            test_skip(db);
+            let db = open_redb(temp_dir.path(), false);
             test_skip(db);
         }
-        let db = open_mdbx(temp_dir.path());
+        let db = open_mdbx(temp_dir.path(), true);
+        test_skip(db);
+        let db = open_mdbx(temp_dir.path(), false);
         test_skip(db);
     }
 
@@ -503,10 +564,14 @@ mod test {
         let temp_dir = tempdir().expect("failed to create temp dir");
         #[cfg(feature = "redb")]
         {
-            let db = open_redb(temp_dir.path());
+            let db = open_redb(temp_dir.path(), true);
+            test_skip_to_previous_simple(db);
+            let db = open_redb(temp_dir.path(), false);
             test_skip_to_previous_simple(db);
         }
-        let db = open_mdbx(temp_dir.path());
+        let db = open_mdbx(temp_dir.path(), true);
+        test_skip_to_previous_simple(db);
+        let db = open_mdbx(temp_dir.path(), false);
         test_skip_to_previous_simple(db);
     }
 
@@ -515,10 +580,14 @@ mod test {
         let temp_dir = tempdir().expect("failed to create temp dir");
         #[cfg(feature = "redb")]
         {
-            let db = open_redb(temp_dir.path());
+            let db = open_redb(temp_dir.path(), true);
+            test_iter_skip_to_previous_gap(db);
+            let db = open_redb(temp_dir.path(), false);
             test_iter_skip_to_previous_gap(db);
         }
-        let db = open_mdbx(temp_dir.path());
+        let db = open_mdbx(temp_dir.path(), true);
+        test_iter_skip_to_previous_gap(db);
+        let db = open_mdbx(temp_dir.path(), false);
         test_iter_skip_to_previous_gap(db);
     }
 
@@ -527,10 +596,14 @@ mod test {
         let temp_dir = tempdir().expect("failed to create temp dir");
         #[cfg(feature = "redb")]
         {
-            let db = open_redb(temp_dir.path());
+            let db = open_redb(temp_dir.path(), true);
+            test_remove(db);
+            let db = open_redb(temp_dir.path(), false);
             test_remove(db);
         }
-        let db = open_mdbx(temp_dir.path());
+        let db = open_mdbx(temp_dir.path(), true);
+        test_remove(db);
+        let db = open_mdbx(temp_dir.path(), false);
         test_remove(db);
     }
 
@@ -539,10 +612,14 @@ mod test {
         let temp_dir = tempdir().expect("failed to create temp dir");
         #[cfg(feature = "redb")]
         {
-            let db = open_redb(temp_dir.path());
+            let db = open_redb(temp_dir.path(), true);
+            test_iter(db);
+            let db = open_redb(temp_dir.path(), false);
             test_iter(db);
         }
-        let db = open_mdbx(temp_dir.path());
+        let db = open_mdbx(temp_dir.path(), true);
+        test_iter(db);
+        let db = open_mdbx(temp_dir.path(), false);
         test_iter(db);
     }
 
@@ -551,10 +628,14 @@ mod test {
         let temp_dir = tempdir().expect("failed to create temp dir");
         #[cfg(feature = "redb")]
         {
-            let db = open_redb(temp_dir.path());
+            let db = open_redb(temp_dir.path(), true);
+            test_iter_reverse(db);
+            let db = open_redb(temp_dir.path(), false);
             test_iter_reverse(db);
         }
-        let db = open_mdbx(temp_dir.path());
+        let db = open_mdbx(temp_dir.path(), true);
+        test_iter_reverse(db);
+        let db = open_mdbx(temp_dir.path(), false);
         test_iter_reverse(db);
     }
 
@@ -563,10 +644,14 @@ mod test {
         let temp_dir = tempdir().expect("failed to create temp dir");
         #[cfg(feature = "redb")]
         {
-            let db = open_redb(temp_dir.path());
+            let db = open_redb(temp_dir.path(), true);
+            test_clear(db);
+            let db = open_redb(temp_dir.path(), false);
             test_clear(db);
         }
-        let db = open_mdbx(temp_dir.path());
+        let db = open_mdbx(temp_dir.path(), true);
+        test_clear(db);
+        let db = open_mdbx(temp_dir.path(), false);
         test_clear(db);
     }
 
@@ -575,10 +660,14 @@ mod test {
         let temp_dir = tempdir().expect("failed to create temp dir");
         #[cfg(feature = "redb")]
         {
-            let db = open_redb(temp_dir.path());
+            let db = open_redb(temp_dir.path(), true);
+            test_is_empty(db);
+            let db = open_redb(temp_dir.path(), false);
             test_is_empty(db);
         }
-        let db = open_mdbx(temp_dir.path());
+        let db = open_mdbx(temp_dir.path(), true);
+        test_is_empty(db);
+        let db = open_mdbx(temp_dir.path(), false);
         test_is_empty(db);
     }
 
@@ -588,10 +677,14 @@ mod test {
         let temp_dir = tempdir().expect("failed to create temp dir");
         #[cfg(feature = "redb")]
         {
-            let db = open_redb(temp_dir.path());
+            let db = open_redb(temp_dir.path(), true);
+            test_multi_insert(db);
+            let db = open_redb(temp_dir.path(), false);
             test_multi_insert(db);
         }
-        let db = open_mdbx(temp_dir.path());
+        let db = open_mdbx(temp_dir.path(), true);
+        test_multi_insert(db);
+        let db = open_mdbx(temp_dir.path(), false);
         test_multi_insert(db);
     }
 
@@ -601,23 +694,28 @@ mod test {
         let temp_dir = tempdir().expect("failed to create temp dir");
         #[cfg(feature = "redb")]
         {
-            let db = open_redb(temp_dir.path());
+            let db = open_redb(temp_dir.path(), true);
+            test_multi_remove(db);
+            let db = open_redb(temp_dir.path(), false);
             test_multi_remove(db);
         }
-        let db = open_mdbx(temp_dir.path());
+        let db = open_mdbx(temp_dir.path(), true);
+        test_multi_remove(db);
+        let db = open_mdbx(temp_dir.path(), false);
         test_multi_remove(db);
     }
 
     #[test]
     fn test_layereddb_dbsimpbench() {
+        // Only test with full memory.  Otherwise iterators, while correct, may not work the test.
         // Init a DB
         let temp_dir = tempdir().expect("failed to create temp dir");
         #[cfg(feature = "redb")]
         {
-            let db = open_redb(temp_dir.path());
+            let db = open_redb(temp_dir.path(), true);
             db_simp_bench(db, "LayeredDB<ReDB>");
         }
-        let db = open_mdbx(temp_dir.path());
+        let db = open_mdbx(temp_dir.path(), true);
         db_simp_bench(db, "LayeredDB<MdbxDatabase>");
     }
 }

@@ -119,8 +119,9 @@ impl Drop for MdbxDatabase {
     }
 }
 
-const GIGABYTE: usize = 1024 * 1024 * 1024;
-const TERABYTE: usize = GIGABYTE * 1024;
+pub const MEGABYTE: usize = 1024 * 1024;
+pub const GIGABYTE: usize = MEGABYTE * 1024;
+pub const TERABYTE: usize = GIGABYTE * 1024;
 
 /// Returns the default page size that can be used in this OS.
 fn default_page_size() -> usize {
@@ -139,15 +140,20 @@ fn default_page_size() -> usize {
 impl MdbxDatabase {
     /// Creates a new database at the specified path if it doesn't exist. Does NOT create tables.
     /// Check [`init_db`].
-    pub fn open<P: AsRef<Path>>(path: P) -> eyre::Result<Self> {
+    pub fn open<P: AsRef<Path>>(
+        path: P,
+        max_tables: usize,
+        max_size: usize,
+        growth_step: usize,
+    ) -> eyre::Result<Self> {
         let env = Environment::builder()
-            .set_max_dbs(32)
+            .set_max_dbs(max_tables)
             .write_map()
             .set_geometry(Geometry {
-                // Maximum database size of 4 terabytes
-                size: Some(0..(4 * TERABYTE)),
-                // We grow the database in increments of 4 gigabytes
-                growth_step: Some(4 * GIGABYTE as isize),
+                // Maximum database size
+                size: Some(0..max_size),
+                // We grow the database in increments of 1 gigabyte
+                growth_step: Some(growth_step as isize),
                 // The database never shrinks
                 shrink_threshold: Some(0),
                 page_size: Some(PageSize::Set(default_page_size())),
@@ -185,13 +191,6 @@ impl MdbxDatabase {
 
         Ok(MdbxDatabase { inner: env, shutdown_tx: Arc::new(shutdown_tx) })
     }
-
-    pub fn open_table<T: Table>(&self) -> eyre::Result<()> {
-        let txn = self.inner.begin_rw_txn()?;
-        txn.create_db(Some(T::NAME), DatabaseFlags::default())?;
-        txn.commit()?;
-        Ok(())
-    }
 }
 
 impl Database for MdbxDatabase {
@@ -204,6 +203,13 @@ impl Database for MdbxDatabase {
         = MdbxTxMut
     where
         Self: 'txn;
+
+    fn open_table<T: Table>(&self) -> eyre::Result<()> {
+        let txn = self.inner.begin_rw_txn()?;
+        txn.create_db(Some(T::NAME), DatabaseFlags::default())?;
+        txn.commit()?;
+        Ok(())
+    }
 
     fn read_txn(&self) -> eyre::Result<Self::TX<'_>> {
         Ok(MdbxTx { inner: self.inner.begin_ro_txn()? })
@@ -363,12 +369,14 @@ where
 #[cfg(test)]
 mod test {
     use super::MdbxDatabase;
-    use crate::test::*;
+    use crate::{mdbx::database::MEGABYTE, test::*};
     use std::path::Path;
     use tempfile::tempdir;
+    use tn_types::Database as _;
 
     fn open_db(path: &Path) -> MdbxDatabase {
-        let db = MdbxDatabase::open(path).expect("Cannot open database");
+        let db =
+            MdbxDatabase::open(path, 4, 16 * MEGABYTE, 8 * MEGABYTE).expect("Cannot open database");
         db.open_table::<TestTable>().expect("failed to open table!");
         db
     }

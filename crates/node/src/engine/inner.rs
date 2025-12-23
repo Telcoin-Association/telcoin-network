@@ -281,6 +281,10 @@ impl ExecutionNodeInner {
                 }
                 block_num -= 1;
                 if let Some(header) = self.reth_env.sealed_header_by_number(block_num)? {
+                    // Do this check so we only track the "finalized" blocks not all the extra
+                    // batches.  Note that the nonce will be the same for all batches in the same
+                    // consensus output but will change for each output (composed of epoch and
+                    // round).
                     if header.nonce != last_nonce {
                         last_nonce = header.nonce;
                         result.push(header);
