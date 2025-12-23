@@ -4,9 +4,7 @@
 
 use consensus_metrics::monitored_future;
 use tn_config::ConsensusConfig;
-use tn_primary::{
-    consensus::ConsensusRound, network::PrimaryNetworkHandle, ConsensusBus, NodeMode,
-};
+use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus, NodeMode};
 use tn_storage::{
     tables::{
         Batches, ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache,
@@ -48,10 +46,7 @@ pub async fn prime_consensus<DB: Database>(
         last_subdag.leader_round()
     };
 
-    consensus_bus.update_consensus_rounds(ConsensusRound::new_with_gc_depth(
-        last_consensus_round,
-        config.parameters().gc_depth,
-    ));
+    consensus_bus.committed_round_updates().send_replace(last_consensus_round);
     consensus_bus.primary_round_updates().send_replace(last_consensus_round);
 }
 

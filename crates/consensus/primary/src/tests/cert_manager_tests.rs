@@ -1,7 +1,7 @@
 //! Tests for the cert manager.
 
 use super::CertificateManager;
-use crate::{error::CertManagerError, state_sync::AtomicRound, ConsensusBus};
+use crate::{error::CertManagerError, ConsensusBus};
 use assert_matches::assert_matches;
 use std::collections::BTreeSet;
 use tn_primary::test_utils::make_optimal_signed_certificates;
@@ -23,10 +23,8 @@ fn create_test_types() -> TestTypes<MemDatabase> {
 
     // for validator
     let config = primary.consensus_config();
-    let gc_round = AtomicRound::new(0);
-    let highest_processed_round = AtomicRound::new(0);
 
-    let manager = CertificateManager::new(config, cb, gc_round, highest_processed_round);
+    let manager = CertificateManager::new(config, cb);
 
     TestTypes { manager, fixture }
 }

@@ -340,7 +340,7 @@ impl<DB: Database> Consensus<DB> {
             consensus_config.node_storage().clone(),
         );
 
-        consensus_bus.update_consensus_rounds(state.last_round);
+        consensus_bus.committed_round_updates().send_replace(state.last_round.committed_round);
 
         let s = Self {
             committee: consensus_config.committee().clone(),
@@ -455,7 +455,9 @@ impl<DB: Database> Consensus<DB> {
 
                 assert_eq!(self.state.last_round.committed_round, leader_commit_round);
 
-                self.consensus_bus.update_consensus_rounds(self.state.last_round);
+                self.consensus_bus
+                    .committed_round_updates()
+                    .send_replace(self.state.last_round.committed_round);
             }
 
             self.metrics

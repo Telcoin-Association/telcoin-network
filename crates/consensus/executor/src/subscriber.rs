@@ -11,7 +11,6 @@ use std::{
 use tn_config::ConsensusConfig;
 use tn_network_types::{local::LocalNetwork, PrimaryToWorkerClient};
 use tn_primary::{
-    consensus::ConsensusRound,
     network::{ConsensusResult, PrimaryNetworkHandle},
     ConsensusBus, NodeMode,
 };
@@ -156,10 +155,7 @@ impl<DB: Database> Subscriber<DB> {
 
         // We aren't doing consensus now but still need to update these watches before
         // we send the consensus output.
-        self.consensus_bus.update_consensus_rounds(ConsensusRound::new_with_gc_depth(
-            last_round,
-            self.config.parameters().gc_depth,
-        ));
+        self.consensus_bus.committed_round_updates().send_replace(last_round);
         let _ = self.consensus_bus.primary_round_updates().send(last_round);
 
         if let Err(e) = self.consensus_bus.consensus_output().send(consensus_output).await {
