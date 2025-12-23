@@ -162,7 +162,7 @@ where
                 if let Some(committee) = self.get_committee(epoch) {
                     match unverified_cert.verify_cert(&committee) {
                         Ok(cert) => {
-                            if !self.consensus_bus.node_mode().borrow().is_observer() {
+                            if self.consensus_bus.node_mode().borrow().is_active_cvv() {
                                 if self.behind_consensus(epoch, cert.header().round, None).await {
                                     warn!(target: "primary", "certificate indicates we are behind, go to catchup mode!");
                                     return Ok(());
@@ -285,6 +285,19 @@ where
             ensure!(auth_id == auth.id(), HeaderError::PeerNotAuthor.into());
         } else {
             return Err(HeaderError::UnknownAuthority(committee_peer.to_string()).into());
+        }
+        if let Ok(Some(vote_info)) = self.consensus_config.node_storage().read_vote_info(&auth_id) {
+            // If we have already cast a vote for this header then just recast it quickly.
+            if vote_info.vote_digest == header.digest().into() {
+                let vote = Vote::new(
+                    &header,
+                    self.consensus_config.authority_id().expect("only validators can vote"),
+                    self.consensus_config.key_config(),
+                );
+
+                info!(target: "primary", "Recast vote {vote:?} for {} at round {}", header, header.round());
+                return Ok(PrimaryResponse::Vote(vote));
+            }
         }
         {
             // Check for validator equivocation early and reject if so

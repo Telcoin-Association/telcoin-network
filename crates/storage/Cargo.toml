@@ -19,9 +19,11 @@ prometheus = { workspace = true }
 ouroboros = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
+# For the persist async implemetation.
+tokio = { workspace = true, features = [ "sync" ] }
 
 # redb backend
-redb = { version = "2.1.1", optional = false }
+redb = { version = "3.1.0", optional = false }
 
 # mdbx backend- default
 reth-libmdbx = { workspace = true, optional = true, features = [

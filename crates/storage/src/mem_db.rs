@@ -134,8 +134,45 @@ impl MemDatabase {
 
         Self { store, metrics, shutdown_tx: Arc::new(shutdown_tx) }
     }
+}
 
-    pub fn open_table<T: Table>(&self) {
+impl Default for MemDatabase {
+    fn default() -> Self {
+        let db = Self::new();
+        let _ = db.open_table::<crate::tables::LastProposed>();
+        let _ = db.open_table::<crate::tables::Votes>();
+        let _ = db.open_table::<crate::tables::Certificates>();
+        let _ = db.open_table::<crate::tables::CertificateDigestByRound>();
+        let _ = db.open_table::<crate::tables::CertificateDigestByOrigin>();
+        let _ = db.open_table::<crate::tables::Payload>();
+        let _ = db.open_table::<crate::tables::Batches>();
+        let _ = db.open_table::<crate::tables::ConsensusBlocks>();
+        let _ = db.open_table::<crate::tables::ConsensusBlockNumbersByDigest>();
+        let _ = db.open_table::<crate::tables::ConsensusBlocksCache>();
+        let _ = db.open_table::<crate::tables::NodeBatchesCache>();
+        let _ = db.open_table::<crate::tables::EpochRecords>();
+        let _ = db.open_table::<crate::tables::EpochCerts>();
+        let _ = db.open_table::<crate::tables::EpochRecordsIndex>();
+        let _ = db.open_table::<crate::tables::KadRecords>();
+        let _ = db.open_table::<crate::tables::KadProviderRecords>();
+        let _ = db.open_table::<crate::tables::KadWorkerRecords>();
+        let _ = db.open_table::<crate::tables::KadWorkerProviderRecords>();
+        db
+    }
+}
+
+impl Database for MemDatabase {
+    type TX<'txn>
+        = MemDbTx
+    where
+        Self: 'txn;
+
+    type TXMut<'txn>
+        = MemDbTxMut
+    where
+        Self: 'txn;
+
+    fn open_table<T: Table>(&self) -> eyre::Result<()> {
         self.store.insert(T::NAME, Arc::new(RwLock::new(BTreeMap::new())));
         match register_int_gauge_with_registry!(
             format!("memdb_{}_count", T::NAME),
@@ -152,39 +189,8 @@ impl MemDatabase {
                 tracing::debug!(target: "telcoin::memdb", "Error adding metrics for table {}: {e}", T::NAME)
             }
         }
+        Ok(())
     }
-}
-
-impl Default for MemDatabase {
-    fn default() -> Self {
-        let db = Self::new();
-        db.open_table::<crate::tables::LastProposed>();
-        db.open_table::<crate::tables::Votes>();
-        db.open_table::<crate::tables::Certificates>();
-        db.open_table::<crate::tables::CertificateDigestByRound>();
-        db.open_table::<crate::tables::CertificateDigestByOrigin>();
-        db.open_table::<crate::tables::Payload>();
-        db.open_table::<crate::tables::Batches>();
-        db.open_table::<crate::tables::ConsensusBlocks>();
-        db.open_table::<crate::tables::ConsensusBlockNumbersByDigest>();
-        db.open_table::<crate::tables::KadRecords>();
-        db.open_table::<crate::tables::KadProviderRecords>();
-        db.open_table::<crate::tables::KadWorkerRecords>();
-        db.open_table::<crate::tables::KadWorkerProviderRecords>();
-        db
-    }
-}
-
-impl Database for MemDatabase {
-    type TX<'txn>
-        = MemDbTx
-    where
-        Self: 'txn;
-
-    type TXMut<'txn>
-        = MemDbTxMut
-    where
-        Self: 'txn;
 
     fn read_txn(&self) -> eyre::Result<Self::TX<'_>> {
         Ok(MemDbTx { store: (*self.store).clone() })
@@ -421,11 +427,13 @@ impl Default for MemDBMetrics {
 
 #[cfg(test)]
 mod test {
+    use tn_types::Database as _;
+
     use crate::{mem_db::MemDatabase, test::*};
 
     fn open_db() -> MemDatabase {
         let db = MemDatabase::new();
-        db.open_table::<TestTable>();
+        db.open_table::<TestTable>().expect("mem db open to succeed");
         db
     }
 

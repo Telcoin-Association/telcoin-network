@@ -1,7 +1,7 @@
 //! Database traits for compatibility.
 
 use serde::{de::DeserializeOwned, Serialize};
-use std::{borrow::Borrow, fmt::Debug};
+use std::{borrow::Borrow, fmt::Debug, future::Future};
 
 pub trait KeyT: Serialize + DeserializeOwned + Send + Sync + Ord + Clone + Debug + 'static {}
 pub trait ValueT: Serialize + DeserializeOwned + Send + Sync + Clone + Debug + 'static {}
@@ -9,11 +9,22 @@ pub trait ValueT: Serialize + DeserializeOwned + Send + Sync + Clone + Debug + '
 impl<K: Serialize + DeserializeOwned + Send + Sync + Ord + Clone + Debug + 'static> KeyT for K {}
 impl<V: Serialize + DeserializeOwned + Send + Sync + Clone + Debug + 'static> ValueT for V {}
 
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub enum TableHint {
+    Epoch,
+    ConsensusChain,
+    EpochChain,
+    Batch,
+    Kad,
+    Cache,
+}
+
 pub trait Table: Send + Sync + Debug + 'static {
     type Key: KeyT;
     type Value: ValueT;
 
     const NAME: &'static str;
+    const HINT: TableHint;
 }
 
 /// Interface to a DB read transaction.
@@ -52,6 +63,9 @@ pub trait Database: Send + Sync + Clone + Unpin + 'static {
     type TXMut<'txn>: DbTxMut + Send + Debug + 'txn
     where
         Self: 'txn;
+
+    /// Open a new database table.
+    fn open_table<T: Table>(&self) -> eyre::Result<()>;
 
     /// Return a read txn object.
     fn read_txn(&self) -> eyre::Result<Self::TX<'_>>;
@@ -116,4 +130,15 @@ pub trait Database: Send + Sync + Clone + Unpin + 'static {
     fn compact(&self) -> eyre::Result<()> {
         Ok(())
     }
+
+    /// Some implementations may perform perstance operations in the background.
+    /// If so they can return a future that will resolve when they are complete.
+    /// This allows us to use a mostly sync DB interface but still allow async
+    /// "catch-up".  Uses Table as a hint.
+    fn persist<T: Table>(&self) -> impl Future<Output = ()> + Send {
+        std::future::ready(())
+    }
+    /// Sync version of persist- useful for test not for prod code.
+    /// Since this is intended for testing don't bother with the Table hint.
+    fn sync_persist(&self) {}
 }

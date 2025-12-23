@@ -13,8 +13,8 @@ use std::{
 use ouroboros::self_referencing;
 use parking_lot::{RwLock, RwLockReadGuard};
 use redb::{
-    Database as ReDatabase, ReadOnlyTable, ReadTransaction, ReadableTable, ReadableTableMetadata,
-    TableDefinition, WriteTransaction,
+    Database as ReDatabase, ReadOnlyTable, ReadTransaction, ReadableDatabase as _, ReadableTable,
+    ReadableTableMetadata, TableDefinition, WriteTransaction,
 };
 
 use tn_types::{DBIter, Database, DbTx, DbTxMut, KeyT, Table, ValueT};
@@ -103,7 +103,8 @@ impl Drop for ReDB {
 
 impl ReDB {
     pub fn open<P: AsRef<Path>>(path: P) -> eyre::Result<ReDB> {
-        let db = Arc::new(RwLock::new(ReDatabase::create(path.as_ref().join("redb"))?));
+        let db_path = path.as_ref();
+        let db = Arc::new(RwLock::new(ReDatabase::create(db_path)?));
         let db_cloned = Arc::clone(&db);
         let (shutdown_tx, rx) = mpsc::sync_channel::<()>(0);
 
@@ -150,19 +151,19 @@ impl ReDB {
 
         Ok(ReDB { db, shutdown_tx })
     }
+}
 
-    pub fn open_table<T: Table>(&self) -> eyre::Result<()> {
+impl Database for ReDB {
+    type TX<'txn> = ReDbTx;
+    type TXMut<'txn> = ReDbTxMut;
+
+    fn open_table<T: Table>(&self) -> eyre::Result<()> {
         let txn = self.db.read().begin_write()?;
         let td = TableDefinition::<KeyWrap<T::Key>, ValWrap<T::Value>>::new(T::NAME);
         txn.open_table(td)?;
         txn.commit()?;
         Ok(())
     }
-}
-
-impl Database for ReDB {
-    type TX<'txn> = ReDbTx;
-    type TXMut<'txn> = ReDbTxMut;
 
     fn read_txn(&self) -> eyre::Result<Self::TX<'_>> {
         let tx = self.db.read().begin_read()?;
@@ -369,7 +370,7 @@ mod test {
     use super::ReDB;
 
     fn open_db(path: &Path) -> ReDB {
-        let db = ReDB::open(path).expect("Cannot open database");
+        let db = ReDB::open(path.join("redb")).expect("Cannot open database");
         db.open_table::<TestTable>().expect("failed to open table!");
         db
     }

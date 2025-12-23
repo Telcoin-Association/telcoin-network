@@ -125,11 +125,6 @@ impl<CDB: ConsensusDatabase> PrimaryNode<CDB> {
         guard.start(task_manager).await
     }
 
-    pub async fn shutdown(&self) {
-        let guard = self.internal.write().await;
-        guard.consensus_config.shutdown().notify();
-    }
-
     /// Return the consensus metrics.
     pub async fn consensus_metrics(&self) -> Arc<ConsensusMetrics> {
         self.internal.read().await.consensus_bus.consensus_metrics()
