@@ -102,21 +102,16 @@ pub fn spawn_state_sync<DB: Database>(
 ///
 /// An error here indicates a critical node failure.
 /// Note, if this returns an error then the DB could not be written to- this is probably fatal.
-pub fn save_consensus<DB: Database>(
+pub async fn save_consensus<DB: Database>(
     db: &DB,
     consensus_output: ConsensusOutput,
     authority_id: &Option<AuthorityIdentifier>,
 ) -> eyre::Result<()> {
+    // Make sure we have all the batches we need before writing the consensus header.
+    db.persist::<Batches>().await;
     match db.write_txn() {
         Ok(mut txn) => {
-            for certified_batches in consensus_output.batches.iter() {
-                for batch in certified_batches.batches.iter() {
-                    if let Err(e) = txn.insert::<Batches>(&batch.digest(), batch) {
-                        error!(target: "state-sync", ?e, "error saving a batch to persistant storage!");
-                        return Err(e);
-                    }
-                }
-            }
+            // We should have all the batches saved at this point so no need to do so again.
             let header: ConsensusHeader = consensus_output.into();
             if let Err(e) = txn.insert::<ConsensusBlocks>(&header.number, &header) {
                 error!(target: "state-sync", ?e, "error saving a consensus header to persistant storage!");
@@ -145,6 +140,8 @@ pub fn save_consensus<DB: Database>(
                 error!(target: "state-sync", ?e, "error saving committing to persistant storage!");
                 return Err(e);
             }
+            // Make sure we have persisted the consensus output before we execute.
+            db.persist::<ConsensusBlocks>().await;
         }
         Err(e) => {
             error!(target: "state-sync", ?e, "error getting a transaction on persistant storage!");

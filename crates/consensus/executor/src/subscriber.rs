@@ -15,7 +15,7 @@ use tn_primary::{
     network::{ConsensusResult, PrimaryNetworkHandle},
     ConsensusBus, NodeMode,
 };
-use tn_storage::{tables::ConsensusBlocks, CertificateStore};
+use tn_storage::CertificateStore;
 use tn_types::{
     encode, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash, BlsSigner as _,
     CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput, Database,
@@ -149,7 +149,8 @@ impl<DB: Database> Subscriber<DB> {
             self.config.node_storage(),
             consensus_output.clone(),
             &self.inner.authority_id,
-        )?;
+        )
+        .await?;
 
         let last_round = consensus_output.leader_round();
 
@@ -160,8 +161,6 @@ impl<DB: Database> Subscriber<DB> {
             self.config.parameters().gc_depth,
         ));
         let _ = self.consensus_bus.primary_round_updates().send(last_round);
-        // Make sure we have persisted the consensus output before we execute.
-        self.config.node_storage().persist::<ConsensusBlocks>().await;
 
         if let Err(e) = self.consensus_bus.consensus_output().send(consensus_output).await {
             error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self.inner.authority_id, e);
@@ -282,10 +281,8 @@ impl<DB: Database> Subscriber<DB> {
                     match output {
                         Ok(output) => {
                             debug!(target: "subscriber", output=?output.digest(), "saving next output");
-                            save_consensus(self.config.node_storage(), output.clone(), &self.inner.authority_id)?;
+                            save_consensus(self.config.node_storage(), output.clone(), &self.inner.authority_id).await?;
                             debug!(target: "subscriber", "broadcasting output...");
-                            // Make sure we have persisted the consensus output before we execute.
-                            self.config.node_storage().persist::<ConsensusBlocks>().await;
                             if let Err(e) = self.consensus_bus.consensus_output().send(output).await {
                                 error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self.inner.authority_id, e);
                                 return Err(SubscriberError::ClosedChannel("failed to broadcast consensus output".to_string()));
