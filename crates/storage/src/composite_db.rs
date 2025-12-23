@@ -151,6 +151,7 @@ impl<DB: Database> Database for CompositeDatabase<DB> {
     }
 }
 
+/// Read transaction for a composite DB.
 #[derive(Clone)]
 pub struct CompositeDbTx<DB: Database> {
     inner: Arc<Inner<DB>>,
@@ -175,6 +176,10 @@ impl<DB: Database> DbTx for CompositeDbTx<DB> {
     }
 }
 
+/// Mutable transaction for a composite DB.
+///
+/// This contains the underlying DB as well as optimistically
+/// created mutable transactions for each underlying DB.
 #[derive(Clone)]
 pub struct CompositeDbTxMut<DB: Database> {
     inner: Arc<Inner<DB>>,

@@ -150,7 +150,7 @@ impl MdbxDatabase {
             .set_max_dbs(max_tables)
             .write_map()
             .set_geometry(Geometry {
-                // Maximum database size of a terabyte
+                // Maximum database size
                 size: Some(0..max_size),
                 // We grow the database in increments of 1 gigabyte
                 growth_step: Some(growth_step as isize),
