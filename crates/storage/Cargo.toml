@@ -39,7 +39,6 @@ tempfile = { workspace = true }
 redb = []
 reth-libmdbx = ["dep:reth-libmdbx", "dep:page_size"]
 default = ["reth-libmdbx"]
-# XXXX default = ["reth-libmdbx", "redb"]
 
 [lints]
 workspace = true
