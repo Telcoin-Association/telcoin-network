@@ -69,10 +69,15 @@ const ENGINE_TASK_MANAGER: &str = "Engine Task Manager";
 /// The worker's base task manager name. This is used by `fn worker_task_manager_name(id)`.
 pub(super) const WORKER_TASK_BASE: &str = "Worker Task";
 
+/// Modes for an epoch.
 #[derive(Debug, Copy, Clone)]
 enum RunEpochMode {
+    /// This is the initial epoch when the system starts, will need to get established.
     Initial,
+    /// We re-ran an epoch as a result of a node change (CVV is to far behind or CVV has caught up
+    /// for instance).
     ModeChange,
+    /// This a fresh new epoch on an already running node.
     NewEpoch,
 }
 
@@ -904,7 +909,7 @@ where
             .last_consensus_header()
             .borrow()
             .clone()
-            .unwrap_or_default()
+            .ok_or_eyre("no consensus header after an epoch!")?
             .digest();
         let parent_state = self.consensus_bus.recent_blocks().borrow().latest_block_num_hash();
 

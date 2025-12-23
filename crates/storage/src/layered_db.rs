@@ -259,7 +259,11 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
     }
 
     fn contains_key<T: Table>(&self, key: &T::Key) -> eyre::Result<bool> {
-        Ok(self.mem_db.contains_key::<T>(key)? || self.db.contains_key::<T>(key)?)
+        if self.full_memory {
+            Ok(self.mem_db.contains_key::<T>(key)?)
+        } else {
+            Ok(self.mem_db.contains_key::<T>(key)? || self.db.contains_key::<T>(key)?)
+        }
     }
 
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
