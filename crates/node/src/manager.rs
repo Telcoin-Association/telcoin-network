@@ -632,6 +632,7 @@ where
         info!(target: "epoch-manager", "Starting epoch");
 
         // Lets make sure our consesus db has a clear write queue and is ready to go.
+        self.consensus_db.persist::<Batches>().await;
         self.consensus_db.persist::<ConsensusBlocks>().await;
         if epoch_mode.replay_consensus() {
             // If we are starting up then make sure that any consensus we previously validated goes
