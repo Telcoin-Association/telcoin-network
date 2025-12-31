@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::{consensus::ConsensusRound, state_sync::HeaderValidator, ConsensusBus};
+use crate::{state_sync::HeaderValidator, ConsensusBus};
 use assert_matches::assert_matches;
 use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_storage::{mem_db::MemDatabase, CertificateStore, PayloadStore};
@@ -49,7 +49,7 @@ async fn test_sync_batches_drops_old_rounds() -> eyre::Result<()> {
 
     // update round
     let committed_round = 30;
-    cb.update_consensus_rounds(ConsensusRound::new(committed_round, 0));
+    cb.committed_round_updates().send_replace(committed_round);
 
     let expected_digest = test_header.digest();
     let expected_round = test_header.round();

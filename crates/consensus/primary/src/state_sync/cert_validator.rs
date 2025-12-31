@@ -1,8 +1,9 @@
 //! Validate certificates received from peers.
 
-use super::{cert_manager::CertificateManager, AtomicRound, HeaderValidator};
+use super::{cert_manager::CertificateManager, HeaderValidator};
 use crate::{
     certificate_fetcher::CertificateFetcherCommand,
+    consensus::gc_round,
     error::{CertManagerError, CertManagerResult},
     state_sync::CertificateManagerCommand,
     ConsensusBus,
@@ -44,14 +45,6 @@ pub(super) struct CertificateValidator<DB> {
     consensus_bus: ConsensusBus,
     /// The configuration for consensus.
     config: ConsensusConfig<DB>,
-    /// Highest garbage collection round.
-    ///
-    /// This is managed by GarbageCollector and shared with CertificateValidator.
-    gc_round: AtomicRound,
-    /// Highest round of certificate accepted into the certificate store.
-    highest_processed_round: AtomicRound,
-    /// Highest round of verfied certificate that has been received.
-    highest_received_round: AtomicRound,
     /// Spawner for async tasks.
     task_spawner: TaskSpawner,
 }
@@ -64,19 +57,9 @@ where
     pub(super) fn new(
         config: ConsensusConfig<DB>,
         consensus_bus: ConsensusBus,
-        gc_round: AtomicRound,
-        highest_processed_round: AtomicRound,
-        highest_received_round: AtomicRound,
         task_spawner: TaskSpawner,
     ) -> Self {
-        Self {
-            consensus_bus,
-            config,
-            gc_round,
-            highest_processed_round,
-            highest_received_round,
-            task_spawner,
-        }
+        Self { consensus_bus, config, task_spawner }
     }
 
     /// Convenience method for obtaining a new [CertificateManager].
@@ -84,12 +67,7 @@ where
     /// This is useful so the primary can handle new/spawn methods separately.
     /// The cert manager only needs to run during `spawn`.
     pub(super) fn new_cert_manager(&self) -> CertificateManager<DB> {
-        CertificateManager::new(
-            self.config.clone(),
-            self.consensus_bus.clone(),
-            self.gc_round.clone(),
-            self.highest_processed_round.clone(),
-        )
+        CertificateManager::new(self.config.clone(), self.consensus_bus.clone())
     }
 
     /// Process a certificate produced by the this node.
@@ -106,6 +84,13 @@ where
         certificate: Certificate,
     ) -> CertManagerResult<()> {
         self.process_certificate(certificate, true).await
+    }
+
+    fn gc_round(&self) -> Round {
+        gc_round(
+            *self.consensus_bus.committed_round_updates().borrow(),
+            self.config.config().parameters.gc_depth,
+        )
     }
 
     /// Validate certificate.
@@ -164,7 +149,7 @@ where
     /// This method validates the certificate and verifies signatures.
     fn validate_and_verify(&self, certificate: Certificate) -> CertManagerResult<Certificate> {
         // certificates outside gc can never be included in the DAG
-        let gc_round = self.gc_round.load();
+        let gc_round = self.gc_round();
 
         if certificate.round() < gc_round {
             return Err(CertificateError::TooOld(
@@ -188,7 +173,7 @@ where
         certificates: Vec<Certificate>,
     ) -> CertManagerResult<()> {
         let highest_received_round =
-            self.highest_received_round.fetch_max(highest_round).max(highest_round);
+            self.consensus_bus.committed_round_updates().borrow().max(highest_round);
 
         // highest received round metric
         self.consensus_bus
@@ -220,7 +205,7 @@ where
         // return error if certificate round is too far ahead
         //
         // trigger certificate fetching
-        let highest_processed_round = self.highest_processed_round.load();
+        let highest_processed_round = *self.consensus_bus.committed_round_updates().borrow();
         for cert in &certificates {
             // Initiate asynchronous batch downloads for any payloads referenced in this certificate
             // that are not yet available locally. This step is critical for maintaining data

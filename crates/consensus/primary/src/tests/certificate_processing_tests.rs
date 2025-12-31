@@ -3,15 +3,11 @@
 //! Certificates are validated and sent to the [CertificateManager].
 //! The [CertificateManager] tracks pending certificates and accepts certificates that are complete.
 
-use super::{cert_manager::CertificateManager, cert_validator::CertificateValidator, AtomicRound};
-use crate::{
-    consensus::{gc_round, ConsensusRound},
-    error::CertManagerError,
-    state_sync::HeaderValidator,
-    ConsensusBus,
-};
+use super::{cert_manager::CertificateManager, cert_validator::CertificateValidator};
+use crate::{error::CertManagerError, state_sync::HeaderValidator, ConsensusBus};
 use assert_matches::assert_matches;
 use std::{collections::BTreeSet, time::Duration};
+use tn_config::Parameters;
 use tn_primary::test_utils::{make_optimal_signed_certificates, signed_cert_for_test};
 use tn_storage::{mem_db::MemDatabase, CertificateStore};
 use tn_test_utils_committee::{AuthorityFixture, CommitteeFixture};
@@ -34,8 +30,15 @@ struct TestTypes<DB = MemDatabase> {
     task_manager: TaskManager,
 }
 
-fn create_all_test_types() -> TestTypes<MemDatabase> {
-    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+fn create_all_test_types(parameters: Option<Parameters>) -> TestTypes<MemDatabase> {
+    let fixture = if let Some(parameters) = parameters {
+        CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .with_consensus_parameters(parameters)
+            .build()
+    } else {
+        CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build()
+    };
     let primary = fixture.authorities().last().unwrap();
     let (manager, validator, cb, task_manager) = create_core_test_types(primary);
 
@@ -49,27 +52,13 @@ fn create_core_test_types_with_tasks<DB: Database>(
 ) -> (CertificateManager<DB>, CertificateValidator<DB>, ConsensusBus, TaskManager) {
     let cb = ConsensusBus::new();
     let config = primary.consensus_config();
-    let gc_round = AtomicRound::new(0);
-    let highest_processed_round = AtomicRound::new(0);
-    let highest_received_round = AtomicRound::new(0);
 
     // manager
-    let manager = CertificateManager::new(
-        config.clone(),
-        cb.clone(),
-        gc_round.clone(),
-        highest_processed_round.clone(),
-    );
+    let manager = CertificateManager::new(config.clone(), cb.clone());
 
     // validator
-    let validator = CertificateValidator::new(
-        config.clone(),
-        cb.clone(),
-        gc_round.clone(),
-        highest_processed_round,
-        highest_received_round,
-        task_manager.get_spawner(),
-    );
+    let validator =
+        CertificateValidator::new(config.clone(), cb.clone(), task_manager.get_spawner());
 
     (manager, validator, cb, task_manager)
 }
@@ -89,7 +78,8 @@ fn sort_by_digest(a: &CertificateDigest, b: &CertificateDigest) -> core::cmp::Or
 
 #[tokio::test]
 async fn test_accept_valid_certs() -> eyre::Result<()> {
-    let TestTypes { validator, manager, cb, fixture, task_manager, .. } = create_all_test_types();
+    let TestTypes { validator, manager, cb, fixture, task_manager, .. } =
+        create_all_test_types(None);
     // test types uses last authority for config
     let primary = fixture.authorities().last().unwrap();
     let certificate_store = primary.consensus_config().node_storage().clone();
@@ -140,7 +130,8 @@ async fn test_accept_valid_certs() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_accept_pending_certs() -> eyre::Result<()> {
-    let TestTypes { validator, manager, cb, fixture, task_manager, .. } = create_all_test_types();
+    let TestTypes { validator, manager, cb, fixture, task_manager, .. } =
+        create_all_test_types(None);
 
     // spawn manager task
     task_manager.spawn_critical_task("manager", manager.run());
@@ -200,6 +191,7 @@ async fn test_accept_pending_certs() -> eyre::Result<()> {
     );
 
     // try to accept
+    cb.committed_round_updates().send_replace(5); // Set this to 5 since we are not using the machinery to keep it up to date in this test.
     let err = validator.process_peer_certificate(cert).await;
     assert_matches!(err, Err(CertManagerError::Certificate(
         CertificateError::TooNew(d, wrong, correct))
@@ -213,7 +205,8 @@ async fn test_gc_pending_certs() -> eyre::Result<()> {
     const GC_DEPTH: Round = 5;
 
     // create test types
-    let TestTypes { validator, manager, cb, fixture, task_manager } = create_all_test_types();
+    let TestTypes { validator, manager, cb, fixture, task_manager } =
+        create_all_test_types(Some(Parameters { gc_depth: GC_DEPTH, ..Default::default() }));
 
     // cert store
     let primary = fixture.authorities().last().unwrap();
@@ -257,7 +250,7 @@ async fn test_gc_pending_certs() -> eyre::Result<()> {
     // update consensus rounds
     // commit at round 8, so round 3 becomes the GC round
     let commit_round = 8;
-    cb.update_consensus_rounds(ConsensusRound::new(commit_round, gc_round(commit_round, GC_DEPTH)));
+    cb.committed_round_updates().send_replace(commit_round);
 
     // wait for certs to storage
     timeout(Duration::from_secs(3), certificate_store.notify_read(last_digest)).await??;
@@ -279,7 +272,7 @@ async fn test_gc_pending_certs() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_node_restart_syncs_state() -> eyre::Result<()> {
-    let TestTypes { validator, manager, fixture, task_manager, .. } = create_all_test_types();
+    let TestTypes { validator, manager, fixture, task_manager, .. } = create_all_test_types(None);
     // test types uses last authority for config
     let primary = fixture.authorities().last().unwrap();
     let certificate_store = primary.consensus_config().node_storage().clone();
@@ -367,7 +360,8 @@ async fn test_node_restart_syncs_state() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_filter_unknown_parents() -> eyre::Result<()> {
-    let TestTypes { validator, manager, cb, fixture, task_manager, .. } = create_all_test_types();
+    let TestTypes { validator, manager, cb, fixture, task_manager, .. } =
+        create_all_test_types(None);
 
     // test types uses last authority for config
     let primary = fixture.authorities().last().unwrap();
