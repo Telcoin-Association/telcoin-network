@@ -89,6 +89,8 @@ where
             .last_executed_consensus_block(self.consensus_config.node_storage())
             .map(|h| (h.number, h.sub_dag.leader_epoch(), h.sub_dag.leader_round()))
             .unwrap_or((0, 0, 0));
+        let (last_consensus_number, _) =
+            *self.consensus_bus.last_published_consensus_num_hash().borrow();
         // Use GC depth to estimate how many rounds we can be behind.
         // Subtract ten here so if we are right on the GC depth we will still go inactive (small
         // safety buffer).  Ten is arbitrary but should make sure we are comfortably within
@@ -104,7 +106,9 @@ where
         // note, we need to make sure we are not at the epoch boundary otherwise
         // we can get false positives
         let epoch_behind = if let Some(number) = number {
-            epoch > exec_epoch && exec_number + 1 < number
+            // Throw this max() in so we can avoid races when execution is behind consensus at an
+            // epoch boundary.
+            epoch > exec_epoch && exec_number.max(last_consensus_number) + 1 < number
         } else if exec_epoch + 1 == epoch {
             // This check is a little hand-wavy, basically if we don't have the number (i.e.
             // checking a cert) then we let the next epoch early rounds through. Having the
@@ -119,6 +123,7 @@ where
         if active_cvv && (outside_gc_window || epoch_behind) {
             // We seem to be too far behind to be an active CVV, try to go
             // inactive to catch up.
+            warn!(target: "primary", "we are behind, go to catchup mode!, epoch: {epoch}, exec_epoch: {exec_epoch}, number: {number:?}, exec_number: {exec_number}");
             let _ = self.consensus_bus.node_mode().send(NodeMode::CvvInactive);
             self.consensus_config.shutdown().notify();
             true
@@ -216,6 +221,7 @@ where
                     if let Some(sigs) = sigs {
                         if (sigs + 1) as usize >= enough_sigs {
                             if self.behind_consensus(epoch, round, Some(number)).await {
+                                warn!(target: "primary", "consensus result indicates we are behind, go to catchup mode!");
                                 self.consensus_certs.lock().clear();
                                 return Ok(());
                             }

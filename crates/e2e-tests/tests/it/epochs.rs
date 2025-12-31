@@ -32,7 +32,7 @@ use tn_types::{
     U256,
 };
 use tokio::time::timeout;
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 const NEW_VALIDATOR: &str = "new-validator";
 const NODE_PASSWORD: &str = "sup3rsecuur";
@@ -167,7 +167,7 @@ async fn loop_epochs(start: u32, iterations: u32) -> eyre::Result<()> {
     for i in start..start + iterations {
         let new_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
         if new_epoch_info == current_epoch_info && last_pause != i {
-            tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 2)).await;
             last_pause = i + 1;
             continue;
         }
@@ -181,7 +181,7 @@ async fn loop_epochs(start: u32, iterations: u32) -> eyre::Result<()> {
         current_epoch_info = new_epoch_info;
 
         // sleep for epoch duration
-        tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
     }
     Ok(())
 }
@@ -254,19 +254,41 @@ async fn test_epoch_sync_inner(
 }
 
 fn kill_procs(procs: &Vec<Arc<std::sync::Mutex<Child>>>) {
-    // We need to capture the result above and then kill all the procs.
-    for proc in procs.iter() {
-        let _ = proc.lock().unwrap().kill();
-    }
     for proc in procs {
-        let _ = proc.lock().unwrap().wait();
+        kill_child(&mut *proc.lock().unwrap());
+    }
+}
+
+/// Helper function to shutdown child processes and log errors.
+fn kill_child(child: &mut Child) {
+    send_term(child);
+
+    for _ in 0..5 {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                info!(target: "epoch-test", "child exited");
+                return;
+            }
+            Ok(None) => {}
+            Err(e) => error!(target: "epoch-test", "error waiting on child to exit: {e}"),
+        }
+        std::thread::sleep(Duration::from_millis(1200));
+    }
+    // The child is not exiting...
+    // The code below will send SIGKILL without the use of nix.
+    if let Err(e) = child.kill() {
+        error!(target: "epoch-test", ?e, "error killing child");
+    }
+    // Hopefully it will exit now...
+    if let Err(e) = child.wait() {
+        error!(target: "epoch-test", ?e, "error waiting for child to die");
     }
 }
 
 /// Send SIGTERM to child, can use this to pre-send TERM to all children when shutting down.
 fn send_term(child: &mut Child) {
     if let Err(e) = signal::kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM) {
-        tracing::error!(target: "restart-test", ?e, "error killing child");
+        tracing::error!(target: "epoch-test", ?e, "error killing child");
     }
 }
 
