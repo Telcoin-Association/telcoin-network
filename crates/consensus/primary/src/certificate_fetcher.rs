@@ -1,6 +1,7 @@
 //! Fetch missing certificates from peers and verify them.
 
 use crate::{
+    consensus::gc_round,
     error::{CertManagerError, CertManagerResult},
     network::{MissingCertificatesRequest, PrimaryNetworkHandle},
     state_sync::StateSynchronizer,
@@ -70,6 +71,8 @@ pub(crate) struct CertificateFetcher<DB> {
     max_rpc_message_size: usize,
     /// Delay duration before issuing another parallel fetch request for missing certs.
     parallel_fetch_request_delay_interval: Duration,
+    /// Configuration.
+    config: ConsensusConfig<DB>,
 }
 
 impl<DB: Database> CertificateFetcher<DB> {
@@ -109,6 +112,7 @@ impl<DB: Database> CertificateFetcher<DB> {
                         fetch_task: FetchTask::new(),
                         max_rpc_message_size,
                         parallel_fetch_request_delay_interval,
+                        config,
                     }
                     .run()
                     .await
@@ -348,7 +352,10 @@ impl<DB: Database> CertificateFetcher<DB> {
 
     /// Read latest gc round from consensus bus watch channel.
     fn gc_round(&self) -> Round {
-        *self.consensus_bus.gc_round_updates().borrow()
+        gc_round(
+            *self.consensus_bus.committed_round_updates().borrow(),
+            self.config.parameters().gc_depth,
+        )
     }
 }
 
