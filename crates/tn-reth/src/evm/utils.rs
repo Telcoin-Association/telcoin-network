@@ -8,7 +8,7 @@ const MIN_GAS_LIMIT_THRESHOLD: u64 = 210_000;
 /// Precision for calculating usage ratio with 10^18.
 // 10^9 precision (1 billion) - sufficient for 0.001% granularity
 static PRECISION: LazyLock<u128> = LazyLock::new(|| 10_u128.pow(9));
-/// Usage ratio threshold below which penalties apply (10%)
+/// Usage ratio threshold below which penalties apply (used to calc 10%)
 // 10% threshold = 10^8 with 10^9 precision
 static THRESHOLD: LazyLock<u128> = LazyLock::new(|| 10_u128.pow(8));
 /// THRESHOLD squared
@@ -80,8 +80,8 @@ pub fn calculate_gas_penalty(gas_limit: u64, gas_used: u64) -> u64 {
         "assessing penalty"
     );
 
-    // clamp to unused gas (safety fallback) and convert to u64
-    penalty.min(unused_gas) as u64
+    // unused_gas is the fallback if penalty overflows (u128 cast from u64)
+    penalty.try_into().unwrap_or(unused_gas as u64)
 }
 
 #[cfg(test)]
