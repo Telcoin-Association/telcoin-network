@@ -8,3 +8,4 @@ pub mod flush;
 pub mod insert;
 pub mod load_header;
 pub mod open;
+pub mod rename;

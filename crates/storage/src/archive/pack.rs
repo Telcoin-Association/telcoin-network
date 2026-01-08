@@ -2,7 +2,7 @@
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use tn_types::{decode, encode_into_buffer};
+use tn_types::{encode_into_buffer, try_decode};
 
 use crate::archive::error::commit::CommitError;
 use crate::archive::error::fetch::FetchError;
@@ -10,6 +10,7 @@ use crate::archive::error::flush::FlushError;
 use crate::archive::error::insert::AppendError;
 use crate::archive::error::load_header::LoadHeaderError;
 use crate::archive::error::open::OpenError;
+use crate::archive::error::rename::RenameError;
 use crate::archive::fxhasher::FxHasher;
 use crate::archive::pack_iter::PackIter;
 
@@ -20,8 +21,8 @@ use std::hash::Hasher as _;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use std::path::Path;
-use std::time;
 use std::time::UNIX_EPOCH;
+use std::{fs, time};
 
 /// An instance of a DB.
 /// Will consist of a data file (.dat), hash index (.hdx) and hash bucket overflow file (.odx).
@@ -90,6 +91,17 @@ where
         self.inner.flush()
     }
 
+    /// Close and destroy the Pack (remove it's file).
+    /// If it can not remove a file it will silently ignore this.
+    pub fn destroy(self) {
+        self.inner.destroy();
+    }
+
+    /// Rename the pack file to name.
+    pub fn rename<P: AsRef<Path>>(&mut self, path: P) -> Result<(), RenameError> {
+        self.inner.rename(path)
+    }
+
     /// Return an iterator over the key values in insertion order.
     /// Note this iterator only uses the data file not the indexes.
     /// This iterator will not see any data in the write cache.
@@ -154,6 +166,7 @@ where
     /// Do the actual insert so the public function can rollback easily on an error.
     fn append_inner(&mut self, value: &V) -> Result<u64, AppendError> {
         let record_pos = self.data_file.len();
+        self.value_buffer.clear();
         encode_into_buffer(&mut self.value_buffer, value)
             .map_err(|e| AppendError::SerializeValue(e.to_string()))?;
 
@@ -273,14 +286,28 @@ where
         self.data_file.read_exact(&mut self.value_buffer[..])?;
         crc32_hasher.update(&self.value_buffer);
         let calc_crc32 = crc32_hasher.finalize();
-        let val = decode::<V>(&self.value_buffer[..]);
         let mut buf_u32 = [0_u8; 4];
         self.data_file.read_exact(&mut buf_u32)?;
         let read_crc32 = u32::from_le_bytes(buf_u32);
         if calc_crc32 != read_crc32 {
             return Err(FetchError::CrcFailed);
         }
+        let val = try_decode::<V>(&self.value_buffer[..])
+            .map_err(|e| FetchError::DeserializeValue(e.to_string()))?;
         Ok(val)
+    }
+
+    /// Close and destroy the Pack (remove it's file).
+    /// If it can not remove a file it will silently ignore this.
+    fn destroy(self) {
+        let path = self.data_file.path().to_owned();
+        drop(self);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Rename the pack file to name.
+    fn rename<P: AsRef<Path>>(&mut self, path: P) -> Result<(), RenameError> {
+        self.data_file.rename(path)
     }
 
     /// Return an iterator over the key values in insertion order.
@@ -293,16 +320,16 @@ where
 }
 
 /// Size of the data file header.
-pub const DATA_HEADER_BYTES: usize = 30;
+pub const DATA_HEADER_BYTES: usize = 28;
 
-/// Struct that contains the header for a sldb data file.
+/// Struct that contains the header for a pack file.
 /// This data is immutable was written, the data file is an append only log file and will only be
 /// truncated to maintain consistency.
 /// This data in the file will be followed by a CRC32 checksum value to verify it.
 #[derive(Debug, Copy, Clone)]
 #[repr(C)]
 pub(crate) struct DataHeader {
-    type_id: [u8; 8], // The characters "sldb.dat"
+    type_id: [u8; 6], // The characters "telnet"
     version: u16,     // Holds the version number
     uid: u64,         // Unique ID generated on creation
     appnum: u64,      // Application defined constant
@@ -322,7 +349,7 @@ impl DataHeader {
         // This is pretty basic, just has the current millis with FX to get a UID.
         // This is just to make sure sets of files belong together so not going crazy here.
         let uid = hasher.finish();
-        Self { type_id: *b"sldb.dat", version: 0, uid, appnum: 1 }
+        Self { type_id: *b"telnet", version: 0, uid, appnum: 1 }
     }
 
     /// Load a DataHeader from source.
@@ -342,10 +369,10 @@ impl DataHeader {
         if calc_crc32 != read_crc32 {
             return Err(LoadHeaderError::CrcFailed);
         }
-        let mut type_id = [0_u8; 8];
-        type_id.copy_from_slice(&buffer[0..8]);
-        pos += 8;
-        if &type_id != b"sldb.dat" {
+        let mut type_id = [0_u8; 6];
+        type_id.copy_from_slice(&buffer[0..6]);
+        pos += 6;
+        if &type_id != b"telnet" {
             return Err(LoadHeaderError::InvalidType);
         }
         buf16.copy_from_slice(&buffer[pos..(pos + 2)]);
@@ -364,8 +391,8 @@ impl DataHeader {
     fn write_header<R: Write + Seek>(&self, sync: &mut R) -> Result<(), io::Error> {
         let mut buffer = [0_u8; DATA_HEADER_BYTES];
         let mut pos = 0;
-        buffer[pos..8].copy_from_slice(&self.type_id);
-        pos += 8;
+        buffer[pos..6].copy_from_slice(&self.type_id);
+        pos += 6;
         buffer[pos..(pos + 2)].copy_from_slice(&self.version.to_le_bytes());
         pos += 2;
         buffer[pos..(pos + 8)].copy_from_slice(&self.uid.to_le_bytes());
@@ -392,5 +419,161 @@ impl DataHeader {
     /// User defined appnum.
     fn appnum(&self) -> u64 {
         self.appnum
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde::Deserialize;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct TestRec {
+        idx: u64,
+        name: String,
+    }
+    type TestPack = Pack<TestRec>;
+
+    #[test]
+    fn test_archive_pack_one() {
+        let tmp_path = TempDir::with_prefix("test_archive_pack_one").expect("temp dir");
+        let mut db: TestPack =
+            Pack::open(tmp_path.path().join("pack_test_one"), false).expect("open pack");
+        let pos_1 = db.append(&TestRec { idx: 1, name: "Value One".to_string() }).expect("append");
+        let pos_2 = db.append(&TestRec { idx: 2, name: "Value Two".to_string() }).expect("append");
+        let pos_3 =
+            db.append(&TestRec { idx: 3, name: "Value Three".to_string() }).expect("append");
+        let pos_4 = db.append(&TestRec { idx: 4, name: "Value Four".to_string() }).expect("append");
+        let pos_5 = db.append(&TestRec { idx: 5, name: "Value Five".to_string() }).expect("append");
+
+        let v = db.fetch(pos_5).unwrap();
+        assert_eq!(v.idx, 5);
+        assert_eq!(v.name, "Value Five");
+        let v = db.fetch(pos_1).unwrap();
+        assert_eq!(v.idx, 1);
+        assert_eq!(v.name, "Value One");
+        let v = db.fetch(pos_3).unwrap();
+        assert_eq!(v.idx, 3);
+        assert_eq!(v.name, "Value Three");
+        let v = db.fetch(pos_2).unwrap();
+        assert_eq!(v.idx, 2);
+        assert_eq!(v.name, "Value Two");
+        let v = db.fetch(pos_4).unwrap();
+        assert_eq!(v.idx, 4);
+        assert_eq!(v.name, "Value Four");
+
+        db.flush().unwrap();
+        let iter = db.raw_iter().unwrap().map(|r| r.unwrap());
+        assert_eq!(iter.count(), 5);
+        let mut iter = db.raw_iter().unwrap().map(|r| r.unwrap());
+        let v = iter.next().unwrap();
+        assert_eq!(v.idx, 1);
+        assert_eq!(v.name, "Value One");
+        let v = iter.next().unwrap();
+        assert_eq!(v.idx, 2);
+        assert_eq!(v.name, "Value Two");
+        let v = iter.next().unwrap();
+        assert_eq!(v.idx, 3);
+        assert_eq!(v.name, "Value Three");
+        let v = iter.next().unwrap();
+        assert_eq!(v.idx, 4);
+        assert_eq!(v.name, "Value Four");
+        let v = iter.next().unwrap();
+        assert_eq!(v.idx, 5);
+        assert_eq!(v.name, "Value Five");
+        assert!(iter.next().is_none());
+        drop(db);
+
+        let mut db: TestPack =
+            Pack::open(tmp_path.path().join("pack_test_one"), false).expect("open pack");
+        let pos_1_2 =
+            db.append(&TestRec { idx: 6, name: "Value One2".to_string() }).expect("append");
+        let pos_2_2 =
+            db.append(&TestRec { idx: 7, name: "Value Two2".to_string() }).expect("append");
+        let pos_3_2 =
+            db.append(&TestRec { idx: 8, name: "Value Three2".to_string() }).expect("append");
+        db.commit().unwrap();
+        let v = db.fetch(pos_1_2).unwrap();
+        assert_eq!(v.idx, 6);
+        assert_eq!(v.name, "Value One2");
+        let v = db.fetch(pos_2_2).unwrap();
+        assert_eq!(v.idx, 7);
+        assert_eq!(v.name, "Value Two2");
+        let v = db.fetch(pos_3_2).unwrap();
+        assert_eq!(v.idx, 8);
+        assert_eq!(v.name, "Value Three2");
+        drop(db);
+
+        let mut db: TestPack =
+            Pack::open(tmp_path.path().join("pack_test_one"), true).expect("open pack");
+        let v = db.fetch(pos_1_2).unwrap();
+        assert_eq!(v.idx, 6);
+        assert_eq!(v.name, "Value One2");
+        let v = db.fetch(pos_2_2).unwrap();
+        assert_eq!(v.idx, 7);
+        assert_eq!(v.name, "Value Two2");
+        let v = db.fetch(pos_3_2).unwrap();
+        assert_eq!(v.idx, 8);
+        assert_eq!(v.name, "Value Three2");
+        drop(db);
+
+        let mut iter =
+            PackIter::open(tmp_path.path().join("pack_test_one")).unwrap().map(|r| r.unwrap());
+        let v: TestRec = iter.next().unwrap();
+        assert_eq!(v.idx, 1);
+        assert_eq!(v.name, "Value One");
+        let v: TestRec = iter.next().unwrap();
+        assert_eq!(v.idx, 2);
+        assert_eq!(v.name, "Value Two");
+        let v: TestRec = iter.next().unwrap();
+        assert_eq!(v.idx, 3);
+        assert_eq!(v.name, "Value Three");
+        let v: TestRec = iter.next().unwrap();
+        assert_eq!(v.idx, 4);
+        assert_eq!(v.name, "Value Four");
+        let v: TestRec = iter.next().unwrap();
+        assert_eq!(v.idx, 5);
+        assert_eq!(v.name, "Value Five");
+        let v: TestRec = iter.next().unwrap();
+        assert_eq!(v.idx, 6);
+        assert_eq!(v.name, "Value One2");
+        let v: TestRec = iter.next().unwrap();
+        assert_eq!(v.idx, 7);
+        assert_eq!(v.name, "Value Two2");
+        let v: TestRec = iter.next().unwrap();
+        assert_eq!(v.idx, 8);
+        assert_eq!(v.name, "Value Three2");
+        assert!(iter.next().is_none());
+
+        let db: TestPack =
+            Pack::open(tmp_path.path().join("pack_test_one"), true).expect("open pack");
+        let mut iter = db.raw_iter().unwrap().map(|r| r.unwrap());
+        let v: TestRec = iter.next().unwrap();
+        assert_eq!(v.idx, 1);
+        assert_eq!(v.name, "Value One");
+        let v: TestRec = iter.next().unwrap();
+        assert_eq!(v.idx, 2);
+        assert_eq!(v.name, "Value Two");
+        let v: TestRec = iter.next().unwrap();
+        assert_eq!(v.idx, 3);
+        assert_eq!(v.name, "Value Three");
+        let v: TestRec = iter.next().unwrap();
+        assert_eq!(v.idx, 4);
+        assert_eq!(v.name, "Value Four");
+        let v: TestRec = iter.next().unwrap();
+        assert_eq!(v.idx, 5);
+        assert_eq!(v.name, "Value Five");
+        let v: TestRec = iter.next().unwrap();
+        assert_eq!(v.idx, 6);
+        assert_eq!(v.name, "Value One2");
+        let v: TestRec = iter.next().unwrap();
+        assert_eq!(v.idx, 7);
+        assert_eq!(v.name, "Value Two2");
+        let v: TestRec = iter.next().unwrap();
+        assert_eq!(v.idx, 8);
+        assert_eq!(v.name, "Value Three2");
+        assert!(iter.next().is_none());
     }
 }

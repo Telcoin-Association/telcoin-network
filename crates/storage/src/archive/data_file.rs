@@ -1,9 +1,11 @@
 //! Implement the core file IO abstraction.
 
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use crate::archive::error::rename::RenameError;
 
 const READ_BUFFER_SIZE: usize = 16 * 1024; // 16kb
 const WRITE_BUFFER_SIZE: usize = 16 * 1024; // 16kb
@@ -13,6 +15,7 @@ const WRITE_BUFFER_SIZE: usize = 16 * 1024; // 16kb
 #[derive(Debug)]
 pub struct DataFile {
     data_file: File,
+    data_file_path: PathBuf,
     data_file_end: u64,
     write_buffer: Vec<u8>,
     read_buffer: Vec<u8>,
@@ -26,19 +29,14 @@ pub struct DataFile {
 impl DataFile {
     /// Open a new data file, read only if ro is true.
     pub fn open<P: AsRef<Path>>(path: P, ro: bool) -> Result<Self, io::Error> {
-        /*XXXXif config.truncate && config.write {
-            // truncate is incompatible with append so truncate then open for append.
-            OpenOptions::new()
-                .write(true)
-                .create(config.create)
-                .truncate(true)
-                .open(config.files.data_path())?;
-        }*/
-        let mut data_file = OpenOptions::new()
-            .read(true)
-            .append(!ro)
-            //XXXX.create(config.create && config.write)
-            .open(path.as_ref())?; //XXXXconfig.files.data_path())?;
+        let path = path.as_ref();
+        if !ro {
+            // If we are opening for write then make sure the file exists.
+            // This function will create it if it does not exist or produce
+            // an error if it does so ignore the errors.
+            let _ = File::create_new(path);
+        }
+        let mut data_file = OpenOptions::new().read(true).append(!ro).open(path)?;
         data_file.seek(SeekFrom::End(0))?;
         let data_file_end = data_file.stream_position()?;
         let write_buffer = if ro {
@@ -62,6 +60,7 @@ impl DataFile {
         }
         Ok(Self {
             data_file,
+            data_file_path: path.to_owned(),
             data_file_end,
             write_buffer,
             read_buffer,
@@ -71,6 +70,11 @@ impl DataFile {
             read_buffer_size: READ_BUFFER_SIZE as u32,
             write_buffer_size: WRITE_BUFFER_SIZE as u32,
         })
+    }
+
+    /// Return the path to this file.
+    pub fn path(&self) -> &Path {
+        &self.data_file_path
     }
 
     /// The files end position (i.e. bytes on disk but not any buffered bytes).
@@ -104,6 +108,28 @@ impl DataFile {
     /// Refresh the data_file_end, useful for readonly DBs to sync.
     pub fn refresh_data_file_end(&mut self) {
         self.data_file_end = self.data_file.seek(SeekFrom::End(0)).unwrap_or(self.data_file_end);
+    }
+
+    /// Delete the file.
+    pub fn delete(self) {
+        drop(self.data_file);
+        let _ = fs::remove_file(&self.data_file_path);
+    }
+
+    /// Rename the underlying file.
+    pub fn rename<P: AsRef<Path>>(&mut self, path: P) -> Result<(), RenameError> {
+        let path = path.as_ref();
+        if &self.data_file_path == path {
+            return Ok(());
+        }
+        if path.exists() {
+            return Err(RenameError::FilesExist);
+        }
+        let res = fs::rename(&self.data_file_path, path);
+        if res.is_ok() {
+            self.data_file_path = path.to_owned();
+        }
+        res.map_err(RenameError::RenameIO)
     }
 
     /// Copy bytes form the read buffer into buf.  This expects seek_pos to be within the

@@ -35,8 +35,7 @@ where
     /// Open the data file in dir with base_name (note do not include the .dat- that is appended).
     /// Produces an iterator over all the (key, values).  Does not use the index at all and records
     /// are returned in insert order.
-    pub fn open<P: AsRef<Path>>(dir: P, base_name: P) -> Result<Self, LoadHeaderError> {
-        let data_name = dir.as_ref().join(base_name.as_ref()).join("db").with_extension("dat");
+    pub fn open<P: AsRef<Path>>(data_name: P) -> Result<Self, LoadHeaderError> {
         let mut data_file =
             OpenOptions::new().read(true).write(false).create(false).open(data_name)?;
 
