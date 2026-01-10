@@ -3,7 +3,7 @@
 
 /// Check buffers crc32.  The last 4 bytes of the buffer are the CRC32 code and rest of the buffer
 /// is checked against that.
-pub(crate) fn _check_crc(buffer: &[u8]) -> bool {
+pub(crate) fn check_crc(buffer: &[u8]) -> bool {
     let len = buffer.len();
     if len < 5 {
         return false;

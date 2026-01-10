@@ -5,6 +5,7 @@
 
 pub(crate) mod crc;
 pub mod data_file;
+pub mod digest_index;
 pub mod error;
 pub mod fxhasher;
 pub mod pack;

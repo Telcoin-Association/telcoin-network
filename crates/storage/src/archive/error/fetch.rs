@@ -1,7 +1,6 @@
 //! Contains the error for the data fetching.
 
-use std::error::Error;
-use std::{fmt, io};
+use std::{error::Error, fmt, io};
 
 /// Error on reading a DB record.
 #[derive(Debug)]

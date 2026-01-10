@@ -1,9 +1,11 @@
 //! Implement the core file IO abstraction.
 
-use std::fs::{self, File, OpenOptions};
-use std::io;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::{
+    fs::{self, File, OpenOptions},
+    io,
+    io::{Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+};
 
 use crate::archive::error::rename::RenameError;
 
@@ -87,6 +89,11 @@ impl DataFile {
         self.data_file_end + self.write_buffer.len() as u64
     }
 
+    /// Is the data file empty?
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Set the file length by truncating or extending.
     /// Used to truncate an incomplete record.
     pub fn set_len(&mut self, len: u64) -> Result<(), io::Error> {
@@ -119,7 +126,7 @@ impl DataFile {
     /// Rename the underlying file.
     pub fn rename<P: AsRef<Path>>(&mut self, path: P) -> Result<(), RenameError> {
         let path = path.as_ref();
-        if &self.data_file_path == path {
+        if self.data_file_path == path {
             return Ok(());
         }
         if path.exists() {
@@ -152,9 +159,9 @@ impl DataFile {
 
 impl Read for DataFile {
     /// Read for the DbInner.  This allows other code to not worry about whether data is read from
-    /// the file, write buffer or the read buffer.  The file and write buffer will not have overlapping records
-    /// so this will not read across them in one call.  This will not happen on a proper DB although
-    /// the Read contract should handle this fine.
+    /// the file, write buffer or the read buffer.  The file and write buffer will not have
+    /// overlapping records so this will not read across them in one call.  This will not happen
+    /// on a proper DB although the Read contract should handle this fine.
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.seek_pos >= self.data_file_end {
             let write_pos = (self.seek_pos - self.data_file_end) as usize;
@@ -177,20 +184,14 @@ impl Read for DataFile {
             let mut seek_pos = self.seek_pos;
             let mut end = self.data_file_end - seek_pos;
             if end < self.read_buffer_size as u64 {
-                // If remaining bytes are less then the buffer pull back seek_pos to fill the buffer.
-                seek_pos = if self.data_file_end > self.read_buffer_size as u64 {
-                    self.data_file_end - self.read_buffer_size as u64
-                } else {
-                    0
-                };
+                // If remaining bytes are less then the buffer pull back seek_pos to fill the
+                // buffer.
+                seek_pos = self.data_file_end.saturating_sub(self.read_buffer_size as u64);
             } else {
-                // Put the seek position in the mid point of the read buffer.  This might help increase
-                // buffer hits or might do nothing or hurt depending on fetch patterns.
-                seek_pos = if seek_pos > (self.read_buffer_size / 2) as u64 {
-                    seek_pos - (self.read_buffer_size / 2) as u64
-                } else {
-                    0
-                };
+                // Put the seek position in the mid point of the read buffer.  This might help
+                // increase buffer hits or might do nothing or hurt depending on
+                // fetch patterns.
+                seek_pos = seek_pos.saturating_sub((self.read_buffer_size / 2) as u64);
             }
             end = self.data_file_end - seek_pos;
             if end > 0 {

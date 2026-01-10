@@ -1,28 +1,29 @@
-//! A data/log file of archival data.  Once written is only indended to be read and shared with other nodes.
+//! A data/log file of archival data.  Once written is only indended to be read and shared with
+//! other nodes.
 
-use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{de::DeserializeOwned, Serialize};
 use tn_types::{encode_into_buffer, try_decode};
 
-use crate::archive::error::commit::CommitError;
-use crate::archive::error::fetch::FetchError;
-use crate::archive::error::flush::FlushError;
-use crate::archive::error::insert::AppendError;
-use crate::archive::error::load_header::LoadHeaderError;
-use crate::archive::error::open::OpenError;
-use crate::archive::error::rename::RenameError;
-use crate::archive::fxhasher::FxHasher;
-use crate::archive::pack_iter::PackIter;
+use crate::archive::{
+    error::{
+        commit::CommitError, fetch::FetchError, flush::FlushError, insert::AppendError,
+        load_header::LoadHeaderError, open::OpenError, rename::RenameError,
+    },
+    fxhasher::FxHasher,
+    pack_iter::PackIter,
+};
 
-use super::crc::add_crc32;
-use super::data_file::DataFile;
-use std::fmt::Debug;
-use std::hash::Hasher as _;
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::marker::PhantomData;
-use std::path::Path;
-use std::time::UNIX_EPOCH;
-use std::{fs, time};
+use super::{crc::add_crc32, data_file::DataFile};
+use std::{
+    fmt::Debug,
+    fs,
+    hash::Hasher as _,
+    io::{self, Read, Seek, SeekFrom, Write},
+    marker::PhantomData,
+    path::Path,
+    time,
+    time::UNIX_EPOCH,
+};
 
 /// An instance of a DB.
 /// Will consist of a data file (.dat), hash index (.hdx) and hash bucket overflow file (.odx).
@@ -114,7 +115,8 @@ where
 /// Will consist of a data file (.dat), hash index (.hdx) and hash bucket overflow file (.odx).
 /// This is synchronous and single threaded.  It is intended to keep the algorithms clearer and
 /// to be wrapped for async or multi-threaded synchronous use.
-/// This is the private inner type, this protects the io (Read, Write, Sync) traits from external use).
+/// This is the private inner type, this protects the io (Read, Write, Sync) traits from external
+/// use).
 #[derive(Debug)]
 struct PackInner<V>
 where
@@ -171,8 +173,8 @@ where
             .map_err(|e| AppendError::SerializeValue(e.to_string()))?;
 
         let mut crc32_hasher = crc32fast::Hasher::new();
-        // Once we have written to write_buffer, it needs to be rolled back before returning an error.
-        // Space for the value length.
+        // Once we have written to write_buffer, it needs to be rolled back before returning an
+        // error. Space for the value length.
         let value_size = (self.value_buffer.len() as u32).to_le_bytes();
         self.data_file.write_all(&value_size)?;
         crc32_hasher.update(&value_size);
@@ -193,9 +195,9 @@ where
     ///   - key data
     ///   - value data
     ///
-    /// For the errors IndexCrcError, IndexOverflow, WriteDataError or KeyError the DB will move to a
-    /// failed state and become read only.  These errors all indicate serious underlying issues that
-    /// can not be trivially fixed, a reopen/repair might help.
+    /// For the errors IndexCrcError, IndexOverflow, WriteDataError or KeyError the DB will move to
+    /// a failed state and become read only.  These errors all indicate serious underlying
+    /// issues that can not be trivially fixed, a reopen/repair might help.
     fn append(&mut self, value: &V) -> Result<u64, AppendError> {
         if self.read_only || self.failed {
             return Err(AppendError::ReadOnly);
@@ -206,7 +208,10 @@ where
                 // These errors all indicate a failed DB that can no longer be inserted too.
                 AppendError::WriteDataError(_io_err) => self.failed = true,
                 // These errors do not indicate a failed DB.
-                AppendError::SerializeValue(_) | AppendError::ReadOnly => {}
+                AppendError::SerializeValue(_)
+                | AppendError::ReadOnly
+                | AppendError::CrcError
+                | AppendError::DuplicateKey => {}
             }
         }
         result
@@ -328,7 +333,7 @@ pub const DATA_HEADER_BYTES: usize = 28;
 /// This data in the file will be followed by a CRC32 checksum value to verify it.
 #[derive(Debug, Copy, Clone)]
 #[repr(C)]
-pub(crate) struct DataHeader {
+pub struct DataHeader {
     type_id: [u8; 6], // The characters "telnet"
     version: u16,     // Holds the version number
     uid: u64,         // Unique ID generated on creation
@@ -407,17 +412,17 @@ impl DataHeader {
     }
 
     /// Version of the DB file.
-    fn version(&self) -> u16 {
+    pub(crate) fn version(&self) -> u16 {
         self.version
     }
 
     /// Generated uid for this DB.
-    fn uid(&self) -> u64 {
+    pub(crate) fn uid(&self) -> u64 {
         self.uid
     }
 
     /// User defined appnum.
-    fn appnum(&self) -> u64 {
+    pub(crate) fn appnum(&self) -> u64 {
         self.appnum
     }
 }

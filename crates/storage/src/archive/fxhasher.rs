@@ -23,12 +23,13 @@
 //! # fn main() { }
 //! ```
 
-use core::convert::TryInto;
-use core::default::Default;
-use core::hash::BuildHasherDefault;
-use core::hash::Hasher;
-use core::mem::size_of;
-use core::ops::BitXor;
+use core::{
+    convert::TryInto,
+    default::Default,
+    hash::{BuildHasherDefault, Hasher},
+    mem::size_of,
+    ops::BitXor,
+};
 use std::collections::{HashMap, HashSet};
 
 /// Type alias for a hashmap using the `fx` hash algorithm.

@@ -1,8 +1,6 @@
 //! Contains the error type for the flush() function.
 
-use std::error::Error;
-use std::fmt;
-use std::io;
+use std::{error::Error, fmt, io};
 
 /// Error from read_key().
 #[derive(Debug)]

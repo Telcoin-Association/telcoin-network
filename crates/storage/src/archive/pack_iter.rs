@@ -1,20 +1,22 @@
 //! Raw iterator over a sldb data file.  This will work without an index file and can be used to
 //! open the file directly.
 
-use std::fmt::Debug;
-use std::fs::{File, OpenOptions};
-use std::io;
-use std::io::{BufReader, Read, Seek};
-use std::marker::PhantomData;
-use std::path::Path;
+use std::{
+    fmt::Debug,
+    fs::{File, OpenOptions},
+    io,
+    io::{BufReader, Read, Seek},
+    marker::PhantomData,
+    path::Path,
+};
 
-use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{de::DeserializeOwned, Serialize};
 use tn_types::decode;
 
-use crate::archive::error::fetch::FetchError;
-use crate::archive::error::load_header::LoadHeaderError;
-use crate::archive::pack::DataHeader;
+use crate::archive::{
+    error::{fetch::FetchError, load_header::LoadHeaderError},
+    pack::DataHeader,
+};
 
 /// Iterate over a Db's key, value pairs in insert order.
 /// This iterator is "raw", it does not use any indexes just the data file.
@@ -67,7 +69,8 @@ where
         let mut val_size_buf = [0_u8; 4];
         if let Err(err) = file.read_exact(&mut val_size_buf) {
             // An EOF here should be caused by no more records although it is possible there
-            // was a bit of garbage at the end of the file, not worrying about that now (maybe ever).
+            // was a bit of garbage at the end of the file, not worrying about that now (maybe
+            // ever).
             if let io::ErrorKind::UnexpectedEof = err.kind() {
                 return Err(FetchError::NotFound);
             }
