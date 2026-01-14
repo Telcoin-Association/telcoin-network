@@ -341,7 +341,7 @@ pub struct DataHeader {
 }
 
 impl DataHeader {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let mut hasher = FxHasher::default();
         let now = time::SystemTime::now();
         let now_millis = now

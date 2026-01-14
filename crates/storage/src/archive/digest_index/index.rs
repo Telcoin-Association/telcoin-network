@@ -3,8 +3,11 @@
 use crate::archive::{
     crc::{add_crc32, check_crc},
     digest_index::{bucket_iter::BucketIter, odx_header::OdxHeader},
-    error::{commit::CommitError, insert::AppendError, load_header::LoadHeaderError},
+    error::{
+        commit::CommitError, fetch::FetchError, insert::AppendError, load_header::LoadHeaderError,
+    },
     fxhasher::{FxHashMap, FxHasher},
+    index::Index,
     pack::{DataHeader, DATA_HEADER_BYTES},
 };
 use std::{
@@ -484,7 +487,8 @@ impl<const KSIZE: usize> HdxIndex<KSIZE> {
             _t_buf = Some(buffer);
             BucketIter::new(_t_buf.as_ref().expect("not None"))
         } else {
-            BucketIter::new_empty()
+            _t_buf = Some(vec![]);
+            BucketIter::new_with_empty_buffer(_t_buf.as_ref().expect("not None"))
         };
         while let Some((rec_hash, rec_pos)) = self.next_bucket_element(&mut iter) {
             if rec_pos > 0 {
@@ -525,6 +529,44 @@ impl<const KSIZE: usize> HdxIndex<KSIZE> {
         result
     }
 
+    /// Fetch the value stored at key.  Will return an error if not found.
+    pub fn fetch_position(&mut self, key: &[u8]) -> Result<u64, FetchError> {
+        let bucket = self.hash_to_bucket(key);
+
+        let mut result = None;
+        let mut t_buf = None;
+        let mut _t_buf_empty = vec![];
+        let t_buf_dirty = self.dirty_bucket_cache.contains_key(&bucket);
+        let mut iter = if let Ok(buffer) = self.remove_bucket(bucket) {
+            t_buf = Some(buffer);
+            BucketIter::new(t_buf.as_ref().expect("not None"))
+        } else {
+            BucketIter::new_with_empty_buffer(&_t_buf_empty)
+        };
+        while let Some((rec_hash, rec_pos)) = self.next_bucket_element(&mut iter) {
+            if key == rec_hash {
+                result = Some(rec_pos);
+            }
+        }
+        let crc_failure = iter.crc_failure();
+        drop(iter);
+        if let Some(buffer) = t_buf.take() {
+            // Make sure we return this to the cache especially if dirty.
+            if t_buf_dirty {
+                self.dirty_bucket_cache.insert(bucket, buffer);
+            } else {
+                self.bucket_cache.insert(bucket, buffer);
+            }
+        }
+        if let Some(result) = result {
+            Ok(result)
+        } else if crc_failure {
+            Err(FetchError::CrcFailed)
+        } else {
+            Err(FetchError::NotFound)
+        }
+    }
+
     /// Save the (hash, position) tuple to the bucket.  Handles overflow records.
     /// If this produces an Error then buffer will contain the same data.
     fn save_to_bucket_buffer(
@@ -551,38 +593,15 @@ impl<const KSIZE: usize> HdxIndex<KSIZE> {
         let overflow_pos = read_u64(buffer, &mut pos);
         let elements = read_u32(buffer, &mut pos);
         if overflow_pos > 0 {
-            let bucket = self.hash_to_bucket(key);
-            // If we don't allow dups and have overflow bucket(s) then we have to check them for
+            // We don't allow dups and have overflow bucket(s) then we have to check them for
             // dups... This code is a bummer, ideally not a lot of overflow but still
             // stinky.
-            let mut t_buf = None;
-            let t_buf_dirty = self.dirty_bucket_cache.contains_key(&bucket);
-            let mut bucket_iter = if let Ok(buffer) = self.remove_bucket(bucket) {
-                t_buf = Some(buffer);
-                BucketIter::new_from_overflow(t_buf.as_ref().expect("not None"), overflow_pos)
-            } else {
-                BucketIter::new_empty()
-            };
+            let mut bucket_iter =
+                BucketIter::new_with_elements_overflow(buffer, elements, overflow_pos);
             while let Some((rkey, _rec_pos)) = self.next_bucket_element(&mut bucket_iter) {
                 if rkey == key {
-                    // Make sure we return this to the cache especially if dirty.
-                    if let Some(buffer) = t_buf.take() {
-                        if t_buf_dirty {
-                            self.dirty_bucket_cache.insert(bucket, buffer);
-                        } else {
-                            self.bucket_cache.insert(bucket, buffer);
-                        }
-                    }
                     // Don't allow duplicates so error out (caller should roll back insert).
                     return Err(AppendError::DuplicateKey);
-                }
-            }
-            if let Some(buffer) = t_buf.take() {
-                // Make sure we return this to the cache especially if dirty.
-                if t_buf_dirty {
-                    self.dirty_bucket_cache.insert(bucket, buffer);
-                } else {
-                    self.bucket_cache.insert(bucket, buffer);
                 }
             }
         }
@@ -612,7 +631,6 @@ impl<const KSIZE: usize> HdxIndex<KSIZE> {
             Ok(())
         } else {
             for _ in 0..elements as u64 {
-                //let rec_hash = read_u64(buffer, &mut pos);
                 let rec_key = &buffer[pos..(pos + KSIZE)];
                 pos += KSIZE;
                 if rec_key == key {
@@ -633,5 +651,45 @@ impl<const KSIZE: usize> HdxIndex<KSIZE> {
             self.inc_values();
         }
         res
+    }
+}
+
+impl Index<&[u8]> for HdxIndex {
+    fn save(&mut self, key: &[u8], record_pos: u64) -> Result<(), AppendError> {
+        self.save_to_bucket(key, record_pos)
+    }
+
+    fn load(&mut self, key: &[u8]) -> Result<u64, FetchError> {
+        self.fetch_position(key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+    use tn_types::DefaultHashFunction;
+
+    use super::*;
+
+    #[test]
+    fn test_archive_hdx_index() {
+        let tmp_path = TempDir::with_prefix("test_archive_hdx_index").expect("temp dir");
+        let data_header = DataHeader::new();
+        let builder = BuildHasherDefault::<FxHasher>::default();
+        let mut idx: HdxIndex =
+            HdxIndex::open_hdx_file(tmp_path.path().join("index.hdx"), &data_header, &builder)
+                .expect("hdx file");
+        for i in 0..1_000_000 {
+            let mut hasher = DefaultHashFunction::new();
+            hasher.update(&format!("idx-{i}").into_bytes());
+            let hash = hasher.finalize();
+            idx.save(hash.as_bytes(), i).expect("add to index");
+        }
+        for i in 0..1_000_000 {
+            let mut hasher = DefaultHashFunction::new();
+            hasher.update(&format!("idx-{i}").into_bytes());
+            let hash = hasher.finalize();
+            assert_eq!(idx.load(hash.as_bytes()).expect("load idx"), i);
+        }
     }
 }

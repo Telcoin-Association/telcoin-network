@@ -45,15 +45,13 @@ impl<'bucket> BucketIter<'bucket> {
         }
     }
 
-    pub(super) fn new_empty() -> Self {
+    pub(super) fn new_with_empty_buffer(buffer: &'bucket [u8]) -> Self {
         let overflow_pos = 0;
         let elements = 0;
         let start_pos = 0;
         let end_pos = elements as usize;
         let bucket_pos = 0;
         let overflow_buffer = vec![];
-        let buffer =
-            unsafe { (&overflow_buffer as *const Vec<u8>).as_ref().expect("this can't be null") };
         Self {
             buffer,
             overflow_buffer,
@@ -66,8 +64,11 @@ impl<'bucket> BucketIter<'bucket> {
         }
     }
 
-    pub(super) fn new_from_overflow(buffer: &'bucket [u8], overflow_pos: u64) -> Self {
-        let elements = 0;
+    pub(super) fn new_with_elements_overflow(
+        buffer: &'bucket [u8],
+        elements: u32,
+        overflow_pos: u64,
+    ) -> Self {
         let start_pos = 0;
         let end_pos = elements as usize;
         let bucket_pos = 0;

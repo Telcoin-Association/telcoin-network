@@ -8,5 +8,6 @@ pub mod data_file;
 pub mod digest_index;
 pub mod error;
 pub mod fxhasher;
+pub mod index;
 pub mod pack;
 pub mod pack_iter;
