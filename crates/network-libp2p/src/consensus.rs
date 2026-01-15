@@ -8,6 +8,7 @@ use crate::{
     kad::{KadStore, KadStoreType},
     peers::{self, PeerEvent, PeerManager, Penalty},
     send_or_log_error,
+    stream::{codec::StreamCodec, TN_STREAM_PROTOCOL},
     types::{
         KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo, NetworkResult,
         NodeRecord,
@@ -26,13 +27,14 @@ use libp2p::{
         InboundRequestId, OutboundRequestId,
     },
     swarm::{NetworkBehaviour, SwarmEvent},
-    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
+    Multiaddr, PeerId, Stream, StreamProtocol, Swarm, SwarmBuilder,
 };
+use libp2p_stream as stream;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     time::Duration,
 };
-use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig};
+use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig, StreamConfig};
 use tn_types::{
     decode, encode, now, try_decode, BlsPublicKey, BlsSigner, Database, NetworkKeypair,
     NetworkPublicKey, TaskSpawner, TnSender,
@@ -60,11 +62,14 @@ where
     /// The gossipsub network behavior.
     pub(crate) gossipsub: gossipsub::Behaviour,
     /// The request-response network behavior.
+    /// NOTE: Kept for easier rollback, will be removed in follow-up PR.
     pub(crate) req_res: request_response::Behaviour<C>,
     /// The peer manager.
     pub(crate) peer_manager: peers::PeerManager,
     /// Used for peer discovery.
     pub(crate) kademlia: kad::Behaviour<KadStore<DB>>,
+    /// Stream-based messaging behavior for efficient request/response.
+    pub(crate) stream: stream::Behaviour,
 }
 
 impl<C, DB> TNBehavior<C, DB>
@@ -80,7 +85,8 @@ where
         peer_config: &PeerConfig,
     ) -> Self {
         let peer_manager = PeerManager::new(peer_config);
-        Self { gossipsub, req_res, peer_manager, kademlia }
+        let stream = stream::Behaviour::new();
+        Self { gossipsub, req_res, peer_manager, kademlia, stream }
     }
 }
 
@@ -153,6 +159,14 @@ where
     ///
     /// The external address is self-reported and unconfirmed.
     node_record: NodeRecord,
+    /// Stream control handle for opening outbound streams.
+    stream_control: stream::Control,
+    /// Channel receiver for incoming streams from peers.
+    incoming_streams_rx: Receiver<(PeerId, Stream)>,
+    /// Channel sender for incoming streams (passed to acceptor task).
+    incoming_streams_tx: Sender<(PeerId, Stream)>,
+    /// Stream configuration.
+    stream_config: StreamConfig,
 }
 
 impl<Req, Res, DB, Events> ConsensusNetwork<Req, Res, DB, Events>
@@ -306,6 +320,11 @@ where
         let pending_px_disconnects = HashMap::with_capacity(config.max_px_disconnects);
         let node_record = Self::create_node_record(external_addr, &key_config, network_pubkey);
 
+        // Initialize stream control and channels
+        let stream_control = swarm.behaviour().stream.new_control();
+        let (incoming_streams_tx, incoming_streams_rx) = tokio::sync::mpsc::channel(32);
+        let stream_config = network_config.stream_config().clone();
+
         Ok(Self {
             swarm,
             handle,
@@ -321,6 +340,10 @@ where
             key_config,
             task_spawner,
             node_record,
+            stream_control,
+            incoming_streams_rx,
+            incoming_streams_tx,
+            stream_config,
         })
     }
 
@@ -414,6 +437,21 @@ where
         self.swarm.behaviour_mut().kademlia.set_mode(Some(Mode::Server));
         self.provide_our_data();
 
+        // Spawn incoming stream acceptor task
+        let mut incoming_streams =
+            self.stream_control.accept(TN_STREAM_PROTOCOL).expect("stream protocol not registered");
+        let incoming_tx = self.incoming_streams_tx.clone();
+        self.task_spawner.spawn_task("stream-acceptor", async move {
+            while let Some((peer_id, stream)) = incoming_streams.next().await {
+                if incoming_tx.send((peer_id, stream)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Periodic interval for cleaning up stale stream requests
+        let mut stale_check = tokio::time::interval(self.stream_config.stale_request_interval);
+
         loop {
             tokio::select! {
                 event = self.swarm.select_next_some() => self.process_event(event).await.inspect_err(|e| {
@@ -428,6 +466,16 @@ where
                         return Ok(())
                     }
                 },
+                // Handle incoming streams from peers
+                Some((peer_id, stream)) = self.incoming_streams_rx.recv() => {
+                    self.handle_incoming_stream(peer_id, stream);
+                }
+                // Periodic stale request cleanup (placeholder for future use)
+                _ = stale_check.tick() => {
+                    // For one-request-per-stream design, cleanup is handled by
+                    // individual task timeouts. This is a placeholder for any
+                    // additional cleanup logic if needed.
+                }
             }
         }
     }
@@ -444,6 +492,9 @@ where
                 TNBehaviorEvent::ReqRes(event) => self.process_reqres_event(event)?,
                 TNBehaviorEvent::PeerManager(event) => self.process_peer_manager_event(event)?,
                 TNBehaviorEvent::Kademlia(event) => self.process_kad_event(event)?,
+                TNBehaviorEvent::Stream(()) => {
+                    // Stream behavior doesn't emit events - all handling is done via Control
+                }
             },
             SwarmEvent::ExternalAddrConfirmed { address: _ } => {
                 // New confirmed address so lets publish/update or kademlia address rocord.
@@ -696,6 +747,15 @@ where
             NetworkCommand::FindAuthorities { bls_keys } => {
                 // this will trigger a PeerEvent to fetch records through kad if not in the peer map
                 self.swarm.behaviour_mut().peer_manager.find_authorities(bls_keys);
+            }
+            NetworkCommand::SendStreamRequest { peer, request, reply } => {
+                self.send_stream_request(peer, request, reply);
+            }
+            NetworkCommand::SendStreamRequestBulk { peer, request, reply } => {
+                self.send_stream_request_bulk(peer, request, reply);
+            }
+            NetworkCommand::SetPeerHasStream { peer_id, has_stream } => {
+                self.swarm.behaviour_mut().peer_manager.set_peer_has_stream(&peer_id, has_stream);
             }
         }
 
@@ -1043,6 +1103,25 @@ where
                 if self.swarm.behaviour().peer_manager.peer_is_important(&peer_id) {
                     self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                 }
+
+                // Eagerly open outbound stream to validate peer supports the protocol
+                let mut control = self.stream_control.clone();
+                let handle = self.network_handle();
+                self.task_spawner.spawn_task(format!("open-stream-{peer_id}"), async move {
+                    match control.open_stream(peer_id, TN_STREAM_PROTOCOL).await {
+                        Ok(_stream) => {
+                            // Stream opened successfully, peer supports protocol
+                            // We don't store the stream - one-request-per-stream design
+                            // opens a fresh stream for each request
+                            debug!(target: "network-stream", ?peer_id, "outbound stream opened");
+                            // Update peer state via command
+                            handle.set_peer_has_stream(peer_id, true).await;
+                        }
+                        Err(e) => {
+                            debug!(target: "network-stream", ?peer_id, ?e, "failed to open stream");
+                        }
+                    }
+                });
             }
             PeerEvent::Banned(peer_id) => {
                 warn!(target: "network", ?peer_id, "peer banned");
@@ -1376,6 +1455,179 @@ where
                     .add_known_peer(query.request, node_record.info);
             }
         }
+    }
+
+    /// Send a stream request expecting a single response.
+    fn send_stream_request(
+        &mut self,
+        peer_bls: BlsPublicKey,
+        request: Req,
+        reply: oneshot::Sender<NetworkResult<Res>>,
+    ) {
+        let Some((peer_id, _)) = self.swarm.behaviour().peer_manager.auth_to_peer(peer_bls) else {
+            let _ = reply.send(Err(NetworkError::PeerMissing));
+            return;
+        };
+
+        let mut control = self.stream_control.clone();
+        let config = self.stream_config.clone();
+
+        self.task_spawner.spawn_task(format!("stream-req-{peer_id}"), async move {
+            // Open new stream for this request
+            let mut stream = match control.open_stream(peer_id, TN_STREAM_PROTOCOL).await {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = reply.send(Err(NetworkError::StreamOpen(e.to_string())));
+                    return;
+                }
+            };
+
+            let mut codec = StreamCodec::new(config.max_frame_size);
+
+            // Write request
+            if let Err(e) = codec.write_frame(&mut stream, &request).await {
+                let _ = reply.send(Err(NetworkError::StreamWrite(e.to_string())));
+                return;
+            }
+
+            // Read single response
+            match codec.read_frame::<_, Res>(&mut stream).await {
+                Ok(response) => {
+                    let _ = reply.send(Ok(response));
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(NetworkError::StreamRead(e.to_string())));
+                }
+            }
+        });
+    }
+
+    /// Send a stream request expecting multiple responses (bulk data).
+    fn send_stream_request_bulk(
+        &mut self,
+        peer_bls: BlsPublicKey,
+        request: Req,
+        reply: oneshot::Sender<NetworkResult<tokio::sync::mpsc::Receiver<NetworkResult<Res>>>>,
+    ) {
+        let Some((peer_id, _)) = self.swarm.behaviour().peer_manager.auth_to_peer(peer_bls) else {
+            let _ = reply.send(Err(NetworkError::PeerMissing));
+            return;
+        };
+
+        let mut control = self.stream_control.clone();
+        let config = self.stream_config.clone();
+        let (response_tx, response_rx) = tokio::sync::mpsc::channel(64);
+
+        // Return receiver immediately
+        let _ = reply.send(Ok(response_rx));
+
+        self.task_spawner.spawn_task(format!("stream-bulk-{peer_id}"), async move {
+            let mut stream = match control.open_stream(peer_id, TN_STREAM_PROTOCOL).await {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = response_tx.send(Err(NetworkError::StreamOpen(e.to_string()))).await;
+                    return;
+                }
+            };
+
+            let mut codec = StreamCodec::new(config.max_frame_size);
+
+            // Write request
+            if let Err(e) = codec.write_frame(&mut stream, &request).await {
+                let _ = response_tx.send(Err(NetworkError::StreamWrite(e.to_string()))).await;
+                return;
+            }
+
+            // Read chunked responses until end marker
+            loop {
+                match codec.read_chunk::<_, Res>(&mut stream).await {
+                    Ok(Some(items)) => {
+                        for item in items {
+                            if response_tx.send(Ok(item)).await.is_err() {
+                                return; // Receiver dropped
+                            }
+                        }
+                    }
+                    Ok(None) => break, // End of stream
+                    Err(e) => {
+                        let _ =
+                            response_tx.send(Err(NetworkError::StreamRead(e.to_string()))).await;
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Handle an incoming stream from a peer.
+    fn handle_incoming_stream(&mut self, peer_id: PeerId, stream: Stream) {
+        let Some(bls_key) = self.swarm.behaviour().peer_manager.peer_to_bls(&peer_id) else {
+            debug!(target: "network-stream", ?peer_id, "incoming stream from unknown peer");
+            return;
+        };
+
+        let events = self.event_stream.clone();
+        let config = self.stream_config.clone();
+
+        self.task_spawner.spawn_task(format!("stream-in-{peer_id}"), async move {
+            let mut stream = stream;
+            let mut codec = StreamCodec::new(config.max_frame_size);
+
+            // Read request
+            let request: Req = match codec.read_frame(&mut stream).await {
+                Ok(r) => r,
+                Err(e) => {
+                    debug!(target: "network-stream", ?peer_id, ?e, "failed to read request");
+                    return;
+                }
+            };
+
+            // Create response channel
+            let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<Res>(64);
+            let (_cancel_tx, cancel_rx) = oneshot::channel();
+
+            // Forward to application
+            if events
+                .try_send(NetworkEvent::StreamRequest {
+                    peer: bls_key,
+                    request,
+                    response_tx,
+                    cancel: cancel_rx,
+                })
+                .is_err()
+            {
+                return;
+            }
+
+            // Collect and write responses
+            let mut items = Vec::new();
+            let items_per_chunk = config.items_per_chunk;
+
+            while let Some(item) = response_rx.recv().await {
+                items.push(item);
+
+                // Check if we should write a chunk (bulk mode)
+                if items.len() >= items_per_chunk {
+                    if codec.write_chunk(&mut stream, &items).await.is_err() {
+                        return;
+                    }
+                    items.clear();
+                }
+            }
+
+            // Write remaining items
+            if items.len() == 1 {
+                // Single response: write as frame
+                let _ = codec.write_frame(&mut stream, &items[0]).await;
+            } else if !items.is_empty() {
+                // Bulk: write final chunk + end marker
+                let _ = codec.write_chunk(&mut stream, &items).await;
+                let _ = codec.write_end(&mut stream).await;
+            } else {
+                // Empty response (error case), write end marker
+                let _ = codec.write_end(&mut stream).await;
+            }
+        });
     }
 }
 

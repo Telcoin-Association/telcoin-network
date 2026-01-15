@@ -19,7 +19,7 @@ mod codec_tests;
 
 /// Convenience type for all traits implemented for messages used for TN request-response codec.
 pub trait TNMessage:
-    Send + Serialize + DeserializeOwned + Clone + fmt::Debug + From<PeerExchangeMap> + 'static
+    Send + Sync + Serialize + DeserializeOwned + Clone + fmt::Debug + From<PeerExchangeMap> + 'static
 {
     /// Function to intercept peer exchange messages at the network layer before passing to the
     /// application layer. Only the network layer needs peer exchange messages.

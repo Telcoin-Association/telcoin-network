@@ -334,6 +334,25 @@ where
                     },
                 );
             }
+            NetworkEvent::StreamRequest { peer, request, response_tx, cancel: _ } => {
+                // Handle stream requests similarly to regular requests
+                match request {
+                    WorkerRequest::ReportBatch { sealed_batch } => {
+                        self.process_report_batch_stream(peer, sealed_batch, response_tx);
+                    }
+                    WorkerRequest::RequestBatches { batch_digests, max_response_size } => {
+                        self.process_request_batches_stream(
+                            peer,
+                            batch_digests,
+                            max_response_size,
+                            response_tx,
+                        );
+                    }
+                    WorkerRequest::PeerExchange { .. } => {
+                        warn!(target: "worker::network", "worker application received unexpected peer exchange message via stream");
+                    }
+                }
+            }
         }
     }
 
@@ -405,6 +424,60 @@ where
                 // cancel notification from network layer
                 _ = cancel => (),
             }
+        });
+    }
+
+    /// Process a new reported batch via stream.
+    fn process_report_batch_stream(
+        &self,
+        peer: BlsPublicKey,
+        sealed_batch: SealedBatch,
+        response_tx: tokio::sync::mpsc::Sender<WorkerResponse>,
+    ) {
+        let request_handler = self.request_handler.clone();
+        let network_handle = self.network_handle.clone();
+        let task_name = format!("process-report-batch-stream-{}", sealed_batch.digest());
+        self.network_handle.get_task_spawner().spawn_task(task_name, async move {
+            let response = match request_handler.process_report_batch(&peer, sealed_batch).await {
+                Ok(()) => WorkerResponse::ReportBatch,
+                Err(err) => {
+                    let error = err.to_string();
+                    if let Some(penalty) = err.into() {
+                        network_handle.report_penalty(peer, penalty).await;
+                    }
+                    WorkerResponse::Error(message::WorkerRPCError(error))
+                }
+            };
+            let _ = response_tx.send(response).await;
+        });
+    }
+
+    /// Process request batches via stream.
+    fn process_request_batches_stream(
+        &self,
+        peer: BlsPublicKey,
+        batch_digests: Vec<BlockHash>,
+        max_response_size: usize,
+        response_tx: tokio::sync::mpsc::Sender<WorkerResponse>,
+    ) {
+        let request_handler = self.request_handler.clone();
+        let network_handle = self.network_handle.clone();
+        let task_name = format!("process-request-batches-stream-{peer}");
+        self.network_handle.get_task_spawner().spawn_task(task_name, async move {
+            let response = match request_handler
+                .process_request_batches(batch_digests, max_response_size)
+                .await
+            {
+                Ok(r) => WorkerResponse::RequestBatches(r),
+                Err(err) => {
+                    let error = err.to_string();
+                    if let Some(penalty) = err.into() {
+                        network_handle.report_penalty(peer, penalty).await;
+                    }
+                    WorkerResponse::Error(message::WorkerRPCError(error))
+                }
+            };
+            let _ = response_tx.send(response).await;
         });
     }
 

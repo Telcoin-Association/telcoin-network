@@ -794,4 +794,12 @@ impl PeerManager {
     pub(crate) fn update_routing_for_peer(&mut self, peer_id: &PeerId, routable: bool) {
         self.peers.update_routing_for_peer(peer_id, routable);
     }
+
+    /// Update a peer's outbound stream status.
+    ///
+    /// Called after successfully opening an outbound stream to validate the peer supports
+    /// the streaming protocol.
+    pub(crate) fn set_peer_has_stream(&mut self, peer_id: &PeerId, has: bool) {
+        self.peers.set_peer_has_stream(peer_id, has);
+    }
 }

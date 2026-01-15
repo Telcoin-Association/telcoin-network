@@ -67,6 +67,21 @@ pub enum NetworkEvent<Req, Res> {
         /// The oneshot channel if the request gets cancelled at the network level.
         cancel: oneshot::Receiver<()>,
     },
+    /// Stream request from peer.
+    ///
+    /// Application processes request and sends response(s) via the mpsc channel.
+    /// For single responses, send one item and drop the sender.
+    /// For bulk responses, send multiple items then drop the sender.
+    StreamRequest {
+        /// The peer making the request.
+        peer: BlsPublicKey,
+        /// The request payload.
+        request: Req,
+        /// Channel to send response(s) - single item or multiple for bulk.
+        response_tx: mpsc::Sender<Res>,
+        /// Cancellation receiver.
+        cancel: oneshot::Receiver<()>,
+    },
     /// Gossip message received and propagation source.
     Gossip(GossipMessage, BlsPublicKey),
     /// Send an error back the requester.
@@ -284,6 +299,31 @@ where
     FindAuthorities {
         /// The collection of bls public keys associated with authorities to find.
         bls_keys: Vec<BlsPublicKey>,
+    },
+    /// Send request via stream and await single response.
+    SendStreamRequest {
+        /// Destination peer.
+        peer: BlsPublicKey,
+        /// The request.
+        request: Req,
+        /// Reply channel for response.
+        reply: oneshot::Sender<NetworkResult<Res>>,
+    },
+    /// Send request via stream, receive multiple responses (for bulk data).
+    SendStreamRequestBulk {
+        /// Destination peer.
+        peer: BlsPublicKey,
+        /// The request.
+        request: Req,
+        /// Reply channel for response receiver.
+        reply: oneshot::Sender<NetworkResult<mpsc::Receiver<NetworkResult<Res>>>>,
+    },
+    /// Update a peer's stream status (internal command).
+    SetPeerHasStream {
+        /// The peer's id.
+        peer_id: PeerId,
+        /// Whether the peer has an open stream.
+        has_stream: bool,
     },
 }
 
@@ -518,6 +558,38 @@ where
     pub async fn find_authorities(&self, bls_keys: Vec<BlsPublicKey>) -> NetworkResult<()> {
         self.sender.send(NetworkCommand::FindAuthorities { bls_keys }).await?;
         Ok(())
+    }
+
+    /// Send a request via stream and await single response.
+    ///
+    /// Used for requests expecting a single response (e.g., Vote, ConsensusHeader).
+    pub async fn send_stream_request(
+        &self,
+        peer: BlsPublicKey,
+        request: Req,
+    ) -> NetworkResult<Res> {
+        let (reply, rx) = oneshot::channel();
+        self.sender.send(NetworkCommand::SendStreamRequest { peer, request, reply }).await?;
+        rx.await?
+    }
+
+    /// Send a request via stream and receive multiple responses.
+    ///
+    /// Used for bulk data requests (e.g., certificates, batches) where the response
+    /// is streamed in chunks. The caller receives a channel and collects items.
+    pub async fn send_stream_request_bulk(
+        &self,
+        peer: BlsPublicKey,
+        request: Req,
+    ) -> NetworkResult<mpsc::Receiver<NetworkResult<Res>>> {
+        let (reply, rx) = oneshot::channel();
+        self.sender.send(NetworkCommand::SendStreamRequestBulk { peer, request, reply }).await?;
+        rx.await?
+    }
+
+    /// Update a peer's stream status (internal use).
+    pub(crate) async fn set_peer_has_stream(&self, peer_id: PeerId, has_stream: bool) {
+        let _ = self.sender.send(NetworkCommand::SetPeerHasStream { peer_id, has_stream }).await;
     }
 }
 

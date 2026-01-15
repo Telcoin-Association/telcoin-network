@@ -349,6 +349,30 @@ where
                     let _ = network_handle.handle.send_response(err, channel).await;
                 });
             }
+            NetworkEvent::StreamRequest { peer, request, response_tx, cancel: _ } => {
+                match request {
+                    PrimaryRequest::Vote { header, parents } => {
+                        self.process_vote_request_stream(
+                            peer,
+                            Arc::unwrap_or_clone(header),
+                            parents,
+                            response_tx,
+                        );
+                    }
+                    PrimaryRequest::MissingCertificates { inner } => {
+                        self.process_missing_certs_stream(peer, inner, response_tx);
+                    }
+                    PrimaryRequest::ConsensusHeader { number, hash } => {
+                        self.process_consensus_output_stream(peer, number, hash, response_tx);
+                    }
+                    PrimaryRequest::EpochRecord { epoch, hash } => {
+                        self.process_epoch_record_stream(peer, epoch, hash, response_tx);
+                    }
+                    PrimaryRequest::PeerExchange { .. } => {
+                        warn!(target: "primary::network", "primary application received unexpected peer exchange message via stream");
+                    }
+                }
+            }
         }
     }
 
@@ -464,6 +488,78 @@ where
                 // cancel notification from network layer
                 _ = cancel => (),
             }
+        });
+    }
+
+    /// Process vote request via stream.
+    fn process_vote_request_stream(
+        &self,
+        peer: BlsPublicKey,
+        header: Header,
+        parents: Vec<Certificate>,
+        response_tx: mpsc::Sender<PrimaryResponse>,
+    ) {
+        let request_handler = self.request_handler.clone();
+        let task_name = format!("VoteRequestStream-{}", header.digest());
+        self.task_spawner.spawn_task(task_name, async move {
+            let response = request_handler.vote(peer, header, parents).await.into_response();
+            let _ = response_tx.send(response).await;
+        });
+    }
+
+    /// Process missing certificates request via stream.
+    fn process_missing_certs_stream(
+        &self,
+        peer: BlsPublicKey,
+        request: MissingCertificatesRequest,
+        response_tx: mpsc::Sender<PrimaryResponse>,
+    ) {
+        let request_handler = self.request_handler.clone();
+        let network_handle = self.network_handle.clone();
+        let task_name = format!("MissingCertsStreamReq-{peer}");
+        self.task_spawner.spawn_task(task_name, async move {
+            let result = request_handler.retrieve_missing_certs(request).await;
+            // report penalty if any
+            if let Err(ref e) = result {
+                if let Some(penalty) = e.into() {
+                    network_handle.report_penalty(peer, penalty).await;
+                }
+            }
+            let response = result.into_response();
+            let _ = response_tx.send(response).await;
+        });
+    }
+
+    /// Process consensus output request via stream.
+    fn process_consensus_output_stream(
+        &self,
+        peer: BlsPublicKey,
+        number: Option<u64>,
+        hash: Option<BlockHash>,
+        response_tx: mpsc::Sender<PrimaryResponse>,
+    ) {
+        let request_handler = self.request_handler.clone();
+        let task_name = format!("ConsensusOutputStreamReq-{peer}");
+        self.task_spawner.spawn_task(task_name, async move {
+            let response =
+                request_handler.retrieve_consensus_header(number, hash).await.into_response();
+            let _ = response_tx.send(response).await;
+        });
+    }
+
+    /// Process epoch record request via stream.
+    fn process_epoch_record_stream(
+        &self,
+        peer: BlsPublicKey,
+        epoch: Option<Epoch>,
+        hash: Option<BlockHash>,
+        response_tx: mpsc::Sender<PrimaryResponse>,
+    ) {
+        let request_handler = self.request_handler.clone();
+        let task_name = format!("EpochRecordStreamReq-{peer}");
+        self.task_spawner.spawn_task(task_name, async move {
+            let response = request_handler.retrieve_epoch_record(epoch, hash).await.into_response();
+            let _ = response_tx.send(response).await;
         });
     }
 

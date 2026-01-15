@@ -892,4 +892,11 @@ impl AllPeers {
             peer.update_routability(routable)
         }
     }
+
+    /// Update a peer's outbound stream status.
+    pub(super) fn set_peer_has_stream(&mut self, peer_id: &PeerId, has: bool) {
+        if let Some(peer) = self.peers.get_mut(peer_id) {
+            peer.set_has_outbound_stream(has);
+        }
+    }
 }

@@ -104,6 +104,15 @@ pub enum NetworkError {
     /// Kademlia store write error.
     #[error("Failed to store kad record: {0}")]
     StoreKademliaRecord(String),
+    /// Failed to open stream to peer.
+    #[error("Failed to open stream: {0}")]
+    StreamOpen(String),
+    /// Failed to write to stream.
+    #[error("Failed to write to stream: {0}")]
+    StreamWrite(String),
+    /// Failed to read from stream.
+    #[error("Failed to read from stream: {0}")]
+    StreamRead(String),
 }
 
 impl From<oneshot::error::RecvError> for NetworkError {

@@ -50,6 +50,11 @@ pub(super) struct Peer {
     /// prioritizes non-routable peers during connection limit pruning. If a peer is not in the
     /// routing table and this node needs to prune connections, then the peer may be disconnected.
     routable: bool,
+    /// Whether we have validated that this peer supports the streaming protocol.
+    ///
+    /// Set to true after successfully opening an outbound stream to the peer.
+    /// This is used to eagerly validate protocol support on peer connect.
+    has_outbound_stream: bool,
 }
 
 impl Peer {
@@ -70,6 +75,7 @@ impl Peer {
             connection_status: Default::default(),
             connection_direction: Default::default(),
             routable: false,
+            has_outbound_stream: false,
         }
     }
 
@@ -90,6 +96,7 @@ impl Peer {
             connection_status: Default::default(),
             connection_direction: Default::default(),
             routable: false,
+            has_outbound_stream: false,
         }
     }
 
@@ -112,6 +119,7 @@ impl Peer {
             connection_status: Default::default(),
             connection_direction: Default::default(),
             routable: false,
+            has_outbound_stream: false,
         }
     }
 
@@ -342,5 +350,15 @@ impl Peer {
     /// Bool indicating if the peer is a known participant in kademlia routing table.
     pub(super) fn is_routable(&self) -> bool {
         self.routable
+    }
+
+    /// Whether we have validated that this peer supports the streaming protocol.
+    pub(super) fn has_outbound_stream(&self) -> bool {
+        self.has_outbound_stream
+    }
+
+    /// Update the peer's outbound stream status.
+    pub(super) fn set_has_outbound_stream(&mut self, has: bool) {
+        self.has_outbound_stream = has;
     }
 }
