@@ -33,6 +33,7 @@ use tracing::{debug, info};
 #[tokio::test]
 async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result<()> {
     let _guard = IT_TEST_MUTEX.lock();
+    tn_types::test_utils::init_test_tracing();
 
     // create google env and temp chain spec for state initialization
     let (tmp_chain, kms_address) = prepare_google_kms_env().await?;
@@ -399,7 +400,7 @@ async fn test_faucet_transfers_tel_and_xyz_with_google_kms_e2e() -> eyre::Result
     info!(target: "faucet-test", ?tx_hash, "tx submitted :D");
 
     // ensure account balance decreased
-    let expected_balance = U256::from_str("0x2e0b6b3a761c1c9")?;
+    let expected_balance = U256::from_str("0xde0b6b3a7640000")?;
     let _ = timeout(
         duration,
         ensure_account_balance_infinite_loop(&client, random_address, expected_balance),

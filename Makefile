@@ -1,4 +1,4 @@
-.PHONY: help attest udeps check test test-faucet fmt clippy docker-login docker-adiri docker-push docker-builder docker-builder-init up down validators pr init-submodules update-tn-contracts revert-submodule
+.PHONY: help attest udeps check test test-faucet fmt clippy docker-login docker-adiri docker-push docker-builder docker-builder-init up down validators pr init-submodules update-tn-contracts revert-submodule clean-logs
 
 # full path for the Makefile
 ROOT_DIR:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
@@ -61,6 +61,9 @@ help:
 	@echo ;
 	@echo "make validators" ;
 	@echo "    :::> Run 4 validators locally (outside of docker)." ;
+	@echo ;
+	@echo "make clean-logs LOG_FILE=path/to/file.log" ;
+	@echo "    :::> Strip ANSI color codes and timestamps from a log file." ;
 	@echo ;
 
 # run CI locally and submit attestation githash to on-chain program
@@ -153,3 +156,12 @@ pr:
 	make fmt && \
 	make clippy && \
 	make public-tests
+
+# strip ANSI color codes and timestamps from a log file
+# usage: make clean-logs LOG_FILE=path/to/logfile.log
+clean-logs:
+	@if [ -z "$(LOG_FILE)" ]; then \
+		echo "Error: LOG_FILE is required. Usage: make clean-logs LOG_FILE=/path/to/file.log"; \
+		exit 1; \
+	fi
+	sed -i '' -E "s/[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]+Z //g; s/\x1B\[([0-9]{1,3}(;[0-9]{1,3})*)?[mGK]//g" $(LOG_FILE)

@@ -22,12 +22,13 @@ mod config;
 mod context;
 mod factory;
 mod handler;
+mod utils;
+use crate::evm::handler::TNEvmHandler;
 pub(crate) use block::*;
 pub(crate) use config::*;
 pub(crate) use context::*;
 pub(crate) use factory::*;
-
-use crate::evm::handler::TNEvmHandler;
+pub use utils::calculate_gas_penalty;
 
 /// TN EVM implementation.
 ///

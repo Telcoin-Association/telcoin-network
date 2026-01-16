@@ -3,10 +3,11 @@
 //! This module is responsible for checking certificate parents, managing pending certificates, and
 //! accepting certificates that become unlocked.
 
-use super::{gc::GarbageCollector, pending_cert_manager::PendingCertificateManager, AtomicRound};
+use super::{gc::GarbageCollector, pending_cert_manager::PendingCertificateManager};
 use crate::{
     aggregators::certificates::CertificatesAggregatorManager,
     certificate_fetcher::CertificateFetcherCommand,
+    consensus::gc_round,
     error::{CertManagerError, CertManagerResult, GarbageCollectorError},
     state_sync::cert_validator::certificate_source,
     ConsensusBus,
@@ -20,7 +21,7 @@ use tn_config::ConsensusConfig;
 use tn_storage::CertificateStore;
 use tn_types::{
     error::{CertificateError, HeaderError},
-    Certificate, CertificateDigest, Database, Hash as _, TnReceiver as _, TnSender as _,
+    Certificate, CertificateDigest, Database, Hash as _, Round, TnReceiver as _, TnSender as _,
 };
 use tokio::sync::oneshot;
 use tracing::{debug, error};
@@ -46,12 +47,6 @@ pub(super) struct CertificateManager<DB> {
     parents: CertificatesAggregatorManager,
     /// The task responsible for managing garbage collection.
     garbage_collector: GarbageCollector<DB>,
-    /// Highest garbage collection round.
-    ///
-    /// This is managed by GarbageCollector and shared with CertificateValidator.
-    gc_round: AtomicRound,
-    /// Highest round of certificate accepted into the certificate store.
-    highest_processed_round: AtomicRound,
 }
 
 impl<DB> CertificateManager<DB>
@@ -59,26 +54,19 @@ where
     DB: Database,
 {
     /// Create a new instance of Self.
-    pub(super) fn new(
-        config: ConsensusConfig<DB>,
-        consensus_bus: ConsensusBus,
-        gc_round: AtomicRound,
-        highest_processed_round: AtomicRound,
-    ) -> Self {
+    pub(super) fn new(config: ConsensusConfig<DB>, consensus_bus: ConsensusBus) -> Self {
         let parents = CertificatesAggregatorManager::new(consensus_bus.clone());
         let pending = PendingCertificateManager::new(consensus_bus.clone());
-        let garbage_collector =
-            GarbageCollector::new(config.clone(), consensus_bus.clone(), gc_round.clone());
+        let garbage_collector = GarbageCollector::new(config.clone(), consensus_bus.clone());
 
-        Self {
-            consensus_bus,
-            config,
-            pending,
-            parents,
-            garbage_collector,
-            gc_round,
-            highest_processed_round,
-        }
+        Self { consensus_bus, config, pending, parents, garbage_collector }
+    }
+
+    fn gc_round(&self) -> Round {
+        gc_round(
+            *self.consensus_bus.committed_round_updates().borrow(),
+            self.config.config().parameters.gc_depth,
+        )
     }
 
     /// Process verified certificate.
@@ -127,7 +115,7 @@ where
             //
             // NOTE: this also ensures certificates are accepted in causal order
             // which is a strict requirement for consensus to build the DAG correctly
-            if cert.round() > self.gc_round.load() + 1 {
+            if cert.round() > self.gc_round() + 1 {
                 let missing_parents = self.get_missing_parents(&cert).await?;
                 if !missing_parents.is_empty() {
                     self.pending.insert_pending(cert, missing_parents)?;
@@ -230,7 +218,7 @@ where
         for cert in certificates.into_iter() {
             // Update metrics for accepted certificates.
             let highest_processed_round =
-                self.highest_processed_round.fetch_max(cert.round()).max(cert.round());
+                self.consensus_bus.committed_round_updates().borrow().max(cert.round());
             let certificate_source = certificate_source(&self.config, &cert);
             self.consensus_bus
                 .primary_metrics()
@@ -275,7 +263,7 @@ where
     /// missing parents).
     async fn process_gc_round(&mut self) -> CertManagerResult<()> {
         // load latest gc round
-        let gc_round = self.gc_round.load();
+        let gc_round = self.gc_round();
 
         // clear certificate aggregators for expired rounds
         self.parents.garbage_collect(&gc_round);

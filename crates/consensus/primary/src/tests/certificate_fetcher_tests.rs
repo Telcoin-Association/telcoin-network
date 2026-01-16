@@ -627,6 +627,7 @@ async fn test_gc_round_update_during_fetch() {
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .with_consensus_parameters(Parameters {
             parallel_fetch_request_delay_interval: Duration::from_millis(100),
+            gc_depth: 5,
             ..Default::default()
         })
         .randomize_ports(true)
@@ -688,8 +689,6 @@ async fn test_gc_round_update_during_fetch() {
         drop(reply);
     }
 
-    // update GC round to 5
-    cb.gc_round_updates().send(5).unwrap();
     sleep(Duration::from_millis(100)).await;
 
     // trigger another fetch with Kick
@@ -703,34 +702,24 @@ async fn test_gc_round_update_during_fetch() {
                 request: PrimaryRequest::MissingCertificates { inner },
                 reply,
             })) => {
-                let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
-                if lower_bound == 5 {
-                    // request received with updated GC round
-                    assert_eq!(lower_bound, 5, "should use updated GC round");
-
-                    // verify skip_rounds don't include rounds <= 5
-                    for rounds in skip_rounds.values() {
-                        assert!(
-                            rounds.iter().all(|&r| r > 5),
-                            "should not fetch rounds <= GC round"
-                        );
-                    }
-
-                    reply
-                        .send(Ok(PrimaryResponse::RequestedCertificates(
-                            all_certificates
-                                .iter()
-                                .filter(|c| c.header().round() > 5)
-                                .cloned()
-                                .collect(),
-                        )))
-                        .unwrap();
-
-                    // break here to prevent timeout
-                    break;
+                let (_lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+                // verify skip_rounds don't include rounds <= 5
+                for rounds in skip_rounds.values() {
+                    assert!(rounds.iter().all(|&r| r > 5), "should not fetch rounds <= GC round");
                 }
-                // continue for old requests
-                drop(reply);
+
+                reply
+                    .send(Ok(PrimaryResponse::RequestedCertificates(
+                        all_certificates
+                            .iter()
+                            .filter(|c| c.header().round() > 5)
+                            .cloned()
+                            .collect(),
+                    )))
+                    .unwrap();
+
+                // break here to prevent timeout
+                break;
             }
             _ => {
                 panic!("Should receive fetch request with updated GC round but timedout");

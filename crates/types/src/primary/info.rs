@@ -26,7 +26,7 @@ impl Default for NodeP2pInfo {
         // They need to work for tests though so localhost and a random port are good.
         let host = "127.0.0.1".to_string();
         let primary_udp_port = get_available_udp_port(&host).unwrap_or(49584);
-        let worker_udp_port = get_available_udp_port(&host).unwrap_or(49584);
+        let worker_udp_port = get_available_udp_port(&host).unwrap_or(49594);
 
         Self {
             primary: P2pNode {

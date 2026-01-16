@@ -15,6 +15,7 @@ use tn_batch_builder::test_utils::execute_test_batch;
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
 use tn_engine::{ExecutorEngine, TnEngineError};
 use tn_reth::{
+    calculate_gas_penalty, recover_signed_transaction,
     system_calls::EpochState,
     test_utils::{
         calculate_withdrawals_root, create_committee_from_state,
@@ -26,9 +27,9 @@ use tn_reth::{
 use tn_test_utils::default_test_execution_node;
 use tn_types::{
     gas_accumulator::GasAccumulator, max_batch_gas, now, test_chain_spec_arc, test_genesis,
-    Address, BlockHash, Bloom, Bytes, Certificate, CertifiedBatch, CommittedSubDag,
+    Address, Batch, BlockHash, Bloom, Bytes, Certificate, CertifiedBatch, CommittedSubDag,
     ConsensusOutput, Encodable2718, Hash as _, Notifier, ReputationScores, SealedBlock,
-    TaskManager, B256, EMPTY_WITHDRAWALS, MIN_PROTOCOL_BASE_FEE, U256,
+    TaskManager, TransactionTrait as _, B256, EMPTY_WITHDRAWALS, MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tokio::{sync::oneshot, time::timeout};
 use tracing::debug;
@@ -39,15 +40,15 @@ const HISTORY_BUFFER_LENGTH: u64 = 8191;
 /// transactions.
 const TOTAL_GAS_PER_TX: u64 = 21_000;
 /// Arbitrary value used for priority fee calcs in tests.
-const MAX_PRIORITY_FEE_PER_GAS: u128 = 100;
+const MAX_PRIORITY_FEE_PER_GAS: u64 = 100;
 /// Arbitrary value used for priority fee calcs in tests.
-const MAX_FEE_PER_GAS: u128 = 100;
+const MAX_FEE_PER_GAS: u64 = 100;
 
 /// Helper function to calculate expected priority fees for batch producer.
-fn calc_priority_fees(basefee: u128) -> u128 {
+fn calc_priority_fees(basefee: u64) -> u64 {
     let effective_gas_price = MAX_FEE_PER_GAS.min(basefee + MAX_PRIORITY_FEE_PER_GAS);
     let coinbase_gas_price = effective_gas_price - basefee;
-    coinbase_gas_price * TOTAL_GAS_PER_TX as u128
+    coinbase_gas_price * TOTAL_GAS_PER_TX
 }
 
 /// Helper function to assert EIP-4788 correctly executed. (cancun)
@@ -308,8 +309,8 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         .create_explicit_eip1559(
             Some(genesis.config.chain_id),
             None,
-            Some(MAX_PRIORITY_FEE_PER_GAS),
-            Some(MAX_FEE_PER_GAS),
+            Some(MAX_PRIORITY_FEE_PER_GAS as u128),
+            Some(MAX_FEE_PER_GAS as u128),
             None,
             Some(Address::random()),
             None,
@@ -321,8 +322,8 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         .create_explicit_eip1559(
             Some(genesis.config.chain_id),
             None,
-            Some(MAX_PRIORITY_FEE_PER_GAS),
-            Some(MAX_FEE_PER_GAS),
+            Some(MAX_PRIORITY_FEE_PER_GAS as u128),
+            Some(MAX_FEE_PER_GAS as u128),
             None,
             Some(Address::random()),
             None,
@@ -389,11 +390,12 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         // actually execute the batch now
         execute_test_batch(batch);
 
+        let transactions = batch.transactions();
+
         // all txs in test batches are EOA->EOA native token transfers
         // which costs 21_000 gas
-        let batch_basefees = U256::from(
-            batch.transactions().len() as u64 * TOTAL_GAS_PER_TX * batch.base_fee_per_gas,
-        );
+        let batch_basefees =
+            U256::from(transactions.len() as u64 * TOTAL_GAS_PER_TX * batch.base_fee_per_gas);
         expected_base_fees = expected_base_fees
             .checked_add(batch_basefees)
             .expect("u256 did not overflow during add");
@@ -401,8 +403,22 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         // calculate expected priority fees
         // encoded_tx_priority_fee_1 is last tx in the first batch
         if idx == 0 {
-            let priority_fees = calc_priority_fees(batch.base_fee_per_gas as u128);
+            let priority_fees = calc_priority_fees(batch.base_fee_per_gas);
             expected_priority_fees += priority_fees;
+        }
+
+        // calculate anticipated penalty for setting gas limit too high
+        for tx in transactions {
+            let recovered = recover_signed_transaction(&tx).expect("tx valid");
+            let effective_gas_price = recovered.effective_gas_price(Some(batch.base_fee_per_gas));
+            let expected_penalty = U256::from(
+                calculate_gas_penalty(recovered.gas_limit(), TOTAL_GAS_PER_TX) as u128
+                    * effective_gas_price,
+            );
+            debug!(target: "engine", ?expected_penalty, "adding expected penalty to basefees");
+            expected_base_fees = expected_base_fees
+                .checked_add(expected_penalty)
+                .expect("u256 did not overflow during add");
         }
     }
 
@@ -419,11 +435,12 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
 
         // actually execute the block now
         execute_test_batch(batch);
+        let transactions = batch.transactions();
+
         // all txs in test batches are EOA->EOA native token transfers
         // 21_000 gas
-        let batch_basefees = U256::from(
-            batch.transactions().len() as u64 * TOTAL_GAS_PER_TX * batch.base_fee_per_gas,
-        );
+        let batch_basefees =
+            U256::from(transactions.len() as u64 * TOTAL_GAS_PER_TX * batch.base_fee_per_gas);
         expected_base_fees = expected_base_fees
             .checked_add(batch_basefees)
             .expect("u256 did not overflow during add");
@@ -431,8 +448,22 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         // calculate expected priority fees
         // encoded_tx_priority_fee_2 is last tx in the first batch
         if idx == 0 {
-            let priority_fees = calc_priority_fees(batch.base_fee_per_gas as u128);
+            let priority_fees = calc_priority_fees(batch.base_fee_per_gas);
             expected_priority_fees += priority_fees;
+        }
+
+        // calculate anticipated penalty for setting gas limit too high
+        for tx in transactions {
+            let recovered = recover_signed_transaction(&tx).expect("tx valid");
+            let effective_gas_price = recovered.effective_gas_price(Some(batch.base_fee_per_gas));
+            let expected_penalty = U256::from(
+                calculate_gas_penalty(recovered.gas_limit(), TOTAL_GAS_PER_TX) as u128
+                    * effective_gas_price,
+            );
+            debug!(target: "engine", ?expected_penalty, "adding expected penalty to basefees");
+            expected_base_fees = expected_base_fees
+                .checked_add(expected_penalty)
+                .expect("u256 did not overflow during add");
         }
     }
 
@@ -504,13 +535,8 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     let all_batch_digests: Vec<BlockHash> = batch_digests_1.into();
 
     //=== Execution
-    // setup rewards for first two rounds of consensus
     let rewards_counter = gas_accumulator.rewards_counter();
     rewards_counter.set_committee(committee.clone());
-
-    // inc leader counter - normally performed by `EpochManager`
-    rewards_counter.inc_leader_count(consensus_output_1.leader().origin());
-    rewards_counter.inc_leader_count(consensus_output_2.leader().origin());
 
     // retrieve rewards info for current epoch
     let EpochState { epoch_info, .. } = execution_node.epoch_state_from_canonical_tip().await?;
@@ -602,7 +628,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         .alloc
         .get(&GOVERNANCE_SAFE_ADDRESS)
         .map(|acct| acct.balance)
-        .unwrap_or(U256::ZERO);
+        .unwrap_or(U256::MAX);
     let governance_safe = reth_env
         .retrieve_account(&GOVERNANCE_SAFE_ADDRESS)?
         .map(|acct| acct.balance)
@@ -757,8 +783,8 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         .create_explicit_eip1559(
             Some(genesis.config.chain_id),
             None,
-            Some(MAX_PRIORITY_FEE_PER_GAS),
-            Some(MAX_FEE_PER_GAS),
+            Some(MAX_PRIORITY_FEE_PER_GAS as u128),
+            Some(MAX_FEE_PER_GAS as u128),
             None,
             Some(Address::random()),
             None,
@@ -770,8 +796,8 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         .create_explicit_eip1559(
             Some(genesis.config.chain_id),
             None,
-            Some(MAX_PRIORITY_FEE_PER_GAS),
-            Some(MAX_FEE_PER_GAS),
+            Some(MAX_PRIORITY_FEE_PER_GAS as u128),
+            Some(MAX_FEE_PER_GAS as u128),
             None,
             Some(Address::random()),
             None,
@@ -848,23 +874,38 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
 
         // actually execute the batch now
         execute_test_batch(batch);
+        let transactions = batch.transactions();
 
         // skip duplicate batch, otherwise calculate expected basefees
         if idx != DUPLICATE_BATCH_INDEX {
             // all txs in test batches are EOA->EOA native token transfers
             // which costs 21_000 gas
-            let batch_basefees = U256::from(
-                batch.transactions().len() as u64 * TOTAL_GAS_PER_TX * batch.base_fee_per_gas,
-            );
+            let batch_basefees =
+                U256::from(transactions.len() as u64 * TOTAL_GAS_PER_TX * batch.base_fee_per_gas);
             expected_base_fees = expected_base_fees
                 .checked_add(batch_basefees)
                 .expect("u256 did not overflow during add");
+
+            // calculate anticipated penalty for setting gas limit too high
+            for tx in transactions {
+                let recovered = recover_signed_transaction(&tx).expect("tx valid");
+                let effective_gas_price =
+                    recovered.effective_gas_price(Some(batch.base_fee_per_gas));
+                let expected_penalty = U256::from(
+                    calculate_gas_penalty(recovered.gas_limit(), TOTAL_GAS_PER_TX) as u128
+                        * effective_gas_price,
+                );
+                debug!(target: "engine", ?expected_penalty, "adding expected penalty to basefees");
+                expected_base_fees = expected_base_fees
+                    .checked_add(expected_penalty)
+                    .expect("u256 did not overflow during add");
+            }
         }
 
         // calculate expected priority fees
         // encoded_tx_priority_fee_1 is last tx in the first batch
         if idx == 0 {
-            let priority_fees = calc_priority_fees(batch.base_fee_per_gas as u128);
+            let priority_fees = calc_priority_fees(batch.base_fee_per_gas);
             expected_priority_fees.insert(batch_producer_1, priority_fees);
         }
     }
@@ -882,23 +923,38 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
 
         // actually execute the block now
         execute_test_batch(batch);
+        let transactions = batch.transactions();
 
         // skip duplicate batch, otherwise calculate expected basefees
         if idx != DUPLICATE_BATCH_INDEX {
             // all txs in test batches are EOA->EOA native token transfers
             // 21_000 gas
-            let batch_basefees = U256::from(
-                batch.transactions().len() as u64 * TOTAL_GAS_PER_TX * batch.base_fee_per_gas,
-            );
+            let batch_basefees =
+                U256::from(transactions.len() as u64 * TOTAL_GAS_PER_TX * batch.base_fee_per_gas);
             expected_base_fees = expected_base_fees
                 .checked_add(batch_basefees)
                 .expect("u256 did not overflow during add");
+
+            // calculate anticipated penalty for setting gas limit too high
+            for tx in transactions {
+                let recovered = recover_signed_transaction(&tx).expect("tx valid");
+                let effective_gas_price =
+                    recovered.effective_gas_price(Some(batch.base_fee_per_gas));
+                let expected_penalty = U256::from(
+                    calculate_gas_penalty(recovered.gas_limit(), TOTAL_GAS_PER_TX) as u128
+                        * effective_gas_price,
+                );
+                debug!(target: "engine", ?expected_penalty, "adding expected penalty to basefees");
+                expected_base_fees = expected_base_fees
+                    .checked_add(expected_penalty)
+                    .expect("u256 did not overflow during add");
+            }
         }
 
         // calculate expected priority fees
         // encoded_tx_priority_fee_2 is last tx in the first batch
         if idx == 0 {
-            let priority_fees = calc_priority_fees(batch.base_fee_per_gas as u128);
+            let priority_fees = calc_priority_fees(batch.base_fee_per_gas);
             expected_priority_fees.insert(batch_producer_2, priority_fees);
         }
     }
@@ -990,13 +1046,8 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     let all_batch_digests: Vec<BlockHash> = batch_digests_1.into();
 
     //=== Execution
-    // setup rewards for first two rounds of consensus
     let rewards_counter = gas_accumulator.rewards_counter();
     rewards_counter.set_committee(committee.clone());
-
-    // inc leader counter - normally performed by `EpochManager`
-    rewards_counter.inc_leader_count(consensus_output_1.leader().origin());
-    rewards_counter.inc_leader_count(consensus_output_2.leader().origin());
 
     // retrieve rewards info for current epoch
     let EpochState { epoch_info, .. } = execution_node.epoch_state_from_canonical_tip().await?;
@@ -1015,7 +1066,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         parent,
         shutdown.subscribe(),
         task_manager.get_spawner(),
-        GasAccumulator::default(),
+        gas_accumulator.clone(),
     );
 
     // queue the first output - simulate already received from channel
@@ -1101,7 +1152,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         .alloc
         .get(&GOVERNANCE_SAFE_ADDRESS)
         .map(|acct| acct.balance)
-        .unwrap_or(U256::ZERO);
+        .unwrap_or(U256::MAX);
     let governance_safe = reth_env
         .retrieve_account(&GOVERNANCE_SAFE_ADDRESS)?
         .map(|acct| acct.balance)
@@ -1421,6 +1472,338 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     // assert last executed output is correct and finalized
     let last_output = execution_node.last_executed_output().await?;
     assert_eq!(last_output, consensus_output_1_hash);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_simple_basefee_penalty() -> eyre::Result<()> {
+    let tmp_dir = TempDir::new().expect("temp dir");
+    const TX_GAS_LIMIT: u64 = 15_000_000;
+    const PRIORITY_FEE: u64 = 10;
+
+    // create simple batch with different tx types
+    let genesis = test_genesis();
+    let mut tx_factory = TransactionFactory::new_random();
+    let encoded_eip1559_tx = tx_factory
+        .create_explicit_eip1559(
+            Some(genesis.config.chain_id),
+            None,
+            Some(PRIORITY_FEE as u128),    // priority at 10
+            Some(MAX_FEE_PER_GAS as u128), // max fee at 100 (100 > 17)
+            Some(TX_GAS_LIMIT),            // specify gas limit
+            Some(Address::random()),
+            None,
+            None,
+            None,
+        )
+        .encoded_2718();
+    let encoded_legacy_tx = tx_factory
+        .create_explicit_legacy_tx(
+            Some(genesis.config.chain_id),
+            None,
+            Some(MIN_PROTOCOL_BASE_FEE as u128), // gas price
+            Some(TX_GAS_LIMIT),                  // specify gas limit
+            Some(Address::random()),
+            None,
+            None,
+        )
+        .encoded_2718();
+
+    let mut batch = Batch {
+        transactions: vec![encoded_eip1559_tx, encoded_legacy_tx],
+        epoch: 0,
+        beneficiary: Address::ZERO, // updated later
+        base_fee_per_gas: MIN_PROTOCOL_BASE_FEE,
+        worker_id: 0,
+        received_at: None,
+    };
+
+    // okay to clone these because they are only used to seed genesis, decode transactions, and
+    // recover signers
+    let all_batches = vec![batch.clone()];
+
+    // use default genesis and seed accounts to execute batches
+    let (genesis, txs_by_block, signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, all_batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &tmp_dir.path().join("exc-node"),
+        Some(gas_accumulator.rewards_counter()),
+    )?;
+
+    // create committee from genesis state
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let authority_1 =
+        committee.authorities().first().expect("first in 4 auth committee for tests").id();
+    let leader_address_1 =
+        committee.authority(&authority_1).expect("authority in committee").execution_address();
+
+    // execute batches to update headers with valid data
+    let mut expected_base_fees = U256::ZERO;
+    let mut expected_priority_fees = U256::ZERO;
+    let batch_producer =
+        committee.authorities().get(2).expect("authority in committee").execution_address();
+
+    // execute batch
+    batch.beneficiary = batch_producer;
+    batch.base_fee_per_gas = MIN_PROTOCOL_BASE_FEE;
+
+    // actually execute the batch now
+    execute_test_batch(&mut batch);
+
+    // all txs in test batches are EOA->EOA native token transfers
+    // which costs 21_000 gas
+    let eip1559_effective_gas_price =
+        std::cmp::min(MAX_FEE_PER_GAS, batch.base_fee_per_gas.saturating_add(PRIORITY_FEE));
+    let eip1559_base_fees = U256::from(TOTAL_GAS_PER_TX * MIN_PROTOCOL_BASE_FEE);
+    let eip1559_priority_fees = U256::from(TOTAL_GAS_PER_TX * PRIORITY_FEE);
+    let legacy_tx_fees = U256::from(TOTAL_GAS_PER_TX * MIN_PROTOCOL_BASE_FEE);
+    // expected transaction fees
+    expected_base_fees = expected_base_fees
+        .checked_add(eip1559_base_fees)
+        .expect("u256 did not overflow during add eip1559");
+    expected_base_fees = expected_base_fees
+        .checked_add(legacy_tx_fees)
+        .expect("u256 did not overflow during add legacy");
+    expected_priority_fees = expected_priority_fees
+        .checked_add(eip1559_priority_fees)
+        .expect("u256 did not overflow during add priority fees");
+    // expected penalty fees
+    let gas_penalty = calculate_gas_penalty(TX_GAS_LIMIT, TOTAL_GAS_PER_TX);
+    let eip1559_penalty = U256::from(gas_penalty * eip1559_effective_gas_price);
+    debug!(target: "engine", ?eip1559_penalty, "eip1559 penalty");
+    assert!(eip1559_penalty > U256::ZERO);
+    let legacy_penalty = U256::from(gas_penalty * MIN_PROTOCOL_BASE_FEE);
+    debug!(target: "engine", ?legacy_penalty, "legacy penalty");
+    assert!(legacy_penalty > U256::ZERO);
+    expected_base_fees = expected_base_fees
+        .checked_add(eip1559_penalty)
+        .expect("u256 did not overflow during add eip1559 penalty");
+    expected_base_fees = expected_base_fees
+        .checked_add(legacy_penalty)
+        .expect("u256 did not overflow during add legacy penalty");
+
+    //=== Consensus
+
+    // create consensus output bc transactions in batches
+    // are randomly generated
+    //
+    // for each tx, seed address with funds in genesis
+    let timestamp = now();
+    let mut leader = Certificate::default();
+    // update cert
+    leader.update_created_at_for_test(timestamp);
+    leader.header_mut_for_test().author = authority_1;
+    let sub_dag_index = 1;
+    leader.header.round = sub_dag_index as u32;
+    let reputation_scores = ReputationScores::default();
+    let previous_sub_dag = None;
+    let batch_digest = batch.digest();
+    let batch_digests = VecDeque::from([batch_digest]);
+    let subdag = Arc::new(CommittedSubDag::new(
+        vec![leader.clone(), Certificate::default()],
+        leader,
+        sub_dag_index,
+        reputation_scores,
+        previous_sub_dag,
+    ));
+    let consensus_output = ConsensusOutput {
+        sub_dag: subdag.clone(),
+        batches: vec![CertifiedBatch { address: batch_producer, batches: vec![batch] }],
+        batch_digests: batch_digests.clone(),
+        ..Default::default()
+    };
+    let consensus_output_hash = consensus_output.consensus_header_hash();
+
+    //=== Execution
+    let rewards_counter = gas_accumulator.rewards_counter();
+    rewards_counter.set_committee(committee.clone());
+
+    // create engine
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
+    let max_round = None;
+    let parent = chain.sealed_genesis_header();
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let reth_env = execution_node.get_reth_env().await;
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        max_round,
+        from_consensus,
+        parent,
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator.clone(),
+    );
+
+    // assert the canonical chain in-memory is empty
+    let canonical_in_memory_state = reth_env.canonical_in_memory_state();
+    assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
+    let (blocks, gas, gas_limits) = gas_accumulator.get_values(0);
+    assert_eq!((blocks + gas + gas_limits), 0, "gas accumulator didn't start at 0");
+
+    // send second output
+    let broadcast_result = to_engine.send(consensus_output.clone()).await;
+    assert!(broadcast_result.is_ok());
+
+    // drop sending channel before receiver has a chance to process message
+    drop(to_engine);
+
+    // channels for engine shutting down
+    let (tx, rx) = oneshot::channel();
+
+    // spawn engine task
+    //
+    // one output already queued up, one output waiting in broadcast stream
+    task_manager.spawn_task("test task eng", async move {
+        let res = engine.await;
+        let _ = tx.send(res);
+    });
+
+    let engine_task = timeout(Duration::from_secs(5), rx).await??;
+    // consensus stream is closed
+    assert_matches!(engine_task, Err(TnEngineError::ConsensusOutputStreamClosed));
+
+    let last_block_num = reth_env.last_block_number()?;
+    let canonical_tip = reth_env.canonical_tip();
+    let final_block = reth_env.finalized_block_num_hash()?.expect("finalized block");
+    let expected_block_height = 1;
+    // assert canonical memory is cleaned up
+    assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
+    // assert 1 batch was executed
+    assert_eq!(last_block_num, expected_block_height);
+    // assert canonical tip and finalized block are equal
+    assert_eq!(canonical_tip.hash(), final_block.hash);
+    // assert last executed output is correct and finalized
+    let last_output = execution_node.last_executed_output().await?;
+    assert_eq!(last_output, consensus_output_hash);
+    // assert priority fees went to batch producer
+    let batch_producer_account = reth_env
+        .retrieve_account(&batch_producer)?
+        .expect("batch_producer account has priority fees");
+    assert_eq!(batch_producer_account.balance, U256::from(expected_priority_fees));
+
+    // assert block rewards for one round of consensus
+    let rewards = reth_env.get_validator_rewards(final_block.hash, leader_address_1)?;
+    // assert total epoch rewards distributed evenly for two beneficiaries with identical stake
+    assert_eq!(
+        rewards,
+        U256::ZERO, // epoch hasn't closed
+        "block rewards for leader 1 incorrect"
+    );
+    // assert all basefees sent to governance safe
+    let governance_safe_genesis_balance = chain
+        .genesis()
+        .alloc
+        .get(&GOVERNANCE_SAFE_ADDRESS)
+        .map(|acct| acct.balance)
+        .unwrap_or(U256::MAX);
+    let governance_safe = reth_env
+        .retrieve_account(&GOVERNANCE_SAFE_ADDRESS)?
+        .map(|acct| acct.balance)
+        .expect("governance safe has an account");
+    assert_eq!(
+        expected_base_fees,
+        governance_safe
+            .checked_sub(governance_safe_genesis_balance)
+            .expect("governance safe balance doesn't underflow"),
+        "Governance safe unexpected fees"
+    );
+
+    // pull newly executed blocks from database (skip genesis)
+    //
+    // Uses the provided `headers_range` to get the headers for the range, and `assemble_block`
+    // to construct blocks from the following inputs:
+    //     – Header
+    //     - Transactions
+    //     – Ommers
+    //     – Withdrawals
+    //     – Requests
+    //     – Senders
+    let executed_blocks = reth_env.block_with_senders_range(1..=expected_block_height)?;
+    assert_eq!(expected_block_height, executed_blocks.len() as u64);
+
+    // assert blocks are executed as expected
+    for (idx, txs) in txs_by_block.iter().enumerate() {
+        let block = &executed_blocks[idx];
+        let signers = &signers_by_block[idx];
+        assert_eq!(&block.senders(), signers);
+        assert_eq!(&block.body().transactions, txs);
+
+        // basefee was increased for each batch
+        // assert basefee is same as worker's block
+        assert_eq!(block.base_fee_per_gas, Some(MIN_PROTOCOL_BASE_FEE));
+
+        // assert consensus output written to BEACON_ROOTS contract (cancun - eip4788)
+        assert_eip4788(&reth_env, block.sealed_block(), consensus_output_hash)?;
+
+        // assert parent root is written to HISTORY_STORAGE_ADDRESS (pectra - eip2935)
+        assert_eip2935(&reth_env, block.sealed_block())?;
+
+        // beneficiary overwritten
+        assert_eq!(block.beneficiary, batch_producer);
+        // nonce matches subdag index and method all match
+        assert_eq!(<FixedBytes<8> as Into<u64>>::into(block.nonce), sub_dag_index);
+        assert_eq!(<FixedBytes<8> as Into<u64>>::into(block.nonce), consensus_output.nonce());
+
+        // timestamp
+        assert_eq!(block.timestamp, consensus_output.committed_at());
+        // parent beacon block root is output digest
+        assert_eq!(block.parent_beacon_block_root, Some(consensus_output_hash));
+
+        if idx == 0 {
+            // first block's parent is expected to be genesis
+            assert_eq!(block.parent_hash, chain.genesis_hash());
+            // expect header number 1 for batch bc of genesis
+            assert_eq!(block.number, 1);
+        } else {
+            // assert parents executed in order (sanity check)
+            let expected_parent = executed_blocks[idx - 1].header().hash_slow();
+            assert_eq!(block.parent_hash, expected_parent);
+            // expect block numbers NOT the same as batch's headers
+            assert_ne!(block.number, 1);
+        }
+
+        // mix hash is xor batch's hash and consensus output digest
+        let expected_mix_hash = consensus_output_hash ^ batch_digest;
+        assert_eq!(block.mix_hash, expected_mix_hash);
+        // bloom expected to be the same bc all proposed transactions should be good
+        // ie) no duplicates, etc.
+        assert_eq!(block.logs_bloom, Bloom::default());
+        // gas limit should come from batch
+        assert_eq!(block.gas_limit, max_batch_gas(0));
+        // difficulty should match the batch's index within consensus output
+        // and default worker id 0
+        assert_eq!(block.difficulty, U256::from(0 << 16));
+        // assert closing epoch randomness matches extra data field in last block
+        let expected_extra = if idx == 7 {
+            Bytes::from(consensus_output.keccak_leader_sigs().0)
+        } else {
+            Bytes::default()
+        };
+        assert_eq!(block.extra_data, expected_extra);
+        // assert batch digest match ommers hash
+        assert_eq!(block.ommers_hash, batch_digests[0]);
+        // assert requests hash empty
+        assert_eq!(block.requests_hash, Some(EMPTY_REQUESTS_HASH));
+        // assert batch's withdrawals match
+        //
+        // NOTE: this is currently always empty
+        let expected_withdrawals = if idx == 7 {
+            let withdrawals = gas_accumulator.rewards_counter().generate_withdrawals();
+            calculate_withdrawals_root(withdrawals.as_ref())
+        } else {
+            EMPTY_WITHDRAWALS
+        };
+        assert_eq!(block.withdrawals_root, Some(expected_withdrawals));
+    }
 
     Ok(())
 }

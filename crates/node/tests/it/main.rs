@@ -121,7 +121,6 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
             Some(output) = consensus_output.recv() => {
                 debug!(target: "gas-test", output=?output.leader(), round=output.leader().round(), "received output");
                 let leader = output.leader().origin().clone();
-                gas_accumulator.rewards_counter().inc_leader_count(&leader);
                 // manually track values as well
                 rewards.entry(leader).and_modify(|count| *count += 1).or_insert(1);
                 to_engine.send(output).await?;

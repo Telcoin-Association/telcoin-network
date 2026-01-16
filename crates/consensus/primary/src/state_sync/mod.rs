@@ -2,10 +2,8 @@
 
 use crate::{error::CertManagerResult, ConsensusBus};
 use cert_validator::CertificateValidator;
-use gc::AtomicRound;
 use header_validator::HeaderValidator;
 use tn_config::ConsensusConfig;
-use tn_storage::ConsensusStore;
 use tn_types::{
     error::HeaderResult, Certificate, CertificateDigest, Database, Header, Round, TaskManager,
     TaskSpawner,
@@ -44,23 +42,8 @@ where
         task_spawner: TaskSpawner,
     ) -> Self {
         let header_validator = HeaderValidator::new(config.clone(), consensus_bus.clone());
-        // load highest round number from the ConsensusBlock table
-        let highest_process_round = config
-            .node_storage()
-            .get_latest_sub_dag()
-            // it should be impossible to have a subdag that is greater than the current epoch
-            .filter(|subdag| subdag.leader_epoch() >= config.epoch())
-            .map(|subdag| subdag.leader_round())
-            .unwrap_or(0);
 
-        let certificate_validator = CertificateValidator::new(
-            config,
-            consensus_bus,
-            AtomicRound::new(0),
-            AtomicRound::new(highest_process_round),
-            AtomicRound::new(0),
-            task_spawner,
-        );
+        let certificate_validator = CertificateValidator::new(config, consensus_bus, task_spawner);
 
         Self { certificate_validator, header_validator }
     }
