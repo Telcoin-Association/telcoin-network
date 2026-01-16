@@ -746,7 +746,7 @@ where
                 need_join = true;
             },
             // wait for epoch boundary to transition
-            res = self.wait_for_epoch_boundary(to_engine, &gas_accumulator, &mut consensus_output) => {
+            res = self.wait_for_epoch_boundary(to_engine, &mut consensus_output) => {
                 // toggle bool to clear tables
                 clear_tables_for_next_epoch = true;
                 let target_hash = res.inspect_err(|e| {
@@ -815,12 +815,7 @@ where
                 }
             }
         } else {
-            self.send_leftover_consensus_output_to_engine(
-                &gas_accumulator,
-                &mut consensus_output,
-                to_engine,
-            )
-            .await;
+            self.send_leftover_consensus_output_to_engine(&mut consensus_output, to_engine).await;
             res = RunEpochMode::ModeChange;
         }
 
@@ -839,12 +834,10 @@ where
     // saved it should have been sent).
     async fn send_leftover_consensus_output_to_engine(
         &mut self,
-        gas_accumulator: &GasAccumulator,
         consensus_output: &mut impl TnReceiver<ConsensusOutput>,
         to_engine: &mpsc::Sender<ConsensusOutput>,
     ) {
         while let Ok(output) = consensus_output.try_recv() {
-            gas_accumulator.rewards_counter().inc_leader_count(output.leader().origin());
             // only forward the output to the engine
             let _ = to_engine.send(output).await;
         }
@@ -1161,7 +1154,6 @@ where
     async fn wait_for_epoch_boundary(
         &self,
         to_engine: &mpsc::Sender<ConsensusOutput>,
-        gas_accumulator: &GasAccumulator,
         consensus_output: &mut impl TnReceiver<ConsensusOutput>,
     ) -> eyre::Result<B256> {
         // receive output from consensus and forward to engine
@@ -1181,12 +1173,10 @@ where
                 // obtain hash to monitor execution progress
                 let target_hash = output.consensus_header_hash();
 
-                gas_accumulator.rewards_counter().inc_leader_count(output.leader().origin());
                 // forward the output to the engine
                 to_engine.send(output).await?;
                 return Ok(target_hash);
             } else {
-                gas_accumulator.rewards_counter().inc_leader_count(output.leader().origin());
                 // only forward the output to the engine
                 to_engine.send(output).await?;
             }

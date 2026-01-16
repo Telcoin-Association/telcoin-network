@@ -535,13 +535,8 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     let all_batch_digests: Vec<BlockHash> = batch_digests_1.into();
 
     //=== Execution
-    // setup rewards for first two rounds of consensus
     let rewards_counter = gas_accumulator.rewards_counter();
     rewards_counter.set_committee(committee.clone());
-
-    // inc leader counter - normally performed by `EpochManager`
-    rewards_counter.inc_leader_count(consensus_output_1.leader().origin());
-    rewards_counter.inc_leader_count(consensus_output_2.leader().origin());
 
     // retrieve rewards info for current epoch
     let EpochState { epoch_info, .. } = execution_node.epoch_state_from_canonical_tip().await?;
@@ -1051,13 +1046,8 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     let all_batch_digests: Vec<BlockHash> = batch_digests_1.into();
 
     //=== Execution
-    // setup rewards for first two rounds of consensus
     let rewards_counter = gas_accumulator.rewards_counter();
     rewards_counter.set_committee(committee.clone());
-
-    // inc leader counter - normally performed by `EpochManager`
-    rewards_counter.inc_leader_count(consensus_output_1.leader().origin());
-    rewards_counter.inc_leader_count(consensus_output_2.leader().origin());
 
     // retrieve rewards info for current epoch
     let EpochState { epoch_info, .. } = execution_node.epoch_state_from_canonical_tip().await?;
@@ -1076,7 +1066,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         parent,
         shutdown.subscribe(),
         task_manager.get_spawner(),
-        GasAccumulator::default(),
+        gas_accumulator.clone(),
     );
 
     // queue the first output - simulate already received from channel
@@ -1633,12 +1623,8 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
     let consensus_output_hash = consensus_output.consensus_header_hash();
 
     //=== Execution
-    // setup rewards for first two rounds of consensus
     let rewards_counter = gas_accumulator.rewards_counter();
     rewards_counter.set_committee(committee.clone());
-
-    // inc leader counter - normally performed by `EpochManager`
-    rewards_counter.inc_leader_count(consensus_output.leader().origin());
 
     // create engine
     let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);

@@ -19,6 +19,7 @@ pub fn execute_consensus_output(
 ) -> EngineResult<SealedHeader> {
     // rename canonical header for clarity
     let BuildArguments { reth_env, mut output, parent_header: mut canonical_header } = args;
+    gas_accumulator.rewards_counter().inc_leader_count(output.leader().origin());
     let epoch = output.leader().epoch();
     // output digest returns the `ConsensusHeader` digest
     let output_digest: B256 = output.digest().into();
