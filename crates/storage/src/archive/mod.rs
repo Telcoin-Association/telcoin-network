@@ -11,3 +11,4 @@ pub mod fxhasher;
 pub mod index;
 pub mod pack;
 pub mod pack_iter;
+pub mod position_index;

@@ -12,7 +12,7 @@ use crate::archive::{
 };
 use std::{
     fs::{self, File, OpenOptions},
-    hash::{BuildHasher, BuildHasherDefault, Hasher},
+    hash::{BuildHasher, BuildHasherDefault},
     io,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -25,7 +25,7 @@ const HEADER_SIZE: usize = 72;
 /// This file is not a log file and the header and buckets will change in place over time.
 /// This data in the file will be followed by a CRC32 checksum value to verify it.
 #[derive(Debug)]
-pub struct HdxHeader {
+struct HdxHeader {
     type_id: [u8; 8], // The characters "telcoinx"
     version: u16,     // Holds the version number
     uid: u64,         // Unique ID generated on creation
@@ -43,7 +43,7 @@ pub struct HdxHeader {
 impl HdxHeader {
     /// Return a default HdxHeader with any values from data_header overridden.
     /// This includes the version, uid, appnum, bucket_size and bucket_elements.
-    fn from_data_header<const KSIZE: usize>(
+    fn from_data_header<const KSIZE: usize, S: BuildHasher + Default>(
         data_header: &DataHeader,
         salt: u64,
         pepper: u64,
@@ -53,9 +53,9 @@ impl HdxHeader {
             version: data_header.version(),
             uid: data_header.uid(),
             appnum: data_header.appnum(),
-            bucket_elements: HdxIndex::<KSIZE>::BUCKET_ELEMENTS as u16,
-            bucket_size: HdxIndex::<KSIZE>::BUCKET_SIZE as u16,
-            buckets: HdxIndex::<KSIZE>::INITIAL_BUCKETS as u32,
+            bucket_elements: HdxIndex::<KSIZE, S>::BUCKET_ELEMENTS as u16,
+            bucket_size: HdxIndex::<KSIZE, S>::BUCKET_SIZE as u16,
+            buckets: HdxIndex::<KSIZE, S>::INITIAL_BUCKETS as u32,
             load_factor: (u16::MAX as f32 * 0.5) as u16,
             salt,
             pepper,
@@ -167,62 +167,62 @@ impl HdxHeader {
     }
 
     /// Return the size of the HDX header.
-    pub fn header_size(&self) -> usize {
+    fn header_size(&self) -> usize {
         HEADER_SIZE
     }
 
     /// Number of buckets in this index file.
-    pub fn buckets(&self) -> u32 {
+    fn buckets(&self) -> u32 {
         self.buckets
     }
 
     /// Number of elements in each bucket.
-    pub fn bucket_elements(&self) -> u16 {
+    fn bucket_elements(&self) -> u16 {
         self.bucket_elements
     }
 
     /// Size in bytes of a bucket.
-    pub fn bucket_size(&self) -> u16 {
+    fn bucket_size(&self) -> u16 {
         self.bucket_size
     }
 
     /// Load factor converted to a f32.
-    pub fn load_factor(&self) -> f32 {
+    fn load_factor(&self) -> f32 {
         self.load_factor as f32 / u16::MAX as f32
     }
 
     /// Number of elements stored in this DB.
-    pub fn values(&self) -> u64 {
+    fn values(&self) -> u64 {
         self.values
     }
 
     /// File version number.
-    pub fn version(&self) -> u16 {
+    fn version(&self) -> u16 {
         self.version
     }
 
     /// Unique ID generated on creation
-    pub fn uid(&self) -> u64 {
+    fn uid(&self) -> u64 {
         self.uid
     }
 
     /// Application defined constant
-    pub fn appnum(&self) -> u64 {
+    fn appnum(&self) -> u64 {
         self.appnum
     }
 
     /// Return the index salt.
-    pub fn salt(&self) -> u64 {
+    fn salt(&self) -> u64 {
         self.salt
     }
 
     /// Return the index pepper.
-    pub fn pepper(&self) -> u64 {
+    fn pepper(&self) -> u64 {
         self.pepper
     }
 
     /// How long this index thinks the data file is.
-    pub fn data_file_length(&self) -> u64 {
+    fn _data_file_length(&self) -> u64 {
         self.data_file_length
     }
 }
@@ -231,7 +231,7 @@ impl HdxHeader {
 /// This file is not a log file and the header and buckets will change in place over time.
 /// This data in the file will be followed by a CRC32 checksum value to verify it.
 #[derive(Debug)]
-pub struct HdxIndex<const KSIZE: usize = 32> {
+pub struct HdxIndex<const KSIZE: usize = 32, S = BuildHasherDefault<FxHasher>> {
     header: HdxHeader,
     modulus: u32,
     bucket_cache: FxHashMap<u64, Vec<u8>>,
@@ -240,10 +240,11 @@ pub struct HdxIndex<const KSIZE: usize = 32> {
     // Note, if odx_file is ever replaced in HdxIndex then see bucket_iter for undefined behaviour.
     pub(crate) odx_file: File,
     capacity: u64,
+    hasher_builder: S,
     _index_dir: PathBuf,
 }
 
-impl<const KSIZE: usize> HdxIndex<KSIZE> {
+impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     /// Each bucket element is a (KSIZE bytes, u64)- (digest, record_pos).
     pub const BUCKET_ELEMENT_SIZE: usize = KSIZE + 8;
     /// Number of buckets to allocate in a fresh index.
@@ -254,11 +255,14 @@ impl<const KSIZE: usize> HdxIndex<KSIZE> {
     pub const BUCKET_SIZE: usize = 16 + (Self::BUCKET_ELEMENT_SIZE * Self::BUCKET_ELEMENTS);
 
     /// Open an HDX index file and return the open file and the header.
-    pub fn open_hdx_file<P: AsRef<Path>, S: BuildHasher + Default>(
+    /// Note you MUST supply a stable hasher or the index will not work-
+    /// for instance fxhasher.  The default Rust hasher is NOT stable (i.e.
+    /// it can produce different hashes for the same input on different instances)
+    pub fn open_hdx_file<P: AsRef<Path>>(
         dir: P,
         data_header: &DataHeader,
-        hasher: &S,
-    ) -> Result<HdxIndex<KSIZE>, LoadHeaderError> {
+        hasher_builder: S,
+    ) -> Result<HdxIndex<KSIZE, S>, LoadHeaderError> {
         let dir = dir.as_ref();
         let _ = fs::create_dir(dir);
         let mut hdx_file = OpenOptions::new()
@@ -270,11 +274,9 @@ impl<const KSIZE: usize> HdxIndex<KSIZE> {
         let file_end = hdx_file.seek(SeekFrom::End(0))?;
 
         let header = if file_end == 0 {
-            let mut fx_hasher = FxHasher::default();
-            fx_hasher.write_u64(data_header.uid());
-            let salt = fx_hasher.finish();
-            let pepper = hasher.hash_one(salt);
-            let mut header = HdxHeader::from_data_header::<KSIZE>(data_header, salt, pepper);
+            let salt = hasher_builder.hash_one(data_header.uid());
+            let pepper = hasher_builder.hash_one(salt);
+            let mut header = HdxHeader::from_data_header::<KSIZE, S>(data_header, salt, pepper);
             header.write_header(&mut hdx_file)?;
             let bucket_size = header.bucket_size() as usize;
             let mut buffer = vec![0_u8; bucket_size];
@@ -298,7 +300,7 @@ impl<const KSIZE: usize> HdxIndex<KSIZE> {
             // Check the salt/pepper.  This will make sure you are using the same hasher and it
             // seems to be stable (not the default Rust hasher for instance) since
             // changing the hasher would invalidate the index.
-            if header.pepper() != hasher.hash_one(header.salt()) {
+            if header.pepper() != hasher_builder.hash_one(header.salt()) {
                 return Err(LoadHeaderError::InvalidHasher);
             }
             header
@@ -321,38 +323,69 @@ impl<const KSIZE: usize> HdxIndex<KSIZE> {
             hdx_file,
             odx_file,
             capacity,
+            hasher_builder,
             _index_dir: dir.to_owned(),
         })
     }
 
+    /// Number of keys hashed in this index.
+    pub fn len(&self) -> usize {
+        self.header.values() as usize
+    }
+
+    /// True if there are no keys stored in this index.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Set the data_file_length field.
+    /// This can be useful for tracking information about another file but
+    /// does not effect the index.
     pub fn set_data_file_length(&mut self, data_file_length: u64) {
         self.header.data_file_length = data_file_length;
     }
 
+    /// Reload the header from disk.
+    pub fn reload_header(&mut self) {
+        if let Ok(header) = HdxHeader::load_header(&mut self.hdx_file) {
+            self.header = header;
+            self.modulus = (self.header.buckets() + 1).next_power_of_two();
+            self.bucket_cache.clear();
+            self.bucket_cache.shrink_to_fit();
+            self.dirty_bucket_cache.clear();
+            self.dirty_bucket_cache.shrink_to_fit();
+        }
+    }
+
+    /// Add buckets to expand capacity.
+    /// Capacity is number of elements per bucket * number of buckets.
+    /// If current length >= capacity * load factor then split buckets until this is not true.
+    pub fn expand_buckets(&mut self) -> Result<(), AppendError> {
+        while self.header.values >= (self.capacity as f32 * self.header.load_factor()) as u64 {
+            self.split_one_bucket()?;
+            self.capacity = self.buckets() as u64 * self.header.bucket_elements() as u64;
+        }
+        Ok(())
+    }
+
     /// Write the indexes header tyo disk.
-    pub fn write_header(&mut self) -> Result<(), io::Error> {
+    fn write_header(&mut self) -> Result<(), io::Error> {
         self.header.write_header(&mut self.hdx_file)
     }
 
     /// Increment the buckets count by 1.
-    pub fn inc_buckets(&mut self) {
+    fn inc_buckets(&mut self) {
         self.header.buckets += 1;
     }
 
     /// Number of buckets in the index.
-    pub fn buckets(&self) -> u32 {
+    fn buckets(&self) -> u32 {
         self.header.buckets()
     }
 
     /// Increment the values by 1.
-    pub fn inc_values(&mut self) {
+    fn inc_values(&mut self) {
         self.header.values += 1;
-    }
-
-    /// Number of elements stored in this DB.
-    pub fn values(&self) -> u64 {
-        self.header.values()
     }
 
     /// Remove a value from a cache, try the dirty buckets then the read cached buckets.
@@ -389,13 +422,8 @@ impl<const KSIZE: usize> HdxIndex<KSIZE> {
         }
     }
 
-    /// Return the index header.
-    pub fn header(&self) -> &HdxHeader {
-        &self.header
-    }
-
     /// Flush (save) the hash bucket cache to disk.
-    pub(crate) fn save_bucket_cache(&mut self) -> Result<(), io::Error> {
+    fn save_bucket_cache(&mut self) -> Result<(), io::Error> {
         let bucket_size = self.header.bucket_size as usize;
         let header_size = self.header.header_size();
         // Simple cache clear.
@@ -417,13 +445,11 @@ impl<const KSIZE: usize> HdxIndex<KSIZE> {
     }
 
     /// Return the bucket that will contain hash (if hash is available).
-    pub fn hash_to_bucket(&self, key: &[u8]) -> u64 {
+    fn hash_to_bucket(&self, key: &[u8]) -> u64 {
         if key.len() != KSIZE {
             panic!("key wrong size, expected {KSIZE}, got {}", key.len())
         }
-        let mut hash_buf = [0_u8; 8];
-        hash_buf.copy_from_slice(&key[0..8]);
-        let hash = u64::from_le_bytes(hash_buf);
+        let hash = self.hasher_builder.hash_one(key);
         let modulus = self.modulus as u64;
         let bucket = hash % modulus;
         if bucket >= self.buckets() as u64 {
@@ -431,37 +457,6 @@ impl<const KSIZE: usize> HdxIndex<KSIZE> {
         } else {
             bucket
         }
-    }
-
-    /// Reload the header from disk.
-    pub fn reload_header(&mut self) {
-        if let Ok(header) = HdxHeader::load_header(&mut self.hdx_file) {
-            self.header = header;
-            self.modulus = (self.header.buckets() + 1).next_power_of_two();
-            self.bucket_cache.clear();
-            self.bucket_cache.shrink_to_fit();
-            self.dirty_bucket_cache.clear();
-            self.dirty_bucket_cache.shrink_to_fit();
-        }
-    }
-
-    /// Flush and sync all the index data to disk.
-    pub fn sync(&mut self) -> Result<(), CommitError> {
-        self.save_bucket_cache().map_err(CommitError::IndexFileSync)?;
-        self.odx_file.sync_all().map_err(CommitError::IndexFileSync)?;
-        self.hdx_file.sync_all().map_err(CommitError::IndexFileSync)?;
-        Ok(())
-    }
-
-    /// Add buckets to expand capacity.
-    /// Capacity is number of elements per bucket * number of buckets.
-    /// If current length >= capacity * load factor then split buckets until this is not true.
-    pub fn expand_buckets(&mut self) -> Result<(), AppendError> {
-        while self.header.values >= (self.capacity as f32 * self.header.load_factor()) as u64 {
-            self.split_one_bucket()?;
-            self.capacity = self.buckets() as u64 * self.header.bucket_elements() as u64;
-        }
-        Ok(())
     }
 
     /// Add one new bucket to the hash index.
@@ -487,8 +482,7 @@ impl<const KSIZE: usize> HdxIndex<KSIZE> {
             _t_buf = Some(buffer);
             BucketIter::new(_t_buf.as_ref().expect("not None"))
         } else {
-            _t_buf = Some(vec![]);
-            BucketIter::new_with_empty_buffer(_t_buf.as_ref().expect("not None"))
+            BucketIter::new_empty()
         };
         while let Some((rec_hash, rec_pos)) = self.next_bucket_element(&mut iter) {
             if rec_pos > 0 {
@@ -519,7 +513,7 @@ impl<const KSIZE: usize> HdxIndex<KSIZE> {
     }
 
     /// Save the (hash, position) tuple to the bucket.  Handles overflow records.
-    pub fn save_to_bucket(&mut self, key: &[u8], record_pos: u64) -> Result<(), AppendError> {
+    fn save_to_bucket(&mut self, key: &[u8], record_pos: u64) -> Result<(), AppendError> {
         let bucket = self.hash_to_bucket(key);
         let mut buffer = self.remove_bucket(bucket)?;
 
@@ -530,18 +524,17 @@ impl<const KSIZE: usize> HdxIndex<KSIZE> {
     }
 
     /// Fetch the value stored at key.  Will return an error if not found.
-    pub fn fetch_position(&mut self, key: &[u8]) -> Result<u64, FetchError> {
+    fn fetch_position(&mut self, key: &[u8]) -> Result<u64, FetchError> {
         let bucket = self.hash_to_bucket(key);
 
         let mut result = None;
         let mut t_buf = None;
-        let mut _t_buf_empty = vec![];
         let t_buf_dirty = self.dirty_bucket_cache.contains_key(&bucket);
         let mut iter = if let Ok(buffer) = self.remove_bucket(bucket) {
             t_buf = Some(buffer);
             BucketIter::new(t_buf.as_ref().expect("not None"))
         } else {
-            BucketIter::new_with_empty_buffer(&_t_buf_empty)
+            BucketIter::new_empty()
         };
         while let Some((rec_hash, rec_pos)) = self.next_bucket_element(&mut iter) {
             if key == rec_hash {
@@ -654,13 +647,22 @@ impl<const KSIZE: usize> HdxIndex<KSIZE> {
     }
 }
 
-impl Index<&[u8]> for HdxIndex {
+impl<const KSIZE: usize, S: BuildHasher + Default> Index<&[u8]> for HdxIndex<KSIZE, S> {
     fn save(&mut self, key: &[u8], record_pos: u64) -> Result<(), AppendError> {
         self.save_to_bucket(key, record_pos)
     }
 
     fn load(&mut self, key: &[u8]) -> Result<u64, FetchError> {
         self.fetch_position(key)
+    }
+
+    /// Flush and sync all the index data to disk.
+    fn sync(&mut self) -> Result<(), CommitError> {
+        self.write_header().map_err(CommitError::IndexFileSync)?;
+        self.save_bucket_cache().map_err(CommitError::IndexFileSync)?;
+        self.odx_file.sync_all().map_err(CommitError::IndexFileSync)?;
+        self.hdx_file.sync_all().map_err(CommitError::IndexFileSync)?;
+        Ok(())
     }
 }
 
@@ -677,7 +679,7 @@ mod tests {
         let data_header = DataHeader::new();
         let builder = BuildHasherDefault::<FxHasher>::default();
         let mut idx: HdxIndex =
-            HdxIndex::open_hdx_file(tmp_path.path().join("index.hdx"), &data_header, &builder)
+            HdxIndex::open_hdx_file(tmp_path.path().join("index.hdx"), &data_header, builder)
                 .expect("hdx file");
         for i in 0..1_000_000 {
             let mut hasher = DefaultHashFunction::new();
