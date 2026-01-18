@@ -13,7 +13,7 @@ pub enum AppendError {
     WriteDataError(io::Error),
     /// Attempted to insert a duplicate key to an index.
     DuplicateKey,
-    /// CRC problem, XXXX- for hash index...
+    /// CRC problem, some index types might need this.
     CrcError,
 }
 

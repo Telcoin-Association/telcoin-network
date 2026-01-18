@@ -26,6 +26,7 @@ pub struct DataFile {
     seek_pos: u64,
     read_buffer_size: u32,
     write_buffer_size: u32,
+    remove_on_drop: bool,
 }
 
 impl DataFile {
@@ -39,10 +40,9 @@ impl DataFile {
             let _ = File::create_new(path);
         }
         let mut data_file = OpenOptions::new().read(true).append(!ro).open(path)?;
-        data_file.seek(SeekFrom::End(0))?;
-        let data_file_end = data_file.stream_position()?;
+        let data_file_end = data_file.seek(SeekFrom::End(0))?;
         let write_buffer = if ro {
-            // If opening read only wont need capacity.
+            // If opening read only won't need capacity.
             Vec::new()
         } else {
             Vec::with_capacity(WRITE_BUFFER_SIZE)
@@ -71,6 +71,7 @@ impl DataFile {
             seek_pos: 0,
             read_buffer_size: READ_BUFFER_SIZE as u32,
             write_buffer_size: WRITE_BUFFER_SIZE as u32,
+            remove_on_drop: false,
         })
     }
 
@@ -118,9 +119,8 @@ impl DataFile {
     }
 
     /// Delete the file.
-    pub fn delete(self) {
-        drop(self.data_file);
-        let _ = fs::remove_file(&self.data_file_path);
+    pub fn delete(mut self) {
+        self.remove_on_drop = true;
     }
 
     /// Rename the underlying file.
@@ -139,7 +139,7 @@ impl DataFile {
         res.map_err(RenameError::RenameIO)
     }
 
-    /// Copy bytes form the read buffer into buf.  This expects seek_pos to be within the
+    /// Copy bytes from the read buffer into buf.  This expects seek_pos to be within the
     /// read_buffer (will panic if called incorrectly).
     fn copy_read_buffer(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let mut size = buf.len();
@@ -265,5 +265,15 @@ impl Write for DataFile {
         self.data_file_end += self.write_buffer.len() as u64;
         self.write_buffer.clear();
         Ok(())
+    }
+}
+
+impl Drop for DataFile {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ = fs::remove_file(&self.data_file_path);
+        } else {
+            let _ = self.flush();
+        }
     }
 }

@@ -254,7 +254,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     /// How large (in bytes) is each bucket.
     pub const BUCKET_SIZE: usize = 16 + (Self::BUCKET_ELEMENT_SIZE * Self::BUCKET_ELEMENTS);
 
-    /// Open an HDX index file and return the open file and the header.
+    /// Open a HDX index file and return the open file and the header.
     /// Note you MUST supply a stable hasher or the index will not work-
     /// for instance fxhasher.  The default Rust hasher is NOT stable (i.e.
     /// it can produce different hashes for the same input on different instances)

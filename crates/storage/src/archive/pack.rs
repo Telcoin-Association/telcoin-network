@@ -248,7 +248,6 @@ where
     /// Note this is only a flush not a commit, it does not do a sync on the files.
     fn flush(&mut self) -> Result<(), FlushError> {
         self.data_file.flush().map_err(FlushError::WriteData)?;
-        //XXXXlet file_end = self.data_file.data_file_end();
         Ok(())
     }
 
