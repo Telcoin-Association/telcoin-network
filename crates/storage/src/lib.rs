@@ -16,6 +16,7 @@ use tables::{
     LastProposed, NodeBatchesCache, Payload, Votes,
 };
 // Always build redb, we use it as the default for persistant consensus data.
+pub mod archive;
 pub mod composite_db;
 pub mod layered_db;
 #[cfg(feature = "reth-libmdbx")]

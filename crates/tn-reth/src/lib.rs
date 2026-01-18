@@ -450,7 +450,7 @@ pub struct RethEnv {
 
 impl std::fmt::Debug for RethEnv {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "RethEnv, config: {:?}", self.node_config)
+        write!(f, "RethEnv, evm_config: {:?}, node_config: {:?}", self.evm_config, self.node_config)
     }
 }
 
