@@ -7,6 +7,7 @@ use libp2p::{
     swarm::DialError,
     TransportError,
 };
+use libp2p_stream::AlreadyRegistered;
 use std::io;
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -113,6 +114,9 @@ pub enum NetworkError {
     /// Failed to read from stream.
     #[error("Failed to read from stream: {0}")]
     StreamRead(String),
+    /// The stream protocol is already registered with the behavior's `control`.
+    #[error("Stream protocol already registered.")]
+    AlreadyRegistered,
 }
 
 impl From<oneshot::error::RecvError> for NetworkError {
@@ -142,5 +146,11 @@ impl<T> From<mpsc::error::TrySendError<T>> for NetworkError {
 impl From<&DialError> for NetworkError {
     fn from(e: &DialError) -> Self {
         Self::Dial(e.to_string())
+    }
+}
+
+impl From<AlreadyRegistered> for NetworkError {
+    fn from(_: AlreadyRegistered) -> Self {
+        Self::AlreadyRegistered
     }
 }

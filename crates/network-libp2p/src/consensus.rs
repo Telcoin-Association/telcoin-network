@@ -320,7 +320,7 @@ where
         let pending_px_disconnects = HashMap::with_capacity(config.max_px_disconnects);
         let node_record = Self::create_node_record(external_addr, &key_config, network_pubkey);
 
-        // Initialize stream control and channels
+        // initialize stream control and channels
         let stream_control = swarm.behaviour().stream.new_control();
         let (incoming_streams_tx, incoming_streams_rx) = tokio::sync::mpsc::channel(32);
         let stream_config = network_config.stream_config().clone();
@@ -437,19 +437,18 @@ where
         self.swarm.behaviour_mut().kademlia.set_mode(Some(Mode::Server));
         self.provide_our_data();
 
-        // Spawn incoming stream acceptor task
-        let mut incoming_streams =
-            self.stream_control.accept(TN_STREAM_PROTOCOL).expect("stream protocol not registered");
-        let incoming_tx = self.incoming_streams_tx.clone();
-        self.task_spawner.spawn_task("stream-acceptor", async move {
-            while let Some((peer_id, stream)) = incoming_streams.next().await {
-                if incoming_tx.send((peer_id, stream)).await.is_err() {
-                    break;
-                }
-            }
-        });
+        // spawn incoming stream acceptor task
+        let mut incoming_streams = self.stream_control.accept(TN_STREAM_PROTOCOL)?;
+        // let incoming_tx = self.incoming_streams_tx.clone();
+        // self.task_spawner.spawn_task("stream-acceptor", async move {
+        //     while let Some((peer_id, stream)) = incoming_streams.next().await {
+        //         if incoming_tx.send((peer_id, stream)).await.is_err() {
+        //             break;
+        //         }
+        //     }
+        // });
 
-        // Periodic interval for cleaning up stale stream requests
+        // periodic interval for cleaning up stale stream requests
         let mut stale_check = tokio::time::interval(self.stream_config.stale_request_interval);
 
         loop {
@@ -466,16 +465,16 @@ where
                         return Ok(())
                     }
                 },
-                // Handle incoming streams from peers
-                Some((peer_id, stream)) = self.incoming_streams_rx.recv() => {
+                // TODO: return error and handle `None`
+                Some((peer_id, stream)) = incoming_streams.next() => {
                     self.handle_incoming_stream(peer_id, stream);
                 }
-                // Periodic stale request cleanup (placeholder for future use)
-                _ = stale_check.tick() => {
-                    // For one-request-per-stream design, cleanup is handled by
-                    // individual task timeouts. This is a placeholder for any
-                    // additional cleanup logic if needed.
-                }
+                // // Periodic stale request cleanup (placeholder for future use)
+                // _ = stale_check.tick() => {
+                //     // For one-request-per-stream design, cleanup is handled by
+                //     // individual task timeouts. This is a placeholder for any
+                //     // additional cleanup logic if needed.
+                // }
             }
         }
     }
