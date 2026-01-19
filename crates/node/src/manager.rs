@@ -1717,7 +1717,7 @@ where
     /// Helper method to restore execution state for the consensus components.
     async fn try_restore_state(&self, engine: &ExecutionNode) -> eyre::Result<()> {
         // prime the recent_blocks watch with latest executed blocks
-        let block_capacity = self.consensus_bus.recent_blocks().borrow().block_capacity();
+        let block_capacity = self.consensus_bus.recent_blocks_capacity();
 
         for recent_block in engine.last_executed_output_blocks(block_capacity).await? {
             self.consensus_bus

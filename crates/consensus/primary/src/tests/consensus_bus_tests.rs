@@ -85,3 +85,16 @@ fn test_primary_round_after_update() {
     bus.primary_round_updates().send(100).unwrap();
     assert_eq!(bus.primary_round(), 100);
 }
+
+#[test]
+fn test_recent_blocks_capacity() {
+    let bus = ConsensusBus::new();
+    // Default gc_depth is used for capacity
+    assert!(bus.recent_blocks_capacity() > 0);
+}
+
+#[test]
+fn test_recent_blocks_capacity_custom() {
+    let bus = ConsensusBus::new_with_args(100);
+    assert_eq!(bus.recent_blocks_capacity(), 100);
+}

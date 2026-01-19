@@ -512,6 +512,11 @@ impl ConsensusBus {
         self.inner_app.tx_recent_blocks.borrow().latest_block_num_hash()
     }
 
+    /// Returns the maximum number of recent blocks that can be held.
+    pub fn recent_blocks_capacity(&self) -> u64 {
+        self.inner_app.tx_recent_blocks.borrow().block_capacity()
+    }
+
     /// Track the latest consensus header we have seen.
     /// Note, this should be a valid header (authenticated by it's epoch's committee).
     pub fn last_consensus_header(&self) -> &watch::Sender<Option<ConsensusHeader>> {
