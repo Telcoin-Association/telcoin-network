@@ -502,6 +502,11 @@ impl ConsensusBus {
         &self.inner_app.tx_recent_blocks
     }
 
+    /// Returns the latest executed block's number and hash.
+    pub fn latest_block_num_hash(&self) -> BlockNumHash {
+        self.inner_app.tx_recent_blocks.borrow().latest_block_num_hash()
+    }
+
     /// Track the latest consensus header we have seen.
     /// Note, this should be a valid header (authenticated by it's epoch's committee).
     pub fn last_consensus_header(&self) -> &watch::Sender<Option<ConsensusHeader>> {
@@ -612,10 +617,10 @@ impl ConsensusBus {
         while self.recent_blocks().borrow().is_empty() {
             watch_execution_result.changed().await?;
         }
-        let mut current_number = self.recent_blocks().borrow().latest_block_num_hash().number;
+        let mut current_number = self.latest_block_num_hash().number;
         while current_number < target_number {
             watch_execution_result.changed().await?;
-            current_number = self.recent_blocks().borrow().latest_block_num_hash().number;
+            current_number = self.latest_block_num_hash().number;
         }
         if self.recent_blocks().borrow().contains_hash(block.hash) {
             // Once we see our hash, should happen when current_number == target_number- trust

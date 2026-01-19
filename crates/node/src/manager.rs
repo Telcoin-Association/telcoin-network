@@ -905,7 +905,7 @@ where
             .clone()
             .ok_or_eyre("no consensus header after an epoch!")?
             .digest();
-        let parent_state = self.consensus_bus.recent_blocks().borrow().latest_block_num_hash();
+        let parent_state = self.consensus_bus.latest_block_num_hash();
 
         let epoch_rec = EpochRecord {
             epoch,
