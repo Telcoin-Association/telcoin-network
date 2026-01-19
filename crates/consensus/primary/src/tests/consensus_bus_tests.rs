@@ -35,3 +35,19 @@ async fn test_is_active_cvv_after_change() {
     bus.node_mode().send(NodeMode::CvvActive).unwrap();
     assert!(bus.is_active_cvv());
 }
+
+#[tokio::test]
+async fn test_is_cvv_inactive() {
+    let bus = ConsensusBus::new();
+    // Default is CvvActive, not inactive
+    assert!(!bus.is_cvv_inactive());
+
+    bus.node_mode().send(NodeMode::CvvInactive).unwrap();
+    assert!(bus.is_cvv_inactive());
+
+    bus.node_mode().send(NodeMode::CvvActive).unwrap();
+    assert!(!bus.is_cvv_inactive());
+
+    bus.node_mode().send(NodeMode::Observer).unwrap();
+    assert!(!bus.is_cvv_inactive());
+}

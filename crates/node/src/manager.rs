@@ -1738,7 +1738,7 @@ where
         &self,
         consensus_config: &ConsensusConfig<DB>,
     ) -> eyre::Result<NodeMode> {
-        if matches!(*self.consensus_bus.node_mode().borrow(), NodeMode::CvvInactive) {
+        if self.consensus_bus.is_cvv_inactive() {
             // If we have an inactive mode then it was set so keep it for now.
             return Ok(NodeMode::CvvInactive);
         }

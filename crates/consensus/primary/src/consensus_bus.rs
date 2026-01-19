@@ -132,6 +132,11 @@ impl NodeMode {
         matches!(self, NodeMode::CvvActive | NodeMode::CvvInactive)
     }
 
+    /// True if this node is an inactive CVV (catching up to rejoin the committee).
+    pub fn is_cvv_inactive(&self) -> bool {
+        matches!(self, NodeMode::CvvInactive)
+    }
+
     /// True if this node is only an obsever and will never participate in an committee.
     pub fn is_observer(&self) -> bool {
         matches!(self, NodeMode::Observer)
@@ -536,6 +541,14 @@ impl ConsensusBus {
     /// and checks if the node is actively participating in consensus.
     pub fn is_active_cvv(&self) -> bool {
         self.inner_app.tx_sync_status.borrow().is_active_cvv()
+    }
+
+    /// Returns true if this node is an inactive CVV.
+    ///
+    /// An inactive CVV is a staked node that is catching up to rejoin
+    /// the committee after a failure during the epoch.
+    pub fn is_cvv_inactive(&self) -> bool {
+        self.inner_app.tx_sync_status.borrow().is_cvv_inactive()
     }
 
     /// Return the channel for primary network events.
