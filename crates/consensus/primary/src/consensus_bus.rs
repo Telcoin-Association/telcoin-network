@@ -463,6 +463,11 @@ impl ConsensusBus {
         &self.inner_app.tx_primary_round_updates
     }
 
+    /// Returns the current primary round value.
+    pub fn primary_round(&self) -> Round {
+        *self.inner_app.tx_primary_round_updates.borrow()
+    }
+
     /// Batches' digests from our workers.
     /// Can only be subscribed to once.
     pub fn our_digests(&self) -> &impl TnSender<OurDigestMessage> {

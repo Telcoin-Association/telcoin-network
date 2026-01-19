@@ -72,3 +72,16 @@ fn test_latest_block_num_hash_default() {
     // Default is empty, so number should be 0
     assert_eq!(num_hash.number, 0);
 }
+
+#[test]
+fn test_primary_round_default() {
+    let bus = ConsensusBus::new();
+    assert_eq!(bus.primary_round(), 0);
+}
+
+#[test]
+fn test_primary_round_after_update() {
+    let bus = ConsensusBus::new();
+    bus.primary_round_updates().send(100).unwrap();
+    assert_eq!(bus.primary_round(), 100);
+}

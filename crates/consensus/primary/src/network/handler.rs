@@ -643,7 +643,7 @@ where
         let mut unknown_certs = self.state_sync.identify_unkown_parents(header).await?;
 
         // ensure header is not too old
-        let limit = self.consensus_bus.primary_round_updates().borrow().saturating_sub(
+        let limit = self.consensus_bus.primary_round().saturating_sub(
             self.consensus_config.network_config().sync_config().max_proposed_header_age_limit,
         );
         ensure!(
