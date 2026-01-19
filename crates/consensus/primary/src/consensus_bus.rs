@@ -448,6 +448,11 @@ impl ConsensusBus {
         &self.inner_app.tx_committed_round_updates
     }
 
+    /// Returns the current committed round value.
+    pub fn committed_round(&self) -> Round {
+        *self.inner_app.tx_committed_round_updates.borrow()
+    }
+
     /// Contains the last requested epoch to retrieve a record.
     pub fn requested_missing_epoch(&self) -> &watch::Sender<Epoch> {
         &self.inner_app.tx_requested_missing_epoch

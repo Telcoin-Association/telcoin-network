@@ -64,7 +64,7 @@ where
 
     fn gc_round(&self) -> Round {
         gc_round(
-            *self.consensus_bus.committed_round_updates().borrow(),
+            self.consensus_bus.committed_round(),
             self.config.config().parameters.gc_depth,
         )
     }

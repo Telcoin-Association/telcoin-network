@@ -88,7 +88,7 @@ where
 
     fn gc_round(&self) -> Round {
         gc_round(
-            *self.consensus_bus.committed_round_updates().borrow(),
+            self.consensus_bus.committed_round(),
             self.config.config().parameters.gc_depth,
         )
     }
@@ -205,7 +205,7 @@ where
         // return error if certificate round is too far ahead
         //
         // trigger certificate fetching
-        let highest_processed_round = *self.consensus_bus.committed_round_updates().borrow();
+        let highest_processed_round = self.consensus_bus.committed_round();
         for cert in &certificates {
             // Initiate asynchronous batch downloads for any payloads referenced in this certificate
             // that are not yet available locally. This step is critical for maintaining data

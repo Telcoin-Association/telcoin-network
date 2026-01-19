@@ -51,3 +51,16 @@ async fn test_is_cvv_inactive() {
     bus.node_mode().send(NodeMode::Observer).unwrap();
     assert!(!bus.is_cvv_inactive());
 }
+
+#[test]
+fn test_committed_round_default() {
+    let bus = ConsensusBus::new();
+    assert_eq!(bus.committed_round(), 0);
+}
+
+#[test]
+fn test_committed_round_after_update() {
+    let bus = ConsensusBus::new();
+    bus.committed_round_updates().send(42).unwrap();
+    assert_eq!(bus.committed_round(), 42);
+}
