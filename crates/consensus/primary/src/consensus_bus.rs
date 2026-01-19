@@ -522,6 +522,14 @@ impl ConsensusBus {
         &self.inner_app.tx_sync_status
     }
 
+    /// Returns true if this node is a CVV (active or inactive).
+    ///
+    /// A CVV is a staked node that can participate in a committee,
+    /// regardless of whether it's currently active or catching up.
+    pub fn is_cvv(&self) -> bool {
+        self.inner_app.tx_sync_status.borrow().is_cvv()
+    }
+
     /// Return the channel for primary network events.
     pub fn primary_network_events(
         &self,

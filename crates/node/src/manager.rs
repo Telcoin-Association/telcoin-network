@@ -1534,7 +1534,7 @@ where
             .await?;
 
         let mut peers = network_handle.connected_peers_count().await.unwrap_or(0);
-        if peers == 0 || self.consensus_bus.node_mode().borrow().is_cvv() {
+        if peers == 0 || self.consensus_bus.is_cvv() {
             // always dial peers for the new epoch
             // do this if a CVV (may need to connect to the other CVVs) or if we don't have any
             // peers if we are not a committee member and have peers then do not pester
