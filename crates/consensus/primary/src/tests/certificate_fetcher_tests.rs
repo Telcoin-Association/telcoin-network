@@ -161,7 +161,7 @@ async fn test_fetch_certificates_basic() {
     // Verify the fetch request.
     let mut first_batch_len = 0;
     let mut first_batch_resp = vec![];
-    if let Some(NetworkCommand::SendRequest {
+    if let Some(NetworkCommand::SendStreamRequest {
         peer: _,
         request: PrimaryRequest::MissingCertificates { inner },
         reply,
@@ -200,7 +200,7 @@ async fn test_fetch_certificates_basic() {
     let second_batch_resp;
     loop {
         match fake_receiver.recv().await {
-            Some(NetworkCommand::SendRequest {
+            Some(NetworkCommand::SendStreamRequest {
                 peer: _,
                 request: PrimaryRequest::MissingCertificates { inner },
                 reply,
@@ -256,7 +256,7 @@ async fn test_fetch_certificates_basic() {
     sleep(Duration::from_secs(5)).await;
     loop {
         match fake_receiver.try_recv() {
-            Ok(NetworkCommand::SendRequest {
+            Ok(NetworkCommand::SendStreamRequest {
                 peer: _,
                 request: PrimaryRequest::MissingCertificates { inner },
                 reply,
@@ -286,7 +286,7 @@ async fn test_fetch_certificates_basic() {
     // Verify the fetch request.
     if let Some(req) = fake_receiver.recv().await {
         match req {
-            NetworkCommand::SendRequest { peer: _, request, reply } => match request {
+            NetworkCommand::SendStreamRequest { peer: _, request, reply } => match request {
                 PrimaryRequest::MissingCertificates { inner } => {
                     let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
                     assert_eq!(lower_bound, 0);
@@ -333,7 +333,7 @@ async fn test_fetch_certificates_basic() {
     // Verify the fetch request.
     if let Some(req) = fake_receiver.recv().await {
         match req {
-            NetworkCommand::SendRequest { peer: _, request, reply } => match request {
+            NetworkCommand::SendStreamRequest { peer: _, request, reply } => match request {
                 PrimaryRequest::MissingCertificates { inner } => {
                     let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
                     assert_eq!(lower_bound, 0);
@@ -373,7 +373,7 @@ async fn test_fetch_certificates_basic() {
     // Verify the fetch request.
     if let Some(req) = fake_receiver.recv().await {
         match req {
-            NetworkCommand::SendRequest { peer: _, request, reply } => match request {
+            NetworkCommand::SendStreamRequest { peer: _, request, reply } => match request {
                 PrimaryRequest::MissingCertificates { inner } => {
                     let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
                     assert_eq!(lower_bound, 0);
@@ -473,7 +473,7 @@ async fn test_fetch_cancellation_on_success() {
     assert!(result.is_err(), "Should fail due to missing parents");
 
     // expecxt a fetch request for the missing certificates
-    if let Some(NetworkCommand::SendRequest {
+    if let Some(NetworkCommand::SendStreamRequest {
         peer: _,
         request: PrimaryRequest::MissingCertificates { .. },
         reply,
@@ -573,7 +573,7 @@ async fn test_timeout_scenario() {
     // collect all requests but never respond (simulate timeout)
     loop {
         match timeout(Duration::from_millis(200), fake_receiver.recv()).await {
-            Ok(Some(NetworkCommand::SendRequest {
+            Ok(Some(NetworkCommand::SendStreamRequest {
                 peer: _,
                 request: PrimaryRequest::MissingCertificates { .. },
                 reply: _, // don't respond - let the oneshot channel drop to simulate no response
@@ -610,7 +610,7 @@ async fn test_timeout_scenario() {
 
     // expect follow up attempt
     match timeout(Duration::from_millis(200), fake_receiver.recv()).await {
-        Ok(Some(NetworkCommand::SendRequest { .. })) => {
+        Ok(Some(NetworkCommand::SendStreamRequest { .. })) => {
             return;
         }
         _ => {
@@ -676,7 +676,7 @@ async fn test_gc_round_update_during_fetch() {
     let _ = synchronizer.process_peer_certificate(target_cert.clone()).await;
 
     // first fetch request
-    if let Some(NetworkCommand::SendRequest {
+    if let Some(NetworkCommand::SendStreamRequest {
         peer: _,
         request: PrimaryRequest::MissingCertificates { inner },
         reply,
@@ -697,7 +697,7 @@ async fn test_gc_round_update_during_fetch() {
     // next fetch should use updated gc round
     loop {
         match timeout(Duration::from_secs(2), fake_receiver.recv()).await {
-            Ok(Some(NetworkCommand::SendRequest {
+            Ok(Some(NetworkCommand::SendStreamRequest {
                 peer: _,
                 request: PrimaryRequest::MissingCertificates { inner },
                 reply,
@@ -785,7 +785,7 @@ async fn test_network_failure_keeps_trying() {
     // all peers return network errors
     loop {
         match timeout(Duration::from_secs(5), fake_receiver.recv()).await {
-            Ok(Some(NetworkCommand::SendRequest { reply, .. })) => {
+            Ok(Some(NetworkCommand::SendStreamRequest { reply, .. })) => {
                 // simulate network failure
                 reply.send(Err(NetworkError::Timeout)).unwrap();
                 response_count += 1;
@@ -804,7 +804,7 @@ async fn test_network_failure_keeps_trying() {
 
     // expect follow up attempt
     match timeout(Duration::from_millis(200), fake_receiver.recv()).await {
-        Ok(Some(NetworkCommand::SendRequest { .. })) => {
+        Ok(Some(NetworkCommand::SendStreamRequest { .. })) => {
             return;
         }
         _ => {
@@ -869,7 +869,7 @@ async fn test_partial_response_handling_rejects_invalid_cert() {
     let mut bad_cert = all_certificates[target_index - 1].clone();
 
     // first peer returns partial response with some invalid certificates
-    if let Some(NetworkCommand::SendRequest { reply, .. }) = fake_receiver.recv().await {
+    if let Some(NetworkCommand::SendStreamRequest { reply, .. }) = fake_receiver.recv().await {
         let mut response = vec![];
 
         // add some valid certificates
@@ -947,7 +947,7 @@ async fn test_bad_cert_in_fetch_rejects_all() {
     let mut bad_cert = all_certificates[5].clone();
 
     // first peer returns partial response with some invalid certificates
-    if let Some(NetworkCommand::SendRequest { reply, .. }) = fake_receiver.recv().await {
+    if let Some(NetworkCommand::SendStreamRequest { reply, .. }) = fake_receiver.recv().await {
         let mut response = vec![];
 
         // add some valid certificates

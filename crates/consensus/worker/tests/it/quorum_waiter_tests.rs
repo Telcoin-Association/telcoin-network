@@ -49,7 +49,7 @@ async fn test_wait_for_quorum_happy_path() {
     let threshold = committee.quorum_threshold();
     for _i in 0..threshold {
         match network_rx.recv().await {
-            Some(NetworkCommand::SendRequest {
+            Some(NetworkCommand::SendStreamRequest {
                 peer: _,
                 request: WorkerRequest::ReportBatch { sealed_batch: in_batch },
                 reply,
@@ -97,7 +97,7 @@ async fn test_batch_rejected_timeout() {
 
     // send one vote for batch
     match network_rx.recv().await {
-        Some(NetworkCommand::SendRequest {
+        Some(NetworkCommand::SendStreamRequest {
             peer: _,
             request: WorkerRequest::ReportBatch { sealed_batch: in_batch },
             reply,
@@ -152,7 +152,7 @@ async fn test_batch_some_rejected_stake_still_passes() {
 
     // send one rejection for batch
     match network_rx.recv().await {
-        Some(NetworkCommand::SendRequest {
+        Some(NetworkCommand::SendStreamRequest {
             peer: _,
             request: WorkerRequest::ReportBatch { sealed_batch: in_batch },
             reply,
@@ -169,7 +169,7 @@ async fn test_batch_some_rejected_stake_still_passes() {
     // account for first msg (rejection)
     for _i in 0..(threshold - 1) {
         match network_rx.recv().await {
-            Some(NetworkCommand::SendRequest {
+            Some(NetworkCommand::SendStreamRequest {
                 peer: _,
                 request: WorkerRequest::ReportBatch { sealed_batch: in_batch },
                 reply,
@@ -223,7 +223,7 @@ async fn test_batch_rejected_quorum() {
     let threshold = committee.size() / 2;
     for _i in 0..threshold {
         match network_rx.recv().await {
-            Some(NetworkCommand::SendRequest {
+            Some(NetworkCommand::SendStreamRequest {
                 peer: _,
                 request: WorkerRequest::ReportBatch { sealed_batch: in_batch },
                 reply,
@@ -284,7 +284,7 @@ async fn test_batch_rejected_antiquorum() {
     let threshold = committee.size() / 2;
     for _i in 0..threshold {
         match network_rx.recv().await {
-            Some(NetworkCommand::SendRequest {
+            Some(NetworkCommand::SendStreamRequest {
                 peer: _,
                 request: WorkerRequest::ReportBatch { sealed_batch: in_batch },
                 reply,
@@ -341,7 +341,7 @@ async fn test_batch_early_anti_quorum() {
     // timeout.
     for i in 0..8 {
         match network_rx.recv().await {
-            Some(NetworkCommand::SendRequest {
+            Some(NetworkCommand::SendStreamRequest {
                 peer: _,
                 request: WorkerRequest::ReportBatch { sealed_batch: in_batch },
                 reply,

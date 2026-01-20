@@ -61,7 +61,7 @@ async fn propose_header_to_form_certificate() {
     cb.headers().send(proposed_header).await.unwrap();
     // Wait for the vote requests and send the votes back.
     while let Some(req) = network_rx.recv().await {
-        if let NetworkCommand::SendRequest {
+        if let NetworkCommand::SendStreamRequest {
             peer,
             request: PrimaryRequest::Vote { header: _, parents: _ },
             reply,
@@ -121,7 +121,7 @@ async fn propose_header_failure() {
     // Wait for the vote requests and send back errors.
     let mut i = 0;
     while let Some(req) = network_rx.recv().await {
-        if let NetworkCommand::SendRequest {
+        if let NetworkCommand::SendStreamRequest {
             peer: _,
             request: PrimaryRequest::Vote { header: _, parents: _ },
             reply,
@@ -211,7 +211,7 @@ async fn run_vote_aggregator_with_param(
     cb.headers().send(proposed_header).await.unwrap();
     // Wait for the vote requests and send the votes back.
     while let Some(req) = network_rx.recv().await {
-        if let NetworkCommand::SendRequest {
+        if let NetworkCommand::SendStreamRequest {
             peer,
             request: PrimaryRequest::Vote { header: _, parents: _ },
             reply,
@@ -330,7 +330,7 @@ async fn propose_headers_one_bad() {
     cb.headers().send(proposed_header).await.unwrap();
     // Wait for the vote requests and send the votes back.
     while let Some(req) = network_rx.recv().await {
-        if let NetworkCommand::SendRequest {
+        if let NetworkCommand::SendStreamRequest {
             peer,
             request: PrimaryRequest::Vote { header: _, parents: _ },
             reply,

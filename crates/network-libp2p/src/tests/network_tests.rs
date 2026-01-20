@@ -236,7 +236,7 @@ async fn test_valid_req_restt() -> eyre::Result<()> {
         timeout(max_time, network_events_2.recv()).await?.expect("first network event received");
 
     // expect network event
-    if let NetworkEvent::Request { request, channel, .. } = event {
+    if let NetworkEvent::StreamRequest { request, channel, .. } = event {
         assert_eq!(request, batch_req);
 
         // send response
@@ -377,7 +377,7 @@ async fn test_valid_req_res_inbound_failure() -> eyre::Result<()> {
         timeout(max_time, network_events_2.recv()).await?.expect("first network event received");
 
     // expect network event
-    if let NetworkEvent::Request { request, cancel, .. } = event {
+    if let NetworkEvent::StreamRequest { request, cancel, .. } = event {
         assert_eq!(request, batch_req);
 
         // peer 1 crashes after making request
@@ -513,7 +513,7 @@ async fn test_outbound_failure_malicious_response() -> eyre::Result<()> {
         timeout(max_time, network_events_2.recv()).await?.expect("first network event received");
 
     // expect network event
-    if let NetworkEvent::Request { request, channel, .. } = event {
+    if let NetworkEvent::StreamRequest { request, channel, .. } = event {
         assert_eq!(request, honest_req);
         // send response
         let block = fixture_batch_with_transactions(1).seal_slow();
@@ -855,8 +855,9 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
                 debug!(target: "network", ?from, "nvv received gossip from peer");
                 received = true;
             }
-            Ok(Some(NetworkEvent::Request {
-                request: TestWorkerRequest::PeerExchange(_), ..
+            Ok(Some(NetworkEvent::StreamRequest {
+                request: TestWorkerRequest::PeerExchange(_),
+                ..
             })) => {
                 // Ignore additional peer exchanges
                 continue;

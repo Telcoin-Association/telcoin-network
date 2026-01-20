@@ -74,7 +74,7 @@ impl TestRequestBatchesNetwork {
                     NetworkCommand::ConnectedPeers { reply } => {
                         reply.send(data_clone.lock().await.keys().copied().collect()).unwrap();
                     }
-                    NetworkCommand::SendRequest {
+                    NetworkCommand::SendStreamRequest {
                         peer,
                         request:
                             WorkerRequest::RequestBatches { batch_digests: digests, max_response_size },

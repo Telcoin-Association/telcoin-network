@@ -25,7 +25,7 @@ pub mod stream;
 pub mod types;
 
 // export types
-pub use codec::{TNCodec, TNMessage};
+pub use codec::TNMessage;
 pub use consensus::ConsensusNetwork;
 pub use peers::{PeerExchangeMap, Penalty};
 
@@ -33,7 +33,6 @@ pub use peers::{PeerExchangeMap, Penalty};
 pub use libp2p::{
     gossipsub::{Message as GossipMessage, TopicHash},
     identity::PeerId,
-    request_response::ResponseChannel,
     Multiaddr,
 };
 #[cfg(test)]

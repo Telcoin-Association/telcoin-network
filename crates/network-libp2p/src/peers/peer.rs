@@ -352,11 +352,6 @@ impl Peer {
         self.routable
     }
 
-    /// Whether we have validated that this peer supports the streaming protocol.
-    pub(super) fn has_outbound_stream(&self) -> bool {
-        self.has_outbound_stream
-    }
-
     /// Update the peer's outbound stream status.
     pub(super) fn set_has_outbound_stream(&mut self, has: bool) {
         self.has_outbound_stream = has;

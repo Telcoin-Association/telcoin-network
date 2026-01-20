@@ -3,7 +3,7 @@
 //! This network is used by workers and primaries to reliably send consensus messages.
 
 use crate::{
-    codec::{TNCodec, TNMessage},
+    codec::TNMessage,
     error::NetworkError,
     kad::{KadStore, KadStoreType},
     peers::{self, PeerEvent, PeerManager, Penalty},
@@ -13,7 +13,6 @@ use crate::{
         KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo, NetworkResult,
         NodeRecord,
     },
-    PeerExchangeMap,
 };
 use futures::StreamExt as _;
 use libp2p::{
@@ -22,10 +21,6 @@ use libp2p::{
         TopicHash,
     },
     kad::{self, store::RecordStore, Mode, QueryId},
-    request_response::{
-        self, Codec, Event as ReqResEvent, InboundFailure as ReqResInboundFailure,
-        InboundRequestId, OutboundRequestId,
-    },
     swarm::{NetworkBehaviour, SwarmEvent},
     Multiaddr, PeerId, Stream, StreamProtocol, Swarm, SwarmBuilder,
 };
@@ -53,17 +48,14 @@ const DEFAULT_KAD_PROTO_NAME: StreamProtocol = StreamProtocol::new("/ipfs/kad/1.
 
 /// Custom network libp2p behaviour type for Telcoin Network.
 ///
-/// The behavior includes gossipsub and request-response.
+/// The behavior includes gossipsub, kademlia, peer management, and stream-based messaging.
 #[derive(NetworkBehaviour)]
-pub(crate) struct TNBehavior<C, DB>
+pub(crate) struct TNBehavior<DB>
 where
-    C: Codec + Send + Clone + 'static,
+    DB: Database,
 {
     /// The gossipsub network behavior.
     pub(crate) gossipsub: gossipsub::Behaviour,
-    /// The request-response network behavior.
-    /// NOTE: Kept for easier rollback, will be removed in follow-up PR.
-    pub(crate) req_res: request_response::Behaviour<C>,
     /// The peer manager.
     pub(crate) peer_manager: peers::PeerManager,
     /// Used for peer discovery.
@@ -72,21 +64,19 @@ where
     pub(crate) stream: stream::Behaviour,
 }
 
-impl<C, DB> TNBehavior<C, DB>
+impl<DB> TNBehavior<DB>
 where
-    C: Codec + Send + Clone + 'static,
     DB: Database,
 {
     /// Create a new instance of Self.
     pub(crate) fn new(
         gossipsub: gossipsub::Behaviour,
-        req_res: request_response::Behaviour<C>,
         kademlia: kad::Behaviour<KadStore<DB>>,
         peer_config: &PeerConfig,
     ) -> Self {
         let peer_manager = PeerManager::new(peer_config);
         let stream = stream::Behaviour::new();
-        Self { gossipsub, req_res, peer_manager, kademlia, stream }
+        Self { gossipsub, peer_manager, kademlia, stream }
     }
 }
 
@@ -105,7 +95,7 @@ where
     Events: TnSender<NetworkEvent<Req, Res>>,
 {
     /// The gossip network for flood publishing sealed batches.
-    swarm: Swarm<TNBehavior<TNCodec<Req, Res>, DB>>,
+    swarm: Swarm<TNBehavior<DB>>,
     /// The stream for forwarding network events.
     event_stream: Events,
     /// The sender for network handles.
@@ -117,26 +107,6 @@ where
     /// This set must be updated at the start of each epoch. It is used to verify messages
     /// published on certain topics. These are updated when the caller subscribes to a topic.
     authorized_publishers: HashMap<String, Option<HashSet<BlsPublicKey>>>,
-    /// The collection of pending _graceful_ disconnects.
-    ///
-    /// This node disconnects from new peers if it already has the target number of peers.
-    /// For these types of "peer exchange / discovery disconnects", the node shares peer records
-    /// before disconnecting. This keeps track of the number of disconnects to ensure resources
-    /// aren't starved while waiting for the peer's ack.
-    pending_px_disconnects: HashMap<OutboundRequestId, PeerId>,
-    /// The collection of pending outbound requests.
-    ///
-    /// Callers include a oneshot channel for the network to return response. The caller is
-    /// responsible for decoding message bytes and reporting peers who return bad data. Peers that
-    /// send messages that fail to decode must receive an application score penalty.
-    outbound_requests: HashMap<(PeerId, OutboundRequestId), oneshot::Sender<NetworkResult<Res>>>,
-    /// The collection of pending inbound requests.
-    ///
-    /// Callers include a oneshot channel for the network to return a cancellation notice. The
-    /// caller is responsible for decoding message bytes and reporting peers who return bad
-    /// data. Peers that send messages that fail to decode must receive an application score
-    /// penalty.
-    inbound_requests: HashMap<InboundRequestId, oneshot::Sender<()>>,
     /// The collection of kademlia record requests.
     ///
     /// When the application layer makes a request, the swarm stores the kad::QueryId and the
@@ -161,12 +131,10 @@ where
     node_record: NodeRecord,
     /// Stream control handle for opening outbound streams.
     stream_control: stream::Control,
-    /// Channel receiver for incoming streams from peers.
-    incoming_streams_rx: Receiver<(PeerId, Stream)>,
-    /// Channel sender for incoming streams (passed to acceptor task).
-    incoming_streams_tx: Sender<(PeerId, Stream)>,
     /// Stream configuration.
     stream_config: StreamConfig,
+    /// Phantom data for Req/Res types.
+    _phantom: std::marker::PhantomData<(Req, Res)>,
 }
 
 impl<Req, Res, DB, Events> ConsensusNetwork<Req, Res, DB, Events>
@@ -246,14 +214,6 @@ where
         )
         .map_err(NetworkError::GossipBehavior)?;
 
-        let tn_codec =
-            TNCodec::<Req, Res>::new(network_config.libp2p_config().max_rpc_message_size);
-
-        let req_res = request_response::Behaviour::with_codec(
-            tn_codec,
-            network_config.libp2p_config().supported_req_res_protocols.clone(),
-            request_response::Config::default(),
-        );
         let peer_id: PeerId = keypair.public().into();
         let mut kad_config = libp2p::kad::Config::new(DEFAULT_KAD_PROTO_NAME);
         // manually add peers
@@ -271,8 +231,7 @@ where
         let kademlia = kad::Behaviour::with_config(peer_id, kad_store.clone(), kad_config);
 
         // create custom behavior
-        let mut behavior =
-            TNBehavior::new(gossipsub, req_res, kademlia, network_config.peer_config());
+        let mut behavior = TNBehavior::new(gossipsub, kademlia, network_config.peer_config());
 
         // Load the Kad records from DB into the local peer cache.
         for record in kad_store.records() {
@@ -317,12 +276,10 @@ where
 
         let (handle, commands) = tokio::sync::mpsc::channel(100);
         let config = network_config.libp2p_config().clone();
-        let pending_px_disconnects = HashMap::with_capacity(config.max_px_disconnects);
         let node_record = Self::create_node_record(external_addr, &key_config, network_pubkey);
 
-        // initialize stream control and channels
+        // initialize stream control
         let stream_control = swarm.behaviour().stream.new_control();
-        let (incoming_streams_tx, incoming_streams_rx) = tokio::sync::mpsc::channel(32);
         let stream_config = network_config.stream_config().clone();
 
         Ok(Self {
@@ -331,19 +288,15 @@ where
             commands,
             event_stream,
             authorized_publishers: Default::default(),
-            outbound_requests: Default::default(),
-            inbound_requests: Default::default(),
             kad_record_queries: Default::default(),
             config,
             connected_peers: VecDeque::new(),
-            pending_px_disconnects,
             key_config,
             task_spawner,
             node_record,
             stream_control,
-            incoming_streams_rx,
-            incoming_streams_tx,
             stream_config,
+            _phantom: std::marker::PhantomData,
         })
     }
 
@@ -439,17 +392,6 @@ where
 
         // spawn incoming stream acceptor task
         let mut incoming_streams = self.stream_control.accept(TN_STREAM_PROTOCOL)?;
-        // let incoming_tx = self.incoming_streams_tx.clone();
-        // self.task_spawner.spawn_task("stream-acceptor", async move {
-        //     while let Some((peer_id, stream)) = incoming_streams.next().await {
-        //         if incoming_tx.send((peer_id, stream)).await.is_err() {
-        //             break;
-        //         }
-        //     }
-        // });
-
-        // periodic interval for cleaning up stale stream requests
-        let mut stale_check = tokio::time::interval(self.stream_config.stale_request_interval);
 
         loop {
             tokio::select! {
@@ -481,14 +423,10 @@ where
 
     /// Process events from the swarm.
     #[instrument(level = "trace", target = "network::events", skip(self), fields(topics = ?self.authorized_publishers.keys()))]
-    async fn process_event(
-        &mut self,
-        event: SwarmEvent<TNBehaviorEvent<TNCodec<Req, Res>, DB>>,
-    ) -> NetworkResult<()> {
+    async fn process_event(&mut self, event: SwarmEvent<TNBehaviorEvent<DB>>) -> NetworkResult<()> {
         match event {
             SwarmEvent::Behaviour(behavior) => match behavior {
                 TNBehaviorEvent::Gossipsub(event) => self.process_gossip_event(event)?,
-                TNBehaviorEvent::ReqRes(event) => self.process_reqres_event(event)?,
                 TNBehaviorEvent::PeerManager(event) => self.process_peer_manager_event(event)?,
                 TNBehaviorEvent::Kademlia(event) => self.process_kad_event(event)?,
                 TNBehaviorEvent::Stream(()) => {
@@ -669,47 +607,7 @@ where
                     .collect();
                 send_or_log_error!(reply, collection, "MeshPeers");
             }
-            NetworkCommand::SendRequest { peer, request, reply } => {
-                debug!(target: "network", "send request for bls {peer}");
-                if let Some((peer, addr)) = self.swarm.behaviour().peer_manager.auth_to_peer(peer) {
-                    debug!(target: "network", "trying to send to {peer} at {addr:?}");
-                    let request_id = self
-                        .swarm
-                        .behaviour_mut()
-                        .req_res
-                        .send_request_with_addresses(&peer, request, addr);
-                    self.outbound_requests.insert((peer, request_id), reply);
-                } else {
-                    // Best effort to return an error to caller.
-                    let _ = reply.send(Err(NetworkError::PeerMissing));
-                }
-            }
-            NetworkCommand::SendRequestDirect { peer, request, reply } => {
-                let request_id = self.swarm.behaviour_mut().req_res.send_request(&peer, request);
-                self.outbound_requests.insert((peer, request_id), reply);
-            }
-            NetworkCommand::SendRequestAny { request, reply } => {
-                // Rotating an empty list will panic...
-                if !self.connected_peers.is_empty() {
-                    self.connected_peers.rotate_left(1);
-                }
-                if let Some(peer) = self.connected_peers.front() {
-                    let request_id = self.swarm.behaviour_mut().req_res.send_request(peer, request);
-                    self.outbound_requests.insert((*peer, request_id), reply);
-                } else {
-                    // Ignore error since this means other end lost interest and we don't really
-                    // care.
-                    let _ = reply.send(Err(NetworkError::NoPeers));
-                }
-            }
-            NetworkCommand::SendResponse { response, channel, reply } => {
-                let res = self.swarm.behaviour_mut().req_res.send_response(channel, response);
-                send_or_log_error!(reply, res, "SendResponse");
-            }
-            NetworkCommand::PendingRequestCount { reply } => {
-                let count = self.outbound_requests.len();
-                send_or_log_error!(reply, count, "SendResponse");
-            }
+
             NetworkCommand::ReportPenalty { peer, penalty } => {
                 debug!(target: "network", "penalty reported for peer {peer}");
                 if let Some((peer, _)) = self.swarm.behaviour().peer_manager.auth_to_peer(peer) {
@@ -831,150 +729,6 @@ where
         Ok(())
     }
 
-    /// Process req/res events.
-    fn process_reqres_event(&mut self, event: ReqResEvent<Req, Res>) -> NetworkResult<()> {
-        match event {
-            ReqResEvent::Message { peer, message, connection_id: _ } => {
-                match message {
-                    request_response::Message::Request { request_id, request, channel } => {
-                        debug!(target: "network", ?peer, ?request, "request received");
-                        // intercept peer exchange messages
-                        if let Some(peers) = request.peer_exchange_msg() {
-                            debug!(target: "network", ?peers, "processing peer exchange");
-                            self.swarm.behaviour_mut().peer_manager.process_peer_exchange(peers);
-                            // send empty ack and ignore errors
-                            let ack = PeerExchangeMap::default().into();
-                            let _ = self.swarm.behaviour_mut().req_res.send_response(channel, ack);
-
-                            // initiate disconnect from this peer to prevent redial attempts
-                            debug!(target: "peer-manager", ?peer, "initiating reciprocal disconnect after px");
-                            self.swarm.behaviour_mut().peer_manager.disconnect_peer(peer, false);
-
-                            return Ok(());
-                        }
-
-                        // We should not be able to recieve a message from an unknown peer so this
-                        // should always work. It is possible (mostly in
-                        // testing) to have a race where we don't know the requester YET.
-                        // If so send an error back but this should be so infrequent on a real
-                        // network that we can ignore and it should not
-                        // cause any lasting damage if triggered.
-                        if let Some(bls) = self.swarm.behaviour().peer_manager.peer_to_bls(&peer) {
-                            let (notify, cancel) = oneshot::channel();
-                            // forward request to handler without blocking other events
-                            if let Err(e) = self.event_stream.try_send(NetworkEvent::Request {
-                                peer: bls,
-                                request,
-                                channel,
-                                cancel,
-                            }) {
-                                error!(target: "network", topics=?self.authorized_publishers.keys(), ?request_id, ?e, "failed to forward request!");
-                                // ignore failures at the epoch boundary
-                                // During epoch change the event_stream reciever can be closed.
-                                return Ok(());
-                            }
-
-                            // store the request and cancel duplicate requests
-                            //
-                            // NOTE: the request id is internally generated, so this should not
-                            // happen
-                            if let Some(channel) = self.inbound_requests.insert(request_id, notify)
-                            {
-                                // cancel if this is a duplicate request
-                                warn!(target: "network", ?peer, "duplicate request id from peer");
-                                let _ = channel.send(());
-                            }
-                        } else if let Err(e) = self.event_stream.try_send(NetworkEvent::Error(
-                            format!("requesting peer unknown: {peer:?}"),
-                            channel,
-                        )) {
-                            error!(target: "network", topics=?self.authorized_publishers.keys(), ?request_id, ?e, "failed to forward request!");
-                            // ignore failures at the epoch boundary
-                            // During epoch change the event_stream reciever can be closed.
-                            return Ok(());
-                        }
-                    }
-                    request_response::Message::Response { request_id, response } => {
-                        // check if response associated with PX disconnect
-                        if self.pending_px_disconnects.remove(&request_id).is_some() {
-                            let _ = self.swarm.disconnect_peer_id(peer);
-                        }
-
-                        // try to forward response to original caller
-                        let _ = self
-                            .outbound_requests
-                            .remove(&(peer, request_id))
-                            .map(|ack| ack.send(Ok(response)));
-                    }
-                }
-            }
-            ReqResEvent::OutboundFailure { peer, request_id, error, connection_id: _ } => {
-                debug!(target: "network", ?peer, ?error, "Outbound failure for req/res");
-                // handle px disconnects
-                //
-                // px attempts to support peer discovery, but failures are okay
-                // this node disconnects after a px timeout
-                if self.pending_px_disconnects.remove(&request_id).is_some() {
-                    debug!(target: "network", "outbound failure expected because of px disconnect");
-                    return Ok(());
-                }
-
-                // apply penalty
-                self.swarm.behaviour_mut().peer_manager.process_penalty(peer, Penalty::Medium);
-
-                // try to forward error to original caller
-                let _ = self
-                    .outbound_requests
-                    .remove(&(peer, request_id))
-                    .map(|ack| ack.send(Err(error.into())));
-            }
-            ReqResEvent::InboundFailure { peer, request_id, error, connection_id: _ } => {
-                debug!(target: "network", ?peer, ?error, pending=?self.inbound_requests, "Inbound failure for req/res");
-                debug!(target: "network", my_id=?self.swarm.local_peer_id(), "this node");
-                match error {
-                    ReqResInboundFailure::Io(e) => {
-                        // penalize peer since this is an attack surface
-                        warn!(target: "network", ?e, ?peer, ?request_id, "inbound IO failure");
-                        self.swarm
-                            .behaviour_mut()
-                            .peer_manager
-                            .process_penalty(peer, Penalty::Medium);
-                    }
-                    ReqResInboundFailure::UnsupportedProtocols => {
-                        warn!(target: "network", ?peer, ?request_id, ?error, "inbound failure: unsupported protocol");
-
-                        // the local peer supports none of the protocols requested by the remote
-                        self.swarm
-                            .behaviour_mut()
-                            .peer_manager
-                            .process_penalty(peer, Penalty::Fatal);
-                    }
-                    ReqResInboundFailure::Timeout | ReqResInboundFailure::ConnectionClosed => {
-                        // penalty for potentially malicious request
-                        self.swarm
-                            .behaviour_mut()
-                            .peer_manager
-                            .process_penalty(peer, Penalty::Mild);
-                    }
-                    ReqResInboundFailure::ResponseOmission => { /* ignore local error */ }
-                }
-
-                // forward cancelation to handler and ignore errors
-                if let Some(channel) = self.inbound_requests.remove(&request_id) {
-                    let _ = channel.send(());
-                }
-            }
-
-            ReqResEvent::ResponseSent { request_id, .. } => {
-                if let Some(channel) = self.inbound_requests.remove(&request_id) {
-                    let _ = channel.send(());
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     /// Specific logic to accept gossip messages.
     ///
     /// Messages are only published by current committee nodes and must be within max size.
@@ -1028,58 +782,16 @@ where
 
                 // remove from connected peers
                 self.connected_peers.retain(|peer| *peer != peer_id);
-
-                let keys = self
-                    .outbound_requests
-                    .iter()
-                    .filter_map(
-                        |((p_id, req_id), _)| {
-                            if *p_id == peer_id {
-                                Some((*p_id, *req_id))
-                            } else {
-                                None
-                            }
-                        },
-                    )
-                    .collect::<Vec<_>>();
-
-                // remove from outbound_requests and send error
-                for k in keys {
-                    let _ = self
-                        .outbound_requests
-                        .remove(&k)
-                        .map(|ack| ack.send(Err(NetworkError::Disconnected)));
-                }
             }
             PeerEvent::DisconnectPeerX(peer_id, peer_exchange) => {
                 debug!(target: "peer-manager", this_node=?self.swarm.local_peer_id(), ?peer_id, "disconnecting from peer with exchange info");
-                // attempt to exchange peer information if limits allow
-                if self.pending_px_disconnects.len() < self.config.max_px_disconnects {
-                    let (reply, done) = oneshot::channel();
-                    let request_id = self
-                        .swarm
-                        .behaviour_mut()
-                        .req_res
-                        .send_request(&peer_id, peer_exchange.into());
-                    self.outbound_requests.insert((peer_id, request_id), reply);
 
-                    let timeout = self.config.px_disconnect_timeout;
-                    let handle = self.network_handle();
+                // Process the peer exchange info locally (add peers to our known peers)
+                // The peer exchange info contains peer records that we can use for discovery
+                self.swarm.behaviour_mut().peer_manager.process_peer_exchange(peer_exchange);
 
-                    // spawn task
-                    let task_name = format!("peer-exchange-{peer_id}");
-                    self.task_spawner.spawn_task(task_name, async move {
-                        // ignore errors and disconnect after px attempt
-                        let _res = tokio::time::timeout(timeout, done).await;
-                        let _ = handle.disconnect_peer(peer_id).await;
-                    });
-
-                    // insert to pending px disconnects
-                    self.pending_px_disconnects.insert(request_id, peer_id);
-                } else {
-                    // too many px disconnects pending so disconnect without px
-                    let _ = self.swarm.disconnect_peer_id(peer_id);
-                }
+                // Disconnect from the peer
+                let _ = self.swarm.disconnect_peer_id(peer_id);
 
                 // remove peer from kad - will redial if necessary
                 self.swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
@@ -1668,9 +1380,6 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConsensusNetwork")
             .field("authorized_publishers", &self.authorized_publishers)
-            .field("pending_px_disconnects", &self.pending_px_disconnects)
-            .field("outbound_requests", &self.outbound_requests.len())
-            .field("inbound_requests", &self.inbound_requests.len())
             .field("config", &self.config)
             .field("connected_peers", &self.connected_peers)
             .field("swarm", &"<swarm>") // Skip detailed debug for swarm

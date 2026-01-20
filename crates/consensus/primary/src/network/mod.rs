@@ -13,7 +13,7 @@ use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     error::NetworkError,
     types::{IntoResponse as _, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResult},
-    GossipMessage, Penalty, ResponseChannel,
+    GossipMessage, Penalty,
 };
 use tn_network_types::{WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerToPrimaryClient};
 use tn_storage::PayloadStore;
@@ -111,15 +111,13 @@ impl PrimaryNetworkHandle {
     ) -> NetworkResult<RequestVoteResult> {
         let header = Arc::new(header);
         let request = PrimaryRequest::Vote { header: header.clone(), parents: parents.clone() };
-        let res = self.handle.send_request(request, peer).await?;
-        let mut res = res.await??;
+        let mut res = self.handle.send_stream_request(peer, request).await?;
         let mut tries = 0;
         while let PrimaryResponse::RecoverableError(PrimaryRPCError(s)) = res {
             warn!(target: "primary::network", "Got recoverable error {s}, retrying");
             tokio::time::sleep(Duration::from_millis(250)).await;
             let request = PrimaryRequest::Vote { header: header.clone(), parents: parents.clone() };
-            let res_raw = self.handle.send_request(request, peer).await?;
-            res = res_raw.await??;
+            res = self.handle.send_stream_request(peer, request).await?;
             tries += 1;
             if tries > 5 {
                 break;
@@ -153,8 +151,7 @@ impl PrimaryNetworkHandle {
         request: MissingCertificatesRequest,
     ) -> NetworkResult<Vec<Certificate>> {
         let request = PrimaryRequest::MissingCertificates { inner: request };
-        let res = self.handle.send_request(request, peer).await?;
-        let res = res.await??;
+        let res = self.handle.send_stream_request(peer, request).await?;
         match res {
             PrimaryResponse::RequestedCertificates(certs) => Ok(certs),
             PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
@@ -171,8 +168,7 @@ impl PrimaryNetworkHandle {
         hash: Option<BlockHash>,
     ) -> NetworkResult<ConsensusHeader> {
         let request = PrimaryRequest::ConsensusHeader { number, hash };
-        let res = self.handle.send_request(request, peer).await?;
-        let res = res.await??;
+        let res = self.handle.send_stream_request(peer, request).await?;
         match res {
             PrimaryResponse::ConsensusHeader(header) => match (hash, number) {
                 (Some(hash), _) => {
@@ -202,19 +198,24 @@ impl PrimaryNetworkHandle {
         }
     }
 
-    /// Request consensus header from a random peer up to three times from three different peers.
+    /// Request consensus header from connected peers, trying up to three times.
     /// Will verify the returned header matches hash if provided (strong) or number if not (weak).
     pub async fn request_consensus(
         &self,
         number: Option<u64>,
         hash: Option<BlockHash>,
     ) -> NetworkResult<ConsensusHeader> {
+        // Get connected peers to try
+        let peers = self.handle.connected_peers().await?;
+        if peers.is_empty() {
+            return Err(NetworkError::NoPeers);
+        }
+
         let request = PrimaryRequest::ConsensusHeader { number, hash };
         // Try up to three times (from three peers) to get consensus.
         // This could be a lot more complicated but this KISS method should work fine.
-        for _ in 0..3 {
-            let res = self.handle.send_request_any(request.clone()).await?;
-            let res = res.await?;
+        for (i, peer) in peers.iter().cycle().take(3).enumerate() {
+            let res = self.handle.send_stream_request(*peer, request.clone()).await;
             if let Ok(PrimaryResponse::ConsensusHeader(header)) = res {
                 match (hash, number) {
                     (Some(hash), _) => {
@@ -234,23 +235,36 @@ impl PrimaryNetworkHandle {
                     }
                 }
             }
+            // Don't retry if we've exhausted all peers
+            if i >= peers.len().saturating_sub(1) && i >= 2 {
+                break;
+            }
         }
         Err(NetworkError::RPCError("Could not get the consensus header!".to_string()))
     }
 
-    /// Request consensus header from a random peer up to three times from three different peers.
+    /// Request epoch record from connected peers, trying up to three times.
     pub async fn request_epoch_cert(
         &self,
         epoch: Option<Epoch>,
         hash: Option<BlockHash>,
     ) -> NetworkResult<(EpochRecord, EpochCertificate)> {
+        // Get connected peers to try
+        let peers = self.handle.connected_peers().await?;
+        if peers.is_empty() {
+            return Err(NetworkError::NoPeers);
+        }
+
         let request = PrimaryRequest::EpochRecord { epoch, hash };
-        // Try up to three times (from three peers) to get consensus.
-        // This could be a lot more complicated but this KISS method should work fine.
-        for _ in 0..3 {
-            let res = self.handle.send_request_any(request.clone()).await?;
-            if let Ok(Ok(PrimaryResponse::EpochRecord { record, certificate })) = res.await {
+        // Try up to three times (from three peers) to get the epoch record.
+        for (i, peer) in peers.iter().cycle().take(3).enumerate() {
+            let res = self.handle.send_stream_request(*peer, request.clone()).await;
+            if let Ok(PrimaryResponse::EpochRecord { record, certificate }) = res {
                 return Ok((record, certificate));
+            }
+            // Don't retry if we've exhausted all peers
+            if i >= peers.len().saturating_sub(1) && i >= 2 {
+                break;
             }
         }
         Err(NetworkError::RPCError("Could not get the epoch record!".to_string()))
@@ -316,38 +330,8 @@ where
     fn process_network_event(&mut self, event: NetworkEvent<Req, Res>) {
         // match event
         match event {
-            NetworkEvent::Request { peer, request, channel, cancel } => match request {
-                PrimaryRequest::Vote { header, parents } => {
-                    self.process_vote_request(
-                        peer,
-                        Arc::unwrap_or_clone(header),
-                        parents,
-                        channel,
-                        cancel,
-                    );
-                }
-                PrimaryRequest::MissingCertificates { inner } => {
-                    self.process_request_for_missing_certs(peer, inner, channel, cancel)
-                }
-                PrimaryRequest::ConsensusHeader { number, hash } => {
-                    self.process_consensus_output_request(peer, number, hash, channel, cancel)
-                }
-                PrimaryRequest::PeerExchange { .. } => {
-                    warn!(target: "primary::network", "primary application received unexpected peer exchange message");
-                }
-                PrimaryRequest::EpochRecord { epoch, hash } => {
-                    self.process_epoch_record_request(peer, epoch, hash, channel, cancel)
-                }
-            },
             NetworkEvent::Gossip(msg, propagation_source) => {
                 self.process_gossip(msg, propagation_source);
-            }
-            NetworkEvent::Error(msg, channel) => {
-                let err = PrimaryResponse::Error(PrimaryRPCError(msg));
-                let network_handle = self.network_handle.clone();
-                self.task_spawner.spawn_task("report request error", async move {
-                    let _ = network_handle.handle.send_response(err, channel).await;
-                });
             }
             NetworkEvent::StreamRequest { peer, request, response_tx, cancel: _ } => {
                 match request {
@@ -374,121 +358,6 @@ where
                 }
             }
         }
-    }
-
-    /// Process vote request.
-    ///
-    /// Spawn a task to evaluate a peer's proposed header and return a response.
-    fn process_vote_request(
-        &self,
-        peer: BlsPublicKey,
-        header: Header,
-        parents: Vec<Certificate>,
-        channel: ResponseChannel<PrimaryResponse>,
-        cancel: oneshot::Receiver<()>,
-    ) {
-        // clone for spawned tasks
-        let request_handler = self.request_handler.clone();
-        let network_handle = self.network_handle.clone();
-        let task_name = format!("VoteRequest-{}", header.digest());
-
-        self.task_spawner.spawn_task(task_name, async move {
-            tokio::select! {
-                vote = request_handler.vote(peer, header, parents) => {
-                    let response = vote.into_response();
-                    let _ = network_handle.handle.send_response(response, channel).await;
-                }
-                // cancel notification from network layer
-                _ = cancel => (),
-            }
-        });
-    }
-
-    /// Attempt to retrieve certificates for a peer that's missing them.
-    fn process_request_for_missing_certs(
-        &self,
-        peer: BlsPublicKey,
-        request: MissingCertificatesRequest,
-        channel: ResponseChannel<PrimaryResponse>,
-        cancel: oneshot::Receiver<()>,
-    ) {
-        // clone for spawned tasks
-        let request_handler = self.request_handler.clone();
-        let network_handle = self.network_handle.clone();
-        let task_name = format!("MissingCertsReq-{peer}");
-        self.task_spawner.spawn_task(task_name, async move {
-            tokio::select! {
-                result = request_handler.retrieve_missing_certs(request) => {
-                    // report penalty if any
-                    if let Err(ref e) = result {
-                        if let Some(penalty) = e.into() {
-                            network_handle.report_penalty(peer, penalty).await;
-                        }
-                    }
-
-                    let response = result.into_response();
-                    let _ = network_handle.handle.send_response(response, channel).await;
-                }
-                // cancel notification from network layer
-                _ = cancel => (),
-            }
-        });
-    }
-
-    /// Attempt to retrieve consensus chain header from the database.
-    fn process_consensus_output_request(
-        &self,
-        peer: BlsPublicKey,
-        number: Option<u64>,
-        hash: Option<BlockHash>,
-        channel: ResponseChannel<PrimaryResponse>,
-        cancel: oneshot::Receiver<()>,
-    ) {
-        // clone for spawned tasks
-        let request_handler = self.request_handler.clone();
-        let network_handle = self.network_handle.clone();
-        let task_name = format!("ConsensusOutputReq-{peer}");
-        self.task_spawner.spawn_task(task_name, async move {
-            tokio::select! {
-                header =
-                    request_handler.retrieve_consensus_header(number, hash) => {
-                        let response = header.into_response();
-                        // TODO: penalize peer's reputation for bad request
-                        // if response.is_err() { }
-                        let _ = network_handle.handle.send_response(response, channel).await;
-                    }
-                // cancel notification from network layer
-                _ = cancel => (),
-            }
-        });
-    }
-
-    /// Attempt to retrieve consensus chain header from the database.
-    fn process_epoch_record_request(
-        &self,
-        peer: BlsPublicKey,
-        epoch: Option<Epoch>,
-        hash: Option<BlockHash>,
-        channel: ResponseChannel<PrimaryResponse>,
-        cancel: oneshot::Receiver<()>,
-    ) {
-        // clone for spawned tasks
-        let request_handler = self.request_handler.clone();
-        let network_handle = self.network_handle.clone();
-        let task_name = format!("ConsensusOutputReq-{peer}");
-        self.task_spawner.spawn_task(task_name, async move {
-            tokio::select! {
-                header =
-                    request_handler.retrieve_epoch_record(epoch, hash) => {
-                        let response = header.into_response();
-                        // TODO: penalize peer's reputation for bad request
-                        // if response.is_err() { }
-                        let _ = network_handle.handle.send_response(response, channel).await;
-                    }
-                // cancel notification from network layer
-                _ = cancel => (),
-            }
-        });
     }
 
     /// Process vote request via stream.

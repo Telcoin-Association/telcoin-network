@@ -11,7 +11,7 @@ use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     error::NetworkError,
     types::{NetworkEvent, NetworkHandle, NetworkResult},
-    GossipMessage, Penalty, ResponseChannel,
+    GossipMessage, Penalty,
 };
 use tn_network_types::{FetchBatchResponse, PrimaryToWorkerClient, WorkerSynchronizeMessage};
 use tn_storage::tables::Batches;
@@ -94,8 +94,7 @@ impl WorkerNetworkHandle {
         // TODO- issue 237- should we sign these batches and check the sig before accepting any
         // batches during consensus?
         let request = WorkerRequest::ReportBatch { sealed_batch };
-        let res = self.handle.send_request(request, peer_bls).await?;
-        let res = res.await??;
+        let res = self.handle.send_stream_request(peer_bls, request).await?;
         match res {
             WorkerResponse::ReportBatch => Ok(()),
             WorkerResponse::RequestBatches { .. } => Err(NetworkError::RPCError(
@@ -143,9 +142,9 @@ impl WorkerNetworkHandle {
             batch_digests: batch_digests.clone(),
             max_response_size: self.max_rpc_message_size,
         };
-        let res = self.handle.send_request(request, peer).await?;
-        let res =
-            tokio::time::timeout(timeout, res).await.map_err(|_| NetworkError::Timeout)???;
+        let res = tokio::time::timeout(timeout, self.handle.send_stream_request(peer, request))
+            .await
+            .map_err(|_| NetworkError::Timeout)??;
         match res {
             WorkerResponse::ReportBatch => Err(NetworkError::RPCError(
                 "Got wrong response, not a request batches is report batch!".to_string(),
@@ -303,39 +302,10 @@ where
     fn process_network_event(&self, event: NetworkEvent<Req, Res>) {
         // match event
         match event {
-            NetworkEvent::Request { peer, request, channel, cancel } => match request {
-                WorkerRequest::ReportBatch { sealed_batch } => {
-                    self.process_report_batch(peer, sealed_batch, channel, cancel);
-                }
-                WorkerRequest::RequestBatches { batch_digests, max_response_size } => {
-                    self.process_request_batches(
-                        peer,
-                        batch_digests,
-                        max_response_size,
-                        channel,
-                        cancel,
-                    );
-                }
-                WorkerRequest::PeerExchange { .. } => {
-                    // expect this is intercepted by network layer
-                    warn!(target: "worker::network", "worker application received unexpected peer exchange message");
-                }
-            },
             NetworkEvent::Gossip(msg, propagation_source) => {
                 self.process_gossip(msg, propagation_source);
             }
-            NetworkEvent::Error(msg, channel) => {
-                let err = WorkerResponse::Error(message::WorkerRPCError(msg));
-                let network_handle = self.network_handle.clone();
-                self.network_handle.get_task_spawner().spawn_task(
-                    "report request error",
-                    async move {
-                        let _ = network_handle.handle.send_response(err, channel).await;
-                    },
-                );
-            }
             NetworkEvent::StreamRequest { peer, request, response_tx, cancel: _ } => {
-                // Handle stream requests similarly to regular requests
                 match request {
                     WorkerRequest::ReportBatch { sealed_batch } => {
                         self.process_report_batch_stream(peer, sealed_batch, response_tx);
@@ -354,77 +324,6 @@ where
                 }
             }
         }
-    }
-
-    /// Process a new reported batch.
-    ///
-    /// Spawn a task to evaluate a peer's proposed header and return a response.
-    fn process_report_batch(
-        &self,
-        peer: BlsPublicKey,
-        sealed_batch: SealedBatch,
-        channel: ResponseChannel<WorkerResponse>,
-        cancel: oneshot::Receiver<()>,
-    ) {
-        // clone for spawned tasks
-        let request_handler = self.request_handler.clone();
-        let network_handle = self.network_handle.clone();
-        let task_name = format!("process-report-batch-{}", sealed_batch.digest());
-        self.network_handle.get_task_spawner().spawn_task(task_name, async move {
-            tokio::select! {
-                res = request_handler.process_report_batch(&peer, sealed_batch) => {
-                    let response = match res {
-                        Ok(()) => WorkerResponse::ReportBatch,
-                        Err(err) => {
-                            let error = err.to_string();
-                            if let Some(penalty) = err.into() {
-                                network_handle.report_penalty(peer, penalty).await;
-                            }
-                            WorkerResponse::Error(message::WorkerRPCError(error))
-                        }
-                    };
-                    let _ = network_handle.handle.send_response(response, channel).await;
-                },
-                // cancel notification from network layer
-                _ = cancel => (),
-            }
-        });
-    }
-
-    /// Attempt to return requested batches.
-    fn process_request_batches(
-        &self,
-        peer: BlsPublicKey,
-        batch_digests: Vec<BlockHash>,
-        max_response_size: usize,
-        channel: ResponseChannel<WorkerResponse>,
-        cancel: oneshot::Receiver<()>,
-    ) {
-        // clone for spawned tasks
-        let request_handler = self.request_handler.clone();
-        let network_handle = self.network_handle.clone();
-        let task_name = format!("process-request-batches-{peer}");
-        self.network_handle.get_task_spawner().spawn_task(task_name, async move {
-            tokio::select! {
-                res = request_handler.process_request_batches(batch_digests, max_response_size) => {
-                    let response = match res {
-                        Ok(r) => WorkerResponse::RequestBatches(r),
-                        Err(err) => {
-                            let error = err.to_string();
-                            if let Some(penalty) = err.into() {
-                                network_handle.report_penalty(peer, penalty).await;
-                            }
-
-                            WorkerResponse::Error(message::WorkerRPCError(error))
-                        }
-                    };
-
-                    let _ = network_handle.handle.send_response(response, channel).await;
-                }
-                // cancel notification from network layer
-                _ = cancel => (),
-            }
-        });
     }
 
     /// Process a new reported batch via stream.

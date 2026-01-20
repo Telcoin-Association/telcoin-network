@@ -7,7 +7,6 @@ pub use libp2p::gossipsub::MessageId;
 use libp2p::{
     core::transport::ListenerId,
     gossipsub::{PublishError, SubscriptionError, TopicHash},
-    request_response::ResponseChannel,
     Multiaddr, PeerId, TransportError,
 };
 use serde::{Deserialize, Serialize};
@@ -56,17 +55,6 @@ pub const CONSENSUS_HEADER_TOPIC: &str = "tn_consensus_headers";
 /// Events created from network activity.
 #[derive(Debug)]
 pub enum NetworkEvent<Req, Res> {
-    /// Direct request from peer.
-    Request {
-        /// The peer that made the request.
-        peer: BlsPublicKey,
-        /// The network request type.
-        request: Req,
-        /// The network response channel.
-        channel: ResponseChannel<Res>,
-        /// The oneshot channel if the request gets cancelled at the network level.
-        cancel: oneshot::Receiver<()>,
-    },
     /// Stream request from peer.
     ///
     /// Application processes request and sends response(s) via the mpsc channel.
@@ -84,8 +72,6 @@ pub enum NetworkEvent<Req, Res> {
     },
     /// Gossip message received and propagation source.
     Gossip(GossipMessage, BlsPublicKey),
-    /// Send an error back the requester.
-    Error(String, ResponseChannel<Res>),
 }
 
 /// Commands for the swarm.
@@ -172,52 +158,7 @@ where
         /// Reply to caller.
         reply: oneshot::Sender<PeerId>,
     },
-    /// Send a request to a peer.
-    ///
-    /// The caller is responsible for decoding message bytes and reporting peers who return bad
-    /// data. Peers that send messages that fail to decode must receive an application score
-    /// penalty.
-    SendRequest {
-        /// The destination peer.
-        peer: BlsPublicKey,
-        /// The request to send.
-        request: Req,
-        /// Channel for forwarding any responses.
-        reply: oneshot::Sender<NetworkResult<Res>>,
-    },
-    /// Send a request to a peer by PeerId.
-    ///
-    /// The caller is responsible for decoding message bytes and reporting peers who return bad
-    /// data. Peers that send messages that fail to decode must receive an application score
-    /// penalty.
-    SendRequestDirect {
-        /// The destination peer.
-        peer: PeerId,
-        /// The request to send.
-        request: Req,
-        /// Channel for forwarding any responses.
-        reply: oneshot::Sender<NetworkResult<Res>>,
-    },
-    /// Send a request to any connected peer.
-    ///
-    /// The caller is responsible for decoding message bytes and reporting peers who return bad
-    /// data. Peers that send messages that fail to decode must receive an application score
-    /// penalty.
-    SendRequestAny {
-        /// The request to send.
-        request: Req,
-        /// Channel for forwarding any responses.
-        reply: oneshot::Sender<NetworkResult<Res>>,
-    },
-    /// Send response to a peer's request.
-    SendResponse {
-        /// The encoded message data.
-        response: Res,
-        /// The libp2p response channel.
-        channel: ResponseChannel<Res>,
-        /// Oneshot channel for returning result.
-        reply: oneshot::Sender<Result<(), Res>>,
-    },
+
     /// Subscribe to a topic.
     Subscribe {
         /// The topic to subscribe to.
@@ -271,11 +212,6 @@ where
         peer: BlsPublicKey,
         /// The penalty to apply to the peer.
         penalty: Penalty,
-    },
-    /// Return the number of pending outbound requests.
-    PendingRequestCount {
-        /// Reply to caller.
-        reply: oneshot::Sender<usize>,
     },
     /// Disconnect a peer by [PeerId]. The oneshot returns a result if the peer
     /// was connected or not.
@@ -481,61 +417,6 @@ where
         peers.await.map_err(Into::into)
     }
 
-    /// Send a request to a peer.
-    ///
-    /// Returns a handle for the caller to await the peer's response.
-    pub async fn send_request(
-        &self,
-        request: Req,
-        peer: BlsPublicKey,
-    ) -> NetworkResult<oneshot::Receiver<NetworkResult<Res>>> {
-        let (reply, to_caller) = oneshot::channel();
-        self.sender.send(NetworkCommand::SendRequest { peer, request, reply }).await?;
-        Ok(to_caller)
-    }
-
-    /// Send a request to a peer- any peer will do.
-    ///
-    /// Returns a handle for the caller to await the peer's response.
-    pub async fn send_request_any(
-        &self,
-        request: Req,
-    ) -> NetworkResult<oneshot::Receiver<NetworkResult<Res>>> {
-        let (reply, to_caller) = oneshot::channel();
-        self.sender.send(NetworkCommand::SendRequestAny { request, reply }).await?;
-        Ok(to_caller)
-    }
-
-    /// Respond to a peer's request.
-    pub async fn send_response(
-        &self,
-        response: Res,
-        channel: ResponseChannel<Res>,
-    ) -> NetworkResult<()> {
-        let (reply, res) = oneshot::channel();
-        self.sender.send(NetworkCommand::SendResponse { response, channel, reply }).await?;
-        res.await?.map_err(|_| NetworkError::SendResponse)
-    }
-
-    /// Return the number of pending requests.
-    ///
-    /// Mostly helpful for testing, but could be useful for managing outbound requests.
-    pub async fn get_pending_request_count(&self) -> NetworkResult<usize> {
-        let (reply, count) = oneshot::channel();
-        self.sender.send(NetworkCommand::PendingRequestCount { reply }).await?;
-        count.await.map_err(Into::into)
-    }
-
-    /// Disconnect from the peer.
-    ///
-    /// This method closes all connections to the peer without waiting for handlers
-    /// to complete.
-    pub(crate) async fn disconnect_peer(&self, peer_id: PeerId) -> NetworkResult<()> {
-        let (reply, res) = oneshot::channel();
-        self.sender.send(NetworkCommand::DisconnectPeer { peer_id, reply }).await?;
-        res.await?.map_err(|_| NetworkError::DisconnectPeer)
-    }
-
     /// Report a penalty to the peer manager.
     pub async fn report_penalty(&self, peer: BlsPublicKey, penalty: Penalty) {
         let _ = self.sender.send(NetworkCommand::ReportPenalty { peer, penalty }).await;
@@ -563,11 +444,7 @@ where
     /// Send a request via stream and await single response.
     ///
     /// Used for requests expecting a single response (e.g., Vote, ConsensusHeader).
-    pub async fn send_stream_request(
-        &self,
-        peer: BlsPublicKey,
-        request: Req,
-    ) -> NetworkResult<Res> {
+    pub async fn send_request(&self, peer: BlsPublicKey, request: Req) -> NetworkResult<Res> {
         let (reply, rx) = oneshot::channel();
         self.sender.send(NetworkCommand::SendStreamRequest { peer, request, reply }).await?;
         rx.await?
@@ -735,19 +612,5 @@ where
         let (reply, peers) = oneshot::channel();
         self.sender.send(NetworkCommand::ConnectedPeerIds { reply }).await?;
         peers.await.map_err(Into::into)
-    }
-
-    /// Send a request to a peer by peer id.
-    ///
-    /// Returns a handle for the caller to await the peer's response.
-    /// For internal network use.
-    pub(crate) async fn send_request_direct(
-        &self,
-        request: Req,
-        peer: PeerId,
-    ) -> NetworkResult<oneshot::Receiver<NetworkResult<Res>>> {
-        let (reply, to_caller) = oneshot::channel();
-        self.sender.send(NetworkCommand::SendRequestDirect { peer, request, reply }).await?;
-        Ok(to_caller)
     }
 }

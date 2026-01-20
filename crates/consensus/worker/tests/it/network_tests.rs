@@ -229,7 +229,7 @@ async fn test_batch_gossip_succeeds() {
                 // request_batches calls this first
                 reply.send(vec![expected_peer]).expect("peer sent");
             }
-            NetworkCommand::SendRequest { peer, request, .. } => {
+            NetworkCommand::SendStreamRequest { peer, request, .. } => {
                 // assert expected output
                 let max_response_size = committee
                     .first_authority()
