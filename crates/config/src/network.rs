@@ -21,6 +21,8 @@ pub struct NetworkConfig {
     quic_config: QuicConfig,
     /// The configuration for managing peers.
     peer_config: PeerConfig,
+    /// The configuration for stream-based messaging.
+    stream_config: StreamConfig,
     /// The hostname for the validator.
     hostname: String,
 }
@@ -50,6 +52,11 @@ impl NetworkConfig {
     /// Return a reference to the [PeerConfig].
     pub fn peer_config(&self) -> &PeerConfig {
         &self.peer_config
+    }
+
+    /// Return a reference to the [StreamConfig].
+    pub fn stream_config(&self) -> &StreamConfig {
+        &self.stream_config
     }
 
     /// The human-readable identity for this node.
@@ -283,6 +290,47 @@ impl Default for QuicConfig {
             // maximum throughput = (buffer size / round-trip time)
             max_stream_data: 50 * 1024 * 1024,      // 50MiB
             max_connection_data: 100 * 1024 * 1024, // 100MiB
+        }
+    }
+}
+
+/// Configuration for stream-based messaging.
+///
+/// This replaces the traditional request-response pattern with libp2p-stream
+/// for efficient streaming and to remove the 1 MiB message size bottleneck.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct StreamConfig {
+    /// Maximum frame size in bytes (uncompressed).
+    ///
+    /// This is the limit for a single frame when reading/writing to streams.
+    /// Default: 1 MiB (same as old max_rpc_message_size).
+    pub max_frame_size: usize,
+    /// Number of items per chunk when streaming bulk data.
+    ///
+    /// For bulk responses (e.g., certificates), items are batched into chunks
+    /// of this size before being written to the stream.
+    /// Default: 10.
+    pub items_per_chunk: usize,
+    /// Timeout for stream requests.
+    ///
+    /// Individual stream request tasks will timeout after this duration.
+    /// Default: 120 seconds.
+    pub request_timeout: Duration,
+    /// Interval for cleaning up stale stream requests.
+    ///
+    /// Periodic task that checks for and cleans up requests that have exceeded
+    /// their timeout.
+    /// Default: 10 seconds.
+    pub stale_request_interval: Duration,
+}
+
+impl Default for StreamConfig {
+    fn default() -> Self {
+        Self {
+            max_frame_size: 1024 * 1024, // 1 MiB
+            items_per_chunk: 10,
+            request_timeout: Duration::from_secs(120),
+            stale_request_interval: Duration::from_secs(10),
         }
     }
 }

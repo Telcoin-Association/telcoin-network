@@ -28,11 +28,12 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent},
     Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
+use libp2p_stream as stream;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     time::Duration,
 };
-use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig};
+use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig, StreamConfig};
 use tn_types::{
     decode, encode, now, try_decode, BlsPublicKey, BlsSigner, Database, NetworkKeypair,
     NetworkPublicKey, TaskSpawner, TnSender,
@@ -47,11 +48,12 @@ use tracing::{debug, error, info, instrument, trace, warn};
 #[path = "tests/network_tests.rs"]
 mod network_tests;
 
-const DEFAULT_KAD_PROTO_NAME: StreamProtocol = StreamProtocol::new("/ipfs/kad/1.0.0");
+/// Kademlia stream protocol.
+const DEFAULT_KAD_PROTO_NAME: StreamProtocol = StreamProtocol::new("/tn/kad/1.0.0");
 
 /// Custom network libp2p behaviour type for Telcoin Network.
 ///
-/// The behavior includes gossipsub and request-response.
+/// The behavior includes gossipsub, kademlia, peer management, and stream-based messaging.
 #[derive(NetworkBehaviour)]
 pub(crate) struct TNBehavior<C, DB>
 where
