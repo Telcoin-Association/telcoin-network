@@ -10,6 +10,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::{Display, Formatter},
     num::NonZeroU64,
+    str::FromStr,
     sync::Arc,
 };
 
@@ -230,10 +231,49 @@ impl Eq for Committee {}
 // Every authority gets uniquely identified by the AuthorityIdentifier
 // The type can be easily swapped without needing to change anything else in the implementation.
 // Currently it is the hash of the authorities BLS key (which will be stable).
-#[derive(Eq, PartialEq, Ord, PartialOrd, Clone, Hash, Serialize, Deserialize)]
+#[derive(Eq, PartialEq, Ord, PartialOrd, Clone, Hash)]
 pub struct AuthorityIdentifier(Arc<[u8; 32]>);
 
+impl Serialize for AuthorityIdentifier {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if serializer.is_human_readable() {
+            // JSON: serialize as bs58 string
+            serializer.serialize_str(&self.to_string())
+        } else {
+            // Binary: serialize as raw bytes for backward compatibility
+            self.0.as_ref().serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AuthorityIdentifier {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        if deserializer.is_human_readable() {
+            // JSON: deserialize from bs58 string
+            let s = String::deserialize(deserializer)?;
+            s.parse().map_err(D::Error::custom)
+        } else {
+            // Binary: deserialize from raw bytes
+            let bytes = <[u8; 32]>::deserialize(deserializer)?;
+            Ok(Self::from_bytes(bytes))
+        }
+    }
+}
+
 impl AuthorityIdentifier {
+    /// Create an `AuthorityIdentifier` from raw bytes.
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(Arc::new(bytes))
+    }
+
     pub fn dummy_for_test(byte: u8) -> Self {
         Self(Arc::new([byte; 32]))
     }
@@ -263,6 +303,42 @@ impl Display for AuthorityIdentifier {
 impl std::fmt::Debug for AuthorityIdentifier {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.write_str(&bs58::encode(&*self.0).into_string())
+    }
+}
+
+/// Error when parsing an `AuthorityIdentifier` from a string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseAuthorityIdentifierError {
+    /// Invalid bs58 encoding.
+    InvalidBs58(String),
+    /// Invalid length (expected 32 bytes).
+    InvalidLength { expected: usize, actual: usize },
+}
+
+impl std::fmt::Display for ParseAuthorityIdentifierError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidBs58(msg) => write!(f, "invalid bs58 encoding: {msg}"),
+            Self::InvalidLength { expected, actual } => {
+                write!(f, "invalid length: expected {expected} bytes, got {actual}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ParseAuthorityIdentifierError {}
+
+impl FromStr for AuthorityIdentifier {
+    type Err = ParseAuthorityIdentifierError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let bytes = bs58::decode(s)
+            .into_vec()
+            .map_err(|e| ParseAuthorityIdentifierError::InvalidBs58(e.to_string()))?;
+        let bytes: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
+            ParseAuthorityIdentifierError::InvalidLength { expected: 32, actual: v.len() }
+        })?;
+        Ok(Self::from_bytes(bytes))
     }
 }
 
@@ -561,8 +637,8 @@ pub fn quorum_threshold(committee_members: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Address, Authority, BlsKeypair, BlsPublicKey, BootstrapServer, Committee, Multiaddr,
-        NetworkKeypair,
+        Address, Authority, AuthorityIdentifier, BlsKeypair, BlsPublicKey, BootstrapServer,
+        Committee, Multiaddr, NetworkKeypair, ParseAuthorityIdentifierError, ReputationScores,
     };
     use rand::rng;
     use std::collections::BTreeMap;
@@ -574,9 +650,10 @@ mod tests {
         let num_of_authorities = 10;
 
         let authorities = (0..num_of_authorities)
-            .map(|_| {
+            .enumerate()
+            .map(|(i, _)| {
                 let keypair = BlsKeypair::generate(&mut rng);
-                let execution_address = Address::random();
+                let execution_address = Address::repeat_byte(i as u8);
 
                 let a = Authority::new(*keypair.public(), 1, execution_address);
 
@@ -627,5 +704,143 @@ mod tests {
             total += 1;
         }
         assert_eq!(total, num_of_authorities);
+    }
+
+    #[test]
+    fn reputation_scores_json_roundtrip() {
+        let mut scores = ReputationScores::default();
+        let id1 = AuthorityIdentifier::from_bytes([1u8; 32]);
+        let id2 = AuthorityIdentifier::from_bytes([2u8; 32]);
+        scores.scores_per_authority.insert(id1.clone(), 100);
+        scores.scores_per_authority.insert(id2.clone(), 200);
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&scores).expect("JSON serialization failed");
+
+        // Verify JSON contains bs58 string keys (not array format)
+        assert!(json.contains(&id1.to_string()), "JSON should contain bs58 key for id1");
+        assert!(json.contains(&id2.to_string()), "JSON should contain bs58 key for id2");
+        assert!(!json.contains("[["), "JSON should not be array of tuples format");
+
+        // Deserialize back
+        let parsed: ReputationScores =
+            serde_json::from_str(&json).expect("JSON deserialization failed");
+        assert_eq!(scores, parsed);
+    }
+
+    #[test]
+    fn reputation_scores_bincode_roundtrip() {
+        let mut scores = ReputationScores::default();
+        let id1 = AuthorityIdentifier::from_bytes([1u8; 32]);
+        let id2 = AuthorityIdentifier::from_bytes([2u8; 32]);
+        scores.scores_per_authority.insert(id1, 100);
+        scores.scores_per_authority.insert(id2, 200);
+
+        // Serialize to bincode
+        let bytes = bincode::serialize(&scores).expect("bincode serialization failed");
+
+        // Deserialize back
+        let parsed: ReputationScores =
+            bincode::deserialize(&bytes).expect("bincode deserialization failed");
+        assert_eq!(scores, parsed);
+    }
+
+    #[test]
+    fn reputation_scores_json_invalid_key() {
+        // JSON with invalid bs58 key (contains '0' which is not valid bs58)
+        let invalid_json =
+            r#"{"scores_per_authority":{"invalid0key":100},"final_of_schedule":false}"#;
+        let result: Result<ReputationScores, _> = serde_json::from_str(invalid_json);
+        assert!(result.is_err(), "Should fail on invalid bs58 key");
+    }
+
+    #[test]
+    fn authority_identifier_json_serialization() {
+        let id = AuthorityIdentifier::from_bytes([42u8; 32]);
+
+        // JSON should serialize as a bs58 string
+        let json = serde_json::to_string(&id).expect("JSON serialization failed");
+
+        // Should be a quoted string, not an array
+        assert!(json.starts_with('"'), "JSON should be a string");
+        assert!(json.ends_with('"'), "JSON should be a string");
+        assert!(!json.contains('['), "JSON should not be an array");
+
+        // The string should be the bs58 representation
+        let expected = format!("\"{}\"", id.to_string());
+        assert_eq!(json, expected);
+
+        // Roundtrip
+        let parsed: AuthorityIdentifier =
+            serde_json::from_str(&json).expect("JSON deserialization failed");
+        assert_eq!(id, parsed);
+    }
+
+    #[test]
+    fn authority_identifier_bincode_serialization() {
+        let bytes = [42u8; 32];
+        let id = AuthorityIdentifier::from_bytes(bytes);
+
+        // Serialize to bincode
+        let serialized = bincode::serialize(&id).expect("bincode serialization failed");
+
+        // Bincode should serialize as raw 32 bytes (the array itself)
+        assert_eq!(serialized.len(), 32, "bincode should be exactly 32 bytes");
+        assert_eq!(serialized.as_slice(), &bytes, "bincode should be raw bytes");
+
+        // Roundtrip
+        let parsed: AuthorityIdentifier =
+            bincode::deserialize(&serialized).expect("bincode deserialization failed");
+        assert_eq!(id, parsed);
+    }
+
+    #[test]
+    fn authority_identifier_bincode_backward_compatibility() {
+        // Simulate data serialized with the OLD format (raw bytes)
+        // This ensures we maintain backward compatibility
+        let raw_bytes: [u8; 32] = [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25, 26, 27, 28, 29, 30, 31, 32,
+        ];
+
+        // The old format was just the raw 32 bytes
+        let parsed: AuthorityIdentifier =
+            bincode::deserialize(&raw_bytes).expect("Should deserialize old format");
+
+        // Verify we got the right bytes
+        assert_eq!(parsed, AuthorityIdentifier::from_bytes(raw_bytes));
+    }
+
+    #[test]
+    fn authority_identifier_display_fromstr_roundtrip() {
+        // Test with known bytes
+        let bytes = [42u8; 32];
+        let id = AuthorityIdentifier::from_bytes(bytes);
+
+        // Display should produce bs58
+        let displayed = id.to_string();
+        assert!(!displayed.is_empty());
+
+        // FromStr should parse back to the same identifier
+        let parsed: AuthorityIdentifier = displayed.parse().unwrap();
+        assert_eq!(id, parsed);
+    }
+
+    #[test]
+    fn authority_identifier_fromstr_invalid_bs58() {
+        // Invalid bs58 character (0, O, I, l are not valid in bs58)
+        let result: Result<AuthorityIdentifier, _> = "invalid0string".parse();
+        assert!(matches!(result, Err(ParseAuthorityIdentifierError::InvalidBs58(_))));
+    }
+
+    #[test]
+    fn authority_identifier_fromstr_wrong_length() {
+        // Valid bs58 but wrong length (only 4 bytes when decoded)
+        let short = bs58::encode([1u8, 2, 3, 4]).into_string();
+        let result: Result<AuthorityIdentifier, _> = short.parse();
+        assert!(matches!(
+            result,
+            Err(ParseAuthorityIdentifierError::InvalidLength { expected: 32, actual: 4 })
+        ));
     }
 }
