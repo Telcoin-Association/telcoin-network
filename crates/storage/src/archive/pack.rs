@@ -16,13 +16,12 @@ use crate::archive::{
 use super::{crc::add_crc32, data_file::DataFile};
 use std::{
     fmt::Debug,
-    fs,
+    fs::{self, File},
     hash::Hasher as _,
     io::{self, Read, Seek, SeekFrom, Write},
     marker::PhantomData,
     path::Path,
-    time,
-    time::UNIX_EPOCH,
+    time::{self, UNIX_EPOCH},
 };
 
 /// An instance of a DB.
@@ -47,6 +46,11 @@ where
     /// Fetch the value stored at key.  Will return an error if not found.
     pub fn fetch(&mut self, pos: u64) -> Result<V, FetchError> {
         self.inner.fetch(pos)
+    }
+
+    /// Return a refernce to the pack files header.
+    pub fn header(&self) -> &DataHeader {
+        &self.inner.header
     }
 
     /// Insert a new key/value pair in Db.
@@ -106,7 +110,7 @@ where
     /// Return an iterator over the key values in insertion order.
     /// Note this iterator only uses the data file not the indexes.
     /// This iterator will not see any data in the write cache.
-    pub fn raw_iter(&self) -> Result<PackIter<V>, LoadHeaderError> {
+    pub fn raw_iter(&self) -> Result<PackIter<V, File>, LoadHeaderError> {
         self.inner.raw_iter()
     }
 }
@@ -317,9 +321,9 @@ where
     /// Return an iterator over the key values in insertion order.
     /// Note this iterator only uses the data file not the indexes.
     /// This iterator will not see any data in the write cache.
-    fn raw_iter(&self) -> Result<PackIter<V>, LoadHeaderError> {
+    fn raw_iter(&self) -> Result<PackIter<V, File>, LoadHeaderError> {
         let dat_file = { self.data_file.try_clone()? };
-        PackIter::with_file(dat_file)
+        PackIter::open(dat_file)
     }
 }
 
@@ -428,6 +432,8 @@ impl DataHeader {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::OpenOptions;
+
     use serde::Deserialize;
     use tempfile::TempDir;
 
@@ -523,8 +529,13 @@ mod tests {
         assert_eq!(v.name, "Value Three2");
         drop(db);
 
-        let mut iter =
-            PackIter::open(tmp_path.path().join("pack_test_one")).unwrap().map(|r| r.unwrap());
+        let data_file = OpenOptions::new()
+            .read(true)
+            .write(false)
+            .create(false)
+            .open(tmp_path.path().join("pack_test_one"))
+            .unwrap();
+        let mut iter = PackIter::open(data_file).unwrap().map(|r| r.unwrap());
         let v: TestRec = iter.next().unwrap();
         assert_eq!(v.idx, 1);
         assert_eq!(v.name, "Value One");

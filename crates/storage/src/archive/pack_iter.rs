@@ -3,11 +3,9 @@
 
 use std::{
     fmt::Debug,
-    fs::{File, OpenOptions},
     io,
     io::{BufReader, Read, Seek},
     marker::PhantomData,
-    path::Path,
 };
 
 use serde::{de::DeserializeOwned, Serialize};
@@ -21,48 +19,39 @@ use crate::archive::{
 /// Iterate over a Db's key, value pairs in insert order.
 /// This iterator is "raw", it does not use any indexes just the data file.
 #[derive(Debug)]
-pub struct PackIter<V>
+pub struct PackIter<V, R>
 where
     V: Debug + Serialize + DeserializeOwned,
+    R: Read,
 {
     _val: PhantomData<V>,
-    file: BufReader<File>,
+    reader: BufReader<R>,
     buffer: Vec<u8>,
 }
 
-impl<V> PackIter<V>
+impl<V, R> PackIter<V, R>
 where
     V: Debug + Serialize + DeserializeOwned,
+    R: Read + Seek,
 {
-    /// Open the data file in dir with base_name (note do not include the .dat- that is appended).
-    /// Produces an iterator over all the (key, values).  Does not use the index at all and records
+    /// Open the iterator using reader as a data source.
+    /// Produces an iterator over all the (key, values).  All and records
     /// are returned in insert order.
-    pub fn open<P: AsRef<Path>>(data_name: P) -> Result<Self, LoadHeaderError> {
-        let mut data_file =
-            OpenOptions::new().read(true).write(false).create(false).open(data_name)?;
-
-        let _header = DataHeader::load_header(&mut data_file)?;
-        let file = BufReader::new(data_file);
-        Ok(Self { _val: PhantomData, file, buffer: Vec::new() })
-    }
-
-    /// Same as open but created from an existing File.
-    pub fn with_file(dat_file: File) -> Result<Self, LoadHeaderError> {
-        let mut dat_file = dat_file;
-        let _header = DataHeader::load_header(&mut dat_file)?;
-        let file = BufReader::new(dat_file);
-        Ok(Self { _val: PhantomData, file, buffer: Vec::new() })
+    pub fn open(mut reader: R) -> Result<Self, LoadHeaderError> {
+        let _header = DataHeader::load_header(&mut reader)?;
+        let reader = BufReader::new(reader);
+        Ok(PackIter { _val: PhantomData, reader, buffer: Vec::new() })
     }
 
     /// Return the current position of the data file.
     pub fn position(&mut self) -> io::Result<u64> {
-        self.file.stream_position()
+        self.reader.stream_position()
     }
 
     /// Read the next record or return an error if an overflow bucket.
     /// This expects the file cursor to be positioned at the records first byte.
-    fn read_record_file<R: Read + Seek>(
-        file: &mut R,
+    fn read_record_file<R2: Read + Seek>(
+        file: &mut R2,
         buffer: &mut Vec<u8>,
     ) -> Result<V, FetchError> {
         let mut crc32_hasher = crc32fast::Hasher::new();
@@ -93,14 +82,14 @@ where
     }
 }
 
-impl<V> Iterator for PackIter<V>
+impl<V, R: Read + Seek> Iterator for PackIter<V, R>
 where
     V: Debug + Serialize + DeserializeOwned,
 {
     type Item = Result<V, FetchError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match Self::read_record_file(&mut self.file, &mut self.buffer) {
+        match Self::read_record_file(&mut self.reader, &mut self.buffer) {
             Ok(val) => Some(Ok(val)),
             Err(err) => match err {
                 FetchError::NotFound => None,
