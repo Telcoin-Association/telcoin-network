@@ -530,6 +530,14 @@ impl ConsensusBus {
         self.inner_app.tx_sync_status.borrow().is_cvv()
     }
 
+    /// Returns true if this node is an active CVV (Committee Voting Validator).
+    ///
+    /// This is a helper method that borrows the node mode watch channel
+    /// and checks if the node is actively participating in consensus.
+    pub fn is_active_cvv(&self) -> bool {
+        self.inner_app.tx_sync_status.borrow().is_active_cvv()
+    }
+
     /// Return the channel for primary network events.
     pub fn primary_network_events(
         &self,

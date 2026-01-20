@@ -749,7 +749,7 @@ impl<DB: Database> Proposer<DB> {
     }
 
     pub(crate) fn spawn(mut self, task_manager: &TaskManager) {
-        if self.consensus_bus.node_mode().borrow().is_active_cvv() {
+        if self.consensus_bus.is_active_cvv() {
             task_manager.spawn_critical_task(
                 "proposer task",
                 monitored_future!(

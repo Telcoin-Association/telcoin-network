@@ -476,7 +476,7 @@ where
             epoch_task_manager.spawn_task("Orphaned Batches", async move {
                 info!(target: "epoch-manager", "Re-introducing orphaned batchs {} transactions", orphan_batches.len());
                 let pools = engine.get_all_worker_transaction_pools().await;
-                let is_cvv = consensus_bus.node_mode().borrow().is_active_cvv();
+                let is_cvv = consensus_bus.is_active_cvv();
                 for (digest, batch) in orphan_batches.drain(..) {
                     // Loop through any orphaned batches and resubmit it's transactions.
                     // This is most likely because of epoch changes but could be caused by a restart as

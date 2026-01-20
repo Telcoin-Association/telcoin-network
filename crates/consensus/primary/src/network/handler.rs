@@ -97,7 +97,7 @@ where
         // the current DAG. Trying to ride the GC window exactly can lead to subtle races
         // (allow some time to get going).
         let gc_depth = self.consensus_config.parameters().gc_depth.saturating_sub(10);
-        let active_cvv = self.consensus_bus.node_mode().borrow().is_active_cvv();
+        let active_cvv = self.consensus_bus.is_active_cvv();
         // is our round outside the GC window
         // Will be false when not the same epoch (can't compare rounds) but
         // epoch_behind will work in that case.
@@ -167,7 +167,7 @@ where
                 if let Some(committee) = self.get_committee(epoch) {
                     match unverified_cert.verify_cert(&committee) {
                         Ok(cert) => {
-                            if self.consensus_bus.node_mode().borrow().is_active_cvv() {
+                            if self.consensus_bus.is_active_cvv() {
                                 if self.behind_consensus(epoch, cert.header().round, None).await {
                                     warn!(target: "primary", "certificate indicates we are behind, go to catchup mode!");
                                     return Ok(());
