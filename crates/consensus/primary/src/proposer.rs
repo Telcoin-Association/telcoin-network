@@ -20,7 +20,6 @@ use crate::{
     error::{ProposerError, ProposerResult},
     ConsensusBus,
 };
-use consensus_metrics::monitored_future;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, VecDeque},
@@ -750,16 +749,10 @@ impl<DB: Database> Proposer<DB> {
 
     pub(crate) fn spawn(mut self, task_manager: &TaskManager) {
         if self.consensus_bus.is_active_cvv() {
-            task_manager.spawn_critical_task(
-                "proposer task",
-                monitored_future!(
-                    async move {
-                        info!(target: "primary::proposer", "Starting proposer");
-                        self.run().await
-                    },
-                    "ProposerTask"
-                ),
-            );
+            task_manager.spawn_critical_task("proposer task", async move {
+                info!(target: "primary::proposer", "Starting proposer");
+                self.run().await
+            });
         }
         // If not an active CVV then don't propose anything.
     }

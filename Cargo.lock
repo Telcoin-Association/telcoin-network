@@ -2401,10 +2401,8 @@ version = "0.1.0"
 dependencies = [
  "axum 0.8.6",
  "futures",
- "once_cell",
  "parking_lot",
  "prometheus",
- "scopeguard",
  "tn-types",
  "tokio",
  "tracing",
@@ -11327,7 +11325,6 @@ checksum = "a8f112729512f8e442d81f95a8a7ddf2b7c6b8a1a6f509a95864142b30cab2d3"
 name = "state-sync"
 version = "0.1.0"
 dependencies = [
- "consensus-metrics",
  "eyre",
  "tn-config",
  "tn-primary",
@@ -11851,7 +11848,6 @@ dependencies = [
 name = "tn-executor"
 version = "0.1.0"
 dependencies = [
- "consensus-metrics",
  "eyre",
  "futures",
  "state-sync",
@@ -12173,7 +12169,6 @@ version = "0.1.0"
 dependencies = [
  "assert_matches",
  "async-trait",
- "consensus-metrics",
  "eyre",
  "futures",
  "prometheus",

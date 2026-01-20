@@ -12,7 +12,6 @@ use crate::{
     state_sync::cert_validator::certificate_source,
     ConsensusBus,
 };
-use consensus_metrics::monitored_scope;
 use std::{
     collections::{HashSet, VecDeque},
     sync::Arc,
@@ -146,8 +145,6 @@ where
         &self,
         certificate: &Certificate,
     ) -> CertManagerResult<HashSet<CertificateDigest>> {
-        let _scope = monitored_scope("primary::state-sync::get_missing_parents");
-
         // handle genesis cert
         if certificate.round() == 1 {
             debug!(target: "primary::cert_manager", ?certificate, "cert round 1");
@@ -206,7 +203,6 @@ where
         &mut self,
         certificates: VecDeque<Certificate>,
     ) -> CertManagerResult<()> {
-        let _scope = monitored_scope("primary::cert_manager::accept_certificate");
         debug!(target: "primary::cert_manager", ?certificates, "accepting {:?} certificates", certificates.len());
 
         // write certificates to storage

@@ -1,7 +1,6 @@
 //! Subscriber handles consensus output.
 
 use crate::{errors::SubscriberResult, SubscriberError};
-use consensus_metrics::monitored_future;
 use futures::{stream::FuturesOrdered, StreamExt};
 use state_sync::{last_executed_consensus_block, save_consensus, spawn_state_sync};
 use std::{
@@ -71,50 +70,35 @@ pub fn spawn_subscriber<DB: Database>(
     match mode {
         // If we are active then partcipate in consensus.
         NodeMode::CvvActive => {
-            task_manager.spawn_critical_task(
-                "subscriber consensus",
-                monitored_future!(
-                    async move {
-                        info!(target: "subscriber", "Starting subscriber: CVV");
-                        if let Err(e) = subscriber.run(rx_shutdown).await {
-                            error!(target: "subscriber", "Error subscriber consensus: {e}");
-                        }
-                    },
-                    "SubscriberTask"
-                ),
-            );
+            task_manager.spawn_critical_task("subscriber consensus", async move {
+                info!(target: "subscriber", "Starting subscriber: CVV");
+                if let Err(e) = subscriber.run(rx_shutdown).await {
+                    error!(target: "subscriber", "Error subscriber consensus: {e}");
+                }
+            });
         }
         NodeMode::CvvInactive => {
             let clone = task_manager.get_spawner();
             // If we are not active but are a CVV then catch up and rejoin.
             task_manager.spawn_critical_task(
                 "subscriber catch up and rejoin consensus",
-                monitored_future!(
-                    async move {
-                        info!(target: "subscriber", "Starting subscriber: Catch up and rejoin");
-                        if let Err(e) = subscriber.catch_up_rejoin_consensus(clone).await {
-                            error!(target: "subscriber", "Error catching up consensus: {e}");
-                        }
-                    },
-                    "SubscriberFollowTask"
-                ),
+                async move {
+                    info!(target: "subscriber", "Starting subscriber: Catch up and rejoin");
+                    if let Err(e) = subscriber.catch_up_rejoin_consensus(clone).await {
+                        error!(target: "subscriber", "Error catching up consensus: {e}");
+                    }
+                },
             );
         }
         NodeMode::Observer => {
             let clone = task_manager.get_spawner();
             // If we are not active then just follow consensus.
-            task_manager.spawn_critical_task(
-                "subscriber follow consensus",
-                monitored_future!(
-                    async move {
-                        info!(target: "subscriber", "Starting subscriber: Follower");
-                        if let Err(e) = subscriber.follow_consensus(clone).await {
-                            error!(target: "subscriber", "Error following consensus: {e}");
-                        }
-                    },
-                    "SubscriberFollowTask"
-                ),
-            );
+            task_manager.spawn_critical_task("subscriber follow consensus", async move {
+                info!(target: "subscriber", "Starting subscriber: Follower");
+                if let Err(e) = subscriber.follow_consensus(clone).await {
+                    error!(target: "subscriber", "Error following consensus: {e}");
+                }
+            });
         }
     }
 }
