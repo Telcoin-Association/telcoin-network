@@ -1,0 +1,357 @@
+//! Implement a Pack file to contain consensus chain data (Batches and ConsensusHeaders).
+//! Stored per epoch.
+
+use std::{
+    collections::HashSet, error::Error, fmt::Display, hash::BuildHasherDefault, io, path::Path,
+    sync::Arc,
+};
+
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+use tn_types::{
+    Batch, BlockHash, BlockNumHash, BlsPublicKey, CertifiedBatch, Committee, ConsensusHeader,
+    ConsensusOutput, Database, Epoch, EpochRecord, B256,
+};
+
+use crate::{
+    archive::{
+        digest_index::index::HdxIndex,
+        error::open::OpenError,
+        fxhasher::FxHasher,
+        index::Index as _,
+        pack::Pack,
+        position_index::index::{PositionIndex, PACK_HEADER_SIZE},
+    },
+    tables::Batches,
+};
+
+/// Metadata for an Epoch.  Should always be the first record in a consensus pack.
+#[derive(PartialEq, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct EpochMeta {
+    /// The epoch this record is for.
+    pub epoch: Epoch,
+    /// The active committee for this epoch.
+    pub committee: Vec<BlsPublicKey>,
+    /// The first consensus block number of this epoch.
+    pub start_consensus_number: u64,
+    /// The block number and hash of the last execution state of the previous epoch.
+    /// Basically the execution genesis for this epoch.
+    pub genesis_exec_state: BlockNumHash,
+    /// The hash of the last ['ConsensusHeader'] of the previous epoch.
+    /// This is the "genesis" consensus ofder  this epoch.
+    pub genesis_consensus: B256,
+}
+
+/// Descriminant type for records in a Consensus Pack file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PackRecord {
+    EpochMeta(EpochMeta),
+    Batch(Batch),
+    Consensus(Box<ConsensusHeader>),
+}
+
+impl PackRecord {
+    fn into_consensus(self) -> Result<ConsensusHeader, PackError> {
+        if let Self::Consensus(header) = self {
+            Ok(*header)
+        } else {
+            Err(PackError::NotConsensus)
+        }
+    }
+    fn into_batch(self) -> Result<Batch, PackError> {
+        if let Self::Batch(batch) = self {
+            Ok(batch)
+        } else {
+            Err(PackError::NotBatch)
+        }
+    }
+    fn into_epoch(self) -> Result<EpochMeta, PackError> {
+        if let Self::EpochMeta(epoch) = self {
+            Ok(epoch)
+        } else {
+            Err(PackError::NotEpoch)
+        }
+    }
+}
+
+/// Manage a single pack file of consensus data (typically one epoch os the consensus chain).
+#[derive(Debug, Clone)]
+pub struct ConsensusPack<DB: Database> {
+    inner: Arc<RwLock<Inner<DB>>>,
+}
+
+impl<DB: Database> ConsensusPack<DB> {
+    const DATA_NAME: &str = "data";
+    const CONSENSUS_POS_NAME: &str = "idx";
+    const CONSENSUS_HASH_NAME: &str = "hash";
+    const BATCH_HASH_NAME: &str = "bhash";
+
+    /// Create a new set of epoch static files to write consensus output into.
+    pub fn open_new<P: AsRef<Path>>(
+        path: P,
+        epoch: Epoch,
+        previous_epoch: &EpochRecord,
+        start_consensus_number: u64,
+        db: DB,
+    ) -> Result<ConsensusPack<DB>, PackError> {
+        let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
+        let mut data = Pack::open(base_dir.join(Self::DATA_NAME), false)?;
+        let epoch_meta = EpochMeta {
+            epoch,
+            committee: previous_epoch.next_committee.clone(),
+            start_consensus_number,
+            genesis_exec_state: previous_epoch.parent_state,
+            genesis_consensus: previous_epoch.parent_consensus,
+        };
+        data.append(&PackRecord::EpochMeta(epoch_meta.clone()))
+            .map_err(|e| PackError::Append(e.to_string()))?;
+        let consensus_idx =
+            PositionIndex::open_pdx_file(base_dir.join(Self::CONSENSUS_POS_NAME), data.header())
+                .map_err(OpenError::IndexFileOpen)?;
+        let builder = BuildHasherDefault::<FxHasher>::default();
+        let consensus_digests = HdxIndex::open_hdx_file(
+            base_dir.join(Self::CONSENSUS_HASH_NAME),
+            data.header(),
+            builder,
+        )
+        .map_err(OpenError::IndexFileOpen)?;
+        let builder = BuildHasherDefault::<FxHasher>::default();
+        let batch_digests =
+            HdxIndex::open_hdx_file(base_dir.join(Self::BATCH_HASH_NAME), data.header(), builder)
+                .map_err(OpenError::IndexFileOpen)?;
+        Ok(Self {
+            inner: Arc::new(RwLock::new(Inner {
+                db: Some(db),
+                data,
+                consensus_idx,
+                consensus_digests,
+                batch_digests,
+                epoch_meta,
+            })),
+        })
+    }
+
+    /// Open up the static files for previous epoch.  These will be read only.
+    pub fn open_static<P: AsRef<Path>>(
+        path: P,
+        epoch: Epoch,
+    ) -> Result<ConsensusPack<DB>, PackError> {
+        let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
+
+        let mut data = Pack::<PackRecord>::open(base_dir.join(Self::DATA_NAME), true)?;
+        let epoch_meta = data
+            .fetch(PACK_HEADER_SIZE as u64)
+            .map_err(|e| PackError::EpochLoad(e.to_string()))?
+            .into_epoch()?;
+        let consensus_idx =
+            PositionIndex::open_pdx_file(base_dir.join(Self::CONSENSUS_POS_NAME), data.header())
+                .map_err(OpenError::IndexFileOpen)?;
+        let builder = BuildHasherDefault::<FxHasher>::default();
+        let consensus_digests = HdxIndex::open_hdx_file(
+            base_dir.join(Self::CONSENSUS_HASH_NAME),
+            data.header(),
+            builder,
+        )
+        .map_err(OpenError::IndexFileOpen)?;
+        let builder = BuildHasherDefault::<FxHasher>::default();
+        let batch_digests =
+            HdxIndex::open_hdx_file(base_dir.join(Self::BATCH_HASH_NAME), data.header(), builder)
+                .map_err(OpenError::IndexFileOpen)?;
+
+        Ok(Self {
+            inner: Arc::new(RwLock::new(Inner {
+                db: None,
+                data,
+                consensus_idx,
+                consensus_digests,
+                batch_digests,
+                epoch_meta,
+            })),
+        })
+    }
+
+    /// Save all the batches and consensus header to the pack file.
+    pub fn save_consensus(&self, consensus: ConsensusHeader) -> Result<(), PackError> {
+        let mut guard = self.inner.write();
+        let mut batches = Vec::new();
+        if let Some(db) = &guard.db {
+            // Collect all the batches for the consensus header.
+            for cert in &consensus.sub_dag.certificates {
+                for (batch_digest, _) in cert.header().payload() {
+                    match db
+                        .get::<Batches>(batch_digest)
+                        .map_err(|e| PackError::BatchLoad(e.to_string()))?
+                    {
+                        Some(batch) => batches.push((batch_digest, batch)),
+                        None => return Err(PackError::MissingBatch),
+                    }
+                }
+            }
+        } else {
+            return Err(PackError::ReadOnly);
+        }
+        // Save all the required batcdhes into the pack file.
+        for (batch_digest, batch) in batches.drain(..) {
+            let position = guard
+                .data
+                .append(&PackRecord::Batch(batch))
+                .map_err(|e| PackError::Append(e.to_string()))?;
+            guard
+                .batch_digests
+                .save(batch_digest.as_slice(), position)
+                .map_err(|e| PackError::IndexAppend(e.to_string()))?;
+        }
+        // Now save the consensus header.
+        let consensus_digest = consensus.digest();
+        let consensus_number = consensus.number;
+        let position = guard
+            .data
+            .append(&PackRecord::Consensus(Box::new(consensus)))
+            .map_err(|e| PackError::Append(e.to_string()))?;
+        guard
+            .consensus_digests
+            .save(consensus_digest.as_slice(), position)
+            .map_err(|e| PackError::IndexAppend(e.to_string()))?;
+        let consensus_idx =
+            consensus_number.saturating_sub(guard.epoch_meta.start_consensus_number);
+        guard
+            .consensus_idx
+            .save(consensus_idx, position)
+            .map_err(|e| PackError::IndexAppend(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Load and return the consensus output form this epoch.
+    pub fn get_consensus_output(
+        &self,
+        number: u64,
+        committee: &Committee,
+    ) -> Result<ConsensusOutput, PackError> {
+        let mut guard = self.inner.write();
+        let rec_pos_idx = number.saturating_sub(guard.epoch_meta.start_consensus_number);
+        let position = guard
+            .consensus_idx
+            .load(rec_pos_idx)
+            .map_err(|e| PackError::ReadError(e.to_string()))?;
+        let header = guard
+            .data
+            .fetch(position)
+            .map_err(|e| PackError::ReadError(e.to_string()))?
+            .into_consensus()?;
+        let parent_hash = header.parent_hash;
+        let deliver = header.sub_dag;
+        let num_blocks = deliver.num_primary_blocks();
+        let num_certs = deliver.len();
+
+        if num_blocks == 0 {
+            return Ok(ConsensusOutput {
+                sub_dag: Arc::new(deliver),
+                parent_hash,
+                number,
+                ..Default::default()
+            });
+        }
+
+        let sub_dag = Arc::new(deliver);
+        let mut consensus_output = ConsensusOutput {
+            sub_dag: sub_dag.clone(),
+            batches: Vec::with_capacity(num_certs),
+            parent_hash,
+            number,
+            ..Default::default()
+        };
+
+        let mut batch_set: HashSet<BlockHash> = HashSet::new();
+
+        for cert in &sub_dag.certificates {
+            for (digest, _) in cert.header().payload().iter() {
+                batch_set.insert(*digest);
+                consensus_output.batch_digests.push_back(*digest);
+            }
+        }
+
+        // map all fetched batches to their respective certificates for applying block rewards
+        for cert in &sub_dag.certificates {
+            // create collection of batches to execute for this certificate
+            let mut cert_batches = Vec::with_capacity(cert.header().payload().len());
+
+            // retrieve fetched batch by digest
+            for digest in cert.header().payload().keys() {
+                let position = guard
+                    .batch_digests
+                    .load(digest.as_slice())
+                    .map_err(|e| PackError::ReadError(e.to_string()))?;
+                let batch = guard
+                    .data
+                    .fetch(position)
+                    .map_err(|e| PackError::ReadError(e.to_string()))?
+                    .into_batch()?;
+                cert_batches.push(batch);
+            }
+
+            let address = committee.authority(cert.origin()).map(|a| a.execution_address());
+            if let Some(address) = address {
+                // main collection for execution
+                consensus_output.batches.push(CertifiedBatch { address, batches: cert_batches });
+            } else {
+                return Err(PackError::MissingAuthority);
+            }
+        }
+        Ok(consensus_output)
+    }
+}
+
+#[derive(Debug)]
+struct Inner<DB: Database> {
+    db: Option<DB>,
+    data: Pack<PackRecord>,
+    consensus_idx: PositionIndex,
+    consensus_digests: HdxIndex,
+    batch_digests: HdxIndex,
+    epoch_meta: EpochMeta,
+}
+
+#[derive(Debug)]
+pub enum PackError {
+    IO(io::Error),
+    MissingBatch,
+    BatchLoad(String),
+    EpochLoad(String),
+    Append(String),
+    IndexAppend(String),
+    Open(OpenError),
+    ReadOnly,
+    NotConsensus,
+    NotBatch,
+    NotEpoch,
+    ReadError(String),
+    MissingAuthority,
+}
+
+impl Error for PackError {}
+impl Display for PackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PackError::IO(error) => write!(f, "IO({error}"),
+            PackError::MissingBatch => write!(f, "Missing Batch"),
+            PackError::BatchLoad(error) => write!(f, "Batch Load Error ({error})"),
+            PackError::EpochLoad(error) => write!(f, "Epoch Load Error ({error})"),
+            PackError::Append(error) => write!(f, "Data Append Error ({error})"),
+            PackError::IndexAppend(error) => write!(f, "Index Append Error ({error})"),
+            PackError::Open(error) => write!(f, "Open Error {error}"),
+            PackError::ReadOnly => write!(f, "Read Only"),
+            PackError::NotConsensus => write!(f, "Record is not a consensus header"),
+            PackError::NotBatch => write!(f, "Record is not a Batch"),
+            PackError::NotEpoch => write!(f, "Record is not an EpochMeta"),
+            PackError::ReadError(error) => write!(f, "Read Error {error}"),
+            PackError::MissingAuthority => write!(f, "Missing authority"),
+        }
+    }
+}
+
+impl From<OpenError> for PackError {
+    fn from(value: OpenError) -> Self {
+        Self::Open(value)
+    }
+}
