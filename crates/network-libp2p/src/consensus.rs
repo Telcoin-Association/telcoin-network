@@ -33,7 +33,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     time::Duration,
 };
-use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig, StreamConfig};
+use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig};
 use tn_types::{
     decode, encode, now, try_decode, BlsPublicKey, BlsSigner, Database, NetworkKeypair,
     NetworkPublicKey, TaskSpawner, TnSender,
@@ -67,6 +67,8 @@ where
     pub(crate) peer_manager: peers::PeerManager,
     /// Used for peer discovery.
     pub(crate) kademlia: kad::Behaviour<KadStore<DB>>,
+    /// Stream-based messaging for large data transfers.
+    pub(crate) stream: stream::Behaviour,
 }
 
 impl<C, DB> TNBehavior<C, DB>
@@ -82,7 +84,13 @@ where
         peer_config: &PeerConfig,
     ) -> Self {
         let peer_manager = PeerManager::new(peer_config);
-        Self { gossipsub, req_res, peer_manager, kademlia }
+        let stream = stream::Behaviour::new();
+        Self { gossipsub, req_res, peer_manager, kademlia, stream }
+    }
+
+    /// Get a control handle for opening streams.
+    pub(crate) fn stream_control(&self) -> stream::Control {
+        self.stream.new_control()
     }
 }
 
@@ -446,6 +454,7 @@ where
                 TNBehaviorEvent::ReqRes(event) => self.process_reqres_event(event)?,
                 TNBehaviorEvent::PeerManager(event) => self.process_peer_manager_event(event)?,
                 TNBehaviorEvent::Kademlia(event) => self.process_kad_event(event)?,
+                TNBehaviorEvent::Stream(event) => self.process_stream_event(event)?,
             },
             SwarmEvent::ExternalAddrConfirmed { address: _ } => {
                 // New confirmed address so lets publish/update or kademlia address rocord.
@@ -1228,6 +1237,19 @@ where
                 trace!(target: "network-kad", "mode changed {new_mode:?}")
             }
         }
+        Ok(())
+    }
+
+    /// Process an event from the stream behaviour.
+    ///
+    /// Note: The stream::Behaviour has `ToSwarm = ()` (void event type).
+    /// Actual stream handling is done through the Control handle, not through events.
+    /// This handler is called when the behaviour emits an event, which is currently
+    /// just a unit type.
+    fn process_stream_event(&mut self, _event: ()) -> NetworkResult<()> {
+        // The stream behaviour doesn't emit meaningful events.
+        // Incoming streams are handled through the Control::accept() mechanism,
+        // and the StreamManager polls for them separately.
         Ok(())
     }
 

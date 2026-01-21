@@ -5,10 +5,14 @@
 //! implement the TNStreamMessage trait.
 //!
 //! The StreamManager handles:
-//! - Opening and closing streams to peers
+//! - Accepting incoming streams from peers via libp2p-stream
+//! - Opening outbound streams to peers
 //! - Routing requests/responses through the correct stream
 //! - Tracking pending requests and handling timeouts
 //! - Managing raw byte streaming for large transfers
+//!
+//! Events flow through the native swarm integration: the StreamManager polls
+//! both incoming streams (via IncomingStreams) and existing stream events.
 
 use super::{
     codec::StreamCodec,
@@ -16,12 +20,13 @@ use super::{
     protocol::{FrameHeader, StreamError, StreamErrorCode, TN_STREAM_PROTOCOL},
     TNStreamMessage,
 };
+use futures::Stream;
 use libp2p::{bytes::Bytes, swarm::Stream as NegotiatedStream, PeerId};
 use libp2p_stream as stream;
 use std::{collections::HashMap, marker::PhantomData, time::Instant};
 use tn_config::StreamConfig;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 /// Handle for controlling an active raw byte stream.
 ///
@@ -55,6 +60,10 @@ enum PeerStreamState {
 ///
 /// Generic over request and response types, following the same pattern
 /// as ConsensusNetwork with TNMessage.
+///
+/// Events are received through polling both:
+/// - `incoming_streams`: New inbound connections from peers (via libp2p-stream)
+/// - Per-peer stream event channels: Data from existing connections
 pub struct StreamManager<Req, Res>
 where
     Req: TNStreamMessage,
@@ -62,6 +71,8 @@ where
 {
     /// libp2p-stream control handle for opening new streams.
     control: stream::Control,
+    /// Handle to receive incoming streams from peers.
+    incoming_streams: stream::IncomingStreams,
     /// Active streams by peer ID.
     streams: HashMap<PeerId, PeerStreamState>,
     /// Pending typed requests awaiting responses.
@@ -153,22 +164,34 @@ where
     Res: TNStreamMessage,
 {
     /// Create a new stream manager.
-    pub fn new(control: stream::Control, config: StreamConfig) -> Self {
+    ///
+    /// This registers the stream manager to accept incoming streams for the TN stream protocol.
+    /// Returns an error if the protocol is already registered.
+    pub fn new(
+        mut control: stream::Control,
+        config: StreamConfig,
+    ) -> Result<Self, StreamNetworkError> {
         let handler_config = StreamHandlerConfig {
             max_frame_size: config.max_frame_size,
             read_timeout: config.request_timeout,
             write_buffer_size: 64,
         };
 
-        Self {
+        // Register to accept incoming streams for our protocol
+        let incoming_streams = control.accept(TN_STREAM_PROTOCOL).map_err(|e| {
+            StreamNetworkError::OpenFailed(format!("protocol already registered: {e:?}"))
+        })?;
+
+        Ok(Self {
             control,
+            incoming_streams,
             streams: HashMap::new(),
             pending_requests: HashMap::new(),
             active_raw_streams: HashMap::new(),
             config,
             handler_config,
             _phantom: PhantomData,
-        }
+        })
     }
 
     /// Get or create a stream to a peer.
@@ -256,9 +279,10 @@ where
 
         // Create and send the frame
         let header = FrameHeader::typed_request(request_id, request_payload.len() as u32);
-        handle.send_frame(header, request_payload).await.map_err(|e| {
-            StreamNetworkError::Io(std::io::Error::other(e.to_string()))
-        })?;
+        handle
+            .send_frame(header, request_payload)
+            .await
+            .map_err(|e| StreamNetworkError::Io(std::io::Error::other(e.to_string())))?;
 
         Ok(reply_rx)
     }
@@ -273,9 +297,10 @@ where
         let handle = self.get_stream_handle(&peer_id)?;
 
         let header = FrameHeader::typed_response(request_id, response_payload.len() as u32);
-        handle.send_frame(header, response_payload).await.map_err(|e| {
-            StreamNetworkError::Io(std::io::Error::other(e.to_string()))
-        })?;
+        handle
+            .send_frame(header, response_payload)
+            .await
+            .map_err(|e| StreamNetworkError::Io(std::io::Error::other(e.to_string())))?;
 
         Ok(())
     }
@@ -295,9 +320,10 @@ where
             .map_err(|e| StreamNetworkError::Serialization(e.to_string()))?;
 
         let header = FrameHeader::error(request_id, payload.len() as u32);
-        handle.send_frame(header, payload).await.map_err(|e| {
-            StreamNetworkError::Io(std::io::Error::other(e.to_string()))
-        })?;
+        handle
+            .send_frame(header, payload)
+            .await
+            .map_err(|e| StreamNetworkError::Io(std::io::Error::other(e.to_string())))?;
 
         Ok(())
     }
@@ -332,9 +358,10 @@ where
 
         // Send the request with RawStreamBegin (has_more = true since we expect data)
         let header = FrameHeader::raw_stream_begin(request_id, request_payload.len() as u32, true);
-        handle.send_frame(header, request_payload).await.map_err(|e| {
-            StreamNetworkError::Io(std::io::Error::other(e.to_string()))
-        })?;
+        handle
+            .send_frame(header, request_payload)
+            .await
+            .map_err(|e| StreamNetworkError::Io(std::io::Error::other(e.to_string())))?;
 
         let raw_handle = RawStreamHandle { cancel: cancel_tx, done: done_rx };
 
@@ -344,8 +371,27 @@ where
     /// Process events from all streams.
     ///
     /// This should be called in the main event loop to handle incoming data.
-    pub async fn poll_streams(&mut self) -> Option<StreamEvent<Req, Res>> {
-        // Collect peers with active streams
+    /// The method polls both:
+    /// - Incoming streams from new peers (via libp2p-stream IncomingStreams)
+    /// - Events from existing peer streams
+    pub fn poll_streams(&mut self) -> Option<StreamEvent<Req, Res>> {
+        // First, check for new incoming streams (non-blocking)
+        // Use poll_next to avoid blocking
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        if let Poll::Ready(Some((peer_id, stream))) =
+            Pin::new(&mut self.incoming_streams).poll_next(&mut cx)
+        {
+            trace!(target: "stream-manager", ?peer_id, "accepting incoming stream");
+            self.handle_incoming_stream(peer_id, stream);
+            return Some(StreamEvent::IncomingStream { peer_id });
+        }
+
+        // Then check existing streams for events
         let peers: Vec<PeerId> = self
             .streams
             .iter()
@@ -560,6 +606,9 @@ where
     StreamClosed { peer_id: PeerId },
     /// Stream error occurred.
     StreamError { peer_id: PeerId, error: String },
+    /// A new incoming stream was accepted from a peer.
+    /// This is emitted when poll_streams() accepts a new inbound connection.
+    IncomingStream { peer_id: PeerId },
     /// Phantom data to satisfy type constraints.
     #[doc(hidden)]
     _Phantom(PhantomData<(Req, Res)>),
