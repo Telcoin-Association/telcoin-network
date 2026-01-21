@@ -3,7 +3,7 @@
 //! Reuses the snappy compression and BCS encoding from the existing TNCodec,
 //! but with a different framing format suitable for multiplexed streams.
 
-use super::protocol::{FrameHeader, InvalidRequestType, FRAME_HEADER_SIZE};
+use super::protocol::{FrameHeader, InvalidMessageType, FRAME_HEADER_SIZE};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use snap::read::FrameDecoder;
 use std::io::{Read as _, Write as _};
@@ -225,7 +225,7 @@ pub enum CodecError {
 
     /// Invalid frame header.
     #[error("invalid frame header: {0}")]
-    InvalidHeader(#[from] InvalidRequestType),
+    InvalidHeader(#[from] InvalidMessageType),
 
     /// Payload too large.
     #[error("payload too large: {size} > {max}")]
@@ -248,7 +248,7 @@ pub enum CodecError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stream::protocol::{FrameFlags, StreamRequestType};
+    use crate::stream::protocol::{FrameFlags, StreamMessageType};
 
     #[tokio::test]
     async fn test_frame_roundtrip() {
@@ -260,7 +260,7 @@ mod tests {
         // Create header
         let header = FrameHeader::new(
             42,
-            StreamRequestType::TypedRequest,
+            StreamMessageType::TypedRequest,
             FrameFlags::NONE,
             0, // Will be set during write
         );
@@ -274,7 +274,7 @@ mod tests {
         let (read_header, read_payload) = codec.read_frame(&mut cursor).await.unwrap();
 
         assert_eq!(read_header.request_id, 42);
-        assert_eq!(read_header.request_type, StreamRequestType::TypedRequest);
+        assert_eq!(read_header.message_type, StreamMessageType::TypedRequest);
         assert_eq!(read_payload, payload);
     }
 
@@ -305,7 +305,7 @@ mod tests {
         let mut codec = StreamCodec::new(100); // Small max size
 
         // Create a header claiming a large payload
-        let header = FrameHeader::new(1, StreamRequestType::TypedRequest, FrameFlags::NONE, 1000);
+        let header = FrameHeader::new(1, StreamMessageType::TypedRequest, FrameFlags::NONE, 1000);
 
         // Write the header only
         let mut buffer = Vec::new();

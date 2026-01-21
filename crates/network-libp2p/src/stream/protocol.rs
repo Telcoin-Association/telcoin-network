@@ -1,7 +1,8 @@
 //! Stream protocol constants and frame types.
 //!
 //! Defines the wire protocol for stream-based messaging, supporting both typed request-response
-//! (for backwards compatibility) and raw byte streaming (for epoch pack files).
+//! and raw byte streaming. The protocol is generic - application-layer types (like epoch sync)
+//! are defined elsewhere.
 
 use libp2p::StreamProtocol;
 use serde::{Deserialize, Serialize};
@@ -12,25 +13,29 @@ pub const TN_STREAM_PROTOCOL: StreamProtocol = StreamProtocol::new("/tn/stream/1
 /// Size of the frame header in bytes.
 pub const FRAME_HEADER_SIZE: usize = 14;
 
-/// Stream request types discriminant.
+/// Stream message type discriminant.
 ///
 /// Used as a single byte in the frame header to indicate the type of message.
+/// This enum is generic - it doesn't know about application-specific types like epoch sync.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub enum StreamRequestType {
-    /// Traditional typed request-response (serialized application messages).
-    /// The payload contains a compressed, BCS-encoded request or response.
+pub enum StreamMessageType {
+    /// Typed request (serialized application message).
+    /// The payload contains a compressed, BCS-encoded request.
     TypedRequest = 0x01,
 
     /// Typed response to a request.
+    /// The payload contains a compressed, BCS-encoded response.
     TypedResponse = 0x02,
 
-    /// Stream epoch pack file request.
-    /// After the initial metadata response, raw pack file bytes follow.
-    EpochStreamRequest = 0x10,
+    /// Begin raw byte streaming mode.
+    /// After this frame, subsequent data is raw bytes until RawStreamEnd or stream close.
+    /// The payload contains metadata about the stream (application-defined).
+    RawStreamBegin = 0x10,
 
-    /// Epoch stream metadata response (sent before raw bytes).
-    EpochStreamMeta = 0x11,
+    /// End raw byte streaming mode.
+    /// Returns to framed mode. The payload may contain final metadata.
+    RawStreamEnd = 0x11,
 
     /// Error response.
     ErrorResponse = 0xFE,
@@ -39,32 +44,32 @@ pub enum StreamRequestType {
     Cancel = 0xFF,
 }
 
-impl TryFrom<u8> for StreamRequestType {
-    type Error = InvalidRequestType;
+impl TryFrom<u8> for StreamMessageType {
+    type Error = InvalidMessageType;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0x01 => Ok(Self::TypedRequest),
             0x02 => Ok(Self::TypedResponse),
-            0x10 => Ok(Self::EpochStreamRequest),
-            0x11 => Ok(Self::EpochStreamMeta),
+            0x10 => Ok(Self::RawStreamBegin),
+            0x11 => Ok(Self::RawStreamEnd),
             0xFE => Ok(Self::ErrorResponse),
             0xFF => Ok(Self::Cancel),
-            _ => Err(InvalidRequestType(value)),
+            _ => Err(InvalidMessageType(value)),
         }
     }
 }
 
-impl From<StreamRequestType> for u8 {
-    fn from(value: StreamRequestType) -> Self {
+impl From<StreamMessageType> for u8 {
+    fn from(value: StreamMessageType) -> Self {
         value as u8
     }
 }
 
-/// Error when parsing an invalid request type byte.
+/// Error when parsing an invalid message type byte.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
-#[error("invalid stream request type: {0:#x}")]
-pub struct InvalidRequestType(pub u8);
+#[error("invalid stream message type: {0:#x}")]
+pub struct InvalidMessageType(pub u8);
 
 /// Frame flags byte.
 ///
@@ -131,8 +136,8 @@ pub struct FrameHeader {
     /// Responses echo the request ID from the original request.
     pub request_id: u64,
 
-    /// Type of message (request, response, error, etc.).
-    pub request_type: StreamRequestType,
+    /// Type of message (request, response, raw stream, etc.).
+    pub message_type: StreamMessageType,
 
     /// Additional flags for the frame.
     pub flags: FrameFlags,
@@ -146,114 +151,68 @@ impl FrameHeader {
     /// Create a new frame header.
     pub fn new(
         request_id: u64,
-        request_type: StreamRequestType,
+        message_type: StreamMessageType,
         flags: FrameFlags,
         payload_len: u32,
     ) -> Self {
-        Self { request_id, request_type, flags, payload_len }
+        Self { request_id, message_type, flags, payload_len }
     }
 
     /// Create a typed request header.
     pub fn typed_request(request_id: u64, payload_len: u32) -> Self {
-        Self::new(request_id, StreamRequestType::TypedRequest, FrameFlags::NONE, payload_len)
+        Self::new(request_id, StreamMessageType::TypedRequest, FrameFlags::NONE, payload_len)
     }
 
     /// Create a typed response header.
     pub fn typed_response(request_id: u64, payload_len: u32) -> Self {
-        Self::new(request_id, StreamRequestType::TypedResponse, FrameFlags::NONE, payload_len)
+        Self::new(request_id, StreamMessageType::TypedResponse, FrameFlags::NONE, payload_len)
     }
 
-    /// Create an epoch stream request header.
-    pub fn epoch_stream_request(request_id: u64, payload_len: u32) -> Self {
-        Self::new(request_id, StreamRequestType::EpochStreamRequest, FrameFlags::NONE, payload_len)
-    }
-
-    /// Create an epoch stream metadata response header.
-    pub fn epoch_stream_meta(request_id: u64, payload_len: u32, has_more: bool) -> Self {
+    /// Create a raw stream begin header.
+    ///
+    /// The `has_more` flag indicates whether raw bytes will follow this frame.
+    pub fn raw_stream_begin(request_id: u64, payload_len: u32, has_more: bool) -> Self {
         Self::new(
             request_id,
-            StreamRequestType::EpochStreamMeta,
+            StreamMessageType::RawStreamBegin,
             FrameFlags::with_has_more(has_more),
             payload_len,
         )
     }
 
+    /// Create a raw stream end header.
+    pub fn raw_stream_end(request_id: u64, payload_len: u32) -> Self {
+        Self::new(request_id, StreamMessageType::RawStreamEnd, FrameFlags::NONE, payload_len)
+    }
+
     /// Create an error response header.
     pub fn error(request_id: u64, payload_len: u32) -> Self {
-        Self::new(request_id, StreamRequestType::ErrorResponse, FrameFlags::NONE, payload_len)
+        Self::new(request_id, StreamMessageType::ErrorResponse, FrameFlags::NONE, payload_len)
     }
 
     /// Create a cancel header.
     pub fn cancel(request_id: u64) -> Self {
-        Self::new(request_id, StreamRequestType::Cancel, FrameFlags::NONE, 0)
+        Self::new(request_id, StreamMessageType::Cancel, FrameFlags::NONE, 0)
     }
 
     /// Encode the header to bytes.
     pub fn encode(&self) -> [u8; FRAME_HEADER_SIZE] {
         let mut buf = [0u8; FRAME_HEADER_SIZE];
         buf[0..8].copy_from_slice(&self.request_id.to_le_bytes());
-        buf[8] = self.request_type.into();
+        buf[8] = self.message_type.into();
         buf[9] = self.flags.into();
         buf[10..14].copy_from_slice(&self.payload_len.to_le_bytes());
         buf
     }
 
     /// Decode a header from bytes.
-    pub fn decode(buf: &[u8; FRAME_HEADER_SIZE]) -> Result<Self, InvalidRequestType> {
+    pub fn decode(buf: &[u8; FRAME_HEADER_SIZE]) -> Result<Self, InvalidMessageType> {
         let request_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-        let request_type = StreamRequestType::try_from(buf[8])?;
+        let message_type = StreamMessageType::try_from(buf[8])?;
         let flags = FrameFlags::from(buf[9]);
         let payload_len = u32::from_le_bytes(buf[10..14].try_into().unwrap());
 
-        Ok(Self { request_id, request_type, flags, payload_len })
-    }
-}
-
-/// Request to stream an epoch pack file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EpochStreamRequest {
-    /// The epoch number to stream.
-    pub epoch: u64,
-
-    /// Byte offset to start streaming from.
-    /// Use 0 to start from the beginning.
-    /// Use a non-zero value to resume an interrupted transfer.
-    pub start_offset: u64,
-}
-
-impl EpochStreamRequest {
-    /// Create a new epoch stream request.
-    pub fn new(epoch: u64, start_offset: u64) -> Self {
-        Self { epoch, start_offset }
-    }
-
-    /// Create a request to stream from the beginning.
-    pub fn from_start(epoch: u64) -> Self {
-        Self::new(epoch, 0)
-    }
-}
-
-/// Metadata response for an epoch stream.
-///
-/// Sent before the raw pack file bytes begin streaming.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EpochStreamResponse {
-    /// The epoch being streamed.
-    pub epoch: u64,
-
-    /// Total size of the pack file in bytes, if known.
-    /// May be `None` if the file is still being written.
-    pub total_size: Option<u64>,
-
-    /// Unique identifier of the pack file.
-    /// Used to verify consistency when resuming interrupted transfers.
-    pub pack_uid: u64,
-}
-
-impl EpochStreamResponse {
-    /// Create a new epoch stream response.
-    pub fn new(epoch: u64, total_size: Option<u64>, pack_uid: u64) -> Self {
-        Self { epoch, total_size, pack_uid }
+        Ok(Self { request_id, message_type, flags, payload_len })
     }
 }
 
@@ -275,32 +234,34 @@ impl StreamError {
 }
 
 /// Error codes for stream errors.
+///
+/// These are network-level error codes. Application-specific error codes
+/// should be defined in the application layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u16)]
 pub enum StreamErrorCode {
     /// Unknown or unspecified error.
     Unknown = 0,
 
-    /// The requested epoch is not available.
-    EpochNotFound = 1,
-
-    /// The requested offset is out of bounds.
-    InvalidOffset = 2,
-
     /// The peer cannot fulfill the request (resource constraints).
-    Unavailable = 3,
+    Unavailable = 1,
 
     /// The request was malformed or invalid.
-    BadRequest = 4,
+    BadRequest = 2,
 
     /// Internal error on the serving peer.
-    InternalError = 5,
+    InternalError = 3,
 
     /// Request was cancelled.
-    Cancelled = 6,
+    Cancelled = 4,
 
     /// Request timed out.
-    Timeout = 7,
+    Timeout = 5,
+
+    /// Application-level error (check error message for details).
+    /// Used when the application layer returns an error that doesn't
+    /// map to a specific network-level code.
+    ApplicationError = 100,
 }
 
 #[cfg(test)]
@@ -310,7 +271,7 @@ mod tests {
     #[test]
     fn test_frame_header_roundtrip() {
         let header =
-            FrameHeader::new(12345, StreamRequestType::TypedRequest, FrameFlags::NONE, 1024);
+            FrameHeader::new(12345, StreamMessageType::TypedRequest, FrameFlags::NONE, 1024);
 
         let encoded = header.encode();
         assert_eq!(encoded.len(), FRAME_HEADER_SIZE);
@@ -321,13 +282,13 @@ mod tests {
 
     #[test]
     fn test_frame_header_with_flags() {
-        let header = FrameHeader::epoch_stream_meta(999, 2048, true);
+        let header = FrameHeader::raw_stream_begin(999, 2048, true);
 
         let encoded = header.encode();
         let decoded = FrameHeader::decode(&encoded).unwrap();
 
         assert_eq!(decoded.request_id, 999);
-        assert_eq!(decoded.request_type, StreamRequestType::EpochStreamMeta);
+        assert_eq!(decoded.message_type, StreamMessageType::RawStreamBegin);
         assert!(decoded.flags.has_more());
         assert_eq!(decoded.payload_len, 2048);
     }
@@ -345,24 +306,24 @@ mod tests {
     }
 
     #[test]
-    fn test_request_type_roundtrip() {
-        for rt in [
-            StreamRequestType::TypedRequest,
-            StreamRequestType::TypedResponse,
-            StreamRequestType::EpochStreamRequest,
-            StreamRequestType::EpochStreamMeta,
-            StreamRequestType::ErrorResponse,
-            StreamRequestType::Cancel,
+    fn test_message_type_roundtrip() {
+        for mt in [
+            StreamMessageType::TypedRequest,
+            StreamMessageType::TypedResponse,
+            StreamMessageType::RawStreamBegin,
+            StreamMessageType::RawStreamEnd,
+            StreamMessageType::ErrorResponse,
+            StreamMessageType::Cancel,
         ] {
-            let byte: u8 = rt.into();
-            let decoded = StreamRequestType::try_from(byte).unwrap();
-            assert_eq!(decoded, rt);
+            let byte: u8 = mt.into();
+            let decoded = StreamMessageType::try_from(byte).unwrap();
+            assert_eq!(decoded, mt);
         }
     }
 
     #[test]
-    fn test_invalid_request_type() {
-        assert!(StreamRequestType::try_from(0x00).is_err());
-        assert!(StreamRequestType::try_from(0x50).is_err());
+    fn test_invalid_message_type() {
+        assert!(StreamMessageType::try_from(0x00).is_err());
+        assert!(StreamMessageType::try_from(0x50).is_err());
     }
 }

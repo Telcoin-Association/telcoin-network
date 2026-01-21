@@ -4,9 +4,7 @@
 
 use super::{
     codec::StreamCodec,
-    protocol::{
-        EpochStreamRequest, EpochStreamResponse, FrameHeader, StreamError, StreamRequestType,
-    },
+    protocol::{FrameHeader, StreamError, StreamMessageType},
 };
 use futures::{AsyncRead, AsyncWrite};
 use libp2p::bytes::Bytes;
@@ -41,11 +39,12 @@ pub enum ReadEvent {
     Request { request_id: u64, payload: Vec<u8> },
     /// Received a typed response.
     Response { request_id: u64, payload: Vec<u8> },
-    /// Received an epoch stream request.
-    EpochStreamRequest { request_id: u64, request: EpochStreamRequest },
-    /// Received epoch stream metadata.
-    EpochStreamMeta { request_id: u64, meta: EpochStreamResponse, has_more: bool },
-    /// Received raw bytes (epoch stream data).
+    /// Received raw stream begin (with metadata payload).
+    /// The payload should be deserialized by the application layer.
+    RawStreamBegin { request_id: u64, payload: Vec<u8>, has_more: bool },
+    /// Received raw stream end (with optional final payload).
+    RawStreamEnd { request_id: u64, payload: Vec<u8> },
+    /// Received raw bytes during streaming.
     RawData { data: Bytes },
     /// Received an error response.
     Error { request_id: u64, error: StreamError },
@@ -267,47 +266,34 @@ where
             // Normal framed mode
             match codec.read_frame(&mut reader).await {
                 Ok((header, payload)) => {
-                    let event = match header.request_type {
-                        StreamRequestType::TypedRequest => {
+                    let event = match header.message_type {
+                        StreamMessageType::TypedRequest => {
                             ReadEvent::Request { request_id: header.request_id, payload }
                         }
-                        StreamRequestType::TypedResponse => {
+                        StreamMessageType::TypedResponse => {
                             ReadEvent::Response { request_id: header.request_id, payload }
                         }
-                        StreamRequestType::EpochStreamRequest => {
-                            match codec.decode_payload::<EpochStreamRequest>(&payload) {
-                                Ok(request) => ReadEvent::EpochStreamRequest {
-                                    request_id: header.request_id,
-                                    request,
-                                },
-                                Err(e) => ReadEvent::ReadError {
-                                    error: std::io::Error::other(format!(
-                                        "failed to decode epoch request: {e}"
-                                    )),
-                                },
+                        StreamMessageType::RawStreamBegin => {
+                            // Switch to raw mode if has_more is set
+                            if header.flags.has_more() {
+                                in_raw_mode = true;
+                            }
+                            // Pass the raw payload to application layer for deserialization
+                            ReadEvent::RawStreamBegin {
+                                request_id: header.request_id,
+                                payload,
+                                has_more: header.flags.has_more(),
                             }
                         }
-                        StreamRequestType::EpochStreamMeta => {
-                            match codec.decode_payload::<EpochStreamResponse>(&payload) {
-                                Ok(meta) => {
-                                    // Switch to raw mode after metadata if has_more is set
-                                    if header.flags.has_more() {
-                                        in_raw_mode = true;
-                                    }
-                                    ReadEvent::EpochStreamMeta {
-                                        request_id: header.request_id,
-                                        meta,
-                                        has_more: header.flags.has_more(),
-                                    }
-                                }
-                                Err(e) => ReadEvent::ReadError {
-                                    error: std::io::Error::other(format!(
-                                        "failed to decode epoch meta: {e}"
-                                    )),
-                                },
+                        StreamMessageType::RawStreamEnd => {
+                            // Exit raw mode
+                            in_raw_mode = false;
+                            ReadEvent::RawStreamEnd {
+                                request_id: header.request_id,
+                                payload,
                             }
                         }
-                        StreamRequestType::ErrorResponse => {
+                        StreamMessageType::ErrorResponse => {
                             match codec.decode_payload::<StreamError>(&payload) {
                                 Ok(error) => {
                                     ReadEvent::Error { request_id: header.request_id, error }
@@ -319,7 +305,7 @@ where
                                 },
                             }
                         }
-                        StreamRequestType::Cancel => {
+                        StreamMessageType::Cancel => {
                             ReadEvent::Cancelled { request_id: header.request_id }
                         }
                     };

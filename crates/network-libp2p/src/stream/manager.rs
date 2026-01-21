@@ -1,71 +1,38 @@
 //! Stream manager for managing long-lived streams per peer.
 //!
+//! The StreamManager is generic over request and response types, following the same
+//! pattern as ConsensusNetwork with TNMessage. Application-layer types (like epoch sync)
+//! implement the TNStreamMessage trait.
+//!
 //! The StreamManager handles:
 //! - Opening and closing streams to peers
 //! - Routing requests/responses through the correct stream
 //! - Tracking pending requests and handling timeouts
-//! - Managing epoch pack file streaming
+//! - Managing raw byte streaming for large transfers
 
 use super::{
     codec::StreamCodec,
-    handler::{
-        spawn_stream_tasks, ReadEvent, StreamHandle, StreamHandlerConfig, StreamHandlerError,
-    },
-    protocol::{
-        EpochStreamRequest, EpochStreamResponse, FrameHeader, StreamError, StreamErrorCode,
-        TN_STREAM_PROTOCOL,
-    },
+    handler::{spawn_stream_tasks, ReadEvent, StreamHandle, StreamHandlerConfig},
+    protocol::{FrameHeader, StreamError, StreamErrorCode, TN_STREAM_PROTOCOL},
+    TNStreamMessage,
 };
 use libp2p::{bytes::Bytes, swarm::Stream as NegotiatedStream, PeerId};
 use libp2p_stream as stream;
-use std::{collections::HashMap, time::Instant};
+use std::{collections::HashMap, marker::PhantomData, time::Instant};
 use tn_config::StreamConfig;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
-/// Handle for controlling an active epoch stream.
+/// Handle for controlling an active raw byte stream.
+///
+/// Used when streaming large data (e.g., epoch pack files).
+/// The application layer decides when to use background streaming.
 #[derive(Debug)]
-pub struct EpochStreamHandle {
+pub struct RawStreamHandle {
     /// Cancel the stream early.
     pub cancel: oneshot::Sender<()>,
     /// Stream completion notification.
-    pub done: oneshot::Receiver<Result<(), EpochStreamError>>,
-}
-
-/// Error type for epoch streaming operations.
-#[derive(Debug, thiserror::Error)]
-pub enum EpochStreamError {
-    /// The requested epoch was not found.
-    #[error("epoch not found: {0}")]
-    EpochNotFound(u64),
-
-    /// Invalid offset for resumption.
-    #[error("invalid offset: {0}")]
-    InvalidOffset(u64),
-
-    /// Stream was cancelled.
-    #[error("stream cancelled")]
-    Cancelled,
-
-    /// IO error during streaming.
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
-
-    /// Stream handler error.
-    #[error("handler error: {0}")]
-    Handler(#[from] StreamHandlerError),
-
-    /// Peer sent an error response.
-    #[error("peer error: {0}")]
-    PeerError(String),
-
-    /// Connection to peer was lost.
-    #[error("disconnected")]
-    Disconnected,
-
-    /// Request timed out.
-    #[error("timeout")]
-    Timeout,
+    pub done: oneshot::Receiver<Result<(), StreamNetworkError>>,
 }
 
 /// State of a peer's stream connection.
@@ -85,7 +52,14 @@ enum PeerStreamState {
 }
 
 /// Manages streams for all connected peers.
-pub struct StreamManager {
+///
+/// Generic over request and response types, following the same pattern
+/// as ConsensusNetwork with TNMessage.
+pub struct StreamManager<Req, Res>
+where
+    Req: TNStreamMessage,
+    Res: TNStreamMessage,
+{
     /// libp2p-stream control handle for opening new streams.
     control: stream::Control,
     /// Active streams by peer ID.
@@ -93,37 +67,41 @@ pub struct StreamManager {
     /// Pending typed requests awaiting responses.
     /// Key: (PeerId, request_id), Value: response channel
     pending_requests: HashMap<(PeerId, u64), PendingTypedRequest>,
-    /// Active epoch streams by (PeerId, request_id).
-    active_epoch_streams: HashMap<(PeerId, u64), ActiveEpochStream>,
+    /// Active raw streams by (PeerId, request_id).
+    active_raw_streams: HashMap<(PeerId, u64), ActiveRawStream>,
     /// Configuration.
     config: StreamConfig,
     /// Handler configuration derived from StreamConfig.
     handler_config: StreamHandlerConfig,
+    /// Phantom data for generic types.
+    _phantom: PhantomData<(Req, Res)>,
 }
 
 /// A pending typed request awaiting a response.
 struct PendingTypedRequest {
     /// Channel to send the response payload.
-    reply: oneshot::Sender<Result<Vec<u8>, StreamManagerError>>,
+    reply: oneshot::Sender<Result<Vec<u8>, StreamNetworkError>>,
     /// When the request was sent.
     sent_at: Instant,
 }
 
-/// An active epoch stream transfer.
-struct ActiveEpochStream {
+/// An active raw byte stream transfer.
+struct ActiveRawStream {
     /// Channel to send received bytes to the application.
     data_tx: mpsc::Sender<Bytes>,
     /// Channel to receive cancellation signal.
+    #[allow(dead_code)]
     cancel_rx: oneshot::Receiver<()>,
     /// Channel to notify completion.
-    done_tx: Option<oneshot::Sender<Result<(), EpochStreamError>>>,
-    /// Metadata received from peer.
-    metadata: Option<EpochStreamResponse>,
+    done_tx: Option<oneshot::Sender<Result<(), StreamNetworkError>>>,
 }
 
-/// Error type for stream manager operations.
+/// Network-level error type for stream operations.
+///
+/// Application-specific errors (like "epoch not found") should be defined
+/// in the application layer, not here.
 #[derive(Debug, thiserror::Error)]
-pub enum StreamManagerError {
+pub enum StreamNetworkError {
     /// No stream to the peer.
     #[error("no stream to peer")]
     NoStream,
@@ -144,10 +122,6 @@ pub enum StreamManagerError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// Handler error.
-    #[error("handler error: {0}")]
-    Handler(#[from] StreamHandlerError),
-
     /// Serialization error.
     #[error("serialization error: {0}")]
     Serialization(String),
@@ -163,9 +137,21 @@ pub enum StreamManagerError {
     /// Channel was closed.
     #[error("channel closed")]
     ChannelClosed,
+
+    /// Stream was cancelled.
+    #[error("cancelled")]
+    Cancelled,
+
+    /// Connection to peer was lost.
+    #[error("disconnected")]
+    Disconnected,
 }
 
-impl StreamManager {
+impl<Req, Res> StreamManager<Req, Res>
+where
+    Req: TNStreamMessage,
+    Res: TNStreamMessage,
+{
     /// Create a new stream manager.
     pub fn new(control: stream::Control, config: StreamConfig) -> Self {
         let handler_config = StreamHandlerConfig {
@@ -178,9 +164,10 @@ impl StreamManager {
             control,
             streams: HashMap::new(),
             pending_requests: HashMap::new(),
-            active_epoch_streams: HashMap::new(),
+            active_raw_streams: HashMap::new(),
             config,
             handler_config,
+            _phantom: PhantomData,
         }
     }
 
@@ -191,7 +178,7 @@ impl StreamManager {
     pub async fn get_or_open_stream(
         &mut self,
         peer_id: PeerId,
-    ) -> Result<StreamHandle, StreamManagerError> {
+    ) -> Result<StreamHandle, StreamNetworkError> {
         // Check if we already have an active stream
         let needs_open =
             !matches!(self.streams.get(&peer_id), Some(PeerStreamState::Active { .. }));
@@ -204,12 +191,12 @@ impl StreamManager {
         // Now get the handle (clone it to avoid borrow issues)
         match self.streams.get(&peer_id) {
             Some(PeerStreamState::Active { handle, .. }) => Ok(handle.clone()),
-            _ => Err(StreamManagerError::OpenFailed("stream not in active state".to_string())),
+            _ => Err(StreamNetworkError::OpenFailed("stream not in active state".to_string())),
         }
     }
 
     /// Open a new stream to a peer.
-    async fn open_stream(&mut self, peer_id: PeerId) -> Result<(), StreamManagerError> {
+    async fn open_stream(&mut self, peer_id: PeerId) -> Result<(), StreamNetworkError> {
         debug!(target: "stream-manager", ?peer_id, "opening stream to peer");
 
         // Mark as connecting
@@ -220,7 +207,7 @@ impl StreamManager {
             .control
             .open_stream(peer_id, TN_STREAM_PROTOCOL)
             .await
-            .map_err(|e| StreamManagerError::OpenFailed(e.to_string()))?;
+            .map_err(|e| StreamNetworkError::OpenFailed(e.to_string()))?;
 
         // Spawn read/write tasks
         let (handle, events_rx) = spawn_stream_tasks(stream, peer_id, self.handler_config.clone());
@@ -251,7 +238,7 @@ impl StreamManager {
         &mut self,
         peer_id: PeerId,
         request_payload: Vec<u8>,
-    ) -> Result<oneshot::Receiver<Result<Vec<u8>, StreamManagerError>>, StreamManagerError> {
+    ) -> Result<oneshot::Receiver<Result<Vec<u8>, StreamNetworkError>>, StreamNetworkError> {
         // Get or open stream
         let handle = self.get_or_open_stream(peer_id).await?;
 
@@ -269,7 +256,9 @@ impl StreamManager {
 
         // Create and send the frame
         let header = FrameHeader::typed_request(request_id, request_payload.len() as u32);
-        handle.send_frame(header, request_payload).await.map_err(StreamManagerError::Handler)?;
+        handle.send_frame(header, request_payload).await.map_err(|e| {
+            StreamNetworkError::Io(std::io::Error::other(e.to_string()))
+        })?;
 
         Ok(reply_rx)
     }
@@ -280,11 +269,13 @@ impl StreamManager {
         peer_id: PeerId,
         request_id: u64,
         response_payload: Vec<u8>,
-    ) -> Result<(), StreamManagerError> {
+    ) -> Result<(), StreamNetworkError> {
         let handle = self.get_stream_handle(&peer_id)?;
 
         let header = FrameHeader::typed_response(request_id, response_payload.len() as u32);
-        handle.send_frame(header, response_payload).await.map_err(StreamManagerError::Handler)?;
+        handle.send_frame(header, response_payload).await.map_err(|e| {
+            StreamNetworkError::Io(std::io::Error::other(e.to_string()))
+        })?;
 
         Ok(())
     }
@@ -295,29 +286,33 @@ impl StreamManager {
         peer_id: PeerId,
         request_id: u64,
         error: StreamError,
-    ) -> Result<(), StreamManagerError> {
+    ) -> Result<(), StreamNetworkError> {
         let handle = self.get_stream_handle(&peer_id)?;
 
         let mut codec = StreamCodec::new(self.config.max_frame_size);
         let payload = codec
             .encode_payload(&error)
-            .map_err(|e| StreamManagerError::Serialization(e.to_string()))?;
+            .map_err(|e| StreamNetworkError::Serialization(e.to_string()))?;
 
         let header = FrameHeader::error(request_id, payload.len() as u32);
-        handle.send_frame(header, payload).await.map_err(StreamManagerError::Handler)?;
+        handle.send_frame(header, payload).await.map_err(|e| {
+            StreamNetworkError::Io(std::io::Error::other(e.to_string()))
+        })?;
 
         Ok(())
     }
 
-    /// Start streaming an epoch pack file from a peer.
+    /// Start a raw byte stream to a peer.
+    ///
+    /// This is the generic version for streaming large data. The request payload
+    /// should be pre-serialized by the application layer.
     ///
     /// Returns a handle for controlling the stream and a receiver for the data bytes.
-    pub async fn start_epoch_stream(
+    pub async fn start_raw_stream(
         &mut self,
         peer_id: PeerId,
-        epoch: u64,
-        start_offset: u64,
-    ) -> Result<(EpochStreamHandle, mpsc::Receiver<Bytes>), StreamManagerError> {
+        request_payload: Vec<u8>,
+    ) -> Result<(RawStreamHandle, mpsc::Receiver<Bytes>), StreamNetworkError> {
         // Get or open stream
         let handle = self.get_or_open_stream(peer_id).await?;
 
@@ -329,32 +324,27 @@ impl StreamManager {
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let (done_tx, done_rx) = oneshot::channel();
 
-        // Create the request
-        let request = EpochStreamRequest::new(epoch, start_offset);
-        let mut codec = StreamCodec::new(self.config.max_frame_size);
-        let payload = codec
-            .encode_payload(&request)
-            .map_err(|e| StreamManagerError::Serialization(e.to_string()))?;
-
         // Track the active stream
-        self.active_epoch_streams.insert(
+        self.active_raw_streams.insert(
             (peer_id, request_id),
-            ActiveEpochStream { data_tx, cancel_rx, done_tx: Some(done_tx), metadata: None },
+            ActiveRawStream { data_tx, cancel_rx, done_tx: Some(done_tx) },
         );
 
-        // Send the request
-        let header = FrameHeader::epoch_stream_request(request_id, payload.len() as u32);
-        handle.send_frame(header, payload).await.map_err(StreamManagerError::Handler)?;
+        // Send the request with RawStreamBegin (has_more = true since we expect data)
+        let header = FrameHeader::raw_stream_begin(request_id, request_payload.len() as u32, true);
+        handle.send_frame(header, request_payload).await.map_err(|e| {
+            StreamNetworkError::Io(std::io::Error::other(e.to_string()))
+        })?;
 
-        let epoch_handle = EpochStreamHandle { cancel: cancel_tx, done: done_rx };
+        let raw_handle = RawStreamHandle { cancel: cancel_tx, done: done_rx };
 
-        Ok((epoch_handle, data_rx))
+        Ok((raw_handle, data_rx))
     }
 
     /// Process events from all streams.
     ///
     /// This should be called in the main event loop to handle incoming data.
-    pub async fn poll_streams(&mut self) -> Option<StreamEvent> {
+    pub async fn poll_streams(&mut self) -> Option<StreamEvent<Req, Res>> {
         // Collect peers with active streams
         let peers: Vec<PeerId> = self
             .streams
@@ -386,7 +376,7 @@ impl StreamManager {
     }
 
     /// Process a read event from a peer's stream.
-    fn process_read_event(&mut self, peer_id: PeerId, event: ReadEvent) -> StreamEvent {
+    fn process_read_event(&mut self, peer_id: PeerId, event: ReadEvent) -> StreamEvent<Req, Res> {
         match event {
             ReadEvent::Request { request_id, payload } => {
                 StreamEvent::InboundRequest { peer_id, request_id, payload }
@@ -398,20 +388,22 @@ impl StreamManager {
                 }
                 StreamEvent::ResponseReceived { peer_id, request_id, payload }
             }
-            ReadEvent::EpochStreamRequest { request_id, request } => {
-                StreamEvent::EpochStreamRequested { peer_id, request_id, request }
+            ReadEvent::RawStreamBegin { request_id, payload, has_more } => {
+                StreamEvent::RawStreamBegin { peer_id, request_id, payload, has_more }
             }
-            ReadEvent::EpochStreamMeta { request_id, meta, has_more } => {
-                // Store metadata for the active stream
-                if let Some(active) = self.active_epoch_streams.get_mut(&(peer_id, request_id)) {
-                    active.metadata = Some(meta.clone());
+            ReadEvent::RawStreamEnd { request_id, payload } => {
+                // Complete the raw stream
+                if let Some(mut active) = self.active_raw_streams.remove(&(peer_id, request_id)) {
+                    if let Some(done_tx) = active.done_tx.take() {
+                        let _ = done_tx.send(Ok(()));
+                    }
                 }
-                StreamEvent::EpochStreamMetaReceived { peer_id, request_id, meta, has_more }
+                StreamEvent::RawStreamEnd { peer_id, request_id, payload }
             }
             ReadEvent::RawData { data } => {
-                // Forward to any active epoch stream for this peer
+                // Forward to any active raw stream for this peer
                 // Note: In raw mode, we don't have request_id, so we forward to all active streams
-                for ((pid, _), active) in self.active_epoch_streams.iter() {
+                for ((pid, _), active) in self.active_raw_streams.iter() {
                     if *pid == peer_id {
                         let _ = active.data_tx.try_send(data.clone());
                     }
@@ -421,16 +413,18 @@ impl StreamManager {
             ReadEvent::Error { request_id, error } => {
                 // Complete pending request with error
                 if let Some(pending) = self.pending_requests.remove(&(peer_id, request_id)) {
-                    let _ = pending.reply.send(Err(StreamManagerError::PeerError {
+                    let _ = pending.reply.send(Err(StreamNetworkError::PeerError {
                         code: error.code,
                         message: error.message.clone(),
                     }));
                 }
-                // Complete epoch stream with error
-                if let Some(mut active) = self.active_epoch_streams.remove(&(peer_id, request_id)) {
+                // Complete raw stream with error
+                if let Some(mut active) = self.active_raw_streams.remove(&(peer_id, request_id)) {
                     if let Some(done_tx) = active.done_tx.take() {
-                        let _ =
-                            done_tx.send(Err(EpochStreamError::PeerError(error.message.clone())));
+                        let _ = done_tx.send(Err(StreamNetworkError::PeerError {
+                            code: error.code,
+                            message: error.message.clone(),
+                        }));
                     }
                 }
                 StreamEvent::ErrorReceived { peer_id, request_id, error }
@@ -461,18 +455,18 @@ impl StreamManager {
 
         for key in to_remove {
             if let Some(pending) = self.pending_requests.remove(&key) {
-                let _ = pending.reply.send(Err(StreamManagerError::StreamClosed));
+                let _ = pending.reply.send(Err(StreamNetworkError::StreamClosed));
             }
         }
 
-        // Fail all active epoch streams to this peer
-        let epoch_to_remove: Vec<_> =
-            self.active_epoch_streams.keys().filter(|(pid, _)| *pid == peer_id).cloned().collect();
+        // Fail all active raw streams to this peer
+        let raw_to_remove: Vec<_> =
+            self.active_raw_streams.keys().filter(|(pid, _)| *pid == peer_id).cloned().collect();
 
-        for key in epoch_to_remove {
-            if let Some(mut active) = self.active_epoch_streams.remove(&key) {
+        for key in raw_to_remove {
+            if let Some(mut active) = self.active_raw_streams.remove(&key) {
                 if let Some(done_tx) = active.done_tx.take() {
-                    let _ = done_tx.send(Err(EpochStreamError::Disconnected));
+                    let _ = done_tx.send(Err(StreamNetworkError::Disconnected));
                 }
             }
         }
@@ -506,16 +500,16 @@ impl StreamManager {
 
         for key in timed_out {
             if let Some(pending) = self.pending_requests.remove(&key) {
-                let _ = pending.reply.send(Err(StreamManagerError::Timeout));
+                let _ = pending.reply.send(Err(StreamNetworkError::Timeout));
             }
         }
     }
 
     /// Get the stream handle for a peer, if it exists.
-    fn get_stream_handle(&self, peer_id: &PeerId) -> Result<StreamHandle, StreamManagerError> {
+    fn get_stream_handle(&self, peer_id: &PeerId) -> Result<StreamHandle, StreamNetworkError> {
         match self.streams.get(peer_id) {
             Some(PeerStreamState::Active { handle, .. }) => Ok(handle.clone()),
-            _ => Err(StreamManagerError::NoStream),
+            _ => Err(StreamNetworkError::NoStream),
         }
     }
 
@@ -536,22 +530,27 @@ impl StreamManager {
 }
 
 /// Events emitted by the stream manager for the network layer to process.
+///
+/// Generic over request and response types, following the same pattern as ConsensusNetwork.
 #[derive(Debug)]
-pub enum StreamEvent {
+pub enum StreamEvent<Req, Res>
+where
+    Req: TNStreamMessage,
+    Res: TNStreamMessage,
+{
     /// Received an inbound typed request.
+    /// The payload should be deserialized by the application layer.
     InboundRequest { peer_id: PeerId, request_id: u64, payload: Vec<u8> },
     /// Received a response to our request.
+    /// The payload should be deserialized by the application layer.
     ResponseReceived { peer_id: PeerId, request_id: u64, payload: Vec<u8> },
-    /// Peer requested an epoch stream.
-    EpochStreamRequested { peer_id: PeerId, request_id: u64, request: EpochStreamRequest },
-    /// Received epoch stream metadata.
-    EpochStreamMetaReceived {
-        peer_id: PeerId,
-        request_id: u64,
-        meta: EpochStreamResponse,
-        has_more: bool,
-    },
-    /// Received raw data (epoch stream).
+    /// Received raw stream begin message.
+    /// The payload contains application-defined metadata about the stream.
+    RawStreamBegin { peer_id: PeerId, request_id: u64, payload: Vec<u8>, has_more: bool },
+    /// Received raw stream end message.
+    /// The payload may contain final metadata.
+    RawStreamEnd { peer_id: PeerId, request_id: u64, payload: Vec<u8> },
+    /// Received raw data during streaming.
     RawDataReceived { peer_id: PeerId, data: Bytes },
     /// Received an error response.
     ErrorReceived { peer_id: PeerId, request_id: u64, error: StreamError },
@@ -561,4 +560,7 @@ pub enum StreamEvent {
     StreamClosed { peer_id: PeerId },
     /// Stream error occurred.
     StreamError { peer_id: PeerId, error: String },
+    /// Phantom data to satisfy type constraints.
+    #[doc(hidden)]
+    _Phantom(PhantomData<(Req, Res)>),
 }
