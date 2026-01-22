@@ -252,8 +252,12 @@ async fn test_consensus_recovery_with_bullshark() {
     // AND ensure that scores are exactly the same
     assert_eq!(score_with_crash.scores_per_authority.len(), 4);
     assert_eq!(score_with_crash, score_no_crash);
+    // With sequential sub_dag_index and num_sub_dags_per_schedule = 3:
+    // - Round 2 (index 0): reset, scores = 0
+    // - Round 4 (index 1): scores = 1 (vote for round 2 leader)
+    // - Round 6 (index 2): scores = 2 (vote for round 4 leader)
     assert_eq!(
-        score_with_crash.scores_per_authority.into_iter().filter(|(_, score)| *score == 1).count(),
+        score_with_crash.scores_per_authority.into_iter().filter(|(_, score)| *score == 2).count(),
         4
     );
 }

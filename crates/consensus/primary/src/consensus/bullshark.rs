@@ -70,10 +70,8 @@ impl Bullshark {
     ) -> ReputationScores {
         // we reset the scores for every schedule change window, or initialise when it's the first
         // sub dag we are going to create.
-        // sub_dag_index is based on epoch and round so / 2 so this check works on commit rounds
-        // (every other one).
         let mut reputation_score =
-            if (sub_dag_index / 2).is_multiple_of(self.num_sub_dags_per_schedule as u64) {
+            if sub_dag_index.is_multiple_of(self.num_sub_dags_per_schedule as u64) {
                 ReputationScores::new(&self.committee)
             } else if let Some(last) = state.last_committed_sub_dag.as_ref() {
                 last.reputation_score.clone()
@@ -96,10 +94,8 @@ impl Bullshark {
         // we check if this is the last sub dag of the current schedule. If yes then we mark the
         // scores as final_of_schedule = true so any downstream user can now that those are the last
         // ones calculated for the current schedule.
-        // sub_dag_index is based on epoch and round so / 2 so this check works on commit rounds
-        // (every other one).
         reputation_score.final_of_schedule =
-            ((sub_dag_index / 2) + 1).is_multiple_of(self.num_sub_dags_per_schedule as u64);
+            (sub_dag_index + 1).is_multiple_of(self.num_sub_dags_per_schedule as u64);
 
         // Always ensure that all the authorities are present in the reputation scores - even
         // when score is zero.
@@ -235,7 +231,7 @@ impl Bullshark {
         let mut leaders_to_commit = self.order_leaders(leader, state);
 
         while let Some(leader) = leaders_to_commit.pop_front() {
-            let sub_dag_index = leader.nonce();
+            let sub_dag_index = state.next_sub_dag_index();
             let _span = error_span!("bullshark_process_sub_dag", sub_dag_index);
 
             debug!("Leader {:?} has enough support", leader);
