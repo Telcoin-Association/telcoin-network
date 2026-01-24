@@ -10,7 +10,6 @@ use crate::{
     worker::{worker_task_manager_name, WorkerNode},
     EngineToPrimaryRpc,
 };
-use consensus_metrics::start_prometheus_server;
 use eyre::{eyre, OptionExt};
 use std::{
     collections::{HashMap, HashSet},
@@ -296,16 +295,6 @@ where
         )
         .await?;
 
-        // start consensus metrics for the epoch
-        let metrics_shutdown = Notifier::new();
-        if let Some(metrics_socket) = self.builder.metrics {
-            start_prometheus_server(
-                metrics_socket,
-                &node_task_manager,
-                metrics_shutdown.subscribe(),
-            );
-        }
-
         self.try_restore_state(&engine).await?;
         // spawn task to update the latest execution results for consensus
         self.spawn_engine_update_task(engine.canonical_block_stream().await, &node_task_manager);
@@ -334,9 +323,6 @@ where
             // loop through short-term epochs
             epoch_result = self.run_epochs(&engine, network_config, to_engine, gas_accumulator) => epoch_result
         };
-
-        // shutdown metrics
-        metrics_shutdown.notify();
 
         result
     }

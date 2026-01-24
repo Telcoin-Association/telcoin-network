@@ -18,11 +18,9 @@ members = [
     "crates/telcoin-network-cli",
 
     # consensus
-    "crates/consensus/consensus-metrics",
     "crates/consensus/executor",
     "crates/consensus/primary",
     "crates/consensus/worker",
-    "crates/consensus/primary-metrics",
 
     # execution
     "crates/batch-builder",
@@ -164,8 +162,6 @@ tn-storage = { path = "./crates/storage" }
 tn-primary = { path = "./crates/consensus/primary" }
 tn-test-utils = { path = "./crates/test-utils" }
 tn-test-utils-committee = { path = "./crates/test-utils-committee" }
-consensus-metrics = { path = "./crates/consensus/consensus-metrics" }
-tn-primary-metrics = { path = "./crates/consensus/primary-metrics" }
 
 # misc
 match_opt = "0.1.2"

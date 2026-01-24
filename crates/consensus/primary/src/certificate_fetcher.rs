@@ -17,7 +17,6 @@ use std::{
     time::Duration,
 };
 use tn_config::ConsensusConfig;
-use tn_primary_metrics::PrimaryMetrics;
 use tn_storage::CertificateStore;
 use tn_types::{
     validate_fetched_certificate, AuthorityIdentifier, BlsPublicKey, Certificate, Committee,
@@ -58,8 +57,6 @@ pub(crate) struct CertificateFetcher<DB> {
     consensus_bus: ConsensusBus,
     /// Receiver for shutdown.
     rx_shutdown: Noticer,
-    /// The metrics handler
-    metrics: Arc<PrimaryMetrics>,
     /// Task spawner for creating concurrent tasks
     task_spawner: TaskSpawner,
     /// Map of validator to target rounds that local store must catch up to.
@@ -87,7 +84,6 @@ impl<DB: Database> CertificateFetcher<DB> {
         let committee = config.committee().clone();
         let certificate_store = config.node_storage().clone();
         let rx_shutdown = config.shutdown().subscribe();
-        let metrics = consensus_bus.primary_metrics().node_metrics.clone();
         let max_rpc_message_size = config.network_config().libp2p_config().max_rpc_message_size;
         let task_spawner = task_manager.get_spawner();
         let parallel_fetch_request_delay_interval =
@@ -102,7 +98,6 @@ impl<DB: Database> CertificateFetcher<DB> {
                 state_sync,
                 consensus_bus,
                 rx_shutdown,
-                metrics,
                 task_spawner,
                 targets: BTreeMap::new(),
                 fetch_task: FetchTask::new(),
@@ -257,7 +252,6 @@ impl<DB: Database> CertificateFetcher<DB> {
         let network = self.network.clone();
         let committee = self.committee.clone();
         let state_sync = self.state_sync.clone();
-        let metrics = self.metrics.clone();
         let task_spawner = self.task_spawner.clone();
         let authority_id = self.authority_id.clone();
         let fallback_delay = self.parallel_fetch_request_delay_interval;
@@ -271,8 +265,6 @@ impl<DB: Database> CertificateFetcher<DB> {
         self.task_spawner.spawn_task(
             format!("fetch-certs-{}", request.exclusive_lower_bound),
             async move {
-                metrics.certificate_fetcher_inflight_fetch.inc();
-
                 let result = fetch_and_process_certificates(
                     authority_id,
                     network,
@@ -285,7 +277,6 @@ impl<DB: Database> CertificateFetcher<DB> {
                 .await;
 
                 let _ = tx.send(result);
-                metrics.certificate_fetcher_inflight_fetch.dec();
             },
         );
 

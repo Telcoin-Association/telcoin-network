@@ -341,9 +341,7 @@ mod tests {
         gas_accumulator::GasAccumulator, test_genesis, Bytes, Certificate, CommittedSubDag,
         ConsensusOutput, Database, GenesisAccount, TaskManager, U160, U256,
     };
-    use tn_worker::{
-        metrics::WorkerMetrics, test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle,
-    };
+    use tn_worker::{test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle};
     use tokio::time::timeout;
 
     #[tokio::test]
@@ -377,12 +375,10 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let store = open_db(temp_dir.path());
         let qw = TestMakeBlockQuorumWaiter::new_test();
-        let node_metrics = WorkerMetrics::default();
         let timeout = Duration::from_secs(5);
         let mut block_provider = Worker::new(
             0,
             Some(qw),
-            Arc::new(node_metrics),
             client,
             store.clone(),
             timeout,

@@ -21,7 +21,6 @@ tn-storage = { workspace = true }
 tn-network-types = { workspace = true }
 tn-types = { workspace = true }
 tn-config = { workspace = true }
-prometheus = { workspace = true }
 
 eyre = { workspace = true }
 tn-network-libp2p = { workspace = true }

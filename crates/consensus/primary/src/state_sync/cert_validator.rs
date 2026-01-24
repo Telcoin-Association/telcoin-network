@@ -8,7 +8,7 @@ use crate::{
     state_sync::CertificateManagerCommand,
     ConsensusBus,
 };
-use std::{collections::HashSet, sync::Arc, time::Instant};
+use std::{collections::HashSet, sync::Arc};
 use tn_config::ConsensusConfig;
 use tn_storage::CertificateStore;
 use tn_types::{
@@ -21,21 +21,6 @@ use tracing::{debug, error, trace};
 #[cfg(test)]
 #[path = "../tests/cert_validator_tests.rs"]
 mod cert_validator_tests;
-
-pub(super) fn certificate_source<DB: Database>(
-    config: &ConsensusConfig<DB>,
-    certificate: &Certificate,
-) -> &'static str {
-    if let Some(authority_id) = config.authority_id() {
-        if authority_id.eq(certificate.origin()) {
-            "own"
-        } else {
-            "other"
-        }
-    } else {
-        "other"
-    }
-}
 
 /// Process unverified headers and certificates.
 #[derive(Debug, Clone)]
@@ -118,11 +103,6 @@ where
         let digest = certificate.digest();
         if self.config.node_storage().contains(&digest)? {
             trace!(target: "primary::cert_validator", "Certificate {digest:?} has already been processed. Skip processing.");
-            self.consensus_bus
-                .primary_metrics()
-                .node_metrics
-                .duplicate_certificates_processed
-                .inc();
             return Ok(());
         }
 
@@ -132,11 +112,9 @@ where
             certificate = self.validate_and_verify(certificate)?;
         }
 
-        // update metrics
         debug!(target: "primary::cert_validator", round=certificate.round(), ?certificate, "processing certificate");
 
-        let certificate_source = certificate_source(&self.config, &certificate);
-        self.forward_verified_certs(certificate_source, certificate.round(), vec![certificate])
+        self.forward_verified_certs(certificate.round(), vec![certificate])
             .await
     }
 
@@ -161,23 +139,14 @@ where
         Ok(verified_cert)
     }
 
-    /// Update metrics and send to Certificate Manager for final processing.
+    /// Send to Certificate Manager for final processing.
     async fn forward_verified_certs(
         &self,
-        certificate_source: &str,
         highest_round: Round,
         certificates: Vec<Certificate>,
     ) -> CertManagerResult<()> {
         let highest_received_round =
             self.consensus_bus.committed_round_updates().borrow().max(highest_round);
-
-        // highest received round metric
-        self.consensus_bus
-            .primary_metrics()
-            .node_metrics
-            .highest_received_round
-            .with_label_values(&[certificate_source])
-            .set(highest_received_round as i64);
 
         // A well-signed certificate from round r provides important information about network
         // progress, even before its contents are fully validated. The certificate's signatures
@@ -281,9 +250,8 @@ where
     ) -> CertManagerResult<()> {
         let certificates = self.verify_collection(certificates).await?;
 
-        // update metrics
         let highest_round = certificates.iter().map(|c| c.round()).max().unwrap_or(0);
-        self.forward_verified_certs("other", highest_round, certificates).await
+        self.forward_verified_certs(highest_round, certificates).await
     }
 
     /// Main method to subdivide certificates into groups and verify based on causal relationship.
@@ -302,9 +270,6 @@ where
 
         // Verify certificates that need direct verification
         let verified_certs = self.verify_certificate_chunk(certs_for_verification).await?;
-
-        // Update metrics about verification types
-        self.update_fetch_metrics(&certificates, verified_certs.len());
 
         // Update the original certificates with verified versions
         for (idx, cert) in verified_certs {
@@ -401,40 +366,13 @@ where
         // strictly sync task even if we did it would not really do
         // anything special so Ok for now.
         tokio::task::spawn_blocking(move || {
-            let now = Instant::now();
             let mut sanitized_certs = Vec::new();
 
             for (idx, cert) in certs {
                 sanitized_certs.push((idx, validator.validate_and_verify(cert)?))
             }
 
-            // Update metrics for verification time
-            validator
-                .consensus_bus
-                .primary_metrics()
-                .node_metrics
-                .certificate_fetcher_total_verification_us
-                .inc_by(now.elapsed().as_micros() as u64);
-
             Ok(sanitized_certs)
         })
-    }
-
-    /// Update metrics for fetched certificates.
-    fn update_fetch_metrics(&self, certificates: &[Certificate], direct_count: usize) {
-        let total_count = certificates.len() as u64;
-        let direct_count = direct_count as u64;
-
-        self.consensus_bus
-            .primary_metrics()
-            .node_metrics
-            .fetched_certificates_verified_directly
-            .inc_by(direct_count);
-
-        self.consensus_bus
-            .primary_metrics()
-            .node_metrics
-            .fetched_certificates_verified_indirectly
-            .inc_by(total_count.saturating_sub(direct_count));
     }
 }

@@ -81,13 +81,6 @@ async fn accept_certificates() {
         let stored = certificate_store.read(x.digest()).unwrap();
         assert_eq!(stored, Some(x.clone()));
     }
-
-    let mut m = HashMap::new();
-    m.insert("source", "other");
-    assert_eq!(
-        cb.primary_metrics().node_metrics.certificates_processed.get_metric_with(&m).unwrap().get(),
-        3
-    );
 }
 
 #[tokio::test]
@@ -189,14 +182,6 @@ async fn synchronizer_recover_basic() {
     drop(synchronizer);
 
     // Restart Synchronizer.
-
-    let mut m = HashMap::new();
-    m.insert("source", "other");
-    assert_eq!(
-        cb.primary_metrics().node_metrics.certificates_processed.get_metric_with(&m).unwrap().get(),
-        3
-    );
-
     let cb = ConsensusBus::new();
     let mut rx_parents = cb.parents().subscribe();
     let synchronizer = Arc::new(Synchronizer::new(primary.consensus_config(), &cb));
@@ -218,12 +203,6 @@ async fn synchronizer_recover_basic() {
         let stored = certificate_store.read(x.digest()).unwrap();
         assert_eq!(stored, Some(x.clone()));
     }
-
-    // New metrics, they should be zeroed out.
-    assert_eq!(
-        cb.primary_metrics().node_metrics.certificates_processed.get_metric_with(&m).unwrap().get(),
-        0
-    );
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]

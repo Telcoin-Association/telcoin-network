@@ -33,7 +33,6 @@ use tn_types::{
     TaskManager, TaskSpawner, TransactionSigned, TransactionTrait as _, B256, U160, U256,
 };
 use tn_worker::{
-    metrics::WorkerMetrics,
     quorum_waiter::{QuorumWaiterError, QuorumWaiterTrait},
     Worker, WorkerNetworkHandle,
 };
@@ -300,14 +299,12 @@ async fn test_with_creds_faucet_transfers_tel_with_google_kms() -> eyre::Result<
     let temp_dir = TempDir::new().unwrap();
     let store = open_db(temp_dir.path());
     let qw = TestChanQuorumWaiter(to_worker);
-    let node_metrics = WorkerMetrics::default();
     let timeout = Duration::from_secs(5);
     let task_manager = TaskManager::default();
     let worker_network = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
     let mut batch_provider = Worker::new(
         0,
         Some(qw.clone()),
-        Arc::new(node_metrics),
         client,
         store.clone(),
         timeout,

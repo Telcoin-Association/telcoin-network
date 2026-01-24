@@ -5,16 +5,13 @@ use tn_network_types::{local::LocalNetwork, MockWorkerToPrimary};
 use tn_reth::test_utils::transaction;
 use tn_storage::{open_db, tables::Batches};
 use tn_types::{test_chain_spec_arc, Batch, Database, TaskManager};
-use tn_worker::{
-    metrics::WorkerMetrics, test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle,
-};
+use tn_worker::{test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle};
 
 #[tokio::test]
 async fn make_batch() {
     let client = LocalNetwork::new_with_empty_id();
     let temp_dir = TempDir::new().unwrap();
     let store = open_db(temp_dir.path());
-    let node_metrics = WorkerMetrics::default();
 
     // Mock the primary client to always succeed.
     let mock_server = MockWorkerToPrimary();
@@ -28,7 +25,6 @@ async fn make_batch() {
     let batch_provider = Worker::new(
         id,
         Some(qw.clone()),
-        Arc::new(node_metrics),
         client,
         store.clone(),
         timeout,

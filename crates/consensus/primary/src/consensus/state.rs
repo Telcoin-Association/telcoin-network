@@ -1,14 +1,13 @@
 //! The state of consensus
 
 use crate::{
-    consensus::{bullshark::Bullshark, utils::gc_round, ConsensusError, ConsensusMetrics},
+    consensus::{bullshark::Bullshark, utils::gc_round, ConsensusError},
     ConsensusBus, NodeMode,
 };
 use std::{
     cmp::{max, Ordering},
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Debug,
-    sync::Arc,
 };
 use tn_config::ConsensusConfig;
 use tn_storage::{CertificateStore, ConsensusStore};
@@ -41,25 +40,21 @@ pub struct ConsensusState {
     /// Keeps the latest committed certificate (and its parents) for every authority. Anything
     /// older must be regularly cleaned up through the function `update`.
     pub dag: Dag,
-    /// Metrics handler
-    pub metrics: Arc<ConsensusMetrics>,
 }
 
 impl ConsensusState {
     /// Create a new empty ConsensusState.  Used for tests.
-    pub fn new(metrics: Arc<ConsensusMetrics>, gc_depth: Round) -> Self {
+    pub fn new(gc_depth: Round) -> Self {
         Self {
             last_round: ConsensusRound::default(),
             gc_depth,
             last_committed: Default::default(),
             dag: Default::default(),
             last_committed_sub_dag: None,
-            metrics,
         }
     }
 
     fn new_from_store<DB: Database>(
-        metrics: Arc<ConsensusMetrics>,
         last_committed_round: Round,
         gc_depth: Round,
         recovered_last_committed: HashMap<AuthorityIdentifier, Round>,
@@ -74,13 +69,8 @@ impl ConsensusState {
             last_round.gc_round,
         )
         .expect("error when recovering DAG from store");
-        metrics.recovered_consensus_state.inc();
 
         let last_committed_sub_dag = if let Some(latest_sub_dag) = latest_sub_dag.as_ref() {
-            let mut certificates = Vec::new();
-            for cert in &latest_sub_dag.certificates {
-                certificates.push(cert.clone());
-            }
             Some(latest_sub_dag.clone())
         } else {
             None
@@ -92,7 +82,6 @@ impl ConsensusState {
             last_committed: recovered_last_committed,
             last_committed_sub_dag,
             dag,
-            metrics,
         }
     }
 
@@ -179,14 +168,7 @@ impl ConsensusState {
             .or_insert_with(|| certificate.round());
         self.last_round = self.last_round.update(certificate.round(), self.gc_depth);
 
-        self.metrics
-            .last_committed_round
-            .with_label_values(&[])
-            .set(self.last_round.committed_round as i64);
         let elapsed = certificate.created_at().elapsed().as_secs_f64();
-        self.metrics
-            .certificate_commit_latency
-            .observe(certificate.created_at().elapsed().as_secs_f64());
 
         // NOTE: This log entry is used to compute performance.
         tracing::debug!(target: "telcoin::consensus_state",
@@ -269,7 +251,7 @@ impl ConsensusRound {
 pub struct Consensus<DB> {
     /// The committee information.
     committee: Committee,
-    /// The chanell "bus" for consensus (container for consesus channel and watches).
+    /// The channel "bus" for consensus (container for consensus channel and watches).
     consensus_bus: ConsensusBus,
     /// Consensus config for the app, used to shutdown an epoch for mode switching.
     consensus_config: ConsensusConfig<DB>,
@@ -279,9 +261,6 @@ pub struct Consensus<DB> {
 
     /// The consensus protocol to run.
     protocol: Bullshark,
-
-    /// Metrics handler
-    metrics: Arc<ConsensusMetrics>,
 
     /// Inner state
     state: ConsensusState,
@@ -298,7 +277,6 @@ impl<DB: Database> Consensus<DB> {
         protocol: Bullshark,
         task_manager: &TaskManager,
     ) {
-        let metrics = consensus_bus.consensus_metrics();
         let rx_shutdown = consensus_config.shutdown().subscribe();
         // The consensus state (everything else is immutable).
         let current_epoch = consensus_config.epoch();
@@ -331,7 +309,6 @@ impl<DB: Database> Consensus<DB> {
 
         // restore local dag
         let state = ConsensusState::new_from_store(
-            metrics.clone(),
             last_committed_round,
             consensus_config.parameters().gc_depth,
             recovered_last_committed,
@@ -347,14 +324,13 @@ impl<DB: Database> Consensus<DB> {
             consensus_config: consensus_config.clone(),
             rx_shutdown,
             protocol,
-            metrics,
             state,
             active: false,
         };
 
         // Only run the consensus task if we are an active CVV.
         // Active means we are participating in consensus.
-        if consensus_bus.is_active_cvv() {
+        if consensus_bus.node_mode().borrow().is_active_cvv() {
             task_manager.spawn_critical_task("consensus task", s.run());
         }
     }
@@ -455,11 +431,6 @@ impl<DB: Database> Consensus<DB> {
                     .committed_round_updates()
                     .send_replace(self.state.last_round.committed_round);
             }
-
-            self.metrics
-                .consensus_dag_rounds
-                .with_label_values(&[])
-                .set(self.state.dag.len() as i64);
         }
         Ok(())
     }

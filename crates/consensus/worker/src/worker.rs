@@ -5,7 +5,6 @@
 
 use crate::{
     batch_fetcher::BatchFetcher,
-    metrics::{Metrics, WorkerMetrics},
     network::PrimaryReceiverHandler,
     quorum_waiter::{QuorumWaiter, QuorumWaiterTrait},
     WorkerNetworkHandle,
@@ -29,19 +28,13 @@ pub const CHANNEL_CAPACITY: usize = 1_000;
 pub fn new_worker<DB: Database>(
     id: WorkerId,
     validator: Arc<dyn BatchValidation>,
-    metrics: Metrics,
     consensus_config: ConsensusConfig<DB>,
     network_handle: WorkerNetworkHandle,
 ) -> Worker<DB, QuorumWaiter> {
     info!(target: "worker::worker", "Boot worker node with id {} key {:?}", id, consensus_config.key_config().primary_public_key());
 
-    let node_metrics = metrics.worker_metrics.clone();
-
-    let batch_fetcher = BatchFetcher::new(
-        network_handle.clone(),
-        consensus_config.node_storage().clone(),
-        node_metrics.clone(),
-    );
+    let batch_fetcher =
+        BatchFetcher::new(network_handle.clone(), consensus_config.node_storage().clone());
     consensus_config.local_network().set_primary_to_worker_local_handler(Arc::new(
         PrimaryReceiverHandler {
             store: consensus_config.node_storage().clone(),
@@ -54,7 +47,6 @@ pub fn new_worker<DB: Database>(
     let batch_provider = new_worker_internal(
         id,
         &consensus_config,
-        node_metrics,
         consensus_config.local_network().clone(),
         network_handle.clone(),
     );
@@ -73,7 +65,6 @@ pub fn new_worker<DB: Database>(
 fn new_worker_internal<DB: Database>(
     id: WorkerId,
     consensus_config: &ConsensusConfig<DB>,
-    node_metrics: Arc<WorkerMetrics>,
     client: LocalNetwork,
     network_handle: WorkerNetworkHandle,
 ) -> Worker<DB, QuorumWaiter> {
@@ -83,18 +74,12 @@ fn new_worker_internal<DB: Database>(
     // before forwarding the batch to the `Processor`
     // Only have a quorum waiter if we are an authority (validator).
     let quorum_waiter = consensus_config.authority().clone().map(|authority| {
-        QuorumWaiter::new(
-            authority,
-            consensus_config.committee().clone(),
-            network_handle.clone(),
-            node_metrics.clone(),
-        )
+        QuorumWaiter::new(authority, consensus_config.committee().clone(), network_handle.clone())
     });
 
     Worker::new(
         id,
         quorum_waiter,
-        node_metrics,
         client,
         consensus_config.node_storage().clone(),
         consensus_config.parameters().batch_vote_timeout,
@@ -108,8 +93,6 @@ pub struct Worker<DB, QW> {
     id: WorkerId,
     /// Use `QuorumWaiter` to attest to batches.
     quorum_waiter: Option<QW>,
-    /// Metrics handler
-    node_metrics: Arc<WorkerMetrics>,
     /// The network client to send our batches to the primary.
     client: LocalNetwork,
     /// The batch store to store our own batches.
@@ -133,7 +116,6 @@ impl<DB: Clone, QW: Clone> Clone for Worker<DB, QW> {
         Self {
             id: self.id,
             quorum_waiter: self.quorum_waiter.clone(),
-            node_metrics: self.node_metrics.clone(),
             client: self.client.clone(),
             store: self.store.clone(),
             tx_batches: self.tx_batches.clone(),
@@ -151,12 +133,10 @@ impl<DB, QW> std::fmt::Debug for Worker<DB, QW> {
 }
 
 impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
-    #[allow(clippy::too_many_arguments)]
     /// Create an instance of `Self`.
     pub fn new(
         id: WorkerId,
         quorum_waiter: Option<QW>,
-        node_metrics: Arc<WorkerMetrics>,
         client: LocalNetwork,
         store: DB,
         timeout: Duration,
@@ -166,7 +146,6 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         Self {
             id,
             quorum_waiter,
-            node_metrics,
             client,
             store,
             tx_batches,
@@ -223,12 +202,6 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
             // We are not a validator so need to send any transactions out for a CVV to pickup.
             return self.disburse_txns(sealed_batch).await;
         };
-        let size = sealed_batch.size();
-
-        self.node_metrics
-            .created_batch_size
-            .with_label_values(&["latest batch size"])
-            .observe(size as f64);
 
         let batch_attest_handle = quorum_waiter.verify_batch(
             sealed_batch.clone(),

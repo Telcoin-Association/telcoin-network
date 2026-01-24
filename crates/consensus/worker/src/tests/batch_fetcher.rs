@@ -21,7 +21,6 @@ async fn test_fetchertt() {
     let fetcher = BatchFetcher {
         network: Arc::new(network.handle()),
         batch_store: batch_store.clone(),
-        metrics: Arc::new(WorkerMetrics::default()),
     };
     let mut expected_batches = HashMap::from_iter(vec![
         (batch1.digest(), batch1.clone()),
@@ -69,7 +68,6 @@ async fn test_fetcher_locally_with_remaining() {
     let fetcher = BatchFetcher {
         network: Arc::new(network.handle()),
         batch_store,
-        metrics: Arc::new(WorkerMetrics::default()),
     };
     let expected_batches = HashMap::from_iter(vec![
         (batch1.digest(), batch1.clone()),
@@ -98,7 +96,6 @@ async fn test_fetcher_remote_with_remaining() {
     let fetcher = BatchFetcher {
         network: Arc::new(network.handle()),
         batch_store,
-        metrics: Arc::new(WorkerMetrics::default()),
     };
     let mut expected_batches = HashMap::from_iter(vec![
         (batch1.digest(), batch1.clone()),
@@ -137,7 +134,6 @@ async fn test_fetcher_local_and_remote() {
     let fetcher = BatchFetcher {
         network: Arc::new(network.handle()),
         batch_store,
-        metrics: Arc::new(WorkerMetrics::default()),
     };
     let mut expected_batches = HashMap::from_iter(vec![
         (batch1.digest(), batch1.clone()),
@@ -193,7 +189,6 @@ async fn test_fetcher_response_size_limit() {
     let fetcher = BatchFetcher {
         network: Arc::new(network.handle()),
         batch_store,
-        metrics: Arc::new(WorkerMetrics::default()),
     };
     let mut fetched_batches = fetcher.fetch(digests).await;
 

@@ -414,11 +414,6 @@ where
             num_parents <= committee.size(),
             HeaderError::TooManyParents(num_parents, committee.size()).into()
         );
-        self.consensus_bus
-            .primary_metrics()
-            .node_metrics
-            .certificates_in_votes
-            .inc_by(num_parents as u64);
 
         // if peer is ahead, wait for execution to catch up
         // NOTE: this doesn't hurt since this node shouldn't vote until execution is caught up
@@ -600,13 +595,6 @@ where
                         header.author(),
                         header,
                     );
-
-                    // metrics
-                    self.consensus_bus
-                        .primary_metrics()
-                        .node_metrics
-                        .votes_dropped_equivocation_protection
-                        .inc();
 
                     return Err(HeaderError::AlreadyVoted(header.digest(), header.round()).into());
                 }

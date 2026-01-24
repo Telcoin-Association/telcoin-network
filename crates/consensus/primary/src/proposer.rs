@@ -23,14 +23,12 @@ use crate::{
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, VecDeque},
-    sync::Arc,
 };
 use tn_config::ConsensusConfig;
-use tn_primary_metrics::PrimaryMetrics;
 use tn_storage::ProposerStore;
 use tn_types::{
     now, AuthorityIdentifier, BlockHash, Certificate, Committee, Database, Epoch, Hash as _,
-    Header, Noticer, Round, TaskManager, TaskSpawner, TimestampSec, TnReceiver, TnSender, WorkerId,
+    Header, Noticer, Round, TaskManager, TaskSpawner, TnReceiver, TnSender, WorkerId,
 };
 use tokio::{
     sync::oneshot,
@@ -112,8 +110,6 @@ pub(crate) struct Proposer<DB: ProposerStore> {
     proposer_store: DB,
     /// The current round of the dag.
     round: Round,
-    /// Last time the round has been updated
-    last_round_timestamp: Option<TimestampSec>,
     /// Holds the certificates' ids waiting to be included in the next header.
     last_parents: Vec<Certificate>,
     /// Holds the certificate of the last leader (if any).
@@ -165,7 +161,6 @@ impl<DB: Database> Proposer<DB> {
             consensus_bus,
             proposer_store: config.node_storage().clone(),
             round: 0,
-            last_round_timestamp: None,
             last_parents: genesis,
             last_leader: None,
             digests: VecDeque::with_capacity(2 * config.parameters().max_header_num_of_batches),
@@ -182,7 +177,6 @@ impl<DB: Database> Proposer<DB> {
     ///
     /// - current_header: caller checks to see if there is already a header built for this round. If
     ///   current_header.is_some() the proposer uses this header instead of building a new one.
-    #[allow(clippy::too_many_arguments)]
     async fn propose_header(
         current_round: Round,
         current_epoch: Epoch,
@@ -191,10 +185,6 @@ impl<DB: Database> Proposer<DB> {
         consensus_bus: &ConsensusBus,
         parents: Vec<Certificate>,
         digests: VecDeque<ProposerDigest>,
-        reason: String,
-        metrics: Arc<PrimaryMetrics>,
-        leader_and_support: String,
-        max_delay: Duration,
     ) -> ProposerResult<Header> {
         // check that the included timestamp is consistent with the parent's timestamp
         //
@@ -211,7 +201,6 @@ impl<DB: Database> Proposer<DB> {
                 "Current time earlier than most recent parent! Sleeping for {}sec until max parent time...",
                 drift_sec,
             );
-            metrics.header_max_parent_wait_ms.inc_by(drift_sec);
             sleep(Duration::from_secs(drift_sec)).await;
         }
 
@@ -224,10 +213,6 @@ impl<DB: Database> Proposer<DB> {
             consensus_bus.latest_block_num_hash(),
         );
 
-        // update metrics before sending/storing header
-        metrics.headers_proposed.with_label_values(&[&leader_and_support]).inc();
-        metrics.header_parents.observe(parents.len() as f64);
-
         if enabled!(target: "primary::proposer", tracing::Level::TRACE) {
             let mut msg = format!("Created header {header:?} with parent certificates:\n");
             for parent in parents.iter() {
@@ -238,44 +223,8 @@ impl<DB: Database> Proposer<DB> {
             debug!(target: "primary::proposer", ?header, parents=?header.parents(), "created new header");
         }
 
-        // Update metrics related to latency
-        let mut total_inclusion_secs = 0.0;
-        for digest in &digests {
-            let batch_inclusion_secs =
-                Duration::from_secs(header.created_at().saturating_sub(now())).as_secs_f64();
-            total_inclusion_secs += batch_inclusion_secs;
-
-            // NOTE: this log entry is used to measure performance
-            trace!(
-                "Batch {:?} from worker {} took {} seconds from creation to be included in a proposed header",
-                digest.digest,
-                digest.worker_id,
-                batch_inclusion_secs
-            );
-            metrics.proposer_batch_latency.observe(batch_inclusion_secs);
-        }
-
-        // NOTE: this log entry is used to measure performance
-        let (header_creation_secs, avg_inclusion_secs) = if !digests.is_empty() {
-            (
-                Duration::from_secs(header.created_at().saturating_sub(now())).as_secs_f64(),
-                total_inclusion_secs / digests.len() as f64,
-            )
-        } else {
-            (max_delay.as_secs_f64(), 0.0)
-        };
-
-        trace!(
-            target: "primary::proposer",
-            "Header {:?} was created in {} seconds. Contains {} batches, with average delay {} seconds.",
-            header.digest(),
-            header_creation_secs,
-            digests.len(),
-            avg_inclusion_secs,
-        );
-
         // store and send newly built header
-        Proposer::store_and_send_header(&header, proposer_store, consensus_bus, &reason).await?;
+        Proposer::store_and_send_header(&header, proposer_store, consensus_bus).await?;
 
         Ok(header)
     }
@@ -291,9 +240,8 @@ impl<DB: Database> Proposer<DB> {
         header: Header,
         proposer_store: DB,
         consensus_bus: &ConsensusBus,
-        reason: String,
     ) -> ProposerResult<Header> {
-        Proposer::store_and_send_header(&header, proposer_store, consensus_bus, &reason).await?;
+        Proposer::store_and_send_header(&header, proposer_store, consensus_bus).await?;
 
         Ok(header)
     }
@@ -303,7 +251,6 @@ impl<DB: Database> Proposer<DB> {
         header: &Header,
         proposer_store: DB,
         consensus_bus: &ConsensusBus,
-        reason: &str,
     ) -> ProposerResult<()> {
         // Store the last header.
         proposer_store
@@ -311,17 +258,7 @@ impl<DB: Database> Proposer<DB> {
             .map_err(|e| ProposerError::StoreError(e.to_string()))?;
 
         // Send the new header to the `Certifier` that will broadcast and certify it.
-        let result =
-            consensus_bus.headers().send(header.clone()).await.map_err(|e| Box::new(e).into());
-        let num_digests = header.payload().len();
-        consensus_bus
-            .primary_metrics()
-            .node_metrics
-            .num_of_batch_digests_in_header
-            .with_label_values(&[reason])
-            .observe(num_digests as f64);
-
-        result
+        consensus_bus.headers().send(header.clone()).await.map_err(|e| Box::new(e).into())
     }
 
     /// Calculate the max delay to use when resetting the max_delay_interval.
@@ -520,14 +457,6 @@ impl<DB: Database> Proposer<DB> {
         self.advance_round = self.ready();
         debug!(target: "primary::proposer", authority=?self.authority_id, advance_round=self.advance_round, round=self.round, "parents");
 
-        // update metrics
-        let round_type = if self.round.is_multiple_of(2) { "even" } else { "odd" };
-        self.consensus_bus
-            .primary_metrics()
-            .node_metrics
-            .proposer_ready_to_advance
-            .with_label_values(&[&self.advance_round.to_string(), round_type])
-            .inc();
         Ok(())
     }
 
@@ -598,17 +527,6 @@ impl<DB: Database> Proposer<DB> {
                 "Repropose {num_digests_to_resend} batches in undelivered headers {retransmit_rounds:?} at commit round {commit_round:?}, remaining headers {}",
                 self.proposed_headers.len()
             );
-
-            self.consensus_bus
-                .primary_metrics()
-                .node_metrics
-                .proposer_resend_headers
-                .inc_by(retransmit_rounds.len() as u64);
-            self.consensus_bus
-                .primary_metrics()
-                .node_metrics
-                .proposer_resend_batches
-                .inc_by(num_digests_to_resend as u64);
         }
     }
 
@@ -619,7 +537,7 @@ impl<DB: Database> Proposer<DB> {
     ///
     /// If a different header was already produced for the same round, then
     /// this method returns the earlier header. Otherwise the newly created header is returned.
-    fn propose_next_header(&mut self, reason: String) -> ProposerResult<PendingHeaderTask> {
+    fn propose_next_header(&mut self) -> ProposerResult<PendingHeaderTask> {
         // Advance to the next round.
         self.round += 1;
         let updated_round = self.consensus_bus.primary_round() + 1;
@@ -628,18 +546,6 @@ impl<DB: Database> Proposer<DB> {
         }
         let _ = self.consensus_bus.primary_round_updates().send(self.round);
 
-        // Update the metrics
-        self.consensus_bus.primary_metrics().node_metrics.current_round.set(self.round as i64);
-        let current_timestamp = now();
-        if let Some(t) = &self.last_round_timestamp {
-            self.consensus_bus
-                .primary_metrics()
-                .node_metrics
-                .proposal_latency
-                .with_label_values(&[&reason])
-                .observe(Duration::from_millis(current_timestamp - t).as_secs_f64());
-        }
-        self.last_round_timestamp = Some(current_timestamp);
         debug!(target: "primary::proposer", authority=?self.authority_id, round=self.round, "advanced round - proposing next block...");
 
         // oneshot channel to spawn a task
@@ -655,7 +561,6 @@ impl<DB: Database> Proposer<DB> {
         let possible_header_to_repropose =
             last_proposed.filter(|h| h.round() == current_round && h.epoch() == current_epoch);
         let proposer_store = self.proposer_store.clone();
-        let metrics = self.consensus_bus.primary_metrics().node_metrics.clone();
 
         match possible_header_to_repropose {
             // resend header
@@ -668,8 +573,7 @@ impl<DB: Database> Proposer<DB> {
                 self.task_spawner.spawn_task("re-propose header", async move {
                     // use this instead of store_and_send to because rx always expects a Header
                     let res =
-                        Proposer::repropose_header(header, proposer_store, &consensus_bus, reason)
-                            .await;
+                        Proposer::repropose_header(header, proposer_store, &consensus_bus).await;
                     let _ = tx.send(res);
                 });
             }
@@ -680,22 +584,6 @@ impl<DB: Database> Proposer<DB> {
                 let digests: VecDeque<_> = self.digests.drain(..num_of_digests).collect();
                 let parents = std::mem::take(&mut self.last_parents);
                 let authority_id = self.authority_id.clone();
-                let min_delay = self.min_header_delay; // copy
-                let leader_and_support = if current_round.is_multiple_of(2) {
-                    let authority = self.leader_schedule.leader(current_round);
-                    if self.authority_id == authority.id() {
-                        "even_round_is_leader"
-                    } else {
-                        "even_round_not_leader"
-                    }
-                } else {
-                    let authority = self.leader_schedule.leader(current_round - 1);
-                    if parents.iter().any(|c| c.origin() == &authority.id()) {
-                        "odd_round_gives_support"
-                    } else {
-                        "odd_round_no_support"
-                    }
-                };
 
                 let consensus_bus = self.consensus_bus.clone();
                 // spawn tokio task to create, store, and send new header to certifier
@@ -708,10 +596,6 @@ impl<DB: Database> Proposer<DB> {
                         &consensus_bus,
                         parents,
                         digests,
-                        reason,
-                        metrics,
-                        leader_and_support.to_string(),
-                        min_delay,
                     )
                     .await;
 
@@ -748,7 +632,7 @@ impl<DB: Database> Proposer<DB> {
     }
 
     pub(crate) fn spawn(mut self, task_manager: &TaskManager) {
-        if self.consensus_bus.is_active_cvv() {
+        if self.consensus_bus.node_mode().borrow().is_active_cvv() {
             task_manager.spawn_critical_task("proposer task", async move {
                 info!(target: "primary::proposer", "Starting proposer");
                 self.run().await
@@ -880,7 +764,7 @@ impl<DB: Database> Proposer<DB> {
                     warn!(target: "primary::proposer", interval=?self.max_delay_interval.period(), "max delay interval expired for round {}", self.round);
                 }
 
-                // obtain reason for metrics
+                // obtain reason for logging
                 let reason = if max_delay_timed_out {
                     "max_timeout"
                 } else if enough_digests {
@@ -892,7 +776,7 @@ impl<DB: Database> Proposer<DB> {
                 debug!(target: "primary::proposer", authority=?self.authority_id, ?reason, "proposing next header!");
 
                 // propose header
-                pending_header = Some(self.propose_next_header(reason.to_string())?);
+                pending_header = Some(self.propose_next_header()?);
                 max_delay_timed_out = false;
                 min_delay_timed_out = false;
             } else if should_repropose_header {
@@ -907,7 +791,6 @@ impl<DB: Database> Proposer<DB> {
                             last_proposed,
                             proposer_store,
                             &consensus_bus,
-                            "repropose header after delay".to_string(),
                         )
                         .await;
                         let _ = tx.send(res);

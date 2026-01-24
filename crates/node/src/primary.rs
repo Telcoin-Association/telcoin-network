@@ -1,17 +1,16 @@
 //! Hierarchical type to hold tasks spawned for a worker in the network.
-use std::sync::Arc;
 use tn_config::ConsensusConfig;
 use tn_executor::{Executor, SubscriberResult};
 use tn_primary::{
-    consensus::{Bullshark, Consensus, ConsensusMetrics, LeaderSchedule},
+    consensus::{Bullshark, Consensus, LeaderSchedule},
     network::PrimaryNetworkHandle,
     ConsensusBus, Primary, StateSynchronizer,
 };
-use tn_primary_metrics::Metrics;
 use tn_types::{
     Committee, Database as ConsensusDatabase, Notifier, TaskManager,
     DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
+use std::sync::Arc;
 use tokio::sync::RwLock;
 
 #[derive(Debug)]
@@ -72,7 +71,6 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
         // Spawn the consensus core who only sequences transactions.
         let ordering_engine = Bullshark::new(
             self.consensus_config.committee().clone(),
-            self.consensus_bus.consensus_metrics().clone(),
             Self::CONSENSUS_SCHEDULE_CHANGE_SUB_DAGS,
             leader_schedule.clone(),
             DEFAULT_BAD_NODES_STAKE_THRESHOLD,
@@ -123,16 +121,6 @@ impl<CDB: ConsensusDatabase> PrimaryNode<CDB> {
     {
         let mut guard = self.internal.write().await;
         guard.start(task_manager).await
-    }
-
-    /// Return the consensus metrics.
-    pub async fn consensus_metrics(&self) -> Arc<ConsensusMetrics> {
-        self.internal.read().await.consensus_bus.consensus_metrics()
-    }
-
-    /// Return the primary metrics.
-    pub async fn primary_metrics(&self) -> Arc<Metrics> {
-        self.internal.read().await.consensus_bus.primary_metrics()
     }
 
     /// Return a copy of the primaries consensus bus.

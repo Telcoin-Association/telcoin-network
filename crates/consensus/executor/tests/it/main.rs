@@ -66,8 +66,6 @@ async fn test_output_to_header() -> eyre::Result<()> {
     );
     let bullshark = Bullshark::new(
         committee.clone(),
-        // metrics.clone(),
-        Arc::new(Default::default()),
         num_sub_dags_per_schedule,
         leader_schedule.clone(),
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
@@ -156,7 +154,6 @@ async fn test_executor_output_ordering() -> eyre::Result<()> {
     );
     let bullshark = Bullshark::new(
         committee.clone(),
-        Arc::new(Default::default()),
         num_sub_dags_per_schedule,
         leader_schedule,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
@@ -236,7 +233,6 @@ async fn test_executor_batch_fetching() -> eyre::Result<()> {
     );
     let bullshark = Bullshark::new(
         committee.clone(),
-        Arc::new(Default::default()),
         num_sub_dags_per_schedule,
         leader_schedule,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
