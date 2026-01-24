@@ -8,7 +8,7 @@ use tn_types::{
     Certificate, CommittedSubDag, Committee, Hash as _, ReputationScores, Round, VotingPower,
 };
 use tokio::time::Instant;
-use tracing::{debug, error_span};
+use tracing::{debug, error_span, info, instrument};
 
 #[cfg(test)]
 #[path = "tests/bullshark_tests.rs"]
@@ -103,12 +103,13 @@ impl Bullshark {
         reputation_score
     }
 
+    #[instrument(level = "debug", skip_all, fields(round = certificate.round(), origin = ?certificate.origin()))]
     pub fn process_certificate(
         &mut self,
         state: &mut ConsensusState,
         certificate: Certificate,
     ) -> Result<(Outcome, Vec<CommittedSubDag>), ConsensusError> {
-        debug!("Processing {:?}", certificate);
+        debug!("Processing certificate");
         let round = certificate.round();
 
         // Add the new certificate to the local storage.
@@ -174,6 +175,7 @@ impl Bullshark {
     /// If the schedule has changed due to a commit and there are more leaders to commit, then this
     /// method will return the enum `ScheduleChanged` so the caller will know to retry for the
     /// uncommitted leaders with the updated schedule now.
+    #[instrument(level = "debug", skip_all, fields(leader_round))]
     fn commit_leader(
         &mut self,
         leader_round: Round,
@@ -232,7 +234,8 @@ impl Bullshark {
                 // Add the certificate to the sequence.
                 sequence.push(x);
             }
-            debug!(min_round, "Subdag has {} certificates", sequence.len());
+            let num_certificates = sequence.len();
+            debug!(min_round, "Subdag has {} certificates", num_certificates);
 
             // We resolve the reputation score that should be stored alongside with this sub dag.
             let reputation_score = self.resolve_reputation_score(state, &sequence, sub_dag_index);
@@ -243,6 +246,17 @@ impl Bullshark {
                 sub_dag_index,
                 reputation_score.clone(),
                 state.last_committed_sub_dag.as_ref(),
+            );
+
+            // Metric: subdag_committed - tracks subdag commits with key metrics
+            info!(
+                target: "consensus::metrics",
+                subdag_index = sub_dag_index,
+                leader_round = leader.round(),
+                num_certificates = num_certificates,
+                min_round = min_round,
+                committed_round = state.last_round.committed_round,
+                "subdag committed"
             );
 
             // Update the last sub dag
@@ -269,6 +283,7 @@ impl Bullshark {
 
     /// Order the past leaders that we didn't already commit. It orders the leaders from the one
     /// of the older (smaller) round to the newest round.
+    #[instrument(level = "debug", skip_all, fields(leader_round = leader.round()))]
     fn order_leaders(&self, leader: &Certificate, state: &ConsensusState) -> VecDeque<Certificate> {
         let mut to_commit = VecDeque::new();
         to_commit.push_front(leader.clone());

@@ -70,11 +70,7 @@ impl ConsensusState {
         )
         .expect("error when recovering DAG from store");
 
-        let last_committed_sub_dag = if let Some(latest_sub_dag) = latest_sub_dag.as_ref() {
-            Some(latest_sub_dag.clone())
-        } else {
-            None
-        };
+        let last_committed_sub_dag = latest_sub_dag.clone();
 
         Self {
             gc_depth,
@@ -111,6 +107,7 @@ impl ConsensusState {
     }
 
     /// Returns true if certificate is inserted in the dag.
+    #[instrument(level = "debug", skip_all, fields(round = certificate.round(), origin = ?certificate.origin()))]
     pub fn try_insert(&mut self, certificate: &Certificate) -> Result<bool, ConsensusError> {
         Self::try_insert_in_dag(
             &mut self.dag,
@@ -168,14 +165,18 @@ impl ConsensusState {
             .or_insert_with(|| certificate.round());
         self.last_round = self.last_round.update(certificate.round(), self.gc_depth);
 
-        let elapsed = certificate.created_at().elapsed().as_secs_f64();
+        let commit_latency_ms = certificate.created_at().elapsed().as_millis() as u64;
 
-        // NOTE: This log entry is used to compute performance.
-        tracing::debug!(target: "telcoin::consensus_state",
-            "Certificate {:?} took {} seconds to be committed at round {}",
-            certificate.digest(),
-            elapsed,
-            certificate.round(),
+        // Metric: certificate_commit_latency_ms - time from certificate creation to commit
+        info!(
+            target: "consensus::metrics",
+            certificate_commit_latency_ms = commit_latency_ms,
+            round = certificate.round(),
+            origin = ?certificate.origin(),
+            digest = ?certificate.digest(),
+            committed_round = self.last_round.committed_round,
+            gc_round = self.last_round.gc_round,
+            "certificate committed"
         );
 
         // Purge all certificates past the gc depth.
@@ -358,6 +359,7 @@ impl<DB: Database> Consensus<DB> {
     }
 
     /// Process a new certificate.
+    #[instrument(level = "debug", skip_all, fields(round = certificate.round(), origin = ?certificate.origin()))]
     async fn new_certificate(&mut self, certificate: Certificate) -> Result<(), ConsensusError> {
         match certificate.epoch().cmp(&self.committee.epoch()) {
             Ordering::Equal => {

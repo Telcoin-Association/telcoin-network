@@ -114,8 +114,7 @@ where
 
         debug!(target: "primary::cert_validator", round=certificate.round(), ?certificate, "processing certificate");
 
-        self.forward_verified_certs(certificate.round(), vec![certificate])
-            .await
+        self.forward_verified_certs(certificate.round(), vec![certificate]).await
     }
 
     /// Validate and verify the certificate.

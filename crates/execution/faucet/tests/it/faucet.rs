@@ -302,14 +302,8 @@ async fn test_with_creds_faucet_transfers_tel_with_google_kms() -> eyre::Result<
     let timeout = Duration::from_secs(5);
     let task_manager = TaskManager::default();
     let worker_network = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
-    let mut batch_provider = Worker::new(
-        0,
-        Some(qw.clone()),
-        client,
-        store.clone(),
-        timeout,
-        worker_network.clone(),
-    );
+    let mut batch_provider =
+        Worker::new(0, Some(qw.clone()), client, store.clone(), timeout, worker_network.clone());
     batch_provider.spawn_batch_builder("kms batch builder", &task_manager);
 
     // start batch maker

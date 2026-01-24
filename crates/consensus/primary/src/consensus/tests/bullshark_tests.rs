@@ -203,12 +203,8 @@ async fn not_enough_support_with_leader_schedule_change() {
     let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
 
     let bad_nodes_stake_threshold = 33;
-    let mut bullshark = Bullshark::new(
-        committee,
-        sub_dags_per_schedule,
-        schedule,
-        bad_nodes_stake_threshold,
-    );
+    let mut bullshark =
+        Bullshark::new(committee, sub_dags_per_schedule, schedule, bad_nodes_stake_threshold);
 
     let mut total_13_certs = 0;
     let mut total_15_certs = 0;

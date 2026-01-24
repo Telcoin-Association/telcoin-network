@@ -14,7 +14,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tn_config::ConsensusConfig;
 use tn_storage::CertificateStore;
@@ -26,7 +26,7 @@ use tokio::{
     sync::oneshot,
     time::{sleep, timeout},
 };
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 #[cfg(test)]
 #[path = "tests/certificate_fetcher_tests.rs"]
@@ -341,6 +341,7 @@ impl<DB: Database> CertificateFetcher<DB> {
 
 /// Fetch missing certificates from peers and process them.
 /// Tries peers in random order with parallel requests.
+#[instrument(level = "debug", skip_all, fields(lower_bound = request.exclusive_lower_bound))]
 async fn fetch_and_process_certificates<DB: Database>(
     authority_id: Option<AuthorityIdentifier>,
     network: PrimaryNetworkHandle,
@@ -350,6 +351,9 @@ async fn fetch_and_process_certificates<DB: Database>(
     task_spawner: TaskSpawner,
     fallback_delay: Duration,
 ) -> CertManagerResult<()> {
+    let start_time = Instant::now();
+    let lower_bound = request.exclusive_lower_bound;
+
     // get randomized list of peers
     let mut peers: Vec<_> = committee
         .others_primaries_by_id(authority_id.as_ref())
@@ -373,8 +377,20 @@ async fn fetch_and_process_certificates<DB: Database>(
         CertManagerError::Timeout
     })??;
 
+    let num_certificates = certificates.len();
+
     // process the certificates
     state_sync.process_fetched_certificates_in_parallel(certificates).await?;
+
+    // Metric: certificates_fetched - tracks certificate fetch operations
+    let fetch_latency_ms = start_time.elapsed().as_millis() as u64;
+    info!(
+        target: "consensus::metrics",
+        fetch_latency_ms = fetch_latency_ms,
+        num_certificates = num_certificates,
+        lower_bound = lower_bound,
+        "certificates fetched"
+    );
 
     Ok(())
 }

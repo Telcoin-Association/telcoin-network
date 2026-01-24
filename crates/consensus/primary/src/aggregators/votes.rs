@@ -7,7 +7,7 @@ use tn_types::{
     to_intent_message, AuthorityIdentifier, BlsSignature, Certificate, Committee, Header,
     ProtocolSignature, SignatureVerificationState, Vote, VotingPower,
 };
-use tracing::trace;
+use tracing::{info, instrument, trace};
 
 /// Aggregates votes for a particular header to form a certificate
 pub(crate) struct VotesAggregator {
@@ -30,6 +30,7 @@ impl VotesAggregator {
     /// Append the vote to the collection.
     ///
     /// This method protects against equivocation by keeping track of peers that have already voted.
+    #[instrument(level = "debug", skip_all, fields(voter = ?vote.author(), weight = self.weight))]
     pub(crate) fn append(
         &mut self,
         vote: Vote,
@@ -67,6 +68,17 @@ impl VotesAggregator {
                 header.clone(),
                 self.verified_votes.clone(),
             )?;
+
+            // Metric: quorum_reached - tracks when vote quorum is achieved
+            info!(
+                target: "consensus::metrics",
+                round = header.round(),
+                epoch = header.epoch(),
+                voting_power = self.weight,
+                quorum_threshold = committee.quorum_threshold(),
+                num_votes = self.verified_votes.len(),
+                "quorum reached"
+            );
 
             trace!(target: "primary::votes_aggregator", ?cert, "certificate verified");
             // cert signature verified

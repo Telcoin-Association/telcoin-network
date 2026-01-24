@@ -16,7 +16,7 @@ use tn_types::{
     AuthorityIdentifier, BlsPublicKey, Certificate, CertificateDigest, Committee, Database, Header,
     Noticer, Notifier, TaskManager, TaskSpawner, TnReceiver, TnSender, Vote,
 };
-use tracing::{debug, enabled, error, info};
+use tracing::{debug, enabled, error, info, instrument};
 
 #[cfg(test)]
 #[path = "tests/certifier_tests.rs"]
@@ -110,6 +110,7 @@ impl<DB: Database> Certifier<DB> {
 
     /// Requests a vote for a Header from the given peer. Retries indefinitely until either a
     /// vote is received, or a permanent error is returned.
+    #[instrument(level = "debug", skip_all, fields(peer = ?authority, round = header.round()))]
     async fn request_vote(
         authority: AuthorityIdentifier,
         header: Header,
@@ -241,6 +242,7 @@ impl<DB: Database> Certifier<DB> {
     }
 
     /// Propose a header produced by this authority.
+    #[instrument(level = "debug", skip_all, fields(round = header.round(), epoch = header.epoch()))]
     async fn propose_header(&self, header: Header) -> DagResult<Certificate> {
         debug!(target: "primary::certifier", auth=?self.authority_id, "proposing header");
 

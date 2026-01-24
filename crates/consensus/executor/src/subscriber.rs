@@ -19,7 +19,7 @@ use tn_types::{
     CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput, Database,
     Hash as _, Noticer, TaskManager, TaskSpawner, Timestamp, TnReceiver, TnSender, B256,
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, instrument};
 
 /// The `Subscriber` receives certificates sequenced by the consensus and waits until the
 /// downloaded all the transactions references by the certificates; it then
@@ -109,6 +109,7 @@ impl<DB: Database> Subscriber<DB> {
 
     /// Turns a ConsensusHeader into a ConsensusOutput and sends it down the consensus_output
     /// channel for execution.
+    #[instrument(level = "debug", skip_all, fields(number = consensus_header.number))]
     async fn handle_consensus_header(
         &self,
         consensus_header: ConsensusHeader,
@@ -210,6 +211,7 @@ impl<DB: Database> Subscriber<DB> {
     }
 
     /// Main loop connecting to the consensus to listen to sequence messages.
+    #[instrument(level = "info", skip_all, fields(authority = ?self.inner.authority_id))]
     async fn run(self, rx_shutdown: Noticer) -> SubscriberResult<()> {
         // It's important to have the futures in ordered fashion as we want
         // to guarantee that will deliver to the executor the certificates
@@ -307,6 +309,7 @@ impl<DB: Database> Subscriber<DB> {
     /// to execute.
     /// Note, an error here is BAD and will most likely cause node shutdown (clean).  Do
     /// not provide a bogus sub dag...
+    #[instrument(level = "debug", skip_all, fields(number, num_certs = deliver.len()))]
     async fn fetch_batches(
         &self,
         deliver: CommittedSubDag,
@@ -371,6 +374,25 @@ impl<DB: Database> Subscriber<DB> {
                 batches: cert_batches,
             });
         }
+        // Count total transactions across all batches
+        let total_txs: usize = consensus_output
+            .batches
+            .iter()
+            .flat_map(|cb| cb.batches.iter())
+            .map(|b| b.transactions.len())
+            .sum();
+
+        // Metric: consensus_output_ready - tracks consensus output ready for execution
+        info!(
+            target: "consensus::metrics",
+            number = number,
+            leader_round = sub_dag.leader_round(),
+            num_certs = num_certs,
+            num_batches = consensus_output.batch_digests.len(),
+            total_txs = total_txs,
+            "consensus output ready"
+        );
+
         debug!(target: "subscriber", "returning output to subscriber");
         Ok(consensus_output)
     }

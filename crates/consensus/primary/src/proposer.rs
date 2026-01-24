@@ -34,7 +34,7 @@ use tokio::{
     sync::oneshot,
     time::{sleep, Duration, Interval},
 };
-use tracing::{debug, enabled, error, info, trace, warn};
+use tracing::{debug, enabled, error, info, instrument, trace, warn};
 
 /// Type alias for the async task that creates, stores, and sends the proposer's new header.
 type PendingHeaderTask = oneshot::Receiver<ProposerResult<Header>>;
@@ -177,6 +177,7 @@ impl<DB: Database> Proposer<DB> {
     ///
     /// - current_header: caller checks to see if there is already a header built for this round. If
     ///   current_header.is_some() the proposer uses this header instead of building a new one.
+    #[instrument(level = "debug", skip_all, fields(round = current_round, epoch = current_epoch, num_digests = digests.len()))]
     async fn propose_header(
         current_round: Round,
         current_epoch: Epoch,
@@ -211,6 +212,16 @@ impl<DB: Database> Proposer<DB> {
             digests.iter().map(|m| (m.digest, m.worker_id)).collect(),
             parents.iter().map(|x| x.digest()).collect(),
             consensus_bus.latest_block_num_hash(),
+        );
+
+        // Metric: header_proposed - tracks header proposals
+        info!(
+            target: "consensus::metrics",
+            round = current_round,
+            epoch = current_epoch,
+            num_batches = digests.len(),
+            num_parents = parents.len(),
+            "header proposed"
         );
 
         if enabled!(target: "primary::proposer", tracing::Level::TRACE) {

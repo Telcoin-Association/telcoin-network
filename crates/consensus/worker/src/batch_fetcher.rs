@@ -12,7 +12,7 @@ use tn_network_libp2p::error::NetworkError;
 use tn_storage::tables::Batches;
 use tn_types::{now, Batch, BlockHash, Database, DbTxMut};
 use tokio::time::error::Elapsed;
-use tracing::debug;
+use tracing::{debug, instrument};
 
 #[cfg(test)]
 #[path = "tests/batch_fetcher.rs"]
@@ -31,6 +31,7 @@ impl<DB: Database> BatchFetcher<DB> {
 
     /// Bulk fetches payload from local storage and remote workers.
     /// This function performs infinite retries and until all batches are available.
+    #[instrument(level = "debug", skip_all, fields(num_digests = digests.len()))]
     pub(crate) async fn fetch(&self, digests: HashSet<BlockHash>) -> HashMap<BlockHash, Batch> {
         debug!(target: "batch_fetcher", "Attempting to fetch {} digests from peers", digests.len(),);
 
@@ -103,6 +104,7 @@ impl<DB: Database> BatchFetcher<DB> {
     }
 
     /// Issue request_batches RPC and verifies response integrity
+    #[instrument(level = "debug", skip_all, fields(num_digests = digests_to_fetch.len()))]
     async fn safe_request_batches(
         &self,
         digests_to_fetch: &HashSet<BlockHash>,

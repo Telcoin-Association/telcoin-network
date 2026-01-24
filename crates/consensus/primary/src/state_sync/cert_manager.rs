@@ -54,7 +54,7 @@ where
     /// Create a new instance of Self.
     pub(super) fn new(config: ConsensusConfig<DB>, consensus_bus: ConsensusBus) -> Self {
         let parents = CertificatesAggregatorManager::new(consensus_bus.clone());
-        let pending = PendingCertificateManager::new(consensus_bus.clone());
+        let pending = PendingCertificateManager::new();
         let garbage_collector = GarbageCollector::new(config.clone(), consensus_bus.clone());
 
         Self { consensus_bus, config, pending, parents, garbage_collector }

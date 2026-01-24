@@ -1,4 +1,5 @@
 //! Hierarchical type to hold tasks spawned for a worker in the network.
+use std::sync::Arc;
 use tn_config::ConsensusConfig;
 use tn_executor::{Executor, SubscriberResult};
 use tn_primary::{
@@ -10,7 +11,6 @@ use tn_types::{
     Committee, Database as ConsensusDatabase, Notifier, TaskManager,
     DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
-use std::sync::Arc;
 use tokio::sync::RwLock;
 
 #[derive(Debug)]

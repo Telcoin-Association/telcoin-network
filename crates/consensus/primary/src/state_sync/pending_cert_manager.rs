@@ -3,10 +3,7 @@
 //! Pending certificates are waiting to be accepted due to missing parents.
 //! This mod manages and tracks pending certificates for rounds of consensus.
 
-use crate::{
-    error::{CertManagerError, CertManagerResult},
-    ConsensusBus,
-};
+use crate::error::{CertManagerError, CertManagerResult};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use tn_types::{Certificate, CertificateDigest, Hash as _, Round};
 use tracing::debug;
@@ -47,14 +44,12 @@ pub(super) struct PendingCertificateManager {
     ///
     /// The keys are (round, digest) to enable garbage collection by round.
     missing_for_pending: BTreeMap<(Round, CertificateDigest), HashSet<CertificateDigest>>,
-    /// Consensus channels.
-    consensus_bus: ConsensusBus,
 }
 
 impl PendingCertificateManager {
     /// Create a new instance of Self.
-    pub(super) fn new(consensus_bus: ConsensusBus) -> Self {
-        Self { pending: Default::default(), missing_for_pending: Default::default(), consensus_bus }
+    pub(super) fn new() -> Self {
+        Self { pending: Default::default(), missing_for_pending: Default::default() }
     }
 
     /// Attempts to insert a new pending certificate.
@@ -171,6 +166,7 @@ impl PendingCertificateManager {
     }
 
     /// Returns the number of pending certificates.
+    #[cfg(test)]
     pub(super) fn num_pending(&self) -> usize {
         self.pending.len()
     }

@@ -17,7 +17,7 @@ use tn_types::{
     error::BlockSealError, BatchReceiver, BatchSender, BatchValidation, Database, SealedBatch,
     TaskManager, WorkerId,
 };
-use tracing::{error, info};
+use tracing::{error, info, instrument};
 
 /// The default channel capacity for each channel of the worker.
 pub const CHANNEL_CAPACITY: usize = 1_000;
@@ -197,6 +197,7 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
     }
 
     /// Seal and broadcast the current batch.
+    #[instrument(level = "debug", skip_all, fields(batch_size = sealed_batch.size(), num_txs = sealed_batch.batch.transactions.len()))]
     pub async fn seal(&self, sealed_batch: SealedBatch) -> Result<(), BlockSealError> {
         let Some(quorum_waiter) = &self.quorum_waiter else {
             // We are not a validator so need to send any transactions out for a CVV to pickup.
@@ -223,6 +224,14 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
                 match res {
                     Ok(()) => {
                         // batch reached quorum!
+                        // Metric: batch_sealed - tracks successfully sealed batches
+                        info!(
+                            target: "consensus::metrics",
+                            worker_id = self.id,
+                            batch_size = batch.size(),
+                            num_txs = batch.transactions.len(),
+                            "batch sealed"
+                        );
                         // Publish the digest for any nodes listening to this gossip (non-committee
                         // members). Note, ignore error- this should not
                         // happen and should not cause an issue (except the
