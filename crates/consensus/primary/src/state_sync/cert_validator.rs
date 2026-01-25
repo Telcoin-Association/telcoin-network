@@ -87,10 +87,7 @@ where
     }
 
     fn gc_round(&self) -> Round {
-        gc_round(
-            self.consensus_bus.committed_round(),
-            self.config.config().parameters.gc_depth,
-        )
+        gc_round(self.consensus_bus.committed_round(), self.config.config().parameters.gc_depth)
     }
 
     /// Validate certificate.

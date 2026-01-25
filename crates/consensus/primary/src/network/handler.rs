@@ -395,8 +395,8 @@ where
 
         // validate header
         header.validate(committee)?;
-        let max_round = self.consensus_bus.committed_round()
-            + self.consensus_config.parameters().gc_depth;
+        let max_round =
+            self.consensus_bus.committed_round() + self.consensus_config.parameters().gc_depth;
         // Make sure the header is not unreasonable in the future.
         ensure!(
             header.round() <= max_round,
