@@ -132,6 +132,11 @@ impl NodeMode {
         matches!(self, NodeMode::CvvActive | NodeMode::CvvInactive)
     }
 
+    /// True if this node is an inactive CVV (catching up to rejoin the committee).
+    pub fn is_cvv_inactive(&self) -> bool {
+        matches!(self, NodeMode::CvvInactive)
+    }
+
     /// True if this node is only an obsever and will never participate in an committee.
     pub fn is_observer(&self) -> bool {
         matches!(self, NodeMode::Observer)
@@ -443,6 +448,11 @@ impl ConsensusBus {
         &self.inner_app.tx_committed_round_updates
     }
 
+    /// Returns the current committed round value.
+    pub fn committed_round(&self) -> Round {
+        *self.inner_app.tx_committed_round_updates.borrow()
+    }
+
     /// Contains the last requested epoch to retrieve a record.
     pub fn requested_missing_epoch(&self) -> &watch::Sender<Epoch> {
         &self.inner_app.tx_requested_missing_epoch
@@ -451,6 +461,11 @@ impl ConsensusBus {
     /// Signals a new round
     pub fn primary_round_updates(&self) -> &watch::Sender<Round> {
         &self.inner_app.tx_primary_round_updates
+    }
+
+    /// Returns the current primary round value.
+    pub fn primary_round(&self) -> Round {
+        *self.inner_app.tx_primary_round_updates.borrow()
     }
 
     /// Batches' digests from our workers.
@@ -492,6 +507,16 @@ impl ConsensusBus {
         &self.inner_app.tx_recent_blocks
     }
 
+    /// Returns the latest executed block's number and hash.
+    pub fn latest_block_num_hash(&self) -> BlockNumHash {
+        self.inner_app.tx_recent_blocks.borrow().latest_block_num_hash()
+    }
+
+    /// Returns the maximum number of recent blocks that can be held.
+    pub fn recent_blocks_capacity(&self) -> u64 {
+        self.inner_app.tx_recent_blocks.borrow().block_capacity()
+    }
+
     /// Track the latest consensus header we have seen.
     /// Note, this should be a valid header (authenticated by it's epoch's committee).
     pub fn last_consensus_header(&self) -> &watch::Sender<Option<ConsensusHeader>> {
@@ -520,6 +545,30 @@ impl ConsensusBus {
     /// Status of initial sync operation.
     pub fn node_mode(&self) -> &watch::Sender<NodeMode> {
         &self.inner_app.tx_sync_status
+    }
+
+    /// Returns true if this node is a CVV (active or inactive).
+    ///
+    /// A CVV is a staked node that can participate in a committee,
+    /// regardless of whether it's currently active or catching up.
+    pub fn is_cvv(&self) -> bool {
+        self.inner_app.tx_sync_status.borrow().is_cvv()
+    }
+
+    /// Returns true if this node is an active CVV (Committee Voting Validator).
+    ///
+    /// This is a helper method that borrows the node mode watch channel
+    /// and checks if the node is actively participating in consensus.
+    pub fn is_active_cvv(&self) -> bool {
+        self.inner_app.tx_sync_status.borrow().is_active_cvv()
+    }
+
+    /// Returns true if this node is an inactive CVV.
+    ///
+    /// An inactive CVV is a staked node that is catching up to rejoin
+    /// the committee after a failure during the epoch.
+    pub fn is_cvv_inactive(&self) -> bool {
+        self.inner_app.tx_sync_status.borrow().is_cvv_inactive()
     }
 
     /// Return the channel for primary network events.
@@ -578,10 +627,10 @@ impl ConsensusBus {
         while self.recent_blocks().borrow().is_empty() {
             watch_execution_result.changed().await?;
         }
-        let mut current_number = self.recent_blocks().borrow().latest_block_num_hash().number;
+        let mut current_number = self.latest_block_num_hash().number;
         while current_number < target_number {
             watch_execution_result.changed().await?;
-            current_number = self.recent_blocks().borrow().latest_block_num_hash().number;
+            current_number = self.latest_block_num_hash().number;
         }
         if self.recent_blocks().borrow().contains_hash(block.hash) {
             // Once we see our hash, should happen when current_number == target_number- trust

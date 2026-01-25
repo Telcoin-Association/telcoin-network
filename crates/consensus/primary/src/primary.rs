@@ -84,7 +84,7 @@ impl<DB: Database> Primary<DB> {
         );
 
         // Only run the proposer task if we are a CVV.
-        if consensus_bus.node_mode().borrow().is_cvv() {
+        if consensus_bus.is_cvv() {
             // When the `Synchronizer` collects enough parent certificates, the `Proposer` generates
             // a new header with new block digests from our workers and sends it to the `Certifier`.
             let proposer = Proposer::new(

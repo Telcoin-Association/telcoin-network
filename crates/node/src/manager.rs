@@ -476,7 +476,7 @@ where
             epoch_task_manager.spawn_task("Orphaned Batches", async move {
                 info!(target: "epoch-manager", "Re-introducing orphaned batchs {} transactions", orphan_batches.len());
                 let pools = engine.get_all_worker_transaction_pools().await;
-                let is_cvv = consensus_bus.node_mode().borrow().is_active_cvv();
+                let is_cvv = consensus_bus.is_active_cvv();
                 for (digest, batch) in orphan_batches.drain(..) {
                     // Loop through any orphaned batches and resubmit it's transactions.
                     // This is most likely because of epoch changes but could be caused by a restart as
@@ -905,7 +905,7 @@ where
             .clone()
             .ok_or_eyre("no consensus header after an epoch!")?
             .digest();
-        let parent_state = self.consensus_bus.recent_blocks().borrow().latest_block_num_hash();
+        let parent_state = self.consensus_bus.latest_block_num_hash();
 
         let epoch_rec = EpochRecord {
             epoch,
@@ -1534,7 +1534,7 @@ where
             .await?;
 
         let mut peers = network_handle.connected_peers_count().await.unwrap_or(0);
-        if peers == 0 || self.consensus_bus.node_mode().borrow().is_cvv() {
+        if peers == 0 || self.consensus_bus.is_cvv() {
             // always dial peers for the new epoch
             // do this if a CVV (may need to connect to the other CVVs) or if we don't have any
             // peers if we are not a committee member and have peers then do not pester
@@ -1717,7 +1717,7 @@ where
     /// Helper method to restore execution state for the consensus components.
     async fn try_restore_state(&self, engine: &ExecutionNode) -> eyre::Result<()> {
         // prime the recent_blocks watch with latest executed blocks
-        let block_capacity = self.consensus_bus.recent_blocks().borrow().block_capacity();
+        let block_capacity = self.consensus_bus.recent_blocks_capacity();
 
         for recent_block in engine.last_executed_output_blocks(block_capacity).await? {
             self.consensus_bus
@@ -1738,7 +1738,7 @@ where
         &self,
         consensus_config: &ConsensusConfig<DB>,
     ) -> eyre::Result<NodeMode> {
-        if matches!(*self.consensus_bus.node_mode().borrow(), NodeMode::CvvInactive) {
+        if self.consensus_bus.is_cvv_inactive() {
             // If we have an inactive mode then it was set so keep it for now.
             return Ok(NodeMode::CvvInactive);
         }
