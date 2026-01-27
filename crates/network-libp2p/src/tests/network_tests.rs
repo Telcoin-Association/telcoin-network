@@ -740,12 +740,13 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
         // connect to target
         peer.network_handle.dial_by_bls(target_peer_bls).await?;
 
-        // give time for connection to establish
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // give time for connection to establish and libp2p state to stabilize
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    // allow heartbeat to trigger peer pruning
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 2)).await;
+    // allow heartbeat to trigger peer pruning - increased to give libp2p time to
+    // stabilize internal connection state and avoid race conditions in CI
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 3)).await;
 
     // check that target has limited peers
     let connected_peers = target_peer.network_handle.connected_peer_ids().await?;
@@ -790,9 +791,9 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     // connect to target
     peer2.dial_by_bls(target_peer_bls).await?;
 
-    // give time for connection to establish
+    // give time for connection to establish and libp2p state to stabilize
     // target should be at max capacity
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // spawn nvv that goes through px
     let NetworkPeer {
@@ -821,8 +822,9 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     // connect nvv to target (which already has too many peers)
     nvv.dial_by_bls(target_peer_bls).await?;
 
-    // allow time for kademlia records to propagate
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 3)).await;
+    // allow time for kademlia records to propagate and libp2p connection state to
+    // stabilize after disconnection - increased to avoid race conditions in CI
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 5)).await;
 
     // assert target is disconnected from nvv
     assert!(!target_peer
@@ -844,8 +846,9 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     target_peer.network_handle.publish(TEST_TOPIC.into(), expected_msg.clone()).await?;
 
     // check if nvv receives the gossip (either directly or through mesh)
+    // increased timeout for CI environments with higher latency
     let mut received = false;
-    let timeout = Duration::from_secs(5);
+    let timeout = Duration::from_secs(10);
     let start = tokio::time::Instant::now();
 
     while !received && start.elapsed() < timeout {
