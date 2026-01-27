@@ -352,10 +352,7 @@ impl<DB: Database> CertificateFetcher<DB> {
 
     /// Read latest gc round from consensus bus watch channel.
     fn gc_round(&self) -> Round {
-        gc_round(
-            self.consensus_bus.committed_round(),
-            self.config.parameters().gc_depth,
-        )
+        gc_round(self.consensus_bus.committed_round(), self.config.parameters().gc_depth)
     }
 }
 
