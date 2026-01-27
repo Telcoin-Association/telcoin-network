@@ -924,6 +924,10 @@ async fn test_score_decay_and_reconnection() -> eyre::Result<()> {
         peer1.report_penalty(peer2_bls, Penalty::Medium).await;
     }
 
+    // Wait briefly for penalties to be processed by the network task,
+    // but capture score before the next heartbeat can decay it
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
     // Check peer2's score is lower but still connected
     let score_after_penalty = peer1.peer_score(peer2_id).await?.unwrap();
     assert!(
@@ -934,9 +938,12 @@ async fn test_score_decay_and_reconnection() -> eyre::Result<()> {
     // Wait for scores to recover through heartbeats
     tokio::time::sleep(Duration::from_secs(4 * TEST_HEARTBEAT_INTERVAL)).await;
 
-    // Check score improved
+    // Check score improved (decayed toward 0)
     let score_after_decay = peer1.peer_score(peer2_id).await?.unwrap();
-    assert!(score_after_decay > score_after_penalty);
+    assert!(
+        score_after_decay > score_after_penalty,
+        "Score should decay toward 0. After penalty: {score_after_penalty}, after decay: {score_after_decay}"
+    );
 
     // Peer should still be connected
     let connected_peers = peer1.connected_peer_ids().await?;
