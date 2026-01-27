@@ -12149,6 +12149,7 @@ dependencies = [
  "roaring",
  "secp256k1 0.31.0",
  "serde",
+ "serde_json",
  "serde_repr",
  "serde_with 2.3.3",
  "serde_yaml",
