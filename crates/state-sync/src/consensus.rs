@@ -154,7 +154,7 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
     }
 }
 
-/// Spawn a long running task on task_manager that will keep fetch consensus for an epoch.
+/// Spawn a long running task on task_manager that will fetch consensus for an epoch.
 /// This should only be used when NOT participating in active consensus.
 async fn spawn_fetch_consensus<DB: TNDatabase>(
     config: ConsensusConfig<DB>,
@@ -183,7 +183,7 @@ async fn spawn_fetch_consensus<DB: TNDatabase>(
             Some((permit, epoch_record)) = next_epoch(&epoch_queue, &next_sem) => {
                 epoch = epoch_record.epoch;
                 info!(target: "state-sync", "epoch consensus fetcher {worker} retreiving epoch {epoch}");
-                let _ = tx.send((None, epoch_record.parent_consensus)).await;
+                let _ = tx.send((None, epoch_record.final_consensus.hash)).await;
                 next_permit = Some(permit);
             }
             Some((number, hash)) = rx.recv() => {

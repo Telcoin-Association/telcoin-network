@@ -2,7 +2,7 @@
 //! Stored per epoch.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     error::Error,
     fmt::Display,
     hash::BuildHasherDefault,
@@ -45,7 +45,7 @@ pub struct EpochMeta {
     pub genesis_exec_state: BlockNumHash,
     /// The hash of the last ['ConsensusHeader'] of the previous epoch.
     /// This is the "genesis" consensus ofder  this epoch.
-    pub genesis_consensus: B256,
+    pub genesis_consensus: BlockNumHash,
 }
 
 /// Descriminant type for records in a Consensus Pack file.
@@ -98,20 +98,30 @@ impl<DB: Database> ConsensusPack<DB> {
         path: P,
         epoch: Epoch,
         previous_epoch: &EpochRecord,
-        start_consensus_number: u64,
         db: DB,
     ) -> Result<ConsensusPack<DB>, PackError> {
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
-        let mut data = Pack::open(base_dir.join(Self::DATA_NAME), false)?;
+        let _ = std::fs::create_dir_all(&base_dir);
+        let mut data: Pack<PackRecord> = Pack::open(base_dir.join(Self::DATA_NAME), false)?;
+        let start_consensus_number =
+            if epoch == 0 { 1 } else { previous_epoch.final_consensus.number + 1 };
         let epoch_meta = EpochMeta {
             epoch,
             committee: previous_epoch.next_committee.clone(),
             start_consensus_number,
-            genesis_exec_state: previous_epoch.parent_state,
-            genesis_consensus: previous_epoch.parent_consensus,
+            genesis_exec_state: previous_epoch.final_state,
+            genesis_consensus: previous_epoch.final_consensus,
         };
-        data.append(&PackRecord::EpochMeta(epoch_meta.clone()))
-            .map_err(|e| PackError::Append(e.to_string()))?;
+
+        if let Ok(meta) = data.fetch(PACK_HEADER_SIZE as u64) {
+            let meta = meta.into_epoch()?;
+            if epoch_meta != meta {
+                return Err(PackError::InvalidEpoch);
+            }
+        } else {
+            data.append(&PackRecord::EpochMeta(epoch_meta.clone()))
+                .map_err(|e| PackError::Append(e.to_string()))?;
+        }
         let consensus_idx =
             PositionIndex::open_pdx_file(base_dir.join(Self::CONSENSUS_POS_NAME), data.header())
                 .map_err(OpenError::IndexFileOpen)?;
@@ -194,8 +204,8 @@ impl<DB: Database> ConsensusPack<DB> {
             epoch,
             committee: previous_epoch.next_committee.clone(),
             start_consensus_number,
-            genesis_exec_state: previous_epoch.parent_state,
-            genesis_consensus: previous_epoch.parent_consensus,
+            genesis_exec_state: previous_epoch.final_state,
+            genesis_consensus: previous_epoch.final_consensus,
         };
         let stream_meta = if let Some(Ok(meta)) = stream_iter.next() {
             meta.into_epoch()?
@@ -221,7 +231,7 @@ impl<DB: Database> ConsensusPack<DB> {
         let mut batch_digests =
             HdxIndex::open_hdx_file(base_dir.join(Self::BATCH_HASH_NAME), data.header(), builder)
                 .map_err(OpenError::IndexFileOpen)?;
-        let mut parent_digest = previous_epoch.parent_consensus;
+        let mut parent_digest = previous_epoch.final_consensus.hash;
         let mut batches = HashSet::new();
         for record in stream_iter {
             let record = record.map_err(|e| PackError::ReadError(e.to_string()))?;
@@ -334,6 +344,50 @@ impl<DB: Database> ConsensusPack<DB> {
         Ok(())
     }
 
+    /// Save all the batches and consensus header from the ConsensusOutput the pack file.
+    pub fn save_consensus_output(&self, consensus: &ConsensusOutput) -> Result<(), PackError> {
+        let mut guard = self.inner.write();
+        let mut batches = BTreeMap::new();
+        // We want to make sure batches are saved to the pack in a deterministic order, so
+        // collect them in a BTreeMap.  We probably don't actually need this but this
+        // means we do not impose any extra restrictions on consensus output.
+        for cert_batch in &consensus.batches {
+            for batch in &cert_batch.batches {
+                batches.insert(batch.digest(), batch.clone());
+            }
+        }
+        // Save all the required batcdhes into the pack file.
+        for (batch_digest, batch) in batches.into_iter() {
+            let position = guard
+                .data
+                .append(&PackRecord::Batch(batch))
+                .map_err(|e| PackError::Append(e.to_string()))?;
+            guard
+                .batch_digests
+                .save(batch_digest.as_slice(), position)
+                .map_err(|e| PackError::IndexAppend(e.to_string()))?;
+        }
+        // Now save the consensus header.
+        let consensus_digest = consensus.consensus_header().digest();
+        let consensus_number = consensus.number;
+        let position = guard
+            .data
+            .append(&PackRecord::Consensus(Box::new(consensus.consensus_header())))
+            .map_err(|e| PackError::Append(e.to_string()))?;
+        guard
+            .consensus_digests
+            .save(consensus_digest.as_slice(), position)
+            .map_err(|e| PackError::IndexAppend(e.to_string()))?;
+        let consensus_idx =
+            consensus_number.saturating_sub(guard.epoch_meta.start_consensus_number);
+        guard
+            .consensus_idx
+            .save(consensus_idx, position)
+            .map_err(|e| PackError::IndexAppend(e.to_string()))?;
+
+        Ok(())
+    }
+
     /// Load and return the consensus output form this epoch.
     pub fn get_consensus_output(
         &self,
@@ -411,6 +465,20 @@ impl<DB: Database> ConsensusPack<DB> {
             }
         }
         Ok(consensus_output)
+    }
+
+    /// True if consensus header by digest is found.
+    pub fn contains_consensus_header(&self, digest: B256) -> bool {
+        let mut guard = self.inner.write();
+        guard.consensus_digests.load(digest.as_slice()).is_ok()
+    }
+
+    /// Retrieve a consensus header by digest.
+    pub fn consensus_header_by_digest(&self, digest: B256) -> Option<ConsensusHeader> {
+        let mut guard = self.inner.write();
+        let pos = guard.consensus_digests.load(digest.as_slice()).ok()?;
+        let rec = guard.data.fetch(pos).ok()?;
+        rec.into_consensus().ok()
     }
 }
 

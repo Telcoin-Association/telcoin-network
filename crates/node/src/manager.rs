@@ -31,10 +31,14 @@ use tn_primary::{
 };
 use tn_reth::{
     bytes_to_txn,
-    system_calls::{ConsensusRegistry, EpochState},
+    system_calls::{
+        ConsensusRegistry::{self, EpochInfo},
+        EpochState,
+    },
     CanonStateNotificationStream, RethDb, RethEnv,
 };
 use tn_storage::{
+    consensus_pack::ConsensusPack,
     open_db,
     tables::{
         Batches, CertificateDigestByOrigin, CertificateDigestByRound, Certificates,
@@ -44,10 +48,11 @@ use tn_storage::{
 };
 use tn_types::{
     error::HeaderError, gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash,
-    BlsAggregateSignature, BlsPublicKey, BlsSignature, CertifiedBatch, CommittedSubDag, Committee,
-    CommitteeBuilder, ConsensusOutput, Database as TNDatabase, Epoch, EpochCertificate,
-    EpochRecord, EpochVote, Hash, Multiaddr, NetworkPublicKey, Notifier, TaskJoinError,
-    TaskManager, TaskSpawner, TimestampSec, TnReceiver, TnSender, B256, MIN_PROTOCOL_BASE_FEE,
+    BlockNumHash, BlsAggregateSignature, BlsPublicKey, BlsSignature, CertifiedBatch,
+    CommittedSubDag, Committee, CommitteeBuilder, ConsensusHeader, ConsensusOutput,
+    Database as TNDatabase, Epoch, EpochCertificate, EpochRecord, EpochVote, Hash, Multiaddr,
+    NetworkPublicKey, Notifier, TaskJoinError, TaskManager, TaskSpawner, TimestampSec, TnReceiver,
+    TnSender, B256, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{
     quorum_waiter::QuorumWaiterTrait, Worker, WorkerNetwork, WorkerNetworkHandle, WorkerRequest,
@@ -123,6 +128,9 @@ pub(crate) struct EpochManager<P, DB> {
     consensus_bus: ConsensusBus,
     /// Persistent event stream for worker network events.
     worker_event_stream: QueChannel<NetworkEvent<WorkerRequest, WorkerResponse>>,
+
+    /// The last consenses header for a closing epoch.
+    last_consensus_header: Option<ConsensusHeader>,
 
     /// The record for a just completed epoch.
     epoch_record: Option<EpochRecord>,
@@ -241,6 +249,7 @@ where
             consensus_db,
             consensus_bus,
             worker_event_stream,
+            last_consensus_header: None,
             epoch_record: None,
         }
     }
@@ -576,13 +585,45 @@ where
     /// Note, this has to be called correctly or it can lead to double execution.
     async fn replay_missed_consensus(
         &self,
-        engine: &ExecutionNode,
+        missing: Vec<ConsensusHeader>,
+        committee: Committee,
         to_engine: &mpsc::Sender<ConsensusOutput>,
-        gas_accumulator: &GasAccumulator,
+        epoch_pack: &mut ConsensusPack<DB>,
     ) -> eyre::Result<()> {
-        // We have not created this epoch's primary yet (no committee) so get it from chain
-        // ourselves... Note, any consensus output to replay should be in the same epoch...
-        let EpochState { epoch, epoch_info: _, validators, epoch_start: _ } =
+        for consensus_header in missing.into_iter() {
+            if consensus_header.sub_dag.leader_epoch() != committee.epoch() {
+                error!(target: "epoch-manager", "Crossed epoch boundary with missing execution! expected epoch {} got {}",
+                    committee.epoch(), consensus_header.sub_dag.leader_epoch());
+                return Err(eyre::eyre!(
+                    "Crossed epoch boundary with missing execution! expected epoch {} got {}",
+                    committee.epoch(),
+                    consensus_header.sub_dag.leader_epoch()
+                ));
+            }
+            let consensus_output = self
+                .fetch_local_batches(
+                    consensus_header.sub_dag.clone(),
+                    consensus_header.parent_hash,
+                    consensus_header.number,
+                    &committee,
+                )
+                .await?;
+            if let Err(e) = self.process_output(to_engine, epoch_pack, consensus_output, true).await
+            {
+                error!(target: "epoch-manager", "error sending consensus output to engine: {}", e);
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Create the current committee from the current execution state.  Also return the epoch info
+    /// and epoch start since this will be needed by some callers (avoid extra system calls).
+    async fn get_committee_with_epoch_start_info(
+        &self,
+        engine: &ExecutionNode,
+    ) -> eyre::Result<(Committee, EpochInfo, u64)> {
+        let EpochState { epoch, epoch_info, validators, epoch_start } =
             engine.epoch_state_from_canonical_tip().await?;
         let validators = validators
             .iter()
@@ -593,31 +634,7 @@ where
             .collect::<Result<HashMap<_, _>, _>>()
             .map_err(|err| eyre!("failed to create bls key from on-chain bytes: {err:?}"))?;
 
-        let committee = self.create_committee_from_state(epoch, validators).await?;
-        // Need to set the committee early or we will get failures to execute...
-        gas_accumulator.rewards_counter().set_committee(committee.clone());
-
-        // Make sure any old consensus that was not executed gets executed.
-        // Note, "missing" in this context is consensus that was reached but not executed
-        // before the last shutdown.  We need to execute it now so that everything will be
-        // in sync, otherwise we could get out of order execution racing with Bullshark.
-        let missing =
-            state_sync::get_missing_consensus(&self.consensus_db, &self.consensus_bus).await?;
-        for consensus_header in missing.into_iter() {
-            let consensus_output = self
-                .fetch_local_batches(
-                    consensus_header.sub_dag.clone(),
-                    consensus_header.parent_hash,
-                    consensus_header.number,
-                    &committee,
-                )
-                .await?;
-            if let Err(e) = to_engine.send(consensus_output).await {
-                error!(target: "epoch-manager", "error sending consensus output to engine: {}", e);
-                return Err(e.into());
-            }
-        }
-        Ok(())
+        Ok((self.create_committee_from_state(epoch, validators).await?, epoch_info, epoch_start))
     }
 
     /// Run a single epoch.
@@ -634,10 +651,41 @@ where
         // Lets make sure our consesus db has a clear write queue and is ready to go.
         self.consensus_db.persist::<Batches>().await;
         self.consensus_db.persist::<ConsensusBlocks>().await;
+        self.last_consensus_header = None;
+        // We have not created this epoch's primary yet (no committee) so get it from chain
+        // ourselves... Note, any consensus output to replay should be in the same epoch...
+        let (committee, _, _) = self.get_committee_with_epoch_start_info(engine).await?;
+        let current_epoch = committee.epoch();
+        let previous_epoch_rec = self
+            .consensus_db
+            .get::<EpochRecords>(&current_epoch.saturating_sub(1))?
+            .unwrap_or_else(|| EpochRecord {
+                // If we can't find the recort then this we should be starting at epoch 0- use this
+                // filler.
+                epoch: 0,
+                committee: committee.bls_keys().iter().copied().collect(),
+                next_committee: committee.bls_keys().iter().copied().collect(),
+                ..Default::default()
+            });
+        let epochs_db_path = self.tn_datadir.epochs_db_path();
+        let _ = std::fs::create_dir_all(&epochs_db_path);
+        let mut epoch_pack = match ConsensusPack::open_append(
+            &epochs_db_path,
+            current_epoch,
+            &previous_epoch_rec,
+            self.consensus_db.clone(),
+        ) {
+            Ok(pack) => pack,
+            Err(e) => {
+                panic!("failed to open pack {e}");
+            }
+        };
         if epoch_mode.replay_consensus() {
             // If we are starting up then make sure that any consensus we previously validated goes
             // to the engine and is executed.  Otherwise we could miss consensus execution.
-            self.replay_missed_consensus(engine, to_engine, &gas_accumulator).await?;
+            let missing =
+                state_sync::get_missing_consensus(&self.consensus_db, &self.consensus_bus).await?;
+            self.replay_missed_consensus(missing, committee, to_engine, &mut epoch_pack).await?;
         }
         // If we are restarting the epoch not on a boundary
         // and we sent some consensus output to the engine
@@ -746,7 +794,7 @@ where
                 need_join = true;
             },
             // wait for epoch boundary to transition
-            res = self.wait_for_epoch_boundary(to_engine, &mut consensus_output) => {
+            res = self.wait_for_epoch_boundary(to_engine, &mut consensus_output, &mut epoch_pack) => {
                 // toggle bool to clear tables
                 clear_tables_for_next_epoch = true;
                 let target_hash = res.inspect_err(|e| {
@@ -815,7 +863,12 @@ where
                 }
             }
         } else {
-            self.send_leftover_consensus_output_to_engine(&mut consensus_output, to_engine).await;
+            self.send_leftover_consensus_output_to_engine(
+                &mut consensus_output,
+                to_engine,
+                &mut epoch_pack,
+            )
+            .await;
             res = RunEpochMode::ModeChange;
         }
 
@@ -827,6 +880,22 @@ where
         Ok(res)
     }
 
+    async fn process_output(
+        &self,
+        to_engine: &mpsc::Sender<ConsensusOutput>,
+        epoch_pack: &mut ConsensusPack<DB>,
+        output: ConsensusOutput,
+        check_contains: bool,
+    ) -> eyre::Result<()> {
+        if !check_contains || !epoch_pack.contains_consensus_header(output.consensus_header_hash())
+        {
+            epoch_pack.save_consensus_output(&output)?;
+        }
+        // only forward the output to the engine
+        to_engine.send(output).await?;
+        Ok(())
+    }
+
     // If we stopped waiting on the epoch boundary so lets make sure that the consensus queue
     // is sent to the engine. If we don't do this it is possible that a quick
     // exit could orphan output (for instance a CVV that is behind).
@@ -836,10 +905,11 @@ where
         &mut self,
         consensus_output: &mut impl TnReceiver<ConsensusOutput>,
         to_engine: &mpsc::Sender<ConsensusOutput>,
+        epoch_pack: &mut ConsensusPack<DB>,
     ) {
         while let Ok(output) = consensus_output.try_recv() {
             // only forward the output to the engine
-            let _ = to_engine.send(output).await;
+            let _ = self.process_output(to_engine, epoch_pack, output, false).await;
         }
     }
 
@@ -894,17 +964,11 @@ where
             );
             return Err(eyre!("failed to find previous epoch record when starting epoch"));
         };
-        // Note on the unwrap_or_default(), if we are here then consensus was produced or followed
-        // so this watch would have to have a value.
-        // If somehow this is not true then this will produce an invalid epoch record which
-        // will not get signed so will not pollute the network.
-        let target_hash = self
-            .consensus_bus
-            .last_consensus_header()
-            .borrow()
-            .clone()
-            .ok_or_eyre("no consensus header after an epoch!")?
-            .digest();
+        let last_consensus_header = self
+            .last_consensus_header
+            .take()
+            .expect("epoch was finished with last consensus header");
+        let target_hash = last_consensus_header.digest();
         let parent_state = self.consensus_bus.recent_blocks().borrow().latest_block_num_hash();
 
         let epoch_rec = EpochRecord {
@@ -912,8 +976,8 @@ where
             committee: committee_keys,
             next_committee: next_committee_keys,
             parent_hash,
-            parent_state,
-            parent_consensus: target_hash,
+            final_state: parent_state,
+            final_consensus: BlockNumHash::new(last_consensus_header.number, target_hash),
         };
 
         self.consensus_db.save_epoch_record(&epoch_rec);
@@ -1152,9 +1216,10 @@ where
     /// This method forwards all consensus output to the engine for execution.
     /// Once the epoch boundary is reached, the manager initiates the epoch transitions.
     async fn wait_for_epoch_boundary(
-        &self,
+        &mut self,
         to_engine: &mpsc::Sender<ConsensusOutput>,
         consensus_output: &mut impl TnReceiver<ConsensusOutput>,
+        epoch_pack: &mut ConsensusPack<DB>,
     ) -> eyre::Result<B256> {
         // receive output from consensus and forward to engine
         while let Some(mut output) = consensus_output.recv().await {
@@ -1173,12 +1238,13 @@ where
                 // obtain hash to monitor execution progress
                 let target_hash = output.consensus_header_hash();
 
+                self.last_consensus_header = Some(output.clone().into());
                 // forward the output to the engine
-                to_engine.send(output).await?;
+                self.process_output(to_engine, epoch_pack, output, false).await?;
                 return Ok(target_hash);
             } else {
                 // only forward the output to the engine
-                to_engine.send(output).await?;
+                self.process_output(to_engine, epoch_pack, output, false).await?;
             }
         }
         Err(eyre::eyre!("invalid wait for epoch end"))
@@ -1292,17 +1358,9 @@ where
         network_config: &NetworkConfig,
     ) -> eyre::Result<(ConsensusConfig<DB>, Vec<BlsPublicKey>)> {
         // retrieve epoch information from canonical tip
-        let EpochState { epoch, epoch_info, validators, epoch_start } =
-            engine.epoch_state_from_canonical_tip().await?;
-        debug!(target: "epoch-manager", ?epoch_info, "epoch state from canonical tip for epoch {}", epoch);
-        let validators = validators
-            .iter()
-            .map(|v| {
-                let decoded_bls = BlsPublicKey::from_literal_bytes(v.blsPubkey.as_ref());
-                decoded_bls.map(|decoded| (decoded, v))
-            })
-            .collect::<Result<HashMap<_, _>, _>>()
-            .map_err(|err| eyre!("failed to create bls key from on-chain bytes: {err:?}"))?;
+        let (committee, epoch_info, epoch_start) =
+            self.get_committee_with_epoch_start_info(engine).await?;
+        let validators = committee.bls_keys();
 
         self.epoch_boundary = epoch_start + epoch_info.epochDuration as u64;
         debug!(target: "epoch-manager", new_epoch_boundary=self.epoch_boundary, "resetting epoch boundary");
@@ -1310,11 +1368,10 @@ where
         debug!(target: "epoch-manager", ?validators, "creating committee for validators");
 
         let mut next_vals: HashSet<BlsPublicKey> = HashSet::new();
-        next_vals.extend(validators.keys().copied());
-        let committee = self.create_committee_from_state(epoch, validators).await?;
+        next_vals.extend(validators.iter());
 
-        next_vals.extend(engine.validators_for_epoch(epoch + 1).await?.into_iter());
-        next_vals.extend(engine.validators_for_epoch(epoch + 2).await?.into_iter());
+        next_vals.extend(engine.validators_for_epoch(committee.epoch() + 1).await?.into_iter());
+        next_vals.extend(engine.validators_for_epoch(committee.epoch() + 2).await?.into_iter());
 
         // create config for consensus
         let consensus_config = ConsensusConfig::new_for_epoch(
