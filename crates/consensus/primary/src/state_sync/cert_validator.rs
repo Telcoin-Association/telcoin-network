@@ -8,7 +8,6 @@ use crate::{
     state_sync::CertificateManagerCommand,
     ConsensusBus,
 };
-use consensus_metrics::monitored_scope;
 use std::{collections::HashSet, sync::Arc, time::Instant};
 use tn_config::ConsensusConfig;
 use tn_storage::CertificateStore;
@@ -280,7 +279,6 @@ where
         &self,
         certificates: Vec<Certificate>,
     ) -> CertManagerResult<()> {
-        let _scope = monitored_scope("primary::cert_validator");
         let certificates = self.verify_collection(certificates).await?;
 
         // update metrics

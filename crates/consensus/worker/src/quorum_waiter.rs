@@ -1,7 +1,6 @@
 //! Wait for a quorum of acks from workers before sharing with the primary.
 
 use crate::{metrics::WorkerMetrics, network::WorkerNetworkHandle};
-use consensus_metrics::monitored_future;
 use futures::stream::{futures_unordered::FuturesUnordered, StreamExt as _};
 use std::{
     sync::Arc,
@@ -133,12 +132,10 @@ impl QuorumWaiterTrait for QuorumWaiter {
                         available_stake += stake;
                         let (tx, rx) = oneshot::channel();
                         let task_name = format!("qw-peer-{i}");
-                        spawner_clone.spawn_task(task_name, {
-                            monitored_future!(async move {
-                                // forward result through oneshot channel
-                                let res = Self::waiter(name, handler, stake).await;
-                                let _ = tx.send(res);
-                            })
+                        spawner_clone.spawn_task(task_name, async move {
+                            // forward result through oneshot channel
+                            let res = Self::waiter(name, handler, stake).await;
+                            let _ = tx.send(res);
                         });
                         rx
                     })

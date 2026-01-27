@@ -2,7 +2,6 @@
 //! Currently used by nodes that are not participating in consensus
 //! to follow along with consensus and execute blocks.
 
-use consensus_metrics::monitored_future;
 use tn_config::ConsensusConfig;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus, NodeMode};
 use tn_storage::{
@@ -67,27 +66,28 @@ pub fn spawn_state_sync<DB: Database>(
             let task_spawner_clone = task_spawner.clone();
             task_spawner.spawn_task(
                 "state sync: track latest consensus header from peers",
-                monitored_future!(
-                    async move {
-                        info!(target: "state-sync", "Starting state sync: track latest consensus header from peers");
-                        if let Err(e) = spawn_track_recent_consensus(config_clone, consensus_bus_clone, network, task_spawner_clone).await {
-                            error!(target: "state-sync", "Error tracking latest consensus headers: {e}");
-                        }
-                    },
-                    "StateSyncLatestConsensus"
-                ),
+                async move {
+                    info!(target: "state-sync", "Starting state sync: track latest consensus header from peers");
+                    if let Err(e) = spawn_track_recent_consensus(
+                        config_clone,
+                        consensus_bus_clone,
+                        network,
+                        task_spawner_clone,
+                    )
+                    .await
+                    {
+                        error!(target: "state-sync", "Error tracking latest consensus headers: {e}");
+                    }
+                },
             );
             task_spawner.spawn_task(
                 "state sync: stream consensus headers",
-                monitored_future!(
-                    async move {
-                        info!(target: "state-sync", "Starting state sync: stream consensus header from peers");
-                        if let Err(e) = spawn_stream_consensus_headers(config, consensus_bus).await {
-                            error!(target: "state-sync", "Error streaming consensus headers: {e}");
-                        }
-                    },
-                    "StateSyncStreamConsensusHeaders"
-                ),
+                async move {
+                    info!(target: "state-sync", "Starting state sync: stream consensus header from peers");
+                    if let Err(e) = spawn_stream_consensus_headers(config, consensus_bus).await {
+                        error!(target: "state-sync", "Error streaming consensus headers: {e}");
+                    }
+                },
             );
         }
     }

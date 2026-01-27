@@ -7,7 +7,6 @@ use crate::{
     state_sync::StateSynchronizer,
     ConsensusBus,
 };
-use consensus_metrics::{monitored_future, monitored_scope};
 use rand::{rngs::ThreadRng, seq::SliceRandom};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -94,35 +93,29 @@ impl<DB: Database> CertificateFetcher<DB> {
         let parallel_fetch_request_delay_interval =
             config.parameters().parallel_fetch_request_delay_interval;
 
-        task_manager.spawn_critical_task(
-            "certificate fetcher task",
-            monitored_future!(
-                async move {
-                    Self {
-                        authority_id,
-                        committee,
-                        certificate_store,
-                        network,
-                        state_sync,
-                        consensus_bus,
-                        rx_shutdown,
-                        metrics,
-                        task_spawner,
-                        targets: BTreeMap::new(),
-                        fetch_task: FetchTask::new(),
-                        max_rpc_message_size,
-                        parallel_fetch_request_delay_interval,
-                        config,
-                    }
-                    .run()
-                    .await
-                    .map_err(|e| {
-                        error!(target: "primary::cert_fetcher", ?e, "cert fetcher shutting down");
-                    })
-                },
-                "CertificateFetcherTask"
-            ),
-        );
+        task_manager.spawn_critical_task("certificate fetcher task", async move {
+            Self {
+                authority_id,
+                committee,
+                certificate_store,
+                network,
+                state_sync,
+                consensus_bus,
+                rx_shutdown,
+                metrics,
+                task_spawner,
+                targets: BTreeMap::new(),
+                fetch_task: FetchTask::new(),
+                max_rpc_message_size,
+                parallel_fetch_request_delay_interval,
+                config,
+            }
+            .run()
+            .await
+            .map_err(|e| {
+                error!(target: "primary::cert_fetcher", ?e, "cert fetcher shutting down");
+            })
+        });
     }
 
     /// Receive messages on async channels until shutdown.
@@ -277,8 +270,7 @@ impl<DB: Database> CertificateFetcher<DB> {
         // spawn task and hold receiver
         self.task_spawner.spawn_task(
             format!("fetch-certs-{}", request.exclusive_lower_bound),
-            monitored_future!(async move {
-                let _scope = monitored_scope("CertificatesFetching");
+            async move {
                 metrics.certificate_fetcher_inflight_fetch.inc();
 
                 let result = fetch_and_process_certificates(
@@ -294,7 +286,7 @@ impl<DB: Database> CertificateFetcher<DB> {
 
                 let _ = tx.send(result);
                 metrics.certificate_fetcher_inflight_fetch.dec();
-            }),
+            },
         );
 
         Ok(())

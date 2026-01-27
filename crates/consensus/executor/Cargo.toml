@@ -20,7 +20,6 @@ tn-network-types = { workspace = true }
 state-sync = { workspace = true }
 tn-types = { workspace = true }
 tn-config = { workspace = true }
-consensus-metrics.workspace = true
 tn-primary = { workspace = true }
 
 [dev-dependencies]

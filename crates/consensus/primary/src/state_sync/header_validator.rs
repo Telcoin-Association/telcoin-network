@@ -2,7 +2,6 @@
 
 use super::CertificateManagerCommand;
 use crate::ConsensusBus;
-use consensus_metrics::monitored_scope;
 use futures::{stream::FuturesOrdered, StreamExt as _};
 use std::collections::HashMap;
 use tn_config::{ConsensusConfig, RetryConfig};
@@ -200,8 +199,6 @@ where
         &self,
         header: &Header,
     ) -> HeaderResult<Vec<CertificateDigest>> {
-        let _scope = monitored_scope("vote::get_unknown_parent_digests");
-
         // handle genesis
         if header.round() == 1 {
             for digest in header.parents() {
