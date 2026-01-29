@@ -683,6 +683,7 @@ where
         if epoch_mode.replay_consensus() {
             // If we are starting up then make sure that any consensus we previously validated goes
             // to the engine and is executed.  Otherwise we could miss consensus execution.
+            gas_accumulator.rewards_counter().set_committee(committee.clone());
             let missing =
                 state_sync::get_missing_consensus(&self.consensus_db, &self.consensus_bus).await?;
             self.replay_missed_consensus(missing, committee, to_engine, &mut epoch_pack).await?;
@@ -887,7 +888,9 @@ where
         output: ConsensusOutput,
         check_contains: bool,
     ) -> eyre::Result<()> {
-        if !check_contains || !epoch_pack.contains_consensus_header(output.consensus_header_hash())
+        if !check_contains || !epoch_pack.contains_consensus_header_number(output.number)
+        //XXXX- this not working need to figure it out even if we stick with the number approach
+        // !epoch_pack.contains_consensus_header(output.consensus_header_hash())
         {
             epoch_pack.save_consensus_output(&output)?;
         }

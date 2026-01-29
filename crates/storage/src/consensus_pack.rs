@@ -368,7 +368,7 @@ impl<DB: Database> ConsensusPack<DB> {
                 .map_err(|e| PackError::IndexAppend(e.to_string()))?;
         }
         // Now save the consensus header.
-        let consensus_digest = consensus.consensus_header().digest();
+        let consensus_digest = consensus.consensus_header_hash();
         let consensus_number = consensus.number;
         let position = guard
             .data
@@ -467,7 +467,14 @@ impl<DB: Database> ConsensusPack<DB> {
         Ok(consensus_output)
     }
 
-    /// True if consensus header by digest is found.
+    /// True if consensus header by digest is found by digest.
+    pub fn contains_consensus_header_number(&self, number: u64) -> bool {
+        let guard = self.inner.read();
+        number >= guard.epoch_meta.start_consensus_number
+            && number < guard.consensus_idx.len() as u64 + guard.epoch_meta.start_consensus_number
+    }
+
+    /// True if consensus header by digest is found by digest.
     pub fn contains_consensus_header(&self, digest: B256) -> bool {
         let mut guard = self.inner.write();
         guard.consensus_digests.load(digest.as_slice()).is_ok()
