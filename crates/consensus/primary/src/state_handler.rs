@@ -1,7 +1,6 @@
 //! Filter consensus results to update execution state.
 
 use crate::ConsensusBus;
-use consensus_metrics::monitored_future;
 use tn_types::{
     AuthorityIdentifier, Certificate, Noticer, Round, TaskManager, TnReceiver, TnSender,
 };
@@ -26,15 +25,9 @@ impl StateHandler {
     ) {
         let state_handler =
             Self { authority_id, consensus_bus: consensus_bus.clone(), rx_shutdown };
-        task_manager.spawn_critical_task(
-            "state handler task",
-            monitored_future!(
-                async move {
-                    state_handler.run().await;
-                },
-                "StateHandlerTask"
-            ),
-        );
+        task_manager.spawn_critical_task("state handler task", async move {
+            state_handler.run().await;
+        });
     }
 
     async fn handle_sequenced(&mut self, commit_round: Round, certificates: Vec<Certificate>) {

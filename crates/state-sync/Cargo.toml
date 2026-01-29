@@ -17,7 +17,6 @@ tn-storage = { workspace = true }
 tn-types = { workspace = true }
 tn-config = { workspace = true }
 tn-primary = { workspace = true }
-consensus-metrics.workspace = true
 
 [lints]
 workspace = true

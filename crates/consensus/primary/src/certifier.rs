@@ -6,7 +6,6 @@ use crate::{
     state_sync::StateSynchronizer,
     ConsensusBus,
 };
-use consensus_metrics::monitored_future;
 use std::{sync::Arc, time::Duration};
 use tn_config::{ConsensusConfig, KeyConfig};
 use tn_network_libp2p::error::NetworkError;
@@ -75,44 +74,44 @@ impl<DB: Database> Certifier<DB> {
 
         // spawn long-running task to gossip own certificates
         let task_spawner = task_manager.get_spawner();
-        task_manager.spawn_critical_task("certifier task", monitored_future!(
-            async move {
-                let highest_created_certificate = config.node_storage().last_round(&authority_id).expect("certificate store available");
-                debug!(
-                    target: "epoch-manager",
-                    ?highest_created_certificate,
-                    "restoring certifier with highest created certificate for epoch {}",
-                    config.epoch(),
-                );
+        task_manager.spawn_critical_task("certifier task", async move {
+            let highest_created_certificate = config
+                .node_storage()
+                .last_round(&authority_id)
+                .expect("certificate store available");
+            debug!(
+                target: "epoch-manager",
+                ?highest_created_certificate,
+                "restoring certifier with highest created certificate for epoch {}",
+                config.epoch(),
+            );
 
-                // publish last certificate on startup
-                if let Some(cert) = highest_created_certificate {
-                    if let Err(e) = primary_network.publish_certificate(cert).await {
-                        error!(target: "primary::certifier", ?e, "failed to publish highest created certificate gossip during startup");
-                    }
+            // publish last certificate on startup
+            if let Some(cert) = highest_created_certificate {
+                if let Err(e) = primary_network.publish_certificate(cert).await {
+                    error!(target: "primary::certifier", ?e, "failed to publish highest created certificate gossip during startup");
                 }
+            }
 
-                info!(target: "primary::certifier", "Certifier on node {:?} has started successfully.", authority_id);
+            info!(target: "primary::certifier", "Certifier on node {:?} has started successfully.", authority_id);
 
-                Self {
-                    authority_id: authority_id.clone(),
-                    committee: config.committee().clone(),
-                    certificate_store: config.node_storage().clone(),
-                    state_sync,
-                    signature_service: config.key_config().clone(),
-                    config,
-                    consensus_bus,
-                    network: primary_network,
-                    metrics: primary_metrics,
-                    task_spawner,
-                    new_proposal: Notifier::new(),
-                }
-                .run()
-                .await;
-                info!(target: "primary::certifier", "Certifier on node {} has shutdown.", authority_id);
-            },
-            "CertifierTask"
-        ));
+            Self {
+                authority_id: authority_id.clone(),
+                committee: config.committee().clone(),
+                certificate_store: config.node_storage().clone(),
+                state_sync,
+                signature_service: config.key_config().clone(),
+                config,
+                consensus_bus,
+                network: primary_network,
+                metrics: primary_metrics,
+                task_spawner,
+                new_proposal: Notifier::new(),
+            }
+            .run()
+            .await;
+            info!(target: "primary::certifier", "Certifier on node {} has shutdown.", authority_id);
+        });
     }
 
     /// Requests a vote for a Header from the given peer. Retries indefinitely until either a

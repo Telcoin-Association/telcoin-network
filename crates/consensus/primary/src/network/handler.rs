@@ -97,7 +97,7 @@ where
         // the current DAG. Trying to ride the GC window exactly can lead to subtle races
         // (allow some time to get going).
         let gc_depth = self.consensus_config.parameters().gc_depth.saturating_sub(10);
-        let active_cvv = self.consensus_bus.node_mode().borrow().is_active_cvv();
+        let active_cvv = self.consensus_bus.is_active_cvv();
         // is our round outside the GC window
         // Will be false when not the same epoch (can't compare rounds) but
         // epoch_behind will work in that case.
@@ -167,7 +167,7 @@ where
                 if let Some(committee) = self.get_committee(epoch) {
                     match unverified_cert.verify_cert(&committee) {
                         Ok(cert) => {
-                            if self.consensus_bus.node_mode().borrow().is_active_cvv() {
+                            if self.consensus_bus.is_active_cvv() {
                                 if self.behind_consensus(epoch, cert.header().round, None).await {
                                     warn!(target: "primary", "certificate indicates we are behind, go to catchup mode!");
                                     return Ok(());
@@ -395,8 +395,8 @@ where
 
         // validate header
         header.validate(committee)?;
-        let max_round = *self.consensus_bus.committed_round_updates().borrow()
-            + self.consensus_config.parameters().gc_depth;
+        let max_round =
+            self.consensus_bus.committed_round() + self.consensus_config.parameters().gc_depth;
         // Make sure the header is not unreasonable in the future.
         ensure!(
             header.round() <= max_round,
@@ -643,7 +643,7 @@ where
         let mut unknown_certs = self.state_sync.identify_unkown_parents(header).await?;
 
         // ensure header is not too old
-        let limit = self.consensus_bus.primary_round_updates().borrow().saturating_sub(
+        let limit = self.consensus_bus.primary_round().saturating_sub(
             self.consensus_config.network_config().sync_config().max_proposed_header_age_limit,
         );
         ensure!(

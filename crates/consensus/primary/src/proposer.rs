@@ -20,7 +20,6 @@ use crate::{
     error::{ProposerError, ProposerResult},
     ConsensusBus,
 };
-use consensus_metrics::monitored_future;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, VecDeque},
@@ -222,7 +221,7 @@ impl<DB: Database> Proposer<DB> {
             current_epoch,
             digests.iter().map(|m| (m.digest, m.worker_id)).collect(),
             parents.iter().map(|x| x.digest()).collect(),
-            consensus_bus.recent_blocks().borrow().latest_block_num_hash(),
+            consensus_bus.latest_block_num_hash(),
         );
 
         // update metrics before sending/storing header
@@ -623,7 +622,7 @@ impl<DB: Database> Proposer<DB> {
     fn propose_next_header(&mut self, reason: String) -> ProposerResult<PendingHeaderTask> {
         // Advance to the next round.
         self.round += 1;
-        let updated_round = *self.consensus_bus.primary_round_updates().borrow() + 1;
+        let updated_round = self.consensus_bus.primary_round() + 1;
         if updated_round > self.round {
             self.round = updated_round;
         }
@@ -749,17 +748,11 @@ impl<DB: Database> Proposer<DB> {
     }
 
     pub(crate) fn spawn(mut self, task_manager: &TaskManager) {
-        if self.consensus_bus.node_mode().borrow().is_active_cvv() {
-            task_manager.spawn_critical_task(
-                "proposer task",
-                monitored_future!(
-                    async move {
-                        info!(target: "primary::proposer", "Starting proposer");
-                        self.run().await
-                    },
-                    "ProposerTask"
-                ),
-            );
+        if self.consensus_bus.is_active_cvv() {
+            task_manager.spawn_critical_task("proposer task", async move {
+                info!(target: "primary::proposer", "Starting proposer");
+                self.run().await
+            });
         }
         // If not an active CVV then don't propose anything.
     }
