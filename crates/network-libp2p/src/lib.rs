@@ -28,12 +28,12 @@ pub mod types;
 pub use codec::{TNCodec, TNMessage};
 pub use consensus::ConsensusNetwork;
 pub use peers::{PeerExchangeMap, Penalty};
+pub use types::StreamResponseChannel;
 
 // re-export specific libp2p types
 pub use libp2p::{
     gossipsub::{Message as GossipMessage, TopicHash},
     identity::PeerId,
-    request_response::ResponseChannel,
     Multiaddr,
 };
 #[cfg(test)]

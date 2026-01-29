@@ -51,7 +51,7 @@ pub trait TNStreamMessage:
 }
 
 pub use codec::StreamCodec;
-pub use handler::{StreamHandle, StreamHandlerConfig};
+pub use handler::{spawn_stream_tasks, ReadEvent, StreamHandle, StreamHandlerConfig};
 pub use manager::{RawStreamHandle, StreamEvent, StreamManager, StreamNetworkError};
 pub use protocol::{
     FrameFlags, FrameHeader, StreamError, StreamErrorCode, StreamMessageType, TN_STREAM_PROTOCOL,

@@ -13,7 +13,7 @@ use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     error::NetworkError,
     types::{IntoResponse as _, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResult},
-    GossipMessage, Penalty, ResponseChannel,
+    GossipMessage, Penalty, StreamResponseChannel,
 };
 use tn_network_types::{WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerToPrimaryClient};
 use tn_storage::PayloadStore;
@@ -349,6 +349,7 @@ where
                     let _ = network_handle.handle.send_response(err, channel).await;
                 });
             }
+            NetworkEvent::_Phantom(_) => unreachable!(),
         }
     }
 
@@ -360,7 +361,7 @@ where
         peer: BlsPublicKey,
         header: Header,
         parents: Vec<Certificate>,
-        channel: ResponseChannel<PrimaryResponse>,
+        channel: StreamResponseChannel,
         cancel: oneshot::Receiver<()>,
     ) {
         // clone for spawned tasks
@@ -385,7 +386,7 @@ where
         &self,
         peer: BlsPublicKey,
         request: MissingCertificatesRequest,
-        channel: ResponseChannel<PrimaryResponse>,
+        channel: StreamResponseChannel,
         cancel: oneshot::Receiver<()>,
     ) {
         // clone for spawned tasks
@@ -417,7 +418,7 @@ where
         peer: BlsPublicKey,
         number: Option<u64>,
         hash: Option<BlockHash>,
-        channel: ResponseChannel<PrimaryResponse>,
+        channel: StreamResponseChannel,
         cancel: oneshot::Receiver<()>,
     ) {
         // clone for spawned tasks
@@ -445,7 +446,7 @@ where
         peer: BlsPublicKey,
         epoch: Option<Epoch>,
         hash: Option<BlockHash>,
-        channel: ResponseChannel<PrimaryResponse>,
+        channel: StreamResponseChannel,
         cancel: oneshot::Receiver<()>,
     ) {
         // clone for spawned tasks

@@ -249,6 +249,7 @@ pub enum CodecError {
 mod tests {
     use super::*;
     use crate::stream::protocol::{FrameFlags, StreamMessageType};
+    use futures::io::Cursor;
 
     #[tokio::test]
     async fn test_frame_roundtrip() {
@@ -270,7 +271,7 @@ mod tests {
         codec.write_frame(&mut buffer, &header, payload).await.unwrap();
 
         // Read back
-        let mut cursor = std::io::Cursor::new(buffer);
+        let mut cursor = Cursor::new(buffer);
         let (read_header, read_payload) = codec.read_frame(&mut cursor).await.unwrap();
 
         assert_eq!(read_header.request_id, 42);
@@ -312,7 +313,7 @@ mod tests {
         codec.write_header(&mut buffer, &header).await.unwrap();
 
         // Try to read - should fail due to size
-        let mut cursor = std::io::Cursor::new(buffer);
+        let mut cursor = Cursor::new(buffer);
         let result = codec.read_frame(&mut cursor).await;
 
         assert!(result.is_err());

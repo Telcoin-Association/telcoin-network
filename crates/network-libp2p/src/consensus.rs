@@ -3,16 +3,19 @@
 //! This network is used by workers and primaries to reliably send consensus messages.
 
 use crate::{
-    codec::{TNCodec, TNMessage},
+    codec::TNMessage,
     error::NetworkError,
     kad::{KadStore, KadStoreType},
-    peers::{self, PeerEvent, PeerManager, Penalty},
+    peers::{self, PeerEvent, PeerExchangeMap, PeerManager, Penalty},
     send_or_log_error,
+    stream::{
+        spawn_stream_tasks, FrameHeader, ReadEvent, StreamError, StreamErrorCode, StreamHandle,
+        StreamHandlerConfig, TN_STREAM_PROTOCOL,
+    },
     types::{
         KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo, NetworkResult,
-        NodeRecord,
+        NodeRecord, StreamResponseChannel,
     },
-    PeerExchangeMap,
 };
 use futures::StreamExt as _;
 use libp2p::{
@@ -21,25 +24,25 @@ use libp2p::{
         TopicHash,
     },
     kad::{self, store::RecordStore, Mode, QueryId},
-    request_response::{
-        self, Codec, Event as ReqResEvent, InboundFailure as ReqResInboundFailure,
-        InboundRequestId, OutboundRequestId,
-    },
     swarm::{NetworkBehaviour, SwarmEvent},
     Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
 use libp2p_stream as stream;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig};
 use tn_types::{
-    decode, encode, now, try_decode, BlsPublicKey, BlsSigner, Database, NetworkKeypair,
-    NetworkPublicKey, TaskSpawner, TnSender,
+    decode, encode, encode_into_buffer, now, try_decode, BlsPublicKey, BlsSigner, Database,
+    NetworkKeypair, NetworkPublicKey, TaskSpawner, TnSender,
 };
 use tokio::sync::{
-    mpsc::{Receiver, Sender},
+    mpsc::{self, Receiver, Sender},
     oneshot,
 };
 use tracing::{debug, error, info, instrument, trace, warn};
@@ -55,14 +58,12 @@ const DEFAULT_KAD_PROTO_NAME: StreamProtocol = StreamProtocol::new("/tn/kad/1.0.
 ///
 /// The behavior includes gossipsub, kademlia, peer management, and stream-based messaging.
 #[derive(NetworkBehaviour)]
-pub(crate) struct TNBehavior<C, DB>
+pub(crate) struct TNBehavior<DB>
 where
-    C: Codec + Send + Clone + 'static,
+    DB: Database,
 {
     /// The gossipsub network behavior.
     pub(crate) gossipsub: gossipsub::Behaviour,
-    /// The request-response network behavior.
-    pub(crate) req_res: request_response::Behaviour<C>,
     /// The peer manager.
     pub(crate) peer_manager: peers::PeerManager,
     /// Used for peer discovery.
@@ -71,27 +72,46 @@ where
     pub(crate) stream: stream::Behaviour,
 }
 
-impl<C, DB> TNBehavior<C, DB>
+impl<DB> TNBehavior<DB>
 where
-    C: Codec + Send + Clone + 'static,
     DB: Database,
 {
     /// Create a new instance of Self.
     pub(crate) fn new(
         gossipsub: gossipsub::Behaviour,
-        req_res: request_response::Behaviour<C>,
         kademlia: kad::Behaviour<KadStore<DB>>,
         peer_config: &PeerConfig,
     ) -> Self {
         let peer_manager = PeerManager::new(peer_config);
         let stream = stream::Behaviour::new();
-        Self { gossipsub, req_res, peer_manager, kademlia, stream }
+        Self { gossipsub, peer_manager, kademlia, stream }
     }
 
     /// Get a control handle for opening streams.
     pub(crate) fn stream_control(&self) -> stream::Control {
         self.stream.new_control()
     }
+}
+
+/// Events from background stream tasks back to ConsensusNetwork.
+#[derive(Debug)]
+enum StreamTaskEvent {
+    /// Received an inbound request from a peer.
+    InboundRequest { peer_id: PeerId, request_id: u64, payload: Vec<u8> },
+    /// Received a response to an outbound request.
+    Response { peer_id: PeerId, request_id: u64, payload: Vec<u8> },
+    /// Received an error response from a peer.
+    ErrorResponse { peer_id: PeerId, request_id: u64, error: String },
+    /// Stream closed or errored.
+    StreamClosed { peer_id: PeerId, error: Option<String> },
+    /// Error sending request.
+    SendError { peer_id: PeerId, request_id: u64, error: String },
+    /// Response bytes ready to send (from application layer).
+    SendResponse { peer_id: PeerId, request_id: u64, payload: Vec<u8> },
+    /// Stream successfully opened - store the handle and receiver.
+    StreamOpened { peer_id: PeerId, handle: StreamHandle, events_rx: mpsc::Receiver<ReadEvent> },
+    /// Failed to open stream.
+    StreamOpenFailed { peer_id: PeerId, request_id: u64, error: String },
 }
 
 /// The network type for consensus messages.
@@ -109,7 +129,7 @@ where
     Events: TnSender<NetworkEvent<Req, Res>>,
 {
     /// The gossip network for flood publishing sealed batches.
-    swarm: Swarm<TNBehavior<TNCodec<Req, Res>, DB>>,
+    swarm: Swarm<TNBehavior<DB>>,
     /// The stream for forwarding network events.
     event_stream: Events,
     /// The sender for network handles.
@@ -121,26 +141,21 @@ where
     /// This set must be updated at the start of each epoch. It is used to verify messages
     /// published on certain topics. These are updated when the caller subscribes to a topic.
     authorized_publishers: HashMap<String, Option<HashSet<BlsPublicKey>>>,
-    /// The collection of pending _graceful_ disconnects.
-    ///
-    /// This node disconnects from new peers if it already has the target number of peers.
-    /// For these types of "peer exchange / discovery disconnects", the node shares peer records
-    /// before disconnecting. This keeps track of the number of disconnects to ensure resources
-    /// aren't starved while waiting for the peer's ack.
-    pending_px_disconnects: HashMap<OutboundRequestId, PeerId>,
-    /// The collection of pending outbound requests.
-    ///
-    /// Callers include a oneshot channel for the network to return response. The caller is
-    /// responsible for decoding message bytes and reporting peers who return bad data. Peers that
-    /// send messages that fail to decode must receive an application score penalty.
-    outbound_requests: HashMap<(PeerId, OutboundRequestId), oneshot::Sender<NetworkResult<Res>>>,
-    /// The collection of pending inbound requests.
-    ///
-    /// Callers include a oneshot channel for the network to return a cancellation notice. The
-    /// caller is responsible for decoding message bytes and reporting peers who return bad
-    /// data. Peers that send messages that fail to decode must receive an application score
-    /// penalty.
-    inbound_requests: HashMap<InboundRequestId, oneshot::Sender<()>>,
+    /// Stream control for opening new streams.
+    stream_control: stream::Control,
+    /// Active stream handles per peer (long-lived).
+    stream_handles: HashMap<PeerId, StreamHandle>,
+    /// Next request ID counter for stream requests.
+    next_request_id: Arc<AtomicU64>,
+    /// Pending outbound requests: (PeerId, request_id) -> reply channel.
+    outbound_requests: HashMap<(PeerId, u64), oneshot::Sender<NetworkResult<Res>>>,
+    /// Pending inbound requests: (PeerId, request_id) -> cancel channel.
+    inbound_requests: HashMap<(PeerId, u64), oneshot::Sender<()>>,
+    /// Channel to receive events from background stream tasks.
+    stream_events_tx: mpsc::Sender<StreamTaskEvent>,
+    stream_events_rx: mpsc::Receiver<StreamTaskEvent>,
+    /// Stream handler configuration.
+    stream_handler_config: StreamHandlerConfig,
     /// The collection of kademlia record requests.
     ///
     /// When the application layer makes a request, the swarm stores the kad::QueryId and the
@@ -163,6 +178,8 @@ where
     ///
     /// The external address is self-reported and unconfirmed.
     node_record: NodeRecord,
+    /// Phantom marker for request/response types.
+    _phantom: std::marker::PhantomData<(Req, Res)>,
 }
 
 impl<Req, Res, DB, Events> ConsensusNetwork<Req, Res, DB, Events>
@@ -242,14 +259,6 @@ where
         )
         .map_err(NetworkError::GossipBehavior)?;
 
-        let tn_codec =
-            TNCodec::<Req, Res>::new(network_config.libp2p_config().max_rpc_message_size);
-
-        let req_res = request_response::Behaviour::with_codec(
-            tn_codec,
-            network_config.libp2p_config().supported_req_res_protocols.clone(),
-            request_response::Config::default(),
-        );
         let peer_id: PeerId = keypair.public().into();
         let mut kad_config = libp2p::kad::Config::new(DEFAULT_KAD_PROTO_NAME);
         // manually add peers
@@ -267,8 +276,7 @@ where
         let kademlia = kad::Behaviour::with_config(peer_id, kad_store.clone(), kad_config);
 
         // create custom behavior
-        let mut behavior =
-            TNBehavior::new(gossipsub, req_res, kademlia, network_config.peer_config());
+        let mut behavior = TNBehavior::new(gossipsub, kademlia, network_config.peer_config());
 
         // Load the Kad records from DB into the local peer cache.
         for record in kad_store.records() {
@@ -285,6 +293,9 @@ where
         }
 
         let network_pubkey = keypair.public().into();
+
+        // get stream control before moving behavior into swarm
+        let stream_control = behavior.stream_control();
 
         // create swarm
         let mut swarm = SwarmBuilder::with_existing_identity(keypair)
@@ -313,8 +324,18 @@ where
 
         let (handle, commands) = tokio::sync::mpsc::channel(100);
         let config = network_config.libp2p_config().clone();
-        let pending_px_disconnects = HashMap::with_capacity(config.max_px_disconnects);
         let node_record = Self::create_node_record(external_addr, &key_config, network_pubkey);
+
+        // create stream event channels
+        let (stream_events_tx, stream_events_rx) = mpsc::channel(256);
+
+        // create stream handler config
+        let stream_config = network_config.stream_config();
+        let stream_handler_config = StreamHandlerConfig {
+            max_frame_size: stream_config.max_frame_size,
+            read_timeout: stream_config.request_timeout,
+            write_buffer_size: 64,
+        };
 
         Ok(Self {
             swarm,
@@ -322,15 +343,21 @@ where
             commands,
             event_stream,
             authorized_publishers: Default::default(),
+            stream_control,
+            stream_handles: Default::default(),
+            next_request_id: Arc::new(AtomicU64::new(1)),
             outbound_requests: Default::default(),
             inbound_requests: Default::default(),
+            stream_events_tx,
+            stream_events_rx,
+            stream_handler_config,
             kad_record_queries: Default::default(),
             config,
             connected_peers: VecDeque::new(),
-            pending_px_disconnects,
             key_config,
             task_spawner,
             node_record,
+            _phantom: std::marker::PhantomData,
         })
     }
 
@@ -424,6 +451,12 @@ where
         self.swarm.behaviour_mut().kademlia.set_mode(Some(Mode::Server));
         self.provide_our_data();
 
+        // accept incoming streams
+        let mut incoming_streams = self
+            .stream_control
+            .accept(TN_STREAM_PROTOCOL)
+            .map_err(|e| NetworkError::Stream(format!("protocol already registered: {e:?}")))?;
+
         loop {
             tokio::select! {
                 event = self.swarm.select_next_some() => self.process_event(event).await.inspect_err(|e| {
@@ -438,20 +471,24 @@ where
                         return Ok(())
                     }
                 },
+                // handle incoming streams from peers
+                Some((peer_id, stream)) = incoming_streams.next() => {
+                    self.handle_incoming_stream(peer_id, stream);
+                }
+                // handle events from background stream tasks
+                Some(event) = self.stream_events_rx.recv() => {
+                    self.process_stream_task_event(event)?;
+                }
             }
         }
     }
 
     /// Process events from the swarm.
     #[instrument(level = "trace", target = "network::events", skip(self), fields(topics = ?self.authorized_publishers.keys()))]
-    async fn process_event(
-        &mut self,
-        event: SwarmEvent<TNBehaviorEvent<TNCodec<Req, Res>, DB>>,
-    ) -> NetworkResult<()> {
+    async fn process_event(&mut self, event: SwarmEvent<TNBehaviorEvent<DB>>) -> NetworkResult<()> {
         match event {
             SwarmEvent::Behaviour(behavior) => match behavior {
                 TNBehaviorEvent::Gossipsub(event) => self.process_gossip_event(event)?,
-                TNBehaviorEvent::ReqRes(event) => self.process_reqres_event(event)?,
                 TNBehaviorEvent::PeerManager(event) => self.process_peer_manager_event(event)?,
                 TNBehaviorEvent::Kademlia(event) => self.process_kad_event(event)?,
                 TNBehaviorEvent::Stream(event) => self.process_stream_event(event)?,
@@ -632,40 +669,64 @@ where
             }
             NetworkCommand::SendRequest { peer, request, reply } => {
                 debug!(target: "network", "send request for bls {peer}");
-                if let Some((peer, addr)) = self.swarm.behaviour().peer_manager.auth_to_peer(peer) {
-                    debug!(target: "network", "trying to send to {peer} at {addr:?}");
-                    let request_id = self
-                        .swarm
-                        .behaviour_mut()
-                        .req_res
-                        .send_request_with_addresses(&peer, request, addr);
-                    self.outbound_requests.insert((peer, request_id), reply);
+                if let Some((peer_id, _addr)) =
+                    self.swarm.behaviour().peer_manager.auth_to_peer(peer)
+                {
+                    debug!(target: "network", "trying to send to {peer_id}");
+                    let request_id = self.next_request_id();
+                    let payload = Self::encode_message(&request);
+
+                    // store the reply channel
+                    self.outbound_requests.insert((peer_id, request_id), reply);
+
+                    // spawn send request task
+                    self.spawn_send_request_task(peer_id, request_id, payload);
                 } else {
-                    // Best effort to return an error to caller.
+                    // best effort to return an error to caller
                     let _ = reply.send(Err(NetworkError::PeerMissing));
                 }
             }
             NetworkCommand::SendRequestDirect { peer, request, reply } => {
-                let request_id = self.swarm.behaviour_mut().req_res.send_request(&peer, request);
+                let request_id = self.next_request_id();
+                let payload = Self::encode_message(&request);
+
+                // store the reply channel
                 self.outbound_requests.insert((peer, request_id), reply);
+
+                // spawn send request task
+                self.spawn_send_request_task(peer, request_id, payload);
             }
             NetworkCommand::SendRequestAny { request, reply } => {
-                // Rotating an empty list will panic...
+                // rotating an empty list will panic...
                 if !self.connected_peers.is_empty() {
                     self.connected_peers.rotate_left(1);
                 }
-                if let Some(peer) = self.connected_peers.front() {
-                    let request_id = self.swarm.behaviour_mut().req_res.send_request(peer, request);
-                    self.outbound_requests.insert((*peer, request_id), reply);
+                if let Some(peer) = self.connected_peers.front().copied() {
+                    let request_id = self.next_request_id();
+                    let payload = Self::encode_message(&request);
+
+                    // store the reply channel
+                    self.outbound_requests.insert((peer, request_id), reply);
+
+                    // spawn send request task
+                    self.spawn_send_request_task(peer, request_id, payload);
                 } else {
-                    // Ignore error since this means other end lost interest and we don't really
-                    // care.
+                    // ignore error since this means other end lost interest
                     let _ = reply.send(Err(NetworkError::NoPeers));
                 }
             }
             NetworkCommand::SendResponse { response, channel, reply } => {
-                let res = self.swarm.behaviour_mut().req_res.send_response(channel, response);
-                send_or_log_error!(reply, res, "SendResponse");
+                // encode the response and send it through the channel
+                let payload = Self::encode_message(&response);
+                match channel.response_tx.send(payload) {
+                    Ok(()) => {
+                        send_or_log_error!(reply, Ok(()), "SendResponse");
+                    }
+                    Err(_) => {
+                        // channel was closed, return error response
+                        send_or_log_error!(reply, Err(response), "SendResponse");
+                    }
+                }
             }
             NetworkCommand::PendingRequestCount { reply } => {
                 let count = self.outbound_requests.len();
@@ -783,150 +844,6 @@ where
         Ok(())
     }
 
-    /// Process req/res events.
-    fn process_reqres_event(&mut self, event: ReqResEvent<Req, Res>) -> NetworkResult<()> {
-        match event {
-            ReqResEvent::Message { peer, message, connection_id: _ } => {
-                match message {
-                    request_response::Message::Request { request_id, request, channel } => {
-                        debug!(target: "network", ?peer, ?request, "request received");
-                        // intercept peer exchange messages
-                        if let Some(peers) = request.peer_exchange_msg() {
-                            debug!(target: "network", ?peers, "processing peer exchange");
-                            self.swarm.behaviour_mut().peer_manager.process_peer_exchange(peers);
-                            // send empty ack and ignore errors
-                            let ack = PeerExchangeMap::default().into();
-                            let _ = self.swarm.behaviour_mut().req_res.send_response(channel, ack);
-
-                            // initiate disconnect from this peer to prevent redial attempts
-                            debug!(target: "peer-manager", ?peer, "initiating reciprocal disconnect after px");
-                            self.swarm.behaviour_mut().peer_manager.disconnect_peer(peer, false);
-
-                            return Ok(());
-                        }
-
-                        // We should not be able to recieve a message from an unknown peer so this
-                        // should always work. It is possible (mostly in
-                        // testing) to have a race where we don't know the requester YET.
-                        // If so send an error back but this should be so infrequent on a real
-                        // network that we can ignore and it should not
-                        // cause any lasting damage if triggered.
-                        if let Some(bls) = self.swarm.behaviour().peer_manager.peer_to_bls(&peer) {
-                            let (notify, cancel) = oneshot::channel();
-                            // forward request to handler without blocking other events
-                            if let Err(e) = self.event_stream.try_send(NetworkEvent::Request {
-                                peer: bls,
-                                request,
-                                channel,
-                                cancel,
-                            }) {
-                                error!(target: "network", topics=?self.authorized_publishers.keys(), ?request_id, ?e, "failed to forward request!");
-                                // ignore failures at the epoch boundary
-                                // During epoch change the event_stream reciever can be closed.
-                                return Ok(());
-                            }
-
-                            // store the request and cancel duplicate requests
-                            //
-                            // NOTE: the request id is internally generated, so this should not
-                            // happen
-                            if let Some(channel) = self.inbound_requests.insert(request_id, notify)
-                            {
-                                // cancel if this is a duplicate request
-                                warn!(target: "network", ?peer, "duplicate request id from peer");
-                                let _ = channel.send(());
-                            }
-                        } else if let Err(e) = self.event_stream.try_send(NetworkEvent::Error(
-                            format!("requesting peer unknown: {peer:?}"),
-                            channel,
-                        )) {
-                            error!(target: "network", topics=?self.authorized_publishers.keys(), ?request_id, ?e, "failed to forward request!");
-                            // ignore failures at the epoch boundary
-                            // During epoch change the event_stream reciever can be closed.
-                            return Ok(());
-                        }
-                    }
-                    request_response::Message::Response { request_id, response } => {
-                        // check if response associated with PX disconnect
-                        if self.pending_px_disconnects.remove(&request_id).is_some() {
-                            let _ = self.swarm.disconnect_peer_id(peer);
-                        }
-
-                        // try to forward response to original caller
-                        let _ = self
-                            .outbound_requests
-                            .remove(&(peer, request_id))
-                            .map(|ack| ack.send(Ok(response)));
-                    }
-                }
-            }
-            ReqResEvent::OutboundFailure { peer, request_id, error, connection_id: _ } => {
-                debug!(target: "network", ?peer, ?error, "Outbound failure for req/res");
-                // handle px disconnects
-                //
-                // px attempts to support peer discovery, but failures are okay
-                // this node disconnects after a px timeout
-                if self.pending_px_disconnects.remove(&request_id).is_some() {
-                    debug!(target: "network", "outbound failure expected because of px disconnect");
-                    return Ok(());
-                }
-
-                // apply penalty
-                self.swarm.behaviour_mut().peer_manager.process_penalty(peer, Penalty::Medium);
-
-                // try to forward error to original caller
-                let _ = self
-                    .outbound_requests
-                    .remove(&(peer, request_id))
-                    .map(|ack| ack.send(Err(error.into())));
-            }
-            ReqResEvent::InboundFailure { peer, request_id, error, connection_id: _ } => {
-                debug!(target: "network", ?peer, ?error, pending=?self.inbound_requests, "Inbound failure for req/res");
-                debug!(target: "network", my_id=?self.swarm.local_peer_id(), "this node");
-                match error {
-                    ReqResInboundFailure::Io(e) => {
-                        // penalize peer since this is an attack surface
-                        warn!(target: "network", ?e, ?peer, ?request_id, "inbound IO failure");
-                        self.swarm
-                            .behaviour_mut()
-                            .peer_manager
-                            .process_penalty(peer, Penalty::Medium);
-                    }
-                    ReqResInboundFailure::UnsupportedProtocols => {
-                        warn!(target: "network", ?peer, ?request_id, ?error, "inbound failure: unsupported protocol");
-
-                        // the local peer supports none of the protocols requested by the remote
-                        self.swarm
-                            .behaviour_mut()
-                            .peer_manager
-                            .process_penalty(peer, Penalty::Fatal);
-                    }
-                    ReqResInboundFailure::Timeout | ReqResInboundFailure::ConnectionClosed => {
-                        // penalty for potentially malicious request
-                        self.swarm
-                            .behaviour_mut()
-                            .peer_manager
-                            .process_penalty(peer, Penalty::Mild);
-                    }
-                    ReqResInboundFailure::ResponseOmission => { /* ignore local error */ }
-                }
-
-                // forward cancelation to handler and ignore errors
-                if let Some(channel) = self.inbound_requests.remove(&request_id) {
-                    let _ = channel.send(());
-                }
-            }
-
-            ReqResEvent::ResponseSent { request_id, .. } => {
-                if let Some(channel) = self.inbound_requests.remove(&request_id) {
-                    let _ = channel.send(());
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     /// Specific logic to accept gossip messages.
     ///
     /// Messages are only published by current committee nodes and must be within max size.
@@ -978,6 +895,9 @@ where
                     let _ = self.swarm.disconnect_peer_id(peer_id);
                 }
 
+                // clean up stream handle
+                self.stream_handles.remove(&peer_id);
+
                 // remove from connected peers
                 self.connected_peers.retain(|peer| *peer != peer_id);
 
@@ -1002,35 +922,72 @@ where
                         .remove(&k)
                         .map(|ack| ack.send(Err(NetworkError::Disconnected)));
                 }
+
+                // cancel pending inbound requests from this peer
+                let inbound_keys: Vec<_> = self
+                    .inbound_requests
+                    .keys()
+                    .filter(|(pid, _)| *pid == peer_id)
+                    .cloned()
+                    .collect();
+
+                for key in inbound_keys {
+                    if let Some(cancel_tx) = self.inbound_requests.remove(&key) {
+                        let _ = cancel_tx.send(());
+                    }
+                }
             }
             PeerEvent::DisconnectPeerX(peer_id, peer_exchange) => {
                 debug!(target: "peer-manager", this_node=?self.swarm.local_peer_id(), ?peer_id, "disconnecting from peer with exchange info");
-                // attempt to exchange peer information if limits allow
-                if self.pending_px_disconnects.len() < self.config.max_px_disconnects {
-                    let (reply, done) = oneshot::channel();
-                    let request_id = self
-                        .swarm
-                        .behaviour_mut()
-                        .req_res
-                        .send_request(&peer_id, peer_exchange.into());
-                    self.outbound_requests.insert((peer_id, request_id), reply);
 
-                    let timeout = self.config.px_disconnect_timeout;
-                    let handle = self.network_handle();
+                let timeout = self.config.px_disconnect_timeout;
+                let network_handle = self.network_handle();
 
-                    // spawn task
+                // encode peer exchange as a request
+                let request_id = self.next_request_id();
+                let payload = Self::encode_message(&Req::from(peer_exchange));
+                let header = FrameHeader::typed_request(request_id, payload.len() as u32);
+
+                // attempt to send peer exchange info via stream before disconnecting
+                if let Some(handle) = self.stream_handles.get(&peer_id).cloned() {
+                    // spawn task to send px and then disconnect
                     let task_name = format!("peer-exchange-{peer_id}");
                     self.task_spawner.spawn_task(task_name, async move {
-                        // ignore errors and disconnect after px attempt
-                        let _res = tokio::time::timeout(timeout, done).await;
-                        let _ = handle.disconnect_peer(peer_id).await;
-                    });
+                        // best effort send with timeout - ignore errors
+                        let send_fut = handle.send_frame(header, payload);
+                        let _ = tokio::time::timeout(timeout, send_fut).await;
 
-                    // insert to pending px disconnects
-                    self.pending_px_disconnects.insert(request_id, peer_id);
+                        // disconnect after px attempt
+                        let _ = network_handle.disconnect_peer(peer_id).await;
+                    });
                 } else {
-                    // too many px disconnects pending so disconnect without px
-                    let _ = self.swarm.disconnect_peer_id(peer_id);
+                    // no stream exists - need to open one first
+                    let mut stream_control = self.stream_control.clone();
+                    let stream_handler_config = self.stream_handler_config.clone();
+
+                    let task_name = format!("peer-exchange-open-{peer_id}");
+                    self.task_spawner.spawn_task(task_name, async move {
+                        // try to open stream with timeout
+                        let open_result = tokio::time::timeout(
+                            timeout,
+                            stream_control.open_stream(peer_id, TN_STREAM_PROTOCOL),
+                        )
+                        .await;
+
+                        if let Ok(Ok(stream)) = open_result {
+                            // spawn read/write tasks
+                            let (handle, _events_rx) =
+                                spawn_stream_tasks(stream, peer_id, stream_handler_config);
+
+                            // best effort send with timeout - ignore errors
+                            let _ =
+                                tokio::time::timeout(timeout, handle.send_frame(header, payload))
+                                    .await;
+                        }
+
+                        // disconnect after px attempt (regardless of success)
+                        let _ = network_handle.disconnect_peer(peer_id).await;
+                    });
                 }
 
                 // remove peer from kad - will redial if necessary
@@ -1244,13 +1201,357 @@ where
     ///
     /// Note: The stream::Behaviour has `ToSwarm = ()` (void event type).
     /// Actual stream handling is done through the Control handle, not through events.
-    /// This handler is called when the behaviour emits an event, which is currently
-    /// just a unit type.
     fn process_stream_event(&mut self, _event: ()) -> NetworkResult<()> {
         // The stream behaviour doesn't emit meaningful events.
-        // Incoming streams are handled through the Control::accept() mechanism,
-        // and the StreamManager polls for them separately.
+        // Incoming streams are handled through the Control::accept() mechanism.
         Ok(())
+    }
+
+    /// Handle an incoming stream from a peer.
+    fn handle_incoming_stream(&mut self, peer_id: PeerId, stream: libp2p::swarm::Stream) {
+        debug!(target: "network", ?peer_id, "handling incoming stream");
+
+        // spawn read/write tasks
+        let (handle, events_rx) =
+            spawn_stream_tasks(stream, peer_id, self.stream_handler_config.clone());
+
+        // spawn task to forward events to main loop
+        let events_tx = self.stream_events_tx.clone();
+        self.task_spawner.spawn_task(format!("stream-read-{peer_id}"), async move {
+            Self::stream_read_loop(peer_id, events_rx, events_tx).await;
+        });
+
+        // store the handle (may replace existing)
+        self.stream_handles.insert(peer_id, handle);
+    }
+
+    /// Background task that reads from a peer's stream and forwards events.
+    async fn stream_read_loop(
+        peer_id: PeerId,
+        mut events_rx: mpsc::Receiver<ReadEvent>,
+        events_tx: mpsc::Sender<StreamTaskEvent>,
+    ) {
+        debug!(target: "network", ?peer_id, "stream_read_loop started");
+        while let Some(event) = events_rx.recv().await {
+            debug!(target: "network", ?peer_id, ?event, "stream_read_loop received event");
+            let task_event = match event {
+                ReadEvent::Request { request_id, payload } => {
+                    StreamTaskEvent::InboundRequest { peer_id, request_id, payload }
+                }
+                ReadEvent::Response { request_id, payload } => {
+                    StreamTaskEvent::Response { peer_id, request_id, payload }
+                }
+                ReadEvent::Closed => StreamTaskEvent::StreamClosed { peer_id, error: None },
+                ReadEvent::ReadError { error } => {
+                    StreamTaskEvent::StreamClosed { peer_id, error: Some(error.to_string()) }
+                }
+                ReadEvent::Error { request_id, error } => {
+                    StreamTaskEvent::ErrorResponse { peer_id, request_id, error: error.message }
+                }
+                // For now, ignore raw stream events (not used for request-response)
+                ReadEvent::RawStreamBegin { .. }
+                | ReadEvent::RawStreamEnd { .. }
+                | ReadEvent::RawData { .. }
+                | ReadEvent::Cancelled { .. } => continue,
+            };
+
+            if events_tx.send(task_event).await.is_err() {
+                // main loop shut down
+                debug!(target: "network", ?peer_id, "stream_read_loop: main loop shut down");
+                break;
+            }
+        }
+        debug!(target: "network", ?peer_id, "stream_read_loop ended (channel closed)");
+    }
+
+    /// Process events from background stream tasks.
+    fn process_stream_task_event(&mut self, event: StreamTaskEvent) -> NetworkResult<()> {
+        match event {
+            StreamTaskEvent::InboundRequest { peer_id, request_id, payload } => {
+                // forward to application layer
+                if let Some(bls) = self.swarm.behaviour().peer_manager.peer_to_bls(&peer_id) {
+                    // decode the request - handle errors gracefully
+                    let request: Req = match try_decode(&payload) {
+                        Ok(req) => req,
+                        Err(e) => {
+                            warn!(target: "network", ?peer_id, ?e, "failed to decode inbound request");
+                            self.swarm
+                                .behaviour_mut()
+                                .peer_manager
+                                .process_penalty(peer_id, Penalty::Medium);
+                            // send error response to the sender
+                            if let Some(handle) = self.stream_handles.get(&peer_id).cloned() {
+                                let error =
+                                    StreamError::new(StreamErrorCode::BadRequest, e.to_string());
+                                let error_payload = encode(&error);
+                                let header =
+                                    FrameHeader::error(request_id, error_payload.len() as u32);
+                                self.task_spawner.spawn_task(
+                                    format!("send-error-{peer_id}-{request_id}"),
+                                    async move {
+                                        let _ = handle.send_frame(header, error_payload).await;
+                                    },
+                                );
+                            }
+                            return Ok(());
+                        }
+                    };
+
+                    // intercept peer exchange messages - handle at network layer
+                    if let Some(peers) = request.peer_exchange_msg() {
+                        debug!(target: "network", ?peers, "processing peer exchange");
+                        self.swarm.behaviour_mut().peer_manager.process_peer_exchange(peers);
+
+                        // send empty ack response
+                        if let Some(handle) = self.stream_handles.get(&peer_id).cloned() {
+                            let ack = PeerExchangeMap::default();
+                            let ack_payload = Self::encode_message(&Res::from(ack));
+                            let header =
+                                FrameHeader::typed_response(request_id, ack_payload.len() as u32);
+                            self.task_spawner.spawn_task(
+                                format!("px-ack-{peer_id}-{request_id}"),
+                                async move {
+                                    let _ = handle.send_frame(header, ack_payload).await;
+                                },
+                            );
+                        }
+
+                        // temporarily ban the sender to prevent reconnection attempts
+                        // the sender already rejected us, so we should not try to reconnect
+                        self.swarm.behaviour_mut().peer_manager.temporarily_ban_peer(peer_id);
+
+                        return Ok(());
+                    }
+
+                    // create response channel
+                    let (response_tx, response_rx) = oneshot::channel();
+                    let channel = StreamResponseChannel::new(peer_id, request_id, response_tx);
+
+                    // create cancel channel
+                    let (notify, cancel) = oneshot::channel();
+
+                    // spawn task to wait for response and send it back
+                    let stream_events_tx = self.stream_events_tx.clone();
+                    self.task_spawner.spawn_task(
+                        format!("stream-response-{peer_id}-{request_id}"),
+                        async move {
+                            if let Ok(response_bytes) = response_rx.await {
+                                let _ = stream_events_tx
+                                    .send(StreamTaskEvent::SendResponse {
+                                        peer_id,
+                                        request_id,
+                                        payload: response_bytes,
+                                    })
+                                    .await;
+                            }
+                        },
+                    );
+
+                    // forward request to handler
+                    if let Err(e) = self.event_stream.try_send(NetworkEvent::Request {
+                        peer: bls,
+                        request,
+                        channel,
+                        cancel,
+                    }) {
+                        error!(target: "network", ?e, "failed to forward request!");
+                        // ignore failures at the epoch boundary
+                        return Ok(());
+                    }
+
+                    // store the request and cancel duplicate requests
+                    if let Some(cancel_tx) =
+                        self.inbound_requests.insert((peer_id, request_id), notify)
+                    {
+                        // cancel if this is a duplicate request
+                        warn!(target: "network", ?peer_id, "duplicate request id from peer");
+                        let _ = cancel_tx.send(());
+                    }
+                } else {
+                    warn!(target: "network", ?peer_id, "request from unknown peer");
+                }
+            }
+            StreamTaskEvent::Response { peer_id, request_id, payload } => {
+                if let Some(reply) = self.outbound_requests.remove(&(peer_id, request_id)) {
+                    // decode the response - handle errors gracefully
+                    match try_decode::<Res>(&payload) {
+                        Ok(response) => {
+                            let _ = reply.send(Ok(response));
+                        }
+                        Err(e) => {
+                            // return error to caller instead of panicking
+                            let _ =
+                                reply.send(Err(NetworkError::Stream(format!("decode error: {e}"))));
+                            // apply penalty for malformed response
+                            self.swarm
+                                .behaviour_mut()
+                                .peer_manager
+                                .process_penalty(peer_id, Penalty::Medium);
+                        }
+                    }
+                }
+            }
+            StreamTaskEvent::ErrorResponse { peer_id, request_id, error } => {
+                // received an error response from the peer (e.g., failed to decode our request)
+                if let Some(reply) = self.outbound_requests.remove(&(peer_id, request_id)) {
+                    let _ = reply.send(Err(NetworkError::Stream(error)));
+                }
+            }
+            StreamTaskEvent::StreamClosed { peer_id, error } => {
+                debug!(target: "network", ?peer_id, ?error, "stream closed event received");
+                self.handle_stream_closed(peer_id);
+            }
+            StreamTaskEvent::SendError { peer_id, request_id, error } => {
+                if let Some(reply) = self.outbound_requests.remove(&(peer_id, request_id)) {
+                    let _ = reply.send(Err(NetworkError::Stream(error)));
+                }
+            }
+            StreamTaskEvent::SendResponse { peer_id, request_id, payload } => {
+                // send response through the stream
+                if let Some(handle) = self.stream_handles.get(&peer_id) {
+                    let handle = handle.clone();
+                    self.task_spawner.spawn_task(
+                        format!("send-response-{peer_id}-{request_id}"),
+                        async move {
+                            let header =
+                                FrameHeader::typed_response(request_id, payload.len() as u32);
+                            if let Err(e) = handle.send_frame(header, payload).await {
+                                warn!(target: "network", ?peer_id, ?e, "failed to send response");
+                            }
+                        },
+                    );
+                }
+            }
+            StreamTaskEvent::StreamOpened { peer_id, handle, events_rx } => {
+                debug!(target: "network", ?peer_id, "stream opened - storing handle and spawning read loop");
+                // store the handle if not already present (another task may have added it)
+                self.stream_handles.entry(peer_id).or_insert(handle);
+
+                // spawn task to forward events from this stream to main loop
+                let events_tx = self.stream_events_tx.clone();
+                self.task_spawner.spawn_task(format!("stream-read-{peer_id}"), async move {
+                    Self::stream_read_loop(peer_id, events_rx, events_tx).await;
+                });
+            }
+            StreamTaskEvent::StreamOpenFailed { peer_id, request_id, error } => {
+                debug!(target: "network", ?peer_id, ?error, "failed to open stream");
+                if let Some(reply) = self.outbound_requests.remove(&(peer_id, request_id)) {
+                    let _ = reply.send(Err(NetworkError::Stream(error)));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle stream closed - clean up handles and fail pending requests.
+    fn handle_stream_closed(&mut self, peer_id: PeerId) {
+        self.stream_handles.remove(&peer_id);
+
+        // fail pending outbound requests to this peer
+        let to_fail: Vec<_> =
+            self.outbound_requests.keys().filter(|(pid, _)| *pid == peer_id).cloned().collect();
+
+        for key in to_fail {
+            if let Some(reply) = self.outbound_requests.remove(&key) {
+                let _ = reply.send(Err(NetworkError::Disconnected));
+            }
+        }
+
+        // cancel pending inbound requests from this peer
+        let to_cancel: Vec<_> =
+            self.inbound_requests.keys().filter(|(pid, _)| *pid == peer_id).cloned().collect();
+
+        for key in to_cancel {
+            if let Some(cancel_tx) = self.inbound_requests.remove(&key) {
+                let _ = cancel_tx.send(());
+            }
+        }
+    }
+
+    /// Generate the next request ID.
+    fn next_request_id(&self) -> u64 {
+        self.next_request_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Spawn a task to send a request to a peer.
+    ///
+    /// If a stream handle already exists, the request is sent immediately.
+    /// Otherwise, a new stream is opened first.
+    fn spawn_send_request_task(&mut self, peer_id: PeerId, request_id: u64, payload: Vec<u8>) {
+        let header = FrameHeader::typed_request(request_id, payload.len() as u32);
+        let events_tx = self.stream_events_tx.clone();
+
+        if let Some(handle) = self.stream_handles.get(&peer_id).cloned() {
+            // stream already exists, just send
+            self.task_spawner.spawn_task(
+                format!("send-request-{peer_id}-{request_id}"),
+                async move {
+                    if let Err(e) = handle.send_frame(header, payload).await {
+                        let _ = events_tx
+                            .send(StreamTaskEvent::SendError {
+                                peer_id,
+                                request_id,
+                                error: e.to_string(),
+                            })
+                            .await;
+                    }
+                },
+            );
+        } else {
+            // need to open stream first
+            let mut stream_control = self.stream_control.clone();
+            let stream_handler_config = self.stream_handler_config.clone();
+
+            self.task_spawner.spawn_task(
+                format!("open-stream-send-{peer_id}-{request_id}"),
+                async move {
+                    // try to open stream
+                    match stream_control.open_stream(peer_id, TN_STREAM_PROTOCOL).await {
+                        Ok(stream) => {
+                            // spawn read/write tasks
+                            let (handle, events_rx) =
+                                spawn_stream_tasks(stream, peer_id, stream_handler_config);
+
+                            // notify main loop about the new stream
+                            let _ = events_tx
+                                .send(StreamTaskEvent::StreamOpened {
+                                    peer_id,
+                                    handle: handle.clone(),
+                                    events_rx,
+                                })
+                                .await;
+
+                            // send the request
+                            if let Err(e) = handle.send_frame(header, payload).await {
+                                let _ = events_tx
+                                    .send(StreamTaskEvent::SendError {
+                                        peer_id,
+                                        request_id,
+                                        error: e.to_string(),
+                                    })
+                                    .await;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = events_tx
+                                .send(StreamTaskEvent::StreamOpenFailed {
+                                    peer_id,
+                                    request_id,
+                                    error: e.to_string(),
+                                })
+                                .await;
+                        }
+                    }
+                },
+            );
+        }
+    }
+
+    /// Encode a message to bytes using BCS and compression.
+    fn encode_message<M: TNMessage>(msg: &M) -> Vec<u8> {
+        let mut buffer = Vec::new();
+        encode_into_buffer(&mut buffer, msg).expect("encoding should not fail");
+        buffer
     }
 
     /// Process an inbound kad put request.
@@ -1441,12 +1742,12 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConsensusNetwork")
             .field("authorized_publishers", &self.authorized_publishers)
-            .field("pending_px_disconnects", &self.pending_px_disconnects)
+            .field("stream_handles", &self.stream_handles.len())
             .field("outbound_requests", &self.outbound_requests.len())
             .field("inbound_requests", &self.inbound_requests.len())
             .field("config", &self.config)
             .field("connected_peers", &self.connected_peers)
-            .field("swarm", &"<swarm>") // Skip detailed debug for swarm
+            .field("swarm", &"<swarm>")
             .finish()
     }
 }

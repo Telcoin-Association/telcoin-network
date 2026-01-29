@@ -11,7 +11,7 @@ use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     error::NetworkError,
     types::{NetworkEvent, NetworkHandle, NetworkResult},
-    GossipMessage, Penalty, ResponseChannel,
+    GossipMessage, Penalty, StreamResponseChannel,
 };
 use tn_network_types::{FetchBatchResponse, PrimaryToWorkerClient, WorkerSynchronizeMessage};
 use tn_storage::tables::Batches;
@@ -334,6 +334,7 @@ where
                     },
                 );
             }
+            NetworkEvent::_Phantom(_) => unreachable!(),
         }
     }
 
@@ -344,7 +345,7 @@ where
         &self,
         peer: BlsPublicKey,
         sealed_batch: SealedBatch,
-        channel: ResponseChannel<WorkerResponse>,
+        channel: StreamResponseChannel,
         cancel: oneshot::Receiver<()>,
     ) {
         // clone for spawned tasks
@@ -378,7 +379,7 @@ where
         peer: BlsPublicKey,
         batch_digests: Vec<BlockHash>,
         max_response_size: usize,
-        channel: ResponseChannel<WorkerResponse>,
+        channel: StreamResponseChannel,
         cancel: oneshot::Receiver<()>,
     ) {
         // clone for spawned tasks

@@ -7,7 +7,6 @@ pub use libp2p::gossipsub::MessageId;
 use libp2p::{
     core::transport::ListenerId,
     gossipsub::{PublishError, SubscriptionError, TopicHash},
-    request_response::ResponseChannel,
     Multiaddr, PeerId, TransportError,
 };
 use serde::{Deserialize, Serialize};
@@ -53,6 +52,27 @@ pub const PRIMARY_CERT_TOPIC: &str = "tn_certificates";
 /// The topic for NVVs to subscribe to for published consensus chain.
 pub const CONSENSUS_HEADER_TOPIC: &str = "tn_consensus_headers";
 
+/// Handle for sending a response back through a stream.
+///
+/// This replaces `ResponseChannel<Res>` from request-response.
+/// The response is sent by providing the serialized response bytes.
+#[derive(Debug)]
+pub struct StreamResponseChannel {
+    /// The peer to send the response to.
+    pub peer_id: PeerId,
+    /// The request ID to correlate the response.
+    pub request_id: u64,
+    /// Channel to send response bytes back to the network task.
+    pub response_tx: oneshot::Sender<Vec<u8>>,
+}
+
+impl StreamResponseChannel {
+    /// Create a new stream response channel.
+    pub fn new(peer_id: PeerId, request_id: u64, response_tx: oneshot::Sender<Vec<u8>>) -> Self {
+        Self { peer_id, request_id, response_tx }
+    }
+}
+
 /// Events created from network activity.
 #[derive(Debug)]
 pub enum NetworkEvent<Req, Res> {
@@ -62,15 +82,18 @@ pub enum NetworkEvent<Req, Res> {
         peer: BlsPublicKey,
         /// The network request type.
         request: Req,
-        /// The network response channel.
-        channel: ResponseChannel<Res>,
+        /// The stream response channel for sending the response.
+        channel: StreamResponseChannel,
         /// The oneshot channel if the request gets cancelled at the network level.
         cancel: oneshot::Receiver<()>,
     },
     /// Gossip message received and propagation source.
     Gossip(GossipMessage, BlsPublicKey),
     /// Send an error back the requester.
-    Error(String, ResponseChannel<Res>),
+    Error(String, StreamResponseChannel),
+    /// Phantom marker for response type.
+    #[doc(hidden)]
+    _Phantom(std::marker::PhantomData<Res>),
 }
 
 /// Commands for the swarm.
@@ -198,8 +221,8 @@ where
     SendResponse {
         /// The encoded message data.
         response: Res,
-        /// The libp2p response channel.
-        channel: ResponseChannel<Res>,
+        /// The stream response channel.
+        channel: StreamResponseChannel,
         /// Oneshot channel for returning result.
         reply: oneshot::Sender<Result<(), Res>>,
     },
@@ -470,7 +493,7 @@ where
     pub async fn send_response(
         &self,
         response: Res,
-        channel: ResponseChannel<Res>,
+        channel: StreamResponseChannel,
     ) -> NetworkResult<()> {
         let (reply, res) = oneshot::channel();
         self.sender.send(NetworkCommand::SendResponse { response, channel, reply }).await?;

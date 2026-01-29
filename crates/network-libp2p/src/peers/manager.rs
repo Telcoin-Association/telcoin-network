@@ -329,18 +329,20 @@ impl PeerManager {
         })
     }
 
-    /// Check if the peer id is banned or associated with any banned ip addresses.
+    /// Check if a peer is banned due to reputation.
     ///
-    /// This is called before accepting new connections. Also checks that the peer
-    /// wasn't temporarily banned due to excess peers connections.
+    /// This does NOT include temporarily banned peers (those banned for reconnection
+    /// prevention after peer exchange). Temporarily banned peers can still send
+    /// network messages like KAD records - they are only prevented from being dialed.
     pub(crate) fn peer_banned(&self, peer_id: &PeerId) -> bool {
-        debug!(
-            target: "peer-manager",
-            ?peer_id,
-            "checking if peer banned...current banned peers:\n{:?}",
-            self.temporarily_banned
-        );
-        self.temporarily_banned.contains(peer_id) || self.peers.peer_banned(peer_id)
+        self.peers.peer_banned(peer_id)
+    }
+
+    /// Check if a peer is temporarily banned (from peer exchange disconnection).
+    ///
+    /// Temporarily banned peers should not be dialed but can still send network messages.
+    pub(crate) fn peer_temporarily_banned(&self, peer_id: &PeerId) -> bool {
+        self.temporarily_banned.contains(peer_id)
     }
 
     /// Process new connection and return boolean indicating if the peer limit was reached.
@@ -584,6 +586,15 @@ impl PeerManager {
     /// Create [PeerExchangeMap] for exchange with peers.
     pub(crate) fn peers_for_exchange(&self) -> PeerExchangeMap {
         self.peers.peer_exchange()
+    }
+
+    /// Temporarily ban a peer to prevent immediate reconnection attempts.
+    ///
+    /// This is called when receiving peer exchange from a peer that rejected us.
+    /// The peer is banned for the configured `excess_peers_reconnection_timeout`.
+    pub(crate) fn temporarily_ban_peer(&mut self, peer_id: PeerId) {
+        debug!(target: "peer-manager", ?peer_id, "temporarily banning peer after receiving px");
+        self.temporarily_banned.insert(peer_id);
     }
 
     /// Return the score for a peer if they exist.

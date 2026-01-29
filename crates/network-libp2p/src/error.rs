@@ -3,7 +3,6 @@
 use libp2p::{
     gossipsub::{ConfigBuilderError, PublishError, SubscriptionError},
     kad::GetRecordError,
-    request_response::OutboundFailure,
     swarm::DialError,
     TransportError,
 };
@@ -62,9 +61,9 @@ pub enum NetworkError {
     /// Libp2p `ResponseChannel` already closed due to timeout or loss of connection.
     #[error("Response channel closed.")]
     SendResponse,
-    /// Failed to send request/response outbound to peer.
-    #[error("Outbound failure: {0}")]
-    Outbound(#[from] OutboundFailure),
+    /// Stream error.
+    #[error("Stream error: {0}")]
+    Stream(String),
     /// Failed to create gossipsub behavior.
     #[error("{0}")]
     GossipBehavior(&'static str),

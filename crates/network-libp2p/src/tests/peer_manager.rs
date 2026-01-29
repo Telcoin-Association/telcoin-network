@@ -426,7 +426,7 @@ async fn test_temporarily_banned_peer() {
     );
 
     // Verify peer is temporarily banned
-    assert!(peer_manager.peer_banned(&peer_id), "Peer should be temporarily banned");
+    assert!(peer_manager.peer_temporarily_banned(&peer_id), "Peer should be temporarily banned");
 
     // sleep for temp ban duration
     let _ = sleep(temp_ban_duration * 2).await;
@@ -446,8 +446,11 @@ async fn test_temporarily_banned_peer() {
         "Expected peer is unbanned"
     );
 
-    // Verify peer is no longer banned
-    assert!(!peer_manager.peer_banned(&peer_id), "Peer should not be banned after heartbeat");
+    // Verify peer is no longer temporarily banned
+    assert!(
+        !peer_manager.peer_temporarily_banned(&peer_id),
+        "Peer should not be temporarily banned after heartbeat"
+    );
 }
 
 #[tokio::test]
