@@ -26,7 +26,6 @@ prometheus = { workspace = true }
 eyre = { workspace = true }
 tn-network-libp2p = { workspace = true }
 serde = { workspace = true }
-consensus-metrics = { workspace = true }
 rand = { workspace = true, optional = true }
 
 [dev-dependencies]

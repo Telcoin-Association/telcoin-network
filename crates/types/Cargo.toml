@@ -45,6 +45,9 @@ hex = { workspace = true }
 tracing-subscriber = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
 
+[dev-dependencies]
+serde_json = { workspace = true }
+
 [features]
 default = []
 test-utils = ["tracing-subscriber", "clap"]

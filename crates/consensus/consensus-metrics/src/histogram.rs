@@ -1,6 +1,5 @@
 //! Histogram
 
-use crate::monitored_scope;
 use futures::FutureExt;
 use parking_lot::Mutex;
 use prometheus::{
@@ -253,7 +252,6 @@ impl HistogramCollector {
 
 impl HistogramReporter {
     fn report(&mut self, labeled_data: HashMap<HistogramLabels, Vec<Point>>) {
-        let _scope = monitored_scope("HistogramReporter::report");
         let mut reset_labels = self.known_labels.clone();
         for (label, mut data) in labeled_data {
             self.known_labels.insert(label.clone());

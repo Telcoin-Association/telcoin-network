@@ -8,7 +8,6 @@ use crate::{
     state_sync::CertificateManagerCommand,
     ConsensusBus,
 };
-use consensus_metrics::monitored_scope;
 use std::{collections::HashSet, sync::Arc, time::Instant};
 use tn_config::ConsensusConfig;
 use tn_storage::CertificateStore;
@@ -87,10 +86,7 @@ where
     }
 
     fn gc_round(&self) -> Round {
-        gc_round(
-            *self.consensus_bus.committed_round_updates().borrow(),
-            self.config.config().parameters.gc_depth,
-        )
+        gc_round(self.consensus_bus.committed_round(), self.config.config().parameters.gc_depth)
     }
 
     /// Validate certificate.
@@ -205,7 +201,7 @@ where
         // return error if certificate round is too far ahead
         //
         // trigger certificate fetching
-        let highest_processed_round = *self.consensus_bus.committed_round_updates().borrow();
+        let highest_processed_round = self.consensus_bus.committed_round();
         for cert in &certificates {
             // Initiate asynchronous batch downloads for any payloads referenced in this certificate
             // that are not yet available locally. This step is critical for maintaining data
@@ -283,7 +279,6 @@ where
         &self,
         certificates: Vec<Certificate>,
     ) -> CertManagerResult<()> {
-        let _scope = monitored_scope("primary::cert_validator");
         let certificates = self.verify_collection(certificates).await?;
 
         // update metrics

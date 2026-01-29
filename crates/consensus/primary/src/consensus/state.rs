@@ -4,7 +4,6 @@ use crate::{
     consensus::{bullshark::Bullshark, utils::gc_round, ConsensusError, ConsensusMetrics},
     ConsensusBus, NodeMode,
 };
-use consensus_metrics::monitored_future;
 use std::{
     cmp::{max, Ordering},
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -355,11 +354,8 @@ impl<DB: Database> Consensus<DB> {
 
         // Only run the consensus task if we are an active CVV.
         // Active means we are participating in consensus.
-        if consensus_bus.node_mode().borrow().is_active_cvv() {
-            task_manager.spawn_critical_task(
-                "consensus task",
-                monitored_future!(s.run(), "Consensus", INFO),
-            );
+        if consensus_bus.is_active_cvv() {
+            task_manager.spawn_critical_task("consensus task", s.run());
         }
     }
 
