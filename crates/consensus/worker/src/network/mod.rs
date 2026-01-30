@@ -334,6 +334,18 @@ where
                     },
                 );
             }
+            NetworkEvent::InboundSyncStream { peer, stream, header } => {
+                // Handle inbound sync stream for batch synchronization
+                // TODO: Implement batch sync stream handling
+                debug!(
+                    target: "worker::network",
+                    ?peer,
+                    resource_id = header.resource_id,
+                    request_id = header.request_id,
+                    "inbound sync stream received - not yet implemented"
+                );
+                drop(stream);
+            }
         }
     }
 

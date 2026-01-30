@@ -11,7 +11,7 @@ use libp2p::{
         store::{Error, MemoryStoreConfig, RecordStore},
         ProviderRecord, Record, RecordKey,
     },
-    Multiaddr, PeerId,
+    Multiaddr, PeerId, StreamProtocol,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::{serde_as, DeserializeAs, SerializeAs};
@@ -20,6 +20,9 @@ use tn_storage::tables::{
     KadProviderRecords, KadRecords, KadWorkerProviderRecords, KadWorkerRecords,
 };
 use tn_types::{decode, encode, BlockHash, Database, DefaultHashFunction};
+
+/// The TN-specific kad protocol.
+pub(crate) const DEFAULT_KAD_PROTO_NAME: StreamProtocol = StreamProtocol::new("/tn-kad/1.0.0");
 
 /// A record stored in the DHT.
 /// This is a "shadow" struct for a kad Record so we can serialize/deserialize

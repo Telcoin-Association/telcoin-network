@@ -23,7 +23,7 @@ use tn_types::{
     TnReceiver, TnSender, Vote,
 };
 use tokio::sync::{mpsc, oneshot};
-use tracing::warn;
+use tracing::{debug, warn};
 pub mod handler;
 mod message;
 pub use message::ConsensusResult;
@@ -348,6 +348,18 @@ where
                 self.task_spawner.spawn_task("report request error", async move {
                     let _ = network_handle.handle.send_response(err, channel).await;
                 });
+            }
+            NetworkEvent::InboundSyncStream { peer, stream, header } => {
+                // Handle inbound sync stream for epoch synchronization
+                // TODO: Implement epoch sync stream handling
+                debug!(
+                    target: "primary::network",
+                    ?peer,
+                    resource_id = header.resource_id,
+                    request_id = header.request_id,
+                    "inbound sync stream received - not yet implemented"
+                );
+                drop(stream);
             }
         }
     }
