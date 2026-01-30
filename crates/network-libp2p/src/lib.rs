@@ -21,6 +21,7 @@ mod consensus;
 pub mod error;
 pub mod kad;
 mod peers;
+mod stream;
 pub mod types;
 
 // export types
