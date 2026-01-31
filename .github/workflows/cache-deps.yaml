@@ -1,0 +1,37 @@
+name: Warm dependency cache
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+
+env:
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-D warnings -D unused_extern_crates"
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  warm-cache:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install nightly toolchain
+        run: |
+          rustup toolchain install nightly-2025-11-04
+          rustup default nightly-2025-11-04
+
+      - name: Remove local dev cargo config
+        run: rm -f .cargo/config.toml
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
+        with:
+          shared-key: shared-cache-key
+          cache-on-failure: "true"
+
+      - name: Build to populate cache
+        run: cargo check --locked --all-targets
