@@ -1,0 +1,31 @@
+[build]
+rustc-wrapper = "sccache"
+
+[target.x86_64-unknown-linux-gnu]
+# mold linker - faster linking
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[profile.dev]
+# Reduce debuginfo - major I/O savings on HDD
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+opt-level = 0
+# Incremental compilation for faster rebuilds
+incremental = true
+codegen-units = 256
+
+[profile.dev.package."*"]
+# Optimize dependencies (compiled once, cached)
+opt-level = 2
+debug = false
+
+[profile.test]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+# Incremental compilation for faster rebuilds
+incremental = true
+codegen-units = 256
+
+[profile.test.package."*"]
+opt-level = 2
+debug = false

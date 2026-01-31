@@ -18,5 +18,19 @@ tn-types = { workspace = true }
 tn-config = { workspace = true }
 tn-primary = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros"] }
+tn-storage = { workspace = true }
+tn-test-utils-committee = { workspace = true }
+tn-test-utils = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+tn-types = { workspace = true }
+
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
+
 [lints]
 workspace = true
