@@ -164,7 +164,11 @@ impl PositionIndex {
 impl Index<u64> for PositionIndex {
     fn save(&mut self, key: u64, record_pos: u64) -> Result<(), AppendError> {
         if self.len() != key as usize {
-            Err(AppendError::SerializeValue("must add the next item by position".to_string()))
+            Err(AppendError::SerializeValue(format!(
+                "{} must add the next item by position, expected {} got {key}",
+                self.pdx_file.path().to_string_lossy(),
+                self.len()
+            )))
         } else {
             self.pdx_file.write_all(&record_pos.to_le_bytes())?;
             self.file_len += 8;
