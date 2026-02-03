@@ -73,11 +73,13 @@ proptest! {
     #[test]
     fn prop_penalty_increases_with_lower_usage(
         gas_limit in MIN_GAS_LIMIT_THRESHOLD * 2..30_000_000u64,
-        usage_pct_high in 1u64..USAGE_THRESHOLD_PCT,
+        usage_pct_high in 2u64..USAGE_THRESHOLD_PCT,
         usage_delta in 1u64..10
     ) {
+        // usage_pct_high >= 2 guarantees usage_pct_low < usage_pct_high:
+        // - if delta < high: low = high - delta >= 1, and low <= high - 1 < high
+        // - if delta >= high: saturating_sub yields 0, max(1) = 1 < high (since high >= 2)
         let usage_pct_low = usage_pct_high.saturating_sub(usage_delta).max(1);
-        prop_assume!(usage_pct_low < usage_pct_high);
 
         let gas_used_high = (gas_limit * usage_pct_high) / 100;
         let gas_used_low = (gas_limit * usage_pct_low) / 100;

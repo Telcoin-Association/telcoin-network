@@ -106,7 +106,7 @@ test-faucet:
 
 # run restart integration tests
 test-restarts:
-	cargo nextest run --filter 'test_restarts' --run-ignored all ;
+	cargo nextest run --run-ignored all test_restarts ;
 
 # run tests with coverage (using llvm-cov + nextest)
 coverage:
@@ -176,8 +176,8 @@ revert-submodule:
 # workspace tests that don't require faucet credentials
 public-tests:
 	cargo nextest run --workspace --exclude tn-faucet --no-fail-fast ;
-	cargo nextest run -p telcoin-network --test it --filter 'test_epoch_boundary' --run-ignored all ;
-	cargo nextest run --filter 'test_restarts' --run-ignored all ;
+	cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
+	cargo nextest run --run-ignored all test_restarts ;
 
 # local checks to ensure PR is ready
 pr:

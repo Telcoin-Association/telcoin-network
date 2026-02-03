@@ -76,6 +76,26 @@ We recommend looking through existing tests as a helpful guide to creating new o
 **make fmt**: Preffered format checks using nightly rust.
 **make clippy**: Prefferred lint check using nightly rust.
 
+#### Optional: Faster local builds
+
+For faster compile and link times, you can add these to your **personal** `~/.cargo/config.toml` (not the project config):
+
+**sccache** (compilation cache, all platforms):
+```toml
+[build]
+rustc-wrapper = "sccache"
+```
+Install: `cargo install sccache --locked`
+
+**mold linker** (faster linking, Linux only):
+```toml
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+```
+Install: `sudo apt install mold` (or see [mold releases](https://github.com/rui314/mold))
+
+These are not required -- the project builds without them. The project `.cargo/config.toml` already includes optimized profile settings (dependency opt-level=2, reduced debuginfo) that benefit all developers automatically.
+
 #### Commits
 
 There is no limit to the number of commits a PR may have, but we recommend squashing commits that are used as "checkpoint" during development to help maintainers review your PR.

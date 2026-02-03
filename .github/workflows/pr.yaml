@@ -15,6 +15,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
   # maintainers test and attest locally
@@ -72,13 +73,8 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
         with:
-          shared-key: shared-cache-key
+          shared-key: clippy-cache
           cache-on-failure: "true"
-
-      # .cargo/config.toml is for local dev (opt-level=2 for deps, sccache, mold)
-      # remove it in CI to use cargo defaults and avoid 5x slower builds
-      - name: Remove local dev cargo config
-        run: rm -f .cargo/config.toml
 
       - name: Run clippy
         run: cargo clippy --locked --all --all-features -- -D warnings
@@ -109,11 +105,8 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
         with:
-          shared-key: shared-cache-key
+          shared-key: test-cache
           cache-on-failure: "true"
-
-      - name: Remove local dev cargo config
-        run: rm -f .cargo/config.toml
 
       - name: Run tests
         run: cargo nextest run --locked --workspace --exclude tn-faucet --no-fail-fast --profile ci
