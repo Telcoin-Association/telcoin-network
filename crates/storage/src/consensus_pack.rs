@@ -7,15 +7,19 @@ use std::{
     fmt::Display,
     hash::BuildHasherDefault,
     io::{self, Read, Seek},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
+    thread::JoinHandle,
 };
 
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tn_types::{
     Batch, BlockHash, BlockNumHash, BlsPublicKey, CertifiedBatch, Committee, ConsensusHeader,
     ConsensusOutput, Database, Epoch, EpochRecord, B256,
+};
+use tokio::sync::{
+    mpsc::{self, Receiver, Sender},
+    oneshot, watch,
 };
 
 use crate::{
@@ -80,13 +84,191 @@ impl PackRecord {
     }
 }
 
-/// Manage a single pack file of consensus data (typically one epoch os the consensus chain).
-#[derive(Debug, Clone)]
-pub struct ConsensusPack<DB: Database> {
-    inner: Arc<RwLock<Inner<DB>>>,
+enum PackMessage {
+    ConsensusOutput(ConsensusOutput),
+    ContainsConsensusHeaderNumber(u64, oneshot::Sender<bool>),
+    ContainsConsensusHeader(B256, oneshot::Sender<bool>),
+    ConsensusHeader(B256, oneshot::Sender<Option<ConsensusHeader>>),
 }
 
-impl<DB: Database> ConsensusPack<DB> {
+/// Manage a single pack file of consensus data (typically one epoch os the consensus chain).
+#[derive(Debug, Clone)]
+pub struct ConsensusPack {
+    tx: Sender<PackMessage>,
+    _handle: Arc<JoinHandle<()>>,
+    error: watch::Receiver<Option<PackError>>,
+}
+
+fn run_pack_loop(
+    mut inner: Inner,
+    mut rx: Receiver<PackMessage>,
+    tx_error: watch::Sender<Option<PackError>>,
+) {
+    // When this returns None then the channel is consumed and closed, so exit the thread.
+    while let Some(msg) = rx.blocking_recv() {
+        match msg {
+            PackMessage::ConsensusOutput(output) => {
+                if let Err(e) = inner.save_consensus_output(&output) {
+                    tx_error.send_replace(Some(e));
+                }
+            }
+            PackMessage::ContainsConsensusHeaderNumber(number, tx) => {
+                let _ = tx.send(inner.contains_consensus_header_number(number));
+            }
+            PackMessage::ContainsConsensusHeader(digest, tx) => {
+                let _ = tx.send(inner.contains_consensus_header(digest));
+            }
+            PackMessage::ConsensusHeader(digest, tx) => {
+                let _ = tx.send(inner.consensus_header_by_digest(digest));
+            }
+        }
+    }
+}
+
+impl ConsensusPack {
+    /// Opens a new epoch pack for append.  Will create a new set of epoch static
+    /// files to write consensus output into if they do not exist.
+    pub fn open_append<P: Into<PathBuf>>(
+        path: P,
+        epoch: Epoch,
+        previous_epoch: EpochRecord,
+    ) -> Result<ConsensusPack, PackError> {
+        let (tx, rx) = mpsc::channel(1000);
+        let path: PathBuf = path.into();
+        let (tx_error, error) = watch::channel(None);
+        let handle =
+            std::thread::spawn(move || match Inner::open_append(path, epoch, &previous_epoch) {
+                Ok(inner) => {
+                    run_pack_loop(inner, rx, tx_error);
+                }
+                Err(e) => {
+                    tx_error.send_replace(Some(e));
+                }
+            });
+        Ok(Self { tx, _handle: Arc::new(handle), error })
+    }
+
+    /// Open up the static files for previous epoch.  These will be read only.
+    pub fn open_static<P: Into<PathBuf>>(
+        path: P,
+        epoch: Epoch,
+    ) -> Result<ConsensusPack, PackError> {
+        let (tx, rx) = mpsc::channel(1000);
+        let path: PathBuf = path.into();
+        let (tx_error, error) = watch::channel(None);
+        let handle = std::thread::spawn(move || match Inner::open_static(path, epoch) {
+            Ok(inner) => {
+                run_pack_loop(inner, rx, tx_error);
+            }
+            Err(e) => {
+                tx_error.send_replace(Some(e));
+            }
+        });
+        Ok(Self { tx, _handle: Arc::new(handle), error })
+    }
+
+    /// Create a new set of epoch static files to write consensus output into.
+    pub fn stream_import<P: Into<PathBuf>, R: Read + Seek + Send + 'static>(
+        path: P,
+        stream: R,
+        epoch: Epoch,
+        previous_epoch: EpochRecord,
+        start_consensus_number: u64,
+    ) -> Result<ConsensusPack, PackError> {
+        let (tx, rx) = mpsc::channel(1000);
+        let path: PathBuf = path.into();
+        let (tx_error, error) = watch::channel(None);
+        let handle = std::thread::spawn(move || {
+            match Inner::stream_import(path, stream, epoch, &previous_epoch, start_consensus_number)
+            {
+                Ok(inner) => {
+                    run_pack_loop(inner, rx, tx_error);
+                }
+                Err(e) => {
+                    tx_error.send_replace(Some(e));
+                }
+            }
+        });
+        Ok(Self { tx, _handle: Arc::new(handle), error })
+    }
+
+    /* XXXX
+    /// Save all the batches and consensus header to the pack file.
+    pub fn save_consensus<DB: Database>(
+        &self,
+        consensus: ConsensusHeader,
+        db: DB,
+    ) -> Result<(), PackError> {
+        Ok(())
+    }
+    */
+
+    /// Return a delayed error value.
+    /// Work is sent to a background thread and any errors are recorded.
+    pub fn get_error(&self) -> Result<(), PackError> {
+        match &*self.error.borrow() {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
+        }
+    }
+
+    /// Save all the batches and consensus header from the ConsensusOutput the pack file.
+    pub fn save_consensus_output(&self, consensus: ConsensusOutput) -> Result<(), PackError> {
+        let _ = self.tx.send(PackMessage::ConsensusOutput(consensus));
+        Ok(())
+    }
+
+    /* XXXX
+    /// Load and return the consensus output form this epoch.
+    pub fn get_consensus_output(
+        &self,
+        number: u64,
+        committee: &Committee,
+    ) -> Result<ConsensusOutput, PackError> {
+    }
+    */
+
+    /// True if consensus header by digest is found by digest.
+    pub async fn contains_consensus_header_number(&self, number: u64) -> bool {
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(PackMessage::ContainsConsensusHeaderNumber(number, tx)).await.is_ok() {
+            rx.await.unwrap_or(false)
+        } else {
+            false
+        }
+    }
+
+    /// True if consensus header by digest is found by digest.
+    pub async fn contains_consensus_header(&self, digest: B256) -> bool {
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(PackMessage::ContainsConsensusHeader(digest, tx)).await.is_ok() {
+            rx.await.unwrap_or(false)
+        } else {
+            false
+        }
+    }
+
+    /// Retrieve a consensus header by digest.
+    pub async fn consensus_header_by_digest(&self, digest: B256) -> Option<ConsensusHeader> {
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(PackMessage::ConsensusHeader(digest, tx)).await.is_ok() {
+            rx.await.unwrap_or(None)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Inner {
+    data: Pack<PackRecord>,
+    consensus_idx: PositionIndex,
+    consensus_digests: HdxIndex,
+    batch_digests: HdxIndex,
+    epoch_meta: EpochMeta,
+}
+
+impl Inner {
     const DATA_NAME: &str = "data";
     const CONSENSUS_POS_NAME: &str = "idx";
     const CONSENSUS_HASH_NAME: &str = "hash";
@@ -94,12 +276,11 @@ impl<DB: Database> ConsensusPack<DB> {
 
     /// Opens a new epoch pack for append.  Will create a new set of epoch static
     /// files to write consensus output into if they do not exist.
-    pub fn open_append<P: AsRef<Path>>(
+    fn open_append<P: AsRef<Path>>(
         path: P,
         epoch: Epoch,
         previous_epoch: &EpochRecord,
-        db: DB,
-    ) -> Result<ConsensusPack<DB>, PackError> {
+    ) -> Result<Self, PackError> {
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
         let _ = std::fs::create_dir_all(&base_dir);
         let mut data: Pack<PackRecord> = Pack::open(base_dir.join(Self::DATA_NAME), false)?;
@@ -136,23 +317,11 @@ impl<DB: Database> ConsensusPack<DB> {
         let batch_digests =
             HdxIndex::open_hdx_file(base_dir.join(Self::BATCH_HASH_NAME), data.header(), builder)
                 .map_err(OpenError::IndexFileOpen)?;
-        Ok(Self {
-            inner: Arc::new(RwLock::new(Inner {
-                db: Some(db),
-                data,
-                consensus_idx,
-                consensus_digests,
-                batch_digests,
-                epoch_meta,
-            })),
-        })
+        Ok(Self { data, consensus_idx, consensus_digests, batch_digests, epoch_meta })
     }
 
     /// Open up the static files for previous epoch.  These will be read only.
-    pub fn open_static<P: AsRef<Path>>(
-        path: P,
-        epoch: Epoch,
-    ) -> Result<ConsensusPack<DB>, PackError> {
+    fn open_static<P: AsRef<Path>>(path: P, epoch: Epoch) -> Result<Self, PackError> {
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
 
         let mut data = Pack::<PackRecord>::open(base_dir.join(Self::DATA_NAME), true)?;
@@ -175,27 +344,17 @@ impl<DB: Database> ConsensusPack<DB> {
             HdxIndex::open_hdx_file(base_dir.join(Self::BATCH_HASH_NAME), data.header(), builder)
                 .map_err(OpenError::IndexFileOpen)?;
 
-        Ok(Self {
-            inner: Arc::new(RwLock::new(Inner {
-                db: None,
-                data,
-                consensus_idx,
-                consensus_digests,
-                batch_digests,
-                epoch_meta,
-            })),
-        })
+        Ok(Self { data, consensus_idx, consensus_digests, batch_digests, epoch_meta })
     }
 
     /// Create a new set of epoch static files to write consensus output into.
-    pub fn stream_import<P: AsRef<Path>, R: Read + Seek>(
+    fn stream_import<P: AsRef<Path>, R: Read + Seek>(
         path: P,
         stream: R,
         epoch: Epoch,
         previous_epoch: &EpochRecord,
         start_consensus_number: u64,
-        db: DB,
-    ) -> Result<ConsensusPack<DB>, PackError> {
+    ) -> Result<Self, PackError> {
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
         let mut stream_iter = PackIter::<PackRecord, R>::open(stream)
             .map_err(|e| PackError::ReadError(e.to_string()))?;
@@ -280,64 +439,50 @@ impl<DB: Database> ConsensusPack<DB> {
                 }
             }
         }
-        Ok(Self {
-            inner: Arc::new(RwLock::new(Inner {
-                db: Some(db),
-                data,
-                consensus_idx,
-                consensus_digests,
-                batch_digests,
-                epoch_meta,
-            })),
-        })
+        Ok(Self { data, consensus_idx, consensus_digests, batch_digests, epoch_meta })
     }
 
     /// Save all the batches and consensus header to the pack file.
-    pub fn save_consensus(&self, consensus: ConsensusHeader) -> Result<(), PackError> {
-        let mut guard = self.inner.write();
+    fn _save_consensus<DB: Database>(
+        &mut self,
+        consensus: ConsensusHeader,
+        db: DB,
+    ) -> Result<(), PackError> {
         let mut batches = Vec::new();
-        if let Some(db) = &guard.db {
-            // Collect all the batches for the consensus header.
-            for cert in &consensus.sub_dag.certificates {
-                for (batch_digest, _) in cert.header().payload() {
-                    match db
-                        .get::<Batches>(batch_digest)
-                        .map_err(|e| PackError::BatchLoad(e.to_string()))?
-                    {
-                        Some(batch) => batches.push((batch_digest, batch)),
-                        None => return Err(PackError::MissingBatch),
-                    }
+        // Collect all the batches for the consensus header.
+        for cert in &consensus.sub_dag.certificates {
+            for (batch_digest, _) in cert.header().payload() {
+                match db
+                    .get::<Batches>(batch_digest)
+                    .map_err(|e| PackError::BatchLoad(e.to_string()))?
+                {
+                    Some(batch) => batches.push((batch_digest, batch)),
+                    None => return Err(PackError::MissingBatch),
                 }
             }
-        } else {
-            return Err(PackError::ReadOnly);
         }
         // Save all the required batcdhes into the pack file.
         for (batch_digest, batch) in batches.drain(..) {
-            let position = guard
+            let position = self
                 .data
                 .append(&PackRecord::Batch(batch))
                 .map_err(|e| PackError::Append(e.to_string()))?;
-            guard
-                .batch_digests
+            self.batch_digests
                 .save(batch_digest.as_slice(), position)
                 .map_err(|e| PackError::IndexAppend(e.to_string()))?;
         }
         // Now save the consensus header.
         let consensus_digest = consensus.digest();
         let consensus_number = consensus.number;
-        let position = guard
+        let position = self
             .data
             .append(&PackRecord::Consensus(Box::new(consensus)))
             .map_err(|e| PackError::Append(e.to_string()))?;
-        guard
-            .consensus_digests
+        self.consensus_digests
             .save(consensus_digest.as_slice(), position)
             .map_err(|e| PackError::IndexAppend(e.to_string()))?;
-        let consensus_idx =
-            consensus_number.saturating_sub(guard.epoch_meta.start_consensus_number);
-        guard
-            .consensus_idx
+        let consensus_idx = consensus_number.saturating_sub(self.epoch_meta.start_consensus_number);
+        self.consensus_idx
             .save(consensus_idx, position)
             .map_err(|e| PackError::IndexAppend(e.to_string()))?;
 
@@ -345,8 +490,7 @@ impl<DB: Database> ConsensusPack<DB> {
     }
 
     /// Save all the batches and consensus header from the ConsensusOutput the pack file.
-    pub fn save_consensus_output(&self, consensus: &ConsensusOutput) -> Result<(), PackError> {
-        let mut guard = self.inner.write();
+    fn save_consensus_output(&mut self, consensus: &ConsensusOutput) -> Result<(), PackError> {
         let mut batches = BTreeMap::new();
         // We want to make sure batches are saved to the pack in a deterministic order, so
         // collect them in a BTreeMap.  We probably don't actually need this but this
@@ -358,30 +502,26 @@ impl<DB: Database> ConsensusPack<DB> {
         }
         // Save all the required batcdhes into the pack file.
         for (batch_digest, batch) in batches.into_iter() {
-            let position = guard
+            let position = self
                 .data
                 .append(&PackRecord::Batch(batch))
                 .map_err(|e| PackError::Append(e.to_string()))?;
-            guard
-                .batch_digests
+            self.batch_digests
                 .save(batch_digest.as_slice(), position)
                 .map_err(|e| PackError::IndexAppend(e.to_string()))?;
         }
         // Now save the consensus header.
         let consensus_digest = consensus.consensus_header_hash();
         let consensus_number = consensus.number;
-        let position = guard
+        let position = self
             .data
             .append(&PackRecord::Consensus(Box::new(consensus.consensus_header())))
             .map_err(|e| PackError::Append(e.to_string()))?;
-        guard
-            .consensus_digests
+        self.consensus_digests
             .save(consensus_digest.as_slice(), position)
             .map_err(|e| PackError::IndexAppend(e.to_string()))?;
-        let consensus_idx =
-            consensus_number.saturating_sub(guard.epoch_meta.start_consensus_number);
-        guard
-            .consensus_idx
+        let consensus_idx = consensus_number.saturating_sub(self.epoch_meta.start_consensus_number);
+        self.consensus_idx
             .save(consensus_idx, position)
             .map_err(|e| PackError::IndexAppend(e.to_string()))?;
 
@@ -389,18 +529,17 @@ impl<DB: Database> ConsensusPack<DB> {
     }
 
     /// Load and return the consensus output form this epoch.
-    pub fn get_consensus_output(
-        &self,
+    fn _get_consensus_output(
+        &mut self,
         number: u64,
         committee: &Committee,
     ) -> Result<ConsensusOutput, PackError> {
-        let mut guard = self.inner.write();
-        let rec_pos_idx = number.saturating_sub(guard.epoch_meta.start_consensus_number);
-        let position = guard
+        let rec_pos_idx = number.saturating_sub(self.epoch_meta.start_consensus_number);
+        let position = self
             .consensus_idx
             .load(rec_pos_idx)
             .map_err(|e| PackError::ReadError(e.to_string()))?;
-        let header = guard
+        let header = self
             .data
             .fetch(position)
             .map_err(|e| PackError::ReadError(e.to_string()))?
@@ -444,11 +583,11 @@ impl<DB: Database> ConsensusPack<DB> {
 
             // retrieve fetched batch by digest
             for digest in cert.header().payload().keys() {
-                let position = guard
+                let position = self
                     .batch_digests
                     .load(digest.as_slice())
                     .map_err(|e| PackError::ReadError(e.to_string()))?;
-                let batch = guard
+                let batch = self
                     .data
                     .fetch(position)
                     .map_err(|e| PackError::ReadError(e.to_string()))?
@@ -468,46 +607,33 @@ impl<DB: Database> ConsensusPack<DB> {
     }
 
     /// True if consensus header by digest is found by digest.
-    pub fn contains_consensus_header_number(&self, number: u64) -> bool {
-        let guard = self.inner.read();
-        number >= guard.epoch_meta.start_consensus_number
-            && number < guard.consensus_idx.len() as u64 + guard.epoch_meta.start_consensus_number
+    fn contains_consensus_header_number(&self, number: u64) -> bool {
+        number >= self.epoch_meta.start_consensus_number
+            && number < self.consensus_idx.len() as u64 + self.epoch_meta.start_consensus_number
     }
 
     /// True if consensus header by digest is found by digest.
-    pub fn contains_consensus_header(&self, digest: B256) -> bool {
-        let mut guard = self.inner.write();
-        guard.consensus_digests.load(digest.as_slice()).is_ok()
+    fn contains_consensus_header(&mut self, digest: B256) -> bool {
+        self.consensus_digests.load(digest.as_slice()).is_ok()
     }
 
     /// Retrieve a consensus header by digest.
-    pub fn consensus_header_by_digest(&self, digest: B256) -> Option<ConsensusHeader> {
-        let mut guard = self.inner.write();
-        let pos = guard.consensus_digests.load(digest.as_slice()).ok()?;
-        let rec = guard.data.fetch(pos).ok()?;
+    fn consensus_header_by_digest(&mut self, digest: B256) -> Option<ConsensusHeader> {
+        let pos = self.consensus_digests.load(digest.as_slice()).ok()?;
+        let rec = self.data.fetch(pos).ok()?;
         rec.into_consensus().ok()
     }
 }
 
-#[derive(Debug)]
-struct Inner<DB: Database> {
-    db: Option<DB>,
-    data: Pack<PackRecord>,
-    consensus_idx: PositionIndex,
-    consensus_digests: HdxIndex,
-    batch_digests: HdxIndex,
-    epoch_meta: EpochMeta,
-}
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum PackError {
-    IO(io::Error),
+    IO(Arc<io::Error>),
     MissingBatch,
     BatchLoad(String),
     EpochLoad(String),
     Append(String),
     IndexAppend(String),
-    Open(OpenError),
+    Open(Arc<OpenError>),
     ReadOnly,
     NotConsensus,
     NotBatch,
@@ -547,6 +673,6 @@ impl Display for PackError {
 
 impl From<OpenError> for PackError {
     fn from(value: OpenError) -> Self {
-        Self::Open(value)
+        Self::Open(Arc::new(value))
     }
 }

@@ -69,7 +69,6 @@ async fn test_epoch_boundary_inner(
     .await?;
 
     // submit txs to: issue NFT, stake, and activate new validator
-    eprintln!("XXXX number of pending tx: {}", txs.len());
     for tx in txs {
         let pending = provider.send_raw_transaction(&tx).await?;
         // Some txns will likely be submitted as epochs switch.
@@ -77,7 +76,6 @@ async fn test_epoch_boundary_inner(
         // no need to re-submit, etc.  If that becomes needed then the
         // missed txns may not be getting re-injected into the mempool.
         debug!(target: "epoch-test", "pending tx: {pending:?}");
-        eprintln!("XXXX pending tx: {pending:?}");
         timeout(Duration::from_secs(5), pending.watch()).await??;
     }
 

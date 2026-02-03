@@ -585,11 +585,12 @@ where
     /// Note, this has to be called correctly or it can lead to double execution.
     async fn replay_missed_consensus(
         &self,
-        missing: Vec<ConsensusHeader>,
         committee: Committee,
         to_engine: &mpsc::Sender<ConsensusOutput>,
-        epoch_pack: &mut ConsensusPack<DB>,
-    ) -> eyre::Result<()> {
+        epoch_pack: &mut Option<ConsensusPack>,
+    ) -> eyre::Result<Option<BlockHash>> {
+        let missing =
+            state_sync::get_missing_consensus(&self.consensus_db, &self.consensus_bus).await?;
         for consensus_header in missing.into_iter() {
             if consensus_header.sub_dag.leader_epoch() != committee.epoch() {
                 error!(target: "epoch-manager", "Crossed epoch boundary with missing execution! expected epoch {} got {}",
@@ -608,13 +609,21 @@ where
                     &committee,
                 )
                 .await?;
+            let result = if consensus_output.committed_at() >= self.epoch_boundary {
+                Some(consensus_output.consensus_header_hash())
+            } else {
+                None
+            };
             if let Err(e) = self.process_output(to_engine, epoch_pack, consensus_output, true).await
             {
                 error!(target: "epoch-manager", "error sending consensus output to engine: {}", e);
                 return Err(e);
             }
+            if result.is_some() {
+                return Ok(result);
+            }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Create the current committee from the current execution state.  Also return the epoch info
@@ -637,6 +646,29 @@ where
         Ok((self.create_committee_from_state(epoch, validators).await?, epoch_info, epoch_start))
     }
 
+    fn get_epoch_pack(&mut self, committee: &Committee) -> eyre::Result<ConsensusPack> {
+        let current_epoch = committee.epoch();
+        let previous_epoch_rec = self
+            .consensus_db
+            .get::<EpochRecords>(&current_epoch.saturating_sub(1))?
+            .unwrap_or_else(|| EpochRecord {
+                // If we can't find the recort then this we should be starting at epoch 0- use this
+                // filler.
+                epoch: 0,
+                committee: committee.bls_keys().iter().copied().collect(),
+                next_committee: committee.bls_keys().iter().copied().collect(),
+                ..Default::default()
+            });
+        let epochs_db_path = self.tn_datadir.epochs_db_path();
+        let _ = std::fs::create_dir_all(&epochs_db_path);
+        Ok(match ConsensusPack::open_append(&epochs_db_path, current_epoch, previous_epoch_rec) {
+            Ok(pack) => pack,
+            Err(e) => {
+                panic!("failed to open pack {e}");
+            }
+        })
+    }
+
     /// Run a single epoch.
     async fn run_epoch(
         &mut self,
@@ -654,39 +686,24 @@ where
         self.last_consensus_header = None;
         // We have not created this epoch's primary yet (no committee) so get it from chain
         // ourselves... Note, any consensus output to replay should be in the same epoch...
-        let (committee, _, _) = self.get_committee_with_epoch_start_info(engine).await?;
-        let current_epoch = committee.epoch();
-        let previous_epoch_rec = self
-            .consensus_db
-            .get::<EpochRecords>(&current_epoch.saturating_sub(1))?
-            .unwrap_or_else(|| EpochRecord {
-                // If we can't find the recort then this we should be starting at epoch 0- use this
-                // filler.
-                epoch: 0,
-                committee: committee.bls_keys().iter().copied().collect(),
-                next_committee: committee.bls_keys().iter().copied().collect(),
-                ..Default::default()
-            });
-        let epochs_db_path = self.tn_datadir.epochs_db_path();
-        let _ = std::fs::create_dir_all(&epochs_db_path);
-        let mut epoch_pack = match ConsensusPack::open_append(
-            &epochs_db_path,
-            current_epoch,
-            &previous_epoch_rec,
-            self.consensus_db.clone(),
-        ) {
-            Ok(pack) => pack,
-            Err(e) => {
-                panic!("failed to open pack {e}");
-            }
-        };
+        let (committee, epoch_info, epoch_start) =
+            self.get_committee_with_epoch_start_info(engine).await?;
+        self.epoch_boundary = epoch_start + epoch_info.epochDuration as u64;
+
+        let mut epoch_pack = Some(self.get_epoch_pack(&committee)?);
         if epoch_mode.replay_consensus() {
             // If we are starting up then make sure that any consensus we previously validated goes
             // to the engine and is executed.  Otherwise we could miss consensus execution.
             gas_accumulator.rewards_counter().set_committee(committee.clone());
-            let missing =
-                state_sync::get_missing_consensus(&self.consensus_db, &self.consensus_bus).await?;
-            self.replay_missed_consensus(missing, committee, to_engine, &mut epoch_pack).await?;
+            if let Some(target_hash) =
+                self.replay_missed_consensus(committee, to_engine, &mut epoch_pack).await?
+            {
+                // XXXX- need?
+                // If things go down at exactly the wrong time we might have to replay the epoch end
+                // so account for that.
+                self.close_epoch(None, &gas_accumulator, target_hash).await?;
+                return Ok(RunEpochMode::NewEpoch);
+            }
         }
         // If we are restarting the epoch not on a boundary
         // and we sent some consensus output to the engine
@@ -801,7 +818,7 @@ where
                 let target_hash = res.inspect_err(|e| {
                     error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
                 })?;
-                self.close_epoch(consensus_shutdown.clone(), &gas_accumulator, target_hash)
+                self.close_epoch(Some(consensus_shutdown.clone()), &gas_accumulator, target_hash)
                     .await?;
 
                 // Write the epoch record to DB and save in manager for next epoch.
@@ -864,13 +881,22 @@ where
                 }
             }
         } else {
-            self.send_leftover_consensus_output_to_engine(
-                &mut consensus_output,
-                to_engine,
-                &mut epoch_pack,
-            )
-            .await;
-            res = RunEpochMode::ModeChange;
+            if let Some(target_hash) = self
+                .send_leftover_consensus_output_to_engine(
+                    &mut consensus_output,
+                    to_engine,
+                    &mut epoch_pack,
+                )
+                .await
+            {
+                // If things go down at exactly the wrong time we might have reached the epoch end
+                // so account for that.
+                self.close_epoch(None, &gas_accumulator, target_hash).await?;
+                res = RunEpochMode::NewEpoch;
+                clear_tables_for_next_epoch = true;
+            } else {
+                res = RunEpochMode::ModeChange;
+            }
         }
 
         // clear tables
@@ -884,22 +910,30 @@ where
     async fn process_output(
         &self,
         to_engine: &mpsc::Sender<ConsensusOutput>,
-        epoch_pack: &mut ConsensusPack<DB>,
-        output: ConsensusOutput,
+        epoch_pack: &mut Option<ConsensusPack>,
+        mut output: ConsensusOutput,
         check_contains: bool,
     ) -> eyre::Result<()> {
-        if !check_contains || !epoch_pack.contains_consensus_header_number(output.number)
-        //XXXX- this not working need to figure it out even if we stick with the number approach
-        // !epoch_pack.contains_consensus_header(output.consensus_header_hash())
-        {
-            epoch_pack.save_consensus_output(&output)?;
+        if output.committed_at() >= self.epoch_boundary {
+            // update output so engine closes epoch
+            output.close_epoch = true;
+        }
+        if let Some(epoch_pack) = epoch_pack {
+            if !check_contains || !epoch_pack.contains_consensus_header_number(output.number).await
+            //XXXX- this not working need to figure it out even if we stick with the number
+            // approach !epoch_pack.contains_consensus_header(output.
+            // consensus_header_hash())
+            {
+                epoch_pack.save_consensus_output(output.clone())?; // XXXX get rid of this clone its
+                                                                   // heavy?
+            }
         }
         // only forward the output to the engine
         to_engine.send(output).await?;
         Ok(())
     }
 
-    // If we stopped waiting on the epoch boundary so lets make sure that the consensus queue
+    // We stopped waiting on the epoch boundary so lets make sure that the consensus queue
     // is sent to the engine. If we don't do this it is possible that a quick
     // exit could orphan output (for instance a CVV that is behind).
     // We need to go until all the consensus output in DB has been sent to the engine (if it was
@@ -908,12 +942,21 @@ where
         &mut self,
         consensus_output: &mut impl TnReceiver<ConsensusOutput>,
         to_engine: &mpsc::Sender<ConsensusOutput>,
-        epoch_pack: &mut ConsensusPack<DB>,
-    ) {
+        epoch_pack: &mut Option<ConsensusPack>,
+    ) -> Option<BlockHash> {
         while let Ok(output) = consensus_output.try_recv() {
+            let result = if output.committed_at() >= self.epoch_boundary {
+                Some(output.consensus_header_hash())
+            } else {
+                None
+            };
             // only forward the output to the engine
             let _ = self.process_output(to_engine, epoch_pack, output, false).await;
+            if result.is_some() {
+                return result;
+            }
         }
+        None
     }
 
     /// Record the epoch record for just completed epoch in our DB.
@@ -1222,7 +1265,7 @@ where
         &mut self,
         to_engine: &mpsc::Sender<ConsensusOutput>,
         consensus_output: &mut impl TnReceiver<ConsensusOutput>,
-        epoch_pack: &mut ConsensusPack<DB>,
+        epoch_pack: &mut Option<ConsensusPack>,
     ) -> eyre::Result<B256> {
         // receive output from consensus and forward to engine
         while let Some(mut output) = consensus_output.recv().await {
@@ -1265,17 +1308,14 @@ where
     }
 
     /// Close an epoch after wait_for_epoch_boundary returns.
-    ///
-    /// This is broken out so it can shutdown the epoch tasks and not suffer race conditions
-    /// in the run_epoch() select.
     async fn close_epoch(
         &self,
-        shutdown_consensus: Notifier,
+        shutdown_consensus: Option<Notifier>,
         gas_accumulator: &GasAccumulator,
         target_hash: B256,
     ) -> eyre::Result<()> {
         // begin consensus shutdown while engine executes
-        shutdown_consensus.notify();
+        shutdown_consensus.map(|s| s.notify());
         self.consensus_bus.wait_for_consensus_execution(target_hash).await?;
         self.adjust_base_fees(gas_accumulator);
         gas_accumulator.clear(); // Clear the accumlated values for next epoch.
@@ -1406,7 +1446,6 @@ where
                 ConfigFmt::YAML,
             )?
         } else {
-            // build the committee using kad network
             let mut committee_builder = CommitteeBuilder::new(epoch);
 
             for validator in validators {
