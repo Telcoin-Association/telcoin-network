@@ -9,6 +9,8 @@ use crate::{
     WorkerResponse,
 };
 use futures::AsyncWriteExt as _;
+#[cfg(any(test, feature = "test-utils"))]
+use libp2p::quic::Stream;
 use std::sync::{Arc, LazyLock};
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{GossipMessage, StreamHeader};
@@ -241,23 +243,11 @@ where
         if let Err(e) =
             stream_codec::send_batches_over_stream(&mut stream, store, &request.batch_digests).await
         {
-            warn!(
-                target: "worker::network",
-                %peer,
-                ?e,
-                "failed to send batches over stream"
-            );
+            warn!(target: "worker::network", %peer, ?e, "failed to send batches over stream");
         }
 
-        // close the stream gracefully
-        if let Err(e) = stream.close().await {
-            debug!(
-                target: "worker::network",
-                %peer,
-                ?e,
-                "failed to close stream"
-            );
-        }
+        // attempt to close the stream gracefully
+        let _ = stream.close().await;
 
         Ok(())
     }
@@ -296,5 +286,20 @@ where
         max_response_size: usize,
     ) -> WorkerNetworkResult<Vec<Batch>> {
         self.process_request_batches(batch_digests, max_response_size).await
+    }
+
+    /// Publicly available for tests.
+    /// Sends requested batches over the provided stream.
+    ///
+    /// This is a simplified version for tests that bypasses the pending request mechanism.
+    pub async fn pub_process_request_batches_stream(
+        &self,
+        peer: BlsPublicKey,
+        batch_digests: Vec<BlockHash>,
+        stream: libp2p::Stream,
+        pending_request: Option<PendingBatchStream>,
+        header: StreamHeader,
+    ) -> WorkerNetworkResult<()> {
+        self.process_request_batches_stream(peer, pending_request, stream, header).await
     }
 }

@@ -197,3 +197,170 @@ where
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::io::Cursor;
+    use tn_types::max_batch_size;
+
+    /// Helper to write batch to buffer and return it
+    async fn encode_batch_to_vec(batch: &Batch) -> Vec<u8> {
+        let max_size = max_batch_size(0);
+        let mut output = Vec::new();
+        let mut encode_buffer = Vec::with_capacity(max_size);
+        let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(max_size));
+
+        write_batch(&mut output, batch, &mut encode_buffer, &mut compressed_buffer)
+            .await
+            .expect("write batch");
+        output
+    }
+
+    #[tokio::test]
+    async fn test_write_read_batch_roundtrip() {
+        let batch =
+            Batch { transactions: vec![vec![1, 2, 3], vec![4, 5, 6]], ..Default::default() };
+
+        // write batch
+        let encoded = encode_batch_to_vec(&batch).await;
+
+        // read batch back
+        let max_size = max_batch_size(0);
+        let mut cursor = Cursor::new(encoded);
+        let mut decode_buffer = Vec::with_capacity(max_size);
+        let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(max_size));
+
+        let decoded = read_batch(&mut cursor, &mut decode_buffer, &mut compressed_buffer)
+            .await
+            .expect("read batch");
+
+        assert_eq!(batch, decoded);
+    }
+
+    #[tokio::test]
+    async fn test_write_read_empty_batch_roundtrip() {
+        let batch = Batch::default();
+
+        // write batch
+        let encoded = encode_batch_to_vec(&batch).await;
+
+        // read batch back
+        let max_size = max_batch_size(0);
+        let mut cursor = Cursor::new(encoded);
+        let mut decode_buffer = Vec::with_capacity(max_size);
+        let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(max_size));
+
+        let decoded = read_batch(&mut cursor, &mut decode_buffer, &mut compressed_buffer)
+            .await
+            .expect("read batch");
+
+        assert_eq!(batch, decoded);
+    }
+
+    #[tokio::test]
+    async fn test_write_read_multiple_batches() {
+        let batches = vec![
+            Batch { transactions: vec![vec![1, 2, 3]], ..Default::default() },
+            Batch { transactions: vec![vec![4, 5, 6]], ..Default::default() },
+            Batch { transactions: vec![vec![7, 8, 9]], ..Default::default() },
+        ];
+
+        // write all batches to buffer
+        let max_size = max_batch_size(0);
+        let mut output = Vec::new();
+        let mut encode_buffer = Vec::with_capacity(max_size);
+        let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(max_size));
+
+        for batch in &batches {
+            write_batch(&mut output, batch, &mut encode_buffer, &mut compressed_buffer)
+                .await
+                .expect("write batch");
+        }
+
+        // read all batches back
+        let mut cursor = Cursor::new(output);
+        let mut decode_buffer = Vec::with_capacity(max_size);
+        let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(max_size));
+
+        for expected in &batches {
+            let decoded = read_batch(&mut cursor, &mut decode_buffer, &mut compressed_buffer)
+                .await
+                .expect("read batch");
+            assert_eq!(*expected, decoded);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_batch_stream_closed() {
+        // empty buffer - should fail with StreamClosed
+        let max_size = max_batch_size(0);
+        let mut cursor = Cursor::new(Vec::new());
+        let mut decode_buffer = Vec::with_capacity(max_size);
+        let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(max_size));
+
+        let result = read_batch(&mut cursor, &mut decode_buffer, &mut compressed_buffer).await;
+        assert!(matches!(result, Err(WorkerNetworkError::StreamClosed)));
+    }
+
+    #[tokio::test]
+    async fn test_read_batch_exceeds_max_size() {
+        // Create a buffer with an oversized length prefix
+        let max_size = max_batch_size(0);
+        let oversized_len = (max_size + 1) as u32;
+        let mut buffer = oversized_len.to_le_bytes().to_vec();
+        // Add a dummy compressed length
+        buffer.extend_from_slice(&100u32.to_le_bytes());
+
+        let mut cursor = Cursor::new(buffer);
+        let mut decode_buffer = Vec::with_capacity(max_size);
+        let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(max_size));
+
+        let result = read_batch(&mut cursor, &mut decode_buffer, &mut compressed_buffer).await;
+        assert!(matches!(result, Err(WorkerNetworkError::InvalidRequest(_))));
+    }
+
+    #[tokio::test]
+    async fn test_read_chunk_count() {
+        let count = 42u32;
+        let buffer = count.to_le_bytes().to_vec();
+        let mut cursor = Cursor::new(buffer);
+
+        let result = read_chunk_count(&mut cursor).await.expect("read chunk count");
+        assert_eq!(result, count);
+    }
+
+    #[tokio::test]
+    async fn test_read_chunk_count_stream_closed() {
+        let mut cursor = Cursor::new(Vec::new());
+        let result = read_chunk_count(&mut cursor).await;
+        assert!(matches!(result, Err(WorkerNetworkError::StreamClosed)));
+    }
+
+    #[tokio::test]
+    async fn test_wire_format_structure() {
+        // Verify the wire format is: [4-byte uncompressed len][4-byte compressed len][compressed data]
+        let batch = Batch { transactions: vec![vec![1, 2, 3]], ..Default::default() };
+        let encoded = encode_batch_to_vec(&batch).await;
+
+        // Read the length prefixes
+        let uncompressed_len = u32::from_le_bytes(encoded[0..4].try_into().unwrap()) as usize;
+        let compressed_len = u32::from_le_bytes(encoded[4..8].try_into().unwrap()) as usize;
+
+        // Verify total length
+        assert_eq!(encoded.len(), 8 + compressed_len);
+
+        // Verify we can decompress the data
+        let compressed_data = &encoded[8..];
+        assert_eq!(compressed_data.len(), compressed_len);
+
+        // Decompress and verify size matches
+        let mut decoder = FrameDecoder::new(std::io::Cursor::new(compressed_data));
+        let mut decompressed = vec![0u8; uncompressed_len];
+        decoder.read_exact(&mut decompressed).expect("decompress");
+
+        // Verify BCS decoding works
+        let decoded: Batch = bcs::from_bytes(&decompressed).expect("bcs decode");
+        assert_eq!(batch, decoded);
+    }
+}

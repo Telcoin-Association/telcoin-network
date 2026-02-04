@@ -42,8 +42,9 @@ const MAX_PENDING_BATCH_REQUESTS: usize = 5;
 const PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Tracks a pending batch stream request awaiting stream establishment.
+// pub for IT
 #[derive(Debug)]
-struct PendingBatchStream {
+pub struct PendingBatchStream {
     /// The batch digests requested (looked up from DB when stream arrives).
     batch_digests: Vec<BlockHash>,
     /// When this request was created (for timeout cleanup).
@@ -52,6 +53,14 @@ struct PendingBatchStream {
 
 /// Key for pending requests: (peer_bls, request_digest)
 type PendingBatchRequestKey = (BlsPublicKey, B256);
+
+impl PendingBatchStream {
+    /// Create a new pending batch stream for testing.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn new_for_test(batch_digests: Vec<BlockHash>) -> Self {
+        Self { batch_digests, created_at: Instant::now() }
+    }
+}
 
 /// Handle inter-node communication between primaries.
 #[derive(Debug)]
