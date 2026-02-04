@@ -118,7 +118,7 @@ impl Bullshark {
             return Ok((Outcome::CertificateBelowCommitRound, vec![]));
         }
 
-        self.report_leader_on_time_metrics(round, state);
+        self.update_max_inserted_round(round);
 
         // Try to order the dag to commit. Start from the highest round for which we have at least
         // f+1 certificates. This is because we need them to provide
@@ -353,7 +353,7 @@ impl Bullshark {
         }
     }
 
-    fn report_leader_on_time_metrics(&mut self, certificate_round: Round, _state: &ConsensusState) {
+    fn update_max_inserted_round(&mut self, certificate_round: Round) {
         self.max_inserted_certificate_round =
             self.max_inserted_certificate_round.max(certificate_round);
     }
