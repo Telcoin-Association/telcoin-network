@@ -199,7 +199,7 @@ async fn test_write_all_and_read_all_by_store_type<DB: CertificateStore>(store: 
     let ids = certs.iter().map(|c| c.digest()).collect::<Vec<CertificateDigest>>();
 
     // store them in both main and secondary index
-    store.write_all(certs.clone()).unwrap();
+    store.write_all(certs.iter()).unwrap();
 
     // WHEN
     let result = store.read_all(ids).unwrap();
@@ -231,7 +231,7 @@ async fn test_certificate_store_next_round_number() {
         certs.push(c);
     }
 
-    store.write_all(certs).unwrap();
+    store.write_all(certs.iter()).unwrap();
 
     // THEN
     let mut i = 0;
@@ -254,7 +254,7 @@ async fn test_certificate_store_last_two_rounds() {
     let origin = certs[0].origin().clone();
 
     // store them in both main and secondary index
-    store.write_all(certs).unwrap();
+    store.write_all(certs.iter()).unwrap();
     store.persist::<CertificateDigestByRound>().await;
 
     // WHEN
@@ -314,7 +314,7 @@ async fn test_certificate_store_after_round() {
     tracing::debug!("Storing certificates");
 
     // store them in both main and secondary index
-    store.write_all(certs.clone()).unwrap();
+    store.write_all(certs.iter()).unwrap();
     store.persist::<CertificateDigestByRound>().await; // Let the writes settle
 
     tracing::debug!("Stored certificates: {} seconds", now.elapsed().as_secs_f32());
@@ -397,7 +397,7 @@ async fn test_certificate_store_notify_read() {
         }
 
         // and populate the rest with a write_all
-        store.write_all(certs).unwrap();
+        store.write_all(certs.iter()).unwrap();
 
         // now wait on handle an assert result for a single certificate
         let received_certificate =
@@ -425,7 +425,7 @@ async fn test_certificate_store_write_all_and_clear() {
     let certs = certificates(10);
 
     // store them in both main and secondary index
-    store.write_all(certs).unwrap();
+    store.write_all(certs.iter()).unwrap();
 
     // confirm store is not empty
     assert!(!store.is_empty_certs());
@@ -453,7 +453,7 @@ async fn test_certificate_store_delete_store() {
     let certs = certificates(10);
 
     // store them in both main and secondary index
-    store.write_all(certs.clone()).unwrap();
+    store.write_all(certs.iter()).unwrap();
 
     // WHEN now delete a couple of certificates
     let to_delete = certs.iter().take(2).map(|c| c.digest()).collect::<Vec<_>>();

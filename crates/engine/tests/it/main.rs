@@ -139,17 +139,15 @@ async fn test_empty_output_executes() -> eyre::Result<()> {
     let previous_sub_dag = None;
     leader.header_mut_for_test().author = leader_id;
 
-    let consensus_output = ConsensusOutput {
-        sub_dag: CommittedSubDag::new(
-            vec![leader.clone()],
-            leader,
-            sub_dag_index,
-            reputation_scores,
-            previous_sub_dag,
-        )
-        .into(),
-        ..Default::default()
-    };
+    let sub_dag: Arc<CommittedSubDag> = CommittedSubDag::new(
+        vec![leader.clone()],
+        leader,
+        sub_dag_index,
+        reputation_scores,
+        previous_sub_dag,
+    )
+    .into();
+    let consensus_output = ConsensusOutput::new_with_subdag(sub_dag, BlockHash::default(), 0);
     let consensus_output_hash = consensus_output.consensus_header_hash();
 
     let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
@@ -493,12 +491,14 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         reputation_scores,
         previous_sub_dag,
     ));
-    let consensus_output_1 = ConsensusOutput {
-        sub_dag: subdag_1.clone(),
-        batches: vec![CertifiedBatch { address: batch_producer, batches: batches_1 }],
-        batch_digests: batch_digests_1.clone(),
-        ..Default::default()
-    };
+    let consensus_output_1 = ConsensusOutput::new(
+        subdag_1.clone(),
+        BlockHash::default(),
+        0,
+        false,
+        batch_digests_1.clone(),
+        vec![CertifiedBatch { address: batch_producer, batches: batches_1 }],
+    );
 
     // create second output
     let mut leader_2 = Certificate::default();
@@ -509,7 +509,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     let sub_dag_index_2 = 2;
     leader_2.header.round = sub_dag_index_2 as u32;
     let reputation_scores = ReputationScores::default();
-    let previous_sub_dag = Some(subdag_1.as_ref());
+    let previous_sub_dag = Some(subdag_1.clone());
     let batch_digests_2: VecDeque<BlockHash> = batches_2.iter().map(|b| b.digest()).collect();
     let subdag_2 = CommittedSubDag::new(
         vec![leader_2.clone(), Certificate::default()],
@@ -519,15 +519,14 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         previous_sub_dag,
     )
     .into();
-    let consensus_output_2 = ConsensusOutput {
-        sub_dag: subdag_2,
-        batches: vec![CertifiedBatch { address: batch_producer, batches: batches_2 }],
-        batch_digests: batch_digests_2.clone(),
-        parent_hash: consensus_output_1.consensus_header_hash(),
-        number: 1,
-        close_epoch: true, // close epoch after 2nd output
-        ..Default::default()
-    };
+    let consensus_output_2 = ConsensusOutput::new(
+        subdag_2,
+        consensus_output_1.consensus_header_hash(),
+        1,
+        true,
+        batch_digests_2.clone(),
+        vec![CertifiedBatch { address: batch_producer, batches: batches_2 }],
+    );
     let consensus_output_2_hash = consensus_output_2.consensus_header_hash();
 
     // combine VecDeque and convert to Vec for assertions later
@@ -1002,12 +1001,14 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         reputation_scores,
         previous_sub_dag,
     ));
-    let consensus_output_1 = ConsensusOutput {
-        sub_dag: subdag_1.clone(),
-        batches: vec![CertifiedBatch { address: batch_producer_1, batches: batches_1 }],
-        batch_digests: batch_digests_1.clone(),
-        ..Default::default()
-    };
+    let consensus_output_1 = ConsensusOutput::new(
+        subdag_1.clone(),
+        BlockHash::default(),
+        0,
+        false,
+        batch_digests_1.clone(),
+        vec![CertifiedBatch { address: batch_producer_1, batches: batches_1 }],
+    );
 
     // create second output
     let mut leader_2 = Certificate::default();
@@ -1018,11 +1019,11 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     let sub_dag_index_2 = 2;
     leader_2.header.round = sub_dag_index_2 as u32;
     let reputation_scores = ReputationScores::default();
-    let previous_sub_dag = Some(subdag_1.as_ref());
+    let previous_sub_dag = Some(subdag_1.clone());
     let batch_digests_2: VecDeque<BlockHash> = batches_2.iter().map(|b| b.digest()).collect();
     let mut cert_2 = Certificate::default();
     cert_2.header.round = 2;
-    let subdag_2 = CommittedSubDag::new(
+    let subdag_2: Arc<CommittedSubDag> = CommittedSubDag::new(
         vec![cert_2],
         leader_2,
         sub_dag_index_2,
@@ -1030,15 +1031,14 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         previous_sub_dag,
     )
     .into();
-    let consensus_output_2 = ConsensusOutput {
-        sub_dag: subdag_2,
-        batches: vec![CertifiedBatch { address: batch_producer_2, batches: batches_2 }],
-        batch_digests: batch_digests_2.clone(),
-        parent_hash: consensus_output_1.consensus_header_hash(),
-        number: 1,
-        close_epoch: true,
-        ..Default::default()
-    };
+    let consensus_output_2 = ConsensusOutput::new(
+        subdag_2.clone(),
+        consensus_output_1.consensus_header_hash(),
+        1,
+        true,
+        batch_digests_2.clone(),
+        vec![CertifiedBatch { address: batch_producer_2, batches: batches_2 }],
+    );
     let consensus_output_2_hash = consensus_output_2.consensus_header_hash();
 
     // combine VecDeque and convert to Vec for assertions later
@@ -1381,12 +1381,14 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         reputation_scores,
         previous_sub_dag,
     ));
-    let consensus_output_1 = ConsensusOutput {
-        sub_dag: subdag_1.clone(),
-        batches: vec![CertifiedBatch { address: Address::random(), batches: batches_1 }],
-        batch_digests: batch_digests_1,
-        ..Default::default()
-    };
+    let consensus_output_1 = ConsensusOutput::new(
+        subdag_1.clone(),
+        BlockHash::default(),
+        0,
+        false,
+        batch_digests_1,
+        vec![CertifiedBatch { address: Address::random(), batches: batches_1 }],
+    );
     let consensus_output_1_hash = consensus_output_1.consensus_header_hash();
 
     // create second output
@@ -1396,9 +1398,9 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     let sub_dag_index_2 = 2;
     leader_2.header.round = sub_dag_index_2 as u32;
     let reputation_scores = ReputationScores::default();
-    let previous_sub_dag = Some(subdag_1.as_ref());
+    let previous_sub_dag = Some(subdag_1.clone());
     let batch_digests_2: VecDeque<BlockHash> = batches_2.iter().map(|b| b.digest()).collect();
-    let subdag_2 = CommittedSubDag::new(
+    let subdag_2: Arc<CommittedSubDag> = CommittedSubDag::new(
         vec![Certificate::default()],
         leader_2,
         sub_dag_index_2,
@@ -1406,14 +1408,14 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         previous_sub_dag,
     )
     .into();
-    let consensus_output_2 = ConsensusOutput {
-        sub_dag: subdag_2,
-        batches: vec![CertifiedBatch { address: Address::random(), batches: batches_2 }],
-        batch_digests: batch_digests_2,
-        parent_hash: consensus_output_1.consensus_header_hash(),
-        number: 1,
-        ..Default::default()
-    };
+    let consensus_output_2 = ConsensusOutput::new(
+        subdag_2,
+        consensus_output_1.consensus_header_hash(),
+        1,
+        false,
+        batch_digests_2,
+        vec![CertifiedBatch { address: Address::random(), batches: batches_2 }],
+    );
 
     //=== Execution
 
@@ -1614,12 +1616,14 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
         reputation_scores,
         previous_sub_dag,
     ));
-    let consensus_output = ConsensusOutput {
-        sub_dag: subdag.clone(),
-        batches: vec![CertifiedBatch { address: batch_producer, batches: vec![batch] }],
-        batch_digests: batch_digests.clone(),
-        ..Default::default()
-    };
+    let consensus_output = ConsensusOutput::new(
+        subdag.clone(),
+        BlockHash::default(),
+        0,
+        false,
+        batch_digests.clone(),
+        vec![CertifiedBatch { address: batch_producer, batches: vec![batch] }],
+    );
     let consensus_output_hash = consensus_output.consensus_header_hash();
 
     //=== Execution

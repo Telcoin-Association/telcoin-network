@@ -264,11 +264,11 @@ impl Bullshark {
                 leader.clone(),
                 sub_dag_index,
                 reputation_score.clone(),
-                state.last_committed_sub_dag.as_ref(),
+                state.last_committed_sub_dag.clone(),
             );
 
             // Update the last sub dag
-            state.last_committed_sub_dag = Some(sub_dag.clone());
+            state.last_committed_sub_dag = Some(Arc::new(sub_dag.clone())); // XXXX clone?
 
             committed_sub_dags.push(sub_dag);
 

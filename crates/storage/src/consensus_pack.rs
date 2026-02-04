@@ -2,7 +2,7 @@
 //! Stored per epoch.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashSet, VecDeque},
     error::Error,
     fmt::Display,
     hash::BuildHasherDefault,
@@ -495,7 +495,7 @@ impl Inner {
         // We want to make sure batches are saved to the pack in a deterministic order, so
         // collect them in a BTreeMap.  We probably don't actually need this but this
         // means we do not impose any extra restrictions on consensus output.
-        for cert_batch in &consensus.batches {
+        for cert_batch in consensus.batches() {
             for batch in &cert_batch.batches {
                 batches.insert(batch.digest(), batch.clone());
             }
@@ -512,7 +512,7 @@ impl Inner {
         }
         // Now save the consensus header.
         let consensus_digest = consensus.consensus_header_hash();
-        let consensus_number = consensus.number;
+        let consensus_number = consensus.number();
         let position = self
             .data
             .append(&PackRecord::Consensus(Box::new(consensus.consensus_header())))
@@ -549,34 +549,24 @@ impl Inner {
         let num_blocks = deliver.num_primary_blocks();
         let num_certs = deliver.len();
 
+        let sub_dag = deliver;
         if num_blocks == 0 {
-            return Ok(ConsensusOutput {
-                sub_dag: Arc::new(deliver),
-                parent_hash,
-                number,
-                ..Default::default()
-            });
+            return Ok(ConsensusOutput::new_with_subdag(sub_dag, parent_hash, number));
         }
-
-        let sub_dag = Arc::new(deliver);
-        let mut consensus_output = ConsensusOutput {
-            sub_dag: sub_dag.clone(),
-            batches: Vec::with_capacity(num_certs),
-            parent_hash,
-            number,
-            ..Default::default()
-        };
 
         let mut batch_set: HashSet<BlockHash> = HashSet::new();
 
-        for cert in &sub_dag.certificates {
+        let mut batch_digests = VecDeque::with_capacity(num_certs);
+        for cert in sub_dag.certificates() {
             for (digest, _) in cert.header().payload().iter() {
                 batch_set.insert(*digest);
-                consensus_output.batch_digests.push_back(*digest);
+                //XXXXconsensus_output.batch_digests.push_back(*digest);
+                batch_digests.push_back(*digest);
             }
         }
 
         // map all fetched batches to their respective certificates for applying block rewards
+        let mut batches = Vec::with_capacity(num_certs);
         for cert in &sub_dag.certificates {
             // create collection of batches to execute for this certificate
             let mut cert_batches = Vec::with_capacity(cert.header().payload().len());
@@ -598,12 +588,13 @@ impl Inner {
             let address = committee.authority(cert.origin()).map(|a| a.execution_address());
             if let Some(address) = address {
                 // main collection for execution
-                consensus_output.batches.push(CertifiedBatch { address, batches: cert_batches });
+                //XXXXconsensus_output.batches.push(CertifiedBatch { address, batches: cert_batches });
+                batches.push(CertifiedBatch { address, batches: cert_batches });
             } else {
                 return Err(PackError::MissingAuthority);
             }
         }
-        Ok(consensus_output)
+        Ok(ConsensusOutput::new(sub_dag, parent_hash, number, false, batch_digests, batches))
     }
 
     /// True if consensus header by digest is found by digest.

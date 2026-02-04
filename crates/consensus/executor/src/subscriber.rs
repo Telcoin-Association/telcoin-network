@@ -4,7 +4,7 @@ use crate::{errors::SubscriberResult, SubscriberError};
 use futures::{stream::FuturesOrdered, StreamExt};
 use state_sync::{last_executed_consensus_block, save_consensus, spawn_state_sync};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 use tn_config::ConsensusConfig;
@@ -122,8 +122,8 @@ impl<DB: Database> Subscriber<DB> {
             .await?;
 
         // If we want to rejoin consensus eventually then save certs.
-        let _ = self.config.node_storage().write(consensus_output.sub_dag.leader.clone());
-        let _ = self.config.node_storage().write_all(consensus_output.sub_dag.certificates.clone());
+        let _ = self.config.node_storage().write(consensus_output.sub_dag().leader.clone());
+        let _ = self.config.node_storage().write_all(consensus_output.sub_dag().certificates());
 
         // This save will essentially mark this consensus output as written in stone (added to the
         // consensus chain). This does NOT imply execution although it will be sent off for
@@ -237,7 +237,7 @@ impl<DB: Database> Subscriber<DB> {
 
                     // Record the latest ConsensusHeader, we probably don't need this in this mode but keep it up to date anyway.
                     // Note we don't bother sending this to the consensus header channel since not needed when an active CVV.
-                    if let Err(e) = self.consensus_bus.last_consensus_header().send(Some(ConsensusHeader { parent_hash, sub_dag: sub_dag.clone(), number, extra: B256::default() })) {
+                    if let Err(e) = self.consensus_bus.last_consensus_header().send(Some(ConsensusHeader { parent_hash, sub_dag: Arc::new(sub_dag.clone()), number, extra: B256::default() })) {
                         error!(target: "subscriber", "error sending latest consensus header for authority {:?}: {}", self.inner.authority_id, e);
                         return Err(SubscriberError::ClosedChannel("failed to send last consensus header on bus".to_string()));
                     }
@@ -250,7 +250,7 @@ impl<DB: Database> Subscriber<DB> {
                         error!(target: "subscriber", "error publishing latest consensus to network {:?}: {}", self.inner.authority_id, e);
                     }
                     last_number += 1;
-                    waiting.push_back(self.fetch_batches(sub_dag, parent_hash, number));
+                    waiting.push_back(self.fetch_batches(Arc::new(sub_dag), parent_hash, number));
                 },
 
                 // Receive consensus messages after all transaction data is downloaded
@@ -314,38 +314,25 @@ impl<DB: Database> Subscriber<DB> {
     /// not provide a bogus sub dag...
     async fn fetch_batches(
         &self,
-        deliver: CommittedSubDag,
+        sub_dag: Arc<CommittedSubDag>,
         parent_hash: B256,
         number: u64,
     ) -> SubscriberResult<ConsensusOutput> {
-        let num_blocks = deliver.num_primary_blocks();
-        let num_certs = deliver.len();
+        let num_blocks = sub_dag.num_primary_blocks();
+        let num_certs = sub_dag.len();
 
         if num_blocks == 0 {
             debug!(target: "subscriber", "No blocks to fetch, payload is empty");
-            return Ok(ConsensusOutput {
-                sub_dag: Arc::new(deliver),
-                parent_hash,
-                number,
-                ..Default::default()
-            });
+            return Ok(ConsensusOutput::new_with_subdag(sub_dag, parent_hash, number));
         }
-
-        let sub_dag = Arc::new(deliver);
-        let mut consensus_output = ConsensusOutput {
-            sub_dag: sub_dag.clone(),
-            batches: Vec::with_capacity(num_certs),
-            parent_hash,
-            number,
-            ..Default::default()
-        };
 
         let mut batch_set: HashSet<BlockHash> = HashSet::new();
 
-        for cert in &sub_dag.certificates {
+        let mut batch_digests = VecDeque::with_capacity(num_certs);
+        for cert in sub_dag.certificates() {
             for (digest, _) in cert.header().payload().iter() {
                 batch_set.insert(*digest);
-                consensus_output.batch_digests.push_back(*digest);
+                batch_digests.push_back(*digest);
             }
         }
 
@@ -361,8 +348,9 @@ impl<DB: Database> Subscriber<DB> {
         let mut fetched_batches = self.fetch_batches_from_peers(batch_set).await?;
         drop(fetched_batches_timer);
 
+        let mut batches = Vec::with_capacity(num_certs);
         // map all fetched batches to their respective certificates for applying block rewards
-        for cert in &sub_dag.certificates {
+        for cert in sub_dag.certificates() {
             // create collection of batches to execute for this certificate
             let mut cert_batches = Vec::with_capacity(cert.header().payload().len());
             self.consensus_bus.executor_metrics().subscriber_current_round.set(cert.round() as i64);
@@ -387,13 +375,20 @@ impl<DB: Database> Subscriber<DB> {
             }
 
             // main collection for execution
-            consensus_output.batches.push(CertifiedBatch {
+            batches.push(CertifiedBatch {
                 address: self.authority_execution_address(cert.origin())?,
                 batches: cert_batches,
             });
         }
         debug!(target: "subscriber", "returning output to subscriber");
-        Ok(consensus_output)
+        Ok(ConsensusOutput::new(
+            sub_dag.clone(),
+            parent_hash,
+            number,
+            false,
+            batch_digests,
+            batches,
+        ))
     }
 
     async fn fetch_batches_from_peers(

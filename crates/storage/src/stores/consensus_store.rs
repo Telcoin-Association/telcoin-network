@@ -1,7 +1,7 @@
 //! NOTE: tests for this module are in test-utils storage_tests.rs to avoid circular dependancies.
 
 use crate::tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache};
-use std::{cmp::max, collections::HashMap};
+use std::{cmp::max, collections::HashMap, sync::Arc};
 use tn_types::{
     AuthorityIdentifier, BlockHash, CommittedSubDag, ConsensusHeader, Database, DbTxMut, Epoch,
     Round,
@@ -29,7 +29,7 @@ pub trait ConsensusStore: Clone {
 
     /// Returns the latest subdag committed. If none is committed yet, then
     /// None is returned instead.
-    fn get_latest_sub_dag(&self) -> Option<CommittedSubDag>;
+    fn get_latest_sub_dag(&self) -> Option<Arc<CommittedSubDag>>;
 
     /// Reads from storage the latest commit sub dag from the epoch where its
     /// ReputationScores are marked as "final". If none exists then this
@@ -37,7 +37,7 @@ pub trait ConsensusStore: Clone {
     fn read_latest_commit_with_final_reputation_scores(
         &self,
         epoch: Epoch,
-    ) -> Option<CommittedSubDag>;
+    ) -> Option<Arc<CommittedSubDag>>;
 
     /// Get a ConsensusHeader by hash.
     fn get_consensus_by_hash(&self, hash: BlockHash) -> Option<ConsensusHeader>;
@@ -52,7 +52,7 @@ pub trait ConsensusStore: Clone {
 
 impl<DB: Database> ConsensusStore for DB {
     fn write_subdag_for_test(&self, number: u64, sub_dag: CommittedSubDag) {
-        let header = ConsensusHeader { number, sub_dag, ..Default::default() };
+        let header = ConsensusHeader { number, sub_dag: Arc::new(sub_dag), ..Default::default() };
         let mut txn = self.write_txn().expect("failed to get DB txn");
         txn.insert::<ConsensusBlocks>(&header.number, &header)
             .expect("error saving a consensus header to persistant storage!");
@@ -73,21 +73,18 @@ impl<DB: Database> ConsensusStore for DB {
 
     fn read_last_committed(&self, epoch: Epoch) -> HashMap<AuthorityIdentifier, Round> {
         let mut res = HashMap::new();
-        for (id, round, certs) in
-            self.reverse_iter::<ConsensusBlocks>().take(50).filter_map(|(_, block)| {
-                if block.sub_dag.leader_epoch() == epoch {
-                    Some((
-                        block.sub_dag.leader.origin().clone(),
-                        block.sub_dag.leader_round(),
-                        block.sub_dag.certificates,
-                    ))
-                } else {
-                    None
-                }
-            })
-        {
+        for block in self.reverse_iter::<ConsensusBlocks>().take(50).filter_map(|(_, block)| {
+            if block.sub_dag.leader_epoch() == epoch {
+                Some(block)
+            } else {
+                None
+            }
+        }) {
+            let id = block.sub_dag.leader.origin().clone();
+            let round = block.sub_dag.leader_round();
+            let certs = block.sub_dag.certificates();
             res.entry(id).and_modify(|r| *r = max(*r, round)).or_insert_with(|| round);
-            for c in &certs {
+            for c in certs {
                 res.entry(c.origin().clone())
                     .and_modify(|r| *r = max(*r, c.round()))
                     .or_insert_with(|| c.round());
@@ -96,14 +93,14 @@ impl<DB: Database> ConsensusStore for DB {
         res
     }
 
-    fn get_latest_sub_dag(&self) -> Option<CommittedSubDag> {
+    fn get_latest_sub_dag(&self) -> Option<Arc<CommittedSubDag>> {
         self.last_record::<ConsensusBlocks>().map(|(_, block)| block.sub_dag)
     }
 
     fn read_latest_commit_with_final_reputation_scores(
         &self,
         epoch: Epoch,
-    ) -> Option<CommittedSubDag> {
+    ) -> Option<Arc<CommittedSubDag>> {
         for commit in self.reverse_iter::<ConsensusBlocks>().map(|(_, block)| block.sub_dag) {
             // ignore previous epochs
             if commit.leader_epoch() < epoch {

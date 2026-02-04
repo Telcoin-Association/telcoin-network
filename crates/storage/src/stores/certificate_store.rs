@@ -44,7 +44,10 @@ pub trait CertificateStore {
     /// Inserts multiple certificates in the storage. This is an atomic operation.
     /// In the end it notifies any subscribers that are waiting to hear for the
     /// value.
-    fn write_all(&self, certificates: impl IntoIterator<Item = Certificate>) -> StoreResult<()>;
+    fn write_all<'a>(
+        &self,
+        certificates: impl IntoIterator<Item = &'a Certificate>,
+    ) -> StoreResult<()>;
 
     /// Retrieves a certificate from the store. If not found
     /// then None is returned as result.
@@ -126,7 +129,7 @@ pub trait CertificateStore {
 fn save_cert<TX: DbTxMut>(
     txn: &mut TX,
     digest: CertificateDigest,
-    certificate: Certificate,
+    certificate: &Certificate,
 ) -> StoreResult<()> {
     txn.insert::<Certificates>(&digest, &certificate)?;
 
@@ -175,7 +178,7 @@ impl<DB: Database> CertificateStore for DB {
 
         let id = certificate.digest();
         let round = certificate.round();
-        save_cert(&mut txn, id, certificate)?;
+        save_cert(&mut txn, id, &certificate)?;
 
         txn.commit()?;
         gc_rounds(self, round)?;
@@ -185,7 +188,10 @@ impl<DB: Database> CertificateStore for DB {
     /// Inserts multiple certificates in the storage. This is an atomic operation.
     /// In the end it notifies any subscribers that are waiting to hear for the
     /// value.
-    fn write_all(&self, certificates: impl IntoIterator<Item = Certificate>) -> StoreResult<()> {
+    fn write_all<'a>(
+        &self,
+        certificates: impl IntoIterator<Item = &'a Certificate>,
+    ) -> StoreResult<()> {
         let mut txn = self.write_txn()?;
         let mut round = 0;
         for certificate in certificates {
