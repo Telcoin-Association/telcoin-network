@@ -7,7 +7,13 @@ use crate::{
     state_sync::CertificateManagerCommand, RecentBlocks,
 };
 use parking_lot::Mutex;
-use std::{error::Error, sync::Arc};
+use std::{
+    error::Error,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 use tn_config::Parameters;
 use tn_network_libp2p::types::NetworkEvent;
 use tn_types::{
@@ -29,11 +35,14 @@ use tokio::{
 struct QueChanReceiver<T> {
     receiver: Option<mpsc::Receiver<T>>,
     container: Arc<Mutex<Option<mpsc::Receiver<T>>>>,
+    /// Flag to signal the sender that this receiver has been dropped.
+    subscribed: Arc<AtomicBool>,
 }
 
-/// Use the Drop to decrement subs.
+/// Use the Drop to decrement subs and signal unsubscribed.
 impl<T> Drop for QueChanReceiver<T> {
     fn drop(&mut self) {
+        self.subscribed.store(false, Ordering::Release);
         (*self.container.lock()) = self.receiver.take();
     }
 }
@@ -46,6 +55,9 @@ pub struct QueChannel<T> {
     channel: mpsc::Sender<T>,
     // Putting this in a lock is unfortunate but if want an mpsc under the hood is needed.
     receiver: Arc<Mutex<Option<mpsc::Receiver<T>>>>,
+    /// Tracks whether a receiver is currently subscribed.
+    /// When `false`, `send()` and `try_send()` become no-ops.
+    subscribed: Arc<AtomicBool>,
 }
 
 impl<T> QueChannel<T> {
@@ -53,7 +65,8 @@ impl<T> QueChannel<T> {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         let receiver = Arc::new(Mutex::new(Some(rx)));
-        Self { channel: tx, receiver }
+        let subscribed = Arc::new(AtomicBool::new(false));
+        Self { channel: tx, receiver, subscribed }
     }
 }
 
@@ -65,16 +78,26 @@ impl<T> Default for QueChannel<T> {
 
 impl<T> Clone for QueChannel<T> {
     fn clone(&self) -> Self {
-        Self { channel: self.channel.clone(), receiver: self.receiver.clone() }
+        Self {
+            channel: self.channel.clone(),
+            receiver: self.receiver.clone(),
+            subscribed: self.subscribed.clone(),
+        }
     }
 }
 
 impl<T: Send + 'static> TnSender<T> for QueChannel<T> {
     async fn send(&self, value: T) -> Result<(), tn_types::SendError<T>> {
+        if !self.subscribed.load(Ordering::Acquire) {
+            return Ok(());
+        }
         Ok(self.channel.send(value).await?)
     }
 
     fn try_send(&self, value: T) -> Result<(), tn_types::TrySendError<T>> {
+        if !self.subscribed.load(Ordering::Acquire) {
+            return Ok(());
+        }
         Ok(self.channel.try_send(value)?)
     }
 
@@ -83,7 +106,12 @@ impl<T: Send + 'static> TnSender<T> for QueChannel<T> {
         if receiver.is_none() {
             panic!("Another subscription is already in use!")
         }
-        QueChanReceiver { receiver, container: self.receiver.clone() }
+        self.subscribed.store(true, Ordering::Release);
+        QueChanReceiver {
+            receiver,
+            container: self.receiver.clone(),
+            subscribed: self.subscribed.clone(),
+        }
     }
 }
 
