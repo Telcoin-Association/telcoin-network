@@ -13,6 +13,9 @@ use tracing::{debug, error, field, info, info_span};
 /// Execute output from consensus to extend the canonical chain.
 ///
 /// The function handles all types of output, included multiple blocks and empty blocks.
+/// If the output contains no batches and the epoch is not closing, execution is skipped
+/// entirely and the current canonical header is returned unchanged. The leader count is
+/// still incremented for rewards tracking.
 pub fn execute_consensus_output(
     args: BuildArguments,
     gas_accumulator: GasAccumulator,
@@ -35,6 +38,14 @@ pub fn execute_consensus_output(
     let _guard = span.enter();
     debug!(target: "engine", ?output, "executing output");
 
+    // Skip execution entirely when output contains no batches AND the epoch is not closing.
+    // The leader count has already been incremented above for rewards tracking.
+    if batches.is_empty() && !output.close_epoch {
+        info!(target: "engine", "skipping execution for empty non-epoch-closing output");
+        span.record("executed_blocks", "0");
+        return Ok(canonical_header);
+    }
+
     // assert vecs match
     debug_assert_eq!(
         batches.len(),
@@ -42,7 +53,7 @@ pub fn execute_consensus_output(
         "uneven number of sealed blocks from batches and batch digests"
     );
 
-    // ensure at least 1 block for empty output with no batches
+    // ensure at least 1 block for empty output when close_epoch is true
     let mut executed_blocks = Vec::with_capacity(batches.len().max(1));
     let canonical_in_memory_state = reth_env.canonical_in_memory_state();
 
