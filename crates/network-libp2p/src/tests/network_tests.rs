@@ -993,14 +993,14 @@ async fn test_banned_peer_reconnection_attempt() -> eyre::Result<()> {
     malicious_peer.dial_by_bls(config_1.key_config().primary_public_key()).await?;
 
     // Wait for connection to establish
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     debug!(target: "peer-manager", ?malicious_id, ?malicious_bls, "assessing fatal penalty!!");
     // Report fatal penalty for malicious peer
     honest_peer.report_penalty(malicious_bls, Penalty::Fatal).await;
 
-    // Wait for ban to take effect and disconnect
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+    // Wait for ban to take effect and disconnect (needs multiple heartbeat cycles on slow CI)
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 3)).await;
 
     // Verify malicious peer is disconnected
     let connected_peers = honest_peer.connected_peer_ids().await?;

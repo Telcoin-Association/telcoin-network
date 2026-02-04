@@ -47,6 +47,9 @@ clap = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+proptest = { workspace = true }
+tn-test-utils-committee = { workspace = true }
+tn-storage = { workspace = true }
 
 [features]
 default = []

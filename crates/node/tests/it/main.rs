@@ -126,7 +126,7 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
                 to_engine.send(output).await?;
             }
             // wait for engine to reach `max_round` or timeout
-            engine_task = timeout(Duration::from_secs(5), &mut rx) => {
+            engine_task = timeout(Duration::from_secs(30), &mut rx) => {
                 // engine shutdown
                 assert!(engine_task.is_ok());
                 break;

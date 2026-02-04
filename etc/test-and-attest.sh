@@ -46,6 +46,18 @@ cd "$(dirname "$0")/.."
 
 echo "executing bash script from $(pwd)"
 
+# Check if cargo-nextest is installed
+if ! cargo nextest --version &> /dev/null; then
+    echo "cargo-nextest is not installed."
+    read -p "Would you like to install it? (y/Y to install): " response
+    if [[ "$response" =~ ^[Yy]$ ]]; then
+        cargo install cargo-nextest --locked
+    else
+        echo "cargo-nextest is required to run tests. Exiting."
+        exit 1
+    fi
+fi
+
 # set environment
 CARGO_INCREMENTAL=0 # disable incremental compilation
 RUSTFLAGS="-D warnings -D unused_extern_crates"
@@ -82,13 +94,13 @@ echo "clippy for workspace: default and all features passed"
 # run tests
 #
 # default features
-cargo test --workspace --no-fail-fast -- --show-output
+cargo nextest run --workspace --no-fail-fast
 # Run tests that require credentials.
-cargo test test_with_creds -- --ignored
+cargo nextest run test_with_creds --run-ignored ignored-only
 # run the e2e restart and epoch tests, they are seperate to avoid any port/node confusion
-cargo test -p e2e-tests -- --ignored
+cargo nextest run -p e2e-tests --run-ignored ignored-only
 # faucet it test
-cargo test -p e2e-tests --test it --features faucet --no-fail-fast -- --ignored faucet
+cargo nextest run -p e2e-tests --test it --features faucet --no-fail-fast --run-ignored ignored-only faucet
 
 echo "all checks passed - submitting attestation on-chain..."
 

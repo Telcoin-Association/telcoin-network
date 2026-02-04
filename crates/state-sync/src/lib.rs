@@ -2,6 +2,14 @@
 //! Currently used by nodes that are not participating in consensus
 //! to follow along with consensus and execute blocks.
 
+// Used in tests
+#[cfg(test)]
+use tempfile as _;
+#[cfg(test)]
+use tn_test_utils as _;
+#[cfg(test)]
+use tn_test_utils_committee as _;
+
 use tn_config::ConsensusConfig;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus, NodeMode};
 use tn_storage::{

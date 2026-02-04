@@ -17,6 +17,10 @@
 #![deny(unused_must_use, rust_2018_idioms)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
+// Used in tests
+#[cfg(test)]
+use proptest as _;
+
 use crate::{
     evm::TNEvm,
     traits::{DefaultEthPayloadTypes, TNExecution},
