@@ -37,6 +37,7 @@ use error::{TnRethError, TnRethResult};
 use evm::TnEvmConfig;
 use eyre::OptionExt;
 use jsonrpsee::Methods;
+use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 use reth::{
     args::{
         DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, DiscoveryArgs, EngineArgs, EraArgs,
@@ -227,6 +228,10 @@ pub struct RethCommand {
 pub struct RethConfig(NodeConfig<RethChainSpec>);
 
 const DEFAULT_UNUSED_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+
+/// Minimum number of transactions to justify parallel ECDSA recovery via rayon.
+/// Below this threshold, sequential recovery avoids thread-pool overhead.
+const PARALLEL_RECOVERY_THRESHOLD: usize = 5;
 
 /// All the rpc modules we allow.
 /// Disallow admin, txpool.
@@ -611,17 +616,45 @@ impl RethEnv {
             warn!(target: "engine", %err, "failed to apply pre-execution changes");
         })?;
 
-        for tx_bytes in transactions {
-            let recovered = reth_recover_raw_transaction::<TransactionSigned>(tx_bytes)
-                .inspect_err(|e| {
-                    error!(
-                        target: "engine",
-                        batch=?batch_digest,
-                        ?tx_bytes,
-                        "failed to recover signer: {e}"
-                    )
-                })?;
+        // Phase 1: Recover all transactions (ECDSA ecrecover).
+        // Use rayon for parallel recovery when there are enough transactions
+        // to justify the thread-pool overhead.
+        let recovered_txs = if transactions.len() >= PARALLEL_RECOVERY_THRESHOLD {
+            transactions
+                .par_iter()
+                .map(|tx_bytes| {
+                    reth_recover_raw_transaction::<TransactionSigned>(tx_bytes)
+                        .inspect_err(|e| {
+                            error!(
+                                target: "engine",
+                                batch=?batch_digest,
+                                ?tx_bytes,
+                                "failed to recover signer: {e}"
+                            )
+                        })
+                        .map_err(TnRethError::from)
+                })
+                .collect::<TnRethResult<Vec<_>>>()?
+        } else {
+            transactions
+                .iter()
+                .map(|tx_bytes| {
+                    reth_recover_raw_transaction::<TransactionSigned>(tx_bytes)
+                        .inspect_err(|e| {
+                            error!(
+                                target: "engine",
+                                batch=?batch_digest,
+                                ?tx_bytes,
+                                "failed to recover signer: {e}"
+                            )
+                        })
+                        .map_err(TnRethError::from)
+                })
+                .collect::<TnRethResult<Vec<_>>>()?
+        };
 
+        // Phase 2: Execute recovered transactions sequentially.
+        for recovered in recovered_txs {
             // forks are impossible
             match builder.execute_transaction(recovered.clone()) {
                 Ok(_gas_used) => (),
@@ -1800,6 +1833,57 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn test_parallel_recovery_preserves_order() {
+        use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
+        use tn_types::Encodable2718;
+
+        // Create 20 transactions from different random signers so each tx is unique.
+        let chain: Arc<RethChainSpec> = Arc::new(tn_types::test_genesis().into());
+        let num_txs = 20;
+        let mut encoded_txs = Vec::with_capacity(num_txs);
+        for i in 0..num_txs {
+            let mut factory =
+                TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(i as u64));
+            let tx = factory.create_eip1559(
+                chain.clone(),
+                None,
+                100_000,
+                Some(Address::ZERO),
+                U256::from(1),
+                Default::default(),
+            );
+            encoded_txs.push(tx.encoded_2718());
+        }
+
+        // Recover sequentially
+        let sequential: Vec<_> = encoded_txs
+            .iter()
+            .map(|tx_bytes| {
+                reth_recover_raw_transaction::<TransactionSigned>(tx_bytes)
+                    .expect("sequential recovery")
+            })
+            .collect();
+
+        // Recover in parallel (using rayon, same as production code)
+        let parallel: Vec<_> = encoded_txs
+            .par_iter()
+            .map(|tx_bytes| {
+                reth_recover_raw_transaction::<TransactionSigned>(tx_bytes)
+                    .expect("parallel recovery")
+            })
+            .collect();
+
+        // Assert same length
+        assert_eq!(sequential.len(), parallel.len());
+
+        // Assert same order by comparing tx hashes and recovered signer addresses
+        for (seq, par) in sequential.iter().zip(parallel.iter()) {
+            assert_eq!(seq.hash(), par.hash(), "transaction hashes must match in order");
+            assert_eq!(seq.signer(), par.signer(), "recovered signers must match in order");
+        }
     }
 
     #[test]
