@@ -101,10 +101,10 @@ fn assert_eip2935(reth_env: &RethEnv, block: &SealedBlock) -> eyre::Result<()> {
     Ok(())
 }
 
-/// This tests that a single block is executed if the output from consensus contains no
-/// transactions.
+/// This tests that execution is skipped when consensus output contains no batches
+/// and close_epoch is false (the default).
 #[tokio::test]
-async fn test_empty_output_executes() -> eyre::Result<()> {
+async fn test_empty_output_skips_execution() -> eyre::Result<()> {
     let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
     let tmp_dir = TempDir::new().expect("temp dir");
     // execution node components
@@ -119,16 +119,11 @@ async fn test_empty_output_executes() -> eyre::Result<()> {
     let committee =
         create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
     let leader_id = committee.authorities().first().expect("first authority").id();
-    let expected_beneficiary =
-        committee.authority(&leader_id).expect("leader in committee").execution_address();
     gas_accumulator.rewards_counter().set_committee(committee);
 
     //=== Consensus
     //
-    // create consensus output bc transactions in batches
-    // are randomly generated
-    //
-    // for each tx, seed address with funds in genesis
+    // create empty consensus output with close_epoch: false (default)
     let timestamp = now();
     let mut leader = Certificate::default();
     let sub_dag_index = 0;
@@ -150,6 +145,105 @@ async fn test_empty_output_executes() -> eyre::Result<()> {
         .into(),
         ..Default::default()
     };
+
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
+    let reth_env = execution_node.get_reth_env().await;
+    let max_round = None;
+    let genesis_header = chain.sealed_genesis_header();
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        max_round,
+        from_consensus,
+        genesis_header.clone(),
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator,
+    );
+
+    // send output
+    let broadcast_result = to_engine.send(consensus_output.clone()).await;
+    assert!(broadcast_result.is_ok());
+
+    // drop sending channel to shut engine down
+    drop(to_engine);
+
+    let (tx, rx) = oneshot::channel();
+
+    let canonical_in_memory_state = reth_env.canonical_in_memory_state();
+    assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
+
+    // spawn engine task
+    task_manager.spawn_task("Test task eng", async move {
+        let res = engine.await;
+        let _ = tx.send(res);
+    });
+
+    let engine_task = timeout(Duration::from_secs(10), rx).await??;
+    // consensus output stream closed
+    assert_matches!(engine_task, Err(TnEngineError::ConsensusOutputStreamClosed));
+
+    // assert no blocks were produced - execution was skipped
+    assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
+    let last_block_num = reth_env.last_block_number()?;
+    let canonical_tip = reth_env.canonical_tip();
+
+    // block number stays at 0 (genesis) - no new blocks produced
+    assert_eq!(last_block_num, 0);
+    // canonical tip is still genesis
+    assert_eq!(canonical_tip.hash(), genesis_header.hash());
+
+    Ok(())
+}
+
+/// This tests that a single empty block IS executed when consensus output contains
+/// no batches but close_epoch is true.
+#[tokio::test]
+async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()> {
+    let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+    let tmp_dir = TempDir::new().expect("temp dir");
+    // execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.rewards_counter()),
+    )?;
+    // update rewards counter so execution address is visible
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+    let expected_beneficiary =
+        committee.authority(&leader_id).expect("leader in committee").execution_address();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    //=== Consensus
+    //
+    // create consensus output with no batches but close_epoch: true
+    let timestamp = now();
+    let mut leader = Certificate::default();
+    let sub_dag_index = 0;
+    leader.header.round = sub_dag_index as u32;
+    // update timestamp so it's not default 0
+    leader.header.created_at = timestamp;
+    let reputation_scores = ReputationScores::default();
+    let previous_sub_dag = None;
+    leader.header_mut_for_test().author = leader_id;
+
+    let mut consensus_output = ConsensusOutput {
+        sub_dag: CommittedSubDag::new(
+            vec![leader.clone()],
+            leader,
+            sub_dag_index,
+            reputation_scores,
+            previous_sub_dag,
+        )
+        .into(),
+        ..Default::default()
+    };
+    consensus_output.close_epoch = true;
     let consensus_output_hash = consensus_output.consensus_header_hash();
 
     let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
@@ -199,7 +293,7 @@ async fn test_empty_output_executes() -> eyre::Result<()> {
     assert_eq!(last_block_num, final_block.number);
 
     let expected_block_height = 1;
-    // assert 1 empty block was executed for consensus
+    // assert 1 empty block was executed for consensus (close_epoch forces execution)
     assert_eq!(last_block_num, expected_block_height);
     // assert canonical tip and finalized block are equal
     assert_eq!(canonical_tip.hash(), final_block.hash);
@@ -260,20 +354,117 @@ async fn test_empty_output_executes() -> eyre::Result<()> {
     assert_eq!(expected_block.gas_used, 0);
     // difficulty should be 0 to indicate first (and only) block from round
     assert_eq!(expected_block.difficulty, U256::ZERO);
-    // assert extra data is default bytes
-    assert_eq!(expected_block.extra_data, Bytes::default());
     // assert batch digest match requests hash
     assert_eq!(expected_block.requests_hash, Some(EMPTY_REQUESTS_HASH));
-    // assert withdrawals are empty
-    //
-    // NOTE: this is currently always empty
-    assert_eq!(expected_block.withdrawals_root, genesis_header.withdrawals_root);
 
     // assert consensus output written to BEACON_ROOTS contract (cancun - eip4788)
     assert_eip4788(&reth_env, &expected_block, consensus_output.consensus_header_hash())?;
 
     // assert parent root is written to HISTORY_STORAGE_ADDRESS (pectra - eip2935)
     assert_eip2935(&reth_env, &expected_block)?;
+
+    Ok(())
+}
+
+/// This tests that leader count is incremented even when execution is skipped
+/// for empty non-epoch-closing output.
+#[tokio::test]
+async fn test_empty_output_increments_leader_count() -> eyre::Result<()> {
+    let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+    let tmp_dir = TempDir::new().expect("temp dir");
+    // execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.rewards_counter()),
+    )?;
+    // update rewards counter so execution address is visible
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+    let leader_address =
+        committee.authority(&leader_id).expect("leader in committee").execution_address();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    //=== Consensus
+    //
+    // create empty consensus output with close_epoch: false (default)
+    let timestamp = now();
+    let mut leader = Certificate::default();
+    let sub_dag_index = 0;
+    leader.header.round = sub_dag_index as u32;
+    leader.header.created_at = timestamp;
+    let reputation_scores = ReputationScores::default();
+    let previous_sub_dag = None;
+    leader.header_mut_for_test().author = leader_id;
+
+    let consensus_output = ConsensusOutput {
+        sub_dag: CommittedSubDag::new(
+            vec![leader.clone()],
+            leader,
+            sub_dag_index,
+            reputation_scores,
+            previous_sub_dag,
+        )
+        .into(),
+        ..Default::default()
+    };
+
+    // verify leader counts start at zero
+    let address_counts = gas_accumulator.rewards_counter().get_address_counts();
+    assert!(address_counts.is_empty(), "leader counts should start empty");
+
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
+    let reth_env = execution_node.get_reth_env().await;
+    let max_round = None;
+    let genesis_header = chain.sealed_genesis_header();
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        max_round,
+        from_consensus,
+        genesis_header.clone(),
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator.clone(),
+    );
+
+    // send output
+    let broadcast_result = to_engine.send(consensus_output.clone()).await;
+    assert!(broadcast_result.is_ok());
+
+    // drop sending channel to shut engine down
+    drop(to_engine);
+
+    let (tx, rx) = oneshot::channel();
+
+    // spawn engine task
+    task_manager.spawn_task("Test task eng", async move {
+        let res = engine.await;
+        let _ = tx.send(res);
+    });
+
+    let engine_task = timeout(Duration::from_secs(10), rx).await??;
+    // consensus output stream closed
+    assert_matches!(engine_task, Err(TnEngineError::ConsensusOutputStreamClosed));
+
+    // no blocks produced (execution skipped)
+    let last_block_num = reth_env.last_block_number()?;
+    assert_eq!(
+        last_block_num, 0,
+        "no blocks should be produced for empty non-epoch-closing output"
+    );
+
+    // verify leader count was incremented despite execution being skipped
+    let address_counts = gas_accumulator.rewards_counter().get_address_counts();
+    assert_eq!(
+        address_counts.get(&leader_address),
+        Some(&1u32),
+        "leader count should be incremented even when execution is skipped"
+    );
 
     Ok(())
 }
