@@ -141,7 +141,7 @@ impl<DB: Database> Subscriber<DB> {
         // We aren't doing consensus now but still need to update these watches before
         // we send the consensus output.
         self.consensus_bus.committed_round_updates().send_replace(last_round);
-        let _ = self.consensus_bus.primary_round_updates().send(last_round);
+        self.consensus_bus.primary_round_updates().send_replace(last_round);
 
         if let Err(e) = self.consensus_bus.consensus_output().send(consensus_output).await {
             error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self.inner.authority_id, e);
@@ -169,7 +169,7 @@ impl<DB: Database> Subscriber<DB> {
                 if consensus_header_number == last_consensus_header.number {
                     // We are caught up enough so try to jump back into consensus
                     info!(target: "subscriber", "attempting to rejoin consensus, consensus block height {consensus_header_number}");
-                    let _ = self.consensus_bus.node_mode().send(NodeMode::CvvActive);
+                    self.consensus_bus.node_mode().send_replace(NodeMode::CvvActive);
                     self.config.shutdown().notify();
                     return Ok(());
                 }
@@ -239,10 +239,7 @@ impl<DB: Database> Subscriber<DB> {
 
                     // Record the latest ConsensusHeader, we probably don't need this in this mode but keep it up to date anyway.
                     // Note we don't bother sending this to the consensus header channel since not needed when an active CVV.
-                    if let Err(e) = self.consensus_bus.last_consensus_header().send(Some(ConsensusHeader { parent_hash, sub_dag: sub_dag.clone(), number, extra: B256::default() })) {
-                        error!(target: "subscriber", "error sending latest consensus header for authority {:?}: {}", self.inner.authority_id, e);
-                        return Err(SubscriberError::ClosedChannel("failed to send last consensus header on bus".to_string()));
-                    }
+                    self.consensus_bus.last_consensus_header().send_replace(Some(ConsensusHeader { parent_hash, sub_dag: sub_dag.clone(), number, extra: B256::default() }));
                     let epoch = sub_dag.leader_epoch();
                     let round = sub_dag.leader_round();
                     let consensus_result_hash = ConsensusResult::digest_data(epoch, round, number, last_parent);
