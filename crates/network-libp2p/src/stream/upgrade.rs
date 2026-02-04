@@ -4,6 +4,7 @@ use libp2p::swarm::StreamProtocol;
 use libp2p::{InboundUpgrade, OutboundUpgrade, Stream};
 use serde::{Deserialize, Serialize};
 use std::io;
+use tn_types::B256;
 
 use crate::stream::behavior::TN_STREAM_PROTOCOL;
 
@@ -74,16 +75,12 @@ pub struct StreamHeader {
     ///
     /// This allows the receiver to correlate this stream with the
     /// previously received SyncStateRequest and its response.
-    pub request_id: u64,
-    /// Expected hash of the complete data to be transferred.
-    ///
-    /// Used for integrity verification after the transfer completes.
-    pub expected_hash: [u8; 32],
+    pub request_digest: B256,
 }
 
 /// Errors that can occur during stream sync operations.
 #[derive(Debug)]
-pub enum StreamSyncError {
+pub enum StreamError {
     /// An I/O error occurred during stream operations.
     Io(io::Error),
     /// The protocol upgrade failed during stream negotiation.
@@ -96,7 +93,7 @@ pub enum StreamSyncError {
     Timeout,
 }
 
-impl std::fmt::Display for StreamSyncError {
+impl std::fmt::Display for StreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "IO error: {}", e),
@@ -108,4 +105,4 @@ impl std::fmt::Display for StreamSyncError {
     }
 }
 
-impl std::error::Error for StreamSyncError {}
+impl std::error::Error for StreamError {}

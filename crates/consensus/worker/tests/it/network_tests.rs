@@ -229,20 +229,32 @@ async fn test_batch_gossip_succeeds() {
                 // request_batches calls this first
                 reply.send(vec![expected_peer]).expect("peer sent");
             }
-            NetworkCommand::SendRequest { peer, request, .. } => {
-                // assert expected output
-                let max_response_size = committee
-                    .first_authority()
-                    .consensus_config()
-                    .network_config()
-                    .libp2p_config()
-                    .max_rpc_message_size;
-                let expected_request = WorkerRequest::RequestBatches {
-                    batch_digests: vec![batch_digest],
-                    max_response_size,
-                };
+            NetworkCommand::SendRequest { peer, request, reply } => {
+                // The new implementation first tries stream-based transfer
                 assert_eq!(peer, expected_peer);
-                assert_eq!(request, expected_request);
+                match request {
+                    WorkerRequest::RequestBatchesStream { batch_digests } => {
+                        // Stream request - reject to trigger fallback
+                        assert_eq!(batch_digests, vec![batch_digest]);
+                        reply
+                            .send(Ok(WorkerResponse::RequestBatchesStream { ack: false }))
+                            .expect("reply sent");
+                    }
+                    WorkerRequest::RequestBatches { batch_digests, max_response_size } => {
+                        // Fallback request-response
+                        let expected_max = committee
+                            .first_authority()
+                            .consensus_config()
+                            .network_config()
+                            .libp2p_config()
+                            .max_rpc_message_size;
+                        assert_eq!(batch_digests, vec![batch_digest]);
+                        assert_eq!(max_response_size, expected_max);
+                        // Don't send reply - test just verifies the request format
+                        break;
+                    }
+                    _ => panic!("unexpected request type"),
+                }
             }
             _ => panic!("unexpected network command"),
         }

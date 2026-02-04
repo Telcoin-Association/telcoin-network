@@ -1,5 +1,6 @@
+//! Worker's network-related errors.
 use tn_network_libp2p::{error::NetworkError, Penalty};
-use tn_types::{BatchValidationError, BcsError};
+use tn_types::{BatchValidationError, BcsError, BlockHash};
 use tokio::time::error::Elapsed;
 
 /// Result alias for results that possibly return [`WorkerNetworkError`].
@@ -8,9 +9,9 @@ pub(crate) type WorkerNetworkResult<T> = Result<T, WorkerNetworkError>;
 /// Core error variants when executing the output from consensus and extending the canonical block.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerNetworkError {
-    /// Error decoding with bcs.
-    #[error("Failed to decode gossip message: {0}")]
-    Decode(#[from] BcsError),
+    /// Error decoding with bcs. (gossipsub, and stream)
+    #[error("BCS encode/decode error: {0}")]
+    Bcs(#[from] BcsError),
     /// Batch validation error occured.
     #[error("Failed batch validation: {0}")]
     BatchValidation(#[from] BatchValidationError),
@@ -32,6 +33,32 @@ pub enum WorkerNetworkError {
     /// Invalid topic- something was published to the wrong topic.
     #[error("Gossip was published to the wrong topic")]
     InvalidTopic,
+    /// Peer sent more batches than expected.
+    #[error("Peer sent too many batches: expected {expected}, received {received}")]
+    TooManyBatches {
+        /// The expected number of batches.
+        expected: usize,
+        /// The number of batches received.
+        received: usize,
+    },
+    /// Peer sent a batch we didn't request.
+    #[error("Received unexpected batch with digest {0}")]
+    UnexpectedBatch(BlockHash),
+    /// Peer sent duplicate batch.
+    #[error("Received duplicate batch with digest {0}")]
+    DuplicateBatch(BlockHash),
+    /// Stream was closed unexpectedly.
+    #[error("Stream closed unexpectedly")]
+    StreamClosed,
+    /// No matching pending request for inbound stream.
+    #[error("No pending request matches stream hash")]
+    UnknownStreamRequest(BlockHash),
+    /// Request hash mismatch between negotiation and stream.
+    #[error("Request hash mismatch")]
+    RequestHashMismatch,
+    /// Error conversion from [std::io::Error]
+    #[error(transparent)]
+    StdIo(#[from] std::io::Error),
 }
 
 impl From<WorkerNetworkError> for Option<Penalty> {
@@ -64,13 +91,20 @@ impl From<WorkerNetworkError> for Option<Penalty> {
             }
             WorkerNetworkError::InvalidRequest(_) => Some(Penalty::Mild),
             // may occur at epoch boundaries
-            WorkerNetworkError::NonCommitteeBatch => Some(Penalty::Medium),
-            // fatal
-            WorkerNetworkError::InvalidTopic | WorkerNetworkError::Decode(_) => {
-                Some(Penalty::Fatal)
+            WorkerNetworkError::NonCommitteeBatch | WorkerNetworkError::StdIo(_) => {
+                Some(Penalty::Medium)
             }
+            // protocol violations - fatal penalty
+            WorkerNetworkError::InvalidTopic
+            | WorkerNetworkError::Bcs(_)
+            | WorkerNetworkError::TooManyBatches { .. }
+            | WorkerNetworkError::UnexpectedBatch(_)
+            | WorkerNetworkError::DuplicateBatch(_)
+            | WorkerNetworkError::UnknownStreamRequest(_)
+            | WorkerNetworkError::RequestHashMismatch => Some(Penalty::Fatal),
             // ignore
             WorkerNetworkError::Timeout(_)
+            | WorkerNetworkError::StreamClosed
             | WorkerNetworkError::Network(_)
             | WorkerNetworkError::Internal(_) => None,
         }

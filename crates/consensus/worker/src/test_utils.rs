@@ -109,6 +109,17 @@ impl TestRequestBatchesNetwork {
 
                         reply.send(Ok(WorkerResponse::RequestBatches(batches))).unwrap();
                     }
+                    NetworkCommand::SendRequest {
+                        peer: _,
+                        request: WorkerRequest::RequestBatchesStream { batch_digests: _ },
+                        reply,
+                    } => {
+                        // For stream requests in tests, reject them so tests fall back
+                        // to request-response or we can test stream handling separately
+                        reply
+                            .send(Ok(WorkerResponse::RequestBatchesStream { ack: false }))
+                            .unwrap();
+                    }
                     _ => {}
                 }
             }

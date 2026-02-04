@@ -21,4 +21,4 @@ mod handler;
 mod upgrade;
 
 pub use behavior::{StreamBehavior, StreamCommand, StreamEvent, TN_STREAM_PROTOCOL};
-pub use upgrade::{StreamHeader, StreamSyncError, TNStreamProtocol};
+pub use upgrade::{StreamError, StreamHeader, TNStreamProtocol};

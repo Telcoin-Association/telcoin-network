@@ -4,7 +4,7 @@ use crate::{
     codec::TNMessage,
     error::NetworkError,
     peers::Penalty,
-    stream::{StreamHeader, StreamSyncError},
+    stream::{StreamError, StreamHeader},
     GossipMessage, PeerExchangeMap,
 };
 pub use libp2p::gossipsub::MessageId;
@@ -16,7 +16,9 @@ use libp2p::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use tn_types::{encode, now, BlsPublicKey, BlsSignature, NetworkPublicKey, P2pNode, TimestampSec};
+use tn_types::{
+    encode, now, BlsPublicKey, BlsSignature, NetworkPublicKey, P2pNode, TimestampSec, B256,
+};
 use tokio::sync::{mpsc, oneshot};
 
 #[cfg(test)]
@@ -75,11 +77,11 @@ pub enum NetworkEvent<Req, Res> {
     Gossip(GossipMessage, BlsPublicKey),
     /// Send an error back the requester.
     Error(String, ResponseChannel<Res>),
-    /// An inbound sync stream was established by a peer.
+    /// An inbound stream was established by a peer.
     ///
     /// This occurs after the peer sent a `SyncStateRequest` and this node
     /// responded positively. The application should read data from the stream.
-    InboundSyncStream {
+    InboundStream {
         /// The peer that opened the stream.
         peer: BlsPublicKey,
         /// The established stream for reading data.
@@ -185,7 +187,7 @@ pub enum SyncStateError {
     /// The peer rejected the sync request.
     Rejected(String),
     /// Failed to open the stream after successful negotiation.
-    StreamFailed(StreamSyncError),
+    StreamFailed(StreamError),
     /// The operation timed out.
     Timeout,
     /// The peer disconnected during the operation.
@@ -438,10 +440,10 @@ where
         peer: BlsPublicKey,
         /// The resource identifier (epoch number, batch sequence, etc.).
         resource_id: u64,
-        /// Expected hash of the data for integrity verification.
-        expected_hash: [u8; 32],
+        /// Hash of the preceeding request for integrity verification.
+        request_digest: B256,
         /// Channel for returning the established stream.
-        reply: oneshot::Sender<Result<Stream, SyncStateError>>,
+        reply: oneshot::Sender<NetworkResult<Stream>>,
     },
 }
 
@@ -683,32 +685,24 @@ where
     /// This method is called after a successful request-response sync negotiation.
     /// The typical flow is:
     /// 1. Send a sync request via [`send_request`](Self::send_request)
-    /// 2. Receive and verify the response indicates sync is accepted
+    /// 2. Receive and verify the response indicates sync request is accepted
     /// 3. Call this method to open the data transfer stream
     ///
     /// # Arguments
     /// * `peer` - The peer to open the stream to (same peer that accepted the sync request)
     /// * `resource_id` - Resource identifier (epoch number, batch sequence, etc.)
-    /// * `expected_hash` - Hash of the expected data for integrity verification
+    /// * `request_digest` - Hash of the requested data for stream verification
     ///
-    /// # Returns
-    /// The established [`Stream`] for reading sync data, or a [`SyncStateError`] on failure.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // After receiving a positive sync response from the peer:
-    /// let stream = network.open_sync_stream(peer, epoch, data_hash).await??;
-    /// // Read data from stream...
-    /// ```
+    /// Returns the established [`Stream`] for reading sync data, or a [`SyncStateError`] on failure.
     pub async fn open_sync_stream(
         &self,
         peer: BlsPublicKey,
         resource_id: u64,
-        expected_hash: [u8; 32],
-    ) -> NetworkResult<Result<Stream, SyncStateError>> {
+        request_digest: B256,
+    ) -> NetworkResult<NetworkResult<Stream>> {
         let (reply, rx) = oneshot::channel();
         self.sender
-            .send(NetworkCommand::OpenStream { peer, resource_id, expected_hash, reply })
+            .send(NetworkCommand::OpenStream { peer, resource_id, request_digest, reply })
             .await?;
         rx.await.map_err(Into::into)
     }
