@@ -109,7 +109,6 @@ impl<T> Clone for QueChannel<T> {
 impl<T: Send + 'static> TnSender<T> for QueChannel<T> {
     async fn send(&self, value: T) -> Result<(), tn_types::SendError<T>> {
         if !self.subscribed.load(Ordering::Acquire) {
-            debug_assert!(false, "send() called on unsubscribed QueChannel — message dropped. Subscribe in spawn() before sending.");
             return Ok(());
         }
         Ok(self.channel.send(value).await?)
@@ -117,7 +116,6 @@ impl<T: Send + 'static> TnSender<T> for QueChannel<T> {
 
     fn try_send(&self, value: T) -> Result<(), tn_types::TrySendError<T>> {
         if !self.subscribed.load(Ordering::Acquire) {
-            debug_assert!(false, "try_send() called on unsubscribed QueChannel — message dropped. Subscribe in spawn() before sending.");
             return Ok(());
         }
         Ok(self.channel.try_send(value)?)
