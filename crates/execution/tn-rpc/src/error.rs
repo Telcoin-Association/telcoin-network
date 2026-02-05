@@ -22,8 +22,10 @@ pub enum TNRpcError {
 impl From<TNRpcError> for jsonrpsee_types::ErrorObject<'static> {
     fn from(error: TNRpcError) -> Self {
         match error {
-            TNRpcError::InvalidProofOfPossession => rpc_error(401, error.to_string(), None),
-            TNRpcError::NotFound => rpc_error(401, error.to_string(), None),
+            // JSON-RPC server error range: -32000 to -32099
+            TNRpcError::InvalidProofOfPossession => rpc_error(-32002, error.to_string(), None),
+            // JSON-RPC server error range: -32000 to -32099
+            TNRpcError::NotFound => rpc_error(-32001, error.to_string(), None),
         }
     }
 }

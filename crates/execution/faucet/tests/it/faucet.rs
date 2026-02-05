@@ -87,6 +87,18 @@ impl EngineToPrimary for EmptyEngToPrimary {
     ) -> Option<(tn_types::EpochRecord, tn_types::EpochCertificate)> {
         None
     }
+
+    fn sync_status(&self) -> tn_rpc::SyncStatus {
+        tn_rpc::SyncStatus::Synced
+    }
+
+    fn current_epoch_info(&self) -> Option<tn_rpc::EpochInfo> {
+        None
+    }
+
+    fn current_committee(&self) -> Option<tn_rpc::CommitteeInfo> {
+        None
+    }
 }
 
 #[tokio::test]
