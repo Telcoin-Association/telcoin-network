@@ -138,7 +138,7 @@ pub fn catchup_accumulator<DB: TNDatabase>(
         let epoch_state = reth_env.epoch_state_from_canonical_tip()?;
 
         // Note WORKER: In a single worker world this should be suffecient to set the base fee.
-        // In a multi-worker world (furture) this will NOT work and needs updating.
+        // In a multi-worker world (future) this will NOT work and needs updating.
         gas_accumulator
             .base_fee(0)
             .set_base_fee(block.base_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE));
