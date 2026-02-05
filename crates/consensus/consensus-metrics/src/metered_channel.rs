@@ -128,6 +128,23 @@ impl<T> MeteredMpscChannel<T> {
     }
 }
 
+impl<T: Send + 'static> MeteredMpscChannel<T> {
+    /// Subscribe to receive messages on this channel.
+    ///
+    /// Must be called in synchronous `spawn()` methods, BEFORE spawning async tasks.
+    /// Can only be called once per channel.
+    pub fn subscribe(&self) -> Receiver<T> {
+        self.subscribed.store(true, Ordering::Release);
+        let mut rx = self
+            .receiver
+            .lock()
+            .take()
+            .expect("No receiver to subscribe, can only subscribe once!");
+        rx.subscribed = Some(self.subscribed.clone());
+        rx
+    }
+}
+
 impl<T: Send + 'static> TnSender<T> for MeteredMpscChannel<T> {
     /// Sends a value, waiting until there is capacity.
     /// Increments the gauge in case of a successful `send`.
@@ -153,17 +170,6 @@ impl<T: Send + 'static> TnSender<T> for MeteredMpscChannel<T> {
             .inspect(|_| {
                 self.gauge.inc();
             })?)
-    }
-
-    fn subscribe(&self) -> impl TnReceiver<T> + 'static {
-        self.subscribed.store(true, Ordering::Release);
-        let mut rx = self
-            .receiver
-            .lock()
-            .take()
-            .expect("No receiver to subscribe, can only subscribe once!");
-        rx.subscribed = Some(self.subscribed.clone());
-        rx
     }
 }
 
