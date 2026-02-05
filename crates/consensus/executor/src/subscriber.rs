@@ -237,7 +237,7 @@ impl<DB: Database> Subscriber<DB> {
 
                     // Record the latest ConsensusHeader, we probably don't need this in this mode but keep it up to date anyway.
                     // Note we don't bother sending this to the consensus header channel since not needed when an active CVV.
-                    if let Err(e) = self.consensus_bus.last_consensus_header().send(Some(ConsensusHeader { parent_hash, sub_dag: Arc::new(sub_dag.clone()), number, extra: B256::default() })) {
+                    if let Err(e) = self.consensus_bus.last_consensus_header().send(Some(ConsensusHeader { parent_hash, sub_dag: sub_dag.clone(), number, extra: B256::default() })) {
                         error!(target: "subscriber", "error sending latest consensus header for authority {:?}: {}", self.inner.authority_id, e);
                         return Err(SubscriberError::ClosedChannel("failed to send last consensus header on bus".to_string()));
                     }
@@ -250,7 +250,7 @@ impl<DB: Database> Subscriber<DB> {
                         error!(target: "subscriber", "error publishing latest consensus to network {:?}: {}", self.inner.authority_id, e);
                     }
                     last_number += 1;
-                    waiting.push_back(self.fetch_batches(Arc::new(sub_dag), parent_hash, number));
+                    waiting.push_back(self.fetch_batches(sub_dag, parent_hash, number));
                 },
 
                 // Receive consensus messages after all transaction data is downloaded

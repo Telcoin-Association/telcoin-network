@@ -18,7 +18,7 @@ pub trait ConsensusStore: Clone {
     /// This uses garbage parent hash and number and is ONLY for testing.
     /// As a test only function this will panic if unable to write the sub dag
     /// to the consensus chain
-    fn write_subdag_for_test(&self, number: u64, sub_dag: CommittedSubDag);
+    fn write_subdag_for_test(&self, number: u64, sub_dag: Arc<CommittedSubDag>);
 
     /// Clear the consensus chain, ONLY for testing.
     /// Will panic on an error.
@@ -51,8 +51,8 @@ pub trait ConsensusStore: Clone {
 }
 
 impl<DB: Database> ConsensusStore for DB {
-    fn write_subdag_for_test(&self, number: u64, sub_dag: CommittedSubDag) {
-        let header = ConsensusHeader { number, sub_dag: Arc::new(sub_dag), ..Default::default() };
+    fn write_subdag_for_test(&self, number: u64, sub_dag: Arc<CommittedSubDag>) {
+        let header = ConsensusHeader { number, sub_dag, ..Default::default() };
         let mut txn = self.write_txn().expect("failed to get DB txn");
         txn.insert::<ConsensusBlocks>(&header.number, &header)
             .expect("error saving a consensus header to persistant storage!");

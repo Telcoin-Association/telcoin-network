@@ -870,23 +870,21 @@ where
                     self.consensus_db.remove_consensus_by_hash(output.digest().into());
                 }
             }
+        } else if let Some(target_hash) = self
+            .send_leftover_consensus_output_to_engine(
+                &mut consensus_output,
+                to_engine,
+                &mut epoch_pack,
+            )
+            .await
+        {
+            // If things go down at exactly the wrong time we might have reached the epoch end
+            // so account for that.
+            self.close_epoch(None, &gas_accumulator, target_hash).await?;
+            res = RunEpochMode::NewEpoch;
+            clear_tables_for_next_epoch = true;
         } else {
-            if let Some(target_hash) = self
-                .send_leftover_consensus_output_to_engine(
-                    &mut consensus_output,
-                    to_engine,
-                    &mut epoch_pack,
-                )
-                .await
-            {
-                // If things go down at exactly the wrong time we might have reached the epoch end
-                // so account for that.
-                self.close_epoch(None, &gas_accumulator, target_hash).await?;
-                res = RunEpochMode::NewEpoch;
-                clear_tables_for_next_epoch = true;
-            } else {
-                res = RunEpochMode::ModeChange;
-            }
+            res = RunEpochMode::ModeChange;
         }
 
         // clear tables
@@ -915,7 +913,7 @@ where
             // approach !epoch_pack.contains_consensus_header(output.
             // consensus_header_hash())
             {
-                epoch_pack.save_consensus_output(output.clone())?;
+                epoch_pack.save_consensus_output(output.clone()).await?;
             }
         }
         // only forward the output to the engine
@@ -1305,7 +1303,9 @@ where
         target_hash: B256,
     ) -> eyre::Result<()> {
         // begin consensus shutdown while engine executes
-        shutdown_consensus.map(|s| s.notify());
+        if let Some(s) = shutdown_consensus {
+            s.notify()
+        }
         self.consensus_bus.wait_for_consensus_execution(target_hash).await?;
         self.adjust_base_fees(gas_accumulator);
         gas_accumulator.clear(); // Clear the accumlated values for next epoch.

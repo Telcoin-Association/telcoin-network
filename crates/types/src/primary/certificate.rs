@@ -238,7 +238,7 @@ impl Certificate {
         );
 
         // Genesis certificates are always valid.
-        if self.round() == 0 && Self::genesis(committee).contains(&self) {
+        if self.round() == 0 && Self::genesis(committee).contains(self) {
             return Ok(());
         }
 

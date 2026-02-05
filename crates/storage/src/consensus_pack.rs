@@ -68,7 +68,7 @@ impl PackRecord {
             Err(PackError::NotConsensus)
         }
     }
-    fn into_batch(self) -> Result<Batch, PackError> {
+    fn _into_batch(self) -> Result<Batch, PackError> {
         if let Self::Batch(batch) = self {
             Ok(batch)
         } else {
@@ -213,8 +213,8 @@ impl ConsensusPack {
     }
 
     /// Save all the batches and consensus header from the ConsensusOutput the pack file.
-    pub fn save_consensus_output(&self, consensus: ConsensusOutput) -> Result<(), PackError> {
-        let _ = self.tx.send(PackMessage::ConsensusOutput(consensus));
+    pub async fn save_consensus_output(&self, consensus: ConsensusOutput) -> Result<(), PackError> {
+        let _ = self.tx.send(PackMessage::ConsensusOutput(consensus)).await;
         Ok(())
     }
 
@@ -560,7 +560,6 @@ impl Inner {
         for cert in sub_dag.certificates() {
             for (digest, _) in cert.header().payload().iter() {
                 batch_set.insert(*digest);
-                //XXXXconsensus_output.batch_digests.push_back(*digest);
                 batch_digests.push_back(*digest);
             }
         }
@@ -581,14 +580,13 @@ impl Inner {
                     .data
                     .fetch(position)
                     .map_err(|e| PackError::ReadError(e.to_string()))?
-                    .into_batch()?;
+                    ._into_batch()?;
                 cert_batches.push(batch);
             }
 
             let address = committee.authority(cert.origin()).map(|a| a.execution_address());
             if let Some(address) = address {
                 // main collection for execution
-                //XXXXconsensus_output.batches.push(CertifiedBatch { address, batches: cert_batches });
                 batches.push(CertifiedBatch { address, batches: cert_batches });
             } else {
                 return Err(PackError::MissingAuthority);

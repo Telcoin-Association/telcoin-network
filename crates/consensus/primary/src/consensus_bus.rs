@@ -290,7 +290,7 @@ struct ConsensusBusEpochInner {
     committed_own_headers: MeteredMpscChannel<(Round, Vec<Round>)>,
 
     /// Outputs the sequence of ordered certificates to the application layer.
-    sequence: MeteredMpscChannel<CommittedSubDag>,
+    sequence: MeteredMpscChannel<Arc<CommittedSubDag>>,
 
     /// Messages to the Certificate Manager.
     certificate_manager: MeteredMpscChannel<CertificateManagerCommand>,
@@ -490,7 +490,7 @@ impl ConsensusBus {
 
     /// Outputs the sequence of ordered certificates from consensus.
     /// Can only be subscribed to once.
-    pub fn sequence(&self) -> &impl TnSender<CommittedSubDag> {
+    pub fn sequence(&self) -> &impl TnSender<Arc<CommittedSubDag>> {
         &self.inner_epoch.sequence
     }
 

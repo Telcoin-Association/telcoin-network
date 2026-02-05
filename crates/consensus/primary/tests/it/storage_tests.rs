@@ -4,6 +4,7 @@
 use futures::future::join_all;
 use std::{
     collections::{BTreeSet, HashSet},
+    sync::Arc,
     time::Instant,
 };
 use tempfile::TempDir;
@@ -103,13 +104,13 @@ async fn test_consensus_store_read_latest_final_reputation_scores() {
 
     // AND we add some commits without any final scores
     for sequence_number in 0..10 {
-        let sub_dag = CommittedSubDag::new(
+        let sub_dag = Arc::new(CommittedSubDag::new(
             vec![],
             Certificate::default(),
             sequence_number,
             ReputationScores::new(&committee),
             None,
-        );
+        ));
 
         store.write_subdag_for_test(sequence_number, sub_dag);
     }
@@ -129,8 +130,13 @@ async fn test_consensus_store_read_latest_final_reputation_scores() {
             scores.final_of_schedule = true;
         }
 
-        let sub_dag =
-            CommittedSubDag::new(vec![], Certificate::default(), sequence_number, scores, None);
+        let sub_dag = Arc::new(CommittedSubDag::new(
+            vec![],
+            Certificate::default(),
+            sequence_number,
+            scores,
+            None,
+        ));
 
         store.write_subdag_for_test(sequence_number, sub_dag);
     }

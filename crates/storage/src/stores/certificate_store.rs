@@ -131,7 +131,7 @@ fn save_cert<TX: DbTxMut>(
     digest: CertificateDigest,
     certificate: &Certificate,
 ) -> StoreResult<()> {
-    txn.insert::<Certificates>(&digest, &certificate)?;
+    txn.insert::<Certificates>(&digest, certificate)?;
 
     // write the certificates id by their rounds
     let key = (certificate.round(), certificate.origin().clone());
@@ -141,7 +141,7 @@ fn save_cert<TX: DbTxMut>(
     let key = (certificate.origin().clone(), certificate.round());
     txn.insert::<CertificateDigestByOrigin>(&key, &digest)?;
 
-    NOTIFY_SUBSCRIBERS.notify(&digest, &certificate);
+    NOTIFY_SUBSCRIBERS.notify(&digest, certificate);
 
     Ok(())
 }
