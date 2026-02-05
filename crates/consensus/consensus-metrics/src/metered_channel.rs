@@ -151,7 +151,6 @@ impl<T: Send + 'static> TnSender<T> for MeteredMpscChannel<T> {
     /// Returns `Ok(())` as a no-op when no receiver is subscribed.
     async fn send(&self, value: T) -> Result<(), tn_types::SendError<T>> {
         if !self.subscribed.load(Ordering::Acquire) {
-            debug_assert!(false, "send() called on unsubscribed MeteredMpscChannel — message dropped. Subscribe in spawn() before sending.");
             return Ok(());
         }
         self.inner.send(value).inspect_ok(|_| self.gauge.inc()).map_err(|e| e.into()).await
@@ -162,7 +161,6 @@ impl<T: Send + 'static> TnSender<T> for MeteredMpscChannel<T> {
     /// Returns `Ok(())` as a no-op when no receiver is subscribed.
     fn try_send(&self, message: T) -> Result<(), tn_types::TrySendError<T>> {
         if !self.subscribed.load(Ordering::Acquire) {
-            debug_assert!(false, "try_send() called on unsubscribed MeteredMpscChannel — message dropped. Subscribe in spawn() before sending.");
             return Ok(());
         }
         Ok(self

@@ -147,8 +147,7 @@ async fn test_try_send_full() {
 
 #[tokio::test]
 async fn test_send_before_subscribe_is_noop() {
-    // Create a channel via channel_sender (no receiver handed out yet).
-    // Sends should be no-ops since subscribed starts false.
+    // Sends on unsubscribed channels are silent no-ops.
     let counter = IntGauge::new("TEST_COUNTER_NO_SUB", "test").unwrap();
     let tx = channel_sender::<i32>(8, &counter);
 
@@ -173,8 +172,7 @@ async fn test_send_before_subscribe_is_noop() {
 
 #[tokio::test]
 async fn test_send_no_op_after_subscribe_drop() {
-    // Create a channel via channel_sender, subscribe and immediately drop.
-    // After the receiver is dropped, sends become no-ops.
+    // After receiver is dropped, sends become silent no-ops.
     let counter = IntGauge::new("TEST_COUNTER_SUB_THEN_DROP", "test").unwrap();
     let tx = channel_sender::<i32>(8, &counter);
 
@@ -212,8 +210,7 @@ async fn test_send_after_subscribe() {
 
 #[tokio::test]
 async fn test_send_after_subscribe_then_drop() {
-    // Create a channel via channel_sender, subscribe, drop the receiver,
-    // then send. The send should be a no-op and return Ok(()).
+    // After receiver is dropped, sends become silent no-ops.
     let counter = IntGauge::new("TEST_COUNTER_SUB_DROP", "test").unwrap();
     let tx = channel_sender::<i32>(8, &counter);
 
