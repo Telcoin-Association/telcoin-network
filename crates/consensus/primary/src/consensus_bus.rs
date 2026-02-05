@@ -109,6 +109,7 @@ impl<T> Clone for QueChannel<T> {
 impl<T: Send + 'static> TnSender<T> for QueChannel<T> {
     async fn send(&self, value: T) -> Result<(), tn_types::SendError<T>> {
         if !self.subscribed.load(Ordering::Acquire) {
+            debug_assert!(false, "send() called on unsubscribed QueChannel — message dropped. Subscribe in spawn() before sending.");
             return Ok(());
         }
         Ok(self.channel.send(value).await?)
@@ -116,6 +117,7 @@ impl<T: Send + 'static> TnSender<T> for QueChannel<T> {
 
     fn try_send(&self, value: T) -> Result<(), tn_types::TrySendError<T>> {
         if !self.subscribed.load(Ordering::Acquire) {
+            debug_assert!(false, "try_send() called on unsubscribed QueChannel — message dropped. Subscribe in spawn() before sending.");
             return Ok(());
         }
         Ok(self.channel.try_send(value)?)
@@ -533,6 +535,71 @@ impl ConsensusBus {
         &self,
     ) -> &impl TnSender<(EpochVote, oneshot::Sender<Result<(), HeaderError>>)> {
         &self.inner_app.new_epoch_votes
+    }
+
+    //
+    //=== Channel subscription methods
+    //
+    // These must be called in synchronous spawn() methods, BEFORE spawning async tasks.
+    // This ensures the channel is active before any messages are sent.
+    //
+
+    pub fn subscribe_new_certificates(&self) -> impl TnReceiver<Certificate> {
+        self.inner_epoch.new_certificates.subscribe()
+    }
+
+    pub fn subscribe_committed_certificates(&self) -> impl TnReceiver<(Round, Vec<Certificate>)> {
+        self.inner_epoch.committed_certificates.subscribe()
+    }
+
+    pub fn subscribe_certificate_fetcher(&self) -> impl TnReceiver<CertificateFetcherCommand> {
+        self.inner_epoch.certificate_fetcher.subscribe()
+    }
+
+    pub fn subscribe_parents(&self) -> impl TnReceiver<(Vec<Certificate>, Round)> {
+        self.inner_epoch.parents.subscribe()
+    }
+
+    pub fn subscribe_our_digests(&self) -> impl TnReceiver<OurDigestMessage> {
+        self.inner_epoch.our_digests.subscribe()
+    }
+
+    pub fn subscribe_headers(&self) -> impl TnReceiver<Header> {
+        self.inner_epoch.headers.subscribe()
+    }
+
+    pub fn subscribe_committed_own_headers(&self) -> impl TnReceiver<(Round, Vec<Round>)> {
+        self.inner_epoch.committed_own_headers.subscribe()
+    }
+
+    pub fn subscribe_sequence(&self) -> impl TnReceiver<CommittedSubDag> {
+        self.inner_epoch.sequence.subscribe()
+    }
+
+    pub(crate) fn subscribe_certificate_manager(
+        &self,
+    ) -> impl TnReceiver<CertificateManagerCommand> {
+        self.inner_epoch.certificate_manager.subscribe()
+    }
+
+    pub fn subscribe_new_epoch_votes(
+        &self,
+    ) -> impl TnReceiver<(EpochVote, oneshot::Sender<Result<(), HeaderError>>)> {
+        self.inner_app.new_epoch_votes.subscribe()
+    }
+
+    pub fn subscribe_primary_network_events(
+        &self,
+    ) -> impl TnReceiver<NetworkEvent<crate::network::Req, crate::network::Res>> {
+        self.inner_app.primary_network_events.subscribe()
+    }
+
+    pub fn subscribe_consensus_output(&self) -> broadcast::Receiver<ConsensusOutput> {
+        self.inner_app.consensus_output.subscribe()
+    }
+
+    pub fn subscribe_consensus_header(&self) -> broadcast::Receiver<ConsensusHeader> {
+        self.inner_app.consensus_header.subscribe()
     }
 
     /// Will resolve once we have executed block.
