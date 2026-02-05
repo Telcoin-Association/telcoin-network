@@ -46,7 +46,7 @@ use tn_types::{
     BlsAggregateSignature, BlsPublicKey, BlsSignature, CertifiedBatch, CommittedSubDag, Committee,
     CommitteeBuilder, ConsensusOutput, Database as TNDatabase, Epoch, EpochCertificate,
     EpochRecord, EpochVote, Hash, Multiaddr, NetworkPublicKey, Notifier, TaskJoinError,
-    TaskManager, TaskSpawner, TimestampSec, TnReceiver, TnSender, B256, MIN_PROTOCOL_BASE_FEE,
+    TaskManager, TaskSpawner, TimestampSec, TnReceiver, B256, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{
     quorum_waiter::QuorumWaiterTrait, Worker, WorkerNetwork, WorkerNetworkHandle, WorkerRequest,
@@ -647,7 +647,7 @@ where
         epoch_task_manager.set_join_wait(200);
 
         // subscribe to output early to prevent missed messages
-        let mut consensus_output = self.consensus_bus.consensus_output().subscribe();
+        let mut consensus_output = self.consensus_bus.subscribe_consensus_output();
 
         // create primary and worker nodes
         let (primary, worker_node) = self
@@ -974,7 +974,7 @@ where
             my_vote = Some(epoch_vote);
         }
 
-        let mut rx = self.consensus_bus.new_epoch_votes().subscribe();
+        let mut rx = self.consensus_bus.subscribe_new_epoch_votes();
         epoch_task_manager.spawn_task("Collect Epoch Signatures", async move {
             let mut reached_quorum = false;
             let mut timeout = Duration::from_secs(5);
@@ -1468,8 +1468,7 @@ where
         initial_epoch: bool,
     ) -> eyre::Result<()> {
         // get event streams for the primary network handler
-        let event_stream = self.consensus_bus.primary_network_events().clone();
-        let rx_event_stream = event_stream.subscribe();
+        let rx_event_stream = self.consensus_bus.subscribe_primary_network_events();
 
         // set committee for network to prevent banning
         debug!(target: "epoch-manager", auth=?consensus_config.authority_id(), "spawning primary network for epoch");

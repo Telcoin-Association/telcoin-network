@@ -594,11 +594,11 @@ impl ConsensusBus {
         self.inner_app.primary_network_events.subscribe()
     }
 
-    pub fn subscribe_consensus_output(&self) -> broadcast::Receiver<ConsensusOutput> {
+    pub fn subscribe_consensus_output(&self) -> impl TnReceiver<ConsensusOutput> {
         self.inner_app.consensus_output.subscribe()
     }
 
-    pub fn subscribe_consensus_header(&self) -> broadcast::Receiver<ConsensusHeader> {
+    pub fn subscribe_consensus_header(&self) -> impl TnReceiver<ConsensusHeader> {
         self.inner_app.consensus_header.subscribe()
     }
 

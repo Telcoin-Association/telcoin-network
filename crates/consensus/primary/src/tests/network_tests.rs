@@ -17,7 +17,7 @@ use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     error::HeaderError, now, AuthorityIdentifier, BlockHash, BlockHeader, BlockNumHash,
     BlsPublicKey, Certificate, CertificateDigest, EpochVote, ExecHeader, Hash as _, SealedHeader,
-    TaskManager, TnReceiver, TnSender,
+    TaskManager, TnReceiver,
 };
 use tracing::debug;
 
@@ -307,7 +307,7 @@ async fn test_primary_batch_gossip_topics() {
     let TestTypes { handler, task_manager, consensus_bus, .. } = create_test_types();
 
     task_manager.spawn_task("process-gossip-test", async move {
-        let mut rx = consensus_bus.new_epoch_votes().subscribe();
+        let mut rx = consensus_bus.subscribe_new_epoch_votes();
         while let Some((_, tx)) = rx.recv().await {
             let _ = tx.send(Ok(()));
         }
