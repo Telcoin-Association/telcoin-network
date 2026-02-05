@@ -96,11 +96,6 @@ impl<DB: Database> Primary<DB> {
             );
 
             proposer.spawn(task_manager);
-        } else {
-            // Non-CVV nodes have no Proposer consuming the parents channel.
-            // Subscribe and immediately drop so sends become no-ops instead of
-            // backing up the channel and causing hung tasks.
-            drop(consensus_bus.parents().subscribe());
         }
 
         if let Some(authority_id) = config.authority_id() {
