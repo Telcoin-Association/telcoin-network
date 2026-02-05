@@ -229,10 +229,6 @@ pub struct RethConfig(NodeConfig<RethChainSpec>);
 
 const DEFAULT_UNUSED_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 
-/// Minimum number of transactions to justify parallel ECDSA recovery via rayon.
-/// Below this threshold, sequential recovery avoids thread-pool overhead.
-const PARALLEL_RECOVERY_THRESHOLD: usize = 5;
-
 /// All the rpc modules we allow.
 /// Disallow admin, txpool.
 const ALL_MODULES: [RethRpcModule; 6] = [
@@ -616,42 +612,24 @@ impl RethEnv {
             warn!(target: "engine", %err, "failed to apply pre-execution changes");
         })?;
 
-        // Phase 1: Recover all transactions (ECDSA ecrecover).
-        // Use rayon for parallel recovery when there are enough transactions
-        // to justify the thread-pool overhead.
-        let recovered_txs = if transactions.len() >= PARALLEL_RECOVERY_THRESHOLD {
-            transactions
-                .par_iter()
-                .map(|tx_bytes| {
-                    reth_recover_raw_transaction::<TransactionSigned>(tx_bytes)
-                        .inspect_err(|e| {
-                            error!(
-                                target: "engine",
-                                batch=?batch_digest,
-                                ?tx_bytes,
-                                "failed to recover signer: {e}"
-                            )
-                        })
-                        .map_err(TnRethError::from)
-                })
-                .collect::<TnRethResult<Vec<_>>>()?
-        } else {
-            transactions
-                .iter()
-                .map(|tx_bytes| {
-                    reth_recover_raw_transaction::<TransactionSigned>(tx_bytes)
-                        .inspect_err(|e| {
-                            error!(
-                                target: "engine",
-                                batch=?batch_digest,
-                                ?tx_bytes,
-                                "failed to recover signer: {e}"
-                            )
-                        })
-                        .map_err(TnRethError::from)
-                })
-                .collect::<TnRethResult<Vec<_>>>()?
-        };
+        // Phase 1: Recover all transactions (ECDSA ecrecover) in parallel via rayon.
+        // Always use par_iter — the slight overhead on small batches is negligible
+        // compared to the savings on large ones, and avoids an extra code path.
+        let recovered_txs = transactions
+            .par_iter()
+            .map(|tx_bytes| {
+                reth_recover_raw_transaction::<TransactionSigned>(tx_bytes)
+                    .inspect_err(|e| {
+                        error!(
+                            target: "engine",
+                            batch=?batch_digest,
+                            ?tx_bytes,
+                            "failed to recover signer: {e}"
+                        )
+                    })
+                    .map_err(TnRethError::from)
+            })
+            .collect::<TnRethResult<Vec<_>>>()?;
 
         // Phase 2: Execute recovered transactions sequentially.
         for recovered in recovered_txs {
