@@ -11,7 +11,7 @@ use crate::{
 };
 use std::sync::Arc;
 use tn_config::ConsensusConfig;
-use tn_types::{Database, TaskManager, TnSender};
+use tn_types::{Database, TaskManager};
 use tracing::info;
 
 #[cfg(test)]

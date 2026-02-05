@@ -40,7 +40,7 @@ async fn propose_header_to_form_certificate() {
     }
 
     let cb = ConsensusBus::new();
-    let mut rx_new_certificates = cb.new_certificates().subscribe();
+    let mut rx_new_certificates = cb.subscribe_new_certificates();
     // Spawn the core.
     let task_manager = TaskManager::default();
     let synchronizer =
@@ -100,7 +100,7 @@ async fn propose_header_failure() {
     let network: NetworkHandle<PrimaryRequest, PrimaryResponse> = NetworkHandle::new(sender);
 
     let cb = ConsensusBus::new();
-    let mut rx_new_certificates = cb.new_certificates().subscribe();
+    let mut rx_new_certificates = cb.subscribe_new_certificates();
     // Spawn the core.
     let task_manager = TaskManager::default();
     let synchronizer =
@@ -192,7 +192,7 @@ async fn run_vote_aggregator_with_param(
     }
 
     let cb = ConsensusBus::new();
-    let mut rx_new_certificates = cb.new_certificates().subscribe();
+    let mut rx_new_certificates = cb.subscribe_new_certificates();
     // Spawn the core.
     let task_manager = TaskManager::default();
     let synchronizer =
@@ -309,7 +309,7 @@ async fn propose_headers_one_bad() {
     }
 
     let cb = ConsensusBus::new();
-    let mut rx_new_certificates = cb.new_certificates().subscribe();
+    let mut rx_new_certificates = cb.subscribe_new_certificates();
     // Spawn the core.
     let task_manager = TaskManager::default();
     let synchronizer =
