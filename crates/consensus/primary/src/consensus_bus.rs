@@ -13,8 +13,9 @@ use tn_config::Parameters;
 use tn_network_libp2p::types::NetworkEvent;
 use tn_primary_metrics::{ChannelMetrics, ConsensusMetrics, ExecutorMetrics, Metrics};
 use tn_types::{
-    error::HeaderError, BlockHash, BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader,
-    ConsensusOutput, Epoch, EpochVote, Header, Round, TnReceiver, TnSender, CHANNEL_CAPACITY,
+    error::HeaderError, BlockHash, BlockNumHash, Certificate, CommittedSubDag, Committee,
+    ConsensusHeader, ConsensusOutput, Epoch, EpochVote, Header, Round, TnReceiver, TnSender,
+    CHANNEL_CAPACITY,
 };
 use tokio::{
     sync::{
@@ -188,6 +189,11 @@ struct ConsensusBusAppInner {
     /// Hold onto the recent sync_status to keep it "open"
     _rx_sync_status: watch::Receiver<NodeMode>,
 
+    /// Watch channel for the current committee.
+    tx_current_committee: watch::Sender<Option<Committee>>,
+    /// Hold onto a receiver to keep it "open".
+    _rx_current_committee: watch::Receiver<Option<Committee>>,
+
     /// Produce new epoch certs as they are recieved.
     new_epoch_votes: QueChannel<(EpochVote, oneshot::Sender<Result<(), HeaderError>>)>,
     /// The que channel for primary network events.
@@ -223,6 +229,7 @@ impl ConsensusBusAppInner {
         let (tx_recent_blocks, _rx_recent_blocks) =
             watch::channel(RecentBlocks::new(recent_blocks as usize));
         let (tx_sync_status, _rx_sync_status) = watch::channel(NodeMode::default());
+        let (tx_current_committee, _rx_current_committee) = watch::channel(None);
 
         let (consensus_header, _rx_consensus_header) = broadcast::channel(CHANNEL_CAPACITY);
         let (consensus_output, _rx_consensus_output) = broadcast::channel(100);
@@ -245,6 +252,8 @@ impl ConsensusBusAppInner {
             consensus_output,
             tx_sync_status,
             _rx_sync_status,
+            tx_current_committee,
+            _rx_current_committee,
             new_epoch_votes: QueChannel::new(),
             primary_network_events: QueChannel::new(),
             consensus_metrics,
@@ -540,6 +549,11 @@ impl ConsensusBus {
     /// This is useful pre-consensus output when not participating in consensus.
     pub fn consensus_header(&self) -> &impl TnSender<ConsensusHeader> {
         &self.inner_app.consensus_header
+    }
+
+    /// Watch channel for the current committee.
+    pub fn current_committee(&self) -> &watch::Sender<Option<Committee>> {
+        &self.inner_app.tx_current_committee
     }
 
     /// Status of initial sync operation.
