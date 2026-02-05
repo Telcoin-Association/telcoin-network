@@ -146,28 +146,29 @@ async fn test_try_send_full() {
 }
 
 #[tokio::test]
-async fn test_send_before_subscribe_buffers() {
+async fn test_send_before_subscribe_is_noop() {
     // Create a channel via channel_sender (no receiver handed out yet).
-    // Sends should buffer normally since subscribed starts true.
+    // Sends should be no-ops since subscribed starts false.
     let counter = IntGauge::new("TEST_COUNTER_NO_SUB", "test").unwrap();
     let tx = channel_sender::<i32>(8, &counter);
 
-    // send() should succeed and buffer the message
+    // send() should succeed but be a no-op (counter stays 0)
     let result = tx.send(42).await;
     assert!(result.is_ok());
-    assert_eq!(counter.get(), 1);
+    assert_eq!(counter.get(), 0);
 
-    // try_send() should also succeed and buffer
+    // try_send() should also succeed but be a no-op
     let result = tx.try_send(99);
     assert!(result.is_ok());
-    assert_eq!(counter.get(), 2);
+    assert_eq!(counter.get(), 0);
 
-    // Now subscribe and verify the messages were buffered
+    // After subscribe, sends should go through
     let mut rx = tx.subscribe();
+    let result = tx.send(7).await;
+    assert!(result.is_ok());
+    assert_eq!(counter.get(), 1);
     let received = rx.recv().await.unwrap();
-    assert_eq!(received, 42);
-    let received = rx.recv().await.unwrap();
-    assert_eq!(received, 99);
+    assert_eq!(received, 7);
 }
 
 #[tokio::test]

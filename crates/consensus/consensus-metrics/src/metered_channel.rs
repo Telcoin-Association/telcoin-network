@@ -277,9 +277,9 @@ pub fn channel_sender<T>(size: usize, gauge: &IntGauge) -> MeteredMpscChannel<T>
     gauge.set(0);
     let (sender, receiver) = mpsc::channel(size);
     let rx = Receiver { inner: receiver, gauge: gauge.clone(), total: None, subscribed: None };
-    // Start subscribed so sends buffer normally until subscribe() is called.
-    // The receiver's Drop will set subscribed to false, enabling no-op sends.
-    let subscribed = Arc::new(AtomicBool::new(true));
+    // Start unsubscribed so sends are no-ops until subscribe() is called.
+    // This prevents channels from filling up when no receiver is active (e.g. observer mode).
+    let subscribed = Arc::new(AtomicBool::new(false));
     MeteredMpscChannel {
         inner: sender,
         gauge: gauge.clone(),
@@ -301,9 +301,9 @@ pub fn channel_with_total_sender<T>(
         total: Some(total_gauge.clone()),
         subscribed: None,
     };
-    // Start subscribed so sends buffer normally until subscribe() is called.
-    // The receiver's Drop will set subscribed to false, enabling no-op sends.
-    let subscribed = Arc::new(AtomicBool::new(true));
+    // Start unsubscribed so sends are no-ops until subscribe() is called.
+    // This prevents channels from filling up when no receiver is active (e.g. observer mode).
+    let subscribed = Arc::new(AtomicBool::new(false));
     MeteredMpscChannel {
         inner: sender,
         gauge: gauge.clone(),
