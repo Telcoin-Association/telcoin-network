@@ -68,6 +68,26 @@ impl<T> QueChannel<T> {
         let subscribed = Arc::new(AtomicBool::new(false));
         Self { channel: tx, receiver, subscribed }
     }
+
+    /// Subscribe to receive messages on this channel.
+    ///
+    /// Must be called in synchronous `spawn()` methods, BEFORE spawning async tasks.
+    /// Can only be called once at a time (returned receiver restores on Drop).
+    pub fn subscribe(&self) -> impl TnReceiver<T> + 'static
+    where
+        T: Send + 'static,
+    {
+        let receiver = self.receiver.lock().take();
+        if receiver.is_none() {
+            panic!("Another subscription is already in use!")
+        }
+        self.subscribed.store(true, Ordering::Release);
+        QueChanReceiver {
+            receiver,
+            container: self.receiver.clone(),
+            subscribed: self.subscribed.clone(),
+        }
+    }
 }
 
 impl<T> Default for QueChannel<T> {
@@ -99,19 +119,6 @@ impl<T: Send + 'static> TnSender<T> for QueChannel<T> {
             return Ok(());
         }
         Ok(self.channel.try_send(value)?)
-    }
-
-    fn subscribe(&self) -> impl TnReceiver<T> + 'static {
-        let receiver = self.receiver.lock().take();
-        if receiver.is_none() {
-            panic!("Another subscription is already in use!")
-        }
-        self.subscribed.store(true, Ordering::Release);
-        QueChanReceiver {
-            receiver,
-            container: self.receiver.clone(),
-            subscribed: self.subscribed.clone(),
-        }
     }
 }
 
