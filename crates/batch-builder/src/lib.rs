@@ -275,6 +275,10 @@ impl Future for BatchBuilder {
 
                         // NOTE: empty vec returned for non-fatal error during block proposal
                         if mined_transactions.is_empty() {
+                            // reset interval to prevent immediate re-wake from stale tick
+                            this.max_delay_interval.reset();
+                            let _ = this.max_delay_interval.poll_tick(cx);
+
                             // return pending and wait for canonical update to wake up again
                             break;
                         }
