@@ -12028,6 +12028,7 @@ dependencies = [
  "parking_lot",
  "proptest",
  "rand 0.9.1",
+ "rayon",
  "reth",
  "reth-chain-state",
  "reth-chainspec",
