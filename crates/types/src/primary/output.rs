@@ -171,6 +171,11 @@ pub struct CommittedSubDag {
     pub certificates: Vec<Certificate>,
     /// The leader certificate responsible of committing this sub-dag.
     pub leader: Certificate,
+    /// Sequential index of this committed subdag (monotonically increasing).
+    /// This is a counter that increments by 1 for each commit, regardless of
+    /// which rounds are committed or skipped.
+    #[serde(default)] // Backward compatibility: 0 if absent
+    sub_dag_index: SequenceNumber,
     /// The so far calculated reputation score for nodes
     pub reputation_score: ReputationScores,
     /// The timestamp that should identify this commit. This is guaranteed to be monotonically
@@ -199,7 +204,12 @@ impl CommittedSubDag {
             leader.header().created_at(), previous_sub_dag_ts, commit_timestamp);
         }
 
-        Self { certificates, leader, reputation_score, commit_timestamp }
+        Self { certificates, leader, sub_dag_index, reputation_score, commit_timestamp }
+    }
+
+    /// Returns the sequential index of this committed subdag.
+    pub fn sub_dag_index(&self) -> SequenceNumber {
+        self.sub_dag_index
     }
 
     pub fn len(&self) -> usize {
@@ -240,7 +250,8 @@ impl CommittedSubDag {
 
     /// Verify that all of the contained certificates are valid and signed by a quorum of committee.
     pub fn verify_certificates(self, committee: &Committee) -> CertificateResult<Self> {
-        let Self { mut certificates, leader, reputation_score, commit_timestamp } = self;
+        let Self { mut certificates, leader, sub_dag_index, reputation_score, commit_timestamp } =
+            self;
         let leader = leader.verify_cert(&committee.bls_keys())?;
         let mut verified_certs: HashSet<CertificateDigest> =
             leader.header.parents().iter().copied().collect();
@@ -267,7 +278,13 @@ impl CommittedSubDag {
                 new_certs.push(cert);
             }
         }
-        Ok(Self { certificates: new_certs, leader, reputation_score, commit_timestamp })
+        Ok(Self {
+            certificates: new_certs,
+            leader,
+            sub_dag_index,
+            reputation_score,
+            commit_timestamp,
+        })
     }
 }
 

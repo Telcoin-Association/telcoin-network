@@ -269,9 +269,11 @@ async fn not_enough_support_with_leader_schedule_change() {
 }
 
 /// We test here the leader schedule change when we experience a long period of asynchrony. That
-/// prohibit us from committing for 8 rounds where 2 schedule changes should have happened given our
-/// setup. Then once we manage to commit on round 15 we observe 2 schedule changes happening and 5
-/// commits.
+/// prohibits us from committing for several rounds. With sequential sub_dag_index and
+/// num_sub_dags_per_schedule = 4, schedule changes happen at indices 3, 7, 11, etc.
+/// Rounds 2 and 4 commit earlier (indices 0, 1), then rounds 6, 8, 10, 12, 14 commit at round 15
+/// (indices 2, 3, 4, 5, 6), and round 16 commits at round 17 (index 7).
+/// Schedule changes occur at index 3 (round 8) and index 7 (round 16).
 #[tokio::test]
 async fn test_long_period_of_asynchrony_for_leader_schedule_change() {
     // GIVEN
@@ -358,9 +360,19 @@ async fn test_long_period_of_asynchrony_for_leader_schedule_change() {
                 assert_eq!(committed_dag_12.leader_round(), 12);
                 assert_eq!(committed_dag_14.leader_round(), 14);
 
-                // Two schedule changes have happened during this commit
-                assert!(committed_dag_6.reputation_score.final_of_schedule);
-                assert!(committed_dag_14.reputation_score.final_of_schedule);
+                // With sequential sub_dag_index and num_sub_dags_per_schedule = 4,
+                // final_of_schedule is true when (index + 1) % 4 == 0.
+                // Rounds 2 and 4 were committed earlier (indices 0, 1), so:
+                // - Round 6: index 2, (2+1) % 4 = 3 → false
+                // - Round 8: index 3, (3+1) % 4 = 0 → TRUE (schedule change)
+                // - Round 10: index 4, (4+1) % 4 = 1 → false
+                // - Round 12: index 5, (5+1) % 4 = 2 → false
+                // - Round 14: index 6, (6+1) % 4 = 3 → false
+                assert!(!committed_dag_6.reputation_score.final_of_schedule);
+                assert!(committed_dag_8.reputation_score.final_of_schedule);
+                assert!(!committed_dag_10.reputation_score.final_of_schedule);
+                assert!(!committed_dag_12.reputation_score.final_of_schedule);
+                assert!(!committed_dag_14.reputation_score.final_of_schedule);
 
                 //
                 // We are still using a swap table with no bad list...
@@ -388,12 +400,11 @@ async fn test_long_period_of_asynchrony_for_leader_schedule_change() {
                 let committed_dag = &committed[0];
                 assert_eq!(committed_dag.leader_round(), 16);
 
-                // Originally, as we do round robin the leaders in testing, we would expect the
-                // leader of round 16 to be the Authority 3. However, since a reputation scores
-                // update happened the leader schedule changed and now the Authority
-                // 3 is flagged as low score and it will be swapped with Authority
-                // 0.
-                assert_eq!(committed_dag.leader.origin(), ids.get(0).unwrap());
+                // With sequential sub_dag_index, the schedule change happens at index 3 (round 8).
+                // At that point, auth 2 (round 6 leader with weak support) is flagged as bad.
+                // Round 16's leader is auth 3, who is NOT in the bad list, so no swap happens.
+                // The leader remains auth 3.
+                assert_eq!(committed_dag.leader.origin(), ids.get(3).unwrap());
                 break;
             }
         }
@@ -978,16 +989,20 @@ async fn reset_consensus_scores_on_every_schedule_change() {
     }
 
     // ensure the leaders of rounds 2 and 4 have been committed
-    let mut current_score = 0;
+    let mut current_score: u64 = 0;
     for sub_dag in all_subdags {
-        if (sub_dag.leader.round() / 2) % NUM_SUB_DAGS_PER_SCHEDULE == 0 {
-            // On every 5th commit we reset the scores and count from the beginning with
-            // scores updated to 1, as we expect now every node to have voted for the previous
-            // leader.
+        // Use sub_dag_index which is a sequential counter (0, 1, 2, ...) instead of
+        // leader.round() / 2, which was incorrect because rounds can be skipped.
+        if sub_dag.sub_dag_index() % NUM_SUB_DAGS_PER_SCHEDULE as u64 == 0 {
+            // On every 5th commit we reset the scores.
+            // For the first commit (index 0), all scores are 0 because there's no previous leader.
+            // For subsequent resets (index 5, 10, ...), scores are 1 because everyone voted
+            // for the previous leader.
+            let expected_score: u64 = if sub_dag.sub_dag_index() == 0 { 0 } else { 1 };
             for score in sub_dag.reputation_score.scores_per_authority.values() {
-                assert_eq!(*score as usize, 1);
+                assert_eq!(*score, expected_score);
             }
-            current_score = 2;
+            current_score = expected_score + 1;
         } else {
             for score in sub_dag.reputation_score.scores_per_authority.values() {
                 assert_eq!(*score, current_score);
@@ -997,7 +1012,7 @@ async fn reset_consensus_scores_on_every_schedule_change() {
             // for every commit.
             current_score += 1;
 
-            if ((sub_dag.leader.round() / 2) + 1) % NUM_SUB_DAGS_PER_SCHEDULE == 0 {
+            if (sub_dag.sub_dag_index() + 1) % NUM_SUB_DAGS_PER_SCHEDULE as u64 == 0 {
                 // if this is going to be the last score update for the current schedule, then
                 // make sure that the `final_of_schedule` will be true
                 assert!(sub_dag.reputation_score.final_of_schedule);
@@ -1449,4 +1464,274 @@ async fn not_enough_support_and_missing_leaders_and_gc() {
     }
 
     assert!(committed);
+}
+
+/// Test that sub_dag_index is sequential and increments by 1 for each commit,
+/// regardless of which leader rounds are committed.
+#[tokio::test]
+async fn test_sub_dag_index_sequential() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let epoch = committee.epoch();
+    let gc_depth = 50;
+
+    // Make certificates for rounds 1 to 20.
+    let genesis =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
+    let metrics = Arc::new(ConsensusMetrics::default());
+    let (certificates, _) = make_certificates_with_epoch(&committee, 1..=20, epoch, &genesis, &ids);
+
+    let mut state = ConsensusState::new(metrics.clone(), gc_depth);
+    let mut bullshark = Bullshark::new(
+        committee.clone(),
+        metrics,
+        NUM_SUB_DAGS_PER_SCHEDULE,
+        LeaderSchedule::new(committee, LeaderSwapTable::default()),
+        DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    );
+
+    // Populate DAG and collect all committed sub dags
+    let mut all_subdags = Vec::new();
+    for certificate in certificates {
+        let (_, committed_subdags) =
+            bullshark.process_certificate(&mut state, certificate).unwrap();
+        all_subdags.extend(committed_subdags);
+    }
+
+    // Verify sub_dag_index is sequential starting from 0
+    for (expected_index, sub_dag) in all_subdags.iter().enumerate() {
+        assert_eq!(
+            sub_dag.sub_dag_index(),
+            expected_index as u64,
+            "sub_dag_index should be sequential. Expected {}, got {} for leader round {}",
+            expected_index,
+            sub_dag.sub_dag_index(),
+            sub_dag.leader_round()
+        );
+    }
+}
+
+/// Test that sub_dag_index remains sequential even when some leader rounds are skipped
+/// (because the leader was missing or didn't have enough support).
+#[tokio::test]
+async fn test_sub_dag_index_sequential_with_skipped_leaders() {
+    const NUM_SUB_DAGS_PER_SCHEDULE: u32 = 3;
+
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let genesis =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
+
+    let mut certificates: VecDeque<Certificate> = VecDeque::new();
+    let mut leader_configs = HashMap::new();
+
+    // Configure leader of round 4 to be missing (not omitted, but has weak support)
+    // This means round 4 leader won't get committed immediately
+    leader_configs.insert(
+        4,
+        TestLeaderConfiguration {
+            round: 4,
+            authority: ids.get(1).unwrap().clone(),
+            should_omit: true, // Omit the leader certificate
+            support: None,
+        },
+    );
+
+    let (out, _parents) = make_certificates_with_leader_configuration(
+        &committee,
+        1..=11,
+        &genesis,
+        &ids,
+        leader_configs,
+    );
+    certificates.extend(out);
+
+    let metrics = Arc::new(ConsensusMetrics::default());
+    let gc_depth = 50;
+    let mut state = ConsensusState::new(metrics.clone(), gc_depth);
+    let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
+
+    let bad_nodes_stake_threshold = 33;
+    let mut bullshark = Bullshark::new(
+        committee,
+        metrics,
+        NUM_SUB_DAGS_PER_SCHEDULE,
+        schedule,
+        bad_nodes_stake_threshold,
+    );
+
+    // Collect all committed sub dags
+    let mut all_subdags = Vec::new();
+    for certificate in certificates {
+        let (_, committed_subdags) =
+            bullshark.process_certificate(&mut state, certificate).unwrap();
+        all_subdags.extend(committed_subdags);
+    }
+
+    // Verify sub_dag_index is still sequential despite skipped leaders
+    for (expected_index, sub_dag) in all_subdags.iter().enumerate() {
+        assert_eq!(
+            sub_dag.sub_dag_index(),
+            expected_index as u64,
+            "sub_dag_index should be sequential even with skipped leaders. Expected {}, got {} for leader round {}",
+            expected_index,
+            sub_dag.sub_dag_index(),
+            sub_dag.leader_round()
+        );
+    }
+
+    // Verify that the schedule change and final_of_schedule work correctly
+    // with sequential indices
+    for sub_dag in &all_subdags {
+        let is_reset_point = sub_dag.sub_dag_index() % NUM_SUB_DAGS_PER_SCHEDULE as u64 == 0;
+        let is_final = (sub_dag.sub_dag_index() + 1) % NUM_SUB_DAGS_PER_SCHEDULE as u64 == 0;
+
+        if is_reset_point {
+            // At reset points (index 0, 3, 6, ...), all scores should be reset
+            // and start fresh with scores of 1 (vote for previous leader)
+            // For index 0, scores are all 0 (no previous leader)
+            if sub_dag.sub_dag_index() == 0 {
+                assert!(
+                    sub_dag.reputation_score.all_zero(),
+                    "First sub_dag should have all zero scores"
+                );
+            }
+        }
+
+        assert_eq!(
+            sub_dag.reputation_score.final_of_schedule,
+            is_final,
+            "final_of_schedule mismatch at index {}",
+            sub_dag.sub_dag_index()
+        );
+    }
+}
+
+/// Test that sub_dag_index persists correctly across epoch boundaries.
+/// This is critical for ensuring that ReputationScores and LeaderSwapTable
+/// updates happen at consistent intervals regardless of epoch changes.
+#[tokio::test]
+async fn sub_dag_index_persists_across_epochs() {
+    const NUM_SUB_DAGS_PER_SCHEDULE: u32 = 10;
+
+    let mut fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let mut committee: Committee = fixture.committee();
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let mut global_sub_dag_index: u64 = 0;
+    let mut all_committed_indices: Vec<u64> = Vec::new();
+
+    // Run consensus for multiple epochs
+    for epoch in 0..3 {
+        let config = fixture.authorities().next().unwrap().consensus_config();
+        let config = ConsensusConfig::new_with_committee_for_test(
+            config.config().clone(),
+            config.node_storage().clone(),
+            config.key_config().clone(),
+            committee.clone(),
+            NetworkConfig::default(),
+        )
+        .unwrap();
+        let store = config.node_storage().clone();
+        let metrics = Arc::new(ConsensusMetrics::default());
+
+        // Recover the next_sub_dag_index from the global latest subdag
+        // (this simulates what happens in Consensus::spawn after epoch change)
+        let recovered_index =
+            store.get_latest_sub_dag().map(|s| s.sub_dag_index() + 1).unwrap_or(0);
+
+        // Verify the recovered index matches what we expect
+        assert_eq!(
+            recovered_index, global_sub_dag_index,
+            "Epoch {}: recovered sub_dag_index should be {}, got {}",
+            epoch, global_sub_dag_index, recovered_index
+        );
+
+        let bullshark = Bullshark::new(
+            committee.clone(),
+            metrics.clone(),
+            NUM_SUB_DAGS_PER_SCHEDULE,
+            LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+            DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+        );
+
+        let cb = ConsensusBus::new();
+        let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
+        cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
+        let mut rx_output = cb.sequence().subscribe();
+        let mut task_manager = TaskManager::default();
+        Consensus::spawn(config.clone(), &cb, bullshark, &task_manager);
+
+        // Make certificates for several rounds to trigger multiple commits
+        let genesis =
+            Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
+        let (mut certificates, next_parents) =
+            make_certificates_with_epoch(&committee, 1..=6, epoch, &genesis, &ids);
+
+        // Add round 7 certificates to trigger commit of round 6 leader
+        for id in ids.iter().take(3) {
+            let (_, certificate) =
+                mock_certificate_with_epoch(&committee, id.clone(), 7, epoch, next_parents.clone());
+            certificates.push_back(certificate);
+        }
+
+        // Feed certificates to consensus
+        while let Some(certificate) = certificates.pop_front() {
+            cb.new_certificates().send(certificate).await.unwrap();
+        }
+
+        // Collect committed subdags for this epoch
+        let mut epoch_commits = 0;
+        while let Ok(sub_dag) =
+            tokio::time::timeout(std::time::Duration::from_millis(100), rx_output.recv()).await
+        {
+            if let Some(sub_dag) = sub_dag {
+                // Verify this sub_dag_index is sequential globally
+                assert_eq!(
+                    sub_dag.sub_dag_index(),
+                    global_sub_dag_index,
+                    "Epoch {}: Expected sub_dag_index {}, got {}",
+                    epoch,
+                    global_sub_dag_index,
+                    sub_dag.sub_dag_index()
+                );
+
+                all_committed_indices.push(sub_dag.sub_dag_index());
+                global_sub_dag_index += 1;
+                epoch_commits += 1;
+
+                // Store the subdag so it can be recovered in next epoch
+                store.write_subdag_for_test(sub_dag.sub_dag_index(), sub_dag);
+            }
+        }
+
+        info!(
+            "Epoch {} completed with {} commits, global index now at {}",
+            epoch, epoch_commits, global_sub_dag_index
+        );
+
+        // Move to next epoch
+        committee = committee.advance_epoch_for_test(epoch + 1);
+        fixture.update_committee(committee.clone());
+        config.shutdown().notify();
+        let _ = task_manager.join(Notifier::default()).await;
+    }
+
+    // Verify we have a continuous sequence of indices
+    assert!(!all_committed_indices.is_empty(), "Should have committed at least some subdags");
+
+    for (i, &index) in all_committed_indices.iter().enumerate() {
+        assert_eq!(
+            index, i as u64,
+            "Indices should be continuous: expected {}, got {} at position {}",
+            i, index, i
+        );
+    }
+
+    info!(
+        "Successfully verified {} continuous sub_dag_indices across 3 epochs",
+        all_committed_indices.len()
+    );
 }

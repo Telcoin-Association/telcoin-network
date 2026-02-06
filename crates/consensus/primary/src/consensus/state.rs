@@ -43,6 +43,9 @@ pub struct ConsensusState {
     pub dag: Dag,
     /// Metrics handler
     pub metrics: Arc<ConsensusMetrics>,
+    /// Next sequential sub_dag_index to assign. This counter increments by 1 for each
+    /// committed sub dag, regardless of which rounds are committed or skipped.
+    next_sub_dag_index: u64,
 }
 
 impl ConsensusState {
@@ -55,6 +58,7 @@ impl ConsensusState {
             dag: Default::default(),
             last_committed_sub_dag: None,
             metrics,
+            next_sub_dag_index: 0,
         }
     }
 
@@ -64,6 +68,7 @@ impl ConsensusState {
         gc_depth: Round,
         recovered_last_committed: HashMap<AuthorityIdentifier, Round>,
         latest_sub_dag: Option<CommittedSubDag>,
+        next_sub_dag_index: u64,
         cert_store: DB,
     ) -> Self {
         let last_round = ConsensusRound::new_with_gc_depth(last_committed_round, gc_depth);
@@ -93,6 +98,7 @@ impl ConsensusState {
             last_committed_sub_dag,
             dag,
             metrics,
+            next_sub_dag_index,
         }
     }
 
@@ -229,6 +235,14 @@ impl ConsensusState {
         }
         Ok(())
     }
+
+    /// Returns the next sequential sub_dag_index and increments the counter.
+    /// This ensures each committed sub dag gets a unique, monotonically increasing index.
+    pub fn next_sub_dag_index(&mut self) -> u64 {
+        let index = self.next_sub_dag_index;
+        self.next_sub_dag_index += 1;
+        index
+    }
 }
 
 /// Holds information about a committed round in consensus.
@@ -312,11 +326,15 @@ impl<DB: Database> Consensus<DB> {
             .map(|(_k, v)| *v)
             .unwrap_or_else(|| 0);
 
-        // ignore previous epochs
-        let latest_sub_dag = consensus_config
-            .node_storage()
-            .get_latest_sub_dag()
-            .filter(|subdag| subdag.leader_epoch() >= current_epoch);
+        // Get the global latest sub_dag_index before filtering by epoch.
+        // This ensures the sequential counter continues across epoch boundaries.
+        let global_latest_sub_dag = consensus_config.node_storage().get_latest_sub_dag();
+        let next_sub_dag_index =
+            global_latest_sub_dag.as_ref().map(|s| s.sub_dag_index() + 1).unwrap_or(0);
+
+        // ignore previous epochs for DAG reconstruction
+        let latest_sub_dag =
+            global_latest_sub_dag.filter(|subdag| subdag.leader_epoch() >= current_epoch);
 
         debug!(target: "epoch-manager", ?latest_sub_dag, "recovered latest subdag:");
         if let Some(sub_dag) = &latest_sub_dag {
@@ -336,6 +354,7 @@ impl<DB: Database> Consensus<DB> {
             consensus_config.parameters().gc_depth,
             recovered_last_committed,
             latest_sub_dag,
+            next_sub_dag_index,
             consensus_config.node_storage().clone(),
         );
 
@@ -419,7 +438,7 @@ impl<DB: Database> Consensus<DB> {
                     return Ok(());
                 }
 
-                tracing::debug!(target: "telcoin::consensus_state", "Commit in Sequence {:?}", committed_sub_dag.leader.nonce());
+                tracing::debug!(target: "telcoin::consensus_state", "Commit in Sequence {:?}", committed_sub_dag.sub_dag_index());
 
                 for certificate in &committed_sub_dag.certificates {
                     committed_certificates.push(certificate.clone());
