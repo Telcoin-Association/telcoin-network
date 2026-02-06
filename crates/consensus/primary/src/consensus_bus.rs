@@ -8,7 +8,13 @@ use crate::{
 };
 use consensus_metrics::metered_channel::{self, channel_with_total_sender, MeteredMpscChannel};
 use parking_lot::Mutex;
-use std::{error::Error, sync::Arc};
+use std::{
+    error::Error,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 use tn_config::Parameters;
 use tn_network_libp2p::types::NetworkEvent;
 use tn_primary_metrics::{ChannelMetrics, ConsensusMetrics, ExecutorMetrics, Metrics};
@@ -31,11 +37,14 @@ use tokio::{
 struct QueChanReceiver<T> {
     receiver: Option<mpsc::Receiver<T>>,
     container: Arc<Mutex<Option<mpsc::Receiver<T>>>>,
+    /// Flag to signal the sender that this receiver has been dropped.
+    subscribed: Arc<AtomicBool>,
 }
 
-/// Use the Drop to decrement subs.
+/// Use the Drop to decrement subs and signal unsubscribed.
 impl<T> Drop for QueChanReceiver<T> {
     fn drop(&mut self) {
+        self.subscribed.store(false, Ordering::Release);
         (*self.container.lock()) = self.receiver.take();
     }
 }
@@ -48,6 +57,9 @@ pub struct QueChannel<T> {
     channel: mpsc::Sender<T>,
     // Putting this in a lock is unfortunate but if want an mpsc under the hood is needed.
     receiver: Arc<Mutex<Option<mpsc::Receiver<T>>>>,
+    /// Tracks whether a receiver is currently subscribed.
+    /// When `false`, `send()` and `try_send()` become no-ops.
+    subscribed: Arc<AtomicBool>,
 }
 
 impl<T> QueChannel<T> {
@@ -55,7 +67,28 @@ impl<T> QueChannel<T> {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         let receiver = Arc::new(Mutex::new(Some(rx)));
-        Self { channel: tx, receiver }
+        let subscribed = Arc::new(AtomicBool::new(false));
+        Self { channel: tx, receiver, subscribed }
+    }
+
+    /// Subscribe to receive messages on this channel.
+    ///
+    /// Must be called in synchronous `spawn()` methods, BEFORE spawning async tasks.
+    /// Can only be called once at a time (returned receiver restores on Drop).
+    pub fn subscribe(&self) -> impl TnReceiver<T> + 'static
+    where
+        T: Send + 'static,
+    {
+        let receiver = self.receiver.lock().take();
+        if receiver.is_none() {
+            panic!("Another subscription is already in use!")
+        }
+        self.subscribed.store(true, Ordering::Release);
+        QueChanReceiver {
+            receiver,
+            container: self.receiver.clone(),
+            subscribed: self.subscribed.clone(),
+        }
     }
 }
 
@@ -67,25 +100,27 @@ impl<T> Default for QueChannel<T> {
 
 impl<T> Clone for QueChannel<T> {
     fn clone(&self) -> Self {
-        Self { channel: self.channel.clone(), receiver: self.receiver.clone() }
+        Self {
+            channel: self.channel.clone(),
+            receiver: self.receiver.clone(),
+            subscribed: self.subscribed.clone(),
+        }
     }
 }
 
 impl<T: Send + 'static> TnSender<T> for QueChannel<T> {
     async fn send(&self, value: T) -> Result<(), tn_types::SendError<T>> {
+        if !self.subscribed.load(Ordering::Acquire) {
+            return Ok(());
+        }
         Ok(self.channel.send(value).await?)
     }
 
     fn try_send(&self, value: T) -> Result<(), tn_types::TrySendError<T>> {
-        Ok(self.channel.try_send(value)?)
-    }
-
-    fn subscribe(&self) -> impl TnReceiver<T> + 'static {
-        let receiver = self.receiver.lock().take();
-        if receiver.is_none() {
-            panic!("Another subscription is already in use!")
+        if !self.subscribed.load(Ordering::Acquire) {
+            return Ok(());
         }
-        QueChanReceiver { receiver, container: self.receiver.clone() }
+        Ok(self.channel.try_send(value)?)
     }
 }
 
@@ -610,6 +645,71 @@ impl ConsensusBus {
         &self,
     ) -> &impl TnSender<(EpochVote, oneshot::Sender<Result<(), HeaderError>>)> {
         &self.inner_app.new_epoch_votes
+    }
+
+    //
+    //=== Channel subscription methods
+    //
+    // These must be called in synchronous spawn() methods, BEFORE spawning async tasks.
+    // This ensures the channel is active before any messages are sent.
+    //
+
+    pub fn subscribe_new_certificates(&self) -> impl TnReceiver<Certificate> {
+        self.inner_epoch.new_certificates.subscribe()
+    }
+
+    pub fn subscribe_committed_certificates(&self) -> impl TnReceiver<(Round, Vec<Certificate>)> {
+        self.inner_epoch.committed_certificates.subscribe()
+    }
+
+    pub fn subscribe_certificate_fetcher(&self) -> impl TnReceiver<CertificateFetcherCommand> {
+        self.inner_epoch.certificate_fetcher.subscribe()
+    }
+
+    pub fn subscribe_parents(&self) -> impl TnReceiver<(Vec<Certificate>, Round)> {
+        self.inner_epoch.parents.subscribe()
+    }
+
+    pub fn subscribe_our_digests(&self) -> impl TnReceiver<OurDigestMessage> {
+        self.inner_epoch.our_digests.subscribe()
+    }
+
+    pub fn subscribe_headers(&self) -> impl TnReceiver<Header> {
+        self.inner_epoch.headers.subscribe()
+    }
+
+    pub fn subscribe_committed_own_headers(&self) -> impl TnReceiver<(Round, Vec<Round>)> {
+        self.inner_epoch.committed_own_headers.subscribe()
+    }
+
+    pub fn subscribe_sequence(&self) -> impl TnReceiver<CommittedSubDag> {
+        self.inner_epoch.sequence.subscribe()
+    }
+
+    pub(crate) fn subscribe_certificate_manager(
+        &self,
+    ) -> impl TnReceiver<CertificateManagerCommand> {
+        self.inner_epoch.certificate_manager.subscribe()
+    }
+
+    pub fn subscribe_new_epoch_votes(
+        &self,
+    ) -> impl TnReceiver<(EpochVote, oneshot::Sender<Result<(), HeaderError>>)> {
+        self.inner_app.new_epoch_votes.subscribe()
+    }
+
+    pub fn subscribe_primary_network_events(
+        &self,
+    ) -> impl TnReceiver<NetworkEvent<crate::network::Req, crate::network::Res>> {
+        self.inner_app.primary_network_events.subscribe()
+    }
+
+    pub fn subscribe_consensus_output(&self) -> impl TnReceiver<ConsensusOutput> {
+        self.inner_app.consensus_output.subscribe()
+    }
+
+    pub fn subscribe_consensus_header(&self) -> impl TnReceiver<ConsensusHeader> {
+        self.inner_app.consensus_header.subscribe()
     }
 
     /// Will resolve once we have executed block.

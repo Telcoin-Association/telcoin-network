@@ -1,6 +1,6 @@
 //! Unit tests for metered channels
 
-use super::{channel, channel_with_total};
+use super::{channel, channel_sender, channel_with_total};
 use futures::{
     task::{noop_waker, Context, Poll},
     FutureExt,
@@ -142,5 +142,89 @@ async fn test_try_send_full() {
     assert_eq!(counter.get(), 1);
     let received_item = rx.recv().await.unwrap();
     assert_eq!(received_item, item);
+    assert_eq!(counter.get(), 0);
+}
+
+#[tokio::test]
+async fn test_send_before_subscribe_is_noop() {
+    // Sends on unsubscribed channels are silent no-ops.
+    let counter = IntGauge::new("TEST_COUNTER_NO_SUB", "test").unwrap();
+    let tx = channel_sender::<i32>(8, &counter);
+
+    // send() should succeed but be a no-op (counter stays 0)
+    let result = tx.send(42).await;
+    assert!(result.is_ok());
+    assert_eq!(counter.get(), 0);
+
+    // try_send() should also succeed but be a no-op
+    let result = tx.try_send(99);
+    assert!(result.is_ok());
+    assert_eq!(counter.get(), 0);
+
+    // After subscribe, sends should go through
+    let mut rx = tx.subscribe();
+    let result = tx.send(7).await;
+    assert!(result.is_ok());
+    assert_eq!(counter.get(), 1);
+    let received = rx.recv().await.unwrap();
+    assert_eq!(received, 7);
+}
+
+#[tokio::test]
+async fn test_send_no_op_after_subscribe_drop() {
+    // After receiver is dropped, sends become silent no-ops.
+    let counter = IntGauge::new("TEST_COUNTER_SUB_THEN_DROP", "test").unwrap();
+    let tx = channel_sender::<i32>(8, &counter);
+
+    // Subscribe and immediately drop to set subscribed = false
+    drop(tx.subscribe());
+
+    // send() should be a no-op
+    let result = tx.send(42).await;
+    assert!(result.is_ok());
+    assert_eq!(counter.get(), 0);
+
+    // try_send() should also be a no-op
+    let result = tx.try_send(99);
+    assert!(result.is_ok());
+    assert_eq!(counter.get(), 0);
+}
+
+#[tokio::test]
+async fn test_send_after_subscribe() {
+    // Create a channel via channel_sender, subscribe, then send.
+    // The message should arrive at the receiver.
+    let counter = IntGauge::new("TEST_COUNTER_AFTER_SUB", "test").unwrap();
+    let tx = channel_sender::<i32>(8, &counter);
+
+    let mut rx = tx.subscribe();
+
+    let item = 42;
+    tx.send(item).await.unwrap();
+    assert_eq!(counter.get(), 1);
+
+    let received = rx.recv().await.unwrap();
+    assert_eq!(received, item);
+    assert_eq!(counter.get(), 0);
+}
+
+#[tokio::test]
+async fn test_send_after_subscribe_then_drop() {
+    // After receiver is dropped, sends become silent no-ops.
+    let counter = IntGauge::new("TEST_COUNTER_SUB_DROP", "test").unwrap();
+    let tx = channel_sender::<i32>(8, &counter);
+
+    let rx = tx.subscribe();
+    // Drop the receiver - this should set subscribed to false
+    drop(rx);
+
+    // send() should now be a no-op
+    let result = tx.send(42).await;
+    assert!(result.is_ok());
+    assert_eq!(counter.get(), 0);
+
+    // try_send() should also be a no-op
+    let result = tx.try_send(99);
+    assert!(result.is_ok());
     assert_eq!(counter.get(), 0);
 }

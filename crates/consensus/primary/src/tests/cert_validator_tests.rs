@@ -8,7 +8,7 @@ use tn_storage::mem_db::MemDatabase;
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     BlsSignature, Certificate, Hash as _, Round, SignatureVerificationState, TaskManager,
-    TnReceiver as _, TnSender,
+    TnReceiver as _,
 };
 
 struct TestTypes<DB = MemDatabase> {
@@ -41,9 +41,9 @@ async fn test_certificates_verified() -> eyre::Result<()> {
     let TestTypes { validator, cb, fixture, task_manager: _task_manager } = create_test_types();
 
     // receive parent updates
-    let mut parents_rx = cb.parents().subscribe();
+    let mut parents_rx = cb.subscribe_parents();
     // receive verified certificates
-    let mut certificate_manager_rx = cb.certificate_manager().subscribe();
+    let mut certificate_manager_rx = cb.subscribe_certificate_manager();
 
     // create 3 certs
     // NOTE: test types uses the last authority
@@ -92,7 +92,7 @@ async fn test_process_fetched_certificates_in_parallel() -> eyre::Result<()> {
     let TestTypes { validator, cb, fixture, task_manager: _task_manager } = create_test_types();
 
     // receive verified certificates
-    let mut certificate_manager_rx = cb.certificate_manager().subscribe();
+    let mut certificate_manager_rx = cb.subscribe_certificate_manager();
     let committee = fixture.committee();
 
     // NOTE: test types uses the last authority

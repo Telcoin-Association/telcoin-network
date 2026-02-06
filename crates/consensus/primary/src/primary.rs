@@ -11,7 +11,7 @@ use crate::{
 };
 use std::sync::Arc;
 use tn_config::ConsensusConfig;
-use tn_types::{Database, TaskManager, TnReceiver, TnSender};
+use tn_types::{Database, TaskManager};
 use tracing::info;
 
 #[cfg(test)]
@@ -96,16 +96,6 @@ impl<DB: Database> Primary<DB> {
             );
 
             proposer.spawn(task_manager);
-        } else {
-            // This is a dumb task to keep the parents channel clear when not
-            // a cvv.  Otherwise the senders to this channel will eventually "back up"
-            // and cause hung tasks.  Not the end of the world but wastes resources.
-            // TODO- issue 457- remove this once we have a clean way to handle this at the consensus
-            // bus.
-            let mut parents_rx = consensus_bus.parents().subscribe();
-            task_manager.spawn_critical_task("Clear parent certs for non-CVV", async move {
-                while (parents_rx.recv().await).is_some() {}
-            });
         }
 
         if let Some(authority_id) = config.authority_id() {

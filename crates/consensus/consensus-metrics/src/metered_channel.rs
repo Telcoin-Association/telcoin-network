@@ -4,7 +4,10 @@ use futures::{FutureExt, Stream, TryFutureExt};
 use parking_lot::Mutex;
 use prometheus::{IntCounter, IntGauge};
 use std::{
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
 };
 use tn_types::{TnReceiver, TnSender};
@@ -21,6 +24,9 @@ pub struct MeteredMpscChannel<T> {
     inner: mpsc::Sender<T>,
     gauge: IntGauge,
     receiver: Arc<Mutex<Option<Receiver<T>>>>,
+    /// Tracks whether a receiver is currently subscribed.
+    /// When `false`, `send()` and `try_send()` become no-ops.
+    subscribed: Arc<AtomicBool>,
 }
 
 impl<T> Clone for MeteredMpscChannel<T> {
@@ -29,6 +35,7 @@ impl<T> Clone for MeteredMpscChannel<T> {
             inner: self.inner.clone(),
             gauge: self.gauge.clone(),
             receiver: self.receiver.clone(),
+            subscribed: self.subscribed.clone(),
         }
     }
 }
@@ -40,6 +47,9 @@ pub struct Receiver<T> {
     inner: mpsc::Receiver<T>,
     gauge: IntGauge,
     total: Option<IntCounter>,
+    /// When present, this flag is set to `false` on drop to signal
+    /// that the receiver is no longer subscribed.
+    subscribed: Option<Arc<AtomicBool>>,
 }
 
 impl<T> Receiver<T> {
@@ -84,6 +94,14 @@ impl<T: Send> TnReceiver<T> for Receiver<T> {
     }
 }
 
+impl<T> Drop for Receiver<T> {
+    fn drop(&mut self) {
+        if let Some(flag) = &self.subscribed {
+            flag.store(false, Ordering::Release);
+        }
+    }
+}
+
 impl<T> Unpin for Receiver<T> {}
 
 impl<T> MeteredMpscChannel<T> {
@@ -110,19 +128,41 @@ impl<T> MeteredMpscChannel<T> {
     }
 }
 
+impl<T: Send + 'static> MeteredMpscChannel<T> {
+    /// Subscribe to receive messages on this channel.
+    ///
+    /// Must be called in synchronous `spawn()` methods, BEFORE spawning async tasks.
+    /// Can only be called once per channel.
+    pub fn subscribe(&self) -> Receiver<T> {
+        self.subscribed.store(true, Ordering::Release);
+        let mut rx = self
+            .receiver
+            .lock()
+            .take()
+            .expect("No receiver to subscribe, can only subscribe once!");
+        rx.subscribed = Some(self.subscribed.clone());
+        rx
+    }
+}
+
 impl<T: Send + 'static> TnSender<T> for MeteredMpscChannel<T> {
     /// Sends a value, waiting until there is capacity.
     /// Increments the gauge in case of a successful `send`.
-    fn send(
-        &self,
-        value: T,
-    ) -> impl std::future::Future<Output = Result<(), tn_types::SendError<T>>> + Send {
-        self.inner.send(value).inspect_ok(|_| self.gauge.inc()).map_err(|e| e.into())
+    /// Returns `Ok(())` as a no-op when no receiver is subscribed.
+    async fn send(&self, value: T) -> Result<(), tn_types::SendError<T>> {
+        if !self.subscribed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.inner.send(value).inspect_ok(|_| self.gauge.inc()).map_err(|e| e.into()).await
     }
 
     /// Attempts to immediately send a message on this `Sender`
     /// Increments the gauge in case of a successful `try_send`.
+    /// Returns `Ok(())` as a no-op when no receiver is subscribed.
     fn try_send(&self, message: T) -> Result<(), tn_types::TrySendError<T>> {
+        if !self.subscribed.load(Ordering::Acquire) {
+            return Ok(());
+        }
         Ok(self
             .inner
             .try_send(message)
@@ -130,10 +170,6 @@ impl<T: Send + 'static> TnSender<T> for MeteredMpscChannel<T> {
             .inspect(|_| {
                 self.gauge.inc();
             })?)
-    }
-
-    fn subscribe(&self) -> impl TnReceiver<T> + 'static {
-        self.receiver.lock().take().expect("No receiver to subscribe, can only subscribe once!")
     }
 }
 
@@ -202,13 +238,16 @@ impl<T> From<Receiver<T>> for ReceiverStream<T> {
 pub fn channel<T>(size: usize, gauge: &IntGauge) -> (MeteredMpscChannel<T>, Receiver<T>) {
     gauge.set(0);
     let (sender, receiver) = mpsc::channel(size);
+    // Receiver is returned directly, so mark as subscribed.
+    let subscribed = Arc::new(AtomicBool::new(true));
     (
         MeteredMpscChannel {
             inner: sender,
             gauge: gauge.clone(),
             receiver: Arc::new(Mutex::new(None)),
+            subscribed,
         },
-        Receiver { inner: receiver, gauge: gauge.clone(), total: None },
+        Receiver { inner: receiver, gauge: gauge.clone(), total: None, subscribed: None },
     )
 }
 
@@ -220,13 +259,21 @@ pub fn channel_with_total<T>(
 ) -> (MeteredMpscChannel<T>, Receiver<T>) {
     gauge.set(0);
     let (sender, receiver) = mpsc::channel(size);
+    // Receiver is returned directly, so mark as subscribed.
+    let subscribed = Arc::new(AtomicBool::new(true));
     (
         MeteredMpscChannel {
             inner: sender,
             gauge: gauge.clone(),
             receiver: Arc::new(Mutex::new(None)),
+            subscribed,
         },
-        Receiver { inner: receiver, gauge: gauge.clone(), total: Some(total_gauge.clone()) },
+        Receiver {
+            inner: receiver,
+            gauge: gauge.clone(),
+            total: Some(total_gauge.clone()),
+            subscribed: None,
+        },
     )
 }
 
@@ -235,11 +282,15 @@ pub fn channel_with_total<T>(
 pub fn channel_sender<T>(size: usize, gauge: &IntGauge) -> MeteredMpscChannel<T> {
     gauge.set(0);
     let (sender, receiver) = mpsc::channel(size);
-    let rx = Receiver { inner: receiver, gauge: gauge.clone(), total: None };
+    let rx = Receiver { inner: receiver, gauge: gauge.clone(), total: None, subscribed: None };
+    // Start unsubscribed so sends are no-ops until subscribe() is called.
+    // This prevents channels from filling up when no receiver is active (e.g. observer mode).
+    let subscribed = Arc::new(AtomicBool::new(false));
     MeteredMpscChannel {
         inner: sender,
         gauge: gauge.clone(),
         receiver: Arc::new(Mutex::new(Some(rx))),
+        subscribed,
     }
 }
 
@@ -250,10 +301,19 @@ pub fn channel_with_total_sender<T>(
 ) -> MeteredMpscChannel<T> {
     gauge.set(0);
     let (sender, receiver) = mpsc::channel(size);
-    let rx = Receiver { inner: receiver, gauge: gauge.clone(), total: Some(total_gauge.clone()) };
+    let rx = Receiver {
+        inner: receiver,
+        gauge: gauge.clone(),
+        total: Some(total_gauge.clone()),
+        subscribed: None,
+    };
+    // Start unsubscribed so sends are no-ops until subscribe() is called.
+    // This prevents channels from filling up when no receiver is active (e.g. observer mode).
+    let subscribed = Arc::new(AtomicBool::new(false));
     MeteredMpscChannel {
         inner: sender,
         gauge: gauge.clone(),
         receiver: Arc::new(Mutex::new(Some(rx))),
+        subscribed,
     }
 }
