@@ -11,7 +11,6 @@ pub use crate::consensus::{
     utils::gc_round,
 };
 use thiserror::Error;
-pub use tn_primary_metrics::consensus::{ChannelMetrics, ConsensusMetrics};
 use tn_storage::StoreError;
 use tn_types::{Certificate, CertificateDigest};
 

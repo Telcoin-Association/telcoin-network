@@ -6,12 +6,10 @@ use crate::{
     certificate_fetcher::CertificateFetcherCommand, proposer::OurDigestMessage,
     state_sync::CertificateManagerCommand, RecentBlocks,
 };
-use consensus_metrics::metered_channel::{self, channel_with_total_sender, MeteredMpscChannel};
 use parking_lot::Mutex;
 use std::{error::Error, sync::Arc};
 use tn_config::Parameters;
 use tn_network_libp2p::types::NetworkEvent;
-use tn_primary_metrics::{ChannelMetrics, ConsensusMetrics, ExecutorMetrics, Metrics};
 use tn_types::{
     error::HeaderError, BlockHash, BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader,
     ConsensusOutput, Epoch, EpochVote, Header, Round, TnReceiver, TnSender, CHANNEL_CAPACITY,
@@ -160,7 +158,7 @@ struct ConsensusBusAppInner {
 
     /// Signals a new round
     tx_primary_round_updates: watch::Sender<Round>,
-    /// Hold onto the primary metrics (allow early creation)
+    /// Hold onto the primary round updates receiver to keep it "open"
     _rx_primary_round_updates: watch::Receiver<Round>,
 
     /// Watch tracking most recent blocks
@@ -192,23 +190,10 @@ struct ConsensusBusAppInner {
     new_epoch_votes: QueChannel<(EpochVote, oneshot::Sender<Result<(), HeaderError>>)>,
     /// The que channel for primary network events.
     primary_network_events: QueChannel<NetworkEvent<crate::network::Req, crate::network::Res>>,
-
-    /// Hold onto the consensus_metrics (mostly for testing)
-    consensus_metrics: Arc<ConsensusMetrics>,
-    /// Hold onto the primary metrics (allow early creation)
-    primary_metrics: Arc<Metrics>,
-    /// Hold onto the channel metrics.
-    channel_metrics: Arc<ChannelMetrics>,
-    /// Hold onto the executor metrics.
-    executor_metrics: Arc<ExecutorMetrics>,
 }
 
 impl ConsensusBusAppInner {
     fn new(recent_blocks: u32) -> Self {
-        let consensus_metrics = Arc::new(ConsensusMetrics::default());
-        let primary_metrics = Arc::new(Metrics::default()); // Initialize the metrics
-        let channel_metrics = Arc::new(ChannelMetrics::default());
-        let executor_metrics = Arc::new(ExecutorMetrics::default());
         let (tx_committed_round_updates, _rx_committed_round_updates) =
             watch::channel(Round::default());
 
@@ -247,10 +232,6 @@ impl ConsensusBusAppInner {
             _rx_sync_status,
             new_epoch_votes: QueChannel::new(),
             primary_network_events: QueChannel::new(),
-            consensus_metrics,
-            primary_metrics,
-            channel_metrics,
-            executor_metrics,
         }
     }
 
@@ -269,92 +250,45 @@ impl ConsensusBusAppInner {
 struct ConsensusBusEpochInner {
     /// New certificates from the primary. The primary should send us new certificates
     /// only if it already sent us its whole history.
-    new_certificates: MeteredMpscChannel<Certificate>,
+    new_certificates: QueChannel<Certificate>,
     /// Outputs the sequence of ordered certificates to the primary (for cleanup and feedback).
-    committed_certificates: MeteredMpscChannel<(Round, Vec<Certificate>)>,
+    committed_certificates: QueChannel<(Round, Vec<Certificate>)>,
 
     /// Sends missing certificates to the `CertificateFetcher`.
     /// Receives certificates with missing parents from the `Synchronizer`.
-    certificate_fetcher: MeteredMpscChannel<CertificateFetcherCommand>,
+    certificate_fetcher: QueChannel<CertificateFetcherCommand>,
     /// Send valid a quorum of certificates' ids to the `Proposer` (along with their round).
     /// Receives the parents to include in the next header (along with their round number) from
     /// `Synchronizer`.
-    parents: MeteredMpscChannel<(Vec<Certificate>, Round)>,
+    parents: QueChannel<(Vec<Certificate>, Round)>,
     /// Receives the batches' digests from our workers.
-    our_digests: MeteredMpscChannel<OurDigestMessage>,
+    our_digests: QueChannel<OurDigestMessage>,
     /// Sends newly created headers to the `Certifier`.
-    headers: MeteredMpscChannel<Header>,
+    headers: QueChannel<Header>,
     /// Updates when headers were committed by consensus.
     ///
     /// NOTE: this does not mean the header was executed yet.
-    committed_own_headers: MeteredMpscChannel<(Round, Vec<Round>)>,
+    committed_own_headers: QueChannel<(Round, Vec<Round>)>,
 
     /// Outputs the sequence of ordered certificates to the application layer.
-    sequence: MeteredMpscChannel<CommittedSubDag>,
+    sequence: QueChannel<CommittedSubDag>,
 
     /// Messages to the Certificate Manager.
-    certificate_manager: MeteredMpscChannel<CertificateManagerCommand>,
+    certificate_manager: QueChannel<CertificateManagerCommand>,
 }
 
 impl ConsensusBusEpochInner {
-    fn new(app_inner: &ConsensusBusAppInner) -> Self {
-        let new_certificates = metered_channel::channel_sender(
-            CHANNEL_CAPACITY,
-            &app_inner.primary_metrics.primary_channel_metrics.tx_new_certificates,
-        );
-
-        let committed_certificates = metered_channel::channel_sender(
-            CHANNEL_CAPACITY,
-            &app_inner.primary_metrics.primary_channel_metrics.tx_committed_certificates,
-        );
-
-        let our_digests = channel_with_total_sender(
-            CHANNEL_CAPACITY,
-            &app_inner.primary_metrics.primary_channel_metrics.tx_our_digests,
-            &app_inner.primary_metrics.primary_channel_metrics.tx_our_digests_total,
-        );
-        let parents = channel_with_total_sender(
-            CHANNEL_CAPACITY,
-            &app_inner.primary_metrics.primary_channel_metrics.tx_parents,
-            &app_inner.primary_metrics.primary_channel_metrics.tx_parents_total,
-        );
-        let headers = channel_with_total_sender(
-            CHANNEL_CAPACITY,
-            &app_inner.primary_metrics.primary_channel_metrics.tx_headers,
-            &app_inner.primary_metrics.primary_channel_metrics.tx_headers_total,
-        );
-        let certificate_fetcher = channel_with_total_sender(
-            CHANNEL_CAPACITY,
-            &app_inner.primary_metrics.primary_channel_metrics.tx_certificate_fetcher,
-            &app_inner.primary_metrics.primary_channel_metrics.tx_certificate_fetcher_total,
-        );
-        let committed_own_headers = channel_with_total_sender(
-            CHANNEL_CAPACITY,
-            &app_inner.primary_metrics.primary_channel_metrics.tx_committed_own_headers,
-            &app_inner.primary_metrics.primary_channel_metrics.tx_committed_own_headers_total,
-        );
-
-        let certificate_manager = channel_with_total_sender(
-            CHANNEL_CAPACITY,
-            &app_inner.primary_metrics.primary_channel_metrics.tx_certificate_acceptor,
-            &app_inner.primary_metrics.primary_channel_metrics.tx_certificate_acceptor_total,
-        );
-
-        let sequence = metered_channel::channel_sender(
-            CHANNEL_CAPACITY,
-            &app_inner.channel_metrics.tx_sequence,
-        );
-
+    fn new() -> Self {
         Self {
-            new_certificates,
-            committed_certificates,
-            certificate_fetcher,
-            parents,
-            our_digests,
-            headers,
-            committed_own_headers,
-            sequence,
-            certificate_manager,
+            new_certificates: QueChannel::new(),
+            committed_certificates: QueChannel::new(),
+            certificate_fetcher: QueChannel::new(),
+            parents: QueChannel::new(),
+            our_digests: QueChannel::new(),
+            headers: QueChannel::new(),
+            committed_own_headers: QueChannel::new(),
+            sequence: QueChannel::new(),
+            certificate_manager: QueChannel::new(),
         }
     }
 }
@@ -377,11 +311,10 @@ impl Default for ConsensusBus {
     }
 }
 
-/// This contains the shared consensus channels and the prometheus metrics
-/// containers (used mostly to track consensus messages).
+/// This contains the shared consensus channels.
 /// A new bus can be created with new() but there should only ever be one created (except for
-/// tests). This allows us to not create and pass channels all over the place add-hoc.
-/// It also allows makes it much easier to find where channels are fed and consumed.
+/// tests). This allows us to not create and pass channels all over the place ad-hoc.
+/// It also makes it much easier to find where channels are fed and consumed.
 impl ConsensusBus {
     /// Create a new consensus bus.
     pub fn new() -> Self {
@@ -397,7 +330,7 @@ impl ConsensusBus {
     /// Store recent_blocks number of the last generated execution blocks.
     pub fn new_with_args(recent_blocks: u32) -> Self {
         let inner_app = Arc::new(ConsensusBusAppInner::new(recent_blocks));
-        let inner_epoch = Arc::new(ConsensusBusEpochInner::new(&inner_app));
+        let inner_epoch = Arc::new(ConsensusBusEpochInner::new());
         Self { inner_app, inner_epoch }
     }
 
@@ -405,7 +338,7 @@ impl ConsensusBus {
     /// This is primarily so we can resubscribe to "one-time" subscription channels.
     pub fn reset_for_epoch(&mut self) {
         self.inner_app.reset_for_epoch();
-        let inner_epoch = Arc::new(ConsensusBusEpochInner::new(&self.inner_app));
+        let inner_epoch = Arc::new(ConsensusBusEpochInner::new());
         self.inner_epoch = inner_epoch;
     }
 
@@ -583,26 +516,6 @@ impl ConsensusBus {
         &self,
     ) -> QueChannel<NetworkEvent<crate::network::Req, crate::network::Res>> {
         self.inner_app.primary_network_events.clone()
-    }
-
-    /// Hold onto the consensus_metrics (mostly for testing)
-    pub fn consensus_metrics(&self) -> Arc<ConsensusMetrics> {
-        self.inner_app.consensus_metrics.clone()
-    }
-
-    /// Hold onto the primary metrics (allow early creation)
-    pub fn primary_metrics(&self) -> Arc<Metrics> {
-        self.inner_app.primary_metrics.clone()
-    }
-
-    /// Hold onto the channel metrics (metrics for the sequence channel).
-    pub fn channel_metrics(&self) -> Arc<ChannelMetrics> {
-        self.inner_app.channel_metrics.clone()
-    }
-
-    /// Hold onto the executor metrics
-    pub fn executor_metrics(&self) -> &ExecutorMetrics {
-        &self.inner_app.executor_metrics
     }
 
     /// New epoch certs as they are recieved.

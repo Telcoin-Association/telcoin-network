@@ -1,14 +1,13 @@
 //! Aggregate votes after proposing a header.
 
-use std::{collections::HashSet, sync::Arc};
-use tn_primary_metrics::PrimaryMetrics;
+use std::collections::HashSet;
 use tn_types::{
     ensure,
     error::{DagError, DagResult},
     to_intent_message, AuthorityIdentifier, BlsSignature, Certificate, Committee, Header,
     ProtocolSignature, SignatureVerificationState, Vote, VotingPower,
 };
-use tracing::trace;
+use tracing::{info, instrument, trace};
 
 /// Aggregates votes for a particular header to form a certificate
 pub(crate) struct VotesAggregator {
@@ -20,21 +19,18 @@ pub(crate) struct VotesAggregator {
     verified_votes: Vec<(AuthorityIdentifier, BlsSignature)>,
     /// The collection of authority ids that have already voted.
     authorities_seen: HashSet<AuthorityIdentifier>,
-    /// Metrics for votes aggregator.
-    metrics: Arc<PrimaryMetrics>,
 }
 
 impl VotesAggregator {
     /// Create a new instance of `Self`.
-    pub(crate) fn new(metrics: Arc<PrimaryMetrics>) -> Self {
-        metrics.votes_received_last_round.set(0);
-
-        Self { weight: 0, verified_votes: Vec::new(), authorities_seen: HashSet::new(), metrics }
+    pub(crate) fn new() -> Self {
+        Self { weight: 0, verified_votes: Vec::new(), authorities_seen: HashSet::new() }
     }
 
     /// Append the vote to the collection.
     ///
     /// This method protects against equivocation by keeping track of peers that have already voted.
+    #[instrument(level = "debug", skip_all, fields(voter = ?vote.author(), weight = self.weight))]
     pub(crate) fn append(
         &mut self,
         vote: Vote,
@@ -65,9 +61,6 @@ impl VotesAggregator {
         self.verified_votes.push((author.clone(), *vote.signature()));
         self.weight += committee.voting_power_by_id(author);
 
-        // update metrics
-        self.metrics.votes_received_last_round.set(self.verified_votes.len() as i64);
-
         // check if this vote reaches quorum
         if self.weight >= committee.quorum_threshold() {
             let mut cert = Certificate::new_unverified(
@@ -75,6 +68,17 @@ impl VotesAggregator {
                 header.clone(),
                 self.verified_votes.clone(),
             )?;
+
+            // Metric: quorum_reached - tracks when vote quorum is achieved
+            info!(
+                target: "consensus::metrics",
+                round = header.round(),
+                epoch = header.epoch(),
+                voting_power = self.weight,
+                quorum_threshold = committee.quorum_threshold(),
+                num_votes = self.verified_votes.len(),
+                "quorum reached"
+            );
 
             trace!(target: "primary::votes_aggregator", ?cert, "certificate verified");
             // cert signature verified

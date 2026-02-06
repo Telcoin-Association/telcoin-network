@@ -202,7 +202,6 @@ fn spawn_consensus(
     );
     let bullshark = Bullshark::new(
         committee.clone(),
-        Arc::new(Default::default()),
         3,
         leader_schedule.clone(),
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
