@@ -1348,6 +1348,9 @@ where
         // load committee
         committee.load();
 
+        // update the consensus bus with the current committee for RPC access
+        self.consensus_bus.current_committee().send_replace(Some(committee.clone()));
+
         Ok(committee)
     }
 
