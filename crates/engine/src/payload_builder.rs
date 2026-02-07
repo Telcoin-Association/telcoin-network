@@ -62,7 +62,10 @@ pub fn execute_consensus_output(
             info!(target: "engine", "skipping execution for empty non-epoch-closing output");
             span.record("executed_blocks", "0");
             // Notify consensus that this round was processed (no block produced)
-            let _ = engine_update_tx.try_send((leader_round, consensus_hash, None));
+            engine_update_tx.try_send((leader_round, consensus_hash, None)).map_err(|e| {
+                error!(target: "engine", ?e, "engine update channel send failed");
+                TnEngineError::ChannelClosed
+            })?;
             return Ok(canonical_header);
         }
 
@@ -148,8 +151,12 @@ pub fn execute_consensus_output(
     // Send engine update BEFORE broadcasting canon state notification.
     // This ensures the primary has the latest execution info before a batch
     // is also proposed (batch builder subscribes to canon state notifications).
-    let _ =
-        engine_update_tx.try_send((leader_round, consensus_hash, Some(canonical_header.clone())));
+    engine_update_tx
+        .try_send((leader_round, consensus_hash, Some(canonical_header.clone())))
+        .map_err(|e| {
+            error!(target: "engine", ?e, "engine update channel send failed");
+            TnEngineError::ChannelClosed
+        })?;
 
     reth_env.finish_executing_output(executed_blocks)?;
     // remove blocks from memory and stores them in the database
