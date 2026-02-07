@@ -79,6 +79,7 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
     let shutdown = Notifier::default();
     let task_manager = TaskManager::default();
     let reth_env = execution_node.get_reth_env().await;
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
     let engine = ExecutorEngine::new(
         reth_env.clone(),
         max,
@@ -87,6 +88,7 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
         shutdown.subscribe(),
         task_manager.get_spawner(),
         gas_accumulator.clone(),
+        engine_update_tx,
     );
     let (tx, mut rx) = oneshot::channel();
     task_manager.spawn_task("test task eng", async move {
@@ -343,6 +345,8 @@ fn spawn_consensus(
 
     // spawn consensus to await certificates
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    consensus_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
+    consensus_bus
+        .recent_blocks()
+        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
     Consensus::spawn(config, consensus_bus, bullshark, task_manager);
 }

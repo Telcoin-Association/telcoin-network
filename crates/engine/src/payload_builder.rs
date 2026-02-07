@@ -7,7 +7,10 @@ use tn_reth::{
     payload::{BuildArguments, TNPayload},
     CanonicalInMemoryState, ExecutedBlockWithTrieUpdates, NewCanonicalChain, RethEnv,
 };
-use tn_types::{gas_accumulator::GasAccumulator, max_batch_gas, Hash as _, SealedHeader, B256};
+use tn_types::{
+    gas_accumulator::GasAccumulator, max_batch_gas, Hash as _, Round, SealedHeader, B256,
+};
+use tokio::sync::mpsc;
 use tracing::{debug, error, field, info, info_span};
 
 /// Execute output from consensus to extend the canonical chain.
@@ -19,6 +22,7 @@ use tracing::{debug, error, field, info, info_span};
 pub fn execute_consensus_output(
     args: BuildArguments,
     gas_accumulator: GasAccumulator,
+    engine_update_tx: mpsc::Sender<(Round, B256, Option<SealedHeader>)>,
 ) -> EngineResult<SealedHeader> {
     // rename canonical header for clarity
     let BuildArguments { reth_env, mut output, parent_header: mut canonical_header } = args;
@@ -26,6 +30,8 @@ pub fn execute_consensus_output(
     let epoch = output.leader().epoch();
     // output digest returns the `ConsensusHeader` digest
     let output_digest: B256 = output.digest().into();
+    let leader_round = output.leader_round();
+    let consensus_hash = output.consensus_header_hash();
     let batches = output.flatten_batches();
 
     let span = info_span!(target: "telcoin", "execute-consensus", epoch,
@@ -38,14 +44,6 @@ pub fn execute_consensus_output(
     let _guard = span.enter();
     debug!(target: "engine", ?output, "executing output");
 
-    // Skip execution entirely when output contains no batches AND the epoch is not closing.
-    // The leader count has already been incremented above for rewards tracking.
-    if batches.is_empty() && !output.close_epoch {
-        info!(target: "engine", "skipping execution for empty non-epoch-closing output");
-        span.record("executed_blocks", "0");
-        return Ok(canonical_header);
-    }
-
     // assert vecs match
     debug_assert_eq!(
         batches.len(),
@@ -57,12 +55,19 @@ pub fn execute_consensus_output(
     let mut executed_blocks = Vec::with_capacity(batches.len().max(1));
     let canonical_in_memory_state = reth_env.canonical_in_memory_state();
 
-    // extend canonical tip if output contains batches with transactions
-    // otherwise execute an empty block to extend canonical tip
     if batches.is_empty() {
-        // execute single block with no transactions
-        //
-        // use parent values for next block (these values would come from the worker's block)
+        if !output.close_epoch {
+            // Skip execution entirely — no batches and epoch is not closing.
+            // Leader count was already incremented above for rewards tracking.
+            info!(target: "engine", "skipping execution for empty non-epoch-closing output");
+            span.record("executed_blocks", "0");
+            // Notify consensus that this round was processed (no block produced)
+            let _ = engine_update_tx.try_send((leader_round, consensus_hash, None));
+            return Ok(canonical_header);
+        }
+
+        // Execute single empty block to close the epoch.
+        // Use parent values for next block (these values would come from the worker's block).
         let base_fee_per_gas = canonical_header.base_fee_per_gas.unwrap_or_default();
         let gas_limit = canonical_header.gas_limit;
         let leader = output.leader().origin();
@@ -139,6 +144,13 @@ pub fn execute_consensus_output(
     } // end block execution for round
 
     span.record("executed_blocks", executed_blocks.len().to_string());
+
+    // Send engine update BEFORE broadcasting canon state notification.
+    // This ensures the primary has the latest execution info before a batch
+    // is also proposed (batch builder subscribes to canon state notifications).
+    let _ =
+        engine_update_tx.try_send((leader_round, consensus_hash, Some(canonical_header.clone())));
+
     reth_env.finish_executing_output(executed_blocks)?;
     // remove blocks from memory and stores them in the database
     reth_env.finalize_block(canonical_header.clone())?;

@@ -72,7 +72,9 @@ async fn test_output_to_header() -> eyre::Result<()> {
     );
 
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    consensus_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
+    consensus_bus
+        .recent_blocks()
+        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
     let task_manager = TaskManager::default();
     Consensus::spawn(config.clone(), &consensus_bus, bullshark, &task_manager);
 
@@ -160,7 +162,9 @@ async fn test_executor_output_ordering() -> eyre::Result<()> {
     );
 
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    consensus_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
+    consensus_bus
+        .recent_blocks()
+        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
     let task_manager2 = TaskManager::default();
     Consensus::spawn(config.clone(), &consensus_bus, bullshark, &task_manager2);
 
@@ -239,7 +243,9 @@ async fn test_executor_batch_fetching() -> eyre::Result<()> {
     );
 
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    consensus_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
+    consensus_bus
+        .recent_blocks()
+        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
     let task_manager2 = TaskManager::default();
     Consensus::spawn(config.clone(), &consensus_bus, bullshark, &task_manager2);
 

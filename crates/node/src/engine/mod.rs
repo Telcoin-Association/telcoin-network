@@ -80,9 +80,14 @@ impl ExecutionNode {
         rx_output: mpsc::Receiver<ConsensusOutput>,
         rx_shutdown: Noticer,
         gas_accumulator: GasAccumulator,
+        engine_update_tx: mpsc::Sender<(
+            tn_types::Round,
+            tn_types::B256,
+            Option<tn_types::SealedHeader>,
+        )>,
     ) -> eyre::Result<()> {
         let guard = self.internal.read().await;
-        guard.start_engine(rx_output, rx_shutdown, gas_accumulator).await
+        guard.start_engine(rx_output, rx_shutdown, gas_accumulator, engine_update_tx).await
     }
 
     /// Initialize the worker's transaction pool and public RPC.

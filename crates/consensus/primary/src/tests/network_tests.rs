@@ -17,7 +17,7 @@ use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     error::HeaderError, now, AuthorityIdentifier, BlockHash, BlockHeader, BlockNumHash,
     BlsPublicKey, Certificate, CertificateDigest, EpochVote, ExecHeader, Hash as _, SealedHeader,
-    TaskManager,
+    TaskManager, TnReceiver, TnSender, B256,
 };
 use tracing::debug;
 
@@ -79,8 +79,10 @@ fn create_test_types() -> TestTypes {
 
     // set the latest execution result to genesis - test headers are proposed for round 1
     let mut recent = RecentBlocks::new(1);
-    recent.push_latest(parent.clone());
-    cb.recent_blocks().send_replace(recent);
+    recent.push_latest(0, B256::default(), Some(parent.clone()));
+    cb.recent_blocks()
+        .send(recent)
+        .expect("watch channel updates for default parent in primary handler tests");
 
     let handler = RequestHandler::new(config.clone(), cb.clone(), synchronizer);
     TestTypes { committee, handler, parent, task_manager }

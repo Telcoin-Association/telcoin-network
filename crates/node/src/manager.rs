@@ -31,7 +31,7 @@ use tn_primary::{
 use tn_reth::{
     bytes_to_txn,
     system_calls::{ConsensusRegistry, EpochState},
-    CanonStateNotificationStream, RethDb, RethEnv,
+    RethDb, RethEnv,
 };
 use tn_storage::{
     open_db,
@@ -53,7 +53,6 @@ use tn_worker::{
     WorkerResponse,
 };
 use tokio::sync::mpsc::{self};
-use tokio_stream::StreamExt;
 use tracing::{debug, error, info, info_span, warn, Instrument};
 
 /// The long-running task manager name.
@@ -584,10 +583,18 @@ where
         // Create our epoch gas accumulator, we currently have one worker.
         // All nodes have to agree on the worker count, do not change this for an existing chain.
         let gas_accumulator = GasAccumulator::new(1);
+        // create channel for engine updates to consensus
+        let (engine_update_tx, engine_update_rx) = mpsc::channel(64);
+
         // create the engine
         let engine = self.create_engine(&engine_task_manager, &gas_accumulator)?;
         engine
-            .start_engine(for_engine, self.node_shutdown.subscribe(), gas_accumulator.clone())
+            .start_engine(
+                for_engine,
+                self.node_shutdown.subscribe(),
+                gas_accumulator.clone(),
+                engine_update_tx,
+            )
             .await?;
 
         // retrieve epoch information from canonical tip on startup
@@ -628,7 +635,7 @@ where
 
         self.try_restore_state(&engine).await?;
         // spawn task to update the latest execution results for consensus
-        self.spawn_engine_update_task(engine.canonical_block_stream().await, &node_task_manager);
+        self.spawn_engine_update_task(engine_update_rx, &node_task_manager);
 
         // add engine task manager
         node_task_manager.add_task_manager(engine_task_manager);
@@ -1810,9 +1817,13 @@ where
         let block_capacity = self.consensus_bus.recent_blocks_capacity();
 
         for recent_block in engine.last_executed_output_blocks(block_capacity).await? {
+            // On restore, use the block's consensus hash from parent_beacon_block_root.
+            // Round is set to 0 since we don't persist it; only the consensus hash matters
+            // for wait_for_consensus_execution resolution.
+            let consensus_hash = recent_block.parent_beacon_block_root.unwrap_or_default();
             self.consensus_bus
                 .recent_blocks()
-                .send_modify(|blocks| blocks.push_latest(recent_block));
+                .send_modify(|blocks| blocks.push_latest(0, consensus_hash, Some(recent_block)));
         }
 
         Ok(())
@@ -1852,22 +1863,23 @@ where
         Ok(mode)
     }
 
-    /// Spawn a task to update `ConsensusBus::recent_blocks` everytime the engine produces a new
-    /// final block.
+    /// Spawn a task to update `ConsensusBus::recent_blocks` every time the engine processes a
+    /// consensus output (with or without blocks).
     fn spawn_engine_update_task(
         &self,
-        mut engine_state: CanonStateNotificationStream,
+        mut engine_update: mpsc::Receiver<(tn_types::Round, B256, Option<tn_types::SealedHeader>)>,
         task_manager: &TaskManager,
     ) {
-        // spawn epoch-specific task to forward blocks from the engine to consensus
         let consensus_bus = self.consensus_bus.clone();
-        task_manager.spawn_critical_task("latest execution block", async move {
-            while let Some(latest) = engine_state.next().await {
-                consensus_bus
-                    .recent_blocks()
-                    .send_modify(|blocks| blocks.push_latest(latest.tip().clone_sealed_header()));
+        task_manager.spawn_critical_task("engine updates for consensus", async move {
+            while let Some((latest_round, consensus_hash, latest_executed_block)) =
+                engine_update.recv().await
+            {
+                consensus_bus.recent_blocks().send_modify(|blocks| {
+                    blocks.push_latest(latest_round, consensus_hash, latest_executed_block)
+                });
             }
-            error!(target: "engine", "engine state stream ended, node will exit");
+            error!(target: "engine", "engine updates ended, node will exit");
         });
     }
 
