@@ -10,7 +10,7 @@ use tn_storage::{
 };
 use tn_types::{Database as TNDatabase, DbTxMut as _, Epoch, EpochRecord, TaskSpawner, B256};
 use tokio::sync::{mpsc::Receiver, Mutex, Semaphore, SemaphorePermit};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Retrieve a consensus header from a peer.
 /// If we are requesting a hash then that hash should
@@ -71,6 +71,13 @@ async fn get_consensus_header<DB: TNDatabase>(
             Some((epoch, parent_number, parent))
         }
         Err(e) => {
+            warn!(
+                target: "tn::observer",
+                %e,
+                ?hash,
+                ?number,
+                "failed to fetch consensus header from peer"
+            );
             error!(target: "state-sync", ?e, "error requesting consensus!");
             None
         }
@@ -120,6 +127,15 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
         tokio::select! {
             _ = rx_gossip_update.changed() => {
                 let (number, hash) = *rx_gossip_update.borrow_and_update();
+                let latest_executed = consensus_bus.latest_block_num_hash().number;
+                let sync_distance = number.saturating_sub(latest_executed);
+                info!(
+                    target: "tn::observer",
+                    sync_distance,
+                    latest_network = number,
+                    latest_executed,
+                    "observer sync status"
+                );
                 debug!(target: "state-sync", ?number, ?hash, "tracking recent consensus and detected change through gossip - requesting consensus from peer");
 
                 if let Some(next) = get_consensus_header(Some(number), hash, &config, &consensus_bus, &network).await {
