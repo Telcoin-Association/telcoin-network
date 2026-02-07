@@ -152,6 +152,7 @@ async fn test_empty_output_skips_execution() -> eyre::Result<()> {
     let genesis_header = chain.sealed_genesis_header();
     let shutdown = Notifier::default();
     let task_manager = TaskManager::default();
+    let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(64);
     let engine = ExecutorEngine::new(
         reth_env.clone(),
         max_round,
@@ -160,6 +161,7 @@ async fn test_empty_output_skips_execution() -> eyre::Result<()> {
         shutdown.subscribe(),
         task_manager.get_spawner(),
         gas_accumulator,
+        engine_update_tx,
     );
 
     // send output
@@ -183,6 +185,12 @@ async fn test_empty_output_skips_execution() -> eyre::Result<()> {
     let engine_task = timeout(Duration::from_secs(10), rx).await??;
     // consensus output stream closed
     assert_matches!(engine_task, Err(TnEngineError::ConsensusOutputStreamClosed));
+
+    // verify engine sent skip notification on the channel
+    let update = engine_update_rx.try_recv();
+    assert!(update.is_ok(), "engine should have sent an update for skipped output");
+    let (_round, _consensus_hash, tip) = update.unwrap();
+    assert!(tip.is_none(), "skipped output should not produce a block");
 
     // assert no blocks were produced - execution was skipped
     assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
@@ -252,6 +260,7 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
     let genesis_header = chain.sealed_genesis_header();
     let shutdown = Notifier::default();
     let task_manager = TaskManager::default();
+    let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(64);
     let engine = ExecutorEngine::new(
         reth_env.clone(),
         max_round,
@@ -260,6 +269,7 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
         shutdown.subscribe(),
         task_manager.get_spawner(),
         gas_accumulator,
+        engine_update_tx,
     );
 
     // send output
@@ -283,6 +293,12 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
     let engine_task = timeout(Duration::from_secs(10), rx).await??;
     // consensus output stream closed
     assert_matches!(engine_task, Err(TnEngineError::ConsensusOutputStreamClosed));
+
+    // verify engine sent update with block tip for epoch-closing output
+    let update = engine_update_rx.try_recv();
+    assert!(update.is_ok(), "engine should have sent an update for epoch-closing output");
+    let (_round, _consensus_hash, tip) = update.unwrap();
+    assert!(tip.is_some(), "epoch-closing output should produce a block");
 
     // assert memory is clean after execution
     assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
@@ -422,6 +438,7 @@ async fn test_empty_output_increments_leader_count() -> eyre::Result<()> {
     let genesis_header = chain.sealed_genesis_header();
     let shutdown = Notifier::default();
     let task_manager = TaskManager::default();
+    let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(64);
     let engine = ExecutorEngine::new(
         reth_env.clone(),
         max_round,
@@ -430,6 +447,7 @@ async fn test_empty_output_increments_leader_count() -> eyre::Result<()> {
         shutdown.subscribe(),
         task_manager.get_spawner(),
         gas_accumulator.clone(),
+        engine_update_tx,
     );
 
     // send output
@@ -450,6 +468,12 @@ async fn test_empty_output_increments_leader_count() -> eyre::Result<()> {
     let engine_task = timeout(Duration::from_secs(10), rx).await??;
     // consensus output stream closed
     assert_matches!(engine_task, Err(TnEngineError::ConsensusOutputStreamClosed));
+
+    // verify engine sent skip notification
+    let update = engine_update_rx.try_recv();
+    assert!(update.is_ok(), "engine should have sent an update for skipped output");
+    let (_round, _consensus_hash, tip) = update.unwrap();
+    assert!(tip.is_none(), "skipped output should not produce a block");
 
     // no blocks produced (execution skipped)
     let last_block_num = reth_env.last_block_number()?;
@@ -738,6 +762,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     let shutdown = Notifier::default();
     let task_manager = TaskManager::default();
     let reth_env = execution_node.get_reth_env().await;
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
     let mut engine = ExecutorEngine::new(
         reth_env.clone(),
         max_round,
@@ -746,6 +771,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         shutdown.subscribe(),
         task_manager.get_spawner(),
         gas_accumulator.clone(),
+        engine_update_tx,
     );
 
     // assert the canonical chain in-memory is empty
@@ -1250,6 +1276,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     let shutdown = Notifier::default();
     let task_manager = TaskManager::default();
     let reth_env = execution_node.get_reth_env().await;
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
     let mut engine = ExecutorEngine::new(
         reth_env.clone(),
         max_round,
@@ -1258,6 +1285,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         shutdown.subscribe(),
         task_manager.get_spawner(),
         gas_accumulator.clone(),
+        engine_update_tx,
     );
 
     // queue the first output - simulate already received from channel
@@ -1616,6 +1644,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     let shutdown = Notifier::default();
     let task_manager = TaskManager::default();
     let reth_env = execution_node.get_reth_env().await;
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
     let mut engine = ExecutorEngine::new(
         reth_env.clone(),
         max_round,
@@ -1624,6 +1653,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         shutdown.subscribe(),
         task_manager.get_spawner(),
         GasAccumulator::default(),
+        engine_update_tx,
     );
 
     // queue both output - simulate already received from channel
@@ -1824,6 +1854,7 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
     let shutdown = Notifier::default();
     let task_manager = TaskManager::default();
     let reth_env = execution_node.get_reth_env().await;
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
     let engine = ExecutorEngine::new(
         reth_env.clone(),
         max_round,
@@ -1832,6 +1863,7 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
         shutdown.subscribe(),
         task_manager.get_spawner(),
         gas_accumulator.clone(),
+        engine_update_tx,
     );
 
     // assert the canonical chain in-memory is empty
