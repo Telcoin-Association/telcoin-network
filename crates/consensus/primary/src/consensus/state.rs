@@ -37,7 +37,7 @@ pub struct ConsensusState {
     pub last_committed: HashMap<AuthorityIdentifier, Round>,
     /// The last committed sub dag. If value is None, it means that we haven't committed any sub
     /// dag yet.
-    pub last_committed_sub_dag: Option<CommittedSubDag>,
+    pub last_committed_sub_dag: Option<Arc<CommittedSubDag>>,
     /// Keeps the latest committed certificate (and its parents) for every authority. Anything
     /// older must be regularly cleaned up through the function `update`.
     pub dag: Dag,
@@ -63,7 +63,7 @@ impl ConsensusState {
         last_committed_round: Round,
         gc_depth: Round,
         recovered_last_committed: HashMap<AuthorityIdentifier, Round>,
-        latest_sub_dag: Option<CommittedSubDag>,
+        latest_sub_dag: Option<Arc<CommittedSubDag>>,
         cert_store: DB,
     ) -> Self {
         let last_round = ConsensusRound::new_with_gc_depth(last_committed_round, gc_depth);

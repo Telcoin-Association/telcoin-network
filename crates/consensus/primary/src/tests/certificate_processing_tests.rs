@@ -97,7 +97,7 @@ async fn test_accept_valid_certs() -> eyre::Result<()> {
     let certs: Vec<_> = fixture.headers().iter().take(3).map(|h| fixture.certificate(h)).collect();
 
     // assert unverified certificates and process
-    for cert in certs.clone() {
+    for cert in certs.clone().iter_mut() {
         assert!(!cert.is_verified());
         // try to accept
         validator.process_peer_certificate(cert).await?;
@@ -152,7 +152,7 @@ async fn test_accept_pending_certs() -> eyre::Result<()> {
 
     // try to process certs for rounds 2..5 before round 1
     // assert pending
-    for cert in later_rounds {
+    for cert in later_rounds.clone().iter_mut() {
         let expected = cert.digest();
         let err = validator.process_peer_certificate(cert).await;
         assert_matches!(err, Err(CertManagerError::Pending(digest)) if digest == expected);
@@ -163,7 +163,7 @@ async fn test_accept_pending_certs() -> eyre::Result<()> {
     assert!(rx_new_certificates.try_recv().is_err()); // empty channel
 
     // process round 1
-    for cert in first_round {
+    for cert in first_round.clone().iter_mut() {
         let res = validator.process_peer_certificate(cert).await;
         assert_matches!(res, Ok(()));
     }
@@ -182,7 +182,7 @@ async fn test_accept_pending_certs() -> eyre::Result<()> {
 
     // create a certificate too far in the future
     let wrong_round = 2000;
-    let (digest, cert) = signed_cert_for_test(
+    let (digest, mut cert) = signed_cert_for_test(
         keys.as_slice(),
         all_certificates.iter().last().cloned().unwrap().origin().clone(),
         wrong_round,
@@ -192,7 +192,7 @@ async fn test_accept_pending_certs() -> eyre::Result<()> {
 
     // try to accept
     cb.committed_round_updates().send_replace(5); // Set this to 5 since we are not using the machinery to keep it up to date in this test.
-    let err = validator.process_peer_certificate(cert).await;
+    let err = validator.process_peer_certificate(&mut cert).await;
     assert_matches!(err, Err(CertManagerError::Certificate(
         CertificateError::TooNew(d, wrong, correct))
     ) if d == digest && wrong == wrong_round && correct == 5);
@@ -231,7 +231,7 @@ async fn test_gc_pending_certs() -> eyre::Result<()> {
 
     // try to process certs for rounds 2..5 (before round 1)
     // assert pending
-    for cert in later_rounds.clone() {
+    for cert in later_rounds.clone().iter_mut() {
         let expected = cert.digest();
         let err = validator.process_peer_certificate(cert).await;
         assert_matches!(err, Err(CertManagerError::Pending(digest)) if digest == expected);
@@ -285,11 +285,11 @@ async fn test_node_restart_syncs_state() -> eyre::Result<()> {
     let mut certs: Vec<_> =
         fixture.headers().iter().take(3).map(|h| fixture.certificate(h)).collect();
 
-    let last_cert = certs.last().cloned().expect("last certificate");
+    let mut last_cert = certs.last().cloned().expect("last certificate");
     let last_digest = last_cert.digest();
 
     // process 1 certificate
-    validator.process_peer_certificate(last_cert).await?;
+    validator.process_peer_certificate(&mut last_cert).await?;
 
     // wait for certs to storage
     timeout(Duration::from_secs(3), certificate_store.notify_read(last_digest)).await??;
@@ -316,7 +316,7 @@ async fn test_node_restart_syncs_state() -> eyre::Result<()> {
 
     // send remaining 2 certs to reach quorum
     let mut last_digest = CertificateDigest::default();
-    for cert in certs.clone().into_iter().take(2) {
+    for cert in certs.clone().iter_mut().take(2) {
         last_digest = cert.digest();
         validator_first_recovery.process_peer_certificate(cert).await.unwrap();
     }
@@ -401,7 +401,7 @@ async fn test_filter_unknown_parents() -> eyre::Result<()> {
 
     // try to process certs for rounds 2..5 before round 1
     // assert pending
-    for cert in later_rounds.clone() {
+    for cert in later_rounds.clone().iter_mut() {
         let expected = cert.digest();
         let err = validator.process_peer_certificate(cert).await;
         assert_matches!(err, Err(CertManagerError::Pending(digest)) if digest == expected);

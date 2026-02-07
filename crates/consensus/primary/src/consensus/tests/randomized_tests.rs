@@ -496,7 +496,7 @@ fn generate_and_run_execution_plans(
             let (_outcome, committed_sub_dags) =
                 bullshark.process_certificate(&mut state, c).unwrap();
             for sub_dag in committed_sub_dags {
-                plan_committed_certificates.extend(sub_dag.certificates);
+                plan_committed_certificates.extend(sub_dag.certificates().iter().cloned());
             }
         }
 

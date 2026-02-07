@@ -13,7 +13,7 @@ use crate::{
 use consensus_metrics::start_prometheus_server;
 use eyre::{eyre, OptionExt};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -518,7 +518,7 @@ where
     /// not provide a bogus sub dag...
     async fn fetch_local_batches(
         &self,
-        deliver: CommittedSubDag,
+        deliver: Arc<CommittedSubDag>,
         parent_hash: B256,
         number: u64,
         committee: &Committee,
@@ -528,33 +528,23 @@ where
 
         if num_blocks == 0 {
             debug!(target: "epoch-manager", "No blocks to fetch, payload is empty");
-            return Ok(ConsensusOutput {
-                sub_dag: Arc::new(deliver),
-                parent_hash,
-                number,
-                ..Default::default()
-            });
+            return Ok(ConsensusOutput::new_with_subdag(deliver, parent_hash, number));
         }
 
-        let sub_dag = Arc::new(deliver);
-        let mut consensus_output = ConsensusOutput {
-            sub_dag: sub_dag.clone(),
-            batches: Vec::with_capacity(num_certs),
-            parent_hash,
-            number,
-            ..Default::default()
-        };
+        let sub_dag = deliver.clone();
 
         let mut batch_set: HashSet<BlockHash> = HashSet::new();
 
+        let mut batch_digests = VecDeque::with_capacity(num_certs);
         for cert in &sub_dag.certificates {
             for (digest, _) in cert.header().payload().iter() {
                 batch_set.insert(*digest);
-                consensus_output.batch_digests.push_back(*digest);
+                batch_digests.push_back(*digest);
             }
         }
 
         // map all fetched batches to their respective certificates for applying block rewards
+        let mut batches = Vec::with_capacity(num_certs);
         for cert in &sub_dag.certificates {
             // create collection of batches to execute for this certificate
             let mut cert_batches = Vec::with_capacity(cert.header().payload().len());
@@ -571,13 +561,13 @@ where
             let address = committee.authority(cert.origin()).map(|a| a.execution_address());
             if let Some(address) = address {
                 // main collection for execution
-                consensus_output.batches.push(CertifiedBatch { address, batches: cert_batches });
+                batches.push(CertifiedBatch { address, batches: cert_batches });
             } else {
                 return Err(eyre::eyre!("Unknown authority address {}", cert.origin()));
             }
         }
         debug!(target: "epoch-manager", "returning output to subscriber");
-        Ok(consensus_output)
+        Ok(ConsensusOutput::new(deliver, parent_hash, number, false, batch_digests, batches))
     }
 
     /// If we have any consensus that made it into the consensus chain but was not executed
@@ -646,7 +636,7 @@ where
         Ok((self.create_committee_from_state(epoch, validators).await?, epoch_info, epoch_start))
     }
 
-    fn get_epoch_pack(&mut self, committee: &Committee) -> eyre::Result<ConsensusPack> {
+    fn get_epoch_pack(&mut self, committee: Committee) -> eyre::Result<ConsensusPack> {
         let current_epoch = committee.epoch();
         let previous_epoch_rec = self
             .consensus_db
@@ -661,12 +651,19 @@ where
             });
         let epochs_db_path = self.tn_datadir.epochs_db_path();
         let _ = std::fs::create_dir_all(&epochs_db_path);
-        Ok(match ConsensusPack::open_append(&epochs_db_path, current_epoch, previous_epoch_rec) {
-            Ok(pack) => pack,
-            Err(e) => {
-                panic!("failed to open pack {e}");
-            }
-        })
+        Ok(
+            match ConsensusPack::open_append(
+                &epochs_db_path,
+                current_epoch,
+                previous_epoch_rec,
+                committee,
+            ) {
+                Ok(pack) => pack,
+                Err(e) => {
+                    panic!("failed to open pack {e}");
+                }
+            },
+        )
     }
 
     /// Run a single epoch.
@@ -690,7 +687,7 @@ where
             self.get_committee_with_epoch_start_info(engine).await?;
         self.epoch_boundary = epoch_start + epoch_info.epochDuration as u64;
 
-        let mut epoch_pack = Some(self.get_epoch_pack(&committee)?);
+        let mut epoch_pack = Some(self.get_epoch_pack(committee.clone())?);
         if epoch_mode.replay_consensus() {
             // If we are starting up then make sure that any consensus we previously validated goes
             // to the engine and is executed.  Otherwise we could miss consensus execution.
@@ -874,29 +871,27 @@ where
             // This should not really happen but it is dificult to guarentee
             // it so deal with it.
             while let Ok(output) = consensus_output.try_recv() {
-                if current_epoch == output.sub_dag.leader_epoch() {
+                if current_epoch == output.sub_dag().leader_epoch() {
                     // Found some extra output...
                     // Anything from the epoch we closed should be garbage.
                     self.consensus_db.remove_consensus_by_hash(output.digest().into());
                 }
             }
+        } else if let Some(target_hash) = self
+            .send_leftover_consensus_output_to_engine(
+                &mut consensus_output,
+                to_engine,
+                &mut epoch_pack,
+            )
+            .await
+        {
+            // If things go down at exactly the wrong time we might have reached the epoch end
+            // so account for that.
+            self.close_epoch(None, &gas_accumulator, target_hash).await?;
+            res = RunEpochMode::NewEpoch;
+            clear_tables_for_next_epoch = true;
         } else {
-            if let Some(target_hash) = self
-                .send_leftover_consensus_output_to_engine(
-                    &mut consensus_output,
-                    to_engine,
-                    &mut epoch_pack,
-                )
-                .await
-            {
-                // If things go down at exactly the wrong time we might have reached the epoch end
-                // so account for that.
-                self.close_epoch(None, &gas_accumulator, target_hash).await?;
-                res = RunEpochMode::NewEpoch;
-                clear_tables_for_next_epoch = true;
-            } else {
-                res = RunEpochMode::ModeChange;
-            }
+            res = RunEpochMode::ModeChange;
         }
 
         // clear tables
@@ -919,13 +914,13 @@ where
             output.close_epoch = true;
         }
         if let Some(epoch_pack) = epoch_pack {
-            if !check_contains || !epoch_pack.contains_consensus_header_number(output.number).await
+            if !check_contains
+                || !epoch_pack.contains_consensus_header_number(output.number()).await
             //XXXX- this not working need to figure it out even if we stick with the number
             // approach !epoch_pack.contains_consensus_header(output.
             // consensus_header_hash())
             {
-                epoch_pack.save_consensus_output(output.clone())?; // XXXX get rid of this clone its
-                                                                   // heavy?
+                epoch_pack.save_consensus_output(output.clone()).await?;
             }
         }
         // only forward the output to the engine
@@ -1315,7 +1310,9 @@ where
         target_hash: B256,
     ) -> eyre::Result<()> {
         // begin consensus shutdown while engine executes
-        shutdown_consensus.map(|s| s.notify());
+        if let Some(s) = shutdown_consensus {
+            s.notify()
+        }
         self.consensus_bus.wait_for_consensus_execution(target_hash).await?;
         self.adjust_base_fees(gas_accumulator);
         gas_accumulator.clear(); // Clear the accumlated values for next epoch.
@@ -1457,9 +1454,6 @@ where
             }
             committee_builder.build()
         };
-
-        // load committee
-        committee.load();
 
         Ok(committee)
     }

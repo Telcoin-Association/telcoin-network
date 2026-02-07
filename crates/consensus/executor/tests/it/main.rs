@@ -89,7 +89,7 @@ async fn test_output_to_header() -> eyre::Result<()> {
         // assert epoch boundary not reached
         assert!(!output.close_epoch);
 
-        let num = output.number;
+        let num = output.number();
         let consensus_header = output.consensus_header();
         consensus_headers_seen.push(consensus_header);
         if num == expected_num as u64 {
