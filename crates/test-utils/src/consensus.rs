@@ -56,6 +56,29 @@ where
     (cert.digest(), cert, batches)
 }
 
+/// Creates one signed certificate with an empty payload (no batches).
+fn signed_cert_empty<DB>(
+    origin: AuthorityIdentifier,
+    round: Round,
+    parents: BTreeSet<CertificateDigest>,
+    committee: &CommitteeFixture<DB>,
+) -> (CertificateDigest, Certificate)
+where
+    DB: Database,
+{
+    let header = HeaderBuilder::default()
+        .author(origin)
+        .payload(IndexMap::new())
+        .round(round)
+        .epoch(0)
+        .parents(parents)
+        .created_at(now())
+        .build();
+
+    let cert = committee.certificate(&header);
+    (cert.digest(), cert)
+}
+
 /// Create a range of certificates for specified rounds from committee.
 pub fn create_signed_certificates_for_rounds<DB>(
     range: RangeInclusive<Round>,
@@ -80,6 +103,47 @@ where
             certificates.push_back(certificate);
             next_parents.insert(digest);
             batches.extend(payload);
+        }
+        parents.clone_from(&next_parents);
+    }
+
+    (certificates, next_parents, batches)
+}
+
+/// Create a range of certificates where rounds in `empty_rounds` have empty payloads (no batches).
+/// Returns the certificates, next parents, and only the batches for non-empty rounds.
+pub fn create_signed_certificates_with_empty_rounds<DB>(
+    range: RangeInclusive<Round>,
+    fixture: &CommitteeFixture<DB>,
+    empty_rounds: &[Round],
+) -> (VecDeque<Certificate>, BTreeSet<CertificateDigest>, HashMap<BlockHash, Batch>)
+where
+    DB: Database,
+{
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let mut certificates = VecDeque::new();
+    let mut next_parents = BTreeSet::new();
+    let mut batches = HashMap::new();
+    // use genesis for initial parents
+    let mut parents: BTreeSet<_> = fixture.genesis().collect();
+
+    // create signed certificates for every round
+    for round in range {
+        next_parents.clear();
+        let is_empty = empty_rounds.contains(&round);
+        for id in &ids {
+            if is_empty {
+                let (digest, certificate) =
+                    signed_cert_empty(id.clone(), round, parents.clone(), fixture);
+                certificates.push_back(certificate);
+                next_parents.insert(digest);
+            } else {
+                let (digest, certificate, payload) =
+                    signed_cert(id.clone(), round, parents.clone(), fixture);
+                certificates.push_back(certificate);
+                next_parents.insert(digest);
+                batches.extend(payload);
+            }
         }
         parents.clone_from(&next_parents);
     }
