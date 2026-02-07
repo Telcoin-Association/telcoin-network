@@ -267,28 +267,29 @@ fn run_restart_tests2(client_urls: &[String; 4]) -> eyre::Result<()> {
 }
 
 fn network_advancing(client_urls: &[String; 4]) -> eyre::Result<()> {
-    fn max_start(client_urls: &[String; 4]) -> eyre::Result<u64> {
-        let mut start_num = get_block_number(&client_urls[0])?;
-        start_num = start_num.max(get_block_number(&client_urls[1])?);
-        start_num = start_num.max(get_block_number(&client_urls[2])?);
-        start_num = start_num.max(get_block_number(&client_urls[3])?);
-        Ok(start_num)
-    }
-    let start_num = max_start(client_urls)?;
-    let mut next_num = start_num;
+    // Wait for all nodes to respond to RPC.
+    // With skip-empty-execution, blocks are only produced when transactions
+    // exist or an epoch closes, so we cannot rely on block_number advancing
+    // during idle periods. Actual block production is verified later by
+    // send_and_confirm().
     let mut i = 0;
-    // Wait until a node is advancing agian, network should be back now.
-    while next_num <= start_num {
+    loop {
+        let mut all_responsive = true;
+        for url in client_urls {
+            if get_block_number(url).is_err() {
+                all_responsive = false;
+                break;
+            }
+        }
+        if all_responsive {
+            return Ok(());
+        }
         std::thread::sleep(Duration::from_secs(1));
-        next_num = max_start(client_urls)?;
         i += 1;
         if i > 45 {
-            return Err(eyre::eyre!(
-                "Network not advancing past {next_num} within 45 seconds after restart!"
-            ));
+            return Err(eyre::eyre!("Network not responding within 45 seconds!"));
         }
     }
-    Ok(())
 }
 
 fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {

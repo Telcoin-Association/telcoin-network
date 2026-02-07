@@ -55,6 +55,11 @@ impl ExecutionNodeInner {
         rx_output: mpsc::Receiver<ConsensusOutput>,
         rx_shutdown: Noticer,
         gas_accumulator: GasAccumulator,
+        engine_update_tx: mpsc::Sender<(
+            tn_types::Round,
+            tn_types::B256,
+            Option<tn_types::SealedHeader>,
+        )>,
     ) -> eyre::Result<()> {
         let parent_header = self.reth_env.lookup_head()?;
 
@@ -70,6 +75,7 @@ impl ExecutionNodeInner {
             rx_shutdown,
             self.reth_env.get_task_spawner().clone(),
             gas_accumulator,
+            engine_update_tx,
         );
 
         // spawn tn engine
