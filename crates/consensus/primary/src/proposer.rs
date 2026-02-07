@@ -408,7 +408,7 @@ impl<DB: Database> Proposer<DB> {
                 // late (or just joined the network).
                 self.round = round;
                 // broadcast new round
-                let _ = self.consensus_bus.primary_round_updates().send(self.round);
+                self.consensus_bus.primary_round_updates().send_replace(self.round);
                 self.last_parents = parents;
                 // Reset advance flag.
                 self.advance_round = false;
@@ -555,7 +555,7 @@ impl<DB: Database> Proposer<DB> {
         if updated_round > self.round {
             self.round = updated_round;
         }
-        let _ = self.consensus_bus.primary_round_updates().send(self.round);
+        self.consensus_bus.primary_round_updates().send_replace(self.round);
 
         debug!(target: "primary::proposer", authority=?self.authority_id, round=self.round, "advanced round - proposing next block...");
 

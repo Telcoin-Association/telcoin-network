@@ -130,7 +130,7 @@ where
                 if last_epoch < requested_epoch {
                     // Small sanity check in case someone sends a malicious large epoch restore to
                     // sanity.
-                    let _ = consensus_bus.requested_missing_epoch().send(last_epoch);
+                    consensus_bus.requested_missing_epoch().send_replace(last_epoch);
                 }
             }
             // Wait until the watch is updated to indicate we have more work to do.

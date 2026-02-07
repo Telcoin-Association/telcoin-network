@@ -124,7 +124,7 @@ where
             // We seem to be too far behind to be an active CVV, try to go
             // inactive to catch up.
             warn!(target: "primary", "we are behind, go to catchup mode!, epoch: {epoch}, exec_epoch: {exec_epoch}, number: {number:?}, exec_number: {exec_number}");
-            let _ = self.consensus_bus.node_mode().send(NodeMode::CvvInactive);
+            self.consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
             self.consensus_config.shutdown().notify();
             true
         } else {
@@ -232,10 +232,9 @@ where
                             // sure it is valid. Receivers will count on
                             // this being verified.
                             info!(target: "primary", "got new consensus {number}/{hash}");
-                            let _ = self
-                                .consensus_bus
+                            self.consensus_bus
                                 .last_published_consensus_num_hash()
-                                .send((number, hash));
+                                .send_replace((number, hash));
                             self.consensus_certs.lock().clear();
                         } else {
                             self.consensus_certs.lock().insert(consensus_result_hash, sigs + 1);
@@ -249,7 +248,7 @@ where
                         // Not sure we can sanity check this epoch.  However if it is bogus the code
                         // to handle it should be fine and will reset requested_missing_epoch to
                         // sanity.
-                        let _ = self.consensus_bus.requested_missing_epoch().send(epoch);
+                        self.consensus_bus.requested_missing_epoch().send_replace(epoch);
                     }
                 }
             }

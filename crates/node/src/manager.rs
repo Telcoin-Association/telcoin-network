@@ -224,7 +224,7 @@ where
         let consensus_bus = ConsensusBus::new_with_args(builder.tn_config.parameters.gc_depth);
         if builder.tn_config.observer {
             // Don't risk keeping the default CVV active mode...
-            let _ = consensus_bus.node_mode().send(NodeMode::Observer);
+            consensus_bus.node_mode().send_replace(NodeMode::Observer);
         }
         let worker_event_stream = QueChannel::new();
 

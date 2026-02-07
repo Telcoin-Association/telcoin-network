@@ -148,32 +148,20 @@ impl NodeMode {
 struct ConsensusBusAppInner {
     /// Outputs the highest committed round & corresponding gc_round in the consensus.
     tx_committed_round_updates: watch::Sender<Round>,
-    /// Hold onto a receiver to keep it "open".
-    _rx_committed_round_updates: watch::Receiver<Round>,
 
     /// An epoch we need an epoch record for.
     tx_requested_missing_epoch: watch::Sender<Epoch>,
-    /// Hold onto a receiver to keep it "open".
-    _rx_requested_missing_epoch: watch::Receiver<Epoch>,
 
     /// Signals a new round
     tx_primary_round_updates: watch::Sender<Round>,
-    /// Hold onto the primary round updates receiver to keep it "open"
-    _rx_primary_round_updates: watch::Receiver<Round>,
 
     /// Watch tracking most recent blocks
     tx_recent_blocks: watch::Sender<RecentBlocks>,
-    /// Hold onto the recent blocks watch to keep it "open"
-    _rx_recent_blocks: watch::Receiver<RecentBlocks>,
 
     /// Watch tracking most recently seen consensus header.
     tx_last_consensus_header: watch::Sender<Option<ConsensusHeader>>,
-    /// Hold onto the consensus header watch to keep it "open"
-    _rx_last_consensus_header: watch::Receiver<Option<ConsensusHeader>>,
     /// Watch tracking the last gossipped consensus block number and hash.
     tx_last_published_consensus_num_hash: watch::Sender<(u64, BlockHash)>,
-    /// Hold onto the published consensus header watch to keep it "open"
-    _rx_last_published_consensus_num_hash: watch::Receiver<(u64, BlockHash)>,
 
     /// Consensus header.  Note this can be used to create consensus output to execute for non
     /// validators.
@@ -183,8 +171,6 @@ struct ConsensusBusAppInner {
     consensus_output: broadcast::Sender<ConsensusOutput>,
     /// Status of sync?
     tx_sync_status: watch::Sender<NodeMode>,
-    /// Hold onto the recent sync_status to keep it "open"
-    _rx_sync_status: watch::Receiver<NodeMode>,
 
     /// Produce new epoch certs as they are recieved.
     new_epoch_votes: QueChannel<(EpochVote, oneshot::Sender<Result<(), HeaderError>>)>,
@@ -194,42 +180,31 @@ struct ConsensusBusAppInner {
 
 impl ConsensusBusAppInner {
     fn new(recent_blocks: u32) -> Self {
-        let (tx_committed_round_updates, _rx_committed_round_updates) =
-            watch::channel(Round::default());
+        let (tx_committed_round_updates, _) = watch::channel(Round::default());
 
-        let (tx_requested_missing_epoch, _rx_requested_missing_epoch) =
-            watch::channel(Epoch::default());
+        let (tx_requested_missing_epoch, _) = watch::channel(Epoch::default());
 
-        let (tx_primary_round_updates, _rx_primary_round_updates) = watch::channel(0u32);
-        let (tx_last_consensus_header, _rx_last_consensus_header) = watch::channel(None);
-        let (tx_last_published_consensus_num_hash, _rx_last_published_consensus_num_hash) =
-            watch::channel((0, BlockHash::default()));
+        let (tx_primary_round_updates, _) = watch::channel(0u32);
+        let (tx_last_consensus_header, _) = watch::channel(None);
+        let (tx_last_published_consensus_num_hash, _) = watch::channel((0, BlockHash::default()));
 
-        let (tx_recent_blocks, _rx_recent_blocks) =
-            watch::channel(RecentBlocks::new(recent_blocks as usize));
-        let (tx_sync_status, _rx_sync_status) = watch::channel(NodeMode::default());
+        let (tx_recent_blocks, _) = watch::channel(RecentBlocks::new(recent_blocks as usize));
+        let (tx_sync_status, _) = watch::channel(NodeMode::default());
 
         let (consensus_header, _rx_consensus_header) = broadcast::channel(CHANNEL_CAPACITY);
         let (consensus_output, _rx_consensus_output) = broadcast::channel(100);
 
         Self {
             tx_committed_round_updates,
-            _rx_committed_round_updates,
             tx_requested_missing_epoch,
-            _rx_requested_missing_epoch,
 
             tx_primary_round_updates,
-            _rx_primary_round_updates,
             tx_recent_blocks,
-            _rx_recent_blocks,
             tx_last_consensus_header,
-            _rx_last_consensus_header,
             tx_last_published_consensus_num_hash,
-            _rx_last_published_consensus_num_hash,
             consensus_header,
             consensus_output,
             tx_sync_status,
-            _rx_sync_status,
             new_epoch_votes: QueChannel::new(),
             primary_network_events: QueChannel::new(),
         }
@@ -238,8 +213,8 @@ impl ConsensusBusAppInner {
     /// Reset for a new epoch.
     /// This is primarily so we can resubscribe to "one-time" subscription channels.
     fn reset_for_epoch(&self) {
-        let _ = self.tx_committed_round_updates.send(Round::default());
-        let _ = self.tx_primary_round_updates.send(0u32);
+        self.tx_committed_round_updates.send_replace(Round::default());
+        self.tx_primary_round_updates.send_replace(0u32);
     }
 }
 
