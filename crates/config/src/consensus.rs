@@ -57,7 +57,6 @@ where
         // load committee from file
         let committee: Committee =
             Config::load_from_path_or_default(tn_datadir.committee_path(), ConfigFmt::YAML)?;
-        committee.load();
         info!(target: "telcoin", "committee loaded");
         Self::new_with_committee(config, node_storage, key_config, committee, network_config)
     }

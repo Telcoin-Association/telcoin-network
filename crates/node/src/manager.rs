@@ -636,7 +636,7 @@ where
         Ok((self.create_committee_from_state(epoch, validators).await?, epoch_info, epoch_start))
     }
 
-    fn get_epoch_pack(&mut self, committee: &Committee) -> eyre::Result<ConsensusPack> {
+    fn get_epoch_pack(&mut self, committee: Committee) -> eyre::Result<ConsensusPack> {
         let current_epoch = committee.epoch();
         let previous_epoch_rec = self
             .consensus_db
@@ -651,12 +651,19 @@ where
             });
         let epochs_db_path = self.tn_datadir.epochs_db_path();
         let _ = std::fs::create_dir_all(&epochs_db_path);
-        Ok(match ConsensusPack::open_append(&epochs_db_path, current_epoch, previous_epoch_rec) {
-            Ok(pack) => pack,
-            Err(e) => {
-                panic!("failed to open pack {e}");
-            }
-        })
+        Ok(
+            match ConsensusPack::open_append(
+                &epochs_db_path,
+                current_epoch,
+                previous_epoch_rec,
+                committee,
+            ) {
+                Ok(pack) => pack,
+                Err(e) => {
+                    panic!("failed to open pack {e}");
+                }
+            },
+        )
     }
 
     /// Run a single epoch.
@@ -680,7 +687,7 @@ where
             self.get_committee_with_epoch_start_info(engine).await?;
         self.epoch_boundary = epoch_start + epoch_info.epochDuration as u64;
 
-        let mut epoch_pack = Some(self.get_epoch_pack(&committee)?);
+        let mut epoch_pack = Some(self.get_epoch_pack(committee.clone())?);
         if epoch_mode.replay_consensus() {
             // If we are starting up then make sure that any consensus we previously validated goes
             // to the engine and is executed.  Otherwise we could miss consensus execution.
@@ -1447,9 +1454,6 @@ where
             }
             committee_builder.build()
         };
-
-        // load committee
-        committee.load();
 
         Ok(committee)
     }

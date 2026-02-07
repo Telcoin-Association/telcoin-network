@@ -4,7 +4,6 @@ use crate::{
     crypto::{BlsPublicKey, NetworkPublicKey},
     Address, Multiaddr,
 };
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -197,7 +196,7 @@ impl CommitteeInner {
 /// The committee lists all validators that participate in consensus.
 #[derive(Clone, Debug, Default)]
 pub struct Committee {
-    inner: Arc<RwLock<CommitteeInner>>,
+    inner: Arc<CommitteeInner>,
 }
 
 impl Serialize for Committee {
@@ -205,7 +204,7 @@ impl Serialize for Committee {
     where
         S: serde::Serializer,
     {
-        let ok = self.inner.read().serialize(serializer)?;
+        let ok = self.inner.serialize(serializer)?;
         Ok(ok)
     }
 }
@@ -215,14 +214,15 @@ impl<'de> Deserialize<'de> for Committee {
     where
         D: serde::Deserializer<'de>,
     {
-        let inner = CommitteeInner::deserialize(deserializer)?;
-        Ok(Self { inner: Arc::new(RwLock::new(inner)) })
+        let mut inner = CommitteeInner::deserialize(deserializer)?;
+        inner.load();
+        Ok(Self { inner: Arc::new(inner) })
     }
 }
 
 impl PartialEq for Committee {
     fn eq(&self, other: &Self) -> bool {
-        self.inner.read().eq(&*other.inner.read())
+        self.inner.eq(&other.inner)
     }
 }
 
@@ -366,7 +366,7 @@ impl Committee {
         assert_eq!(committee.validity_threshold, committee.calculate_validity_threshold().get());
         assert_eq!(committee.quorum_threshold, committee.calculate_quorum_threshold().get());
 
-        Self { inner: Arc::new(RwLock::new(committee)) }
+        Self { inner: Arc::new(committee) }
     }
 
     /// Expose new for tests.  If you are calling this outside of a test you are wrong, see comment
@@ -398,53 +398,48 @@ impl Committee {
         assert!(committee.authorities_by_id.len() > 1, "committee size must be larger that 1");
         // Some sanity checks to ensure that we'll not end up in invalid state
         assert_eq!(committee.authorities_by_id.len(), committee.authorities.len());
+        committee.load();
 
-        Self { inner: Arc::new(RwLock::new(committee)) }
-    }
-
-    /// Updates the committee internal secondary indexes.
-    pub fn load(&self) {
-        self.inner.write().load()
+        Self { inner: Arc::new(committee) }
     }
 
     /// Returns the current epoch.
     pub fn epoch(&self) -> Epoch {
-        self.inner.read().epoch
+        self.inner.epoch
     }
 
     /// Provided an identifier it returns the corresponding authority
     pub fn authority(&self, identifier: &AuthorityIdentifier) -> Option<Authority> {
-        self.inner.read().authorities_by_id.get(identifier).cloned()
+        self.inner.authorities_by_id.get(identifier).cloned()
     }
 
     pub fn authority_by_key(&self, key: &BlsPublicKey) -> Option<Authority> {
-        self.inner.read().authorities.get(key).cloned()
+        self.inner.authorities.get(key).cloned()
     }
 
     pub fn authorities(&self) -> Vec<Authority> {
         // Return sorted by id (using the id keyed BTree) since this may be important to some code.
-        self.inner.read().authorities_by_id.values().cloned().collect()
+        self.inner.authorities_by_id.values().cloned().collect()
     }
 
     /// Return true if the authority for id is in the committee.
     pub fn is_authority(&self, id: &AuthorityIdentifier) -> bool {
         // Return sorted by id (using the id keyed BTree) since this may be important to some code.
-        self.inner.read().authorities_by_id.contains_key(id)
+        self.inner.authorities_by_id.contains_key(id)
     }
 
     /// Returns the number of authorities.
     pub fn size(&self) -> usize {
-        self.inner.read().authorities.len()
+        self.inner.authorities.len()
     }
 
     /// Return the stake of a specific authority.
     pub fn voting_power(&self, name: &BlsPublicKey) -> VotingPower {
-        self.inner.read().authorities.get(&name.clone()).map_or_else(|| 0, |x| x.inner.voting_power)
+        self.inner.authorities.get(&name.clone()).map_or_else(|| 0, |x| x.inner.voting_power)
     }
 
     pub fn voting_power_by_id(&self, id: &AuthorityIdentifier) -> VotingPower {
         self.inner
-            .read()
             .authorities_by_id
             .get(id)
             .map_or_else(|| 0, |authority| authority.inner.voting_power)
@@ -452,12 +447,12 @@ impl Committee {
 
     /// Returns the stake required to reach a quorum (2f+1).
     pub fn quorum_threshold(&self) -> VotingPower {
-        self.inner.read().quorum_threshold
+        self.inner.quorum_threshold
     }
 
     /// Returns the stake required to reach availability (f+1).
     pub fn validity_threshold(&self) -> VotingPower {
-        self.inner.read().validity_threshold
+        self.inner.validity_threshold
     }
 
     /// Returns true if the provided stake has reached quorum (2f+1)
@@ -471,7 +466,7 @@ impl Committee {
     }
 
     pub fn total_voting_power(&self) -> VotingPower {
-        self.inner.read().total_voting_power()
+        self.inner.total_voting_power()
     }
 
     /// Return all the network addresses in the committee.
@@ -480,7 +475,6 @@ impl Committee {
         myself: Option<&AuthorityIdentifier>,
     ) -> Vec<(AuthorityIdentifier, BlsPublicKey)> {
         self.inner
-            .read()
             .authorities
             .iter()
             .filter(
@@ -499,7 +493,6 @@ impl Committee {
     /// Returns the bls keys of all members except `myself`.
     pub fn others_keys_except(&self, myself: &BlsPublicKey) -> Vec<BlsPublicKey> {
         self.inner
-            .read()
             .authorities
             .iter()
             .filter_map(|(_, authority)| {
@@ -515,26 +508,26 @@ impl Committee {
     /// Returns all the bls keys of all members.
     /// Return as a BTreeSet to inforce an order.
     pub fn bls_keys(&self) -> BTreeSet<BlsPublicKey> {
-        self.inner.read().authorities.values().map(|authority| *authority.protocol_key()).collect()
+        self.inner.authorities.values().map(|authority| *authority.protocol_key()).collect()
     }
 
     /// Return the bootstrap record for key if it exists.
     pub fn get_bootstrap(&self, key: &BlsPublicKey) -> Option<BootstrapServer> {
-        self.inner.read().bootstrap_servers.get(key).cloned()
+        self.inner.bootstrap_servers.get(key).cloned()
     }
 
     /// Return the map of bootstrap servers.
     pub fn bootstrap_servers(&self) -> BTreeMap<BlsPublicKey, BootstrapServer> {
-        self.inner.read().bootstrap_servers.clone()
+        self.inner.bootstrap_servers.clone()
     }
 
     /// Used for testing - not recommended to use for any other case.
     /// It creates a new instance with updated epoch
     pub fn advance_epoch_for_test(&self, new_epoch: Epoch) -> Committee {
         Committee::new_for_test(
-            self.inner.read().authorities.clone(),
+            self.inner.authorities.clone(),
             new_epoch,
-            self.inner.read().bootstrap_servers.clone(),
+            self.inner.bootstrap_servers.clone(),
         )
     }
 
@@ -554,7 +547,6 @@ impl std::fmt::Display for Committee {
             "Committee E{}: {:?}",
             self.epoch(),
             self.inner
-                .read()
                 .authorities
                 .keys()
                 .map(|x| {
@@ -680,10 +672,10 @@ mod tests {
         let committee = Committee::new(authorities, 10, bootstrap_servers);
 
         // THEN
-        assert_eq!(committee.inner.read().authorities_by_id.len() as u64, num_of_authorities);
-        assert_eq!(committee.inner.read().authorities.len() as u64, num_of_authorities);
+        assert_eq!(committee.inner.authorities_by_id.len() as u64, num_of_authorities);
+        assert_eq!(committee.inner.authorities.len() as u64, num_of_authorities);
 
-        for (identifier, authority) in committee.inner.read().authorities_by_id.iter() {
+        for (identifier, authority) in committee.inner.authorities_by_id.iter() {
             assert_eq!(*identifier, authority.id());
         }
 
@@ -691,7 +683,7 @@ mod tests {
         assert_eq!(committee.quorum_threshold(), 7);
         assert_eq!(committee.validity_threshold(), 4);
 
-        let guard = committee.inner.read();
+        let guard = committee.inner;
         // AND ensure authorities are in both maps
         let mut total = 0;
         for ((public_key, authority_1), (boot_key, _)) in
