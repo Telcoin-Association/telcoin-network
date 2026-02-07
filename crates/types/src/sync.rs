@@ -215,7 +215,26 @@ impl<T: Send + 'static> TnSender<T> for mpsc::Sender<T> {
 
 impl<T: Send + Clone> TnReceiver<T> for broadcast::Receiver<T> {
     async fn recv(&mut self) -> Option<T> {
-        broadcast::Receiver::recv(self).await.ok()
+        loop {
+            match broadcast::Receiver::recv(self).await {
+                Ok(value) => return Some(value),
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    // Log the lag event and continue receiving.
+                    // After Lagged, the internal cursor is updated and the next recv
+                    // will return the oldest message still in the buffer.
+                    // Previously this was silently converted to None via .ok(),
+                    // which caused observers to exit their recv loop and stop following
+                    // consensus entirely.
+                    tracing::warn!(
+                        target: "tn::observer",
+                        messages_lost = n,
+                        "broadcast channel lagged - receiver lost messages, resuming"
+                    );
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
     }
 
     fn try_recv(&mut self) -> Result<T, TryRecvError> {
@@ -238,5 +257,73 @@ impl<T: Send> TnReceiver<T> for mpsc::Receiver<T> {
 
     fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
         mpsc::Receiver::poll_recv(self, cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify that broadcast lag does NOT cause recv() to return None.
+    /// This was the root cause of observers silently stopping: the old
+    /// implementation converted RecvError::Lagged to None via .ok(),
+    /// which caused `while let Some(x) = rx.recv().await` loops to exit.
+    #[tokio::test]
+    async fn test_broadcast_lag_does_not_return_none() {
+        let (tx, _default_rx) = broadcast::channel::<u64>(16);
+        let mut slow_rx = tx.subscribe();
+
+        // Overflow the channel: send 32 messages into a capacity-16 channel
+        for i in 0..32 {
+            let _ = tx.send(i);
+        }
+
+        // The receiver has lagged. With the fix, TnReceiver::recv() should NOT
+        // return None. Instead, it should skip the lagged messages and return the
+        // oldest available message (which is 16, since 0..15 were dropped).
+        let value = TnReceiver::recv(&mut slow_rx).await;
+        assert!(value.is_some(), "recv() must not return None on lag");
+        // After lag, the next available message should be 16 (first non-dropped)
+        assert_eq!(value.unwrap(), 16);
+    }
+
+    /// Verify that recv() returns None only when the channel is actually closed.
+    #[tokio::test]
+    async fn test_broadcast_closed_returns_none() {
+        let (tx, _default_rx) = broadcast::channel::<u64>(16);
+        let mut rx = tx.subscribe();
+
+        // Send a message and then drop the sender
+        let _ = tx.send(42);
+        drop(tx);
+
+        // First recv gets the message
+        let value = TnReceiver::recv(&mut rx).await;
+        assert_eq!(value, Some(42));
+
+        // Second recv: channel closed, should return None
+        let value = TnReceiver::recv(&mut rx).await;
+        assert!(value.is_none(), "closed channel must return None");
+    }
+
+    /// Verify that try_recv correctly reports Lagged errors.
+    #[test]
+    fn test_broadcast_try_recv_lagged() {
+        let (tx, _default_rx) = broadcast::channel::<u64>(16);
+        let mut slow_rx: broadcast::Receiver<u64> = tx.subscribe();
+
+        // Overflow the channel
+        for i in 0..32 {
+            let _ = tx.send(i);
+        }
+
+        // try_recv should report the lag
+        let result: Result<u64, TryRecvError> = TnReceiver::try_recv(&mut slow_rx);
+        assert_eq!(result, Err(TryRecvError::Lagged));
+
+        // After acknowledging the lag, next try_recv should succeed
+        let result: Result<u64, TryRecvError> = TnReceiver::try_recv(&mut slow_rx);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 16);
     }
 }
