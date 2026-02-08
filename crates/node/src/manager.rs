@@ -417,6 +417,96 @@ fn spawn_epoch_vote_collector<DB: TNDatabase>(
     });
 }
 
+#[cfg(test)]
+mod epoch_vote_collector_tests {
+    use super::*;
+    use rand::{rngs::StdRng, SeedableRng as _};
+    use tn_network_libp2p::types::{MessageId, NetworkCommand};
+    use tn_primary::network::{PrimaryRequest, PrimaryResponse};
+    use tn_storage::mem_db::MemDatabase;
+    use tn_types::{BlsKeypair, TnSender as _};
+
+    /// Happy path: committee of 4, node signs + receives 3 peer votes → cert stored.
+    #[tokio::test]
+    async fn test_collector_reaches_quorum_and_stores_cert() {
+        let mut rng = StdRng::from_os_rng();
+        let kp1 = BlsKeypair::generate(&mut rng);
+        let kp2 = BlsKeypair::generate(&mut rng);
+        let kp3 = BlsKeypair::generate(&mut rng);
+        let kp4 = BlsKeypair::generate(&mut rng);
+        let pk1 = *kp1.public();
+        let pk2 = *kp2.public();
+        let pk3 = *kp3.public();
+        let pk4 = *kp4.public();
+
+        // Node is kp1
+        let key_config = KeyConfig::new_with_testing_key(kp1);
+
+        // Committee of 4: super_quorum = (4*2)/3 + 1 = 3
+        let epoch_rec = EpochRecord {
+            epoch: 0,
+            committee: vec![pk1, pk2, pk3, pk4],
+            next_committee: vec![pk1, pk2, pk3, pk4],
+            ..Default::default()
+        };
+        let epoch_hash = epoch_rec.digest();
+
+        let consensus_bus = ConsensusBus::new();
+        let db = MemDatabase::default();
+
+        // Mock network: drain commands and reply to Publish
+        let (net_tx, mut net_rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(100);
+        let primary_network = PrimaryNetworkHandle::new_for_test(net_tx);
+        tokio::spawn(async move {
+            while let Some(cmd) = net_rx.recv().await {
+                if let NetworkCommand::Publish { reply, .. } = cmd {
+                    let _ = reply.send(Ok(MessageId::new(b"test")));
+                }
+            }
+        });
+
+        let task_manager = TaskManager::default();
+        let node_shutdown = Notifier::new();
+
+        spawn_epoch_vote_collector(
+            db.clone(),
+            consensus_bus.clone(),
+            key_config,
+            primary_network,
+            task_manager.get_spawner(),
+            node_shutdown.subscribe(),
+        );
+
+        // Sign votes from the 3 other committee members
+        let kc2 = KeyConfig::new_with_testing_key(kp2);
+        let kc3 = KeyConfig::new_with_testing_key(kp3);
+        let kc4 = KeyConfig::new_with_testing_key(kp4);
+        let vote2 = epoch_rec.sign_vote(&kc2);
+        let vote3 = epoch_rec.sign_vote(&kc3);
+        let vote4 = epoch_rec.sign_vote(&kc4);
+
+        // Buffer the votes in the channel (channel is already subscribed)
+        consensus_bus.new_epoch_votes().send(vote2).await.unwrap();
+        consensus_bus.new_epoch_votes().send(vote3).await.unwrap();
+        consensus_bus.new_epoch_votes().send(vote4).await.unwrap();
+
+        // Send the epoch record — collector wakes up, self-signs, reads buffered votes
+        consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec.clone()));
+
+        // Wait for collector to aggregate and store
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Verify cert is in DB
+        let cert = db.get::<EpochCerts>(&epoch_hash).expect("db read").expect("cert missing");
+        assert_eq!(cert.epoch_hash, epoch_hash);
+        assert!(epoch_rec.verify_with_cert(&cert), "cert should verify against epoch record");
+
+        // Shutdown
+        node_shutdown.notify();
+    }
+}
+
 impl<P, DB> EpochManager<P, DB>
 where
     P: TelcoinDirs + Clone + 'static,
