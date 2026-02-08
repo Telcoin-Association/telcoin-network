@@ -27,7 +27,6 @@ use tn_types::{
     Header, HeaderDigest, ProtocolSignature, Round, SignatureVerificationState, TnSender as _,
     Vote,
 };
-use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
 /// Map to hold vote info to detect invalid votes, equivocation and cache responses in case of
@@ -257,14 +256,25 @@ where
                     topic.to_string().eq(&tn_config::LibP2pConfig::epoch_vote_topic()),
                     PrimaryNetworkError::InvalidTopic
                 );
-                let (tx, rx) = oneshot::channel();
-                let _ = self.consensus_bus.new_epoch_votes().send((*vote, tx)).await;
-                match rx.await {
-                    // Propogate any errors so the peer can be punished.
-                    Ok(res) => res?,
-                    // Don't punish the peer for an internal channel issue...
-                    Err(e) => error!(target: "primary", "error waiting on epoch vote result: {e}"),
+                // Verify the BLS signature
+                ensure!(
+                    vote.check_signature(),
+                    PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor)
+                );
+                // Verify committee membership if the epoch record is available
+                if let Some((epoch_rec, _)) =
+                    self.consensus_config.node_storage().get_epoch_by_hash(vote.epoch_hash)
+                {
+                    ensure!(
+                        epoch_rec.committee.contains(&vote.public_key),
+                        PrimaryNetworkError::InvalidHeader(HeaderError::UnknownAuthority(format!(
+                            "{} not in committee for epoch {}",
+                            vote.public_key, vote.epoch_hash
+                        )))
+                    );
                 }
+                // Fire-and-forget: no oneshot, no blocking
+                let _ = self.consensus_bus.new_epoch_votes().send(*vote).await;
             }
         }
 

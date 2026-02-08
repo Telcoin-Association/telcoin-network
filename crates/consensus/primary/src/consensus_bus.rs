@@ -17,12 +17,12 @@ use std::{
 use tn_config::Parameters;
 use tn_network_libp2p::types::NetworkEvent;
 use tn_types::{
-    error::HeaderError, BlockHash, BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader,
-    ConsensusOutput, Epoch, EpochVote, Header, Round, TnReceiver, TnSender, CHANNEL_CAPACITY,
+    BlockHash, BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput, Epoch,
+    EpochRecord, EpochVote, Header, Round, TnReceiver, TnSender, CHANNEL_CAPACITY,
 };
 use tokio::{
     sync::{
-        broadcast, mpsc, oneshot,
+        broadcast, mpsc,
         watch::{self, error::RecvError},
     },
     time::error::Elapsed,
@@ -208,7 +208,9 @@ struct ConsensusBusAppInner {
     tx_sync_status: watch::Sender<NodeMode>,
 
     /// Produce new epoch certs as they are recieved.
-    new_epoch_votes: QueChannel<(EpochVote, oneshot::Sender<Result<(), HeaderError>>)>,
+    new_epoch_votes: QueChannel<EpochVote>,
+    /// Watch channel to communicate the current epoch record to the vote collector.
+    tx_epoch_record: watch::Sender<Option<EpochRecord>>,
     /// The que channel for primary network events.
     primary_network_events: QueChannel<NetworkEvent<crate::network::Req, crate::network::Res>>,
 }
@@ -229,6 +231,8 @@ impl ConsensusBusAppInner {
         let (consensus_header, _rx_consensus_header) = broadcast::channel(CHANNEL_CAPACITY);
         let (consensus_output, _rx_consensus_output) = broadcast::channel(100);
 
+        let (tx_epoch_record, _) = watch::channel(None);
+
         Self {
             tx_committed_round_updates,
             tx_requested_missing_epoch,
@@ -241,6 +245,7 @@ impl ConsensusBusAppInner {
             consensus_output,
             tx_sync_status,
             new_epoch_votes: QueChannel::new(),
+            tx_epoch_record,
             primary_network_events: QueChannel::new(),
         }
     }
@@ -529,10 +534,14 @@ impl ConsensusBus {
     }
 
     /// New epoch certs as they are recieved.
-    pub fn new_epoch_votes(
-        &self,
-    ) -> &impl TnSender<(EpochVote, oneshot::Sender<Result<(), HeaderError>>)> {
+    pub fn new_epoch_votes(&self) -> &impl TnSender<EpochVote> {
         &self.inner_app.new_epoch_votes
+    }
+
+    /// Watch channel for the current epoch record.
+    /// The epoch vote collector observes this to know when a new epoch starts.
+    pub fn epoch_record_watch(&self) -> &watch::Sender<Option<EpochRecord>> {
+        &self.inner_app.tx_epoch_record
     }
 
     //
@@ -580,9 +589,7 @@ impl ConsensusBus {
         self.inner_epoch.certificate_manager.subscribe()
     }
 
-    pub fn subscribe_new_epoch_votes(
-        &self,
-    ) -> impl TnReceiver<(EpochVote, oneshot::Sender<Result<(), HeaderError>>)> {
+    pub fn subscribe_new_epoch_votes(&self) -> impl TnReceiver<EpochVote> {
         self.inner_app.new_epoch_votes.subscribe()
     }
 
