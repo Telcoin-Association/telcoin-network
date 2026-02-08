@@ -142,11 +142,13 @@ pub fn catchup_accumulator<DB: TNDatabase>(
             .base_fee(0)
             .set_base_fee(block.base_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE));
 
+        let nonce: u64 = block.nonce.into();
+        let (current_epoch, last_executed_round) = RethEnv::deconstruct_nonce(nonce);
+
         let blocks =
             reth_env.blocks_for_range(epoch_state.epoch_info.blockHeight..=block.number)?;
-        let mut last_round: Option<u32> = None;
 
-        // loop through blocks to increment leader counts
+        // loop through blocks to accumulate gas stats
         for current in blocks {
             let gas = current.gas_used;
             let limit = current.gas_limit;
@@ -156,35 +158,35 @@ pub fn catchup_accumulator<DB: TNDatabase>(
             let lower64 = current.difficulty.into_limbs()[0];
             let worker_id = (lower64 & 0xffff) as u16;
             gas_accumulator.inc_block(worker_id, gas, limit);
+        }
 
-            // extract epoch and round from nonce
-            // - epoch: first 32 bits
-            // - round: lower 32 bits
-            let nonce: u64 = current.nonce.into();
-            let (epoch, round) = RethEnv::deconstruct_nonce(nonce);
-            // skip genesis
-            if round == 0 {
-                continue;
+        // count leaders from consensus DB for the current epoch
+        // NOTE: replaying consensus for unexecuted blocks will inc remaining leaders
+        if last_executed_round > 0 {
+            for (_block_number, header) in db.reverse_iter::<ConsensusBlocks>() {
+                let leader_epoch = header.sub_dag.leader_epoch();
+                let leader_round = header.sub_dag.leader_round();
+
+                // only accumulate for current epoch
+                if leader_epoch > current_epoch {
+                    continue;
+                } else if leader_epoch < current_epoch {
+                    break;
+                }
+
+                // no rewards for round 0
+                if leader_round == 0 {
+                    continue;
+                }
+
+                // ignore consensus blocks that will be sent resent to engine
+                // leader rewards incremented through normal `payload_builder` logic
+                if leader_round > last_executed_round {
+                    continue;
+                }
+
+                gas_accumulator.rewards_counter().inc_leader_count(header.sub_dag.leader.origin());
             }
-
-            debug!(target: "epoch-manager", ?epoch, ?round, block=current.number, "catchup from nonce:");
-
-            // only increment leader count for new rounds
-            if last_round != Some(round) {
-                // this is a new round, increment the leader count
-                let consensus_digest =
-                    current.parent_beacon_block_root.ok_or_eyre("consensus root missing")?;
-                let leader = db
-                    .get_consensus_by_hash(consensus_digest)
-                    .ok_or_eyre("missing consensus block")?
-                    .sub_dag
-                    .leader
-                    .origin()
-                    .clone();
-
-                gas_accumulator.rewards_counter().inc_leader_count(&leader);
-            }
-            last_round = Some(round);
         }
     };
 
