@@ -127,7 +127,24 @@ pub(crate) struct EpochManager<P, DB> {
     epoch_record: Option<EpochRecord>,
 }
 
-/// When rejoining a network mid epoch this will accumulate any gas state for previous epoch blocks.
+/// Restore the [`GasAccumulator`] state after a mid-epoch restart.
+///
+/// This is the first of three recovery stages (see the module docs on
+/// [`tn_types::gas_accumulator`] for the full picture). It runs once at startup, before
+/// execution resumes, and performs the following:
+///
+/// 1. **Base fee** — sets worker 0's base fee from the finalized reth header. In a multi-worker
+///    configuration this will need per-worker restoration.
+/// 2. **Gas stats** — iterates every reth block from the epoch's start height through the finalized
+///    tip, extracting the worker id from each block's `difficulty` field and calling
+///    [`GasAccumulator::inc_block`] to rebuild per-worker gas totals.
+/// 3. **Leader counts** — walks the consensus DB in reverse, counting each leader's committed
+///    blocks for rounds that have already been executed (i.e. `leader_round <=
+///    last_executed_round`). Rounds beyond the last executed round are intentionally skipped
+///    because [`EpochManager::replay_missed_consensus`] will re-execute them, which increments
+///    leader counts through the normal payload-builder path.
+///
+/// If there is no finalized header (fresh genesis), this is a no-op.
 pub fn catchup_accumulator<DB: TNDatabase>(
     db: &DB,
     reth_env: RethEnv,
