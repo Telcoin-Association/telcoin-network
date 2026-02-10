@@ -10,7 +10,6 @@ use crate::{
     worker::{worker_task_manager_name, WorkerNode},
     EngineToPrimaryRpc,
 };
-use consensus_metrics::start_prometheus_server;
 use eyre::{eyre, OptionExt};
 use std::{
     collections::{HashMap, HashSet},
@@ -128,7 +127,24 @@ pub(crate) struct EpochManager<P, DB> {
     epoch_record: Option<EpochRecord>,
 }
 
-/// When rejoining a network mid epoch this will accumulate any gas state for previous epoch blocks.
+/// Restore the [`GasAccumulator`] state after a mid-epoch restart.
+///
+/// This is the first of three recovery stages (see the module docs on
+/// [`tn_types::gas_accumulator`] for the full picture). It runs once at startup, before
+/// execution resumes, and performs the following:
+///
+/// 1. **Base fee** — sets worker 0's base fee from the finalized reth header. In a multi-worker
+///    configuration this will need per-worker restoration.
+/// 2. **Gas stats** — iterates every reth block from the epoch's start height through the finalized
+///    tip, extracting the worker id from each block's `difficulty` field and calling
+///    [`GasAccumulator::inc_block`] to rebuild per-worker gas totals.
+/// 3. **Leader counts** — walks the consensus DB in reverse, counting each leader's committed
+///    blocks for rounds that have already been executed (i.e. `leader_round <=
+///    last_executed_round`). Rounds beyond the last executed round are intentionally skipped
+///    because [`EpochManager::replay_missed_consensus`] will re-execute them, which increments
+///    leader counts through the normal payload-builder path.
+///
+/// If there is no finalized header (fresh genesis), this is a no-op.
 pub fn catchup_accumulator<DB: TNDatabase>(
     db: &DB,
     reth_env: RethEnv,
@@ -143,11 +159,13 @@ pub fn catchup_accumulator<DB: TNDatabase>(
             .base_fee(0)
             .set_base_fee(block.base_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE));
 
+        let nonce: u64 = block.nonce.into();
+        let (current_epoch, last_executed_round) = RethEnv::deconstruct_nonce(nonce);
+
         let blocks =
             reth_env.blocks_for_range(epoch_state.epoch_info.blockHeight..=block.number)?;
-        let mut last_round: Option<u32> = None;
 
-        // loop through blocks to increment leader counts
+        // loop through blocks to accumulate gas stats
         for current in blocks {
             let gas = current.gas_used;
             let limit = current.gas_limit;
@@ -157,35 +175,35 @@ pub fn catchup_accumulator<DB: TNDatabase>(
             let lower64 = current.difficulty.into_limbs()[0];
             let worker_id = (lower64 & 0xffff) as u16;
             gas_accumulator.inc_block(worker_id, gas, limit);
+        }
 
-            // extract epoch and round from nonce
-            // - epoch: first 32 bits
-            // - round: lower 32 bits
-            let nonce: u64 = current.nonce.into();
-            let (epoch, round) = RethEnv::deconstruct_nonce(nonce);
-            // skip genesis
-            if round == 0 {
-                continue;
+        // count leaders from consensus DB for the current epoch
+        // NOTE: replaying consensus for unexecuted blocks will inc remaining leaders
+        if last_executed_round > 0 {
+            for (_block_number, header) in db.reverse_iter::<ConsensusBlocks>() {
+                let leader_epoch = header.sub_dag.leader_epoch();
+                let leader_round = header.sub_dag.leader_round();
+
+                // only accumulate for current epoch
+                if leader_epoch > current_epoch {
+                    continue;
+                } else if leader_epoch < current_epoch {
+                    break;
+                }
+
+                // no rewards for round 0
+                if leader_round == 0 {
+                    continue;
+                }
+
+                // ignore consensus blocks that will be sent resent to engine
+                // leader rewards incremented through normal `payload_builder` logic
+                if leader_round > last_executed_round {
+                    continue;
+                }
+
+                gas_accumulator.rewards_counter().inc_leader_count(header.sub_dag.leader.origin());
             }
-
-            debug!(target: "epoch-manager", ?epoch, ?round, block=current.number, "catchup from nonce:");
-
-            // only increment leader count for new rounds
-            if last_round != Some(round) {
-                // this is a new round, increment the leader count
-                let consensus_digest =
-                    current.parent_beacon_block_root.ok_or_eyre("consensus root missing")?;
-                let leader = db
-                    .get_consensus_by_hash(consensus_digest)
-                    .ok_or_eyre("missing consensus block")?
-                    .sub_dag
-                    .leader
-                    .origin()
-                    .clone();
-
-                gas_accumulator.rewards_counter().inc_leader_count(&leader);
-            }
-            last_round = Some(round);
         }
     };
 
@@ -225,7 +243,7 @@ where
         let consensus_bus = ConsensusBus::new_with_args(builder.tn_config.parameters.gc_depth);
         if builder.tn_config.observer {
             // Don't risk keeping the default CVV active mode...
-            let _ = consensus_bus.node_mode().send(NodeMode::Observer);
+            consensus_bus.node_mode().send_replace(NodeMode::Observer);
         }
         let worker_event_stream = QueChannel::new();
 
@@ -296,16 +314,6 @@ where
         )
         .await?;
 
-        // start consensus metrics for the epoch
-        let metrics_shutdown = Notifier::new();
-        if let Some(metrics_socket) = self.builder.metrics {
-            start_prometheus_server(
-                metrics_socket,
-                &node_task_manager,
-                metrics_shutdown.subscribe(),
-            );
-        }
-
         self.try_restore_state(&engine).await?;
         // spawn task to update the latest execution results for consensus
         self.spawn_engine_update_task(engine.canonical_block_stream().await, &node_task_manager);
@@ -334,9 +342,6 @@ where
             // loop through short-term epochs
             epoch_result = self.run_epochs(&engine, network_config, to_engine, gas_accumulator) => epoch_result
         };
-
-        // shutdown metrics
-        metrics_shutdown.notify();
 
         result
     }
@@ -408,11 +413,8 @@ where
         });
 
         // set temporary task spawner - this is updated with each epoch
-        self.worker_network_handle = Some(WorkerNetworkHandle::new(
-            worker_network_handle,
-            node_task_spawner.clone(),
-            network_config.libp2p_config().max_rpc_message_size,
-        ));
+        self.worker_network_handle =
+            Some(WorkerNetworkHandle::new(worker_network_handle, node_task_spawner.clone()));
 
         Ok(())
     }

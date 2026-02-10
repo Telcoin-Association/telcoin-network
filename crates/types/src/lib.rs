@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #![allow(missing_docs)]
 
+// Used in tests
+#[cfg(test)]
+use proptest as _;
+#[cfg(test)]
+use tn_storage as _;
+#[cfg(test)]
+use tn_test_utils_committee as _;
+
 mod codec;
 #[allow(clippy::mutable_key_type)]
 mod committee;

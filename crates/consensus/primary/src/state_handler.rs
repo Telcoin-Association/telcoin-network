@@ -4,7 +4,7 @@ use crate::ConsensusBus;
 use tn_types::{
     AuthorityIdentifier, Certificate, Noticer, Round, TaskManager, TnReceiver, TnSender,
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, instrument};
 
 /// Updates Narwhal system state based on certificates received from consensus.
 pub(crate) struct StateHandler {
@@ -30,6 +30,7 @@ impl StateHandler {
         });
     }
 
+    #[instrument(level = "debug", skip_all, fields(commit_round, num_certs = certificates.len()))]
     async fn handle_sequenced(&mut self, commit_round: Round, certificates: Vec<Certificate>) {
         // Now we are going to signal which of our own batches have been committed.
         let own_rounds_committed: Vec<_> = certificates

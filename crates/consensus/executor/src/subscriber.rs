@@ -19,7 +19,7 @@ use tn_types::{
     CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput, Database,
     Hash as _, Noticer, TaskManager, TaskSpawner, Timestamp, TnReceiver, TnSender, B256,
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, instrument};
 
 /// The `Subscriber` receives certificates sequenced by the consensus and waits until the
 /// downloaded all the transactions references by the certificates; it then
@@ -109,6 +109,7 @@ impl<DB: Database> Subscriber<DB> {
 
     /// Turns a ConsensusHeader into a ConsensusOutput and sends it down the consensus_output
     /// channel for execution.
+    #[instrument(level = "debug", skip_all, fields(number = consensus_header.number))]
     async fn handle_consensus_header(
         &self,
         consensus_header: ConsensusHeader,
@@ -140,7 +141,7 @@ impl<DB: Database> Subscriber<DB> {
         // We aren't doing consensus now but still need to update these watches before
         // we send the consensus output.
         self.consensus_bus.committed_round_updates().send_replace(last_round);
-        let _ = self.consensus_bus.primary_round_updates().send(last_round);
+        self.consensus_bus.primary_round_updates().send_replace(last_round);
 
         if let Err(e) = self.consensus_bus.consensus_output().send(consensus_output).await {
             error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self.inner.authority_id, e);
@@ -168,7 +169,7 @@ impl<DB: Database> Subscriber<DB> {
                 if consensus_header_number == last_consensus_header.number {
                     // We are caught up enough so try to jump back into consensus
                     info!(target: "subscriber", "attempting to rejoin consensus, consensus block height {consensus_header_number}");
-                    let _ = self.consensus_bus.node_mode().send(NodeMode::CvvActive);
+                    self.consensus_bus.node_mode().send_replace(NodeMode::CvvActive);
                     self.config.shutdown().notify();
                     return Ok(());
                 }
@@ -210,6 +211,7 @@ impl<DB: Database> Subscriber<DB> {
     }
 
     /// Main loop connecting to the consensus to listen to sequence messages.
+    #[instrument(level = "info", skip_all, fields(authority = ?self.inner.authority_id))]
     async fn run(self, rx_shutdown: Noticer) -> SubscriberResult<()> {
         // It's important to have the futures in ordered fashion as we want
         // to guarantee that will deliver to the executor the certificates
@@ -237,10 +239,7 @@ impl<DB: Database> Subscriber<DB> {
 
                     // Record the latest ConsensusHeader, we probably don't need this in this mode but keep it up to date anyway.
                     // Note we don't bother sending this to the consensus header channel since not needed when an active CVV.
-                    if let Err(e) = self.consensus_bus.last_consensus_header().send(Some(ConsensusHeader { parent_hash, sub_dag: sub_dag.clone(), number, extra: B256::default() })) {
-                        error!(target: "subscriber", "error sending latest consensus header for authority {:?}: {}", self.inner.authority_id, e);
-                        return Err(SubscriberError::ClosedChannel("failed to send last consensus header on bus".to_string()));
-                    }
+                    self.consensus_bus.last_consensus_header().send_replace(Some(ConsensusHeader { parent_hash, sub_dag: sub_dag.clone(), number, extra: B256::default() }));
                     let epoch = sub_dag.leader_epoch();
                     let round = sub_dag.leader_round();
                     let consensus_result_hash = ConsensusResult::digest_data(epoch, round, number, last_parent);
@@ -282,11 +281,6 @@ impl<DB: Database> Subscriber<DB> {
                 }
 
             }
-
-            self.consensus_bus
-                .executor_metrics()
-                .waiting_elements_subscriber
-                .set(waiting.len() as i64);
         }
     }
 
@@ -312,6 +306,7 @@ impl<DB: Database> Subscriber<DB> {
     /// to execute.
     /// Note, an error here is BAD and will most likely cause node shutdown (clean).  Do
     /// not provide a bogus sub dag...
+    #[instrument(level = "debug", skip_all, fields(number, num_certs = deliver.len()))]
     async fn fetch_batches(
         &self,
         deliver: CommittedSubDag,
@@ -349,31 +344,15 @@ impl<DB: Database> Subscriber<DB> {
             }
         }
 
-        let fetched_batches_timer = self
-            .consensus_bus
-            .executor_metrics()
-            .block_fetch_for_committed_subdag_total_latency
-            .start_timer();
-        self.consensus_bus
-            .executor_metrics()
-            .committed_subdag_block_count
-            .observe(num_blocks as f64);
         let mut fetched_batches = self.fetch_batches_from_peers(batch_set).await?;
-        drop(fetched_batches_timer);
 
         // map all fetched batches to their respective certificates for applying block rewards
         for cert in &sub_dag.certificates {
             // create collection of batches to execute for this certificate
             let mut cert_batches = Vec::with_capacity(cert.header().payload().len());
-            self.consensus_bus.executor_metrics().subscriber_current_round.set(cert.round() as i64);
-            self.consensus_bus
-                .executor_metrics()
-                .subscriber_certificate_latency
-                .observe(cert.created_at().elapsed().as_secs_f64());
 
             // retrieve fetched batch by digest
             for digest in cert.header().payload().keys() {
-                self.consensus_bus.executor_metrics().subscriber_processed_blocks.inc();
                 let batch = fetched_batches.remove(digest).ok_or(SubscriberError::MissingFetchedBatch(*digest)).inspect_err(|_| {
                     error!(target: "subscriber", "[Protocol violation] Batch not found in fetched batches from workers of certificate signers");
                 })?;
@@ -392,6 +371,25 @@ impl<DB: Database> Subscriber<DB> {
                 batches: cert_batches,
             });
         }
+        // Count total transactions across all batches
+        let total_txs: usize = consensus_output
+            .batches
+            .iter()
+            .flat_map(|cb| cb.batches.iter())
+            .map(|b| b.transactions.len())
+            .sum();
+
+        // Metric: consensus_output_ready - tracks consensus output ready for execution
+        info!(
+            target: "consensus::metrics",
+            number = number,
+            leader_round = sub_dag.leader_round(),
+            num_certs = num_certs,
+            num_batches = consensus_output.batch_digests.len(),
+            total_txs = total_txs,
+            "consensus output ready"
+        );
+
         debug!(target: "subscriber", "returning output to subscriber");
         Ok(consensus_output)
     }
@@ -411,34 +409,18 @@ impl<DB: Database> Subscriber<DB> {
             }
         };
         for (digest, block) in blocks.batches.into_iter() {
-            self.record_fetched_batch_metrics(&block, &digest);
+            if let Some(received_at) = block.received_at() {
+                let remote_duration = received_at.elapsed().as_secs_f64();
+                debug!(
+                    target: "subscriber",
+                    "Block {:?} took {} seconds since it was received to when it was fetched for execution",
+                    digest,
+                    remote_duration,
+                );
+            }
             fetched_blocks.insert(digest, block);
         }
 
         Ok(fetched_blocks)
-    }
-
-    fn record_fetched_batch_metrics(&self, batch: &Batch, digest: &BlockHash) {
-        if let Some(received_at) = batch.received_at() {
-            let remote_duration = received_at.elapsed().as_secs_f64();
-            debug!(
-                target: "subscriber",
-                "Batch was fetched for execution after being received from another worker {}s ago.",
-                remote_duration
-            );
-            self.consensus_bus
-                .executor_metrics()
-                .block_execution_local_latency
-                .with_label_values(&["other"])
-                .observe(remote_duration);
-
-            self.consensus_bus.executor_metrics().block_execution_latency.observe(remote_duration);
-            debug!(
-                target: "subscriber",
-                "Block {:?} took {} seconds since it has been created to when it has been fetched for execution",
-                digest,
-                remote_duration,
-            );
-        };
     }
 }

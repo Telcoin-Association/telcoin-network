@@ -82,9 +82,7 @@ fn create_test_types() -> TestTypes {
     // set the latest execution result to genesis - test headers are proposed for round 1
     let mut recent = RecentBlocks::new(1);
     recent.push_latest(parent.clone());
-    cb.recent_blocks()
-        .send(recent)
-        .expect("watch channel updates for default parent in primary handler tests");
+    cb.recent_blocks().send_replace(recent);
 
     let handler = RequestHandler::new(config.clone(), cb.clone(), synchronizer);
     TestTypes { committee, handler, parent, task_manager, consensus_bus: cb }
@@ -355,4 +353,161 @@ async fn test_primary_batch_gossip_topics() {
     let topic = TopicHash::from_raw(tn_config::LibP2pConfig::consensus_output_topic());
     let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     assert!(handler.process_gossip(&bad_msg).await.is_err());
+}
+
+// ============================================================================
+// Equivocation Detection Tests
+// ============================================================================
+// These tests verify that validators cannot vote for conflicting headers
+// in the same round (equivocation), which is critical for consensus safety.
+
+/// Test that voting twice for the same header (same digest) returns cached response.
+#[tokio::test]
+async fn test_vote_same_digest_returns_cached() -> eyre::Result<()> {
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types();
+
+    let parents = Vec::new();
+
+    // Create valid header
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .build();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    // First vote should succeed
+    let res1 = handler.vote(peer, header.clone(), parents.clone()).await;
+    assert!(res1.is_ok(), "First vote should succeed");
+
+    // Second vote for same header should return cached response (also success)
+    let res2 = handler.vote(peer, header, parents).await;
+    assert!(res2.is_ok(), "Second vote for same digest should return cached success");
+
+    Ok(())
+}
+
+/// Test that voting for different header in same round is rejected (equivocation).
+#[tokio::test]
+async fn test_vote_different_digest_same_round_rejected() -> eyre::Result<()> {
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types();
+
+    let parents = Vec::new();
+
+    // Create first valid header
+    let header1 = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .build();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    // First vote should succeed
+    let res1 = handler.vote(peer, header1, parents.clone()).await;
+    assert!(res1.is_ok(), "First vote should succeed");
+
+    // Create different header for same round (different timestamp = different digest)
+    let header2 = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(2) // Different timestamp
+        .build();
+
+    // Second vote for different digest in same round should be rejected
+    let res2 = handler.vote(peer, header2, parents).await;
+    assert_matches!(
+        res2,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound { .. })),
+        "Vote for different header in same round should be rejected as equivocation"
+    );
+
+    Ok(())
+}
+
+/// Test that voting for older round after voting for newer round is rejected.
+#[tokio::test]
+async fn test_vote_older_round_rejected() -> eyre::Result<()> {
+    let TestTypes {
+        committee, handler, parent, task_manager: _task_manager, consensus_bus: _, ..
+    } = create_test_types();
+
+    let parents = Vec::new();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    // Create and vote for round 2 header first
+    let header_round2 = committee
+        .header_builder_last_authority()
+        .round(2)
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(2)
+        .build();
+
+    // Vote for round 2 (may fail for other reasons but registers the round)
+    let _res1 = handler.vote(peer, header_round2, parents.clone()).await;
+
+    // Now try to vote for round 1 (should be rejected - already voted for later round)
+    let header_round1 = committee
+        .header_builder_last_authority()
+        .round(1)
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .build();
+
+    let res2 = handler.vote(peer, header_round1, parents).await;
+    // This should be rejected because we already processed a header for a later round
+    assert_matches!(
+        res2,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound { .. })),
+        "Vote for older round should be rejected"
+    );
+
+    Ok(())
+}
+
+/// Test that the equivocation cache is per-authority.
+#[tokio::test]
+async fn test_vote_equivocation_per_authority() -> eyre::Result<()> {
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types();
+
+    let parents = Vec::new();
+
+    // Get two different authorities
+    let authorities: Vec<_> = committee.authorities().collect();
+    assert!(authorities.len() >= 2, "Need at least 2 authorities for this test");
+    let committee_ref = committee.committee();
+
+    // Create header from first authority
+    let header1 = authorities[0]
+        .header_builder(&committee_ref)
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .build();
+    let peer1 = *authorities[0].authority().protocol_key();
+
+    // Vote from first authority
+    let _res1 = handler.vote(peer1, header1, parents.clone()).await;
+
+    // Create header from second authority (same round, different author)
+    let header2 = authorities[1]
+        .header_builder(&committee_ref)
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .build();
+    let peer2 = *authorities[1].authority().protocol_key();
+
+    // Vote from second authority should NOT be rejected (different author)
+    let res2 = handler.vote(peer2, header2, parents).await;
+    // Should not fail due to equivocation (may fail for other reasons)
+    assert!(
+        !matches!(
+            res2,
+            Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound { .. }))
+        ),
+        "Vote from different authority should not trigger equivocation check"
+    );
+
+    Ok(())
 }

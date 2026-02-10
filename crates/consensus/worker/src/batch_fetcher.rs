@@ -1,14 +1,13 @@
 //! Fetch batches from peers
 
-use crate::{metrics::WorkerMetrics, network::WorkerNetworkHandle, WorkerNetworkError};
+use crate::{network::WorkerNetworkHandle, WorkerNetworkError};
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
     time::Duration,
 };
 use tn_storage::tables::Batches;
 use tn_types::{now, Batch, BlockHash, Database, DbTxMut};
-use tracing::debug;
+use tracing::{debug, instrument};
 
 #[cfg(test)]
 #[path = "tests/batch_fetcher.rs"]
@@ -18,20 +17,17 @@ mod batch_fetcher_tests;
 pub(crate) struct BatchFetcher<DB> {
     network: WorkerNetworkHandle,
     batch_store: DB,
-    metrics: Arc<WorkerMetrics>,
 }
 
 impl<DB: Database> BatchFetcher<DB> {
-    pub(crate) fn new(
-        network: WorkerNetworkHandle,
-        batch_store: DB,
-        metrics: Arc<WorkerMetrics>,
-    ) -> Self {
-        Self { network, batch_store, metrics }
+    /// Create a new instance of `Self`.
+    pub(crate) fn new(network: WorkerNetworkHandle, batch_store: DB) -> Self {
+        Self { network, batch_store }
     }
 
     /// Bulk fetches payload from local storage and remote workers.
     /// This function performs infinite retries and until all batches are available.
+    #[instrument(level = "debug", skip_all, fields(num_digests = digests.len()))]
     pub(crate) async fn fetch(&self, digests: HashSet<BlockHash>) -> HashMap<BlockHash, Batch> {
         debug!(target: "batch_fetcher", "Attempting to fetch {} digests from peers", digests.len(),);
 
@@ -45,16 +41,13 @@ impl<DB: Database> BatchFetcher<DB> {
             }
 
             // Fetch from local storage.
-            let _timer = self.metrics.worker_local_fetch_latency.start_timer();
             fetched_batches.extend(self.fetch_local(remaining_digests.clone()).await);
             remaining_digests.retain(|d| !fetched_batches.contains_key(d));
             if remaining_digests.is_empty() {
                 return fetched_batches;
             }
-            drop(_timer);
 
             // Fetch from peers.
-            let _timer = self.metrics.worker_remote_fetch_latency.start_timer();
             if let Ok(new_batches) =
                 self.safe_request_batches(&remaining_digests, Duration::from_secs(10)).await
             {
@@ -99,10 +92,7 @@ impl<DB: Database> BatchFetcher<DB> {
         if let Ok(local_batches) = self.batch_store.multi_get::<Batches>(digests.iter()) {
             for (digest, batch) in digests.into_iter().zip(local_batches.into_iter()) {
                 if let Some(batch) = batch {
-                    self.metrics.batch_fetch.with_label_values(&["local", "success"]).inc();
                     fetched_batches.insert(digest, batch);
-                } else {
-                    self.metrics.batch_fetch.with_label_values(&["local", "missing"]).inc();
                 }
             }
         }
@@ -111,6 +101,7 @@ impl<DB: Database> BatchFetcher<DB> {
     }
 
     /// Issue request_batches RPC and verifies response integrity
+    #[instrument(level = "debug", skip_all, fields(num_digests = digests_to_fetch.len()))]
     async fn safe_request_batches(
         &self,
         digests_to_fetch: &HashSet<BlockHash>,

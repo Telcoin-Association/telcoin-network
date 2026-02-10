@@ -18,11 +18,7 @@ async fn test_fetchertt() {
     let digests = HashSet::from_iter(vec![batch1.digest(), batch2.digest()]);
     network.put(&[1, 2], batch1.clone()).await;
     network.put(&[2, 3], batch2.clone()).await;
-    let fetcher = BatchFetcher {
-        network: network.handle(),
-        batch_store: batch_store.clone(),
-        metrics: Arc::new(WorkerMetrics::default()),
-    };
+    let fetcher = BatchFetcher { network: network.handle(), batch_store: batch_store.clone() };
     let mut expected_batches = HashMap::from_iter(vec![
         (batch1.digest(), batch1.clone()),
         (batch2.digest(), batch2.clone()),
@@ -66,11 +62,7 @@ async fn test_fetcher_locally_with_remaining() {
     network.put(&[1, 2], batch1.clone()).await;
     network.put(&[2, 3], batch2.clone()).await;
     network.put(&[3, 4], batch3.clone()).await;
-    let fetcher = BatchFetcher {
-        network: network.handle(),
-        batch_store,
-        metrics: Arc::new(WorkerMetrics::default()),
-    };
+    let fetcher = BatchFetcher { network: network.handle(), batch_store };
     let expected_batches = HashMap::from_iter(vec![
         (batch1.digest(), batch1.clone()),
         (batch2.digest(), batch2.clone()),
@@ -95,11 +87,7 @@ async fn test_fetcher_remote_with_remaining() {
     network.put(&[3, 4], batch1.clone()).await;
     network.put(&[2, 3], batch2.clone()).await;
     network.put(&[2, 3, 4], batch3.clone()).await;
-    let fetcher = BatchFetcher {
-        network: network.handle(),
-        batch_store,
-        metrics: Arc::new(WorkerMetrics::default()),
-    };
+    let fetcher = BatchFetcher { network: network.handle(), batch_store };
     let mut expected_batches = HashMap::from_iter(vec![
         (batch1.digest(), batch1.clone()),
         (batch2.digest(), batch2.clone()),
@@ -135,11 +123,7 @@ async fn test_fetcher_local_and_remote() {
     network.put(&[1, 2, 3], batch1.clone()).await;
     network.put(&[2, 3, 4], batch2.clone()).await;
     network.put(&[1, 4], batch3.clone()).await;
-    let fetcher = BatchFetcher {
-        network: network.handle(),
-        batch_store,
-        metrics: Arc::new(WorkerMetrics::default()),
-    };
+    let fetcher = BatchFetcher { network: network.handle(), batch_store };
     let mut expected_batches = HashMap::from_iter(vec![
         (batch1.digest(), batch1.clone()),
         (batch2.digest(), batch2.clone()),
@@ -193,11 +177,7 @@ async fn test_fetcher_response_size_limit() {
     let mut expected_batches =
         HashMap::from_iter(expected_batches.iter().map(|batch| (batch.digest(), batch.clone())));
     let digests = HashSet::from_iter(expected_batches.clone().into_keys());
-    let fetcher = BatchFetcher {
-        network: network.handle(),
-        batch_store,
-        metrics: Arc::new(WorkerMetrics::default()),
-    };
+    let fetcher = BatchFetcher { network: network.handle(), batch_store };
     let mut fetched_batches = fetcher.fetch(digests).await;
 
     // Reset metadata from the fetched and expected remote batches

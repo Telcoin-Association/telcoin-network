@@ -205,7 +205,7 @@ async fn test_batch_gossip_triggers_stream_request() {
                 match request {
                     WorkerRequest::RequestBatchesStream { batch_digests } => {
                         // Verify the stream request contains the correct digest
-                        assert_eq!(batch_digests, vec![batch_digest]);
+                        assert_eq!(batch_digests, HashSet::from([batch_digest]));
                         // Reject to end the test (no actual stream setup in unit test)
                         reply
                             .send(Ok(WorkerResponse::RequestBatchesStream { ack: false }))
@@ -252,7 +252,7 @@ async fn test_batch_gossip_stream_accepted_opens_stream() {
                 assert_eq!(peer, expected_peer);
                 match request {
                     WorkerRequest::RequestBatchesStream { batch_digests } => {
-                        assert_eq!(batch_digests, vec![batch_digest]);
+                        assert_eq!(batch_digests, HashSet::from([batch_digest]));
                         // Accept the stream request
                         reply
                             .send(Ok(WorkerResponse::RequestBatchesStream { ack: true }))

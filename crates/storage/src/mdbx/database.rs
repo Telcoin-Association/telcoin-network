@@ -1,14 +1,6 @@
 //! Impl db traits for mdbx.
 
-use std::{
-    marker::PhantomData,
-    path::Path,
-    sync::{
-        mpsc::{self, SyncSender},
-        Arc,
-    },
-    time::Duration,
-};
+use std::{marker::PhantomData, path::Path};
 
 use reth_libmdbx::{
     ffi::MDBX_dbi, Cursor, DatabaseFlags, Environment, Geometry, PageSize, Transaction, WriteFlags,
@@ -17,8 +9,6 @@ use reth_libmdbx::{
 use tn_types::{
     decode, decode_key, encode, encode_key, DBIter, Database, DbTx, DbTxMut, KeyT, Table, ValueT,
 };
-
-use crate::mdbx::metrics::MdbxMetrics;
 
 /// Wrapper for the libmdbx transaction.
 #[derive(Debug)]
@@ -103,20 +93,6 @@ impl DbTxMut for MdbxTxMut {
 pub struct MdbxDatabase {
     /// Libmdbx-sys environment.
     inner: Environment,
-    shutdown_tx: Arc<SyncSender<()>>,
-}
-
-impl Drop for MdbxDatabase {
-    fn drop(&mut self) {
-        if Arc::strong_count(&self.shutdown_tx) <= 1 {
-            tracing::info!(target: "telcoin::mdbx", "MDBX Dropping, shutting down metrics thread");
-            // shutdown_tx is a sync sender with no buffer so this should block until the thread
-            // reads it and shuts down.
-            if let Err(e) = self.shutdown_tx.send(()) {
-                tracing::error!(target: "telcoin::mdbx", "Error while trying to send shutdown to MDBX metrics thread {e}");
-            }
-        }
-    }
 }
 
 pub const MEGABYTE: usize = 1024 * 1024;
@@ -160,36 +136,7 @@ impl MdbxDatabase {
             })
             .open(path.as_ref())?;
 
-        let (shutdown_tx, rx) = mpsc::sync_channel::<()>(0);
-
-        let db_cloned = env.clone();
-        // Spawn thread to update metrics from MDBX stats every 2 seconds.
-        std::thread::spawn(move || {
-            tracing::info!(target: "telcoin::mdbx", "Starting MDBX metrics thread");
-            let metrics = MdbxMetrics::default();
-            while let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(Duration::from_secs(2))
-            {
-                match db_cloned.stat() {
-                    Ok(status) => {
-                        tracing::trace!(target: "telcoin::mdbx", "MDBX metrics thread {status:?}");
-                        metrics.page_size.set(status.page_size().into());
-                        metrics.depth.set(status.depth().into());
-                        metrics.branch_pages.set(status.branch_pages().try_into().unwrap_or(-1));
-                        metrics.leaf_pages.set(status.leaf_pages().try_into().unwrap_or(-1));
-                        metrics
-                            .overflow_pages
-                            .set(status.overflow_pages().try_into().unwrap_or(-1));
-                        metrics.entries.set(status.entries().try_into().unwrap_or(-1));
-                    }
-                    Err(e) => {
-                        tracing::error!(target: "telcoin::mdbx", "Error while trying to get MDBX status: {e}");
-                    }
-                }
-            }
-            tracing::info!(target: "telcoin::mdbx", "Ending MDBX metrics thread");
-        });
-
-        Ok(MdbxDatabase { inner: env, shutdown_tx: Arc::new(shutdown_tx) })
+        Ok(MdbxDatabase { inner: env })
     }
 }
 
