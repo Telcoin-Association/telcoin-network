@@ -88,8 +88,11 @@ where
             .last_executed_consensus_block(self.consensus_config.node_storage())
             .map(|h| (h.number, h.sub_dag.leader_epoch(), h.sub_dag.leader_round()))
             .unwrap_or((0, 0, 0));
-        let (last_consensus_number, _) =
-            *self.consensus_bus.last_published_consensus_num_hash().borrow();
+        // When empty outputs are skipped by execution, no new EVM block is produced.
+        // In that case, rely on the most recent consensus round processed by the engine.
+        let processed_consensus_round = self.consensus_bus.last_consensus_round();
+        let effective_exec_round = exec_round.max(processed_consensus_round);
+        let (last_consensus_number, _) = self.consensus_bus.published_consensus_num_hash();
         // Use GC depth to estimate how many rounds we can be behind.
         // Subtract ten here so if we are right on the GC depth we will still go inactive (small
         // safety buffer).  Ten is arbitrary but should make sure we are comfortably within
@@ -100,7 +103,7 @@ where
         // is our round outside the GC window
         // Will be false when not the same epoch (can't compare rounds) but
         // epoch_behind will work in that case.
-        let outside_gc_window = epoch == exec_epoch && (exec_round + gc_depth) < round;
+        let outside_gc_window = epoch == exec_epoch && (effective_exec_round + gc_depth) < round;
         // are we on older epoch?
         // note, we need to make sure we are not at the epoch boundary otherwise
         // we can get false positives
@@ -122,7 +125,10 @@ where
         if active_cvv && (outside_gc_window || epoch_behind) {
             // We seem to be too far behind to be an active CVV, try to go
             // inactive to catch up.
-            warn!(target: "primary", "we are behind, go to catchup mode!, epoch: {epoch}, exec_epoch: {exec_epoch}, number: {number:?}, exec_number: {exec_number}");
+            warn!(
+                target: "primary",
+                "we are behind, go to catchup mode!, epoch: {epoch}, exec_epoch: {exec_epoch}, number: {number:?}, exec_number: {exec_number}, exec_round: {exec_round}, processed_round: {processed_consensus_round}, effective_round: {effective_exec_round}"
+            );
             self.consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
             self.consensus_config.shutdown().notify();
             true
@@ -195,8 +201,7 @@ where
                 let consensus_result_hash = result.digest();
                 let ConsensusResult { epoch, round, number, hash, validator: key, signature } =
                     *result;
-                let (old_number, old_hash) =
-                    *self.consensus_bus.last_published_consensus_num_hash().borrow();
+                let (old_number, old_hash) = self.consensus_bus.published_consensus_num_hash();
                 if hash == old_hash || old_number >= number {
                     // We have already dealt with this hash or we are past this output.
                     return Ok(());
@@ -431,7 +436,7 @@ where
             error!(
                 target: "primary",
                 peer_hash = ?header.latest_execution_block,
-                expected = ?self.consensus_bus.recent_blocks().borrow().latest_block(),
+                expected = ?self.consensus_bus.latest_block_num_hash(),
                 "unexpected execution result received"
             );
             return Err(HeaderError::UnknownExecutionResult(header.latest_execution_block).into());

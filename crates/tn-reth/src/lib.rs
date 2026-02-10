@@ -112,9 +112,9 @@ use tn_config::{
 };
 use tn_types::{
     gas_accumulator::RewardsCounter, Address, BlockBody, BlockHashOrNumber, BlockHeader as _,
-    BlockNumHash, BlockNumber, Epoch, ExecHeader, Genesis, GenesisAccount, RecoveredBlock,
-    SealedBlock, SealedHeader, TaskManager, TaskSpawner, TransactionSigned, B256,
-    ETHEREUM_BLOCK_GAS_LIMIT_30M, U256,
+    BlockNumHash, BlockNumber, EngineUpdate, Epoch, ExecHeader, Genesis, GenesisAccount,
+    RecoveredBlock, Round, SealedBlock, SealedHeader, TaskManager, TaskSpawner, TransactionSigned,
+    B256, ETHEREUM_BLOCK_GAS_LIMIT_30M, U256,
 };
 use tracing::{debug, error, info, warn};
 use traits::{TNPrimitives, TelcoinNode};
@@ -706,6 +706,7 @@ impl RethEnv {
     pub fn finish_executing_output(
         &self,
         blocks: Vec<ExecutedBlockWithTrieUpdates>,
+        engine_update: Option<(Round, B256, tokio::sync::mpsc::Sender<EngineUpdate>)>,
     ) -> TnRethResult<()> {
         // NOTE: this makes all blocks canonical, commits them to the database,
         // and broadcasts new chain on `canon_state_notification_sender`
@@ -743,9 +744,21 @@ impl RethEnv {
             canonical_head.hash(),
         );
 
-        let notification = chain_update.to_chain_notification();
+        if let Some((leader_round, consensus_hash, engine_update_tx)) = engine_update {
+            engine_update_tx
+                .try_send((
+                    leader_round,
+                    consensus_hash,
+                    Some(canonical_head.clone_sealed_header()),
+                ))
+                .map_err(|e| {
+                    error!(target: "engine", ?e, "engine update channel send failed");
+                    TnRethError::EngineUpdateChannelClosed
+                })?;
+        }
 
         // broadcast canonical update
+        let notification = chain_update.to_chain_notification();
         self.canonical_in_memory_state().notify_canon_state(notification);
 
         Ok(())
@@ -1407,7 +1420,7 @@ mod tests {
         canonical_in_memory_state
             .update_chain(NewCanonicalChain::Commit { new: vec![block.clone()] });
         canonical_in_memory_state.set_canonical_head(canonical_header.clone());
-        reth_env.finish_executing_output(vec![block.clone()])?;
+        reth_env.finish_executing_output(vec![block.clone()], None)?;
         reth_env.finalize_block(canonical_header.clone())?;
         Ok(block)
     }

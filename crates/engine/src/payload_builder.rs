@@ -8,7 +8,7 @@ use tn_reth::{
     CanonicalInMemoryState, ExecutedBlockWithTrieUpdates, NewCanonicalChain, RethEnv,
 };
 use tn_types::{
-    gas_accumulator::GasAccumulator, max_batch_gas, Hash as _, Round, SealedHeader, B256,
+    gas_accumulator::GasAccumulator, max_batch_gas, EngineUpdate, Hash as _, SealedHeader, B256,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, field, info, info_span};
@@ -22,7 +22,7 @@ use tracing::{debug, error, field, info, info_span};
 pub fn execute_consensus_output(
     args: BuildArguments,
     gas_accumulator: GasAccumulator,
-    engine_update_tx: mpsc::Sender<(Round, B256, Option<SealedHeader>)>,
+    engine_update_tx: mpsc::Sender<EngineUpdate>,
 ) -> EngineResult<SealedHeader> {
     // rename canonical header for clarity
     let BuildArguments { reth_env, mut output, parent_header: mut canonical_header } = args;
@@ -148,17 +148,10 @@ pub fn execute_consensus_output(
 
     span.record("executed_blocks", executed_blocks.len().to_string());
 
-    // Send engine update BEFORE broadcasting canon state notification.
-    // This ensures the primary has the latest execution info before a batch
-    // is also proposed (batch builder subscribes to canon state notifications).
-    engine_update_tx
-        .try_send((leader_round, consensus_hash, Some(canonical_header.clone())))
-        .map_err(|e| {
-            error!(target: "engine", ?e, "engine update channel send failed");
-            TnEngineError::ChannelClosed
-        })?;
-
-    reth_env.finish_executing_output(executed_blocks)?;
+    reth_env.finish_executing_output(
+        executed_blocks,
+        Some((leader_round, consensus_hash, engine_update_tx)),
+    )?;
     // remove blocks from memory and stores them in the database
     reth_env.finalize_block(canonical_header.clone())?;
 

@@ -80,39 +80,9 @@ where
 }
 
 /// Create a range of certificates for specified rounds from committee.
+///
+/// Rounds in `empty_rounds` generate certificates with empty payloads.
 pub fn create_signed_certificates_for_rounds<DB>(
-    range: RangeInclusive<Round>,
-    fixture: &CommitteeFixture<DB>,
-) -> (VecDeque<Certificate>, BTreeSet<CertificateDigest>, HashMap<BlockHash, Batch>)
-where
-    DB: Database,
-{
-    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
-    let mut certificates = VecDeque::new();
-    let mut next_parents = BTreeSet::new();
-    let mut batches = HashMap::new();
-    // use genesis for initial parents
-    let mut parents: BTreeSet<_> = fixture.genesis().collect();
-
-    // create signed certificates for every round
-    for round in range {
-        next_parents.clear();
-        for id in &ids {
-            let (digest, certificate, payload) =
-                signed_cert(id.clone(), round, parents.clone(), fixture);
-            certificates.push_back(certificate);
-            next_parents.insert(digest);
-            batches.extend(payload);
-        }
-        parents.clone_from(&next_parents);
-    }
-
-    (certificates, next_parents, batches)
-}
-
-/// Create a range of certificates where rounds in `empty_rounds` have empty payloads (no batches).
-/// Returns the certificates, next parents, and only the batches for non-empty rounds.
-pub fn create_signed_certificates_with_empty_rounds<DB>(
     range: RangeInclusive<Round>,
     fixture: &CommitteeFixture<DB>,
     empty_rounds: &[Round],
@@ -149,4 +119,19 @@ where
     }
 
     (certificates, next_parents, batches)
+}
+
+/// Create a range of certificates where rounds in `empty_rounds` have empty payloads.
+///
+/// This wrapper is kept for readability in tests that model mixed empty/non-empty consensus
+/// rounds.
+pub fn create_signed_certificates_with_empty_rounds<DB>(
+    range: RangeInclusive<Round>,
+    fixture: &CommitteeFixture<DB>,
+    empty_rounds: &[Round],
+) -> (VecDeque<Certificate>, BTreeSet<CertificateDigest>, HashMap<BlockHash, Batch>)
+where
+    DB: Database,
+{
+    create_signed_certificates_for_rounds(range, fixture, empty_rounds)
 }

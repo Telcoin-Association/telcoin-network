@@ -44,9 +44,9 @@ use tn_storage::{
 use tn_types::{
     gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash, BlsAggregateSignature,
     BlsPublicKey, BlsSignature, CertifiedBatch, CommittedSubDag, Committee, CommitteeBuilder,
-    ConsensusOutput, Database as TNDatabase, Epoch, EpochCertificate, EpochRecord, Hash, Multiaddr,
-    NetworkPublicKey, Noticer, Notifier, TaskJoinError, TaskManager, TaskSpawner, TimestampSec,
-    TnReceiver, B256, MIN_PROTOCOL_BASE_FEE,
+    ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, EpochCertificate, EpochRecord,
+    Hash, Multiaddr, NetworkPublicKey, Noticer, Notifier, TaskJoinError, TaskManager,
+    TaskSpawner, TimestampSec, TnReceiver, B256, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{
     quorum_waiter::QuorumWaiterTrait, Worker, WorkerNetwork, WorkerNetworkHandle, WorkerRequest,
@@ -176,27 +176,21 @@ pub fn catchup_accumulator<DB: TNDatabase>(
             gas_accumulator.inc_block(worker_id, gas, limit);
         }
 
-        // count leaders from consensus DB for the current epoch
-        // NOTE: replaying consensus for unexecuted blocks will inc remaining leaders
+        // count leaders from consensus db for the current epoch
+        // NOTE: replay_missed_consensus catches up rounds above last_executed_round.
         if last_executed_round > 0 {
             for (_block_number, header) in db.reverse_iter::<ConsensusBlocks>() {
                 let leader_epoch = header.sub_dag.leader_epoch();
                 let leader_round = header.sub_dag.leader_round();
 
-                // only accumulate for current epoch
                 if leader_epoch > current_epoch {
                     continue;
                 } else if leader_epoch < current_epoch {
                     break;
                 }
-
-                // no rewards for round 0
                 if leader_round == 0 {
                     continue;
                 }
-
-                // ignore consensus blocks that will be sent resent to engine
-                // leader rewards incremented through normal `payload_builder` logic
                 if leader_round > last_executed_round {
                     continue;
                 }
@@ -1867,7 +1861,7 @@ where
     /// consensus output (with or without blocks).
     fn spawn_engine_update_task(
         &self,
-        mut engine_update: mpsc::Receiver<(tn_types::Round, B256, Option<tn_types::SealedHeader>)>,
+        mut engine_update: mpsc::Receiver<EngineUpdate>,
         task_manager: &TaskManager,
     ) {
         let consensus_bus = self.consensus_bus.clone();

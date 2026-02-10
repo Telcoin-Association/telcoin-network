@@ -20,8 +20,8 @@ use std::{
 };
 use tn_reth::{payload::BuildArguments, RethEnv};
 use tn_types::{
-    gas_accumulator::GasAccumulator, ConsensusOutput, Noticer, Round, SealedHeader, TaskSpawner,
-    B256,
+    gas_accumulator::GasAccumulator, ConsensusOutput, EngineUpdate, Noticer, SealedHeader,
+    TaskSpawner,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
@@ -70,7 +70,7 @@ pub struct ExecutorEngine {
     /// Channel to notify consensus about processed outputs.
     /// Sends (leader_round, consensus_hash, Option<SealedHeader>) after each ConsensusOutput is
     /// processed.
-    engine_update_tx: mpsc::Sender<(Round, B256, Option<SealedHeader>)>,
+    engine_update_tx: mpsc::Sender<EngineUpdate>,
 }
 
 impl ExecutorEngine {
@@ -89,7 +89,7 @@ impl ExecutorEngine {
         rx_shutdown: Noticer,
         task_spawner: TaskSpawner,
         gas_accumulator: GasAccumulator,
-        engine_update_tx: mpsc::Sender<(Round, B256, Option<SealedHeader>)>,
+        engine_update_tx: mpsc::Sender<EngineUpdate>,
     ) -> Self {
         let consensus_output_stream = ReceiverStream::new(rx_consensus_output);
 
