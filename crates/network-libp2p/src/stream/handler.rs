@@ -4,7 +4,7 @@ use libp2p::Stream;
 use std::collections::VecDeque;
 use std::task::{Context, Poll};
 
-use crate::stream::upgrade::{StreamHeader, StreamSyncError, TNStreamProtocol};
+use crate::stream::upgrade::{StreamError, StreamHeader, TNStreamProtocol};
 
 /// Commands from behavior to handler.
 ///
@@ -46,7 +46,7 @@ pub enum StreamHandlerEvent {
         /// The ID for the failed stream.
         request_id: u64,
         /// The error that occurred.
-        error: StreamSyncError,
+        error: StreamError,
     },
 }
 
@@ -147,7 +147,7 @@ impl ConnectionHandler for StreamHandler {
             ConnectionEvent::DialUpgradeError(e) => {
                 self.events.push_back(StreamHandlerEvent::OutboundFailure {
                     request_id: e.info.0,
-                    error: StreamSyncError::UpgradeFailed,
+                    error: StreamError::UpgradeFailed,
                 });
             }
             _ => {}

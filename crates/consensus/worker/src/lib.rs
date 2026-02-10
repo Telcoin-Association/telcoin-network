@@ -6,10 +6,11 @@
 mod batch_fetcher;
 mod network;
 mod worker;
-pub use network::{WorkerNetwork, WorkerNetworkHandle, WorkerRequest, WorkerResponse};
-pub mod quorum_waiter;
-
+pub use network::{
+    PendingBatchStream, WorkerNetwork, WorkerNetworkHandle, WorkerRequest, WorkerResponse,
+};
 pub mod metrics;
+pub mod quorum_waiter;
 
 pub use crate::{
     network::{

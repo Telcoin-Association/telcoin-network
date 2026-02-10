@@ -10,7 +10,7 @@ use std::task::{Context, Poll};
 
 use crate::stream::{
     handler::{HandlerCommand, StreamHandler, StreamHandlerEvent},
-    upgrade::{StreamHeader, StreamSyncError},
+    upgrade::{StreamError, StreamHeader},
 };
 
 /// The protocol identifier for stream-based sync.
@@ -62,7 +62,7 @@ pub enum StreamEvent {
         /// The ID linking this failure to the original sync request.
         request_id: u64,
         /// The specific error that occurred.
-        error: StreamSyncError,
+        error: StreamError,
     },
 }
 

@@ -28,7 +28,7 @@ pub mod types;
 pub use codec::{TNCodec, TNMessage};
 pub use consensus::ConsensusNetwork;
 pub use peers::{PeerExchangeMap, Penalty};
-pub use stream::{StreamHeader, StreamSyncError};
+pub use stream::{StreamError, StreamHeader};
 
 // re-export specific libp2p types
 pub use libp2p::{

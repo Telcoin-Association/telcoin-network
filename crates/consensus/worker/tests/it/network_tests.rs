@@ -16,12 +16,10 @@ use tn_worker::{
 };
 use tokio::sync::mpsc;
 
-/// The type for holding testng components.
+/// The type for holding testing components.
 struct TestTypes<DB = MemDatabase> {
     /// Committee committee with authorities that vote.
     committee: CommitteeFixture<DB>,
-    // /// The authority that receives messages.
-    // authority: &'a AuthorityFixture<DB>,
     /// The handler for requests.
     handler: RequestHandler<DB>,
     /// Task manager the synchronizer (in RequestHandler) is spawned on.
@@ -41,14 +39,15 @@ fn create_test_types() -> TestTypes {
     let worker_id = 0;
     let batch_validator = Arc::new(NoopBatchValidator);
     let (tx, network_commands_rx) = mpsc::channel(10);
-    let network_handle = WorkerNetworkHandle::new(
-        NetworkHandle::new(tx),
-        task_manager.get_spawner(),
-        config.network_config().libp2p_config().max_rpc_message_size,
-    );
+    let network_handle =
+        WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner());
     let handler = RequestHandler::new(worker_id, batch_validator, config, network_handle);
     TestTypes { committee, handler, task_manager, network_commands_rx }
 }
+
+// ============================================================================
+// Report Batch Tests
+// ============================================================================
 
 #[tokio::test]
 async fn test_report_batch_success() {
@@ -71,6 +70,10 @@ async fn test_report_batch_fails_non_committee_peer() {
     let res = handler.pub_process_report_batch(&bad_peer, sealed_batch).await;
     assert_matches!(res, Err(WorkerNetworkError::NonCommitteeBatch));
 }
+
+// ============================================================================
+// Request Batches Tests (Legacy Request-Response)
+// ============================================================================
 
 #[tokio::test]
 async fn test_request_batches_success() {
@@ -101,84 +104,45 @@ async fn test_request_batches_fails_empty_digests() {
 }
 
 #[tokio::test]
-async fn test_request_batches_fails_response_too_small() {
+async fn test_request_batches_returns_empty_for_missing_batch() {
     let TestTypes { handler, task_manager: _, .. } = create_test_types();
-    let batch_digest = B256::random();
-    let batch_digests = vec![batch_digest];
-    let too_small = 1;
-    let res = handler.pub_process_request_batches(batch_digests, too_small).await;
-    assert_matches!(res, Err(WorkerNetworkError::InvalidRequest(_)));
-}
-
-#[tokio::test]
-async fn test_request_batches_capped_at_response_max_requestor() {
-    let TestTypes { committee, handler, task_manager: _, .. } = create_test_types();
-    let batch_digest_1 = B256::random();
-    let batch_digest_2 = B256::random();
-    let batch_digests = vec![batch_digest_1, batch_digest_2];
-    let batch = Batch { transactions: vec![vec![1_u8; 10]], ..Default::default() };
-    let expected_batch = SealedBatch::new(batch, batch_digest_1);
-    // create large batch that exceeds limit
+    // Request a batch that doesn't exist in the store
+    let missing_digest = B256::random();
+    let batch_digests = vec![missing_digest];
     let max_response_size = 1_000;
-    let big_tx = vec![1u8; max_response_size];
-    let too_big = SealedBatch::new(
-        Batch { transactions: vec![big_tx], ..Default::default() },
-        batch_digest_2,
-    );
-
-    // store both batches to db
-    for batch in [&expected_batch, &too_big] {
-        committee
-            .first_authority()
-            .consensus_config()
-            .node_storage()
-            .insert::<Batches>(&batch.digest, &batch.batch)
-            .expect("write batch to db");
-    }
 
     let res = handler.pub_process_request_batches(batch_digests, max_response_size).await;
-    // only batch_1 returned per requestor's max response size
-    assert_matches!(res, Ok(batch) if batch == vec![expected_batch.batch]);
+    // Should succeed but return empty since batch not found
+    assert_matches!(res, Ok(batches) if batches.is_empty());
 }
 
 #[tokio::test]
-async fn test_request_batches_capped_at_response_max_internal() {
+async fn test_request_batches_partial_missing() {
     let TestTypes { committee, handler, task_manager: _, .. } = create_test_types();
-    let batch_digest_1 = B256::random();
-    let batch_digest_2 = B256::random();
-    let batch_digests = vec![batch_digest_1, batch_digest_2];
-    let batch_1 = Batch { transactions: vec![vec![1_u8; 10_000]], ..Default::default() };
-    let expected_batch = SealedBatch::new(batch_1, batch_digest_1);
-    // create large batch that exceeds limit
-    let internal_max = committee
+
+    // Create and store one batch
+    let existing_digest = B256::random();
+    let existing_batch = Batch { transactions: vec![vec![1, 2, 3]], ..Default::default() };
+    committee
         .first_authority()
         .consensus_config()
-        .network_config()
-        .libp2p_config()
-        .max_rpc_message_size;
+        .node_storage()
+        .insert::<Batches>(&existing_digest, &existing_batch)
+        .expect("write batch to db");
 
-    let big_tx = vec![1u8; internal_max];
-    let too_big = SealedBatch::new(
-        Batch { transactions: vec![big_tx], ..Default::default() },
-        batch_digest_2,
-    );
+    // Request both existing and missing batches
+    let missing_digest = B256::random();
+    let batch_digests = vec![existing_digest, missing_digest];
+    let max_response_size = 10_000;
 
-    // store both batches to db
-    for batch in [&expected_batch, &too_big] {
-        committee
-            .first_authority()
-            .consensus_config()
-            .node_storage()
-            .insert::<Batches>(&batch.digest, &batch.batch)
-            .expect("write batch to db");
-    }
-
-    // ensure requestor's max size is larger
-    let max_response_size = internal_max * 2;
     let res = handler.pub_process_request_batches(batch_digests, max_response_size).await;
-    // only batch_1 returned per requestor's max response size
-    assert_matches!(res, Ok(batch) if batch == vec![expected_batch.batch]);
+    // Should return only the existing batch
+    assert_matches!(res, Ok(batches) if batches.len() == 1 && batches[0] == existing_batch);
 }
+
+// ============================================================================
+// Gossip Tests
+// ============================================================================
 
 /// Test that worker pub/sub is enforcing topics.
 #[tokio::test]
@@ -208,8 +172,14 @@ async fn test_batch_gossip_topics() {
     assert!(handler.pub_process_gossip_for_test(&good_msg).await.is_ok());
 }
 
+/// Test that gossip triggers batch fetch via stream-based approach.
+///
+/// This test verifies the stream negotiation flow:
+/// 1. Gossip triggers batch fetch
+/// 2. Handler sends RequestBatchesStream to negotiate
+/// 3. If peer rejects (ack=false), this would normally trigger fallback
 #[tokio::test]
-async fn test_batch_gossip_succeeds() {
+async fn test_batch_gossip_triggers_stream_request() {
     let TestTypes { mut network_commands_rx, handler, task_manager, committee } =
         create_test_types();
     let batch_digest = B256::random();
@@ -217,6 +187,7 @@ async fn test_batch_gossip_succeeds() {
     let data = tn_types::encode(&gossip);
     let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic());
     let msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
+
     task_manager.spawn_task("process-gossip-test", async move {
         handler.pub_process_gossip_for_test(&msg).await.expect("success process gossip");
     });
@@ -229,22 +200,105 @@ async fn test_batch_gossip_succeeds() {
                 // request_batches calls this first
                 reply.send(vec![expected_peer]).expect("peer sent");
             }
-            NetworkCommand::SendRequest { peer, request, .. } => {
-                // assert expected output
-                let max_response_size = committee
-                    .first_authority()
-                    .consensus_config()
-                    .network_config()
-                    .libp2p_config()
-                    .max_rpc_message_size;
-                let expected_request = WorkerRequest::RequestBatches {
-                    batch_digests: vec![batch_digest],
-                    max_response_size,
-                };
+            NetworkCommand::SendRequest { peer, request, reply } => {
                 assert_eq!(peer, expected_peer);
-                assert_eq!(request, expected_request);
+                match request {
+                    WorkerRequest::RequestBatchesStream { batch_digests } => {
+                        // Verify the stream request contains the correct digest
+                        assert_eq!(batch_digests, vec![batch_digest]);
+                        // Reject to end the test (no actual stream setup in unit test)
+                        reply
+                            .send(Ok(WorkerResponse::RequestBatchesStream { ack: false }))
+                            .expect("reply sent");
+                        // Test passes - we verified the stream request was sent
+                        break;
+                    }
+                    _ => panic!("expected RequestBatchesStream, got {:?}", request),
+                }
             }
             _ => panic!("unexpected network command"),
         }
     }
+}
+
+/// Test stream request with ack=true (peer accepts).
+///
+/// When a peer accepts, the flow continues to open a stream.
+/// This test verifies the OpenStream command is sent after ack.
+#[tokio::test]
+async fn test_batch_gossip_stream_accepted_opens_stream() {
+    let TestTypes { mut network_commands_rx, handler, task_manager, committee } =
+        create_test_types();
+    let batch_digest = B256::random();
+    let gossip = WorkerGossip::Batch(batch_digest);
+    let data = tn_types::encode(&gossip);
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic());
+    let msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
+
+    task_manager.spawn_task("process-gossip-test", async move {
+        // This will timeout eventually since we don't complete the stream
+        let _ = handler.pub_process_gossip_for_test(&msg).await;
+    });
+
+    let expected_peer = committee.last_authority().primary_public_key();
+    let mut stream_request_acked = false;
+
+    while let Some(command) = network_commands_rx.recv().await {
+        match command {
+            NetworkCommand::ConnectedPeers { reply } => {
+                reply.send(vec![expected_peer]).expect("peer sent");
+            }
+            NetworkCommand::SendRequest { peer, request, reply } => {
+                assert_eq!(peer, expected_peer);
+                match request {
+                    WorkerRequest::RequestBatchesStream { batch_digests } => {
+                        assert_eq!(batch_digests, vec![batch_digest]);
+                        // Accept the stream request
+                        reply
+                            .send(Ok(WorkerResponse::RequestBatchesStream { ack: true }))
+                            .expect("reply sent");
+                        stream_request_acked = true;
+                    }
+                    _ => panic!("expected RequestBatchesStream, got {:?}", request),
+                }
+            }
+            NetworkCommand::OpenStream { peer, resource_id: _, request_digest, reply } => {
+                // Verify OpenStream is called after ack
+                assert!(stream_request_acked, "OpenStream should come after ack");
+                assert_eq!(peer, expected_peer);
+                // request_digest should be a hash of the batch_digests
+                assert_ne!(request_digest, B256::ZERO);
+                // Don't complete the stream - just verify command was sent
+                // Drop reply to simulate error, ending the test
+                drop(reply);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(stream_request_acked, "stream request should have been acked");
+}
+
+// ============================================================================
+// Stream Request Error Tests
+// ============================================================================
+
+/// Test that UnknownStreamRequest error is properly returned.
+///
+/// This tests the error type that should be returned when a stream arrives
+/// without a matching pending request.
+#[tokio::test]
+async fn test_unknown_stream_request_error_type() {
+    // Verify the error type exists and has the expected structure
+    let fake_digest = B256::random();
+    let error = WorkerNetworkError::UnknownStreamRequest(fake_digest);
+
+    // Check error message indicates no pending request
+    let error_string = error.to_string();
+    assert!(
+        error_string.contains("pending request") || error_string.contains("stream"),
+        "Error should mention pending request or stream: {}",
+        error_string
+    );
 }

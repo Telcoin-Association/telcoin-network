@@ -12,7 +12,10 @@ publish = false
 
 [dependencies]
 async-trait = { workspace = true }
+bcs = { workspace = true }
 futures = { workspace = true }
+libp2p = { workspace = true }
+snap = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "macros"] }
 tracing = { workspace = true }

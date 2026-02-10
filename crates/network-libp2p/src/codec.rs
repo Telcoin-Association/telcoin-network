@@ -11,7 +11,7 @@ use std::{
     io::{Read as _, Write as _},
     marker::PhantomData,
 };
-use tn_types::encode_into_buffer;
+use tn_types::{encode, encode_into_buffer, B256};
 
 #[cfg(test)]
 #[path = "tests/codec_tests.rs"]
@@ -24,6 +24,13 @@ pub trait TNMessage:
     /// Function to intercept peer exchange messages at the network layer before passing to the
     /// application layer. Only the network layer needs peer exchange messages.
     fn peer_exchange_msg(&self) -> Option<PeerExchangeMap>;
+    /// The digest of the request.
+    fn digest(&self) -> B256 {
+        let mut hasher = tn_types::DefaultHashFunction::new();
+        let bytes = encode(self);
+        hasher.update(&bytes);
+        B256::from_slice(hasher.finalize().as_bytes())
+    }
 }
 
 /// The Telcoin Network request/response codec for consensus messages between peers.

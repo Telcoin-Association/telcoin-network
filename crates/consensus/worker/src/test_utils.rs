@@ -62,11 +62,7 @@ impl TestRequestBatchesNetwork {
         let data_clone = data.clone();
         let (tx, mut rx) = mpsc::channel(100);
         let task_manager = TaskManager::default();
-        let handle = WorkerNetworkHandle::new(
-            NetworkHandle::new(tx),
-            task_manager.get_spawner(),
-            1024 * 1024,
-        );
+        let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner());
         tokio::spawn(async move {
             let _owned = task_manager;
             while let Some(r) = rx.recv().await {
@@ -108,6 +104,17 @@ impl TestRequestBatchesNetwork {
                         }
 
                         reply.send(Ok(WorkerResponse::RequestBatches(batches))).unwrap();
+                    }
+                    NetworkCommand::SendRequest {
+                        peer: _,
+                        request: WorkerRequest::RequestBatchesStream { batch_digests: _ },
+                        reply,
+                    } => {
+                        // For stream requests in tests, reject them so tests fall back
+                        // to request-response or we can test stream handling separately
+                        reply
+                            .send(Ok(WorkerResponse::RequestBatchesStream { ack: false }))
+                            .unwrap();
                     }
                     _ => {}
                 }

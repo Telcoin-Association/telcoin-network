@@ -1,19 +1,24 @@
+//! The type that handles core logic for requests between workers.
 use super::{
     error::{WorkerNetworkError, WorkerNetworkResult},
+    handle::WorkerNetworkHandle,
     message::WorkerGossip,
-    WorkerNetworkHandle,
 };
-use crate::WorkerResponse;
+use crate::{
+    network::{stream_codec, PendingBatchStream},
+    WorkerResponse,
+};
+use futures::AsyncWriteExt as _;
 use std::sync::{Arc, LazyLock};
 use tn_config::ConsensusConfig;
-use tn_network_libp2p::GossipMessage;
+use tn_network_libp2p::{GossipMessage, StreamHeader};
 use tn_network_types::{WorkerOthersBatchMessage, WorkerToPrimaryClient};
 use tn_storage::tables::Batches;
 use tn_types::{
     ensure, now, try_decode, Batch, BatchValidation, BlockHash, BlsPublicKey, Database,
     SealedBatch, WorkerId,
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// The minimal length of a single, encoded, default [Batch] used to set a local min for
 /// message validation.
@@ -156,13 +161,13 @@ where
         // NOTE: caller needs to account for batches + msg overhead, and batches must have
         // transactions
         if max_response_size < *LOCAL_MIN_REQUEST_SIZE {
-            debug!(target: "cert-collector", "batch request max size too small: {}", max_response_size);
+            debug!(target: "worker::network", "batch request max size too small: {}", max_response_size);
             return Err(WorkerNetworkError::InvalidRequest("Request size too small".into()));
         }
 
         // return error for empty batches
         if batch_digests.is_empty() {
-            debug!(target: "cert-collector", "batch request empty");
+            debug!(target: "worker::network", "batch request empty");
             return Err(WorkerNetworkError::InvalidRequest("Empty batch digests".into()));
         }
 
@@ -202,6 +207,48 @@ where
 
         Ok(batches)
     }
+
+    /// Process request to open batches sync stream.
+    pub(super) async fn process_request_batches_stream(
+        &self,
+        peer: BlsPublicKey,
+        pending_request: Option<PendingBatchStream>,
+        mut stream: libp2p::Stream,
+        header: StreamHeader,
+    ) -> WorkerNetworkResult<()> {
+        // `None` indicates unexpected request
+        let Some(request) = pending_request else {
+            // this is a protocol violation - return error for penalty
+            warn!(
+                target: "worker::network",
+                %peer,
+                ?header.request_digest,
+                "inbound stream has no matching pending request"
+            );
+            return Err(WorkerNetworkError::UnknownStreamRequest(header.request_digest));
+        };
+
+        // process request to send batches through stream
+        debug!(
+            target: "worker::network",
+            %peer,
+            ?header.request_digest,
+            batch_count = request.batch_digests.len(),
+            "processing inbound batch stream"
+        );
+
+        let store = self.consensus_config.node_storage();
+        if let Err(e) =
+            stream_codec::send_batches_over_stream(&mut stream, store, &request.batch_digests).await
+        {
+            warn!(target: "worker::network", %peer, ?e, "failed to send batches over stream");
+        }
+
+        // attempt to close the stream gracefully
+        let _ = stream.close().await;
+
+        Ok(())
+    }
 }
 
 // support IT tests
@@ -237,5 +284,19 @@ where
         max_response_size: usize,
     ) -> WorkerNetworkResult<Vec<Batch>> {
         self.process_request_batches(batch_digests, max_response_size).await
+    }
+
+    /// Publicly available for tests.
+    /// Sends requested batches over the provided stream.
+    ///
+    /// This is a simplified version for tests that bypasses the pending request mechanism.
+    pub async fn pub_process_request_batches_stream(
+        &self,
+        peer: BlsPublicKey,
+        stream: libp2p::Stream,
+        pending_request: Option<PendingBatchStream>,
+        header: StreamHeader,
+    ) -> WorkerNetworkResult<()> {
+        self.process_request_batches_stream(peer, pending_request, stream, header).await
     }
 }

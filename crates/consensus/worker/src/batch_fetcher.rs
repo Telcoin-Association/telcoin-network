@@ -1,17 +1,13 @@
 //! Fetch batches from peers
 
-use crate::{metrics::WorkerMetrics, network::WorkerNetworkHandle};
-use async_trait::async_trait;
+use crate::{metrics::WorkerMetrics, network::WorkerNetworkHandle, WorkerNetworkError};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
     time::Duration,
 };
-use thiserror::Error;
-use tn_network_libp2p::error::NetworkError;
 use tn_storage::tables::Batches;
 use tn_types::{now, Batch, BlockHash, Database, DbTxMut};
-use tokio::time::error::Elapsed;
 use tracing::debug;
 
 #[cfg(test)]
@@ -20,7 +16,7 @@ mod batch_fetcher_tests;
 
 #[derive(Debug)]
 pub(crate) struct BatchFetcher<DB> {
-    network: Arc<dyn RequestBatchesNetwork>,
+    network: WorkerNetworkHandle,
     batch_store: DB,
     metrics: Arc<WorkerMetrics>,
 }
@@ -31,7 +27,7 @@ impl<DB: Database> BatchFetcher<DB> {
         batch_store: DB,
         metrics: Arc<WorkerMetrics>,
     ) -> Self {
-        Self { network: Arc::new(network), batch_store, metrics }
+        Self { network, batch_store, metrics }
     }
 
     /// Bulk fetches payload from local storage and remote workers.
@@ -43,6 +39,7 @@ impl<DB: Database> BatchFetcher<DB> {
         let mut fetched_batches = HashMap::new();
 
         loop {
+            debug!(target: "batch_fetcher", "looooop");
             if remaining_digests.is_empty() {
                 return fetched_batches;
             }
@@ -118,16 +115,17 @@ impl<DB: Database> BatchFetcher<DB> {
         &self,
         digests_to_fetch: &HashSet<BlockHash>,
         timeout: Duration,
-    ) -> Result<HashMap<BlockHash, Batch>, RequestBatchesNetworkError> {
+    ) -> Result<HashMap<BlockHash, Batch>, WorkerNetworkError> {
         let mut fetched_batches = HashMap::new();
         if digests_to_fetch.is_empty() {
             return Ok(fetched_batches);
         }
 
-        let batches = self
-            .network
-            .request_batches_from_all(digests_to_fetch.clone().into_iter().collect(), timeout)
-            .await?;
+        let batches = tokio::time::timeout(
+            timeout,
+            self.network.request_batches(digests_to_fetch.clone().into_iter().collect()),
+        )
+        .await??;
         for batch in batches {
             let batch_digest = batch.digest();
             // This batch is part of a certificate, so no need to validate it.
@@ -135,36 +133,5 @@ impl<DB: Database> BatchFetcher<DB> {
         }
 
         Ok(fetched_batches)
-    }
-}
-
-/// Possible errors when requesting batches.
-#[derive(Debug, Error)]
-enum RequestBatchesNetworkError {
-    #[error(transparent)]
-    Timeout(#[from] Elapsed),
-    #[error(transparent)]
-    Network(#[from] NetworkError),
-}
-
-// Utility trait to add a timeout to a batch request.
-#[async_trait]
-trait RequestBatchesNetwork: Send + Sync + std::fmt::Debug {
-    async fn request_batches_from_all(
-        &self,
-        batch_digests: Vec<BlockHash>,
-        timeout: Duration,
-    ) -> Result<Vec<Batch>, RequestBatchesNetworkError>;
-}
-
-#[async_trait]
-impl RequestBatchesNetwork for WorkerNetworkHandle {
-    async fn request_batches_from_all(
-        &self,
-        batch_digests: Vec<BlockHash>,
-        timeout: Duration,
-    ) -> Result<Vec<Batch>, RequestBatchesNetworkError> {
-        let res = tokio::time::timeout(timeout, self.request_batches(batch_digests)).await??;
-        Ok(res)
     }
 }

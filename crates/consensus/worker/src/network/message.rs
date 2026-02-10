@@ -1,5 +1,7 @@
 //! Messages sent between workers.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 use tn_network_libp2p::{PeerExchangeMap, TNMessage};
 use tn_types::{Batch, BlockHash, SealedBatch};
@@ -22,6 +24,7 @@ impl TNMessage for WorkerRequest {
         }
     }
 }
+
 impl TNMessage for WorkerResponse {
     fn peer_exchange_msg(&self) -> Option<PeerExchangeMap> {
         None
@@ -42,6 +45,16 @@ pub enum WorkerRequest {
         batch_digests: Vec<BlockHash>,
         /// Maximum expected response size.
         max_response_size: usize,
+    },
+    /// Request batches via stream.
+    ///
+    /// This initiates a stream-based batch transfer. The responder will
+    /// return `WorkerResponse::RequestBatchesStream` with acceptance status.
+    /// If accepted, the requestor opens a stream with the request digest
+    /// in the header for correlation.
+    RequestBatchesStream {
+        /// The batch digests being requested.
+        batch_digests: HashSet<BlockHash>,
     },
     /// Exchange peer information.
     ///
@@ -73,6 +86,15 @@ pub enum WorkerResponse {
     ReportBatch,
     /// Provided the requested batches.
     RequestBatches(Vec<Batch>),
+    /// Response to stream-based batch request.
+    ///
+    /// If `ack` is true, the requestor should open a stream with the
+    /// request digest in the header. The responder will send batches
+    /// over that stream.
+    RequestBatchesStream {
+        /// Whether the request is accepted.
+        ack: bool,
+    },
     /// Exchange peer information.
     PeerExchange {
         /// The peer information being exchanged.

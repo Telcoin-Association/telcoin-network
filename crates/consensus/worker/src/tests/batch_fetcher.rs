@@ -5,7 +5,7 @@ use crate::test_utils::TestRequestBatchesNetwork;
 use tempfile::TempDir;
 use tn_reth::test_utils::transaction;
 use tn_storage::open_db;
-use tn_types::test_chain_spec_arc;
+use tn_types::{test_chain_spec_arc, test_utils::init_test_tracing};
 
 #[tokio::test]
 async fn test_fetchertt() {
@@ -19,7 +19,7 @@ async fn test_fetchertt() {
     network.put(&[1, 2], batch1.clone()).await;
     network.put(&[2, 3], batch2.clone()).await;
     let fetcher = BatchFetcher {
-        network: Arc::new(network.handle()),
+        network: network.handle(),
         batch_store: batch_store.clone(),
         metrics: Arc::new(WorkerMetrics::default()),
     };
@@ -67,7 +67,7 @@ async fn test_fetcher_locally_with_remaining() {
     network.put(&[2, 3], batch2.clone()).await;
     network.put(&[3, 4], batch3.clone()).await;
     let fetcher = BatchFetcher {
-        network: Arc::new(network.handle()),
+        network: network.handle(),
         batch_store,
         metrics: Arc::new(WorkerMetrics::default()),
     };
@@ -96,7 +96,7 @@ async fn test_fetcher_remote_with_remaining() {
     network.put(&[2, 3], batch2.clone()).await;
     network.put(&[2, 3, 4], batch3.clone()).await;
     let fetcher = BatchFetcher {
-        network: Arc::new(network.handle()),
+        network: network.handle(),
         batch_store,
         metrics: Arc::new(WorkerMetrics::default()),
     };
@@ -122,6 +122,7 @@ async fn test_fetcher_remote_with_remaining() {
 
 #[tokio::test]
 async fn test_fetcher_local_and_remote() {
+    init_test_tracing();
     let mut network = TestRequestBatchesNetwork::new();
     let temp_dir = TempDir::new().unwrap();
     let batch_store = open_db(temp_dir.path());
@@ -135,7 +136,7 @@ async fn test_fetcher_local_and_remote() {
     network.put(&[2, 3, 4], batch2.clone()).await;
     network.put(&[1, 4], batch3.clone()).await;
     let fetcher = BatchFetcher {
-        network: Arc::new(network.handle()),
+        network: network.handle(),
         batch_store,
         metrics: Arc::new(WorkerMetrics::default()),
     };
@@ -144,7 +145,9 @@ async fn test_fetcher_local_and_remote() {
         (batch2.digest(), batch2.clone()),
         (batch3.digest(), batch3.clone()),
     ]);
+    debug!(target: "batch_fetcher", "fetching...");
     let mut fetched_batches = fetcher.fetch(digests).await;
+    debug!(target: "batch_fetcher", "fetched");
 
     // Reset metadata from the fetched and expected remote batches
     for batch in fetched_batches.values_mut() {
@@ -191,7 +194,7 @@ async fn test_fetcher_response_size_limit() {
         HashMap::from_iter(expected_batches.iter().map(|batch| (batch.digest(), batch.clone())));
     let digests = HashSet::from_iter(expected_batches.clone().into_keys());
     let fetcher = BatchFetcher {
-        network: Arc::new(network.handle()),
+        network: network.handle(),
         batch_store,
         metrics: Arc::new(WorkerMetrics::default()),
     };
