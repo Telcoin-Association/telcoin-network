@@ -9,10 +9,10 @@ async fn test_is_cvv() {
     // Default is CvvActive, which is a CVV
     assert!(bus.is_cvv());
 
-    bus.node_mode().send(NodeMode::CvvInactive).unwrap();
+    bus.node_mode().send_replace(NodeMode::CvvInactive);
     assert!(bus.is_cvv());
 
-    bus.node_mode().send(NodeMode::Observer).unwrap();
+    bus.node_mode().send_replace(NodeMode::Observer);
     assert!(!bus.is_cvv());
 }
 
@@ -26,13 +26,13 @@ async fn test_is_active_cvv_default() {
 #[tokio::test]
 async fn test_is_active_cvv_after_change() {
     let bus = ConsensusBus::new();
-    bus.node_mode().send(NodeMode::Observer).unwrap();
+    bus.node_mode().send_replace(NodeMode::Observer);
     assert!(!bus.is_active_cvv());
 
-    bus.node_mode().send(NodeMode::CvvInactive).unwrap();
+    bus.node_mode().send_replace(NodeMode::CvvInactive);
     assert!(!bus.is_active_cvv());
 
-    bus.node_mode().send(NodeMode::CvvActive).unwrap();
+    bus.node_mode().send_replace(NodeMode::CvvActive);
     assert!(bus.is_active_cvv());
 }
 
@@ -42,13 +42,13 @@ async fn test_is_cvv_inactive() {
     // Default is CvvActive, not inactive
     assert!(!bus.is_cvv_inactive());
 
-    bus.node_mode().send(NodeMode::CvvInactive).unwrap();
+    bus.node_mode().send_replace(NodeMode::CvvInactive);
     assert!(bus.is_cvv_inactive());
 
-    bus.node_mode().send(NodeMode::CvvActive).unwrap();
+    bus.node_mode().send_replace(NodeMode::CvvActive);
     assert!(!bus.is_cvv_inactive());
 
-    bus.node_mode().send(NodeMode::Observer).unwrap();
+    bus.node_mode().send_replace(NodeMode::Observer);
     assert!(!bus.is_cvv_inactive());
 }
 
@@ -61,7 +61,7 @@ async fn test_committed_round_default() {
 #[tokio::test]
 async fn test_committed_round_after_update() {
     let bus = ConsensusBus::new();
-    bus.committed_round_updates().send(42).unwrap();
+    bus.committed_round_updates().send_replace(42);
     assert_eq!(bus.committed_round(), 42);
 }
 
@@ -82,7 +82,7 @@ async fn test_primary_round_default() {
 #[tokio::test]
 async fn test_primary_round_after_update() {
     let bus = ConsensusBus::new();
-    bus.primary_round_updates().send(100).unwrap();
+    bus.primary_round_updates().send_replace(100);
     assert_eq!(bus.primary_round(), 100);
 }
 

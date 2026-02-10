@@ -22,13 +22,14 @@ use tn_primary::{
     ConsensusBus,
 };
 use tn_reth::{test_utils::seeded_genesis_from_random_batches, RethChainSpec};
-use tn_storage::mem_db::MemDatabase;
+use tn_storage::{mem_db::MemDatabase, tables::ConsensusBlocks};
 use tn_test_utils::{
     create_signed_certificates_for_rounds, default_test_execution_node, CommitteeFixture,
 };
 use tn_types::{
-    adiri_genesis, gas_accumulator::GasAccumulator, Batch, ExecHeader, Notifier, SealedHeader,
-    TaskManager, TnReceiver as _, TnSender as _, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    adiri_genesis, gas_accumulator::GasAccumulator, Batch, Database as _, ExecHeader, Notifier,
+    SealedHeader, TaskManager, TnReceiver as _, TnSender as _, B256,
+    DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -165,6 +166,139 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Test that `catchup_accumulator` only counts leaders for rounds that were actually executed,
+/// even when ConsensusBlocks contains entries for later (not-yet-executed) rounds.
+///
+/// This covers the edge case where the engine stops partway through and `replay_missed_consensus`
+/// would handle the remaining rounds on the next startup.
+#[tokio::test]
+async fn test_catchup_accumulator_partial_execution() -> eyre::Result<()> {
+    let tmp = temp_dir();
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .with_rng(StdRng::seed_from_u64(8991))
+        .build();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config().clone();
+    let consensus_store = config.node_storage().clone();
+    let consensus_bus = ConsensusBus::new();
+
+    // same certificates as the full test
+    let max_round = 21;
+    let (certificates, _next_parents, batches) =
+        create_signed_certificates_for_rounds(1..=max_round, &fixture);
+
+    let genesis = adiri_genesis();
+    let all_batches: Vec<_> = batches.values().cloned().collect();
+    let (genesis, _, _) = seeded_genesis_from_random_batches(genesis, all_batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    let gas_accumulator = GasAccumulator::new(1);
+    gas_accumulator.rewards_counter().set_committee(fixture.committee());
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &tmp.path().join("reth"),
+        Some(gas_accumulator.rewards_counter()),
+    )?;
+
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(10);
+    // stop the engine at round 10 — consensus will commit leaders through round 20
+    let engine_stop_round = 10u64;
+    let max = Some(engine_stop_round);
+    let parent = chain.sealed_genesis_header();
+
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let reth_env = execution_node.get_reth_env().await;
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        max,
+        from_consensus,
+        parent,
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator.clone(),
+    );
+    let (tx, mut rx) = oneshot::channel();
+    task_manager.spawn_task("test task eng", async move {
+        let res = engine.await;
+        debug!(target: "gas-test", ?res, "partial res:");
+        let _ = tx.send(res);
+    });
+
+    let mut consensus_output = consensus_bus.consensus_output().subscribe();
+
+    spawn_consensus(
+        &fixture,
+        &consensus_bus,
+        batches,
+        config,
+        consensus_store.clone(),
+        &task_manager,
+    );
+
+    for certificate in certificates.iter() {
+        consensus_bus.new_certificates().send(certificate.clone()).await.unwrap();
+    }
+
+    // forward consensus output to engine, tracking leaders only for executed rounds
+    let mut executed_rewards = HashMap::new();
+    loop {
+        tokio::select! {
+            Some(output) = consensus_output.recv() => {
+                let leader = output.leader().origin().clone();
+                let round = output.leader().round();
+                if round <= engine_stop_round as u32 {
+                    executed_rewards.entry(leader).and_modify(|c| *c += 1).or_insert(1u32);
+                }
+                // engine may have already stopped — ignore send errors
+                let _ = to_engine.send(output).await;
+            }
+            engine_task = timeout(Duration::from_secs(30), &mut rx) => {
+                assert!(engine_task.is_ok());
+                break;
+            }
+        }
+    }
+
+    // wait for the subscriber to persist consensus outputs for rounds beyond engine_stop_round
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let has_later_rounds = consensus_store
+            .reverse_iter::<ConsensusBlocks>()
+            .any(|(_, header)| header.sub_dag.leader_round() > engine_stop_round as u32);
+        if has_later_rounds {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for ConsensusBlocks entries beyond round {engine_stop_round}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // recover accumulator — should only count leaders for executed rounds
+    let recovered = GasAccumulator::new(1);
+    recovered.rewards_counter().set_committee(fixture.committee());
+    catchup_accumulator(&consensus_store, reth_env.clone(), &recovered)?;
+
+    // gas stats should match the live accumulator (both cover blocks up to engine_stop_round)
+    let worker_id = 0;
+    assert_eq!(gas_accumulator.get_values(worker_id), recovered.get_values(worker_id));
+
+    // leader counts should match only the executed rounds, not all consensus entries
+    let expected: BTreeMap<_, _> = executed_rewards
+        .iter()
+        .map(|(auth, count)| {
+            (fixture.authority_by_id(auth).expect("in committee").execution_address(), *count)
+        })
+        .collect();
+    assert_eq!(expected, recovered.rewards_counter().get_address_counts());
+    assert_eq!(expected, gas_accumulator.rewards_counter().get_address_counts());
+
+    Ok(())
+}
+
 /// Helper to spawn consensus components.
 fn spawn_consensus(
     fixture: &CommitteeFixture<MemDatabase>,
@@ -202,7 +336,6 @@ fn spawn_consensus(
     );
     let bullshark = Bullshark::new(
         committee.clone(),
-        Arc::new(Default::default()),
         3,
         leader_schedule.clone(),
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,

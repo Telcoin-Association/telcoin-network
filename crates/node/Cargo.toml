@@ -27,8 +27,6 @@ tn-rpc = { workspace = true }
 eyre = { workspace = true }
 tn-network-libp2p = { workspace = true }
 tn-reth = { workspace = true }
-consensus-metrics = { workspace = true }
-tn-primary-metrics = { workspace = true }
 state-sync = { workspace = true }
 tn-engine = { workspace = true }
 tn-batch-builder = { workspace = true }

@@ -6,11 +6,9 @@
 //! - Leader schedule changes based on reputation
 //! - Commits delivered in correct order
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::collections::BTreeSet;
 use tn_primary::{
-    consensus::{
-        Bullshark, ConsensusMetrics, ConsensusState, LeaderSchedule, LeaderSwapTable, Outcome,
-    },
+    consensus::{Bullshark, ConsensusState, LeaderSchedule, LeaderSwapTable, Outcome},
     test_utils::{
         make_certificates_with_leader_configuration, make_optimal_certificates,
         TestLeaderConfiguration, TestLeaderSupport,
@@ -50,12 +48,10 @@ async fn test_bullshark_f_plus_1_support_required() {
         [(2, leader_config)].into_iter().collect(),
     );
 
-    let metrics = Arc::new(ConsensusMetrics::default());
     let gc_depth = 50;
-    let mut state = ConsensusState::new(metrics.clone(), gc_depth);
+    let mut state = ConsensusState::new(gc_depth);
     let mut bullshark = Bullshark::new(
         committee.clone(),
-        metrics,
         NUM_SUB_DAGS_PER_SCHEDULE,
         schedule,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
@@ -88,13 +84,11 @@ async fn test_bullshark_strong_support_commits() {
     // All leaders have strong support (default)
     let (certificates, _) = make_optimal_certificates(&committee, 1..=5, &genesis, &ids);
 
-    let metrics = Arc::new(ConsensusMetrics::default());
     let gc_depth = 50;
-    let mut state = ConsensusState::new(metrics.clone(), gc_depth);
+    let mut state = ConsensusState::new(gc_depth);
     let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
     let mut bullshark = Bullshark::new(
         committee,
-        metrics,
         NUM_SUB_DAGS_PER_SCHEDULE,
         schedule,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
@@ -142,12 +136,10 @@ async fn test_bullshark_recursive_leader_commit() {
         [(2, leader_config_2)].into_iter().collect(),
     );
 
-    let metrics = Arc::new(ConsensusMetrics::default());
     let gc_depth = 50;
-    let mut state = ConsensusState::new(metrics.clone(), gc_depth);
+    let mut state = ConsensusState::new(gc_depth);
     let mut bullshark = Bullshark::new(
         committee,
-        metrics,
         NUM_SUB_DAGS_PER_SCHEDULE,
         schedule,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
@@ -188,14 +180,12 @@ async fn test_bullshark_schedule_change_reputation() {
     // With sub_dags_per_schedule = 3, schedule changes every 3 commits
     let (certificates, _) = make_optimal_certificates(&committee, 1..=15, &genesis, &ids);
 
-    let metrics = Arc::new(ConsensusMetrics::default());
     let gc_depth = 50;
     let sub_dags_per_schedule = 3; // Schedule changes every 3 commits
-    let mut state = ConsensusState::new(metrics.clone(), gc_depth);
+    let mut state = ConsensusState::new(gc_depth);
     let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
     let mut bullshark = Bullshark::new(
         committee,
-        metrics,
         sub_dags_per_schedule,
         schedule,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
@@ -245,13 +235,11 @@ async fn test_commit_order_oldest_first() {
 
     let (certificates, _) = make_optimal_certificates(&committee, 1..=9, &genesis, &ids);
 
-    let metrics = Arc::new(ConsensusMetrics::default());
     let gc_depth = 50;
-    let mut state = ConsensusState::new(metrics.clone(), gc_depth);
+    let mut state = ConsensusState::new(gc_depth);
     let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
     let mut bullshark = Bullshark::new(
         committee,
-        metrics,
         NUM_SUB_DAGS_PER_SCHEDULE,
         schedule,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,

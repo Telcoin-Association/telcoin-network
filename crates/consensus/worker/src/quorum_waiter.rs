@@ -1,6 +1,6 @@
 //! Wait for a quorum of acks from workers before sharing with the primary.
 
-use crate::{metrics::WorkerMetrics, network::WorkerNetworkHandle};
+use crate::network::WorkerNetworkHandle;
 use futures::stream::{futures_unordered::FuturesUnordered, StreamExt as _};
 use std::{
     sync::Arc,
@@ -42,8 +42,6 @@ struct QuorumWaiterInner {
     committee: Committee,
     /// A network sender to broadcast the batches to the other workers.
     network: WorkerNetworkHandle,
-    /// Record metrics for quorum waiter.
-    metrics: Arc<WorkerMetrics>,
 }
 
 /// The QuorumWaiter waits for 2f authorities to acknowledge reception of a batch.
@@ -54,13 +52,8 @@ pub struct QuorumWaiter {
 
 impl QuorumWaiter {
     /// Create a new QuorumWaiter.
-    pub fn new(
-        authority: Authority,
-        committee: Committee,
-        network: WorkerNetworkHandle,
-        metrics: Arc<WorkerMetrics>,
-    ) -> Self {
-        Self { inner: Arc::new(QuorumWaiterInner { authority, committee, network, metrics }) }
+    pub fn new(authority: Authority, committee: Committee, network: WorkerNetworkHandle) -> Self {
+        Self { inner: Arc::new(QuorumWaiterInner { authority, committee, network }) }
     }
 
     /// Helper function. It waits for a future to complete and then delivers a value.
@@ -113,7 +106,6 @@ impl QuorumWaiterTrait for QuorumWaiter {
                 let peers: Vec<_> =
                     inner.committee.others_keys_except(inner.authority.protocol_key());
                 let handlers = inner.network.report_batch_to_peers(&peers, sealed_batch);
-                let _timer = inner.metrics.batch_broadcast_quorum_latency.start_timer();
 
                 // Collect all the handlers to receive acknowledgements.
                 let mut wait_for_quorum: FuturesUnordered<

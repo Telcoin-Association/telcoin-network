@@ -48,6 +48,7 @@ reth-eth-wire = { workspace = true }
 reth-tracing = { workspace = true }
 
 rand = { workspace = true }
+rayon = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

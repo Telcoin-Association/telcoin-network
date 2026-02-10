@@ -6,8 +6,8 @@
 //! - Garbage collection (old rounds are removed)
 //! - Idempotent insertion (same certificate twice is OK)
 
-use std::{collections::BTreeSet, sync::Arc};
-use tn_primary::consensus::{ConsensusMetrics, ConsensusState};
+use std::collections::BTreeSet;
+use tn_primary::consensus::ConsensusState;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{Certificate, Hash as _, HeaderBuilder};
@@ -19,8 +19,7 @@ async fn test_dag_equivocation_same_round() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
     let gc_depth = 50;
-    let metrics = Arc::new(ConsensusMetrics::default());
-    let mut state = ConsensusState::new(metrics, gc_depth);
+    let mut state = ConsensusState::new(gc_depth);
 
     // Get genesis parents
     let genesis: BTreeSet<_> = fixture.genesis().collect();
@@ -68,8 +67,7 @@ async fn test_dag_parent_verification() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
     let gc_depth = 50;
-    let metrics = Arc::new(ConsensusMetrics::default());
-    let mut state = ConsensusState::new(metrics, gc_depth);
+    let mut state = ConsensusState::new(gc_depth);
 
     // Get genesis and create round 1 certificates
     let genesis: BTreeSet<_> = fixture.genesis().collect();
@@ -122,8 +120,7 @@ async fn test_dag_gc_removes_old_rounds() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let _committee = fixture.committee();
     let gc_depth = 5; // Small gc_depth for testing
-    let metrics = Arc::new(ConsensusMetrics::default());
-    let mut state = ConsensusState::new(metrics, gc_depth);
+    let mut state = ConsensusState::new(gc_depth);
 
     // Build up DAG with multiple rounds
     let genesis: BTreeSet<_> = fixture.genesis().collect();
@@ -171,8 +168,7 @@ async fn test_dag_idempotent_insert() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let _committee = fixture.committee();
     let gc_depth = 50;
-    let metrics = Arc::new(ConsensusMetrics::default());
-    let mut state = ConsensusState::new(metrics, gc_depth);
+    let mut state = ConsensusState::new(gc_depth);
 
     // Create a certificate
     let genesis: BTreeSet<_> = fixture.genesis().collect();
@@ -200,8 +196,7 @@ async fn test_dag_rejects_old_certificates() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let _committee = fixture.committee();
     let gc_depth = 5;
-    let metrics = Arc::new(ConsensusMetrics::default());
-    let mut state = ConsensusState::new(metrics, gc_depth);
+    let mut state = ConsensusState::new(gc_depth);
 
     // Build DAG and advance committed round
     let genesis: BTreeSet<_> = fixture.genesis().collect();

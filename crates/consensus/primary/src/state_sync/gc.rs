@@ -54,8 +54,6 @@ where
             return Err(GarbageCollectorError::TNSend("certificate fetcher".to_string()));
         }
 
-        // log metrics and warning
-        self.consensus_bus.primary_metrics().node_metrics.synchronizer_gc_timeout.inc();
         Ok(())
     }
 
