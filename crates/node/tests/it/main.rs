@@ -226,7 +226,7 @@ async fn test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
         let _ = tx.send(res);
     });
 
-    let mut consensus_output = consensus_bus.consensus_output().subscribe();
+    let mut consensus_output = consensus_bus.subscribe_consensus_output();
 
     spawn_consensus(
         &fixture,
@@ -381,7 +381,7 @@ async fn test_catchup_accumulator_partial_execution() -> eyre::Result<()> {
         let _ = tx.send(res);
     });
 
-    let mut consensus_output = consensus_bus.consensus_output().subscribe();
+    let mut consensus_output = consensus_bus.subscribe_consensus_output();
 
     spawn_consensus(
         &fixture,

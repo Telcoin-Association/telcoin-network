@@ -17,7 +17,7 @@ use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     error::HeaderError, now, AuthorityIdentifier, BlockHash, BlockHeader, BlockNumHash,
     BlsPublicKey, Certificate, CertificateDigest, EpochVote, ExecHeader, Hash as _, SealedHeader,
-    TaskManager, TnReceiver, TnSender, B256,
+    TaskManager, B256,
 };
 use tracing::debug;
 

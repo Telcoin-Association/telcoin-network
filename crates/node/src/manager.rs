@@ -45,8 +45,8 @@ use tn_types::{
     gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash, BlsAggregateSignature,
     BlsPublicKey, BlsSignature, CertifiedBatch, CommittedSubDag, Committee, CommitteeBuilder,
     ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, EpochCertificate, EpochRecord,
-    Hash, Multiaddr, NetworkPublicKey, Noticer, Notifier, TaskJoinError, TaskManager,
-    TaskSpawner, TimestampSec, TnReceiver, B256, MIN_PROTOCOL_BASE_FEE,
+    Hash, Multiaddr, NetworkPublicKey, Noticer, Notifier, TaskJoinError, TaskManager, TaskSpawner,
+    TimestampSec, TnReceiver, B256, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{
     quorum_waiter::QuorumWaiterTrait, Worker, WorkerNetwork, WorkerNetworkHandle, WorkerRequest,
