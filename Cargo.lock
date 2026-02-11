@@ -12088,6 +12088,8 @@ dependencies = [
  "reth-libmdbx",
  "serde",
  "tempfile",
+ "tn-reth",
+ "tn-test-utils",
  "tn-types",
  "tn-utils",
  "tokio",
