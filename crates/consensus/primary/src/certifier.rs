@@ -14,7 +14,7 @@ use tn_types::{
     ensure,
     error::{DagError, DagResult},
     AuthorityIdentifier, BlsPublicKey, Certificate, CertificateDigest, Committee, Database, Header,
-    Noticer, Notifier, TaskManager, TaskSpawner, TnReceiver, TnSender, Vote,
+    Noticer, Notifier, TaskManager, TaskSpawner, TnReceiver, Vote,
 };
 use tracing::{debug, enabled, error, info, instrument};
 
@@ -41,8 +41,6 @@ pub(crate) struct Certifier<DB> {
     signature_service: KeyConfig,
     /// Consensus config to subscribe to shutdown.
     config: ConsensusConfig<DB>,
-    /// Consensus channels.
-    consensus_bus: ConsensusBus,
     /// A network sender to send the batches to the other workers.
     network: PrimaryNetworkHandle,
     /// Spawn epoch-related tasks.
@@ -69,6 +67,8 @@ impl<DB: Database> Certifier<DB> {
 
         // spawn long-running task to gossip own certificates
         let task_spawner = task_manager.get_spawner();
+        // Subscribe before spawning so the channel is active before any messages are sent.
+        let rx_headers = consensus_bus.subscribe_headers();
         task_manager.spawn_critical_task("certifier task", async move {
             let highest_created_certificate = config
                 .node_storage()
@@ -97,12 +97,11 @@ impl<DB: Database> Certifier<DB> {
                 state_sync,
                 signature_service: config.key_config().clone(),
                 config,
-                consensus_bus,
                 network: primary_network,
                 task_spawner,
                 new_proposal: Notifier::new(),
             }
-            .run()
+            .run(rx_headers)
             .await;
             info!(target: "primary::certifier", "Certifier on node {} has shutdown.", authority_id);
         });
@@ -441,9 +440,8 @@ impl<DB: Database> Certifier<DB> {
     /// Execute the main certification task.  Will run until shutdown is signalled.
     /// If this exits outside of shutdown it will log an error and this will trigger a node
     /// shutdown.
-    async fn run(self) {
+    async fn run(self, mut rx_headers: impl TnReceiver<Header>) {
         info!(target: "primary::certifier", "Certifier on node {} has started successfully.", &self.authority_id);
-        let mut rx_headers = self.consensus_bus.headers().subscribe();
         let shutdown = &self.config.shutdown().subscribe();
         loop {
             tokio::select! {

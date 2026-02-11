@@ -167,10 +167,6 @@ pub trait TnSender<T>: Unpin + Clone {
 
     /// Attempts to immediately send a message on this `Sender`
     fn try_send(&self, value: T) -> Result<(), TrySendError<T>>;
-
-    /// Get a reciever for this TnSender.
-    /// For an MPSC or other limited channel this may panic if called more than once.
-    fn subscribe(&self) -> impl TnReceiver<T> + 'static;
 }
 
 impl<T: Send + Clone + 'static> TnSender<T> for broadcast::Sender<T> {
@@ -189,10 +185,6 @@ impl<T: Send + Clone + 'static> TnSender<T> for broadcast::Sender<T> {
         let _ = self.send(value);
         Ok(())
     }
-
-    fn subscribe(&self) -> impl TnReceiver<T> + 'static {
-        self.subscribe()
-    }
 }
 
 impl<T: Send + 'static> TnSender<T> for mpsc::Sender<T> {
@@ -202,14 +194,6 @@ impl<T: Send + 'static> TnSender<T> for mpsc::Sender<T> {
 
     fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
         Ok(mpsc::Sender::try_send(self, value)?)
-    }
-
-    #[allow(unreachable_code)]
-    fn subscribe(&self) -> impl TnReceiver<T> + 'static {
-        panic!("mpsc Sender does not support subscibe!");
-        // This code is unreachable but the compiler needs it to infer the return type.
-        let (_tx, _rx) = mpsc::channel(1);
-        _rx
     }
 }
 

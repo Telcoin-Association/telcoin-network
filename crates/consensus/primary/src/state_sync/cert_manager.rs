@@ -19,7 +19,7 @@ use tn_config::ConsensusConfig;
 use tn_storage::CertificateStore;
 use tn_types::{
     error::{CertificateError, HeaderError},
-    Certificate, CertificateDigest, Database, Hash as _, Round, TnReceiver as _, TnSender as _,
+    Certificate, CertificateDigest, Database, Hash as _, Round, TnReceiver, TnSender as _,
 };
 use tokio::sync::oneshot;
 use tracing::{debug, error};
@@ -254,9 +254,11 @@ where
     /// parents are missing, the manager tracks them as pending. As parents become available or are
     /// removed through garbage collection, the certificate manager will update pending state and
     /// try to accept all known certificates.
-    pub(crate) async fn run(mut self) -> CertManagerResult<()> {
+    pub(crate) async fn run(
+        mut self,
+        mut certificate_manager_rx: impl TnReceiver<CertificateManagerCommand>,
+    ) -> CertManagerResult<()> {
         let shutdown_rx = self.config.shutdown().subscribe();
-        let mut certificate_manager_rx = self.consensus_bus.certificate_manager().subscribe();
 
         // recover state
         self.recover_state().await?;

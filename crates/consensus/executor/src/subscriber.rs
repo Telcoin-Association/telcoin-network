@@ -70,9 +70,11 @@ pub fn spawn_subscriber<DB: Database>(
     match mode {
         // If we are active then partcipate in consensus.
         NodeMode::CvvActive => {
+            // Subscribe before spawning so the channel is active before any messages are sent.
+            let rx_sequence = subscriber.consensus_bus.subscribe_sequence();
             task_manager.spawn_critical_task("subscriber consensus", async move {
                 info!(target: "subscriber", "Starting subscriber: CVV");
-                if let Err(e) = subscriber.run(rx_shutdown).await {
+                if let Err(e) = subscriber.run(rx_shutdown, rx_sequence).await {
                     error!(target: "subscriber", "Error subscriber consensus: {e}");
                 }
             });
@@ -153,7 +155,7 @@ impl<DB: Database> Subscriber<DB> {
     /// Catch up to current consensus and then try to rejoin as an active CVV.
     async fn catch_up_rejoin_consensus(&self, tasks: TaskSpawner) -> SubscriberResult<()> {
         // Get a receiver and then stream any missing headers so we don't miss them.
-        let mut rx_consensus_headers = self.consensus_bus.consensus_header().subscribe();
+        let mut rx_consensus_headers = self.consensus_bus.subscribe_consensus_header();
         spawn_state_sync(
             self.config.clone(),
             self.consensus_bus.clone(),
@@ -181,7 +183,7 @@ impl<DB: Database> Subscriber<DB> {
     /// Follow along with consensus output but do not try to join consensus.
     async fn follow_consensus(&self, tasks: TaskSpawner) -> SubscriberResult<()> {
         // Get a receiver then stream any missing headers so we don't miss them.
-        let mut rx_consensus_headers = self.consensus_bus.consensus_header().subscribe();
+        let mut rx_consensus_headers = self.consensus_bus.subscribe_consensus_header();
         spawn_state_sync(
             self.config.clone(),
             self.consensus_bus.clone(),
@@ -212,7 +214,11 @@ impl<DB: Database> Subscriber<DB> {
 
     /// Main loop connecting to the consensus to listen to sequence messages.
     #[instrument(level = "info", skip_all, fields(authority = ?self.inner.authority_id))]
-    async fn run(self, rx_shutdown: Noticer) -> SubscriberResult<()> {
+    async fn run(
+        self,
+        rx_shutdown: Noticer,
+        mut rx_sequence: impl TnReceiver<CommittedSubDag>,
+    ) -> SubscriberResult<()> {
         // It's important to have the futures in ordered fashion as we want
         // to guarantee that will deliver to the executor the certificates
         // in the same order we received from rx_sequence. So it doesn't
@@ -223,7 +229,7 @@ impl<DB: Database> Subscriber<DB> {
 
         let (mut last_parent, mut last_number) = self.get_last_executed_consensus().await?;
 
-        let mut rx_sequence = self.consensus_bus.sequence().subscribe();
+        // rx_sequence is now passed as parameter to avoid race condition
         // Listen to sequenced consensus message and process them.
         loop {
             tokio::select! {

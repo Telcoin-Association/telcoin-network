@@ -20,7 +20,7 @@ use tn_config::ConsensusConfig;
 use tn_storage::CertificateStore;
 use tn_types::{
     validate_fetched_certificate, AuthorityIdentifier, BlsPublicKey, Certificate, Committee,
-    Database, Header, Noticer, Notifier, Round, TaskManager, TaskSpawner, TnReceiver, TnSender,
+    Database, Header, Noticer, Notifier, Round, TaskManager, TaskSpawner, TnReceiver,
 };
 use tokio::{
     sync::oneshot,
@@ -89,6 +89,9 @@ impl<DB: Database> CertificateFetcher<DB> {
         let parallel_fetch_request_delay_interval =
             config.parameters().parallel_fetch_request_delay_interval;
 
+        // Subscribe before spawning so the channel is active before any messages are sent.
+        let rx_certificate_fetcher = consensus_bus.subscribe_certificate_fetcher();
+
         task_manager.spawn_critical_task("certificate fetcher task", async move {
             Self {
                 authority_id,
@@ -105,7 +108,7 @@ impl<DB: Database> CertificateFetcher<DB> {
                 parallel_fetch_request_delay_interval,
                 config,
             }
-            .run()
+            .run(rx_certificate_fetcher)
             .await
             .map_err(|e| {
                 error!(target: "primary::cert_fetcher", ?e, "cert fetcher shutting down");
@@ -114,9 +117,10 @@ impl<DB: Database> CertificateFetcher<DB> {
     }
 
     /// Receive messages on async channels until shutdown.
-    async fn run(&mut self) -> CertManagerResult<()> {
-        let mut rx_certificate_fetcher = self.consensus_bus.certificate_fetcher().subscribe();
-
+    async fn run(
+        &mut self,
+        mut rx_certificate_fetcher: impl TnReceiver<CertificateFetcherCommand>,
+    ) -> CertManagerResult<()> {
         loop {
             tokio::select! {
                 Some(command) = rx_certificate_fetcher.recv() => {

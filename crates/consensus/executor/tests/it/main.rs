@@ -33,7 +33,7 @@ async fn test_output_to_header() -> eyre::Result<()> {
 
     // subscribe to channels early
     let rx_consensus_headers = consensus_bus.last_consensus_header().subscribe();
-    let mut consensus_output = consensus_bus.consensus_output().subscribe();
+    let mut consensus_output = consensus_bus.subscribe_consensus_output();
 
     let (tx, mut rx) = mpsc::channel(5);
     tokio::spawn(async move {
@@ -125,7 +125,7 @@ async fn test_executor_output_ordering() -> eyre::Result<()> {
     let rx_shutdown = config.shutdown().subscribe();
     let consensus_bus = ConsensusBus::new();
 
-    let mut consensus_output = consensus_bus.consensus_output().subscribe();
+    let mut consensus_output = consensus_bus.subscribe_consensus_output();
 
     let (tx, mut rx) = mpsc::channel(5);
     tokio::spawn(async move {
@@ -204,7 +204,7 @@ async fn test_executor_batch_fetching() -> eyre::Result<()> {
     let rx_shutdown = config.shutdown().subscribe();
     let consensus_bus = ConsensusBus::new();
 
-    let mut consensus_output = consensus_bus.consensus_output().subscribe();
+    let mut consensus_output = consensus_bus.subscribe_consensus_output();
 
     let (tx, mut rx) = mpsc::channel(5);
     tokio::spawn(async move {

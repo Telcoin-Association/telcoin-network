@@ -332,15 +332,17 @@ impl<DB: Database> Consensus<DB> {
         // Only run the consensus task if we are an active CVV.
         // Active means we are participating in consensus.
         if consensus_bus.node_mode().borrow().is_active_cvv() {
-            task_manager.spawn_critical_task("consensus task", s.run());
+            // Subscribe before spawning so the channel is active before any messages are sent.
+            let rx_new_certificates = consensus_bus.subscribe_new_certificates();
+            task_manager.spawn_critical_task("consensus task", s.run(rx_new_certificates));
         }
     }
 
-    async fn run(mut self) -> Result<(), ConsensusError> {
-        // Clone the bus or the borrow checker will yell at us...
-        let bus_clone = self.consensus_bus.clone();
-        let mut rx_new_certificates = bus_clone.new_certificates().subscribe();
-        self.active = bus_clone.node_mode().borrow().is_active_cvv();
+    async fn run(
+        mut self,
+        mut rx_new_certificates: impl TnReceiver<Certificate>,
+    ) -> Result<(), ConsensusError> {
+        self.active = self.consensus_bus.node_mode().borrow().is_active_cvv();
 
         // Listen to incoming certificates.
         loop {

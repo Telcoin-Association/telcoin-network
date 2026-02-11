@@ -42,11 +42,11 @@ use tn_storage::{
     ConsensusStore, DatabaseType, EpochStore as _,
 };
 use tn_types::{
-    error::HeaderError, gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash,
-    BlsAggregateSignature, BlsPublicKey, BlsSignature, CertifiedBatch, CommittedSubDag, Committee,
-    CommitteeBuilder, ConsensusOutput, Database as TNDatabase, Epoch, EpochCertificate,
-    EpochRecord, EpochVote, Hash, Multiaddr, NetworkPublicKey, Notifier, TaskJoinError,
-    TaskManager, TaskSpawner, TimestampSec, TnReceiver, TnSender, B256, MIN_PROTOCOL_BASE_FEE,
+    gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash, BlsAggregateSignature,
+    BlsPublicKey, BlsSignature, CertifiedBatch, CommittedSubDag, Committee, CommitteeBuilder,
+    ConsensusOutput, Database as TNDatabase, Epoch, EpochCertificate, EpochRecord, Hash, Multiaddr,
+    NetworkPublicKey, Noticer, Notifier, TaskJoinError, TaskManager, TaskSpawner, TimestampSec,
+    TnReceiver, B256, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{
     quorum_waiter::QuorumWaiterTrait, Worker, WorkerNetwork, WorkerNetworkHandle, WorkerRequest,
@@ -223,6 +223,309 @@ pub(crate) fn open_consensus_db<P: TelcoinDirs + 'static>(tn_datadir: &P) -> Dat
     db
 }
 
+/// Spawn a node-lifetime task to collect epoch vote signatures.
+///
+/// This actor subscribes once to the `new_epoch_votes` channel and never drops the receiver,
+/// eliminating the gap at epoch boundaries where votes could be lost. It watches for new
+/// `EpochRecord`s via a `watch` channel and collects votes for each epoch.
+fn spawn_epoch_vote_collector<DB: TNDatabase>(
+    consensus_db: DB,
+    consensus_bus: ConsensusBus,
+    key_config: KeyConfig,
+    primary_network: PrimaryNetworkHandle,
+    node_task_spawner: TaskSpawner,
+    node_shutdown: Noticer,
+) {
+    let mut vote_rx = consensus_bus.subscribe_new_epoch_votes();
+    let mut epoch_rx = consensus_bus.epoch_record_watch().subscribe();
+
+    node_task_spawner.spawn_critical_task("Epoch Vote Collector", async move {
+        loop {
+            // Wait for an EpochRecord to arrive
+            let epoch_rec = loop {
+                if let Some(rec) = epoch_rx.borrow_and_update().clone() {
+                    break rec;
+                }
+                tokio::select! {
+                    _ = &node_shutdown => return,
+                    _ = epoch_rx.changed() => {}
+                }
+            };
+
+            // Check if we already have the cert for this epoch
+            if let Some((_, Some(_))) = consensus_db.get_epoch_by_number(epoch_rec.epoch) {
+                // Already have cert, wait for next epoch record
+                tokio::select! {
+                    _ = &node_shutdown => return,
+                    _ = epoch_rx.changed() => continue,
+                }
+            }
+
+            let epoch_hash = epoch_rec.digest();
+            let mut committee_keys: HashSet<BlsPublicKey> =
+                epoch_rec.committee.iter().copied().collect();
+            let committee_index: HashMap<BlsPublicKey, usize> =
+                epoch_rec.committee.iter().enumerate().map(|(i, k)| (*k, i)).collect();
+            let committee_size = committee_keys.len() as u64;
+            let quorum = epoch_rec.super_quorum();
+            let mut sigs = Vec::new();
+            let mut signed_authorities = roaring::RoaringBitmap::new();
+            let mut my_vote = None;
+
+            // If we are in the committee, sign and publish our vote
+            let me = key_config.primary_public_key();
+            if committee_keys.contains(&me) {
+                committee_keys.remove(&me);
+                let epoch_vote = epoch_rec.sign_vote(&key_config);
+                sigs.push(epoch_vote.signature);
+                if let Some(idx) = committee_index.get(&me) {
+                    signed_authorities.insert(*idx as u32);
+                }
+                info!(
+                    target: "epoch-manager",
+                    "publishing epoch record {epoch_hash}",
+                );
+                let _ = primary_network.publish_epoch_vote(epoch_vote).await;
+                my_vote = Some(epoch_vote);
+            }
+
+            // Collect votes from peers
+            let mut reached_quorum = false;
+            let mut timeout = Duration::from_secs(5);
+            let mut timeouts = 0;
+            let mut alt_recs: HashMap<B256, usize> = HashMap::default();
+            loop {
+                tokio::select! {
+                    _ = &node_shutdown => return,
+                    // If a new epoch record arrives, move to the next epoch
+                    _ = epoch_rx.changed() => break,
+                    result = tokio::time::timeout(timeout, vote_rx.recv()) => {
+                        match result {
+                            Ok(Some(vote)) => {
+                                // Signature already verified by handler, just check
+                                // epoch_hash match and committee membership
+                                if vote.epoch_hash == epoch_hash
+                                    && committee_keys.contains(&vote.public_key)
+                                {
+                                    let source = vote.public_key;
+                                    if committee_keys.remove(&source) {
+                                        sigs.push(vote.signature);
+                                        if let Some(idx) = committee_index.get(&source) {
+                                            signed_authorities.insert(*idx as u32);
+                                        }
+                                        if signed_authorities.len() >= quorum as u64 {
+                                            reached_quorum = true;
+                                            // Have quorum, wait briefly for more then move on
+                                            timeout = Duration::from_secs(1);
+                                        }
+                                        if signed_authorities.len() >= committee_size {
+                                            break;
+                                        }
+                                    }
+                                } else if vote.epoch_hash != epoch_hash {
+                                    // Track votes for alternative epoch records
+                                    if epoch_rec.committee.contains(&vote.public_key) {
+                                        let votes =
+                                            *alt_recs.get(&vote.epoch_hash).unwrap_or(&0);
+                                        if votes + 1 >= quorum {
+                                            error!(
+                                                target: "epoch-manager",
+                                                "Reached quorum on epoch record {} instead of {}.",
+                                                vote.epoch_hash,
+                                                epoch_hash,
+                                            );
+                                            break;
+                                        }
+                                        alt_recs.insert(vote.epoch_hash, votes + 1);
+                                    }
+                                }
+                            }
+                            Ok(None) => break, // channel closed
+                            Err(_) => {
+                                // Timeout: have quorum or tried long enough
+                                if reached_quorum || timeouts > 12 {
+                                    break;
+                                }
+                                timeouts += 1;
+                                // Republish our vote in case peers are also struggling
+                                if let Some(vote) = my_vote {
+                                    let _ = primary_network.publish_epoch_vote(vote).await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Aggregate signatures and save the cert
+            if reached_quorum {
+                info!(
+                    target: "epoch-manager",
+                    "reached quorum on epoch close for {epoch_hash}",
+                );
+                match BlsAggregateSignature::aggregate(&sigs[..], true) {
+                    Ok(aggregated_signature) => {
+                        let signature: BlsSignature = aggregated_signature.to_signature();
+                        let cert =
+                            EpochCertificate { epoch_hash, signature, signed_authorities };
+                        if epoch_rec.verify_with_cert(&cert) {
+                            let _ = consensus_db.insert::<EpochCerts>(&cert.epoch_hash, &cert);
+                        } else {
+                            error!(
+                                target: "epoch-manager",
+                                "failed to verify epoch record and cert for {epoch_hash}",
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        error!(
+                            target: "epoch-manager",
+                            "failed to aggregate epoch record signatures for {epoch_hash}",
+                        );
+                    }
+                }
+            } else {
+                error!(
+                    target: "epoch-manager",
+                    "failed to reach quorum on epoch close for {epoch_hash} {epoch_rec:?}",
+                );
+                // Try to recover by downloading the epoch record and cert from a peer
+                let mut got_epoch_record = false;
+                for _ in 0..3 {
+                    match primary_network
+                        .request_epoch_cert(Some(epoch_rec.epoch), None)
+                        .await
+                    {
+                        Ok((new_epoch_rec, cert)) => {
+                            if new_epoch_rec.verify_with_cert(&cert) {
+                                let new_epoch_hash = new_epoch_rec.digest();
+                                if new_epoch_hash != epoch_hash {
+                                    warn!(
+                                        target: "epoch-manager",
+                                        "Over wrote expected epoch record {epoch_hash} with verified epoch record {new_epoch_hash}",
+                                    );
+                                    consensus_db
+                                        .save_epoch_record_with_cert(&new_epoch_rec, &cert);
+                                } else {
+                                    info!(
+                                        target: "epoch-manager",
+                                        "retrieved cert for epoch {new_epoch_hash} from a peer",
+                                    );
+                                    let _ = consensus_db
+                                        .insert::<EpochCerts>(&new_epoch_hash, &cert);
+                                }
+                                got_epoch_record = true;
+                                break;
+                            }
+                        }
+                        Err(err) => error!(
+                            target: "epoch-manager",
+                            "failed to retrieve epoch from a peer {epoch_hash}: {err}",
+                        ),
+                    }
+                }
+                if !got_epoch_record {
+                    error!(
+                        target: "epoch-manager",
+                        "Failed to retrieve an epoch record for epoch {}",
+                        epoch_rec.epoch,
+                    );
+                }
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod epoch_vote_collector_tests {
+    use super::*;
+    use rand::{rngs::StdRng, SeedableRng as _};
+    use tn_network_libp2p::types::{MessageId, NetworkCommand};
+    use tn_primary::network::{PrimaryRequest, PrimaryResponse};
+    use tn_storage::mem_db::MemDatabase;
+    use tn_types::{BlsKeypair, TnSender as _};
+
+    /// Happy path: committee of 4, node signs + receives 3 peer votes → cert stored.
+    #[tokio::test]
+    async fn test_collector_reaches_quorum_and_stores_cert() {
+        let mut rng = StdRng::from_os_rng();
+        let kp1 = BlsKeypair::generate(&mut rng);
+        let kp2 = BlsKeypair::generate(&mut rng);
+        let kp3 = BlsKeypair::generate(&mut rng);
+        let kp4 = BlsKeypair::generate(&mut rng);
+        let pk1 = *kp1.public();
+        let pk2 = *kp2.public();
+        let pk3 = *kp3.public();
+        let pk4 = *kp4.public();
+
+        // Node is kp1
+        let key_config = KeyConfig::new_with_testing_key(kp1);
+
+        // Committee of 4: super_quorum = (4*2)/3 + 1 = 3
+        let epoch_rec = EpochRecord {
+            epoch: 0,
+            committee: vec![pk1, pk2, pk3, pk4],
+            next_committee: vec![pk1, pk2, pk3, pk4],
+            ..Default::default()
+        };
+        let epoch_hash = epoch_rec.digest();
+
+        let consensus_bus = ConsensusBus::new();
+        let db = MemDatabase::default();
+
+        // Mock network: drain commands and reply to Publish
+        let (net_tx, mut net_rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(100);
+        let primary_network = PrimaryNetworkHandle::new_for_test(net_tx);
+        tokio::spawn(async move {
+            while let Some(cmd) = net_rx.recv().await {
+                if let NetworkCommand::Publish { reply, .. } = cmd {
+                    let _ = reply.send(Ok(MessageId::new(b"test")));
+                }
+            }
+        });
+
+        let task_manager = TaskManager::default();
+        let node_shutdown = Notifier::new();
+
+        spawn_epoch_vote_collector(
+            db.clone(),
+            consensus_bus.clone(),
+            key_config,
+            primary_network,
+            task_manager.get_spawner(),
+            node_shutdown.subscribe(),
+        );
+
+        // Sign votes from the 3 other committee members
+        let kc2 = KeyConfig::new_with_testing_key(kp2);
+        let kc3 = KeyConfig::new_with_testing_key(kp3);
+        let kc4 = KeyConfig::new_with_testing_key(kp4);
+        let vote2 = epoch_rec.sign_vote(&kc2);
+        let vote3 = epoch_rec.sign_vote(&kc3);
+        let vote4 = epoch_rec.sign_vote(&kc4);
+
+        // Buffer the votes in the channel (channel is already subscribed)
+        consensus_bus.new_epoch_votes().send(vote2).await.unwrap();
+        consensus_bus.new_epoch_votes().send(vote3).await.unwrap();
+        consensus_bus.new_epoch_votes().send(vote4).await.unwrap();
+
+        // Send the epoch record — collector wakes up, self-signs, reads buffered votes
+        consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec.clone()));
+
+        // Wait for collector to aggregate and store
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Verify cert is in DB
+        let cert = db.get::<EpochCerts>(&epoch_hash).expect("db read").expect("cert missing");
+        assert_eq!(cert.epoch_hash, epoch_hash);
+        assert!(epoch_rec.verify_with_cert(&cert), "cert should verify against epoch record");
+
+        // Shutdown
+        node_shutdown.notify();
+    }
+}
+
 impl<P, DB> EpochManager<P, DB>
 where
     P: TelcoinDirs + Clone + 'static,
@@ -307,12 +610,21 @@ where
             .await?;
         state_sync::spawn_epoch_record_collector(
             self.consensus_db.clone(),
-            primary_network_handle,
+            primary_network_handle.clone(),
             self.consensus_bus.clone(),
             node_task_manager.get_spawner(),
             self.node_shutdown.subscribe(),
         )
         .await?;
+
+        spawn_epoch_vote_collector(
+            self.consensus_db.clone(),
+            self.consensus_bus.clone(),
+            self.key_config.clone(),
+            primary_network_handle,
+            node_task_manager.get_spawner(),
+            self.node_shutdown.subscribe(),
+        );
 
         self.try_restore_state(&engine).await?;
         // spawn task to update the latest execution results for consensus
@@ -666,7 +978,7 @@ where
         epoch_task_manager.set_join_wait(200);
 
         // subscribe to output early to prevent missed messages
-        let mut consensus_output = self.consensus_bus.consensus_output().subscribe();
+        let mut consensus_output = self.consensus_bus.subscribe_consensus_output();
 
         // create primary and worker nodes
         let (primary, worker_node) = self
@@ -740,9 +1052,9 @@ where
         // tables should be cleared
         let mut clear_tables_for_next_epoch = false;
 
-        // New Epoch, should be able to collect the certs from the last epoch.
+        // New Epoch: send the epoch record to the node-lifetime vote collector via watch.
         if let Some(epoch_rec) = self.epoch_record.take() {
-            let _ = self.collect_epoch_votes(&primary, epoch_rec, &epoch_task_manager).await;
+            self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec));
         }
 
         let mut need_join = false;
@@ -923,232 +1235,6 @@ where
 
         self.consensus_db.save_epoch_record(&epoch_rec);
         self.epoch_record = Some(epoch_rec);
-        Ok(())
-    }
-
-    /// Extremely local helper fn used by the committee_epoch_certs task..
-    /// Checks to see if any keys in committee_keys signed the cert and
-    /// that the cert hash matches hash and returns the BlsPublicKey of the signer if found.
-    fn signed_by_committee(
-        committee_keys: &[BlsPublicKey],
-        vote: &EpochVote,
-        hash: B256,
-    ) -> Option<BlsPublicKey> {
-        if vote.epoch_hash == hash
-            && committee_keys.contains(&vote.public_key)
-            && vote.check_signature()
-        {
-            return Some(vote.public_key);
-        }
-        None
-    }
-
-    /// Start a task to collect the epoch record votes previous epochs record.
-    /// This should run quickly at epoch start and make epoch records/certs available to syncing
-    /// nodes.
-    #[tracing::instrument(
-        target = "telcoin",
-        skip(self, primary, epoch_task_manager),
-        level = "info"
-    )]
-    async fn collect_epoch_votes(
-        &self,
-        primary: &PrimaryNode<DB>,
-        epoch_rec: EpochRecord,
-        epoch_task_manager: &TaskManager,
-    ) -> eyre::Result<()> {
-        if let Some((_, Some(_))) = self.consensus_db.get_epoch_by_number(epoch_rec.epoch) {
-            // We already have this record and cert...
-            return Ok(());
-        }
-
-        let mut committee_keys: HashSet<BlsPublicKey> =
-            epoch_rec.committee.iter().copied().collect();
-        let committee_index: HashMap<BlsPublicKey, usize> =
-            epoch_rec.committee.iter().enumerate().map(|(i, k)| (*k, i)).collect();
-        let consensus_db = self.consensus_db.clone();
-
-        let epoch_hash = epoch_rec.digest();
-
-        let me = self.builder.tn_config.primary_bls_key();
-        let committee_size = committee_keys.len() as u64;
-        let quorum = epoch_rec.super_quorum();
-        let mut sigs = Vec::new();
-        let mut signed_authorities = roaring::RoaringBitmap::new();
-        let primary_network = primary.network_handle().await;
-        let mut my_vote = None;
-        // We are in the committee so sign and gossip the epoch record.
-        if committee_keys.contains(me) {
-            committee_keys.remove(me);
-            let epoch_vote = epoch_rec.sign_vote(&self.key_config);
-            sigs.push(epoch_vote.signature);
-            if let Some(idx) = committee_index.get(&self.key_config.primary_public_key()) {
-                signed_authorities.insert(*idx as u32);
-            }
-            info!(
-                target: "epoch-manager",
-                "publishing epoch record {epoch_hash}",
-            );
-            let _ = primary_network.publish_epoch_vote(epoch_vote).await;
-            my_vote = Some(epoch_vote);
-        }
-
-        let mut rx = self.consensus_bus.new_epoch_votes().subscribe();
-        epoch_task_manager.spawn_task("Collect Epoch Signatures", async move {
-            let mut reached_quorum = false;
-            let mut timeout = Duration::from_secs(5);
-            let mut timeouts = 0;
-            let mut alt_recs: HashMap<B256, usize> = HashMap::default();
-            loop {
-                match tokio::time::timeout(timeout, rx.recv()).await {
-                    Ok(Some((vote, vote_tx))) => {
-                        if let Some(source) =
-                            Self::signed_by_committee(&epoch_rec.committee, &vote, epoch_hash)
-                        {
-                            let _ = vote_tx.send(Ok(())); // If we lost this channel somehow then no big deal.
-                            if committee_keys.remove(&source) {
-                                sigs.push(vote.signature);
-                                if let Some(idx) = committee_index.get(&source) {
-                                    signed_authorities.insert(*idx as u32);
-                                }
-                                if signed_authorities.len() >= quorum as u64 {
-                                    reached_quorum = true;
-                                    // We have quorum so just wait a sec longer for new certs then
-                                    // move on.
-                                    timeout = Duration::from_secs(1);
-                                }
-                                if signed_authorities.len() >= committee_size {
-                                    break;
-                                }
-                            }
-                        } else {
-                            // Send an error back to punish the peer that sent a bad epoch vote.
-                            let err = if vote.epoch_hash != epoch_hash {
-                                if epoch_rec.committee.contains(&vote.public_key)
-                                    && vote.check_signature()
-                                {
-                                    // If we got a valid vote on another epoch record track that and break if we get quorum...
-                                    // This will cause us to query the record and cert from a peer.
-                                    let votes = *alt_recs.get(&vote.epoch_hash).unwrap_or(&0);
-                                    if votes + 1 >= quorum {
-                                        error!(
-                                            target: "epoch-manager",
-                                            "Reached quorum on epoch record {} instead of {}.",
-                                            vote.epoch_hash,
-                                            epoch_hash,
-                                        );
-                                        let _ = vote_tx.send(Err(HeaderError::InvalidHeaderDigest));
-                                        break;
-                                    }
-                                    alt_recs.insert(vote.epoch_hash, votes + 1);
-                                }
-                                HeaderError::InvalidHeaderDigest
-                            } else if epoch_rec.committee.contains(&vote.public_key) {
-                                HeaderError::UnknownAuthority(format!(
-                                    "{} not in the committee for epoch {epoch_hash}",
-                                    vote.public_key
-                                ))
-                            } else {
-                                HeaderError::PeerNotAuthor
-                            };
-                            error!(
-                                target: "epoch-manager",
-                                ?err,
-                                "Received an invalid epoch cert from {} for {}.",
-                                vote.public_key,
-                                vote.epoch_hash,
-                            );
-                            let _ = vote_tx.send(Err(err)); // If we lost this channel somehow then no big deal.
-                        }
-                    }
-                    Ok(None) => break, // channel issues...
-                    Err(_) => {
-                        // We timed out but have reached quorum so good enough
-                        // Or we have failed after a minute try break and try to request the cert
-                        // instead.
-                        if reached_quorum || timeouts > 12 {
-                            break;
-                        }
-                        timeouts += 1;
-                        // Timed out, maybe we are not the only ones having issues so republish.
-                        if let Some(vote) = my_vote {
-                            let _ = primary_network.publish_epoch_vote(vote).await;
-                        }
-                    }
-                }
-            }
-            if reached_quorum {
-                info!(
-                    target: "epoch-manager",
-                    "reached quorum on epoch close for {epoch_hash}",
-                );
-                match BlsAggregateSignature::aggregate(&sigs[..], true) {
-                    Ok(aggregated_signature) => {
-                        let signature: BlsSignature = aggregated_signature.to_signature();
-                        let cert = EpochCertificate { epoch_hash, signature, signed_authorities };
-                        // Sanity check that we have generated a valid cert before saving.
-                        if epoch_rec.verify_with_cert(&cert) {
-                            let _ = consensus_db.insert::<EpochCerts>(&cert.epoch_hash, &cert);
-                        } else {
-                            error!(
-                                target: "epoch-manager",
-                                "failed to verify epoch record and cert for {epoch_hash}",
-                            );
-                        }
-                    }
-                    Err(_) => {
-                        error!(
-                            target: "epoch-manager",
-                            "failed to aggregate epoch record signatures for {epoch_hash}",
-                        );
-                    }
-                }
-            } else {
-                error!(
-                    target: "epoch-manager",
-                    "failed to reach quorum on epoch close for {epoch_hash} {epoch_rec:?}",
-                );
-                // Try to recover by downloading the epoch record and cert from a peer.
-                let mut got_epoch_record = false;
-                for _ in 0..3 {
-                    // Request by epoch number in case we had a bad hash...
-                    match primary_network.request_epoch_cert(Some(epoch_rec.epoch), None).await {
-                        Ok((new_epoch_rec, cert)) => {
-                            if new_epoch_rec.verify_with_cert(&cert) {
-                                let new_epoch_hash = new_epoch_rec.digest();
-                                // Humm, we got another epoch record than the one we expected...
-                                // The network came to quorum on this one so lets go with it...
-                                if new_epoch_hash != epoch_hash {
-                                    warn!(
-                                        target: "epoch-manager",
-                                        "Over wrote expected epoch record {epoch_hash} with verified epoch record {new_epoch_hash}",
-                                    );
-                                    consensus_db.save_epoch_record_with_cert(&new_epoch_rec, &cert);
-                                } else {
-                                    info!(
-                                        target: "epoch-manager",
-                                        "retrieved cert for epoch {new_epoch_hash} from a peer",
-                                    );
-                                    let _ = consensus_db.insert::<EpochCerts>(&new_epoch_hash, &cert);
-                                }
-                                got_epoch_record = true;
-                                break;
-                            }
-                        }
-                        Err(err) => error!(
-                            target: "epoch-manager",
-                            "failed to retrieve epoch from a peer {epoch_hash}: {err}",
-                        ),
-                    }
-                }
-                if !got_epoch_record {
-                    error!(
-                        target: "epoch-manager",
-                        "Failed to retrieve an epoch record for epoch {}", epoch_rec.epoch,
-                    );
-                }
-            }
-        });
         Ok(())
     }
 
@@ -1487,8 +1573,7 @@ where
         initial_epoch: bool,
     ) -> eyre::Result<()> {
         // get event streams for the primary network handler
-        let event_stream = self.consensus_bus.primary_network_events().clone();
-        let rx_event_stream = event_stream.subscribe();
+        let rx_event_stream = self.consensus_bus.subscribe_primary_network_events();
 
         // set committee for network to prevent banning
         debug!(target: "epoch-manager", auth=?consensus_config.authority_id(), "spawning primary network for epoch");

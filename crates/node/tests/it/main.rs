@@ -96,7 +96,7 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
     });
 
     // subscribe to output early
-    let mut consensus_output = consensus_bus.consensus_output().subscribe();
+    let mut consensus_output = consensus_bus.subscribe_consensus_output();
 
     // spawn consensus to send output to engine for full execution
     spawn_consensus(

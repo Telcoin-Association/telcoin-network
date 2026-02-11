@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Tests for ConsensusBus helper methods.
 
-use crate::{ConsensusBus, NodeMode};
+use crate::{consensus_bus::QueChannel, ConsensusBus, NodeMode};
+use tn_types::{EpochRecord, TnReceiver, TnSender};
 
 #[tokio::test]
 async fn test_is_cvv() {
@@ -97,4 +98,113 @@ async fn test_recent_blocks_capacity() {
 async fn test_recent_blocks_capacity_custom() {
     let bus = ConsensusBus::new_with_args(100);
     assert_eq!(bus.recent_blocks_capacity(), 100);
+}
+
+#[tokio::test]
+async fn test_que_channel_send_no_subscriber() {
+    // Create a QueChannel, send without subscribing.
+    // The send should be a no-op and return Ok(()).
+    let channel = QueChannel::<i32>::new();
+
+    let result = channel.send(42).await;
+    assert!(result.is_ok());
+
+    let result = channel.try_send(99);
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_que_channel_send_after_subscribe() {
+    // Create a QueChannel, subscribe, then send.
+    // The message should arrive at the receiver.
+    let channel = QueChannel::<i32>::new();
+
+    let mut rx = channel.subscribe();
+
+    channel.send(42).await.unwrap();
+    let received = rx.recv().await.unwrap();
+    assert_eq!(received, 42);
+}
+
+#[tokio::test]
+async fn test_que_channel_send_after_subscribe_then_drop() {
+    // Create a QueChannel, subscribe, drop the receiver,
+    // then send. The send should be a no-op.
+    let channel = QueChannel::<i32>::new();
+
+    let rx = channel.subscribe();
+    drop(rx);
+
+    let result = channel.send(42).await;
+    assert!(result.is_ok());
+
+    let result = channel.try_send(99);
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_que_channel_resubscribe_after_drop() {
+    // Simulate an epoch transition: subscribe, use, drop, then subscribe again.
+    // This is the real lifecycle for QueChannels like new_epoch_votes and
+    // primary_network_events across epoch boundaries.
+    let channel = QueChannel::<i32>::new();
+
+    // Epoch 1: subscribe and exchange messages
+    let mut rx1 = channel.subscribe();
+    channel.send(1).await.unwrap();
+    channel.try_send(2).unwrap();
+    assert_eq!(rx1.recv().await.unwrap(), 1);
+    assert_eq!(rx1.recv().await.unwrap(), 2);
+
+    // Epoch 1 ends: drop the receiver, sends become no-ops
+    drop(rx1);
+    assert!(channel.send(3).await.is_ok());
+    assert!(channel.try_send(4).is_ok());
+
+    // Epoch 2: re-subscribe on the same channel
+    let mut rx2 = channel.subscribe();
+    channel.send(5).await.unwrap();
+    assert_eq!(rx2.recv().await.unwrap(), 5);
+
+    // Messages sent during the no-op gap (3, 4) are not received
+    assert!(rx2.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn test_epoch_record_watch_default() {
+    let bus = ConsensusBus::new();
+    // Default is None
+    assert!(bus.epoch_record_watch().borrow().is_none());
+}
+
+#[tokio::test]
+async fn test_epoch_record_watch_send_and_receive() {
+    let bus = ConsensusBus::new();
+    let mut rx = bus.epoch_record_watch().subscribe();
+
+    let epoch_rec = EpochRecord { epoch: 1, ..Default::default() };
+    bus.epoch_record_watch().send_replace(Some(epoch_rec.clone()));
+
+    rx.changed().await.unwrap();
+    let received = rx.borrow_and_update().clone();
+    assert!(received.is_some());
+    assert_eq!(received.unwrap().epoch, 1);
+}
+
+#[tokio::test]
+async fn test_epoch_record_watch_updates() {
+    let bus = ConsensusBus::new();
+    let mut rx = bus.epoch_record_watch().subscribe();
+
+    // Send first epoch record
+    let epoch_rec1 = EpochRecord { epoch: 1, ..Default::default() };
+    bus.epoch_record_watch().send_replace(Some(epoch_rec1));
+    rx.changed().await.unwrap();
+    assert_eq!(rx.borrow_and_update().as_ref().unwrap().epoch, 1);
+
+    // Send second epoch record
+    let epoch_rec2 = EpochRecord { epoch: 2, ..Default::default() };
+    bus.epoch_record_watch().send_replace(Some(epoch_rec2));
+    rx.changed().await.unwrap();
+    assert_eq!(rx.borrow_and_update().as_ref().unwrap().epoch, 2);
 }
