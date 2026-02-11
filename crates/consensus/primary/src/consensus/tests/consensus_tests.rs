@@ -60,7 +60,8 @@ async fn test_consensus_recovery_with_bullshark() {
 
     let cb = ConsensusBus::new();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
+    cb.recent_blocks()
+        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
     Consensus::spawn(config.clone(), &cb, bullshark, &task_manager);
@@ -144,7 +145,8 @@ async fn test_consensus_recovery_with_bullshark() {
 
     let cb = ConsensusBus::new();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
+    cb.recent_blocks()
+        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
     Consensus::spawn(config.clone(), &cb, bullshark, &task_manager);
@@ -201,7 +203,8 @@ async fn test_consensus_recovery_with_bullshark() {
 
     let cb = ConsensusBus::new();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
+    cb.recent_blocks()
+        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
     Consensus::spawn(config, &cb, bullshark, &task_manager);

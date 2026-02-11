@@ -460,6 +460,11 @@ impl ConsensusBus {
         self.inner_app.tx_recent_blocks.borrow().latest_block_num_hash()
     }
 
+    /// Returns the last consensus round processed by the engine.
+    pub fn last_consensus_round(&self) -> Round {
+        self.inner_app.tx_recent_blocks.borrow().last_consensus_round()
+    }
+
     /// Returns the maximum number of recent blocks that can be held.
     pub fn recent_blocks_capacity(&self) -> u64 {
         self.inner_app.tx_recent_blocks.borrow().block_capacity()
@@ -478,6 +483,11 @@ impl ConsensusBus {
         &self.inner_app.tx_last_published_consensus_num_hash
     }
 
+    /// Returns the latest verified consensus block number and hash from gossip.
+    pub fn published_consensus_num_hash(&self) -> (u64, BlockHash) {
+        *self.inner_app.tx_last_published_consensus_num_hash.borrow()
+    }
+
     /// Broadcast channel with consensus output (includes the consensus chain block).
     /// This also provides the ConsesusHeader, use this for block execution.
     pub fn consensus_output(&self) -> &impl TnSender<ConsensusOutput> {
@@ -493,6 +503,11 @@ impl ConsensusBus {
     /// Status of initial sync operation.
     pub fn node_mode(&self) -> &watch::Sender<NodeMode> {
         &self.inner_app.tx_sync_status
+    }
+
+    /// Returns the current node mode.
+    pub fn current_node_mode(&self) -> NodeMode {
+        *self.inner_app.tx_sync_status.borrow()
     }
 
     /// Returns true if this node is a CVV (active or inactive).

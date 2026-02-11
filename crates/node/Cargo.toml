@@ -15,7 +15,6 @@ authors = [
 [dependencies]
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
-tokio-stream = { workspace = true }
 tracing = { workspace = true }
 tn-executor = { workspace = true }
 tn-primary = { workspace = true }

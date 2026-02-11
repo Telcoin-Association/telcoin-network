@@ -13,7 +13,7 @@ use tn_primary::{
     network::{ConsensusResult, PrimaryNetworkHandle},
     ConsensusBus, NodeMode,
 };
-use tn_storage::CertificateStore;
+use tn_storage::{tables::ConsensusBlocks, CertificateStore};
 use tn_types::{
     encode, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash, BlsSigner as _,
     CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput, Database,
@@ -60,7 +60,7 @@ pub fn spawn_subscriber<DB: Database>(
     let authority_id = config.authority_id();
     let committee = config.committee().clone();
     let client = config.local_network().clone();
-    let mode = *consensus_bus.node_mode().borrow();
+    let mode = consensus_bus.current_node_mode();
     let subscriber = Subscriber {
         consensus_bus,
         config,
@@ -201,15 +201,33 @@ impl<DB: Database> Subscriber<DB> {
     /// This method is called on startup to retrieve the needed information to build the next
     /// `ConsensusHeader` off of this parent.
     async fn get_last_executed_consensus(&self) -> SubscriberResult<(BlockHash, u64)> {
-        // Get the DB and load our last executed consensus block (note there may be unexecuted
-        // blocks, catch up will execute them).
+        // Load the consensus block associated with the latest executed EVM block.
+        // This can lag when outputs were processed but execution was skipped (empty rounds).
         let last_executed_block =
             last_executed_consensus_block(&self.consensus_bus, self.config.node_storage())
                 .unwrap_or_default();
 
-        info!(target: "subscriber", ?last_executed_block, "restoring last executed consensus for constucting the next ConsensusHeader:");
+        // Use the latest persisted consensus header as startup parent when it is newer.
+        // replay_missed_consensus + wait_for_consensus_execution ensures this header has already
+        // been processed by execution (including skipped rounds).
+        let (_, last_db_block) = self
+            .config
+            .node_storage()
+            .last_record::<ConsensusBlocks>()
+            .unwrap_or((last_executed_block.number, last_executed_block.clone()));
+        let parent = if last_db_block.number > last_executed_block.number {
+            last_db_block
+        } else {
+            last_executed_block
+        };
 
-        Ok((last_executed_block.digest(), last_executed_block.number))
+        info!(
+            target: "subscriber",
+            ?parent,
+            "restoring last executed consensus for constucting the next ConsensusHeader:"
+        );
+
+        Ok((parent.digest(), parent.number))
     }
 
     /// Main loop connecting to the consensus to listen to sequence messages.

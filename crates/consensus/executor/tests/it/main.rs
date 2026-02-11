@@ -53,7 +53,7 @@ async fn test_output_to_header() -> eyre::Result<()> {
 
     // make certificates for rounds 1 to 7 (inclusive)
     let (certificates, _next_parents, batches) =
-        create_signed_certificates_for_rounds(1..=7, &fixture);
+        create_signed_certificates_for_rounds(1..=7, &fixture, &[]);
 
     // Set up mock worker.
     let mock_client = Arc::new(MockPrimaryToWorkerClient { batches });
@@ -72,7 +72,9 @@ async fn test_output_to_header() -> eyre::Result<()> {
     );
 
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    consensus_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
+    consensus_bus
+        .recent_blocks()
+        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
     let task_manager = TaskManager::default();
     Consensus::spawn(config.clone(), &consensus_bus, bullshark, &task_manager);
 
@@ -142,7 +144,7 @@ async fn test_executor_output_ordering() -> eyre::Result<()> {
 
     // Create more rounds for multiple commits
     let (certificates, _next_parents, batches) =
-        create_signed_certificates_for_rounds(1..=11, &fixture);
+        create_signed_certificates_for_rounds(1..=11, &fixture, &[]);
 
     let mock_client = Arc::new(MockPrimaryToWorkerClient { batches });
     config.local_network().set_primary_to_worker_local_handler(mock_client);
@@ -160,7 +162,9 @@ async fn test_executor_output_ordering() -> eyre::Result<()> {
     );
 
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    consensus_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
+    consensus_bus
+        .recent_blocks()
+        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
     let task_manager2 = TaskManager::default();
     Consensus::spawn(config.clone(), &consensus_bus, bullshark, &task_manager2);
 
@@ -220,7 +224,7 @@ async fn test_executor_batch_fetching() -> eyre::Result<()> {
     tokio::task::yield_now().await;
 
     let (certificates, _next_parents, batches) =
-        create_signed_certificates_for_rounds(1..=7, &fixture);
+        create_signed_certificates_for_rounds(1..=7, &fixture, &[]);
 
     let batch_count = batches.len();
     let mock_client = Arc::new(MockPrimaryToWorkerClient { batches });
@@ -239,7 +243,9 @@ async fn test_executor_batch_fetching() -> eyre::Result<()> {
     );
 
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    consensus_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
+    consensus_bus
+        .recent_blocks()
+        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
     let task_manager2 = TaskManager::default();
     Consensus::spawn(config.clone(), &consensus_bus, bullshark, &task_manager2);
 
