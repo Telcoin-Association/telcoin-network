@@ -163,6 +163,22 @@ impl RethEnv {
         let rewards = self.call_consensus_registry::<_, U256>(&mut tn_evm, calldata)?;
         Ok(rewards)
     }
+
+    /// Retrieve validator info from the ConsensusRegistry.
+    pub fn get_validator_info(
+        &self,
+        hash: BlockHash,
+        address: Address,
+    ) -> eyre::Result<ConsensusRegistry::ValidatorInfo> {
+        let mut tn_evm = self.tn_evm(hash)?;
+        let calldata =
+            ConsensusRegistry::getValidatorCall { validatorAddress: address }.abi_encode().into();
+        let info = self.call_consensus_registry::<_, ConsensusRegistry::ValidatorInfo>(
+            &mut tn_evm,
+            calldata,
+        )?;
+        Ok(info)
+    }
 }
 
 /// Transaction factory
