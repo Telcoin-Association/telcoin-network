@@ -1,18 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Network messages for anemo communication
-#![warn(
-    missing_debug_implementations,
-    missing_docs,
-    unreachable_pub,
-    rustdoc::all,
-    unused_crate_dependencies
-)]
+#![warn(missing_debug_implementations, missing_docs, unreachable_pub, rustdoc::all)]
 
 pub mod local;
 mod notify;
-mod response;
 pub use notify::*;
-pub use response::*;
 use std::collections::{HashMap, HashSet};
 use tn_types::{Batch, BlockHash};
 
@@ -64,8 +56,11 @@ pub trait PrimaryToWorkerClient: Send + Sync + 'static {
     /// Synchronize
     async fn synchronize(&self, message: WorkerSynchronizeMessage) -> eyre::Result<()>;
 
-    /// Fetch batches
-    async fn fetch_batches(&self, digests: HashSet<BlockHash>) -> eyre::Result<FetchBatchResponse>;
+    /// Fetch batches from local database or from peers.
+    async fn fetch_batches(
+        &self,
+        digests: HashSet<BlockHash>,
+    ) -> eyre::Result<HashMap<BlockHash, Batch>>;
 }
 
 /// Type that can return batches.
@@ -84,7 +79,7 @@ impl PrimaryToWorkerClient for MockPrimaryToWorkerClient {
     async fn fetch_batches(
         &self,
         _digests: HashSet<BlockHash>,
-    ) -> eyre::Result<FetchBatchResponse> {
-        Ok(FetchBatchResponse { batches: self.batches.clone() })
+    ) -> eyre::Result<HashMap<BlockHash, Batch>> {
+        Ok(self.batches.clone())
     }
 }

@@ -1,4 +1,4 @@
-//! Subscriber handles consensus output.
+//! Subscriber gathers all information needed from consensus and forwards to the execution engine.
 
 use crate::{errors::SubscriberResult, SubscriberError};
 use futures::{stream::FuturesOrdered, StreamExt};
@@ -344,6 +344,8 @@ impl<DB: Database> Subscriber<DB> {
             }
         }
 
+        // SAFETY: 10-node committees * 6-round commit max * 5 batch max = 300 max batch digests possible
+        // 32bytes * 300 = 9.6 kb => well within 1MB max message size
         let mut fetched_batches = self.fetch_batches_from_peers(batch_set).await?;
 
         // map all fetched batches to their respective certificates for applying block rewards
@@ -394,21 +396,34 @@ impl<DB: Database> Subscriber<DB> {
         Ok(consensus_output)
     }
 
+    /// Send message to relevant workers to fetch batches for execution.
+    ///
+    /// The worker is responsible for retrieving the batch from it's local DB or fetching from peers.
     async fn fetch_batches_from_peers(
         &self,
         batch_digests: HashSet<BlockHash>,
     ) -> SubscriberResult<HashMap<BlockHash, Batch>> {
         let mut fetched_blocks = HashMap::new();
 
-        debug!(target: "subscriber", "Attempting to fetch {} digests peers", batch_digests.len(),);
-        let blocks = match self.inner.client.fetch_batches(batch_digests.clone()).await {
+        debug!(target: "subscriber", "Attempting to fetch {} digests from workers", batch_digests.len());
+        let batches = match self.inner.client.fetch_batches(batch_digests).await {
             Ok(resp) => resp,
             Err(e) => {
                 error!(target: "subscriber", "Failed to fetch batches from peers: {e:?}");
                 return Err(SubscriberError::ClientRequestsFailed);
             }
         };
-        for (digest, block) in blocks.batches.into_iter() {
+
+        for (digest, block) in batches.into_iter() {
+            //
+            // TODO: this is not worth much???
+            //
+            //
+            //
+            //
+            //
+            //
+            //
             if let Some(received_at) = block.received_at() {
                 let remote_duration = received_at.elapsed().as_secs_f64();
                 debug!(
@@ -418,6 +433,7 @@ impl<DB: Database> Subscriber<DB> {
                     remote_duration,
                 );
             }
+
             fetched_blocks.insert(digest, block);
         }
 

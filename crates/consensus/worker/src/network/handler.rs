@@ -9,7 +9,10 @@ use crate::{
     WorkerResponse,
 };
 use futures::AsyncWriteExt as _;
-use std::sync::{Arc, LazyLock};
+use std::{
+    collections::HashSet,
+    sync::{Arc, LazyLock},
+};
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{GossipMessage, StreamHeader};
 use tn_network_types::{WorkerOthersBatchMessage, WorkerToPrimaryClient};
@@ -72,16 +75,17 @@ where
                     topic.to_string().eq(&tn_config::LibP2pConfig::worker_batch_topic()),
                     WorkerNetworkError::InvalidTopic
                 );
-                // Retrieve the block...
+                // Retrieve the batch...
                 let store = self.consensus_config.node_storage();
                 if !matches!(store.get::<Batches>(&batch_hash), Ok(Some(_))) {
-                    // If we don't have this batch already then try to get it.
+                    // If batch is missing from db, then request from peer.
                     // If we are a CVV then we should already have it.
                     // This allows non-CVVs to pre fetch batches they will soon need.
-                    match self.network_handle.request_batches(vec![batch_hash]).await {
+                    let mut missing = HashSet::from([batch_hash]);
+                    match self.network_handle.request_batches(&mut missing).await {
                         Ok(batches) => {
-                            if let Some(batch) = batches.first() {
-                                store.insert::<Batches>(&batch.digest(), batch).map_err(|e| {
+                            if let Some((digest, batch)) = batches.first() {
+                                store.insert::<Batches>(digest, batch).map_err(|e| {
                                     WorkerNetworkError::Internal(format!(
                                         "failed to write to batch store: {e}"
                                     ))

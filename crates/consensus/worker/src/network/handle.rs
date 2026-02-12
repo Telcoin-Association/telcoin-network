@@ -244,42 +244,38 @@ impl WorkerNetworkHandle {
 
     /// Request a group of batches by hashes using stream-based transfer.
     ///
-    /// Tries peers one at a time until all batches are received or all peers fail.
+    /// Tries peers one at a time until all batches are received or all peers fail. Returns `Ok` if any batches successfully fetched from peers.
     pub(crate) async fn request_batches(
         &self,
-        requested_digests: Vec<BlockHash>,
-    ) -> NetworkResult<Vec<Batch>> {
+        requested_digests: &mut HashSet<BlockHash>,
+    ) -> NetworkResult<Vec<(BlockHash, Batch)>> {
         let peers = self.handle.connected_peers().await?;
         if requested_digests.is_empty() || peers.is_empty() {
             return Ok(vec![]);
         }
 
-        let mut remaining_digests: HashSet<_> = requested_digests.iter().cloned().collect();
-        let mut all_batches = Vec::new();
+        let mut all_batches = Vec::with_capacity(requested_digests.len());
 
         // try peers one at a time with fallback
         for peer in peers {
             // check remaining digests before sending request
-            if remaining_digests.is_empty() {
+            if requested_digests.is_empty() {
                 break;
             }
 
-            // let digests_to_request: Vec<_> = remaining_digests.iter().cloned().collect();
-
             // loop: update remaining batches or log error
-            match self.request_batches_from_peer(peer, &remaining_digests).await {
+            match self.request_batches_from_peer(peer, &requested_digests).await {
                 Ok(batches) => {
-                    for batch in batches {
-                        let digest = batch.digest();
-                        if remaining_digests.remove(&digest) {
-                            all_batches.push(batch);
+                    for (digest, batch) in batches {
+                        if requested_digests.remove(&digest) {
+                            all_batches.push((digest, batch));
                         }
                     }
                     debug!(
                         target: "worker::network",
                         %peer,
                         received = all_batches.len(),
-                        remaining = remaining_digests.len(),
+                        remaining = requested_digests.len(),
                         "received batches from peer"
                     );
                 }
@@ -313,7 +309,7 @@ impl WorkerNetworkHandle {
         &self,
         peer: BlsPublicKey,
         batch_digests: &HashSet<BlockHash>,
-    ) -> NetworkResult<Vec<Batch>> {
+    ) -> NetworkResult<Vec<(BlockHash, Batch)>> {
         // sanity check - should never happen
         if batch_digests.is_empty() {
             warn!(target: "worker::network", "requested empty batches from peer!");
@@ -328,64 +324,57 @@ impl WorkerNetworkHandle {
         //
         // SAFETY: network layer handles request timeout
         let res = self.handle.send_request(request.clone(), peer).await?.await??;
+        match res {
+            WorkerResponse::RequestBatchesStream { ack } => {
+                // return error if denied to try next peer
+                if !ack {
+                    return Err(NetworkError::RPCError(
+                        "Peer {peer:%} denied request to sync".to_string(),
+                    ));
+                }
 
-        // check response
-        let ack = match res {
-            WorkerResponse::RequestBatchesStream { ack } => ack,
-            WorkerResponse::ReportBatch => {
-                return Err(NetworkError::RPCError(
-                    "Got wrong response: report batch instead of stream ack".to_string(),
-                ));
-            }
-            WorkerResponse::RequestBatches(_) => {
-                return Err(NetworkError::RPCError(
-                    "Got wrong response: batches instead of stream ack".to_string(),
-                ));
-            }
-            WorkerResponse::PeerExchange { .. } => {
-                return Err(NetworkError::RPCError(
-                    "Got wrong response: peer exchange instead of stream ack".to_string(),
-                ));
-            }
-            WorkerResponse::Error(WorkerRPCError(s)) => {
-                return Err(NetworkError::RPCError(s));
-            }
-        };
+                // peer ack'd request - open stream to begin sync
+                //
+                //
+                // open stream with request digest for correlation
+                // resource_id is set to 0 for batch sync
+                //
+                //
+                // TODO: we could use worker_id in the future?
 
-        // TODO: request from new peer instead
-        if !ack {
-            // peer rejected stream request - fallback to old request-response
-            debug!(
-                target: "worker::network",
-                %peer,
-                "peer rejected stream request, falling back to request-response"
-            );
-            // return self.request_batches_from_peer_old(peer, batch_digests, timeout).await;
+                debug!(
+                    target: "worker::network",
+                    %peer,
+                    ?ack,
+                    "peer ack for stream request"
+                );
+
+                let mut stream =
+                    self.handle.open_sync_stream(peer, 0, request_digest.into()).await??;
+
+                debug!(
+                    target: "worker::network",
+                    %peer,
+                    "stream opened - reading and validating batches..."
+                );
+
+                // read and validate batches from stream with timeout per batch
+                let batches =
+                    self.read_and_validate_batches_with_timeout(&mut stream, batch_digests).await?;
+
+                Ok(batches)
+            }
+            WorkerResponse::ReportBatch => Err(NetworkError::RPCError(
+                "Got wrong response: report batch instead of stream ack".to_string(),
+            )),
+            WorkerResponse::RequestBatches(_) => Err(NetworkError::RPCError(
+                "Got wrong response: batches instead of stream ack".to_string(),
+            )),
+            WorkerResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
+                "Got wrong response: peer exchange instead of stream ack".to_string(),
+            )),
+            WorkerResponse::Error(WorkerRPCError(s)) => Err(NetworkError::RPCError(s)),
         }
-
-        // open stream with request digest for correlation
-        // resource_id is set to 0 for batch sync
-        //
-        //
-        // TODO:we could use worker_id in the future?
-
-        debug!(
-            target: "worker::network",
-            %peer,
-            "peer accepted stream request - opening stream..."
-        );
-        let mut stream = self.handle.open_sync_stream(peer, 0, request_digest.into()).await??;
-
-        debug!(
-            target: "worker::network",
-            %peer,
-            "stream opened - reading and validating batches..."
-        );
-
-        // read and validate batches from stream
-        let batches = self.read_and_validate_batches(&mut stream, batch_digests).await?;
-
-        Ok(batches)
     }
 
     /// Read and validate batches from a stream.
@@ -394,24 +383,15 @@ impl WorkerNetworkHandle {
     /// - Checks batch count matches expected
     /// - Verifies each batch digest was requested
     /// - Detects duplicate batches
-    async fn read_and_validate_batches(
+    ///
+    /// SAFETY: this method times out if a batch fails to stream within time limit.
+    async fn read_and_validate_batches_with_timeout(
         &self,
         stream: &mut libp2p::Stream,
         requested_digests: &HashSet<BlockHash>,
-    ) -> NetworkResult<Vec<Batch>> {
+    ) -> NetworkResult<Vec<(BlockHash, Batch)>> {
         // TODO: Use epoch from context when available
         let max_size = max_batch_size(0);
-
-        //
-        //
-        //
-        // TODO: this needs to loop to handle next chunk!!!!
-        //
-        //
-        //
-        //
-        //
-
         // allocate reusable buffers
         //
         // SAFETY: requests are capped by `MAX_PENDING_BATCH_REQUESTS`
@@ -470,7 +450,7 @@ impl WorkerNetworkHandle {
                 )));
             }
 
-            batches.push(batch);
+            batches.push((batch_digest, batch));
         }
 
         Ok(batches)

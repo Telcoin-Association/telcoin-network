@@ -1,7 +1,7 @@
 //! Test network handler tests.
 
 use assert_matches::assert_matches;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 use tn_batch_validator::NoopBatchValidator;
 use tn_network_libp2p::{
     types::{NetworkCommand, NetworkHandle},

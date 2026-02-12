@@ -14,11 +14,11 @@ use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     stream::StreamHeader, types::NetworkEvent, GossipMessage, ResponseChannel,
 };
-use tn_network_types::{FetchBatchResponse, PrimaryToWorkerClient, WorkerSynchronizeMessage};
+use tn_network_types::{PrimaryToWorkerClient, WorkerSynchronizeMessage};
 use tn_storage::tables::Batches;
 use tn_types::{
-    now, BatchValidation, BlockHash, BlsPublicKey, Database, DbTxMut, SealedBatch, TaskSpawner,
-    TnReceiver, WorkerId, B256,
+    now, Batch, BatchValidation, BlockHash, BlsPublicKey, Database, DbTxMut, SealedBatch,
+    TaskSpawner, TnReceiver, WorkerId, B256,
 };
 use tokio::sync::oneshot;
 use tracing::{debug, trace, warn};
@@ -403,14 +403,11 @@ impl<DB: Database> PrimaryToWorkerClient for PrimaryReceiverHandler<DB> {
             return Ok(());
         }
 
-        let response = tokio::time::timeout(
-            self.request_batches_timeout,
-            network.request_batches(missing.iter().cloned().collect()),
-        )
-        .await??;
+        let response = network.request_batches(&mut missing).await?;
 
+        // SAFETY: `request_batches` ensures the batch digest matches
         let sealed_batches_from_response: Vec<SealedBatch> =
-            response.into_iter().map(|b| b.seal_slow()).collect();
+            response.into_iter().map(|(digest, batch)| batch.seal(digest)).collect();
 
         for sealed_batch in sealed_batches_from_response.into_iter() {
             if !message.is_certified {
@@ -450,13 +447,17 @@ impl<DB: Database> PrimaryToWorkerClient for PrimaryReceiverHandler<DB> {
         Err(eyre::eyre!("failed to synchronize batches!".to_string()))
     }
 
-    async fn fetch_batches(&self, digests: HashSet<BlockHash>) -> eyre::Result<FetchBatchResponse> {
+    async fn fetch_batches(
+        &self,
+        digests: HashSet<BlockHash>,
+    ) -> eyre::Result<HashMap<BlockHash, Batch>> {
+        // option approach required for startup - this should never happen
         let Some(batch_fetcher) = self.batch_fetcher.as_ref() else {
             return Err(eyre::eyre!(
                 "fetch_batches() is unsupported via RPC interface, please call via local worker handler instead".to_string(),
             ));
         };
-        let batches = batch_fetcher.fetch(digests).await;
-        Ok(FetchBatchResponse { batches })
+
+        batch_fetcher.fetch_for_primary(digests).await
     }
 }
