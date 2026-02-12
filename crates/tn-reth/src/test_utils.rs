@@ -61,12 +61,12 @@ impl RethEnv {
 
     /// Retrieve the state at the provided block hash.
     pub fn state_by_block_hash(&self, hash: BlockHash) -> TnRethResult<StateProviderBox> {
-        Ok(self.blockchain_provider.state_by_block_hash(hash)?)
+        Ok(self.inner.blockchain_provider.state_by_block_hash(hash)?)
     }
 
     /// Retrieve the account balance.
     pub fn retrieve_account(&self, address: &Address) -> TnRethResult<Option<Account>> {
-        Ok(self.blockchain_provider.basic_account(address)?)
+        Ok(self.inner.blockchain_provider.basic_account(address)?)
     }
 
     /// Create an EVM-environment from state provider.
@@ -77,7 +77,11 @@ impl RethEnv {
             .with_database(StateProviderDatabase::new(state))
             .with_bundle_update()
             .build();
-        Ok(self.evm_config.evm_factory().create_evm(db, self.evm_config.evm_env(&header)?))
+        Ok(self
+            .inner
+            .evm_config
+            .evm_factory()
+            .create_evm(db, self.inner.evm_config.evm_env(&header)?))
     }
 
     /// Test utility to execute batch and return execution outcome.
@@ -147,7 +151,7 @@ impl RethEnv {
         let mut db = StateProviderDatabase::new(
             self.latest().expect("provider retrieves latest during test batch execution"),
         );
-        let executor = self.evm_config.executor(&mut db);
+        let executor = self.inner.evm_config.executor(&mut db);
         let res = executor
             .execute(&RecoveredBlock::new_unhashed(block, signers))
             .expect("execute one block");
