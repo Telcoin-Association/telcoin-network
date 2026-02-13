@@ -6,7 +6,7 @@ use crate::{
     crypto, encode,
     error::{CertificateError, CertificateResult},
     Address, Batch, BlockHash, BlsSignature, Certificate, Committee, Digest, Epoch, Hash,
-    ReputationScores, Round, TimestampSec, B256,
+    ReputationScores, Round, SealedHeader, TimestampSec, B256,
 };
 use alloy::primitives::keccak256;
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,14 @@ use tracing::{error, warn};
 
 /// A global sequence number assigned to every CommittedSubDag.
 pub type SequenceNumber = u64;
+
+/// Notification sent by execution to consensus after processing one consensus output.
+///
+/// Tuple contents are:
+/// - leader round from consensus
+/// - consensus header hash
+/// - latest canonical tip when execution produced a block (`None` when execution was skipped)
+pub type EngineUpdate = (Round, B256, Option<SealedHeader>);
 
 #[derive(Debug, Clone)]
 /// Struct that contains all necessary information for executing a batch post-consensus.

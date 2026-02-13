@@ -3,9 +3,7 @@ use crate::manager::WORKER_TASK_BASE;
 use std::sync::Arc;
 use tn_config::ConsensusConfig;
 use tn_types::{BatchValidation, Database as ConsensusDatabase, WorkerId};
-use tn_worker::{
-    metrics::Metrics, new_worker, quorum_waiter::QuorumWaiter, Worker, WorkerNetworkHandle,
-};
+use tn_worker::{new_worker, quorum_waiter::QuorumWaiter, Worker, WorkerNetworkHandle};
 use tokio::sync::RwLock;
 
 #[derive(Debug)]
@@ -28,12 +26,9 @@ impl<CDB: ConsensusDatabase> WorkerNodeInner<CDB> {
     ///
     /// Return the task manager for the worker and the [Worker] struct for spawning execution tasks.
     async fn new_worker(&mut self) -> eyre::Result<Worker<CDB, QuorumWaiter>> {
-        let metrics = Metrics::default();
-
         let batch_provider = new_worker(
             self.id,
             self.validator.clone(),
-            metrics,
             self.consensus_config.clone(),
             self.network_handle.clone(),
         );

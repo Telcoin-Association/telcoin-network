@@ -37,6 +37,7 @@ use error::{TnRethError, TnRethResult};
 use evm::TnEvmConfig;
 use eyre::OptionExt;
 use jsonrpsee::Methods;
+use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 use reth::{
     args::{
         DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, DiscoveryArgs, EngineArgs, EraArgs,
@@ -111,9 +112,9 @@ use tn_config::{
 };
 use tn_types::{
     gas_accumulator::RewardsCounter, Address, BlockBody, BlockHashOrNumber, BlockHeader as _,
-    BlockNumHash, BlockNumber, Epoch, ExecHeader, Genesis, GenesisAccount, RecoveredBlock,
-    SealedBlock, SealedHeader, TaskManager, TaskSpawner, TransactionSigned, B256,
-    ETHEREUM_BLOCK_GAS_LIMIT_30M, U256,
+    BlockNumHash, BlockNumber, EngineUpdate, Epoch, ExecHeader, Genesis, GenesisAccount,
+    RecoveredBlock, Round, SealedBlock, SealedHeader, TaskManager, TaskSpawner, TransactionSigned,
+    B256, ETHEREUM_BLOCK_GAS_LIMIT_30M, U256,
 };
 use tracing::{debug, error, info, warn};
 use traits::{TNPrimitives, TelcoinNode};
@@ -437,8 +438,19 @@ impl RethConfig {
 /// It should allow the telcoin app to access the required functionality without
 /// leaking Reth internals all over the codebase (this makes staying up to date
 /// VERY time consuming).
+///
+/// `RethEnv` wraps its fields in an `Arc<RethEnvInner>` so that cloning is cheap
+/// (just an `Arc` bump) and the type is trivially `Send + Sync`.
 #[derive(Clone)]
 pub struct RethEnv {
+    /// The inner state wrapped in an Arc for cheap cloning and thread safety.
+    inner: Arc<RethEnvInner>,
+}
+
+/// Inner state for [`RethEnv`].
+///
+/// This struct holds all the actual fields and is wrapped in an `Arc` by `RethEnv`.
+struct RethEnvInner {
     /// The type that holds all information needed to launch the node's engine.
     ///
     /// The [NodeConfig] is reth-specific and holds many helper functions that
@@ -454,7 +466,7 @@ pub struct RethEnv {
 
 impl std::fmt::Debug for RethEnv {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "RethEnv, config: {:?}", self.node_config)
+        write!(f, "RethEnv, config: {:?}", self.inner.node_config)
     }
 }
 
@@ -531,7 +543,14 @@ impl RethEnv {
         let task_spawner = task_manager.get_spawner();
         set_basefee_address(basefee_address);
 
-        Ok(Self { node_config, blockchain_provider, evm_config, task_spawner })
+        Ok(Self {
+            inner: Arc::new(RethEnvInner {
+                node_config,
+                blockchain_provider,
+                evm_config,
+                task_spawner,
+            }),
+        })
     }
 
     /// Initialize the provider factory and related components
@@ -556,27 +575,31 @@ impl RethEnv {
 
     /// Initialize a new transaction pool for worker.
     pub fn init_txn_pool(&self) -> eyre::Result<WorkerTxPool> {
-        WorkerTxPool::new(&self.node_config, &self.task_spawner, &self.blockchain_provider)
+        WorkerTxPool::new(
+            &self.inner.node_config,
+            &self.inner.task_spawner,
+            &self.inner.blockchain_provider,
+        )
     }
 
     /// Return a channel reciever that will return each canonical block in turn.
     pub fn canonical_block_stream(&self) -> CanonStateNotificationStream {
-        self.blockchain_provider.canonical_state_stream()
+        self.inner.blockchain_provider.canonical_state_stream()
     }
 
     /// Return a reference to the [TaskSpawner] for spawning tasks.
     pub fn get_task_spawner(&self) -> &TaskSpawner {
-        &self.task_spawner
+        &self.inner.task_spawner
     }
 
     /// Return the chainspec for this instance.
     pub fn chainspec(&self) -> ChainSpec {
-        ChainSpec(self.node_config.chain.clone())
+        ChainSpec(self.inner.node_config.chain.clone())
     }
 
     /// Return the canonical in-memory state.
     pub fn canonical_in_memory_state(&self) -> CanonicalInMemoryState {
-        self.blockchain_provider.canonical_in_memory_state()
+        self.inner.blockchain_provider.canonical_in_memory_state()
     }
 
     /// Construct a canonical block from a worker's block that reached consensus.
@@ -587,7 +610,8 @@ impl RethEnv {
     ) -> TnRethResult<ExecutedBlockWithTrieUpdates> {
         let parent_header = payload.parent_header.clone();
         debug!(target: "engine", ?parent_header, "retrieving state for next block");
-        let state_provider = self.blockchain_provider.state_by_block_hash(parent_header.hash())?;
+        let state_provider =
+            self.inner.blockchain_provider.state_by_block_hash(parent_header.hash())?;
         let state = StateProviderDatabase::new(&state_provider);
         let mut cached_reads = CachedReads::default();
         let mut db = State::builder()
@@ -605,23 +629,33 @@ impl RethEnv {
         let batch_digest = payload.batch_digest;
 
         let mut builder =
-            self.evm_config.builder_for_next_block(&mut db, &parent_header, payload)?;
+            self.inner.evm_config.builder_for_next_block(&mut db, &parent_header, payload)?;
 
         builder.apply_pre_execution_changes().inspect_err(|err| {
             warn!(target: "engine", %err, "failed to apply pre-execution changes");
         })?;
 
-        for tx_bytes in transactions {
-            let recovered = reth_recover_raw_transaction::<TransactionSigned>(tx_bytes)
-                .inspect_err(|e| {
-                    error!(
-                        target: "engine",
-                        batch=?batch_digest,
-                        ?tx_bytes,
-                        "failed to recover signer: {e}"
-                    )
-                })?;
+        // Phase 1: Recover all transactions (ECDSA ecrecover) in parallel via rayon.
+        // Always use par_iter — the slight overhead on small batches is negligible
+        // compared to the savings on large ones, and avoids an extra code path.
+        let recovered_txs = transactions
+            .par_iter()
+            .map(|tx_bytes| {
+                reth_recover_raw_transaction::<TransactionSigned>(tx_bytes)
+                    .inspect_err(|e| {
+                        error!(
+                            target: "engine",
+                            batch=?batch_digest,
+                            ?tx_bytes,
+                            "failed to recover signer: {e}"
+                        )
+                    })
+                    .map_err(TnRethError::from)
+            })
+            .collect::<TnRethResult<Vec<_>>>()?;
 
+        // Phase 2: Execute recovered transactions sequentially.
+        for recovered in recovered_txs {
             // forks are impossible
             match builder.execute_transaction(recovered.clone()) {
                 Ok(_gas_used) => (),
@@ -668,21 +702,24 @@ impl RethEnv {
     pub fn finalize_block(&self, header: SealedHeader) -> TnRethResult<()> {
         let num_hash = header.num_hash();
         // persiste final block info for node recovery
-        let provider = self.blockchain_provider.database_provider_rw()?;
+        let provider = self.inner.blockchain_provider.database_provider_rw()?;
         provider.save_finalized_block_number(header.number)?;
         // this clears up old blocks in-memory
-        self.blockchain_provider.set_finalized(header.clone());
+        self.inner.blockchain_provider.set_finalized(header.clone());
 
         // update safe block last because this is less time sensitive but still needs to happen
         provider.save_safe_block_number(header.number)?;
-        self.blockchain_provider.set_safe(header);
+        self.inner.blockchain_provider.set_safe(header);
 
         // commit db transaction
         provider.commit()?;
 
         // cleanup chain state in memory
         // this returns the `canonical_chain().count()` back to 0
-        self.blockchain_provider.canonical_in_memory_state().remove_persisted_blocks(num_hash);
+        self.inner
+            .blockchain_provider
+            .canonical_in_memory_state()
+            .remove_persisted_blocks(num_hash);
 
         Ok(())
     }
@@ -695,6 +732,7 @@ impl RethEnv {
     pub fn finish_executing_output(
         &self,
         blocks: Vec<ExecutedBlockWithTrieUpdates>,
+        engine_update: Option<(Round, B256, tokio::sync::mpsc::Sender<EngineUpdate>)>,
     ) -> TnRethResult<()> {
         // NOTE: this makes all blocks canonical, commits them to the database,
         // and broadcasts new chain on `canon_state_notification_sender`
@@ -710,8 +748,8 @@ impl RethEnv {
         );
 
         // insert blocks to db
-        let provider_rw = self.blockchain_provider.database_provider_rw()?;
-        let static_file_provider = self.blockchain_provider.static_file_provider();
+        let provider_rw = self.inner.blockchain_provider.database_provider_rw()?;
+        let static_file_provider = self.inner.blockchain_provider.static_file_provider();
         UnifiedStorageWriter::from(&provider_rw, &static_file_provider)
             .save_blocks(blocks.clone())?;
         UnifiedStorageWriter::commit(provider_rw)?;
@@ -732,9 +770,21 @@ impl RethEnv {
             canonical_head.hash(),
         );
 
-        let notification = chain_update.to_chain_notification();
+        if let Some((leader_round, consensus_hash, engine_update_tx)) = engine_update {
+            engine_update_tx
+                .try_send((
+                    leader_round,
+                    consensus_hash,
+                    Some(canonical_head.clone_sealed_header()),
+                ))
+                .map_err(|e| {
+                    error!(target: "engine", ?e, "engine update channel send failed");
+                    TnRethError::EngineUpdateChannelClosed
+                })?;
+        }
 
         // broadcast canonical update
+        let notification = chain_update.to_chain_notification();
         self.canonical_in_memory_state().notify_canon_state(notification);
 
         Ok(())
@@ -749,17 +799,18 @@ impl RethEnv {
 
     /// Look up and return the sealed header for hash.
     pub fn sealed_header_by_hash(&self, hash: B256) -> TnRethResult<Option<SealedHeader>> {
-        Ok(self.blockchain_provider.sealed_header_by_hash(hash)?)
+        Ok(self.inner.blockchain_provider.sealed_header_by_hash(hash)?)
     }
 
     /// Look up and return the sealed header for block number.
     pub fn sealed_header_by_number(&self, number: u64) -> TnRethResult<Option<SealedHeader>> {
-        Ok(self.blockchain_provider.database_provider_ro()?.sealed_header(number)?)
+        Ok(self.inner.blockchain_provider.database_provider_ro()?.sealed_header(number)?)
     }
 
     /// Look up and return the sealed block for number.
     pub fn sealed_block_by_number(&self, number: u64) -> TnRethResult<Option<SealedBlock>> {
         Ok(self
+            .inner
             .blockchain_provider
             .sealed_block_with_senders(
                 BlockHashOrNumber::Number(number),
@@ -773,7 +824,10 @@ impl RethEnv {
         &self,
         id: BlockHashOrNumber,
     ) -> TnRethResult<Option<BlockWithSenders>> {
-        Ok(self.blockchain_provider.sealed_block_with_senders(id, TransactionVariant::NoHash)?)
+        Ok(self
+            .inner
+            .blockchain_provider
+            .sealed_block_with_senders(id, TransactionVariant::NoHash)?)
     }
 
     /// Return the blocks with senders for a range of block numbers.
@@ -781,7 +835,7 @@ impl RethEnv {
         &self,
         range: RangeInclusive<BlockNumber>,
     ) -> TnRethResult<Vec<BlockWithSenders>> {
-        Ok(self.blockchain_provider.block_with_senders_range(range)?)
+        Ok(self.inner.blockchain_provider.block_with_senders_range(range)?)
     }
 
     /// Return the blocks for a range of block numbers.
@@ -789,13 +843,14 @@ impl RethEnv {
         &self,
         range: RangeInclusive<BlockNumber>,
     ) -> TnRethResult<Vec<SealedHeader>> {
-        Ok(self.blockchain_provider.sealed_headers_range(range)?)
+        Ok(self.inner.blockchain_provider.sealed_headers_range(range)?)
     }
 
     /// Return the head header from the reth db.
     pub fn lookup_head(&self) -> TnRethResult<SealedHeader> {
-        let head = self.node_config.lookup_head(&self.blockchain_provider)?;
+        let head = self.inner.node_config.lookup_head(&self.inner.blockchain_provider)?;
         let header = self
+            .inner
             .blockchain_provider
             .sealed_header(head.number)?
             .expect("Failed to retrieve sealed header from head's block number");
@@ -804,7 +859,7 @@ impl RethEnv {
 
     /// If a dubug max round is set then return it.
     pub fn get_debug_max_round(&self) -> Option<u64> {
-        self.node_config.debug.max_block
+        self.inner.node_config.debug.max_block
     }
 
     /// Helper to get the gas price based on the provider's latest header.
@@ -815,20 +870,20 @@ impl RethEnv {
 
     /// Return the execution header for hash if available.
     pub fn header(&self, hash: B256) -> TnRethResult<Option<ExecHeader>> {
-        Ok(self.blockchain_provider.header(&hash)?)
+        Ok(self.inner.blockchain_provider.header(&hash)?)
     }
 
     /// Return the execution header for block number if available.
     pub fn header_by_number(&self, block_num: u64) -> TnRethResult<Option<ExecHeader>> {
-        Ok(self.blockchain_provider.database_provider_ro()?.header_by_number(block_num)?)
+        Ok(self.inner.blockchain_provider.database_provider_ro()?.header_by_number(block_num)?)
     }
 
     /// Return the finalalized execution header if available.
     pub fn finalized_header(&self) -> TnRethResult<Option<ExecHeader>> {
         let finalized_block_num_hash =
-            self.blockchain_provider.finalized_block_num_hash().unwrap_or_default();
+            self.inner.blockchain_provider.finalized_block_num_hash().unwrap_or_default();
         if let Some(finalized_block_num_hash) = finalized_block_num_hash {
-            Ok(self.blockchain_provider.header(&finalized_block_num_hash.hash)?)
+            Ok(self.inner.blockchain_provider.header(&finalized_block_num_hash.hash)?)
         } else {
             Ok(None)
         }
@@ -836,26 +891,27 @@ impl RethEnv {
 
     /// Return the latest canonical block number.
     pub fn last_block_number(&self) -> TnRethResult<u64> {
-        Ok(self.blockchain_provider.database_provider_ro()?.last_block_number().unwrap_or(0))
+        Ok(self.inner.blockchain_provider.database_provider_ro()?.last_block_number().unwrap_or(0))
     }
 
     /// Return the block number and hash for the current canonical tip.
     ///
     /// This checks the canonical-in-memory-state.
     pub fn canonical_tip(&self) -> SealedHeader {
-        self.blockchain_provider.canonical_in_memory_state().get_canonical_head()
+        self.inner.blockchain_provider.canonical_in_memory_state().get_canonical_head()
     }
 
     /// If available return the finalized block number and hash.
     ///
     /// This checks the canonical-in-memory-state.
     pub fn finalized_block_num_hash(&self) -> TnRethResult<Option<BlockNumHash>> {
-        Ok(self.blockchain_provider.finalized_block_num_hash()?)
+        Ok(self.inner.blockchain_provider.finalized_block_num_hash()?)
     }
 
     /// Returns the block number of the last finialized block.
     pub fn last_finalized_block_number(&self) -> TnRethResult<u64> {
         Ok(self
+            .inner
             .blockchain_provider
             .database_provider_ro()?
             .last_finalized_block_number()?
@@ -869,10 +925,11 @@ impl RethEnv {
     /// will resync with the network if it exists.
     pub fn finalized_block_hash_number_for_startup(&self) -> TnRethResult<BlockHashNumber> {
         let hash = self
+            .inner
             .blockchain_provider
             .finalized_block_hash()?
-            .unwrap_or_else(|| self.node_config.chain.sealed_genesis_header().hash());
-        let number = self.blockchain_provider.finalized_block_number()?.unwrap_or_default();
+            .unwrap_or_else(|| self.inner.node_config.chain.sealed_genesis_header().hash());
+        let number = self.inner.blockchain_provider.finalized_block_number()?.unwrap_or_default();
         Ok(BlockHashNumber { hash, number })
     }
 
@@ -890,23 +947,23 @@ impl RethEnv {
         > = transaction_pool.into();
         let tn_execution = Arc::new(TNExecution);
         let rpc_builder = RpcModuleBuilder::default()
-            .with_provider(self.blockchain_provider.clone())
+            .with_provider(self.inner.blockchain_provider.clone())
             .with_pool(transaction_pool.clone())
             .with_network(network.clone())
-            .with_executor(Box::new(self.task_spawner.clone()))
-            .with_evm_config(self.evm_config.clone())
-            // .with_events(self.blockchain_provider.clone())
+            .with_executor(Box::new(self.inner.task_spawner.clone()))
+            .with_evm_config(self.inner.evm_config.clone())
+            // .with_events(self.inner.blockchain_provider.clone())
             // .with_block_executor(self.evm_executor.clone())
             .with_consensus(tn_execution.clone());
 
         // //.node_configure namespaces
-        let modules_config = self.node_config.rpc.transport_rpc_module_config();
+        let modules_config = self.inner.node_config.rpc.transport_rpc_module_config();
         let eth_api = EthApi::builder(
-            self.blockchain_provider.clone(),
+            self.inner.blockchain_provider.clone(),
             transaction_pool,
             network,
             // TODO: there is a trait definition blocking TNEvmConfig
-            EthEvmConfig::new(self.blockchain_provider.chain_spec()),
+            EthEvmConfig::new(self.inner.blockchain_provider.chain_spec()),
         )
         .build();
 
@@ -920,13 +977,13 @@ impl RethEnv {
 
     /// Start running the RPC server for this instance.
     pub async fn start_rpc(&self, server: &RpcServer) -> TnRethResult<RpcServerHandle> {
-        let server_config = self.node_config.rpc.rpc_server_config();
+        let server_config = self.inner.node_config.rpc.rpc_server_config();
         Ok(server_config.start(server).await?)
     }
 
     /// Provide the state for the latest block in this instance.
     pub fn latest(&self) -> TnRethResult<StateProviderBox> {
-        Ok(self.blockchain_provider.latest()?)
+        Ok(self.inner.blockchain_provider.latest()?)
     }
 
     /// Create a new temp RethEnv using a specified chain spec.
@@ -973,9 +1030,9 @@ impl RethEnv {
 
         // deploy blsg1 library separately first, scoped to release borrow on db before registry
         let blsg1_address = {
-            let mut tn_evm = reth_env.evm_config.evm_factory().create_evm(
+            let mut tn_evm = reth_env.inner.evm_config.evm_factory().create_evm(
                 &mut db,
-                reth_env.evm_config.evm_env(&tmp_chain.sealed_genesis_header())?,
+                reth_env.inner.evm_config.evm_env(&tmp_chain.sealed_genesis_header())?,
             );
 
             let blsg1_initcode_binding =
@@ -1048,13 +1105,13 @@ impl RethEnv {
         // after adding bls proof of possession, registry precompile exceeds size limit so disable
         // it for tmp chain
         let mut tmp_evm_no_eip170 =
-            reth_env.evm_config.evm_env(&tmp_chain.sealed_genesis_header())?;
+            reth_env.inner.evm_config.evm_env(&tmp_chain.sealed_genesis_header())?;
         tmp_evm_no_eip170.cfg_env.limit_contract_code_size = Some(0x12000000);
 
         // deploy registry now that it can use the previously deployed blsg1 lib
         let tmp_registry_address = {
             let mut tn_evm =
-                reth_env.evm_config.evm_factory().create_evm(&mut db, tmp_evm_no_eip170);
+                reth_env.inner.evm_config.evm_factory().create_evm(&mut db, tmp_evm_no_eip170);
             let ResultAndState { result, state } =
                 tn_evm.transact_pre_genesis_create(owner_address, create_registry.into())?;
             debug!(target: "engine", "create consensus registry result:\n{:#?}", result);
@@ -1195,14 +1252,16 @@ impl RethEnv {
         // create EVM with latest state
         let canonical_tip = self.canonical_tip();
         debug!(target: "engine", ?canonical_tip, "retrieving epoch state from canonical tip");
-        let state_provider = self.blockchain_provider.state_by_block_hash(canonical_tip.hash())?;
+        let state_provider =
+            self.inner.blockchain_provider.state_by_block_hash(canonical_tip.hash())?;
         let state = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder().with_database(state).with_bundle_update().build();
         debug!(target: "engine", state=?db.bundle_state, hashes=?db.block_hashes, "retrieving epoch state from canonical tip");
         let mut tn_evm = self
+            .inner
             .evm_config
             .evm_factory()
-            .create_evm(&mut db, self.evm_config.evm_env(&canonical_tip)?);
+            .create_evm(&mut db, self.inner.evm_config.evm_env(&canonical_tip)?);
 
         // current epoch number
         let epoch = self.get_current_epoch_number(&mut tn_evm)?;
@@ -1233,14 +1292,16 @@ impl RethEnv {
         // create EVM with latest state
         let canonical_tip = self.canonical_tip();
         debug!(target: "engine", ?canonical_tip, "retrieving validators for epoch {epoch}");
-        let state_provider = self.blockchain_provider.state_by_block_hash(canonical_tip.hash())?;
+        let state_provider =
+            self.inner.blockchain_provider.state_by_block_hash(canonical_tip.hash())?;
         let state = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder().with_database(state).with_bundle_update().build();
         debug!(target: "engine", state=?db.bundle_state, hashes=?db.block_hashes, "retrieving epoch state from canonical tip");
         let mut tn_evm = self
+            .inner
             .evm_config
             .evm_factory()
-            .create_evm(&mut db, self.evm_config.evm_env(&canonical_tip)?);
+            .create_evm(&mut db, self.inner.evm_config.evm_env(&canonical_tip)?);
 
         self.get_committee_validators_by_epoch(epoch, &mut tn_evm)
     }
@@ -1392,11 +1453,12 @@ mod tests {
         let block = reth_env.build_block_from_batch_payload(payload, &transactions)?;
         // update chain state - normally handled by tn_engine::payload_builder
         let canonical_header = block.recovered_block.clone_sealed_header();
-        let canonical_in_memory_state = reth_env.blockchain_provider.canonical_in_memory_state();
+        let canonical_in_memory_state =
+            reth_env.inner.blockchain_provider.canonical_in_memory_state();
         canonical_in_memory_state
             .update_chain(NewCanonicalChain::Commit { new: vec![block.clone()] });
         canonical_in_memory_state.set_canonical_head(canonical_header.clone());
-        reth_env.finish_executing_output(vec![block.clone()])?;
+        reth_env.finish_executing_output(vec![block.clone()], None)?;
         reth_env.finalize_block(canonical_header.clone())?;
         Ok(block)
     }
@@ -1616,9 +1678,10 @@ mod tests {
             .with_bundle_update()
             .build();
         let mut tn_evm = reth_env
+            .inner
             .evm_config
             .evm_factory()
-            .create_evm(&mut db, reth_env.evm_config.evm_env(canonical_header.header())?);
+            .create_evm(&mut db, reth_env.inner.evm_config.evm_env(canonical_header.header())?);
 
         // read new committee (always 2 epochs ahead)
         let calldata = ConsensusRegistry::getEpochInfoCall { epoch: epoch + 1 }.abi_encode().into();
@@ -1695,9 +1758,10 @@ mod tests {
             .with_bundle_update()
             .build();
         let mut tn_evm = reth_env
+            .inner
             .evm_config
             .evm_factory()
-            .create_evm(&mut db, reth_env.evm_config.evm_env(canonical_header.header())?);
+            .create_evm(&mut db, reth_env.inner.evm_config.evm_env(canonical_header.header())?);
 
         // assert validator 2 is pending exit
         let calldata =
@@ -1758,9 +1822,10 @@ mod tests {
             .with_bundle_update()
             .build();
         let mut tn_evm = reth_env
+            .inner
             .evm_config
             .evm_factory()
-            .create_evm(&mut db, reth_env.evm_config.evm_env(canonical_header.header())?);
+            .create_evm(&mut db, reth_env.inner.evm_config.evm_env(canonical_header.header())?);
 
         // assert validator 2 is pending exit
         let calldata =
@@ -1800,6 +1865,57 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn test_parallel_recovery_preserves_order() {
+        use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
+        use tn_types::Encodable2718;
+
+        // Create 20 transactions from different random signers so each tx is unique.
+        let chain: Arc<RethChainSpec> = Arc::new(tn_types::test_genesis().into());
+        let num_txs = 20;
+        let mut encoded_txs = Vec::with_capacity(num_txs);
+        for i in 0..num_txs {
+            let mut factory =
+                TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(i as u64));
+            let tx = factory.create_eip1559(
+                chain.clone(),
+                None,
+                100_000,
+                Some(Address::ZERO),
+                U256::from(1),
+                Default::default(),
+            );
+            encoded_txs.push(tx.encoded_2718());
+        }
+
+        // Recover sequentially
+        let sequential: Vec<_> = encoded_txs
+            .iter()
+            .map(|tx_bytes| {
+                reth_recover_raw_transaction::<TransactionSigned>(tx_bytes)
+                    .expect("sequential recovery")
+            })
+            .collect();
+
+        // Recover in parallel (using rayon, same as production code)
+        let parallel: Vec<_> = encoded_txs
+            .par_iter()
+            .map(|tx_bytes| {
+                reth_recover_raw_transaction::<TransactionSigned>(tx_bytes)
+                    .expect("parallel recovery")
+            })
+            .collect();
+
+        // Assert same length
+        assert_eq!(sequential.len(), parallel.len());
+
+        // Assert same order by comparing tx hashes and recovered signer addresses
+        for (seq, par) in sequential.iter().zip(parallel.iter()) {
+            assert_eq!(seq.hash(), par.hash(), "transaction hashes must match in order");
+            assert_eq!(seq.signer(), par.signer(), "recovered signers must match in order");
+        }
     }
 
     #[test]

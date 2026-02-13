@@ -9,8 +9,6 @@ mod worker;
 pub use network::{WorkerNetwork, WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 pub mod quorum_waiter;
 
-pub mod metrics;
-
 pub use crate::{
     network::{
         error::WorkerNetworkError,

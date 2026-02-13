@@ -2,13 +2,12 @@
 
 use crate::{
     consensus::{
-        Bullshark, Consensus, ConsensusError, ConsensusMetrics, ConsensusState, LeaderSchedule,
-        LeaderSwapTable,
+        Bullshark, Consensus, ConsensusError, ConsensusState, LeaderSchedule, LeaderSwapTable,
     },
     test_utils::{make_optimal_certificates, mock_certificate},
     ConsensusBus,
 };
-use std::{collections::BTreeSet, sync::Arc};
+use std::collections::BTreeSet;
 use tn_storage::{mem_db::MemDatabase, CertificateStore, ConsensusStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
@@ -47,7 +46,6 @@ async fn test_consensus_recovery_with_bullshark() {
     let (certificates, _next_parents) =
         make_optimal_certificates(&committee, 1..=7, &genesis, &ids);
 
-    let metrics = Arc::new(ConsensusMetrics::default());
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),
         consensus_store.clone(),
@@ -55,7 +53,6 @@ async fn test_consensus_recovery_with_bullshark() {
     );
     let bullshark = Bullshark::new(
         committee.clone(),
-        metrics.clone(),
         num_sub_dags_per_schedule,
         leader_schedule.clone(),
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
@@ -63,8 +60,9 @@ async fn test_consensus_recovery_with_bullshark() {
 
     let cb = ConsensusBus::new();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
-    let mut rx_output = cb.sequence().subscribe();
+    cb.recent_blocks()
+        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
+    let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
     Consensus::spawn(config.clone(), &cb, bullshark, &task_manager);
 
@@ -140,7 +138,6 @@ async fn test_consensus_recovery_with_bullshark() {
     );
     let bullshark = Bullshark::new(
         committee.clone(),
-        metrics.clone(),
         num_sub_dags_per_schedule,
         leader_schedule,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
@@ -148,8 +145,9 @@ async fn test_consensus_recovery_with_bullshark() {
 
     let cb = ConsensusBus::new();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
-    let mut rx_output = cb.sequence().subscribe();
+    cb.recent_blocks()
+        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
+    let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
     Consensus::spawn(config.clone(), &cb, bullshark, &task_manager);
 
@@ -198,7 +196,6 @@ async fn test_consensus_recovery_with_bullshark() {
     let bad_nodes_stake_threshold = 0;
     let bullshark = Bullshark::new(
         committee.clone(),
-        metrics.clone(),
         num_sub_dags_per_schedule,
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
         bad_nodes_stake_threshold,
@@ -206,8 +203,9 @@ async fn test_consensus_recovery_with_bullshark() {
 
     let cb = ConsensusBus::new();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
-    let mut rx_output = cb.sequence().subscribe();
+    cb.recent_blocks()
+        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
+    let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
     Consensus::spawn(config, &cb, bullshark, &task_manager);
 
@@ -271,9 +269,8 @@ async fn test_dag_rejects_certificate_with_missing_parents() {
     let committee = fixture.committee();
     let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
 
-    let metrics = Arc::new(ConsensusMetrics::default());
     let gc_depth = 10;
-    let mut state = ConsensusState::new(metrics, gc_depth);
+    let mut state = ConsensusState::new(gc_depth);
 
     // Get genesis digests
     let genesis: BTreeSet<CertificateDigest> =
@@ -320,9 +317,8 @@ async fn test_dag_rejects_certificate_at_gc_boundary() {
     let committee = fixture.committee();
     let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
 
-    let metrics = Arc::new(ConsensusMetrics::default());
     let gc_depth = 5;
-    let mut state = ConsensusState::new(metrics, gc_depth);
+    let mut state = ConsensusState::new(gc_depth);
 
     let genesis: BTreeSet<CertificateDigest> =
         Certificate::genesis(&committee).iter().map(|x| x.digest()).collect();
@@ -366,9 +362,8 @@ async fn test_dag_detects_equivocation_same_round_different_cert() {
     let committee = fixture.committee();
     let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
 
-    let metrics = Arc::new(ConsensusMetrics::default());
     let gc_depth = 10;
-    let mut state = ConsensusState::new(metrics, gc_depth);
+    let mut state = ConsensusState::new(gc_depth);
 
     let genesis: BTreeSet<CertificateDigest> =
         Certificate::genesis(&committee).iter().map(|x| x.digest()).collect();
@@ -415,9 +410,8 @@ async fn test_dag_accepts_duplicate_certificate_insertion() {
     let committee = fixture.committee();
     let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
 
-    let metrics = Arc::new(ConsensusMetrics::default());
     let gc_depth = 10;
-    let mut state = ConsensusState::new(metrics, gc_depth);
+    let mut state = ConsensusState::new(gc_depth);
 
     let genesis: BTreeSet<CertificateDigest> =
         Certificate::genesis(&committee).iter().map(|x| x.digest()).collect();
@@ -443,9 +437,8 @@ async fn test_dag_rejects_certificate_with_missing_parent_round() {
     let committee = fixture.committee();
     let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
 
-    let metrics = Arc::new(ConsensusMetrics::default());
     let gc_depth = 10;
-    let mut state = ConsensusState::new(metrics, gc_depth);
+    let mut state = ConsensusState::new(gc_depth);
 
     let genesis: BTreeSet<CertificateDigest> =
         Certificate::genesis(&committee).iter().map(|x| x.digest()).collect();

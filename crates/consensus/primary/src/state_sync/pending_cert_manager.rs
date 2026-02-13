@@ -3,10 +3,7 @@
 //! Pending certificates are waiting to be accepted due to missing parents.
 //! This mod manages and tracks pending certificates for rounds of consensus.
 
-use crate::{
-    error::{CertManagerError, CertManagerResult},
-    ConsensusBus,
-};
+use crate::error::{CertManagerError, CertManagerResult};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use tn_types::{Certificate, CertificateDigest, Hash as _, Round};
 use tracing::debug;
@@ -47,14 +44,12 @@ pub(super) struct PendingCertificateManager {
     ///
     /// The keys are (round, digest) to enable garbage collection by round.
     missing_for_pending: BTreeMap<(Round, CertificateDigest), HashSet<CertificateDigest>>,
-    /// Consensus channels.
-    consensus_bus: ConsensusBus,
 }
 
 impl PendingCertificateManager {
     /// Create a new instance of Self.
-    pub(super) fn new(consensus_bus: ConsensusBus) -> Self {
-        Self { pending: Default::default(), missing_for_pending: Default::default(), consensus_bus }
+    pub(super) fn new() -> Self {
+        Self { pending: Default::default(), missing_for_pending: Default::default() }
     }
 
     /// Attempts to insert a new pending certificate.
@@ -69,13 +64,6 @@ impl PendingCertificateManager {
         let parent_round = certificate.round() - 1;
         debug!(target: "primary::pending_certs", ?digest, "Processing certificate with missing parents");
 
-        self.consensus_bus
-            .primary_metrics()
-            .node_metrics
-            .certificates_suspended
-            .with_label_values(&["missing_parents"])
-            .inc();
-
         // track pending certificate
         let pending = PendingCertificate::new(certificate, missing_parents.clone());
         if let Some(existing) = self.pending.insert(digest, pending) {
@@ -88,12 +76,6 @@ impl PendingCertificateManager {
         for parent in missing_parents {
             self.missing_for_pending.entry((parent_round, parent)).or_default().insert(digest);
         }
-
-        self.consensus_bus
-            .primary_metrics()
-            .node_metrics
-            .certificates_currently_suspended
-            .set(self.pending.len() as i64);
 
         Ok(())
     }
@@ -184,6 +166,7 @@ impl PendingCertificateManager {
     }
 
     /// Returns the number of pending certificates.
+    #[cfg(test)]
     pub(super) fn num_pending(&self) -> usize {
         self.pending.len()
     }

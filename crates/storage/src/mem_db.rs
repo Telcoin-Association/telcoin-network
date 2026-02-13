@@ -1,20 +1,10 @@
 //! Impermanent storage in memory - useful for tests.
 
-use std::{
-    collections::{BTreeMap, HashMap},
-    fmt::Debug,
-    marker::PhantomData,
-    sync::{
-        mpsc::{self, SyncSender},
-        Arc,
-    },
-    time::Duration,
-};
+use std::{collections::BTreeMap, fmt::Debug, marker::PhantomData, sync::Arc};
 
 use dashmap::DashMap;
 use ouroboros::self_referencing;
 use parking_lot::{RwLock, RwLockReadGuard};
-use prometheus::{default_registry, register_int_gauge_with_registry, IntGauge, Registry};
 use tn_types::{decode, decode_key, encode, encode_key, DBIter, Database, DbTx, DbTxMut, Table};
 
 type StoreType = DashMap<&'static str, Arc<RwLock<BTreeMap<Vec<u8>, Vec<u8>>>>>;
@@ -90,49 +80,12 @@ impl DbTxMut for MemDbTxMut {
 #[derive(Clone, Debug)]
 pub struct MemDatabase {
     store: Arc<StoreType>,
-    metrics: Arc<RwLock<MemDBMetrics>>,
-    shutdown_tx: Arc<SyncSender<()>>,
-}
-
-impl Drop for MemDatabase {
-    fn drop(&mut self) {
-        if Arc::strong_count(&self.shutdown_tx) <= 1 {
-            tracing::info!(target: "telcoin::memdb", "MemDatabase Dropping, shutting down metrics thread");
-            // shutdown_tx is a sync sender with no buffer so this should block until the thread
-            // reads it and shuts down.
-            if let Err(e) = self.shutdown_tx.send(()) {
-                tracing::error!(target: "telcoin::memdb",
-                    "Error while trying to send shutdown to MemDatabase metrics thread {e}"
-                );
-            }
-        }
-    }
 }
 
 impl MemDatabase {
     pub fn new() -> Self {
         let store: Arc<StoreType> = Arc::new(DashMap::new());
-        let metrics = Arc::new(RwLock::new(MemDBMetrics::default()));
-        let (shutdown_tx, rx) = mpsc::sync_channel::<()>(0);
-
-        let store_cloned = Arc::clone(&store);
-        let metrics_cloned = metrics.clone();
-        // Spawn thread to update metrics from MemDB stats every 30 seconds.
-        std::thread::spawn(move || {
-            tracing::info!(target: "telcoin::memdb", "Starting MemDB metrics thread");
-            while let Err(mpsc::RecvTimeoutError::Timeout) =
-                rx.recv_timeout(Duration::from_secs(30))
-            {
-                for kv in &*store_cloned {
-                    if let Some(m) = metrics_cloned.read().table_counts.get(kv.key()) {
-                        m.set(kv.value().read().len().try_into().unwrap_or(-1));
-                    }
-                }
-            }
-            tracing::info!(target: "telcoin::memdb", "Ending MemDB metrics thread");
-        });
-
-        Self { store, metrics, shutdown_tx: Arc::new(shutdown_tx) }
+        Self { store }
     }
 }
 
@@ -174,21 +127,6 @@ impl Database for MemDatabase {
 
     fn open_table<T: Table>(&self) -> eyre::Result<()> {
         self.store.insert(T::NAME, Arc::new(RwLock::new(BTreeMap::new())));
-        match register_int_gauge_with_registry!(
-            format!("memdb_{}_count", T::NAME),
-            format!("Entries in the {} memory table.", T::NAME),
-            default_registry(),
-        ) {
-            Ok(m) => {
-                self.metrics.write().table_counts.insert(T::NAME, m);
-            }
-            Err(e) => {
-                // This will happen for tests.  Nothing really to do, if the guage is missing then
-                // the metrics thread will just not update it... Log at debug level
-                // in case something else is going on and someone is debugging.
-                tracing::debug!(target: "telcoin::memdb", "Error adding metrics for table {}: {e}", T::NAME)
-            }
-        }
         Ok(())
     }
 
@@ -391,37 +329,6 @@ impl<T: Table> Iterator for MemDBIter<T> {
                 (key, value)
             })
         })
-    }
-}
-
-#[derive(Debug)]
-struct MemDBMetrics {
-    table_counts: HashMap<&'static str, IntGauge>,
-}
-
-impl MemDBMetrics {
-    fn try_new(_registry: &Registry) -> Result<Self, prometheus::Error> {
-        Ok(Self { table_counts: HashMap::default() })
-    }
-}
-
-impl Default for MemDBMetrics {
-    fn default() -> Self {
-        // try_new() should not fail except under certain conditions with testing (see comment
-        // below). This pushes the panic or retry decision lower and supporting try_new
-        // allways a user to deal with errors if desired (have a non-panic option).
-        // We always want do use default_registry() when not in test.
-        match Self::try_new(default_registry()) {
-            Ok(metrics) => metrics,
-            Err(_) => {
-                // If we are in a test then don't panic on prometheus errors (usually an already
-                // registered error) but try again with a new Registry. This is not
-                // great for prod code, however should not happen, but will happen in tests due to
-                // how Rust runs them so lets just gloss over it. cfg(test) does not
-                // always work as expected.
-                Self::try_new(&Registry::new()).expect("Prometheus error, are you using it wrong?")
-            }
-        }
     }
 }
 

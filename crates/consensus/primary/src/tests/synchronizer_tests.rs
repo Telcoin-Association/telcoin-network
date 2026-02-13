@@ -20,7 +20,7 @@ use tn_storage::{mem_db::MemDatabase, traits::Database};
 use tn_types::{
     error::{CertificateError, HeaderError},
     BlsAggregateSignatureBytes, Certificate, Committee, Hash as _, Round,
-    SignatureVerificationState, TaskManager, TnReceiver, TnSender,
+    SignatureVerificationState, TaskManager, TnReceiver,
 };
 
 /// Try to accept certificate. Sleep if error.
@@ -44,8 +44,8 @@ async fn accept_certificates() {
     let certificate_store = primary.consensus_config().node_storage().certificate_store.clone();
 
     let cb = ConsensusBus::new();
-    let mut rx_new_certificates = cb.new_certificates().subscribe();
-    let mut rx_parents = cb.parents().subscribe();
+    let mut rx_new_certificates = cb.subscribe_new_certificates();
+    let mut rx_parents = cb.subscribe_parents();
     // Make a synchronizer.
     let synchronizer = Arc::new(Synchronizer::new(primary.consensus_config(), &cb));
     let task_manager = TaskManager::default();
@@ -81,13 +81,6 @@ async fn accept_certificates() {
         let stored = certificate_store.read(x.digest()).unwrap();
         assert_eq!(stored, Some(x.clone()));
     }
-
-    let mut m = HashMap::new();
-    m.insert("source", "other");
-    assert_eq!(
-        cb.primary_metrics().node_metrics.certificates_processed.get_metric_with(&m).unwrap().get(),
-        3
-    );
 }
 
 #[tokio::test]
@@ -189,16 +182,8 @@ async fn synchronizer_recover_basic() {
     drop(synchronizer);
 
     // Restart Synchronizer.
-
-    let mut m = HashMap::new();
-    m.insert("source", "other");
-    assert_eq!(
-        cb.primary_metrics().node_metrics.certificates_processed.get_metric_with(&m).unwrap().get(),
-        3
-    );
-
     let cb = ConsensusBus::new();
-    let mut rx_parents = cb.parents().subscribe();
+    let mut rx_parents = cb.subscribe_parents();
     let synchronizer = Arc::new(Synchronizer::new(primary.consensus_config(), &cb));
     let task_manager = TaskManager::default();
     synchronizer.spawn(&task_manager);
@@ -218,12 +203,6 @@ async fn synchronizer_recover_basic() {
         let stored = certificate_store.read(x.digest()).unwrap();
         assert_eq!(stored, Some(x.clone()));
     }
-
-    // New metrics, they should be zeroed out.
-    assert_eq!(
-        cb.primary_metrics().node_metrics.certificates_processed.get_metric_with(&m).unwrap().get(),
-        0
-    );
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -249,7 +228,7 @@ async fn synchronizer_recover_partial_certs() {
     // Restart Synchronizer.
 
     let cb = ConsensusBus::new();
-    let mut rx_parents = cb.parents().subscribe();
+    let mut rx_parents = cb.subscribe_parents();
     let synchronizer = Arc::new(Synchronizer::new(primary.consensus_config(), &cb));
     let task_manager = TaskManager::default();
     synchronizer.spawn(&task_manager);
@@ -307,7 +286,7 @@ async fn synchronizer_recover_previous_round() {
     // Restart Synchronizer.
 
     let cb = ConsensusBus::new();
-    let mut rx_parents = cb.parents().subscribe();
+    let mut rx_parents = cb.subscribe_parents();
     let synchronizer = Arc::new(Synchronizer::new(primary.consensus_config(), &cb));
     let task_manager = TaskManager::default();
     synchronizer.spawn(&task_manager);
@@ -365,7 +344,7 @@ async fn deliver_certificate_not_found_parents() {
     let committee = fixture.committee();
 
     let cb = ConsensusBus::new();
-    let mut rx_certificate_fetcher = cb.certificate_fetcher().subscribe();
+    let mut rx_certificate_fetcher = cb.subscribe_certificate_fetcher();
     let synchronizer = Synchronizer::new(primary.consensus_config(), &cb);
     let task_manager = TaskManager::default();
     synchronizer.spawn(&task_manager);
@@ -552,7 +531,7 @@ async fn gc_suspended_certificates() {
     let primary = fixture.authorities().next().unwrap();
 
     let cb = ConsensusBus::new();
-    let mut rx_new_certificates = cb.new_certificates().subscribe();
+    let mut rx_new_certificates = cb.subscribe_new_certificates();
     let synchronizer = Arc::new(Synchronizer::new(primary.consensus_config(), &cb));
     let task_manager = TaskManager::default();
     synchronizer.spawn(&task_manager);

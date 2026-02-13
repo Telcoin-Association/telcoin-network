@@ -345,9 +345,7 @@ mod tests {
         gas_accumulator::GasAccumulator, test_genesis, Bytes, Certificate, CommittedSubDag,
         ConsensusOutput, Database, GenesisAccount, TaskManager, U160, U256,
     };
-    use tn_worker::{
-        metrics::WorkerMetrics, test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle,
-    };
+    use tn_worker::{test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle};
     use tokio::time::timeout;
 
     #[tokio::test]
@@ -381,12 +379,10 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let store = open_db(temp_dir.path());
         let qw = TestMakeBlockQuorumWaiter::new_test();
-        let node_metrics = WorkerMetrics::default();
         let timeout = Duration::from_secs(5);
         let mut block_provider = Worker::new(
             0,
             Some(qw),
-            Arc::new(node_metrics),
             client,
             store.clone(),
             timeout,
@@ -667,8 +663,10 @@ mod tests {
             // canonical update to wake up task
             // execute output to trigger canonical update
             let args = BuildArguments::new(reth_env.clone(), output.clone(), parent);
+            let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
             let final_header =
-                execute_consensus_output(args, gas_accumulator.clone()).expect("output executed");
+                execute_consensus_output(args, gas_accumulator.clone(), engine_update_tx)
+                    .expect("output executed");
 
             // update values for next loop
             parent = final_header;

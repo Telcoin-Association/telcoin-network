@@ -1597,8 +1597,6 @@ dependencies = [
  "http 1.3.1",
  "http-body 1.0.1",
  "http-body-util",
- "hyper 1.6.0",
- "hyper-util",
  "itoa",
  "matchit 0.8.4",
  "memchr",
@@ -1607,7 +1605,6 @@ dependencies = [
  "pin-project-lite",
  "serde_core",
  "sync_wrapper 1.0.2",
- "tokio",
  "tower 0.5.2",
  "tower-layer",
  "tower-service",
@@ -2393,19 +2390,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ca0197aee26d1ae37445ee532fefce43251d24cc7c166799f4d46817f1d3973"
 dependencies = [
  "crossbeam-utils",
-]
-
-[[package]]
-name = "consensus-metrics"
-version = "0.1.0"
-dependencies = [
- "axum 0.8.6",
- "futures",
- "parking_lot",
- "prometheus",
- "tn-types",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -6937,20 +6921,6 @@ dependencies = [
  "bitflags 2.9.1",
  "chrono",
  "hex",
-]
-
-[[package]]
-name = "prometheus"
-version = "0.13.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d33c28a30771f7f96db69893f78b857f7450d7e0237e9c8fc6427a81bae7ed1"
-dependencies = [
- "cfg-if",
- "fnv",
- "lazy_static",
- "memchr",
- "parking_lot",
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -11875,7 +11845,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "clap",
- "consensus-metrics",
  "ecdsa",
  "eyre",
  "futures",
@@ -11946,7 +11915,6 @@ dependencies = [
 name = "tn-node"
 version = "0.1.0"
 dependencies = [
- "consensus-metrics",
  "eyre",
  "jsonrpsee",
  "rand 0.9.1",
@@ -11962,7 +11930,6 @@ dependencies = [
  "tn-network-libp2p",
  "tn-network-types",
  "tn-primary",
- "tn-primary-metrics",
  "tn-reth",
  "tn-rpc",
  "tn-storage",
@@ -11970,7 +11937,6 @@ dependencies = [
  "tn-types",
  "tn-worker",
  "tokio",
- "tokio-stream",
  "tracing",
 ]
 
@@ -11981,7 +11947,6 @@ dependencies = [
  "assert_matches",
  "async-trait",
  "backoff",
- "consensus-metrics",
  "eyre",
  "futures",
  "indexmap 2.9.0",
@@ -11996,21 +11961,11 @@ dependencies = [
  "tn-network-libp2p",
  "tn-network-types",
  "tn-primary",
- "tn-primary-metrics",
  "tn-reth",
  "tn-storage",
  "tn-test-utils-committee",
  "tn-types",
  "tokio",
- "tracing",
-]
-
-[[package]]
-name = "tn-primary-metrics"
-version = "0.1.0"
-dependencies = [
- "consensus-metrics",
- "prometheus",
  "tracing",
 ]
 
@@ -12028,6 +11983,7 @@ dependencies = [
  "parking_lot",
  "proptest",
  "rand 0.9.1",
+ "rayon",
  "reth",
  "reth-chain-state",
  "reth-chainspec",
@@ -12090,7 +12046,6 @@ dependencies = [
  "ouroboros",
  "page_size",
  "parking_lot",
- "prometheus",
  "redb",
  "reth-libmdbx",
  "tempfile",
@@ -12183,7 +12138,6 @@ dependencies = [
  "async-trait",
  "eyre",
  "futures",
- "prometheus",
  "rand 0.9.1",
  "serde",
  "tempfile",

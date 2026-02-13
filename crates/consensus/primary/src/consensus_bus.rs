@@ -6,20 +6,24 @@ use crate::{
     certificate_fetcher::CertificateFetcherCommand, proposer::OurDigestMessage,
     state_sync::CertificateManagerCommand, RecentBlocks,
 };
-use consensus_metrics::metered_channel::{self, channel_with_total_sender, MeteredMpscChannel};
 use parking_lot::Mutex;
-use std::{error::Error, sync::Arc};
+use std::{
+    error::Error,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 use tn_config::Parameters;
 use tn_network_libp2p::types::NetworkEvent;
-use tn_primary_metrics::{ChannelMetrics, ConsensusMetrics, ExecutorMetrics, Metrics};
 use tn_types::{
-    error::HeaderError, BlockHash, BlockNumHash, Certificate, CommittedSubDag, Committee,
-    ConsensusHeader, ConsensusOutput, Epoch, EpochVote, Header, Round, TnReceiver, TnSender,
+    BlockHash, BlockNumHash, Certificate, CommittedSubDag, Committee, ConsensusHeader,
+    ConsensusOutput, Epoch, EpochRecord, EpochVote, Header, Round, TnReceiver, TnSender,
     CHANNEL_CAPACITY,
 };
 use tokio::{
     sync::{
-        broadcast, mpsc, oneshot,
+        broadcast, mpsc,
         watch::{self, error::RecvError},
     },
     time::error::Elapsed,
@@ -32,11 +36,14 @@ use tokio::{
 struct QueChanReceiver<T> {
     receiver: Option<mpsc::Receiver<T>>,
     container: Arc<Mutex<Option<mpsc::Receiver<T>>>>,
+    /// Flag to signal the sender that this receiver has been dropped.
+    subscribed: Arc<AtomicBool>,
 }
 
-/// Use the Drop to decrement subs.
+/// Use the Drop to decrement subs and signal unsubscribed.
 impl<T> Drop for QueChanReceiver<T> {
     fn drop(&mut self) {
+        self.subscribed.store(false, Ordering::Release);
         (*self.container.lock()) = self.receiver.take();
     }
 }
@@ -49,6 +56,9 @@ pub struct QueChannel<T> {
     channel: mpsc::Sender<T>,
     // Putting this in a lock is unfortunate but if want an mpsc under the hood is needed.
     receiver: Arc<Mutex<Option<mpsc::Receiver<T>>>>,
+    /// Tracks whether a receiver is currently subscribed.
+    /// When `false`, `send()` and `try_send()` become no-ops.
+    subscribed: Arc<AtomicBool>,
 }
 
 impl<T> QueChannel<T> {
@@ -56,7 +66,28 @@ impl<T> QueChannel<T> {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         let receiver = Arc::new(Mutex::new(Some(rx)));
-        Self { channel: tx, receiver }
+        let subscribed = Arc::new(AtomicBool::new(false));
+        Self { channel: tx, receiver, subscribed }
+    }
+
+    /// Subscribe to receive messages on this channel.
+    ///
+    /// Must be called in synchronous `spawn()` methods, BEFORE spawning async tasks.
+    /// Can only be called once at a time (returned receiver restores on Drop).
+    pub fn subscribe(&self) -> impl TnReceiver<T> + 'static
+    where
+        T: Send + 'static,
+    {
+        let receiver = self.receiver.lock().take();
+        if receiver.is_none() {
+            panic!("Another subscription is already in use!")
+        }
+        self.subscribed.store(true, Ordering::Release);
+        QueChanReceiver {
+            receiver,
+            container: self.receiver.clone(),
+            subscribed: self.subscribed.clone(),
+        }
     }
 }
 
@@ -68,25 +99,27 @@ impl<T> Default for QueChannel<T> {
 
 impl<T> Clone for QueChannel<T> {
     fn clone(&self) -> Self {
-        Self { channel: self.channel.clone(), receiver: self.receiver.clone() }
+        Self {
+            channel: self.channel.clone(),
+            receiver: self.receiver.clone(),
+            subscribed: self.subscribed.clone(),
+        }
     }
 }
 
 impl<T: Send + 'static> TnSender<T> for QueChannel<T> {
     async fn send(&self, value: T) -> Result<(), tn_types::SendError<T>> {
+        if !self.subscribed.load(Ordering::Acquire) {
+            return Ok(());
+        }
         Ok(self.channel.send(value).await?)
     }
 
     fn try_send(&self, value: T) -> Result<(), tn_types::TrySendError<T>> {
-        Ok(self.channel.try_send(value)?)
-    }
-
-    fn subscribe(&self) -> impl TnReceiver<T> + 'static {
-        let receiver = self.receiver.lock().take();
-        if receiver.is_none() {
-            panic!("Another subscription is already in use!")
+        if !self.subscribed.load(Ordering::Acquire) {
+            return Ok(());
         }
-        QueChanReceiver { receiver, container: self.receiver.clone() }
+        Ok(self.channel.try_send(value)?)
     }
 }
 
@@ -151,32 +184,20 @@ impl NodeMode {
 struct ConsensusBusAppInner {
     /// Outputs the highest committed round & corresponding gc_round in the consensus.
     tx_committed_round_updates: watch::Sender<Round>,
-    /// Hold onto a receiver to keep it "open".
-    _rx_committed_round_updates: watch::Receiver<Round>,
 
     /// An epoch we need an epoch record for.
     tx_requested_missing_epoch: watch::Sender<Epoch>,
-    /// Hold onto a receiver to keep it "open".
-    _rx_requested_missing_epoch: watch::Receiver<Epoch>,
 
     /// Signals a new round
     tx_primary_round_updates: watch::Sender<Round>,
-    /// Hold onto the primary metrics (allow early creation)
-    _rx_primary_round_updates: watch::Receiver<Round>,
 
     /// Watch tracking most recent blocks
     tx_recent_blocks: watch::Sender<RecentBlocks>,
-    /// Hold onto the recent blocks watch to keep it "open"
-    _rx_recent_blocks: watch::Receiver<RecentBlocks>,
 
     /// Watch tracking most recently seen consensus header.
     tx_last_consensus_header: watch::Sender<Option<ConsensusHeader>>,
-    /// Hold onto the consensus header watch to keep it "open"
-    _rx_last_consensus_header: watch::Receiver<Option<ConsensusHeader>>,
     /// Watch tracking the last gossipped consensus block number and hash.
     tx_last_published_consensus_num_hash: watch::Sender<(u64, BlockHash)>,
-    /// Hold onto the published consensus header watch to keep it "open"
-    _rx_last_published_consensus_num_hash: watch::Receiver<(u64, BlockHash)>,
 
     /// Consensus header.  Note this can be used to create consensus output to execute for non
     /// validators.
@@ -186,8 +207,6 @@ struct ConsensusBusAppInner {
     consensus_output: broadcast::Sender<ConsensusOutput>,
     /// Status of sync?
     tx_sync_status: watch::Sender<NodeMode>,
-    /// Hold onto the recent sync_status to keep it "open"
-    _rx_sync_status: watch::Receiver<NodeMode>,
 
     /// Watch channel for the current committee.
     tx_current_committee: watch::Sender<Option<Committee>>,
@@ -195,79 +214,56 @@ struct ConsensusBusAppInner {
     _rx_current_committee: watch::Receiver<Option<Committee>>,
 
     /// Produce new epoch certs as they are recieved.
-    new_epoch_votes: QueChannel<(EpochVote, oneshot::Sender<Result<(), HeaderError>>)>,
+    new_epoch_votes: QueChannel<EpochVote>,
+    /// Watch channel to communicate the current epoch record to the vote collector.
+    tx_epoch_record: watch::Sender<Option<EpochRecord>>,
     /// The que channel for primary network events.
     primary_network_events: QueChannel<NetworkEvent<crate::network::Req, crate::network::Res>>,
-
-    /// Hold onto the consensus_metrics (mostly for testing)
-    consensus_metrics: Arc<ConsensusMetrics>,
-    /// Hold onto the primary metrics (allow early creation)
-    primary_metrics: Arc<Metrics>,
-    /// Hold onto the channel metrics.
-    channel_metrics: Arc<ChannelMetrics>,
-    /// Hold onto the executor metrics.
-    executor_metrics: Arc<ExecutorMetrics>,
 }
 
 impl ConsensusBusAppInner {
     fn new(recent_blocks: u32) -> Self {
-        let consensus_metrics = Arc::new(ConsensusMetrics::default());
-        let primary_metrics = Arc::new(Metrics::default()); // Initialize the metrics
-        let channel_metrics = Arc::new(ChannelMetrics::default());
-        let executor_metrics = Arc::new(ExecutorMetrics::default());
-        let (tx_committed_round_updates, _rx_committed_round_updates) =
-            watch::channel(Round::default());
+        let (tx_committed_round_updates, _) = watch::channel(Round::default());
 
-        let (tx_requested_missing_epoch, _rx_requested_missing_epoch) =
-            watch::channel(Epoch::default());
+        let (tx_requested_missing_epoch, _) = watch::channel(Epoch::default());
 
-        let (tx_primary_round_updates, _rx_primary_round_updates) = watch::channel(0u32);
-        let (tx_last_consensus_header, _rx_last_consensus_header) = watch::channel(None);
-        let (tx_last_published_consensus_num_hash, _rx_last_published_consensus_num_hash) =
-            watch::channel((0, BlockHash::default()));
+        let (tx_primary_round_updates, _) = watch::channel(0u32);
+        let (tx_last_consensus_header, _) = watch::channel(None);
+        let (tx_last_published_consensus_num_hash, _) = watch::channel((0, BlockHash::default()));
 
-        let (tx_recent_blocks, _rx_recent_blocks) =
-            watch::channel(RecentBlocks::new(recent_blocks as usize));
-        let (tx_sync_status, _rx_sync_status) = watch::channel(NodeMode::default());
+        let (tx_recent_blocks, _) = watch::channel(RecentBlocks::new(recent_blocks as usize));
+        let (tx_sync_status, _) = watch::channel(NodeMode::default());
         let (tx_current_committee, _rx_current_committee) = watch::channel(None);
 
         let (consensus_header, _rx_consensus_header) = broadcast::channel(CHANNEL_CAPACITY);
         let (consensus_output, _rx_consensus_output) = broadcast::channel(100);
 
+        let (tx_epoch_record, _) = watch::channel(None);
+
         Self {
             tx_committed_round_updates,
-            _rx_committed_round_updates,
             tx_requested_missing_epoch,
-            _rx_requested_missing_epoch,
 
             tx_primary_round_updates,
-            _rx_primary_round_updates,
             tx_recent_blocks,
-            _rx_recent_blocks,
             tx_last_consensus_header,
-            _rx_last_consensus_header,
             tx_last_published_consensus_num_hash,
-            _rx_last_published_consensus_num_hash,
             consensus_header,
             consensus_output,
             tx_sync_status,
-            _rx_sync_status,
             tx_current_committee,
             _rx_current_committee,
             new_epoch_votes: QueChannel::new(),
+            tx_epoch_record,
             primary_network_events: QueChannel::new(),
-            consensus_metrics,
-            primary_metrics,
-            channel_metrics,
-            executor_metrics,
         }
     }
 
     /// Reset for a new epoch.
     /// This is primarily so we can resubscribe to "one-time" subscription channels.
     fn reset_for_epoch(&self) {
-        let _ = self.tx_committed_round_updates.send(Round::default());
-        let _ = self.tx_primary_round_updates.send(0u32);
+        self.tx_committed_round_updates.send_replace(Round::default());
+        self.tx_primary_round_updates.send_replace(0u32);
     }
 }
 
@@ -278,92 +274,45 @@ impl ConsensusBusAppInner {
 struct ConsensusBusEpochInner {
     /// New certificates from the primary. The primary should send us new certificates
     /// only if it already sent us its whole history.
-    new_certificates: MeteredMpscChannel<Certificate>,
+    new_certificates: QueChannel<Certificate>,
     /// Outputs the sequence of ordered certificates to the primary (for cleanup and feedback).
-    committed_certificates: MeteredMpscChannel<(Round, Vec<Certificate>)>,
+    committed_certificates: QueChannel<(Round, Vec<Certificate>)>,
 
     /// Sends missing certificates to the `CertificateFetcher`.
     /// Receives certificates with missing parents from the `Synchronizer`.
-    certificate_fetcher: MeteredMpscChannel<CertificateFetcherCommand>,
+    certificate_fetcher: QueChannel<CertificateFetcherCommand>,
     /// Send valid a quorum of certificates' ids to the `Proposer` (along with their round).
     /// Receives the parents to include in the next header (along with their round number) from
     /// `Synchronizer`.
-    parents: MeteredMpscChannel<(Vec<Certificate>, Round)>,
+    parents: QueChannel<(Vec<Certificate>, Round)>,
     /// Receives the batches' digests from our workers.
-    our_digests: MeteredMpscChannel<OurDigestMessage>,
+    our_digests: QueChannel<OurDigestMessage>,
     /// Sends newly created headers to the `Certifier`.
-    headers: MeteredMpscChannel<Header>,
+    headers: QueChannel<Header>,
     /// Updates when headers were committed by consensus.
     ///
     /// NOTE: this does not mean the header was executed yet.
-    committed_own_headers: MeteredMpscChannel<(Round, Vec<Round>)>,
+    committed_own_headers: QueChannel<(Round, Vec<Round>)>,
 
     /// Outputs the sequence of ordered certificates to the application layer.
-    sequence: MeteredMpscChannel<CommittedSubDag>,
+    sequence: QueChannel<CommittedSubDag>,
 
     /// Messages to the Certificate Manager.
-    certificate_manager: MeteredMpscChannel<CertificateManagerCommand>,
+    certificate_manager: QueChannel<CertificateManagerCommand>,
 }
 
 impl ConsensusBusEpochInner {
-    fn new(app_inner: &ConsensusBusAppInner) -> Self {
-        let new_certificates = metered_channel::channel_sender(
-            CHANNEL_CAPACITY,
-            &app_inner.primary_metrics.primary_channel_metrics.tx_new_certificates,
-        );
-
-        let committed_certificates = metered_channel::channel_sender(
-            CHANNEL_CAPACITY,
-            &app_inner.primary_metrics.primary_channel_metrics.tx_committed_certificates,
-        );
-
-        let our_digests = channel_with_total_sender(
-            CHANNEL_CAPACITY,
-            &app_inner.primary_metrics.primary_channel_metrics.tx_our_digests,
-            &app_inner.primary_metrics.primary_channel_metrics.tx_our_digests_total,
-        );
-        let parents = channel_with_total_sender(
-            CHANNEL_CAPACITY,
-            &app_inner.primary_metrics.primary_channel_metrics.tx_parents,
-            &app_inner.primary_metrics.primary_channel_metrics.tx_parents_total,
-        );
-        let headers = channel_with_total_sender(
-            CHANNEL_CAPACITY,
-            &app_inner.primary_metrics.primary_channel_metrics.tx_headers,
-            &app_inner.primary_metrics.primary_channel_metrics.tx_headers_total,
-        );
-        let certificate_fetcher = channel_with_total_sender(
-            CHANNEL_CAPACITY,
-            &app_inner.primary_metrics.primary_channel_metrics.tx_certificate_fetcher,
-            &app_inner.primary_metrics.primary_channel_metrics.tx_certificate_fetcher_total,
-        );
-        let committed_own_headers = channel_with_total_sender(
-            CHANNEL_CAPACITY,
-            &app_inner.primary_metrics.primary_channel_metrics.tx_committed_own_headers,
-            &app_inner.primary_metrics.primary_channel_metrics.tx_committed_own_headers_total,
-        );
-
-        let certificate_manager = channel_with_total_sender(
-            CHANNEL_CAPACITY,
-            &app_inner.primary_metrics.primary_channel_metrics.tx_certificate_acceptor,
-            &app_inner.primary_metrics.primary_channel_metrics.tx_certificate_acceptor_total,
-        );
-
-        let sequence = metered_channel::channel_sender(
-            CHANNEL_CAPACITY,
-            &app_inner.channel_metrics.tx_sequence,
-        );
-
+    fn new() -> Self {
         Self {
-            new_certificates,
-            committed_certificates,
-            certificate_fetcher,
-            parents,
-            our_digests,
-            headers,
-            committed_own_headers,
-            sequence,
-            certificate_manager,
+            new_certificates: QueChannel::new(),
+            committed_certificates: QueChannel::new(),
+            certificate_fetcher: QueChannel::new(),
+            parents: QueChannel::new(),
+            our_digests: QueChannel::new(),
+            headers: QueChannel::new(),
+            committed_own_headers: QueChannel::new(),
+            sequence: QueChannel::new(),
+            certificate_manager: QueChannel::new(),
         }
     }
 }
@@ -386,11 +335,10 @@ impl Default for ConsensusBus {
     }
 }
 
-/// This contains the shared consensus channels and the prometheus metrics
-/// containers (used mostly to track consensus messages).
+/// This contains the shared consensus channels.
 /// A new bus can be created with new() but there should only ever be one created (except for
-/// tests). This allows us to not create and pass channels all over the place add-hoc.
-/// It also allows makes it much easier to find where channels are fed and consumed.
+/// tests). This allows us to not create and pass channels all over the place ad-hoc.
+/// It also makes it much easier to find where channels are fed and consumed.
 impl ConsensusBus {
     /// Create a new consensus bus.
     pub fn new() -> Self {
@@ -406,7 +354,7 @@ impl ConsensusBus {
     /// Store recent_blocks number of the last generated execution blocks.
     pub fn new_with_args(recent_blocks: u32) -> Self {
         let inner_app = Arc::new(ConsensusBusAppInner::new(recent_blocks));
-        let inner_epoch = Arc::new(ConsensusBusEpochInner::new(&inner_app));
+        let inner_epoch = Arc::new(ConsensusBusEpochInner::new());
         Self { inner_app, inner_epoch }
     }
 
@@ -414,7 +362,7 @@ impl ConsensusBus {
     /// This is primarily so we can resubscribe to "one-time" subscription channels.
     pub fn reset_for_epoch(&mut self) {
         self.inner_app.reset_for_epoch();
-        let inner_epoch = Arc::new(ConsensusBusEpochInner::new(&self.inner_app));
+        let inner_epoch = Arc::new(ConsensusBusEpochInner::new());
         self.inner_epoch = inner_epoch;
     }
 
@@ -521,6 +469,11 @@ impl ConsensusBus {
         self.inner_app.tx_recent_blocks.borrow().latest_block_num_hash()
     }
 
+    /// Returns the last consensus round processed by the engine.
+    pub fn last_consensus_round(&self) -> Round {
+        self.inner_app.tx_recent_blocks.borrow().last_consensus_round()
+    }
+
     /// Returns the maximum number of recent blocks that can be held.
     pub fn recent_blocks_capacity(&self) -> u64 {
         self.inner_app.tx_recent_blocks.borrow().block_capacity()
@@ -537,6 +490,11 @@ impl ConsensusBus {
     /// for block number.  DO NOT send unverified values to this watch.
     pub fn last_published_consensus_num_hash(&self) -> &watch::Sender<(u64, BlockHash)> {
         &self.inner_app.tx_last_published_consensus_num_hash
+    }
+
+    /// Returns the latest verified consensus block number and hash from gossip.
+    pub fn published_consensus_num_hash(&self) -> (u64, BlockHash) {
+        *self.inner_app.tx_last_published_consensus_num_hash.borrow()
     }
 
     /// Broadcast channel with consensus output (includes the consensus chain block).
@@ -559,6 +517,11 @@ impl ConsensusBus {
     /// Status of initial sync operation.
     pub fn node_mode(&self) -> &watch::Sender<NodeMode> {
         &self.inner_app.tx_sync_status
+    }
+
+    /// Returns the current node mode.
+    pub fn current_node_mode(&self) -> NodeMode {
+        *self.inner_app.tx_sync_status.borrow()
     }
 
     /// Returns true if this node is a CVV (active or inactive).
@@ -599,31 +562,78 @@ impl ConsensusBus {
         self.inner_app.primary_network_events.clone()
     }
 
-    /// Hold onto the consensus_metrics (mostly for testing)
-    pub fn consensus_metrics(&self) -> Arc<ConsensusMetrics> {
-        self.inner_app.consensus_metrics.clone()
-    }
-
-    /// Hold onto the primary metrics (allow early creation)
-    pub fn primary_metrics(&self) -> Arc<Metrics> {
-        self.inner_app.primary_metrics.clone()
-    }
-
-    /// Hold onto the channel metrics (metrics for the sequence channel).
-    pub fn channel_metrics(&self) -> Arc<ChannelMetrics> {
-        self.inner_app.channel_metrics.clone()
-    }
-
-    /// Hold onto the executor metrics
-    pub fn executor_metrics(&self) -> &ExecutorMetrics {
-        &self.inner_app.executor_metrics
-    }
-
     /// New epoch certs as they are recieved.
-    pub fn new_epoch_votes(
-        &self,
-    ) -> &impl TnSender<(EpochVote, oneshot::Sender<Result<(), HeaderError>>)> {
+    pub fn new_epoch_votes(&self) -> &impl TnSender<EpochVote> {
         &self.inner_app.new_epoch_votes
+    }
+
+    /// Watch channel for the current epoch record.
+    /// The epoch vote collector observes this to know when a new epoch starts.
+    pub fn epoch_record_watch(&self) -> &watch::Sender<Option<EpochRecord>> {
+        &self.inner_app.tx_epoch_record
+    }
+
+    //
+    //=== Channel subscription methods
+    //
+    // These must be called in synchronous spawn() methods, BEFORE spawning async tasks.
+    // This ensures the channel is active before any messages are sent.
+    //
+
+    pub fn subscribe_new_certificates(&self) -> impl TnReceiver<Certificate> {
+        self.inner_epoch.new_certificates.subscribe()
+    }
+
+    pub fn subscribe_committed_certificates(&self) -> impl TnReceiver<(Round, Vec<Certificate>)> {
+        self.inner_epoch.committed_certificates.subscribe()
+    }
+
+    pub fn subscribe_certificate_fetcher(&self) -> impl TnReceiver<CertificateFetcherCommand> {
+        self.inner_epoch.certificate_fetcher.subscribe()
+    }
+
+    pub fn subscribe_parents(&self) -> impl TnReceiver<(Vec<Certificate>, Round)> {
+        self.inner_epoch.parents.subscribe()
+    }
+
+    pub fn subscribe_our_digests(&self) -> impl TnReceiver<OurDigestMessage> {
+        self.inner_epoch.our_digests.subscribe()
+    }
+
+    pub fn subscribe_headers(&self) -> impl TnReceiver<Header> {
+        self.inner_epoch.headers.subscribe()
+    }
+
+    pub fn subscribe_committed_own_headers(&self) -> impl TnReceiver<(Round, Vec<Round>)> {
+        self.inner_epoch.committed_own_headers.subscribe()
+    }
+
+    pub fn subscribe_sequence(&self) -> impl TnReceiver<CommittedSubDag> {
+        self.inner_epoch.sequence.subscribe()
+    }
+
+    pub(crate) fn subscribe_certificate_manager(
+        &self,
+    ) -> impl TnReceiver<CertificateManagerCommand> {
+        self.inner_epoch.certificate_manager.subscribe()
+    }
+
+    pub fn subscribe_new_epoch_votes(&self) -> impl TnReceiver<EpochVote> {
+        self.inner_app.new_epoch_votes.subscribe()
+    }
+
+    pub fn subscribe_primary_network_events(
+        &self,
+    ) -> impl TnReceiver<NetworkEvent<crate::network::Req, crate::network::Res>> {
+        self.inner_app.primary_network_events.subscribe()
+    }
+
+    pub fn subscribe_consensus_output(&self) -> impl TnReceiver<ConsensusOutput> {
+        self.inner_app.consensus_output.subscribe()
+    }
+
+    pub fn subscribe_consensus_header(&self) -> impl TnReceiver<ConsensusHeader> {
+        self.inner_app.consensus_header.subscribe()
     }
 
     /// Will resolve once we have executed block.

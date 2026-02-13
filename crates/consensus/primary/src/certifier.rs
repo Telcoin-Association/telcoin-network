@@ -6,18 +6,17 @@ use crate::{
     state_sync::StateSynchronizer,
     ConsensusBus,
 };
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 use tn_config::{ConsensusConfig, KeyConfig};
 use tn_network_libp2p::error::NetworkError;
-use tn_primary_metrics::PrimaryMetrics;
 use tn_storage::CertificateStore;
 use tn_types::{
     ensure,
     error::{DagError, DagResult},
     AuthorityIdentifier, BlsPublicKey, Certificate, CertificateDigest, Committee, Database, Header,
-    Noticer, Notifier, TaskManager, TaskSpawner, TnReceiver, TnSender, Vote,
+    Noticer, Notifier, TaskManager, TaskSpawner, TnReceiver, Vote,
 };
-use tracing::{debug, enabled, error, info};
+use tracing::{debug, enabled, error, info, instrument};
 
 #[cfg(test)]
 #[path = "tests/certifier_tests.rs"]
@@ -42,12 +41,8 @@ pub(crate) struct Certifier<DB> {
     signature_service: KeyConfig,
     /// Consensus config to subscribe to shutdown.
     config: ConsensusConfig<DB>,
-    /// Consensus channels.
-    consensus_bus: ConsensusBus,
     /// A network sender to send the batches to the other workers.
     network: PrimaryNetworkHandle,
-    /// Metrics handler
-    metrics: Arc<PrimaryMetrics>,
     /// Spawn epoch-related tasks.
     task_spawner: TaskSpawner,
     /// Notifier to cancel pending proposals and vote requests if new header is received.
@@ -70,10 +65,10 @@ impl<DB: Database> Certifier<DB> {
             return;
         };
 
-        let primary_metrics = consensus_bus.primary_metrics().node_metrics.clone();
-
         // spawn long-running task to gossip own certificates
         let task_spawner = task_manager.get_spawner();
+        // Subscribe before spawning so the channel is active before any messages are sent.
+        let rx_headers = consensus_bus.subscribe_headers();
         task_manager.spawn_critical_task("certifier task", async move {
             let highest_created_certificate = config
                 .node_storage()
@@ -102,13 +97,11 @@ impl<DB: Database> Certifier<DB> {
                 state_sync,
                 signature_service: config.key_config().clone(),
                 config,
-                consensus_bus,
                 network: primary_network,
-                metrics: primary_metrics,
                 task_spawner,
                 new_proposal: Notifier::new(),
             }
-            .run()
+            .run(rx_headers)
             .await;
             info!(target: "primary::certifier", "Certifier on node {} has shutdown.", authority_id);
         });
@@ -116,6 +109,7 @@ impl<DB: Database> Certifier<DB> {
 
     /// Requests a vote for a Header from the given peer. Retries indefinitely until either a
     /// vote is received, or a permanent error is returned.
+    #[instrument(level = "debug", skip_all, fields(peer = ?authority, round = header.round()))]
     async fn request_vote(
         authority: AuthorityIdentifier,
         header: Header,
@@ -247,6 +241,7 @@ impl<DB: Database> Certifier<DB> {
     }
 
     /// Propose a header produced by this authority.
+    #[instrument(level = "debug", skip_all, fields(round = header.round(), epoch = header.epoch()))]
     async fn propose_header(&self, header: Header) -> DagResult<Certificate> {
         debug!(target: "primary::certifier", auth=?self.authority_id, "proposing header");
 
@@ -264,13 +259,11 @@ impl<DB: Database> Certifier<DB> {
             });
         }
 
-        self.metrics.proposed_header_round.set(header.round() as i64);
-
         // subscribe early for shutdown notifications
         let cancel_proposal = self.new_proposal.subscribe();
 
         // reset the votes aggregator and sign own header
-        let mut votes_aggregator = VotesAggregator::new(self.metrics.clone());
+        let mut votes_aggregator = VotesAggregator::new();
         let vote = Vote::new(&header, self.authority_id.clone(), &self.signature_service);
         let mut certificate = votes_aggregator.append(vote, &self.committee, &header)?;
 
@@ -447,9 +440,8 @@ impl<DB: Database> Certifier<DB> {
     /// Execute the main certification task.  Will run until shutdown is signalled.
     /// If this exits outside of shutdown it will log an error and this will trigger a node
     /// shutdown.
-    async fn run(self) {
+    async fn run(self, mut rx_headers: impl TnReceiver<Header>) {
         info!(target: "primary::certifier", "Certifier on node {} has started successfully.", &self.authority_id);
-        let mut rx_headers = self.consensus_bus.headers().subscribe();
         let shutdown = &self.config.shutdown().subscribe();
         loop {
             tokio::select! {

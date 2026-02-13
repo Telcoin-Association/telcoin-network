@@ -34,9 +34,8 @@ async fn order_leaders() {
     let (certificates, _next_parents) =
         make_optimal_certificates(&committee, 1..=7, &genesis, &ids);
 
-    let metrics = Arc::new(ConsensusMetrics::default());
     let gc_depth = 50;
-    let mut state = ConsensusState::new(metrics.clone(), gc_depth);
+    let mut state = ConsensusState::new(gc_depth);
 
     for certificate in certificates {
         state.try_insert(&certificate).unwrap();
@@ -45,7 +44,6 @@ async fn order_leaders() {
     let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
     let bullshark = Bullshark::new(
         committee,
-        metrics,
         NUM_SUB_DAGS_PER_SCHEDULE,
         schedule.clone(),
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
@@ -96,15 +94,13 @@ async fn commit_one_with_leader() {
         let (certificates, _next_parents) =
             make_optimal_certificates(&committee, 1..=test_case.rounds, &genesis, &ids);
 
-        let metrics = Arc::new(ConsensusMetrics::default());
         let gc_depth = 50;
         let sub_dags_per_schedule = 3;
-        let mut state = ConsensusState::new(metrics.clone(), gc_depth);
+        let mut state = ConsensusState::new(gc_depth);
         let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
         let bad_nodes_stake_threshold = 33;
         let mut bullshark = Bullshark::new(
             committee,
-            metrics,
             sub_dags_per_schedule,
             schedule.clone(),
             bad_nodes_stake_threshold,
@@ -201,20 +197,14 @@ async fn not_enough_support_with_leader_schedule_change() {
     );
     certificates.extend(out);
 
-    let metrics = Arc::new(ConsensusMetrics::default());
     let gc_depth = 50;
     let sub_dags_per_schedule = 4;
-    let mut state = ConsensusState::new(metrics.clone(), gc_depth);
+    let mut state = ConsensusState::new(gc_depth);
     let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
 
     let bad_nodes_stake_threshold = 33;
-    let mut bullshark = Bullshark::new(
-        committee,
-        metrics,
-        sub_dags_per_schedule,
-        schedule,
-        bad_nodes_stake_threshold,
-    );
+    let mut bullshark =
+        Bullshark::new(committee, sub_dags_per_schedule, schedule, bad_nodes_stake_threshold);
 
     let mut total_13_certs = 0;
     let mut total_15_certs = 0;
@@ -311,16 +301,14 @@ async fn test_long_period_of_asynchrony_for_leader_schedule_change() {
     );
     certificates.extend(out);
 
-    let metrics = Arc::new(ConsensusMetrics::default());
     let gc_depth = 50;
     let sub_dags_per_schedule = 4;
-    let mut state = ConsensusState::new(metrics.clone(), gc_depth);
+    let mut state = ConsensusState::new(gc_depth);
     let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
 
     let bad_nodes_stake_threshold = 33;
     let mut bullshark = Bullshark::new(
         committee.clone(),
-        metrics,
         sub_dags_per_schedule,
         schedule,
         bad_nodes_stake_threshold,
@@ -426,25 +414,24 @@ async fn commit_one() {
     certificates.push_back(certificate);
 
     let config = fixture.authorities().next().unwrap().consensus_config();
-    let metrics = Arc::new(ConsensusMetrics::default());
 
     let bullshark = Bullshark::new(
         committee.clone(),
-        metrics.clone(),
         NUM_SUB_DAGS_PER_SCHEDULE,
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     );
 
     let cb = ConsensusBus::new();
-    let mut rx_output = cb.sequence().subscribe();
+    let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
     Consensus::spawn(config, &cb, bullshark, &task_manager);
     let cb_clone = cb.clone();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
+    cb.recent_blocks()
+        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
     tokio::spawn(async move {
-        let mut rx_primary = cb_clone.committed_certificates().subscribe();
+        let mut rx_primary = cb_clone.subscribe_committed_certificates();
         while rx_primary.recv().await.is_some() {}
     });
 
@@ -489,11 +476,9 @@ async fn dead_node() {
     let (mut certificates, _) = make_optimal_certificates(&committee, 1..=11, &genesis, &ids);
 
     let config = fixture.authorities().next().unwrap().consensus_config();
-    let metrics = Arc::new(ConsensusMetrics::default());
 
     let bullshark = Bullshark::new(
         committee.clone(),
-        metrics.clone(),
         NUM_SUB_DAGS_PER_SCHEDULE,
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
@@ -501,13 +486,14 @@ async fn dead_node() {
 
     let cb = ConsensusBus::new();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
-    let mut rx_output = cb.sequence().subscribe();
+    cb.recent_blocks()
+        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
+    let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
     Consensus::spawn(config, &cb, bullshark, &task_manager);
     let cb_clone = cb.clone();
     tokio::spawn(async move {
-        let mut rx_primary = cb_clone.committed_certificates().subscribe();
+        let mut rx_primary = cb_clone.subscribe_committed_certificates();
         while rx_primary.recv().await.is_some() {}
     });
 
@@ -623,11 +609,9 @@ async fn not_enough_support() {
     certificates.push_back(certificate);
 
     let config = fixture.authorities().next().unwrap().consensus_config();
-    let metrics = Arc::new(ConsensusMetrics::default());
 
     let bullshark = Bullshark::new(
         committee.clone(),
-        metrics.clone(),
         NUM_SUB_DAGS_PER_SCHEDULE,
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
@@ -635,13 +619,14 @@ async fn not_enough_support() {
 
     let cb = ConsensusBus::new();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
-    let mut rx_output = cb.sequence().subscribe();
+    cb.recent_blocks()
+        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
+    let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
     Consensus::spawn(config, &cb, bullshark, &task_manager);
     let cb_clone = cb.clone();
     tokio::spawn(async move {
-        let mut rx_primary = cb_clone.committed_certificates().subscribe();
+        let mut rx_primary = cb_clone.subscribe_committed_certificates();
         while rx_primary.recv().await.is_some() {}
     });
 
@@ -724,10 +709,8 @@ async fn missing_leader() {
     certificates.push_back(certificate);
 
     let config = fixture.authorities().next().unwrap().consensus_config();
-    let metrics = Arc::new(ConsensusMetrics::default());
     let bullshark = Bullshark::new(
         committee.clone(),
-        metrics.clone(),
         NUM_SUB_DAGS_PER_SCHEDULE,
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
@@ -735,13 +718,14 @@ async fn missing_leader() {
 
     let cb = ConsensusBus::new();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
-    let mut rx_output = cb.sequence().subscribe();
+    cb.recent_blocks()
+        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
+    let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
     Consensus::spawn(config, &cb, bullshark, &task_manager);
     let cb_clone = cb.clone();
     tokio::spawn(async move {
-        let mut rx_primary = cb_clone.committed_certificates().subscribe();
+        let mut rx_primary = cb_clone.subscribe_committed_certificates();
         while rx_primary.recv().await.is_some() {}
     });
 
@@ -791,11 +775,8 @@ async fn committed_round_after_restart() {
     let store = config.node_storage().clone();
 
     for input_round in (1..=11usize).step_by(2) {
-        let metrics = Arc::new(ConsensusMetrics::default());
-
         let bullshark = Bullshark::new(
             committee.clone(),
-            metrics.clone(),
             NUM_SUB_DAGS_PER_SCHEDULE,
             LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
             DEFAULT_BAD_NODES_STAKE_THRESHOLD,
@@ -803,9 +784,10 @@ async fn committed_round_after_restart() {
 
         let cb = ConsensusBus::new();
         let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-        cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
-        let mut rx_primary = cb.committed_certificates().subscribe();
-        let mut rx_output = cb.sequence().subscribe();
+        cb.recent_blocks()
+            .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
+        let mut rx_primary = cb.subscribe_committed_certificates();
+        let mut rx_output = cb.subscribe_sequence();
         let mut task_manager = TaskManager::default();
         Consensus::spawn(config.clone(), &cb, bullshark, &task_manager);
 
@@ -859,14 +841,12 @@ async fn delayed_certificates_are_rejected() {
     // Make certificates for rounds 1 to 11.
     let genesis =
         Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
-    let metrics = Arc::new(ConsensusMetrics::default());
     let (certificates, _) = make_certificates_with_epoch(&committee, 1..=5, epoch, &genesis, &ids);
 
-    let mut state = ConsensusState::new(metrics.clone(), gc_depth);
+    let mut state = ConsensusState::new(gc_depth);
 
     let mut bullshark = Bullshark::new(
         committee.clone(),
-        metrics,
         NUM_SUB_DAGS_PER_SCHEDULE,
         LeaderSchedule::new(committee, LeaderSwapTable::default()),
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
@@ -905,13 +885,11 @@ async fn submitting_equivocating_certificate_should_error() {
     // Make certificates for rounds 1 to 11.
     let genesis =
         Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
-    let metrics = Arc::new(ConsensusMetrics::default());
     let (certificates, _) = make_certificates_with_epoch(&committee, 1..=1, epoch, &genesis, &ids);
 
-    let mut state = ConsensusState::new(metrics.clone(), gc_depth);
+    let mut state = ConsensusState::new(gc_depth);
     let mut bullshark = Bullshark::new(
         committee.clone(),
-        metrics,
         NUM_SUB_DAGS_PER_SCHEDULE,
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
@@ -957,13 +935,11 @@ async fn reset_consensus_scores_on_every_schedule_change() {
     // Make certificates for rounds 1 to 50.
     let genesis =
         Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
-    let metrics = Arc::new(ConsensusMetrics::default());
     let (certificates, _) = make_certificates_with_epoch(&committee, 1..=50, epoch, &genesis, &ids);
 
-    let mut state = ConsensusState::new(metrics.clone(), gc_depth);
+    let mut state = ConsensusState::new(gc_depth);
     let mut bullshark = Bullshark::new(
         committee.clone(),
-        metrics,
         NUM_SUB_DAGS_PER_SCHEDULE,
         LeaderSchedule::new(committee, LeaderSwapTable::default()),
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
@@ -1029,10 +1005,8 @@ async fn restart_with_new_committee() {
         .unwrap();
         let store = config.node_storage().clone();
         store.clear().unwrap();
-        let metrics = Arc::new(ConsensusMetrics::default());
         let bullshark = Bullshark::new(
             committee.clone(),
-            metrics.clone(),
             NUM_SUB_DAGS_PER_SCHEDULE,
             LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
             DEFAULT_BAD_NODES_STAKE_THRESHOLD,
@@ -1040,13 +1014,14 @@ async fn restart_with_new_committee() {
 
         let cb = ConsensusBus::new();
         let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-        cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
-        let mut rx_output = cb.sequence().subscribe();
+        cb.recent_blocks()
+            .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
+        let mut rx_output = cb.subscribe_sequence();
         let mut task_manager = TaskManager::default();
         Consensus::spawn(config.clone(), &cb, bullshark, &task_manager);
         let cb_clone = cb.clone();
         tokio::spawn(async move {
-            let mut rx_primary = cb_clone.committed_certificates().subscribe();
+            let mut rx_primary = cb_clone.subscribe_committed_certificates();
             while rx_primary.recv().await.is_some() {}
         });
 
@@ -1133,11 +1108,9 @@ async fn garbage_collection_basic() {
 
     // Create Bullshark consensus engine
 
-    let metrics = Arc::new(ConsensusMetrics::default());
-    let mut state = ConsensusState::new(metrics.clone(), GC_DEPTH);
+    let mut state = ConsensusState::new(GC_DEPTH);
     let mut bullshark = Bullshark::new(
         committee.clone(),
-        metrics,
         NUM_SUB_DAGS_PER_SCHEDULE,
         LeaderSchedule::new(committee, LeaderSwapTable::default()),
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
@@ -1219,11 +1192,9 @@ async fn slow_node() {
     });
 
     // Create Bullshark consensus engine
-    let metrics = Arc::new(ConsensusMetrics::default());
-    let mut state = ConsensusState::new(metrics.clone(), GC_DEPTH);
+    let mut state = ConsensusState::new(GC_DEPTH);
     let mut bullshark = Bullshark::new(
         committee.clone(),
-        metrics,
         NUM_SUB_DAGS_PER_SCHEDULE,
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
@@ -1375,11 +1346,9 @@ async fn not_enough_support_and_missing_leaders_and_gc() {
     certificates.extend(certificates_5_to_7);
 
     // Create Bullshark consensus engine
-    let metrics = Arc::new(ConsensusMetrics::default());
-    let mut state = ConsensusState::new(metrics.clone(), GC_DEPTH);
+    let mut state = ConsensusState::new(GC_DEPTH);
     let mut bullshark = Bullshark::new(
         committee.clone(),
-        metrics,
         NUM_SUB_DAGS_PER_SCHEDULE,
         LeaderSchedule::new(committee, LeaderSwapTable::default()),
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
