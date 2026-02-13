@@ -206,7 +206,7 @@ where
         debug!(target: "primary::cert_manager", ?certificates, "accepting {:?} certificates", certificates.len());
 
         // write certificates to storage
-        self.config.node_storage().write_all(certificates.clone())?;
+        self.config.node_storage().write_all(certificates.iter())?;
 
         for cert in certificates.into_iter() {
             // Update metrics for accepted certificates.

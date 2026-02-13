@@ -7,7 +7,7 @@
 //! if not directly participating in consesus.
 
 use super::{CommittedSubDag, ConsensusOutput};
-use crate::{crypto, error::CertificateResult, BlockHash, Certificate, Committee, Hash, B256};
+use crate::{crypto, BlockHash, Certificate, Hash, B256};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -21,7 +21,7 @@ pub struct ConsensusHeader {
     pub parent_hash: B256,
 
     /// This is the committed sub dag used to extend the execution chain.
-    pub sub_dag: CommittedSubDag,
+    pub sub_dag: Arc<CommittedSubDag>,
 
     /// A scalar value equal to the number of ancestor blocks. The genesis block has a number of
     /// zero.
@@ -51,36 +51,24 @@ impl ConsensusHeader {
         hasher.update(number.to_le_bytes().as_ref());
         BlockHash::from_slice(hasher.finalize().as_bytes())
     }
-
-    /// Verify that all of the contained certificates are valid and signed by a quorum of committee.
-    pub fn verify_certificates(self, committee: &Committee) -> CertificateResult<Self> {
-        let Self { parent_hash, sub_dag, number, extra } = self;
-        let sub_dag = sub_dag.verify_certificates(committee)?;
-        Ok(Self { parent_hash, sub_dag, number, extra })
-    }
 }
 
 impl Default for ConsensusHeader {
     fn default() -> Self {
-        let sub_dag = CommittedSubDag::new(
+        let sub_dag = Arc::new(CommittedSubDag::new(
             vec![],
             Certificate::default(),
             0,
             crate::ReputationScores::default(),
             None,
-        );
+        ));
         Self { parent_hash: B256::default(), sub_dag, number: 0, extra: B256::default() }
     }
 }
 
 impl From<ConsensusOutput> for ConsensusHeader {
     fn from(value: ConsensusOutput) -> Self {
-        Self {
-            parent_hash: value.parent_hash,
-            sub_dag: Arc::unwrap_or_clone(value.sub_dag),
-            number: value.number,
-            extra: value.extra,
-        }
+        value.into_consensus_header()
     }
 }
 

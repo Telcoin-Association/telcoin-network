@@ -17,7 +17,7 @@ use crate::archive::{
 };
 
 /// Size of a header.
-pub const PACK_HEADER_SIZE: usize = 30;
+pub const PDX_HEADER_SIZE: usize = 30;
 
 /// Header for an pdx (index) file.  This contains file positions at fixed locations for
 /// looking up records by incrementing integer.
@@ -46,7 +46,7 @@ impl PdxHeader {
     /// positioned after the header.
     fn load_header(hdx_file: &mut DataFile) -> Result<Self, LoadHeaderError> {
         hdx_file.rewind()?;
-        let mut buffer = [0_u8; PACK_HEADER_SIZE];
+        let mut buffer = [0_u8; PDX_HEADER_SIZE];
         let mut buf16 = [0_u8; 2];
         let mut buf64 = [0_u8; 8];
         let mut pos = 0;
@@ -75,7 +75,7 @@ impl PdxHeader {
     /// Write this header to sync at current seek position.
     fn write_header(&mut self, hdx_file: &mut DataFile) -> Result<(), io::Error> {
         hdx_file.rewind()?;
-        let mut buffer = [0_u8; PACK_HEADER_SIZE];
+        let mut buffer = [0_u8; PDX_HEADER_SIZE];
         let mut pos = 0;
         buffer[pos..8].copy_from_slice(&self.type_id);
         pos += 8;
@@ -121,16 +121,17 @@ impl PositionIndex {
     pub fn open_pdx_file<P: AsRef<Path>>(
         dir: P,
         data_header: &DataHeader,
+        read_only: bool,
     ) -> Result<PositionIndex, LoadHeaderError> {
         let dir = dir.as_ref();
         let _ = fs::create_dir(dir);
-        let mut pdx_file = DataFile::open(dir.join("index.pdx"), false)?;
+        let mut pdx_file = DataFile::open(dir.join("index.pdx"), read_only)?;
         let mut file_end = pdx_file.seek(SeekFrom::End(0))?;
 
         let header = if file_end == 0 {
             let mut header = PdxHeader::from_data_header(data_header);
             header.write_header(&mut pdx_file)?;
-            file_end += PACK_HEADER_SIZE as u64;
+            file_end += PDX_HEADER_SIZE as u64;
             //pdx_file.flush()?;
             header
         } else {
@@ -152,7 +153,7 @@ impl PositionIndex {
 
     /// Return the number of values in this index.
     pub fn len(&self) -> usize {
-        (self.file_len.saturating_sub(PACK_HEADER_SIZE as u64) / 8) as usize
+        (self.file_len.saturating_sub(PDX_HEADER_SIZE as u64) / 8) as usize
     }
 
     /// True if there are no keys stored in this index.
@@ -177,7 +178,7 @@ impl Index<u64> for PositionIndex {
     }
 
     fn load(&mut self, key: u64) -> Result<u64, FetchError> {
-        let pos = PACK_HEADER_SIZE as u64 + (key * 8);
+        let pos = PDX_HEADER_SIZE as u64 + (key * 8);
         self.pdx_file.seek(SeekFrom::Start(pos))?;
         let mut buf = [0_u8; 8];
         self.pdx_file.read_exact(&mut buf[..])?;
@@ -202,7 +203,7 @@ mod tests {
         let tmp_path = TempDir::with_prefix("test_archive_pdx_index").expect("temp dir");
         let data_header = DataHeader::new();
         let mut idx: PositionIndex =
-            PositionIndex::open_pdx_file(tmp_path.path().join("index.pdx"), &data_header)
+            PositionIndex::open_pdx_file(tmp_path.path().join("index.pdx"), &data_header, false)
                 .expect("pdx file");
         for i in 0..1_000_000 {
             idx.save(i, i * 100).expect("add to index");
@@ -212,7 +213,7 @@ mod tests {
         }
         drop(idx);
         let mut idx: PositionIndex =
-            PositionIndex::open_pdx_file(tmp_path.path().join("index.pdx"), &data_header)
+            PositionIndex::open_pdx_file(tmp_path.path().join("index.pdx"), &data_header, false)
                 .expect("pdx file");
         for i in (0..1_000_000).rev() {
             assert_eq!(
@@ -222,6 +223,18 @@ mod tests {
             );
         }
         idx.save(1_000_000, 66).expect("add to index");
+        assert_eq!(idx.load(1_000_000).expect("load idx"), 66);
+        drop(idx);
+        let mut idx: PositionIndex =
+            PositionIndex::open_pdx_file(tmp_path.path().join("index.pdx"), &data_header, true)
+                .expect("pdx file");
+        for i in (0..1_000_000).rev() {
+            assert_eq!(
+                idx.load(i).expect(&format!("load idx {i}")),
+                i * 100,
+                "failed on iteration {i}"
+            );
+        }
         assert_eq!(idx.load(1_000_000).expect("load idx"), 66);
     }
 }

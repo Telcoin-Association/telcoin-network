@@ -231,7 +231,10 @@ impl HdxHeader {
 /// This file is not a log file and the header and buckets will change in place over time.
 /// This data in the file will be followed by a CRC32 checksum value to verify it.
 #[derive(Debug)]
-pub struct HdxIndex<const KSIZE: usize = 32, S = BuildHasherDefault<FxHasher>> {
+pub struct HdxIndex<
+    const KSIZE: usize = 32,
+    S: BuildHasher + Default = BuildHasherDefault<FxHasher>,
+> {
     header: HdxHeader,
     modulus: u32,
     bucket_cache: FxHashMap<u64, Vec<u8>>,
@@ -647,6 +650,13 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     }
 }
 
+impl<const KSIZE: usize, S: BuildHasher + Default> Drop for HdxIndex<KSIZE, S> {
+    fn drop(&mut self) {
+        let _ = self.write_header();
+        let _ = self.save_bucket_cache();
+    }
+}
+
 impl<const KSIZE: usize, S: BuildHasher + Default> Index<&[u8]> for HdxIndex<KSIZE, S> {
     fn save(&mut self, key: &[u8], record_pos: u64) -> Result<(), AppendError> {
         self.save_to_bucket(key, record_pos)
@@ -687,6 +697,17 @@ mod tests {
             let hash = hasher.finalize();
             idx.save(hash.as_bytes(), i).expect("add to index");
         }
+        for i in 0..1_000_000 {
+            let mut hasher = DefaultHashFunction::new();
+            hasher.update(&format!("idx-{i}").into_bytes());
+            let hash = hasher.finalize();
+            assert_eq!(idx.load(hash.as_bytes()).expect("load idx"), i);
+        }
+        drop(idx);
+        let builder = BuildHasherDefault::<FxHasher>::default();
+        let mut idx: HdxIndex =
+            HdxIndex::open_hdx_file(tmp_path.path().join("index.hdx"), &data_header, builder)
+                .expect("hdx file");
         for i in 0..1_000_000 {
             let mut hasher = DefaultHashFunction::new();
             hasher.update(&format!("idx-{i}").into_bytes());
