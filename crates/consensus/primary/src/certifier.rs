@@ -406,9 +406,9 @@ impl<DB: Database> Certifier<DB> {
             // receive enough votes for certification (or exit early)
             proposal_result = self.propose_header(header) => {
                 match proposal_result {
-                    Ok(certificate) => {
+                    Ok(mut certificate) => {
                         // pass to state_sync for internal processing
-                        if let Err(e) = self.state_sync.process_own_certificate(certificate.clone()).await {
+                        if let Err(e) = self.state_sync.process_own_certificate(&mut certificate).await {
                             error!(target: "primary::certifier", "error accepting own certificate: {e}");
                             return;
                         }

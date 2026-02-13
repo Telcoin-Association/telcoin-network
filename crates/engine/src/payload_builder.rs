@@ -18,7 +18,8 @@ pub fn execute_consensus_output(
     gas_accumulator: GasAccumulator,
 ) -> EngineResult<SealedHeader> {
     // rename canonical header for clarity
-    let BuildArguments { reth_env, mut output, parent_header: mut canonical_header } = args;
+    let BuildArguments { reth_env, output, parent_header } = args;
+    let mut canonical_header = parent_header; // Last canonical header executed.
     gas_accumulator.rewards_counter().inc_leader_count(output.leader().origin());
     let epoch = output.leader().epoch();
     // output digest returns the `ConsensusHeader` digest
@@ -38,7 +39,7 @@ pub fn execute_consensus_output(
     // assert vecs match
     debug_assert_eq!(
         batches.len(),
-        output.batch_digests.len(),
+        output.batch_digests().len(),
         "uneven number of sealed blocks from batches and batch digests"
     );
 
@@ -86,9 +87,10 @@ pub fn execute_consensus_output(
     } else {
         // loop and construct blocks from batches with transactions
         for (batch_index, (cert_idx, batch_idx_in_cert)) in batches.into_iter().enumerate() {
-            let batch_digest =
-                output.next_batch_digest().ok_or(TnEngineError::NextBlockDigestMissing)?;
-            let cert_batch = &output.batches[cert_idx];
+            let batch_digest = output
+                .get_batch_digest(batch_index)
+                .ok_or(TnEngineError::NextBlockDigestMissing)?;
+            let cert_batch = &output.batches()[cert_idx];
             let batch = &cert_batch.batches[batch_idx_in_cert];
 
             // use batch's base fee, gas limit, and withdrawals
