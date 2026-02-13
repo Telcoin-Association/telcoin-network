@@ -27,7 +27,6 @@ use tn_types::{
     Header, HeaderDigest, ProtocolSignature, Round, SignatureVerificationState, TnSender as _,
     Vote,
 };
-use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
 /// Map to hold vote info to detect invalid votes, equivocation and cache responses in case of
@@ -89,8 +88,11 @@ where
             .last_executed_consensus_block(self.consensus_config.node_storage())
             .map(|h| (h.number, h.sub_dag.leader_epoch(), h.sub_dag.leader_round()))
             .unwrap_or((0, 0, 0));
-        let (last_consensus_number, _) =
-            *self.consensus_bus.last_published_consensus_num_hash().borrow();
+        // When empty outputs are skipped by execution, no new EVM block is produced.
+        // In that case, rely on the most recent consensus round processed by the engine.
+        let processed_consensus_round = self.consensus_bus.last_consensus_round();
+        let effective_exec_round = exec_round.max(processed_consensus_round);
+        let (last_consensus_number, _) = self.consensus_bus.published_consensus_num_hash();
         // Use GC depth to estimate how many rounds we can be behind.
         // Subtract ten here so if we are right on the GC depth we will still go inactive (small
         // safety buffer).  Ten is arbitrary but should make sure we are comfortably within
@@ -101,7 +103,7 @@ where
         // is our round outside the GC window
         // Will be false when not the same epoch (can't compare rounds) but
         // epoch_behind will work in that case.
-        let outside_gc_window = epoch == exec_epoch && (exec_round + gc_depth) < round;
+        let outside_gc_window = epoch == exec_epoch && (effective_exec_round + gc_depth) < round;
         // are we on older epoch?
         // note, we need to make sure we are not at the epoch boundary otherwise
         // we can get false positives
@@ -123,8 +125,11 @@ where
         if active_cvv && (outside_gc_window || epoch_behind) {
             // We seem to be too far behind to be an active CVV, try to go
             // inactive to catch up.
-            warn!(target: "primary", "we are behind, go to catchup mode!, epoch: {epoch}, exec_epoch: {exec_epoch}, number: {number:?}, exec_number: {exec_number}");
-            let _ = self.consensus_bus.node_mode().send(NodeMode::CvvInactive);
+            warn!(
+                target: "primary",
+                "we are behind, go to catchup mode!, epoch: {epoch}, exec_epoch: {exec_epoch}, number: {number:?}, exec_number: {exec_number}, exec_round: {exec_round}, processed_round: {processed_consensus_round}, effective_round: {effective_exec_round}"
+            );
+            self.consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
             self.consensus_config.shutdown().notify();
             true
         } else {
@@ -196,8 +201,7 @@ where
                 let consensus_result_hash = result.digest();
                 let ConsensusResult { epoch, round, number, hash, validator: key, signature } =
                     *result;
-                let (old_number, old_hash) =
-                    *self.consensus_bus.last_published_consensus_num_hash().borrow();
+                let (old_number, old_hash) = self.consensus_bus.published_consensus_num_hash();
                 if hash == old_hash || old_number >= number {
                     // We have already dealt with this hash or we are past this output.
                     return Ok(());
@@ -232,10 +236,9 @@ where
                             // sure it is valid. Receivers will count on
                             // this being verified.
                             info!(target: "primary", "got new consensus {number}/{hash}");
-                            let _ = self
-                                .consensus_bus
+                            self.consensus_bus
                                 .last_published_consensus_num_hash()
-                                .send((number, hash));
+                                .send_replace((number, hash));
                             self.consensus_certs.lock().clear();
                         } else {
                             self.consensus_certs.lock().insert(consensus_result_hash, sigs + 1);
@@ -249,7 +252,7 @@ where
                         // Not sure we can sanity check this epoch.  However if it is bogus the code
                         // to handle it should be fine and will reset requested_missing_epoch to
                         // sanity.
-                        let _ = self.consensus_bus.requested_missing_epoch().send(epoch);
+                        self.consensus_bus.requested_missing_epoch().send_replace(epoch);
                     }
                 }
             }
@@ -258,14 +261,25 @@ where
                     topic.to_string().eq(&tn_config::LibP2pConfig::epoch_vote_topic()),
                     PrimaryNetworkError::InvalidTopic
                 );
-                let (tx, rx) = oneshot::channel();
-                let _ = self.consensus_bus.new_epoch_votes().send((*vote, tx)).await;
-                match rx.await {
-                    // Propogate any errors so the peer can be punished.
-                    Ok(res) => res?,
-                    // Don't punish the peer for an internal channel issue...
-                    Err(e) => error!(target: "primary", "error waiting on epoch vote result: {e}"),
+                // Verify the BLS signature
+                ensure!(
+                    vote.check_signature(),
+                    PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor)
+                );
+                // Verify committee membership if the epoch record is available
+                if let Some((epoch_rec, _)) =
+                    self.consensus_config.node_storage().get_epoch_by_hash(vote.epoch_hash)
+                {
+                    ensure!(
+                        epoch_rec.committee.contains(&vote.public_key),
+                        PrimaryNetworkError::InvalidHeader(HeaderError::UnknownAuthority(format!(
+                            "{} not in committee for epoch {}",
+                            vote.public_key, vote.epoch_hash
+                        )))
+                    );
                 }
+                // Fire-and-forget: no oneshot, no blocking
+                let _ = self.consensus_bus.new_epoch_votes().send(*vote).await;
             }
         }
 
@@ -422,7 +436,7 @@ where
             error!(
                 target: "primary",
                 peer_hash = ?header.latest_execution_block,
-                expected = ?self.consensus_bus.recent_blocks().borrow().latest_block(),
+                expected = ?self.consensus_bus.latest_block_num_hash(),
                 "unexpected execution result received"
             );
             return Err(HeaderError::UnknownExecutionResult(header.latest_execution_block).into());

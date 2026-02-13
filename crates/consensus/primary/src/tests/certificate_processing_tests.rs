@@ -13,7 +13,7 @@ use tn_storage::{mem_db::MemDatabase, CertificateStore};
 use tn_test_utils_committee::{AuthorityFixture, CommitteeFixture};
 use tn_types::{
     error::CertificateError, Certificate, CertificateDigest, Database, Hash as _, Round,
-    TaskManager, TnReceiver as _, TnSender,
+    TaskManager, TnReceiver as _,
 };
 use tokio::time::timeout;
 
@@ -85,12 +85,13 @@ async fn test_accept_valid_certs() -> eyre::Result<()> {
     let certificate_store = primary.consensus_config().node_storage().clone();
 
     // spawn manager task
-    task_manager.spawn_critical_task("manager", manager.run());
+    let rx_cert_mgr = cb.subscribe_certificate_manager();
+    task_manager.spawn_critical_task("manager", manager.run(rx_cert_mgr));
 
     // receive parent updates (proposer)
-    let mut rx_parents = cb.parents().subscribe();
+    let mut rx_parents = cb.subscribe_parents();
     // receive new accepted certs (consensus)
-    let mut rx_new_certificates = cb.new_certificates().subscribe();
+    let mut rx_new_certificates = cb.subscribe_new_certificates();
 
     // create 3 certs
     // NOTE: test types uses the last authority
@@ -134,7 +135,8 @@ async fn test_accept_pending_certs() -> eyre::Result<()> {
         create_all_test_types(None);
 
     // spawn manager task
-    task_manager.spawn_critical_task("manager", manager.run());
+    let rx_cert_mgr = cb.subscribe_certificate_manager();
+    task_manager.spawn_critical_task("manager", manager.run(rx_cert_mgr));
 
     let committee = fixture.committee();
     let num_authorities = fixture.num_authorities();
@@ -159,7 +161,7 @@ async fn test_accept_pending_certs() -> eyre::Result<()> {
     }
 
     // assert no certs accepted
-    let mut rx_new_certificates = cb.new_certificates().subscribe();
+    let mut rx_new_certificates = cb.subscribe_new_certificates();
     assert!(rx_new_certificates.try_recv().is_err()); // empty channel
 
     // process round 1
@@ -213,7 +215,8 @@ async fn test_gc_pending_certs() -> eyre::Result<()> {
     let certificate_store = primary.consensus_config().node_storage().clone();
 
     // spawn manager task
-    task_manager.spawn_critical_task("manager", manager.run());
+    let rx_cert_mgr = cb.subscribe_certificate_manager();
+    task_manager.spawn_critical_task("manager", manager.run(rx_cert_mgr));
 
     let committee = fixture.committee();
     let num_authorities = fixture.num_authorities();
@@ -238,7 +241,7 @@ async fn test_gc_pending_certs() -> eyre::Result<()> {
     }
 
     // assert no certs accepted
-    let mut rx_new_certificates = cb.new_certificates().subscribe();
+    let mut rx_new_certificates = cb.subscribe_new_certificates();
     assert!(rx_new_certificates.try_recv().is_err()); // empty channel
 
     // reinsert later rounds as if fetched from peers
@@ -272,13 +275,15 @@ async fn test_gc_pending_certs() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_node_restart_syncs_state() -> eyre::Result<()> {
-    let TestTypes { validator, manager, fixture, task_manager, .. } = create_all_test_types(None);
+    let TestTypes { validator, manager, cb, fixture, task_manager, .. } =
+        create_all_test_types(None);
     // test types uses last authority for config
     let primary = fixture.authorities().last().unwrap();
     let certificate_store = primary.consensus_config().node_storage().clone();
 
     // spawn manager task
-    task_manager.spawn_critical_task("manager", manager.run());
+    let rx_cert_mgr = cb.subscribe_certificate_manager();
+    task_manager.spawn_critical_task("manager", manager.run(rx_cert_mgr));
 
     // create 3 certs
     // NOTE: test types uses the last authority
@@ -306,10 +311,11 @@ async fn test_node_restart_syncs_state() -> eyre::Result<()> {
     let (manager_first_recovery, validator_first_recovery, cb_first_recovery, task_manager) =
         create_core_test_types_with_tasks(primary, task_manager);
 
-    task_manager.spawn_critical_task("recovered manager", manager_first_recovery.run());
+    let rx_cert_mgr = cb_first_recovery.subscribe_certificate_manager();
+    task_manager.spawn_critical_task("recovered manager", manager_first_recovery.run(rx_cert_mgr));
 
     // assert proposer receives parents for round after recovery
-    let mut rx_parents_first_recovery = cb_first_recovery.parents().subscribe();
+    let mut rx_parents_first_recovery = cb_first_recovery.subscribe_parents();
 
     // proposer should not receive parents because quorum wasn't reached
     assert!(rx_parents_first_recovery.try_recv().is_err());
@@ -335,10 +341,11 @@ async fn test_node_restart_syncs_state() -> eyre::Result<()> {
     let (manager_second_recovery, _validator, cb_second_recovery, task_manager) =
         create_core_test_types_with_tasks(primary, task_manager);
 
-    task_manager.spawn_critical_task("recovered manager", manager_second_recovery.run());
+    let rx_cert_mgr = cb_second_recovery.subscribe_certificate_manager();
+    task_manager.spawn_critical_task("recovered manager", manager_second_recovery.run(rx_cert_mgr));
 
     // assert proposer receives parents for round after recovery
-    let mut rx_parents_second_recovery = cb_second_recovery.parents().subscribe();
+    let mut rx_parents_second_recovery = cb_second_recovery.subscribe_parents();
 
     let (mut received_certs, round) = rx_parents_second_recovery.recv().await.unwrap();
 
@@ -367,7 +374,8 @@ async fn test_filter_unknown_parents() -> eyre::Result<()> {
     let primary = fixture.authorities().last().unwrap();
 
     // spawn manager task
-    task_manager.spawn_critical_task("manager", manager.run());
+    let rx_cert_mgr = cb.subscribe_certificate_manager();
+    task_manager.spawn_critical_task("manager", manager.run(rx_cert_mgr));
 
     let committee = fixture.committee();
     let num_authorities = fixture.num_authorities();

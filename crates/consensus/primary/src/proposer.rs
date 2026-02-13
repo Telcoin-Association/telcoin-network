@@ -408,7 +408,7 @@ impl<DB: Database> Proposer<DB> {
                 // late (or just joined the network).
                 self.round = round;
                 // broadcast new round
-                let _ = self.consensus_bus.primary_round_updates().send(self.round);
+                self.consensus_bus.primary_round_updates().send_replace(self.round);
                 self.last_parents = parents;
                 // Reset advance flag.
                 self.advance_round = false;
@@ -555,7 +555,7 @@ impl<DB: Database> Proposer<DB> {
         if updated_round > self.round {
             self.round = updated_round;
         }
-        let _ = self.consensus_bus.primary_round_updates().send(self.round);
+        self.consensus_bus.primary_round_updates().send_replace(self.round);
 
         debug!(target: "primary::proposer", authority=?self.authority_id, round=self.round, "advanced round - proposing next block...");
 
@@ -644,9 +644,13 @@ impl<DB: Database> Proposer<DB> {
 
     pub(crate) fn spawn(mut self, task_manager: &TaskManager) {
         if self.consensus_bus.node_mode().borrow().is_active_cvv() {
+            // Subscribe before spawning so channels are active before any messages are sent.
+            let rx_our_digests = self.consensus_bus.subscribe_our_digests();
+            let rx_parents = self.consensus_bus.subscribe_parents();
+            let rx_committed_own_headers = self.consensus_bus.subscribe_committed_own_headers();
             task_manager.spawn_critical_task("proposer task", async move {
                 info!(target: "primary::proposer", "Starting proposer");
-                self.run().await
+                self.run(rx_our_digests, rx_parents, rx_committed_own_headers).await
             });
         }
         // If not an active CVV then don't propose anything.
@@ -665,11 +669,12 @@ impl<DB: Database> Proposer<DB> {
 
     /// Run the proposer task.
     /// Returns Ok on shutdown or an error to indicate a fatal condition.
-    async fn run(&mut self) -> ProposerResult<()> {
-        let mut rx_our_digests = self.consensus_bus.our_digests().subscribe();
-        let mut rx_parents = self.consensus_bus.parents().subscribe();
-        let mut rx_committed_own_headers = self.consensus_bus.committed_own_headers().subscribe();
-
+    async fn run(
+        &mut self,
+        mut rx_our_digests: impl TnReceiver<OurDigestMessage>,
+        mut rx_parents: impl TnReceiver<(Vec<Certificate>, Round)>,
+        mut rx_committed_own_headers: impl TnReceiver<(Round, Vec<Round>)>,
+    ) -> ProposerResult<()> {
         let mut pending_header = None;
         let mut max_delay_timed_out = false;
         let mut min_delay_timed_out = false;
