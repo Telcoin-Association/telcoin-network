@@ -229,4 +229,57 @@ mod test {
             }
         }
     }
+
+    #[test]
+    fn test_epoch_record_cert_with_signer_ejected_from_next_committee() {
+        let mut rng = StdRng::from_os_rng();
+        let com1 = TestBlsKeypair::new(&mut rng);
+        let com2 = TestBlsKeypair::new(&mut rng);
+        let com3 = TestBlsKeypair::new(&mut rng);
+        let com4 = TestBlsKeypair::new(&mut rng);
+
+        let record = EpochRecord {
+            epoch: 42,
+            committee: vec![
+                com1.public_key(),
+                com2.public_key(),
+                com3.public_key(),
+                com4.public_key(),
+            ],
+            // Simulate validator 2 being ejected for the next epoch.
+            next_committee: vec![com1.public_key(), com3.public_key(), com4.public_key()],
+            parent_hash: B256::default(),
+            parent_state: BlockNumHash::default(),
+            parent_consensus: B256::default(),
+        };
+
+        let vote1 = record.sign_vote(&com1);
+        let vote2 = record.sign_vote(&com2);
+        let vote3 = record.sign_vote(&com3);
+
+        let sigs = vec![vote1.signature, vote2.signature, vote3.signature];
+        let aggregate =
+            BlsAggregateSignature::aggregate(&sigs, true).expect("aggregate signatures");
+        let cert = EpochCertificate {
+            epoch_hash: record.digest(),
+            signature: aggregate.to_signature(),
+            signed_authorities: RoaringBitmap::from_iter([0, 1, 2]),
+        };
+
+        assert!(
+            record.verify_with_cert(&cert),
+            "epoch cert should verify against original committee despite next-epoch ejection"
+        );
+
+        // If we incorrectly re-index against an ejected-committee view, verification should fail.
+        let wrong_committee_view = EpochRecord {
+            committee: record.next_committee.clone(),
+            next_committee: record.next_committee.clone(),
+            ..record.clone()
+        };
+        assert!(
+            !wrong_committee_view.verify_with_cert(&cert),
+            "signature bitmap must stay anchored to the original epoch committee ordering"
+        );
+    }
 }
