@@ -4,11 +4,9 @@ use crate::consensus::{Dag, LeaderSchedule, LeaderSwapTable};
 use std::{collections::BTreeSet, num::NonZeroUsize, sync::Arc};
 use tempfile::TempDir;
 use tn_primary::test_utils::mock_certificate;
-use tn_storage::{mem_db::MemDatabase, open_db, tables::ConsensusBlocks, ConsensusStore};
+use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
 use tn_test_utils_committee::CommitteeFixture;
-use tn_types::{
-    AuthorityIdentifier, Certificate, CommittedSubDag, Database as _, ReputationScores, Round,
-};
+use tn_types::{AuthorityIdentifier, Certificate, CommittedSubDag, ReputationScores, Round};
 
 /// Run a bunch of brute force swap table checks.
 #[tokio::test]
@@ -415,7 +413,8 @@ async fn test_leader_schedule_from_store() {
     let committee = fixture.committee();
     let authority_ids: Vec<AuthorityIdentifier> = fixture.authorities().map(|a| a.id()).collect();
     let temp_dir = TempDir::new().unwrap();
-    let store = open_db(temp_dir.path());
+    let mut consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).unwrap();
 
     // Create a leader schedule with a default swap table, so no authority will be swapped and find
     // the leader at position 2. We expect the leader of round 2 to be the authority of position
@@ -434,11 +433,10 @@ async fn test_leader_schedule_from_store() {
 
     let sub_dag = Arc::new(CommittedSubDag::new(vec![], Certificate::default(), 0, scores, None));
 
-    store.write_subdag_for_test(0, sub_dag);
-    store.persist::<ConsensusBlocks>().await;
+    consensus_chain.write_subdag_for_test(0, sub_dag).await;
 
     // WHEN
-    let schedule = LeaderSchedule::from_store(committee, store, 33);
+    let schedule = LeaderSchedule::from_store(committee, &mut consensus_chain, 33).await;
 
     // THEN the stored schedule should be returned and eventually the low score leader should be
     // swapped with a high score one.

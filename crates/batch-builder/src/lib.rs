@@ -336,7 +336,7 @@ mod tests {
         test_utils::{create_committee_from_state, TransactionFactory},
         RethChainSpec,
     };
-    use tn_storage::{open_db, tables::Batches};
+    use tn_storage::{open_db, tables::NodeBatchesCache};
     use tn_types::{
         gas_accumulator::GasAccumulator, test_genesis, BlockHash, Bytes, Certificate,
         CommittedSubDag, ConsensusOutput, Database, GenesisAccount, TaskManager, U160, U256,
@@ -455,7 +455,7 @@ mod tests {
         for _ in 0..5 {
             let _ = tokio::time::sleep(Duration::from_secs(1)).await;
             // Ensure the block is stored
-            if let Some((_, wb)) = store.iter::<Batches>().next() {
+            if let Some((_, wb)) = store.iter::<NodeBatchesCache>().next() {
                 new_batch = Some(wb);
                 break;
             }

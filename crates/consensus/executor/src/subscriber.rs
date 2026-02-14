@@ -13,7 +13,7 @@ use tn_primary::{
     network::{ConsensusResult, PrimaryNetworkHandle},
     ConsensusBus, NodeMode,
 };
-use tn_storage::CertificateStore;
+use tn_storage::{consensus::ConsensusChain, CertificateStore};
 use tn_types::{
     encode, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash, BlsSigner as _,
     CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput, Database,
@@ -47,6 +47,8 @@ struct Inner {
     committee: Committee,
     /// The client to request worker batches and build consensus output.
     client: LocalNetwork,
+    /// Access to the consensus chain data.
+    consensus_chain: ConsensusChain,
 }
 
 /// Spawn the subscriber in the correct mode based on the validator status for the current epoch.
@@ -56,6 +58,7 @@ pub fn spawn_subscriber<DB: Database>(
     consensus_bus: ConsensusBus,
     task_manager: &TaskManager,
     network_handle: PrimaryNetworkHandle,
+    consensus_chain: ConsensusChain,
 ) {
     let authority_id = config.authority_id();
     let committee = config.committee().clone();
@@ -65,14 +68,19 @@ pub fn spawn_subscriber<DB: Database>(
         consensus_bus,
         config,
         network_handle,
-        inner: Arc::new(Inner { authority_id, committee, client }),
+        inner: Arc::new(Inner {
+            authority_id,
+            committee,
+            client,
+            consensus_chain: consensus_chain.clone(),
+        }),
     };
     match mode {
         // If we are active then partcipate in consensus.
         NodeMode::CvvActive => {
             task_manager.spawn_critical_task("subscriber consensus", async move {
                 info!(target: "subscriber", "Starting subscriber: CVV");
-                if let Err(e) = subscriber.run(rx_shutdown).await {
+                if let Err(e) = subscriber.run(rx_shutdown, consensus_chain).await {
                     error!(target: "subscriber", "Error subscriber consensus: {e}");
                 }
             });
@@ -125,6 +133,7 @@ impl<DB: Database> Subscriber<DB> {
         let _ = self.config.node_storage().write(consensus_output.sub_dag().leader.clone());
         let _ = self.config.node_storage().write_all(consensus_output.sub_dag().certificates());
 
+        let mut consensus_chain = self.inner.consensus_chain.clone();
         // This save will essentially mark this consensus output as written in stone (added to the
         // consensus chain). This does NOT imply execution although it will be sent off for
         // execution.
@@ -132,6 +141,7 @@ impl<DB: Database> Subscriber<DB> {
             self.config.node_storage(),
             consensus_output.clone(),
             &self.inner.authority_id,
+            &mut consensus_chain,
         )
         .await?;
 
@@ -158,6 +168,7 @@ impl<DB: Database> Subscriber<DB> {
             self.consensus_bus.clone(),
             self.network_handle.clone(),
             tasks,
+            self.inner.consensus_chain.clone(),
         );
         while let Some(consensus_header) = rx_consensus_headers.recv().await {
             let consensus_header_number = consensus_header.number;
@@ -186,6 +197,7 @@ impl<DB: Database> Subscriber<DB> {
             self.consensus_bus.clone(),
             self.network_handle.clone(),
             tasks,
+            self.inner.consensus_chain.clone(),
         );
         while let Some(consensus_header) = rx_consensus_headers.recv().await {
             self.handle_consensus_header(consensus_header).await?;
@@ -201,7 +213,8 @@ impl<DB: Database> Subscriber<DB> {
         // Get the DB and load our last executed consensus block (note there may be unexecuted
         // blocks, catch up will execute them).
         let last_executed_block =
-            last_executed_consensus_block(&self.consensus_bus, self.config.node_storage())
+            last_executed_consensus_block(&self.consensus_bus, &self.inner.consensus_chain)
+                .await
                 .unwrap_or_default();
 
         info!(target: "subscriber", ?last_executed_block, "restoring last executed consensus for constucting the next ConsensusHeader:");
@@ -210,7 +223,11 @@ impl<DB: Database> Subscriber<DB> {
     }
 
     /// Main loop connecting to the consensus to listen to sequence messages.
-    async fn run(self, rx_shutdown: Noticer) -> SubscriberResult<()> {
+    async fn run(
+        self,
+        rx_shutdown: Noticer,
+        mut consensus_chain: ConsensusChain,
+    ) -> SubscriberResult<()> {
         // It's important to have the futures in ordered fashion as we want
         // to guarantee that will deliver to the executor the certificates
         // in the same order we received from rx_sequence. So it doesn't
@@ -261,7 +278,7 @@ impl<DB: Database> Subscriber<DB> {
                     match output {
                         Ok(output) => {
                             debug!(target: "subscriber", output=?output.digest(), "saving next output");
-                            save_consensus(self.config.node_storage(), output.clone(), &self.inner.authority_id).await?;
+                            save_consensus(self.config.node_storage(), output.clone(), &self.inner.authority_id, &mut consensus_chain).await?;
                             debug!(target: "subscriber", "broadcasting output...");
                             if let Err(e) = self.consensus_bus.consensus_output().send(output).await {
                                 error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self.inner.authority_id, e);

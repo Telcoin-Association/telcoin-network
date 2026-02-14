@@ -8,7 +8,7 @@ use manager::EpochManager;
 use tn_config::{KeyConfig, TelcoinDirs};
 use tn_primary::ConsensusBus;
 use tn_rpc::EngineToPrimary;
-use tn_storage::{ConsensusStore, EpochStore};
+use tn_storage::EpochStore;
 use tn_types::{BlockHash, ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord};
 use tokio::task::JoinHandle;
 
@@ -19,6 +19,9 @@ mod manager;
 pub mod primary;
 pub mod worker;
 pub use manager::catchup_accumulator;
+
+#[cfg(test)]
+use tempfile as _;
 
 /// Launch all components for the node.
 ///
@@ -79,14 +82,6 @@ impl<DB: Database> EngineToPrimaryRpc<DB> {
 impl<DB: Database> EngineToPrimary for EngineToPrimaryRpc<DB> {
     fn get_latest_consensus_block(&self) -> ConsensusHeader {
         self.consensus_bus.last_consensus_header().borrow().clone().unwrap_or_default()
-    }
-
-    fn consensus_block_by_number(&self, number: u64) -> Option<ConsensusHeader> {
-        self.db.get_consensus_by_number(number)
-    }
-
-    fn consensus_block_by_hash(&self, hash: BlockHash) -> Option<ConsensusHeader> {
-        self.db.get_consensus_by_hash(hash)
     }
 
     fn epoch(

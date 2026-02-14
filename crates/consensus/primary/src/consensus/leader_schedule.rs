@@ -8,7 +8,7 @@ use std::{
     fmt::{Debug, Formatter},
     sync::Arc,
 };
-use tn_storage::ConsensusStore;
+use tn_storage::consensus::ConsensusChain;
 use tn_types::{
     Authority, AuthorityIdentifier, Certificate, Committee, ReputationScores, Round, VotingPower,
 };
@@ -250,13 +250,14 @@ impl LeaderSchedule {
     /// Restores the LeaderSchedule by using the storage. It will attempt to retrieve the last
     /// committed "final" ReputationScores and use them to create build a LeaderSwapTable to use
     /// for the LeaderSchedule.
-    pub fn from_store<DB: ConsensusStore>(
+    pub async fn from_store(
         committee: Committee,
-        store: DB,
+        consensus_chain: &mut ConsensusChain,
         bad_nodes_percent_threshold: u64,
     ) -> Self {
-        let table = store
+        let table = consensus_chain
             .read_latest_commit_with_final_reputation_scores(committee.epoch())
+            .await
             .map_or(LeaderSwapTable::default(), |subdag| {
                 LeaderSwapTable::new(
                     &committee,

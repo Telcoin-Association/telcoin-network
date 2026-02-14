@@ -112,7 +112,6 @@ impl PdxHeader {
 pub struct PositionIndex {
     _header: PdxHeader,
     pdx_file: DataFile,
-    file_len: u64,
     _index_dir: PathBuf,
 }
 
@@ -126,12 +125,10 @@ impl PositionIndex {
         let dir = dir.as_ref();
         let _ = fs::create_dir(dir);
         let mut pdx_file = DataFile::open(dir.join("index.pdx"), read_only)?;
-        let mut file_end = pdx_file.seek(SeekFrom::End(0))?;
 
-        let header = if file_end == 0 {
+        let header = if pdx_file.len() == 0 {
             let mut header = PdxHeader::from_data_header(data_header);
             header.write_header(&mut pdx_file)?;
-            file_end += PDX_HEADER_SIZE as u64;
             //pdx_file.flush()?;
             header
         } else {
@@ -148,17 +145,35 @@ impl PositionIndex {
             }
             header
         };
-        Ok(Self { _header: header, pdx_file, _index_dir: dir.to_owned(), file_len: file_end })
+        Ok(Self { _header: header, pdx_file, _index_dir: dir.to_owned() })
     }
 
     /// Return the number of values in this index.
     pub fn len(&self) -> usize {
-        (self.file_len.saturating_sub(PDX_HEADER_SIZE as u64) / 8) as usize
+        (self.pdx_file.len().saturating_sub(PDX_HEADER_SIZE as u64) / 8) as usize
     }
 
     /// True if there are no keys stored in this index.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Return an iterator over file positions with up to len items.
+    pub fn iter(&mut self, len: usize) -> Result<PositionIter, std::io::Error> {
+        let data_len = if len < self.len() { len } else { self.len() };
+        let mut data = vec![0_u8; data_len * 8];
+        self.pdx_file.seek(SeekFrom::Start(PDX_HEADER_SIZE as u64))?;
+        self.pdx_file.read_exact(data.as_mut_slice())?;
+        Ok(PositionIter::new(data))
+    }
+
+    /// Return a reverse iterator over file positions with up to len items.
+    pub fn rev_iter(&mut self, len: usize) -> Result<PositionIter, std::io::Error> {
+        let data_len = if len < self.len() { len } else { self.len() };
+        let mut data = vec![0_u8; data_len * 8];
+        self.pdx_file.seek(SeekFrom::End(-(data_len as i64 * 8)))?;
+        self.pdx_file.read_exact(data.as_mut_slice())?;
+        Ok(PositionIter::new_rev(data))
     }
 }
 
@@ -172,7 +187,6 @@ impl Index<u64> for PositionIndex {
             )))
         } else {
             self.pdx_file.write_all(&record_pos.to_le_bytes())?;
-            self.file_len += 8;
             Ok(())
         }
     }
@@ -189,6 +203,51 @@ impl Index<u64> for PositionIndex {
         self.pdx_file.flush().map_err(CommitError::IndexFileSync)?;
         self.pdx_file.sync_all().map_err(CommitError::IndexFileSync)?;
         Ok(())
+    }
+}
+
+/// Iterator of u64 record positions from a position index.
+#[derive(Debug)]
+pub struct PositionIter {
+    data: Vec<u8>,
+    pos: usize,
+    done: bool,
+    reverse: bool,
+}
+
+impl PositionIter {
+    /// New position iter over data.
+    fn new(data: Vec<u8>) -> Self {
+        let done = data.is_empty();
+        Self { data, pos: 0, done, reverse: false }
+    }
+
+    /// New reverse iter over data.
+    fn new_rev(data: Vec<u8>) -> Self {
+        let done = data.is_empty();
+        let pos = data.len().saturating_sub(8);
+        Self { data, pos, done, reverse: true }
+    }
+}
+
+impl Iterator for PositionIter {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if !self.done {
+            let mut buf = [0_u8; 8];
+            buf.copy_from_slice(&self.data[self.pos..self.pos + 8]);
+            if self.reverse {
+                self.done = self.pos == 0;
+                self.pos = self.pos.saturating_sub(8);
+            } else {
+                self.pos = self.pos.saturating_add(8);
+                self.done = self.pos >= self.data.len();
+            }
+            Some(u64::from_le_bytes(buf))
+        } else {
+            None
+        }
     }
 }
 
@@ -235,6 +294,25 @@ mod tests {
                 "failed on iteration {i}"
             );
         }
+
+        // Test reverse iter.
+        let iter = idx.rev_iter(1000).unwrap();
+        assert_eq!(iter.count(), 1000, "asked for 1000 items");
+        let mut iter = idx.rev_iter(1000).unwrap();
+        assert_eq!(iter.next().unwrap(), 66, "last record wrong");
+        let d = 999_999;
+        for (i, pos) in iter.enumerate() {
+            assert_eq!(pos, ((d - i) * 100) as u64, "failed rev on iteration {i}");
+        }
+
+        // Test iter
+        let iter = idx.iter(1000).unwrap();
+        assert_eq!(iter.count(), 1000, "asked for 1000 items");
+        let iter = idx.iter(1000).unwrap();
+        for (i, pos) in iter.enumerate() {
+            assert_eq!(pos, (i * 100) as u64, "failed rev on iteration {i}");
+        }
+
         assert_eq!(idx.load(1_000_000).expect("load idx"), 66);
     }
 }

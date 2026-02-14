@@ -7,8 +7,12 @@ use crate::subscriber::spawn_subscriber;
 pub use errors::{SubscriberError, SubscriberResult};
 use tn_config::ConsensusConfig;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus};
+use tn_storage::consensus::ConsensusChain;
 use tn_types::{Database, Noticer, TaskManager};
 use tracing::info;
+
+#[cfg(test)]
+use tempfile as _;
 
 /// A client subscribing to the consensus output and forwarding every transaction to be executed by
 /// the engine.
@@ -23,9 +27,17 @@ impl Executor {
         consensus_bus: ConsensusBus,
         task_manager: &TaskManager,
         network: PrimaryNetworkHandle,
+        consensus_chain: ConsensusChain,
     ) {
         // Spawn the subscriber.
-        spawn_subscriber(config, rx_shutdown, consensus_bus, task_manager, network);
+        spawn_subscriber(
+            config,
+            rx_shutdown,
+            consensus_bus,
+            task_manager,
+            network,
+            consensus_chain,
+        );
 
         info!("Consensus subscriber successfully started");
     }

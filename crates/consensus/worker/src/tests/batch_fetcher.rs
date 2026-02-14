@@ -39,11 +39,11 @@ async fn test_fetchertt() {
     }
     assert_eq!(fetched_batches, expected_batches);
     assert_eq!(
-        batch_store.get::<Batches>(&batch1.digest()).unwrap().unwrap().digest(),
+        batch_store.get::<NodeBatchesCache>(&batch1.digest()).unwrap().unwrap().digest(),
         batch1.digest()
     );
     assert_eq!(
-        batch_store.get::<Batches>(&batch2.digest()).unwrap().unwrap().digest(),
+        batch_store.get::<NodeBatchesCache>(&batch2.digest()).unwrap().unwrap().digest(),
         batch2.digest()
     );
 }
@@ -61,7 +61,7 @@ async fn test_fetcher_locally_with_remaining() {
     let batch3 = Batch { transactions: vec![transaction(chain)], ..Default::default() };
     let digests = HashSet::from_iter(vec![batch1.digest(), batch2.digest(), batch3.digest()]);
     for batch in &[&batch1, &batch2, &batch3] {
-        batch_store.insert::<Batches>(&batch.digest(), batch).unwrap();
+        batch_store.insert::<NodeBatchesCache>(&batch.digest(), batch).unwrap();
     }
     network.put(&[1, 2], batch1.clone()).await;
     network.put(&[2, 3], batch2.clone()).await;
@@ -130,7 +130,7 @@ async fn test_fetcher_local_and_remote() {
     let batch2 = Batch { transactions: vec![transaction(chain.clone())], ..Default::default() };
     let batch3 = Batch { transactions: vec![transaction(chain)], ..Default::default() };
     let digests = HashSet::from_iter(vec![batch1.digest(), batch2.digest(), batch3.digest()]);
-    batch_store.insert::<Batches>(&batch1.digest(), &batch1).unwrap();
+    batch_store.insert::<NodeBatchesCache>(&batch1.digest(), &batch1).unwrap();
     network.put(&[1, 2, 3], batch1.clone()).await;
     network.put(&[2, 3, 4], batch2.clone()).await;
     network.put(&[1, 4], batch3.clone()).await;
@@ -176,7 +176,7 @@ async fn test_fetcher_response_size_limit() {
     for _i in 0..num_digests / 2 {
         let batch = Batch { transactions: vec![transaction(chain.clone())], ..Default::default() };
         local_digests.push(batch.digest());
-        batch_store.insert::<Batches>(&batch.digest(), &batch).unwrap();
+        batch_store.insert::<NodeBatchesCache>(&batch.digest(), &batch).unwrap();
         network.put(&[1, 2, 3], batch.clone()).await;
         expected_batches.push(batch);
     }

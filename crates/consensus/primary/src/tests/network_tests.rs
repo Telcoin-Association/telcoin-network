@@ -10,9 +10,13 @@ use crate::{
     ConsensusBus, RecentBlocks,
 };
 use assert_matches::assert_matches;
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
+use tempfile::TempDir;
 use tn_network_libp2p::{GossipMessage, TopicHash};
-use tn_storage::mem_db::MemDatabase;
+use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     error::HeaderError, now, AuthorityIdentifier, BlockHash, BlockHeader, BlockNumHash,
@@ -64,7 +68,7 @@ struct TestTypes<DB = MemDatabase> {
 
 /// Helper function to create an instance of [RequestHandler] for the first authority in the
 /// committee.
-fn create_test_types() -> TestTypes {
+fn create_test_types(path: &Path) -> TestTypes {
     let committee = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let authority = committee.first_authority();
     let config = authority.consensus_config();
@@ -86,15 +90,18 @@ fn create_test_types() -> TestTypes {
         .send(recent)
         .expect("watch channel updates for default parent in primary handler tests");
 
-    let handler = RequestHandler::new(config.clone(), cb.clone(), synchronizer);
+    let consensus_chain =
+        ConsensusChain::new_for_test(path.to_owned(), committee.committee()).unwrap();
+    let handler = RequestHandler::new(config.clone(), cb.clone(), synchronizer, consensus_chain);
     TestTypes { committee, handler, parent, task_manager, consensus_bus: cb }
 }
 
 #[tokio::test]
 async fn test_vote_succeeds() -> eyre::Result<()> {
     // common types
+    let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types();
+        create_test_types(temp_dir.path());
 
     let parents = Vec::new();
 
@@ -116,8 +123,9 @@ async fn test_vote_succeeds() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_vote_fails_too_many_parents() -> eyre::Result<()> {
     // common types
+    let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types();
+        create_test_types(temp_dir.path());
 
     // last authority produced 2 certs for round 1
     let mut too_many_parents: Vec<_> = Certificate::genesis(&committee.committee());
@@ -142,8 +150,9 @@ async fn test_vote_fails_too_many_parents() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_vote_fails_wrong_authority_network_key() -> eyre::Result<()> {
     // common types
+    let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types();
+        create_test_types(temp_dir.path());
     let parents = Vec::new();
 
     // create valid header proposed by last peer in the committee for round 1
@@ -164,8 +173,9 @@ async fn test_vote_fails_wrong_authority_network_key() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_vote_fails_invalid_genesis_parent() -> eyre::Result<()> {
     // common types
+    let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types();
+        create_test_types(temp_dir.path());
 
     let parents = Vec::new();
 
@@ -196,7 +206,9 @@ async fn test_vote_fails_invalid_genesis_parent() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_vote_fails_unknown_execution_result() -> eyre::Result<()> {
     // common types
-    let TestTypes { committee, handler, task_manager: _task_manager, .. } = create_test_types();
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path());
 
     // create header proposed by last peer in the committee for round 1
     let header = committee.header_from_last_authority();
@@ -213,7 +225,9 @@ async fn test_vote_fails_unknown_execution_result() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_vote_fails_invalid_header_digest() -> eyre::Result<()> {
     // common types
-    let TestTypes { committee, handler, task_manager: _task_manager, .. } = create_test_types();
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path());
 
     let parents = Vec::new();
 
@@ -232,8 +246,9 @@ async fn test_vote_fails_invalid_header_digest() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_vote_fails_invalid_timestamp() -> eyre::Result<()> {
     // common types
+    let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types();
+        create_test_types(temp_dir.path());
 
     let parents = Vec::new();
 
@@ -256,8 +271,9 @@ async fn test_vote_fails_invalid_timestamp() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_vote_fails_wrong_epoch() -> eyre::Result<()> {
     // common types
+    let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types();
+        create_test_types(temp_dir.path());
 
     let parents = Vec::new();
 
@@ -281,8 +297,9 @@ async fn test_vote_fails_wrong_epoch() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_vote_fails_unknown_authority() -> eyre::Result<()> {
     // common types
+    let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types();
+        create_test_types(temp_dir.path());
 
     let parents = Vec::new();
 
@@ -306,7 +323,8 @@ async fn test_vote_fails_unknown_authority() -> eyre::Result<()> {
 /// Test that primary pub/sub is enforcing topics.
 #[tokio::test]
 async fn test_primary_batch_gossip_topics() {
-    let TestTypes { handler, task_manager, consensus_bus, .. } = create_test_types();
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, task_manager, consensus_bus, .. } = create_test_types(temp_dir.path());
 
     task_manager.spawn_task("process-gossip-test", async move {
         let mut rx = consensus_bus.new_epoch_votes().subscribe();

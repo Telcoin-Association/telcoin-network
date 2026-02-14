@@ -69,17 +69,6 @@ impl EngineToPrimary for EmptyEngToPrimary {
         ConsensusHeader::default()
     }
 
-    fn consensus_block_by_number(&self, _number: u64) -> Option<tn_types::ConsensusHeader> {
-        None
-    }
-
-    fn consensus_block_by_hash(
-        &self,
-        _hash: tn_types::BlockHash,
-    ) -> Option<tn_types::ConsensusHeader> {
-        None
-    }
-
     fn epoch(
         &self,
         _epoch: Option<tn_types::Epoch>,

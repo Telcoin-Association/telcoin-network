@@ -3,6 +3,7 @@
 #![allow(unused_crate_dependencies)]
 
 use std::sync::Arc;
+use tempfile::TempDir;
 use tn_executor::subscriber::spawn_subscriber;
 use tn_network_libp2p::types::{MessageId, NetworkCommand};
 use tn_network_types::MockPrimaryToWorkerClient;
@@ -11,7 +12,7 @@ use tn_primary::{
     network::PrimaryNetworkHandle,
     ConsensusBus,
 };
-use tn_storage::mem_db::MemDatabase;
+use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
 use tn_test_utils::{create_signed_certificates_for_rounds, CommitteeFixture};
 use tn_types::{
     ExecHeader, SealedHeader, TaskManager, TnReceiver as _, TnSender as _, B256,
@@ -26,10 +27,13 @@ async fn test_output_to_header() -> eyre::Result<()> {
     let committee = fixture.committee();
     let primary = fixture.authorities().next().unwrap();
     let config = primary.consensus_config().clone();
-    let consensus_store = config.node_storage().clone();
     let task_manager = TaskManager::new("subscriber tests");
     let rx_shutdown = config.shutdown().subscribe();
     let consensus_bus = ConsensusBus::new();
+    let temp_dir = TempDir::with_prefix("test_output_to_header").unwrap();
+    let mut consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), config.committee().clone())
+            .unwrap();
 
     // subscribe to channels early
     let rx_consensus_headers = consensus_bus.last_consensus_header().subscribe();
@@ -46,7 +50,14 @@ async fn test_output_to_header() -> eyre::Result<()> {
     let network = PrimaryNetworkHandle::new_for_test(tx);
 
     // spawn the executor
-    spawn_subscriber(config.clone(), rx_shutdown, consensus_bus.clone(), &task_manager, network);
+    spawn_subscriber(
+        config.clone(),
+        rx_shutdown,
+        consensus_bus.clone(),
+        &task_manager,
+        network,
+        consensus_chain.clone(),
+    );
 
     // yield for subscriber to spawn
     tokio::task::yield_now().await;
@@ -61,9 +72,10 @@ async fn test_output_to_header() -> eyre::Result<()> {
 
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),
-        consensus_store.clone(),
+        &mut consensus_chain,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
-    );
+    )
+    .await;
     let bullshark = Bullshark::new(
         committee.clone(),
         // metrics.clone(),
@@ -76,7 +88,8 @@ async fn test_output_to_header() -> eyre::Result<()> {
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     consensus_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
     let task_manager = TaskManager::default();
-    Consensus::spawn(config.clone(), &consensus_bus, bullshark, &task_manager);
+    Consensus::spawn(config.clone(), &consensus_bus, bullshark, &task_manager, consensus_chain)
+        .await;
 
     // forward certificates to trigger subdag commit
     for certificate in certificates.iter() {

@@ -4,11 +4,8 @@ use std::sync::Arc;
 
 use tn_config::ConsensusConfig;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus};
-use tn_storage::{
-    tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache, EpochRecords},
-    ConsensusStore,
-};
-use tn_types::{Database as TNDatabase, DbTxMut as _, Epoch, EpochRecord, TaskSpawner, B256};
+use tn_storage::{consensus::ConsensusChain, tables::EpochRecords};
+use tn_types::{Database as TNDatabase, Epoch, EpochRecord, TaskSpawner, B256};
 use tokio::sync::{mpsc::Receiver, Mutex, Semaphore, SemaphorePermit};
 use tracing::{debug, error, info};
 
@@ -19,18 +16,18 @@ use tracing::{debug, error, info};
 async fn get_consensus_header<DB: TNDatabase>(
     number: Option<u64>,
     hash: B256,
-    config: &ConsensusConfig<DB>,
+    _config: &ConsensusConfig<DB>, //XXXX
     consensus_bus: &ConsensusBus,
     network: &PrimaryNetworkHandle,
+    consensus_chain: &ConsensusChain,
 ) -> Option<(Epoch, u64, B256)> {
-    let db = config.node_storage();
     if let Some(number) = number {
         // If we have already processed consensus block number then stop.
-        if let Ok(Some(_block)) = db.get::<ConsensusBlocks>(&number) {
+        if let Ok(Some(_block)) = consensus_chain.consensus_header_by_number(None, number).await {
             return None;
         }
     }
-    if let Some(block) = db.get_consensus_by_hash(hash) {
+    if let Ok(Some(block)) = consensus_chain.consensus_header_by_digest(None, hash).await {
         return Some((block.sub_dag.leader_epoch(), block.number - 1, block.parent_hash));
     }
     // request consensus from any peer
@@ -38,24 +35,6 @@ async fn get_consensus_header<DB: TNDatabase>(
         Ok(header) => {
             // The header we got will match hash (request_consensus() contract).
             let parent = header.parent_hash;
-            match db.write_txn() {
-                Ok(mut txn) => {
-                    if let Err(e) = txn.insert::<ConsensusBlocksCache>(&header.number, &header) {
-                        error!(target: "state-sync", ?e, "error saving a consensus header to persistant storage!");
-                    }
-                    if let Err(e) = txn
-                        .insert::<ConsensusBlockNumbersByDigest>(&header.digest(), &header.number)
-                    {
-                        error!(target: "state-sync", ?e, "error saving a consensus header number to persistant storage!");
-                    }
-                    if let Err(e) = txn.commit() {
-                        error!(target: "state-sync", ?e, "error saving committing to persistant storage!");
-                    }
-                }
-                Err(e) => {
-                    error!(target: "state-sync", ?e, "error getting a transaction on persistant storage!");
-                }
-            }
             let parent_number = header.number - 1;
             let epoch = header.sub_dag.leader_epoch();
             let last_seen_header_number = consensus_bus
@@ -84,6 +63,7 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
     consensus_bus: ConsensusBus,
     network: PrimaryNetworkHandle,
     task_spawner: TaskSpawner,
+    consensus_chain: ConsensusChain,
 ) -> eyre::Result<()> {
     let rx_shutdown = config.shutdown().subscribe();
     let mut rx_gossip_update = consensus_bus.last_published_consensus_num_hash().subscribe();
@@ -91,12 +71,13 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
     let (tx, mut rx) = tokio::sync::mpsc::channel(10_000);
     let db = config.node_storage().clone();
     // Get the epoch of our last executed consensus.
-    let mut current_fetch_epoch =
-        if let Some(block) = consensus_bus.last_executed_consensus_block(&db) {
-            block.sub_dag.leader_epoch()
-        } else {
-            0
-        };
+    let mut current_fetch_epoch = if let Some(block) =
+        consensus_bus.last_executed_consensus_block(None, &consensus_chain).await
+    {
+        block.sub_dag.leader_epoch()
+    } else {
+        0
+    };
     let (epochs_tx, epochs_rx) = tokio::sync::mpsc::channel(10_000);
     let epoch_queue = Arc::new(Mutex::new(epochs_rx));
     // spawn four critical workers that will fetch consensus outputs from an epoch work queue.
@@ -110,6 +91,7 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
                 network.clone(),
                 epoch_queue.clone(),
                 i,
+                consensus_chain.clone(),
             ),
         );
     }
@@ -122,7 +104,7 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
                 let (number, hash) = *rx_gossip_update.borrow_and_update();
                 debug!(target: "state-sync", ?number, ?hash, "tracking recent consensus and detected change through gossip - requesting consensus from peer");
 
-                if let Some(next) = get_consensus_header(Some(number), hash, &config, &consensus_bus, &network).await {
+                if let Some(next) = get_consensus_header(Some(number), hash, &config, &consensus_bus, &network, &consensus_chain).await {
                     if current_fetch_epoch < next.0 {
                         // If we still have epochs to fetch then add to the queue until we are out of epoch records.
                         while let Ok(Some(epoch_record)) = db.get::<EpochRecords>(&current_fetch_epoch) {
@@ -142,7 +124,7 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
             Some((_, number, hash)) = rx.recv() => {
                 debug!(target: "state-sync", ?number, ?hash, "tracking recent consensus and detected change through gossip - requesting consensus from peer");
 
-                if let Some(next) = get_consensus_header(Some(number), hash, &config, &consensus_bus, &network).await {
+                if let Some(next) = get_consensus_header(Some(number), hash, &config, &consensus_bus, &network, &consensus_chain).await {
                     let _ = tx.send(next).await;
                 }
             }
@@ -162,6 +144,7 @@ async fn spawn_fetch_consensus<DB: TNDatabase>(
     network: PrimaryNetworkHandle,
     epoch_queue: Arc<Mutex<Receiver<EpochRecord>>>,
     worker: u32, // Worker number for logging.
+    consensus_chain: ConsensusChain,
 ) -> eyre::Result<()> {
     async fn next_epoch<'s>(
         epoch_queue: &Arc<Mutex<Receiver<EpochRecord>>>,
@@ -196,7 +179,7 @@ async fn spawn_fetch_consensus<DB: TNDatabase>(
                     log_counter += 1;
                 }
 
-                if let Some((new_epoch, num, hash)) = get_consensus_header(number, hash, &config, &consensus_bus, &network).await {
+                if let Some((new_epoch, num, hash)) = get_consensus_header(number, hash, &config, &consensus_bus, &network, &consensus_chain).await {
                     if new_epoch == epoch {
                         // Stop once we reach another epoch.
                         let _ = tx.send((Some(num), hash)).await;

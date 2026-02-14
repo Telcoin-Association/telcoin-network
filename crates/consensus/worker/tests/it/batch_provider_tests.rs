@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use tempfile::TempDir;
 use tn_network_types::{local::LocalNetwork, MockWorkerToPrimary};
 use tn_reth::test_utils::transaction;
-use tn_storage::{open_db, tables::Batches};
+use tn_storage::{open_db, tables::NodeBatchesCache};
 use tn_types::{test_chain_spec_arc, Batch, Database, TaskManager};
 use tn_worker::{
     metrics::WorkerMetrics, test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle,
@@ -56,5 +56,5 @@ async fn make_batch() {
     );
 
     // Ensure the batch is stored
-    assert!(store.get::<Batches>(&expected_batch.digest()).unwrap().is_some());
+    assert!(store.get::<NodeBatchesCache>(&expected_batch.digest()).unwrap().is_some());
 }
