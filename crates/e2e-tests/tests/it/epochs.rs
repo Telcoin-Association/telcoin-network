@@ -136,16 +136,8 @@ async fn test_epoch_boundary_inner(
     if shuffled {
         // Do a check to make sure all the nodes have valid (certified) Epoch Records.
         // TODO issue 375, should use tn_latestHeader RPC for this when fixed.
-        let latest_epoch = last_pause;
-        for p in 8540..=8545 {
-            let rpc_url = format!("http://127.0.0.1:{p}");
-            let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-            for epoch in 0..=latest_epoch {
-                let (epoch_rec, cert): (EpochRecord, EpochCertificate) =
-                    provider.raw_request("tn_epochRecord".into(), (epoch,)).await?;
-                assert!(epoch_rec.verify_with_cert(&cert), "invalid epoch record!");
-            }
-        }
+        let latest_epoch = last_pause as u32;
+        verify_epoch_records_for_nodes(8540, 8545, 0, latest_epoch).await?;
 
         Ok(())
     } else {
@@ -183,6 +175,52 @@ async fn loop_epochs(start: u32, iterations: u32) -> eyre::Result<()> {
         // sleep for epoch duration
         tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
     }
+    Ok(())
+}
+
+async fn verify_epoch_records_for_nodes(
+    start_port: u16,
+    end_port: u16,
+    start_epoch: u32,
+    end_epoch: u32,
+) -> eyre::Result<()> {
+    for p in start_port..=end_port {
+        let rpc_url = format!("http://127.0.0.1:{p}");
+        let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+        for epoch in start_epoch..=end_epoch {
+            let mut attempts = 0;
+            loop {
+                let response: Result<(EpochRecord, EpochCertificate), _> =
+                    provider.raw_request("tn_epochRecord".into(), (epoch,)).await;
+                match response {
+                    Ok((epoch_rec, cert)) => {
+                        assert!(
+                            epoch_rec.verify_with_cert(&cert),
+                            "invalid epoch record: {p} {}/{} {}!",
+                            epoch_rec.epoch,
+                            epoch_rec.digest(),
+                            cert.epoch_hash
+                        );
+                        break;
+                    }
+                    Err(e) if attempts < 30 => {
+                        attempts += 1;
+                        debug!(
+                            target: "epoch-test",
+                            "retrying tn_epochRecord for port {p}, epoch {epoch}: {e:?}"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                    Err(e) => {
+                        return Err(eyre::eyre!(
+                            "failed to fetch epoch record for port {p}, epoch {epoch}: {e:?}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -234,21 +272,149 @@ async fn test_epoch_sync_inner(
     // The node that was down should also have all these records after syncing.
     // TODO issue 375, should use tn_latestHeader RPC for this when fixed.
     let latest_epoch = 15;
-    for p in 8540..=8545 {
-        let rpc_url = format!("http://127.0.0.1:{p}");
-        let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-        for epoch in 0..=latest_epoch {
-            let (epoch_rec, cert): (EpochRecord, EpochCertificate) =
-                provider.raw_request("tn_epochRecord".into(), (epoch,)).await?;
-            assert!(
-                epoch_rec.verify_with_cert(&cert),
-                "invalid epoch record: {p} {}/{} {}!",
-                epoch_rec.epoch,
-                epoch_rec.digest(),
-                cert.epoch_hash
-            );
+    verify_epoch_records_for_nodes(8540, 8545, 0, latest_epoch).await?;
+
+    Ok(())
+}
+
+async fn test_epoch_record_validator_ejection_inner(
+    genesis: Genesis,
+    mut governance_wallet: TransactionFactory,
+    temp_path: &Path,
+    new_validator: &mut TransactionFactory,
+    exiting_validator: &mut TransactionFactory,
+) -> eyre::Result<()> {
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let txs = generate_new_validator_txs(
+        temp_path,
+        chain.clone(),
+        new_validator,
+        &mut governance_wallet,
+    )?;
+
+    // create rpc client for node1 default rpc address
+    let rpc_url = "http://127.0.0.1:8545".to_string();
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+
+    // wait for node rpc to become available
+    timeout(std::time::Duration::from_secs(20), async {
+        let mut result = provider.get_chain_id().await;
+        while let Err(e) = result {
+            debug!(target: "epoch-test", "provider error getting chain id: {e:?}");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+            // make next request
+            result = provider.get_chain_id().await;
+        }
+    })
+    .await?;
+
+    // submit txs to: issue NFT, stake, and activate new validator
+    for tx in txs {
+        let pending = provider.send_raw_transaction(&tx).await?;
+        debug!(target: "epoch-test", "pending tx: {pending:?}");
+        timeout(Duration::from_secs(5), pending.watch()).await??;
+    }
+
+    // retrieve current committee
+    let consensus_registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &provider);
+    let mut current_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
+    let mut latest_epoch = consensus_registry.getCurrentEpoch().call().await?;
+
+    tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
+
+    // Wait until the new validator is in committee while the exiting validator is still in
+    // committee. This guarantees the committee reshuffled and then changes again during exit.
+    let mut ready_for_exit = false;
+    for _ in 0..30 {
+        let new_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
+        if new_epoch_info == current_epoch_info {
+            tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
+            continue;
+        }
+
+        latest_epoch = consensus_registry.getCurrentEpoch().call().await?;
+        let new_validator_in_committee =
+            new_epoch_info.committee.contains(&new_validator.address());
+        let exiting_validator_in_committee =
+            new_epoch_info.committee.contains(&exiting_validator.address());
+        current_epoch_info = new_epoch_info;
+
+        if new_validator_in_committee && exiting_validator_in_committee {
+            ready_for_exit = true;
+            break;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
+    }
+
+    if !ready_for_exit {
+        return Err(eyre::eyre!(
+            "new validator and exiting validator were never both in committee"
+        ));
+    }
+
+    // request validator exit
+    let calldata = ConsensusRegistry::beginExitCall {}.abi_encode().into();
+    let begin_exit_tx = exiting_validator.create_eip1559_encoded(
+        chain.clone(),
+        None,
+        100,
+        Some(CONSENSUS_REGISTRY_ADDRESS),
+        U256::ZERO,
+        calldata,
+    );
+    let pending = provider.send_raw_transaction(&begin_exit_tx).await?;
+    timeout(Duration::from_secs(5), pending.watch()).await??;
+
+    tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
+
+    // Wait for the validator to finalize exit on-chain and disappear from committee.
+    let mut ejected = false;
+    for _ in 0..30 {
+        let validator_info =
+            consensus_registry.getValidator(exiting_validator.address()).call().await?;
+        let exit_finalized =
+            validator_info.currentStatus == ConsensusRegistry::ValidatorStatus::Exited;
+
+        let new_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
+        if new_epoch_info == current_epoch_info {
+            if exit_finalized && !new_epoch_info.committee.contains(&exiting_validator.address()) {
+                ejected = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
+            continue;
+        }
+
+        latest_epoch = consensus_registry.getCurrentEpoch().call().await?;
+        let exiting_validator_in_committee =
+            new_epoch_info.committee.contains(&exiting_validator.address());
+        current_epoch_info = new_epoch_info;
+
+        if exit_finalized && !exiting_validator_in_committee {
+            ejected = true;
+            break;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
+    }
+
+    if !ejected {
+        return Err(eyre::eyre!("validator never exited committee"));
+    }
+
+    // wait for extra epochs to ensure records are available on all nodes
+    for _ in 0..2 {
+        tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
+        let new_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
+        if new_epoch_info != current_epoch_info {
+            latest_epoch = consensus_registry.getCurrentEpoch().call().await?;
+            current_epoch_info = new_epoch_info;
         }
     }
+
+    verify_epoch_records_for_nodes(8540, 8545, 0, latest_epoch).await?;
 
     Ok(())
 }
@@ -392,6 +558,64 @@ async fn test_epoch_sync() -> eyre::Result<()> {
     r
 }
 
+#[ignore = "only run independently from all other it tests"]
+#[tokio::test]
+/// Test epoch record validation while a validator exits the committee.
+async fn test_epoch_record_validator_ejection() -> eyre::Result<()> {
+    let _guard = IT_TEST_MUTEX.lock();
+    tn_types::test_utils::init_test_tracing();
+
+    // create validator and governance wallets for adding new validator and initiating exit
+    let mut new_validator = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(6));
+    let mut exiting_validator =
+        TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(77));
+    let mut committee = vec![
+        ("validator-1", Address::from_slice(&[0x11; 20])),
+        ("validator-2", exiting_validator.address()),
+        ("validator-3", Address::from_slice(&[0x33; 20])),
+        ("validator-4", Address::from_slice(&[0x44; 20])),
+        ("validator-5", Address::from_slice(&[0x55; 20])),
+    ];
+
+    // setup genesis
+    let temp_dir = tempfile::TempDir::with_prefix("epoch_record_validator_ejection")?;
+    let temp_path = temp_dir.path();
+
+    let governance_wallet =
+        TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
+    let genesis = create_genesis_for_ejection_test(
+        temp_path,
+        new_validator.address(),
+        governance_wallet.address(),
+        exiting_validator.address(),
+        &committee,
+    )?;
+
+    // start nodes (committee + new validator)
+    committee.push((NEW_VALIDATOR, new_validator.address()));
+    let procs = start_nodes(temp_path, &committee, "epoch_record_validator_ejection", 1)?;
+    let procs: Vec<Arc<std::sync::Mutex<Child>>> =
+        procs.into_iter().map(|c| Arc::new(std::sync::Mutex::new(c))).collect();
+    let procs_clone = procs.clone();
+    // Use a panic hook to make sure we kill the node procs on a panic (assert failure).
+    let org_panic = panic::take_hook();
+    panic::set_hook(Box::new(move |a| {
+        kill_procs(&procs_clone);
+        org_panic(a);
+    }));
+
+    let r = test_epoch_record_validator_ejection_inner(
+        genesis,
+        governance_wallet,
+        temp_path,
+        &mut new_validator,
+        &mut exiting_validator,
+    )
+    .await;
+    kill_procs(&procs);
+    r
+}
+
 /// Create genesis for this test.
 ///
 /// Funds a new validator and the governance wallet to issue NFTs.
@@ -418,6 +642,70 @@ fn create_genesis_for_test(
         (
             new_validator,
             GenesisAccount::default().with_balance(U256::from(parse_ether("2_000_000")?)), /* double stake */
+        ),
+    ];
+
+    let shared_genesis_dir = temp_path.join("shared-genesis");
+
+    // create the initial committee of validators and create genesis
+    let genesis = config_committee(
+        temp_path,
+        &shared_genesis_dir,
+        passphrase,
+        governance_wallet,
+        accounts,
+        committee,
+    )?;
+
+    // copy genesis for new validator
+    std::fs::create_dir_all(new_validator_path.join("genesis"))?;
+    std::fs::copy(
+        shared_genesis_dir.join("genesis/committee.yaml"),
+        new_validator_path.join("genesis/committee.yaml"),
+    )?;
+    std::fs::copy(
+        shared_genesis_dir.join("genesis/genesis.yaml"),
+        new_validator_path.join("genesis/genesis.yaml"),
+    )?;
+    std::fs::copy(
+        shared_genesis_dir.join("parameters.yaml"),
+        new_validator_path.join("parameters.yaml"),
+    )?;
+
+    Ok(genesis)
+}
+
+/// Create genesis for validator ejection test.
+///
+/// Funds governance wallet, the candidate validator to be added, and the validator
+/// that will send beginExit.
+fn create_genesis_for_ejection_test(
+    temp_path: &Path,
+    new_validator: Address,
+    governance_wallet: Address,
+    exiting_validator: Address,
+    committee: &Vec<(&str, Address)>,
+) -> eyre::Result<Genesis> {
+    // use same passphrase for all nodes
+    let passphrase = Some(NODE_PASSWORD.to_string());
+
+    // create validator info for "new" validator to join
+    let new_validator_path = temp_path.join(NEW_VALIDATOR);
+    create_validator_info(&new_validator_path, &new_validator.to_string(), passphrase.clone())?;
+
+    // fund governance to issue NFT and validators for stake/gas
+    let accounts = vec![
+        (
+            governance_wallet,
+            GenesisAccount::default().with_balance(U256::from(parse_ether("50_000_000")?)), /* 50mil TEL */
+        ),
+        (
+            new_validator,
+            GenesisAccount::default().with_balance(U256::from(parse_ether("2_000_000")?)), /* double stake */
+        ),
+        (
+            exiting_validator,
+            GenesisAccount::default().with_balance(U256::from(parse_ether("100_000")?)),
         ),
     ];
 
