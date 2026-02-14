@@ -22,7 +22,7 @@ fn test_certificate_serde_roundtrip() {
     let bytes: Vec<u8> = (&original_cert).into();
 
     // Deserialize
-    let recovered_cert: Certificate = bytes.as_slice().into();
+    let mut recovered_cert: Certificate = bytes.as_slice().into();
 
     // Compare key fields
     assert_eq!(original_cert.digest(), recovered_cert.digest());

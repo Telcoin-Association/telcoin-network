@@ -83,7 +83,7 @@ impl TNPayload {
     ) -> Self {
         // include leader's aggregate bls signature if this is the last payload for the epoch
         let close_epoch = output
-            .close_epoch_for_last_batch()
+            .close_epoch_for_last_batch(batch_index)
             .is_some_and(|last_batch| last_batch)
             .then(|| output.keccak_leader_sigs());
 
