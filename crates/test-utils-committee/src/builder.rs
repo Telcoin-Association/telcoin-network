@@ -4,16 +4,11 @@ use crate::WorkerFixture;
 
 use super::{AuthorityFixture, CommitteeFixture};
 use rand::{rngs::StdRng, SeedableRng};
-use std::{
-    collections::{BTreeMap, VecDeque},
-    marker::PhantomData,
-    num::NonZeroUsize,
-};
+use std::{collections::BTreeMap, marker::PhantomData, num::NonZeroUsize};
 use tn_config::{KeyConfig, NetworkConfig, Parameters};
 use tn_types::{
     get_available_udp_port, test_genesis, Address, Authority, AuthorityIdentifier, BlsKeypair,
-    BootstrapServer, Committee, Database, Epoch, Multiaddr, TimestampSec, VotingPower,
-    DEFAULT_WORKER_PORT,
+    BootstrapServer, Committee, Database, Epoch, Multiaddr, TimestampSec, DEFAULT_WORKER_PORT,
 };
 
 /// The committee builder for tests.
@@ -24,7 +19,6 @@ pub struct Builder<DB, F, R = StdRng> {
     number_of_workers: NonZeroUsize,
     randomize_ports: bool,
     epoch: Epoch,
-    voting_power: VecDeque<VotingPower>,
     network_config: Option<NetworkConfig>,
     epoch_boundary: Option<TimestampSec>,
     new_db: F,
@@ -44,7 +38,6 @@ where
             committee_size: NonZeroUsize::new(4).unwrap(),
             number_of_workers: NonZeroUsize::new(1).unwrap(),
             randomize_ports: false,
-            voting_power: VecDeque::new(),
             network_config: None,
             epoch_boundary: None,
             new_db,
@@ -74,11 +67,6 @@ where
         self
     }
 
-    pub fn voting_power_distribution(mut self, stake: VecDeque<VotingPower>) -> Self {
-        self.voting_power = stake;
-        self
-    }
-
     pub fn with_network_config(mut self, network_config: NetworkConfig) -> Self {
         self.network_config = Some(network_config);
         self
@@ -104,7 +92,6 @@ where
             committee_size: self.committee_size,
             number_of_workers: self.number_of_workers,
             randomize_ports: self.randomize_ports,
-            voting_power: self.voting_power,
             network_config: None,
             epoch_boundary: None,
             new_db: self.new_db,
@@ -120,9 +107,6 @@ where
     F: Fn() -> DB,
 {
     pub fn build(mut self) -> CommitteeFixture<DB> {
-        if !self.voting_power.is_empty() {
-            assert_eq!(self.voting_power.len(), self.committee_size.get(), "Stake vector has been provided but is different length the committee - it should be the same");
-        }
         let committee_size = self.committee_size.get();
         let network_config = self.network_config.unwrap_or_default();
 
@@ -132,7 +116,7 @@ where
         let mut authorities = BTreeMap::new();
         let mut bootstrap_servers = BTreeMap::new();
         // Pass 1 to make the authorities so we can make the committee struct we need later.
-        for i in 0..committee_size {
+        for _ in 0..committee_size {
             let primary_keypair = BlsKeypair::generate(&mut rng);
             let key_config = KeyConfig::new_with_testing_key(primary_keypair.copy());
             let host = "127.0.0.1";
@@ -152,7 +136,7 @@ where
                 format!("/ip4/{host}/udp/{port}/quic-v1").parse().unwrap();
             let authority = Authority::new_for_test(
                 key_config.primary_public_key(),
-                *self.voting_power.get(i).unwrap_or(&1),
+                1,
                 Address::random_with(&mut rng),
             );
             bootstrap_servers.insert(
