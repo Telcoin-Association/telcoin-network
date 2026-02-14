@@ -11,8 +11,8 @@ use std::{
 };
 
 use tn_types::{
-    AuthorityIdentifier, Batch, BlockHash, CommittedSubDag, Committee, ConsensusHeader,
-    ConsensusOutput, Epoch, EpochRecord, Round, B256,
+    gas_accumulator::RewardsCounter, AuthorityIdentifier, Batch, BlockHash, CommittedSubDag,
+    Committee, ConsensusHeader, ConsensusOutput, Epoch, EpochRecord, Round, B256,
 };
 use tokio::sync::{
     mpsc::{self, Sender},
@@ -103,21 +103,19 @@ impl LatestConsensus {
                     tx,
                 }
             }
+        } else if slot1_epoch > slot2_epoch {
+            Self {
+                epoch: slot1_epoch,
+                number: slot1_number,
+                current_slot: ConsensusSlot::Slot1,
+                tx,
+            }
         } else {
-            if slot1_epoch > slot2_epoch {
-                Self {
-                    epoch: slot1_epoch,
-                    number: slot1_number,
-                    current_slot: ConsensusSlot::Slot1,
-                    tx,
-                }
-            } else {
-                Self {
-                    epoch: slot2_epoch,
-                    number: slot2_number,
-                    current_slot: ConsensusSlot::Slot2,
-                    tx,
-                }
+            Self {
+                epoch: slot2_epoch,
+                number: slot2_number,
+                current_slot: ConsensusSlot::Slot2,
+                tx,
             }
         };
         std::thread::spawn(move || {
@@ -380,6 +378,20 @@ impl ConsensusChain {
             pack.batch(digest).await
         } else {
             None
+        }
+    }
+
+    /// Count leaders in this pack (in rewards_counter) lower than last_executed_round.
+    /// This works on the current epoch/pack.
+    pub async fn count_leaders(
+        &mut self,
+        last_executed_round: Round,
+        rewards_counter: RewardsCounter,
+    ) -> Result<(), ConsensusChainError> {
+        if let Some(pack) = &mut self.current_pack {
+            Ok(pack.count_leaders(last_executed_round, rewards_counter).await?)
+        } else {
+            Err(ConsensusChainError::NoCurrentEpoch)
         }
     }
 }

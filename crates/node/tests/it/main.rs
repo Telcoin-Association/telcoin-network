@@ -47,7 +47,7 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
     let config = primary.consensus_config().clone();
     let consensus_bus = ConsensusBus::new();
     let committee = config.committee().clone();
-    let consensus_chain =
+    let mut consensus_chain =
         ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee).unwrap();
 
     // make certificates for rounds 1 to 7 with batches of txs
@@ -145,7 +145,7 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
     // initialize a new gas accumulator to simulate node recovery
     let recovered = GasAccumulator::new(1);
     recovered.rewards_counter().set_committee(fixture.committee());
-    catchup_accumulator(reth_env.clone(), &recovered, &consensus_chain).await?;
+    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain).await?;
     // assert recovered and active track the same expected values
     //      G48pDy85GhyGMp9afPBvWgaNzgPAnvBtMxjReQTe1NiN: 3,
     //      Agv7rsffEbxoa7ybTJj57TiAHchf27ia7ziB5CVrHNTk: 3,
@@ -314,7 +314,7 @@ async fn test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
     let worker_id = 0;
     let recovered = GasAccumulator::new(1);
     recovered.rewards_counter().set_committee(fixture.committee());
-    catchup_accumulator(reth_env.clone(), &recovered, &consensus_chain).await?;
+    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain).await?;
     assert_eq!(gas_accumulator.get_values(worker_id), recovered.get_values(worker_id));
 
     let expected: BTreeMap<_, _> = rewards
@@ -341,7 +341,7 @@ async fn test_catchup_accumulator_partial_execution() -> eyre::Result<()> {
     let primary = fixture.authorities().next().unwrap();
     let config = primary.consensus_config().clone();
     let consensus_bus = ConsensusBus::new();
-    let consensus_chain =
+    let mut consensus_chain =
         ConsensusChain::new_for_test(tmp.path().to_owned(), fixture.committee()).unwrap();
 
     let max_round = 21;
@@ -441,7 +441,7 @@ async fn test_catchup_accumulator_partial_execution() -> eyre::Result<()> {
 
     let recovered = GasAccumulator::new(1);
     recovered.rewards_counter().set_committee(fixture.committee());
-    catchup_accumulator(reth_env.clone(), &recovered, &consensus_chain).await?;
+    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain).await?;
 
     let worker_id = 0;
     assert_eq!(gas_accumulator.get_values(worker_id), recovered.get_values(worker_id));

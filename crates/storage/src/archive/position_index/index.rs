@@ -126,7 +126,7 @@ impl PositionIndex {
         let _ = fs::create_dir(dir);
         let mut pdx_file = DataFile::open(dir.join("index.pdx"), read_only)?;
 
-        let header = if pdx_file.len() == 0 {
+        let header = if pdx_file.is_empty() {
             let mut header = PdxHeader::from_data_header(data_header);
             header.write_header(&mut pdx_file)?;
             //pdx_file.flush()?;

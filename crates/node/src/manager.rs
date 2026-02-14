@@ -157,7 +157,7 @@ pub(crate) struct EpochManager<P, DB> {
 pub async fn catchup_accumulator(
     reth_env: RethEnv,
     gas_accumulator: &GasAccumulator,
-    consensus_chain: &ConsensusChain,
+    consensus_chain: &mut ConsensusChain,
 ) -> eyre::Result<()> {
     if let Some(block) = reth_env.finalized_header()? {
         let epoch_state = reth_env.epoch_state_from_canonical_tip()?;
@@ -169,7 +169,7 @@ pub async fn catchup_accumulator(
             .set_base_fee(block.base_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE));
 
         let nonce: u64 = block.nonce.into();
-        let (current_epoch, last_executed_round) = RethEnv::deconstruct_nonce(nonce);
+        let (_current_epoch, last_executed_round) = RethEnv::deconstruct_nonce(nonce);
 
         let blocks =
             reth_env.blocks_for_range(epoch_state.epoch_info.blockHeight..=block.number)?;
@@ -186,29 +186,13 @@ pub async fn catchup_accumulator(
             gas_accumulator.inc_block(worker_id, gas, limit);
         }
 
-        /* XXXX ConsensusBlocks is gone, need to refactor into ConsensusChain
         // count leaders from consensus db for the current epoch
         // NOTE: replay_missed_consensus catches up rounds above last_executed_round.
         if last_executed_round > 0 {
-            for (_block_number, header) in db.reverse_iter::<ConsensusBlocks>() {
-                let leader_epoch = header.sub_dag.leader_epoch();
-                let leader_round = header.sub_dag.leader_round();
-
-                if leader_epoch > current_epoch {
-                    continue;
-                } else if leader_epoch < current_epoch {
-                    break;
-                }
-                if leader_round == 0 {
-                    continue;
-                }
-                if leader_round > last_executed_round {
-                    continue;
-                }
-
-                gas_accumulator.rewards_counter().inc_leader_count(header.sub_dag.leader.origin());
-            }
-        }*/
+            consensus_chain
+                .count_leaders(last_executed_round, gas_accumulator.rewards_counter().clone())
+                .await?;
+        }
     };
 
     Ok(())
@@ -612,8 +596,12 @@ where
         // retrieve epoch information from canonical tip on startup
         let EpochState { epoch, .. } = engine.epoch_state_from_canonical_tip().await?;
         debug!(target: "epoch-manager", ?epoch, "retrieved epoch state from canonical tip");
-        catchup_accumulator(engine.get_reth_env().await, &gas_accumulator, &self.consensus_chain)
-            .await?;
+        catchup_accumulator(
+            engine.get_reth_env().await,
+            &gas_accumulator,
+            &mut self.consensus_chain,
+        )
+        .await?;
 
         // read the network config or use the default
         let network_config = NetworkConfig::read_config(&self.tn_datadir)?;
@@ -1009,9 +997,6 @@ where
     ) -> eyre::Result<RunEpochMode> {
         info!(target: "epoch-manager", "Starting epoch");
 
-        /*XXXX// Lets make sure our consesus db has a clear write queue and is ready to go.
-        self.consensus_db.persist::<Batches>().await;
-        self.consensus_db.persist::<ConsensusBlocks>().await;*/
         self.last_consensus_header = None;
         // We have not created this epoch's primary yet (no committee) so get it from chain
         // ourselves... Note, any consensus output to replay should be in the same epoch...
@@ -1240,16 +1225,6 @@ where
             // update output so engine closes epoch
             output.close_epoch = true;
         }
-        // Note that is this consensus block number has benn saved this becomes a no-op (not an
-        // error).
-        /*XXXXif let Err(e) = self.consensus_chain.save_consensus_output(output.clone()).await {
-            error!(
-                target: "epoch-manager",
-                "Failed to save consensus output number {} to pack file: {e:?}",
-                output.number(),
-            );
-            return Err(eyre::eyre!("Failed to save consensus output {}: {e}", output.number()));
-        }*/
         // only forward the output to the engine
         to_engine.send(output).await?;
         Ok(())

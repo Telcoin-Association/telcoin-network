@@ -15,8 +15,9 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use tn_types::{
-    AuthorityIdentifier, Batch, BlockHash, BlockNumHash, CertifiedBatch, CommittedSubDag,
-    Committee, ConsensusHeader, ConsensusOutput, Epoch, EpochRecord, Round, B256,
+    gas_accumulator::RewardsCounter, AuthorityIdentifier, Batch, BlockHash, BlockNumHash,
+    CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput, Epoch,
+    EpochRecord, Round, B256,
 };
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
@@ -96,6 +97,7 @@ enum PackMessage {
     ReadLatestFinalRep(oneshot::Sender<Option<Arc<CommittedSubDag>>>),
     ContainsBatch(B256, oneshot::Sender<bool>),
     Batch(B256, oneshot::Sender<Option<Batch>>),
+    CountLeaders(Round, RewardsCounter, oneshot::Sender<Result<(), PackError>>),
 }
 
 /// Manage a single pack file of consensus data (typically one epoch os the consensus chain).
@@ -149,6 +151,9 @@ fn run_pack_loop(
             }
             PackMessage::Batch(digest, tx) => {
                 let _ = tx.send(inner.batch(digest));
+            }
+            PackMessage::CountLeaders(last_executed_round, rewards_counter, tx) => {
+                let _ = tx.send(inner.count_leaders(last_executed_round, &rewards_counter));
             }
         }
     }
@@ -309,11 +314,7 @@ impl ConsensusPack {
     pub async fn read_last_committed(&mut self) -> HashMap<AuthorityIdentifier, Round> {
         let (tx, rx) = oneshot::channel();
         let _ = self.tx.send(PackMessage::ReadLastCommitted(tx)).await;
-        if let Ok(r) = rx.await {
-            r
-        } else {
-            HashMap::new()
-        }
+        rx.await.unwrap_or_default()
     }
 
     /// Reads from storage the latest commit sub dag from the epoch where its
@@ -324,32 +325,36 @@ impl ConsensusPack {
     ) -> Option<Arc<CommittedSubDag>> {
         let (tx, rx) = oneshot::channel();
         let _ = self.tx.send(PackMessage::ReadLatestFinalRep(tx)).await;
-        if let Ok(r) = rx.await {
-            r
-        } else {
-            None
-        }
+        rx.await.unwrap_or_default()
     }
 
     /// True if the pack contains the batch for digest.
     pub async fn contains_batch(&self, digest: BlockHash) -> bool {
         let (tx, rx) = oneshot::channel();
         let _ = self.tx.send(PackMessage::ContainsBatch(digest, tx)).await;
-        if let Ok(r) = rx.await {
-            r
-        } else {
-            false
-        }
+        rx.await.unwrap_or_default()
     }
 
     /// Return the Batch for digest if found.
     pub async fn batch(&mut self, digest: BlockHash) -> Option<Batch> {
         let (tx, rx) = oneshot::channel();
         let _ = self.tx.send(PackMessage::Batch(digest, tx)).await;
+        rx.await.unwrap_or_default()
+    }
+
+    /// Count leaders in this pack (in rewards_counter) lower than last_executed_round.
+    pub async fn count_leaders(
+        &mut self,
+        last_executed_round: Round,
+        rewards_counter: RewardsCounter,
+    ) -> Result<(), PackError> {
+        let (tx, rx) = oneshot::channel();
+        let _ =
+            self.tx.send(PackMessage::CountLeaders(last_executed_round, rewards_counter, tx)).await;
         if let Ok(r) = rx.await {
             r
         } else {
-            None
+            Err(PackError::SendFailed)
         }
     }
 }
@@ -678,7 +683,10 @@ impl Inner {
 
     /// Retrieve a consensus header by number.
     fn consensus_header_by_number(&mut self, number: u64) -> Option<ConsensusHeader> {
-        let pos = self.consensus_idx.load(number).ok()?;
+        let pos = self
+            .consensus_idx
+            .load(number.saturating_sub(self.epoch_meta.start_consensus_number))
+            .ok()?;
         let rec = self.data.fetch(pos).ok()?;
         rec.into_consensus().ok()
     }
@@ -696,11 +704,7 @@ impl Inner {
         if let Ok(iter) = self.consensus_idx.rev_iter(50) {
             for block in iter.filter_map(|pos| {
                 let block = self.data.fetch(pos);
-                if let Some(block) = block.ok().map(|b| b.into_consensus().ok()) {
-                    block
-                } else {
-                    None
-                }
+                block.ok().map(|b| b.into_consensus().ok()).unwrap_or_default()
             }) {
                 let id = block.sub_dag.leader.origin().clone();
                 let round = block.sub_dag.leader_round();
@@ -756,6 +760,34 @@ impl Inner {
         }
         None
     }
+
+    /// Count leaders in this pack (in rewards_counter) lower than last_executed_round.
+    fn count_leaders(
+        &mut self,
+        last_executed_round: Round,
+        rewards_counter: &RewardsCounter,
+    ) -> Result<(), PackError> {
+        let headers = self.consensus_idx.len();
+        let iter = self.consensus_idx.rev_iter(headers)?;
+        for pos in iter {
+            let header = self
+                .data
+                .fetch(pos)
+                .map_err(|e| PackError::Fetch(e.to_string()))?
+                .into_consensus()?;
+            let leader_round = header.sub_dag.leader_round();
+
+            if leader_round == 0 {
+                continue;
+            }
+            if leader_round > last_executed_round {
+                continue;
+            }
+
+            rewards_counter.inc_leader_count(header.sub_dag.leader.origin());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -766,6 +798,7 @@ pub enum PackError {
     EpochLoad(String),
     Append(String),
     IndexAppend(String),
+    Fetch(String),
     Open(Arc<OpenError>),
     ReadOnly,
     NotConsensus,
@@ -794,6 +827,7 @@ impl Display for PackError {
             PackError::EpochLoad(error) => write!(f, "Epoch Load Error ({error})"),
             PackError::Append(error) => write!(f, "Data Append Error ({error})"),
             PackError::IndexAppend(error) => write!(f, "Index Append Error ({error})"),
+            PackError::Fetch(error) => write!(f, "Fetch Error ({error})"),
             PackError::Open(error) => write!(f, "Open Error {error}"),
             PackError::ReadOnly => write!(f, "Read Only"),
             PackError::NotConsensus => write!(f, "Record is not a consensus header"),
@@ -824,6 +858,12 @@ impl Display for PackError {
 impl From<OpenError> for PackError {
     fn from(value: OpenError) -> Self {
         Self::Open(Arc::new(value))
+    }
+}
+
+impl From<io::Error> for PackError {
+    fn from(value: io::Error) -> Self {
+        Self::IO(Arc::new(value))
     }
 }
 
