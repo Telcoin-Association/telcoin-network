@@ -20,6 +20,8 @@ pub type Epoch = u32;
 
 /// The voting power an authority has within the committee.
 pub type VotingPower = u64;
+/// All authorities have equal voting power in consensus.
+pub const EQUAL_VOTING_POWER: VotingPower = 1;
 
 /// A multiaddr and network public key for a libp2p node.
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -82,20 +84,32 @@ impl Authority {
     /// accidentally use stale Authority data, should always derive them via the Commitee.
     fn new(
         protocol_key: BlsPublicKey,
-        voting_power: VotingPower,
+        _voting_power: VotingPower,
         execution_address: Address,
     ) -> Self {
-        Self { inner: Arc::new(AuthorityInner { protocol_key, voting_power, execution_address }) }
+        Self {
+            inner: Arc::new(AuthorityInner {
+                protocol_key,
+                voting_power: EQUAL_VOTING_POWER,
+                execution_address,
+            }),
+        }
     }
 
     /// Version of new that can be called directly.  Useful for testing, if you are calling this
     /// outside of a test you are wrong (see comment on new).
     pub fn new_for_test(
         protocol_key: BlsPublicKey,
-        voting_power: VotingPower,
+        _voting_power: VotingPower,
         execution_address: Address,
     ) -> Self {
-        Self { inner: Arc::new(AuthorityInner { protocol_key, voting_power, execution_address }) }
+        Self {
+            inner: Arc::new(AuthorityInner {
+                protocol_key,
+                voting_power: EQUAL_VOTING_POWER,
+                execution_address,
+            }),
+        }
     }
 
     pub fn id(&self) -> AuthorityIdentifier {
@@ -110,7 +124,7 @@ impl Authority {
     }
 
     pub fn voting_power(&self) -> VotingPower {
-        self.inner.voting_power
+        EQUAL_VOTING_POWER
     }
 
     pub fn execution_address(&self) -> Address {
@@ -190,7 +204,7 @@ impl CommitteeInner {
     }
 
     fn total_voting_power(&self) -> VotingPower {
-        self.authorities.values().map(|x| x.inner.voting_power).sum()
+        self.authorities.len() as VotingPower
     }
 }
 
@@ -437,25 +451,21 @@ impl Committee {
         self.inner.read().authorities.len()
     }
 
-    /// Return the stake of a specific authority.
+    /// Return the voting power of a specific authority.
     pub fn voting_power(&self, name: &BlsPublicKey) -> VotingPower {
-        self.inner.read().authorities.get(&name.clone()).map_or_else(|| 0, |x| x.inner.voting_power)
+        self.inner.read().authorities.get(&name.clone()).map_or_else(|| 0, |_| EQUAL_VOTING_POWER)
     }
 
     pub fn voting_power_by_id(&self, id: &AuthorityIdentifier) -> VotingPower {
-        self.inner
-            .read()
-            .authorities_by_id
-            .get(id)
-            .map_or_else(|| 0, |authority| authority.inner.voting_power)
+        self.inner.read().authorities_by_id.get(id).map_or_else(|| 0, |_| EQUAL_VOTING_POWER)
     }
 
-    /// Returns the stake required to reach a quorum (2f+1).
+    /// Returns the voting power required to reach a quorum (2f+1).
     pub fn quorum_threshold(&self) -> VotingPower {
         self.inner.read().quorum_threshold
     }
 
-    /// Returns the stake required to reach availability (f+1).
+    /// Returns the voting power required to reach availability (f+1).
     pub fn validity_threshold(&self) -> VotingPower {
         self.inner.read().validity_threshold
     }
