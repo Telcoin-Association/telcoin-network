@@ -1,4 +1,4 @@
-.PHONY: help attest udeps check test test-faucet fmt clippy docker-login docker-adiri docker-push docker-builder docker-builder-init up down validators pr init-submodules update-tn-contracts revert-submodule clean-logs
+.PHONY: help attest udeps check test test-cargo test-faucet coverage coverage-html fmt clippy docker-login docker-adiri docker-push docker-builder docker-builder-init up down validators pr init-submodules update-tn-contracts revert-submodule clean-logs
 
 # full path for the Makefile
 ROOT_DIR:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
@@ -10,6 +10,11 @@ BASE_DIR:=$(shell basename $(ROOT_DIR))
 TAG ?= latest
 
 help:
+	@echo ;
+	@echo "=== Prerequisites ===" ;
+	@echo "  cargo install cargo-nextest --locked   # fast test runner" ;
+	@echo "  cargo install cargo-llvm-cov           # code coverage" ;
+	@echo "  cargo install sccache --locked         # compilation cache (optional)" ;
 	@echo ;
 	@echo "make attest" ;
 	@echo "    :::> Run CI locally and submit signed attestation to Adiri testnet." ;
@@ -24,13 +29,23 @@ help:
 	@echo "    :::> Cargo check workspace with all features activated." ;
 	@echo ;
 	@echo "make test" ;
-	@echo "    :::> Run all tests in workspace with all features using 4 threads." ;
+	@echo "    :::> Run all tests in workspace using cargo-nextest (faster parallel execution)." ;
+	@echo ;
+	@echo "make test-cargo" ;
+	@echo "    :::> Run all tests using cargo test (fallback if nextest not installed)." ;
 	@echo ;
 	@echo "make test-faucet" ;
 	@echo "    :::> Test faucet integration test in main binary." ;
 	@echo ;
 	@echo "make test-restarts" ;
 	@echo "    :::> Test restart integration tests." ;
+	@echo ;
+	@echo "make coverage" ;
+	@echo "    :::> Run tests with coverage using cargo-llvm-cov + nextest." ;
+	@echo "    :::> Requires: cargo install cargo-llvm-cov" ;
+	@echo ;
+	@echo "make coverage-html" ;
+	@echo "    :::> Generate HTML coverage report in target/llvm-cov/html/." ;
 	@echo ;
 	@echo "make fmt" ;
 	@echo "    :::> cargo +nightly-2025-11-04 fmt" ;
@@ -77,17 +92,30 @@ udeps:
 check:
 	cargo check --workspace --all-features --all-targets ;
 
-# run workspace unit tests
+# run workspace unit tests (using nextest for faster parallel execution)
 test:
+	cargo nextest run --workspace --no-fail-fast ;
+
+# run workspace unit tests with cargo test (fallback if nextest not installed)
+test-cargo:
 	cargo test --workspace --no-fail-fast -- --show-output ;
 
 # run faucet integration test
 test-faucet:
-	cargo test --package telcoin-network --features faucet --test it ;
+	cargo nextest run --package telcoin-network --features faucet --test it ;
 
 # run restart integration tests
 test-restarts:
-	cargo test test_restarts -- --ignored ;
+	cargo nextest run --run-ignored all test_restarts ;
+
+# run tests with coverage (using llvm-cov + nextest)
+coverage:
+	cargo llvm-cov nextest --workspace --exclude tn-faucet --no-fail-fast ;
+
+# generate HTML coverage report
+coverage-html:
+	cargo llvm-cov nextest --workspace --exclude tn-faucet --no-fail-fast --html ;
+	@echo "Coverage report: target/llvm-cov/html/index.html"
 
 # format using +nightly-2025-11-04 toolchain
 fmt:
@@ -147,9 +175,9 @@ revert-submodule:
 
 # workspace tests that don't require faucet credentials
 public-tests:
-	cargo test --workspace --exclude tn-faucet --no-fail-fast -- --show-output ;
-	cargo test -p telcoin-network --test it test_epoch_boundary -- --ignored ;
-	cargo test test_restarts -- --ignored ;
+	cargo nextest run --workspace --exclude tn-faucet --no-fail-fast ;
+	cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
+	cargo nextest run --run-ignored all test_restarts ;
 
 # local checks to ensure PR is ready
 pr:

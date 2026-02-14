@@ -21,9 +21,7 @@ use tn_types::{
     CommittedSubDag, ConsensusOutput, Database, Encodable2718, GenesisAccount, ReputationScores,
     SealedBatch, TaskManager, U160, U256,
 };
-use tn_worker::{
-    metrics::WorkerMetrics, test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle,
-};
+use tn_worker::{test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle};
 use tokio::time::timeout;
 use tracing::debug;
 
@@ -39,7 +37,6 @@ async fn test_make_batch_el_to_cl() {
     let db_path = tmp_dir.path().join("c-db");
     let _ = std::fs::create_dir_all(&db_path);
     let store = open_db(db_path);
-    let node_metrics = WorkerMetrics::default();
 
     // Mock the primary client to always succeed.
     let mock_server = MockWorkerToPrimary();
@@ -50,7 +47,6 @@ async fn test_make_batch_el_to_cl() {
     let mut batch_provider = Worker::new(
         0,
         Some(qw.clone()),
-        Arc::new(node_metrics),
         network_client,
         store.clone(),
         timeout,
@@ -513,8 +509,9 @@ async fn test_canonical_notification_updates_pool() {
 
     // execute output to trigger canonical update
     let args = BuildArguments::new(reth_env.clone(), output, chain.sealed_genesis_header());
-    let _final_header =
-        execute_consensus_output(args, GasAccumulator::default()).expect("output executed");
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let _final_header = execute_consensus_output(args, GasAccumulator::default(), engine_update_tx)
+        .expect("output executed");
 
     // sleep to ensure canonical update received before ack
     let _ = tokio::time::sleep(Duration::from_secs(1)).await;

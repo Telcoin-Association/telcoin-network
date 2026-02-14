@@ -66,7 +66,7 @@ async fn get_consensus_header<DB: TNDatabase>(
                 .unwrap_or_default();
             if header.number > last_seen_header_number {
                 // Update our last seen valid consensus header if it is newer.
-                let _ = consensus_bus.last_consensus_header().send(Some(header));
+                consensus_bus.last_consensus_header().send_replace(Some(header));
             }
             Some((epoch, parent_number, parent))
         }

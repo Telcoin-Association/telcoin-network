@@ -13,13 +13,13 @@ use tn_primary::{
     network::{ConsensusResult, PrimaryNetworkHandle},
     ConsensusBus, NodeMode,
 };
-use tn_storage::CertificateStore;
+use tn_storage::{tables::ConsensusBlocks, CertificateStore};
 use tn_types::{
     encode, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash, BlsSigner as _,
     CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput, Database,
     Hash as _, Noticer, TaskManager, TaskSpawner, Timestamp, TnReceiver, TnSender, B256,
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, instrument};
 
 /// The `Subscriber` receives certificates sequenced by the consensus and waits until the
 /// downloaded all the transactions references by the certificates; it then
@@ -60,7 +60,7 @@ pub fn spawn_subscriber<DB: Database>(
     let authority_id = config.authority_id();
     let committee = config.committee().clone();
     let client = config.local_network().clone();
-    let mode = *consensus_bus.node_mode().borrow();
+    let mode = consensus_bus.current_node_mode();
     let subscriber = Subscriber {
         consensus_bus,
         config,
@@ -70,9 +70,11 @@ pub fn spawn_subscriber<DB: Database>(
     match mode {
         // If we are active then partcipate in consensus.
         NodeMode::CvvActive => {
+            // Subscribe before spawning so the channel is active before any messages are sent.
+            let rx_sequence = subscriber.consensus_bus.subscribe_sequence();
             task_manager.spawn_critical_task("subscriber consensus", async move {
                 info!(target: "subscriber", "Starting subscriber: CVV");
-                if let Err(e) = subscriber.run(rx_shutdown).await {
+                if let Err(e) = subscriber.run(rx_shutdown, rx_sequence).await {
                     error!(target: "subscriber", "Error subscriber consensus: {e}");
                 }
             });
@@ -109,6 +111,7 @@ impl<DB: Database> Subscriber<DB> {
 
     /// Turns a ConsensusHeader into a ConsensusOutput and sends it down the consensus_output
     /// channel for execution.
+    #[instrument(level = "debug", skip_all, fields(number = consensus_header.number))]
     async fn handle_consensus_header(
         &self,
         consensus_header: ConsensusHeader,
@@ -140,7 +143,7 @@ impl<DB: Database> Subscriber<DB> {
         // We aren't doing consensus now but still need to update these watches before
         // we send the consensus output.
         self.consensus_bus.committed_round_updates().send_replace(last_round);
-        let _ = self.consensus_bus.primary_round_updates().send(last_round);
+        self.consensus_bus.primary_round_updates().send_replace(last_round);
 
         if let Err(e) = self.consensus_bus.consensus_output().send(consensus_output).await {
             error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self.inner.authority_id, e);
@@ -152,7 +155,7 @@ impl<DB: Database> Subscriber<DB> {
     /// Catch up to current consensus and then try to rejoin as an active CVV.
     async fn catch_up_rejoin_consensus(&self, tasks: TaskSpawner) -> SubscriberResult<()> {
         // Get a receiver and then stream any missing headers so we don't miss them.
-        let mut rx_consensus_headers = self.consensus_bus.consensus_header().subscribe();
+        let mut rx_consensus_headers = self.consensus_bus.subscribe_consensus_header();
         spawn_state_sync(
             self.config.clone(),
             self.consensus_bus.clone(),
@@ -168,7 +171,7 @@ impl<DB: Database> Subscriber<DB> {
                 if consensus_header_number == last_consensus_header.number {
                     // We are caught up enough so try to jump back into consensus
                     info!(target: "subscriber", "attempting to rejoin consensus, consensus block height {consensus_header_number}");
-                    let _ = self.consensus_bus.node_mode().send(NodeMode::CvvActive);
+                    self.consensus_bus.node_mode().send_replace(NodeMode::CvvActive);
                     self.config.shutdown().notify();
                     return Ok(());
                 }
@@ -180,7 +183,7 @@ impl<DB: Database> Subscriber<DB> {
     /// Follow along with consensus output but do not try to join consensus.
     async fn follow_consensus(&self, tasks: TaskSpawner) -> SubscriberResult<()> {
         // Get a receiver then stream any missing headers so we don't miss them.
-        let mut rx_consensus_headers = self.consensus_bus.consensus_header().subscribe();
+        let mut rx_consensus_headers = self.consensus_bus.subscribe_consensus_header();
         spawn_state_sync(
             self.config.clone(),
             self.consensus_bus.clone(),
@@ -198,19 +201,42 @@ impl<DB: Database> Subscriber<DB> {
     /// This method is called on startup to retrieve the needed information to build the next
     /// `ConsensusHeader` off of this parent.
     async fn get_last_executed_consensus(&self) -> SubscriberResult<(BlockHash, u64)> {
-        // Get the DB and load our last executed consensus block (note there may be unexecuted
-        // blocks, catch up will execute them).
+        // Load the consensus block associated with the latest executed EVM block.
+        // This can lag when outputs were processed but execution was skipped (empty rounds).
         let last_executed_block =
             last_executed_consensus_block(&self.consensus_bus, self.config.node_storage())
                 .unwrap_or_default();
 
-        info!(target: "subscriber", ?last_executed_block, "restoring last executed consensus for constucting the next ConsensusHeader:");
+        // Use the latest persisted consensus header as startup parent when it is newer.
+        // replay_missed_consensus + wait_for_consensus_execution ensures this header has already
+        // been processed by execution (including skipped rounds).
+        let (_, last_db_block) = self
+            .config
+            .node_storage()
+            .last_record::<ConsensusBlocks>()
+            .unwrap_or((last_executed_block.number, last_executed_block.clone()));
+        let parent = if last_db_block.number > last_executed_block.number {
+            last_db_block
+        } else {
+            last_executed_block
+        };
 
-        Ok((last_executed_block.digest(), last_executed_block.number))
+        info!(
+            target: "subscriber",
+            ?parent,
+            "restoring last executed consensus for constucting the next ConsensusHeader:"
+        );
+
+        Ok((parent.digest(), parent.number))
     }
 
     /// Main loop connecting to the consensus to listen to sequence messages.
-    async fn run(self, rx_shutdown: Noticer) -> SubscriberResult<()> {
+    #[instrument(level = "info", skip_all, fields(authority = ?self.inner.authority_id))]
+    async fn run(
+        self,
+        rx_shutdown: Noticer,
+        mut rx_sequence: impl TnReceiver<Arc<CommittedSubDag>>,
+    ) -> SubscriberResult<()> {
         // It's important to have the futures in ordered fashion as we want
         // to guarantee that will deliver to the executor the certificates
         // in the same order we received from rx_sequence. So it doesn't
@@ -221,7 +247,7 @@ impl<DB: Database> Subscriber<DB> {
 
         let (mut last_parent, mut last_number) = self.get_last_executed_consensus().await?;
 
-        let mut rx_sequence = self.consensus_bus.sequence().subscribe();
+        // rx_sequence is now passed as parameter to avoid race condition
         // Listen to sequenced consensus message and process them.
         loop {
             tokio::select! {
@@ -237,10 +263,7 @@ impl<DB: Database> Subscriber<DB> {
 
                     // Record the latest ConsensusHeader, we probably don't need this in this mode but keep it up to date anyway.
                     // Note we don't bother sending this to the consensus header channel since not needed when an active CVV.
-                    if let Err(e) = self.consensus_bus.last_consensus_header().send(Some(ConsensusHeader { parent_hash, sub_dag: sub_dag.clone(), number, extra: B256::default() })) {
-                        error!(target: "subscriber", "error sending latest consensus header for authority {:?}: {}", self.inner.authority_id, e);
-                        return Err(SubscriberError::ClosedChannel("failed to send last consensus header on bus".to_string()));
-                    }
+                    self.consensus_bus.last_consensus_header().send_replace(Some(ConsensusHeader { parent_hash, sub_dag: sub_dag.clone(), number, extra: B256::default() }));
                     let epoch = sub_dag.leader_epoch();
                     let round = sub_dag.leader_round();
                     let consensus_result_hash = ConsensusResult::digest_data(epoch, round, number, last_parent);
@@ -282,11 +305,6 @@ impl<DB: Database> Subscriber<DB> {
                 }
 
             }
-
-            self.consensus_bus
-                .executor_metrics()
-                .waiting_elements_subscriber
-                .set(waiting.len() as i64);
         }
     }
 
@@ -312,6 +330,7 @@ impl<DB: Database> Subscriber<DB> {
     /// to execute.
     /// Note, an error here is BAD and will most likely cause node shutdown (clean).  Do
     /// not provide a bogus sub dag...
+    #[instrument(level = "debug", skip_all, fields(number))]
     async fn fetch_batches(
         &self,
         sub_dag: Arc<CommittedSubDag>,
@@ -336,32 +355,16 @@ impl<DB: Database> Subscriber<DB> {
             }
         }
 
-        let fetched_batches_timer = self
-            .consensus_bus
-            .executor_metrics()
-            .block_fetch_for_committed_subdag_total_latency
-            .start_timer();
-        self.consensus_bus
-            .executor_metrics()
-            .committed_subdag_block_count
-            .observe(num_blocks as f64);
         let mut fetched_batches = self.fetch_batches_from_peers(batch_set).await?;
-        drop(fetched_batches_timer);
 
         let mut batches = Vec::with_capacity(num_certs);
         // map all fetched batches to their respective certificates for applying block rewards
         for cert in sub_dag.certificates() {
             // create collection of batches to execute for this certificate
             let mut cert_batches = Vec::with_capacity(cert.header().payload().len());
-            self.consensus_bus.executor_metrics().subscriber_current_round.set(cert.round() as i64);
-            self.consensus_bus
-                .executor_metrics()
-                .subscriber_certificate_latency
-                .observe(cert.created_at().elapsed().as_secs_f64());
 
             // retrieve fetched batch by digest
             for digest in cert.header().payload().keys() {
-                self.consensus_bus.executor_metrics().subscriber_processed_blocks.inc();
                 let batch = fetched_batches.remove(digest).ok_or(SubscriberError::MissingFetchedBatch(*digest)).inspect_err(|_| {
                     error!(target: "subscriber", "[Protocol violation] Batch not found in fetched batches from workers of certificate signers");
                 })?;
@@ -380,6 +383,21 @@ impl<DB: Database> Subscriber<DB> {
                 batches: cert_batches,
             });
         }
+        // Count total transactions across all batches
+        let total_txs: usize =
+            batches.iter().flat_map(|cb| cb.batches.iter()).map(|b| b.transactions.len()).sum();
+
+        // Metric: consensus_output_ready - tracks consensus output ready for execution
+        info!(
+            target: "consensus::metrics",
+            number = number,
+            leader_round = sub_dag.leader_round(),
+            num_certs = num_certs,
+            num_batches = batch_digests.len(),
+            total_txs = total_txs,
+            "consensus output ready"
+        );
+
         debug!(target: "subscriber", "returning output to subscriber");
         Ok(ConsensusOutput::new(
             sub_dag.clone(),
@@ -406,34 +424,18 @@ impl<DB: Database> Subscriber<DB> {
             }
         };
         for (digest, block) in blocks.batches.into_iter() {
-            self.record_fetched_batch_metrics(&block, &digest);
+            if let Some(received_at) = block.received_at() {
+                let remote_duration = received_at.elapsed().as_secs_f64();
+                debug!(
+                    target: "subscriber",
+                    "Block {:?} took {} seconds since it was received to when it was fetched for execution",
+                    digest,
+                    remote_duration,
+                );
+            }
             fetched_blocks.insert(digest, block);
         }
 
         Ok(fetched_blocks)
-    }
-
-    fn record_fetched_batch_metrics(&self, batch: &Batch, digest: &BlockHash) {
-        if let Some(received_at) = batch.received_at() {
-            let remote_duration = received_at.elapsed().as_secs_f64();
-            debug!(
-                target: "subscriber",
-                "Batch was fetched for execution after being received from another worker {}s ago.",
-                remote_duration
-            );
-            self.consensus_bus
-                .executor_metrics()
-                .block_execution_local_latency
-                .with_label_values(&["other"])
-                .observe(remote_duration);
-
-            self.consensus_bus.executor_metrics().block_execution_latency.observe(remote_duration);
-            debug!(
-                target: "subscriber",
-                "Block {:?} took {} seconds since it has been created to when it has been fetched for execution",
-                digest,
-                remote_duration,
-            );
-        };
     }
 }

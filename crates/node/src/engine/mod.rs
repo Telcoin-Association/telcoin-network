@@ -22,8 +22,8 @@ use tn_reth::{
 use tn_rpc::EngineToPrimary;
 use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator},
-    BatchSender, BatchValidation, BlsPublicKey, ConsensusOutput, Epoch, ExecHeader, Noticer,
-    SealedHeader, TaskSpawner, WorkerId, B256,
+    BatchSender, BatchValidation, BlsPublicKey, ConsensusOutput, EngineUpdate, Epoch, ExecHeader,
+    Noticer, SealedHeader, TaskSpawner, WorkerId, B256,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::{mpsc, RwLock};
@@ -80,9 +80,10 @@ impl ExecutionNode {
         rx_output: mpsc::Receiver<ConsensusOutput>,
         rx_shutdown: Noticer,
         gas_accumulator: GasAccumulator,
+        engine_update_tx: mpsc::Sender<EngineUpdate>,
     ) -> eyre::Result<()> {
         let guard = self.internal.read().await;
-        guard.start_engine(rx_output, rx_shutdown, gas_accumulator).await
+        guard.start_engine(rx_output, rx_shutdown, gas_accumulator, engine_update_tx).await
     }
 
     /// Initialize the worker's transaction pool and public RPC.

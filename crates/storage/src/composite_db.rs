@@ -373,7 +373,7 @@ mod test {
             let db = open_redb(temp_dir.path());
             test_contains_key(db);
         }
-        let db = open_mdbx(temp_dir.path());
+        let db = open_mdbx(&temp_dir.path().join("mdbx_contains_key_1"));
         test_contains_key(db);
     }
 
@@ -385,7 +385,7 @@ mod test {
             let db = open_redb(temp_dir.path());
             test_get(db);
         }
-        let db = open_mdbx(temp_dir.path());
+        let db = open_mdbx(&temp_dir.path().join("mdbx_get_1"));
         test_get(db);
     }
 
@@ -397,7 +397,7 @@ mod test {
             let db = open_redb(temp_dir.path());
             test_multi_get(db);
         }
-        let db = open_mdbx(temp_dir.path());
+        let db = open_mdbx(&temp_dir.path().join("mdbx_multi_get_1"));
         test_multi_get(db);
     }
 
@@ -409,7 +409,7 @@ mod test {
             let db = open_redb(temp_dir.path());
             test_skip(db);
         }
-        let db = open_mdbx(temp_dir.path());
+        let db = open_mdbx(&temp_dir.path().join("mdbx_skip_1"));
         test_skip(db);
     }
 
@@ -421,7 +421,7 @@ mod test {
             let db = open_redb(temp_dir.path());
             test_skip_to_previous_simple(db);
         }
-        let db = open_mdbx(temp_dir.path());
+        let db = open_mdbx(&temp_dir.path().join("mdbx_skip_to_previous_simple_1"));
         test_skip_to_previous_simple(db);
     }
 
@@ -433,7 +433,7 @@ mod test {
             let db = open_redb(temp_dir.path());
             test_iter_skip_to_previous_gap(db);
         }
-        let db = open_mdbx(temp_dir.path());
+        let db = open_mdbx(&temp_dir.path().join("mdbx_iter_skip_to_previous_gap_1"));
         test_iter_skip_to_previous_gap(db);
     }
 
@@ -445,7 +445,7 @@ mod test {
             let db = open_redb(temp_dir.path());
             test_remove(db);
         }
-        let db = open_mdbx(temp_dir.path());
+        let db = open_mdbx(&temp_dir.path().join("mdbx_remove_1"));
         test_remove(db);
     }
 
@@ -457,7 +457,7 @@ mod test {
             let db = open_redb(temp_dir.path());
             test_iter(db);
         }
-        let db = open_mdbx(temp_dir.path());
+        let db = open_mdbx(&temp_dir.path().join("mdbx_iter_1"));
         test_iter(db);
     }
 
@@ -469,7 +469,7 @@ mod test {
             let db = open_redb(temp_dir.path());
             test_iter_reverse(db);
         }
-        let db = open_mdbx(temp_dir.path());
+        let db = open_mdbx(&temp_dir.path().join("mdbx_iter_reverse_1"));
         test_iter_reverse(db);
     }
 
@@ -481,7 +481,7 @@ mod test {
             let db = open_redb(temp_dir.path());
             test_clear(db);
         }
-        let db = open_mdbx(temp_dir.path());
+        let db = open_mdbx(&temp_dir.path().join("mdbx_clear_1"));
         test_clear(db);
     }
 
@@ -493,7 +493,7 @@ mod test {
             let db = open_redb(temp_dir.path());
             test_is_empty(db);
         }
-        let db = open_mdbx(temp_dir.path());
+        let db = open_mdbx(&temp_dir.path().join("mdbx_is_empty_1"));
         test_is_empty(db);
     }
 
@@ -506,7 +506,7 @@ mod test {
             let db = open_redb(temp_dir.path());
             test_multi_insert(db);
         }
-        let db = open_mdbx(temp_dir.path());
+        let db = open_mdbx(&temp_dir.path().join("mdbx_multi_insert_1"));
         test_multi_insert(db);
     }
 
@@ -519,7 +519,7 @@ mod test {
             let db = open_redb(temp_dir.path());
             test_multi_remove(db);
         }
-        let db = open_mdbx(temp_dir.path());
+        let db = open_mdbx(&temp_dir.path().join("mdbx_multi_remove_1"));
         test_multi_remove(db);
     }
 
@@ -532,7 +532,7 @@ mod test {
             let db = open_redb(temp_dir.path());
             db_simp_bench(db, "LayeredDB<ReDB>");
         }
-        let db = open_mdbx(temp_dir.path());
+        let db = open_mdbx(&temp_dir.path().join("mdbx_dbsimpbench_1"));
         db_simp_bench(db, "LayeredDB<MdbxDatabase>");
     }
 }

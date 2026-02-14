@@ -1,0 +1,41 @@
+# cargo-nextest configuration
+# https://nexte.st/docs/configuration/
+
+[store]
+dir = "target/nextest"
+
+[profile.default]
+retries = 0
+fail-fast = false
+test-threads = "num-cpus"
+
+[profile.ci]
+retries = 2
+fail-fast = true
+test-threads = "num-cpus"
+
+# Property-based tests need fewer parallel threads to avoid resource contention
+[test-groups.prop-serial]
+max-threads = 2
+
+[[profile.default.overrides]]
+filter = "test(/prop_/)"
+test-group = "prop-serial"
+
+# E2E tests use hardcoded ports (8545, 8540-8545) and must run serially.
+# IT_TEST_MUTEX only works within a single process; nextest runs each test
+# in its own process, so we use a test group to enforce serialization.
+[test-groups.e2e-serial]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = "package(e2e-tests)"
+test-group = "e2e-serial"
+
+[[profile.ci.overrides]]
+filter = "test(/prop_/)"
+test-group = "prop-serial"
+
+[[profile.ci.overrides]]
+filter = "package(e2e-tests)"
+test-group = "e2e-serial"
