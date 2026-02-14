@@ -212,8 +212,8 @@ impl ConsensusChain {
         Ok(())
     }
 
-    /// Save all the batches and consensus header from the ConsensusOutput the pack file for the current epoch.
-    /// This should be called "in-order" as consensus is executed.
+    /// Save all the batches and consensus header from the ConsensusOutput the pack file for the
+    /// current epoch. This should be called "in-order" as consensus is executed.
     pub async fn save_consensus_output(
         &mut self,
         consensus: ConsensusOutput,

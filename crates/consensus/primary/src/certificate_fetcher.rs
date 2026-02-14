@@ -14,20 +14,19 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tn_config::ConsensusConfig;
-use tn_primary_metrics::PrimaryMetrics;
 use tn_storage::CertificateStore;
 use tn_types::{
     validate_fetched_certificate, AuthorityIdentifier, BlsPublicKey, Certificate, Committee,
-    Database, Header, Noticer, Notifier, Round, TaskManager, TaskSpawner, TnReceiver, TnSender,
+    Database, Header, Noticer, Notifier, Round, TaskManager, TaskSpawner, TnReceiver,
 };
 use tokio::{
     sync::oneshot,
     time::{sleep, timeout},
 };
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 #[cfg(test)]
 #[path = "tests/certificate_fetcher_tests.rs"]
@@ -58,8 +57,6 @@ pub(crate) struct CertificateFetcher<DB> {
     consensus_bus: ConsensusBus,
     /// Receiver for shutdown.
     rx_shutdown: Noticer,
-    /// The metrics handler
-    metrics: Arc<PrimaryMetrics>,
     /// Task spawner for creating concurrent tasks
     task_spawner: TaskSpawner,
     /// Map of validator to target rounds that local store must catch up to.
@@ -87,11 +84,13 @@ impl<DB: Database> CertificateFetcher<DB> {
         let committee = config.committee().clone();
         let certificate_store = config.node_storage().clone();
         let rx_shutdown = config.shutdown().subscribe();
-        let metrics = consensus_bus.primary_metrics().node_metrics.clone();
         let max_rpc_message_size = config.network_config().libp2p_config().max_rpc_message_size;
         let task_spawner = task_manager.get_spawner();
         let parallel_fetch_request_delay_interval =
             config.parameters().parallel_fetch_request_delay_interval;
+
+        // Subscribe before spawning so the channel is active before any messages are sent.
+        let rx_certificate_fetcher = consensus_bus.subscribe_certificate_fetcher();
 
         task_manager.spawn_critical_task("certificate fetcher task", async move {
             Self {
@@ -102,7 +101,6 @@ impl<DB: Database> CertificateFetcher<DB> {
                 state_sync,
                 consensus_bus,
                 rx_shutdown,
-                metrics,
                 task_spawner,
                 targets: BTreeMap::new(),
                 fetch_task: FetchTask::new(),
@@ -110,7 +108,7 @@ impl<DB: Database> CertificateFetcher<DB> {
                 parallel_fetch_request_delay_interval,
                 config,
             }
-            .run()
+            .run(rx_certificate_fetcher)
             .await
             .map_err(|e| {
                 error!(target: "primary::cert_fetcher", ?e, "cert fetcher shutting down");
@@ -119,9 +117,10 @@ impl<DB: Database> CertificateFetcher<DB> {
     }
 
     /// Receive messages on async channels until shutdown.
-    async fn run(&mut self) -> CertManagerResult<()> {
-        let mut rx_certificate_fetcher = self.consensus_bus.certificate_fetcher().subscribe();
-
+    async fn run(
+        &mut self,
+        mut rx_certificate_fetcher: impl TnReceiver<CertificateFetcherCommand>,
+    ) -> CertManagerResult<()> {
         loop {
             tokio::select! {
                 Some(command) = rx_certificate_fetcher.recv() => {
@@ -257,7 +256,6 @@ impl<DB: Database> CertificateFetcher<DB> {
         let network = self.network.clone();
         let committee = self.committee.clone();
         let state_sync = self.state_sync.clone();
-        let metrics = self.metrics.clone();
         let task_spawner = self.task_spawner.clone();
         let authority_id = self.authority_id.clone();
         let fallback_delay = self.parallel_fetch_request_delay_interval;
@@ -271,8 +269,6 @@ impl<DB: Database> CertificateFetcher<DB> {
         self.task_spawner.spawn_task(
             format!("fetch-certs-{}", request.exclusive_lower_bound),
             async move {
-                metrics.certificate_fetcher_inflight_fetch.inc();
-
                 let result = fetch_and_process_certificates(
                     authority_id,
                     network,
@@ -285,7 +281,6 @@ impl<DB: Database> CertificateFetcher<DB> {
                 .await;
 
                 let _ = tx.send(result);
-                metrics.certificate_fetcher_inflight_fetch.dec();
             },
         );
 
@@ -350,6 +345,7 @@ impl<DB: Database> CertificateFetcher<DB> {
 
 /// Fetch missing certificates from peers and process them.
 /// Tries peers in random order with parallel requests.
+#[instrument(level = "debug", skip_all, fields(lower_bound = request.exclusive_lower_bound))]
 async fn fetch_and_process_certificates<DB: Database>(
     authority_id: Option<AuthorityIdentifier>,
     network: PrimaryNetworkHandle,
@@ -359,6 +355,9 @@ async fn fetch_and_process_certificates<DB: Database>(
     task_spawner: TaskSpawner,
     fallback_delay: Duration,
 ) -> CertManagerResult<()> {
+    let start_time = Instant::now();
+    let lower_bound = request.exclusive_lower_bound;
+
     // get randomized list of peers
     let mut peers: Vec<_> = committee
         .others_primaries_by_id(authority_id.as_ref())
@@ -382,8 +381,20 @@ async fn fetch_and_process_certificates<DB: Database>(
         CertManagerError::Timeout
     })??;
 
+    let num_certificates = certificates.len();
+
     // process the certificates
     state_sync.process_fetched_certificates_in_parallel(certificates).await?;
+
+    // Metric: certificates_fetched - tracks certificate fetch operations
+    let fetch_latency_ms = start_time.elapsed().as_millis() as u64;
+    info!(
+        target: "consensus::metrics",
+        fetch_latency_ms = fetch_latency_ms,
+        num_certificates = num_certificates,
+        lower_bound = lower_bound,
+        "certificates fetched"
+    );
 
     Ok(())
 }

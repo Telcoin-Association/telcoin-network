@@ -1,7 +1,7 @@
 //! Randomized tests
 
 use crate::{
-    consensus::{Bullshark, ConsensusMetrics, ConsensusState, LeaderSchedule, LeaderSwapTable},
+    consensus::{Bullshark, ConsensusState, LeaderSchedule, LeaderSwapTable},
     test_utils::this_cert_parents_with_slow_nodes,
 };
 use futures::{stream::FuturesUnordered, StreamExt};
@@ -15,7 +15,6 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     num::NonZeroUsize,
     ops::RangeInclusive,
-    sync::Arc,
 };
 use tn_primary::test_utils::mock_certificate_with_rand;
 use tn_storage::mem_db::MemDatabase;
@@ -467,13 +466,11 @@ fn generate_and_run_execution_plans(
         }
 
         // Now create a new Bullshark engine
-        let metrics = Arc::new(ConsensusMetrics::default());
-        let mut state = ConsensusState::new(metrics.clone(), gc_depth);
+        let mut state = ConsensusState::new(gc_depth);
         const SUB_DAGS_PER_SCHEDULE: u32 = 5;
         let bad_nodes_stake_threshold = 0;
         let mut bullshark = Bullshark::new(
             committee.clone(),
-            metrics.clone(),
             SUB_DAGS_PER_SCHEDULE,
             LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
             bad_nodes_stake_threshold,

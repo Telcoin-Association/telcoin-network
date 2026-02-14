@@ -1,17 +1,19 @@
 //! Consensus tests
 
 use crate::{
-    consensus::{Bullshark, Consensus, ConsensusMetrics, LeaderSchedule, LeaderSwapTable},
-    test_utils::make_optimal_certificates,
+    consensus::{
+        Bullshark, Consensus, ConsensusError, ConsensusState, LeaderSchedule, LeaderSwapTable,
+    },
+    test_utils::{make_optimal_certificates, mock_certificate},
     ConsensusBus,
 };
-use std::{collections::BTreeSet, sync::Arc};
+use std::collections::BTreeSet;
 use tempfile::TempDir;
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, CertificateStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    Certificate, ExecHeader, Hash as _, ReputationScores, SealedHeader, TaskManager, TnReceiver,
-    TnSender, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    Certificate, CertificateDigest, ExecHeader, Hash as _, ReputationScores, SealedHeader,
+    TaskManager, TnReceiver, TnSender, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::fs::create_dir_all;
 
@@ -48,7 +50,6 @@ async fn test_consensus_recovery_with_bullshark() {
     let mut consensus_chain =
         ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).unwrap();
 
-    let metrics = Arc::new(ConsensusMetrics::default());
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),
         &mut consensus_chain,
@@ -57,7 +58,6 @@ async fn test_consensus_recovery_with_bullshark() {
     .await;
     let bullshark = Bullshark::new(
         committee.clone(),
-        metrics.clone(),
         num_sub_dags_per_schedule,
         leader_schedule.clone(),
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
@@ -65,8 +65,9 @@ async fn test_consensus_recovery_with_bullshark() {
 
     let cb = ConsensusBus::new();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
-    let mut rx_output = cb.sequence().subscribe();
+    cb.recent_blocks()
+        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
+    let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
     Consensus::spawn(config.clone(), &cb, bullshark, &task_manager, consensus_chain.clone()).await;
 
@@ -148,7 +149,6 @@ async fn test_consensus_recovery_with_bullshark() {
     .await;
     let bullshark = Bullshark::new(
         committee.clone(),
-        metrics.clone(),
         num_sub_dags_per_schedule,
         leader_schedule,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
@@ -156,8 +156,9 @@ async fn test_consensus_recovery_with_bullshark() {
 
     let cb = ConsensusBus::new();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
-    let mut rx_output = cb.sequence().subscribe();
+    cb.recent_blocks()
+        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
+    let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
     Consensus::spawn(config.clone(), &cb, bullshark, &task_manager, consensus_chain.clone()).await;
 
@@ -208,7 +209,6 @@ async fn test_consensus_recovery_with_bullshark() {
     let bad_nodes_stake_threshold = 0;
     let bullshark = Bullshark::new(
         committee.clone(),
-        metrics.clone(),
         num_sub_dags_per_schedule,
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
         bad_nodes_stake_threshold,
@@ -219,8 +219,9 @@ async fn test_consensus_recovery_with_bullshark() {
     let mut consensus_chain =
         ConsensusChain::new_for_test(temp_dir.path().join("2"), committee.clone()).unwrap();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
-    let mut rx_output = cb.sequence().subscribe();
+    cb.recent_blocks()
+        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
+    let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
     Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain.clone()).await;
 
@@ -274,4 +275,227 @@ async fn test_consensus_recovery_with_bullshark() {
         score_with_crash.scores_per_authority.into_iter().filter(|(_, score)| *score == 1).count(),
         4
     );
+}
+
+/// Test that certificates with missing parents are rejected.
+///
+/// SECURITY: This ensures DAG integrity. A certificate must reference parents that
+/// exist in the DAG to prevent forks and ensure causal ordering.
+#[tokio::test]
+async fn test_dag_rejects_certificate_with_missing_parents() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+
+    let gc_depth = 10;
+    let mut state = ConsensusState::new(gc_depth);
+
+    // Get genesis digests
+    let genesis: BTreeSet<CertificateDigest> =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect();
+
+    // Create round 1 certificates with valid genesis parents
+    let (round1_certs, round1_digests) =
+        make_optimal_certificates(&committee, 1..=1, &genesis, &ids);
+
+    // Insert round 1 certificates
+    for cert in &round1_certs {
+        assert!(state.try_insert(cert).unwrap(), "Round 1 certs should insert");
+    }
+
+    // Create a fake parent digest that doesn't exist
+    let mut fake_parent_bytes = [0u8; 32];
+    fake_parent_bytes[31] = 0xFF;
+    let fake_parent = CertificateDigest::new(fake_parent_bytes);
+
+    // Create certificate with fake parent (that doesn't exist in DAG)
+    let mut fake_parents = round1_digests.clone();
+    fake_parents.insert(fake_parent);
+
+    let (_, bad_cert) = mock_certificate(&committee, ids[0].clone(), 2, fake_parents);
+
+    // Insertion should fail with MissingParent
+    let result = state.try_insert(&bad_cert);
+    match result {
+        Err(ConsensusError::MissingParent(missing_digest, _)) => {
+            assert_eq!(missing_digest, fake_parent, "Should report the fake parent as missing");
+        }
+        Ok(_) => panic!("Should reject certificate with missing parent - DAG integrity violation!"),
+        Err(e) => panic!("Unexpected error: {:?}", e),
+    }
+}
+
+/// Test that certificates at or below GC round are rejected.
+///
+/// SECURITY: This prevents old certificates from being reprocessed after garbage collection,
+/// which could allow replaying old decisions or cause memory exhaustion.
+#[tokio::test]
+async fn test_dag_rejects_certificate_at_gc_boundary() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+
+    let gc_depth = 5;
+    let mut state = ConsensusState::new(gc_depth);
+
+    let genesis: BTreeSet<CertificateDigest> =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect();
+
+    // Build DAG from round 1 to 10
+    let (certificates, _) = make_optimal_certificates(&committee, 1..=10, &genesis, &ids);
+
+    // Insert all certificates and simulate commits to advance GC round
+    for cert in &certificates {
+        let _ = state.try_insert(cert);
+        // Simulate commit to advance GC
+        state.update(cert);
+    }
+
+    // GC round should now be: committed_round - gc_depth = 10 - 5 = 5
+    assert_eq!(state.last_round.gc_round, 5, "GC round should be 5");
+
+    // Try to insert a certificate at round 4 (below GC round 5)
+    let (_, old_cert) = mock_certificate(&committee, ids[0].clone(), 4, genesis.clone());
+
+    let result = state.try_insert(&old_cert);
+    assert!(result.is_ok(), "Should not error, but reject silently");
+    assert!(!result.unwrap(), "Certificate at round 4 should be rejected (below GC round 5)");
+
+    // Try to insert at exactly GC round (round 5)
+    // Implementation uses `round <= gc_round` so round 5 is also rejected
+    let (_, gc_boundary_cert) = mock_certificate(&committee, ids[1].clone(), 5, genesis.clone());
+
+    let result = state.try_insert(&gc_boundary_cert);
+    assert!(result.is_ok(), "Should not error for boundary case");
+    assert!(!result.unwrap(), "Certificate at round <= gc_round should be rejected");
+}
+
+/// Test that equivocation is detected at the ConsensusState level.
+///
+/// SECURITY: Byzantine validators must not be able to submit two different certificates
+/// for the same round. This is critical for consensus safety.
+#[tokio::test]
+async fn test_dag_detects_equivocation_same_round_different_cert() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+
+    let gc_depth = 10;
+    let mut state = ConsensusState::new(gc_depth);
+
+    let genesis: BTreeSet<CertificateDigest> =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect();
+
+    // Create first certificate from authority 0 at round 1
+    let (_, cert1) = mock_certificate(&committee, ids[0].clone(), 1, genesis.clone());
+
+    // Insert first certificate
+    assert!(state.try_insert(&cert1).unwrap(), "First cert should insert");
+
+    // Create DIFFERENT certificate from same authority at same round
+    // (different payload results in different digest)
+    let mut different_parents = genesis.clone();
+    // Remove one parent to create a different certificate
+    if let Some(first) = different_parents.iter().next().cloned() {
+        different_parents.remove(&first);
+    }
+    let (_, cert2) = mock_certificate(&committee, ids[0].clone(), 1, different_parents);
+
+    // Verify the certificates are different
+    assert_ne!(cert1.digest(), cert2.digest(), "Certificates should have different digests");
+    assert_eq!(cert1.origin(), cert2.origin(), "Same authority");
+    assert_eq!(cert1.round(), cert2.round(), "Same round");
+
+    // Second insertion should fail with equivocation error
+    let result = state.try_insert(&cert2);
+    match result {
+        Err(ConsensusError::CertificateEquivocation(new_cert, existing_cert)) => {
+            assert_eq!(new_cert.digest(), cert2.digest());
+            assert_eq!(existing_cert.digest(), cert1.digest());
+        }
+        Ok(_) => panic!("Should detect equivocation - Byzantine attack possible!"),
+        Err(e) => panic!("Unexpected error: {:?}", e),
+    }
+}
+
+/// Test that reinserting the same certificate is idempotent.
+///
+/// This is important for network retries - receiving the same certificate twice
+/// should not cause errors or state corruption.
+#[tokio::test]
+async fn test_dag_accepts_duplicate_certificate_insertion() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+
+    let gc_depth = 10;
+    let mut state = ConsensusState::new(gc_depth);
+
+    let genesis: BTreeSet<CertificateDigest> =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect();
+
+    let (_, cert) = mock_certificate(&committee, ids[0].clone(), 1, genesis);
+
+    // Insert once
+    assert!(state.try_insert(&cert).unwrap(), "First insertion should succeed");
+
+    // Insert same certificate again - should succeed (idempotent)
+    let result = state.try_insert(&cert);
+    assert!(result.is_ok(), "Duplicate insertion should not error");
+    // Note: Returns false because it's already committed for this authority
+}
+
+/// Test that certificates with missing parent round are rejected.
+///
+/// SECURITY: If the entire parent round is missing from the DAG, the certificate
+/// cannot be validated and must be rejected.
+#[tokio::test]
+async fn test_dag_rejects_certificate_with_missing_parent_round() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+
+    let gc_depth = 10;
+    let mut state = ConsensusState::new(gc_depth);
+
+    let genesis: BTreeSet<CertificateDigest> =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect();
+
+    // Create round 1 certificates
+    let (round1_certs, round1_digests) =
+        make_optimal_certificates(&committee, 1..=1, &genesis, &ids);
+
+    // Insert round 1
+    for cert in &round1_certs {
+        state.try_insert(cert).unwrap();
+    }
+
+    // Create round 2 certificates
+    let (round2_certs, round2_digests) =
+        make_optimal_certificates(&committee, 2..=2, &round1_digests, &ids);
+
+    // Insert round 2
+    for cert in &round2_certs {
+        state.try_insert(cert).unwrap();
+    }
+
+    // Try to insert a round 4 certificate that references round 3
+    // but round 3 doesn't exist in the DAG
+    let (_round3_certs, round3_digests) =
+        make_optimal_certificates(&committee, 3..=3, &round2_digests, &ids);
+
+    // DON'T insert round 3
+
+    // Create round 4 certificate referencing round 3 parents
+    let (_, round4_cert) = mock_certificate(&committee, ids[0].clone(), 4, round3_digests);
+
+    // Should fail because round 3 is missing
+    let result = state.try_insert(&round4_cert);
+    match result {
+        Err(ConsensusError::MissingParentRound(_)) => {
+            // Expected - parent round 3 is missing
+        }
+        Ok(_) => panic!("Should reject certificate with missing parent round!"),
+        Err(e) => panic!("Unexpected error: {:?}", e),
+    }
 }

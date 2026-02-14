@@ -1,0 +1,7 @@
+# Proptest configuration for faster local development
+# Default cases reduced from 256 to 64 for quicker feedback
+# CI can override with PROPTEST_CASES=256
+
+[default]
+cases = 64
+max_shrink_iters = 100

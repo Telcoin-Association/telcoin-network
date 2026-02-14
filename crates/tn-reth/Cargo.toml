@@ -48,6 +48,7 @@ reth-eth-wire = { workspace = true }
 reth-tracing = { workspace = true }
 
 rand = { workspace = true }
+rayon = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
@@ -64,6 +65,7 @@ secp256k1 = { workspace = true, optional = true }
 [dev-dependencies]
 tn-types = { workspace = true, features = ["test-utils"] }
 secp256k1 = { workspace = true }
+proptest = { workspace = true }
 
 [features]
 default = []

@@ -20,7 +20,7 @@ use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, CertificateStor
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     error::HeaderError, now, AuthorityIdentifier, BlockNumHash, Certificate, Committee, ExecHeader,
-    Hash as _, SealedHeader, SignatureVerificationState, TaskManager,
+    Hash as _, SealedHeader, SignatureVerificationState, TaskManager, B256,
 };
 use tokio::time::timeout;
 
@@ -42,7 +42,8 @@ async fn test_request_vote_too_new() {
         ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee()).unwrap();
     // Need a dummy parent so we can request a vote.
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
-    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
+    cb.recent_blocks()
+        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
     let task_manager = TaskManager::default();
     let synchronizer =
         StateSynchronizer::new(target.consensus_config(), cb.clone(), task_manager.get_spawner());
@@ -105,7 +106,8 @@ async fn test_request_vote_has_missing_execution_block() {
         ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee()).unwrap();
     // Need a dummy parent so we can request a vote.
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
-    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
+    cb.recent_blocks()
+        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
     let task_manager = TaskManager::default();
     let synchronizer =
         StateSynchronizer::new(target.consensus_config(), cb.clone(), task_manager.get_spawner());
@@ -178,12 +180,17 @@ async fn test_request_vote_older_execution_block() {
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
     // This will be an "older" execution block, test this still works.
-    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
+    cb.recent_blocks()
+        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
     let mut dummy = ExecHeader { nonce: 110_u64.into(), ..Default::default() };
     dummy.nonce = 110_u64.into();
-    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(SealedHeader::seal_slow(dummy)));
+    cb.recent_blocks().send_modify(|blocks| {
+        blocks.push_latest(0, B256::default(), Some(SealedHeader::seal_slow(dummy)))
+    });
     dummy = ExecHeader { nonce: 120_u64.into(), ..Default::default() };
-    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(SealedHeader::seal_slow(dummy)));
+    cb.recent_blocks().send_modify(|blocks| {
+        blocks.push_latest(0, B256::default(), Some(SealedHeader::seal_slow(dummy)))
+    });
     let task_manager = TaskManager::default();
     let synchronizer =
         StateSynchronizer::new(target.consensus_config(), cb.clone(), task_manager.get_spawner());
@@ -226,7 +233,7 @@ async fn test_request_vote_older_execution_block() {
         certificate_store.write(cert.clone()).unwrap();
     }
 
-    let _ = cb.committed_round_updates().send(2);
+    cb.committed_round_updates().send_replace(2);
     // Trying to build on off of a missing execution block, will be an error.
     let result =
         timeout(Duration::from_secs(5), handler.vote(author_peer, test_header, Vec::new())).await;
@@ -256,7 +263,8 @@ async fn test_request_vote_has_missing_parents() {
     // Need a dummy parent so we can request a vote.
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
-    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
+    cb.recent_blocks()
+        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
     let task_manager = TaskManager::default();
     let synchronizer =
         StateSynchronizer::new(target.consensus_config(), cb.clone(), task_manager.get_spawner());
@@ -300,7 +308,7 @@ async fn test_request_vote_has_missing_parents() {
         certificate_store.write(cert.clone()).unwrap();
     }
 
-    let _ = cb.committed_round_updates().send(1);
+    cb.committed_round_updates().send_replace(1);
     // TEST PHASE 1: Handler should report missing parent certificates to caller.
     let missing = if let PrimaryResponse::MissingParents(missing) =
         handler.vote(author_peer, test_header.clone(), Vec::new()).await.unwrap()
@@ -329,7 +337,7 @@ async fn test_request_vote_has_missing_parents() {
 
     // TEST PHASE 3: Handler should return error if header is too old.
     // Increase round threshold.
-    let _ = cb.primary_round_updates().send(100);
+    cb.primary_round_updates().send_replace(100);
     // Because round 1 certificates are not in store, the missing parents will not be accepted yet.
     let result =
         timeout(Duration::from_secs(5), handler.vote(author_peer, test_header, Vec::new()))
@@ -360,7 +368,8 @@ async fn test_request_vote_accept_missing_parents() {
     // Need a dummy parent so we can request a vote.
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
-    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
+    cb.recent_blocks()
+        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
     let task_manager = TaskManager::default();
     let synchronizer =
         StateSynchronizer::new(target.consensus_config(), cb.clone(), task_manager.get_spawner());
@@ -416,7 +425,7 @@ async fn test_request_vote_accept_missing_parents() {
         payload_store.write_payload(digest, worker_id).unwrap();
     }
 
-    let _ = cb.committed_round_updates().send(2);
+    cb.committed_round_updates().send_replace(2);
     // TEST PHASE 1: Handler should report missing parent certificates to caller.
     let missing = if let PrimaryResponse::MissingParents(missing) =
         handler.vote(author_peer, test_header.clone(), Vec::new()).await.unwrap()
@@ -460,7 +469,8 @@ async fn test_request_vote_missing_batches() {
     // Need a dummy parent so we can request a vote.
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
-    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
+    cb.recent_blocks()
+        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
     let task_manager = TaskManager::default();
     let synchronizer =
         StateSynchronizer::new(primary.consensus_config(), cb.clone(), task_manager.get_spawner());
@@ -502,7 +512,7 @@ async fn test_request_vote_missing_batches() {
 
     client.set_primary_to_worker_local_handler(Arc::new(mock_server));
 
-    let _ = cb.committed_round_updates().send(1);
+    cb.committed_round_updates().send_replace(1);
     // Verify Handler synchronizes missing batches and generates a Vote.
     let _vote = timeout(Duration::from_secs(5), handler.vote(author_peer, test_header, Vec::new()))
         .await
@@ -532,7 +542,8 @@ async fn test_request_vote_already_voted() {
     // Need a dummy parent so we can request a vote.
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
-    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
+    cb.recent_blocks()
+        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
     let task_manager = TaskManager::default();
     let synchronizer =
         StateSynchronizer::new(primary.consensus_config(), cb.clone(), task_manager.get_spawner());
@@ -576,7 +587,7 @@ async fn test_request_vote_already_voted() {
         .with_payload_batch(fixture_batch_with_transactions(10), 0)
         .build();
 
-    let _ = cb.committed_round_updates().send(1);
+    cb.committed_round_updates().send_replace(1);
     let vote = if let PrimaryResponse::Vote(vote) = tokio::time::timeout(
         Duration::from_secs(10),
         handler.vote(author_peer, test_header.clone(), Vec::new()),
@@ -773,7 +784,8 @@ async fn test_request_vote_created_at_in_future() {
     // Need a dummy parent so we can request a vote.
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
-    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
+    cb.recent_blocks()
+        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
     let task_manager = TaskManager::default();
     let synchronizer =
         StateSynchronizer::new(primary.consensus_config(), cb.clone(), task_manager.get_spawner());
@@ -859,7 +871,7 @@ async fn test_request_vote_created_at_in_future() {
         .created_at(created_at)
         .build();
 
-    let _ = cb.committed_round_updates().send(1);
+    cb.committed_round_updates().send_replace(1);
     let _vote = if let PrimaryResponse::Vote(vote) =
         handler.vote(author_peer, test_header, Vec::new()).await.unwrap()
     {

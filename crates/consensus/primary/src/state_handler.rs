@@ -4,7 +4,7 @@ use crate::ConsensusBus;
 use tn_types::{
     AuthorityIdentifier, Certificate, Noticer, Round, TaskManager, TnReceiver, TnSender,
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, instrument};
 
 /// Updates Narwhal system state based on certificates received from consensus.
 pub(crate) struct StateHandler {
@@ -23,13 +23,16 @@ impl StateHandler {
         rx_shutdown: Noticer,
         task_manager: &TaskManager,
     ) {
+        // Subscribe before spawning so the channel is active before any messages are sent.
+        let rx_committed_certificates = consensus_bus.subscribe_committed_certificates();
         let state_handler =
             Self { authority_id, consensus_bus: consensus_bus.clone(), rx_shutdown };
         task_manager.spawn_critical_task("state handler task", async move {
-            state_handler.run().await;
+            state_handler.run(rx_committed_certificates).await;
         });
     }
 
+    #[instrument(level = "debug", skip_all, fields(commit_round, num_certs = certificates.len()))]
     async fn handle_sequenced(&mut self, commit_round: Round, certificates: Vec<Certificate>) {
         // Now we are going to signal which of our own batches have been committed.
         let own_rounds_committed: Vec<_> = certificates
@@ -56,9 +59,11 @@ impl StateHandler {
         }
     }
 
-    async fn run(mut self) {
+    async fn run(
+        mut self,
+        mut rx_committed_certificates: impl TnReceiver<(Round, Vec<Certificate>)>,
+    ) {
         info!(target: "primary::state_handler", "StateHandler on node {} has started successfully.", self.authority_id);
-        let mut rx_committed_certificates = self.consensus_bus.committed_certificates().subscribe();
         loop {
             tokio::select! {
                 Some((commit_round, certificates)) = rx_committed_certificates.recv() => {

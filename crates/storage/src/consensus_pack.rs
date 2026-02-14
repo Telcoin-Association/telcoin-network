@@ -16,7 +16,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tn_types::{
     AuthorityIdentifier, Batch, BlockHash, BlockNumHash, CertifiedBatch, CommittedSubDag,
-    Committee, ConsensusHeader, ConsensusOutput, Epoch, EpochRecord, Hash, Round, B256,
+    Committee, ConsensusHeader, ConsensusOutput, Epoch, EpochRecord, Round, B256,
 };
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
@@ -238,7 +238,6 @@ impl ConsensusPack {
     /// Save all the batches and consensus header from the ConsensusOutput the pack file.
     /// This backgrounds the save, will return any previous error from a past operation.
     pub async fn save_consensus_output(&self, consensus: ConsensusOutput) -> Result<(), PackError> {
-        let digest = consensus.digest();
         self.get_error()?;
         if self.tx.send(PackMessage::ConsensusOutput(consensus)).await.is_err() {
             Err(PackError::SendFailed)
