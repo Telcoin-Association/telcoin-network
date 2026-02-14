@@ -27,6 +27,14 @@ enum VoteProcessing {
     AltQuorumReached(B256),
 }
 
+struct VoteTally<'a> {
+    committee_index: &'a HashMap<BlsPublicKey, usize>,
+    committee_keys: &'a mut HashSet<BlsPublicKey>,
+    signed_authorities: &'a mut roaring::RoaringBitmap,
+    sigs: &'a mut Vec<BlsSignature>,
+    alt_recs: &'a mut HashMap<B256, usize>,
+}
+
 fn track_alternative_vote(
     vote: &EpochVote,
     epoch_hash: B256,
@@ -71,11 +79,7 @@ fn process_vote_for_epoch(
     epoch_hash: B256,
     epoch_record: &EpochRecord,
     quorum: usize,
-    committee_index: &HashMap<BlsPublicKey, usize>,
-    committee_keys: &mut HashSet<BlsPublicKey>,
-    signed_authorities: &mut roaring::RoaringBitmap,
-    sigs: &mut Vec<BlsSignature>,
-    alt_recs: &mut HashMap<B256, usize>,
+    tally: VoteTally<'_>,
 ) -> VoteProcessing {
     // Votes are validated at the primary network handler before reaching this collector.
     // Keep this check to protect against local tests/internal producers bypassing the handler.
@@ -90,16 +94,16 @@ fn process_vote_for_epoch(
 
     if vote.epoch_hash == epoch_hash {
         let source = vote.public_key;
-        if !committee_keys.remove(&source) {
+        if !tally.committee_keys.remove(&source) {
             return VoteProcessing::Ignored;
         }
 
-        sigs.push(vote.signature);
-        if let Some(idx) = committee_index.get(&source) {
-            signed_authorities.insert(*idx as u32);
+        tally.sigs.push(vote.signature);
+        if let Some(idx) = tally.committee_index.get(&source) {
+            tally.signed_authorities.insert(*idx as u32);
         }
 
-        if signed_authorities.len() >= quorum as u64 {
+        if tally.signed_authorities.len() >= quorum as u64 {
             VoteProcessing::ReachedQuorum
         } else {
             VoteProcessing::Accepted
@@ -109,8 +113,8 @@ fn process_vote_for_epoch(
         epoch_hash,
         &epoch_record.committee,
         quorum,
-        committee_keys,
-        alt_recs,
+        tally.committee_keys,
+        tally.alt_recs,
     ) {
         VoteProcessing::AltQuorumReached(vote.epoch_hash)
     } else {
@@ -283,11 +287,13 @@ pub(crate) fn spawn_epoch_vote_collector<DB: TNDatabase>(
                     epoch_hash,
                     &epoch_rec,
                     quorum,
-                    &committee_index,
-                    &mut committee_keys,
-                    &mut signed_authorities,
-                    &mut sigs,
-                    &mut alt_recs,
+                    VoteTally {
+                        committee_index: &committee_index,
+                        committee_keys: &mut committee_keys,
+                        signed_authorities: &mut signed_authorities,
+                        sigs: &mut sigs,
+                        alt_recs: &mut alt_recs,
+                    },
                 ) {
                     VoteProcessing::Ignored => {}
                     VoteProcessing::Accepted => {
@@ -339,11 +345,13 @@ pub(crate) fn spawn_epoch_vote_collector<DB: TNDatabase>(
                                     epoch_hash,
                                     &epoch_rec,
                                     quorum,
-                                    &committee_index,
-                                    &mut committee_keys,
-                                    &mut signed_authorities,
-                                    &mut sigs,
-                                    &mut alt_recs,
+                                    VoteTally {
+                                        committee_index: &committee_index,
+                                        committee_keys: &mut committee_keys,
+                                        signed_authorities: &mut signed_authorities,
+                                        sigs: &mut sigs,
+                                        alt_recs: &mut alt_recs,
+                                    },
                                 ) {
                                     VoteProcessing::Ignored => {}
                                     VoteProcessing::Accepted => {
