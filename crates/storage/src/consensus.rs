@@ -5,7 +5,7 @@ use std::{
     error::Error,
     fmt::Display,
     fs::{File, OpenOptions},
-    io::{Read as _, Seek as _, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -19,7 +19,10 @@ use tokio::sync::{
     oneshot,
 };
 
-use crate::consensus_pack::{ConsensusPack, PackError};
+use crate::consensus_pack::{ConsensusPack, PackError, DATA_NAME};
+
+pub trait ReadStream: Read + Seek + Send {}
+impl ReadStream for File {}
 
 /// Simple enum for which of two saved consensus states we are using.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -208,6 +211,28 @@ impl ConsensusChain {
         let pack = ConsensusPack::open_append(&self.base_path, previous_epoch, committee)?;
         self.current_pack = Some(pack);
         Ok(())
+    }
+
+    /// Populate an epoch poack from a stream.
+    /// This will resolve once the stream has been written.
+    pub async fn stream_import<R: Read + Seek + Send + 'static>(
+        &self,
+        stream: R,
+        epoch: Epoch,
+        previous_epoch: EpochRecord,
+    ) -> Result<(), ConsensusChainError> {
+        let pack = ConsensusPack::stream_import(&self.base_path, stream, epoch, previous_epoch)?;
+        Ok(pack.persist().await?)
+    }
+
+    /// Return a stream reader for the log file of epoch.
+    pub async fn get_epoch_stream(
+        &self,
+        epoch: Epoch,
+    ) -> Result<Box<dyn ReadStream>, ConsensusChainError> {
+        let base_dir = self.base_path.join(format!("epoch-{epoch}"));
+        let stream = File::open(base_dir.join(DATA_NAME))?;
+        Ok(Box::new(stream))
     }
 
     /// Save all the batches and consensus header from the ConsensusOutput the pack file for the
@@ -435,6 +460,17 @@ mod test {
     use tempfile::TempDir;
 
     use crate::consensus::{ConsensusSlot, LatestConsensus};
+    use std::sync::Arc;
+
+    use tn_types::{test_genesis, BlockHash, EpochRecord, Hash as _};
+
+    use crate::{
+        consensus::ConsensusChain,
+        consensus_pack::test::{compare_outputs, make_test_output},
+        mem_db::MemDatabase,
+    };
+    use tn_reth::RethChainSpec;
+    use tn_test_utils::CommitteeFixture;
 
     #[tokio::test]
     async fn test_latest_consensus() {
@@ -457,5 +493,56 @@ mod test {
         assert_eq!(latest.epoch, 2);
         assert_eq!(latest.number, 20);
         assert_eq!(latest.current_slot, ConsensusSlot::Slot2);
+    }
+
+    #[tokio::test]
+    async fn test_consensus_db_stream() {
+        let temp_dir = TempDir::with_prefix("test_consensus_pack").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            // If we can't find the recort then this we should be starting at epoch 0- use this
+            // filler.
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        // Create and load some data in initial file.
+        let mut consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).unwrap();
+        consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).unwrap();
+
+        let num_outputs = 1000;
+        let mut outputs = Vec::new();
+        let mut parent = BlockHash::default();
+        for i in 0..num_outputs {
+            let consensus_output =
+                make_test_output(&committee, i % 4, chain.clone(), (i as u64) + 1, parent);
+            parent = consensus_output.digest().into();
+            outputs.push(consensus_output.clone());
+            consensus_chain.save_consensus_output(consensus_output).await.unwrap();
+        }
+        for i in 0..num_outputs {
+            let output_db =
+                consensus_chain.get_consensus_output_current(i as u64 + 1).await.unwrap();
+            let output = outputs.get(i as usize).unwrap();
+            compare_outputs(&output_db, output);
+        }
+
+        consensus_chain.persist_current().await.expect("persist");
+        //drop(consensus_chain);
+
+        let temp_dir2 = TempDir::with_prefix("test_consensus_pack2").expect("temp dir");
+        let mut consensus_chain2 = ConsensusChain::new(temp_dir2.path().to_owned()).unwrap();
+        let stream = consensus_chain.get_epoch_stream(0).await.unwrap();
+        consensus_chain2.stream_import(stream, 0, previous_epoch.clone()).await.unwrap();
+        consensus_chain2.new_epoch(previous_epoch.clone(), committee.clone()).unwrap();
+        for i in 0..num_outputs {
+            let output_db =
+                consensus_chain2.get_consensus_output_current(i as u64 + 1).await.unwrap();
+            let output = outputs.get(i as usize).unwrap();
+            compare_outputs(&output_db, output);
+        }
     }
 }

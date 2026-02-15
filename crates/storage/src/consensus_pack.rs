@@ -359,6 +359,8 @@ impl ConsensusPack {
     }
 }
 
+pub const DATA_NAME: &str = Inner::DATA_NAME;
+
 #[derive(Debug)]
 struct Inner {
     data: Pack<PackRecord>,
@@ -868,7 +870,7 @@ impl From<io::Error> for PackError {
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use std::{
         collections::VecDeque,
         fs::File,
@@ -890,7 +892,7 @@ mod test {
         mem_db::MemDatabase,
     };
 
-    fn make_test_output(
+    pub(crate) fn make_test_output(
         committee: &Committee,
         authority_index: usize,
         chain: Arc<RethChainSpec>,
@@ -939,7 +941,7 @@ mod test {
         )
     }
 
-    fn compare_outputs(output1: &ConsensusOutput, output2: &ConsensusOutput) {
+    pub(crate) fn compare_outputs(output1: &ConsensusOutput, output2: &ConsensusOutput) {
         assert_eq!(output1.digest(), output2.digest(), "Consensus Output have different hashes");
         assert_eq!(
             output1.batch_digests().len(),
