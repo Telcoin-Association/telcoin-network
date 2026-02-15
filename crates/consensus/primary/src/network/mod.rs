@@ -16,7 +16,7 @@ use tn_network_libp2p::{
     GossipMessage, Penalty, ResponseChannel,
 };
 use tn_network_types::{WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerToPrimaryClient};
-use tn_storage::PayloadStore;
+use tn_storage::{consensus::ConsensusChain, PayloadStore};
 use tn_types::{
     encode, BlockHash, BlsPublicKey, BlsSignature, Certificate, CertificateDigest, ConsensusHeader,
     Database, Epoch, EpochCertificate, EpochRecord, EpochVote, Header, Round, TaskSpawner,
@@ -293,9 +293,14 @@ where
         consensus_bus: ConsensusBus,
         state_sync: StateSynchronizer<DB>,
         task_spawner: TaskSpawner,
+        consensus_chain: ConsensusChain,
     ) -> Self {
-        let request_handler =
-            RequestHandler::new(consensus_config, consensus_bus, state_sync.clone());
+        let request_handler = RequestHandler::new(
+            consensus_config,
+            consensus_bus,
+            state_sync.clone(),
+            consensus_chain,
+        );
         Self { network_events, network_handle, request_handler, task_spawner }
     }
 

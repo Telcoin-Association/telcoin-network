@@ -12,7 +12,7 @@ use crate::{
 use std::{sync::Arc, time::Duration};
 use tn_config::ConsensusConfig;
 use tn_network_types::{local::LocalNetwork, WorkerOwnBatchMessage, WorkerToPrimaryClient};
-use tn_storage::tables::{Batches, NodeBatchesCache};
+use tn_storage::tables::NodeBatchesCache;
 use tn_types::{
     error::BlockSealError, BatchReceiver, BatchSender, BatchValidation, Database, SealedBatch,
     TaskManager, WorkerId,
@@ -265,12 +265,12 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         }
 
         // Now save it to permenant storage
-        if let Err(e) = self.store.insert::<Batches>(&digest, &batch) {
+        if let Err(e) = self.store.insert::<NodeBatchesCache>(&digest, &batch) {
             error!(target: "worker::batch_provider", "Store failed with error: {:?}", e);
             return Err(BlockSealError::FatalDBFailure);
         }
         // Make sure we have persisted the batch before we report it to other nodes.
-        self.store.persist::<Batches>().await;
+        self.store.persist::<NodeBatchesCache>().await;
 
         // Send the batch to the primary.
         let message = WorkerOwnBatchMessage { worker_id: self.id, digest };

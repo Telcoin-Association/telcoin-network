@@ -7,10 +7,11 @@
 use std::{collections::BTreeSet, sync::Arc};
 use tempfile::TempDir;
 use tn_storage::{
+    consensus::ConsensusChain,
     mem_db::MemDatabase,
     open_db,
-    tables::{CertificateDigestByRound, Certificates, ConsensusBlocks},
-    CertificateStore, ConsensusStore,
+    tables::{CertificateDigestByRound, Certificates},
+    CertificateStore,
 };
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{CommittedSubDag, Database, Hash as _, ReputationScores};
@@ -32,7 +33,8 @@ async fn test_subdag_persists_restart() {
 
     // Phase 1: Write data
     {
-        let store = open_db(temp_dir.path());
+        let mut consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).unwrap();
 
         // Create and persist subdags with sequential indices
         for idx in 0..5u64 {
@@ -41,15 +43,13 @@ async fn test_subdag_persists_restart() {
             let subdag =
                 Arc::new(CommittedSubDag::new(certificates.clone(), leader, idx, reputation, None));
 
-            store.write_subdag_for_test(idx, subdag);
+            consensus_chain.write_subdag_for_test(idx, subdag).await;
         }
-        store.persist::<ConsensusBlocks>().await;
+        consensus_chain.persist_current().await.unwrap();
 
         // Verify latest subdag exists
-        let latest = store.get_latest_sub_dag();
+        let latest = consensus_chain.consensus_header_latest().await.unwrap();
         assert!(latest.is_some(), "Should have a latest subdag");
-
-        drop(store); // Explicit drop to release DB lock
     }
 
     // Allow time for MDBX to fully release locks
@@ -57,10 +57,11 @@ async fn test_subdag_persists_restart() {
 
     // Phase 2: Simulate "restart" by opening a new handle to same storage
     {
-        let store2 = open_db(temp_dir.path());
-        let latest_after_restart = store2.get_latest_sub_dag();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        let latest_after_restart = consensus_chain.consensus_header_latest().await.unwrap();
         assert!(latest_after_restart.is_some(), "Should have latest subdag after restart");
-        let latest_subdag = latest_after_restart.unwrap();
+        let latest_subdag = latest_after_restart.unwrap().sub_dag;
 
         // Verify subdag content persisted correctly
         assert_eq!(
@@ -80,11 +81,13 @@ async fn test_subdag_persists_restart() {
 #[tokio::test]
 async fn test_subdag_persists_multiple_writes() {
     let temp_dir = TempDir::new().unwrap();
-    let store = open_db(temp_dir.path());
 
     // Create fixture for epoch 0 (use MemDatabase for certificate generation)
     let fixture_epoch0 = CommitteeFixture::builder(MemDatabase::default).build();
     let committee_epoch0 = fixture_epoch0.committee();
+    let mut consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture_epoch0.committee())
+            .unwrap();
 
     // Create certificates for epoch 0
     let genesis: BTreeSet<_> = fixture_epoch0.genesis().collect();
@@ -97,12 +100,12 @@ async fn test_subdag_persists_multiple_writes() {
         let reputation = ReputationScores::new(&committee_epoch0);
         let subdag =
             Arc::new(CommittedSubDag::new(certs_epoch0.clone(), leader, idx, reputation, None));
-        store.write_subdag_for_test(idx, subdag);
+        consensus_chain.write_subdag_for_test(idx, subdag).await;
     }
-    store.persist::<ConsensusBlocks>().await;
+    consensus_chain.persist_current().await.unwrap();
 
     // Verify state after first batch
-    let latest_epoch0 = store.get_latest_sub_dag();
+    let latest_epoch0 = consensus_chain.consensus_header_latest().await.unwrap();
     assert!(latest_epoch0.is_some(), "Should have subdags after first batch");
 
     // Now simulate epoch transition - create new committee for epoch 1
@@ -121,12 +124,13 @@ async fn test_subdag_persists_multiple_writes() {
         let reputation = ReputationScores::new(&committee_epoch1);
         let subdag =
             Arc::new(CommittedSubDag::new(certs_epoch1.clone(), leader, idx, reputation, None));
-        store.write_subdag_for_test(idx, subdag);
+        consensus_chain.write_subdag_for_test(idx, subdag).await;
     }
-    store.persist::<ConsensusBlocks>().await;
+    consensus_chain.persist_current().await.unwrap();
 
     // Verify latest subdag is from the second batch
-    let latest_after_epoch1 = store.get_latest_sub_dag().unwrap();
+    let latest_after_epoch1 =
+        consensus_chain.consensus_header_latest().await.unwrap().unwrap().sub_dag;
     assert_eq!(
         latest_after_epoch1.leader.digest(),
         epoch1_leader_digest,
@@ -230,10 +234,11 @@ async fn test_dag_reconstruction_from_store() {
 #[tokio::test]
 async fn test_last_committed_persists() {
     let temp_dir = TempDir::new().unwrap();
-    let store = open_db(temp_dir.path());
 
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
+    let mut consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).unwrap();
 
     // Create and commit subdags
     let genesis: BTreeSet<_> = fixture.genesis().collect();
@@ -250,12 +255,12 @@ async fn test_last_committed_persists() {
             reputation,
             None,
         ));
-        store.write_subdag_for_test(idx as u64, subdag);
+        consensus_chain.write_subdag_for_test(idx as u64, subdag).await;
     }
-    store.persist::<ConsensusBlocks>().await;
+    consensus_chain.persist_current().await.unwrap();
 
     // Read last committed state
-    let last_committed = store.read_last_committed(committee.epoch());
+    let last_committed = consensus_chain.read_last_committed(committee.epoch()).await;
 
     // Should have entries for authorities that were leaders
     assert!(!last_committed.is_empty(), "Should have last committed entries for authorities");
