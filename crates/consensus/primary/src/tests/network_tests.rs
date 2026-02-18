@@ -10,14 +10,16 @@ use crate::{
     ConsensusBus, RecentBlocks,
 };
 use assert_matches::assert_matches;
+use rand::{rngs::StdRng, SeedableRng as _};
 use std::collections::{BTreeMap, BTreeSet};
+use tn_config::KeyConfig;
 use tn_network_libp2p::{GossipMessage, TopicHash};
-use tn_storage::mem_db::MemDatabase;
+use tn_storage::{mem_db::MemDatabase, EpochStore as _};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    error::HeaderError, now, AuthorityIdentifier, BlockHash, BlockHeader, BlockNumHash,
-    BlsPublicKey, Certificate, CertificateDigest, EpochVote, ExecHeader, Hash as _, SealedHeader,
-    TaskManager, B256,
+    error::HeaderError, now, AuthorityIdentifier, BlockHash, BlockHeader, BlockNumHash, BlsKeypair,
+    BlsPublicKey, Certificate, CertificateDigest, EpochRecord, EpochVote, ExecHeader, Hash as _,
+    SealedHeader, TaskManager, B256,
 };
 use tracing::debug;
 
@@ -81,6 +83,37 @@ fn create_test_types() -> TestTypes {
     let mut recent = RecentBlocks::new(1);
     recent.push_latest(0, B256::default(), Some(parent.clone()));
     cb.recent_blocks().send_replace(recent);
+
+    let handler = RequestHandler::new(config.clone(), cb.clone(), synchronizer);
+    TestTypes { committee, handler, parent, task_manager }
+}
+
+/// Same as `create_test_types` but pre-populates node storage with epoch 0 record.
+fn create_test_types_with_epoch_record() -> TestTypes {
+    let committee = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let authority = committee.first_authority();
+    let config = authority.consensus_config();
+    let cb = ConsensusBus::new();
+
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(config.clone(), cb.clone(), task_manager.get_spawner());
+    synchronizer.spawn(&task_manager);
+
+    let parent = SealedHeader::seal_slow(ExecHeader::default());
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(0, B256::default(), Some(parent.clone()));
+    cb.recent_blocks().send_replace(recent);
+
+    let committee_keys: Vec<_> =
+        committee.authorities().map(|a| *a.authority().protocol_key()).collect();
+    let epoch_rec = EpochRecord {
+        epoch: 0,
+        committee: committee_keys.clone(),
+        next_committee: committee_keys,
+        ..Default::default()
+    };
+    config.node_storage().save_epoch_record(&epoch_rec);
 
     let handler = RequestHandler::new(config.clone(), cb.clone(), synchronizer);
     TestTypes { committee, handler, parent, task_manager }
@@ -348,6 +381,32 @@ async fn test_primary_batch_gossip_topics() {
     let topic = TopicHash::from_raw(tn_config::LibP2pConfig::consensus_output_topic());
     let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     assert!(handler.process_gossip(&bad_msg).await.is_err());
+}
+
+#[tokio::test]
+async fn test_epoch_vote_gossip_rejects_unknown_authority_when_epoch_record_known() {
+    let TestTypes { committee, handler, .. } = create_test_types_with_epoch_record();
+
+    let committee_keys: Vec<_> =
+        committee.authorities().map(|a| *a.authority().protocol_key()).collect();
+    let epoch_rec = EpochRecord {
+        epoch: 0,
+        committee: committee_keys.clone(),
+        next_committee: committee_keys,
+        ..Default::default()
+    };
+
+    let mut rng = StdRng::from_os_rng();
+    let outsider = BlsKeypair::generate(&mut rng);
+    let outsider_key = KeyConfig::new_with_testing_key(outsider);
+    let vote = epoch_rec.sign_vote(&outsider_key);
+    let gossip = PrimaryGossip::EpochVote(Box::new(vote));
+    let data = tn_types::encode(&gossip);
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::epoch_vote_topic());
+    let msg = GossipMessage { source: None, data, sequence_number: None, topic };
+
+    let res = handler.process_gossip(&msg).await;
+    assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::UnknownAuthority(_))));
 }
 
 // ============================================================================
