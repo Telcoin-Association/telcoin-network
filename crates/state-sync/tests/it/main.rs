@@ -6,7 +6,10 @@
 
 #![allow(unused_crate_dependencies)]
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    sync::Arc,
+};
 use tempfile::TempDir;
 use tn_storage::{mem_db::MemDatabase, open_db, ConsensusStore as _};
 use tn_test_utils_committee::CommitteeFixture;
@@ -29,17 +32,11 @@ async fn test_sync_save_consensus() {
 
     // Create a CommittedSubDag
     let reputation = ReputationScores::new(&committee);
-    let sub_dag = CommittedSubDag::new(certificates.clone(), leader.clone(), 0, reputation, None);
+    let sub_dag =
+        Arc::new(CommittedSubDag::new(certificates.clone(), leader.clone(), 0, reputation, None));
 
     // Create ConsensusOutput using struct initialization
-    let output = ConsensusOutput {
-        sub_dag: Arc::new(sub_dag),
-        batches: vec![],
-        parent_hash: B256::ZERO,
-        number: 1,
-        close_epoch: false,
-        ..Default::default()
-    };
+    let output = ConsensusOutput::new(sub_dag, B256::ZERO, 1, false, VecDeque::new(), vec![]);
 
     // Save consensus using state_sync
     state_sync::save_consensus(&store, output, &None).await.unwrap();
@@ -77,16 +74,11 @@ async fn test_sync_parent_hash_chain() {
     for i in 1..=3u64 {
         let leader = certificates.first().cloned().unwrap();
         let reputation = ReputationScores::new(&committee);
-        let sub_dag = CommittedSubDag::new(certificates.clone(), leader, i - 1, reputation, None);
+        let sub_dag =
+            Arc::new(CommittedSubDag::new(certificates.clone(), leader, i - 1, reputation, None));
 
-        let output = ConsensusOutput {
-            sub_dag: Arc::new(sub_dag.clone()),
-            batches: vec![],
-            parent_hash,
-            number: i,
-            close_epoch: false,
-            ..Default::default()
-        };
+        let output =
+            ConsensusOutput::new(sub_dag.clone(), parent_hash, i, false, VecDeque::new(), vec![]);
 
         state_sync::save_consensus(&store, output, &None).await.unwrap();
 
@@ -129,16 +121,10 @@ async fn test_sync_lookup_by_hash() {
     let leader = certificates.first().cloned().unwrap();
 
     let reputation = ReputationScores::new(&committee);
-    let sub_dag = CommittedSubDag::new(certificates, leader, 0, reputation, None);
+    let sub_dag = Arc::new(CommittedSubDag::new(certificates, leader, 0, reputation, None));
 
-    let output = ConsensusOutput {
-        sub_dag: Arc::new(sub_dag.clone()),
-        batches: vec![],
-        parent_hash: B256::ZERO,
-        number: 1,
-        close_epoch: false,
-        ..Default::default()
-    };
+    let output =
+        ConsensusOutput::new(sub_dag.clone(), B256::ZERO, 1, false, VecDeque::new(), vec![]);
 
     state_sync::save_consensus(&store, output, &None).await.unwrap();
 
@@ -226,17 +212,10 @@ async fn test_digest_mismatch_detection() {
     let leader = certificates.first().cloned().unwrap();
 
     let reputation = ReputationScores::new(&committee);
-    let sub_dag = CommittedSubDag::new(certificates, leader, 0, reputation, None);
+    let sub_dag = Arc::new(CommittedSubDag::new(certificates, leader, 0, reputation, None));
 
     // Save block 1 with correct parent (ZERO)
-    let output1 = ConsensusOutput {
-        sub_dag: Arc::new(sub_dag.clone()),
-        batches: vec![],
-        parent_hash: B256::ZERO,
-        number: 1,
-        close_epoch: false,
-        ..Default::default()
-    };
+    let output1 = ConsensusOutput::new(sub_dag, B256::ZERO, 1, false, VecDeque::new(), vec![]);
     state_sync::save_consensus(&store, output1, &None).await.unwrap();
 
     // Get block 1's digest

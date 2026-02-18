@@ -3,7 +3,7 @@
 use crate::consensus::{
     utils, ConsensusError, ConsensusState, Dag, LeaderSchedule, LeaderSwapTable, Outcome,
 };
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::Arc};
 use tn_types::{
     Certificate, CommittedSubDag, Committee, Hash as _, ReputationScores, Round, VotingPower,
 };
@@ -108,8 +108,8 @@ impl Bullshark {
         &mut self,
         state: &mut ConsensusState,
         certificate: Certificate,
-    ) -> Result<(Outcome, Vec<CommittedSubDag>), ConsensusError> {
-        debug!("Processing certificate");
+    ) -> Result<(Outcome, Vec<Arc<CommittedSubDag>>), ConsensusError> {
+        debug!("Processing {:?}", certificate);
         let round = certificate.round();
 
         // Add the new certificate to the local storage.
@@ -180,7 +180,7 @@ impl Bullshark {
         &mut self,
         leader_round: Round,
         state: &mut ConsensusState,
-    ) -> Result<(Outcome, Vec<CommittedSubDag>), ConsensusError> {
+    ) -> Result<(Outcome, Vec<Arc<CommittedSubDag>>), ConsensusError> {
         let leader = match self.leader_schedule.leader_certificate(leader_round, &state.dag) {
             (_leader_authority, Some(certificate)) => certificate,
             (_leader_authority, None) => {
@@ -240,13 +240,14 @@ impl Bullshark {
             // We resolve the reputation score that should be stored alongside with this sub dag.
             let reputation_score = self.resolve_reputation_score(state, &sequence, sub_dag_index);
 
-            let sub_dag = CommittedSubDag::new(
+            let sub_dag: Arc<CommittedSubDag> = CommittedSubDag::new(
                 sequence,
                 leader.clone(),
                 sub_dag_index,
                 reputation_score.clone(),
-                state.last_committed_sub_dag.as_ref(),
-            );
+                state.last_committed_sub_dag.clone(),
+            )
+            .into();
 
             // Metric: subdag_committed - tracks subdag commits with key metrics
             info!(

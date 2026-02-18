@@ -47,7 +47,8 @@ async fn test_certificates_verified() -> eyre::Result<()> {
 
     // create 3 certs
     // NOTE: test types uses the last authority
-    let certs: Vec<_> = fixture.headers().iter().take(3).map(|h| fixture.certificate(h)).collect();
+    let mut certs: Vec<_> =
+        fixture.headers().iter().take(3).map(|h| fixture.certificate(h)).collect();
     let cloned_certs = certs.clone();
 
     // spawn task to receive processed certificates
@@ -70,7 +71,7 @@ async fn test_certificates_verified() -> eyre::Result<()> {
     });
 
     // assert unverified certificates and process
-    for cert in certs {
+    for cert in certs.iter_mut() {
         assert!(!cert.is_verified());
         // try to accept - ignore err for dropped oneshot
         let _ = validator.process_peer_certificate(cert).await;

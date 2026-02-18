@@ -155,7 +155,9 @@ async fn test_fetch_certificates_basic() {
     // fetching.
     let target_index = 123;
     let expected_digest = certificates[target_index].digest();
-    let error = synchronizer.process_peer_certificate(certificates[target_index].clone()).await;
+    let error = synchronizer
+        .process_peer_certificate(certificates.get_mut(target_index).expect("certificate"))
+        .await;
     assert_matches!(error, Err(CertManagerError::Pending(digest)) if digest == expected_digest);
 
     // Verify the fetch request.
@@ -280,7 +282,8 @@ async fn test_fetch_certificates_basic() {
 
     let target_index = num_written + 204;
     let expected_digest = certificates[target_index].digest();
-    let error = synchronizer.process_peer_certificate(certificates[target_index].clone()).await;
+    let error =
+        synchronizer.process_peer_certificate(certificates.get_mut(target_index).unwrap()).await;
     assert_matches!(error, Err(CertManagerError::Pending(digest)) if digest == expected_digest);
 
     // Verify the fetch request.
@@ -466,8 +469,8 @@ async fn test_fetch_cancellation_on_success() {
     all_certificates.extend(round2_certs.clone());
 
     // try to process a round 2 certificate - this will find missing round 1 parents
-    let target_cert = round2_certs[0].clone();
-    let result = synchronizer.process_peer_certificate(target_cert).await;
+    let mut target_cert = round2_certs[0].clone();
+    let result = synchronizer.process_peer_certificate(&mut target_cert).await;
 
     // should be pending due to missing parents
     assert!(result.is_err(), "Should fail due to missing parents");
@@ -556,11 +559,12 @@ async fn test_timeout_scenario() {
     for (digest, worker_id) in round2_headers.iter().flat_map(|h| h.payload().iter()) {
         payload_store.write_payload(digest, worker_id).unwrap();
     }
-    let round2_certificates: Vec<_> =
+    let mut round2_certificates: Vec<_> =
         round2_headers.iter().map(|h| fixture.certificate(&h)).collect();
 
     // trigger fetch by processing a round 2 certificate (which needs round 1 parents)
-    let result = synchronizer.process_peer_certificate(round2_certificates[0].clone()).await;
+    let result =
+        synchronizer.process_peer_certificate(round2_certificates.get_mut(0).unwrap()).await;
     assert!(result.is_err(), "Should fail due to missing parents");
 
     // calculate expected timeout
@@ -672,8 +676,8 @@ async fn test_gc_round_update_during_fetch() {
     }
 
     // trigger fetch for round 8 certificate
-    let target_cert = all_certificates.iter().find(|c| c.header().round() == 8).unwrap();
-    let _ = synchronizer.process_peer_certificate(target_cert.clone()).await;
+    let target_cert = all_certificates.iter_mut().find(|c| c.header().round() == 8).unwrap();
+    let _ = synchronizer.process_peer_certificate(target_cert).await;
 
     // first fetch request
     if let Some(NetworkCommand::SendRequest {
@@ -773,10 +777,10 @@ async fn test_network_failure_keeps_trying() {
     for (digest, worker_id) in round2_headers.iter().flat_map(|h| h.payload().iter()) {
         payload_store.write_payload(digest, worker_id).unwrap();
     }
-    let round2_certs: Vec<_> = round2_headers.iter().map(|h| fixture.certificate(&h)).collect();
+    let mut round2_certs: Vec<_> = round2_headers.iter().map(|h| fixture.certificate(&h)).collect();
 
     // trigger fetch
-    let result = synchronizer.process_peer_certificate(round2_certs[0].clone()).await;
+    let result = synchronizer.process_peer_certificate(round2_certs.get_mut(0).unwrap()).await;
     assert!(result.is_err(), "should fail due to missing parents");
 
     let num_peers = fixture.committee().authorities().len() - 1;
@@ -859,7 +863,9 @@ async fn test_partial_response_handling_rejects_invalid_cert() {
 
     // trigger fetch
     let target_index = all_certificates.len() - 1;
-    let _ = synchronizer.process_peer_certificate(all_certificates[target_index].clone()).await;
+    let _ = synchronizer
+        .process_peer_certificate(all_certificates.get_mut(target_index).unwrap())
+        .await;
 
     // track bad cert for later assertion
     //
@@ -940,7 +946,9 @@ async fn test_bad_cert_in_fetch_rejects_all() {
 
     // trigger fetch
     let target_index = all_certificates.len() - 1;
-    let _ = synchronizer.process_peer_certificate(all_certificates[target_index].clone()).await;
+    let _ = synchronizer
+        .process_peer_certificate(all_certificates.get_mut(target_index).unwrap())
+        .await;
 
     // track bad cert for later assertion
     // use middle round
