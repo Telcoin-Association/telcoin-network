@@ -42,6 +42,7 @@ fn create_test_types() -> TestTypes {
     let batch_validator = Arc::new(NoopBatchValidator);
     let (tx, network_commands_rx) = mpsc::channel(10);
     let network_handle = WorkerNetworkHandle::new(
+        worker_id,
         NetworkHandle::new(tx),
         task_manager.get_spawner(),
         config.network_config().libp2p_config().max_rpc_message_size,
