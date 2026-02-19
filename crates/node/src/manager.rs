@@ -707,7 +707,7 @@ where
             self.key_config.clone(),
             self.consensus_db.clone(),
             node_task_spawner.clone(),
-            self.builder.tn_config.node_info.worker_network_address().clone(),
+            self.builder.tn_config.node_info.worker_network_address(0).clone(),
         )?;
         let worker_network_handle = worker_network.network_handle();
         let node_shutdown = self.node_shutdown.subscribe();
@@ -1739,7 +1739,7 @@ where
             let worker_address = Self::parse_listener_address_for_swarm(
                 "WORKER_LISTENER_MULTIADDR",
                 consensus_config.primary_networkkey(),
-                consensus_config.worker_address(),
+                consensus_config.worker_address(*worker_id),
             )?;
             network_handle.inner_handle().start_listening(worker_address).await?;
             // Make sure we at least hove bootstrap peers on first epoch.
@@ -1756,7 +1756,7 @@ where
                 .await?;
         }
 
-        let worker_address = consensus_config.worker_address();
+        let worker_address = consensus_config.worker_address(*worker_id);
 
         // always attempt to dial peers for the new epoch
         // the network's peer manager will intercept dial attempts for peers that are already
@@ -1776,14 +1776,14 @@ where
         // update the authorized publishers for gossip every epoch
         network_handle
             .inner_handle()
-            .subscribe(tn_config::LibP2pConfig::worker_txn_topic())
+            .subscribe(tn_config::LibP2pConfig::worker_txn_topic(*worker_id))
             .await?;
         // Get gossip from committee members about batches.
         // Useful for non-CVVs to prefetch and harmless for CVVs.
         network_handle
             .inner_handle()
             .subscribe_with_publishers(
-                tn_config::LibP2pConfig::worker_batch_topic(),
+                tn_config::LibP2pConfig::worker_batch_topic(*worker_id),
                 committee_keys.into_iter().collect(),
             )
             .await?;
