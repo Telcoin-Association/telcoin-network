@@ -122,7 +122,7 @@ where
             return Err(WorkerNetworkError::NonCommitteeBatch);
         }
 
-        let client = self.consensus_config.local_network().clone();
+        let client = self.consensus_config.local_network(self.id).clone();
         let store = self.consensus_config.node_storage().clone();
         // validate batch - log error if invalid
         self.validator.validate_batch(sealed_batch.clone())?;

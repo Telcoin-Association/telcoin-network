@@ -35,7 +35,7 @@ pub fn new_worker<DB: Database>(
 
     let batch_fetcher =
         BatchFetcher::new(network_handle.clone(), consensus_config.node_storage().clone());
-    consensus_config.local_network().set_primary_to_worker_local_handler(Arc::new(
+    consensus_config.local_network(id).set_primary_to_worker_local_handler(Arc::new(
         PrimaryReceiverHandler {
             store: consensus_config.node_storage().clone(),
             request_batches_timeout: consensus_config.parameters().sync_retry_delay,
@@ -47,7 +47,7 @@ pub fn new_worker<DB: Database>(
     let batch_provider = new_worker_internal(
         id,
         &consensus_config,
-        consensus_config.local_network().clone(),
+        consensus_config.local_network(id).clone(),
         network_handle.clone(),
     );
 
