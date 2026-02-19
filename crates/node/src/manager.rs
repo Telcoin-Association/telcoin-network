@@ -1579,7 +1579,6 @@ where
             // We updated our epoch task spawner so make sure worker network tasks are restarted.
             engine.respawn_worker_network_tasks(&self.worker_network_handles).await;
         }
-
         Ok(workers)
     }
 
