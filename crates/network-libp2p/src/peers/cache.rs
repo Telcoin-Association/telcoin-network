@@ -109,6 +109,11 @@ where
         self.map.contains(key)
     }
 
+    /// Return the number of elements in the cache.
+    pub(super) fn len(&self) -> usize {
+        self.map.len()
+    }
+
     #[cfg(test)]
     #[track_caller]
     fn check_invariant(&self) {

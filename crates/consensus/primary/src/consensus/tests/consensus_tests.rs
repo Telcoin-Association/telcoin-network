@@ -11,8 +11,8 @@ use std::collections::BTreeSet;
 use tn_storage::{mem_db::MemDatabase, CertificateStore, ConsensusStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    Certificate, CertificateDigest, ExecHeader, Hash as _, ReputationScores, SealedHeader,
-    TaskManager, TnReceiver, TnSender, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    BlockNumHash, Certificate, CertificateDigest, ExecHeader, Hash as _, ReputationScores,
+    SealedHeader, TaskManager, TnReceiver, TnSender, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 
 /// This test is trying to compare the output of the Consensus algorithm when:
@@ -60,8 +60,9 @@ async fn test_consensus_recovery_with_bullshark() {
 
     let cb = ConsensusBus::new();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    cb.recent_blocks()
-        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
+    cb.recent_blocks().send_modify(|blocks| {
+        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+    });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
     Consensus::spawn(config.clone(), &cb, bullshark, &task_manager);
@@ -145,8 +146,9 @@ async fn test_consensus_recovery_with_bullshark() {
 
     let cb = ConsensusBus::new();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    cb.recent_blocks()
-        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
+    cb.recent_blocks().send_modify(|blocks| {
+        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+    });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
     Consensus::spawn(config.clone(), &cb, bullshark, &task_manager);
@@ -203,8 +205,9 @@ async fn test_consensus_recovery_with_bullshark() {
 
     let cb = ConsensusBus::new();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    cb.recent_blocks()
-        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
+    cb.recent_blocks().send_modify(|blocks| {
+        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+    });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
     Consensus::spawn(config, &cb, bullshark, &task_manager);

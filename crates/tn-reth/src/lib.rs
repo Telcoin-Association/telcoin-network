@@ -732,7 +732,7 @@ impl RethEnv {
     pub fn finish_executing_output(
         &self,
         blocks: Vec<ExecutedBlockWithTrieUpdates>,
-        engine_update: Option<(Round, B256, tokio::sync::mpsc::Sender<EngineUpdate>)>,
+        engine_update: Option<(Round, BlockNumHash, tokio::sync::mpsc::Sender<EngineUpdate>)>,
     ) -> TnRethResult<()> {
         // NOTE: this makes all blocks canonical, commits them to the database,
         // and broadcasts new chain on `canon_state_notification_sender`
@@ -770,11 +770,11 @@ impl RethEnv {
             canonical_head.hash(),
         );
 
-        if let Some((leader_round, consensus_hash, engine_update_tx)) = engine_update {
+        if let Some((leader_round, consensus_num_hash, engine_update_tx)) = engine_update {
             engine_update_tx
                 .try_send((
                     leader_round,
-                    consensus_hash,
+                    consensus_num_hash,
                     Some(canonical_head.clone_sealed_header()),
                 ))
                 .map_err(|e| {
@@ -1441,6 +1441,7 @@ mod tests {
             parent_hash: ConsensusHeader::default().digest(),
             number: subdag_index,
             extra: Default::default(),
+            consensus_header_hash_cache: Default::default(),
         }
     }
 

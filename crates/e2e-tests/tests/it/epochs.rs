@@ -135,7 +135,7 @@ async fn test_epoch_boundary_inner(
 
     if shuffled {
         // Do a check to make sure all the nodes have valid (certified) Epoch Records.
-        // TODO issue 375, should use tn_latestHeader RPC for this when fixed.
+        // TODO issue 375, should use tn_latestConsensusHeader RPC for this when fixed.
         let latest_epoch = last_pause;
         for p in 8540..=8545 {
             let rpc_url = format!("http://127.0.0.1:{p}");
@@ -232,7 +232,7 @@ async fn test_epoch_sync_inner(
 
     // Do a check to make sure all the nodes have valid (certified) Epoch Records.
     // The node that was down should also have all these records after syncing.
-    // TODO issue 375, should use tn_latestHeader RPC for this when fixed.
+    // TODO issue 375, should use tn_latestConsensusHeader RPC for this when fixed.
     let latest_epoch = 15;
     for p in 8540..=8545 {
         let rpc_url = format!("http://127.0.0.1:{p}");

@@ -42,11 +42,11 @@ use tn_storage::{
     ConsensusStore, DatabaseType, EpochStore as _,
 };
 use tn_types::{
-    gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash, BlsAggregateSignature,
-    BlsPublicKey, BlsSignature, CertifiedBatch, CommittedSubDag, Committee, CommitteeBuilder,
-    ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, EpochCertificate, EpochRecord,
-    Hash, Multiaddr, NetworkPublicKey, Noticer, Notifier, TaskJoinError, TaskManager, TaskSpawner,
-    TimestampSec, TnReceiver, B256, MIN_PROTOCOL_BASE_FEE,
+    gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash, BlockNumHash,
+    BlsAggregateSignature, BlsPublicKey, BlsSignature, CertifiedBatch, CommittedSubDag, Committee,
+    CommitteeBuilder, ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch,
+    EpochCertificate, EpochRecord, Hash, Multiaddr, NetworkPublicKey, Noticer, Notifier,
+    TaskJoinError, TaskManager, TaskSpawner, TimestampSec, TnReceiver, B256, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{
     quorum_waiter::QuorumWaiterTrait, Worker, WorkerNetwork, WorkerNetworkHandle, WorkerRequest,
@@ -1223,7 +1223,7 @@ where
             .clone()
             .ok_or_eyre("no consensus header after an epoch!")?
             .digest();
-        let parent_state = self.consensus_bus.latest_block_num_hash();
+        let parent_state = self.consensus_bus.latest_execution_block_num_hash();
 
         let epoch_rec = EpochRecord {
             epoch,
@@ -1808,12 +1808,13 @@ where
 
         for recent_block in engine.last_executed_output_blocks(block_capacity).await? {
             // On restore, use the block's consensus hash from parent_beacon_block_root.
-            // Round is set to 0 since we don't persist it; only the consensus hash matters
-            // for wait_for_consensus_execution resolution.
+            // Round is set to 0 since we don't persist it; consensus number/hash still allows
+            // wait_for_consensus_execution to resolve hash lookups.
             let consensus_hash = recent_block.parent_beacon_block_root.unwrap_or_default();
-            self.consensus_bus
-                .recent_blocks()
-                .send_modify(|blocks| blocks.push_latest(0, consensus_hash, Some(recent_block)));
+            let consensus_num_hash = BlockNumHash::new(recent_block.number, consensus_hash);
+            self.consensus_bus.recent_blocks().send_modify(|blocks| {
+                blocks.push_latest(0, consensus_num_hash, Some(recent_block))
+            });
         }
 
         Ok(())
@@ -1862,11 +1863,11 @@ where
     ) {
         let consensus_bus = self.consensus_bus.clone();
         task_manager.spawn_critical_task("engine updates for consensus", async move {
-            while let Some((latest_round, consensus_hash, latest_executed_block)) =
+            while let Some((latest_round, consensus_num_hash, latest_executed_block)) =
                 engine_update.recv().await
             {
                 consensus_bus.recent_blocks().send_modify(|blocks| {
-                    blocks.push_latest(latest_round, consensus_hash, latest_executed_block)
+                    blocks.push_latest(latest_round, consensus_num_hash, latest_executed_block)
                 });
             }
             error!(target: "engine", "engine updates ended, node will exit");
