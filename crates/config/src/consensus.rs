@@ -199,10 +199,7 @@ where
     /// Contains network identity and local networking setup information.
     /// This is how Primary <-> Workers communicate.
     pub fn local_network(&self, worker_id: WorkerId) -> &LocalNetwork {
-        self.inner
-            .local_networks
-            .get(worker_id as usize)
-            .expect("worker id out of range")
+        self.inner.local_networks.get(worker_id as usize).expect("worker id out of range")
     }
 
     /// Returns a reference to the network configuration.

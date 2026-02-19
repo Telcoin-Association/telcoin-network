@@ -364,6 +364,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_invalid_batch_wrong_worker_id() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let TestTools { valid_batch, validator } = test_tools(tmp_dir.path(), &task_manager).await;
+        let (mut batch, _) = valid_batch.split();
+        batch.worker_id = 1;
+
+        assert_matches!(
+            validator.validate_batch(batch.seal_slow()),
+            Err(BatchValidationError::InvalidWorkerId{expected_worker_id, worker_id})
+                if expected_worker_id == 0 && worker_id == 1
+        );
+    }
+
+    #[tokio::test]
     async fn test_invalid_batch_excess_gas_used() {
         // Set excessive gas limit.
         let tmp_dir = TempDir::new().unwrap();
