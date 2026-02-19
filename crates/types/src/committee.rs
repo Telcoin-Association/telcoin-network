@@ -64,8 +64,6 @@ impl BootstrapServer {
 struct AuthorityInner {
     /// The authority's main BlsPublicKey which is used to verify the content they sign.
     protocol_key: BlsPublicKey,
-    /// The voting power of this authority.
-    voting_power: VotingPower,
     /// The execution address for the authority.
     /// This address will be used as the suggested fee recipient.
     execution_address: Address,
@@ -87,13 +85,7 @@ impl Authority {
         _voting_power: VotingPower,
         execution_address: Address,
     ) -> Self {
-        Self {
-            inner: Arc::new(AuthorityInner {
-                protocol_key,
-                voting_power: EQUAL_VOTING_POWER,
-                execution_address,
-            }),
-        }
+        Self { inner: Arc::new(AuthorityInner { protocol_key, execution_address }) }
     }
 
     /// Version of new that can be called directly.  Useful for testing, if you are calling this
@@ -103,13 +95,7 @@ impl Authority {
         _voting_power: VotingPower,
         execution_address: Address,
     ) -> Self {
-        Self {
-            inner: Arc::new(AuthorityInner {
-                protocol_key,
-                voting_power: EQUAL_VOTING_POWER,
-                execution_address,
-            }),
-        }
+        Self { inner: Arc::new(AuthorityInner { protocol_key, execution_address }) }
     }
 
     pub fn id(&self) -> AuthorityIdentifier {
@@ -649,6 +635,7 @@ mod tests {
     use crate::{
         Address, Authority, AuthorityIdentifier, BlsKeypair, BlsPublicKey, BootstrapServer,
         Committee, Multiaddr, NetworkKeypair, ParseAuthorityIdentifierError, ReputationScores,
+        EQUAL_VOTING_POWER,
     };
     use rand::rng;
     use std::collections::BTreeMap;
@@ -714,6 +701,66 @@ mod tests {
             total += 1;
         }
         assert_eq!(total, num_of_authorities);
+    }
+
+    #[test]
+    fn committee_yaml_deserialize_with_legacy_authority_voting_power() {
+        let mut rng = rng();
+        let num_of_authorities = 4;
+
+        let authorities = (0..num_of_authorities)
+            .enumerate()
+            .map(|(i, _)| {
+                let keypair = BlsKeypair::generate(&mut rng);
+                let execution_address = Address::repeat_byte(i as u8);
+                let authority = Authority::new(*keypair.public(), 1, execution_address);
+                (*keypair.public(), authority)
+            })
+            .collect::<BTreeMap<BlsPublicKey, Authority>>();
+
+        let bootstrap_servers = authorities
+            .keys()
+            .map(|key| {
+                let primary_keypair = NetworkKeypair::generate_ed25519();
+                let worker_keypair = NetworkKeypair::generate_ed25519();
+                let bootstrap = BootstrapServer::new(
+                    (Multiaddr::empty(), primary_keypair.public().clone().into()).into(),
+                    (Multiaddr::empty(), worker_keypair.public().clone().into()).into(),
+                );
+                (*key, bootstrap)
+            })
+            .collect::<BTreeMap<BlsPublicKey, BootstrapServer>>();
+
+        let committee = Committee::new(authorities, 0, bootstrap_servers);
+        let mut yaml_value = serde_yaml::to_value(&committee).expect("YAML serialization failed");
+        let committee_map =
+            yaml_value.as_mapping_mut().expect("committee should serialize to a mapping");
+        let authorities_key = serde_yaml::Value::String("authorities".to_string());
+        let authorities_value = committee_map
+            .get_mut(&authorities_key)
+            .expect("committee YAML should contain authorities");
+        let authorities_map =
+            authorities_value.as_mapping_mut().expect("authorities should serialize as a mapping");
+
+        for (_, authority_value) in authorities_map.iter_mut() {
+            let authority_map =
+                authority_value.as_mapping_mut().expect("authority should serialize as a mapping");
+            authority_map.insert(
+                serde_yaml::Value::String("voting_power".to_string()),
+                serde_yaml::Value::from(999_u64),
+            );
+        }
+
+        let legacy_yaml =
+            serde_yaml::to_string(&yaml_value).expect("legacy committee YAML conversion failed");
+        let reloaded: Committee =
+            serde_yaml::from_str(&legacy_yaml).expect("legacy committee YAML should deserialize");
+        reloaded.load();
+
+        assert_eq!(reloaded.total_voting_power(), num_of_authorities as u64);
+        for authority in reloaded.authorities() {
+            assert_eq!(authority.voting_power(), EQUAL_VOTING_POWER);
+        }
     }
 
     #[test]
