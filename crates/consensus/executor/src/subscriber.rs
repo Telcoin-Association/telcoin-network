@@ -61,6 +61,7 @@ pub fn spawn_subscriber<DB: Database>(
     let committee = config.committee().clone();
     let client = config.local_network().clone();
     let mode = consensus_bus.current_node_mode();
+    info!(target: "tn::observer", node_mode = ?mode, "subscriber starting in mode");
     let subscriber = Subscriber {
         consensus_bus,
         config,
@@ -198,22 +199,23 @@ impl<DB: Database> Subscriber<DB> {
 
             // Periodically log observer progress (every 100 blocks)
             if processed_count.is_multiple_of(100) {
-                let latest_executed = self.consensus_bus.latest_block_num_hash().number;
-                let latest_known = self
+                let latest_processed_consensus = self
                     .consensus_bus
-                    .last_consensus_header()
+                    .recent_blocks()
                     .borrow()
-                    .as_ref()
-                    .map(|h| h.number)
-                    .unwrap_or(0);
-                let sync_distance = latest_known.saturating_sub(latest_executed);
+                    .latest_consensus_block_num_hash()
+                    .number;
+                let (latest_network_consensus, _) =
+                    self.consensus_bus.published_consensus_num_hash();
+                let consensus_sync_distance =
+                    latest_network_consensus.saturating_sub(latest_processed_consensus);
                 info!(
                     target: "tn::observer",
                     processed_count,
                     header_number,
-                    latest_executed,
-                    latest_known,
-                    sync_distance,
+                    latest_processed_consensus,
+                    latest_network_consensus,
+                    consensus_sync_distance,
                     "observer follow progress"
                 );
             }

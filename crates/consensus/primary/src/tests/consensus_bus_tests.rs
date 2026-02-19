@@ -69,7 +69,7 @@ async fn test_committed_round_after_update() {
 #[tokio::test]
 async fn test_latest_block_num_hash_default() {
     let bus = ConsensusBus::new();
-    let num_hash = bus.latest_block_num_hash();
+    let num_hash = bus.latest_execution_block_num_hash();
     // Default is empty, so number should be 0
     assert_eq!(num_hash.number, 0);
 }

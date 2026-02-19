@@ -259,7 +259,7 @@ impl PeerManager {
             self.apply_peer_action(peer_id, action);
         }
 
-        // Issue #254: emit peer metrics via tracing for OpenTelemetry export
+        // Emit peer metrics via tracing for OpenTelemetry export.
         let connected_count = self.peers.connected_peer_ids().count();
         let connected_or_dialing = self.connected_or_dialing_peers().len();
         let banned_count = self.temporarily_banned.len();

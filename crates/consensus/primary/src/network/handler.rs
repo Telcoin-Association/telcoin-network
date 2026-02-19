@@ -436,7 +436,7 @@ where
             error!(
                 target: "primary",
                 peer_hash = ?header.latest_execution_block,
-                expected = ?self.consensus_bus.latest_block_num_hash(),
+                expected = ?self.consensus_bus.latest_execution_block_num_hash(),
                 "unexpected execution result received"
             );
             return Err(HeaderError::UnknownExecutionResult(header.latest_execution_block).into());

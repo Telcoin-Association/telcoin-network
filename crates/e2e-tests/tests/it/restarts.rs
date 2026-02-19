@@ -692,6 +692,31 @@ fn get_block_number(node: &str) -> eyre::Result<u64> {
     Ok(u64::from_str_radix(&block["number"].as_str().unwrap_or("0x100_000")[2..], 16)?)
 }
 
+fn get_latest_consensus_header(node: &str) -> eyre::Result<HashMap<String, Value>> {
+    call_rpc(node, "tn_latestConsensusHeader", rpc_params![], 10, "tn_latestConsensusHeader")
+}
+
+fn get_latest_consensus_header_number(node: &str) -> eyre::Result<u64> {
+    let header = get_latest_consensus_header(node)?;
+    let value = header
+        .get("number")
+        .ok_or_else(|| Report::msg("tn_latestConsensusHeader missing `number` field"))?;
+
+    match value {
+        Value::Number(n) => n
+            .as_u64()
+            .ok_or_else(|| Report::msg("tn_latestConsensusHeader number is not u64-compatible")),
+        Value::String(s) if s.starts_with("0x") => {
+            u64::from_str_radix(s.trim_start_matches("0x"), 16)
+                .map_err(|e| Report::msg(format!("failed to parse consensus number hex: {e}")))
+        }
+        Value::String(s) => s
+            .parse::<u64>()
+            .map_err(|e| Report::msg(format!("failed to parse consensus number: {e}"))),
+        _ => Err(Report::msg("tn_latestConsensusHeader number has unexpected type")),
+    }
+}
+
 /// Take a string and return the deterministic account derived from it.  This is be used
 /// with similiar functionality in the test client to allow easy testing using simple strings
 /// for accounts.
@@ -871,9 +896,9 @@ fn test_observer_late_join_catchup() -> eyre::Result<()> {
     send_and_confirm(&client_urls[0], &client_urls[1], &key, to_account, 0)?;
     send_and_confirm(&client_urls[1], &client_urls[2], &key, to_account, 1)?;
 
-    // Record current validator height
-    let validator_height = get_block_number(&client_urls[0])?;
-    info!(target: "restart-test", ?validator_height, "validators advanced, now starting observer");
+    // Record current validator consensus height
+    let validator_consensus_height = get_latest_consensus_header_number(&client_urls[0])?;
+    info!(target: "restart-test", ?validator_consensus_height, "validators advanced, now starting observer");
 
     // NOW start the observer (it must catch up from behind)
     let obs_rpc_port = get_available_tcp_port("127.0.0.1")
@@ -881,16 +906,16 @@ fn test_observer_late_join_catchup() -> eyre::Result<()> {
     let obs_url = format!("http://127.0.0.1:{obs_rpc_port}");
     let mut obs_child = start_observer(4, &bin, &temp_path, obs_rpc_port, "late_join", 0);
 
-    // Observer must catch up to at least the validator height we recorded
+    // Observer must catch up to at least the validator consensus height we recorded
     let mut retries = 0;
     let max_retries = 120; // 120 seconds max
     let caught_up = loop {
-        if let Ok(obs_height) = get_block_number(&obs_url) {
-            if obs_height >= validator_height {
-                info!(target: "restart-test", ?obs_height, ?validator_height, "observer caught up");
+        if let Ok(obs_consensus_height) = get_latest_consensus_header_number(&obs_url) {
+            if obs_consensus_height >= validator_consensus_height {
+                info!(target: "restart-test", ?obs_consensus_height, ?validator_consensus_height, "observer caught up");
                 break true;
             }
-            info!(target: "restart-test", ?obs_height, ?validator_height, retries, "observer still catching up");
+            info!(target: "restart-test", ?obs_consensus_height, ?validator_consensus_height, retries, "observer still catching up");
         }
         retries += 1;
         if retries >= max_retries {
@@ -955,8 +980,8 @@ fn test_observer_reconnect_after_pause() -> eyre::Result<()> {
     network_advancing(&client_urls)?;
     std::thread::sleep(Duration::from_secs(5));
 
-    let initial_obs_height = get_block_number(&obs_url)?;
-    info!(target: "restart-test", ?initial_obs_height, "observer synced, pausing it");
+    let initial_obs_consensus_height = get_latest_consensus_header_number(&obs_url)?;
+    info!(target: "restart-test", ?initial_obs_consensus_height, "observer synced, pausing it");
 
     // SIGSTOP the observer (simulate network partition / process freeze)
     let obs_pid = Pid::from_raw(obs_child.id() as i32);
@@ -964,10 +989,11 @@ fn test_observer_reconnect_after_pause() -> eyre::Result<()> {
 
     // Let validators advance for 15 seconds while observer is paused
     std::thread::sleep(Duration::from_secs(15));
-    let validator_height_during_pause = get_block_number(&client_urls[0])?;
-    info!(target: "restart-test", ?validator_height_during_pause, "validators advanced while observer paused");
+    let validator_consensus_height_during_pause =
+        get_latest_consensus_header_number(&client_urls[0])?;
+    info!(target: "restart-test", ?validator_consensus_height_during_pause, "validators advanced while observer paused");
     assert!(
-        validator_height_during_pause > initial_obs_height + 5,
+        validator_consensus_height_during_pause > initial_obs_consensus_height + 5,
         "Validators should have advanced significantly"
     );
 
@@ -979,9 +1005,9 @@ fn test_observer_reconnect_after_pause() -> eyre::Result<()> {
     let mut retries = 0;
     let max_retries = 60;
     let caught_up = loop {
-        if let Ok(obs_height) = get_block_number(&obs_url) {
-            if obs_height >= validator_height_during_pause {
-                info!(target: "restart-test", ?obs_height, ?validator_height_during_pause, "observer recovered");
+        if let Ok(obs_consensus_height) = get_latest_consensus_header_number(&obs_url) {
+            if obs_consensus_height >= validator_consensus_height_during_pause {
+                info!(target: "restart-test", ?obs_consensus_height, ?validator_consensus_height_during_pause, "observer recovered");
                 break true;
             }
         }
