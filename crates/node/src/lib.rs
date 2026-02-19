@@ -11,7 +11,9 @@ use tn_primary::{ConsensusBus, NodeMode};
 use tn_reth::RethEnv;
 use tn_rpc::{CommitteeInfo, EngineToPrimary, EpochInfo, SyncProgress, SyncStatus, ValidatorInfo};
 use tn_storage::{tables::EpochRecords, ConsensusStore, EpochStore};
-use tn_types::{BlockHash, ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord, B256};
+use tn_types::{
+    BlockHash, BlsPublicKey, ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord, B256,
+};
 use tokio::task::JoinHandle;
 
 pub mod engine;
@@ -184,8 +186,52 @@ impl<DB: Database> EngineToPrimary for EngineToPrimaryRpc<DB> {
     }
 
     fn current_epoch_info(&self) -> Option<EpochInfo> {
-        let (_, record) = self.db.last_record::<EpochRecords>()?;
-        Some(record.into())
+        let epoch_state = self.reth_env.epoch_state_from_canonical_tip().ok()?;
+        let epoch = epoch_state.epoch;
+
+        let committee = epoch_state
+            .validators
+            .iter()
+            .map(|validator| BlsPublicKey::from_literal_bytes(validator.blsPubkey.as_ref()))
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+
+        let next_committee = self
+            .reth_env
+            .validators_for_epoch(epoch.saturating_add(1))
+            .ok()?
+            .iter()
+            .map(|validator| BlsPublicKey::from_literal_bytes(validator.blsPubkey.as_ref()))
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+
+        let parent_hash = if epoch == 0 {
+            B256::default()
+        } else {
+            self.db
+                .get::<EpochRecords>(&epoch.saturating_sub(1))
+                .ok()
+                .flatten()
+                .map(|record| record.digest())
+                .unwrap_or_default()
+        };
+        let parent_state = self.reth_env.canonical_tip().num_hash();
+        let parent_consensus = self
+            .consensus_bus
+            .last_consensus_header()
+            .borrow()
+            .as_ref()
+            .map(|header| header.digest())
+            .unwrap_or_default();
+
+        Some(EpochInfo {
+            epoch,
+            committee,
+            next_committee,
+            parent_hash,
+            parent_state,
+            parent_consensus,
+        })
     }
 
     fn current_committee(&self) -> Option<CommitteeInfo> {
@@ -404,5 +450,29 @@ mod tests {
             }
             SyncStatus::Synced => panic!("should be Syncing"),
         }
+    }
+
+    #[tokio::test]
+    async fn current_epoch_info_returns_active_epoch_without_epoch_records() {
+        let rpc = setup_rpc(NodeMode::Observer, Some((100, 0, 10)), Some(100), 10, None, None);
+        let local_epoch = fresh_local_epoch();
+        let info = rpc.current_epoch_info().expect("current epoch info should be available");
+        assert_eq!(info.epoch, local_epoch);
+    }
+
+    #[tokio::test]
+    async fn current_epoch_info_uses_active_execution_epoch_not_last_completed_record() {
+        let local_epoch = fresh_local_epoch();
+        let rpc = setup_rpc(
+            NodeMode::Observer,
+            Some((100, local_epoch, 10)),
+            Some(100),
+            10,
+            Some(local_epoch.saturating_add(5)),
+            None,
+        );
+
+        let info = rpc.current_epoch_info().expect("current epoch info should be available");
+        assert_eq!(info.epoch, local_epoch);
     }
 }

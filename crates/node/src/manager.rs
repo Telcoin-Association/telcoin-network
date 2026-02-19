@@ -1180,11 +1180,13 @@ where
             if let Some((epoch_rec, Some(_))) = self.consensus_db.get_epoch_by_number(epoch) {
                 // We already have this record...
                 self.epoch_record = Some(epoch_rec);
+                self.consensus_bus.current_committee().send_replace(Some(committee.clone()));
                 return Ok(());
             }
         } else if let Some((epoch_rec, _)) = self.consensus_db.get_epoch_by_number(epoch) {
             // We already have this record...
             self.epoch_record = Some(epoch_rec);
+            self.consensus_bus.current_committee().send_replace(Some(committee.clone()));
             return Ok(());
         }
 
@@ -1458,6 +1460,8 @@ where
 
         // load committee
         committee.load();
+        // Publish the active committee immediately so RPC reflects the live epoch.
+        self.consensus_bus.current_committee().send_replace(Some(committee.clone()));
 
         Ok(committee)
     }
