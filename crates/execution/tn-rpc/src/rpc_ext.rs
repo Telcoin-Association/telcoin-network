@@ -60,12 +60,14 @@ impl<'de> Deserialize<'de> for SyncStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncProgress {
-    /// The block number the node started syncing from.
+    /// The consensus block number where sync started.
     pub starting_block: u64,
-    /// The current block number the node has reached.
+    /// The latest consensus block number processed by execution.
     pub current_block: u64,
-    /// The highest known block number.
+    /// The highest known consensus block number.
     pub highest_block: u64,
+    /// The current execution canonical tip height.
+    pub execution_block_height: u64,
     /// The node's current local epoch.
     pub current_epoch: u64,
     /// The network's current epoch.
@@ -238,6 +240,7 @@ mod tests {
             starting_block: 100,
             current_block: 5000,
             highest_block: 10000,
+            execution_block_height: 4800,
             current_epoch: 3,
             highest_epoch: 5,
         });
@@ -245,6 +248,7 @@ mod tests {
         assert_eq!(json["startingBlock"], 100);
         assert_eq!(json["currentBlock"], 5000);
         assert_eq!(json["highestBlock"], 10000);
+        assert_eq!(json["executionBlockHeight"], 4800);
         assert_eq!(json["currentEpoch"], 3);
         assert_eq!(json["highestEpoch"], 5);
         // Ensure camelCase field names
@@ -266,6 +270,7 @@ mod tests {
             starting_block: 0,
             current_block: 500,
             highest_block: 1000,
+            execution_block_height: 450,
             current_epoch: 2,
             highest_epoch: 4,
         });
@@ -276,6 +281,7 @@ mod tests {
                 assert_eq!(progress.starting_block, 0);
                 assert_eq!(progress.current_block, 500);
                 assert_eq!(progress.highest_block, 1000);
+                assert_eq!(progress.execution_block_height, 450);
                 assert_eq!(progress.current_epoch, 2);
                 assert_eq!(progress.highest_epoch, 4);
             }

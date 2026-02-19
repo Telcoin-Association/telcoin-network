@@ -1236,6 +1236,8 @@ where
 
         self.consensus_db.save_epoch_record(&epoch_rec);
         self.epoch_record = Some(epoch_rec);
+        // Update RPC-facing committee after the epoch transition has been persisted.
+        self.consensus_bus.current_committee().send_replace(Some(committee.clone()));
         Ok(())
     }
 
@@ -1349,8 +1351,11 @@ where
             )
             .await?;
 
-        let engine_to_primary =
-            EngineToPrimaryRpc::new(primary.consensus_bus().await, self.consensus_db.clone());
+        let engine_to_primary = EngineToPrimaryRpc::new(
+            primary.consensus_bus().await,
+            self.consensus_db.clone(),
+            engine.get_reth_env().await,
+        );
         // only spawns one worker for now
         let worker = self
             .spawn_worker_node_components(
@@ -1453,9 +1458,6 @@ where
 
         // load committee
         committee.load();
-
-        // update the consensus bus with the current committee for RPC access
-        self.consensus_bus.current_committee().send_replace(Some(committee.clone()));
 
         Ok(committee)
     }
