@@ -19,7 +19,7 @@ fn create_test_committee(seed: u64, size: usize) -> Committee {
         .map(|_| {
             let keypair = BlsKeypair::generate(&mut rng);
             let authority =
-                Authority::new_for_test(*keypair.public(), 1, Address::random_with(&mut rng));
+                Authority::new_for_test(*keypair.public(), Address::random_with(&mut rng));
             (*keypair.public(), authority)
         })
         .collect();
@@ -152,10 +152,10 @@ fn test_committee_enforces_equal_voting_power() {
 
     let authorities: BTreeMap<BlsPublicKey, Authority> = configured_weights
         .iter()
-        .map(|weight| {
+        .map(|_| {
             let keypair = BlsKeypair::generate(&mut rng);
             let authority =
-                Authority::new_for_test(*keypair.public(), *weight, Address::random_with(&mut rng));
+                Authority::new_for_test(*keypair.public(), Address::random_with(&mut rng));
             (*keypair.public(), authority)
         })
         .collect();

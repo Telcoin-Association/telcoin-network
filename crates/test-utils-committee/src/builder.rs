@@ -136,7 +136,6 @@ where
                 format!("/ip4/{host}/udp/{port}/quic-v1").parse().unwrap();
             let authority = Authority::new_for_test(
                 key_config.primary_public_key(),
-                1,
                 Address::random_with(&mut rng),
             );
             bootstrap_servers.insert(

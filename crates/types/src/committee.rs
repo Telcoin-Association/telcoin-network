@@ -80,21 +80,13 @@ impl Authority {
     /// it via Committee (more specifically can use [CommitteeBuilder]). As some internal properties
     /// of Authority are initialised via the Committee, to ensure that the user will not
     /// accidentally use stale Authority data, should always derive them via the Commitee.
-    fn new(
-        protocol_key: BlsPublicKey,
-        _voting_power: VotingPower,
-        execution_address: Address,
-    ) -> Self {
+    fn new(protocol_key: BlsPublicKey, execution_address: Address) -> Self {
         Self { inner: Arc::new(AuthorityInner { protocol_key, execution_address }) }
     }
 
     /// Version of new that can be called directly.  Useful for testing, if you are calling this
     /// outside of a test you are wrong (see comment on new).
-    pub fn new_for_test(
-        protocol_key: BlsPublicKey,
-        _voting_power: VotingPower,
-        execution_address: Address,
-    ) -> Self {
+    pub fn new_for_test(protocol_key: BlsPublicKey, execution_address: Address) -> Self {
         Self { inner: Arc::new(AuthorityInner { protocol_key, execution_address }) }
     }
 
@@ -586,25 +578,19 @@ impl CommitteeBuilder {
     pub fn add_authority_and_bootstrap(
         &mut self,
         protocol_key: BlsPublicKey,
-        stake: VotingPower,
         primary_node: P2pNode,
         worker_node: P2pNode,
         execution_address: Address,
     ) {
-        let authority = Authority::new(protocol_key, stake, execution_address);
+        let authority = Authority::new(protocol_key, execution_address);
         self.authorities.insert(protocol_key, authority);
         let bootstrap = BootstrapServer::new(primary_node, worker_node);
         self.bootstrap_server.insert(protocol_key, bootstrap);
     }
 
     /// Add an authority to the committee builder.
-    pub fn add_authority(
-        &mut self,
-        protocol_key: BlsPublicKey,
-        stake: VotingPower,
-        execution_address: Address,
-    ) {
-        let authority = Authority::new(protocol_key, stake, execution_address);
+    pub fn add_authority(&mut self, protocol_key: BlsPublicKey, execution_address: Address) {
+        let authority = Authority::new(protocol_key, execution_address);
         self.authorities.insert(protocol_key, authority);
     }
 
@@ -652,7 +638,7 @@ mod tests {
                 let keypair = BlsKeypair::generate(&mut rng);
                 let execution_address = Address::repeat_byte(i as u8);
 
-                let a = Authority::new(*keypair.public(), 1, execution_address);
+                let a = Authority::new(*keypair.public(), execution_address);
 
                 (*keypair.public(), a)
             })
@@ -713,7 +699,7 @@ mod tests {
             .map(|(i, _)| {
                 let keypair = BlsKeypair::generate(&mut rng);
                 let execution_address = Address::repeat_byte(i as u8);
-                let authority = Authority::new(*keypair.public(), 1, execution_address);
+                let authority = Authority::new(*keypair.public(), execution_address);
                 (*keypair.public(), authority)
             })
             .collect::<BTreeMap<BlsPublicKey, Authority>>();

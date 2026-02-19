@@ -1442,11 +1442,7 @@ where
             let mut committee_builder = CommitteeBuilder::new(epoch);
 
             for validator in validators {
-                committee_builder.add_authority(
-                    validator.0,
-                    1, // set stake so every authority's weight is equal
-                    validator.1.validatorAddress,
-                );
+                committee_builder.add_authority(validator.0, validator.1.validatorAddress);
             }
             committee_builder.build()
         };
