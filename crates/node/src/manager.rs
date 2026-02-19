@@ -639,12 +639,7 @@ where
 
         // spawn node healthcheck service if enabled
         if let Some(port) = self.builder.healthcheck {
-            let _ = HealthcheckServer::spawn(
-                node_task_manager.get_spawner(),
-                port,
-                self.consensus_bus.clone(),
-            )
-            .await;
+            let _ = HealthcheckServer::spawn(node_task_manager.get_spawner(), port).await;
         }
 
         // await all tasks on epoch-task-manager or node shutdown

@@ -65,16 +65,6 @@ pub fn spawn_state_sync<DB: Database>(
     task_spawner: TaskSpawner,
 ) {
     let mode = *consensus_bus.node_mode().borrow();
-    let mode_str = match mode {
-        NodeMode::CvvActive => "cvv_active",
-        NodeMode::CvvInactive => "cvv_inactive",
-        NodeMode::Observer => "observer",
-    };
-    info!(
-        target: "tn::observer",
-        node_mode = mode_str,
-        "state sync starting"
-    );
     match mode {
         // If we are active then partcipate in consensus.
         NodeMode::CvvActive => {}
@@ -300,7 +290,6 @@ async fn catch_up_consensus_from_to<DB: Database>(
                 block_number = number,
                 "consensus header digest mismatch - possible fork detected"
             );
-            error!(target: "state-sync", "consensus header digest mismatch!");
             return Err(eyre::eyre!("consensus header digest mismatch!"));
         }
 

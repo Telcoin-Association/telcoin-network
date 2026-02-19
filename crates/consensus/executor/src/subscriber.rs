@@ -61,16 +61,6 @@ pub fn spawn_subscriber<DB: Database>(
     let committee = config.committee().clone();
     let client = config.local_network().clone();
     let mode = consensus_bus.current_node_mode();
-    let mode_str = match mode {
-        NodeMode::CvvActive => "cvv_active",
-        NodeMode::CvvInactive => "cvv_inactive",
-        NodeMode::Observer => "observer",
-    };
-    info!(
-        target: "tn::observer",
-        node_mode = mode_str,
-        "subscriber starting in mode"
-    );
     let subscriber = Subscriber {
         consensus_bus,
         config,
