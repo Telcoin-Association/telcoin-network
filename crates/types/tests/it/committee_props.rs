@@ -19,24 +19,7 @@ fn create_test_committee(seed: u64, size: usize) -> Committee {
         .map(|_| {
             let keypair = BlsKeypair::generate(&mut rng);
             let authority =
-                Authority::new_for_test(*keypair.public(), 1, Address::random_with(&mut rng));
-            (*keypair.public(), authority)
-        })
-        .collect();
-
-    Committee::new_for_test(authorities, 0, BTreeMap::new())
-}
-
-/// Create a test committee with varying voting powers.
-fn create_weighted_committee(seed: u64, weights: &[u64]) -> Committee {
-    let mut rng = StdRng::seed_from_u64(seed);
-
-    let authorities: BTreeMap<BlsPublicKey, Authority> = weights
-        .iter()
-        .map(|&weight| {
-            let keypair = BlsKeypair::generate(&mut rng);
-            let authority =
-                Authority::new_for_test(*keypair.public(), weight, Address::random_with(&mut rng));
+                Authority::new_for_test(*keypair.public(), Address::random_with(&mut rng));
             (*keypair.public(), authority)
         })
         .collect();
@@ -160,26 +143,28 @@ proptest! {
             intersection, f, quorum, n
         );
     }
+}
 
-    /// Weighted voting: quorum threshold respects total voting power, not just count.
-    #[test]
-    fn prop_weighted_quorum_threshold(
-        seed in any::<u64>(),
-        weights in prop::collection::vec(1u64..100, 4..20)
-    ) {
-        let committee = create_weighted_committee(seed, &weights);
+#[test]
+fn test_committee_enforces_equal_voting_power() {
+    let mut rng = StdRng::seed_from_u64(42);
+    let configured_weights = [5_u64, 9, 42, 100];
 
-        let total = committee.total_voting_power();
-        let quorum = committee.quorum_threshold();
+    let authorities: BTreeMap<BlsPublicKey, Authority> = configured_weights
+        .iter()
+        .map(|_| {
+            let keypair = BlsKeypair::generate(&mut rng);
+            let authority =
+                Authority::new_for_test(*keypair.public(), Address::random_with(&mut rng));
+            (*keypair.public(), authority)
+        })
+        .collect();
 
-        // quorum > 2n/3 where n is total voting power
-        let min_quorum = (2 * total) / 3 + 1;
+    let committee = Committee::new_for_test(authorities, 0, BTreeMap::new());
 
-        prop_assert!(
-            quorum >= min_quorum,
-            "Weighted quorum {} must be >= {} (2n/3 + 1 where n={})",
-            quorum, min_quorum, total
-        );
+    assert_eq!(committee.total_voting_power(), configured_weights.len() as u64);
+    for authority in committee.authorities() {
+        assert_eq!(authority.voting_power(), 1);
     }
 }
 
