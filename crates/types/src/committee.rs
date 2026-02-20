@@ -2,10 +2,10 @@
 
 use crate::{
     crypto::{BlsPublicKey, NetworkPublicKey},
-    Address, Multiaddr,
+    Address, Multiaddr, WorkerId,
 };
 use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::{Display, Formatter},
@@ -45,17 +45,64 @@ impl From<(NetworkPublicKey, Multiaddr)> for P2pNode {
 }
 
 /// Bootstrap p2p server info to join the network.
-#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+#[derive(Clone, Serialize, Debug, Eq, PartialEq)]
 pub struct BootstrapServer {
     /// The p2p info the primary.
     pub primary: P2pNode,
-    /// The p2p info the worker.
-    pub worker: P2pNode,
+    /// The p2p info for workers.
+    ///
+    /// Index corresponds to `WorkerId`.
+    pub workers: Vec<P2pNode>,
+}
+
+#[derive(Deserialize)]
+struct BootstrapServerCompat {
+    primary: P2pNode,
+    #[serde(default)]
+    workers: Vec<P2pNode>,
+    #[serde(default)]
+    worker: Option<P2pNode>,
+}
+
+impl<'de> Deserialize<'de> for BootstrapServer {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let compat = BootstrapServerCompat::deserialize(deserializer)?;
+        let workers = if compat.workers.is_empty() {
+            compat.worker.into_iter().collect()
+        } else {
+            compat.workers
+        };
+
+        if workers.is_empty() {
+            return Err(D::Error::custom("bootstrap server must include at least one worker"));
+        }
+
+        Ok(Self { primary: compat.primary, workers })
+    }
 }
 
 impl BootstrapServer {
     pub fn new(primary_node: P2pNode, worker_node: P2pNode) -> Self {
-        Self { primary: primary_node, worker: worker_node }
+        Self { primary: primary_node, workers: vec![worker_node] }
+    }
+
+    pub fn new_with_workers(primary_node: P2pNode, worker_nodes: Vec<P2pNode>) -> Self {
+        assert!(!worker_nodes.is_empty(), "bootstrap server must include at least one worker");
+        Self { primary: primary_node, workers: worker_nodes }
+    }
+
+    /// Get the worker p2p info by id.
+    ///
+    /// If the worker id is out of bounds, falls back to worker 0 for compatibility with
+    /// single-worker committee files.
+    pub fn worker_for_id(&self, worker_id: WorkerId) -> &P2pNode {
+        self.workers
+            .get(worker_id as usize)
+            .or_else(|| self.workers.first())
+            .expect("bootstrap server contains at least one worker")
     }
 }
 
@@ -531,7 +578,14 @@ impl Committee {
     /// running the required number of workers.
     /// Currently 1 but may change with a future fork on an epoch boundary.
     pub fn number_of_workers(&self) -> usize {
-        1
+        self.inner
+            .read()
+            .bootstrap_servers
+            .values()
+            .next()
+            .map(|server| server.workers.len())
+            .filter(|workers| *workers > 0)
+            .unwrap_or(1)
     }
 }
 
@@ -747,6 +801,67 @@ mod tests {
         for authority in reloaded.authorities() {
             assert_eq!(authority.voting_power(), EQUAL_VOTING_POWER);
         }
+    }
+
+    #[test]
+    fn bootstrap_server_yaml_legacy_worker_field_is_supported() {
+        let primary_keypair = NetworkKeypair::generate_ed25519();
+        let worker0_keypair = NetworkKeypair::generate_ed25519();
+        let worker1_keypair = NetworkKeypair::generate_ed25519();
+        let bootstrap = BootstrapServer::new_with_workers(
+            (Multiaddr::empty(), primary_keypair.public().clone().into()).into(),
+            vec![
+                (Multiaddr::empty(), worker0_keypair.public().clone().into()).into(),
+                (Multiaddr::empty(), worker1_keypair.public().clone().into()).into(),
+            ],
+        );
+        let mut yaml_value = serde_yaml::to_value(&bootstrap).expect("bootstrap should serialize");
+        let mapping =
+            yaml_value.as_mapping_mut().expect("bootstrap serialization should produce a mapping");
+        let workers_value = mapping
+            .remove(&serde_yaml::Value::String("workers".to_string()))
+            .expect("serialized bootstrap contains workers");
+        let first_worker = workers_value
+            .as_sequence()
+            .and_then(|workers| workers.first())
+            .cloned()
+            .expect("workers sequence has first worker");
+        mapping.insert(serde_yaml::Value::String("worker".to_string()), first_worker);
+
+        let parsed: BootstrapServer =
+            serde_yaml::from_value(yaml_value).expect("legacy worker field should deserialize");
+        assert_eq!(parsed.workers.len(), 1);
+    }
+
+    #[test]
+    fn committee_number_of_workers_uses_bootstrap_worker_count() {
+        let mut rng = rng();
+        let authorities = (0..2)
+            .map(|i| {
+                let keypair = BlsKeypair::generate(&mut rng);
+                let authority = Authority::new(*keypair.public(), Address::repeat_byte(i));
+                (*keypair.public(), authority)
+            })
+            .collect::<BTreeMap<BlsPublicKey, Authority>>();
+        let bootstrap_servers = authorities
+            .keys()
+            .map(|key| {
+                let primary_keypair = NetworkKeypair::generate_ed25519();
+                let worker0_keypair = NetworkKeypair::generate_ed25519();
+                let worker1_keypair = NetworkKeypair::generate_ed25519();
+                let bootstrap = BootstrapServer::new_with_workers(
+                    (Multiaddr::empty(), primary_keypair.public().clone().into()).into(),
+                    vec![
+                        (Multiaddr::empty(), worker0_keypair.public().clone().into()).into(),
+                        (Multiaddr::empty(), worker1_keypair.public().clone().into()).into(),
+                    ],
+                );
+                (*key, bootstrap)
+            })
+            .collect::<BTreeMap<BlsPublicKey, BootstrapServer>>();
+
+        let committee = Committee::new_for_test(authorities, 0, bootstrap_servers);
+        assert_eq!(committee.number_of_workers(), 2);
     }
 
     #[test]
