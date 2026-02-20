@@ -12030,6 +12030,8 @@ dependencies = [
  "async-trait",
  "jsonrpsee",
  "jsonrpsee-types",
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tn-reth",
  "tn-types",
