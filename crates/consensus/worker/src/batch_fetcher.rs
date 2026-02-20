@@ -9,8 +9,8 @@ use tn_types::{now, Batch, BlockHash, Database, DbTxMut};
 use tracing::{debug, error, instrument};
 
 #[cfg(test)]
-#[path = "tests/batch_fetcher.rs"]
-mod batch_fetcher_tests;
+#[path = "tests/batch_stream.rs"]
+mod batch_stream_tests;
 
 #[derive(Debug)]
 pub(crate) struct BatchFetcher<DB> {

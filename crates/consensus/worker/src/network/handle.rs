@@ -6,6 +6,7 @@
 
 use std::{collections::HashSet, time::Duration};
 
+use futures::AsyncRead;
 use tn_network_libp2p::{
     error::NetworkError,
     types::{NetworkHandle, NetworkResult},
@@ -385,9 +386,9 @@ impl WorkerNetworkHandle {
     /// - Detects duplicate batches
     ///
     /// SAFETY: this method times out if a batch fails to stream within time limit.
-    async fn read_and_validate_batches_with_timeout(
+    pub(crate) async fn read_and_validate_batches_with_timeout<S: AsyncRead + Unpin + Send>(
         &self,
-        stream: &mut libp2p::Stream,
+        stream: &mut S,
         requested_digests: &HashSet<BlockHash>,
     ) -> NetworkResult<Vec<(BlockHash, Batch)>> {
         // TODO: Use epoch from context when available
@@ -479,5 +480,24 @@ impl WorkerNetworkHandle {
         let bytes = encode(batch_digests);
         hasher.update(&bytes);
         B256::from_slice(hasher.finalize().as_bytes())
+    }
+}
+
+// support IT tests
+#[cfg(any(test, feature = "test-utils"))]
+impl WorkerNetworkHandle {
+    /// Publicly available for tests.
+    /// See [Self::request_batches].
+    pub async fn pub_request_batches(
+        &self,
+        requested_digests: &mut HashSet<BlockHash>,
+    ) -> NetworkResult<Vec<(BlockHash, Batch)>> {
+        self.request_batches(requested_digests).await
+    }
+
+    /// Publicly available for tests.
+    /// See [Self::generate_batch_request_id].
+    pub fn pub_generate_batch_request_id(&self, batch_digests: &HashSet<BlockHash>) -> B256 {
+        self.generate_batch_request_id(batch_digests)
     }
 }

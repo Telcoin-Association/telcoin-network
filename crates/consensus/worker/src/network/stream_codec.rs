@@ -367,4 +367,74 @@ mod tests {
         let decoded: Batch = bcs::from_bytes(&decompressed).expect("bcs decode");
         assert_eq!(batch, decoded);
     }
+
+    #[tokio::test]
+    async fn test_send_batches_over_stream_roundtrip() {
+        use crate::test_utils::{create_test_batches, setup_batch_db};
+
+        let batches = create_test_batches(3);
+        let db = setup_batch_db(&batches);
+
+        // collect digests
+        let digests: HashSet<B256> = batches.iter().map(|b| b.digest()).collect();
+
+        // send batches over a Vec<u8> buffer
+        let mut output = Vec::new();
+        send_batches_over_stream(&mut output, &db, &digests).await.expect("send batches");
+
+        // read back: chunk_count then each batch
+        let mut cursor = Cursor::new(output);
+        let chunk_count = read_chunk_count(&mut cursor).await.expect("read count");
+        assert_eq!(chunk_count as usize, batches.len());
+
+        let max_size = max_batch_size(0);
+        let mut decode_buffer = Vec::with_capacity(max_size);
+        let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(max_size));
+
+        let mut received = Vec::new();
+        for _ in 0..chunk_count {
+            let batch = read_batch(&mut cursor, &mut decode_buffer, &mut compressed_buffer)
+                .await
+                .expect("read batch");
+            received.push(batch);
+        }
+
+        // verify all batches present (order may differ due to HashSet iteration)
+        let received_digests: HashSet<B256> = received.iter().map(|b| b.digest()).collect();
+        assert_eq!(received_digests, digests);
+    }
+
+    #[tokio::test]
+    async fn test_send_batches_over_stream_partial_db() {
+        use crate::test_utils::{create_test_batches, setup_batch_db};
+
+        let batches = create_test_batches(3);
+        // only insert first 2 batches into DB
+        let db = setup_batch_db(&batches[..2]);
+
+        // request all 3 digests
+        let digests: HashSet<B256> = batches.iter().map(|b| b.digest()).collect();
+
+        let mut output = Vec::new();
+        send_batches_over_stream(&mut output, &db, &digests).await.expect("send batches");
+
+        // chunk count should reflect only found batches (2)
+        let mut cursor = Cursor::new(output);
+        let chunk_count = read_chunk_count(&mut cursor).await.expect("read count");
+        assert_eq!(chunk_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_send_batches_over_stream_empty_digests() {
+        use crate::test_utils::setup_batch_db;
+
+        let db = setup_batch_db(&[]);
+        let digests: HashSet<B256> = HashSet::new();
+
+        let mut output = Vec::new();
+        send_batches_over_stream(&mut output, &db, &digests).await.expect("send batches");
+
+        // empty digests → no output (no chunks written)
+        assert!(output.is_empty());
+    }
 }

@@ -302,3 +302,150 @@ async fn test_unknown_stream_request_error_type() {
         error_string
     );
 }
+
+// ============================================================================
+// Negotiation Flow Tests
+// ============================================================================
+
+/// Test that request_batches returns empty when no peers are connected.
+#[tokio::test]
+async fn test_request_batches_no_peers() {
+    let (tx, mut rx) = mpsc::channel(10);
+    let task_manager = TaskManager::default();
+    let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner());
+
+    // reply with empty peer list
+    tokio::spawn(async move {
+        while let Some(cmd) = rx.recv().await {
+            if let NetworkCommand::ConnectedPeers { reply } = cmd {
+                reply.send(vec![]).expect("send peers");
+            }
+        }
+    });
+
+    let mut digests = HashSet::from([B256::random()]);
+    let result = handle.pub_request_batches(&mut digests).await;
+    // no peers → returns Ok(empty)
+    assert!(result.unwrap().is_empty());
+}
+
+/// Test that when a peer rejects (ack=false), the next peer is tried,
+/// and if all reject, an error is returned.
+#[tokio::test]
+async fn test_request_batches_peer_rejects_tries_next() {
+    let (tx, mut rx) = mpsc::channel(10);
+    let task_manager = TaskManager::default();
+    let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner());
+
+    let fixture = tn_test_utils::CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .build();
+    let peer1 = fixture.first_authority().primary_public_key();
+    let peer2 = fixture.last_authority().primary_public_key();
+
+    tokio::spawn(async move {
+        while let Some(cmd) = rx.recv().await {
+            match cmd {
+                NetworkCommand::ConnectedPeers { reply } => {
+                    reply.send(vec![peer1, peer2]).expect("send peers");
+                }
+                NetworkCommand::SendRequest { request, reply, .. } => {
+                    if let WorkerRequest::RequestBatchesStream { .. } = request {
+                        // both peers reject
+                        reply
+                            .send(Ok(WorkerResponse::RequestBatchesStream { ack: false }))
+                            .expect("send reject");
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let mut digests = HashSet::from([B256::random()]);
+    let result = handle.pub_request_batches(&mut digests).await;
+    // all peers rejected → error
+    assert!(result.is_err());
+}
+
+/// Test that generate_batch_request_id is deterministic.
+#[tokio::test]
+async fn test_request_digest_is_deterministic() {
+    let task_manager = TaskManager::default();
+    let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
+
+    let d1 = B256::random();
+    let d2 = B256::random();
+    let digests = HashSet::from([d1, d2]);
+
+    let id1 = handle.pub_generate_batch_request_id(&digests);
+    let id2 = handle.pub_generate_batch_request_id(&digests);
+    assert_eq!(id1, id2, "same digests should produce same request id");
+
+    // different digests produce different id
+    let other_digests = HashSet::from([B256::random()]);
+    let id3 = handle.pub_generate_batch_request_id(&other_digests);
+    assert_ne!(id1, id3, "different digests should produce different request id");
+}
+
+/// Test that the server correctly stores pending requests and can retrieve them by key.
+#[tokio::test]
+async fn test_pending_request_stream_correlation() {
+    use tn_worker::PendingBatchStream;
+
+    let d1 = B256::random();
+    let d2 = B256::random();
+    let batch_digests: HashSet<B256> = HashSet::from([d1, d2]);
+
+    let task_manager = TaskManager::default();
+    let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
+    let request_digest = handle.pub_generate_batch_request_id(&batch_digests);
+
+    // simulate server storing a pending request
+    let peer = BlsPublicKey::default();
+    let key = (peer, request_digest);
+    let pending = PendingBatchStream::new(batch_digests.clone());
+
+    let mut pending_map = std::collections::HashMap::new();
+    pending_map.insert(key, pending);
+
+    // simulate inbound stream lookup
+    let retrieved = pending_map.remove(&key);
+    assert!(retrieved.is_some(), "pending request should be found by (peer, request_digest)");
+}
+
+// ============================================================================
+// Error Penalty Mapping Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_stream_error_penalties() {
+    use tn_network_libp2p::Penalty;
+
+    // Fatal penalties
+    let cases_fatal = vec![
+        WorkerNetworkError::UnknownStreamRequest(B256::random()),
+        WorkerNetworkError::TooManyBatches { expected: 1, received: 5 },
+        WorkerNetworkError::UnexpectedBatch(B256::random()),
+        WorkerNetworkError::DuplicateBatch(B256::random()),
+        WorkerNetworkError::RequestHashMismatch,
+    ];
+    for error in cases_fatal {
+        let penalty: Option<Penalty> = error.into();
+        assert!(matches!(penalty, Some(Penalty::Fatal)), "expected Fatal penalty");
+    }
+
+    // No penalty (None)
+    let timeout_err =
+        WorkerNetworkError::Timeout(tokio::time::timeout(std::time::Duration::ZERO, async {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        })
+        .await
+        .unwrap_err());
+    let penalty: Option<Penalty> = timeout_err.into();
+    assert!(penalty.is_none(), "Timeout should have no penalty");
+
+    let stream_closed = WorkerNetworkError::StreamClosed;
+    let penalty: Option<Penalty> = stream_closed.into();
+    assert!(penalty.is_none(), "StreamClosed should have no penalty");
+}
