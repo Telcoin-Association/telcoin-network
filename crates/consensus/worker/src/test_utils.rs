@@ -75,41 +75,6 @@ impl TestRequestBatchesNetwork {
                         reply.send(data_clone.lock().await.keys().copied().collect()).unwrap();
                     }
                     NetworkCommand::SendRequest {
-                        peer,
-                        request:
-                            WorkerRequest::RequestBatches { batch_digests: digests, max_response_size },
-                        reply,
-                    } => {
-                        // Use this to simulate server side response size limit in
-                        // RequestBlocks
-                        const MAX_READ_BLOCK_DIGESTS: usize = 5;
-
-                        let mut batches = Vec::new();
-                        let mut total_size = 0;
-
-                        let digests_chunks = digests
-                            .chunks(MAX_READ_BLOCK_DIGESTS)
-                            .map(|chunk| chunk.to_vec())
-                            .collect::<Vec<_>>();
-                        for digests_chunk in digests_chunks {
-                            for digest in digests_chunk {
-                                if let Some(batch) =
-                                    data_clone.lock().await.get(&peer).unwrap().get(&digest)
-                                {
-                                    let batch_size = batch.size();
-                                    if total_size + batch_size <= max_response_size {
-                                        batches.push(batch.clone());
-                                        total_size += batch_size;
-                                    } else {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-
-                        reply.send(Ok(WorkerResponse::RequestBatches(batches))).unwrap();
-                    }
-                    NetworkCommand::SendRequest {
                         peer: _,
                         request: WorkerRequest::RequestBatchesStream { batch_digests: _ },
                         reply,

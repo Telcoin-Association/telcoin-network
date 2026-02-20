@@ -136,15 +136,6 @@ where
                 WorkerRequest::ReportBatch { sealed_batch } => {
                     self.process_report_batch(peer, sealed_batch, channel, cancel);
                 }
-                WorkerRequest::RequestBatches { batch_digests, max_response_size } => {
-                    self.process_request_batches(
-                        peer,
-                        batch_digests,
-                        max_response_size,
-                        channel,
-                        cancel,
-                    );
-                }
                 WorkerRequest::RequestBatchesStream { batch_digests } => {
                     self.process_request_batches_stream(peer, batch_digests, channel, cancel);
                 }
@@ -201,42 +192,6 @@ where
                     };
                     let _ = network_handle.inner_handle().send_response(response, channel).await;
                 },
-                // cancel notification from network layer
-                _ = cancel => (),
-            }
-        });
-    }
-
-    /// Attempt to return requested batches.
-    fn process_request_batches(
-        &self,
-        peer: BlsPublicKey,
-        batch_digests: Vec<BlockHash>,
-        max_response_size: usize,
-        channel: ResponseChannel<WorkerResponse>,
-        cancel: oneshot::Receiver<()>,
-    ) {
-        // clone for spawned tasks
-        let request_handler = self.request_handler.clone();
-        let network_handle = self.network_handle.clone();
-        let task_name = format!("process-request-batches-{peer}");
-        self.network_handle.get_task_spawner().spawn_task(task_name, async move {
-            tokio::select! {
-                res = request_handler.process_request_batches(batch_digests, max_response_size) => {
-                    let response = match res {
-                        Ok(r) => WorkerResponse::RequestBatches(r),
-                        Err(err) => {
-                            let error = err.to_string();
-                            if let Some(penalty) = err.into() {
-                                network_handle.report_penalty(peer, penalty).await;
-                            }
-
-                            WorkerResponse::Error(message::WorkerRPCError(error))
-                        }
-                    };
-
-                    let _ = network_handle.inner_handle().send_response(response, channel).await;
-                }
                 // cancel notification from network layer
                 _ = cancel => (),
             }
@@ -365,8 +320,6 @@ where
 pub(super) struct PrimaryReceiverHandler<DB> {
     /// The batch store
     pub store: DB,
-    /// Timeout on RequestBatches RPC.
-    pub request_batches_timeout: Duration,
     /// Synchronize header payloads from other workers.
     pub network: Option<WorkerNetworkHandle>,
     /// Fetch certificate payloads from other workers.

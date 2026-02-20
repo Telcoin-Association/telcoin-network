@@ -7,9 +7,9 @@ use tn_network_libp2p::{
     types::{NetworkCommand, NetworkHandle},
     GossipMessage, TopicHash,
 };
-use tn_storage::{mem_db::MemDatabase, tables::Batches};
+use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
-use tn_types::{Batch, BlsPublicKey, Database, SealedBatch, TaskManager, B256};
+use tn_types::{BlsPublicKey, SealedBatch, TaskManager, B256};
 use tn_worker::{
     RequestHandler, WorkerGossip, WorkerNetworkError, WorkerNetworkHandle, WorkerRequest,
     WorkerResponse,
@@ -69,75 +69,6 @@ async fn test_report_batch_fails_non_committee_peer() {
     let bad_peer = BlsPublicKey::default();
     let res = handler.pub_process_report_batch(&bad_peer, sealed_batch).await;
     assert_matches!(res, Err(WorkerNetworkError::NonCommitteeBatch));
-}
-
-// ============================================================================
-// Request Batches Tests (Legacy Request-Response)
-// ============================================================================
-
-#[tokio::test]
-async fn test_request_batches_success() {
-    let TestTypes { committee, handler, task_manager: _, .. } = create_test_types();
-    let batch_digest = B256::random();
-    let sealed_batch = SealedBatch::new(Default::default(), batch_digest);
-    // insert batch to DB
-    committee
-        .first_authority()
-        .consensus_config()
-        .node_storage()
-        .insert::<Batches>(&sealed_batch.digest, &sealed_batch.batch)
-        .expect("write batch to db");
-
-    let batch_digests = vec![batch_digest];
-    let max_response_size = 1_000;
-    let res = handler.pub_process_request_batches(batch_digests, max_response_size).await;
-    assert_matches!(res, Ok(batches) if batches == vec![Default::default()]);
-}
-
-#[tokio::test]
-async fn test_request_batches_fails_empty_digests() {
-    let TestTypes { handler, task_manager: _, .. } = create_test_types();
-    let batch_digests = vec![];
-    let max_response_size = 1_000;
-    let res = handler.pub_process_request_batches(batch_digests, max_response_size).await;
-    assert_matches!(res, Err(WorkerNetworkError::InvalidRequest(_)));
-}
-
-#[tokio::test]
-async fn test_request_batches_returns_empty_for_missing_batch() {
-    let TestTypes { handler, task_manager: _, .. } = create_test_types();
-    // Request a batch that doesn't exist in the store
-    let missing_digest = B256::random();
-    let batch_digests = vec![missing_digest];
-    let max_response_size = 1_000;
-
-    let res = handler.pub_process_request_batches(batch_digests, max_response_size).await;
-    // Should succeed but return empty since batch not found
-    assert_matches!(res, Ok(batches) if batches.is_empty());
-}
-
-#[tokio::test]
-async fn test_request_batches_partial_missing() {
-    let TestTypes { committee, handler, task_manager: _, .. } = create_test_types();
-
-    // Create and store one batch
-    let existing_digest = B256::random();
-    let existing_batch = Batch { transactions: vec![vec![1, 2, 3]], ..Default::default() };
-    committee
-        .first_authority()
-        .consensus_config()
-        .node_storage()
-        .insert::<Batches>(&existing_digest, &existing_batch)
-        .expect("write batch to db");
-
-    // Request both existing and missing batches
-    let missing_digest = B256::random();
-    let batch_digests = vec![existing_digest, missing_digest];
-    let max_response_size = 10_000;
-
-    let res = handler.pub_process_request_batches(batch_digests, max_response_size).await;
-    // Should return only the existing batch
-    assert_matches!(res, Ok(batches) if batches.len() == 1 && batches[0] == existing_batch);
 }
 
 // ============================================================================

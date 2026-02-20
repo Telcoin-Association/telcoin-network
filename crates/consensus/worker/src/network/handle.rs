@@ -87,9 +87,6 @@ impl WorkerNetworkHandle {
         let res = res.await??;
         match res {
             WorkerResponse::ReportBatch => Ok(()),
-            WorkerResponse::RequestBatches { .. } => Err(NetworkError::RPCError(
-                "Got wrong response, not a report batch is request batches!".to_string(),
-            )),
             WorkerResponse::RequestBatchesStream { .. } => Err(NetworkError::RPCError(
                 "Got wrong response, not a report batch is stream ack!".to_string(),
             )),
@@ -123,125 +120,6 @@ impl WorkerNetworkHandle {
         }
         result
     }
-
-    // /// Request a group of batches by hashes (old request-response approach).
-    // ///
-    // /// Used as a fallback when stream-based transfer is rejected.
-    // async fn request_batches_from_peer_old(
-    //     &self,
-    //     peer: BlsPublicKey,
-    //     batch_digests: Vec<BlockHash>,
-    //     timeout: Duration,
-    // ) -> NetworkResult<Vec<Batch>> {
-    //     let request = WorkerRequest::RequestBatches {
-    //         batch_digests: batch_digests.clone(),
-    //         max_response_size: self.max_rpc_message_size,
-    //     };
-    //     let res = self.handle.send_request(request, peer).await?;
-    //     let res =
-    //         tokio::time::timeout(timeout, res).await.map_err(|_| NetworkError::Timeout)???;
-    //     match res {
-    //         WorkerResponse::ReportBatch => Err(NetworkError::RPCError(
-    //             "Got wrong response, not a request batches is report batch!".to_string(),
-    //         )),
-    //         WorkerResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
-    //             "Got wrong response, not a request batches is peer exchange!".to_string(),
-    //         )),
-    //         WorkerResponse::RequestBatchesStream { .. } => Err(NetworkError::RPCError(
-    //             "Got wrong response, not a request batches is stream ack!".to_string(),
-    //         )),
-    //         WorkerResponse::RequestBatches(batches) => {
-    //             for batch in &batches {
-    //                 let batch_digest = batch.digest();
-    //                 if !batch_digests.contains(&batch_digest) {
-    //                     let msg = format!(
-    //                         "Peer {peer} returned batch with digest \
-    //                         {batch_digest} which is not part of the requested digests: {batch_digests:?}"
-    //                     );
-    //                     return Err(NetworkError::ProtocolError(msg));
-    //                 }
-    //             }
-    //             Ok(batches)
-    //         }
-    //         WorkerResponse::Error(WorkerRPCError(s)) => Err(NetworkError::RPCError(s)),
-    //     }
-    // }
-
-    // /// Request a group of batches by hashes (old request-response approach).
-    // /// Sends request to all our connected peers at once and returns Ok when we
-    // /// get a valid response or Err if no one responds with the batches.
-    // #[allow(dead_code)]
-    // pub(crate) async fn request_batches_old(
-    //     &self,
-    //     requested_digests: Vec<BlockHash>,
-    // ) -> NetworkResult<Vec<Batch>> {
-    //     let mut peers = self.handle.connected_peers().await?;
-    //     if requested_digests.is_empty() || peers.is_empty() {
-    //         // Nothing to do, either no digests requested or no one to ask.
-    //         // Return nothing.
-    //         return Ok(vec![]);
-    //     }
-    //     let mut remaining_digests = requested_digests.clone();
-    //     let num_peers = peers.len();
-    //     let mut all_batches = Vec::new();
-    //     // Attempt to try different batches with different peers.
-    //     // Ideally this will work first time and spread out the network traffic.
-    //     // It is possible for this algorithm to send same batches to the same peer,
-    //     // it is not that precise but should mix up things sufficiently to get batches
-    //     // if peers have them.
-    //     for _ in 0..num_peers {
-    //         let mut batch_of_batches = Vec::with_capacity(num_peers);
-    //         (0..num_peers).for_each(|_| batch_of_batches.push(vec![]));
-    //         peers.rotate_left(1); // Change which peers we ask for which batches.
-    //         for (i, batch) in remaining_digests.iter().enumerate() {
-    //             batch_of_batches
-    //                 .get_mut(i % num_peers)
-    //                 .expect("missing index we just created!")
-    //                 .push(*batch);
-    //         }
-    //         let mut futures = FuturesUnordered::new();
-    //         for (peer, batch_digests) in peers.iter().zip(batch_of_batches.into_iter()) {
-    //             if !batch_digests.is_empty() {
-    //                 futures.push(self.request_batches_from_peer_old(
-    //                     *peer,
-    //                     batch_digests,
-    //                     Duration::from_secs(3),
-    //                 ));
-    //             }
-    //         }
-    //         while let Some(res) = futures.next().await {
-    //             match res {
-    //                 Ok(batches) => {
-    //                     for batch in batches {
-    //                         let batch_digest = batch.digest();
-    //                         if requested_digests.contains(&batch_digest) {
-    //                             // Sanity check we actually asked for this digest...
-    //                             if !all_batches.contains(&batch) {
-    //                                 remaining_digests.retain(|d| *d != batch_digest);
-    //                                 all_batches.push(batch);
-    //                             }
-    //                         } else {
-    //                             // Got a batch we did not ask for...
-    //                             warn!(target: "worker::network", "recieved a batch not requested {batch_digest}");
-    //                         }
-    //                     }
-    //                     if remaining_digests.is_empty() {
-    //                         return Ok(all_batches);
-    //                     }
-    //                 }
-    //                 Err(e) => {
-    //                     // Another worker might succeed so just log this.
-    //                     warn!(target: "worker::network", ?e, "error requesting batches");
-    //                 }
-    //             }
-    //         }
-    //     }
-    //     if all_batches.is_empty() {
-    //         Err(NetworkError::RPCError("Unable to get batches from any peers!".to_string()))
-    //     } else {
-    //         Ok(all_batches)
-    //     }
-    // }
 
     /// Request a group of batches by hashes using stream-based transfer.
     ///
@@ -367,9 +245,6 @@ impl WorkerNetworkHandle {
             }
             WorkerResponse::ReportBatch => Err(NetworkError::RPCError(
                 "Got wrong response: report batch instead of stream ack".to_string(),
-            )),
-            WorkerResponse::RequestBatches(_) => Err(NetworkError::RPCError(
-                "Got wrong response: batches instead of stream ack".to_string(),
             )),
             WorkerResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
                 "Got wrong response: peer exchange instead of stream ack".to_string(),

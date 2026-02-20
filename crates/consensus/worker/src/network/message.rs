@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 use tn_network_libp2p::{PeerExchangeMap, TNMessage};
-use tn_types::{Batch, BlockHash, SealedBatch};
+use tn_types::{BlockHash, SealedBatch};
 
 /// Worker messages on the gossip network.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -38,13 +38,6 @@ pub enum WorkerRequest {
     ReportBatch {
         /// The sealed batch that this worker is reporting.
         sealed_batch: SealedBatch,
-    },
-    /// Request batches by digest from a peer.
-    RequestBatches {
-        /// The requests batches by digests.
-        batch_digests: Vec<BlockHash>,
-        /// Maximum expected response size.
-        max_response_size: usize,
     },
     /// Request batches via stream.
     ///
@@ -84,8 +77,6 @@ impl From<PeerExchangeMap> for WorkerRequest {
 pub enum WorkerResponse {
     /// Status 200 response when a peer accepts a proposed batch.
     ReportBatch,
-    /// Provided the requested batches.
-    RequestBatches(Vec<Batch>),
     /// Response to stream-based batch request.
     ///
     /// If `ack` is true, the requestor should open a stream with the
