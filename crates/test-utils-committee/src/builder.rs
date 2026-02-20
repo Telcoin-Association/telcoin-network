@@ -8,7 +8,8 @@ use std::{collections::BTreeMap, marker::PhantomData, num::NonZeroUsize};
 use tn_config::{KeyConfig, NetworkConfig, Parameters};
 use tn_types::{
     get_available_udp_port, test_genesis, Address, Authority, AuthorityIdentifier, BlsKeypair,
-    BootstrapServer, Committee, Database, Epoch, Multiaddr, TimestampSec, DEFAULT_WORKER_PORT,
+    BootstrapServer, Committee, Database, Epoch, Multiaddr, NetworkKeypair, TimestampSec,
+    DEFAULT_WORKER_PORT,
 };
 
 /// The committee builder for tests.
@@ -67,6 +68,11 @@ where
         self
     }
 
+    /// Configure how many workers should be created per authority.
+    pub fn number_of_workers(mut self, number_of_workers: NonZeroUsize) -> Self {
+        self.number_of_workers = number_of_workers;
+        self
+    }
     pub fn with_network_config(mut self, network_config: NetworkConfig) -> Self {
         self.network_config = Some(network_config);
         self
@@ -127,22 +133,32 @@ where
             };
             let primary_network_address: Multiaddr =
                 format!("/ip4/{host}/udp/{port}/quic-v1").parse().unwrap();
-            let port = if self.randomize_ports {
-                get_available_udp_port(host).unwrap_or(DEFAULT_WORKER_PORT)
-            } else {
-                0
-            };
-            let worker_network_address: Multiaddr =
-                format!("/ip4/{host}/udp/{port}/quic-v1").parse().unwrap();
             let authority = Authority::new_for_test(
                 key_config.primary_public_key(),
                 Address::random_with(&mut rng),
             );
+            let workers = (0..self.number_of_workers.get())
+                .map(|index| {
+                    let port = if self.randomize_ports {
+                        get_available_udp_port(host).unwrap_or(DEFAULT_WORKER_PORT)
+                    } else {
+                        index as u16
+                    };
+                    let worker_network_address: Multiaddr =
+                        format!("/ip4/{host}/udp/{port}/quic-v1").parse().unwrap();
+                    let worker_network_key = if index == 0 {
+                        key_config.worker_network_public_key()
+                    } else {
+                        NetworkKeypair::generate_ed25519().public().into()
+                    };
+                    (worker_network_address, worker_network_key).into()
+                })
+                .collect();
             bootstrap_servers.insert(
                 *authority.protocol_key(),
-                BootstrapServer::new(
+                BootstrapServer::new_with_workers(
                     (primary_network_address, key_config.primary_network_public_key()).into(),
-                    (worker_network_address, key_config.worker_network_public_key()).into(),
+                    workers,
                 ),
             );
             authorities.insert(

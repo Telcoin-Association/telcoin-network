@@ -57,7 +57,7 @@ async fn test_output_to_header() -> eyre::Result<()> {
 
     // Set up mock worker.
     let mock_client = Arc::new(MockPrimaryToWorkerClient { batches });
-    config.local_network().set_primary_to_worker_local_handler(mock_client);
+    config.local_network(0).set_primary_to_worker_local_handler(mock_client);
 
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),
@@ -147,7 +147,7 @@ async fn test_executor_output_ordering() -> eyre::Result<()> {
         create_signed_certificates_for_rounds(1..=11, &fixture, &[]);
 
     let mock_client = Arc::new(MockPrimaryToWorkerClient { batches });
-    config.local_network().set_primary_to_worker_local_handler(mock_client);
+    config.local_network(0).set_primary_to_worker_local_handler(mock_client);
 
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),
@@ -228,7 +228,7 @@ async fn test_executor_batch_fetching() -> eyre::Result<()> {
 
     let batch_count = batches.len();
     let mock_client = Arc::new(MockPrimaryToWorkerClient { batches });
-    config.local_network().set_primary_to_worker_local_handler(mock_client);
+    config.local_network(0).set_primary_to_worker_local_handler(mock_client);
 
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),
