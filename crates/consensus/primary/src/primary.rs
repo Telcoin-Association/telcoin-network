@@ -46,9 +46,11 @@ impl<DB: Database> Primary<DB> {
         let worker_receiver_handler =
             WorkerReceiverHandler::new(consensus_bus.clone(), config.node_storage().clone());
 
-        config
-            .local_network()
-            .set_worker_to_primary_local_handler(Arc::new(worker_receiver_handler));
+        for worker_id in 0..config.config().num_workers() {
+            config
+                .local_network(worker_id)
+                .set_worker_to_primary_local_handler(Arc::new(worker_receiver_handler.clone()));
+        }
 
         Self { primary_network, state_sync }
     }

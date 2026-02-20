@@ -429,7 +429,7 @@ async fn test_request_vote_missing_batches() {
     let authority_id = primary.id();
     let author = fixture.authorities().nth(2).unwrap();
     let author_peer = *author.authority().protocol_key();
-    let client = primary.consensus_config().local_network().clone();
+    let client = primary.consensus_config().local_network(0).clone();
 
     let certificate_store = primary.consensus_config().node_storage().clone();
     let payload_store = primary.consensus_config().node_storage().clone();
@@ -495,7 +495,7 @@ async fn test_request_vote_already_voted() {
     let id = primary.id();
     let author = fixture.authorities().nth(2).unwrap();
     let author_peer = *author.authority().protocol_key();
-    let client = primary.consensus_config().local_network().clone();
+    let client = primary.consensus_config().local_network(0).clone();
 
     let certificate_store = primary.consensus_config().node_storage().clone();
     let payload_store = primary.consensus_config().node_storage().clone();
@@ -722,7 +722,7 @@ async fn test_request_vote_created_at_in_future() {
     let id = primary.id();
     let author = fixture.authorities().nth(2).unwrap();
     let author_peer = *author.authority().protocol_key();
-    let client = primary.consensus_config().local_network().clone();
+    let client = primary.consensus_config().local_network(0).clone();
 
     let certificate_store = primary.consensus_config().node_storage().clone();
     let payload_store = primary.consensus_config().node_storage().clone();
