@@ -9,7 +9,7 @@ use std::{
 use tn_network_types::local::LocalNetwork;
 use tn_types::{
     Authority, AuthorityIdentifier, BlsPublicKey, Certificate, CertificateDigest, Committee,
-    Database, Epoch, Hash as _, Multiaddr, NetworkPublicKey, Notifier,
+    Database, Epoch, Hash as _, Multiaddr, NetworkPublicKey, Notifier, WorkerId,
 };
 use tracing::info;
 
@@ -20,7 +20,7 @@ struct ConsensusConfigInner<DB> {
     node_storage: DB,
     key_config: KeyConfig,
     authority: Option<Authority>,
-    local_network: LocalNetwork,
+    local_networks: Vec<LocalNetwork>,
     network_config: NetworkConfig,
     genesis: HashMap<CertificateDigest, Certificate>,
 }
@@ -105,7 +105,9 @@ where
         committee: Committee,
         network_config: NetworkConfig,
     ) -> eyre::Result<Self> {
-        let local_network = LocalNetwork::new(key_config.primary_public_key());
+        let local_networks = (0..config.num_workers())
+            .map(|_| LocalNetwork::new(key_config.primary_public_key()))
+            .collect();
 
         let primary_public_key = key_config.primary_public_key();
         let authority = committee.authority_by_key(&primary_public_key);
@@ -123,7 +125,7 @@ where
                 node_storage,
                 key_config,
                 authority,
-                local_network,
+                local_networks,
                 network_config,
                 genesis,
             }),
@@ -196,8 +198,8 @@ where
     ///
     /// Contains network identity and local networking setup information.
     /// This is how Primary <-> Workers communicate.
-    pub fn local_network(&self) -> &LocalNetwork {
-        &self.inner.local_network
+    pub fn local_network(&self, worker_id: WorkerId) -> &LocalNetwork {
+        self.inner.local_networks.get(worker_id as usize).expect("worker id out of range")
     }
 
     /// Returns a reference to the network configuration.
@@ -234,7 +236,15 @@ where
 
     /// Retrieve the worker's network address by id.
     /// Note, will panic if id is not valid.
-    pub fn worker_address(&self) -> Multiaddr {
-        self.inner.config.node_info.p2p_info.worker.network_address.clone()
+    pub fn worker_address(&self, worker_id: WorkerId) -> Multiaddr {
+        self.inner
+            .config
+            .node_info
+            .p2p_info
+            .workers
+            .get(worker_id as usize)
+            .expect("worker id out of range")
+            .network_address
+            .clone()
     }
 }

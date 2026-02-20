@@ -34,6 +34,8 @@ pub(crate) type Res = WorkerResponse;
 /// The wrapper around worker-specific network calls.
 #[derive(Clone, Debug)]
 pub struct WorkerNetworkHandle {
+    /// Worker id this handle is bound to.
+    worker_id: WorkerId,
     /// The handle to the node's network.
     handle: NetworkHandle<Req, Res>,
     /// The type to spawn tasks.
@@ -45,11 +47,12 @@ pub struct WorkerNetworkHandle {
 impl WorkerNetworkHandle {
     /// Create a new instance of [Self].
     pub fn new(
+        worker_id: WorkerId,
         handle: NetworkHandle<Req, Res>,
         task_spawner: TaskSpawner,
         max_rpc_message_size: usize,
     ) -> Self {
-        Self { handle, task_spawner, max_rpc_message_size }
+        Self { worker_id, handle, task_spawner, max_rpc_message_size }
     }
 
     /// Return a reference to the task spawner.
@@ -62,7 +65,12 @@ impl WorkerNetworkHandle {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn new_for_test(task_spawner: TaskSpawner) -> Self {
         let (tx, _rx) = tokio::sync::mpsc::channel(5);
-        Self { handle: NetworkHandle::new(tx), task_spawner, max_rpc_message_size: 1024 * 1024 }
+        Self {
+            worker_id: 0,
+            handle: NetworkHandle::new(tx),
+            task_spawner,
+            max_rpc_message_size: 1024 * 1024,
+        }
     }
 
     /// Return a reference to the inner handle.
@@ -73,7 +81,9 @@ impl WorkerNetworkHandle {
     /// Publish a batch digest to the worker network.
     pub(crate) async fn publish_batch(&self, batch_digest: BlockHash) -> NetworkResult<()> {
         let data = encode(&WorkerGossip::Batch(batch_digest));
-        self.handle.publish(tn_config::LibP2pConfig::worker_batch_topic(), data).await?;
+        self.handle
+            .publish(tn_config::LibP2pConfig::worker_batch_topic(self.worker_id), data)
+            .await?;
         Ok(())
     }
 
@@ -81,7 +91,9 @@ impl WorkerNetworkHandle {
     /// Do this when not a committee member so a CVV can include the txn.
     pub(crate) async fn publish_txn(&self, txn: Vec<u8>) -> NetworkResult<()> {
         let data = encode(&WorkerGossip::Txn(txn));
-        self.handle.publish("tn-txn".into(), data).await?;
+        self.handle
+            .publish(tn_config::LibP2pConfig::worker_txn_topic(self.worker_id), data)
+            .await?;
         Ok(())
     }
 

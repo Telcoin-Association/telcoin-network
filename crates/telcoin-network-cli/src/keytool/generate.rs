@@ -125,8 +125,17 @@ impl KeygenArgs {
 
         // network keypair for workers
         let network_publickey = key_config.worker_network_public_key();
-        node_info.p2p_info.worker.network_key = network_publickey.clone();
-        node_info.p2p_info.worker.network_address =
+        if node_info.p2p_info.workers.is_empty() {
+            let default_worker = NodeInfo::default()
+                .p2p_info
+                .workers
+                .into_iter()
+                .next()
+                .expect("default node info has a worker entry");
+            node_info.p2p_info.workers.push(default_worker);
+        }
+        node_info.p2p_info.workers[0].network_key = network_publickey.clone();
+        node_info.p2p_info.workers[0].network_address =
             if let Some(worker_addrs) = &self.external_worker_addrs {
                 if let Some(worker_addr) = worker_addrs.first() {
                     worker_addr.clone().with_p2p(network_publickey.into()).map_err(|_| {
@@ -145,7 +154,7 @@ impl KeygenArgs {
                 addr.with(Protocol::P2p(network_publickey.into()))
             };
 
-        info!(target: "tn::generate_keys", worker=?node_info.p2p_info.worker.network_address, "updating worker external network address");
+        info!(target: "tn::generate_keys", worker=?node_info.p2p_info.workers[0].network_address, "updating worker external network address");
 
         Ok(())
     }

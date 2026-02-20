@@ -321,6 +321,27 @@ async fn test_with_creds_faucet_transfers_tel_with_google_kms() -> eyre::Result<
         )
         .await?;
 
+    // The faucet extension must only be attached to worker 0.
+    let worker_one = 1;
+    execution_node
+        .initialize_worker_components(
+            worker_one,
+            WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
+            EmptyEngToPrimary(),
+        )
+        .await?;
+    let worker_one_client =
+        execution_node.worker_http_client(&worker_one).await?.expect("worker 1 rpc client");
+    let worker_one_faucet_result = worker_one_client
+        .request::<String, _>("faucet_transfer", rpc_params![Address::random()])
+        .await;
+    let err_text =
+        worker_one_faucet_result.expect_err("worker 1 should not expose faucet").to_string();
+    assert!(
+        err_text.to_lowercase().contains("method not found"),
+        "unexpected worker 1 faucet error: {err_text}"
+    );
+
     // create client
     let client = execution_node.worker_http_client(&worker_id).await?.expect("worker rpc client");
     tracing::info!("got client: {:?}", client);
@@ -662,6 +683,30 @@ async fn test_with_creds_faucet_transfers_stablecoin_with_google_kms() -> eyre::
             0, // epoch
         )
         .await?;
+
+    // The faucet extension must only be attached to worker 0.
+    let worker_one = 1;
+    execution_node
+        .initialize_worker_components(
+            worker_one,
+            WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
+            EmptyEngToPrimary(),
+        )
+        .await?;
+    let worker_one_client =
+        execution_node.worker_http_client(&worker_one).await?.expect("worker 1 rpc client");
+    let worker_one_faucet_result = worker_one_client
+        .request::<String, _>(
+            "faucet_transfer",
+            rpc_params![Address::random(), Address::from(U160::from(99999999))],
+        )
+        .await;
+    let err_text =
+        worker_one_faucet_result.expect_err("worker 1 should not expose faucet").to_string();
+    assert!(
+        err_text.to_lowercase().contains("method not found"),
+        "unexpected worker 1 faucet error: {err_text}"
+    );
 
     let user_address = Address::random();
     let client = execution_node.worker_http_client(&worker_id).await?.expect("worker rpc client");

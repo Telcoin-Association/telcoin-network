@@ -5,7 +5,8 @@
 
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    num::NonZeroUsize,
     sync::Arc,
     time::Duration,
 };
@@ -27,9 +28,9 @@ use tn_test_utils::{
     create_signed_certificates_for_rounds, default_test_execution_node, CommitteeFixture,
 };
 use tn_types::{
-    adiri_genesis, gas_accumulator::GasAccumulator, Batch, BlockNumHash, Database as _, ExecHeader,
-    Notifier, SealedHeader, TaskManager, TnReceiver as _, TnSender as _, B256,
-    DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    adiri_genesis, gas_accumulator::GasAccumulator, now, Batch, BlockNumHash, Certificate,
+    CertificateDigest, Database as _, ExecHeader, Hash as _, HeaderBuilder, Notifier, SealedHeader,
+    TaskManager, TnReceiver as _, TnSender as _, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -139,7 +140,6 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
 
     // check results
     debug!(target: "gas-test", "gas accumulator:\n{:#?}", gas_accumulator);
-    let worker_id = 0;
     // initialize a new gas accumulator to simulate node recovery
     let recovered = GasAccumulator::new(1);
     recovered.rewards_counter().set_committee(fixture.committee());
@@ -150,8 +150,179 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
     //      73HL4cMSiCfGthUE7xM1F8JwwYfmM53wQi4r34ECrs3F: 3,
     //      2VDmuopDmr9KZcp4z9q9ne2CAxkaF2ftMt6ejzp42FM7: 1,
     debug!(target: "gas-test", "recovered accumulator:\n{:#?}", recovered);
-    assert_eq!(gas_accumulator.get_values(worker_id), (231, 9702000, 6930000000));
-    assert_eq!(gas_accumulator.get_values(worker_id), recovered.get_values(worker_id));
+    assert_eq!(gas_accumulator.get_values(0), (231, 9702000, 6930000000));
+    assert_matching_worker_gas_values(&gas_accumulator, &recovered);
+
+    // convert manually calculated rewards for assertion
+    let expected: BTreeMap<_, _> = rewards
+        .iter()
+        .map(|(auth, count)| {
+            (fixture.authority_by_id(auth).expect("in committee").execution_address(), *count)
+        })
+        .collect();
+
+    // assert rewards
+    assert_eq!(expected, gas_accumulator.rewards_counter().get_address_counts());
+    assert_eq!(expected, recovered.rewards_counter().get_address_counts());
+
+    Ok(())
+}
+
+/// Build certificates with alternating worker ids so execution and catchup exercise
+/// per-worker paths.
+fn create_signed_multi_worker_certificates_for_rounds(
+    range: std::ops::RangeInclusive<u32>,
+    fixture: &CommitteeFixture<MemDatabase>,
+    worker_count: u16,
+) -> (VecDeque<Certificate>, BTreeSet<CertificateDigest>, HashMap<B256, Batch>) {
+    assert!(worker_count > 0, "worker_count must be greater than 0");
+
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let mut certificates = VecDeque::new();
+    let mut next_parents = BTreeSet::new();
+    let mut batches = HashMap::new();
+    let mut parents: BTreeSet<_> = fixture.genesis().collect();
+    let chain = tn_types::test_chain_spec_arc();
+
+    for round in range {
+        next_parents.clear();
+        for (authority_index, authority_id) in ids.iter().enumerate() {
+            let worker_id = ((round as usize + authority_index) % worker_count as usize) as u16;
+            let batch = tn_reth::test_utils::batch(chain.clone());
+            let batch_digest = batch.digest();
+            let header = HeaderBuilder::default()
+                .author(authority_id.clone())
+                .round(round)
+                .epoch(fixture.committee().epoch())
+                .parents(parents.clone())
+                .created_at(now())
+                .with_payload_batch(batch.clone(), worker_id)
+                .build();
+            let cert = fixture.certificate(&header);
+            next_parents.insert(cert.digest());
+            batches.insert(batch_digest, batch);
+            certificates.push_back(cert);
+        }
+        parents.clone_from(&next_parents);
+    }
+
+    (certificates, next_parents, batches)
+}
+
+#[tokio::test]
+async fn test_catchup_accumulator_multi_worker_roundtrip() -> eyre::Result<()> {
+    let tmp = temp_dir();
+    let worker_count = NonZeroUsize::new(2).expect("non-zero worker count");
+    // create deterministic committee fixture and use first authority's components
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .with_rng(StdRng::seed_from_u64(8991))
+        .number_of_workers(worker_count)
+        .build();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config().clone();
+    let consensus_store = config.node_storage().clone();
+    let consensus_bus = ConsensusBus::new();
+
+    let max_round = 21;
+    let (certificates, _next_parents, batches) = create_signed_multi_worker_certificates_for_rounds(
+        1..=max_round,
+        &fixture,
+        worker_count.get() as u16,
+    );
+
+    // fund accounts in genesis so txs execute
+    let genesis = adiri_genesis();
+    let all_batches: Vec<_> = batches.values().cloned().collect();
+    let (genesis, _, _) = seeded_genesis_from_random_batches(genesis, all_batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution env
+    let gas_accumulator = GasAccumulator::new(worker_count.get());
+    gas_accumulator.rewards_counter().set_committee(fixture.committee());
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &tmp.path().join("reth"),
+        Some(gas_accumulator.rewards_counter()),
+    )?;
+
+    // manually create engine
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(10);
+    let max = Some(max_round as u64 - 1); // consensus needs 1 extra round to commit
+    let parent = chain.sealed_genesis_header();
+
+    // start engine
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let reth_env = execution_node.get_reth_env().await;
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        max,
+        from_consensus,
+        parent,
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator.clone(),
+        engine_update_tx,
+    );
+    let (tx, mut rx) = oneshot::channel();
+    task_manager.spawn_task("test task eng", async move {
+        let res = engine.await;
+        debug!(target: "gas-test", ?res, "res:");
+        let _ = tx.send(res);
+    });
+
+    // subscribe to output early
+    let mut consensus_output = consensus_bus.subscribe_consensus_output();
+
+    // spawn consensus to send output to engine for full execution
+    spawn_consensus(
+        &fixture,
+        &consensus_bus,
+        batches,
+        config,
+        consensus_store.clone(),
+        &task_manager,
+    );
+
+    // send certificates to trigger subdag commit
+    for certificate in certificates.iter() {
+        consensus_bus.new_certificates().send(certificate.clone()).await.unwrap();
+    }
+
+    // simulate epoch manager's role:
+    // forward consensus output to engine until `max_round`
+    let mut rewards = HashMap::new();
+    loop {
+        tokio::select! {
+            // forward output from consensus to engine
+            Some(output) = consensus_output.recv() => {
+                let leader = output.leader().origin().clone();
+                rewards.entry(leader).and_modify(|count| *count += 1).or_insert(1);
+                to_engine.send(output).await?;
+            }
+            // wait for engine to reach `max_round` or timeout
+            engine_task = timeout(Duration::from_secs(30), &mut rx) => {
+                // engine shutdown
+                assert!(engine_task.is_ok());
+                break;
+            }
+        }
+    }
+
+    // initialize a new gas accumulator to simulate node recovery
+    let recovered = GasAccumulator::new(worker_count.get());
+    recovered.rewards_counter().set_committee(fixture.committee());
+    catchup_accumulator(&consensus_store, reth_env.clone(), &recovered)?;
+    assert_matching_worker_gas_values(&gas_accumulator, &recovered);
+    let saw_worker_one_payload =
+        consensus_store.reverse_iter::<ConsensusBlocks>().any(|(_, header)| {
+            header.sub_dag.certificates.iter().any(|certificate| {
+                certificate.header().payload().values().any(|worker_id| *worker_id == 1)
+            })
+        });
+    assert!(saw_worker_one_payload, "expected committed certificates to include worker 1 payloads");
 
     // convert manually calculated rewards for assertion
     let expected: BTreeMap<_, _> = rewards
@@ -306,11 +477,10 @@ async fn test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
     assert!(engine_result.is_err(), "engine should return error when stream closes");
     assert!(empty_outputs_seen > 0, "expected at least one empty consensus output");
 
-    let worker_id = 0;
     let recovered = GasAccumulator::new(1);
     recovered.rewards_counter().set_committee(fixture.committee());
     catchup_accumulator(&consensus_store, reth_env.clone(), &recovered)?;
-    assert_eq!(gas_accumulator.get_values(worker_id), recovered.get_values(worker_id));
+    assert_matching_worker_gas_values(&gas_accumulator, &recovered);
 
     let expected: BTreeMap<_, _> = rewards
         .iter()
@@ -435,8 +605,7 @@ async fn test_catchup_accumulator_partial_execution() -> eyre::Result<()> {
     recovered.rewards_counter().set_committee(fixture.committee());
     catchup_accumulator(&consensus_store, reth_env.clone(), &recovered)?;
 
-    let worker_id = 0;
-    assert_eq!(gas_accumulator.get_values(worker_id), recovered.get_values(worker_id));
+    assert_matching_worker_gas_values(&gas_accumulator, &recovered);
 
     let expected: BTreeMap<_, _> = executed_rewards
         .iter()
@@ -478,7 +647,9 @@ fn spawn_consensus(
 
     // Set up mock worker.
     let mock_client = Arc::new(MockPrimaryToWorkerClient { batches });
-    config.local_network().set_primary_to_worker_local_handler(mock_client);
+    for worker_id in 0..config.config().num_workers() {
+        config.local_network(worker_id).set_primary_to_worker_local_handler(mock_client.clone());
+    }
 
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),
@@ -498,4 +669,16 @@ fn spawn_consensus(
         blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
     });
     Consensus::spawn(config, consensus_bus, bullshark, task_manager);
+}
+
+fn assert_matching_worker_gas_values(gas_accumulator: &GasAccumulator, recovered: &GasAccumulator) {
+    assert_eq!(gas_accumulator.num_workers(), recovered.num_workers());
+    for worker_id in 0..gas_accumulator.num_workers() {
+        let worker_id = worker_id as u16;
+        assert_eq!(
+            gas_accumulator.get_values(worker_id),
+            recovered.get_values(worker_id),
+            "mismatched gas values for worker {worker_id}"
+        );
+    }
 }
