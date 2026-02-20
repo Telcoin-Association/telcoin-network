@@ -25,6 +25,7 @@ async fn test_wait_for_quorum_happy_path() {
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
     let network = WorkerNetworkHandle::new(
+        0,
         NetworkHandle::new(sender),
         task_manager.get_spawner(),
         max_rpc_msg_size,
@@ -75,6 +76,7 @@ async fn test_batch_rejected_timeout() {
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
     let network = WorkerNetworkHandle::new(
+        0,
         NetworkHandle::new(sender),
         task_manager.get_spawner(),
         max_rpc_msg_size,
@@ -128,6 +130,7 @@ async fn test_batch_some_rejected_stake_still_passes() {
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
     let network = WorkerNetworkHandle::new(
+        0,
         NetworkHandle::new(sender),
         task_manager.get_spawner(),
         max_rpc_msg_size,
@@ -197,6 +200,7 @@ async fn test_batch_rejected_quorum() {
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
     let network = WorkerNetworkHandle::new(
+        0,
         NetworkHandle::new(sender),
         task_manager.get_spawner(),
         max_rpc_msg_size,
@@ -257,6 +261,7 @@ async fn test_batch_rejected_antiquorum() {
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
     let network = WorkerNetworkHandle::new(
+        0,
         NetworkHandle::new(sender),
         task_manager.get_spawner(),
         max_rpc_msg_size,
@@ -312,6 +317,7 @@ async fn test_batch_early_anti_quorum() {
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
     let network = WorkerNetworkHandle::new(
+        0,
         NetworkHandle::new(sender),
         task_manager.get_spawner(),
         max_rpc_msg_size,

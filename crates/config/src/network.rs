@@ -4,7 +4,7 @@ use crate::{ConfigFmt, ConfigTrait, TelcoinDirs};
 use libp2p::{kad::K_VALUE, request_response::ProtocolSupport, StreamProtocol};
 use serde::{Deserialize, Serialize};
 use std::{num::NonZeroUsize, sync::OnceLock, time::Duration};
-use tn_types::Round;
+use tn_types::{Round, WorkerId};
 
 impl ConfigTrait for NetworkConfig {}
 
@@ -138,13 +138,13 @@ impl LibP2pConfig {
     }
 
     /// Return topics for worker.
-    pub fn worker_batch_topic() -> String {
-        String::from("tn-worker")
+    pub fn worker_batch_topic(worker_id: WorkerId) -> String {
+        format!("tn-worker-{worker_id}")
     }
 
     /// Return topics for worker.
-    pub fn worker_txn_topic() -> String {
-        String::from("tn-txn")
+    pub fn worker_txn_topic(worker_id: WorkerId) -> String {
+        format!("tn-txn-{worker_id}")
     }
 
     /// Protocol for identify behavior.

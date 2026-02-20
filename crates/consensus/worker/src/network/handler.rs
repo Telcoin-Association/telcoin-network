@@ -64,7 +64,7 @@ where
         match gossip {
             WorkerGossip::Batch(batch_hash) => {
                 ensure!(
-                    topic.to_string().eq(&tn_config::LibP2pConfig::worker_batch_topic()),
+                    topic.to_string().eq(&tn_config::LibP2pConfig::worker_batch_topic(self.id)),
                     WorkerNetworkError::InvalidTopic
                 );
                 // Retrieve the block...
@@ -91,7 +91,7 @@ where
             }
             WorkerGossip::Txn(tx_bytes) => {
                 ensure!(
-                    topic.to_string().eq(&tn_config::LibP2pConfig::worker_txn_topic()),
+                    topic.to_string().eq(&tn_config::LibP2pConfig::worker_txn_topic(self.id)),
                     WorkerNetworkError::InvalidTopic
                 );
                 if let Some(authority) = self.consensus_config.authority() {
@@ -122,7 +122,7 @@ where
             return Err(WorkerNetworkError::NonCommitteeBatch);
         }
 
-        let client = self.consensus_config.local_network().clone();
+        let client = self.consensus_config.local_network(self.id).clone();
         let store = self.consensus_config.node_storage().clone();
         // validate batch - log error if invalid
         self.validator.validate_batch(sealed_batch.clone())?;
