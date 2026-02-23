@@ -11,10 +11,10 @@ use crate::archive::{
     pack::{DataHeader, DATA_HEADER_BYTES},
 };
 use std::{
+    collections::VecDeque,
     fs::{self, File, OpenOptions},
     hash::{BuildHasher, BuildHasherDefault},
-    io,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -239,6 +239,9 @@ pub struct HdxIndex<
     modulus: u32,
     bucket_cache: FxHashMap<u64, Vec<u8>>,
     dirty_bucket_cache: FxHashMap<u64, Vec<u8>>,
+    /// Maintain a fifo of cached buckets.  This is a simple way to make sure the cache is not the
+    /// entire set of buckets (bounded by disk space).
+    bucket_cache_fifo: VecDeque<u64>,
     hdx_file: File,
     // Note, if odx_file is ever replaced in HdxIndex then see bucket_iter for undefined behaviour.
     pub(crate) odx_file: File,
@@ -257,6 +260,11 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     pub const BUCKET_ELEMENTS: usize = 32;
     /// How large (in bytes) is each bucket.
     pub const BUCKET_SIZE: usize = 16 + (Self::BUCKET_ELEMENT_SIZE * Self::BUCKET_ELEMENTS);
+    /// How many buckets to cache (read) at once.
+    /// At current settings (32 byte keys) this could lead to an 500M bucket cache...
+    /// This should be a large enough limit to never be hit in use but provide a backstop just in
+    /// case.
+    pub const CACHED_BUCKETS: usize = 400_000;
 
     /// Open a HDX index file and return the open file and the header.
     /// Note you MUST supply a stable hasher or the index will not work-
@@ -327,12 +335,12 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         // Don't want buckets and modulus to be the same, so +1
         let modulus = (header.buckets + 1).next_power_of_two();
         let capacity = header.buckets() as u64 * header.bucket_elements() as u64;
-        let bucket_cache = FxHashMap::with_hasher(BuildHasherDefault::<FxHasher>::default());
         Ok(Self {
             header,
             modulus,
-            bucket_cache,
+            bucket_cache: FxHashMap::default(),
             dirty_bucket_cache: FxHashMap::default(),
+            bucket_cache_fifo: VecDeque::default(),
             hdx_file,
             odx_file,
             capacity,
@@ -369,6 +377,21 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             self.dirty_bucket_cache.clear();
             self.dirty_bucket_cache.shrink_to_fit();
         }
+    }
+
+    /// Save a bucket to the bucket cache.
+    fn add_bucket_to_cache(&mut self, bucket: u64, buffer: Vec<u8>) {
+        // Remove the least recently added buckets from cache until we are below CACHED_BUCKETS.
+        // This is a D-U-M but very simple way to keep memory usage for the cache in check.
+        // Also, it should not actually get used unless something has gone wrong, the default
+        // should be more than enough buckets for single epoch pack file.
+        while self.bucket_cache_fifo.len() >= Self::CACHED_BUCKETS {
+            if let Some(bucket) = self.bucket_cache_fifo.pop_front() {
+                self.bucket_cache.remove(&bucket);
+            }
+        }
+        self.bucket_cache.insert(bucket, buffer);
+        self.bucket_cache_fifo.push_back(bucket);
     }
 
     /// Add buckets to expand capacity.
@@ -440,19 +463,13 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     fn save_bucket_cache(&mut self) -> Result<(), io::Error> {
         let bucket_size = self.header.bucket_size as usize;
         let header_size = self.header.header_size();
-        // Simple cache clear.
-        // If we do not do this then MUST add the dirty buffers to this cache below.
-        // TODO- do better here?  Maybe a setting as a performance tweak?
-        self.bucket_cache.clear();
-        self.bucket_cache.shrink_to_fit();
         for (bucket, mut buffer) in self.dirty_bucket_cache.drain() {
             let bucket_pos: u64 = (header_size + (bucket as usize * bucket_size)) as u64;
             add_crc32(&mut buffer[..]);
             // Seeking and writing past the file end extends it.
             self.hdx_file.seek(SeekFrom::Start(bucket_pos))?;
             self.hdx_file.write_all(&buffer[..])?;
-            // If we don't clear the bucket cache then do this: self.bucket_cache.insert(bucket,
-            // buffer);
+            self.bucket_cache.insert(bucket, buffer);
         }
         self.dirty_bucket_cache.shrink_to_fit();
         Ok(())
@@ -562,7 +579,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             if t_buf_dirty {
                 self.dirty_bucket_cache.insert(bucket, buffer);
             } else {
-                self.bucket_cache.insert(bucket, buffer);
+                self.add_bucket_to_cache(bucket, buffer);
             }
         }
         if let Some(result) = result {
@@ -705,16 +722,15 @@ mod tests {
 
     #[test]
     fn test_archive_hdx_index() {
-        let tmp_path = TempDir::with_prefix("test_archive_hdx_index").expect("temp dir");
+        //XXXXlet tmp_dir = PathBuf::from("/Users/sstanf/work/telcoin-network/hdx_tst");
+        // //XXXXTempDir::with_prefix("test_archive_hdx_index").expect("temp dir");
+        let tmp_dir = TempDir::with_prefix("test_archive_hdx_index").expect("temp dir");
+        let tmp_path = tmp_dir.path();
         let data_header = DataHeader::new();
         let builder = BuildHasherDefault::<FxHasher>::default();
-        let mut idx: HdxIndex = HdxIndex::open_hdx_file(
-            tmp_path.path().join("index.hdx"),
-            &data_header,
-            builder,
-            false,
-        )
-        .expect("hdx file");
+        let mut idx: HdxIndex =
+            HdxIndex::open_hdx_file(tmp_path.join("index.hdx"), &data_header, builder, false)
+                .expect("hdx file");
         for i in 0..1_000_000 {
             let mut hasher = DefaultHashFunction::new();
             hasher.update(&format!("idx-{i}").into_bytes());
@@ -732,13 +748,9 @@ mod tests {
         // Verify inder when opened for write.
         // Add some more values as well.
         let builder = BuildHasherDefault::<FxHasher>::default();
-        let mut idx: HdxIndex = HdxIndex::open_hdx_file(
-            tmp_path.path().join("index.hdx"),
-            &data_header,
-            builder,
-            false,
-        )
-        .expect("hdx file");
+        let mut idx: HdxIndex =
+            HdxIndex::open_hdx_file(tmp_path.join("index.hdx"), &data_header, builder, false)
+                .expect("hdx file");
         for i in 0..1_000_000 {
             let mut hasher = DefaultHashFunction::new();
             hasher.update(&format!("idx-{i}").into_bytes());
@@ -756,7 +768,7 @@ mod tests {
         // Verify index when opened read only.
         let builder = BuildHasherDefault::<FxHasher>::default();
         let mut idx: HdxIndex =
-            HdxIndex::open_hdx_file(tmp_path.path().join("index.hdx"), &data_header, builder, true)
+            HdxIndex::open_hdx_file(tmp_path.join("index.hdx"), &data_header, builder, true)
                 .expect("hdx file");
         for i in 0..1_001_000 {
             let mut hasher = DefaultHashFunction::new();
