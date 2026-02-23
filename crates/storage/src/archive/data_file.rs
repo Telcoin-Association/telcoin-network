@@ -27,21 +27,22 @@ pub struct DataFile {
     read_buffer_size: u32,
     write_buffer_size: u32,
     remove_on_drop: bool,
+    read_only: bool,
 }
 
 impl DataFile {
     /// Open a new data file, read only if ro is true.
-    pub fn open<P: AsRef<Path>>(path: P, ro: bool) -> Result<Self, io::Error> {
+    pub fn open<P: AsRef<Path>>(path: P, read_only: bool) -> Result<Self, io::Error> {
         let path = path.as_ref();
-        if !ro {
+        if !read_only {
             // If we are opening for write then make sure the file exists.
             // This function will create it if it does not exist or produce
             // an error if it does so ignore the errors.
             let _ = File::create_new(path);
         }
-        let mut data_file = OpenOptions::new().read(true).append(!ro).open(path)?;
+        let mut data_file = OpenOptions::new().read(true).append(!read_only).open(path)?;
         let data_file_end = data_file.seek(SeekFrom::End(0))?;
-        let write_buffer = if ro {
+        let write_buffer = if read_only {
             // If opening read only won't need capacity.
             Vec::new()
         } else {
@@ -72,6 +73,7 @@ impl DataFile {
             read_buffer_size: READ_BUFFER_SIZE as u32,
             write_buffer_size: WRITE_BUFFER_SIZE as u32,
             remove_on_drop: false,
+            read_only,
         })
     }
 
@@ -248,30 +250,36 @@ impl Seek for DataFile {
 
 impl Write for DataFile {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if self.write_buffer.len() >= self.write_buffer_size as usize {
-            self.data_file.write_all(&self.write_buffer)?;
-            self.data_file_end += self.write_buffer.len() as u64;
-            self.write_buffer.clear();
-        }
-        let write_buffer_len = self.write_buffer.len();
-        let write_capacity = self.write_buffer_size as usize - write_buffer_len;
-        let buf_len = buf.len();
-        if write_capacity > buf_len {
-            self.write_buffer.write_all(buf)?;
-            Ok(buf_len)
+        if self.read_only {
+            Err(io::Error::new(io::ErrorKind::ReadOnlyFilesystem, "file not open for write"))
         } else {
-            self.write_buffer.write_all(&buf[..write_capacity])?;
-            self.data_file.write_all(&self.write_buffer)?;
-            self.data_file_end += self.write_buffer.len() as u64;
-            self.write_buffer.clear();
-            Ok(write_capacity)
+            if self.write_buffer.len() >= self.write_buffer_size as usize {
+                self.data_file.write_all(&self.write_buffer)?;
+                self.data_file_end += self.write_buffer.len() as u64;
+                self.write_buffer.clear();
+            }
+            let write_buffer_len = self.write_buffer.len();
+            let write_capacity = self.write_buffer_size as usize - write_buffer_len;
+            let buf_len = buf.len();
+            if write_capacity > buf_len {
+                self.write_buffer.write_all(buf)?;
+                Ok(buf_len)
+            } else {
+                self.write_buffer.write_all(&buf[..write_capacity])?;
+                self.data_file.write_all(&self.write_buffer)?;
+                self.data_file_end += self.write_buffer.len() as u64;
+                self.write_buffer.clear();
+                Ok(write_capacity)
+            }
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.data_file.write_all(&self.write_buffer)?;
-        self.data_file_end += self.write_buffer.len() as u64;
-        self.write_buffer.clear();
+        if !self.read_only {
+            self.data_file.write_all(&self.write_buffer)?;
+            self.data_file_end += self.write_buffer.len() as u64;
+            self.write_buffer.clear();
+        }
         Ok(())
     }
 }
@@ -279,9 +287,18 @@ impl Write for DataFile {
 impl Drop for DataFile {
     fn drop(&mut self) {
         if self.remove_on_drop {
-            let _ = fs::remove_file(&self.data_file_path);
+            if let Err(e) = fs::remove_file(&self.data_file_path) {
+                if !std::thread::panicking() {
+                    tracing::error!("DataFile: failed to remove file on drop: {e}");
+                }
+            }
         } else {
-            let _ = self.flush();
+            // If read only the flush will just return Ok(())
+            if let Err(e) = self.flush() {
+                if !std::thread::panicking() {
+                    tracing::error!("DataFile: failed to flush on drop: {e}");
+                }
+            }
         }
     }
 }

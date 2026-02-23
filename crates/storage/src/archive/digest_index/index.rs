@@ -248,6 +248,7 @@ pub struct HdxIndex<
     capacity: u64,
     hasher_builder: S,
     read_only: bool,
+    synced: bool,
     _index_dir: PathBuf,
 }
 
@@ -346,6 +347,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             capacity,
             hasher_builder,
             read_only,
+            synced: true,
             _index_dir: dir.to_owned(),
         })
     }
@@ -365,18 +367,6 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     /// does not effect the index.
     pub fn set_data_file_length(&mut self, data_file_length: u64) {
         self.header.data_file_length = data_file_length;
-    }
-
-    /// Reload the header from disk.
-    pub fn reload_header(&mut self) {
-        if let Ok(header) = HdxHeader::load_header(&mut self.hdx_file) {
-            self.header = header;
-            self.modulus = (self.header.buckets() + 1).next_power_of_two();
-            self.bucket_cache.clear();
-            self.bucket_cache.shrink_to_fit();
-            self.dirty_bucket_cache.clear();
-            self.dirty_bucket_cache.shrink_to_fit();
-        }
     }
 
     /// Save a bucket to the bucket cache.
@@ -677,9 +667,20 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
 
 impl<const KSIZE: usize, S: BuildHasher + Default> Drop for HdxIndex<KSIZE, S> {
     fn drop(&mut self) {
-        if !self.read_only {
-            let _ = self.write_header();
-            let _ = self.save_bucket_cache();
+        if !self.read_only && !self.synced {
+            if !std::thread::panicking() {
+                tracing::warn!("HdxIndex dropped with unsynced data - caller should call sync()");
+            }
+            if let Err(e) = self.write_header() {
+                if !std::thread::panicking() {
+                    tracing::error!("HdxIndex: failed to write header on drop: {e}");
+                }
+            }
+            if let Err(e) = self.save_bucket_cache() {
+                if !std::thread::panicking() {
+                    tracing::error!("HdxIndex: failed to flush bucket cache on drop: {e}");
+                }
+            }
         }
     }
 }
@@ -689,6 +690,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> Index<&[u8]> for HdxIndex<KSI
         if self.read_only {
             Err(AppendError::ReadOnly)
         } else {
+            self.synced = false;
             // Make sure we have resonable capacity first.
             self.expand_buckets()?;
             self.save_to_bucket(key, record_pos)
@@ -708,6 +710,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> Index<&[u8]> for HdxIndex<KSI
             self.save_bucket_cache().map_err(CommitError::IndexFileSync)?;
             self.odx_file.sync_all().map_err(CommitError::IndexFileSync)?;
             self.hdx_file.sync_all().map_err(CommitError::IndexFileSync)?;
+            self.synced = true;
             Ok(())
         }
     }
