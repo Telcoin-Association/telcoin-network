@@ -5,13 +5,9 @@
 
 use super::error::{WorkerNetworkError, WorkerNetworkResult};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use snap::{read::FrameDecoder, write::FrameEncoder};
-use std::{
-    collections::HashSet,
-    io::{Read, Write},
-};
+use std::collections::HashSet;
 use tn_storage::tables::Batches;
-use tn_types::{encode_into_buffer, max_batch_size, Batch, Database, B256};
+use tn_types::{max_batch_size, Batch, Database, B256};
 
 // chunk batch digest reads to limit amount of batches in memory
 const BATCH_DIGESTS_READ_CHUNK_SIZE: usize = 200;
@@ -30,70 +26,17 @@ pub(crate) async fn read_batch<T>(
 where
     T: AsyncRead + Unpin + Send,
 {
-    // clear buffers
-    decode_buffer.clear();
-    compressed_buffer.clear();
-
-    // read 4-byte uncompressed length prefix first
-    let mut uncompressed_prefix = [0u8; 4];
-    io.read_exact(&mut uncompressed_prefix).await.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::UnexpectedEof {
-            WorkerNetworkError::StreamClosed
-        } else {
-            WorkerNetworkError::StdIo(e)
-        }
-    })?;
-
-    let uncompressed_len = u32::from_le_bytes(uncompressed_prefix) as usize;
-
-    // SECURITY: Validate length before allocation
-    //
-    //
-    //
-    //
-    //
-    //
-    //
     // TODO: Use epoch from context when available
     let max_batch_size = max_batch_size(0);
-    if uncompressed_len > max_batch_size {
-        return Err(WorkerNetworkError::InvalidRequest(format!(
-            "uncompressed batch size {uncompressed_len} exceeds max {max_batch_size}"
-        )));
-    }
-
-    // read 4-byte compressed length prefix next
-    let mut compressed_prefix = [0u8; 4];
-    io.read_exact(&mut compressed_prefix).await.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::UnexpectedEof {
-            WorkerNetworkError::StreamClosed
-        } else {
-            WorkerNetworkError::StdIo(e)
-        }
-    })?;
-
-    let compressed_len = u32::from_le_bytes(compressed_prefix) as usize;
-    let max_compress_len = snap::raw::max_compress_len(uncompressed_len);
-    if compressed_len > max_compress_len {
-        return Err(WorkerNetworkError::InvalidRequest(format!(
-            "compressed batch size {compressed_len} exceeds max {max_compress_len}"
-        )));
-    }
-
-    // resize buffers to reported size
-    decode_buffer.resize(uncompressed_len, 0);
-    compressed_buffer.resize(compressed_len, 0);
-
-    // read compressed data
-    io.read_exact(compressed_buffer).await?;
-
-    // decompress
-    let reader = std::io::Cursor::new(&compressed_buffer);
-    let mut decoder = FrameDecoder::new(reader);
-    decoder.read_exact(decode_buffer)?;
-
-    // deserialize
-    bcs::from_bytes(decode_buffer).map_err(Into::into)
+    tn_network_libp2p::decode_message(io, decode_buffer, compressed_buffer, max_batch_size)
+        .await
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                WorkerNetworkError::StreamClosed
+            } else {
+                WorkerNetworkError::StdIo(e)
+            }
+        })
 }
 
 /// Write a single batch as length-prefixed, snappy-compressed data.
@@ -106,29 +49,10 @@ pub(crate) async fn write_batch<T>(
 where
     T: AsyncWrite + Unpin + Send,
 {
-    // clear buffers
-    encode_buffer.clear();
-    compressed_buffer.clear();
-
-    // encode batch
-    encode_into_buffer(encode_buffer, batch)?;
-
-    // compress into buffer
-    {
-        let mut encoder = FrameEncoder::new(&mut *compressed_buffer);
-        encoder.write_all(encode_buffer)?;
-        // FrameEncoder flushes on drop
-    }
-
-    // write lengths:
-    // [4-byte uncompressed][4-byte compressed][compressed data]
-    let uncompressed_len = (encode_buffer.len() as u32).to_le_bytes();
-    let compressed_len = (compressed_buffer.len() as u32).to_le_bytes();
-
-    io.write_all(&uncompressed_len).await?;
-    io.write_all(&compressed_len).await?;
-    io.write_all(compressed_buffer).await?;
-
+    // TODO: Use epoch from context when available
+    let max_batch_size = max_batch_size(0);
+    tn_network_libp2p::encode_message(io, batch, encode_buffer, compressed_buffer, max_batch_size)
+        .await?;
     Ok(())
 }
 
@@ -206,6 +130,8 @@ where
 mod tests {
     use super::*;
     use futures::io::Cursor;
+    use snap::read::FrameDecoder;
+    use std::io::Read;
     use tn_types::max_batch_size;
 
     /// Helper to write batch to buffer and return it
@@ -321,7 +247,7 @@ mod tests {
         let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(max_size));
 
         let result = read_batch(&mut cursor, &mut decode_buffer, &mut compressed_buffer).await;
-        assert!(matches!(result, Err(WorkerNetworkError::InvalidRequest(_))));
+        assert!(matches!(result, Err(WorkerNetworkError::StdIo(_))));
     }
 
     #[tokio::test]

@@ -25,7 +25,7 @@ pub mod stream;
 pub mod types;
 
 // export types
-pub use codec::{TNCodec, TNMessage};
+pub use codec::{decode_message, encode_message, TNCodec, TNMessage};
 pub use consensus::ConsensusNetwork;
 pub use peers::{PeerExchangeMap, Penalty};
 pub use stream::{StreamError, StreamHeader};
