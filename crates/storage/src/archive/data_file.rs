@@ -21,7 +21,7 @@ pub struct DataFile {
     data_file_end: u64,
     write_buffer: Vec<u8>,
     read_buffer: Vec<u8>,
-    read_buffer_start: usize,
+    read_buffer_start: u64,
     read_buffer_len: usize,
     seek_pos: u64,
     read_buffer_size: u32,
@@ -143,7 +143,9 @@ impl DataFile {
     /// read_buffer (will panic if called incorrectly).
     fn copy_read_buffer(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let mut size = buf.len();
-        let read_depth = self.seek_pos as usize - self.read_buffer_start;
+        // The read buffer will never be larger than a u32 so this should be fine even on a 32bit
+        // platform.
+        let read_depth = (self.seek_pos - self.read_buffer_start) as usize;
         if read_depth + size > self.read_buffer_len {
             size = self.read_buffer_len - read_depth;
         }
@@ -176,8 +178,8 @@ impl Read for DataFile {
             } else {
                 Ok(0)
             }
-        } else if self.seek_pos >= self.read_buffer_start as u64
-            && self.seek_pos < (self.read_buffer_start + self.read_buffer_len) as u64
+        } else if self.seek_pos >= self.read_buffer_start
+            && self.seek_pos < (self.read_buffer_start + self.read_buffer_len as u64)
         {
             self.copy_read_buffer(buf)
         } else {
@@ -203,7 +205,7 @@ impl Read for DataFile {
                     self.data_file.read_exact(&mut self.read_buffer[..])?;
                     self.read_buffer_len = self.read_buffer_size as usize;
                 }
-                self.read_buffer_start = seek_pos as usize;
+                self.read_buffer_start = seek_pos;
                 self.copy_read_buffer(buf)
             } else {
                 Ok(0)
@@ -222,7 +224,10 @@ impl Seek for DataFile {
                 if end >= 0 {
                     self.seek_pos = end as u64;
                 } else {
-                    self.seek_pos = 0;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "seek to negative position",
+                    ));
                 }
             }
             SeekFrom::Current(pos) => {
@@ -230,7 +235,10 @@ impl Seek for DataFile {
                 if end >= 0 {
                     self.seek_pos = end as u64;
                 } else {
-                    self.seek_pos = 0;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "seek to negative position",
+                    ));
                 }
             }
         }

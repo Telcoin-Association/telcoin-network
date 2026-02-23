@@ -29,6 +29,10 @@ pub enum LoadHeaderError {
     InvalidOverflowUID,
     /// The ODX index overflowfile app number did not match the data file.
     InvalidOverflowAppNum,
+    /// Index is read only and write was attempted.
+    ReadOnly,
+    /// Attempted to open a read only index that was missing a header.
+    ReadOnlyEmpty,
 }
 
 impl Error for LoadHeaderError {}
@@ -48,6 +52,8 @@ impl fmt::Display for LoadHeaderError {
             Self::InvalidOverflowVersion => write!(f, "invalid index overflow version"),
             Self::InvalidOverflowUID => write!(f, "invalid index overflow uid"),
             Self::InvalidOverflowAppNum => write!(f, "invalid index overflow appnum"),
+            Self::ReadOnly => write!(f, "attempted to write to read only index"),
+            Self::ReadOnlyEmpty => write!(f, "attempted to open index read only with no index"),
         }
     }
 }

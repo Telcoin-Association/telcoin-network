@@ -244,6 +244,7 @@ pub struct HdxIndex<
     pub(crate) odx_file: File,
     capacity: u64,
     hasher_builder: S,
+    read_only: bool,
     _index_dir: PathBuf,
 }
 
@@ -265,18 +266,26 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         dir: P,
         data_header: &DataHeader,
         hasher_builder: S,
+        read_only: bool,
     ) -> Result<HdxIndex<KSIZE, S>, LoadHeaderError> {
         let dir = dir.as_ref();
         let _ = fs::create_dir(dir);
-        let mut hdx_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.join("index.hdx"))?;
+        let mut hdx_file = if read_only {
+            OpenOptions::new().read(true).write(false).open(dir.join("index.hdx"))?
+        } else {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(dir.join("index.hdx"))?
+        };
         let file_end = hdx_file.seek(SeekFrom::End(0))?;
 
         let header = if file_end == 0 {
+            if read_only {
+                return Err(LoadHeaderError::ReadOnlyEmpty);
+            }
             let salt = hasher_builder.hash_one(data_header.uid());
             let pepper = hasher_builder.hash_one(salt);
             let mut header = HdxHeader::from_data_header::<KSIZE, S>(data_header, salt, pepper);
@@ -313,6 +322,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             header.uid(),
             header.appnum(),
             dir.join("index.odx"),
+            read_only,
         )?;
         // Don't want buckets and modulus to be the same, so +1
         let modulus = (header.buckets + 1).next_power_of_two();
@@ -327,6 +337,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             odx_file,
             capacity,
             hasher_builder,
+            read_only,
             _index_dir: dir.to_owned(),
         })
     }
@@ -363,7 +374,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     /// Add buckets to expand capacity.
     /// Capacity is number of elements per bucket * number of buckets.
     /// If current length >= capacity * load factor then split buckets until this is not true.
-    pub fn expand_buckets(&mut self) -> Result<(), AppendError> {
+    fn expand_buckets(&mut self) -> Result<(), AppendError> {
         while self.header.values >= (self.capacity as f32 * self.header.load_factor()) as u64 {
             self.split_one_bucket()?;
             self.capacity = self.buckets() as u64 * self.header.bucket_elements() as u64;
@@ -601,7 +612,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
                 }
             }
         }
-        let res = if elements >= self.header.bucket_elements() as u32 {
+        if elements >= self.header.bucket_elements() as u32 {
             // Current bucket is full so overflow.
             // First, save bucket as an overflow record and add to the fresh bucket.
             let overflow_pos =
@@ -618,13 +629,11 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             // empty).
             buffer[12..(12 + KSIZE)].copy_from_slice(key);
             buffer[(12 + KSIZE)..(20 + KSIZE)].copy_from_slice(&record_pos.to_le_bytes());
-            Ok(())
         } else if elements == 0 {
             // Empty bucket, add first element.
             buffer[8..12].copy_from_slice(&1_u32.to_le_bytes());
             buffer[12..(12 + KSIZE)].copy_from_slice(key);
             buffer[(12 + KSIZE)..(20 + KSIZE)].copy_from_slice(&record_pos.to_le_bytes());
-            Ok(())
         } else {
             for _ in 0..elements as u64 {
                 let rec_key = &buffer[pos..(pos + KSIZE)];
@@ -641,25 +650,32 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             buffer[pos..(pos + KSIZE)].copy_from_slice(key);
             pos += KSIZE;
             buffer[pos..pos + 8].copy_from_slice(&record_pos.to_le_bytes());
-            Ok(())
-        };
+        }
         if inc_values {
             self.inc_values();
         }
-        res
+        Ok(())
     }
 }
 
 impl<const KSIZE: usize, S: BuildHasher + Default> Drop for HdxIndex<KSIZE, S> {
     fn drop(&mut self) {
-        let _ = self.write_header();
-        let _ = self.save_bucket_cache();
+        if !self.read_only {
+            let _ = self.write_header();
+            let _ = self.save_bucket_cache();
+        }
     }
 }
 
 impl<const KSIZE: usize, S: BuildHasher + Default> Index<&[u8]> for HdxIndex<KSIZE, S> {
     fn save(&mut self, key: &[u8], record_pos: u64) -> Result<(), AppendError> {
-        self.save_to_bucket(key, record_pos)
+        if self.read_only {
+            Err(AppendError::ReadOnly)
+        } else {
+            // Make sure we have resonable capacity first.
+            self.expand_buckets()?;
+            self.save_to_bucket(key, record_pos)
+        }
     }
 
     fn load(&mut self, key: &[u8]) -> Result<u64, FetchError> {
@@ -668,11 +684,15 @@ impl<const KSIZE: usize, S: BuildHasher + Default> Index<&[u8]> for HdxIndex<KSI
 
     /// Flush and sync all the index data to disk.
     fn sync(&mut self) -> Result<(), CommitError> {
-        self.write_header().map_err(CommitError::IndexFileSync)?;
-        self.save_bucket_cache().map_err(CommitError::IndexFileSync)?;
-        self.odx_file.sync_all().map_err(CommitError::IndexFileSync)?;
-        self.hdx_file.sync_all().map_err(CommitError::IndexFileSync)?;
-        Ok(())
+        if self.read_only {
+            Err(CommitError::ReadOnly)
+        } else {
+            self.write_header().map_err(CommitError::IndexFileSync)?;
+            self.save_bucket_cache().map_err(CommitError::IndexFileSync)?;
+            self.odx_file.sync_all().map_err(CommitError::IndexFileSync)?;
+            self.hdx_file.sync_all().map_err(CommitError::IndexFileSync)?;
+            Ok(())
+        }
     }
 }
 
@@ -688,9 +708,13 @@ mod tests {
         let tmp_path = TempDir::with_prefix("test_archive_hdx_index").expect("temp dir");
         let data_header = DataHeader::new();
         let builder = BuildHasherDefault::<FxHasher>::default();
-        let mut idx: HdxIndex =
-            HdxIndex::open_hdx_file(tmp_path.path().join("index.hdx"), &data_header, builder)
-                .expect("hdx file");
+        let mut idx: HdxIndex = HdxIndex::open_hdx_file(
+            tmp_path.path().join("index.hdx"),
+            &data_header,
+            builder,
+            false,
+        )
+        .expect("hdx file");
         for i in 0..1_000_000 {
             let mut hasher = DefaultHashFunction::new();
             hasher.update(&format!("idx-{i}").into_bytes());
@@ -704,11 +728,37 @@ mod tests {
             assert_eq!(idx.load(hash.as_bytes()).expect("load idx"), i);
         }
         drop(idx);
+
+        // Verify inder when opened for write.
+        // Add some more values as well.
+        let builder = BuildHasherDefault::<FxHasher>::default();
+        let mut idx: HdxIndex = HdxIndex::open_hdx_file(
+            tmp_path.path().join("index.hdx"),
+            &data_header,
+            builder,
+            false,
+        )
+        .expect("hdx file");
+        for i in 0..1_000_000 {
+            let mut hasher = DefaultHashFunction::new();
+            hasher.update(&format!("idx-{i}").into_bytes());
+            let hash = hasher.finalize();
+            assert_eq!(idx.load(hash.as_bytes()).expect("load idx"), i);
+        }
+        for i in 1_000_000..1_001_000 {
+            let mut hasher = DefaultHashFunction::new();
+            hasher.update(&format!("idx-{i}").into_bytes());
+            let hash = hasher.finalize();
+            idx.save(hash.as_bytes(), i).expect("add to index");
+        }
+        drop(idx);
+
+        // Verify index when opened read only.
         let builder = BuildHasherDefault::<FxHasher>::default();
         let mut idx: HdxIndex =
-            HdxIndex::open_hdx_file(tmp_path.path().join("index.hdx"), &data_header, builder)
+            HdxIndex::open_hdx_file(tmp_path.path().join("index.hdx"), &data_header, builder, true)
                 .expect("hdx file");
-        for i in 0..1_000_000 {
+        for i in 0..1_001_000 {
             let mut hasher = DefaultHashFunction::new();
             hasher.update(&format!("idx-{i}").into_bytes());
             let hash = hasher.finalize();

@@ -6,7 +6,6 @@ use crate::archive::{
 };
 use std::{
     fs::{File, OpenOptions},
-    io,
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
 };
@@ -25,6 +24,7 @@ pub struct OdxHeader {
     appnum: u64,      // Application defined constant
     header_size: usize, /* Size of the header (not saved to file, max of bucket_size or
                        * MIN_HEADER_SIZE). */
+    read_only: bool, // Is this file read only?
 }
 
 impl OdxHeader {
@@ -34,17 +34,25 @@ impl OdxHeader {
         uid: u64,
         appnum: u64,
         path: P,
+        read_only: bool,
     ) -> Result<(File, OdxHeader), LoadHeaderError> {
         let path = path.as_ref();
-        let mut file = OpenOptions::new().read(true).append(true).create(true).open(path)?;
+        let mut file = if read_only {
+            OpenOptions::new().read(true).write(false).open(path)?
+        } else {
+            OpenOptions::new().read(true).append(true).create(true).open(path)?
+        };
         let file_end = file.seek(SeekFrom::End(0))?;
 
         let header = if file_end == 0 {
-            let header = OdxHeader::new(version, uid, appnum);
+            if read_only {
+                return Err(LoadHeaderError::ReadOnlyEmpty);
+            }
+            let header = OdxHeader::new(version, uid, appnum, read_only);
             header.write_header(&mut file)?;
             header
         } else {
-            let header = OdxHeader::load_header(&mut file)?;
+            let header = OdxHeader::load_header(&mut file, read_only)?;
             // Basic validation of the odx header.
             if header.version() != version {
                 return Err(LoadHeaderError::InvalidIndexVersion);
@@ -62,14 +70,17 @@ impl OdxHeader {
 
     /// Return a default OdxHeader with any values from hdx_header overridden.
     /// This includes the version, uid, appnum and bucket_size.
-    pub fn new(version: u16, uid: u64, appnum: u64) -> Self {
+    fn new(version: u16, uid: u64, appnum: u64, read_only: bool) -> Self {
         let header_size = MIN_HEADER_SIZE;
-        Self { type_id: *b"telcoinx", version, uid, appnum, header_size }
+        Self { type_id: *b"telcoinx", version, uid, appnum, header_size, read_only }
     }
 
     /// Load a HdxHeader from a file.  This will seek to the beginning and leave the file
     /// positioned after the header.
-    pub fn load_header<R: Read + Seek>(source: &mut R) -> Result<Self, LoadHeaderError> {
+    fn load_header<R: Read + Seek>(
+        source: &mut R,
+        read_only: bool,
+    ) -> Result<Self, LoadHeaderError> {
         let header_size = MIN_HEADER_SIZE;
         source.rewind()?;
         let mut buffer = vec![0_u8; header_size];
@@ -94,12 +105,15 @@ impl OdxHeader {
         pos += 8;
         buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
         let appnum = u64::from_le_bytes(buf64);
-        let header = Self { type_id, version, uid, appnum, header_size };
+        let header = Self { type_id, version, uid, appnum, header_size, read_only };
         Ok(header)
     }
 
     /// Write this header to sync at current seek position.
-    pub fn write_header<R: Write + Seek>(&self, sync: &mut R) -> Result<(), io::Error> {
+    fn write_header<R: Write + Seek>(&self, sync: &mut R) -> Result<(), LoadHeaderError> {
+        if self.read_only {
+            return Err(LoadHeaderError::ReadOnly);
+        }
         let mut buffer = vec![0_u8; self.header_size];
         let mut pos = 0;
         buffer[pos..8].copy_from_slice(&self.type_id);

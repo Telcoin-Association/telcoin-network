@@ -330,12 +330,17 @@ impl Inner {
             base_dir.join(Self::CONSENSUS_HASH_NAME),
             data.header(),
             builder,
+            false,
         )
         .map_err(OpenError::IndexFileOpen)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
-        let batch_digests =
-            HdxIndex::open_hdx_file(base_dir.join(Self::BATCH_HASH_NAME), data.header(), builder)
-                .map_err(OpenError::IndexFileOpen)?;
+        let batch_digests = HdxIndex::open_hdx_file(
+            base_dir.join(Self::BATCH_HASH_NAME),
+            data.header(),
+            builder,
+            false,
+        )
+        .map_err(OpenError::IndexFileOpen)?;
         Ok(Self { data, consensus_idx, consensus_digests, batch_digests, epoch_meta })
     }
 
@@ -359,12 +364,17 @@ impl Inner {
             base_dir.join(Self::CONSENSUS_HASH_NAME),
             data.header(),
             builder,
+            true,
         )
         .map_err(OpenError::IndexFileOpen)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
-        let batch_digests =
-            HdxIndex::open_hdx_file(base_dir.join(Self::BATCH_HASH_NAME), data.header(), builder)
-                .map_err(OpenError::IndexFileOpen)?;
+        let batch_digests = HdxIndex::open_hdx_file(
+            base_dir.join(Self::BATCH_HASH_NAME),
+            data.header(),
+            builder,
+            true,
+        )
+        .map_err(OpenError::IndexFileOpen)?;
 
         Ok(Self { data, consensus_idx, consensus_digests, batch_digests, epoch_meta })
     }
@@ -402,12 +412,17 @@ impl Inner {
             base_dir.join(Self::CONSENSUS_HASH_NAME),
             data.header(),
             builder,
+            false,
         )
         .map_err(OpenError::IndexFileOpen)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
-        let mut batch_digests =
-            HdxIndex::open_hdx_file(base_dir.join(Self::BATCH_HASH_NAME), data.header(), builder)
-                .map_err(OpenError::IndexFileOpen)?;
+        let mut batch_digests = HdxIndex::open_hdx_file(
+            base_dir.join(Self::BATCH_HASH_NAME),
+            data.header(),
+            builder,
+            false,
+        )
+        .map_err(OpenError::IndexFileOpen)?;
         let mut parent_digest = previous_epoch.final_consensus.hash;
         let mut batches = HashSet::new();
         for record in stream_iter {
