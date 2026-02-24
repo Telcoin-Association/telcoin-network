@@ -8,7 +8,7 @@ use libp2p::{
     core::transport::ListenerId,
     gossipsub::{PublishError, SubscriptionError, TopicHash},
     request_response::ResponseChannel,
-    Multiaddr, PeerId, TransportError,
+    Multiaddr, PeerId, Stream, TransportError,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -71,7 +71,21 @@ pub enum NetworkEvent<Req, Res> {
     Gossip(GossipMessage, BlsPublicKey),
     /// Send an error back the requester.
     Error(String, ResponseChannel<Res>),
+    /// An inbound stream was established by a peer.
+    ///
+    /// The application is responsible for reading any correlation data
+    /// (e.g. request digest) from the raw stream.
+    InboundStream {
+        /// The peer that opened the stream.
+        peer: BlsPublicKey,
+        /// The established raw p2p stream for reading data.
+        stream: Stream,
+    },
 }
+
+// ============================================================================
+// Network Commands
+// ============================================================================
 
 /// Commands for the swarm.
 #[derive(Debug)]
@@ -284,6 +298,16 @@ where
     FindAuthorities {
         /// The collection of bls public keys associated with authorities to find.
         bls_keys: Vec<BlsPublicKey>,
+    },
+    /// Open a raw stream to a peer for bulk data transfer.
+    ///
+    /// Called after a successful request-response negotiation. The caller
+    /// is responsible for writing any correlation data to the stream.
+    OpenStream {
+        /// The peer to open the stream to.
+        peer: BlsPublicKey,
+        /// Channel for returning the established stream to application layer.
+        reply: oneshot::Sender<NetworkResult<Stream>>,
     },
 }
 
@@ -518,6 +542,17 @@ where
     pub async fn find_authorities(&self, bls_keys: Vec<BlsPublicKey>) -> NetworkResult<()> {
         self.sender.send(NetworkCommand::FindAuthorities { bls_keys }).await?;
         Ok(())
+    }
+
+    /// Open a raw stream to a peer for bulk data transfer.
+    ///
+    /// Called after a successful request-response negotiation. The caller is
+    /// responsible for writing any application-layer correlation data (e.g.
+    /// request digest) to the stream after it is established.
+    pub async fn open_stream(&self, peer: BlsPublicKey) -> NetworkResult<NetworkResult<Stream>> {
+        let (reply, rx) = oneshot::channel();
+        self.sender.send(NetworkCommand::OpenStream { peer, reply }).await?;
+        rx.await.map_err(Into::into)
     }
 }
 
