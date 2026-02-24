@@ -349,14 +349,11 @@ where
                     let _ = network_handle.handle.send_response(err, channel).await;
                 });
             }
-            NetworkEvent::InboundStream { peer, stream, header } => {
-                // Handle inbound sync stream for epoch synchronization
+            NetworkEvent::InboundStream { peer, stream } => {
                 // TODO: Implement epoch sync stream handling
                 debug!(
                     target: "primary::network",
                     ?peer,
-                    resource_id = header.resource_id,
-                    request_id = ?header.request_digest,
                     "inbound sync stream received - not yet implemented"
                 );
                 drop(stream);

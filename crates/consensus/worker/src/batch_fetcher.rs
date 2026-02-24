@@ -1,6 +1,7 @@
 //! Fetch batches from database or peers.
 //!
-//! This type handles requests from the primary. Requests sent to the `BatchFetcher` have already been certified.
+//! This type handles requests from the primary. Requests sent to the `BatchFetcher` have already
+//! been certified.
 
 use crate::network::{error::WorkerNetworkResult, WorkerNetworkHandle};
 use std::collections::{HashMap, HashSet};
@@ -28,13 +29,13 @@ impl<DB: Database> BatchFetcher<DB> {
 
     /// Bulk fetches payload from local storage and remote workers.
     ///
-    /// This function performs infinite retries and until all batches are available. This is called by `Subscriber`
-    /// for each consensus output. The number of batches in a committed subdag is expected to be 10s of kbs max.
-    /// Returns an error if the database writes fail. Otherwise, tries all peers infinitely until all batches
-    /// successfully fetched.
+    /// This function performs infinite retries and until all batches are available. This is called
+    /// by `Subscriber` for each consensus output. The number of batches in a committed subdag
+    /// is expected to be 10s of kbs max. Returns an error if the database writes fail.
+    /// Otherwise, tries all peers infinitely until all batches successfully fetched.
     ///
-    /// SAFETY: 10-node committees * 6-round commit max * 5 batch max = 300 max batch digests possible
-    /// 32bytes * 300 = 9.6 kb => well within 1MB max message size
+    /// SAFETY: 10-node committees * 6-round commit max * 5 batch max = 300 max batch digests
+    /// possible 32bytes * 300 = 9.6 kb => well within 1MB max message size
     #[instrument(level = "debug", skip_all, fields(num_digests = missing_digests.len()))]
     pub(crate) async fn fetch_for_primary(
         &self,
@@ -74,11 +75,13 @@ impl<DB: Database> BatchFetcher<DB> {
                     batch.set_received_at(now());
                     updated_new_batches.insert(*digest, batch.clone());
                     // also persist the batches, so they are available after restarts
-                    txn.insert::<Batches>(digest, &batch).inspect_err(|e| error!(target: "batch_fetcher", ?e, "failed to insert batch! Node shutting down..."))?;
+                    txn.insert::<Batches>(digest, batch)
+                        .inspect_err(|e| error!(target: "batch_fetcher", ?e, "failed to insert batch! Node shutting down..."))?;
                 }
 
                 // commit db after all inserts
-                txn.commit().inspect_err(|e| error!(target: "batch_fetcher", ?e, "failed to commit batch! Node shutting down..."))?;
+                txn.commit()
+                    .inspect_err(|e| error!(target: "batch_fetcher", ?e, "failed to commit batch! Node shutting down..."))?;
 
                 // add recovered batches to final collection
                 fetched_batches.extend(updated_new_batches.iter().map(|(d, b)| (*d, (*b).clone())));

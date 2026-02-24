@@ -11,7 +11,7 @@ use std::{
     io::{Read as _, Write as _},
     marker::PhantomData,
 };
-use tn_types::{encode, encode_into_buffer, B256};
+use tn_types::encode_into_buffer;
 
 /// Decode a single length-prefixed, snappy-compressed BCS message from an async reader.
 ///
@@ -50,7 +50,9 @@ where
     // validate compressed length against max possible compression size
     let max_compress_len = snap::raw::max_compress_len(uncompressed_len);
     if compressed_len > max_compress_len {
-        return Err(std::io::Error::other("compressed size exceeds max for reported uncompressed size"));
+        return Err(std::io::Error::other(
+            "compressed size exceeds max for reported uncompressed size",
+        ));
     }
 
     // resize buffers to reported sizes
@@ -129,13 +131,6 @@ pub trait TNMessage:
     /// Function to intercept peer exchange messages at the network layer before passing to the
     /// application layer. Only the network layer needs peer exchange messages.
     fn peer_exchange_msg(&self) -> Option<PeerExchangeMap>;
-    /// The digest of the request.
-    fn digest(&self) -> B256 {
-        let mut hasher = tn_types::DefaultHashFunction::new();
-        let bytes = encode(self);
-        hasher.update(&bytes);
-        B256::from_slice(hasher.finalize().as_bytes())
-    }
 }
 
 /// The Telcoin Network request/response codec for consensus messages between peers.
@@ -193,8 +188,13 @@ where
     where
         T: AsyncRead + Unpin + Send,
     {
-        decode_message(io, &mut self.decode_buffer, &mut self.compressed_buffer, self.max_chunk_size)
-            .await
+        decode_message(
+            io,
+            &mut self.decode_buffer,
+            &mut self.compressed_buffer,
+            self.max_chunk_size,
+        )
+        .await
     }
 
     async fn read_response<T>(
@@ -205,8 +205,13 @@ where
     where
         T: AsyncRead + Unpin + Send,
     {
-        decode_message(io, &mut self.decode_buffer, &mut self.compressed_buffer, self.max_chunk_size)
-            .await
+        decode_message(
+            io,
+            &mut self.decode_buffer,
+            &mut self.compressed_buffer,
+            self.max_chunk_size,
+        )
+        .await
     }
 
     async fn write_request<T>(
@@ -218,8 +223,14 @@ where
     where
         T: AsyncWrite + Unpin + Send,
     {
-        encode_message(io, &req, &mut self.decode_buffer, &mut self.compressed_buffer, self.max_chunk_size)
-            .await
+        encode_message(
+            io,
+            &req,
+            &mut self.decode_buffer,
+            &mut self.compressed_buffer,
+            self.max_chunk_size,
+        )
+        .await
     }
 
     async fn write_response<T>(
@@ -231,7 +242,13 @@ where
     where
         T: AsyncWrite + Unpin + Send,
     {
-        encode_message(io, &res, &mut self.decode_buffer, &mut self.compressed_buffer, self.max_chunk_size)
-            .await
+        encode_message(
+            io,
+            &res,
+            &mut self.decode_buffer,
+            &mut self.compressed_buffer,
+            self.max_chunk_size,
+        )
+        .await
     }
 }

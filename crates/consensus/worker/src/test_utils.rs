@@ -1,7 +1,7 @@
 //! Test utilities.
 
-use crate::network::stream_codec::write_batch;
 use crate::{
+    network::stream_codec::write_batch,
     quorum_waiter::{QuorumWaiterError, QuorumWaiterTrait},
     WorkerNetworkHandle, WorkerRequest, WorkerResponse,
 };
@@ -12,9 +12,9 @@ use std::{
     time::Duration,
 };
 use tn_network_libp2p::types::{NetworkCommand, NetworkHandle};
-use tn_types::max_batch_size;
 use tn_types::{
-    Batch, BlockHash, BlsKeypair, BlsPublicKey, Database, SealedBatch, TaskManager, TaskSpawner,
+    max_batch_size, Batch, BlockHash, BlsKeypair, BlsPublicKey, Database, SealedBatch, TaskManager,
+    TaskSpawner,
 };
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
 

@@ -269,7 +269,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_wire_format_structure() {
-        // Verify the wire format is: [4-byte uncompressed len][4-byte compressed len][compressed data]
+        // Verify the wire format is: [4-byte uncompressed len][4-byte compressed len][compressed
+        // data]
         let batch = Batch { transactions: vec![vec![1, 2, 3]], ..Default::default() };
         let encoded = encode_batch_to_vec(&batch).await;
 

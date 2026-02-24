@@ -8,11 +8,11 @@ use crate::network::{stream_codec, PendingBatchStream};
 use futures::AsyncWriteExt as _;
 use std::{collections::HashSet, sync::Arc};
 use tn_config::ConsensusConfig;
-use tn_network_libp2p::{GossipMessage, StreamHeader};
+use tn_network_libp2p::GossipMessage;
 use tn_network_types::{WorkerOthersBatchMessage, WorkerToPrimaryClient};
 use tn_storage::tables::Batches;
 use tn_types::{
-    ensure, now, try_decode, BatchValidation, BlsPublicKey, Database, SealedBatch, WorkerId,
+    ensure, now, try_decode, BatchValidation, BlsPublicKey, Database, SealedBatch, WorkerId, B256,
 };
 use tracing::{debug, warn};
 
@@ -144,7 +144,7 @@ where
         peer: BlsPublicKey,
         pending_request: Option<PendingBatchStream>,
         mut stream: libp2p::Stream,
-        header: StreamHeader,
+        request_digest: B256,
     ) -> WorkerNetworkResult<()> {
         // `None` indicates unexpected request
         let Some(request) = pending_request else {
@@ -152,17 +152,17 @@ where
             warn!(
                 target: "worker::network",
                 %peer,
-                ?header.request_digest,
+                ?request_digest,
                 "inbound stream has no matching pending request"
             );
-            return Err(WorkerNetworkError::UnknownStreamRequest(header.request_digest));
+            return Err(WorkerNetworkError::UnknownStreamRequest(request_digest));
         };
 
         // process request to send batches through stream
         debug!(
             target: "worker::network",
             %peer,
-            ?header.request_digest,
+            ?request_digest,
             batch_count = request.batch_digests.len(),
             "processing inbound batch stream"
         );
@@ -215,8 +215,8 @@ where
         peer: BlsPublicKey,
         stream: libp2p::Stream,
         pending_request: Option<PendingBatchStream>,
-        header: StreamHeader,
+        request_digest: B256,
     ) -> WorkerNetworkResult<()> {
-        self.process_request_batches_stream(peer, pending_request, stream, header).await
+        self.process_request_batches_stream(peer, pending_request, stream, request_digest).await
     }
 }

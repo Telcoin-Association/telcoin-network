@@ -5,129 +5,80 @@ use libp2p::{
     },
     PeerId, Stream, StreamProtocol,
 };
-use std::collections::{HashMap, VecDeque};
-use std::task::{Context, Poll};
+use std::{
+    collections::VecDeque,
+    task::{Context, Poll},
+};
+use tokio::sync::oneshot;
 
-use crate::stream::{
-    handler::{HandlerCommand, StreamHandler, StreamHandlerEvent},
-    upgrade::{StreamError, StreamHeader},
+use crate::{
+    stream::handler::{HandlerCommand, StreamHandler, StreamHandlerEvent},
+    types::NetworkResult,
 };
 
 /// The protocol identifier for stream-based sync.
-///
-/// This protocol is used for bulk data transfer after successful request-response negotiation.
-pub const TN_STREAM_PROTOCOL: StreamProtocol = StreamProtocol::new("/tn-stream/1.0.0");
+pub(crate) const TN_STREAM_PROTOCOL: StreamProtocol = StreamProtocol::new("/tn-stream/1.0.0");
 
 /// Events emitted by the stream behavior to the swarm/application layer.
-///
-/// These events notify the application when streams are established or fail,
-/// enabling coordination between the request-response negotiation phase
-/// and the subsequent data transfer phase.
 #[derive(Debug)]
-pub enum StreamEvent {
+pub(crate) enum StreamEvent {
     /// An inbound stream was accepted and is ready for the application to handle.
-    ///
-    /// This occurs when a remote peer opens a stream to this node after
-    /// successful request-response negotiation.
     InboundStream {
         /// The peer that opened the stream.
         peer: PeerId,
         /// The established stream for reading/writing data.
         stream: Stream,
-        /// The header containing sync metadata (resource identifier, expected hash, etc.).
-        header: StreamHeader,
-    },
-    /// An outbound stream was successfully established and is ready for use.
-    ///
-    /// This occurs after this node opens a stream to a peer following
-    /// successful request-response negotiation. The header should be written
-    /// to the stream before sending data.
-    OutboundStream {
-        /// The peer the stream was opened to.
-        peer: PeerId,
-        /// The established stream for reading/writing data.
-        stream: Stream,
-        /// The ID linking this stream to the original sync request.
-        request_id: u64,
-        /// The header to write to the stream before data transfer.
-        header: StreamHeader,
-    },
-    /// Failed to establish an outbound stream.
-    ///
-    /// The application should handle this by notifying the original requester
-    /// and potentially retrying with a different peer.
-    OutboundFailure {
-        /// The peer the stream failed to open to.
-        peer: PeerId,
-        /// The ID linking this failure to the original sync request.
-        request_id: u64,
-        /// The specific error that occurred.
-        error: StreamError,
     },
 }
 
-/// Commands from application to behavior.
-///
-/// These commands are used internally by the network layer to request
-/// stream operations.
-#[derive(Debug)]
-pub enum StreamCommand {
-    /// Open an outbound stream to a peer for data transfer.
-    OpenStream {
-        /// The peer to open the stream to.
-        peer: PeerId,
-        /// The ID for tracking this stream.
-        request_id: u64,
-        /// The header to write to the stream after it's established.
-        header: StreamHeader,
-    },
+/// Internal command queued for dispatch to a connection handler.
+struct PendingOpen {
+    /// The peer to open the stream to.
+    peer: PeerId,
+    /// Channel for returning the established stream directly to the caller.
+    reply: oneshot::Sender<NetworkResult<Stream>>,
 }
 
 /// The network behavior for stream-based sync.
 ///
-/// This behavior manages stream coordination across all peer connections,
-/// handling both inbound streams (from peers requesting data from us) and
-/// outbound streams (for requesting data from peers).
+/// Manages stream establishment across peer connections. After a successful
+/// request-response negotiation, this behavior opens a raw stream for the
+/// application to use for bulk data transfer.
 ///
-/// The behavior works in conjunction with request-response: after a successful
-/// sync negotiation via req/res, this behavior opens a stream for bulk data transfer.
-pub struct StreamBehavior {
-    /// Pending outbound stream requests per peer.
-    #[allow(dead_code)] // Will be used for tracking pending streams
-    pending_outbound: HashMap<PeerId, VecDeque<u64>>,
+/// Outbound streams are returned directly to the caller via oneshot channels,
+/// without requiring correlation IDs or external tracking. The oneshot sender
+/// is passed through to the connection handler as `OutboundOpenInfo`.
+pub(crate) struct StreamBehavior {
     /// Events to emit to the swarm/application.
     events: VecDeque<StreamEvent>,
-    /// Commands received from the application.
-    commands: VecDeque<StreamCommand>,
+    /// Pending outbound stream requests to dispatch to handlers.
+    pending_opens: VecDeque<PendingOpen>,
 }
 
 impl std::fmt::Debug for StreamBehavior {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamBehavior")
-            .field("pending_outbound_count", &self.pending_outbound.len())
             .field("events_count", &self.events.len())
-            .field("commands_count", &self.commands.len())
+            .field("pending_opens_count", &self.pending_opens.len())
             .finish()
     }
 }
 
 impl StreamBehavior {
     /// Create a new instance of the stream behavior.
-    pub fn new() -> Self {
-        Self {
-            pending_outbound: HashMap::new(),
-            events: VecDeque::new(),
-            commands: VecDeque::new(),
-        }
+    pub(crate) fn new() -> Self {
+        Self { events: VecDeque::new(), pending_opens: VecDeque::new() }
     }
 
     /// Initiate an outbound stream to a peer.
     ///
-    /// This should be called after successful request-response negotiation.
-    /// The `request_id` is used to correlate the stream with the original sync request.
-    /// The `header` will be written to the stream after it's established.
-    pub fn open_stream(&mut self, peer: PeerId, request_id: u64, header: StreamHeader) {
-        self.commands.push_back(StreamCommand::OpenStream { peer, request_id, header });
+    /// The established stream (or error) will be sent directly through `reply`.
+    pub(crate) fn open_stream(
+        &mut self,
+        peer: PeerId,
+        reply: oneshot::Sender<NetworkResult<Stream>>,
+    ) {
+        self.pending_opens.push_back(PendingOpen { peer, reply });
     }
 }
 
@@ -162,9 +113,7 @@ impl NetworkBehaviour for StreamBehavior {
         Ok(StreamHandler::new())
     }
 
-    fn on_swarm_event(&mut self, _event: FromSwarm<'_>) {
-        // Handle connection events if needed (currently no-op)
-    }
+    fn on_swarm_event(&mut self, _event: FromSwarm<'_>) {}
 
     fn on_connection_handler_event(
         &mut self,
@@ -173,23 +122,8 @@ impl NetworkBehaviour for StreamBehavior {
         event: <Self::ConnectionHandler as ConnectionHandler>::ToBehaviour,
     ) {
         match event {
-            StreamHandlerEvent::InboundStream { stream, header } => {
-                self.events.push_back(StreamEvent::InboundStream { peer: peer_id, stream, header });
-            }
-            StreamHandlerEvent::OutboundStream { stream, request_id, header } => {
-                self.events.push_back(StreamEvent::OutboundStream {
-                    peer: peer_id,
-                    stream,
-                    request_id,
-                    header,
-                });
-            }
-            StreamHandlerEvent::OutboundFailure { request_id, error } => {
-                self.events.push_back(StreamEvent::OutboundFailure {
-                    peer: peer_id,
-                    request_id,
-                    error,
-                });
+            StreamHandlerEvent::InboundStream { stream } => {
+                self.events.push_back(StreamEvent::InboundStream { peer: peer_id, stream });
             }
         }
     }
@@ -203,17 +137,13 @@ impl NetworkBehaviour for StreamBehavior {
             return Poll::Ready(ToSwarm::GenerateEvent(event));
         }
 
-        // Process commands - tell handlers to open streams
-        if let Some(command) = self.commands.pop_front() {
-            match command {
-                StreamCommand::OpenStream { peer, request_id, header } => {
-                    return Poll::Ready(ToSwarm::NotifyHandler {
-                        peer_id: peer,
-                        handler: libp2p::swarm::NotifyHandler::Any,
-                        event: HandlerCommand::OpenStream { request_id, header },
-                    });
-                }
-            }
+        // Dispatch pending stream open requests to handlers
+        if let Some(PendingOpen { peer, reply }) = self.pending_opens.pop_front() {
+            return Poll::Ready(ToSwarm::NotifyHandler {
+                peer_id: peer,
+                handler: libp2p::swarm::NotifyHandler::Any,
+                event: HandlerCommand::OpenStream { reply },
+            });
         }
 
         Poll::Pending

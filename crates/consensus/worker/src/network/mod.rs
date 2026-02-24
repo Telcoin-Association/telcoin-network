@@ -2,18 +2,17 @@
 
 use crate::batch_fetcher::BatchFetcher;
 use error::WorkerNetworkError;
+use futures::AsyncReadExt as _;
 pub use handle::WorkerNetworkHandle;
 use handler::RequestHandler;
 pub use message::{WorkerRequest, WorkerResponse};
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tn_config::ConsensusConfig;
-use tn_network_libp2p::{
-    stream::StreamHeader, types::NetworkEvent, GossipMessage, ResponseChannel,
-};
+use tn_network_libp2p::{types::NetworkEvent, GossipMessage, ResponseChannel};
 use tn_network_types::{PrimaryToWorkerClient, WorkerSynchronizeMessage};
 use tn_storage::tables::Batches;
 use tn_types::{
@@ -71,7 +70,10 @@ pub struct WorkerNetwork<DB, Events> {
     /// Request handler to process requests and return responses.
     request_handler: RequestHandler<DB>,
     /// Pending batch requests awaiting stream from requestor.
-    pending_batch_requests: HashMap<PendingBatchRequestKey, PendingBatchStream>,
+    ///
+    /// Wrapped in `Arc<Mutex>` so spawned stream tasks can look up the matching
+    /// request after reading the correlation digest from the stream.
+    pending_batch_requests: Arc<Mutex<HashMap<PendingBatchRequestKey, PendingBatchStream>>>,
 }
 
 impl<DB, Events> WorkerNetwork<DB, Events>
@@ -93,7 +95,7 @@ where
             network_events,
             network_handle,
             request_handler,
-            pending_batch_requests: HashMap::new(),
+            pending_batch_requests: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -157,8 +159,8 @@ where
                     },
                 );
             }
-            NetworkEvent::InboundStream { peer, stream, header } => {
-                self.process_inbound_stream(peer, stream, header);
+            NetworkEvent::InboundStream { peer, stream } => {
+                self.process_inbound_stream(peer, stream);
             }
         }
     }
@@ -230,20 +232,22 @@ where
         channel: ResponseChannel<WorkerResponse>,
         cancel: oneshot::Receiver<()>,
     ) {
-        // check if node has capacity to fulfill peer's request
-        let ack = self.pending_batch_requests.len() < MAX_PENDING_BATCH_REQUESTS;
-
         // check if pending batch request is empty
-        let response = if batch_digests.len() == 0 {
+        let response = if batch_digests.is_empty() {
             debug!(target: "worker::network", "batch request empty");
             Err(WorkerNetworkError::InvalidRequest("Empty batch digests".into()))
         } else {
+            let mut pending_map = self.pending_batch_requests.lock().expect("lock poisoned");
+
+            // check if node has capacity to fulfill peer's request
+            let ack = pending_map.len() < MAX_PENDING_BATCH_REQUESTS;
+
             // compute request digest for stream correlation
             let request_digest = self.network_handle.generate_batch_request_id(&batch_digests);
 
             // store the pending request
             let pending = PendingBatchStream::new(batch_digests);
-            self.pending_batch_requests.insert((peer, request_digest), pending);
+            pending_map.insert((peer, request_digest), pending);
             debug!(
                 target: "worker::network",
                 %peer,
@@ -280,28 +284,34 @@ where
 
     /// Process an inbound stream for batch transfer.
     ///
-    /// Validates the stream header against pending requests and sends batches.
-    fn process_inbound_stream(
-        &mut self,
-        peer: BlsPublicKey,
-        stream: libp2p::Stream,
-        header: StreamHeader,
-    ) {
+    /// Reads the request digest from the stream and validates against pending requests.
+    fn process_inbound_stream(&mut self, peer: BlsPublicKey, mut stream: libp2p::Stream) {
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
+        let pending_map = Arc::clone(&self.pending_batch_requests);
         let task_name = format!("stream-requested-batches-{peer}");
-        // check for request and spawn task
-        let request_digest = B256::from(header.request_digest);
-        let key = (peer, request_digest);
-        let opt_pending_req = self.pending_batch_requests.remove(&key);
+
         self.network_handle.get_task_spawner().spawn_task(task_name, async move {
-            tokio::select! {
-                res = request_handler.process_request_batches_stream(peer, opt_pending_req, stream, header) => {
-                     if let Err(err) = res {
-                        if let Some(penalty) = err.into() {
-                            network_handle.report_penalty(peer, penalty).await;
-                        }
-                    }
+            // read the 32-byte request digest from the stream
+            let mut digest_buf = [0u8; 32];
+            if let Err(e) = stream.read_exact(&mut digest_buf).await {
+                warn!(target: "worker::network", %peer, ?e, "failed to read request digest from stream");
+                return;
+            }
+            let request_digest = B256::from(digest_buf);
+
+            // look up and remove the matching pending request
+            let opt_pending_req = pending_map
+                .lock()
+                .expect("lock poisoned")
+                .remove(&(peer, request_digest));
+
+            let res = request_handler
+                .process_request_batches_stream(peer, opt_pending_req, stream, request_digest)
+                .await;
+            if let Err(err) = res {
+                if let Some(penalty) = err.into() {
+                    network_handle.report_penalty(peer, penalty).await;
                 }
             }
         });
@@ -311,6 +321,8 @@ where
     fn cleanup_stale_pending_requests(&mut self) {
         let now = Instant::now();
         self.pending_batch_requests
+            .lock()
+            .expect("lock poisoned")
             .retain(|_, pending| now.duration_since(pending.created_at) < PENDING_REQUEST_TIMEOUT);
     }
 }

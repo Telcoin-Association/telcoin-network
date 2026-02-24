@@ -6,7 +6,7 @@
 
 use std::{collections::HashSet, time::Duration};
 
-use futures::AsyncRead;
+use futures::{AsyncRead, AsyncWriteExt as _};
 use tn_network_libp2p::{
     error::NetworkError,
     types::{NetworkHandle, NetworkResult},
@@ -123,7 +123,8 @@ impl WorkerNetworkHandle {
 
     /// Request a group of batches by hashes using stream-based transfer.
     ///
-    /// Tries peers one at a time until all batches are received or all peers fail. Returns `Ok` if any batches successfully fetched from peers.
+    /// Tries peers one at a time until all batches are received or all peers fail. Returns `Ok` if
+    /// any batches successfully fetched from peers.
     pub(crate) async fn request_batches(
         &self,
         requested_digests: &mut HashSet<BlockHash>,
@@ -143,7 +144,7 @@ impl WorkerNetworkHandle {
             }
 
             // loop: update remaining batches or log error
-            match self.request_batches_from_peer(peer, &requested_digests).await {
+            match self.request_batches_from_peer(peer, requested_digests).await {
                 Ok(batches) => {
                     for (digest, batch) in batches {
                         if requested_digests.remove(&digest) {
@@ -212,15 +213,6 @@ impl WorkerNetworkHandle {
                     ));
                 }
 
-                // peer ack'd request - open stream to begin sync
-                //
-                //
-                // open stream with request digest for correlation
-                // resource_id is set to 0 for batch sync
-                //
-                //
-                // TODO: we could use worker_id in the future?
-
                 debug!(
                     target: "worker::network",
                     %peer,
@@ -228,8 +220,14 @@ impl WorkerNetworkHandle {
                     "peer ack for stream request"
                 );
 
-                let mut stream =
-                    self.handle.open_sync_stream(peer, 0, request_digest.into()).await??;
+                // open raw stream then write request_digest for correlation
+                let mut stream = self.handle.open_stream(peer).await??;
+                stream.write_all(request_digest.as_slice()).await.map_err(|e| {
+                    NetworkError::RPCError(format!("failed to write request digest: {e}"))
+                })?;
+                stream.flush().await.map_err(|e| {
+                    NetworkError::RPCError(format!("failed to flush request digest: {e}"))
+                })?;
 
                 debug!(
                     target: "worker::network",

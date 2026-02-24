@@ -1,11 +1,7 @@
 //! Constants and trait implementations for network compatibility.
 
 use crate::{
-    codec::TNMessage,
-    error::NetworkError,
-    peers::Penalty,
-    stream::{StreamError, StreamHeader},
-    GossipMessage, PeerExchangeMap,
+    codec::TNMessage, error::NetworkError, peers::Penalty, GossipMessage, PeerExchangeMap,
 };
 pub use libp2p::gossipsub::MessageId;
 use libp2p::{
@@ -16,9 +12,7 @@ use libp2p::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use tn_types::{
-    encode, now, BlsPublicKey, BlsSignature, NetworkPublicKey, P2pNode, TimestampSec, B256,
-};
+use tn_types::{encode, now, BlsPublicKey, BlsSignature, NetworkPublicKey, P2pNode, TimestampSec};
 use tokio::sync::{mpsc, oneshot};
 
 #[cfg(test)]
@@ -79,136 +73,15 @@ pub enum NetworkEvent<Req, Res> {
     Error(String, ResponseChannel<Res>),
     /// An inbound stream was established by a peer.
     ///
-    /// This occurs after the peer sent a `SyncStateRequest` and this node
-    /// responded positively. The application should read data from the stream.
+    /// The application is responsible for reading any correlation data
+    /// (e.g. request digest) from the raw stream.
     InboundStream {
         /// The peer that opened the stream.
         peer: BlsPublicKey,
-        /// The established stream for reading data.
+        /// The established raw p2p stream for reading data.
         stream: Stream,
-        /// The header containing sync metadata.
-        header: StreamHeader,
     },
 }
-
-// ============================================================================
-// Sync State Types
-// ============================================================================
-
-/// The type of synchronization being requested.
-///
-/// This enum allows the network layer to remain generic while supporting
-/// different sync use cases.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SyncType {
-    /// Synchronize epoch data (used by primaries).
-    Epoch,
-    /// Synchronize batch data (used by workers).
-    Batch,
-}
-
-impl std::fmt::Display for SyncType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Epoch => write!(f, "epoch"),
-            Self::Batch => write!(f, "batch"),
-        }
-    }
-}
-
-/// Request to initiate a state sync operation.
-///
-/// This is sent via request-response to negotiate sync parameters
-/// before opening a stream for bulk data transfer.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncStateRequest {
-    /// The type of sync being requested.
-    pub sync_type: SyncType,
-    /// Resource identifier (epoch number, batch sequence, etc.).
-    ///
-    /// Interpretation depends on `sync_type`:
-    /// - For epoch sync: the epoch number
-    /// - For batch sync: the batch sequence or round number
-    pub resource_id: u64,
-    /// Optional hash to verify the specific resource version.
-    pub expected_hash: Option<[u8; 32]>,
-}
-
-/// Response to a sync state request containing negotiation results.
-///
-/// A successful response indicates the peer is willing and able to provide
-/// the requested data, and includes metadata about the transfer.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncStateResponse {
-    /// Whether the sync request was accepted.
-    pub accepted: bool,
-    /// Total size of the data to be transferred (in bytes).
-    ///
-    /// This allows the requester to allocate appropriate buffers
-    /// and estimate transfer time.
-    pub total_size: u64,
-    /// The number of chunks the data will be split into.
-    ///
-    /// Useful for progress tracking and verification.
-    pub chunk_count: u32,
-    /// The hash of the complete data for integrity verification.
-    pub data_hash: [u8; 32],
-    /// Optional error message if the request was rejected.
-    pub error: Option<String>,
-}
-
-impl SyncStateResponse {
-    /// Create a successful response with the given metadata.
-    pub fn success(total_size: u64, chunk_count: u32, data_hash: [u8; 32]) -> Self {
-        Self { accepted: true, total_size, chunk_count, data_hash, error: None }
-    }
-
-    /// Create a rejection response with the given reason.
-    pub fn rejected(reason: impl Into<String>) -> Self {
-        Self {
-            accepted: false,
-            total_size: 0,
-            chunk_count: 0,
-            data_hash: [0u8; 32],
-            error: Some(reason.into()),
-        }
-    }
-}
-
-/// Errors specific to the sync state operation.
-#[derive(Debug)]
-pub enum SyncStateError {
-    /// No peers available to sync from.
-    NoPeers,
-    /// The requested peer is not known to the network.
-    PeerMissing,
-    /// The request-response phase failed.
-    RequestFailed(NetworkError),
-    /// The peer rejected the sync request.
-    Rejected(String),
-    /// Failed to open the stream after successful negotiation.
-    StreamFailed(StreamError),
-    /// The operation timed out.
-    Timeout,
-    /// The peer disconnected during the operation.
-    Disconnected,
-}
-
-impl std::fmt::Display for SyncStateError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoPeers => write!(f, "No peers available for sync"),
-            Self::PeerMissing => write!(f, "Requested peer not found"),
-            Self::RequestFailed(e) => write!(f, "Request failed: {}", e),
-            Self::Rejected(reason) => write!(f, "Sync rejected: {}", reason),
-            Self::StreamFailed(e) => write!(f, "Stream failed: {}", e),
-            Self::Timeout => write!(f, "Sync operation timed out"),
-            Self::Disconnected => write!(f, "Peer disconnected"),
-        }
-    }
-}
-
-impl std::error::Error for SyncStateError {}
 
 // ============================================================================
 // Network Commands
@@ -426,23 +299,14 @@ where
         /// The collection of bls public keys associated with authorities to find.
         bls_keys: Vec<BlsPublicKey>,
     },
-    /// Open a direct stream to a peer for bulk data transfer.
+    /// Open a raw stream to a peer for bulk data transfer.
     ///
-    /// This command is called after a successful request-response negotiation.
-    /// The application:
-    /// 1. Sends a sync request via normal `SendRequest`
-    /// 2. Receives and inspects the response to confirm sync is accepted
-    /// 3. Calls this command to open the actual data transfer stream
-    ///
-    /// The stream is returned to the caller for processing data.
+    /// Called after a successful request-response negotiation. The caller
+    /// is responsible for writing any correlation data to the stream.
     OpenStream {
         /// The peer to open the stream to.
         peer: BlsPublicKey,
-        /// The resource identifier (epoch number, batch sequence, etc.).
-        resource_id: u64,
-        /// Hash of the preceeding request for integrity verification.
-        request_digest: B256,
-        /// Channel for returning the established stream.
+        /// Channel for returning the established stream to application layer.
         reply: oneshot::Sender<NetworkResult<Stream>>,
     },
 }
@@ -680,30 +544,14 @@ where
         Ok(())
     }
 
-    /// Open a sync stream to a peer for bulk data transfer.
+    /// Open a raw stream to a peer for bulk data transfer.
     ///
-    /// This method is called after a successful request-response sync negotiation.
-    /// The typical flow is:
-    /// 1. Send a sync request via [`send_request`](Self::send_request)
-    /// 2. Receive and verify the response indicates sync request is accepted
-    /// 3. Call this method to open the data transfer stream
-    ///
-    /// # Arguments
-    /// * `peer` - The peer to open the stream to (same peer that accepted the sync request)
-    /// * `resource_id` - Resource identifier (epoch number, batch sequence, etc.)
-    /// * `request_digest` - Hash of the requested data for stream verification
-    ///
-    /// Returns the established [`Stream`] for reading sync data, or a [`SyncStateError`] on failure.
-    pub async fn open_sync_stream(
-        &self,
-        peer: BlsPublicKey,
-        resource_id: u64,
-        request_digest: B256,
-    ) -> NetworkResult<NetworkResult<Stream>> {
+    /// Called after a successful request-response negotiation. The caller is
+    /// responsible for writing any application-layer correlation data (e.g.
+    /// request digest) to the stream after it is established.
+    pub async fn open_stream(&self, peer: BlsPublicKey) -> NetworkResult<NetworkResult<Stream>> {
         let (reply, rx) = oneshot::channel();
-        self.sender
-            .send(NetworkCommand::OpenStream { peer, resource_id, request_digest, reply })
-            .await?;
+        self.sender.send(NetworkCommand::OpenStream { peer, reply }).await?;
         rx.await.map_err(Into::into)
     }
 }

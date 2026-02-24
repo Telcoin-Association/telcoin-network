@@ -193,12 +193,10 @@ async fn test_batch_gossip_stream_accepted_opens_stream() {
                     _ => panic!("expected RequestBatchesStream, got {:?}", request),
                 }
             }
-            NetworkCommand::OpenStream { peer, resource_id: _, request_digest, reply } => {
+            NetworkCommand::OpenStream { peer, reply } => {
                 // Verify OpenStream is called after ack
                 assert!(stream_request_acked, "OpenStream should come after ack");
                 assert_eq!(peer, expected_peer);
-                // request_digest should be a hash of the batch_digests
-                assert_ne!(request_digest, B256::ZERO);
                 // Don't complete the stream - just verify command was sent
                 // Drop reply to simulate error, ending the test
                 drop(reply);
@@ -367,12 +365,13 @@ async fn test_stream_error_penalties() {
     }
 
     // No penalty (None)
-    let timeout_err =
-        WorkerNetworkError::Timeout(tokio::time::timeout(std::time::Duration::ZERO, async {
+    let timeout_err = WorkerNetworkError::Timeout(
+        tokio::time::timeout(std::time::Duration::ZERO, async {
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         })
         .await
-        .unwrap_err());
+        .unwrap_err(),
+    );
     let penalty: Option<Penalty> = timeout_err.into();
     assert!(penalty.is_none(), "Timeout should have no penalty");
 

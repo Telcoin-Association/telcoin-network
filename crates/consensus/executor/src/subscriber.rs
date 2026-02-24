@@ -344,8 +344,8 @@ impl<DB: Database> Subscriber<DB> {
             }
         }
 
-        // SAFETY: 10-node committees * 6-round commit max * 5 batch max = 300 max batch digests possible
-        // 32bytes * 300 = 9.6 kb => well within 1MB max message size
+        // SAFETY: 10-node committees * 6-round commit max * 5 batch max = 300 max batch digests
+        // possible 32bytes * 300 = 9.6 kb => well within 1MB max message size
         let mut fetched_batches = self.fetch_batches_from_peers(batch_set).await?;
 
         // map all fetched batches to their respective certificates for applying block rewards
@@ -398,7 +398,8 @@ impl<DB: Database> Subscriber<DB> {
 
     /// Send message to relevant workers to fetch batches for execution.
     ///
-    /// The worker is responsible for retrieving the batch from it's local DB or fetching from peers.
+    /// The worker is responsible for retrieving the batch from it's local DB or fetching from
+    /// peers.
     async fn fetch_batches_from_peers(
         &self,
         batch_digests: HashSet<BlockHash>,
