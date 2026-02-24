@@ -15,8 +15,8 @@ use tn_config::{ConsensusConfig, NetworkConfig};
 use tn_storage::{mem_db::MemDatabase, CertificateStore, ConsensusStore as _};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    AuthorityIdentifier, ExecHeader, Notifier, SealedHeader, TaskManager, TnReceiver, TnSender,
-    B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    AuthorityIdentifier, BlockNumHash, ExecHeader, Notifier, SealedHeader, TaskManager, TnReceiver,
+    TnSender, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tracing::info;
 
@@ -428,8 +428,9 @@ async fn commit_one() {
     Consensus::spawn(config, &cb, bullshark, &task_manager);
     let cb_clone = cb.clone();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    cb.recent_blocks()
-        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
+    cb.recent_blocks().send_modify(|blocks| {
+        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+    });
     tokio::spawn(async move {
         let mut rx_primary = cb_clone.subscribe_committed_certificates();
         while rx_primary.recv().await.is_some() {}
@@ -486,8 +487,9 @@ async fn dead_node() {
 
     let cb = ConsensusBus::new();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    cb.recent_blocks()
-        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
+    cb.recent_blocks().send_modify(|blocks| {
+        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+    });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
     Consensus::spawn(config, &cb, bullshark, &task_manager);
@@ -619,8 +621,9 @@ async fn not_enough_support() {
 
     let cb = ConsensusBus::new();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    cb.recent_blocks()
-        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
+    cb.recent_blocks().send_modify(|blocks| {
+        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+    });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
     Consensus::spawn(config, &cb, bullshark, &task_manager);
@@ -718,8 +721,9 @@ async fn missing_leader() {
 
     let cb = ConsensusBus::new();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    cb.recent_blocks()
-        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
+    cb.recent_blocks().send_modify(|blocks| {
+        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+    });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
     Consensus::spawn(config, &cb, bullshark, &task_manager);
@@ -784,8 +788,9 @@ async fn committed_round_after_restart() {
 
         let cb = ConsensusBus::new();
         let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-        cb.recent_blocks()
-            .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
+        cb.recent_blocks().send_modify(|blocks| {
+            blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        });
         let mut rx_primary = cb.subscribe_committed_certificates();
         let mut rx_output = cb.subscribe_sequence();
         let mut task_manager = TaskManager::default();
@@ -1014,8 +1019,9 @@ async fn restart_with_new_committee() {
 
         let cb = ConsensusBus::new();
         let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-        cb.recent_blocks()
-            .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
+        cb.recent_blocks().send_modify(|blocks| {
+            blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        });
         let mut rx_output = cb.subscribe_sequence();
         let mut task_manager = TaskManager::default();
         Consensus::spawn(config.clone(), &cb, bullshark, &task_manager);

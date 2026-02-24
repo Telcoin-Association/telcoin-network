@@ -645,7 +645,7 @@ pub async fn create_committee_from_state(epoch_state: EpochState) -> eyre::Resul
         .map_err(|err| eyre::eyre!("failed to create bls key from on-chain bytes: {err:?}"))?;
     let mut committee_builder = CommitteeBuilder::new(epoch);
     for (bls_key, info) in validators {
-        committee_builder.add_authority(bls_key, 1, info.validatorAddress);
+        committee_builder.add_authority(bls_key, info.validatorAddress);
     }
     let committee = committee_builder.build();
     Ok(committee)

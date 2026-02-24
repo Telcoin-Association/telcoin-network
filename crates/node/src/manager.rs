@@ -1331,7 +1331,7 @@ where
             .take()
             .expect("epoch was finished with last consensus header");
         let target_hash = last_consensus_header.digest();
-        let parent_state = self.consensus_bus.latest_block_num_hash();
+        let parent_state = self.consensus_bus.latest_execution_block_num_hash();
 
         let epoch_rec = EpochRecord {
             epoch,
@@ -1541,11 +1541,7 @@ where
             let mut committee_builder = CommitteeBuilder::new(epoch);
 
             for validator in validators {
-                committee_builder.add_authority(
-                    validator.0,
-                    1, // set stake so every authority's weight is equal
-                    validator.1.validatorAddress,
-                );
+                committee_builder.add_authority(validator.0, validator.1.validatorAddress);
             }
             committee_builder.build()
         };
@@ -1908,12 +1904,13 @@ where
 
         for recent_block in engine.last_executed_output_blocks(block_capacity).await? {
             // On restore, use the block's consensus hash from parent_beacon_block_root.
-            // Round is set to 0 since we don't persist it; only the consensus hash matters
-            // for wait_for_consensus_execution resolution.
+            // Round is set to 0 since we don't persist it; consensus number/hash still allows
+            // wait_for_consensus_execution to resolve hash lookups.
             let consensus_hash = recent_block.parent_beacon_block_root.unwrap_or_default();
-            self.consensus_bus
-                .recent_blocks()
-                .send_modify(|blocks| blocks.push_latest(0, consensus_hash, Some(recent_block)));
+            let consensus_num_hash = BlockNumHash::new(recent_block.number, consensus_hash);
+            self.consensus_bus.recent_blocks().send_modify(|blocks| {
+                blocks.push_latest(0, consensus_num_hash, Some(recent_block))
+            });
         }
 
         Ok(())
@@ -1962,11 +1959,11 @@ where
     ) {
         let consensus_bus = self.consensus_bus.clone();
         task_manager.spawn_critical_task("engine updates for consensus", async move {
-            while let Some((latest_round, consensus_hash, latest_executed_block)) =
+            while let Some((latest_round, consensus_num_hash, latest_executed_block)) =
                 engine_update.recv().await
             {
                 consensus_bus.recent_blocks().send_modify(|blocks| {
-                    blocks.push_latest(latest_round, consensus_hash, latest_executed_block)
+                    blocks.push_latest(latest_round, consensus_num_hash, latest_executed_block)
                 });
             }
             error!(target: "engine", "engine updates ended, node will exit");

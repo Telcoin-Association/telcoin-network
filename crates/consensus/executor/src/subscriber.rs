@@ -19,7 +19,7 @@ use tn_types::{
     CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput, Database,
     Hash as _, Noticer, TaskManager, TaskSpawner, Timestamp, TnReceiver, TnSender, B256,
 };
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, warn};
 
 /// The `Subscriber` receives certificates sequenced by the consensus and waits until the
 /// downloaded all the transactions references by the certificates; it then
@@ -61,6 +61,7 @@ pub fn spawn_subscriber<DB: Database>(
     let committee = config.committee().clone();
     let client = config.local_network().clone();
     let mode = consensus_bus.current_node_mode();
+    info!(target: "tn::observer", node_mode = ?mode, "subscriber starting in mode");
     let subscriber = Subscriber {
         consensus_bus,
         config,
@@ -190,9 +191,36 @@ impl<DB: Database> Subscriber<DB> {
             self.network_handle.clone(),
             tasks,
         );
+        let mut processed_count: u64 = 0;
         while let Some(consensus_header) = rx_consensus_headers.recv().await {
+            let header_number = consensus_header.number;
             self.handle_consensus_header(consensus_header).await?;
+            processed_count += 1;
+
+            // Periodically log observer progress (every 100 blocks)
+            if processed_count.is_multiple_of(100) {
+                let latest_processed_consensus = self
+                    .consensus_bus
+                    .recent_blocks()
+                    .borrow()
+                    .latest_consensus_block_num_hash()
+                    .number;
+                let (latest_network_consensus, _) =
+                    self.consensus_bus.published_consensus_num_hash();
+                let consensus_sync_distance =
+                    latest_network_consensus.saturating_sub(latest_processed_consensus);
+                info!(
+                    target: "tn::observer",
+                    processed_count,
+                    header_number,
+                    latest_processed_consensus,
+                    latest_network_consensus,
+                    consensus_sync_distance,
+                    "observer follow progress"
+                );
+            }
         }
+        warn!(target: "tn::observer", "consensus header channel closed - observer stopped following");
         Ok(())
     }
 

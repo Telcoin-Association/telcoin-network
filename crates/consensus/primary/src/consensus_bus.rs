@@ -456,8 +456,8 @@ impl ConsensusBus {
     }
 
     /// Returns the latest executed block's number and hash.
-    pub fn latest_block_num_hash(&self) -> BlockNumHash {
-        self.inner_app.tx_recent_blocks.borrow().latest_block_num_hash()
+    pub fn latest_execution_block_num_hash(&self) -> BlockNumHash {
+        self.inner_app.tx_recent_blocks.borrow().latest_execution_block_num_hash()
     }
 
     /// Returns the last consensus round processed by the engine.
@@ -637,12 +637,12 @@ impl ConsensusBus {
         while self.recent_blocks().borrow().is_empty() {
             watch_execution_result.changed().await?;
         }
-        let mut current_number = self.latest_block_num_hash().number;
+        let mut current_number = self.latest_execution_block_num_hash().number;
         while current_number < target_number {
             watch_execution_result.changed().await?;
-            current_number = self.latest_block_num_hash().number;
+            current_number = self.latest_execution_block_num_hash().number;
         }
-        if self.recent_blocks().borrow().contains_hash(block.hash) {
+        if self.recent_blocks().borrow().contains_execution_hash(block.hash) {
             // Once we see our hash, should happen when current_number == target_number- trust
             // digesting for this, we are done.
             Ok(())
@@ -682,7 +682,7 @@ impl ConsensusBus {
         let last = self
             .recent_blocks()
             .borrow()
-            .latest_block()
+            .latest_execution_block()
             .header()
             .parent_beacon_block_root
             .and_then(|hash| db.get_consensus_by_hash(hash));
