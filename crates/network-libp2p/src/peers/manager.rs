@@ -259,17 +259,7 @@ impl PeerManager {
             self.apply_peer_action(peer_id, action);
         }
 
-        // Emit peer metrics via tracing for OpenTelemetry export.
-        let connected_count = self.peers.connected_peer_ids().count();
-        let connected_or_dialing = self.connected_or_dialing_peers().len();
-        let banned_count = self.temporarily_banned.len();
-        tracing::info!(
-            target: "tn::network",
-            connected_count,
-            connected_or_dialing,
-            banned_count,
-            "peer metrics heartbeat"
-        );
+        // TODO: Issue #254 update metrics
 
         // enforce connection limits
         self.prune_connected_peers();
