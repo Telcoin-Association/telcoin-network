@@ -32,7 +32,7 @@ pub fn execute_consensus_output(
     // output digest returns the `ConsensusHeader` digest
     let output_digest: B256 = output.digest().into();
     let leader_round = output.leader_round();
-    let consensus_hash = output.consensus_header_hash();
+    let consensus_num_hash = output.num_hash();
     let batches = output.flatten_batches();
 
     let span = info_span!(target: "telcoin", "execute-consensus", epoch,
@@ -63,7 +63,7 @@ pub fn execute_consensus_output(
             info!(target: "engine", "skipping execution for empty non-epoch-closing output");
             span.record("executed_blocks", "0");
             // Notify consensus that this round was processed (no block produced)
-            engine_update_tx.try_send((leader_round, consensus_hash, None)).map_err(|e| {
+            engine_update_tx.try_send((leader_round, consensus_num_hash, None)).map_err(|e| {
                 error!(target: "engine", ?e, "engine update channel send failed");
                 TnEngineError::ChannelClosed
             })?;
@@ -152,7 +152,7 @@ pub fn execute_consensus_output(
 
     reth_env.finish_executing_output(
         executed_blocks,
-        Some((leader_round, consensus_hash, engine_update_tx)),
+        Some((leader_round, consensus_num_hash, engine_update_tx)),
     )?;
     // remove blocks from memory and stores them in the database
     reth_env.finalize_block(canonical_header.clone())?;

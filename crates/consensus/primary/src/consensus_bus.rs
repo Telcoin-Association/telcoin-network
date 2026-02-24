@@ -457,8 +457,8 @@ impl ConsensusBus {
     }
 
     /// Returns the latest executed block's number and hash.
-    pub fn latest_block_num_hash(&self) -> BlockNumHash {
-        self.inner_app.tx_recent_blocks.borrow().latest_block_num_hash()
+    pub fn latest_execution_block_num_hash(&self) -> BlockNumHash {
+        self.inner_app.tx_recent_blocks.borrow().latest_execution_block_num_hash()
     }
 
     /// Returns the last consensus round processed by the engine.
@@ -638,12 +638,12 @@ impl ConsensusBus {
         while self.recent_blocks().borrow().is_empty() {
             watch_execution_result.changed().await?;
         }
-        let mut current_number = self.latest_block_num_hash().number;
+        let mut current_number = self.latest_execution_block_num_hash().number;
         while current_number < target_number {
             watch_execution_result.changed().await?;
-            current_number = self.latest_block_num_hash().number;
+            current_number = self.latest_execution_block_num_hash().number;
         }
-        if self.recent_blocks().borrow().contains_hash(block.hash) {
+        if self.recent_blocks().borrow().contains_execution_hash(block.hash) {
             // Once we see our hash, should happen when current_number == target_number- trust
             // digesting for this, we are done.
             Ok(())
@@ -680,8 +680,12 @@ impl ConsensusBus {
         epoch: Option<Epoch>,
         consensus_chain: &ConsensusChain,
     ) -> Option<ConsensusHeader> {
-        let parent_beacon_block_root =
-            self.recent_blocks().borrow().latest_block().header().parent_beacon_block_root;
+        let parent_beacon_block_root = self
+            .recent_blocks()
+            .borrow()
+            .latest_execution_block()
+            .header()
+            .parent_beacon_block_root;
         if let Some(consensus_hash) = parent_beacon_block_root {
             consensus_chain
                 .consensus_header_by_digest(epoch, consensus_hash)

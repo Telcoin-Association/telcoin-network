@@ -15,7 +15,7 @@ use tn_primary::{
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
 use tn_test_utils::{create_signed_certificates_for_rounds, CommitteeFixture};
 use tn_types::{
-    ExecHeader, SealedHeader, TaskManager, TnReceiver as _, TnSender as _, B256,
+    BlockNumHash, ExecHeader, SealedHeader, TaskManager, TnReceiver as _, TnSender as _, B256,
     DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::sync::mpsc;
@@ -84,9 +84,9 @@ async fn test_output_to_header() -> eyre::Result<()> {
     );
 
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    consensus_bus
-        .recent_blocks()
-        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
+    consensus_bus.recent_blocks().send_modify(|blocks| {
+        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+    });
     let task_manager = TaskManager::default();
     Consensus::spawn(config.clone(), &consensus_bus, bullshark, &task_manager, consensus_chain)
         .await;
@@ -185,9 +185,9 @@ async fn test_executor_output_ordering() -> eyre::Result<()> {
     );
 
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    consensus_bus
-        .recent_blocks()
-        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
+    consensus_bus.recent_blocks().send_modify(|blocks| {
+        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+    });
     let task_manager2 = TaskManager::default();
     Consensus::spawn(
         config.clone(),
@@ -283,9 +283,9 @@ async fn test_executor_batch_fetching() -> eyre::Result<()> {
     );
 
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    consensus_bus
-        .recent_blocks()
-        .send_modify(|blocks| blocks.push_latest(0, B256::default(), Some(dummy_parent)));
+    consensus_bus.recent_blocks().send_modify(|blocks| {
+        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+    });
     let task_manager2 = TaskManager::default();
     Consensus::spawn(config.clone(), &consensus_bus, bullshark, &task_manager2, consensus_chain)
         .await;

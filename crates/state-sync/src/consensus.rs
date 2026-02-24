@@ -7,7 +7,7 @@ use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus};
 use tn_storage::{consensus::ConsensusChain, tables::EpochRecords};
 use tn_types::{Database as TNDatabase, Epoch, EpochRecord, TaskSpawner, B256};
 use tokio::sync::{mpsc::Receiver, Mutex, Semaphore, SemaphorePermit};
-use tracing::{debug, error, info};
+use tracing::{debug, info, warn};
 
 /// Retrieve a consensus header from a peer.
 /// If we are requesting a hash then that hash should
@@ -50,7 +50,13 @@ async fn get_consensus_header<DB: TNDatabase>(
             Some((epoch, parent_number, parent))
         }
         Err(e) => {
-            error!(target: "state-sync", ?e, "error requesting consensus!");
+            warn!(
+                target: "tn::observer",
+                %e,
+                ?hash,
+                ?number,
+                "failed to fetch consensus header from peer"
+            );
             None
         }
     }

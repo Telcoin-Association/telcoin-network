@@ -15,6 +15,11 @@ use tn_types::{BlockHash, ConsensusHeader, Epoch, EpochCertificate, EpochRecord,
 #[rpc(server, namespace = "tn")]
 pub trait TelcoinNetworkRpcExtApi {
     /// Return the latest consensus header.
+    #[method(name = "latestConsensusHeader")]
+    async fn latest_consensus_header(&self) -> TelcoinNetworkRpcResult<ConsensusHeader>;
+    /// Return the latest consensus header.
+    ///
+    /// Deprecated alias for `tn_latestConsensusHeader`.
     #[method(name = "latestHeader")]
     async fn latest_header(&self) -> TelcoinNetworkRpcResult<ConsensusHeader>;
     /// Return the chain genesis.
@@ -50,6 +55,10 @@ impl<N: EngineToPrimary> TelcoinNetworkRpcExtApiServer for TelcoinNetworkRpcExt<
 where
     N: Send + Sync + 'static,
 {
+    async fn latest_consensus_header(&self) -> TelcoinNetworkRpcResult<ConsensusHeader> {
+        Ok(self.inner_node_network.get_latest_consensus_block())
+    }
+
     async fn latest_header(&self) -> TelcoinNetworkRpcResult<ConsensusHeader> {
         Ok(self.inner_node_network.get_latest_consensus_block())
     }

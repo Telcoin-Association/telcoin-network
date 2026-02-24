@@ -233,6 +233,16 @@ async fn catch_up_consensus_from_to(
     // Catch up to the current chain state if we need to.
     let last_consensus_height = from.number;
     let max_consensus_height = max_consensus.number;
+    let catchup_distance = max_consensus_height.saturating_sub(last_consensus_height);
+    if catchup_distance > 0 {
+        info!(
+            target: "tn::observer",
+            last_consensus_height,
+            max_consensus_height,
+            catchup_distance,
+            "catching up consensus blocks"
+        );
+    }
     if last_consensus_height >= max_consensus_height {
         return Ok(from);
     }
@@ -256,7 +266,11 @@ async fn catch_up_consensus_from_to(
         last_parent =
             ConsensusHeader::digest_from_parts(parent_hash, &consensus_header.sub_dag, number);
         if last_parent != consensus_header.digest() {
-            error!(target: "state-sync", "consensus header digest mismatch!");
+            error!(
+                target: "tn::observer",
+                block_number = number,
+                "consensus header digest mismatch - possible fork detected"
+            );
             return Err(eyre::eyre!("consensus header digest mismatch!"));
         }
 
@@ -268,6 +282,12 @@ async fn catch_up_consensus_from_to(
         // an issue (except during initial catch up).
         if consensus_bus.wait_for_execution(base_execution_block).await.is_err() {
             // We seem to have forked, so die.
+            error!(
+                target: "tn::observer",
+                block_number = number,
+                ?base_execution_block,
+                "wait_for_execution failed - execution fork detected"
+            );
             return Err(eyre::eyre!(
                 "consensus_output has a parent not in our chain, missing {base_execution_block:?} recents: {:?}!",
                 consensus_bus.recent_blocks().borrow()

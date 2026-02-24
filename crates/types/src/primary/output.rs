@@ -3,10 +3,11 @@
 
 use super::ConsensusHeader;
 use crate::{
-    crypto, encode, Address, Batch, BlockHash, BlsSignature, Certificate, Digest, Epoch, Hash,
-    ReputationScores, Round, SealedHeader, TimestampSec, B256,
+    crypto, encode, Address, Batch, BlockHash, BlockNumHash, BlsSignature, Certificate, Digest,
+    Epoch, Hash, ReputationScores, Round, SealedHeader, TimestampSec, B256,
 };
 use alloy::primitives::keccak256;
+use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
@@ -23,9 +24,9 @@ pub type SequenceNumber = u64;
 ///
 /// Tuple contents are:
 /// - leader round from consensus
-/// - consensus header hash
+/// - consensus block number/hash
 /// - latest canonical tip when execution produced a block (`None` when execution was skipped)
-pub type EngineUpdate = (Round, B256, Option<SealedHeader>);
+pub type EngineUpdate = (Round, BlockNumHash, Option<SealedHeader>);
 
 #[derive(Debug, Clone)]
 /// Struct that contains all necessary information for executing a batch post-consensus.
@@ -71,6 +72,8 @@ pub struct ConsensusOutput {
     ///
     /// The engine should make a system call to consensus registry contract to close the epoch.
     pub close_epoch: bool,
+    /// Cached digest of the consensus header for this output.
+    pub consensus_header_hash_cache: OnceCell<B256>,
 }
 
 impl ConsensusOutput {
@@ -93,6 +96,7 @@ impl ConsensusOutput {
                 ..Default::default()
             }),
             close_epoch,
+            consensus_header_hash_cache: OnceCell::default(),
         }
     }
     pub fn new_with_subdag(
@@ -194,11 +198,18 @@ impl ConsensusOutput {
 
     /// Return the hash of the consensus header that matches this output.
     pub fn consensus_header_hash(&self) -> B256 {
-        ConsensusHeader::digest_from_parts(
-            self.inner.parent_hash,
-            &self.inner.sub_dag,
-            self.inner.number,
-        )
+        *self.consensus_header_hash_cache.get_or_init(|| {
+            ConsensusHeader::digest_from_parts(
+                self.inner.parent_hash,
+                &self.inner.sub_dag,
+                self.inner.number,
+            )
+        })
+    }
+
+    /// Return number/hash tuple for this consensus output.
+    pub fn num_hash(&self) -> BlockNumHash {
+        BlockNumHash::new(self.inner.number, self.consensus_header_hash())
     }
 
     /// Return a `bool` if this is the last batch (by index) of the last output for the epoch.

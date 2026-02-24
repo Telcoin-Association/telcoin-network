@@ -211,7 +211,7 @@ impl<DB: Database> Proposer<DB> {
             current_epoch,
             digests.iter().map(|m| (m.digest, m.worker_id)).collect(),
             parents.iter().map(|x| x.digest()).collect(),
-            consensus_bus.latest_block_num_hash(),
+            consensus_bus.latest_execution_block_num_hash(),
         );
 
         // Metric: header_proposed - tracks header proposals

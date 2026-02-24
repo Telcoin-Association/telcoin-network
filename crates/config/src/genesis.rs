@@ -139,7 +139,6 @@ impl NetworkGenesis {
         for (pubkey, validator) in self.validators.iter() {
             committee_builder.add_authority_and_bootstrap(
                 *pubkey,
-                1,
                 (
                     validator.primary_network_address().clone(),
                     validator.primary_network_key().clone(),
