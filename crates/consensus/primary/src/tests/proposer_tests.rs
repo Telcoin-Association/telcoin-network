@@ -13,7 +13,7 @@ async fn test_empty_proposal() {
     let primary = fixture.authorities().next().unwrap();
 
     let cb = ConsensusBus::new();
-    let mut rx_headers = cb.headers().subscribe();
+    let mut rx_headers = cb.subscribe_headers();
     let task_manager = TaskManager::default();
     let proposer = Proposer::new(
         primary.consensus_config(),
@@ -48,7 +48,7 @@ async fn test_equivocation_protection_after_restart() {
     */
     // Spawn the proposer.
     let cb = ConsensusBus::new();
-    let mut rx_headers = cb.headers().subscribe();
+    let mut rx_headers = cb.subscribe_headers();
     let mut task_manager = TaskManager::default();
     let proposer = Proposer::new(
         primary.consensus_config(),
@@ -95,7 +95,7 @@ async fn test_equivocation_protection_after_restart() {
     .is_ok());
 
     let cb = ConsensusBus::new();
-    let mut rx_headers = cb.headers().subscribe();
+    let mut rx_headers = cb.subscribe_headers();
     let task_manager = TaskManager::default();
     let proposer = Proposer::new(
         primary.consensus_config(),

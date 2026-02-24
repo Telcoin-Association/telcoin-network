@@ -267,28 +267,29 @@ fn run_restart_tests2(client_urls: &[String; 4]) -> eyre::Result<()> {
 }
 
 fn network_advancing(client_urls: &[String; 4]) -> eyre::Result<()> {
-    fn max_start(client_urls: &[String; 4]) -> eyre::Result<u64> {
-        let mut start_num = get_block_number(&client_urls[0])?;
-        start_num = start_num.max(get_block_number(&client_urls[1])?);
-        start_num = start_num.max(get_block_number(&client_urls[2])?);
-        start_num = start_num.max(get_block_number(&client_urls[3])?);
-        Ok(start_num)
-    }
-    let start_num = max_start(client_urls)?;
-    let mut next_num = start_num;
+    // Wait for all nodes to respond to RPC.
+    // With skip-empty-execution, blocks are only produced when transactions
+    // exist or an epoch closes, so we cannot rely on block_number advancing
+    // during idle periods. Actual block production is verified later by
+    // send_and_confirm().
     let mut i = 0;
-    // Wait until a node is advancing agian, network should be back now.
-    while next_num <= start_num {
+    loop {
+        let mut all_responsive = true;
+        for url in client_urls {
+            if get_block_number(url).is_err() {
+                all_responsive = false;
+                break;
+            }
+        }
+        if all_responsive {
+            return Ok(());
+        }
         std::thread::sleep(Duration::from_secs(1));
-        next_num = max_start(client_urls)?;
         i += 1;
         if i > 45 {
-            return Err(eyre::eyre!(
-                "Network not advancing past {next_num} within 45 seconds after restart!"
-            ));
+            return Err(eyre::eyre!("Network not responding within 45 seconds!"));
         }
     }
-    Ok(())
 }
 
 fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
@@ -691,6 +692,31 @@ fn get_block_number(node: &str) -> eyre::Result<u64> {
     Ok(u64::from_str_radix(&block["number"].as_str().unwrap_or("0x100_000")[2..], 16)?)
 }
 
+fn get_latest_consensus_header(node: &str) -> eyre::Result<HashMap<String, Value>> {
+    call_rpc(node, "tn_latestConsensusHeader", rpc_params![], 10, "tn_latestConsensusHeader")
+}
+
+fn get_latest_consensus_header_number(node: &str) -> eyre::Result<u64> {
+    let header = get_latest_consensus_header(node)?;
+    let value = header
+        .get("number")
+        .ok_or_else(|| Report::msg("tn_latestConsensusHeader missing `number` field"))?;
+
+    match value {
+        Value::Number(n) => n
+            .as_u64()
+            .ok_or_else(|| Report::msg("tn_latestConsensusHeader number is not u64-compatible")),
+        Value::String(s) if s.starts_with("0x") => {
+            u64::from_str_radix(s.trim_start_matches("0x"), 16)
+                .map_err(|e| Report::msg(format!("failed to parse consensus number hex: {e}")))
+        }
+        Value::String(s) => s
+            .parse::<u64>()
+            .map_err(|e| Report::msg(format!("failed to parse consensus number: {e}"))),
+        _ => Err(Report::msg("tn_latestConsensusHeader number has unexpected type")),
+    }
+}
+
 /// Take a string and return the deterministic account derived from it.  This is be used
 /// with similiar functionality in the test client to allow easy testing using simple strings
 /// for accounts.
@@ -827,4 +853,183 @@ where
     });
 
     Ok(resp?)
+}
+
+/// Test that an observer started AFTER validators have already produced blocks
+/// can catch up to the current chain height.
+/// This tests the state-sync catch-up path which is critical for observer reliability.
+#[test]
+#[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
+fn test_observer_late_join_catchup() -> eyre::Result<()> {
+    let _guard = IT_TEST_MUTEX.lock();
+    init_test_tracing();
+    info!(target: "restart-test", "test_observer_late_join_catchup");
+    let tmp_guard = tempfile::TempDir::new().expect("tempdir is okay");
+    let temp_path = tmp_guard.path().to_path_buf();
+    {
+        config_local_testnet(&temp_path, Some("restart_test".to_string()), None)
+            .expect("failed to config");
+    }
+    let bin = e2e_tests::get_telcoin_network_binary();
+
+    // Start 4 validators WITHOUT the observer
+    let mut children: [Option<Child>; 4] = [None, None, None, None];
+    let mut client_urls = [
+        "http://127.0.0.1".to_string(),
+        "http://127.0.0.1".to_string(),
+        "http://127.0.0.1".to_string(),
+        "http://127.0.0.1".to_string(),
+    ];
+    for (i, child) in children.iter_mut().enumerate() {
+        let rpc_port = get_available_tcp_port("127.0.0.1")
+            .expect("Failed to get an ephemeral rpc port for child!");
+        client_urls[i].push_str(&format!(":{rpc_port}"));
+        *child = Some(start_validator(i, &bin, &temp_path, rpc_port, "late_join", 0));
+    }
+
+    // Wait for validators to produce blocks
+    network_advancing(&client_urls)?;
+
+    // Send transactions to advance chain further
+    let key = get_key("test-source");
+    let to_account = address_from_word("late-join-target");
+    send_and_confirm(&client_urls[0], &client_urls[1], &key, to_account, 0)?;
+    send_and_confirm(&client_urls[1], &client_urls[2], &key, to_account, 1)?;
+
+    // Record current validator consensus height
+    let validator_consensus_height = get_latest_consensus_header_number(&client_urls[0])?;
+    info!(target: "restart-test", ?validator_consensus_height, "validators advanced, now starting observer");
+
+    // NOW start the observer (it must catch up from behind)
+    let obs_rpc_port = get_available_tcp_port("127.0.0.1")
+        .expect("Failed to get an ephemeral rpc port for observer!");
+    let obs_url = format!("http://127.0.0.1:{obs_rpc_port}");
+    let mut obs_child = start_observer(4, &bin, &temp_path, obs_rpc_port, "late_join", 0);
+
+    // Observer must catch up to at least the validator consensus height we recorded
+    let mut retries = 0;
+    let max_retries = 120; // 120 seconds max
+    let caught_up = loop {
+        if let Ok(obs_consensus_height) = get_latest_consensus_header_number(&obs_url) {
+            if obs_consensus_height >= validator_consensus_height {
+                info!(target: "restart-test", ?obs_consensus_height, ?validator_consensus_height, "observer caught up");
+                break true;
+            }
+            info!(target: "restart-test", ?obs_consensus_height, ?validator_consensus_height, retries, "observer still catching up");
+        }
+        retries += 1;
+        if retries >= max_retries {
+            break false;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    };
+
+    // Cleanup
+    for child in children.iter_mut() {
+        let child = child.as_mut().expect("missing a child");
+        send_term(child);
+    }
+    send_term(&mut obs_child);
+    for child in children.iter_mut() {
+        let child = child.as_mut().expect("missing a child");
+        kill_child(child);
+    }
+    kill_child(&mut obs_child);
+
+    assert!(caught_up, "Observer did not catch up within {max_retries}s");
+    Ok(())
+}
+
+/// Test that an observer can recover after being paused (simulating network partition).
+/// Uses SIGSTOP/SIGCONT to pause the observer while validators continue producing blocks,
+/// then verifies the observer catches back up.
+#[test]
+#[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
+fn test_observer_reconnect_after_pause() -> eyre::Result<()> {
+    let _guard = IT_TEST_MUTEX.lock();
+    init_test_tracing();
+    info!(target: "restart-test", "test_observer_reconnect_after_pause");
+    let tmp_guard = tempfile::TempDir::new().expect("tempdir is okay");
+    let temp_path = tmp_guard.path().to_path_buf();
+    {
+        config_local_testnet(&temp_path, Some("restart_test".to_string()), None)
+            .expect("failed to config");
+    }
+    let bin = e2e_tests::get_telcoin_network_binary();
+
+    // Start 4 validators + 1 observer
+    let mut children: [Option<Child>; 4] = [None, None, None, None];
+    let mut client_urls = [
+        "http://127.0.0.1".to_string(),
+        "http://127.0.0.1".to_string(),
+        "http://127.0.0.1".to_string(),
+        "http://127.0.0.1".to_string(),
+    ];
+    for (i, child) in children.iter_mut().enumerate() {
+        let rpc_port = get_available_tcp_port("127.0.0.1")
+            .expect("Failed to get an ephemeral rpc port for child!");
+        client_urls[i].push_str(&format!(":{rpc_port}"));
+        *child = Some(start_validator(i, &bin, &temp_path, rpc_port, "reconnect", 0));
+    }
+    let obs_rpc_port = get_available_tcp_port("127.0.0.1")
+        .expect("Failed to get an ephemeral rpc port for observer!");
+    let obs_url = format!("http://127.0.0.1:{obs_rpc_port}");
+    let mut obs_child = start_observer(4, &bin, &temp_path, obs_rpc_port, "reconnect", 0);
+
+    // Wait for network to advance and observer to be in sync
+    network_advancing(&client_urls)?;
+    std::thread::sleep(Duration::from_secs(5));
+
+    let initial_obs_consensus_height = get_latest_consensus_header_number(&obs_url)?;
+    info!(target: "restart-test", ?initial_obs_consensus_height, "observer synced, pausing it");
+
+    // SIGSTOP the observer (simulate network partition / process freeze)
+    let obs_pid = Pid::from_raw(obs_child.id() as i32);
+    signal::kill(obs_pid, Signal::SIGSTOP)?;
+
+    // Let validators advance for 15 seconds while observer is paused
+    std::thread::sleep(Duration::from_secs(15));
+    let validator_consensus_height_during_pause =
+        get_latest_consensus_header_number(&client_urls[0])?;
+    info!(target: "restart-test", ?validator_consensus_height_during_pause, "validators advanced while observer paused");
+    assert!(
+        validator_consensus_height_during_pause > initial_obs_consensus_height + 5,
+        "Validators should have advanced significantly"
+    );
+
+    // SIGCONT the observer (resume)
+    signal::kill(obs_pid, Signal::SIGCONT)?;
+    info!(target: "restart-test", "observer resumed, waiting for catchup");
+
+    // Observer must catch up
+    let mut retries = 0;
+    let max_retries = 60;
+    let caught_up = loop {
+        if let Ok(obs_consensus_height) = get_latest_consensus_header_number(&obs_url) {
+            if obs_consensus_height >= validator_consensus_height_during_pause {
+                info!(target: "restart-test", ?obs_consensus_height, ?validator_consensus_height_during_pause, "observer recovered");
+                break true;
+            }
+        }
+        retries += 1;
+        if retries >= max_retries {
+            break false;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    };
+
+    // Cleanup
+    for child in children.iter_mut() {
+        let child = child.as_mut().expect("missing a child");
+        send_term(child);
+    }
+    send_term(&mut obs_child);
+    for child in children.iter_mut() {
+        let child = child.as_mut().expect("missing a child");
+        kill_child(child);
+    }
+    kill_child(&mut obs_child);
+
+    assert!(caught_up, "Observer did not recover within {max_retries}s after SIGCONT");
+    Ok(())
 }

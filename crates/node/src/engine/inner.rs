@@ -19,8 +19,9 @@ use tn_reth::{
 use tn_rpc::{EngineToPrimary, TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator},
-    Address, BatchSender, BatchValidation, BlockHeader, BlsPublicKey, ConsensusOutput, Epoch,
-    ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId, B256, MIN_PROTOCOL_BASE_FEE,
+    Address, BatchSender, BatchValidation, BlockHeader, BlsPublicKey, ConsensusOutput,
+    EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId, B256,
+    MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::mpsc;
@@ -55,6 +56,7 @@ impl ExecutionNodeInner {
         rx_output: mpsc::Receiver<ConsensusOutput>,
         rx_shutdown: Noticer,
         gas_accumulator: GasAccumulator,
+        engine_update_tx: mpsc::Sender<EngineUpdate>,
     ) -> eyre::Result<()> {
         let parent_header = self.reth_env.lookup_head()?;
 
@@ -70,6 +72,7 @@ impl ExecutionNodeInner {
             rx_shutdown,
             self.reth_env.get_task_spawner().clone(),
             gas_accumulator,
+            engine_update_tx,
         );
 
         // spawn tn engine

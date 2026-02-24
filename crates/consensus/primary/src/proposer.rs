@@ -211,7 +211,7 @@ impl<DB: Database> Proposer<DB> {
             current_epoch,
             digests.iter().map(|m| (m.digest, m.worker_id)).collect(),
             parents.iter().map(|x| x.digest()).collect(),
-            consensus_bus.latest_block_num_hash(),
+            consensus_bus.latest_execution_block_num_hash(),
         );
 
         // Metric: header_proposed - tracks header proposals
@@ -644,9 +644,13 @@ impl<DB: Database> Proposer<DB> {
 
     pub(crate) fn spawn(mut self, task_manager: &TaskManager) {
         if self.consensus_bus.node_mode().borrow().is_active_cvv() {
+            // Subscribe before spawning so channels are active before any messages are sent.
+            let rx_our_digests = self.consensus_bus.subscribe_our_digests();
+            let rx_parents = self.consensus_bus.subscribe_parents();
+            let rx_committed_own_headers = self.consensus_bus.subscribe_committed_own_headers();
             task_manager.spawn_critical_task("proposer task", async move {
                 info!(target: "primary::proposer", "Starting proposer");
-                self.run().await
+                self.run(rx_our_digests, rx_parents, rx_committed_own_headers).await
             });
         }
         // If not an active CVV then don't propose anything.
@@ -665,11 +669,12 @@ impl<DB: Database> Proposer<DB> {
 
     /// Run the proposer task.
     /// Returns Ok on shutdown or an error to indicate a fatal condition.
-    async fn run(&mut self) -> ProposerResult<()> {
-        let mut rx_our_digests = self.consensus_bus.our_digests().subscribe();
-        let mut rx_parents = self.consensus_bus.parents().subscribe();
-        let mut rx_committed_own_headers = self.consensus_bus.committed_own_headers().subscribe();
-
+    async fn run(
+        &mut self,
+        mut rx_our_digests: impl TnReceiver<OurDigestMessage>,
+        mut rx_parents: impl TnReceiver<(Vec<Certificate>, Round)>,
+        mut rx_committed_own_headers: impl TnReceiver<(Round, Vec<Round>)>,
+    ) -> ProposerResult<()> {
         let mut pending_header = None;
         let mut max_delay_timed_out = false;
         let mut min_delay_timed_out = false;

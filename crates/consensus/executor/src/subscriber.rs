@@ -13,13 +13,13 @@ use tn_primary::{
     network::{ConsensusResult, PrimaryNetworkHandle},
     ConsensusBus, NodeMode,
 };
-use tn_storage::CertificateStore;
+use tn_storage::{tables::ConsensusBlocks, CertificateStore};
 use tn_types::{
     encode, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash, BlsSigner as _,
     CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput, Database,
     Hash as _, Noticer, TaskManager, TaskSpawner, Timestamp, TnReceiver, TnSender, B256,
 };
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, warn};
 
 /// The `Subscriber` receives certificates sequenced by the consensus and waits until the
 /// downloaded all the transactions references by the certificates; it then
@@ -60,7 +60,8 @@ pub fn spawn_subscriber<DB: Database>(
     let authority_id = config.authority_id();
     let committee = config.committee().clone();
     let client = config.local_network().clone();
-    let mode = *consensus_bus.node_mode().borrow();
+    let mode = consensus_bus.current_node_mode();
+    info!(target: "tn::observer", node_mode = ?mode, "subscriber starting in mode");
     let subscriber = Subscriber {
         consensus_bus,
         config,
@@ -70,9 +71,11 @@ pub fn spawn_subscriber<DB: Database>(
     match mode {
         // If we are active then partcipate in consensus.
         NodeMode::CvvActive => {
+            // Subscribe before spawning so the channel is active before any messages are sent.
+            let rx_sequence = subscriber.consensus_bus.subscribe_sequence();
             task_manager.spawn_critical_task("subscriber consensus", async move {
                 info!(target: "subscriber", "Starting subscriber: CVV");
-                if let Err(e) = subscriber.run(rx_shutdown).await {
+                if let Err(e) = subscriber.run(rx_shutdown, rx_sequence).await {
                     error!(target: "subscriber", "Error subscriber consensus: {e}");
                 }
             });
@@ -153,7 +156,7 @@ impl<DB: Database> Subscriber<DB> {
     /// Catch up to current consensus and then try to rejoin as an active CVV.
     async fn catch_up_rejoin_consensus(&self, tasks: TaskSpawner) -> SubscriberResult<()> {
         // Get a receiver and then stream any missing headers so we don't miss them.
-        let mut rx_consensus_headers = self.consensus_bus.consensus_header().subscribe();
+        let mut rx_consensus_headers = self.consensus_bus.subscribe_consensus_header();
         spawn_state_sync(
             self.config.clone(),
             self.consensus_bus.clone(),
@@ -181,16 +184,43 @@ impl<DB: Database> Subscriber<DB> {
     /// Follow along with consensus output but do not try to join consensus.
     async fn follow_consensus(&self, tasks: TaskSpawner) -> SubscriberResult<()> {
         // Get a receiver then stream any missing headers so we don't miss them.
-        let mut rx_consensus_headers = self.consensus_bus.consensus_header().subscribe();
+        let mut rx_consensus_headers = self.consensus_bus.subscribe_consensus_header();
         spawn_state_sync(
             self.config.clone(),
             self.consensus_bus.clone(),
             self.network_handle.clone(),
             tasks,
         );
+        let mut processed_count: u64 = 0;
         while let Some(consensus_header) = rx_consensus_headers.recv().await {
+            let header_number = consensus_header.number;
             self.handle_consensus_header(consensus_header).await?;
+            processed_count += 1;
+
+            // Periodically log observer progress (every 100 blocks)
+            if processed_count.is_multiple_of(100) {
+                let latest_processed_consensus = self
+                    .consensus_bus
+                    .recent_blocks()
+                    .borrow()
+                    .latest_consensus_block_num_hash()
+                    .number;
+                let (latest_network_consensus, _) =
+                    self.consensus_bus.published_consensus_num_hash();
+                let consensus_sync_distance =
+                    latest_network_consensus.saturating_sub(latest_processed_consensus);
+                info!(
+                    target: "tn::observer",
+                    processed_count,
+                    header_number,
+                    latest_processed_consensus,
+                    latest_network_consensus,
+                    consensus_sync_distance,
+                    "observer follow progress"
+                );
+            }
         }
+        warn!(target: "tn::observer", "consensus header channel closed - observer stopped following");
         Ok(())
     }
 
@@ -199,20 +229,42 @@ impl<DB: Database> Subscriber<DB> {
     /// This method is called on startup to retrieve the needed information to build the next
     /// `ConsensusHeader` off of this parent.
     async fn get_last_executed_consensus(&self) -> SubscriberResult<(BlockHash, u64)> {
-        // Get the DB and load our last executed consensus block (note there may be unexecuted
-        // blocks, catch up will execute them).
+        // Load the consensus block associated with the latest executed EVM block.
+        // This can lag when outputs were processed but execution was skipped (empty rounds).
         let last_executed_block =
             last_executed_consensus_block(&self.consensus_bus, self.config.node_storage())
                 .unwrap_or_default();
 
-        info!(target: "subscriber", ?last_executed_block, "restoring last executed consensus for constucting the next ConsensusHeader:");
+        // Use the latest persisted consensus header as startup parent when it is newer.
+        // replay_missed_consensus + wait_for_consensus_execution ensures this header has already
+        // been processed by execution (including skipped rounds).
+        let (_, last_db_block) = self
+            .config
+            .node_storage()
+            .last_record::<ConsensusBlocks>()
+            .unwrap_or((last_executed_block.number, last_executed_block.clone()));
+        let parent = if last_db_block.number > last_executed_block.number {
+            last_db_block
+        } else {
+            last_executed_block
+        };
 
-        Ok((last_executed_block.digest(), last_executed_block.number))
+        info!(
+            target: "subscriber",
+            ?parent,
+            "restoring last executed consensus for constucting the next ConsensusHeader:"
+        );
+
+        Ok((parent.digest(), parent.number))
     }
 
     /// Main loop connecting to the consensus to listen to sequence messages.
     #[instrument(level = "info", skip_all, fields(authority = ?self.inner.authority_id))]
-    async fn run(self, rx_shutdown: Noticer) -> SubscriberResult<()> {
+    async fn run(
+        self,
+        rx_shutdown: Noticer,
+        mut rx_sequence: impl TnReceiver<CommittedSubDag>,
+    ) -> SubscriberResult<()> {
         // It's important to have the futures in ordered fashion as we want
         // to guarantee that will deliver to the executor the certificates
         // in the same order we received from rx_sequence. So it doesn't
@@ -223,7 +275,7 @@ impl<DB: Database> Subscriber<DB> {
 
         let (mut last_parent, mut last_number) = self.get_last_executed_consensus().await?;
 
-        let mut rx_sequence = self.consensus_bus.sequence().subscribe();
+        // rx_sequence is now passed as parameter to avoid race condition
         // Listen to sequenced consensus message and process them.
         loop {
             tokio::select! {

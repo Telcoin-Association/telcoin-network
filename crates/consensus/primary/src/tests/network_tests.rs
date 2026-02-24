@@ -17,7 +17,7 @@ use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     error::HeaderError, now, AuthorityIdentifier, BlockHash, BlockHeader, BlockNumHash,
     BlsPublicKey, Certificate, CertificateDigest, EpochVote, ExecHeader, Hash as _, SealedHeader,
-    TaskManager, TnReceiver, TnSender,
+    TaskManager, B256,
 };
 use tracing::debug;
 
@@ -58,8 +58,6 @@ struct TestTypes<DB = MemDatabase> {
     /// Task manager the synchronizer (in RequestHandler) is spawned on.
     /// Save it so that task is not dropped early if needed.
     task_manager: TaskManager,
-    /// The consensus bus for tests.
-    consensus_bus: ConsensusBus,
 }
 
 /// Helper function to create an instance of [RequestHandler] for the first authority in the
@@ -81,11 +79,11 @@ fn create_test_types() -> TestTypes {
 
     // set the latest execution result to genesis - test headers are proposed for round 1
     let mut recent = RecentBlocks::new(1);
-    recent.push_latest(parent.clone());
+    recent.push_latest(0, BlockNumHash::new(0, B256::default()), Some(parent.clone()));
     cb.recent_blocks().send_replace(recent);
 
     let handler = RequestHandler::new(config.clone(), cb.clone(), synchronizer);
-    TestTypes { committee, handler, parent, task_manager, consensus_bus: cb }
+    TestTypes { committee, handler, parent, task_manager }
 }
 
 #[tokio::test]
@@ -304,14 +302,7 @@ async fn test_vote_fails_unknown_authority() -> eyre::Result<()> {
 /// Test that primary pub/sub is enforcing topics.
 #[tokio::test]
 async fn test_primary_batch_gossip_topics() {
-    let TestTypes { handler, task_manager, consensus_bus, .. } = create_test_types();
-
-    task_manager.spawn_task("process-gossip-test", async move {
-        let mut rx = consensus_bus.new_epoch_votes().subscribe();
-        while let Some((_, tx)) = rx.recv().await {
-            let _ = tx.send(Ok(()));
-        }
-    });
+    let TestTypes { handler, .. } = create_test_types();
 
     let gossip = PrimaryGossip::Certificate(Box::new(Certificate::default()));
     let data = tn_types::encode(&gossip);
@@ -328,11 +319,15 @@ async fn test_primary_batch_gossip_topics() {
     let good_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     assert!(handler.process_gossip(&good_msg).await.is_ok());
 
+    // EpochVote::default() has an invalid signature, so check_signature() fails in the handler
+    // and returns InvalidHeader(PeerNotAuthor).
     let gossip = PrimaryGossip::EpochVote(Box::new(EpochVote::default()));
     let data = tn_types::encode(&gossip);
     let topic = TopicHash::from_raw(tn_config::LibP2pConfig::epoch_vote_topic());
     let good_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
-    assert!(handler.process_gossip(&good_msg).await.is_ok());
+    let res = handler.process_gossip(&good_msg).await;
+    // Not rejected for InvalidTopic — rejected for invalid signature instead.
+    assert!(!matches!(res, Err(PrimaryNetworkError::InvalidTopic)));
 
     let gossip = PrimaryGossip::Certificate(Box::new(Certificate::default()));
     let data = tn_types::encode(&gossip);
@@ -429,9 +424,8 @@ async fn test_vote_different_digest_same_round_rejected() -> eyre::Result<()> {
 /// Test that voting for older round after voting for newer round is rejected.
 #[tokio::test]
 async fn test_vote_older_round_rejected() -> eyre::Result<()> {
-    let TestTypes {
-        committee, handler, parent, task_manager: _task_manager, consensus_bus: _, ..
-    } = create_test_types();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types();
 
     let parents = Vec::new();
     let peer = *committee.last_authority().authority().protocol_key();

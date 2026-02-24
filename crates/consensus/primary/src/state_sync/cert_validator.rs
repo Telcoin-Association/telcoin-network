@@ -46,6 +46,11 @@ where
         Self { consensus_bus, config, task_spawner }
     }
 
+    /// Return a reference to the consensus bus.
+    pub(super) fn consensus_bus(&self) -> &ConsensusBus {
+        &self.consensus_bus
+    }
+
     /// Convenience method for obtaining a new [CertificateManager].
     ///
     /// This is useful so the primary can handle new/spawn methods separately.

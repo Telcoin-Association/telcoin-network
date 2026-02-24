@@ -7,16 +7,22 @@ use crate::{
     state_sync::CertificateManagerCommand, RecentBlocks,
 };
 use parking_lot::Mutex;
-use std::{error::Error, sync::Arc};
+use std::{
+    error::Error,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 use tn_config::Parameters;
 use tn_network_libp2p::types::NetworkEvent;
 use tn_types::{
-    error::HeaderError, BlockHash, BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader,
-    ConsensusOutput, Epoch, EpochVote, Header, Round, TnReceiver, TnSender, CHANNEL_CAPACITY,
+    BlockHash, BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput, Epoch,
+    EpochRecord, EpochVote, Header, Round, TnReceiver, TnSender, CHANNEL_CAPACITY,
 };
 use tokio::{
     sync::{
-        broadcast, mpsc, oneshot,
+        broadcast, mpsc,
         watch::{self, error::RecvError},
     },
     time::error::Elapsed,
@@ -29,11 +35,14 @@ use tokio::{
 struct QueChanReceiver<T> {
     receiver: Option<mpsc::Receiver<T>>,
     container: Arc<Mutex<Option<mpsc::Receiver<T>>>>,
+    /// Flag to signal the sender that this receiver has been dropped.
+    subscribed: Arc<AtomicBool>,
 }
 
-/// Use the Drop to decrement subs.
+/// Use the Drop to decrement subs and signal unsubscribed.
 impl<T> Drop for QueChanReceiver<T> {
     fn drop(&mut self) {
+        self.subscribed.store(false, Ordering::Release);
         (*self.container.lock()) = self.receiver.take();
     }
 }
@@ -46,6 +55,9 @@ pub struct QueChannel<T> {
     channel: mpsc::Sender<T>,
     // Putting this in a lock is unfortunate but if want an mpsc under the hood is needed.
     receiver: Arc<Mutex<Option<mpsc::Receiver<T>>>>,
+    /// Tracks whether a receiver is currently subscribed.
+    /// When `false`, `send()` and `try_send()` become no-ops.
+    subscribed: Arc<AtomicBool>,
 }
 
 impl<T> QueChannel<T> {
@@ -53,7 +65,28 @@ impl<T> QueChannel<T> {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         let receiver = Arc::new(Mutex::new(Some(rx)));
-        Self { channel: tx, receiver }
+        let subscribed = Arc::new(AtomicBool::new(false));
+        Self { channel: tx, receiver, subscribed }
+    }
+
+    /// Subscribe to receive messages on this channel.
+    ///
+    /// Must be called in synchronous `spawn()` methods, BEFORE spawning async tasks.
+    /// Can only be called once at a time (returned receiver restores on Drop).
+    pub fn subscribe(&self) -> impl TnReceiver<T> + 'static
+    where
+        T: Send + 'static,
+    {
+        let receiver = self.receiver.lock().take();
+        if receiver.is_none() {
+            panic!("Another subscription is already in use!")
+        }
+        self.subscribed.store(true, Ordering::Release);
+        QueChanReceiver {
+            receiver,
+            container: self.receiver.clone(),
+            subscribed: self.subscribed.clone(),
+        }
     }
 }
 
@@ -65,25 +98,27 @@ impl<T> Default for QueChannel<T> {
 
 impl<T> Clone for QueChannel<T> {
     fn clone(&self) -> Self {
-        Self { channel: self.channel.clone(), receiver: self.receiver.clone() }
+        Self {
+            channel: self.channel.clone(),
+            receiver: self.receiver.clone(),
+            subscribed: self.subscribed.clone(),
+        }
     }
 }
 
 impl<T: Send + 'static> TnSender<T> for QueChannel<T> {
     async fn send(&self, value: T) -> Result<(), tn_types::SendError<T>> {
+        if !self.subscribed.load(Ordering::Acquire) {
+            return Ok(());
+        }
         Ok(self.channel.send(value).await?)
     }
 
     fn try_send(&self, value: T) -> Result<(), tn_types::TrySendError<T>> {
-        Ok(self.channel.try_send(value)?)
-    }
-
-    fn subscribe(&self) -> impl TnReceiver<T> + 'static {
-        let receiver = self.receiver.lock().take();
-        if receiver.is_none() {
-            panic!("Another subscription is already in use!")
+        if !self.subscribed.load(Ordering::Acquire) {
+            return Ok(());
         }
-        QueChanReceiver { receiver, container: self.receiver.clone() }
+        Ok(self.channel.try_send(value)?)
     }
 }
 
@@ -173,7 +208,9 @@ struct ConsensusBusAppInner {
     tx_sync_status: watch::Sender<NodeMode>,
 
     /// Produce new epoch certs as they are recieved.
-    new_epoch_votes: QueChannel<(EpochVote, oneshot::Sender<Result<(), HeaderError>>)>,
+    new_epoch_votes: QueChannel<EpochVote>,
+    /// Watch channel to communicate the current epoch record to the vote collector.
+    tx_epoch_record: watch::Sender<Option<EpochRecord>>,
     /// The que channel for primary network events.
     primary_network_events: QueChannel<NetworkEvent<crate::network::Req, crate::network::Res>>,
 }
@@ -194,6 +231,8 @@ impl ConsensusBusAppInner {
         let (consensus_header, _rx_consensus_header) = broadcast::channel(CHANNEL_CAPACITY);
         let (consensus_output, _rx_consensus_output) = broadcast::channel(100);
 
+        let (tx_epoch_record, _) = watch::channel(None);
+
         Self {
             tx_committed_round_updates,
             tx_requested_missing_epoch,
@@ -206,6 +245,7 @@ impl ConsensusBusAppInner {
             consensus_output,
             tx_sync_status,
             new_epoch_votes: QueChannel::new(),
+            tx_epoch_record,
             primary_network_events: QueChannel::new(),
         }
     }
@@ -416,8 +456,13 @@ impl ConsensusBus {
     }
 
     /// Returns the latest executed block's number and hash.
-    pub fn latest_block_num_hash(&self) -> BlockNumHash {
-        self.inner_app.tx_recent_blocks.borrow().latest_block_num_hash()
+    pub fn latest_execution_block_num_hash(&self) -> BlockNumHash {
+        self.inner_app.tx_recent_blocks.borrow().latest_execution_block_num_hash()
+    }
+
+    /// Returns the last consensus round processed by the engine.
+    pub fn last_consensus_round(&self) -> Round {
+        self.inner_app.tx_recent_blocks.borrow().last_consensus_round()
     }
 
     /// Returns the maximum number of recent blocks that can be held.
@@ -438,6 +483,11 @@ impl ConsensusBus {
         &self.inner_app.tx_last_published_consensus_num_hash
     }
 
+    /// Returns the latest verified consensus block number and hash from gossip.
+    pub fn published_consensus_num_hash(&self) -> (u64, BlockHash) {
+        *self.inner_app.tx_last_published_consensus_num_hash.borrow()
+    }
+
     /// Broadcast channel with consensus output (includes the consensus chain block).
     /// This also provides the ConsesusHeader, use this for block execution.
     pub fn consensus_output(&self) -> &impl TnSender<ConsensusOutput> {
@@ -453,6 +503,11 @@ impl ConsensusBus {
     /// Status of initial sync operation.
     pub fn node_mode(&self) -> &watch::Sender<NodeMode> {
         &self.inner_app.tx_sync_status
+    }
+
+    /// Returns the current node mode.
+    pub fn current_node_mode(&self) -> NodeMode {
+        *self.inner_app.tx_sync_status.borrow()
     }
 
     /// Returns true if this node is a CVV (active or inactive).
@@ -494,10 +549,77 @@ impl ConsensusBus {
     }
 
     /// New epoch certs as they are recieved.
-    pub fn new_epoch_votes(
-        &self,
-    ) -> &impl TnSender<(EpochVote, oneshot::Sender<Result<(), HeaderError>>)> {
+    pub fn new_epoch_votes(&self) -> &impl TnSender<EpochVote> {
         &self.inner_app.new_epoch_votes
+    }
+
+    /// Watch channel for the current epoch record.
+    /// The epoch vote collector observes this to know when a new epoch starts.
+    pub fn epoch_record_watch(&self) -> &watch::Sender<Option<EpochRecord>> {
+        &self.inner_app.tx_epoch_record
+    }
+
+    //
+    //=== Channel subscription methods
+    //
+    // These must be called in synchronous spawn() methods, BEFORE spawning async tasks.
+    // This ensures the channel is active before any messages are sent.
+    //
+
+    pub fn subscribe_new_certificates(&self) -> impl TnReceiver<Certificate> {
+        self.inner_epoch.new_certificates.subscribe()
+    }
+
+    pub fn subscribe_committed_certificates(&self) -> impl TnReceiver<(Round, Vec<Certificate>)> {
+        self.inner_epoch.committed_certificates.subscribe()
+    }
+
+    pub fn subscribe_certificate_fetcher(&self) -> impl TnReceiver<CertificateFetcherCommand> {
+        self.inner_epoch.certificate_fetcher.subscribe()
+    }
+
+    pub fn subscribe_parents(&self) -> impl TnReceiver<(Vec<Certificate>, Round)> {
+        self.inner_epoch.parents.subscribe()
+    }
+
+    pub fn subscribe_our_digests(&self) -> impl TnReceiver<OurDigestMessage> {
+        self.inner_epoch.our_digests.subscribe()
+    }
+
+    pub fn subscribe_headers(&self) -> impl TnReceiver<Header> {
+        self.inner_epoch.headers.subscribe()
+    }
+
+    pub fn subscribe_committed_own_headers(&self) -> impl TnReceiver<(Round, Vec<Round>)> {
+        self.inner_epoch.committed_own_headers.subscribe()
+    }
+
+    pub fn subscribe_sequence(&self) -> impl TnReceiver<CommittedSubDag> {
+        self.inner_epoch.sequence.subscribe()
+    }
+
+    pub(crate) fn subscribe_certificate_manager(
+        &self,
+    ) -> impl TnReceiver<CertificateManagerCommand> {
+        self.inner_epoch.certificate_manager.subscribe()
+    }
+
+    pub fn subscribe_new_epoch_votes(&self) -> impl TnReceiver<EpochVote> {
+        self.inner_app.new_epoch_votes.subscribe()
+    }
+
+    pub fn subscribe_primary_network_events(
+        &self,
+    ) -> impl TnReceiver<NetworkEvent<crate::network::Req, crate::network::Res>> {
+        self.inner_app.primary_network_events.subscribe()
+    }
+
+    pub fn subscribe_consensus_output(&self) -> impl TnReceiver<ConsensusOutput> {
+        self.inner_app.consensus_output.subscribe()
+    }
+
+    pub fn subscribe_consensus_header(&self) -> impl TnReceiver<ConsensusHeader> {
+        self.inner_app.consensus_header.subscribe()
     }
 
     /// Will resolve once we have executed block.
@@ -515,12 +637,12 @@ impl ConsensusBus {
         while self.recent_blocks().borrow().is_empty() {
             watch_execution_result.changed().await?;
         }
-        let mut current_number = self.latest_block_num_hash().number;
+        let mut current_number = self.latest_execution_block_num_hash().number;
         while current_number < target_number {
             watch_execution_result.changed().await?;
-            current_number = self.latest_block_num_hash().number;
+            current_number = self.latest_execution_block_num_hash().number;
         }
-        if self.recent_blocks().borrow().contains_hash(block.hash) {
+        if self.recent_blocks().borrow().contains_execution_hash(block.hash) {
             // Once we see our hash, should happen when current_number == target_number- trust
             // digesting for this, we are done.
             Ok(())
@@ -560,7 +682,7 @@ impl ConsensusBus {
         let last = self
             .recent_blocks()
             .borrow()
-            .latest_block()
+            .latest_execution_block()
             .header()
             .parent_beacon_block_root
             .and_then(|hash| db.get_consensus_by_hash(hash));

@@ -20,7 +20,8 @@ use std::{
 };
 use tn_reth::{payload::BuildArguments, RethEnv};
 use tn_types::{
-    gas_accumulator::GasAccumulator, ConsensusOutput, Noticer, SealedHeader, TaskSpawner,
+    gas_accumulator::GasAccumulator, ConsensusOutput, EngineUpdate, Noticer, SealedHeader,
+    TaskSpawner,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
@@ -66,6 +67,10 @@ pub struct ExecutorEngine {
     task_spawner: TaskSpawner,
     /// Accumulator for epoch gas usage.
     gas_accumulator: GasAccumulator,
+    /// Channel to notify consensus about processed outputs.
+    /// Sends (leader_round, consensus_num_hash, Option<SealedHeader>) after each
+    /// ConsensusOutput is processed.
+    engine_update_tx: mpsc::Sender<EngineUpdate>,
 }
 
 impl ExecutorEngine {
@@ -75,6 +80,7 @@ impl ExecutorEngine {
     /// The engine waits for CL to broadcast output then tries to execute.
     ///
     /// Propagates any database related error.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         reth_env: RethEnv,
         max_round: Option<u64>,
@@ -83,6 +89,7 @@ impl ExecutorEngine {
         rx_shutdown: Noticer,
         task_spawner: TaskSpawner,
         gas_accumulator: GasAccumulator,
+        engine_update_tx: mpsc::Sender<EngineUpdate>,
     ) -> Self {
         let consensus_output_stream = ReceiverStream::new(rx_consensus_output);
 
@@ -96,6 +103,7 @@ impl ExecutorEngine {
             rx_shutdown,
             task_spawner,
             gas_accumulator,
+            engine_update_tx,
         }
     }
 
@@ -114,13 +122,16 @@ impl ExecutorEngine {
             let build_args = BuildArguments::new(reth_env, output, parent);
 
             let gas_accumulator = self.gas_accumulator.clone();
+            let engine_update_tx = self.engine_update_tx.clone();
             // spawn blocking task and return future
             self.task_spawner.spawn_blocking_task(task_name, move || {
                 // this is safe to call on blocking thread without a semaphore bc it's held in
                 // Self::pending_tesk as a single `Option`
-                let result = execute_consensus_output(build_args, gas_accumulator).inspect_err(|e| {
-                    error!(target: "engine", ?e, "error executing consensus output");
-                });
+                let result =
+                    execute_consensus_output(build_args, gas_accumulator, engine_update_tx)
+                        .inspect_err(|e| {
+                            error!(target: "engine", ?e, "error executing consensus output");
+                        });
                 if let Err(e) = tx.send(result) {
                     warn!(target: "engine", ?e, "error sending result from execute_consensus_output")
                 }
