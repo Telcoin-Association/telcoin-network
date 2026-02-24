@@ -10,4 +10,8 @@ pub trait Index<K> {
     fn load(&mut self, key: K) -> Result<u64, FetchError>;
     /// Flush and sync all the index data to disk.
     fn sync(&mut self) -> Result<(), CommitError>;
+    /// True if the index contains the key.
+    fn contains(&mut self, key: K) -> bool {
+        self.load(key).is_ok()
+    }
 }

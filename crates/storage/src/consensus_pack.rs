@@ -438,7 +438,7 @@ impl Inner {
                         .append(&PackRecord::Batch(batch))
                         .map_err(|e| PackError::Append(e.to_string()))?;
                     batch_digests
-                        .save(batch_digest.as_slice(), position)
+                        .save(batch_digest, position)
                         .map_err(|e| PackError::IndexAppend(format!("batch {e}")))?;
                 }
                 PackRecord::Consensus(consensus_header) => {
@@ -462,7 +462,7 @@ impl Inner {
                         .append(&PackRecord::Consensus(consensus_header))
                         .map_err(|e| PackError::Append(e.to_string()))?;
                     consensus_digests
-                        .save(consensus_digest.as_slice(), position)
+                        .save(consensus_digest, position)
                         .map_err(|e| PackError::IndexAppend(format!("consensus digest {e}")))?;
                     let consensus_idx_pos =
                         consensus_number.saturating_sub(epoch_meta.start_consensus_number);
@@ -494,8 +494,8 @@ impl Inner {
         for cert_batch in consensus.batches() {
             for batch in &cert_batch.batches {
                 let digest = batch.digest();
-                // Filter out an batches we already have saved.
-                if self.batch_digests.load(digest.as_slice()).is_err() {
+                // Filter out any batches we already have saved.
+                if !self.batch_digests.contains(digest) {
                     batches.insert(digest, batch.clone());
                 }
             }
@@ -507,7 +507,7 @@ impl Inner {
                 .append(&PackRecord::Batch(batch))
                 .map_err(|e| PackError::Append(e.to_string()))?;
             self.batch_digests
-                .save(batch_digest.as_slice(), position)
+                .save(batch_digest, position)
                 .map_err(|e| PackError::IndexAppend(format!("batch {e}")))?;
         }
         // Now save the consensus header.
@@ -517,7 +517,7 @@ impl Inner {
             .append(&PackRecord::Consensus(Box::new(consensus.consensus_header())))
             .map_err(|e| PackError::Append(e.to_string()))?;
         self.consensus_digests
-            .save(consensus_digest.as_slice(), position)
+            .save(consensus_digest, position)
             .map_err(|e| PackError::IndexAppend(format!("consensus {e}")))?;
         self.consensus_idx
             .save(consensus_idx, position)
@@ -568,7 +568,7 @@ impl Inner {
             for digest in cert.header().payload().keys() {
                 let position = self
                     .batch_digests
-                    .load(digest.as_slice())
+                    .load(*digest)
                     .map_err(|e| PackError::ReadError(e.to_string()))?;
                 let batch = self
                     .data
@@ -596,14 +596,14 @@ impl Inner {
             && number < self.consensus_idx.len() as u64 + self.epoch_meta.start_consensus_number
     }
 
-    /// True if consensus header by digest is found by digest.
+    /// True if consensus header is found by digest.
     fn contains_consensus_header(&mut self, digest: B256) -> bool {
-        self.consensus_digests.load(digest.as_slice()).is_ok()
+        self.consensus_digests.contains(digest)
     }
 
     /// Retrieve a consensus header by digest.
     fn consensus_header_by_digest(&mut self, digest: B256) -> Option<ConsensusHeader> {
-        let pos = self.consensus_digests.load(digest.as_slice()).ok()?;
+        let pos = self.consensus_digests.load(digest).ok()?;
         let rec = self.data.fetch(pos).ok()?;
         rec.into_consensus().ok()
     }
