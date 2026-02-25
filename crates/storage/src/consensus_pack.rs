@@ -299,7 +299,8 @@ impl Inner {
     ) -> Result<Self, PackError> {
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
         let _ = std::fs::create_dir_all(&base_dir);
-        let mut data: Pack<PackRecord> = Pack::open(base_dir.join(Self::DATA_NAME), false)?;
+        let mut data: Pack<PackRecord> =
+            Pack::open(base_dir.join(Self::DATA_NAME), epoch as u64, false)?;
         let start_consensus_number =
             if epoch == 0 { 1 } else { previous_epoch.final_consensus.number + 1 };
         let epoch_meta = EpochMeta {
@@ -348,7 +349,8 @@ impl Inner {
     fn open_static<P: AsRef<Path>>(path: P, epoch: Epoch) -> Result<Self, PackError> {
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
 
-        let mut data = Pack::<PackRecord>::open(base_dir.join(Self::DATA_NAME), true)?;
+        let mut data =
+            Pack::<PackRecord>::open(base_dir.join(Self::DATA_NAME), epoch as u64, true)?;
         let epoch_meta = data
             .fetch(DATA_HEADER_BYTES as u64)
             .map_err(|e| PackError::EpochLoad(e.to_string()))?
@@ -388,9 +390,9 @@ impl Inner {
     ) -> Result<Self, PackError> {
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
         let _ = std::fs::create_dir_all(&base_dir);
-        let mut stream_iter = PackIter::<PackRecord, R>::open(stream)
+        let mut stream_iter = PackIter::<PackRecord, R>::open(stream, epoch as u64)
             .map_err(|e| PackError::ReadError(e.to_string()))?;
-        let mut data = Pack::open(base_dir.join(Self::DATA_NAME), false)?;
+        let mut data = Pack::open(base_dir.join(Self::DATA_NAME), epoch as u64, false)?;
         let epoch_meta = if let Some(Ok(meta)) = stream_iter.next() {
             meta.into_epoch()?
         } else {

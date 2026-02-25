@@ -201,7 +201,7 @@ mod tests {
     #[test]
     fn test_archive_pdx_index() {
         let tmp_path = TempDir::with_prefix("test_archive_pdx_index").expect("temp dir");
-        let data_header = DataHeader::new();
+        let data_header = DataHeader::new(0);
         let mut idx: PositionIndex =
             PositionIndex::open_pdx_file(tmp_path.path().join("index.pdx"), &data_header, false)
                 .expect("pdx file");

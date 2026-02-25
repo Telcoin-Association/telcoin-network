@@ -37,8 +37,8 @@ where
     /// Open the iterator using reader as a data source.
     /// Produces an iterator over all the (key, values).  All and records
     /// are returned in insert order.
-    pub fn open(mut reader: R) -> Result<Self, LoadHeaderError> {
-        let _header = DataHeader::load_header(&mut reader)?;
+    pub fn open(mut reader: R, uid_idx: u64) -> Result<Self, LoadHeaderError> {
+        let _header = DataHeader::load_header(&mut reader, uid_idx)?;
         let reader = BufReader::new(reader);
         Ok(PackIter { _val: PhantomData, reader, buffer: Vec::new() })
     }

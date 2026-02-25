@@ -17,6 +17,8 @@ pub enum LoadHeaderError {
     InvalidAppNum,
     /// The data file version invalid (not supported).
     InvalidVersion,
+    /// The Data file UUID did not match the expected value.
+    InvalidDataUID,
     /// The HDX index file version was wrong.
     InvalidIndexVersion,
     /// The HDX index UUID did not match the data file.
@@ -48,6 +50,7 @@ impl fmt::Display for LoadHeaderError {
             Self::IO(e) => write!(f, "io: {e}"),
             Self::CrcFailed => write!(f, "invalid crc32 checksum"),
             Self::InvalidVersion => write!(f, "invalid version (should be 0)"),
+            Self::InvalidDataUID => write!(f, "invalid data file uid"),
             Self::InvalidAppNum => write!(f, "invalid appnum"),
             Self::InvalidIndexVersion => write!(f, "invalid index version"),
             Self::InvalidIndexUID => write!(f, "invalid index uid"),

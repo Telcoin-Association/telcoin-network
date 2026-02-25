@@ -761,7 +761,7 @@ mod tests {
         // //XXXXTempDir::with_prefix("test_archive_hdx_index").expect("temp dir");
         let tmp_dir = TempDir::with_prefix("test_archive_hdx_index").expect("temp dir");
         let tmp_path = tmp_dir.path();
-        let data_header = DataHeader::new();
+        let data_header = DataHeader::new(0);
         let builder = BuildHasherDefault::<FxHasher>::default();
         let mut idx: HdxIndex =
             HdxIndex::open_hdx_file(tmp_path.join("index.hdx"), &data_header, builder, false)
