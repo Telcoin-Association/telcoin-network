@@ -21,12 +21,14 @@ mod consensus;
 pub mod error;
 pub mod kad;
 mod peers;
+pub mod stream;
 pub mod types;
 
 // export types
 pub use codec::{decode_message, encode_message, TNCodec, TNMessage};
 pub use consensus::ConsensusNetwork;
 pub use peers::{PeerExchangeMap, Penalty};
+pub use stream::StreamError;
 
 // re-export specific libp2p types
 pub use libp2p::{

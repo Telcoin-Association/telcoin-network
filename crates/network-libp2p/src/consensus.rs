@@ -5,9 +5,10 @@
 use crate::{
     codec::{TNCodec, TNMessage},
     error::NetworkError,
-    kad::{KadStore, KadStoreType},
+    kad::{KadStore, KadStoreType, DEFAULT_KAD_PROTO_NAME},
     peers::{self, PeerEvent, PeerManager, Penalty},
     send_or_log_error,
+    stream::{StreamBehavior, StreamEvent},
     types::{
         KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo, NetworkResult,
         NodeRecord,
@@ -26,7 +27,7 @@ use libp2p::{
         InboundRequestId, OutboundRequestId,
     },
     swarm::{NetworkBehaviour, SwarmEvent},
-    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
+    Multiaddr, PeerId, Swarm, SwarmBuilder,
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -47,11 +48,14 @@ use tracing::{debug, error, info, instrument, trace, warn};
 #[path = "tests/network_tests.rs"]
 mod network_tests;
 
-const DEFAULT_KAD_PROTO_NAME: StreamProtocol = StreamProtocol::new("/ipfs/kad/1.0.0");
-
 /// Custom network libp2p behaviour type for Telcoin Network.
 ///
-/// The behavior includes gossipsub and request-response.
+/// The behavior composes multiple sub-behaviors:
+/// - `gossipsub`: Flood publishing for certificates and batches
+/// - `req_res`: Point-to-point request-response messages
+/// - `peer_manager`: Connection management and peer scoring
+/// - `kademlia`: Distributed hash table for peer discovery
+/// - `stream`: Stream-based bulk data transfer for state sync
 #[derive(NetworkBehaviour)]
 pub(crate) struct TNBehavior<C, DB>
 where
@@ -65,6 +69,8 @@ where
     pub(crate) peer_manager: peers::PeerManager,
     /// Used for peer discovery.
     pub(crate) kademlia: kad::Behaviour<KadStore<DB>>,
+    /// Stream-based sync behavior for bulk data transfer.
+    pub(crate) stream: StreamBehavior,
 }
 
 impl<C, DB> TNBehavior<C, DB>
@@ -80,7 +86,8 @@ where
         peer_config: &PeerConfig,
     ) -> Self {
         let peer_manager = PeerManager::new(peer_config);
-        Self { gossipsub, req_res, peer_manager, kademlia }
+        let stream = StreamBehavior::new();
+        Self { gossipsub, req_res, peer_manager, kademlia, stream }
     }
 }
 
@@ -444,6 +451,7 @@ where
                 TNBehaviorEvent::ReqRes(event) => self.process_reqres_event(event)?,
                 TNBehaviorEvent::PeerManager(event) => self.process_peer_manager_event(event)?,
                 TNBehaviorEvent::Kademlia(event) => self.process_kad_event(event)?,
+                TNBehaviorEvent::Stream(event) => self.process_stream_event(event)?,
             },
             SwarmEvent::ExternalAddrConfirmed { address: _ } => {
                 // New confirmed address so lets publish/update or kademlia address rocord.
@@ -697,6 +705,32 @@ where
                 // this will trigger a PeerEvent to fetch records through kad if not in the peer map
                 self.swarm.behaviour_mut().peer_manager.find_authorities(bls_keys);
             }
+            NetworkCommand::OpenStream { peer, reply } => {
+                // Look up the peer's PeerId from their BLS key
+                let peer_id = match self.swarm.behaviour().peer_manager.auth_to_peer(peer) {
+                    Some((id, _addrs)) => id,
+                    None => {
+                        debug!(
+                            target: "network",
+                            ?peer,
+                            "OpenStream: peer not found"
+                        );
+                        let _ = reply.send(Err(NetworkError::PeerMissing));
+                        return Ok(());
+                    }
+                };
+
+                debug!(
+                    target: "network",
+                    ?peer_id,
+                    "opening stream to peer"
+                );
+
+                // Pass the reply channel directly to the stream behavior.
+                // The stream (or error) will be returned to the caller via oneshot
+                // without any intermediate tracking.
+                self.swarm.behaviour_mut().stream.open_stream(peer_id, reply);
+            }
         }
 
         Ok(())
@@ -790,7 +824,6 @@ where
                             // initiate disconnect from this peer to prevent redial attempts
                             debug!(target: "peer-manager", ?peer, "initiating reciprocal disconnect after px");
                             self.swarm.behaviour_mut().peer_manager.disconnect_peer(peer, false);
-
                             return Ok(());
                         }
 
@@ -1069,6 +1102,33 @@ where
             }
         }
 
+        Ok(())
+    }
+
+    /// Process events from the stream behavior.
+    ///
+    /// This handles inbound and outbound stream events for bulk data transfer.
+    fn process_stream_event(&mut self, event: StreamEvent) -> NetworkResult<()> {
+        match event {
+            StreamEvent::InboundStream { peer, stream } => {
+                debug!(
+                    target: "network",
+                    ?peer,
+                    "inbound stream received"
+                );
+                // Forward raw stream to application layer
+                if let Some(bls) = self.swarm.behaviour().peer_manager.peer_to_bls(&peer) {
+                    if let Err(e) = self
+                        .event_stream
+                        .try_send(NetworkEvent::InboundStream { peer: bls, stream })
+                    {
+                        error!(target: "network", ?e, "failed to forward inbound stream");
+                    }
+                } else {
+                    warn!(target: "network", ?peer, "received inbound stream from unknown peer");
+                }
+            }
+        }
         Ok(())
     }
 
