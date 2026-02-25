@@ -21,7 +21,6 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     marker::PhantomData,
     path::Path,
-    time::{self, UNIX_EPOCH},
 };
 
 /// An instance of a DB.
@@ -39,8 +38,8 @@ where
     V: Debug + Serialize + DeserializeOwned,
 {
     /// Open a new or reopen an existing database.
-    pub fn open<P: AsRef<Path>>(path: P, read_only: bool) -> Result<Self, OpenError> {
-        Ok(Self { inner: PackInner::open(path, read_only)? })
+    pub fn open<P: AsRef<Path>>(path: P, uid_idx: u64, read_only: bool) -> Result<Self, OpenError> {
+        Ok(Self { inner: PackInner::open(path, uid_idx, read_only)? })
     }
 
     /// Fetch the value stored at key.  Will return an error if not found.
@@ -131,6 +130,7 @@ where
     value_buffer: Vec<u8>,
     failed: bool,
     read_only: bool,
+    uid_idx: u64, // Store for opening an iterator.
     _value: PhantomData<V>,
 }
 
@@ -150,9 +150,9 @@ where
     V: Debug + Serialize + DeserializeOwned,
 {
     /// Open a new or reopen an existing database.
-    fn open<P: AsRef<Path>>(path: P, read_only: bool) -> Result<Self, OpenError> {
+    fn open<P: AsRef<Path>>(path: P, uid_idx: u64, read_only: bool) -> Result<Self, OpenError> {
         let (data_file, header) =
-            Self::open_data_file(path, read_only).map_err(OpenError::DataFileOpen)?;
+            Self::open_data_file(path, uid_idx, read_only).map_err(OpenError::DataFileOpen)?;
         // XXXX need to have the last valid pos from somewhere.
         Ok(Self {
             header,
@@ -160,6 +160,7 @@ where
             value_buffer: Vec::new(),
             failed: false,
             read_only,
+            uid_idx,
             _value: PhantomData,
         })
     }
@@ -257,17 +258,18 @@ where
 
     fn open_data_file<P: AsRef<Path>>(
         path: P,
+        uid_idx: u64,
         ro: bool,
     ) -> Result<(DataFile, DataHeader), LoadHeaderError> {
         let mut data_file = DataFile::open(path, ro)?;
         let file_end = data_file.data_file_end();
 
         let header = if file_end == 0 {
-            let header = DataHeader::new();
+            let header = DataHeader::new(uid_idx);
             header.write_header(&mut data_file)?;
             header
         } else {
-            let header = DataHeader::load_header(&mut data_file)?;
+            let header = DataHeader::load_header(&mut data_file, uid_idx)?;
             if header.version() != 0 {
                 return Err(LoadHeaderError::InvalidVersion);
             }
@@ -323,7 +325,7 @@ where
     /// This iterator will not see any data in the write cache.
     fn raw_iter(&self) -> Result<PackIter<V, File>, LoadHeaderError> {
         let dat_file = { self.data_file.try_clone()? };
-        PackIter::open(dat_file)
+        PackIter::open(dat_file, self.uid_idx)
     }
 }
 
@@ -344,24 +346,16 @@ pub struct DataHeader {
 }
 
 impl DataHeader {
-    pub(crate) fn new() -> Self {
-        let mut hasher = FxHasher::default();
-        let now = time::SystemTime::now();
-        let now_millis = now
-            .duration_since(UNIX_EPOCH)
-            // Time went backwards, WTF?  This could lead to common uid I guess if using
-            // machines with broken time (i.e. clocks set before the Unix epoch)...
-            .unwrap_or_else(|_| time::Duration::from_millis(66))
-            .as_millis();
-        hasher.write_u128(now_millis);
-        // This is pretty basic, just has the current millis with FX to get a UID.
-        // This is just to make sure sets of files belong together so not going crazy here.
-        let uid = hasher.finish();
+    pub(crate) fn new(uid_idx: u64) -> Self {
+        let uid = Self::gen_uid(uid_idx);
         Self { type_id: *b"telnet", version: 0, uid, appnum: 1 }
     }
 
     /// Load a DataHeader from source.
-    pub(crate) fn load_header<R: Read + Seek>(source: &mut R) -> Result<Self, LoadHeaderError> {
+    pub(crate) fn load_header<R: Read + Seek>(
+        source: &mut R,
+        uid_idx: u64,
+    ) -> Result<Self, LoadHeaderError> {
         source.rewind()?;
         let mut buffer = [0_u8; DATA_HEADER_BYTES];
         let mut buf16 = [0_u8; 2];
@@ -388,11 +382,25 @@ impl DataHeader {
         pos += 2;
         buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
         let uid = u64::from_le_bytes(buf64);
+        if uid != Self::gen_uid(uid_idx) {
+            return Err(LoadHeaderError::InvalidDataUID);
+        }
         pos += 8;
         buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
         let appnum = u64::from_le_bytes(buf64);
         let header = Self { type_id, version, uid, appnum };
         Ok(header)
+    }
+
+    /// Generate a unique (simple not cryptographic) "uid" for a file.
+    /// Use uid_idx for uniqueness.
+    fn gen_uid(uid_idx: u64) -> u64 {
+        let mut hasher = FxHasher::default();
+        hasher.write(b"telcoin-network-epoch-");
+        hasher.write_u64(uid_idx);
+        // This is pretty basic, just use a string and provided u64.
+        // this is just to make sure sets of files belong together so not going crazy here.
+        hasher.finish()
     }
 
     /// Write this header to sync at current seek position.
@@ -450,7 +458,7 @@ mod tests {
     fn test_archive_pack_one() {
         let tmp_path = TempDir::with_prefix("test_archive_pack_one").expect("temp dir");
         let mut db: TestPack =
-            Pack::open(tmp_path.path().join("pack_test_one"), false).expect("open pack");
+            Pack::open(tmp_path.path().join("pack_test_one"), 0, false).expect("open pack");
         let pos_1 = db.append(&TestRec { idx: 1, name: "Value One".to_string() }).expect("append");
         let pos_2 = db.append(&TestRec { idx: 2, name: "Value Two".to_string() }).expect("append");
         let pos_3 =
@@ -497,7 +505,7 @@ mod tests {
         drop(db);
 
         let mut db: TestPack =
-            Pack::open(tmp_path.path().join("pack_test_one"), false).expect("open pack");
+            Pack::open(tmp_path.path().join("pack_test_one"), 0, false).expect("open pack");
         let pos_1_2 =
             db.append(&TestRec { idx: 6, name: "Value One2".to_string() }).expect("append");
         let pos_2_2 =
@@ -517,7 +525,7 @@ mod tests {
         drop(db);
 
         let mut db: TestPack =
-            Pack::open(tmp_path.path().join("pack_test_one"), true).expect("open pack");
+            Pack::open(tmp_path.path().join("pack_test_one"), 0, true).expect("open pack");
         let v = db.fetch(pos_1_2).unwrap();
         assert_eq!(v.idx, 6);
         assert_eq!(v.name, "Value One2");
@@ -535,7 +543,7 @@ mod tests {
             .create(false)
             .open(tmp_path.path().join("pack_test_one"))
             .unwrap();
-        let mut iter = PackIter::open(data_file).unwrap().map(|r| r.unwrap());
+        let mut iter = PackIter::open(data_file, 0).unwrap().map(|r| r.unwrap());
         let v: TestRec = iter.next().unwrap();
         assert_eq!(v.idx, 1);
         assert_eq!(v.name, "Value One");
@@ -563,7 +571,7 @@ mod tests {
         assert!(iter.next().is_none());
 
         let db: TestPack =
-            Pack::open(tmp_path.path().join("pack_test_one"), true).expect("open pack");
+            Pack::open(tmp_path.path().join("pack_test_one"), 0, true).expect("open pack");
         let mut iter = db.raw_iter().unwrap().map(|r| r.unwrap());
         let v: TestRec = iter.next().unwrap();
         assert_eq!(v.idx, 1);

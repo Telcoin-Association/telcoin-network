@@ -2,6 +2,8 @@
 
 use std::{error::Error, fmt, io};
 
+use crate::archive::digest_index::bloom::BloomError;
+
 /// Error on loading a file (inder or data) header.
 #[derive(Debug)]
 pub enum LoadHeaderError {
@@ -15,6 +17,8 @@ pub enum LoadHeaderError {
     InvalidAppNum,
     /// The data file version invalid (not supported).
     InvalidVersion,
+    /// The Data file UUID did not match the expected value.
+    InvalidDataUID,
     /// The HDX index file version was wrong.
     InvalidIndexVersion,
     /// The HDX index UUID did not match the data file.
@@ -33,6 +37,8 @@ pub enum LoadHeaderError {
     ReadOnly,
     /// Attempted to open a read only index that was missing a header.
     ReadOnlyEmpty,
+    /// Bloom related error- i.e. invalid bloom bits most likely.
+    BloomError(BloomError),
 }
 
 impl Error for LoadHeaderError {}
@@ -44,6 +50,7 @@ impl fmt::Display for LoadHeaderError {
             Self::IO(e) => write!(f, "io: {e}"),
             Self::CrcFailed => write!(f, "invalid crc32 checksum"),
             Self::InvalidVersion => write!(f, "invalid version (should be 0)"),
+            Self::InvalidDataUID => write!(f, "invalid data file uid"),
             Self::InvalidAppNum => write!(f, "invalid appnum"),
             Self::InvalidIndexVersion => write!(f, "invalid index version"),
             Self::InvalidIndexUID => write!(f, "invalid index uid"),
@@ -54,6 +61,7 @@ impl fmt::Display for LoadHeaderError {
             Self::InvalidOverflowAppNum => write!(f, "invalid index overflow appnum"),
             Self::ReadOnly => write!(f, "attempted to write to read only index"),
             Self::ReadOnlyEmpty => write!(f, "attempted to open index read only with no index"),
+            Self::BloomError(e) => write!(f, "bloom error: {e}"),
         }
     }
 }
@@ -61,5 +69,11 @@ impl fmt::Display for LoadHeaderError {
 impl From<io::Error> for LoadHeaderError {
     fn from(io_err: io::Error) -> Self {
         Self::IO(io_err)
+    }
+}
+
+impl From<BloomError> for LoadHeaderError {
+    fn from(err: BloomError) -> Self {
+        Self::BloomError(err)
     }
 }

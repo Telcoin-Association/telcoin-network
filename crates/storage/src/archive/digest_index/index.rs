@@ -1,8 +1,14 @@
 //! Contains the Digest Index structure and code.
 
+use tn_types::B256;
+
 use crate::archive::{
     crc::{add_crc32, check_crc},
-    digest_index::{bucket_iter::BucketIter, odx_header::OdxHeader},
+    digest_index::{
+        bloom::{Bloom, BLOOM_SIZE_BYTES},
+        bucket_iter::BucketIter,
+        odx_header::OdxHeader,
+    },
     error::{
         commit::CommitError, fetch::FetchError, insert::AppendError, load_header::LoadHeaderError,
     },
@@ -249,6 +255,7 @@ pub struct HdxIndex<
     hasher_builder: S,
     read_only: bool,
     synced: bool,
+    bloom: Bloom,
     _index_dir: PathBuf,
 }
 
@@ -291,7 +298,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         };
         let file_end = hdx_file.seek(SeekFrom::End(0))?;
 
-        let header = if file_end == 0 {
+        let (header, bloom) = if file_end == 0 {
             if read_only {
                 return Err(LoadHeaderError::ReadOnlyEmpty);
             }
@@ -299,13 +306,15 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             let pepper = hasher_builder.hash_one(salt);
             let mut header = HdxHeader::from_data_header::<KSIZE, S>(data_header, salt, pepper);
             header.write_header(&mut hdx_file)?;
+            let bloom = Bloom::new();
+            hdx_file.write_all(bloom.data())?;
             let bucket_size = header.bucket_size() as usize;
             let mut buffer = vec![0_u8; bucket_size];
             add_crc32(&mut buffer[..]);
             for _ in 0..header.buckets() {
                 hdx_file.write_all(&buffer[..])?;
             }
-            header
+            (header, bloom)
         } else {
             let header = HdxHeader::load_header(&mut hdx_file)?;
             // Basic validation of the odx header.
@@ -324,7 +333,10 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             if header.pepper() != hasher_builder.hash_one(header.salt()) {
                 return Err(LoadHeaderError::InvalidHasher);
             }
-            header
+            let mut bloom_bits = vec![0_u8; BLOOM_SIZE_BYTES];
+            hdx_file.read_exact(&mut bloom_bits[..])?;
+            let bloom: Bloom = bloom_bits.try_into()?;
+            (header, bloom)
         };
         let (odx_file, _odx_header) = OdxHeader::open_odx_file(
             header.version(),
@@ -348,6 +360,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             hasher_builder,
             read_only,
             synced: true,
+            bloom,
             _index_dir: dir.to_owned(),
         })
     }
@@ -395,9 +408,12 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         Ok(())
     }
 
-    /// Write the indexes header tyo disk.
+    /// Write the indexes header and bloom filter to disk.
     fn write_header(&mut self) -> Result<(), io::Error> {
-        self.header.write_header(&mut self.hdx_file)
+        self.header.write_header(&mut self.hdx_file)?;
+        self.hdx_file.seek(SeekFrom::Start(self.header.header_size() as u64))?;
+        self.hdx_file.write_all(self.bloom.data())?;
+        Ok(())
     }
 
     /// Increment the buckets count by 1.
@@ -434,8 +450,9 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             // Read the bucket from the index and verify (crc32) it.
             let bucket_size = self.header.bucket_size as usize;
             let mut buffer = vec![0_u8; bucket_size];
-            let bucket_pos: u64 =
-                (self.header.header_size() + (bucket as usize * bucket_size)) as u64;
+            let bucket_pos: u64 = (self.header.header_size()
+                + BLOOM_SIZE_BYTES
+                + (bucket as usize * bucket_size)) as u64;
             {
                 self.hdx_file
                     .seek(SeekFrom::Start(bucket_pos))
@@ -454,7 +471,8 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         let bucket_size = self.header.bucket_size as usize;
         let header_size = self.header.header_size();
         for (bucket, mut buffer) in self.dirty_bucket_cache.drain() {
-            let bucket_pos: u64 = (header_size + (bucket as usize * bucket_size)) as u64;
+            let bucket_pos: u64 =
+                (header_size + BLOOM_SIZE_BYTES + (bucket as usize * bucket_size)) as u64;
             add_crc32(&mut buffer[..]);
             // Seeking and writing past the file end extends it.
             self.hdx_file.seek(SeekFrom::Start(bucket_pos))?;
@@ -663,6 +681,12 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         }
         Ok(())
     }
+
+    /// Allow direct test of the bloom filter.
+    #[cfg(test)]
+    fn test_bloom_contains(&mut self, key: B256) -> bool {
+        self.bloom.contains(key)
+    }
 }
 
 impl<const KSIZE: usize, S: BuildHasher + Default> Drop for HdxIndex<KSIZE, S> {
@@ -685,20 +709,28 @@ impl<const KSIZE: usize, S: BuildHasher + Default> Drop for HdxIndex<KSIZE, S> {
     }
 }
 
-impl<const KSIZE: usize, S: BuildHasher + Default> Index<&[u8]> for HdxIndex<KSIZE, S> {
-    fn save(&mut self, key: &[u8], record_pos: u64) -> Result<(), AppendError> {
+//XXXXimpl<const KSIZE: usize, S: BuildHasher + Default> Index<&[u8]> for HdxIndex<KSIZE, S> {
+impl<const KSIZE: usize, S: BuildHasher + Default> Index<B256> for HdxIndex<KSIZE, S> {
+    fn save(&mut self, key: B256, record_pos: u64) -> Result<(), AppendError> {
         if self.read_only {
             Err(AppendError::ReadOnly)
         } else {
             self.synced = false;
             // Make sure we have resonable capacity first.
             self.expand_buckets()?;
-            self.save_to_bucket(key, record_pos)
+            // Add to our bloom filter for quick lookups.
+            self.bloom.accrue(key);
+            self.save_to_bucket(key.as_slice(), record_pos)
         }
     }
 
-    fn load(&mut self, key: &[u8]) -> Result<u64, FetchError> {
-        self.fetch_position(key)
+    fn load(&mut self, key: B256) -> Result<u64, FetchError> {
+        // Quick check the bloom filter first.
+        if !self.bloom.contains(key) {
+            Err(FetchError::NotFound)
+        } else {
+            self.fetch_position(key.as_slice())
+        }
     }
 
     /// Flush and sync all the index data to disk.
@@ -729,7 +761,7 @@ mod tests {
         // //XXXXTempDir::with_prefix("test_archive_hdx_index").expect("temp dir");
         let tmp_dir = TempDir::with_prefix("test_archive_hdx_index").expect("temp dir");
         let tmp_path = tmp_dir.path();
-        let data_header = DataHeader::new();
+        let data_header = DataHeader::new(0);
         let builder = BuildHasherDefault::<FxHasher>::default();
         let mut idx: HdxIndex =
             HdxIndex::open_hdx_file(tmp_path.join("index.hdx"), &data_header, builder, false)
@@ -737,14 +769,15 @@ mod tests {
         for i in 0..1_000_000 {
             let mut hasher = DefaultHashFunction::new();
             hasher.update(&format!("idx-{i}").into_bytes());
-            let hash = hasher.finalize();
-            idx.save(hash.as_bytes(), i).expect("add to index");
+            let hash = B256::from_slice(hasher.finalize().as_bytes());
+            idx.save(hash, i).expect("add to index");
         }
         for i in 0..1_000_000 {
             let mut hasher = DefaultHashFunction::new();
             hasher.update(&format!("idx-{i}").into_bytes());
-            let hash = hasher.finalize();
-            assert_eq!(idx.load(hash.as_bytes()).expect("load idx"), i);
+            let hash = B256::from_slice(hasher.finalize().as_bytes());
+            assert!(idx.test_bloom_contains(hash));
+            assert_eq!(idx.load(hash).expect("load idx"), i);
         }
         drop(idx);
 
@@ -757,14 +790,15 @@ mod tests {
         for i in 0..1_000_000 {
             let mut hasher = DefaultHashFunction::new();
             hasher.update(&format!("idx-{i}").into_bytes());
-            let hash = hasher.finalize();
-            assert_eq!(idx.load(hash.as_bytes()).expect("load idx"), i);
+            let hash = B256::from_slice(hasher.finalize().as_bytes());
+            assert!(idx.test_bloom_contains(hash));
+            assert_eq!(idx.load(hash).expect("load idx"), i);
         }
         for i in 1_000_000..1_001_000 {
             let mut hasher = DefaultHashFunction::new();
             hasher.update(&format!("idx-{i}").into_bytes());
-            let hash = hasher.finalize();
-            idx.save(hash.as_bytes(), i).expect("add to index");
+            let hash = B256::from_slice(hasher.finalize().as_bytes());
+            idx.save(hash, i).expect("add to index");
         }
         drop(idx);
 
@@ -776,8 +810,9 @@ mod tests {
         for i in 0..1_001_000 {
             let mut hasher = DefaultHashFunction::new();
             hasher.update(&format!("idx-{i}").into_bytes());
-            let hash = hasher.finalize();
-            assert_eq!(idx.load(hash.as_bytes()).expect("load idx"), i);
+            let hash = B256::from_slice(hasher.finalize().as_bytes());
+            assert!(idx.test_bloom_contains(hash));
+            assert_eq!(idx.load(hash).expect("load idx"), i);
         }
     }
 }
