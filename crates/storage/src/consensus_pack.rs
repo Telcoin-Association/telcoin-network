@@ -765,12 +765,12 @@ impl Inner {
 
     /// True if the pack contains the batch for digest.
     fn contains_batch(&mut self, digest: BlockHash) -> bool {
-        self.batch_digests.load(digest.as_slice()).is_ok()
+        self.batch_digests.load(digest).is_ok()
     }
 
     /// Return the Batch for digest if found.
     fn batch(&mut self, digest: BlockHash) -> Option<Batch> {
-        if let Ok(pos) = self.batch_digests.load(digest.as_slice()) {
+        if let Ok(pos) = self.batch_digests.load(digest) {
             if let Ok(batch) = self.data.fetch(pos) {
                 if let Ok(batch) = batch.into_batch() {
                     return Some(batch);
