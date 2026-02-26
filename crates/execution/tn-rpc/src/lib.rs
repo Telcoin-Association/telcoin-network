@@ -4,7 +4,10 @@
 mod error;
 mod rpc_ext;
 
-pub use rpc_ext::{TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
+pub use rpc_ext::{
+    CommitteeInfo, EpochInfo, SyncProgress, SyncStatus, TelcoinNetworkRpcExt,
+    TelcoinNetworkRpcExtApiServer, ValidatorInfo,
+};
 use tn_types::{BlockHash, ConsensusHeader, Epoch, EpochCertificate, EpochRecord};
 
 /// Trait used to get primary data for our RPC extension (tn namespace).
@@ -21,4 +24,10 @@ pub trait EngineToPrimary {
         epoch: Option<Epoch>,
         hash: Option<BlockHash>,
     ) -> Option<(EpochRecord, EpochCertificate)>;
+    /// Return the node's sync status.
+    fn sync_status(&self) -> SyncStatus;
+    /// Return information about the current epoch, if available.
+    fn current_epoch_info(&self) -> Option<EpochInfo>;
+    /// Return information about the current committee, if available.
+    fn current_committee(&self) -> Option<CommitteeInfo>;
 }

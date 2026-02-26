@@ -1180,11 +1180,13 @@ where
             if let Some((epoch_rec, Some(_))) = self.consensus_db.get_epoch_by_number(epoch) {
                 // We already have this record...
                 self.epoch_record = Some(epoch_rec);
+                self.consensus_bus.current_committee().send_replace(Some(committee.clone()));
                 return Ok(());
             }
         } else if let Some((epoch_rec, _)) = self.consensus_db.get_epoch_by_number(epoch) {
             // We already have this record...
             self.epoch_record = Some(epoch_rec);
+            self.consensus_bus.current_committee().send_replace(Some(committee.clone()));
             return Ok(());
         }
 
@@ -1236,6 +1238,8 @@ where
 
         self.consensus_db.save_epoch_record(&epoch_rec);
         self.epoch_record = Some(epoch_rec);
+        // Update RPC-facing committee after the epoch transition has been persisted.
+        self.consensus_bus.current_committee().send_replace(Some(committee.clone()));
         Ok(())
     }
 
@@ -1349,8 +1353,11 @@ where
             )
             .await?;
 
-        let engine_to_primary =
-            EngineToPrimaryRpc::new(primary.consensus_bus().await, self.consensus_db.clone());
+        let engine_to_primary = EngineToPrimaryRpc::new(
+            primary.consensus_bus().await,
+            self.consensus_db.clone(),
+            engine.get_reth_env().await,
+        );
         // only spawns one worker for now
         let worker = self
             .spawn_worker_node_components(
@@ -1449,6 +1456,8 @@ where
 
         // load committee
         committee.load();
+        // Publish the active committee immediately so RPC reflects the live epoch.
+        self.consensus_bus.current_committee().send_replace(Some(committee.clone()));
 
         Ok(committee)
     }
