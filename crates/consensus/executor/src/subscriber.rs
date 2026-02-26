@@ -59,7 +59,7 @@ pub fn spawn_subscriber<DB: Database>(
 ) {
     let authority_id = config.authority_id();
     let committee = config.committee().clone();
-    let client = config.local_network().clone();
+    let client = config.local_network(0).clone();
     let mode = consensus_bus.current_node_mode();
     info!(target: "tn::observer", node_mode = ?mode, "subscriber starting in mode");
     let subscriber = Subscriber {

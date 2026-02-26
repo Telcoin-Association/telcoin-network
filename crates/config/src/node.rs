@@ -43,6 +43,11 @@ pub struct Config {
 impl ConfigTrait for Config {}
 
 impl Config {
+    /// Return configured number of workers.
+    pub fn num_workers(&self) -> u16 {
+        self.parameters.num_workers
+    }
+
     /// Create a Config for testing.
     pub fn default_for_test() -> Self {
         Self::default_for_test_with_genesis(test_genesis())
@@ -159,7 +164,16 @@ impl Config {
 
     /// Update the worker network key.
     pub fn update_worker_network_key(&mut self, value: NetworkPublicKey) -> eyre::Result<()> {
-        self.node_info.p2p_info.worker.network_key = value;
+        if self.node_info.p2p_info.workers.is_empty() {
+            let default_worker = NodeInfo::default()
+                .p2p_info
+                .workers
+                .into_iter()
+                .next()
+                .expect("default node info has a worker entry");
+            self.node_info.p2p_info.workers.push(default_worker);
+        }
+        self.node_info.p2p_info.workers[0].network_key = value;
         Ok(())
     }
 
@@ -248,6 +262,9 @@ pub struct Parameters {
     /// certificates.
     #[serde(default = "Parameters::default_parallel_fetch_request_delay_interval")]
     pub parallel_fetch_request_delay_interval: Duration,
+    /// Number of workers per validator.
+    #[serde(default = "Parameters::default_num_workers")]
+    pub num_workers: u16,
 }
 
 impl Parameters {
@@ -294,6 +311,10 @@ impl Parameters {
 
     fn default_parallel_fetch_request_delay_interval() -> Duration {
         Duration::from_secs(5)
+    }
+
+    fn default_num_workers() -> u16 {
+        1
     }
 }
 
@@ -357,6 +378,7 @@ impl Default for Parameters {
             basefee_address: None,
             parallel_fetch_request_delay_interval:
                 Parameters::default_parallel_fetch_request_delay_interval(),
+            num_workers: Parameters::default_num_workers(),
         }
     }
 }
