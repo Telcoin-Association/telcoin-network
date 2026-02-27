@@ -100,8 +100,34 @@ impl DataFile {
     /// Set the file length by truncating or extending.
     /// Used to truncate an incomplete record.
     pub fn set_len(&mut self, len: u64) -> Result<(), io::Error> {
+        if !self.read_only && !self.write_buffer.is_empty() {
+            self.data_file.write_all(&self.write_buffer)?;
+            self.data_file_end += self.write_buffer.len() as u64;
+            self.write_buffer.clear();
+        }
         self.data_file.set_len(len)?;
         self.data_file_end = len;
+        if !self.read_only {
+            // Reopen file so the append cursor will be correct.
+            self.data_file =
+                OpenOptions::new().read(true).append(!self.read_only).open(&self.data_file_path)?;
+        }
+        if self.read_buffer_start + self.read_buffer_len as u64 > len {
+            if self.data_file_end > 0 {
+                self.data_file.rewind()?;
+                if self.data_file_end < READ_BUFFER_SIZE as u64 {
+                    self.data_file
+                        .read_exact(&mut self.read_buffer[..self.data_file_end as usize])?;
+                    self.read_buffer_len = self.data_file_end as usize;
+                } else {
+                    self.data_file.read_exact(&mut self.read_buffer[..])?;
+                    self.read_buffer_len = READ_BUFFER_SIZE;
+                }
+            } else {
+                self.read_buffer_len = 0;
+            }
+            self.read_buffer_start = 0;
+        }
         Ok(())
     }
 

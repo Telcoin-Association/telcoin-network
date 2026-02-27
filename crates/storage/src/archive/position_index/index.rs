@@ -112,7 +112,6 @@ impl PdxHeader {
 pub struct PositionIndex {
     _header: PdxHeader,
     pdx_file: DataFile,
-    file_len: u64,
     _index_dir: PathBuf,
 }
 
@@ -126,13 +125,10 @@ impl PositionIndex {
         let dir = dir.as_ref();
         let _ = fs::create_dir(dir);
         let mut pdx_file = DataFile::open(dir.join("index.pdx"), read_only)?;
-        let mut file_end = pdx_file.seek(SeekFrom::End(0))?;
 
-        let header = if file_end == 0 {
+        let header = if pdx_file.is_empty() {
             let mut header = PdxHeader::from_data_header(data_header);
             header.write_header(&mut pdx_file)?;
-            file_end += PDX_HEADER_SIZE as u64;
-            //pdx_file.flush()?;
             header
         } else {
             let header = PdxHeader::load_header(&mut pdx_file)?;
@@ -148,17 +144,29 @@ impl PositionIndex {
             }
             header
         };
-        Ok(Self { _header: header, pdx_file, _index_dir: dir.to_owned(), file_len: file_end })
+        Ok(Self { _header: header, pdx_file, _index_dir: dir.to_owned() })
     }
 
     /// Return the number of values in this index.
     pub fn len(&self) -> usize {
-        (self.file_len.saturating_sub(PDX_HEADER_SIZE as u64) / 8) as usize
+        (self.pdx_file.len().saturating_sub(PDX_HEADER_SIZE as u64) / 8) as usize
     }
 
     /// True if there are no keys stored in this index.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Truncate the index to key (inclusive).
+    pub fn truncate_to_index(&mut self, key: u64) -> Result<(), io::Error> {
+        let pos = PDX_HEADER_SIZE as u64 + (key * 8) + 8;
+        self.pdx_file.set_len(pos)
+    }
+
+    /// Truncate the index to just the header.
+    pub fn truncate_all(&mut self) -> Result<(), io::Error> {
+        let pos = PDX_HEADER_SIZE as u64;
+        self.pdx_file.set_len(pos)
     }
 }
 
@@ -172,7 +180,6 @@ impl Index<u64> for PositionIndex {
             )))
         } else {
             self.pdx_file.write_all(&record_pos.to_le_bytes())?;
-            self.file_len += 8;
             Ok(())
         }
     }
