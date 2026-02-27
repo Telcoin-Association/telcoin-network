@@ -16,6 +16,7 @@ use std::{
 };
 use tn_config::Parameters;
 use tn_network_libp2p::types::NetworkEvent;
+use tn_storage::consensus::ConsensusChain;
 use tn_types::{
     BlockHash, BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput, Epoch,
     EpochRecord, EpochVote, Header, Round, TnReceiver, TnSender, CHANNEL_CAPACITY,
@@ -674,20 +675,25 @@ impl ConsensusBus {
     /// Returns the ConsensusHeader that created the last executed block if it can be found.
     /// If we are not starting at genesis or a new epoch, then not finding this indicates a database
     /// issue.
-    pub fn last_executed_consensus_block<DB: tn_types::Database>(
+    pub async fn last_executed_consensus_block(
         &self,
-        db: &DB,
+        epoch: Option<Epoch>,
+        consensus_chain: &ConsensusChain,
     ) -> Option<ConsensusHeader> {
-        use tn_storage::ConsensusStore as _;
-        let last = self
+        let parent_beacon_block_root = self
             .recent_blocks()
             .borrow()
             .latest_execution_block()
             .header()
-            .parent_beacon_block_root
-            .and_then(|hash| db.get_consensus_by_hash(hash));
-
-        last
+            .parent_beacon_block_root;
+        if let Some(consensus_hash) = parent_beacon_block_root {
+            consensus_chain
+                .consensus_header_by_digest(epoch, consensus_hash)
+                .await
+                .unwrap_or_default()
+        } else {
+            None
+        }
     }
 }
 

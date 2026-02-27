@@ -8,7 +8,7 @@ use std::sync::{Arc, LazyLock};
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::GossipMessage;
 use tn_network_types::{WorkerOthersBatchMessage, WorkerToPrimaryClient};
-use tn_storage::tables::Batches;
+use tn_storage::tables::NodeBatchesCache;
 use tn_types::{
     ensure, now, try_decode, Batch, BatchValidation, BlockHash, BlsPublicKey, Database,
     SealedBatch, WorkerId,
@@ -69,18 +69,20 @@ where
                 );
                 // Retrieve the block...
                 let store = self.consensus_config.node_storage();
-                if !matches!(store.get::<Batches>(&batch_hash), Ok(Some(_))) {
+                if !matches!(store.get::<NodeBatchesCache>(&batch_hash), Ok(Some(_))) {
                     // If we don't have this batch already then try to get it.
                     // If we are a CVV then we should already have it.
                     // This allows non-CVVs to pre fetch batches they will soon need.
                     match self.network_handle.request_batches(vec![batch_hash]).await {
                         Ok(batches) => {
                             if let Some(batch) = batches.first() {
-                                store.insert::<Batches>(&batch.digest(), batch).map_err(|e| {
-                                    WorkerNetworkError::Internal(format!(
-                                        "failed to write to batch store: {e}"
-                                    ))
-                                })?;
+                                store.insert::<NodeBatchesCache>(&batch.digest(), batch).map_err(
+                                    |e| {
+                                        WorkerNetworkError::Internal(format!(
+                                            "failed to write to batch store: {e}"
+                                        ))
+                                    },
+                                )?;
                             }
                         }
                         Err(e) => {
@@ -131,7 +133,7 @@ where
 
         // Set received_at timestamp for remote batch.
         batch.set_received_at(now());
-        store.insert::<Batches>(&digest, &batch).map_err(|e| {
+        store.insert::<NodeBatchesCache>(&digest, &batch).map_err(|e| {
             WorkerNetworkError::Internal(format!("failed to write to batch store: {e}"))
         })?;
 
@@ -185,7 +187,7 @@ where
 
         for digests_chunks in digests_chunks {
             let stored_batches =
-                store.multi_get::<Batches>(digests_chunks.iter()).map_err(|e| {
+                store.multi_get::<NodeBatchesCache>(digests_chunks.iter()).map_err(|e| {
                     WorkerNetworkError::Internal(format!("failed to read from batch store: {e:?}"))
                 })?;
 

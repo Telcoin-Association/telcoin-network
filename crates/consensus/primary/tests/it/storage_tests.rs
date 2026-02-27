@@ -11,15 +11,16 @@ use tempfile::TempDir;
 use tn_primary::test_utils::temp_dir;
 use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_storage::{
+    consensus::ConsensusChain,
     mem_db::MemDatabase,
     open_db,
-    tables::{CertificateDigestByOrigin, CertificateDigestByRound, Certificates, ConsensusBlocks},
-    CertificateStore, ConsensusStore, ProposerStore,
+    tables::{CertificateDigestByOrigin, CertificateDigestByRound, Certificates},
+    CertificateStore, ProposerStore,
 };
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Database, Hash as _,
-    Header, HeaderBuilder, ReputationScores, Round,
+    AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Database, EpochRecord,
+    Hash as _, Header, HeaderBuilder, ReputationScores, Round,
 };
 
 fn create_header_for_round(round: Round) -> Header {
@@ -98,9 +99,21 @@ async fn test_proposer_store_reads() {
 async fn test_consensus_store_read_latest_final_reputation_scores() {
     // GIVEN
     let temp_dir = TempDir::new().unwrap();
-    let store = open_db(temp_dir.path());
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
+    let mut consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).unwrap();
+    consensus_chain
+        .new_epoch(
+            EpochRecord {
+                epoch: 0,
+                committee: committee.bls_keys().iter().copied().collect(),
+                next_committee: committee.bls_keys().iter().copied().collect(),
+                ..Default::default()
+            },
+            committee.clone(),
+        )
+        .unwrap();
 
     // AND we add some commits without any final scores
     for sequence_number in 0..10 {
@@ -112,11 +125,12 @@ async fn test_consensus_store_read_latest_final_reputation_scores() {
             None,
         ));
 
-        store.write_subdag_for_test(sequence_number, sub_dag);
+        consensus_chain.write_subdag_for_test(sequence_number, sub_dag).await;
     }
 
     // WHEN we try to read the final schedule. The one of sub dag sequence 12 should be returned
-    let commit = store.read_latest_commit_with_final_reputation_scores(committee.epoch());
+    let commit =
+        consensus_chain.read_latest_commit_with_final_reputation_scores(committee.epoch()).await;
 
     // THEN no commit is returned
     assert!(commit.is_none());
@@ -138,12 +152,15 @@ async fn test_consensus_store_read_latest_final_reputation_scores() {
             None,
         ));
 
-        store.write_subdag_for_test(sequence_number, sub_dag);
+        consensus_chain.write_subdag_for_test(sequence_number, sub_dag).await;
     }
-    store.persist::<ConsensusBlocks>().await;
+    //XXXXstore.persist::<ConsensusBlocks>().await;
 
     // WHEN we try to read the final schedule. The one of sub dag sequence 20 should be returned
-    let commit = store.read_latest_commit_with_final_reputation_scores(committee.epoch()).unwrap();
+    let commit = consensus_chain
+        .read_latest_commit_with_final_reputation_scores(committee.epoch())
+        .await
+        .unwrap();
 
     assert!(commit.reputation_score.final_of_schedule);
 }

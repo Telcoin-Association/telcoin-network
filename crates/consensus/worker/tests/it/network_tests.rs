@@ -7,7 +7,7 @@ use tn_network_libp2p::{
     types::{NetworkCommand, NetworkHandle},
     GossipMessage, TopicHash,
 };
-use tn_storage::{mem_db::MemDatabase, tables::Batches};
+use tn_storage::{mem_db::MemDatabase, tables::NodeBatchesCache};
 use tn_test_utils::CommitteeFixture;
 use tn_types::{Batch, BlsPublicKey, Database, SealedBatch, TaskManager, B256};
 use tn_worker::{
@@ -82,7 +82,7 @@ async fn test_request_batches_success() {
         .first_authority()
         .consensus_config()
         .node_storage()
-        .insert::<Batches>(&sealed_batch.digest, &sealed_batch.batch)
+        .insert::<NodeBatchesCache>(&sealed_batch.digest, &sealed_batch.batch)
         .expect("write batch to db");
 
     let batch_digests = vec![batch_digest];
@@ -132,7 +132,7 @@ async fn test_request_batches_capped_at_response_max_requestor() {
             .first_authority()
             .consensus_config()
             .node_storage()
-            .insert::<Batches>(&batch.digest, &batch.batch)
+            .insert::<NodeBatchesCache>(&batch.digest, &batch.batch)
             .expect("write batch to db");
     }
 
@@ -169,7 +169,7 @@ async fn test_request_batches_capped_at_response_max_internal() {
             .first_authority()
             .consensus_config()
             .node_storage()
-            .insert::<Batches>(&batch.digest, &batch.batch)
+            .insert::<NodeBatchesCache>(&batch.digest, &batch.batch)
             .expect("write batch to db");
     }
 

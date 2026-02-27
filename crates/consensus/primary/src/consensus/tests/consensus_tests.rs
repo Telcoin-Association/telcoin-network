@@ -8,12 +8,14 @@ use crate::{
     ConsensusBus,
 };
 use std::collections::BTreeSet;
-use tn_storage::{mem_db::MemDatabase, CertificateStore, ConsensusStore};
+use tempfile::TempDir;
+use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, CertificateStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     BlockNumHash, Certificate, CertificateDigest, ExecHeader, Hash as _, ReputationScores,
     SealedHeader, TaskManager, TnReceiver, TnSender, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
+use tokio::fs::create_dir_all;
 
 /// This test is trying to compare the output of the Consensus algorithm when:
 /// (1) running without any crash for certificates processed from round 1 to 5 (inclusive)
@@ -34,7 +36,6 @@ async fn test_consensus_recovery_with_bullshark() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
     let config = fixture.authorities().next().unwrap().consensus_config().clone();
-    let consensus_store = config.node_storage().clone();
     let certificate_store = config.node_storage().clone();
 
     // config.set_consensus_bad_nodes_stake_threshold(33);
@@ -45,12 +46,16 @@ async fn test_consensus_recovery_with_bullshark() {
         Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
     let (certificates, _next_parents) =
         make_optimal_certificates(&committee, 1..=7, &genesis, &ids);
+    let temp_dir = TempDir::new().unwrap();
+    let mut consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).unwrap();
 
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),
-        consensus_store.clone(),
+        &mut consensus_chain,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
-    );
+    )
+    .await;
     let bullshark = Bullshark::new(
         committee.clone(),
         num_sub_dags_per_schedule,
@@ -65,7 +70,7 @@ async fn test_consensus_recovery_with_bullshark() {
     });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
-    Consensus::spawn(config.clone(), &cb, bullshark, &task_manager);
+    Consensus::spawn(config.clone(), &cb, bullshark, &task_manager, consensus_chain.clone()).await;
 
     // WHEN we feed all certificates to the consensus.
     for certificate in certificates.iter() {
@@ -92,10 +97,12 @@ async fn test_consensus_recovery_with_bullshark() {
     let mut committed_output_no_crash: Vec<Certificate> = Vec::new();
     let mut score_no_crash: ReputationScores = ReputationScores::default();
 
+    let mut idx = 1;
     'main: while let Some(sub_dag) = rx_output.recv().await {
         score_no_crash = sub_dag.reputation_score.clone();
         assert_eq!(sub_dag.leader.round(), consensus_index_counter);
-        consensus_store.write_subdag_for_test(consensus_index_counter as u64, sub_dag.clone());
+        consensus_chain.write_subdag_for_test(idx, sub_dag.clone()).await;
+        idx += 1;
         for output in sub_dag.certificates() {
             assert!(output.round() <= 6);
 
@@ -111,7 +118,7 @@ async fn test_consensus_recovery_with_bullshark() {
     }
 
     // AND the last committed store should be updated correctly
-    let last_committed = consensus_store.read_last_committed(config.epoch());
+    let last_committed = consensus_chain.read_last_committed(config.epoch()).await;
 
     for id in ids.clone() {
         let last_round = *last_committed.get(&id).unwrap();
@@ -130,13 +137,17 @@ async fn test_consensus_recovery_with_bullshark() {
     drop(task_manager);
 
     certificate_store.clear().unwrap();
-    consensus_store.clear_consensus_chain_for_test();
+    // Make new chain DB to "clear" it.
+    let path2 = temp_dir.path().join("2");
+    let _ = create_dir_all(&path2);
+    let mut consensus_chain = ConsensusChain::new_for_test(path2, committee.clone()).unwrap();
 
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),
-        consensus_store.clone(),
+        &mut consensus_chain,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
-    );
+    )
+    .await;
     let bullshark = Bullshark::new(
         committee.clone(),
         num_sub_dags_per_schedule,
@@ -151,7 +162,7 @@ async fn test_consensus_recovery_with_bullshark() {
     });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
-    Consensus::spawn(config.clone(), &cb, bullshark, &task_manager);
+    Consensus::spawn(config.clone(), &cb, bullshark, &task_manager, consensus_chain.clone()).await;
 
     // WHEN we send same certificates but up to round 3 (inclusive)
     // Then we store all the certificates up to round 6 so we can let the recovery algorithm
@@ -176,7 +187,9 @@ async fn test_consensus_recovery_with_bullshark() {
 
     'main: while let Some(sub_dag) = rx_output.recv().await {
         assert_eq!(sub_dag.leader.round(), consensus_index_counter);
-        consensus_store.write_subdag_for_test(consensus_index_counter as u64, sub_dag.clone());
+        consensus_chain
+            .write_subdag_for_test(consensus_index_counter as u64, sub_dag.clone())
+            .await;
         for output in sub_dag.certificates() {
             assert!(output.round() <= 2);
 
@@ -204,13 +217,16 @@ async fn test_consensus_recovery_with_bullshark() {
     );
 
     let cb = ConsensusBus::new();
+    let temp_dir = TempDir::new().unwrap();
+    let mut consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().join("2"), committee.clone()).unwrap();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.recent_blocks().send_modify(|blocks| {
         blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
     });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
-    Consensus::spawn(config, &cb, bullshark, &task_manager);
+    Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain.clone()).await;
 
     // WHEN send the certificates of round >= 5 to trigger a leader election for round 4
     // and start committing.
@@ -227,7 +243,9 @@ async fn test_consensus_recovery_with_bullshark() {
     'main: while let Some(sub_dag) = rx_output.recv().await {
         score_with_crash = sub_dag.reputation_score.clone();
         assert_eq!(score_with_crash.total_authorities(), 4);
-        consensus_store.write_subdag_for_test(consensus_index_counter as u64, sub_dag.clone());
+        consensus_chain
+            .write_subdag_for_test(consensus_index_counter as u64, sub_dag.clone())
+            .await;
 
         for output in sub_dag.certificates() {
             assert!(output.round() >= 2);

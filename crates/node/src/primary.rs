@@ -7,6 +7,7 @@ use tn_primary::{
     network::PrimaryNetworkHandle,
     ConsensusBus, Primary, StateSynchronizer,
 };
+use tn_storage::consensus::ConsensusChain;
 use tn_types::{
     Committee, Database as ConsensusDatabase, Notifier, TaskManager,
     DEFAULT_BAD_NODES_STAKE_THRESHOLD,
@@ -33,17 +34,26 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
 
     /// Starts the primary node with the provided info. If the node is already running then this
     /// method will return an error instead.
-    async fn start(&mut self, task_manager: &TaskManager) -> eyre::Result<()> {
+    async fn start(
+        &mut self,
+        task_manager: &TaskManager,
+        consensus_chain: ConsensusChain,
+    ) -> eyre::Result<()> {
         // spawn primary and update `self`
-        self.spawn_primary(task_manager).await?;
+        self.spawn_primary(task_manager, consensus_chain).await?;
 
         Ok(())
     }
 
     /// Spawn a new primary. Optionally also spawn the consensus and a client executing
     /// transactions.
-    async fn spawn_primary(&mut self, task_manager: &TaskManager) -> SubscriberResult<()> {
-        let leader_schedule = self.spawn_consensus(&self.consensus_bus, task_manager).await?;
+    async fn spawn_primary(
+        &mut self,
+        task_manager: &TaskManager,
+        consensus_chain: ConsensusChain,
+    ) -> SubscriberResult<()> {
+        let leader_schedule =
+            self.spawn_consensus(&self.consensus_bus, task_manager, consensus_chain).await?;
 
         self.primary.spawn(
             self.consensus_config.clone(),
@@ -61,12 +71,14 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
         &self,
         consensus_bus: &ConsensusBus,
         task_manager: &TaskManager,
+        mut consensus_chain: ConsensusChain,
     ) -> SubscriberResult<LeaderSchedule> {
         let leader_schedule = LeaderSchedule::from_store(
             self.consensus_config.committee().clone(),
-            self.consensus_config.node_storage().clone(),
+            &mut consensus_chain,
             DEFAULT_BAD_NODES_STAKE_THRESHOLD,
-        );
+        )
+        .await;
 
         // Spawn the consensus core who only sequences transactions.
         let ordering_engine = Bullshark::new(
@@ -80,7 +92,9 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
             consensus_bus,
             ordering_engine,
             task_manager,
-        );
+            consensus_chain.clone(),
+        )
+        .await;
 
         // Spawn the client executing the transactions.
         // It also synchronizes with the subscriber handler if it missed some transactions.
@@ -90,6 +104,7 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
             consensus_bus.clone(),
             task_manager,
             self.primary.network_handle().clone(),
+            consensus_chain,
         );
 
         Ok(leader_schedule)
@@ -115,12 +130,16 @@ impl<CDB: ConsensusDatabase> PrimaryNode<CDB> {
         Self { internal: Arc::new(RwLock::new(inner)) }
     }
 
-    pub async fn start(&self, task_manager: &TaskManager) -> eyre::Result<()>
+    pub async fn start(
+        &self,
+        task_manager: &TaskManager,
+        consensus_chain: ConsensusChain,
+    ) -> eyre::Result<()>
     where
         CDB: ConsensusDatabase,
     {
         let mut guard = self.internal.write().await;
-        guard.start(task_manager).await
+        guard.start(task_manager, consensus_chain).await
     }
 
     /// Return a copy of the primaries consensus bus.
