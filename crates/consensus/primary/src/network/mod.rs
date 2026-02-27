@@ -349,6 +349,7 @@ where
                     let _ = network_handle.handle.send_response(err, channel).await;
                 });
             }
+            _ => unimplemented!("inbound stream unimplemented"),
         }
     }
 
