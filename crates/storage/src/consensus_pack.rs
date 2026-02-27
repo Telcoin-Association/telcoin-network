@@ -339,6 +339,11 @@ impl Inner {
             } else {
                 data.truncate(consensus_final)?;
             }
+            // Note we leave the digest indexes with potentially some missing digests.
+            // This should be OK since they will have to be overwritten with same digests
+            // when they are readded and lookups should handle this.
+            // Alternatively we would need to regen the indexes from scratch or painstakenly
+            // remove digests, both would be expensive operations.
         }
         let pack_len = data.file_len();
         if !consensus_idx.is_empty() {
@@ -709,7 +714,14 @@ impl Inner {
 
     /// True if consensus header is found by digest.
     fn contains_consensus_header(&mut self, digest: B256) -> bool {
-        self.consensus_digests.contains(digest)
+        // This is a bit more complicated (the pos file_len check) because in a very rare
+        // case of repairing a damaged pack we might have something in the index not in the
+        // pack file (yet).
+        if let Ok(pos) = self.consensus_digests.load(digest) {
+            pos < self.data.file_len()
+        } else {
+            false
+        }
     }
 
     /// Retrieve a consensus header by digest.
