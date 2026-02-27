@@ -158,26 +158,26 @@ where
         let gossip = try_decode(data)?;
 
         match gossip {
-            PrimaryGossip::Certificate(cert) => {
+            PrimaryGossip::Certificate(mut cert) => {
                 ensure!(
                     topic.to_string().eq(&tn_config::LibP2pConfig::primary_topic()),
                     PrimaryNetworkError::InvalidTopic
                 );
                 // process certificate
-                let unverified_cert = cert.validate_received().map_err(CertManagerError::from)?;
+                cert.validate_received().map_err(CertManagerError::from)?;
 
-                let epoch = unverified_cert.header().epoch;
+                let epoch = cert.header().epoch;
                 // Early verify so we can detect we are behind.
                 // The verification is cached in the cert so this should not be too expensive.
                 if let Some(committee) = self.get_committee(epoch) {
-                    match unverified_cert.verify_cert(&committee) {
-                        Ok(cert) => {
+                    match cert.verify_cert(&committee) {
+                        Ok(()) => {
                             if self.consensus_bus.is_active_cvv() {
                                 if self.behind_consensus(epoch, cert.header().round, None).await {
                                     warn!(target: "primary", "certificate indicates we are behind, go to catchup mode!");
                                     return Ok(());
                                 }
-                                self.state_sync.process_peer_certificate(cert).await?;
+                                self.state_sync.process_peer_certificate(&mut cert).await?;
                             }
                         }
                         Err(e) => warn!(target: "primary", "Recieved invalid cert {e}"),
@@ -708,7 +708,7 @@ where
         }
 
         // try to accept
-        for parent in parents {
+        for parent in parents.iter_mut() {
             self.state_sync.process_peer_certificate(parent).await?;
         }
 

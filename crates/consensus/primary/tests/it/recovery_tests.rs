@@ -4,7 +4,7 @@
 //! - Subdags persist across restarts
 //! - DAG can be reconstructed from storage
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 use tempfile::TempDir;
 use tn_storage::{
     mem_db::MemDatabase,
@@ -38,7 +38,8 @@ async fn test_subdag_persists_restart() {
         for idx in 0..5u64 {
             let leader = certificates.first().cloned().unwrap();
             let reputation = ReputationScores::new(&committee);
-            let subdag = CommittedSubDag::new(certificates.clone(), leader, idx, reputation, None);
+            let subdag =
+                Arc::new(CommittedSubDag::new(certificates.clone(), leader, idx, reputation, None));
 
             store.write_subdag_for_test(idx, subdag);
         }
@@ -94,7 +95,8 @@ async fn test_subdag_persists_multiple_writes() {
     for idx in 0..3u64 {
         let leader = certs_epoch0.first().cloned().unwrap();
         let reputation = ReputationScores::new(&committee_epoch0);
-        let subdag = CommittedSubDag::new(certs_epoch0.clone(), leader, idx, reputation, None);
+        let subdag =
+            Arc::new(CommittedSubDag::new(certs_epoch0.clone(), leader, idx, reputation, None));
         store.write_subdag_for_test(idx, subdag);
     }
     store.persist::<ConsensusBlocks>().await;
@@ -117,7 +119,8 @@ async fn test_subdag_persists_multiple_writes() {
     for idx in 3..6u64 {
         let leader = certs_epoch1.first().cloned().unwrap();
         let reputation = ReputationScores::new(&committee_epoch1);
-        let subdag = CommittedSubDag::new(certs_epoch1.clone(), leader, idx, reputation, None);
+        let subdag =
+            Arc::new(CommittedSubDag::new(certs_epoch1.clone(), leader, idx, reputation, None));
         store.write_subdag_for_test(idx, subdag);
     }
     store.persist::<ConsensusBlocks>().await;
@@ -147,7 +150,7 @@ async fn test_certificate_store_persists_restart() {
     // Phase 1: Write certificates to storage
     {
         let store = open_db(temp_dir.path());
-        store.write_all(certificates.clone()).unwrap();
+        store.write_all(&certificates).unwrap();
         store.persist::<Certificates>().await;
         drop(store); // Explicit drop to release DB lock
     }
@@ -193,7 +196,7 @@ async fn test_dag_reconstruction_from_store() {
         let certs: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
 
         // Store certificates
-        store.write_all(certs.clone()).unwrap();
+        store.write_all(certs.iter()).unwrap();
 
         parents = certs.iter().map(|c| c.digest()).collect();
         all_certs.extend(certs);
@@ -240,8 +243,13 @@ async fn test_last_committed_persists() {
     // Create subdags with different leaders to track last committed per authority
     for (idx, cert) in certificates.iter().enumerate() {
         let reputation = ReputationScores::new(&committee);
-        let subdag =
-            CommittedSubDag::new(vec![cert.clone()], cert.clone(), idx as u64, reputation, None);
+        let subdag = Arc::new(CommittedSubDag::new(
+            vec![cert.clone()],
+            cert.clone(),
+            idx as u64,
+            reputation,
+            None,
+        ));
         store.write_subdag_for_test(idx as u64, subdag);
     }
     store.persist::<ConsensusBlocks>().await;

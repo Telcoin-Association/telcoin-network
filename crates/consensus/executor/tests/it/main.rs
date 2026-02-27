@@ -89,7 +89,7 @@ async fn test_output_to_header() -> eyre::Result<()> {
         // assert epoch boundary not reached
         assert!(!output.close_epoch);
 
-        let num = output.number;
+        let num = output.number();
         let consensus_header = output.consensus_header();
         consensus_headers_seen.push(consensus_header);
         if num == expected_num as u64 {
@@ -178,7 +178,7 @@ async fn test_executor_output_ordering() -> eyre::Result<()> {
     let mut count = 0;
 
     while let Some(output) = consensus_output.recv().await {
-        let num = output.number;
+        let num = output.number();
 
         // Verify monotonically increasing
         assert!(num > last_number, "Output number {} should be > previous {}", num, last_number);
@@ -260,14 +260,14 @@ async fn test_executor_batch_fetching() -> eyre::Result<()> {
 
     while let Some(output) = consensus_output.recv().await {
         // Count batches in this output
-        for certified_batch in &output.batches {
+        for certified_batch in output.batches() {
             total_batches_received += certified_batch.batches.len();
         }
 
         // Also count batch_digests
-        let digest_count = output.batch_digests.len();
+        let digest_count = output.batch_digests().len();
         assert!(
-            digest_count > 0 || output.batches.iter().all(|cb| cb.batches.is_empty()),
+            digest_count > 0 || output.batches().iter().all(|cb| cb.batches.is_empty()),
             "Should have batch digests if batches exist"
         );
 

@@ -165,8 +165,8 @@ mod tests {
             committee,
             next_committee: vec![],
             parent_hash: B256::ZERO,
-            parent_state: BlockNumHash::default(),
-            parent_consensus: B256::ZERO,
+            final_state: BlockNumHash::default(),
+            final_consensus: BlockNumHash::default(),
         }
     }
 

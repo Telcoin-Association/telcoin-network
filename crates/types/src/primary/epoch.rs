@@ -31,10 +31,10 @@ pub struct EpochRecord {
     /// The block number and hash of the last execution state of this epoch.
     /// Basically the execution genesis for the next epoch after this one.
     /// Also a signed checkpoint of execution state (with the certificate).
-    pub parent_state: BlockNumHash,
-    /// The hash of the last ['ConsensusHeader'] of this epoch.
+    pub final_state: BlockNumHash,
+    /// The hash and consensus block number of the last ['ConsensusHeader'] of this epoch.
     /// Can be used as a signed checkpoint for consensus (with the certificate).
-    pub parent_consensus: B256,
+    pub final_consensus: BlockNumHash,
 }
 
 impl EpochRecord {
@@ -193,8 +193,8 @@ mod test {
             committee: vec![com1.public_key(), com2.public_key(), com3.public_key()],
             next_committee: vec![com1.public_key(), com2.public_key(), com3.public_key()],
             parent_hash: B256::default(),
-            parent_state: BlockNumHash::default(),
-            parent_consensus: B256::default(),
+            final_state: BlockNumHash::default(),
+            final_consensus: BlockNumHash::default(),
         };
         let vote1 = record.sign_vote(&com1);
         let vote2 = record.sign_vote(&com2);

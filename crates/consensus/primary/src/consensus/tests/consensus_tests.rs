@@ -96,7 +96,7 @@ async fn test_consensus_recovery_with_bullshark() {
         score_no_crash = sub_dag.reputation_score.clone();
         assert_eq!(sub_dag.leader.round(), consensus_index_counter);
         consensus_store.write_subdag_for_test(consensus_index_counter as u64, sub_dag.clone());
-        for output in sub_dag.certificates {
+        for output in sub_dag.certificates() {
             assert!(output.round() <= 6);
 
             committed_output_no_crash.push(output.clone());
@@ -177,7 +177,7 @@ async fn test_consensus_recovery_with_bullshark() {
     'main: while let Some(sub_dag) = rx_output.recv().await {
         assert_eq!(sub_dag.leader.round(), consensus_index_counter);
         consensus_store.write_subdag_for_test(consensus_index_counter as u64, sub_dag.clone());
-        for output in sub_dag.certificates {
+        for output in sub_dag.certificates() {
             assert!(output.round() <= 2);
 
             committed_output_before_crash.push(output.clone());
@@ -229,7 +229,7 @@ async fn test_consensus_recovery_with_bullshark() {
         assert_eq!(score_with_crash.total_authorities(), 4);
         consensus_store.write_subdag_for_test(consensus_index_counter as u64, sub_dag.clone());
 
-        for output in sub_dag.certificates {
+        for output in sub_dag.certificates() {
             assert!(output.round() >= 2);
 
             committed_output_after_crash.push(output.clone());

@@ -89,10 +89,10 @@ async fn test_certificate_bls_signature_verification() {
     let certificate = fixture.certificate(&header);
 
     // Verify the certificate against the committee
-    let verified_cert = certificate.validate_and_verify(&committee);
-    assert!(verified_cert.is_ok(), "Valid certificate should verify: {:?}", verified_cert.err());
+    let mut verified_cert = certificate.clone();
+    let res = verified_cert.validate_and_verify(&committee);
+    assert!(res.is_ok(), "Valid certificate should verify: {:?}", res.err());
 
-    let verified_cert = verified_cert.unwrap();
     assert!(verified_cert.is_verified(), "Certificate should be marked as verified");
 
     // Create a certificate with tampered header (different round)
@@ -139,7 +139,7 @@ async fn test_certificate_wrong_epoch_rejected() {
 
     // The certificate might be created (depending on implementation)
     // but validation against the committee should fail
-    if let Ok(certificate) = cert_result {
+    if let Ok(mut certificate) = cert_result {
         assert_eq!(certificate.epoch(), 1);
 
         // Validation should fail due to epoch mismatch
@@ -171,7 +171,7 @@ async fn test_genesis_certificates_valid() {
 
     assert_eq!(genesis_certs.len(), committee.size());
 
-    for cert in genesis_certs {
+    for mut cert in genesis_certs {
         // Genesis certificates should always validate
         let result = cert.validate_and_verify(&committee);
         assert!(result.is_ok(), "Genesis certificate should be valid: {:?}", result.err());
@@ -189,7 +189,7 @@ async fn test_certificate_unknown_authority_rejected() {
 
     // Create a certificate from the other committee's authority
     let other_header = other_fixture.header_from_last_authority();
-    let other_cert = other_fixture.certificate(&other_header);
+    let mut other_cert = other_fixture.certificate(&other_header);
 
     // Try to validate against our committee - should fail
     let result = other_cert.validate_and_verify(&committee);
@@ -209,7 +209,7 @@ async fn test_certificate_verify_with_empty_keys_rejected() {
 
     // Create a valid certificate
     let header = fixture.header_from_last_authority();
-    let certificate = fixture.certificate(&header);
+    let mut certificate = fixture.certificate(&header);
 
     // Empty set of public keys to verify against
     let empty_keys: BTreeSet<tn_types::BlsPublicKey> = BTreeSet::new();

@@ -205,7 +205,7 @@ impl Certificate {
 
     /// Validate the certificate and verify signatures against the committee.
     ///
-    /// The method returns a certificate with verified signature state.
+    /// The method updates the certificate with verified signature state.
     ///
     /// [SignatureVerificationState] stores both the verification status and signature bytes
     /// together. While this creates some data redundancy with signed_authorities, keeping them
@@ -227,7 +227,7 @@ impl Certificate {
     /// While storing signatures in both places uses more memory, the strong correctness guarantees
     /// outweigh the storage cost for certificate verification where maintaining cryptographic
     /// integrity is critical.
-    pub fn validate_and_verify(self, committee: &Committee) -> CertificateResult<Certificate> {
+    pub fn validate_and_verify(&mut self, committee: &Committee) -> CertificateResult<()> {
         // ensure the header is from the correct epoch
         ensure!(
             self.epoch() == committee.epoch(),
@@ -238,8 +238,8 @@ impl Certificate {
         );
 
         // Genesis certificates are always valid.
-        if self.round() == 0 && Self::genesis(committee).contains(&self) {
-            return Ok(self);
+        if self.round() == 0 && Self::genesis(committee).contains(self) {
+            return Ok(());
         }
 
         // Save signature verifications when the header is invalid.
@@ -250,36 +250,33 @@ impl Certificate {
         let threshold = committee.quorum_threshold();
         ensure!(weight >= threshold, CertificateError::Inquorate { stake: weight, threshold });
 
-        let verified_cert = self.verify_signature(pks)?;
+        self.verify_signature(pks)?;
 
-        Ok(verified_cert)
+        Ok(())
     }
 
     /// Performs a signature verification of a certificate against committee.
     /// Will clear the state first and revalidate even if it appears to be valid.
-    pub fn verify_cert(
-        mut self,
-        committee: &BTreeSet<BlsPublicKey>,
-    ) -> CertificateResult<Certificate> {
-        self = self.validate_received()?;
+    pub fn verify_cert(&mut self, committee: &BTreeSet<BlsPublicKey>) -> CertificateResult<()> {
+        self.validate_received()?;
         let (weight, pks) = self.signed_by(committee);
 
         // All validator have a vote weight of 1.
         let threshold = quorum_threshold(committee.len() as u64);
         ensure!(weight >= threshold, CertificateError::Inquorate { stake: weight, threshold });
 
-        let verified_cert = self.verify_signature(pks)?;
+        self.verify_signature(pks)?;
 
-        Ok(verified_cert)
+        Ok(())
     }
 
     /// Check the verification state and try to verify directly.
-    fn verify_signature(mut self, pks: Vec<BlsPublicKey>) -> CertificateResult<Certificate> {
+    fn verify_signature(&mut self, pks: Vec<BlsPublicKey>) -> CertificateResult<()> {
         // get signature from verification state
         let signature = match self.signature_verification_state {
             SignatureVerificationState::VerifiedIndirectly(_)
             | SignatureVerificationState::VerifiedDirectly(_)
-            | SignatureVerificationState::Genesis => return Ok(self),
+            | SignatureVerificationState::Genesis => return Ok(()),
             SignatureVerificationState::Unverified(ref sig) => sig,
             SignatureVerificationState::Unsigned(_) => {
                 return Err(CertificateError::Unsigned);
@@ -296,16 +293,16 @@ impl Certificate {
         self.signature_verification_state =
             SignatureVerificationState::VerifiedDirectly(*signature);
 
-        Ok(self)
+        Ok(())
     }
 
     /// Validate certificate was received and ready for verification.
-    pub fn validate_received(mut self) -> CertificateResult<Self> {
+    pub fn validate_received(&mut self) -> CertificateResult<()> {
         self.set_signature_verification_state(SignatureVerificationState::Unverified(
             self.aggregated_signature()
                 .ok_or(CertificateError::RecoverBlsAggregateSignatureBytes)?,
         ));
-        Ok(self)
+        Ok(())
     }
 
     /// The certificate's round.

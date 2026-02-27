@@ -5,7 +5,7 @@
 
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -276,20 +276,21 @@ async fn test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
             empty_leader.header.created_at = tn_types::now();
             empty_leader.header_mut_for_test().author = leader.clone();
 
-            let empty_subdag = CommittedSubDag::new(
+            let empty_subdag = Arc::new(CommittedSubDag::new(
                 vec![empty_leader.clone()],
                 empty_leader,
                 synthetic_number,
                 ReputationScores::default(),
                 None,
+            ));
+            let empty_output = ConsensusOutput::new(
+                empty_subdag.clone(),
+                output.parent_hash(),
+                synthetic_number,
+                false,
+                VecDeque::new(),
+                vec![],
             );
-            let empty_output = ConsensusOutput {
-                sub_dag: empty_subdag.clone().into(),
-                number: synthetic_number,
-                parent_hash: output.parent_hash,
-                extra: output.extra,
-                ..Default::default()
-            };
             // Persist the synthetic output in consensus chain storage for catchup.
             consensus_store.write_subdag_for_test(synthetic_number, empty_subdag);
             rewards.entry(leader).and_modify(|count| *count += 1).or_insert(1);
