@@ -726,11 +726,8 @@ where
         });
 
         // set temporary task spawner - this is updated with each epoch
-        self.worker_network_handle = Some(WorkerNetworkHandle::new(
-            worker_network_handle,
-            node_task_spawner.clone(),
-            network_config.libp2p_config().max_rpc_message_size,
-        ));
+        self.worker_network_handle =
+            Some(WorkerNetworkHandle::new(worker_network_handle, node_task_spawner.clone()));
 
         Ok(())
     }
