@@ -17,7 +17,7 @@ use crate::archive::{
     pack::{DataHeader, DATA_HEADER_BYTES},
 };
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     fs::{self, File, OpenOptions},
     hash::{BuildHasher, BuildHasherDefault},
     io::{self, Read, Seek, SeekFrom, Write},
@@ -382,6 +382,13 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         self.header.data_file_length = data_file_length;
     }
 
+    /// Get the data_file_length field.
+    /// This can be useful for tracking information about another file but
+    /// does not effect the index.
+    pub fn data_file_length(&self) -> u64 {
+        self.header.data_file_length
+    }
+
     /// Save a bucket to the bucket cache.
     fn add_bucket_to_cache(&mut self, bucket: u64, buffer: Vec<u8>) {
         // Remove the least recently added buckets from cache until we are below CACHED_BUCKETS.
@@ -523,22 +530,28 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         } else {
             BucketIter::new_empty()
         };
+        // Make sure we only keep the first (most recent) key if we find duplicates.
+        let mut rec_hashes = BTreeSet::new();
         while let Some((rec_hash, rec_pos)) = self.next_bucket_element(&mut iter) {
             if rec_pos > 0 {
-                let bucket = self.hash_to_bucket(rec_hash);
-                if bucket != split_bucket && bucket != new_bucket {
-                    panic!(
-                        "got bucket {}, expected {} or {}, mod {}",
-                        bucket,
-                        split_bucket,
-                        self.buckets() - 1,
-                        self.modulus
-                    );
-                }
-                if bucket == split_bucket {
-                    self.save_to_bucket_buffer(rec_hash, rec_pos, &mut buffer, false)?;
-                } else {
-                    self.save_to_bucket_buffer(rec_hash, rec_pos, &mut buffer2, false)?;
+                let hash = B256::from_slice(rec_hash);
+                if !rec_hashes.contains(&hash) {
+                    let bucket = self.hash_to_bucket(rec_hash);
+                    if bucket != split_bucket && bucket != new_bucket {
+                        panic!(
+                            "got bucket {}, expected {} or {}, mod {}",
+                            bucket,
+                            split_bucket,
+                            self.buckets() - 1,
+                            self.modulus
+                        );
+                    }
+                    if bucket == split_bucket {
+                        self.save_to_bucket_buffer(rec_hash, rec_pos, &mut buffer, false)?;
+                    } else {
+                        self.save_to_bucket_buffer(rec_hash, rec_pos, &mut buffer2, false)?;
+                    }
+                    rec_hashes.insert(hash);
                 }
             }
         }
@@ -578,6 +591,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         while let Some((rec_hash, rec_pos)) = self.next_bucket_element(&mut iter) {
             if key == rec_hash {
                 result = Some(rec_pos);
+                break;
             }
         }
         let crc_failure = iter.crc_failure();
@@ -608,12 +622,6 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         buffer: &mut [u8],
         inc_values: bool,
     ) -> Result<(), AppendError> {
-        fn read_u64(buffer: &[u8], pos: &mut usize) -> u64 {
-            let mut buf64 = [0_u8; 8];
-            buf64.copy_from_slice(&buffer[*pos..(*pos + 8)]);
-            *pos += 8;
-            u64::from_le_bytes(buf64)
-        }
         fn read_u32(buffer: &[u8], pos: &mut usize) -> u32 {
             let mut buf32 = [0_u8; 4];
             buf32.copy_from_slice(&buffer[*pos..(*pos + 4)]);
@@ -621,25 +629,13 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             u32::from_le_bytes(buf32)
         }
 
-        let mut pos = 0;
-        let overflow_pos = read_u64(buffer, &mut pos);
+        let mut pos = 8; // Skip over overflow_pos
         let elements = read_u32(buffer, &mut pos);
-        if overflow_pos > 0 {
-            // We don't allow dups and have overflow bucket(s) then we have to check them for
-            // dups... This code is a bummer, ideally not a lot of overflow but still
-            // stinky.
-            let mut bucket_iter =
-                BucketIter::new_with_elements_overflow(buffer, elements, overflow_pos);
-            while let Some((rkey, _rec_pos)) = self.next_bucket_element(&mut bucket_iter) {
-                if rkey == key {
-                    // Don't allow duplicates so error out (caller should roll back insert).
-                    return Err(AppendError::DuplicateKey);
-                }
-            }
-        }
         if elements >= self.header.bucket_elements() as u32 {
             // Current bucket is full so overflow.
             // First, save bucket as an overflow record and add to the fresh bucket.
+            // Note if this is a duplicate then the old record will remain in the overflow
+            // but will be "shadowed" by the more recent entry added now.
             let overflow_pos =
                 self.odx_file.seek(SeekFrom::End(0)).map_err(AppendError::WriteDataError)?;
             add_crc32(buffer);
@@ -660,12 +656,14 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             buffer[12..(12 + KSIZE)].copy_from_slice(key);
             buffer[(12 + KSIZE)..(20 + KSIZE)].copy_from_slice(&record_pos.to_le_bytes());
         } else {
-            for _ in 0..elements as u64 {
+            for element in 0..elements {
+                let mut pos = 12 + (element as usize * Self::BUCKET_ELEMENT_SIZE);
                 let rec_key = &buffer[pos..(pos + KSIZE)];
-                pos += KSIZE;
                 if rec_key == key {
-                    // Don't allow duplicates so error out (caller should roll back insert).
-                    return Err(AppendError::DuplicateKey);
+                    // We just overwrite a duplicate.
+                    pos += KSIZE;
+                    buffer[pos..pos + 8].copy_from_slice(&record_pos.to_le_bytes());
+                    return Ok(());
                 }
             }
             let new_elements: u32 = elements + 1;
@@ -709,7 +707,6 @@ impl<const KSIZE: usize, S: BuildHasher + Default> Drop for HdxIndex<KSIZE, S> {
     }
 }
 
-//XXXXimpl<const KSIZE: usize, S: BuildHasher + Default> Index<&[u8]> for HdxIndex<KSIZE, S> {
 impl<const KSIZE: usize, S: BuildHasher + Default> Index<B256> for HdxIndex<KSIZE, S> {
     fn save(&mut self, key: B256, record_pos: u64) -> Result<(), AppendError> {
         if self.read_only {
@@ -757,8 +754,6 @@ mod tests {
 
     #[test]
     fn test_archive_hdx_index() {
-        //XXXXlet tmp_dir = PathBuf::from("/Users/sstanf/work/telcoin-network/hdx_tst");
-        // //XXXXTempDir::with_prefix("test_archive_hdx_index").expect("temp dir");
         let tmp_dir = TempDir::with_prefix("test_archive_hdx_index").expect("temp dir");
         let tmp_path = tmp_dir.path();
         let data_header = DataHeader::new(0);

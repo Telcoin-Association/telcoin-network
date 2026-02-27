@@ -48,6 +48,12 @@ where
         self.reader.stream_position()
     }
 
+    /// Sets the current position of the data file.
+    pub fn set_position(&mut self, position: u64) -> io::Result<()> {
+        self.reader.seek(io::SeekFrom::Start(position))?;
+        Ok(())
+    }
+
     /// Read the next record or return an error if an overflow bucket.
     /// This expects the file cursor to be positioned at the records first byte.
     fn read_record_file<R2: Read + Seek>(

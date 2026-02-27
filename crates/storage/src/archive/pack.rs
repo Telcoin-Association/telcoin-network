@@ -42,9 +42,20 @@ where
         Ok(Self { inner: PackInner::open(path, uid_idx, read_only)? })
     }
 
+    /// Length of the Pack file.
+    pub fn file_len(&self) -> u64 {
+        self.inner.file_len()
+    }
+
     /// Fetch the value stored at key.  Will return an error if not found.
     pub fn fetch(&mut self, pos: u64) -> Result<V, FetchError> {
         self.inner.fetch(pos)
+    }
+
+    /// Read the record size (with crc32) at position.
+    /// Will produce an error for IO or or for a failed CRC32 integrity check.
+    pub fn record_size(&mut self, pos: u64) -> Result<u32, FetchError> {
+        self.inner.record_size(pos)
     }
 
     /// Return a refernce to the pack files header.
@@ -106,6 +117,11 @@ where
         self.inner.rename(path)
     }
 
+    /// Truncate the pack file.  Use this get back to known good state.
+    pub fn truncate(&mut self, new_len: u64) -> Result<(), io::Error> {
+        self.inner.truncate(new_len)
+    }
+
     /// Return an iterator over the key values in insertion order.
     /// Note this iterator only uses the data file not the indexes.
     /// This iterator will not see any data in the write cache.
@@ -114,8 +130,7 @@ where
     }
 }
 
-/// An instance of a DB.
-/// Will consist of a data file (.dat), hash index (.hdx) and hash bucket overflow file (.odx).
+/// An instance of a DB append only log.
 /// This is synchronous and single threaded.  It is intended to keep the algorithms clearer and
 /// to be wrapped for async or multi-threaded synchronous use.
 /// This is the private inner type, this protects the io (Read, Write, Sync) traits from external
@@ -153,7 +168,6 @@ where
     fn open<P: AsRef<Path>>(path: P, uid_idx: u64, read_only: bool) -> Result<Self, OpenError> {
         let (data_file, header) =
             Self::open_data_file(path, uid_idx, read_only).map_err(OpenError::DataFileOpen)?;
-        // XXXX need to have the last valid pos from somewhere.
         Ok(Self {
             header,
             data_file,
@@ -163,6 +177,11 @@ where
             uid_idx,
             _value: PhantomData,
         })
+    }
+
+    /// Length of the Pack file.
+    fn file_len(&self) -> u64 {
+        self.data_file.len()
     }
 
     /// Fetch the value stored at key.  Will return an error if not found.
@@ -307,6 +326,28 @@ where
         Ok(val)
     }
 
+    /// Read the record size (with crc32) at position.
+    /// Will produce an error for IO or or for a failed CRC32 integrity check.
+    fn record_size(&mut self, position: u64) -> Result<u32, FetchError> {
+        self.data_file.seek(SeekFrom::Start(position))?;
+        let mut crc32_hasher = crc32fast::Hasher::new();
+        let mut val_size_buf = [0_u8; 4];
+        self.data_file.read_exact(&mut val_size_buf)?;
+        crc32_hasher.update(&val_size_buf);
+        let val_size = u32::from_le_bytes(val_size_buf);
+        self.value_buffer.resize(val_size as usize, 0);
+        self.data_file.read_exact(&mut self.value_buffer[..])?;
+        crc32_hasher.update(&self.value_buffer);
+        let calc_crc32 = crc32_hasher.finalize();
+        let mut buf_u32 = [0_u8; 4];
+        self.data_file.read_exact(&mut buf_u32)?;
+        let read_crc32 = u32::from_le_bytes(buf_u32);
+        if calc_crc32 != read_crc32 {
+            return Err(FetchError::CrcFailed);
+        }
+        Ok(val_size + 8)
+    }
+
     /// Close and destroy the Pack (remove it's file).
     /// If it can not remove a file it will silently ignore this.
     fn destroy(self) {
@@ -318,6 +359,11 @@ where
     /// Rename the pack file to name.
     fn rename<P: AsRef<Path>>(&mut self, path: P) -> Result<(), RenameError> {
         self.data_file.rename(path)
+    }
+
+    /// Truncate the pack file.  Use this get back to known good state.
+    fn truncate(&mut self, new_len: u64) -> Result<(), io::Error> {
+        self.data_file.set_len(new_len)
     }
 
     /// Return an iterator over the key values in insertion order.

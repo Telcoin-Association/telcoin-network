@@ -76,30 +76,6 @@ impl<'bucket> BucketIter<'bucket> {
         }
     }
 
-    /// Create a new iter.  Use this when you already have the elements and overflow pos from
-    /// buffer. Used to avoid double reading element/overflow pos and nothing else- these values
-    /// must be correct.
-    pub(super) fn new_with_elements_overflow(
-        buffer: &'bucket [u8],
-        elements: u32,
-        overflow_pos: u64,
-    ) -> Self {
-        let start_pos = 0;
-        let end_pos = elements as usize;
-        let bucket_pos = 0;
-        let overflow_buffer = vec![];
-        Self {
-            buffer: Some(buffer),
-            overflow_buffer,
-            bucket_pos,
-            start_pos,
-            end_pos,
-            overflow_pos,
-            elements,
-            crc_failure: false, // Assume the initial bucket we are provided is valid.
-        }
-    }
-
     /// Have we incountered an invalid crc on a bucket.
     pub(super) fn crc_failure(&self) -> bool {
         self.crc_failure

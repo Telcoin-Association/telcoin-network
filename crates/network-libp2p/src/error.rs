@@ -11,6 +11,8 @@ use std::io;
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+use crate::StreamError;
+
 /// Networking error type.
 #[derive(Debug, Error)]
 pub enum NetworkError {
@@ -104,6 +106,9 @@ pub enum NetworkError {
     /// Kademlia store write error.
     #[error("Failed to store kad record: {0}")]
     StoreKademliaRecord(String),
+    /// Failed to open stream.
+    #[error("Stream failed: {0}")]
+    Stream(#[from] StreamError),
 }
 
 impl From<oneshot::error::RecvError> for NetworkError {

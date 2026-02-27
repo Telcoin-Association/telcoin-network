@@ -334,6 +334,7 @@ where
                     },
                 );
             }
+            _ => unimplemented!("inbound stream unimplemented"),
         }
     }
 

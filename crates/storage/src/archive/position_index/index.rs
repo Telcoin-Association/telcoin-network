@@ -129,7 +129,6 @@ impl PositionIndex {
         let header = if pdx_file.is_empty() {
             let mut header = PdxHeader::from_data_header(data_header);
             header.write_header(&mut pdx_file)?;
-            //pdx_file.flush()?;
             header
         } else {
             let header = PdxHeader::load_header(&mut pdx_file)?;
@@ -174,6 +173,18 @@ impl PositionIndex {
         self.pdx_file.seek(SeekFrom::End(-(data_len as i64 * 8)))?;
         self.pdx_file.read_exact(data.as_mut_slice())?;
         Ok(PositionIter::new_rev(data))
+    }
+
+    /// Truncate the index to key (inclusive).
+    pub fn truncate_to_index(&mut self, key: u64) -> Result<(), io::Error> {
+        let pos = PDX_HEADER_SIZE as u64 + (key * 8) + 8;
+        self.pdx_file.set_len(pos)
+    }
+
+    /// Truncate the index to just the header.
+    pub fn truncate_all(&mut self) -> Result<(), io::Error> {
+        let pos = PDX_HEADER_SIZE as u64;
+        self.pdx_file.set_len(pos)
     }
 }
 

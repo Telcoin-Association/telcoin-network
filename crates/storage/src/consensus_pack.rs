@@ -376,6 +376,96 @@ impl Inner {
     const CONSENSUS_HASH_NAME: &str = "hash";
     const BATCH_HASH_NAME: &str = "bhash";
 
+    /// Determine if the pack and indexes appear to have been closed cleanly.
+    fn files_consistent(
+        data: &Pack<PackRecord>,
+        consensus_idx: &mut PositionIndex,
+        consensus_digests: &HdxIndex,
+        batch_digests: &HdxIndex,
+    ) -> bool {
+        let pack_len = data.file_len();
+        let consensus_final = consensus_digests.data_file_length();
+        let batch_final = batch_digests.data_file_length();
+        if pack_len != consensus_final || pack_len != batch_final {
+            return false;
+        }
+        if !consensus_idx.is_empty() {
+            let last_record = match consensus_idx.load(consensus_idx.len() as u64 - 1) {
+                Ok(p) => p,
+                Err(_) => return false,
+            };
+            let mut iter = match data.raw_iter() {
+                Ok(i) => i,
+                Err(_) => return false,
+            };
+            if iter.set_position(last_record).is_err() {
+                return false;
+            }
+            match (iter.next(), iter.next()) {
+                (Some(_), None) => iter.position().unwrap_or_default() == pack_len,
+                _ => false,
+            }
+        } else {
+            true
+        }
+    }
+
+    /// Truncate the pack file in order to get back to a clean state.
+    fn trunc_and_heal(
+        data: &mut Pack<PackRecord>,
+        consensus_idx: &mut PositionIndex,
+        consensus_digests: &HdxIndex,
+        batch_digests: &HdxIndex,
+    ) -> Result<(), PackError> {
+        let pack_len = data.file_len();
+        let consensus_final = consensus_digests.data_file_length();
+        let batch_final = batch_digests.data_file_length();
+        if pack_len > consensus_final || pack_len > batch_final {
+            if consensus_final > batch_final {
+                data.truncate(batch_final)?;
+            } else {
+                data.truncate(consensus_final)?;
+            }
+            // Note we leave the digest indexes with potentially some missing digests.
+            // This should be OK since they will have to be overwritten with same digests
+            // when they are readded and lookups should handle this.
+            // Alternatively we would need to regen the indexes from scratch or painstakenly
+            // remove digests, both would be expensive operations.
+        }
+        let pack_len = data.file_len();
+        if !consensus_idx.is_empty() {
+            let mut new_pack_len = pack_len;
+            // Make sure we are not indexing any records that no longer exist.
+            // Also make sure we don not have a partial record left on a short file.
+            let start_idx = consensus_idx.len() as u64 - 1;
+            let mut idx = start_idx;
+            loop {
+                if let Ok(last_record) = consensus_idx.load(idx) {
+                    let record_size_res = data.record_size(last_record);
+                    let record_valid = record_size_res.is_ok();
+                    if record_valid {
+                        if idx != start_idx {
+                            consensus_idx.truncate_to_index(idx)?;
+                        }
+                        new_pack_len = last_record + record_size_res.unwrap_or_default() as u64;
+                        break;
+                    }
+                }
+                if idx == 0 {
+                    if idx != start_idx {
+                        consensus_idx.truncate_all()?;
+                    }
+                    break;
+                }
+                idx -= 1;
+            }
+            if new_pack_len != pack_len {
+                data.truncate(new_pack_len)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Opens a new epoch pack for append.  Will create a new set of epoch static
     /// files to write consensus output into if they do not exist.
     fn open_append<P: AsRef<Path>>(
@@ -386,8 +476,9 @@ impl Inner {
         let epoch = committee.epoch();
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
         let _ = std::fs::create_dir_all(&base_dir);
-        let mut data: Pack<PackRecord> =
-            Pack::open(base_dir.join(Self::DATA_NAME), epoch as u64, false)?;
+        let pack_file = base_dir.join(Self::DATA_NAME);
+        let have_pack = std::fs::exists(&pack_file).unwrap_or_default();
+        let mut data: Pack<PackRecord> = Pack::open(&pack_file, epoch as u64, false)?;
         let start_consensus_number =
             if epoch == 0 { 1 } else { previous_epoch.final_consensus.number + 1 };
         let epoch_meta = EpochMeta {
@@ -407,14 +498,14 @@ impl Inner {
             data.append(&PackRecord::EpochMeta(epoch_meta.clone()))
                 .map_err(|e| PackError::Append(e.to_string()))?;
         }
-        let consensus_idx = PositionIndex::open_pdx_file(
+        let mut consensus_idx = PositionIndex::open_pdx_file(
             base_dir.join(Self::CONSENSUS_POS_NAME),
             data.header(),
             false,
         )
         .map_err(OpenError::IndexFileOpen)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
-        let consensus_digests = HdxIndex::open_hdx_file(
+        let mut consensus_digests = HdxIndex::open_hdx_file(
             base_dir.join(Self::CONSENSUS_HASH_NAME),
             data.header(),
             builder,
@@ -422,13 +513,21 @@ impl Inner {
         )
         .map_err(OpenError::IndexFileOpen)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
-        let batch_digests = HdxIndex::open_hdx_file(
+        let mut batch_digests = HdxIndex::open_hdx_file(
             base_dir.join(Self::BATCH_HASH_NAME),
             data.header(),
             builder,
             false,
         )
         .map_err(OpenError::IndexFileOpen)?;
+        if !have_pack {
+            // If this is a new DB then update the file lengths in indexes after create.
+            let len = data.file_len();
+            consensus_digests.set_data_file_length(len);
+            batch_digests.set_data_file_length(len);
+        }
+        // Repair damage.
+        Self::trunc_and_heal(&mut data, &mut consensus_idx, &consensus_digests, &batch_digests)?;
         Ok(Self { data, consensus_idx, consensus_digests, batch_digests, epoch_meta })
     }
 
@@ -442,7 +541,7 @@ impl Inner {
             .fetch(DATA_HEADER_BYTES as u64)
             .map_err(|e| PackError::EpochLoad(e.to_string()))?
             .into_epoch()?;
-        let consensus_idx = PositionIndex::open_pdx_file(
+        let mut consensus_idx = PositionIndex::open_pdx_file(
             base_dir.join(Self::CONSENSUS_POS_NAME),
             data.header(),
             true,
@@ -465,6 +564,10 @@ impl Inner {
         )
         .map_err(OpenError::IndexFileOpen)?;
 
+        if !Self::files_consistent(&data, &mut consensus_idx, &consensus_digests, &batch_digests) {
+            // Corrupt static file is bad (damaged at rest?), produce an error.
+            return Err(PackError::CorruptPack);
+        }
         Ok(Self { data, consensus_idx, consensus_digests, batch_digests, epoch_meta })
     }
 
@@ -529,6 +632,9 @@ impl Inner {
                     batch_digests
                         .save(batch_digest, position)
                         .map_err(|e| PackError::IndexAppend(format!("batch {e}")))?;
+                    let len = data.file_len();
+                    consensus_digests.set_data_file_length(len);
+                    batch_digests.set_data_file_length(len);
                 }
                 PackRecord::Consensus(consensus_header) => {
                     if consensus_header.parent_hash != parent_digest {
@@ -558,6 +664,9 @@ impl Inner {
                     consensus_idx
                         .save(consensus_idx_pos, position)
                         .map_err(|e| PackError::IndexAppend(format!("consensus number {e}")))?;
+                    let len = data.file_len();
+                    consensus_digests.set_data_file_length(len);
+                    batch_digests.set_data_file_length(len);
                 }
             }
         }
@@ -586,10 +695,9 @@ impl Inner {
         for cert_batch in consensus.batches() {
             for batch in &cert_batch.batches {
                 let digest = batch.digest();
-                // Filter out any batches we already have saved.
-                if !self.batch_digests.contains(digest) {
-                    batches.insert(digest, batch.clone());
-                }
+                // Should not have duplicate batches across output.
+                // Will work if we do but will save batches more than once in a pack.
+                batches.insert(digest, batch.clone());
             }
         }
         // Save all the required batcdhes into the pack file.
@@ -601,6 +709,9 @@ impl Inner {
             self.batch_digests
                 .save(batch_digest, position)
                 .map_err(|e| PackError::IndexAppend(format!("batch {e}")))?;
+            let len = self.data.file_len();
+            self.consensus_digests.set_data_file_length(len);
+            self.batch_digests.set_data_file_length(len);
         }
         // Now save the consensus header.
         let consensus_digest = consensus.consensus_header_hash();
@@ -614,6 +725,9 @@ impl Inner {
         self.consensus_idx
             .save(consensus_idx, position)
             .map_err(|e| PackError::IndexAppend(format!("consensus number {e}")))?;
+        let len = self.data.file_len();
+        self.consensus_digests.set_data_file_length(len);
+        self.batch_digests.set_data_file_length(len);
 
         Ok(())
     }
@@ -690,7 +804,14 @@ impl Inner {
 
     /// True if consensus header is found by digest.
     fn contains_consensus_header(&mut self, digest: B256) -> bool {
-        self.consensus_digests.contains(digest)
+        // This is a bit more complicated (the pos file_len check) because in a very rare
+        // case of repairing a damaged pack we might have something in the index not in the
+        // pack file (yet).
+        if let Ok(pos) = self.consensus_digests.load(digest) {
+            pos < self.data.file_len()
+        } else {
+            false
+        }
     }
 
     /// Retrieve a consensus header by digest.
@@ -834,6 +955,7 @@ pub enum PackError {
     PersistError(String),
     InvalidConsensusNumber(u64, u64),
     ConsensusNumberAlreadyAdded,
+    CorruptPack,
 }
 
 impl Error for PackError {}
@@ -870,6 +992,7 @@ impl Display for PackError {
                     "Consensus output MUST be added in consective order by number (already added)"
                 )
             }
+            PackError::CorruptPack => write!(f, "Pack file is corrupt"),
         }
     }
 }
@@ -890,7 +1013,7 @@ impl From<io::Error> for PackError {
 pub(crate) mod test {
     use std::{
         collections::VecDeque,
-        fs::File,
+        fs::{File, OpenOptions},
         io::{Seek as _, SeekFrom},
         sync::Arc,
         time::Duration,
@@ -1017,7 +1140,10 @@ pub(crate) mod test {
             pack.save_consensus_output(consensus_output).await.unwrap();
         }
         for i in 0..num_outputs {
-            let output_db = pack.get_consensus_output(i as u64 + 1).await.unwrap();
+            let output_db = pack
+                .get_consensus_output(i as u64 + 1)
+                .await
+                .expect(&format!("consensus output for {}", i + 1));
             let output = outputs.get(i as usize).unwrap();
             compare_outputs(&output_db, output);
         }
@@ -1041,14 +1167,9 @@ pub(crate) mod test {
             outputs.push(consensus_output.clone());
             pack.save_consensus_output(consensus_output).await.unwrap();
         }
-        for i in 0..num_outputs {
+        for i in 0..(num_outputs * 2) {
             let output_db = pack.get_consensus_output(i as u64 + 1).await.unwrap();
             let output = outputs.get(i as usize).unwrap();
-            compare_outputs(&output_db, output);
-        }
-        for i in 0..num_outputs {
-            let output_db = pack.get_consensus_output((i + num_outputs) as u64 + 1).await.unwrap();
-            let output = outputs.get(i as usize + num_outputs).unwrap();
             compare_outputs(&output_db, output);
         }
         pack.persist().await.expect("persist");
@@ -1056,43 +1177,115 @@ pub(crate) mod test {
 
         // Open read only and verify.
         let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open pack");
-        for i in 0..num_outputs {
+        for i in 0..(num_outputs * 2) {
             let output_db = pack.get_consensus_output(i as u64 + 1).await.unwrap();
             let output = outputs.get(i as usize).unwrap();
             compare_outputs(&output_db, output);
         }
-        for i in 0..num_outputs {
-            let output_db = pack.get_consensus_output((i + num_outputs) as u64 + 1).await.unwrap();
-            let output = outputs.get(i as usize + num_outputs).unwrap();
-            compare_outputs(&output_db, output);
-        }
+        assert!(pack.get_consensus_output(num_outputs as u64 * 2).await.is_ok());
         drop(pack);
 
         // Make sure we can stream the file to create another pack file.
-        let temp_dir2 = TempDir::with_prefix("test_consensus_pack").expect("temp dir");
-        let stream =
-            File::open(temp_dir.path().join("epoch-0").join(Inner::DATA_NAME)).expect("log file");
-        let pack = ConsensusPack::stream_import(temp_dir2.path(), stream, 0, previous_epoch)
-            .expect("open pack");
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        for i in 0..num_outputs {
-            let output_db = pack.get_consensus_output(i as u64 + 1).await.unwrap();
+        {
+            let temp_dir2 = TempDir::with_prefix("test_consensus_pack").expect("temp dir");
+            let stream = File::open(temp_dir.path().join("epoch-0").join(Inner::DATA_NAME))
+                .expect("log file");
+            let pack =
+                ConsensusPack::stream_import(temp_dir2.path(), stream, 0, previous_epoch.clone())
+                    .expect("open pack");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            for i in 0..num_outputs {
+                let output_db = pack.get_consensus_output(i as u64 + 1).await.unwrap();
+                let output = outputs.get(i as usize).unwrap();
+                compare_outputs(&output_db, output);
+            }
+            for i in 0..num_outputs {
+                let output_db =
+                    pack.get_consensus_output((i + num_outputs) as u64 + 1).await.unwrap();
+                let output = outputs.get(i as usize + num_outputs).unwrap();
+                compare_outputs(&output_db, output);
+            }
+            assert!(pack.get_consensus_output(num_outputs as u64 * 2).await.is_ok());
+            drop(pack);
+
+            let mut f1 = File::open(temp_dir.path().join("epoch-0")).expect("log file");
+            let mut f2 = File::open(temp_dir2.path().join("epoch-0")).expect("log file");
+            assert_eq!(
+                f1.seek(SeekFrom::End(0)).unwrap(),
+                f2.seek(SeekFrom::End(0)).unwrap(),
+                "files not the same length"
+            );
+        }
+
+        let mut stream = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(temp_dir.path().join("epoch-0").join(Inner::DATA_NAME))
+            .expect("log file");
+        let stream_len = stream.seek(SeekFrom::End(0)).expect("stream length");
+        stream.set_len(stream_len - 1).unwrap(); // Truncate last byte which will damage last record.
+        drop(stream);
+        // Reopen in append and load some more data.
+        let pack =
+            ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone())
+                .expect("open pack");
+        for i in 0..(num_outputs * 2) - 1 {
+            let output_db = pack
+                .get_consensus_output(i as u64 + 1)
+                .await
+                .expect(&format!("failed to get output (damage 1) {i}"));
             let output = outputs.get(i as usize).unwrap();
             compare_outputs(&output_db, output);
         }
-        for i in 0..num_outputs {
-            let output_db = pack.get_consensus_output((i + num_outputs) as u64 + 1).await.unwrap();
-            let output = outputs.get(i as usize + num_outputs).unwrap();
+        assert!(pack.get_consensus_output(num_outputs as u64 * 2).await.is_err());
+        let last_output = outputs.last().unwrap().clone();
+        pack.save_consensus_output(last_output).await.unwrap();
+
+        for i in 0..(num_outputs * 2) - 1 {
+            let output_db = pack
+                .get_consensus_output(i as u64 + 1)
+                .await
+                .expect(&format!("failed to get output (damage 1) {i}"));
+            let output = outputs.get(i as usize).unwrap();
+            compare_outputs(&output_db, output);
+        }
+
+        let output_db = pack.get_consensus_output(num_outputs as u64 * 2).await.unwrap();
+        let output = outputs.get((num_outputs as usize * 2) - 1).unwrap();
+        compare_outputs(&output_db, output);
+        pack.persist().await.unwrap();
+        drop(pack);
+        let mut stream =
+            File::open(temp_dir.path().join("epoch-0").join(Inner::DATA_NAME)).expect("log file");
+        let stream2_len = stream.seek(SeekFrom::End(0)).expect("stream length");
+        assert_eq!(stream_len, stream2_len);
+        drop(stream);
+
+        let mut stream = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(temp_dir.path().join("epoch-0").join(Inner::DATA_NAME))
+            .expect("log file");
+        let stream_len = stream.seek(SeekFrom::End(0)).expect("stream length");
+        stream.set_len(stream_len + 100).unwrap(); // Truncate last byte which will damage last record.
+        drop(stream);
+        // Reopen in append and load some more data.
+        let pack =
+            ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone())
+                .expect("open pack");
+        for i in 0..(num_outputs * 2) {
+            let output_db = pack
+                .get_consensus_output(i as u64 + 1)
+                .await
+                .expect(&format!("failed to get output (damage 1) {i}"));
+            let output = outputs.get(i as usize).unwrap();
             compare_outputs(&output_db, output);
         }
         drop(pack);
-
-        let mut f1 = File::open(temp_dir.path().join("epoch-0")).expect("log file");
-        let mut f2 = File::open(temp_dir2.path().join("epoch-0")).expect("log file");
-        assert_eq!(
-            f1.seek(SeekFrom::End(0)).unwrap(),
-            f2.seek(SeekFrom::End(0)).unwrap(),
-            "files not the same length"
-        );
+        let mut stream =
+            File::open(temp_dir.path().join("epoch-0").join(Inner::DATA_NAME)).expect("log file");
+        let stream2_len = stream.seek(SeekFrom::End(0)).expect("stream length");
+        drop(stream);
+        assert_eq!(stream_len, stream2_len);
     }
 }
