@@ -138,7 +138,11 @@ impl DataFile {
 
     /// Sync to disk.
     pub fn sync_all(&self) -> Result<(), io::Error> {
-        self.data_file.sync_all()
+        if !self.read_only {
+            self.data_file.sync_all()
+        } else {
+            Ok(())
+        }
     }
 
     /// Refresh the data_file_end, useful for readonly DBs to sync.
@@ -319,10 +323,15 @@ impl Drop for DataFile {
                 }
             }
         } else {
-            // If read only the flush will just return Ok(())
+            // If read only the flush/sync will just return Ok(())
             if let Err(e) = self.flush() {
                 if !std::thread::panicking() {
                     tracing::error!("DataFile: failed to flush on drop: {e}");
+                }
+            }
+            if let Err(e) = self.sync_all() {
+                if !std::thread::panicking() {
+                    tracing::error!("DataFile: failed to sync on drop: {e}");
                 }
             }
         }
