@@ -13,6 +13,7 @@ use std::{
     thread::JoinHandle,
 };
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tn_types::{
     gas_accumulator::RewardsCounter, AuthorityIdentifier, Batch, BlockHash, BlockNumHash,
@@ -98,13 +99,14 @@ enum PackMessage {
     ContainsBatch(B256, oneshot::Sender<bool>),
     Batch(B256, oneshot::Sender<Option<Batch>>),
     CountLeaders(Round, RewardsCounter, oneshot::Sender<Result<(), PackError>>),
+    Shutdown,
 }
 
 /// Manage a single pack file of consensus data (typically one epoch os the consensus chain).
 #[derive(Debug, Clone)]
 pub struct ConsensusPack {
     tx: Sender<PackMessage>,
-    _handle: Arc<JoinHandle<()>>,
+    handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     error: watch::Receiver<Option<PackError>>,
     epoch: Epoch,
 }
@@ -155,6 +157,24 @@ fn run_pack_loop(
             PackMessage::CountLeaders(last_executed_round, rewards_counter, tx) => {
                 let _ = tx.send(inner.count_leaders(last_executed_round, &rewards_counter));
             }
+            PackMessage::Shutdown => {
+                let _ = inner.persist();
+                break;
+            }
+        }
+    }
+}
+
+impl Drop for ConsensusPack {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.handle) == 1 {
+            // If we are the last ConsensusPack then shutdown thread and wait for it persist and
+            // exit.
+            if let Some(handle) = self.handle.lock().take() {
+                if self.tx.try_send(PackMessage::Shutdown).is_ok() {
+                    let _ = handle.join();
+                }
+            }
         }
     }
 }
@@ -181,7 +201,7 @@ impl ConsensusPack {
                 }
             }
         });
-        Ok(Self { tx, _handle: Arc::new(handle), error, epoch })
+        Ok(Self { tx, handle: Arc::new(Mutex::new(Some(handle))), error, epoch })
     }
 
     /// Open up the static files for previous epoch.  These will be read only.
@@ -200,7 +220,7 @@ impl ConsensusPack {
                 tx_error.send_replace(Some(e));
             }
         });
-        Ok(Self { tx, _handle: Arc::new(handle), error, epoch })
+        Ok(Self { tx, handle: Arc::new(Mutex::new(Some(handle))), error, epoch })
     }
 
     /// Create a new set of epoch static files to write consensus output into.
@@ -223,7 +243,7 @@ impl ConsensusPack {
                 }
             }
         });
-        Ok(Self { tx, _handle: Arc::new(handle), error, epoch })
+        Ok(Self { tx, handle: Arc::new(Mutex::new(Some(handle))), error, epoch })
     }
 
     /// Return the epoch for this pack file.
@@ -421,9 +441,9 @@ impl Inner {
         let consensus_final = consensus_digests.data_file_length();
         let batch_final = batch_digests.data_file_length();
         if pack_len > consensus_final || pack_len > batch_final {
-            if consensus_final > batch_final {
+            if consensus_final > batch_final && batch_final > DATA_HEADER_BYTES as u64 {
                 data.truncate(batch_final)?;
-            } else {
+            } else if consensus_final > DATA_HEADER_BYTES as u64 {
                 data.truncate(consensus_final)?;
             }
             // Note we leave the digest indexes with potentially some missing digests.

@@ -703,6 +703,16 @@ impl<const KSIZE: usize, S: BuildHasher + Default> Drop for HdxIndex<KSIZE, S> {
                     tracing::error!("HdxIndex: failed to flush bucket cache on drop: {e}");
                 }
             }
+            if let Err(e) = self.hdx_file.flush() {
+                if !std::thread::panicking() {
+                    tracing::error!("HdxIndex: failed to flush file on drop: {e}");
+                }
+            }
+            if let Err(e) = self.hdx_file.sync_all() {
+                if !std::thread::panicking() {
+                    tracing::error!("HdxIndex: failed to sync file on drop: {e}");
+                }
+            }
         }
     }
 }
