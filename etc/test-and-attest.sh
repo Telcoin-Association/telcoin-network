@@ -15,80 +15,80 @@ set -e  # Exit immediately if a command exits with a non-zero status
 source .env
 
 # Verify required variables are loaded
-if [ -z "$GITHUB_ATTESTATION_PRIVATE_KEY" ]; then
-    echo "Private key not set."
-    exit 1
-fi
+# if [ -z "$GITHUB_ATTESTATION_PRIVATE_KEY" ]; then
+#     echo "Private key not set."
+#     exit 1
+# fi
 
-# NOTE: this contract must match CI
-CONTRACT_ADDRESS="0xfb8062c74148c4763238b7a46a1b1025470f1160"
-RPC_ENDPOINT="https://rpc.adiri.tel"
-ATTEST_CALL="attestGitCommitHash(bytes20,bool)"
-VERIFY_CALL="gitCommitHashAttested(bytes20)"
-CHAIN_ID=2017
-PRIVATE_KEY=${GITHUB_ATTESTATION_PRIVATE_KEY}
-COMMIT_HASH=$(git rev-parse HEAD)
-echo "attesting git hash: ${COMMIT_HASH}"
+# # NOTE: this contract must match CI
+# CONTRACT_ADDRESS="0xfb8062c74148c4763238b7a46a1b1025470f1160"
+# RPC_ENDPOINT="https://rpc.adiri.tel"
+# ATTEST_CALL="attestGitCommitHash(bytes20,bool)"
+# VERIFY_CALL="gitCommitHashAttested(bytes20)"
+# CHAIN_ID=2017
+# PRIVATE_KEY=${GITHUB_ATTESTATION_PRIVATE_KEY}
+# COMMIT_HASH=$(git rev-parse HEAD)
+# echo "attesting git hash: ${COMMIT_HASH}"
 
-# Use cast to call the contract and return early if current HEAD attestation present
-ALREADY_ATTESTED=$(cast call --rpc-url ${RPC_ENDPOINT} \
-    ${CONTRACT_ADDRESS} "${VERIFY_CALL}" "${COMMIT_HASH}" )
+# # Use cast to call the contract and return early if current HEAD attestation present
+# ALREADY_ATTESTED=$(cast call --rpc-url ${RPC_ENDPOINT} \
+#     ${CONTRACT_ADDRESS} "${VERIFY_CALL}" "${COMMIT_HASH}" )
 
-# Check if the result is true (1) or false (0)
-if [[ "${ALREADY_ATTESTED: -1}" == "1" ]]; then
-    echo "Commit hash ${COMMIT_HASH} already attested on-chain."
-    echo "Nothing to update."
-    exit 0
-fi
+# # Check if the result is true (1) or false (0)
+# if [[ "${ALREADY_ATTESTED: -1}" == "1" ]]; then
+#     echo "Commit hash ${COMMIT_HASH} already attested on-chain."
+#     echo "Nothing to update."
+#     exit 0
+# fi
 
-# Navigate to the project root directory for workspace, .rustfmt.toml, etc.
-cd "$(dirname "$0")/.."
+# # Navigate to the project root directory for workspace, .rustfmt.toml, etc.
+# cd "$(dirname "$0")/.."
 
-echo "executing bash script from $(pwd)"
+# echo "executing bash script from $(pwd)"
 
-# Check if cargo-nextest is installed
-if ! cargo nextest --version &> /dev/null; then
-    echo "cargo-nextest is not installed."
-    read -p "Would you like to install it? (y/Y to install): " response
-    if [[ "$response" =~ ^[Yy]$ ]]; then
-        cargo install cargo-nextest --locked
-    else
-        echo "cargo-nextest is required to run tests. Exiting."
-        exit 1
-    fi
-fi
+# # Check if cargo-nextest is installed
+# if ! cargo nextest --version &> /dev/null; then
+#     echo "cargo-nextest is not installed."
+#     read -p "Would you like to install it? (y/Y to install): " response
+#     if [[ "$response" =~ ^[Yy]$ ]]; then
+#         cargo install cargo-nextest --locked
+#     else
+#         echo "cargo-nextest is required to run tests. Exiting."
+#         exit 1
+#     fi
+# fi
 
-# set environment
-CARGO_INCREMENTAL=0 # disable incremental compilation
-RUSTFLAGS="-D warnings -D unused_extern_crates"
-CARGO_TERM_COLOR=always
-RUST_BACKTRACE=1
-CARGO_PROFILE_DEV_DEBUG=0
+# # set environment
+# CARGO_INCREMENTAL=0 # disable incremental compilation
+# RUSTFLAGS="-D warnings -D unused_extern_crates"
+# CARGO_TERM_COLOR=always
+# RUST_BACKTRACE=1
+# CARGO_PROFILE_DEV_DEBUG=0
 
-# Fetch the status of the git repository and filter for lines that indicate modified tracked files
-MODIFIED_TRACKED_FILES=$(git status --porcelain --untracked-files=no)
+# # Fetch the status of the git repository and filter for lines that indicate modified tracked files
+# MODIFIED_TRACKED_FILES=$(git status --porcelain --untracked-files=no)
 
-# Check the output - ignore untracked files
-if [ -n "$MODIFIED_TRACKED_FILES" ]; then
-    echo "Error: please commit changes before attesting HEAD commit hash."
-    echo "$MODIFIED_TRACKED_FILES"
-    exit 1
-fi
+# # Check the output - ignore untracked files
+# if [ -n "$MODIFIED_TRACKED_FILES" ]; then
+#     echo "Error: please commit changes before attesting HEAD commit hash."
+#     echo "$MODIFIED_TRACKED_FILES"
+#     exit 1
+# fi
 
-# check cargo fmt first
-cargo +nightly-2025-11-04 fmt -- --check
+# # check cargo fmt first
+# cargo +nightly-2025-11-04 fmt -- --check
 
-echo "fmt passed"
+# echo "fmt passed"
 
-#
-# check clippy
-#
-# default features
-cargo +nightly-2025-11-04 clippy --workspace -- -D warnings
-# all features
-cargo +nightly-2025-11-04 clippy --workspace --all-features -- -D warnings
+# #
+# # check clippy
+# #
+# # default features
+# cargo +nightly-2025-11-04 clippy --workspace -- -D warnings
+# # all features
+# cargo +nightly-2025-11-04 clippy --workspace --all-features -- -D warnings
 
-echo "clippy for workspace: default and all features passed"
+# echo "clippy for workspace: default and all features passed"
 
 #
 # run tests

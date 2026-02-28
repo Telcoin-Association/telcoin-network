@@ -726,11 +726,8 @@ where
         });
 
         // set temporary task spawner - this is updated with each epoch
-        self.worker_network_handle = Some(WorkerNetworkHandle::new(
-            worker_network_handle,
-            node_task_spawner.clone(),
-            network_config.libp2p_config().max_rpc_message_size,
-        ));
+        self.worker_network_handle =
+            Some(WorkerNetworkHandle::new(worker_network_handle, node_task_spawner.clone(), 0));
 
         Ok(())
     }
@@ -1516,6 +1513,7 @@ where
                 .ok_or_eyre("worker network handle missing from epoch manager")?;
 
             network_handle.update_task_spawner(epoch_task_spawner.clone());
+            network_handle.update_epoch(consensus_config.committee().epoch());
             // initialize worker components on startup
             // This will use the new epoch_task_spawner on network_handle.
             if initial_epoch {

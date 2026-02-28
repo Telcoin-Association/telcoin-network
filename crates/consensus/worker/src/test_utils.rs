@@ -1,6 +1,7 @@
 //! Test utilities.
 
 use crate::{
+    network::stream_codec::write_batch,
     quorum_waiter::{QuorumWaiterError, QuorumWaiterTrait},
     WorkerNetworkHandle, WorkerRequest, WorkerResponse,
 };
@@ -11,7 +12,10 @@ use std::{
     time::Duration,
 };
 use tn_network_libp2p::types::{NetworkCommand, NetworkHandle};
-use tn_types::{Batch, BlockHash, BlsKeypair, BlsPublicKey, SealedBatch, TaskManager, TaskSpawner};
+use tn_types::{
+    max_batch_size, Batch, BlockHash, BlsKeypair, BlsPublicKey, Database, SealedBatch, TaskManager,
+    TaskSpawner,
+};
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
 
 #[derive(Clone, Debug)]
@@ -62,11 +66,8 @@ impl TestRequestBatchesNetwork {
         let data_clone = data.clone();
         let (tx, mut rx) = mpsc::channel(100);
         let task_manager = TaskManager::default();
-        let handle = WorkerNetworkHandle::new(
-            NetworkHandle::new(tx),
-            task_manager.get_spawner(),
-            1024 * 1024,
-        );
+        let handle =
+            WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0);
         tokio::spawn(async move {
             let _owned = task_manager;
             while let Some(r) = rx.recv().await {
@@ -75,39 +76,26 @@ impl TestRequestBatchesNetwork {
                         reply.send(data_clone.lock().await.keys().copied().collect()).unwrap();
                     }
                     NetworkCommand::SendRequest {
-                        peer,
-                        request:
-                            WorkerRequest::RequestBatches { batch_digests: digests, max_response_size },
+                        peer: _,
+                        request: WorkerRequest::RequestBatchesStream { .. },
                         reply,
                     } => {
-                        // Use this to simulate server side response size limit in
-                        // RequestBlocks
-                        const MAX_READ_BLOCK_DIGESTS: usize = 5;
-
-                        let mut batches = Vec::new();
-                        let mut total_size = 0;
-
-                        let digests_chunks = digests
-                            .chunks(MAX_READ_BLOCK_DIGESTS)
-                            .map(|chunk| chunk.to_vec())
-                            .collect::<Vec<_>>();
-                        for digests_chunk in digests_chunks {
-                            for digest in digests_chunk {
-                                if let Some(batch) =
-                                    data_clone.lock().await.get(&peer).unwrap().get(&digest)
-                                {
-                                    let batch_size = batch.size();
-                                    if total_size + batch_size <= max_response_size {
-                                        batches.push(batch.clone());
-                                        total_size += batch_size;
-                                    } else {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-
-                        reply.send(Ok(WorkerResponse::RequestBatches(batches))).unwrap();
+                        //
+                        //
+                        //
+                        //
+                        //
+                        // TODO!!!
+                        //
+                        // this isn't being used anywhere???
+                        //
+                        //
+                        //
+                        // For stream requests in tests, reject them so tests fall back
+                        // to request-response or we can test stream handling separately
+                        reply
+                            .send(Ok(WorkerResponse::RequestBatchesStream { ack: false }))
+                            .unwrap();
                     }
                     _ => {}
                 }
@@ -134,4 +122,47 @@ fn test_pk(i: u8) -> BlsPublicKey {
     use rand::SeedableRng;
     let mut rng = StdRng::from_seed([i; 32]);
     *BlsKeypair::generate(&mut rng).public()
+}
+
+/// Create `count` test batches, each with a unique transaction.
+pub fn create_test_batches(count: usize) -> Vec<Batch> {
+    (0..count)
+        .map(|i| {
+            let tx = vec![i as u8; 32]; // unique per batch
+            Batch { transactions: vec![tx], ..Default::default() }
+        })
+        .collect()
+}
+
+/// Create a [MemDatabase] and insert the given batches.
+pub fn setup_batch_db(batches: &[Batch]) -> tn_storage::mem_db::MemDatabase {
+    let db = tn_storage::mem_db::MemDatabase::default();
+    for batch in batches {
+        db.insert::<tn_storage::tables::Batches>(&batch.digest(), batch)
+            .expect("insert batch into test db");
+    }
+    db
+}
+
+/// Encode batches into the stream wire format for client-side test consumption.
+///
+/// Format: `[4-byte chunk_count][batch1][batch2]...`
+pub async fn encode_batches_to_stream_bytes(batches: &[Batch]) -> Vec<u8> {
+    let max_size = max_batch_size(0);
+    let mut output = Vec::new();
+    let mut encode_buffer = Vec::with_capacity(max_size);
+    let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(max_size));
+
+    // write chunk count
+    let count = batches.len() as u32;
+    output.extend_from_slice(&count.to_le_bytes());
+
+    // write each batch
+    for batch in batches {
+        write_batch(&mut output, batch, &mut encode_buffer, &mut compressed_buffer, 0)
+            .await
+            .expect("encode batch");
+    }
+
+    output
 }
