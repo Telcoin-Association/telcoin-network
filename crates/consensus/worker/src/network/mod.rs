@@ -17,7 +17,7 @@ use tn_network_libp2p::{types::NetworkEvent, GossipMessage, ResponseChannel};
 use tn_network_types::{PrimaryToWorkerClient, WorkerSynchronizeMessage};
 use tn_storage::tables::Batches;
 use tn_types::{
-    now, Batch, BatchValidation, BlockHash, BlsPublicKey, Database, DbTxMut, SealedBatch,
+    now, Batch, BatchValidation, BlockHash, BlsPublicKey, Database, DbTxMut, Epoch, SealedBatch,
     TaskSpawner, TnReceiver, WorkerId, B256,
 };
 use tokio::sync::oneshot;
@@ -47,6 +47,8 @@ const PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct PendingBatchStream {
     /// The batch digests requested (looked up from DB when stream arrives).
     batch_digests: HashSet<BlockHash>,
+    /// The epoch which produced these batches.
+    epoch: Epoch,
     /// When this request was created (for timeout cleanup).
     created_at: Instant,
 }
@@ -56,8 +58,8 @@ type PendingBatchRequestKey = (BlsPublicKey, B256);
 
 impl PendingBatchStream {
     /// Create a new pending batch stream for testing.
-    pub fn new(batch_digests: HashSet<BlockHash>) -> Self {
-        Self { batch_digests, created_at: Instant::now() }
+    pub fn new(batch_digests: HashSet<BlockHash>, epoch: Epoch) -> Self {
+        Self { batch_digests, epoch, created_at: Instant::now() }
     }
 }
 
@@ -139,8 +141,14 @@ where
                 WorkerRequest::ReportBatch { sealed_batch } => {
                     self.process_report_batch(peer, sealed_batch, channel, cancel);
                 }
-                WorkerRequest::RequestBatchesStream { batch_digests } => {
-                    self.process_request_batches_stream(peer, batch_digests, channel, cancel);
+                WorkerRequest::RequestBatchesStream { batch_digests, epoch } => {
+                    self.process_request_batches_stream(
+                        peer,
+                        batch_digests,
+                        epoch,
+                        channel,
+                        cancel,
+                    );
                 }
                 WorkerRequest::PeerExchange { .. } => {
                     // expect this is intercepted by network layer
@@ -227,6 +235,7 @@ where
         &mut self,
         peer: BlsPublicKey,
         batch_digests: HashSet<B256>,
+        epoch: Epoch,
         channel: ResponseChannel<WorkerResponse>,
         cancel: oneshot::Receiver<()>,
     ) {
@@ -244,7 +253,7 @@ where
             let request_digest = self.network_handle.generate_batch_request_id(&batch_digests);
 
             // store the pending request
-            let pending = PendingBatchStream::new(batch_digests);
+            let pending = PendingBatchStream::new(batch_digests, epoch);
             pending_map.insert((peer, request_digest), pending);
             debug!(
                 target: "worker::network",

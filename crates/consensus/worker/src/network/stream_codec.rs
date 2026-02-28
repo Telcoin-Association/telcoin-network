@@ -10,7 +10,7 @@ use super::error::{WorkerNetworkError, WorkerNetworkResult};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use std::collections::HashSet;
 use tn_storage::tables::Batches;
-use tn_types::{max_batch_size, Batch, Database, B256};
+use tn_types::{max_batch_size, Batch, Database, Epoch, B256};
 
 // chunk batch digest reads to limit amount of batches in memory
 const BATCH_DIGESTS_READ_CHUNK_SIZE: usize = 200;
@@ -25,12 +25,12 @@ pub(crate) async fn read_batch<T>(
     io: &mut T,
     decode_buffer: &mut Vec<u8>,
     compressed_buffer: &mut Vec<u8>,
+    epoch: Epoch,
 ) -> WorkerNetworkResult<Batch>
 where
     T: AsyncRead + Unpin + Send,
 {
-    // TODO: Use epoch from context when available
-    let max_batch_size = max_batch_size(0);
+    let max_batch_size = max_batch_size(epoch);
     tn_network_libp2p::decode_message(io, decode_buffer, compressed_buffer, max_batch_size)
         .await
         .map_err(|e| {
@@ -48,12 +48,12 @@ pub(crate) async fn write_batch<T>(
     batch: &Batch,
     encode_buffer: &mut Vec<u8>,
     compressed_buffer: &mut Vec<u8>,
+    epoch: Epoch,
 ) -> WorkerNetworkResult<()>
 where
     T: AsyncWrite + Unpin + Send,
 {
-    // TODO: Use epoch from context when available
-    let max_batch_size = max_batch_size(0);
+    let max_batch_size = max_batch_size(epoch);
     tn_network_libp2p::encode_message(io, batch, encode_buffer, compressed_buffer, max_batch_size)
         .await?;
     Ok(())
@@ -90,13 +90,13 @@ pub(crate) async fn send_batches_over_stream<DB, S>(
     stream: &mut S,
     store: &DB,
     batch_digests: &HashSet<B256>,
+    epoch: Epoch,
 ) -> WorkerNetworkResult<()>
 where
     DB: Database,
     S: AsyncWrite + Unpin + Send,
 {
-    // TODO: Use epoch from context when available
-    let max_size = max_batch_size(0);
+    let max_size = max_batch_size(epoch);
 
     // allocate reusable buffers
     let mut encode_buffer = Vec::with_capacity(max_size);
@@ -119,7 +119,7 @@ where
 
         // write each batch
         for batch in &batches {
-            write_batch(stream, batch, &mut encode_buffer, &mut compressed_buffer).await?;
+            write_batch(stream, batch, &mut encode_buffer, &mut compressed_buffer, epoch).await?;
         }
 
         // flush per chunk
@@ -144,7 +144,7 @@ mod tests {
         let mut encode_buffer = Vec::with_capacity(max_size);
         let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(max_size));
 
-        write_batch(&mut output, batch, &mut encode_buffer, &mut compressed_buffer)
+        write_batch(&mut output, batch, &mut encode_buffer, &mut compressed_buffer, 0)
             .await
             .expect("write batch");
         output
@@ -164,7 +164,7 @@ mod tests {
         let mut decode_buffer = Vec::with_capacity(max_size);
         let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(max_size));
 
-        let decoded = read_batch(&mut cursor, &mut decode_buffer, &mut compressed_buffer)
+        let decoded = read_batch(&mut cursor, &mut decode_buffer, &mut compressed_buffer, 0)
             .await
             .expect("read batch");
 
@@ -184,7 +184,7 @@ mod tests {
         let mut decode_buffer = Vec::with_capacity(max_size);
         let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(max_size));
 
-        let decoded = read_batch(&mut cursor, &mut decode_buffer, &mut compressed_buffer)
+        let decoded = read_batch(&mut cursor, &mut decode_buffer, &mut compressed_buffer, 0)
             .await
             .expect("read batch");
 
@@ -206,7 +206,7 @@ mod tests {
         let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(max_size));
 
         for batch in &batches {
-            write_batch(&mut output, batch, &mut encode_buffer, &mut compressed_buffer)
+            write_batch(&mut output, batch, &mut encode_buffer, &mut compressed_buffer, 0)
                 .await
                 .expect("write batch");
         }
@@ -217,7 +217,7 @@ mod tests {
         let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(max_size));
 
         for expected in &batches {
-            let decoded = read_batch(&mut cursor, &mut decode_buffer, &mut compressed_buffer)
+            let decoded = read_batch(&mut cursor, &mut decode_buffer, &mut compressed_buffer, 0)
                 .await
                 .expect("read batch");
             assert_eq!(*expected, decoded);
@@ -232,7 +232,7 @@ mod tests {
         let mut decode_buffer = Vec::with_capacity(max_size);
         let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(max_size));
 
-        let result = read_batch(&mut cursor, &mut decode_buffer, &mut compressed_buffer).await;
+        let result = read_batch(&mut cursor, &mut decode_buffer, &mut compressed_buffer, 0).await;
         assert!(matches!(result, Err(WorkerNetworkError::StreamClosed)));
     }
 
@@ -249,7 +249,7 @@ mod tests {
         let mut decode_buffer = Vec::with_capacity(max_size);
         let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(max_size));
 
-        let result = read_batch(&mut cursor, &mut decode_buffer, &mut compressed_buffer).await;
+        let result = read_batch(&mut cursor, &mut decode_buffer, &mut compressed_buffer, 0).await;
         assert!(matches!(result, Err(WorkerNetworkError::StdIo(_))));
     }
 
@@ -310,7 +310,7 @@ mod tests {
 
         // send batches over a Vec<u8> buffer
         let mut output = Vec::new();
-        send_batches_over_stream(&mut output, &db, &digests).await.expect("send batches");
+        send_batches_over_stream(&mut output, &db, &digests, 0).await.expect("send batches");
 
         // read back: chunk_count then each batch
         let mut cursor = Cursor::new(output);
@@ -323,7 +323,7 @@ mod tests {
 
         let mut received = Vec::new();
         for _ in 0..chunk_count {
-            let batch = read_batch(&mut cursor, &mut decode_buffer, &mut compressed_buffer)
+            let batch = read_batch(&mut cursor, &mut decode_buffer, &mut compressed_buffer, 0)
                 .await
                 .expect("read batch");
             received.push(batch);
@@ -346,7 +346,7 @@ mod tests {
         let digests: HashSet<B256> = batches.iter().map(|b| b.digest()).collect();
 
         let mut output = Vec::new();
-        send_batches_over_stream(&mut output, &db, &digests).await.expect("send batches");
+        send_batches_over_stream(&mut output, &db, &digests, 0).await.expect("send batches");
 
         // chunk count should reflect only found batches (2)
         let mut cursor = Cursor::new(output);
@@ -362,7 +362,7 @@ mod tests {
         let digests: HashSet<B256> = HashSet::new();
 
         let mut output = Vec::new();
-        send_batches_over_stream(&mut output, &db, &digests).await.expect("send batches");
+        send_batches_over_stream(&mut output, &db, &digests, 0).await.expect("send batches");
 
         // empty digests → no output (no chunks written)
         assert!(output.is_empty());

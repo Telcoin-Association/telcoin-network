@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 use tn_network_libp2p::{PeerExchangeMap, TNMessage};
-use tn_types::{BlockHash, SealedBatch};
+use tn_types::{BlockHash, Epoch, SealedBatch};
 
 /// Worker messages on the gossip network.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -48,6 +48,8 @@ pub enum WorkerRequest {
     RequestBatchesStream {
         /// The batch digests being requested.
         batch_digests: HashSet<BlockHash>,
+        /// The epoch these batches were produced.
+        epoch: Epoch,
     },
     /// Exchange peer information.
     ///

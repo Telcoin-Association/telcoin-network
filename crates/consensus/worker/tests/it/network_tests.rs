@@ -40,7 +40,7 @@ fn create_test_types() -> TestTypes {
     let batch_validator = Arc::new(NoopBatchValidator);
     let (tx, network_commands_rx) = mpsc::channel(10);
     let network_handle =
-        WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner());
+        WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0);
     let handler = RequestHandler::new(worker_id, batch_validator, config, network_handle);
     TestTypes { committee, handler, task_manager, network_commands_rx }
 }
@@ -134,7 +134,7 @@ async fn test_batch_gossip_triggers_stream_request() {
             NetworkCommand::SendRequest { peer, request, reply } => {
                 assert_eq!(peer, expected_peer);
                 match request {
-                    WorkerRequest::RequestBatchesStream { batch_digests } => {
+                    WorkerRequest::RequestBatchesStream { batch_digests, epoch: _ } => {
                         // Verify the stream request contains the correct digest
                         assert_eq!(batch_digests, HashSet::from([batch_digest]));
                         // Reject to end the test (no actual stream setup in unit test)
@@ -182,7 +182,7 @@ async fn test_batch_gossip_stream_accepted_opens_stream() {
             NetworkCommand::SendRequest { peer, request, reply } => {
                 assert_eq!(peer, expected_peer);
                 match request {
-                    WorkerRequest::RequestBatchesStream { batch_digests } => {
+                    WorkerRequest::RequestBatchesStream { batch_digests, epoch: _ } => {
                         assert_eq!(batch_digests, HashSet::from([batch_digest]));
                         // Accept the stream request
                         reply
@@ -241,7 +241,7 @@ async fn test_unknown_stream_request_error_type() {
 async fn test_request_batches_no_peers() {
     let (tx, mut rx) = mpsc::channel(10);
     let task_manager = TaskManager::default();
-    let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner());
+    let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0);
 
     // reply with empty peer list
     tokio::spawn(async move {
@@ -264,7 +264,7 @@ async fn test_request_batches_no_peers() {
 async fn test_request_batches_peer_rejects_tries_next() {
     let (tx, mut rx) = mpsc::channel(10);
     let task_manager = TaskManager::default();
-    let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner());
+    let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0);
 
     let fixture = tn_test_utils::CommitteeFixture::builder(MemDatabase::default)
         .randomize_ports(true)
@@ -333,7 +333,7 @@ async fn test_pending_request_stream_correlation() {
     // simulate server storing a pending request
     let peer = BlsPublicKey::default();
     let key = (peer, request_digest);
-    let pending = PendingBatchStream::new(batch_digests.clone());
+    let pending = PendingBatchStream::new(batch_digests.clone(), 0);
 
     let mut pending_map = std::collections::HashMap::new();
     pending_map.insert(key, pending);

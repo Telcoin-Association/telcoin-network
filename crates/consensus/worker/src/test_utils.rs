@@ -66,7 +66,8 @@ impl TestRequestBatchesNetwork {
         let data_clone = data.clone();
         let (tx, mut rx) = mpsc::channel(100);
         let task_manager = TaskManager::default();
-        let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner());
+        let handle =
+            WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0);
         tokio::spawn(async move {
             let _owned = task_manager;
             while let Some(r) = rx.recv().await {
@@ -76,9 +77,20 @@ impl TestRequestBatchesNetwork {
                     }
                     NetworkCommand::SendRequest {
                         peer: _,
-                        request: WorkerRequest::RequestBatchesStream { batch_digests: _ },
+                        request: WorkerRequest::RequestBatchesStream { .. },
                         reply,
                     } => {
+                        //
+                        //
+                        //
+                        //
+                        //
+                        // TODO!!!
+                        //
+                        // this isn't being used anywhere???
+                        //
+                        //
+                        //
                         // For stream requests in tests, reject them so tests fall back
                         // to request-response or we can test stream handling separately
                         reply
@@ -147,7 +159,7 @@ pub async fn encode_batches_to_stream_bytes(batches: &[Batch]) -> Vec<u8> {
 
     // write each batch
     for batch in batches {
-        write_batch(&mut output, batch, &mut encode_buffer, &mut compressed_buffer)
+        write_batch(&mut output, batch, &mut encode_buffer, &mut compressed_buffer, 0)
             .await
             .expect("encode batch");
     }

@@ -13,7 +13,7 @@ use tn_network_libp2p::{
     Penalty,
 };
 use tn_types::{
-    encode, max_batch_size, Batch, BlockHash, BlsPublicKey, SealedBatch, TaskSpawner, B256,
+    encode, max_batch_size, Batch, BlockHash, BlsPublicKey, Epoch, SealedBatch, TaskSpawner, B256,
 };
 use tokio::sync::oneshot;
 use tracing::{debug, warn};
@@ -33,12 +33,14 @@ pub struct WorkerNetworkHandle {
     handle: NetworkHandle<Req, Res>,
     /// The type to spawn tasks.
     task_spawner: TaskSpawner,
+    /// The current epoch for this node.
+    epoch: Epoch,
 }
 
 impl WorkerNetworkHandle {
     /// Create a new instance of [Self].
-    pub fn new(handle: NetworkHandle<Req, Res>, task_spawner: TaskSpawner) -> Self {
-        Self { handle, task_spawner }
+    pub fn new(handle: NetworkHandle<Req, Res>, task_spawner: TaskSpawner, epoch: Epoch) -> Self {
+        Self { handle, task_spawner, epoch }
     }
 
     /// Return a reference to the task spawner.
@@ -51,7 +53,7 @@ impl WorkerNetworkHandle {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn new_for_test(task_spawner: TaskSpawner) -> Self {
         let (tx, _rx) = tokio::sync::mpsc::channel(5);
-        Self { handle: NetworkHandle::new(tx), task_spawner }
+        Self { handle: NetworkHandle::new(tx), task_spawner, epoch: 0 }
     }
 
     /// Return a reference to the inner handle.
@@ -199,7 +201,10 @@ impl WorkerNetworkHandle {
         }
 
         // send request to negotiate stream
-        let request = WorkerRequest::RequestBatchesStream { batch_digests: batch_digests.clone() };
+        let request = WorkerRequest::RequestBatchesStream {
+            batch_digests: batch_digests.clone(),
+            epoch: self.epoch(),
+        };
         let request_digest = self.generate_batch_request_id(batch_digests);
 
         // send request and await response from peer
@@ -266,8 +271,7 @@ impl WorkerNetworkHandle {
         stream: &mut S,
         requested_digests: &HashSet<BlockHash>,
     ) -> NetworkResult<Vec<(BlockHash, Batch)>> {
-        // TODO: Use epoch from context when available
-        let max_size = max_batch_size(0);
+        let max_size = max_batch_size(self.epoch);
         // allocate reusable buffers
         //
         // SAFETY: requests are capped by `MAX_PENDING_BATCH_REQUESTS`
@@ -298,7 +302,12 @@ impl WorkerNetworkHandle {
         for i in 0..batch_chunk_count {
             let batch = tokio::time::timeout(
                 BATCH_STREAM_TIMEOUT,
-                super::stream_codec::read_batch(stream, &mut decode_buffer, &mut compressed_buffer),
+                super::stream_codec::read_batch(
+                    stream,
+                    &mut decode_buffer,
+                    &mut compressed_buffer,
+                    self.epoch,
+                ),
             )
             .await
             .map_err(|_| {
@@ -345,6 +354,16 @@ impl WorkerNetworkHandle {
     /// Update the task spawner at the epoch boundary.
     pub fn update_task_spawner(&mut self, task_spawner: TaskSpawner) {
         self.task_spawner = task_spawner
+    }
+
+    /// Return an copy of the node's current epoch.
+    pub fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+
+    /// Update the current epoch.
+    pub fn update_epoch(&mut self, epoch: Epoch) {
+        self.epoch = epoch;
     }
 
     /// Helper method to digest missing batch request before initiating stream.

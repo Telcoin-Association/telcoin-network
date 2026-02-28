@@ -22,7 +22,7 @@ async fn test_wait_for_quorum_happy_path() {
 
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
-    let network = WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner());
+    let network = WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
     // Spawn a `QuorumWaiter` instance.
     let quorum_waiter =
         QuorumWaiter::new(my_primary.authority().clone(), committee.clone(), network);
@@ -66,7 +66,7 @@ async fn test_batch_rejected_timeout() {
 
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
-    let network = WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner());
+    let network = WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
     // Spawn a `QuorumWaiter` instance.
     let quorum_waiter =
         QuorumWaiter::new(my_primary.authority().clone(), committee.clone(), network);
@@ -113,7 +113,7 @@ async fn test_batch_some_rejected_stake_still_passes() {
 
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
-    let network = WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner());
+    let network = WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
     // Spawn a `QuorumWaiter` instance.
     let quorum_waiter =
         QuorumWaiter::new(my_primary.authority().clone(), committee.clone(), network);
@@ -176,7 +176,7 @@ async fn test_batch_rejected_quorum() {
 
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
-    let network = WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner());
+    let network = WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
     // Spawn a `QuorumWaiter` instance.
     let quorum_waiter =
         QuorumWaiter::new(my_primary.authority().clone(), committee.clone(), network);
@@ -230,7 +230,7 @@ async fn test_batch_rejected_antiquorum() {
 
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
-    let network = WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner());
+    let network = WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
     // Spawn a `QuorumWaiter` instance.
     let quorum_waiter =
         QuorumWaiter::new(my_primary.authority().clone(), committee.clone(), network);
@@ -279,7 +279,7 @@ async fn test_batch_early_anti_quorum() {
 
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
-    let network = WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner());
+    let network = WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
     // Spawn a `QuorumWaiter` instance.
     let quorum_waiter =
         QuorumWaiter::new(my_primary.authority().clone(), committee.clone(), network);

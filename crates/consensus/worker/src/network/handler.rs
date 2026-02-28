@@ -168,8 +168,13 @@ where
         );
 
         let store = self.consensus_config.node_storage();
-        if let Err(e) =
-            stream_codec::send_batches_over_stream(&mut stream, store, &request.batch_digests).await
+        if let Err(e) = stream_codec::send_batches_over_stream(
+            &mut stream,
+            store,
+            &request.batch_digests,
+            request.epoch,
+        )
+        .await
         {
             warn!(target: "worker::network", %peer, ?e, "failed to send batches over stream");
         }

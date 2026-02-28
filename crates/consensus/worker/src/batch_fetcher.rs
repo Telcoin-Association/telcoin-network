@@ -208,8 +208,8 @@ mod tests {
         // chunk count = 2
         output.extend_from_slice(&2u32.to_le_bytes());
         // write same batch twice
-        write_batch(&mut output, &batch, &mut encode_buffer, &mut compressed_buffer).await.unwrap();
-        write_batch(&mut output, &batch, &mut encode_buffer, &mut compressed_buffer).await.unwrap();
+        write_batch(&mut output, &batch, &mut encode_buffer, &mut compressed_buffer, 0).await.unwrap();
+        write_batch(&mut output, &batch, &mut encode_buffer, &mut compressed_buffer, 0).await.unwrap();
 
         let mut cursor = Cursor::new(output);
 
