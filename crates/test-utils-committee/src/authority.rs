@@ -112,18 +112,29 @@ impl<DB: Database> AuthorityFixture<DB> {
         // Make sure our keys are correct.
         assert_eq!(&key_config.primary_public_key(), authority.protocol_key());
         assert_eq!(primary_keypair.public(), &key_config.primary_public_key());
-        // Currently only support one worker per node.
-        // If/when this is relaxed then the key_config below will need to change.
-        assert_eq!(number_of_workers.get(), 1);
         let mut config = Config::default_for_test_with_genesis(genesis);
         // overwrite default parameters if provided
         if let Some(overwrite) = parameters {
             config.parameters = overwrite.clone();
         }
+        config.parameters.num_workers = number_of_workers.get() as u16;
         // These key updates don't return errors...
         let _ = config.update_protocol_key(key_config.primary_public_key());
         let _ = config.update_primary_network_key(key_config.primary_network_public_key());
         let _ = config.update_worker_network_key(key_config.worker_network_public_key());
+        let default_worker = config
+            .node_info
+            .p2p_info
+            .workers
+            .first()
+            .cloned()
+            .expect("default config has a worker entry");
+        let workers = committee
+            .get_bootstrap(authority.protocol_key())
+            .map(|bootstrap| bootstrap.workers)
+            .filter(|workers| workers.len() == number_of_workers.get())
+            .unwrap_or_else(|| vec![default_worker; number_of_workers.get()]);
+        config.node_info.p2p_info.workers = workers;
 
         let consensus_config = ConsensusConfig::new_with_committee_for_test(
             config,

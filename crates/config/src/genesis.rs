@@ -11,6 +11,7 @@ use std::{
 use tn_types::{
     address, test_genesis, verify_proof_of_possession_bls, Address, BlsPublicKey, BlsSignature,
     Committee, CommitteeBuilder, Genesis, GenesisAccount, Multiaddr, NetworkPublicKey, NodeP2pInfo,
+    WorkerId,
 };
 use tracing::{info, warn};
 
@@ -121,8 +122,18 @@ impl NetworkGenesis {
     /// Validate each validator:
     /// - verify proof of possession
     pub fn validate(&self) -> eyre::Result<()> {
+        let expected_workers =
+            self.validators.values().next().map(NodeInfo::num_workers).unwrap_or(0);
         for (pubkey, validator) in self.validators.iter() {
             info!(target: "genesis::validate", "verifying validator: {}", pubkey);
+            if validator.num_workers() != expected_workers {
+                eyre::bail!(
+                    "validator {} has {} workers, expected {}",
+                    pubkey,
+                    validator.num_workers(),
+                    expected_workers
+                );
+            }
             verify_proof_of_possession_bls(
                 &validator.proof_of_possession,
                 pubkey,
@@ -145,8 +156,8 @@ impl NetworkGenesis {
                 )
                     .into(),
                 (
-                    validator.worker_network_address().clone(),
-                    validator.worker_network_key().clone(),
+                    validator.worker_network_address(0).clone(),
+                    validator.worker_network_key(0).clone(),
                 )
                     .into(),
                 validator.execution_address,
@@ -236,13 +247,23 @@ impl NodeInfo {
     }
 
     /// Return the primary's public network key.
-    pub fn worker_network_key(&self) -> &NetworkPublicKey {
-        &self.p2p_info.worker.network_key
+    pub fn worker_network_key(&self, worker_id: WorkerId) -> &NetworkPublicKey {
+        &self.p2p_info.workers.get(worker_id as usize).expect("worker id out of range").network_key
     }
 
     /// Return the primary's network address.
-    pub fn worker_network_address(&self) -> &Multiaddr {
-        &self.p2p_info.worker.network_address
+    pub fn worker_network_address(&self, worker_id: WorkerId) -> &Multiaddr {
+        &self
+            .p2p_info
+            .workers
+            .get(worker_id as usize)
+            .expect("worker id out of range")
+            .network_address
+    }
+
+    /// Return the number of workers configured for this node.
+    pub fn num_workers(&self) -> usize {
+        self.p2p_info.workers.len()
     }
 }
 
@@ -298,7 +319,9 @@ mod tests {
             let worker_network_address = Multiaddr::empty();
             let primary_info = NodeP2pInfo::new(
                 (network_keypair.public().clone().into(), primary_network_address).into(),
-                (worker_network_keypair.public().clone().into(), worker_network_address).into(),
+                vec![
+                    (worker_network_keypair.public().clone().into(), worker_network_address).into()
+                ],
             );
             let name = format!("validator-{v}");
             // create validator
@@ -335,7 +358,9 @@ mod tests {
             let worker_network_address = Multiaddr::empty();
             let primary_info = NodeP2pInfo::new(
                 (network_keypair.public().clone().into(), primary_network_address).into(),
-                (worker_network_keypair.public().clone().into(), worker_network_address).into(),
+                vec![
+                    (worker_network_keypair.public().clone().into(), worker_network_address).into()
+                ],
             );
             let name = format!("validator-{v}");
             // create validator

@@ -44,7 +44,7 @@ where
     tokio::spawn(async move { epoch_manager.run().await })
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EngineToPrimaryRpc<DB> {
     /// Container for consensus channels.
     consensus_bus: ConsensusBus,

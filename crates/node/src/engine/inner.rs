@@ -195,8 +195,11 @@ impl ExecutionNodeInner {
     ///
     /// This method should be called on epoch rollover.
     /// Will take care of all workers.
-    pub(super) async fn respawn_worker_network_tasks(&self, network_handle: WorkerNetworkHandle) {
-        for worker in &self.workers {
+    pub(super) async fn respawn_worker_network_tasks(
+        &self,
+        network_handles: &[WorkerNetworkHandle],
+    ) {
+        for (worker, network_handle) in self.workers.iter().zip(network_handles.iter()) {
             worker.worker_network().respawn_peer_count(network_handle.clone());
         }
     }
