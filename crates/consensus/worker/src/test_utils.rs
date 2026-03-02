@@ -63,6 +63,7 @@ impl TestRequestBatchesNetwork {
         let (tx, mut rx) = mpsc::channel(100);
         let task_manager = TaskManager::default();
         let handle = WorkerNetworkHandle::new(
+            0,
             NetworkHandle::new(tx),
             task_manager.get_spawner(),
             1024 * 1024,

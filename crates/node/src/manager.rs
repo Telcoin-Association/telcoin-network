@@ -101,8 +101,8 @@ pub(crate) struct EpochManager<P, DB> {
     tn_datadir: P,
     /// Primary network handle.
     primary_network_handle: Option<PrimaryNetworkHandle>,
-    /// Worker network handle.
-    worker_network_handle: Option<WorkerNetworkHandle>,
+    /// Worker network handles keyed by worker id.
+    worker_network_handles: Vec<WorkerNetworkHandle>,
     /// Key config - loaded once for application lifetime.
     key_config: KeyConfig,
     /// The epoch manager's [Notifier] to shutdown all node processes.
@@ -119,8 +119,8 @@ pub(crate) struct EpochManager<P, DB> {
     consensus_db: DB,
     /// ConsensusBus for the application life.
     consensus_bus: ConsensusBus,
-    /// Persistent event stream for worker network events.
-    worker_event_stream: QueChannel<NetworkEvent<WorkerRequest, WorkerResponse>>,
+    /// Persistent event streams for worker network events.
+    worker_event_streams: Vec<QueChannel<NetworkEvent<WorkerRequest, WorkerResponse>>>,
 
     /// The record for a just completed epoch.
     epoch_record: Option<EpochRecord>,
@@ -152,17 +152,12 @@ pub fn catchup_accumulator<DB: TNDatabase>(
     if let Some(block) = reth_env.finalized_header()? {
         let epoch_state = reth_env.epoch_state_from_canonical_tip()?;
 
-        // Note WORKER: In a single worker world this should be suffecient to set the base fee.
-        // In a multi-worker world (furture) this will NOT work and needs updating.
-        gas_accumulator
-            .base_fee(0)
-            .set_base_fee(block.base_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE));
-
         let nonce: u64 = block.nonce.into();
         let (current_epoch, last_executed_round) = RethEnv::deconstruct_nonce(nonce);
 
         let blocks =
             reth_env.blocks_for_range(epoch_state.epoch_info.blockHeight..=block.number)?;
+        let mut base_fees = vec![None; gas_accumulator.num_workers()];
 
         // loop through blocks to accumulate gas stats
         for current in blocks {
@@ -173,7 +168,15 @@ pub fn catchup_accumulator<DB: TNDatabase>(
             // `U256::from(payload.batch_index << 16 | payload.worker_id as usize)`
             let lower64 = current.difficulty.into_limbs()[0];
             let worker_id = (lower64 & 0xffff) as u16;
+            if let Some(base_fee) = base_fees.get_mut(worker_id as usize) {
+                *base_fee = Some(current.base_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE));
+            }
             gas_accumulator.inc_block(worker_id, gas, limit);
+        }
+        for (worker_id, base_fee) in base_fees.into_iter().enumerate() {
+            if let Some(base_fee) = base_fee {
+                gas_accumulator.base_fee(worker_id as u16).set_base_fee(base_fee);
+            }
         }
 
         // count leaders from consensus db for the current epoch
@@ -541,20 +544,20 @@ where
             // Don't risk keeping the default CVV active mode...
             consensus_bus.node_mode().send_replace(NodeMode::Observer);
         }
-        let worker_event_stream = QueChannel::new();
+        let worker_event_streams = Vec::new();
 
         Self {
             builder,
             tn_datadir,
             primary_network_handle: None,
-            worker_network_handle: None,
+            worker_network_handles: Vec::new(),
             key_config,
             node_shutdown,
             epoch_boundary: Default::default(),
             reth_db,
             consensus_db,
             consensus_bus,
-            worker_event_stream,
+            worker_event_streams,
             epoch_record: None,
         }
     }
@@ -574,9 +577,9 @@ where
         // create channels for engine that survive the lifetime of the node
         let (to_engine, for_engine) = mpsc::channel(1000);
 
-        // Create our epoch gas accumulator, we currently have one worker.
+        // Create our epoch gas accumulator from configured workers.
         // All nodes have to agree on the worker count, do not change this for an existing chain.
-        let gas_accumulator = GasAccumulator::new(1);
+        let gas_accumulator = GasAccumulator::new(self.builder.tn_config.num_workers() as usize);
         // create channel for engine updates to consensus
         let (engine_update_tx, engine_update_rx) = mpsc::channel(64);
 
@@ -700,37 +703,42 @@ where
         // primary network handle
         self.primary_network_handle = Some(PrimaryNetworkHandle::new(primary_network_handle));
 
-        // create long-running network task for worker
-        let worker_network = ConsensusNetwork::new_for_worker(
-            network_config,
-            self.worker_event_stream.clone(),
-            self.key_config.clone(),
-            self.consensus_db.clone(),
-            node_task_spawner.clone(),
-            self.builder.tn_config.node_info.worker_network_address().clone(),
-        )?;
-        let worker_network_handle = worker_network.network_handle();
-        let node_shutdown = self.node_shutdown.subscribe();
+        self.worker_network_handles.clear();
+        self.worker_event_streams.clear();
+        let num_workers = self.builder.tn_config.num_workers();
+        for worker_id in 0..num_workers {
+            let worker_event_stream = QueChannel::new();
+            let worker_network = ConsensusNetwork::new_for_worker(
+                network_config,
+                worker_event_stream.clone(),
+                self.key_config.clone(),
+                self.consensus_db.clone(),
+                node_task_spawner.clone(),
+                self.builder.tn_config.node_info.worker_network_address(worker_id).clone(),
+            )?;
+            let worker_network_handle = worker_network.network_handle();
+            let node_shutdown = self.node_shutdown.subscribe();
 
-        // spawn long-running primary network task
-        node_task_spawner.spawn_critical_task("Worker Network", async move {
-            tokio::select!(
-                _ = &node_shutdown => {
-                    Ok(())
-                }
-                res = worker_network.run() => {
-                    warn!(target: "epoch-manager", ?res, "worker network stopped");
-                    res
-                }
-            )
-        });
+            node_task_spawner.spawn_critical_task(format!("Worker Network {worker_id}"), async move {
+                tokio::select!(
+                    _ = &node_shutdown => {
+                        Ok(())
+                    }
+                    res = worker_network.run() => {
+                        warn!(target: "epoch-manager", worker_id, ?res, "worker network stopped");
+                        res
+                    }
+                )
+            });
 
-        // set temporary task spawner - this is updated with each epoch
-        self.worker_network_handle = Some(WorkerNetworkHandle::new(
-            worker_network_handle,
-            node_task_spawner.clone(),
-            network_config.libp2p_config().max_rpc_message_size,
-        ));
+            self.worker_network_handles.push(WorkerNetworkHandle::new(
+                worker_id,
+                worker_network_handle,
+                node_task_spawner.clone(),
+                network_config.libp2p_config().max_rpc_message_size,
+            ));
+            self.worker_event_streams.push(worker_event_stream);
+        }
 
         Ok(())
     }
@@ -982,7 +990,7 @@ where
         let mut consensus_output = self.consensus_bus.subscribe_consensus_output();
 
         // create primary and worker nodes
-        let (primary, worker_node) = self
+        let (primary, worker_nodes) = self
             .create_consensus(
                 engine,
                 &epoch_task_manager,
@@ -995,8 +1003,6 @@ where
         let consensus_shutdown = primary.shutdown_signal().await;
         let epoch_shutdown_rx = consensus_shutdown.subscribe();
 
-        // This needs to be created early so required machinery for other tasks exists when needed.
-        let mut worker = worker_node.new_worker().await?;
         let current_epoch = primary.current_committee().await.epoch();
 
         // Produce a "dummy" epoch 0 EpochRecord if missing.
@@ -1023,22 +1029,33 @@ where
         // start primary
         primary.start(&epoch_task_manager).await?;
 
-        let worker_task_manager_name = worker_task_manager_name(worker_node.id().await);
-        // start batch builder
-        worker.spawn_batch_builder(&worker_task_manager_name, &epoch_task_manager);
-
         let batch_builder_task_spawner = epoch_task_manager.get_spawner();
-        engine
-            .start_batch_builder(
-                worker.id(),
-                worker.batches_tx(),
-                &batch_builder_task_spawner,
-                gas_accumulator.base_fee(worker.id()),
-                current_epoch,
-            )
-            .await?;
+        for worker_node in worker_nodes {
+            // This needs to be created early so required machinery for other tasks exists when
+            // needed.
+            let mut worker = worker_node.new_worker().await?;
+            let worker_id = worker_node.id().await;
+            let worker_task_manager_name = worker_task_manager_name(worker_id);
+            // start batch builder
+            worker.spawn_batch_builder(&worker_task_manager_name, &epoch_task_manager);
 
-        self.orphan_batches(&epoch_task_manager, engine.clone(), worker.clone(), current_epoch)?;
+            engine
+                .start_batch_builder(
+                    worker.id(),
+                    worker.batches_tx(),
+                    &batch_builder_task_spawner,
+                    gas_accumulator.base_fee(worker.id()),
+                    current_epoch,
+                )
+                .await?;
+
+            self.orphan_batches(
+                &epoch_task_manager,
+                engine.clone(),
+                worker.clone(),
+                current_epoch,
+            )?;
+        }
 
         // update tasks
         epoch_task_manager.update_tasks();
@@ -1335,7 +1352,7 @@ where
         network_config: &NetworkConfig,
         initial_epoch: bool,
         gas_accumulator: GasAccumulator,
-    ) -> eyre::Result<(PrimaryNode<DB>, WorkerNode<DB>)> {
+    ) -> eyre::Result<(PrimaryNode<DB>, Vec<WorkerNode<DB>>)> {
         // create config for consensus
         let (consensus_config, preload_keys) =
             self.configure_consensus(engine, network_config).await?;
@@ -1351,8 +1368,7 @@ where
 
         let engine_to_primary =
             EngineToPrimaryRpc::new(primary.consensus_bus().await, self.consensus_db.clone());
-        // only spawns one worker for now
-        let worker = self
+        let workers = self
             .spawn_worker_node_components(
                 &consensus_config,
                 engine,
@@ -1367,11 +1383,13 @@ where
         let prefetches = preload_keys.clone();
         // Attempt to pre-load the next couple of committee's network info.
         let _ = primary_handle.inner_handle().find_authorities(prefetches).await;
-        let worker_handle = worker.network_handle().await;
-        let prefetches = preload_keys.clone();
-        // Attempt to pre-load the next couple of committee's network info.
-        let _ = worker_handle.inner_handle().find_authorities(prefetches).await;
-        Ok((primary, worker))
+        for worker in &workers {
+            let worker_handle = worker.network_handle().await;
+            let prefetches = preload_keys.clone();
+            // Attempt to pre-load the next couple of committee's network info.
+            let _ = worker_handle.inner_handle().find_authorities(prefetches).await;
+        }
+        Ok((primary, workers))
     }
 
     /// Configure consensus for the current epoch.
@@ -1503,59 +1521,66 @@ where
         initial_epoch: bool,
         engine_to_primary: EngineToPrimaryRpc<DB>,
         gas_accumulator: GasAccumulator,
-    ) -> eyre::Result<WorkerNode<DB>> {
-        // only support one worker for now (with id 0) - otherwise, loop here
-        let worker_id = 0;
-        let base_fee = gas_accumulator.base_fee(worker_id);
+    ) -> eyre::Result<Vec<WorkerNode<DB>>> {
+        let num_workers = self.builder.tn_config.num_workers();
+        let mut workers = Vec::with_capacity(num_workers as usize);
+        for worker_id in 0..num_workers {
+            let base_fee = gas_accumulator.base_fee(worker_id);
 
-        // update the network handle's task spawner for reporting batches in the epoch
-        {
-            let network_handle = self
-                .worker_network_handle
-                .as_mut()
-                .ok_or_eyre("worker network handle missing from epoch manager")?;
+            // update the network handle's task spawner for reporting batches in the epoch
+            {
+                let network_handle = self
+                    .worker_network_handles
+                    .get_mut(worker_id as usize)
+                    .ok_or_eyre("worker network handle missing from epoch manager")?;
 
-            network_handle.update_task_spawner(epoch_task_spawner.clone());
-            // initialize worker components on startup
-            // This will use the new epoch_task_spawner on network_handle.
-            if initial_epoch {
-                engine
-                    .initialize_worker_components(
-                        worker_id,
-                        network_handle.clone(),
-                        engine_to_primary,
-                    )
-                    .await?;
-            } else {
-                // We updated our epoch task spawner so make sure worker network tasks are
-                // restarted.
-                engine.respawn_worker_network_tasks(network_handle.clone()).await;
+                network_handle.update_task_spawner(epoch_task_spawner.clone());
+                // initialize worker components on startup
+                // This will use the new epoch_task_spawner on network_handle.
+                if initial_epoch {
+                    engine
+                        .initialize_worker_components(
+                            worker_id,
+                            network_handle.clone(),
+                            engine_to_primary.clone(),
+                        )
+                        .await?;
+                }
             }
+
+            let network_handle = self
+                .worker_network_handles
+                .get(worker_id as usize)
+                .ok_or_eyre("worker network handle missing from epoch manager")?
+                .clone();
+
+            let validator = engine
+                .new_batch_validator(&worker_id, base_fee, consensus_config.committee().epoch())
+                .await;
+            self.spawn_worker_network_for_epoch(
+                consensus_config,
+                &worker_id,
+                validator.clone(),
+                epoch_task_spawner.clone(),
+                &network_handle,
+                initial_epoch,
+            )
+            .await?;
+
+            workers.push(WorkerNode::new(
+                worker_id,
+                consensus_config.clone(),
+                network_handle.clone(),
+                validator,
+            ));
         }
 
-        let network_handle = self
-            .worker_network_handle
-            .as_ref()
-            .ok_or_eyre("worker network handle missing from epoch manager")?
-            .clone();
+        if !initial_epoch {
+            // We updated our epoch task spawner so make sure worker network tasks are restarted.
+            engine.respawn_worker_network_tasks(&self.worker_network_handles).await;
+        }
 
-        let validator = engine
-            .new_batch_validator(&worker_id, base_fee, consensus_config.committee().epoch())
-            .await;
-        self.spawn_worker_network_for_epoch(
-            consensus_config,
-            &worker_id,
-            validator.clone(),
-            epoch_task_spawner,
-            &network_handle,
-            initial_epoch,
-        )
-        .await?;
-
-        let worker =
-            WorkerNode::new(worker_id, consensus_config.clone(), network_handle.clone(), validator);
-
-        Ok(worker)
+        Ok(workers)
     }
 
     /// Create the primary network for the specific epoch.
@@ -1722,8 +1747,12 @@ where
         network_handle: &WorkerNetworkHandle,
         initial_epoch: bool,
     ) -> eyre::Result<()> {
-        // get event streams for the worker network handler
-        let rx_event_stream = self.worker_event_stream.subscribe();
+        // get event stream for this worker network handler
+        let rx_event_stream = self
+            .worker_event_streams
+            .get(*worker_id as usize)
+            .ok_or_eyre("worker event stream missing from epoch manager")?
+            .subscribe();
         debug!(target: "epoch-manager", "spawning worker network for epoch");
 
         let committee_keys: HashSet<BlsPublicKey> = consensus_config
@@ -1739,7 +1768,7 @@ where
             let worker_address = Self::parse_listener_address_for_swarm(
                 "WORKER_LISTENER_MULTIADDR",
                 consensus_config.primary_networkkey(),
-                consensus_config.worker_address(),
+                consensus_config.worker_address(*worker_id),
             )?;
             network_handle.inner_handle().start_listening(worker_address).await?;
             // Make sure we at least hove bootstrap peers on first epoch.
@@ -1750,13 +1779,13 @@ where
                         .committee()
                         .bootstrap_servers()
                         .iter()
-                        .map(|(k, v)| (*k, v.worker.clone()))
+                        .map(|(k, v)| (*k, v.worker_for_id(*worker_id).clone()))
                         .collect(),
                 )
                 .await?;
         }
 
-        let worker_address = consensus_config.worker_address();
+        let worker_address = consensus_config.worker_address(*worker_id);
 
         // always attempt to dial peers for the new epoch
         // the network's peer manager will intercept dial attempts for peers that are already
@@ -1776,14 +1805,14 @@ where
         // update the authorized publishers for gossip every epoch
         network_handle
             .inner_handle()
-            .subscribe(tn_config::LibP2pConfig::worker_txn_topic())
+            .subscribe(tn_config::LibP2pConfig::worker_txn_topic(*worker_id))
             .await?;
         // Get gossip from committee members about batches.
         // Useful for non-CVVs to prefetch and harmless for CVVs.
         network_handle
             .inner_handle()
             .subscribe_with_publishers(
-                tn_config::LibP2pConfig::worker_batch_topic(),
+                tn_config::LibP2pConfig::worker_batch_topic(*worker_id),
                 committee_keys.into_iter().collect(),
             )
             .await?;
