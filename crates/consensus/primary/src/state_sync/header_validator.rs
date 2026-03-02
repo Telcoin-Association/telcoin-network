@@ -125,7 +125,7 @@ where
         // Build Synchronize requests to workers.
         let mut synchronize_handles = Vec::new();
         for (worker_id, digests) in missing {
-            let client = self.config.local_network().clone();
+            let client = self.config.local_network(worker_id).clone();
             let retry_config = RetryConfig::default(); // 30s timeout
             let handle = retry_config.retry(move || {
                 let digests = digests.clone();
