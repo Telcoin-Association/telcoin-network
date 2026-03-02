@@ -73,7 +73,7 @@ impl WorkerNetworkHandle {
     /// Publish a batch digest to the worker network.
     pub(crate) async fn publish_batch(&self, batch_digest: BlockHash) -> NetworkResult<()> {
         let data = encode(&WorkerGossip::Batch(batch_digest));
-        self.handle.publish(tn_config::LibP2pConfig::worker_batch_topic(), data).await?;
+        self.handle.publish(tn_config::LibP2pConfig::worker_batch_topic(0), data).await?;
         Ok(())
     }
 
@@ -81,7 +81,7 @@ impl WorkerNetworkHandle {
     /// Do this when not a committee member so a CVV can include the txn.
     pub(crate) async fn publish_txn(&self, txn: Vec<u8>) -> NetworkResult<()> {
         let data = encode(&WorkerGossip::Txn(txn));
-        self.handle.publish("tn-txn".into(), data).await?;
+        self.handle.publish(tn_config::LibP2pConfig::worker_txn_topic(0), data).await?;
         Ok(())
     }
 

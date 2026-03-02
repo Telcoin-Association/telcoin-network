@@ -188,22 +188,22 @@ async fn test_batch_gossip_topics() {
     let batch_digest = B256::random();
     let gossip = WorkerGossip::Batch(batch_digest);
     let data = tn_types::encode(&gossip);
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(0));
     let good_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     assert!(handler.pub_process_gossip_for_test(&good_msg).await.is_ok());
 
     // Test swapped topics, must fail.
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_txn_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_txn_topic(0));
     let bad_msg = GossipMessage { source: None, data, sequence_number: None, topic };
     assert!(handler.pub_process_gossip_for_test(&bad_msg).await.is_err());
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(0));
     let gossip = WorkerGossip::Txn(vec![]);
     let data = tn_types::encode(&gossip);
     let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     assert!(handler.pub_process_gossip_for_test(&bad_msg).await.is_err());
 
     // Use the correct topic for a txn and make sure it works.
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_txn_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_txn_topic(0));
     let good_msg = GossipMessage { source: None, data, sequence_number: None, topic };
     assert!(handler.pub_process_gossip_for_test(&good_msg).await.is_ok());
 }
@@ -215,7 +215,7 @@ async fn test_batch_gossip_succeeds() {
     let batch_digest = B256::random();
     let gossip = WorkerGossip::Batch(batch_digest);
     let data = tn_types::encode(&gossip);
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(0));
     let msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     task_manager.spawn_task("process-gossip-test", async move {
         handler.pub_process_gossip_for_test(&msg).await.expect("success process gossip");

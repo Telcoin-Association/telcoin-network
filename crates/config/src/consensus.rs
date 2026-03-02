@@ -9,7 +9,7 @@ use std::{
 use tn_network_types::local::LocalNetwork;
 use tn_types::{
     Authority, AuthorityIdentifier, BlsPublicKey, Certificate, CertificateDigest, Committee,
-    Database, Epoch, Hash as _, Multiaddr, NetworkPublicKey, Notifier,
+    Database, Epoch, Hash as _, Multiaddr, NetworkPublicKey, Notifier, WorkerId,
 };
 use tracing::info;
 
@@ -234,7 +234,15 @@ where
 
     /// Retrieve the worker's network address by id.
     /// Note, will panic if id is not valid.
-    pub fn worker_address(&self) -> Multiaddr {
-        self.inner.config.node_info.p2p_info.worker.network_address.clone()
+    pub fn worker_address(&self, worker_id: WorkerId) -> Multiaddr {
+        self.inner
+            .config
+            .node_info
+            .p2p_info
+            .workers
+            .get(worker_id as usize)
+            .expect("worker id out of range")
+            .network_address
+            .clone()
     }
 }
