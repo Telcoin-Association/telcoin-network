@@ -22,27 +22,27 @@ bootstrap_servers:
     primary:
       network_address: /ip4/34.31.250.229/udp/49590/quic-v1/p2p/12D3KooWMDHuRj3E6T1bfVnDZEWJSCsrpvKDtLAryW1G71ttseYX
       network_key: 4XTTMCXyZGsWJhp9FhAEdgGQ8aoXXJbJg1Yn6hiR29FWRqRKd
-    worker:
-      network_address: /ip4/34.31.250.229/udp/49594/quic-v1/p2p/12D3KooWBR7qgvYEKh8GMkgomwTLYgrbZNkqzEem5av87afze6b7
-      network_key: 4XTTM2joVY51Jw4FvPR9DtyMAhHWG33kJ7TFzooKt9pHXbsND
+    workers:
+      - network_address: /ip4/34.31.250.229/udp/49594/quic-v1/p2p/12D3KooWBR7qgvYEKh8GMkgomwTLYgrbZNkqzEem5av87afze6b7
+        network_key: 4XTTM2joVY51Jw4FvPR9DtyMAhHWG33kJ7TFzooKt9pHXbsND
   yutgKePqdvToJeQw3ibQ51CiUgLUTjFFvchifivBSF2dnXfSXDBgkWCVMzFVkcB7B3y3B6ACDH4PVZuHZ9PvQQsq35iUKkPFykVsxARUk1NhBBhpKdUBgEvgfk1tc7gfLFY:
     primary:
       network_address: /ip4/34.102.122.126/udp/49590/quic-v1/p2p/12D3KooWHyxGM6RRgt6LLLQw1BMAdo6dPfU62sGLYsLAHbrDv7Uz
       network_key: 4XTTM9JdvCEtWJFDzMzsM8DEznPkHsLTYA5saH5jvKqTkstG6
-    worker:
-      network_address: /ip4/34.102.122.126/udp/49594/quic-v1/p2p/12D3KooWSSxajivjxX5MmpuokZHbjd6K7hhx2fPfSgkeHsb7npMs
-      network_key: 4XTTMHmeEasPpZtD1oVNDsbBRtDjybNhQ9szuAuAQL7Cekb8y
+    workers:
+      - network_address: /ip4/34.102.122.126/udp/49594/quic-v1/p2p/12D3KooWSSxajivjxX5MmpuokZHbjd6K7hhx2fPfSgkeHsb7npMs
+        network_key: 4XTTMHmeEasPpZtD1oVNDsbBRtDjybNhQ9szuAuAQL7Cekb8y
   21oDHJc5yQk1CfPoMjaG8pwfYXxGktS7HAm3MavahgoBEzVDoHwXU5jXCh4WhHCdBTxd1dKXE4JaJwHKhDKTdyiVkTHpgsq7sBq3X1ADXZC9gdU3JTLfgy7UxnjxCZZn5JrX:
     primary:
       network_address: /ip4/35.245.21.245/udp/49590/quic-v1/p2p/12D3KooWQb59v3a4Bkk4iHa9tHxA3tymHEWRhfu2gq3E5actjVuR
       network_key: 4XTTMFukomC38o7sijx2a1KqzCVdRkuVsptWGR3Sz7pERhGgX
-    worker:
-      network_address: /ip4/35.245.21.245/udp/49594/quic-v1/p2p/12D3KooWFv6FXapx9DVNWiKHoczJ2wLjuZpFMStrVH68sMqC9Fmf
-      network_key: 4XTTM7EmuNjJ2kad2YNmhvet8BXzQPEohUfW6DVVtubSj72Ym
+    workers:
+      - network_address: /ip4/35.245.21.245/udp/49594/quic-v1/p2p/12D3KooWFv6FXapx9DVNWiKHoczJ2wLjuZpFMStrVH68sMqC9Fmf
+        network_key: 4XTTM7EmuNjJ2kad2YNmhvet8BXzQPEohUfW6DVVtubSj72Ym
   23ef485gndoTaSC5tT7d7drqpn8wvK7XT46c42Hd6F24S1kcNwWm6z9CYPVeGUgR5XUmKWuCNKp8yEQxYjrPdKASNWUrj8FVMxKSAGXipx21HTWvceQRzWf89nizMCZTqBSQ:
     primary:
       network_address: /ip4/34.162.82.82/udp/49590/quic-v1/p2p/12D3KooWD3W3yw3Z7p5WhUJVSb7h9t1WsbCuoKrua7J5myKKLdke
       network_key: 4XTTM4NBhq5WdjBDAj8kuZd1XJUfBMGCMvYU9JKhqpCvrJQXk
-    worker:
-      network_address: /ip4/34.162.82.82/udp/49594/quic-v1/p2p/12D3KooWB8YJvGGvGzxgjssZEfx3PRtxu7Y8M8nYGn8t7LhRBtLv
-      network_key: 4XTTM2TDxmQjztN6LmYKyMhqsY2YdNnXaUMPmzzYe9aJx9f82
+    workers:
+      - network_address: /ip4/34.162.82.82/udp/49594/quic-v1/p2p/12D3KooWB8YJvGGvGzxgjssZEfx3PRtxu7Y8M8nYGn8t7LhRBtLv
+        network_key: 4XTTM2TDxmQjztN6LmYKyMhqsY2YdNnXaUMPmzzYe9aJx9f82
