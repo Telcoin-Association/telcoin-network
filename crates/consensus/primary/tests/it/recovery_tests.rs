@@ -34,7 +34,9 @@ async fn test_subdag_persists_restart() {
     // Phase 1: Write data
     {
         let mut consensus_chain =
-            ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).unwrap();
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone())
+                .await
+                .unwrap();
 
         // Create and persist subdags with sequential indices
         for idx in 0..5u64 {
@@ -58,7 +60,9 @@ async fn test_subdag_persists_restart() {
     // Phase 2: Simulate "restart" by opening a new handle to same storage
     {
         let consensus_chain =
-            ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).unwrap();
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone())
+                .await
+                .unwrap();
         let latest_after_restart = consensus_chain.consensus_header_latest().await.unwrap();
         assert!(latest_after_restart.is_some(), "Should have latest subdag after restart");
         let latest_subdag = latest_after_restart.unwrap().sub_dag;
@@ -87,6 +91,7 @@ async fn test_subdag_persists_multiple_writes() {
     let committee_epoch0 = fixture_epoch0.committee();
     let mut consensus_chain =
         ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture_epoch0.committee())
+            .await
             .unwrap();
 
     // Create certificates for epoch 0
@@ -238,7 +243,7 @@ async fn test_last_committed_persists() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
     let mut consensus_chain =
-        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
 
     // Create and commit subdags
     let genesis: BTreeSet<_> = fixture.genesis().collect();

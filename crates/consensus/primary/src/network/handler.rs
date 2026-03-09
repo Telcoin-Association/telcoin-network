@@ -89,7 +89,8 @@ where
         // too far behind.
         let (exec_number, exec_epoch, exec_round) = self
             .consensus_bus
-            .last_executed_consensus_block(Some(epoch), &self.consensus_chain)
+            //XXXX.last_consensus_block(Some(epoch), &self.consensus_chain)
+            .last_consensus_block(None, &self.consensus_chain)
             .await
             .map(|h| (h.number, h.sub_dag.leader_epoch(), h.sub_dag.leader_round()))
             .unwrap_or((0, 0, 0));

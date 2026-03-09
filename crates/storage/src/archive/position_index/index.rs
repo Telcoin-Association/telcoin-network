@@ -127,6 +127,9 @@ impl PositionIndex {
         let mut pdx_file = DataFile::open(dir.join("index.pdx"), read_only)?;
 
         let header = if pdx_file.is_empty() {
+            if read_only {
+                return Err(LoadHeaderError::ReadOnlyEmpty);
+            }
             let mut header = PdxHeader::from_data_header(data_header);
             header.write_header(&mut pdx_file)?;
             header

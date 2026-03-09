@@ -39,7 +39,9 @@ async fn test_request_vote_too_new() {
     let cb = ConsensusBus::new();
     let temp_dir = TempDir::new().unwrap();
     let consensus_chain =
-        ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee()).unwrap();
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+            .await
+            .unwrap();
     // Need a dummy parent so we can request a vote.
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     cb.recent_blocks().send_modify(|blocks| {
@@ -104,7 +106,9 @@ async fn test_request_vote_has_missing_execution_block() {
     let cb = ConsensusBus::new();
     let temp_dir = TempDir::new().unwrap();
     let consensus_chain =
-        ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee()).unwrap();
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+            .await
+            .unwrap();
     // Need a dummy parent so we can request a vote.
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     cb.recent_blocks().send_modify(|blocks| {
@@ -177,7 +181,9 @@ async fn test_request_vote_older_execution_block() {
     let cb = ConsensusBus::new();
     let temp_dir = TempDir::new().unwrap();
     let consensus_chain =
-        ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee()).unwrap();
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+            .await
+            .unwrap();
     // Need a dummy parent so we can request a vote.
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
@@ -270,7 +276,9 @@ async fn test_request_vote_has_missing_parents() {
     let cb = ConsensusBus::new();
     let temp_dir = TempDir::new().unwrap();
     let consensus_chain =
-        ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee()).unwrap();
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+            .await
+            .unwrap();
     // Need a dummy parent so we can request a vote.
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
@@ -376,7 +384,9 @@ async fn test_request_vote_accept_missing_parents() {
     let cb = ConsensusBus::new();
     let temp_dir = TempDir::new().unwrap();
     let consensus_chain =
-        ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee()).unwrap();
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+            .await
+            .unwrap();
     // Need a dummy parent so we can request a vote.
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
@@ -478,7 +488,9 @@ async fn test_request_vote_missing_batches() {
     let cb = ConsensusBus::new();
     let temp_dir = TempDir::new().unwrap();
     let consensus_chain =
-        ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee()).unwrap();
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+            .await
+            .unwrap();
     // Need a dummy parent so we can request a vote.
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
@@ -552,7 +564,9 @@ async fn test_request_vote_already_voted() {
     let cb = ConsensusBus::new();
     let temp_dir = TempDir::new().unwrap();
     let consensus_chain =
-        ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee()).unwrap();
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+            .await
+            .unwrap();
     // Need a dummy parent so we can request a vote.
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
@@ -653,7 +667,9 @@ async fn test_fetch_certificates_handler() {
     let cb = ConsensusBus::new();
     let temp_dir = TempDir::new().unwrap();
     let consensus_chain =
-        ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee()).unwrap();
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+            .await
+            .unwrap();
     let task_manager = TaskManager::default();
     let synchronizer =
         StateSynchronizer::new(primary.consensus_config(), cb.clone(), task_manager.get_spawner());
@@ -795,7 +811,9 @@ async fn test_request_vote_created_at_in_future() {
     let cb = ConsensusBus::new();
     let temp_dir = TempDir::new().unwrap();
     let consensus_chain =
-        ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee()).unwrap();
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+            .await
+            .unwrap();
     // Need a dummy parent so we can request a vote.
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();

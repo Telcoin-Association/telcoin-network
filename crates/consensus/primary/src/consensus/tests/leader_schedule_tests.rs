@@ -414,7 +414,7 @@ async fn test_leader_schedule_from_store() {
     let authority_ids: Vec<AuthorityIdentifier> = fixture.authorities().map(|a| a.id()).collect();
     let temp_dir = TempDir::new().unwrap();
     let mut consensus_chain =
-        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
 
     // Create a leader schedule with a default swap table, so no authority will be swapped and find
     // the leader at position 2. We expect the leader of round 2 to be the authority of position

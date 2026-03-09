@@ -66,7 +66,7 @@ struct TestTypes<DB = MemDatabase> {
 
 /// Helper function to create an instance of [RequestHandler] for the first authority in the
 /// committee.
-fn create_test_types(path: &Path) -> TestTypes {
+async fn create_test_types(path: &Path) -> TestTypes {
     let committee = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let authority = committee.first_authority();
     let config = authority.consensus_config();
@@ -87,7 +87,7 @@ fn create_test_types(path: &Path) -> TestTypes {
     cb.recent_blocks().send_replace(recent);
 
     let consensus_chain =
-        ConsensusChain::new_for_test(path.to_owned(), committee.committee()).unwrap();
+        ConsensusChain::new_for_test(path.to_owned(), committee.committee()).await.unwrap();
     let handler = RequestHandler::new(config.clone(), cb.clone(), synchronizer, consensus_chain);
     TestTypes { committee, handler, parent, task_manager }
 }
@@ -97,7 +97,7 @@ async fn test_vote_succeeds() -> eyre::Result<()> {
     // common types
     let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types(temp_dir.path());
+        create_test_types(temp_dir.path()).await;
 
     let parents = Vec::new();
 
@@ -121,7 +121,7 @@ async fn test_vote_fails_too_many_parents() -> eyre::Result<()> {
     // common types
     let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types(temp_dir.path());
+        create_test_types(temp_dir.path()).await;
 
     // last authority produced 2 certs for round 1
     let mut too_many_parents: Vec<_> = Certificate::genesis(&committee.committee());
@@ -148,7 +148,7 @@ async fn test_vote_fails_wrong_authority_network_key() -> eyre::Result<()> {
     // common types
     let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types(temp_dir.path());
+        create_test_types(temp_dir.path()).await;
     let parents = Vec::new();
 
     // create valid header proposed by last peer in the committee for round 1
@@ -171,7 +171,7 @@ async fn test_vote_fails_invalid_genesis_parent() -> eyre::Result<()> {
     // common types
     let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types(temp_dir.path());
+        create_test_types(temp_dir.path()).await;
 
     let parents = Vec::new();
 
@@ -204,7 +204,7 @@ async fn test_vote_fails_unknown_execution_result() -> eyre::Result<()> {
     // common types
     let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, task_manager: _task_manager, .. } =
-        create_test_types(temp_dir.path());
+        create_test_types(temp_dir.path()).await;
 
     // create header proposed by last peer in the committee for round 1
     let header = committee.header_from_last_authority();
@@ -223,7 +223,7 @@ async fn test_vote_fails_invalid_header_digest() -> eyre::Result<()> {
     // common types
     let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, task_manager: _task_manager, .. } =
-        create_test_types(temp_dir.path());
+        create_test_types(temp_dir.path()).await;
 
     let parents = Vec::new();
 
@@ -244,7 +244,7 @@ async fn test_vote_fails_invalid_timestamp() -> eyre::Result<()> {
     // common types
     let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types(temp_dir.path());
+        create_test_types(temp_dir.path()).await;
 
     let parents = Vec::new();
 
@@ -269,7 +269,7 @@ async fn test_vote_fails_wrong_epoch() -> eyre::Result<()> {
     // common types
     let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types(temp_dir.path());
+        create_test_types(temp_dir.path()).await;
 
     let parents = Vec::new();
 
@@ -295,7 +295,7 @@ async fn test_vote_fails_unknown_authority() -> eyre::Result<()> {
     // common types
     let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types(temp_dir.path());
+        create_test_types(temp_dir.path()).await;
 
     let parents = Vec::new();
 
@@ -320,7 +320,7 @@ async fn test_vote_fails_unknown_authority() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_primary_batch_gossip_topics() {
     let temp_dir = TempDir::new().unwrap();
-    let TestTypes { handler, .. } = create_test_types(temp_dir.path());
+    let TestTypes { handler, .. } = create_test_types(temp_dir.path()).await;
 
     let gossip = PrimaryGossip::Certificate(Box::new(Certificate::default()));
     let data = tn_types::encode(&gossip);
@@ -379,7 +379,7 @@ async fn test_primary_batch_gossip_topics() {
 async fn test_vote_same_digest_returns_cached() -> eyre::Result<()> {
     let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types(temp_dir.path());
+        create_test_types(temp_dir.path()).await;
 
     let parents = Vec::new();
 
@@ -407,7 +407,7 @@ async fn test_vote_same_digest_returns_cached() -> eyre::Result<()> {
 async fn test_vote_different_digest_same_round_rejected() -> eyre::Result<()> {
     let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types(temp_dir.path());
+        create_test_types(temp_dir.path()).await;
 
     let parents = Vec::new();
 
@@ -446,7 +446,7 @@ async fn test_vote_different_digest_same_round_rejected() -> eyre::Result<()> {
 async fn test_vote_older_round_rejected() -> eyre::Result<()> {
     let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types(temp_dir.path());
+        create_test_types(temp_dir.path()).await;
 
     let parents = Vec::new();
     let peer = *committee.last_authority().authority().protocol_key();
@@ -486,7 +486,7 @@ async fn test_vote_older_round_rejected() -> eyre::Result<()> {
 async fn test_vote_equivocation_per_authority() -> eyre::Result<()> {
     let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types(temp_dir.path());
+        create_test_types(temp_dir.path()).await;
 
     let parents = Vec::new();
 

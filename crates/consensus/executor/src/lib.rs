@@ -8,7 +8,7 @@ pub use errors::{SubscriberError, SubscriberResult};
 use tn_config::ConsensusConfig;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus};
 use tn_storage::consensus::ConsensusChain;
-use tn_types::{Database, Noticer, TaskManager};
+use tn_types::{Database, Noticer, TaskManager, TimestampSec};
 use tracing::info;
 
 #[cfg(test)]
@@ -28,6 +28,7 @@ impl Executor {
         task_manager: &TaskManager,
         network: PrimaryNetworkHandle,
         consensus_chain: ConsensusChain,
+        epoch_boundary: TimestampSec,
     ) {
         // Spawn the subscriber.
         spawn_subscriber(
@@ -37,6 +38,7 @@ impl Executor {
             task_manager,
             network,
             consensus_chain,
+            epoch_boundary,
         );
 
         info!("Consensus subscriber successfully started");

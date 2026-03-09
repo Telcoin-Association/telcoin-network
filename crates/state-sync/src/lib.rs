@@ -12,7 +12,10 @@ use tn_test_utils_committee as _;
 
 use tn_config::ConsensusConfig;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus, NodeMode};
-use tn_storage::{consensus::ConsensusChain, tables::NodeBatchesCache};
+use tn_storage::{
+    consensus::ConsensusChain,
+    tables::{ConsensusHeaderCache, NodeBatchesCache},
+};
 use tn_types::{
     AuthorityIdentifier, ConsensusHeader, ConsensusOutput, Database, TaskSpawner, TnSender,
 };
@@ -113,7 +116,7 @@ pub async fn save_consensus<DB: Database>(
     consensus_chain.save_consensus_output(consensus_output).await?;
     if let Some(authority_id) = authority_id {
         // If we are a validator we need to clear any of our batches from our cache that are
-        // now part of consesnus.
+        // now part of consensus.
         for cert in &sub_dag.certificates {
             if cert.header().author() == authority_id {
                 for batch_hash in cert.header().payload().keys() {
@@ -189,7 +192,9 @@ async fn spawn_stream_consensus_headers<DB: Database>(
 
     let mut rx_last_consensus_header = consensus_bus.last_consensus_header().subscribe();
     let mut last_consensus_header =
-        last_executed_consensus_block(&consensus_bus, &consensus_chain).await.unwrap_or_default();
+        consensus_bus.last_consensus_block(None, &consensus_chain).await.unwrap_or_default();
+    //XXXX    last_executed_consensus_block(&consensus_bus,
+    // &consensus_chain).await.unwrap_or_default();
     let mut last_consensus_height = last_consensus_header.number;
 
     // infinite loop over consensus output
@@ -205,6 +210,7 @@ async fn spawn_stream_consensus_headers<DB: Database>(
                         &consensus_bus,
                         last_consensus_header,
                         header,
+                        config.node_storage(),
                         &consensus_chain,
                     )
                     .await?;
@@ -221,13 +227,13 @@ async fn spawn_stream_consensus_headers<DB: Database>(
 /// Applies consensus output "from" (exclusive) to height "max_consensus_height" (inclusive).
 /// Queries peers for latest height and downloads and executes any missing consensus output.
 /// Returns the last ConsensusHeader that was applied on success.
-async fn catch_up_consensus_from_to(
+async fn catch_up_consensus_from_to<DB: Database>(
     consensus_bus: &ConsensusBus,
     from: ConsensusHeader,
     max_consensus: ConsensusHeader,
+    db: &DB,
     consensus_chain: &ConsensusChain,
 ) -> eyre::Result<ConsensusHeader> {
-    // Note use last_executed_block here because
     let mut last_parent = from.digest();
 
     // Catch up to the current chain state if we need to.
@@ -249,16 +255,28 @@ async fn catch_up_consensus_from_to(
     let mut result_header = from;
     for number in last_consensus_height + 1..=max_consensus_height {
         debug!(target: "state-sync", "trying to get consensus block {number}");
+        let mut remove_cache = false;
         // Check if we already have this consensus output in our local DB.
         // We will be verifying and loading these records elsewhere.
         let consensus_header = if number == max_consensus_height {
             max_consensus.clone()
             // XXXX fill epoch below?
-        } else if let Ok(Some(block)) =
-            consensus_chain.consensus_header_by_number(None, number).await
-        {
-            block
+            /*XXXX} else if let Ok(Some(header)) =
+                consensus_chain.consensus_header_by_number(None, number).await
+            {
+                // We have already processed this consensus so ignore it.
+                last_parent = header.digest();
+                result_header = header;
+                continue;*/
+        } else if let Ok(Some(header)) = db.get::<ConsensusHeaderCache>(&number) {
+            remove_cache = true;
+            header
         } else {
+            error!(
+                target: "tn::observer",
+                block_number = number,
+                "Could not find header"
+            );
             // We should have all the required headers in local storage by now...
             return Ok(result_header);
         };
@@ -266,12 +284,23 @@ async fn catch_up_consensus_from_to(
         last_parent =
             ConsensusHeader::digest_from_parts(parent_hash, &consensus_header.sub_dag, number);
         if last_parent != consensus_header.digest() {
+            eprintln!(
+                "XXXX  {number}/{}, parent hashes {parent_hash}/{}, con hashes {last_parent}/{}",
+                consensus_header.number,
+                consensus_header.parent_hash,
+                consensus_header.digest(),
+            );
             error!(
                 target: "tn::observer",
                 block_number = number,
                 "consensus header digest mismatch - possible fork detected"
             );
             return Err(eyre::eyre!("consensus header digest mismatch!"));
+        }
+        if consensus_header.number <= consensus_chain.latest_consesus_number() {
+            // We have already processed this consensus so ignore it.
+            result_header = consensus_header;
+            continue;
         }
 
         let base_execution_block = consensus_header.sub_dag.leader.header().latest_execution_block;
@@ -294,6 +323,9 @@ async fn catch_up_consensus_from_to(
             ));
         }
         consensus_bus.consensus_header().send(consensus_header.clone()).await?;
+        if remove_cache {
+            let _ = db.remove::<ConsensusHeaderCache>(&number); // Should be done with this now.
+        }
         result_header = consensus_header;
     }
     Ok(result_header)

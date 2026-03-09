@@ -33,6 +33,7 @@ async fn test_output_to_header() -> eyre::Result<()> {
     let temp_dir = TempDir::with_prefix("test_output_to_header").unwrap();
     let mut consensus_chain =
         ConsensusChain::new_for_test(temp_dir.path().to_owned(), config.committee().clone())
+            .await
             .unwrap();
 
     // subscribe to channels early
@@ -57,6 +58,7 @@ async fn test_output_to_header() -> eyre::Result<()> {
         &task_manager,
         network,
         consensus_chain.clone(),
+        u64::max_value(),
     );
 
     // yield for subscriber to spawn
@@ -140,7 +142,7 @@ async fn test_executor_output_ordering() -> eyre::Result<()> {
     let consensus_bus = ConsensusBus::new();
     let temp_dir = TempDir::with_prefix("test_executor_output_ordering").unwrap();
     let mut consensus_chain =
-        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
 
     let mut consensus_output = consensus_bus.subscribe_consensus_output();
 
@@ -161,6 +163,7 @@ async fn test_executor_output_ordering() -> eyre::Result<()> {
         &task_manager,
         network,
         consensus_chain.clone(),
+        u64::max_value(),
     );
     tokio::task::yield_now().await;
 
@@ -238,7 +241,7 @@ async fn test_executor_batch_fetching() -> eyre::Result<()> {
     let consensus_bus = ConsensusBus::new();
     let temp_dir = TempDir::with_prefix("test_executor_output_ordering").unwrap();
     let mut consensus_chain =
-        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
 
     let mut consensus_output = consensus_bus.subscribe_consensus_output();
 
@@ -259,6 +262,7 @@ async fn test_executor_batch_fetching() -> eyre::Result<()> {
         &task_manager,
         network,
         consensus_chain.clone(),
+        u64::max_value(),
     );
     tokio::task::yield_now().await;
 

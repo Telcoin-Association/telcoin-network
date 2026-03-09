@@ -293,8 +293,12 @@ impl<DB: Database> Consensus<DB> {
             .unwrap_or_else(|| 0);
 
         // ignore previous epochs
-        let latest_sub_dag =
-            consensus_chain.consensus_header_latest().await.unwrap_or_default().map(|h| h.sub_dag);
+        let latest_sub_dag = consensus_chain
+            .consensus_header_latest()
+            .await
+            .unwrap_or_default()
+            .filter(|h| h.sub_dag.leader_epoch() >= current_epoch)
+            .map(|h| h.sub_dag);
         /*XXXXlet latest_sub_dag = consensus_config
         .node_storage()
         .get_latest_sub_dag()
@@ -302,6 +306,8 @@ impl<DB: Database> Consensus<DB> {
 
         debug!(target: "epoch-manager", ?latest_sub_dag, "recovered latest subdag:");
         if let Some(sub_dag) = &latest_sub_dag {
+            // XXXX- tripped- prob race with two consensus_chain calls?
+            // XXXX- consensus_header_latest() seems to lags sometimes...
             assert_eq!(
                 sub_dag.leader_round(),
                 last_committed_round,

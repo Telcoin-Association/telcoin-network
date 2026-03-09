@@ -28,7 +28,7 @@ use tracing::debug;
 
 use crate::archive::{
     digest_index::index::HdxIndex,
-    error::open::OpenError,
+    error::{fetch::FetchError, open::OpenError},
     fxhasher::FxHasher,
     index::Index as _,
     pack::{Pack, DATA_HEADER_BYTES},
@@ -91,7 +91,7 @@ enum PackMessage {
     ContainsConsensusHeaderNumber(u64, oneshot::Sender<bool>),
     ContainsConsensusHeader(B256, oneshot::Sender<bool>),
     ConsensusHeader(B256, oneshot::Sender<Option<ConsensusHeader>>),
-    ConsensusHeaderNumber(u64, oneshot::Sender<Option<ConsensusHeader>>),
+    ConsensusHeaderNumber(u64, oneshot::Sender<Result<ConsensusHeader, PackError>>),
     GetConsensusOutput(u64, oneshot::Sender<Result<ConsensusOutput, PackError>>),
     Persist(oneshot::Sender<Result<(), PackError>>),
     ReadLastCommitted(oneshot::Sender<HashMap<AuthorityIdentifier, Round>>),
@@ -109,6 +109,14 @@ pub struct ConsensusPack {
     handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     error: watch::Receiver<Option<PackError>>,
     epoch: Epoch,
+}
+
+/// In case of an error consume the command loop so any waiting calls will error out.
+fn clear_pack_loop(mut rx: Receiver<PackMessage>) {
+    rx.close();
+    while let Ok(msg) = rx.try_recv() {
+        drop(msg);
+    }
 }
 
 fn run_pack_loop(
@@ -193,34 +201,43 @@ impl ConsensusPack {
         let epoch = committee.epoch();
         let handle = std::thread::spawn(move || {
             match Inner::open_append(path, &previous_epoch, committee) {
-                Ok(inner) => {
-                    run_pack_loop(inner, rx, tx_error);
-                }
+                Ok(inner) => run_pack_loop(inner, rx, tx_error),
                 Err(e) => {
                     tx_error.send_replace(Some(e));
+                    clear_pack_loop(rx);
                 }
             }
         });
         Ok(Self { tx, handle: Arc::new(Mutex::new(Some(handle))), error, epoch })
     }
 
-    /// Open up the static files for previous epoch.  These will be read only.
-    pub fn open_static<P: Into<PathBuf>>(
-        path: P,
-        epoch: Epoch,
-    ) -> Result<ConsensusPack, PackError> {
+    /// Open up the files for previous epoch in append mode.  Will fail if files do not exist.
+    pub fn open_append_exists<P: Into<PathBuf>>(path: P, epoch: Epoch) -> Result<Self, PackError> {
         let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
         let (tx_error, error) = watch::channel(None);
-        let handle = std::thread::spawn(move || match Inner::open_static(path, epoch) {
+        let inner = Inner::open_append_exists(path.clone(), epoch)?;
+        let handle = std::thread::spawn(move || run_pack_loop(inner, rx, tx_error));
+        Ok(Self { tx, handle: Arc::new(Mutex::new(Some(handle))), error, epoch })
+    }
+
+    /// Open up the static files for previous epoch.  These will be read only.
+    /// Note, you should call persist() on the returned pack to make sure it
+    /// opened cleanly.
+    pub fn open_static<P: Into<PathBuf>>(path: P, epoch: Epoch) -> ConsensusPack {
+        let (tx, rx) = mpsc::channel(1000);
+        let path: PathBuf = path.into();
+        let (tx_error, error) = watch::channel(None);
+        let handle = std::thread::spawn(move || match Inner::open_static(path.clone(), epoch) {
             Ok(inner) => {
                 run_pack_loop(inner, rx, tx_error);
             }
             Err(e) => {
                 tx_error.send_replace(Some(e));
+                clear_pack_loop(rx);
             }
         });
-        Ok(Self { tx, handle: Arc::new(Mutex::new(Some(handle))), error, epoch })
+        Self { tx, handle: Arc::new(Mutex::new(Some(handle))), error, epoch }
     }
 
     /// Create a new set of epoch static files to write consensus output into.
@@ -233,12 +250,14 @@ impl ConsensusPack {
         let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
         let (tx_error, error) = watch::channel(None);
+        // XXXX- potential races while this imports, deal with.
         let handle = std::thread::spawn(move || {
             match Inner::stream_import(path, stream, epoch, &previous_epoch) {
                 Ok(inner) => {
                     run_pack_loop(inner, rx, tx_error);
                 }
                 Err(e) => {
+                    clear_pack_loop(rx);
                     tx_error.send_replace(Some(e));
                 }
             }
@@ -314,20 +333,26 @@ impl ConsensusPack {
     }
 
     /// Retrieve a consensus header by number.
-    pub async fn consensus_header_by_number(&self, number: u64) -> Option<ConsensusHeader> {
+    pub async fn consensus_header_by_number(
+        &self,
+        number: u64,
+    ) -> Result<ConsensusHeader, PackError> {
         let (tx, rx) = oneshot::channel();
-        if self.tx.send(PackMessage::ConsensusHeaderNumber(number, tx)).await.is_ok() {
-            rx.await.unwrap_or(None)
-        } else {
-            None
-        }
+        self.tx
+            .send(PackMessage::ConsensusHeaderNumber(number, tx))
+            .await
+            .map_err(|_| PackError::SendFailed)?;
+        rx.await.map_err(|_| PackError::ReceiveFailed)?
     }
 
     pub async fn persist(&self) -> Result<(), PackError> {
         self.get_error()?;
         let (tx, rx) = oneshot::channel();
         let _ = self.tx.send(PackMessage::Persist(tx)).await;
-        rx.await.map_err(|_| PackError::ReceiveFailed)?
+        rx.await.map_err(|_| match &*self.error.borrow() {
+            Some(e) => e.clone(),
+            None => PackError::ReceiveFailed,
+        })?
     }
 
     /// Read the last committed rounds for authorities from the epoch.
@@ -546,6 +571,44 @@ impl Inner {
             consensus_digests.set_data_file_length(len);
             batch_digests.set_data_file_length(len);
         }
+        // Repair damage.
+        Self::trunc_and_heal(&mut data, &mut consensus_idx, &consensus_digests, &batch_digests)?;
+        Ok(Self { data, consensus_idx, consensus_digests, batch_digests, epoch_meta })
+    }
+
+    /// Open up the files for previous epoch in append mode.  Will fail if files do not exist.
+    fn open_append_exists<P: AsRef<Path>>(path: P, epoch: Epoch) -> Result<Self, PackError> {
+        let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
+
+        let mut data =
+            Pack::<PackRecord>::open(base_dir.join(Self::DATA_NAME), epoch as u64, false)?;
+        let epoch_meta = data
+            .fetch(DATA_HEADER_BYTES as u64)
+            .map_err(|e| PackError::EpochLoad(e.to_string()))?
+            .into_epoch()?;
+        let mut consensus_idx = PositionIndex::open_pdx_file(
+            base_dir.join(Self::CONSENSUS_POS_NAME),
+            data.header(),
+            false,
+        )
+        .map_err(OpenError::IndexFileOpen)?;
+        let builder = BuildHasherDefault::<FxHasher>::default();
+        let consensus_digests = HdxIndex::open_hdx_file(
+            base_dir.join(Self::CONSENSUS_HASH_NAME),
+            data.header(),
+            builder,
+            false,
+        )
+        .map_err(OpenError::IndexFileOpen)?;
+        let builder = BuildHasherDefault::<FxHasher>::default();
+        let batch_digests = HdxIndex::open_hdx_file(
+            base_dir.join(Self::BATCH_HASH_NAME),
+            data.header(),
+            builder,
+            false,
+        )
+        .map_err(OpenError::IndexFileOpen)?;
+
         // Repair damage.
         Self::trunc_and_heal(&mut data, &mut consensus_idx, &consensus_digests, &batch_digests)?;
         Ok(Self { data, consensus_idx, consensus_digests, batch_digests, epoch_meta })
@@ -842,13 +905,17 @@ impl Inner {
     }
 
     /// Retrieve a consensus header by number.
-    fn consensus_header_by_number(&mut self, number: u64) -> Option<ConsensusHeader> {
+    fn consensus_header_by_number(&mut self, number: u64) -> Result<ConsensusHeader, PackError> {
+        if number < self.epoch_meta.start_consensus_number {
+            return Err(PackError::ConsensusNumberTooLow);
+        }
+        if number > (self.epoch_meta.start_consensus_number + self.consensus_idx.len() as u64) {
+            return Err(PackError::ConsensusNumberTooHigh);
+        }
         let pos = self
             .consensus_idx
-            .load(number.saturating_sub(self.epoch_meta.start_consensus_number))
-            .ok()?;
-        let rec = self.data.fetch(pos).ok()?;
-        rec.into_consensus().ok()
+            .load(number.saturating_sub(self.epoch_meta.start_consensus_number))?;
+        self.data.fetch(pos)?.into_consensus()
     }
 
     fn persist(&mut self) -> Result<(), PackError> {
@@ -976,6 +1043,8 @@ pub enum PackError {
     InvalidConsensusNumber(u64, u64),
     ConsensusNumberAlreadyAdded,
     CorruptPack,
+    ConsensusNumberTooLow,
+    ConsensusNumberTooHigh,
 }
 
 impl Error for PackError {}
@@ -1013,6 +1082,10 @@ impl Display for PackError {
                 )
             }
             PackError::CorruptPack => write!(f, "Pack file is corrupt"),
+            PackError::ConsensusNumberTooLow => write!(f, "Consensus number too low for this file"),
+            PackError::ConsensusNumberTooHigh => {
+                write!(f, "Consensus number too high for this file")
+            }
         }
     }
 }
@@ -1020,6 +1093,12 @@ impl Display for PackError {
 impl From<OpenError> for PackError {
     fn from(value: OpenError) -> Self {
         Self::Open(Arc::new(value))
+    }
+}
+
+impl From<FetchError> for PackError {
+    fn from(value: FetchError) -> Self {
+        Self::Fetch(value.to_string())
     }
 }
 
@@ -1081,6 +1160,7 @@ pub(crate) mod test {
         }
         let sub_dag_index_1 = 1;
         leader_1.header.round = sub_dag_index_1 as u32;
+        leader_1.header.epoch = committee.epoch();
         let reputation_scores = ReputationScores::default();
         let previous_sub_dag = None;
         let batch_digests_1: VecDeque<BlockHash> = batches_1.iter().map(|b| b.digest()).collect();
@@ -1196,7 +1276,7 @@ pub(crate) mod test {
         drop(pack);
 
         // Open read only and verify.
-        let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open pack");
+        let pack = ConsensusPack::open_static(temp_dir.path(), 0);
         for i in 0..(num_outputs * 2) {
             let output_db = pack.get_consensus_output(i as u64 + 1).await.unwrap();
             let output = outputs.get(i as usize).unwrap();

@@ -24,7 +24,7 @@ async fn test_sync_save_consensus() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
     let mut consensus_chain =
-        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
 
     // Create certificates for a subdag
     let genesis: BTreeSet<_> = fixture.genesis().collect();
@@ -65,7 +65,7 @@ async fn test_sync_parent_hash_chain() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
     let mut consensus_chain =
-        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
 
     // Create certificates
     let genesis: BTreeSet<_> = fixture.genesis().collect();
@@ -119,7 +119,7 @@ async fn test_sync_lookup_by_hash() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
     let mut consensus_chain =
-        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
 
     let genesis: BTreeSet<_> = fixture.genesis().collect();
     let (_, headers) = fixture.headers_round(0, &genesis);
@@ -212,7 +212,7 @@ async fn test_digest_mismatch_detection() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
     let mut consensus_chain =
-        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
 
     let genesis: BTreeSet<_> = fixture.genesis().collect();
     let (_, headers) = fixture.headers_round(0, &genesis);

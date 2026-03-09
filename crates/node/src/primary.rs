@@ -9,7 +9,7 @@ use tn_primary::{
 };
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{
-    Committee, Database as ConsensusDatabase, Notifier, TaskManager,
+    Committee, Database as ConsensusDatabase, Notifier, TaskManager, TimestampSec,
     DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::sync::RwLock;
@@ -22,6 +22,8 @@ struct PrimaryNodeInner<CDB> {
     consensus_bus: ConsensusBus,
     /// The primary struct that holds handles and network.
     primary: Primary<CDB>,
+    /// The current epochs end boundary time.
+    epoch_boundary: TimestampSec,
 }
 
 impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
@@ -105,6 +107,7 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
             task_manager,
             self.primary.network_handle().clone(),
             consensus_chain,
+            self.epoch_boundary,
         );
 
         Ok(leader_schedule)
@@ -122,10 +125,11 @@ impl<CDB: ConsensusDatabase> PrimaryNode<CDB> {
         consensus_bus: ConsensusBus,
         network: PrimaryNetworkHandle,
         state_sync: StateSynchronizer<CDB>,
+        epoch_boundary: TimestampSec,
     ) -> PrimaryNode<CDB> {
         let primary = Primary::new(consensus_config.clone(), &consensus_bus, network, state_sync);
 
-        let inner = PrimaryNodeInner { consensus_config, consensus_bus, primary };
+        let inner = PrimaryNodeInner { consensus_config, consensus_bus, primary, epoch_boundary };
 
         Self { internal: Arc::new(RwLock::new(inner)) }
     }

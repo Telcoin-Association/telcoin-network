@@ -13,6 +13,7 @@ use tn_types::{BlockHash, ConsensusHeader, Database, Epoch, EpochCertificate, Ep
 use tokio::task::JoinHandle;
 
 pub mod engine;
+mod epoch_votes;
 mod error;
 mod health;
 mod manager;
@@ -39,12 +40,19 @@ where
 {
     let consensus_db = manager::open_consensus_db(&tn_datadir);
 
-    // create the epoch manager
-    let mut epoch_manager = EpochManager::new(builder, tn_datadir, consensus_db, key_config);
     // run the node
     // Note this is the "entry task" for the node and the caller needs to wait on the JoinHandle
     // then exit.
-    tokio::spawn(async move { epoch_manager.run().await })
+    tokio::spawn(async move {
+        // create the epoch manager
+        let mut epoch_manager =
+            EpochManager::new(builder, tn_datadir, consensus_db, key_config).await;
+        let result = epoch_manager.run().await;
+        if let Err(err) = &result {
+            tracing::error!("Error running node: {err}");
+        }
+        result
+    })
 }
 
 #[derive(Debug)]

@@ -10,9 +10,10 @@ use std::{
     sync::Arc,
 };
 
+use parking_lot::Mutex;
 use tn_types::{
-    gas_accumulator::RewardsCounter, AuthorityIdentifier, Batch, BlockHash, CommittedSubDag,
-    Committee, ConsensusHeader, ConsensusOutput, Epoch, EpochRecord, Round, B256,
+    gas_accumulator::RewardsCounter, AuthorityIdentifier, BlockHash, CommittedSubDag, Committee,
+    ConsensusHeader, ConsensusOutput, Epoch, EpochRecord, Round, B256,
 };
 use tokio::sync::{
     mpsc::{self, Sender},
@@ -137,6 +138,7 @@ impl LatestConsensus {
                         crc32_hasher.update(&number.to_le_bytes());
                         let crc32 = crc32_hasher.finalize();
                         let _ = f.write_all(&crc32.to_le_bytes());
+                        let _ = f.sync_all();
                     }
                     LatestConsenusCommand::Persist(tx) => {
                         let _ = tx.send(());
@@ -169,21 +171,30 @@ pub struct ConsensusChain {
     base_path: PathBuf,
     current_pack: Option<ConsensusPack>,
     latest_consensus: LatestConsensus,
+    recent_packs: Arc<Mutex<VecDeque<ConsensusPack>>>,
 }
 
 impl ConsensusChain {
+    /// How many recently opened pack files to maintain.
+    const PACK_CACHE_SIZE: usize = 10;
+
     /// Create a new empty consensus chain.
-    pub fn new(base_path: PathBuf) -> Result<ConsensusChain, ConsensusChainError> {
+    pub async fn new(base_path: PathBuf) -> Result<ConsensusChain, ConsensusChainError> {
+        // XXXX don't need await
         let latest_consensus = LatestConsensus::new(&base_path)?;
-        Ok(Self { base_path, current_pack: None, latest_consensus })
+        // If we have a pack for the last epoch open it so we can read data early.
+        let current_pack =
+            ConsensusPack::open_append_exists(&base_path, latest_consensus.epoch).ok();
+        let recent_packs = Arc::new(Mutex::new(VecDeque::default()));
+        Ok(Self { base_path, current_pack, latest_consensus, recent_packs })
     }
 
     /// Create a new empty consensus chain with a dummy epoch 0 pack ready.
-    pub fn new_for_test(
+    pub async fn new_for_test(
         base_path: PathBuf,
         committee: Committee,
     ) -> Result<ConsensusChain, ConsensusChainError> {
-        let mut me = Self::new(base_path)?;
+        let mut me = Self::new(base_path).await?;
         me.new_epoch(
             EpochRecord {
                 epoch: 0,
@@ -192,28 +203,57 @@ impl ConsensusChain {
                 ..Default::default()
             },
             committee,
-        )?;
+        )
+        .await?;
         Ok(me)
     }
 
-    pub fn new_epoch(
+    pub async fn new_epoch(
         &mut self,
         previous_epoch: EpochRecord,
         committee: Committee,
     ) -> Result<(), ConsensusChainError> {
+        if previous_epoch.epoch != committee.epoch().saturating_sub(1) {
+            return Err(ConsensusChainError::PrevCommitteeEpochMismatch);
+        }
+        {
+            // Make sure we did not wind up with a pack as static and current...
+            let mut recents = self.recent_packs.lock();
+            let mut removes = Vec::new();
+            for i in 0..recents.len() {
+                if recents[i].epoch() == committee.epoch() {
+                    eprintln!(
+                        "XXXX found dup pack for epoch {} current {:?}, recents {}",
+                        committee.epoch(),
+                        self.current_pack.as_ref().map(|p| p.epoch()),
+                        recents.len(),
+                    );
+                    removes.push(i);
+                }
+            }
+            for i in removes.iter().rev() {
+                recents.remove(*i);
+            }
+        }
         if let Some(old_pack) = self.current_pack.take() {
             if old_pack.epoch() == committee.epoch() {
                 self.current_pack = Some(old_pack);
                 return Ok(());
             }
-            // Need to stash this in a cache... XXXX
+            old_pack.persist().await?;
+            let mut recents = self.recent_packs.lock();
+            if recents.len() > Self::PACK_CACHE_SIZE {
+                let _ = recents.pop_front();
+            }
+            recents.push_back(old_pack);
         }
         let pack = ConsensusPack::open_append(&self.base_path, previous_epoch, committee)?;
+        pack.persist().await?; // Surface any open errors.
         self.current_pack = Some(pack);
         Ok(())
     }
 
-    /// Populate an epoch poack from a stream.
+    /// Populate an epoch pack from a stream.
     /// This will resolve once the stream has been written.
     pub async fn stream_import<R: Read + Seek + Send + 'static>(
         &self,
@@ -242,10 +282,18 @@ impl ConsensusChain {
         consensus: ConsensusOutput,
     ) -> Result<(), ConsensusChainError> {
         if let Some(pack) = &self.current_pack {
-            self.latest_consensus
-                .update(consensus.sub_dag().leader_epoch(), consensus.number())
-                .await;
-            pack.save_consensus_output(consensus).await?;
+            if consensus.number() > self.latest_consensus.number {
+                self.latest_consensus
+                    .update(consensus.sub_dag().leader_epoch(), consensus.number())
+                    .await;
+                pack.save_consensus_output(consensus).await?;
+            } else {
+                eprintln!(
+                    "XXXX tried to save previous {} on {}",
+                    consensus.number(),
+                    self.latest_consensus.number
+                );
+            }
             Ok(())
         } else {
             Err(ConsensusChainError::NoCurrentEpoch)
@@ -275,14 +323,27 @@ impl ConsensusChain {
                 if epoch == pack.epoch() {
                     return Ok(pack.consensus_header_by_digest(digest).await);
                 }
-            } else {
-                return Ok(pack.consensus_header_by_digest(digest).await);
+            } else if let Some(header) = pack.consensus_header_by_digest(digest).await {
+                return Ok(Some(header));
             }
         }
         if let Some(epoch) = epoch {
-            let pack = ConsensusPack::open_static(&self.base_path, epoch)?;
-            Ok(pack.consensus_header_by_digest(digest).await)
+            if let Ok(pack) = self.get_static(epoch).await {
+                Ok(pack.consensus_header_by_digest(digest).await)
+            } else {
+                // Don't have this epoch data.
+                Ok(None)
+            }
         } else {
+            let mut epoch = self.current_pack.as_ref().map(|p| p.epoch());
+            while let Some(try_epoch) = epoch {
+                if let Ok(pack) = self.get_static(try_epoch).await {
+                    if let Some(header) = pack.consensus_header_by_digest(digest).await {
+                        return Ok(Some(header));
+                    }
+                }
+                epoch = if try_epoch > 0 { Some(try_epoch - 1) } else { None };
+            }
             Ok(None)
         }
     }
@@ -296,16 +357,27 @@ impl ConsensusChain {
         if let Some(pack) = &self.current_pack {
             if let Some(epoch) = epoch {
                 if epoch == pack.epoch() {
-                    return Ok(pack.consensus_header_by_number(number).await);
+                    return Ok(Some(pack.consensus_header_by_number(number).await?));
                 }
-            } else {
-                return Ok(pack.consensus_header_by_number(number).await);
+            } else if let Ok(header) = pack.consensus_header_by_number(number).await {
+                return Ok(Some(header));
             }
         }
         if let Some(epoch) = epoch {
-            let pack = ConsensusPack::open_static(&self.base_path, epoch)?;
-            Ok(pack.consensus_header_by_number(number).await)
+            let pack = self.get_static(epoch).await?;
+            Ok(Some(pack.consensus_header_by_number(number).await?))
         } else {
+            let mut epoch = self.current_pack.as_ref().map(|p| p.epoch());
+            // XXXX- TODO this is dumb, we should be able to use epoch records to deduce the epoch
+            // for number.
+            while let Some(try_epoch) = epoch {
+                if let Ok(pack) = self.get_static(try_epoch).await {
+                    if let Ok(header) = pack.consensus_header_by_number(number).await {
+                        return Ok(Some(header));
+                    }
+                }
+                epoch = if try_epoch > 0 { Some(try_epoch - 1) } else { None };
+            }
             Ok(None)
         }
     }
@@ -315,16 +387,21 @@ impl ConsensusChain {
         &self,
     ) -> Result<Option<ConsensusHeader>, ConsensusChainError> {
         if let Some(pack) = &self.current_pack {
-            if self.latest_consensus.epoch + 1 == pack.epoch() {
-                Ok(None)
-            } else if self.latest_consensus.epoch != pack.epoch() {
-                Err(ConsensusChainError::EpochMismatch)
+            if self.latest_consensus.epoch == pack.epoch() {
+                Ok(Some(pack.consensus_header_by_number(self.latest_consensus.number).await?))
             } else {
-                Ok(pack.consensus_header_by_number(self.latest_consensus.number).await)
+                let pack = self.get_static(self.latest_consensus.epoch).await?;
+                Ok(Some(pack.consensus_header_by_number(self.latest_consensus.number).await?))
             }
         } else {
-            Err(ConsensusChainError::NoCurrentEpoch)
+            let pack = self.get_static(self.latest_consensus.epoch).await?;
+            Ok(Some(pack.consensus_header_by_number(self.latest_consensus.number).await?))
         }
+    }
+
+    /// Return the last consensus number that was processed.
+    pub fn latest_consesus_number(&self) -> u64 {
+        self.latest_consensus.number
     }
 
     /// Resolve when the current epoch is fully persisted to storage.
@@ -346,7 +423,7 @@ impl ConsensusChain {
                 return pack.read_last_committed().await;
             }
         }
-        if let Ok(mut pack) = ConsensusPack::open_static(&self.base_path, epoch) {
+        if let Ok(mut pack) = self.get_static(epoch).await {
             pack.read_last_committed().await
         } else {
             HashMap::new()
@@ -363,7 +440,7 @@ impl ConsensusChain {
                 return pack.read_latest_commit_with_final_reputation_scores().await;
             }
         }
-        if let Ok(mut pack) = ConsensusPack::open_static(&self.base_path, epoch) {
+        if let Ok(mut pack) = self.get_static(epoch).await {
             pack.read_latest_commit_with_final_reputation_scores().await
         } else {
             None
@@ -397,15 +474,6 @@ impl ConsensusChain {
         }
     }
 
-    /// True if the current epoch pack contains the batch for digest.
-    pub async fn current_batch(&mut self, digest: BlockHash) -> Option<Batch> {
-        if let Some(pack) = &mut self.current_pack {
-            pack.batch(digest).await
-        } else {
-            None
-        }
-    }
-
     /// Count leaders in this pack (in rewards_counter) lower than last_executed_round.
     /// This works on the current epoch/pack.
     pub async fn count_leaders(
@@ -419,6 +487,32 @@ impl ConsensusChain {
             Err(ConsensusChainError::NoCurrentEpoch)
         }
     }
+
+    /// Get a static pack file from the cache if available or create and cache if not.
+    async fn get_static(&self, epoch: Epoch) -> Result<ConsensusPack, PackError> {
+        if let Some(pack) = &self.current_pack {
+            if pack.epoch() == epoch {
+                return Ok(pack.clone());
+            }
+        } else {
+            eprintln!("XXXX asking for static epoch {epoch} with no current...");
+        }
+        {
+            let mut recents = self.recent_packs.lock();
+            for p in recents.iter() {
+                if p.epoch() == epoch {
+                    return Ok(p.clone());
+                }
+            }
+            if recents.len() > Self::PACK_CACHE_SIZE {
+                let _ = recents.pop_front();
+            }
+        }
+        let pack = ConsensusPack::open_static(&self.base_path, epoch);
+        pack.persist().await?; // Surface any open errors.
+        self.recent_packs.lock().push_back(pack.clone());
+        Ok(pack)
+    }
 }
 
 #[derive(Debug)]
@@ -427,6 +521,7 @@ pub enum ConsensusChainError {
     NoCurrentEpoch,
     IO(std::io::Error),
     EpochMismatch,
+    PrevCommitteeEpochMismatch,
 }
 
 impl Error for ConsensusChainError {}
@@ -438,6 +533,9 @@ impl Display for ConsensusChainError {
             ConsensusChainError::IO(e) => write!(f, "IO Error: {e}"),
             ConsensusChainError::EpochMismatch => {
                 write!(f, "Current epoch does not contain the latest consensus header")
+            }
+            ConsensusChainError::PrevCommitteeEpochMismatch => {
+                write!(f, "Current committee epoch and previous epoch not in sync")
             }
         }
     }
@@ -462,7 +560,7 @@ mod test {
     use crate::consensus::{ConsensusSlot, LatestConsensus};
     use std::sync::Arc;
 
-    use tn_types::{test_genesis, BlockHash, EpochRecord, Hash as _};
+    use tn_types::{test_genesis, BlockHash, BlockNumHash, EpochRecord, Hash as _, B256};
 
     use crate::{
         consensus::ConsensusChain,
@@ -473,7 +571,7 @@ mod test {
     use tn_test_utils::CommitteeFixture;
 
     #[tokio::test]
-    async fn test_latest_consensus() {
+    async fn test_consensus_store_latest_consensus() {
         let temp_dir = TempDir::with_prefix("test_latest_consensus").unwrap();
         let mut latest = LatestConsensus::new(temp_dir.path()).unwrap();
         assert_eq!(latest.epoch, 0);
@@ -496,7 +594,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_consensus_db_stream() {
+    async fn test_consensus_store_db_stream() {
         let temp_dir = TempDir::with_prefix("test_consensus_pack").expect("temp dir");
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
@@ -510,8 +608,8 @@ mod test {
             ..Default::default()
         };
         // Create and load some data in initial file.
-        let mut consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).unwrap();
-        consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).unwrap();
+        let mut consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).await.unwrap();
+        consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
 
         let num_outputs = 1000;
         let mut outputs = Vec::new();
@@ -534,15 +632,163 @@ mod test {
         //drop(consensus_chain);
 
         let temp_dir2 = TempDir::with_prefix("test_consensus_pack2").expect("temp dir");
-        let mut consensus_chain2 = ConsensusChain::new(temp_dir2.path().to_owned()).unwrap();
+        let mut consensus_chain2 = ConsensusChain::new(temp_dir2.path().to_owned()).await.unwrap();
         let stream = consensus_chain.get_epoch_stream(0).await.unwrap();
         consensus_chain2.stream_import(stream, 0, previous_epoch.clone()).await.unwrap();
-        consensus_chain2.new_epoch(previous_epoch.clone(), committee.clone()).unwrap();
+        consensus_chain2.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
         for i in 0..num_outputs {
             let output_db =
                 consensus_chain2.get_consensus_output_current(i as u64 + 1).await.unwrap();
             let output = outputs.get(i as usize).unwrap();
             compare_outputs(&output_db, output);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_consensus_store_general() {
+        let temp_dir = TempDir::with_prefix("test_consensus_pack").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            // If we can't find the recort then this we should be starting at epoch 0- use this
+            // filler.
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        // Create and load some data in initial file.
+        let mut consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).await.unwrap();
+        consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+
+        let num_outputs = 100;
+        let mut outputs = Vec::new();
+        let mut parent = BlockHash::default();
+        for i in 0..num_outputs {
+            let consensus_output =
+                make_test_output(&committee, i % 4, chain.clone(), (i as u64) + 1, parent);
+            parent = consensus_output.digest().into();
+            outputs.push(consensus_output.clone());
+            let last_header = consensus_output.consensus_header();
+            consensus_chain.save_consensus_output(consensus_output).await.unwrap();
+            let latest = consensus_chain.consensus_header_latest().await.unwrap().unwrap();
+            assert_eq!(last_header.digest(), latest.digest(), "latest header mismatch {i}");
+        }
+
+        let previous_epoch = EpochRecord {
+            // If we can't find the recort then this we should be starting at epoch 0- use this
+            // filler.
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            parent_hash: previous_epoch.digest(),
+            final_consensus: BlockNumHash { number: 100, hash: BlockHash::default() },
+            ..Default::default()
+        };
+        let committee = committee.advance_epoch_for_test(1);
+        consensus_chain.persist_current().await.unwrap();
+        consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+
+        for i in num_outputs..(num_outputs * 2) {
+            let consensus_output =
+                make_test_output(&committee, i % 4, chain.clone(), (i as u64) + 1, parent);
+            parent = consensus_output.digest().into();
+            outputs.push(consensus_output.clone());
+            let last_header = consensus_output.consensus_header();
+            consensus_chain.save_consensus_output(consensus_output).await.unwrap();
+            let latest = consensus_chain
+                .consensus_header_latest()
+                .await
+                .expect(&format!("to have latest {i}"))
+                .unwrap();
+            assert_eq!(last_header.digest(), latest.digest(), "latest header mismatch {i}");
+        }
+
+        let previous_epoch = EpochRecord {
+            // If we can't find the recort then this we should be starting at epoch 0- use this
+            // filler.
+            epoch: 1,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            parent_hash: previous_epoch.digest(),
+            final_consensus: BlockNumHash { number: 200, hash: BlockHash::default() },
+            ..Default::default()
+        };
+        let committee = committee.advance_epoch_for_test(2);
+        consensus_chain.persist_current().await.unwrap();
+        consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+
+        for i in (num_outputs * 2)..(num_outputs * 3) {
+            let consensus_output =
+                make_test_output(&committee, i % 4, chain.clone(), (i as u64) + 1, parent);
+            parent = consensus_output.digest().into();
+            outputs.push(consensus_output.clone());
+            let last_header = consensus_output.consensus_header();
+            consensus_chain.save_consensus_output(consensus_output).await.unwrap();
+            //consensus_chain.persist_current().await.expect(&format!("Failed to save on {i}"));
+            let latest = consensus_chain.consensus_header_latest().await.unwrap().unwrap();
+            assert_eq!(last_header.digest(), latest.digest(), "latest header mismatch {i}");
+        }
+
+        for i in 0..(num_outputs * 3) {
+            let header_db = consensus_chain
+                .consensus_header_by_number(None, i as u64 + 1)
+                .await
+                .expect(&format!("Failed to get header by number on {i}"))
+                .unwrap();
+            let output = outputs.get(i as usize).unwrap().consensus_header();
+            assert_eq!(header_db.digest(), output.digest(), "consensus headers mismatch {i}");
+        }
+
+        consensus_chain.persist_current().await.expect("persist chain");
+        drop(consensus_chain);
+        let mut consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).await.unwrap();
+        consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+
+        // Check that last consenus held over a DB shutdown/restart.
+        let last_header = outputs.last().unwrap().consensus_header();
+        let latest = consensus_chain.consensus_header_latest().await.unwrap().unwrap();
+        assert_eq!(last_header.digest(), latest.digest(), "latest header mismatch after reload");
+
+        // Test that all our outputs are still good.
+        for i in 0..(num_outputs * 3) {
+            let header_db = consensus_chain
+                .consensus_header_by_number(None, i as u64 + 1)
+                .await
+                .unwrap()
+                .unwrap();
+            let output = outputs.get(i as usize).unwrap().consensus_header();
+            assert_eq!(header_db.digest(), output.digest(), "consensus headers mismatch {i}");
+        }
+        // Now by digest
+        for i in 0..(num_outputs * 3) {
+            let digest: B256 = outputs[i].digest().into();
+            let header_db =
+                consensus_chain.consensus_header_by_digest(None, digest).await.unwrap().unwrap();
+            assert_eq!(digest, header_db.digest(), "consensus headers mismatch (by digest) {i}");
+        }
+
+        // Now with epochs.
+        for i in 0..(num_outputs * 3) {
+            let epoch = i / num_outputs;
+            let header_db = consensus_chain
+                .consensus_header_by_number(Some(epoch as u32), i as u64 + 1)
+                .await
+                .expect(&format!("failed to get header by number epoch {epoch}, {i}"))
+                .unwrap();
+            let output = outputs.get(i as usize).unwrap().consensus_header();
+            assert_eq!(header_db.digest(), output.digest(), "consensus headers mismatch {i}");
+        }
+        for i in 0..(num_outputs * 3) {
+            let epoch = i / num_outputs;
+            let digest: B256 = outputs[i].digest().into();
+            let header_db = consensus_chain
+                .consensus_header_by_digest(Some(epoch as u32), digest)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(digest, header_db.digest(), "consensus headers mismatch (by digest) {i}");
         }
     }
 }

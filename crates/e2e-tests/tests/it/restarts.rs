@@ -341,7 +341,6 @@ fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
     };
     info!(target: "restart-test", "Ran restart tests 1: {res1:?}");
     let is_ok = res1.is_ok();
-
     // kill new child2 if successfully restarted
     let assert_str = match res1 {
         Ok(mut child2_restarted) => {

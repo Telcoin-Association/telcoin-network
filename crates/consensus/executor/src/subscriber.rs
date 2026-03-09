@@ -17,7 +17,8 @@ use tn_storage::{consensus::ConsensusChain, CertificateStore};
 use tn_types::{
     encode, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash, BlsSigner as _,
     CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput, Database,
-    Hash as _, Noticer, TaskManager, TaskSpawner, Timestamp, TnReceiver, TnSender, B256,
+    Hash as _, Noticer, TaskManager, TaskSpawner, Timestamp, TimestampSec, TnReceiver, TnSender,
+    B256,
 };
 use tracing::{debug, error, info, instrument, warn};
 
@@ -49,6 +50,8 @@ struct Inner {
     client: LocalNetwork,
     /// Access to the consensus chain data.
     consensus_chain: ConsensusChain,
+    /// Epoch boundary time.
+    epoch_boundary: TimestampSec,
 }
 
 /// Spawn the subscriber in the correct mode based on the validator status for the current epoch.
@@ -59,6 +62,7 @@ pub fn spawn_subscriber<DB: Database>(
     task_manager: &TaskManager,
     network_handle: PrimaryNetworkHandle,
     consensus_chain: ConsensusChain,
+    epoch_boundary: TimestampSec,
 ) {
     let authority_id = config.authority_id();
     let committee = config.committee().clone();
@@ -74,6 +78,7 @@ pub fn spawn_subscriber<DB: Database>(
             committee,
             client,
             consensus_chain: consensus_chain.clone(),
+            epoch_boundary,
         }),
     };
     match mode {
@@ -291,12 +296,15 @@ impl<DB: Database> Subscriber<DB> {
 
         let (mut last_parent, mut last_number) = self.get_last_executed_consensus().await?;
 
+        let mut epoch_done = false;
         // rx_sequence is now passed as parameter to avoid race condition
         // Listen to sequenced consensus message and process them.
         loop {
             tokio::select! {
                 // Receive the ordered sequence of consensus messages from a consensus node.
-                Some(sub_dag) = rx_sequence.recv(), if waiting.len() < Self::MAX_PENDING_PAYLOADS => {
+                Some(sub_dag) = rx_sequence.recv(), if !epoch_done && waiting.len() < Self::MAX_PENDING_PAYLOADS => {
+                    // Once we cross epoch boundary then process this last output then we are done.
+                    if sub_dag.commit_timestamp() >= self.inner.epoch_boundary { epoch_done = true; }
                     debug!(target: "subscriber", subdag=?sub_dag.digest(), round=?sub_dag.leader_round(), "received committed subdag from consensus");
                     // We can schedule more then MAX_PENDING_PAYLOADS payloads but
                     // don't process more consensus messages when more
