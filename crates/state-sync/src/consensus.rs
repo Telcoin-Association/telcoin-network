@@ -31,9 +31,6 @@ async fn get_consensus_header<DB: TNDatabase>(
         // This will be a quicker way to check if this consensus output has been finalized.
         return None;
     }
-    /*XXXXif let Ok(Some(_block)) = consensus_chain.consensus_header_by_number(epoch, number).await {
-        return None;
-    }*/
     if let Ok(Some(block)) = config.node_storage().get::<ConsensusHeaderCache>(&number) {
         return if block.number > 0 {
             Some((block.sub_dag.leader_epoch(), block.number - 1, block.parent_hash))
@@ -41,9 +38,6 @@ async fn get_consensus_header<DB: TNDatabase>(
             None
         };
     }
-    /*XXXXif let Ok(Some(block)) = consensus_chain.consensus_header_by_digest(epoch, hash).await {
-        return Some((block.sub_dag.leader_epoch(), block.number - 1, block.parent_hash));
-    }*/
     // request consensus from any peer
     match network.request_consensus(None, Some(hash)).await {
         Ok(header) => {

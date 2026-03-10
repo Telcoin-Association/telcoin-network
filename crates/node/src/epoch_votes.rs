@@ -15,6 +15,8 @@ use tn_types::{
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::{error, info, warn};
 
+type VoteQueue = VecDeque<(Epoch, Sender<EpochVote>, Option<Receiver<EpochVote>>)>;
+
 async fn manage_epoch_votes<DB: TNDatabase>(
     epoch_rec: EpochRecord,
     key_config: KeyConfig,
@@ -49,7 +51,6 @@ async fn manage_epoch_votes<DB: TNDatabase>(
     let epoch_hash = epoch_rec.digest();
     // Collect votes from peers
     let mut reached_quorum = false;
-    //XXXXlet mut timeout = Duration::from_secs(5);
     let mut timeout = Duration::from_millis(2500);
     let mut timeouts = 0;
     let mut alt_recs: HashMap<B256, usize> = HashMap::default();
@@ -193,10 +194,7 @@ async fn manage_epoch_votes<DB: TNDatabase>(
 }
 
 /// Direct a newly received vote to it's task.
-fn get_new_vote_channel(
-    epoch: Epoch,
-    vote_queues: &mut VecDeque<(Epoch, Sender<EpochVote>, Option<Receiver<EpochVote>>)>,
-) -> Option<Receiver<EpochVote>> {
+fn get_new_vote_channel(epoch: Epoch, vote_queues: &mut VoteQueue) -> Option<Receiver<EpochVote>> {
     for q in vote_queues.iter_mut() {
         if q.0 == epoch {
             return q.2.take();
@@ -211,10 +209,7 @@ fn get_new_vote_channel(
 }
 
 /// Direct a newly received vote to it's task.
-async fn handle_new_vote(
-    vote: EpochVote,
-    vote_queues: &mut VecDeque<(Epoch, Sender<EpochVote>, Option<Receiver<EpochVote>>)>,
-) {
+async fn handle_new_vote(vote: EpochVote, vote_queues: &mut VoteQueue) {
     let mut remove = None;
     let mut found = false;
     for (i, q) in vote_queues.iter().enumerate() {
@@ -263,8 +258,7 @@ pub(crate) fn spawn_epoch_vote_collector<DB: TNDatabase>(
     let mut vote_rx = consensus_bus.subscribe_new_epoch_votes();
     let mut epoch_rx = consensus_bus.epoch_record_watch().subscribe();
     let task_spawner = node_task_spawner.clone();
-    let mut vote_queues: VecDeque<(Epoch, Sender<EpochVote>, Option<Receiver<EpochVote>>)> =
-        VecDeque::with_capacity(5);
+    let mut vote_queues: VoteQueue = VecDeque::with_capacity(5);
 
     node_task_spawner.spawn_critical_task("Epoch Vote Collector", async move {
         loop {

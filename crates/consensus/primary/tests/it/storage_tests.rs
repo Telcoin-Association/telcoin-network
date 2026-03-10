@@ -155,7 +155,6 @@ async fn test_consensus_store_read_latest_final_reputation_scores() {
 
         consensus_chain.write_subdag_for_test(sequence_number, sub_dag).await;
     }
-    //XXXXstore.persist::<ConsensusBlocks>().await;
 
     // WHEN we try to read the final schedule. The one of sub dag sequence 20 should be returned
     let commit = consensus_chain

@@ -193,9 +193,8 @@ async fn spawn_stream_consensus_headers<DB: Database>(
     let mut rx_last_consensus_header = consensus_bus.last_consensus_header().subscribe();
     let mut last_consensus_header =
         consensus_bus.last_consensus_block(None, &consensus_chain).await.unwrap_or_default();
-    //XXXX    last_executed_consensus_block(&consensus_bus,
-    // &consensus_chain).await.unwrap_or_default();
     let mut last_consensus_height = last_consensus_header.number;
+    let epoch = consensus_chain.latest_consesus_epoch();
 
     // infinite loop over consensus output
     loop {
@@ -214,6 +213,7 @@ async fn spawn_stream_consensus_headers<DB: Database>(
                         &consensus_chain,
                     )
                     .await?;
+                    if last_consensus_header.sub_dag.leader_epoch() > epoch { return Ok(()); }
                     last_consensus_height = last_consensus_header.number;
                 }
             }
@@ -235,6 +235,7 @@ async fn catch_up_consensus_from_to<DB: Database>(
     consensus_chain: &ConsensusChain,
 ) -> eyre::Result<ConsensusHeader> {
     let mut last_parent = from.digest();
+    let epoch = consensus_chain.latest_consesus_epoch();
 
     // Catch up to the current chain state if we need to.
     let last_consensus_height = from.number;
@@ -260,14 +261,6 @@ async fn catch_up_consensus_from_to<DB: Database>(
         // We will be verifying and loading these records elsewhere.
         let consensus_header = if number == max_consensus_height {
             max_consensus.clone()
-            // XXXX fill epoch below?
-            /*XXXX} else if let Ok(Some(header)) =
-                consensus_chain.consensus_header_by_number(None, number).await
-            {
-                // We have already processed this consensus so ignore it.
-                last_parent = header.digest();
-                result_header = header;
-                continue;*/
         } else if let Ok(Some(header)) = db.get::<ConsensusHeaderCache>(&number) {
             remove_cache = true;
             header
@@ -280,6 +273,13 @@ async fn catch_up_consensus_from_to<DB: Database>(
             // We should have all the required headers in local storage by now...
             return Ok(result_header);
         };
+        if consensus_header.sub_dag.leader_epoch() > epoch {
+            // Don't outrun the epoch and produce next epochs output.
+            return Ok(consensus_header);
+        }
+        if remove_cache {
+            let _ = db.remove::<ConsensusHeaderCache>(&number); // Should be done with this now.
+        }
         let parent_hash = last_parent;
         last_parent =
             ConsensusHeader::digest_from_parts(parent_hash, &consensus_header.sub_dag, number);
@@ -323,9 +323,6 @@ async fn catch_up_consensus_from_to<DB: Database>(
             ));
         }
         consensus_bus.consensus_header().send(consensus_header.clone()).await?;
-        if remove_cache {
-            let _ = db.remove::<ConsensusHeaderCache>(&number); // Should be done with this now.
-        }
         result_header = consensus_header;
     }
     Ok(result_header)

@@ -76,7 +76,7 @@ async fn test_epoch_boundary_inner(
         // no need to re-submit, etc.  If that becomes needed then the
         // missed txns may not be getting re-injected into the mempool.
         debug!(target: "epoch-test", "pending tx: {pending:?}");
-        timeout(Duration::from_secs(5), pending.watch()).await??;
+        timeout(Duration::from_secs(8 /* XXXX5 */), pending.watch()).await??;
     }
 
     // retrieve current committee

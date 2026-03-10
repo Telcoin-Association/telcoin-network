@@ -180,7 +180,6 @@ impl ConsensusChain {
 
     /// Create a new empty consensus chain.
     pub async fn new(base_path: PathBuf) -> Result<ConsensusChain, ConsensusChainError> {
-        // XXXX don't need await
         let latest_consensus = LatestConsensus::new(&base_path)?;
         // If we have a pack for the last epoch open it so we can read data early.
         let current_pack =
@@ -215,25 +214,6 @@ impl ConsensusChain {
     ) -> Result<(), ConsensusChainError> {
         if previous_epoch.epoch != committee.epoch().saturating_sub(1) {
             return Err(ConsensusChainError::PrevCommitteeEpochMismatch);
-        }
-        {
-            // Make sure we did not wind up with a pack as static and current...
-            let mut recents = self.recent_packs.lock();
-            let mut removes = Vec::new();
-            for i in 0..recents.len() {
-                if recents[i].epoch() == committee.epoch() {
-                    eprintln!(
-                        "XXXX found dup pack for epoch {} current {:?}, recents {}",
-                        committee.epoch(),
-                        self.current_pack.as_ref().map(|p| p.epoch()),
-                        recents.len(),
-                    );
-                    removes.push(i);
-                }
-            }
-            for i in removes.iter().rev() {
-                recents.remove(*i);
-            }
         }
         if let Some(old_pack) = self.current_pack.take() {
             if old_pack.epoch() == committee.epoch() {
@@ -404,6 +384,11 @@ impl ConsensusChain {
         self.latest_consensus.number
     }
 
+    /// Return the last consensus epoch that was processed.
+    pub fn latest_consesus_epoch(&self) -> Epoch {
+        self.latest_consensus.epoch
+    }
+
     /// Resolve when the current epoch is fully persisted to storage.
     pub async fn persist_current(&self) -> Result<(), ConsensusChainError> {
         if let Some(pack) = &self.current_pack {
@@ -494,8 +479,6 @@ impl ConsensusChain {
             if pack.epoch() == epoch {
                 return Ok(pack.clone());
             }
-        } else {
-            eprintln!("XXXX asking for static epoch {epoch} with no current...");
         }
         {
             let mut recents = self.recent_packs.lock();

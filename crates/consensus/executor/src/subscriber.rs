@@ -130,6 +130,13 @@ impl<DB: Database> Subscriber<DB> {
         &self,
         consensus_header: ConsensusHeader,
     ) -> SubscriberResult<()> {
+        if consensus_header.sub_dag.leader_epoch()
+            > self.inner.consensus_chain.latest_consesus_epoch()
+        {
+            // Do not process past our epoch.  Can just NO-OP here to avoid producing bogus output
+            // before run_epoch() winds down.
+            return Ok(());
+        }
         let consensus_output = self
             .fetch_batches(
                 consensus_header.sub_dag.clone(),
