@@ -9,8 +9,8 @@ pub(crate) type WorkerNetworkResult<T> = Result<T, WorkerNetworkError>;
 /// Core error variants when executing the output from consensus and extending the canonical block.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerNetworkError {
-    /// Error decoding with bcs. (gossipsub, and stream)
-    #[error("BCS encode/decode error: {0}")]
+    /// Serialization error from BCS.
+    #[error("BCS error: {0}")]
     Bcs(#[from] BcsError),
     /// Batch validation error occured.
     #[error("Failed batch validation: {0}")]

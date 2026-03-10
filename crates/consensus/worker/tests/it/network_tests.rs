@@ -5,14 +5,14 @@ use std::{collections::HashSet, sync::Arc};
 use tn_batch_validator::NoopBatchValidator;
 use tn_network_libp2p::{
     types::{NetworkCommand, NetworkHandle},
-    GossipMessage, TopicHash,
+    GossipMessage, Penalty, TopicHash,
 };
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
 use tn_types::{BlsPublicKey, SealedBatch, TaskManager, B256};
 use tn_worker::{
-    RequestHandler, WorkerGossip, WorkerNetworkError, WorkerNetworkHandle, WorkerRequest,
-    WorkerResponse,
+    PendingBatchStream, RequestHandler, WorkerGossip, WorkerNetworkError, WorkerNetworkHandle,
+    WorkerRequest, WorkerResponse,
 };
 use tokio::sync::mpsc;
 
@@ -320,8 +320,6 @@ async fn test_request_digest_is_deterministic() {
 /// Test that the server correctly stores pending requests and can retrieve them by key.
 #[tokio::test]
 async fn test_pending_request_stream_correlation() {
-    use tn_worker::PendingBatchStream;
-
     let d1 = B256::random();
     let d2 = B256::random();
     let batch_digests: HashSet<B256> = HashSet::from([d1, d2]);
@@ -349,8 +347,6 @@ async fn test_pending_request_stream_correlation() {
 
 #[tokio::test]
 async fn test_stream_error_penalties() {
-    use tn_network_libp2p::Penalty;
-
     // Fatal penalties
     let cases_fatal = vec![
         WorkerNetworkError::UnknownStreamRequest(B256::random()),

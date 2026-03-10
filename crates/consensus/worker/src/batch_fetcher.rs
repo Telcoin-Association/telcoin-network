@@ -1,4 +1,4 @@
-//! Fetch batches from database or peers.
+//! Fetch batches from database or peers for this worker's primary.
 //!
 //! This type handles requests from the primary. Requests sent to the `BatchFetcher` have already
 //! been certified.
@@ -66,9 +66,10 @@ impl<DB: Database> BatchFetcher<DB> {
                 let mut txn = self.batch_store.write_txn()?;
 
                 // update batch timestamps and insert to db
-                for (digest, batch) in
-                    new_batches.iter_mut().filter(|(d, _)| missing_digests.remove(*d))
-                {
+                //
+                // NOTE: `request_batches` already removed successful digests from
+                // `missing_digests`, so all returned batches are valid and should be stored.
+                for (digest, batch) in new_batches.iter_mut() {
                     batch.set_received_at(now());
                     updated_new_batches.insert(*digest, batch.clone());
                     // also persist the batches, so they are available after restarts
@@ -208,8 +209,12 @@ mod tests {
         // chunk count = 2
         output.extend_from_slice(&2u32.to_le_bytes());
         // write same batch twice
-        write_batch(&mut output, &batch, &mut encode_buffer, &mut compressed_buffer, 0).await.unwrap();
-        write_batch(&mut output, &batch, &mut encode_buffer, &mut compressed_buffer, 0).await.unwrap();
+        write_batch(&mut output, &batch, &mut encode_buffer, &mut compressed_buffer, 0)
+            .await
+            .unwrap();
+        write_batch(&mut output, &batch, &mut encode_buffer, &mut compressed_buffer, 0)
+            .await
+            .unwrap();
 
         let mut cursor = Cursor::new(output);
 

@@ -44,8 +44,6 @@ For large transfers, stream-based transfer is more efficient than individual RPC
 │  send_batches_over_stream()  ──► Chunked sending with backpres. │
 │  write_batch()               ──► Single batch serialization     │
 │  read_batch()                ──► Single batch deserialization   │
-│  write_batch_count()         ──► Chunk header                   │
-│  read_chunk_count()          ──► Chunk header parsing           │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -82,7 +80,9 @@ The batch header includes both uncompressed and compressed lengths for precise s
 
 2. **Compressed length**: Required for exact stream reading. Without it, the receiver cannot determine where one batch ends and the next begins in a multi-batch stream.
 
-TCP is a byte stream, not a message stream. The receiver's `read_exact()` calls have no relationship to the sender's `write_all()` calls. Including the compressed length allows the receiver to read exactly the right number of bytes for each batch.
+TCP is a byte stream, not a message stream.
+The receiver's `read_exact()` calls have no relationship to the sender's `write_all()` calls.
+Including the compressed length allows the receiver to read exactly the right number of bytes for each batch.
 
 #### Why Not Derive Compressed Length?
 
@@ -150,6 +150,7 @@ if batch_count > requested_digests.len() {
 ```
 
 The receiver validates that the peer isn't sending more batches than were requested.
+This also allows peers to partially support batch syncing (may also be syncing).
 
 ### Digest Verification
 

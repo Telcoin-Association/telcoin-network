@@ -8,7 +8,7 @@ use crate::network::{stream_codec, PendingBatchStream};
 use futures::AsyncWriteExt as _;
 use std::{collections::HashSet, sync::Arc};
 use tn_config::ConsensusConfig;
-use tn_network_libp2p::GossipMessage;
+use tn_network_libp2p::{GossipMessage, Stream};
 use tn_network_types::{WorkerOthersBatchMessage, WorkerToPrimaryClient};
 use tn_storage::tables::Batches;
 use tn_types::{
@@ -17,6 +17,8 @@ use tn_types::{
 use tracing::{debug, warn};
 
 /// The type that handles requests from peers.
+///
+/// An instance is cloned for each request and used in a spawned task.
 #[derive(Clone, Debug)]
 pub struct RequestHandler<DB> {
     /// This worker's id.
@@ -138,12 +140,12 @@ where
         Ok(())
     }
 
-    /// Process request to open batches sync stream.
+    /// Process request to open stream for batches.
     pub(super) async fn process_request_batches_stream(
         &self,
         peer: BlsPublicKey,
         pending_request: Option<PendingBatchStream>,
-        mut stream: libp2p::Stream,
+        mut stream: Stream,
         request_digest: B256,
     ) -> WorkerNetworkResult<()> {
         // `None` indicates unexpected request
@@ -218,7 +220,7 @@ where
     pub async fn pub_process_request_batches_stream(
         &self,
         peer: BlsPublicKey,
-        stream: libp2p::Stream,
+        stream: Stream,
         pending_request: Option<PendingBatchStream>,
         request_digest: B256,
     ) -> WorkerNetworkResult<()> {

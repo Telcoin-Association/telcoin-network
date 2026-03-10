@@ -1,6 +1,5 @@
 //! Worker network implementation.
 
-use crate::batch_fetcher::BatchFetcher;
 use error::WorkerNetworkError;
 use futures::AsyncReadExt as _;
 pub use handle::WorkerNetworkHandle;
@@ -13,20 +12,19 @@ use std::{
     time::{Duration, Instant},
 };
 use tn_config::ConsensusConfig;
-use tn_network_libp2p::{types::NetworkEvent, GossipMessage, ResponseChannel};
-use tn_network_types::{PrimaryToWorkerClient, WorkerSynchronizeMessage};
-use tn_storage::tables::Batches;
+use tn_network_libp2p::{types::NetworkEvent, GossipMessage, ResponseChannel, Stream};
 use tn_types::{
-    now, Batch, BatchValidation, BlockHash, BlsPublicKey, Database, DbTxMut, Epoch, SealedBatch,
-    TaskSpawner, TnReceiver, WorkerId, B256,
+    BatchValidation, BlockHash, BlsPublicKey, Database, Epoch, SealedBatch, TaskSpawner,
+    TnReceiver, WorkerId, B256,
 };
 use tokio::sync::oneshot;
-use tracing::{debug, trace, warn};
+use tracing::{debug, warn};
 
 pub(crate) mod error;
 pub(crate) mod handle;
 pub(crate) mod handler;
 pub(crate) mod message;
+pub(crate) mod primary;
 pub(crate) mod stream_codec;
 
 /// Convenience type for Worker network.
@@ -40,6 +38,9 @@ const MAX_PENDING_BATCH_REQUESTS: usize = 5;
 
 /// Timeout for pending batch requests before cleanup.
 const PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Interval for pruning pending batch requests (awaiting peer to open stream).
+const PENDING_REQUEST_PRUNE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Tracks a pending batch stream request awaiting stream establishment.
 // pub for IT
@@ -106,10 +107,7 @@ where
     pub fn spawn(mut self, epoch_task_spawner: &TaskSpawner) {
         epoch_task_spawner.spawn_critical_task("worker network events", async move {
             // start interval for pruning stale stream requests
-            //
-            //
-            // TODO: Duration should be a const or value from config - is 15s correct?
-            let mut prune_requests = tokio::time::interval(Duration::from_secs(15));
+            let mut prune_requests = tokio::time::interval(PENDING_REQUEST_PRUNE_INTERVAL);
             loop {
                 tokio::select! {
                     // process network events
@@ -134,7 +132,7 @@ where
     }
 
     /// Handle events concurrently.
-    fn process_network_event(&mut self, event: NetworkEvent<Req, Res>) {
+    fn process_network_event(&self, event: NetworkEvent<Req, Res>) {
         // match event
         match event {
             NetworkEvent::Request { peer, request, channel, cancel } => match request {
@@ -232,14 +230,14 @@ where
     /// we store the pending request and return an ack. The requestor will
     /// then open a stream with the request digest for correlation.
     fn process_request_batches_stream(
-        &mut self,
+        &self,
         peer: BlsPublicKey,
         batch_digests: HashSet<B256>,
         epoch: Epoch,
         channel: ResponseChannel<WorkerResponse>,
         cancel: oneshot::Receiver<()>,
     ) {
-        // check if pending batch request is empty
+        // validate pending batch request
         let response = if batch_digests.is_empty() {
             debug!(target: "worker::network", "batch request empty");
             Err(WorkerNetworkError::InvalidRequest("Empty batch digests".into()))
@@ -249,19 +247,23 @@ where
             // check if node has capacity to fulfill peer's request
             let ack = pending_map.len() < MAX_PENDING_BATCH_REQUESTS;
 
-            // compute request digest for stream correlation
-            let request_digest = self.network_handle.generate_batch_request_id(&batch_digests);
+            // track pending request if able to process request
+            if ack {
+                // compute request digest for stream correlation
+                let request_digest = self.network_handle.generate_batch_request_id(&batch_digests);
 
-            // store the pending request
-            let pending = PendingBatchStream::new(batch_digests, epoch);
-            pending_map.insert((peer, request_digest), pending);
-            debug!(
-                target: "worker::network",
-                %peer,
-                ?request_digest,
-                ?ack,
-                "ack for batch stream request"
-            );
+                // store the pending request
+                let pending = PendingBatchStream::new(batch_digests, epoch);
+                pending_map.insert((peer, request_digest), pending);
+                debug!(
+                    target: "worker::network",
+                    %peer,
+                    ?request_digest,
+                    ?ack,
+                    "pending batch stream request"
+                );
+            }
+
             Ok(WorkerResponse::RequestBatchesStream { ack })
         };
 
@@ -292,15 +294,14 @@ where
     /// Process an inbound stream for batch transfer.
     ///
     /// Reads the request digest from the stream and validates against pending requests.
-    fn process_inbound_stream(&mut self, peer: BlsPublicKey, mut stream: libp2p::Stream) {
+    fn process_inbound_stream(&self, peer: BlsPublicKey, mut stream: Stream) {
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
         let pending_map = Arc::clone(&self.pending_batch_requests);
         let task_name = format!("stream-requested-batches-{peer}");
-
         self.network_handle.get_task_spawner().spawn_task(task_name, async move {
-            // read the 32-byte request digest from the stream
-            let mut digest_buf = [0u8; 32];
+            // read the request digest (32-bytes) from the stream
+            let mut digest_buf = [0u8; tn_types::DIGEST_LENGTH];
             if let Err(e) = stream.read_exact(&mut digest_buf).await {
                 warn!(target: "worker::network", %peer, ?e, "failed to read request digest from stream");
                 return;
@@ -312,14 +313,16 @@ where
                 .lock()
                 .remove(&(peer, request_digest));
 
-            let res = request_handler
+            // process stream
+            if let Err(err) = request_handler
                 .process_request_batches_stream(peer, opt_pending_req, stream, request_digest)
-                .await;
-            if let Err(err) = res {
-                if let Some(penalty) = err.into() {
-                    network_handle.report_penalty(peer, penalty).await;
+                .await {
+                    // apply applicable penalty for error
+                    warn!(target: "worker::network", ?err, "error processing request batches stream");
+                    if let Some(penalty) = err.into() {
+                        network_handle.report_penalty(peer, penalty).await;
+                    }
                 }
-            }
         });
     }
 
@@ -329,105 +332,5 @@ where
         self.pending_batch_requests
             .lock()
             .retain(|_, pending| now.duration_since(pending.created_at) < PENDING_REQUEST_TIMEOUT);
-    }
-}
-
-/// Defines how the network receiver handles incoming primary messages.
-#[derive(Debug)]
-pub(super) struct PrimaryReceiverHandler<DB> {
-    /// The local batch store
-    pub store: DB,
-    /// Synchronize header payloads from other workers.
-    pub network: Option<WorkerNetworkHandle>,
-    /// Fetch certificate payloads from other workers.
-    pub batch_fetcher: Option<BatchFetcher<DB>>,
-    /// Validate incoming batches
-    pub validator: Arc<dyn BatchValidation>,
-}
-
-#[async_trait::async_trait]
-impl<DB: Database> PrimaryToWorkerClient for PrimaryReceiverHandler<DB> {
-    async fn synchronize(&self, message: WorkerSynchronizeMessage) -> eyre::Result<()> {
-        let Some(network) = self.network.as_ref() else {
-            return Err(eyre::eyre!(
-                "synchronize() is unsupported via RPC interface, please call via local worker handler instead".to_string(),
-            ));
-        };
-        let mut missing = HashSet::new();
-        for digest in message.digests.iter() {
-            // Check if we already have the batch.
-            match self.store.get::<Batches>(digest) {
-                Ok(None) => {
-                    missing.insert(*digest);
-                    debug!("Requesting sync for batch {digest}");
-                }
-                Ok(Some(_)) => {
-                    trace!("Digest {digest} already in store, nothing to sync");
-                }
-                Err(e) => {
-                    return Err(eyre::eyre!("failed to read from batch store: {e:?}"));
-                }
-            };
-        }
-        if missing.is_empty() {
-            return Ok(());
-        }
-
-        let response = network.request_batches(&mut missing).await?;
-
-        // SAFETY: `request_batches` ensures the batch digest matches
-        let sealed_batches_from_response: Vec<SealedBatch> =
-            response.into_iter().map(|(digest, batch)| batch.seal(digest)).collect();
-
-        for sealed_batch in sealed_batches_from_response.into_iter() {
-            if !message.is_certified {
-                // This batch is not part of a certificate, so we need to validate it.
-                if let Err(err) = self.validator.validate_batch(sealed_batch.clone()) {
-                    return Err(eyre::eyre!("Invalid batch: {err}"));
-                }
-            }
-
-            let (mut batch, digest) = sealed_batch.split();
-            if missing.remove(&digest) {
-                // Set received_at timestamp for remote batch.
-                batch.set_received_at(now());
-                let mut tx = self.store.write_txn().map_err(|e| {
-                    WorkerNetworkError::Internal(format!(
-                        "failed to create batch transaction to commit: {e:?}"
-                    ))
-                })?;
-                tx.insert::<Batches>(&digest, &batch).map_err(|e| {
-                    WorkerNetworkError::Internal(format!(
-                        "failed to batch transaction to commit: {e:?}"
-                    ))
-                })?;
-                tx.commit().map_err(|e| {
-                    WorkerNetworkError::Internal(format!("failed to commit batch: {e:?}"))
-                })?;
-            } else {
-                return Err(eyre::eyre!(format!(
-                    "failed to synchronize batches- received a batch {digest} we did not request!"
-                )));
-            }
-        }
-
-        if missing.is_empty() {
-            return Ok(());
-        }
-        Err(eyre::eyre!("failed to synchronize batches!".to_string()))
-    }
-
-    async fn fetch_batches(
-        &self,
-        digests: HashSet<BlockHash>,
-    ) -> eyre::Result<HashMap<BlockHash, Batch>> {
-        // option approach required for startup - this should never happen
-        let Some(batch_fetcher) = self.batch_fetcher.as_ref() else {
-            return Err(eyre::eyre!(
-                "fetch_batches() is unsupported via RPC interface, please call via local worker handler instead".to_string(),
-            ));
-        };
-
-        batch_fetcher.fetch_for_primary(digests).await
     }
 }

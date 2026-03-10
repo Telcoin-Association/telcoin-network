@@ -235,17 +235,24 @@ impl QuorumWaiterTrait for QuorumWaiter {
 }
 
 #[derive(Clone, Debug, Error)]
+/// Error variants for proposing batches.
 pub enum QuorumWaiterError {
+    /// Block was rejected by enough peers to never reach quorum
     #[error("Block was rejected by enough peers to never reach quorum")]
     QuorumRejected,
+    /// Anti quorum reached for batch (note this may not be permanent)
     #[error("Anti quorum reached for batch (note this may not be permanent)")]
     AntiQuorum,
+    /// Timed out waiting for quorum
     #[error("Timed out waiting for quorum")]
     Timeout,
+    /// Network-related error
     #[error("Network Error")]
     Network,
+    /// RPC error (application-specific)
     #[error("RPC Status Error {0}")]
     Rpc(String),
+    /// Oneshot receiver dropped.
     #[error("Oneshot receiver dropped.")]
     DroppedReceiver,
 }
@@ -258,8 +265,10 @@ impl From<oneshot::error::RecvError> for QuorumWaiterError {
 
 #[derive(Clone, Debug, Error)]
 enum WaiterError {
-    #[error("Block was rejected by peer")]
+    /// Batch was rejected by peer.
+    #[error("Batch was rejected by peer")]
     Rejected(VotingPower),
+    /// Network-related error.
     #[error("Network Error")]
     Network(VotingPower),
 }

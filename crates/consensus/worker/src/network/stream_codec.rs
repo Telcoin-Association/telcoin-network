@@ -12,7 +12,10 @@ use std::collections::HashSet;
 use tn_storage::tables::Batches;
 use tn_types::{max_batch_size, Batch, Database, Epoch, B256};
 
-// chunk batch digest reads to limit amount of batches in memory
+/// Max number of batch digests per chunk.
+/// Batch db reads are chunked to limit the amount of batches in memory.
+///
+/// SAFETY: current max batch size is 1MB.
 const BATCH_DIGESTS_READ_CHUNK_SIZE: usize = 200;
 
 /// Read a single length-prefixed, snappy-compressed batch from a stream.
@@ -74,14 +77,6 @@ where
     })?;
 
     let count = u32::from_le_bytes(buf);
-
-    // TODO:
-    //
-    // assert chunk count is expected/within limit
-    if count as usize > BATCH_DIGESTS_READ_CHUNK_SIZE {
-        todo!() // error
-    }
-
     Ok(count)
 }
 
@@ -131,11 +126,16 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::{
+        test_utils::{create_test_batches, setup_batch_db},
+        WorkerNetworkHandle,
+    };
+
     use super::*;
     use futures::io::Cursor;
     use snap::read::FrameDecoder;
     use std::io::Read;
-    use tn_types::max_batch_size;
+    use tn_types::{max_batch_size, TaskManager};
 
     /// Helper to write batch to buffer and return it
     async fn encode_batch_to_vec(batch: &Batch) -> Vec<u8> {
@@ -300,8 +300,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_batches_over_stream_roundtrip() {
-        use crate::test_utils::{create_test_batches, setup_batch_db};
-
         let batches = create_test_batches(3);
         let db = setup_batch_db(&batches);
 
@@ -336,8 +334,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_batches_over_stream_partial_db() {
-        use crate::test_utils::{create_test_batches, setup_batch_db};
-
         let batches = create_test_batches(3);
         // only insert first 2 batches into DB
         let db = setup_batch_db(&batches[..2]);
@@ -356,8 +352,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_batches_over_stream_empty_digests() {
-        use crate::test_utils::setup_batch_db;
-
         let db = setup_batch_db(&[]);
         let digests: HashSet<B256> = HashSet::new();
 
@@ -366,5 +360,36 @@ mod tests {
 
         // empty digests → no output (no chunks written)
         assert!(output.is_empty());
+    }
+
+    /// Test that send/receive works correctly with >200 batches,
+    /// which produces multiple chunks (BATCH_DIGESTS_READ_CHUNK_SIZE = 200).
+    #[tokio::test]
+    async fn test_send_receive_multi_chunk_roundtrip() {
+        // 250 batches → 2 chunks (200 + 50)
+        let batch_count = BATCH_DIGESTS_READ_CHUNK_SIZE + 50;
+        let batches = create_test_batches(batch_count);
+        let db = setup_batch_db(&batches);
+
+        let digests: HashSet<B256> = batches.iter().map(|b| b.digest()).collect();
+        assert_eq!(digests.len(), batch_count);
+
+        // send batches (will chunk into 200 + 50)
+        let mut output = Vec::new();
+        send_batches_over_stream(&mut output, &db, &digests, 0).await.expect("send batches");
+
+        // read back using the handle's multi-chunk reader
+        let mut cursor = Cursor::new(output);
+        let task_manager = TaskManager::default();
+        let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
+
+        let result = handle
+            .read_and_validate_batches_with_timeout(&mut cursor, &digests)
+            .await
+            .expect("should read all chunks");
+
+        assert_eq!(result.len(), batch_count);
+        let received_digests: HashSet<B256> = result.iter().map(|(d, _)| *d).collect();
+        assert_eq!(received_digests, digests);
     }
 }

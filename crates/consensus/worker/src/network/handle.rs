@@ -19,7 +19,7 @@ use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
 use crate::{
-    network::{Req, Res},
+    network::{stream_codec, Req, Res},
     WorkerGossip, WorkerRPCError, WorkerRequest, WorkerResponse,
 };
 
@@ -46,14 +46,6 @@ impl WorkerNetworkHandle {
     /// Return a reference to the task spawner.
     pub fn get_task_spawner(&self) -> &TaskSpawner {
         &self.task_spawner
-    }
-
-    /// Convenience method for creating a new Self for tests- sends events no-where and does
-    /// nothing.
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn new_for_test(task_spawner: TaskSpawner) -> Self {
-        let (tx, _rx) = tokio::sync::mpsc::channel(5);
-        Self { handle: NetworkHandle::new(tx), task_spawner, epoch: 0 }
     }
 
     /// Return a reference to the inner handle.
@@ -265,7 +257,12 @@ impl WorkerNetworkHandle {
     /// - Verifies each batch digest was requested
     /// - Detects duplicate batches
     ///
-    /// SAFETY: this method times out if a batch fails to stream within time limit.
+    /// The sender chunks batch digests into groups of 200 and writes
+    /// `[chunk_count][batches...][flush]` per chunk. This method loops
+    /// reading chunks until the stream closes.
+    ///
+    /// SAFETY: this method times out if a batch fails to stream within time limit. If this
+    /// happens, the entire stream is shut down.
     pub(crate) async fn read_and_validate_batches_with_timeout<S: AsyncRead + Unpin + Send>(
         &self,
         stream: &mut S,
@@ -274,68 +271,83 @@ impl WorkerNetworkHandle {
         let max_size = max_batch_size(self.epoch);
         // allocate reusable buffers
         //
-        // SAFETY: requests are capped by `MAX_PENDING_BATCH_REQUESTS`
+        // SAFETY: num of requests capped by `MAX_PENDING_BATCH_REQUESTS`
         let mut decode_buffer = Vec::with_capacity(max_size);
         let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(max_size));
 
-        // read chunk count reported by peer
-        let batch_chunk_count = super::stream_codec::read_chunk_count(stream)
-            .await
-            .map_err(|e| NetworkError::RPCError(format!("Failed to read batch count: {e}")))?
-            as usize;
-
-        // validate batch count reported by peer matches this node's request
-        if batch_chunk_count > requested_digests.len() {
-            return Err(NetworkError::ProtocolError(format!(
-                "Peer sent too many batches: expected {}, received {}",
-                requested_digests.len(),
-                batch_chunk_count
-            )));
-        }
-
-        let mut batches = Vec::with_capacity(batch_chunk_count);
-        let mut received_digests = HashSet::with_capacity(batch_chunk_count);
-
-        // validate each batch as it arrives - immediately return error for malformed batches
+        // SAFETY:
+        // TODO:
+        // - requested_digests capped by per msg max (1MB)
+        // - ~33k digest max per request (32 bytes)
+        // - !!!!! theoretical 33GB allocation
+        // - how does this allocation work with `Vec<u8>` in Batch?
         //
-        // SAFETY: ensure timeout for stream per batch (disconnect if no progress made)
-        for i in 0..batch_chunk_count {
-            let batch = tokio::time::timeout(
-                BATCH_STREAM_TIMEOUT,
-                super::stream_codec::read_batch(
-                    stream,
-                    &mut decode_buffer,
-                    &mut compressed_buffer,
-                    self.epoch,
-                ),
-            )
-            .await
-            .map_err(|_| {
-                warn!(target: "worker::network", "timeout streaming batch");
-                NetworkError::Timeout
-            })?
-            .map_err(|e| {
-                warn!(target: "worker::network", ?e, "error reading batch from stream");
-                NetworkError::RPCError(format!("Failed to read batch {}: {e}", i))
-            })?;
+        //
+        //
+        let mut batches = Vec::with_capacity(requested_digests.len());
+        let mut received_digests = HashSet::with_capacity(requested_digests.len());
 
-            let batch_digest = batch.digest();
+        // read chunks until stream closes (sender writes multiple chunks for large requests)
+        loop {
+            // try to read next chunk count — StreamClosed means transfer complete
+            let batch_chunk_count = match stream_codec::read_chunk_count(stream).await {
+                Ok(count) => count as usize,
+                Err(super::error::WorkerNetworkError::StreamClosed) => break,
+                Err(e) => {
+                    return Err(NetworkError::RPCError(format!("Failed to read batch count: {e}")))
+                }
+            };
 
-            // validate batch was requested
-            if !requested_digests.contains(&batch_digest) {
+            // validate running total doesn't exceed requested
+            if batches.len() + batch_chunk_count > requested_digests.len() {
                 return Err(NetworkError::ProtocolError(format!(
-                    "Peer sent unexpected batch with digest {batch_digest}"
+                    "Peer sent too many batches: expected {}, received {}",
+                    requested_digests.len(),
+                    batches.len() + batch_chunk_count
                 )));
             }
 
-            // validate batch is unique (no duplicates)
-            if !received_digests.insert(batch_digest) {
-                return Err(NetworkError::ProtocolError(format!(
-                    "Peer sent duplicate batch with digest {batch_digest}"
-                )));
-            }
+            // validate each batch as it arrives - immediately return error for malformed batches
+            //
+            // SAFETY: ensure timeout for stream per batch (disconnect if no progress made)
+            for i in 0..batch_chunk_count {
+                let batch = tokio::time::timeout(
+                    BATCH_STREAM_TIMEOUT,
+                    stream_codec::read_batch(
+                        stream,
+                        &mut decode_buffer,
+                        &mut compressed_buffer,
+                        self.epoch,
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    warn!(target: "worker::network", "timeout streaming batch");
+                    NetworkError::Timeout
+                })?
+                .map_err(|e| {
+                    warn!(target: "worker::network", ?e, "error reading batch from stream");
+                    NetworkError::RPCError(format!("Failed to read batch {}: {e}", i))
+                })?;
 
-            batches.push((batch_digest, batch));
+                let batch_digest = batch.digest();
+
+                // validate batch was requested
+                if !requested_digests.contains(&batch_digest) {
+                    return Err(NetworkError::ProtocolError(format!(
+                        "Peer sent unexpected batch with digest {batch_digest}"
+                    )));
+                }
+
+                // validate batch is unique (no duplicates)
+                if !received_digests.insert(batch_digest) {
+                    return Err(NetworkError::ProtocolError(format!(
+                        "Peer sent duplicate batch with digest {batch_digest}"
+                    )));
+                }
+
+                batches.push((batch_digest, batch));
+            }
         }
 
         Ok(batches)
@@ -380,6 +392,13 @@ impl WorkerNetworkHandle {
 // support IT tests
 #[cfg(any(test, feature = "test-utils"))]
 impl WorkerNetworkHandle {
+    /// Convenience method for creating a new Self for tests- sends events no-where and does
+    /// nothing.
+    pub fn new_for_test(task_spawner: TaskSpawner) -> Self {
+        let (tx, _rx) = tokio::sync::mpsc::channel(5);
+        Self { handle: NetworkHandle::new(tx), task_spawner, epoch: 0 }
+    }
+
     /// Publicly available for tests.
     /// See [Self::request_batches].
     pub async fn pub_request_batches(

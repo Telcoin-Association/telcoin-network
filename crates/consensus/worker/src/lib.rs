@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Worker components to create and sync batches.
 
-#![allow(missing_docs)]
-
 mod batch_fetcher;
 mod network;
 mod worker;

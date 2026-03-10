@@ -5,7 +5,7 @@
 
 use crate::{
     batch_fetcher::BatchFetcher,
-    network::PrimaryReceiverHandler,
+    network::primary::PrimaryReceiverHandler,
     quorum_waiter::{QuorumWaiter, QuorumWaiterTrait},
     WorkerNetworkHandle,
 };
