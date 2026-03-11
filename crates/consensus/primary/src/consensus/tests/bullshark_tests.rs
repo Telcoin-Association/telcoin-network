@@ -808,6 +808,7 @@ async fn committed_round_after_restart() {
     };
     consensus_chain.new_epoch(previous_epoch, committee.clone()).await.unwrap();
 
+    let mut consensus_number = 0u64;
     for input_round in (1..=11usize).step_by(2) {
         let bullshark = Bullshark::new(
             committee.clone(),
@@ -850,9 +851,10 @@ async fn committed_round_after_restart() {
 
         // There should only be one new item in the output streams.
         if input_round > 1 {
+            consensus_number += 1;
             let committed = rx_output.recv().await.unwrap();
             info!("Received output from consensus, committed_round={}", committed.leader.round());
-            consensus_chain.write_subdag_for_test(input_round as u64, committed).await;
+            consensus_chain.write_subdag_for_test(consensus_number, committed).await;
             let (round, _certs) = rx_primary.recv().await.unwrap();
             info!("Received committed certificates from consensus, committed_round={round}",);
         }
