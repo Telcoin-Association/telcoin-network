@@ -176,8 +176,8 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
 /// With skip-empty-execution, rounds with no batches and no epoch close skip EVM execution.
 /// This test verifies that `catchup_accumulator` still restores leader counts and gas totals
 /// consistently when empty outputs are present in the committed consensus sequence.
-//#[tokio::test]XXXX
-async fn _test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
+#[tokio::test]
+async fn test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
     let tmp = TempDir::with_prefix("catch_acc_with_out").unwrap();
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .with_rng(StdRng::seed_from_u64(8991))
@@ -262,10 +262,19 @@ async fn _test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
         }
     }
 
+    // Wait for the subscriber to persist all real outputs so synthetic writes are sequential.
+    let expected = real_outputs.len() as u64;
+    for _ in 0..200 {
+        if consensus_chain.latest_consensus_number() >= expected {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let mut synthetic_number = consensus_chain.latest_consensus_number() + 1;
+
     // Send outputs to engine and inject deterministic empty outputs in between.
     let mut rewards = HashMap::new();
     let mut empty_outputs_seen = 0u32;
-    let mut synthetic_number = 100_000u64;
     for (i, output) in real_outputs.into_iter().enumerate() {
         let leader = output.leader().origin().clone();
         rewards.entry(leader.clone()).and_modify(|count| *count += 1).or_insert(1);
@@ -422,23 +431,6 @@ async fn test_catchup_accumulator_partial_execution() -> eyre::Result<()> {
             }
         }
     }
-
-    // Ensure consensus DB has rounds beyond what execution processed.
-    /*XXXX needs refactor
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let has_later_rounds = consensus_store
-            .reverse_iter::<ConsensusBlocks>()
-            .any(|(_, header)| header.sub_dag.leader_round() > engine_stop_round as u32);
-        if has_later_rounds {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for ConsensusBlocks entries beyond round {engine_stop_round}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }*/
 
     let recovered = GasAccumulator::new(1);
     recovered.rewards_counter().set_committee(fixture.committee());

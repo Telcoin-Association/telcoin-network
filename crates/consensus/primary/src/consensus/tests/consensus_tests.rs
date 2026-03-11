@@ -27,8 +27,8 @@ use tokio::fs::create_dir_all;
 /// * no certificates re-commit happens
 /// * no certificates are skipped
 /// * no forks created
-//XXXX#[tokio::test]
-async fn _test_consensus_recovery_with_bullshark() {
+#[tokio::test]
+async fn test_consensus_recovery_with_bullshark() {
     // GIVEN
     let num_sub_dags_per_schedule = 3;
 
