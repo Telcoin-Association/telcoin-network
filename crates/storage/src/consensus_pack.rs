@@ -99,6 +99,7 @@ enum PackMessage {
     ContainsBatch(B256, oneshot::Sender<bool>),
     Batch(B256, oneshot::Sender<Option<Batch>>),
     CountLeaders(Round, RewardsCounter, oneshot::Sender<Result<(), PackError>>),
+    LatestConsensusHeader(oneshot::Sender<Option<ConsensusHeader>>),
     Shutdown,
 }
 
@@ -164,6 +165,9 @@ fn run_pack_loop(
             }
             PackMessage::CountLeaders(last_executed_round, rewards_counter, tx) => {
                 let _ = tx.send(inner.count_leaders(last_executed_round, &rewards_counter));
+            }
+            PackMessage::LatestConsensusHeader(tx) => {
+                let _ = tx.send(inner.latest_consensus_header());
             }
             PackMessage::Shutdown => {
                 let _ = inner.persist();
@@ -250,7 +254,6 @@ impl ConsensusPack {
         let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
         let (tx_error, error) = watch::channel(None);
-        // XXXX- potential races while this imports, deal with.
         let handle = std::thread::spawn(move || {
             match Inner::stream_import(path, stream, epoch, &previous_epoch) {
                 Ok(inner) => {
@@ -356,7 +359,7 @@ impl ConsensusPack {
     }
 
     /// Read the last committed rounds for authorities from the epoch.
-    pub async fn read_last_committed(&mut self) -> HashMap<AuthorityIdentifier, Round> {
+    pub async fn read_last_committed(&self) -> HashMap<AuthorityIdentifier, Round> {
         let (tx, rx) = oneshot::channel();
         let _ = self.tx.send(PackMessage::ReadLastCommitted(tx)).await;
         rx.await.unwrap_or_default()
@@ -366,11 +369,23 @@ impl ConsensusPack {
     /// ReputationScores are marked as "final". If none exists then this
     /// method returns `None`.
     pub async fn read_latest_commit_with_final_reputation_scores(
-        &mut self,
+        &self,
     ) -> Option<Arc<CommittedSubDag>> {
         let (tx, rx) = oneshot::channel();
         let _ = self.tx.send(PackMessage::ReadLatestFinalRep(tx)).await;
         rx.await.unwrap_or_default()
+    }
+
+    /// Return the latest consensus header by reading directly from the pack index.
+    /// Unlike consensus_header_latest on ConsensusChain, this does not rely on the
+    /// slot files (LatestConsensus) and is always consistent with read_last_committed.
+    pub async fn latest_consensus_header(&self) -> Option<ConsensusHeader> {
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(PackMessage::LatestConsensusHeader(tx)).await.is_ok() {
+            rx.await.unwrap_or(None)
+        } else {
+            None
+        }
     }
 
     /// True if the pack contains the batch for digest.
@@ -381,7 +396,7 @@ impl ConsensusPack {
     }
 
     /// Return the Batch for digest if found.
-    pub async fn batch(&mut self, digest: BlockHash) -> Option<Batch> {
+    pub async fn batch(&self, digest: BlockHash) -> Option<Batch> {
         let (tx, rx) = oneshot::channel();
         let _ = self.tx.send(PackMessage::Batch(digest, tx)).await;
         rx.await.unwrap_or_default()
@@ -389,7 +404,7 @@ impl ConsensusPack {
 
     /// Count leaders in this pack (in rewards_counter) lower than last_executed_round.
     pub async fn count_leaders(
-        &mut self,
+        &self,
         last_executed_round: Round,
         rewards_counter: RewardsCounter,
     ) -> Result<(), PackError> {
@@ -764,6 +779,7 @@ impl Inner {
         // Make sure this number is valid before we write anything...
         if (consensus_idx as usize) < self.consensus_idx.len() {
             // If we have saved this output already then ignore it.
+            // Note this can be important when we replay consensus from downloaded pack files.
             return Ok(());
         } else if consensus_idx as usize != self.consensus_idx.len() {
             return Err(PackError::InvalidConsensusNumber(
@@ -926,6 +942,18 @@ impl Inner {
             self.batch_digests.sync().map_err(|e| PackError::PersistError(e.to_string()))?;
         }
         Ok(())
+    }
+
+    /// Return the latest consensus header by reading directly from the pack index,
+    /// bypassing the slot file (LatestConsensus). Used during startup recovery to
+    /// get a ground-truth latest header consistent with read_last_committed.
+    fn latest_consensus_header(&mut self) -> Option<ConsensusHeader> {
+        if self.consensus_idx.is_empty() {
+            return None;
+        }
+        let latest_number =
+            self.epoch_meta.start_consensus_number + self.consensus_idx.len() as u64 - 1;
+        self.consensus_header_by_number(latest_number).ok()
     }
 
     fn read_last_committed(&mut self) -> HashMap<AuthorityIdentifier, Round> {

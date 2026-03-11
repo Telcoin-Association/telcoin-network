@@ -784,8 +784,8 @@ async fn missing_leader() {
 
 /// Run for 11 dag rounds in ideal conditions (all nodes reference all other nodes).
 /// Every two rounds (on odd rounds), restart consensus and check consistency.
-//XXXX#[tokio::test]
-async fn _committed_round_after_restart() {
+#[tokio::test]
+async fn committed_round_after_restart() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
     let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
@@ -799,16 +799,11 @@ async fn _committed_round_after_restart() {
     let config = fixture.authorities().next().unwrap().consensus_config();
     let store = config.node_storage().clone();
     let temp_dir = TempDir::new().unwrap();
-    let mut consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).await.unwrap();
+    let consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).await.unwrap();
     let previous_epoch = EpochRecord {
         epoch: committee.epoch().saturating_sub(1),
         committee: committee.bls_keys().iter().copied().collect(),
         next_committee: committee.bls_keys().iter().copied().collect(),
-        //XXXXparent_hash: prev_epoch_digest,
-        /*final_consensus: BlockNumHash {
-            number: last.map(|l| l.number).unwrap_or_default(),
-            hash: BlockHash::default(),
-        },*/
         ..Default::default()
     };
     consensus_chain.new_epoch(previous_epoch, committee.clone()).await.unwrap();
@@ -822,10 +817,6 @@ async fn _committed_round_after_restart() {
         );
 
         let cb = ConsensusBus::new();
-        /*XXXXlet mut consensus_chain =
-        ConsensusChain::new_for_test(temp_dir.path().to_owned(), config.committee().clone())
-            .await
-            .unwrap();*/
         let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
         cb.recent_blocks().send_modify(|blocks| {
             blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
@@ -1041,7 +1032,7 @@ async fn restart_with_new_committee() {
     let mut committee: Committee = fixture.committee();
     let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
     let temp_dir = TempDir::new().unwrap();
-    let mut consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).await.unwrap();
+    let consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).await.unwrap();
     let mut prev_epoch_digest = BlockHash::default();
 
     // Run for a few epochs.

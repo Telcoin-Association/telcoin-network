@@ -89,7 +89,6 @@ where
         // too far behind.
         let (exec_number, exec_epoch, exec_round) = self
             .consensus_bus
-            //XXXX.last_consensus_block(Some(epoch), &self.consensus_chain)
             .last_consensus_block(None, &self.consensus_chain)
             .await
             .map(|h| (h.number, h.sub_dag.leader_epoch(), h.sub_dag.leader_round()))
@@ -790,7 +789,6 @@ where
 
     /// Retrieve the consensus header by number.
     async fn get_header_by_number(&self, number: u64) -> PrimaryNetworkResult<ConsensusHeader> {
-        // XXXX- need epoch for completness
         match self.consensus_chain.consensus_header_by_number(None, number).await {
             Ok(Some(header)) => Ok(header),
             _ => Err(PrimaryNetworkError::UnknownConsensusHeaderNumber(number)),
@@ -799,7 +797,6 @@ where
 
     /// Retrieve the consensus header by hash
     async fn get_header_by_hash(&self, hash: BlockHash) -> PrimaryNetworkResult<ConsensusHeader> {
-        // XXXX- need epoch for completness
         match self.consensus_chain.consensus_header_by_digest(None, hash).await {
             Ok(Some(header)) => Ok(header),
             _ => Err(PrimaryNetworkError::UnknownConsensusHeaderDigest(hash)),
