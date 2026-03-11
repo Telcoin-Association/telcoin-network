@@ -51,33 +51,40 @@ impl<DB: Database> BatchFetcher<DB> {
             }
 
             // Fetch from peers.
-            if let Ok(new_batches) =
-                self.safe_request_batches(&remaining_digests, Duration::from_secs(10)).await
-            {
-                // Set received_at timestamp for remote batches.
-                let mut updated_new_batches = HashMap::new();
-                let mut txn =
-                    self.batch_store.write_txn().expect("unable to create DB transaction!");
-                for (digest, batch) in
-                    new_batches.iter().filter(|(d, _)| remaining_digests.remove(*d))
-                {
-                    let mut batch = (*batch).clone();
-                    batch.set_received_at(now());
-                    updated_new_batches.insert(*digest, batch.clone());
-                    // Also persist the batches, so they are available after restarts.
-                    if let Err(e) = txn.insert::<NodeBatchesCache>(digest, &batch) {
-                        tracing::error!(target: "batch_fetcher", "failed to insert batch! We can not continue.. {e}");
-                        panic!("failed to insert batch! We can not continue.. {e}");
+            match self.safe_request_batches(&remaining_digests, Duration::from_secs(10)).await {
+                Ok(new_batches) => {
+                    // Set received_at timestamp for remote batches.
+                    let mut updated_new_batches = HashMap::new();
+                    let mut txn =
+                        self.batch_store.write_txn().expect("unable to create DB transaction!");
+                    for (digest, batch) in
+                        new_batches.iter().filter(|(d, _)| remaining_digests.remove(*d))
+                    {
+                        let mut batch = (*batch).clone();
+                        batch.set_received_at(now());
+                        updated_new_batches.insert(*digest, batch.clone());
+                        // Also persist the batches, so they are available after restarts.
+                        if let Err(e) = txn.insert::<NodeBatchesCache>(digest, &batch) {
+                            tracing::error!(target: "batch_fetcher", "failed to insert batch! We can not continue.. {e}");
+                            panic!("failed to insert batch! We can not continue.. {e}");
+                        }
+                    }
+                    if let Err(e) = txn.commit() {
+                        tracing::error!(target: "batch_fetcher", "failed to commit batch! We can not continue.. {e}");
+                        panic!("failed to commit batch! We can not continue.. {e}");
+                    }
+                    fetched_batches
+                        .extend(updated_new_batches.iter().map(|(d, b)| (*d, (*b).clone())));
+
+                    if remaining_digests.is_empty() {
+                        return fetched_batches;
                     }
                 }
-                if let Err(e) = txn.commit() {
-                    tracing::error!(target: "batch_fetcher", "failed to commit batch! We can not continue.. {e}");
-                    panic!("failed to commit batch! We can not continue.. {e}");
-                }
-                fetched_batches.extend(updated_new_batches.iter().map(|(d, b)| (*d, (*b).clone())));
-
-                if remaining_digests.is_empty() {
-                    return fetched_batches;
+                Err(_) => {
+                    // All peer requests failed. Sleep briefly before retrying to avoid
+                    // a tight spin that hammers peers with thousands of requests/second
+                    // when batches are temporarily unavailable (e.g. epoch transitions).
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                 }
             }
         }

@@ -10,6 +10,7 @@ use tn_test_utils as _;
 #[cfg(test)]
 use tn_test_utils_committee as _;
 
+use std::time::Duration;
 use tn_config::ConsensusConfig;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus, NodeMode};
 use tn_storage::{
@@ -17,9 +18,9 @@ use tn_storage::{
     tables::{ConsensusHeaderCache, NodeBatchesCache},
 };
 use tn_types::{
-    AuthorityIdentifier, ConsensusHeader, ConsensusOutput, Database, TaskSpawner, TnSender,
+    AuthorityIdentifier, ConsensusHeader, ConsensusOutput, Database, Epoch, TaskSpawner, TnSender,
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 mod epoch;
 pub use epoch::spawn_epoch_record_collector;
@@ -158,7 +159,7 @@ pub async fn get_missing_consensus(
     let last_db_block = consensus_chain
         .consensus_header_latest()
         .await
-        .unwrap_or_default() // XXXX- should not need
+        .unwrap_or_default()
         .unwrap_or_else(|| last_executed_block.clone());
 
     info!(target: "state-sync", ?last_executed_block, ?last_db_block, "comparing last executed block and last recorded consensus block");
@@ -194,27 +195,60 @@ async fn spawn_stream_consensus_headers<DB: Database>(
     let mut last_consensus_header =
         consensus_bus.last_consensus_block(None, &consensus_chain).await.unwrap_or_default();
     let mut last_consensus_height = last_consensus_header.number;
-    let epoch = consensus_chain.latest_consesus_epoch();
+    let epoch = config.committee().epoch();
 
     // infinite loop over consensus output
     loop {
         tokio::select! {
             _ = rx_last_consensus_header.changed() => {
                 // If this changes it should not be None...
-                let header = rx_last_consensus_header.borrow().clone().unwrap_or_default();
+                // Use borrow_and_update so the change is marked consumed; any subsequent
+                // updates during the retry loop below will re-arm changed() correctly.
+                let header = rx_last_consensus_header.borrow_and_update().clone().unwrap_or_default();
                 debug!(target: "state-sync", rx_last_consensus_header=?header.number, ?last_consensus_height, "streaming consensus headers detected change");
 
                 if header.number > last_consensus_height {
-                    last_consensus_header = catch_up_consensus_from_to(
-                        &consensus_bus,
-                        last_consensus_header,
-                        header,
-                        config.node_storage(),
-                        &consensus_chain,
-                    )
-                    .await?;
-                    if last_consensus_header.sub_dag.leader_epoch() > epoch { return Ok(()); }
-                    last_consensus_height = last_consensus_header.number;
+                    // Retry loop: the concurrent backward traversal in
+                    // spawn_track_recent_consensus fills ConsensusHeaderCache asynchronously.
+                    // catch_up_consensus_from_to may return early on a cache miss before the
+                    // backward traversal has fetched an intermediate block. Retry with a short
+                    // delay to let the traversal finish rather than waiting for the next gossip
+                    // update (which may never come for an older epoch's blocks).
+                    let mut no_progress_count = 0u32;
+                    const MAX_NO_PROGRESS: u32 = 50; // 50 * 100ms = 5 seconds max wait
+                    loop {
+                        let prev_height = last_consensus_height;
+                        last_consensus_header = catch_up_consensus_from_to(
+                            &consensus_bus,
+                            last_consensus_header,
+                            header.clone(),
+                            config.node_storage(),
+                            &consensus_chain,
+                            epoch,
+                        )
+                        .await?;
+                        if last_consensus_header.sub_dag.leader_epoch() > epoch { return Ok(()); }
+                        last_consensus_height = last_consensus_header.number;
+
+                        if last_consensus_height >= header.number {
+                            break; // Fully caught up to the target.
+                        }
+                        if last_consensus_height == prev_height {
+                            // No progress: the backward traversal hasn't yet cached this block.
+                            no_progress_count += 1;
+                            if no_progress_count >= MAX_NO_PROGRESS {
+                                warn!(target: "state-sync", ?epoch, last_consensus_height, target=header.number,
+                                    "could not catch up to consensus target after retries, waiting for next gossip update");
+                                break;
+                            }
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                                _ = &rx_shutdown => return Ok(()),
+                            }
+                        } else {
+                            no_progress_count = 0; // Progress was made, reset counter.
+                        }
+                    }
                 }
             }
             _ = &rx_shutdown => {
@@ -233,9 +267,9 @@ async fn catch_up_consensus_from_to<DB: Database>(
     max_consensus: ConsensusHeader,
     db: &DB,
     consensus_chain: &ConsensusChain,
+    epoch: Epoch,
 ) -> eyre::Result<ConsensusHeader> {
     let mut last_parent = from.digest();
-    let epoch = consensus_chain.latest_consesus_epoch();
 
     // Catch up to the current chain state if we need to.
     let last_consensus_height = from.number;
@@ -284,12 +318,6 @@ async fn catch_up_consensus_from_to<DB: Database>(
         last_parent =
             ConsensusHeader::digest_from_parts(parent_hash, &consensus_header.sub_dag, number);
         if last_parent != consensus_header.digest() {
-            eprintln!(
-                "XXXX  {number}/{}, parent hashes {parent_hash}/{}, con hashes {last_parent}/{}",
-                consensus_header.number,
-                consensus_header.parent_hash,
-                consensus_header.digest(),
-            );
             error!(
                 target: "tn::observer",
                 block_number = number,
@@ -297,7 +325,7 @@ async fn catch_up_consensus_from_to<DB: Database>(
             );
             return Err(eyre::eyre!("consensus header digest mismatch!"));
         }
-        if consensus_header.number <= consensus_chain.latest_consesus_number() {
+        if consensus_header.number <= consensus_chain.latest_consensus_number() {
             // We have already processed this consensus so ignore it.
             result_header = consensus_header;
             continue;

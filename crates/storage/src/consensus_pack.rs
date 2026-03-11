@@ -919,10 +919,12 @@ impl Inner {
     }
 
     fn persist(&mut self) -> Result<(), PackError> {
-        self.data.commit().map_err(|e| PackError::PersistError(e.to_string()))?;
-        self.consensus_idx.sync().map_err(|e| PackError::PersistError(e.to_string()))?;
-        self.consensus_digests.sync().map_err(|e| PackError::PersistError(e.to_string()))?;
-        self.batch_digests.sync().map_err(|e| PackError::PersistError(e.to_string()))?;
+        if !self.data.read_only() {
+            self.data.commit().map_err(|e| PackError::PersistError(e.to_string()))?;
+            self.consensus_idx.sync().map_err(|e| PackError::PersistError(e.to_string()))?;
+            self.consensus_digests.sync().map_err(|e| PackError::PersistError(e.to_string()))?;
+            self.batch_digests.sync().map_err(|e| PackError::PersistError(e.to_string()))?;
+        }
         Ok(())
     }
 

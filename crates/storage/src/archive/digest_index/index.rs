@@ -309,10 +309,17 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             let bloom = Bloom::new();
             hdx_file.write_all(bloom.data())?;
             let bucket_size = header.bucket_size() as usize;
-            let mut buffer = vec![0_u8; bucket_size];
-            add_crc32(&mut buffer[..]);
-            for _ in 0..header.buckets() {
-                hdx_file.write_all(&buffer[..])?;
+            let mut single_bucket = vec![0_u8; bucket_size];
+            add_crc32(&mut single_bucket[..]);
+            // Write buckets in large chunks to avoid 100k individual syscalls.
+            // All buckets are identical (zeros + CRC32), so tile a chunk buffer.
+            let chunk_buckets = 1024.min(header.buckets() as usize);
+            let chunk = single_bucket.repeat(chunk_buckets);
+            let mut remaining = header.buckets() as usize;
+            while remaining > 0 {
+                let n = chunk_buckets.min(remaining);
+                hdx_file.write_all(&chunk[..n * bucket_size])?;
+                remaining -= n;
             }
             (header, bloom)
         } else {

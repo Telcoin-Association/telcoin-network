@@ -130,9 +130,7 @@ impl<DB: Database> Subscriber<DB> {
         &self,
         consensus_header: ConsensusHeader,
     ) -> SubscriberResult<()> {
-        if consensus_header.sub_dag.leader_epoch()
-            > self.inner.consensus_chain.latest_consesus_epoch()
-        {
+        if consensus_header.sub_dag.leader_epoch() > self.inner.committee.epoch() {
             // Do not process past our epoch.  Can just NO-OP here to avoid producing bogus output
             // before run_epoch() winds down.
             return Ok(());

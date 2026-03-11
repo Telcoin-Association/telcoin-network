@@ -380,12 +380,12 @@ impl ConsensusChain {
     }
 
     /// Return the last consensus number that was processed.
-    pub fn latest_consesus_number(&self) -> u64 {
+    pub fn latest_consensus_number(&self) -> u64 {
         self.latest_consensus.number
     }
 
     /// Return the last consensus epoch that was processed.
-    pub fn latest_consesus_epoch(&self) -> Epoch {
+    pub fn latest_consensus_epoch(&self) -> Epoch {
         self.latest_consensus.epoch
     }
 
@@ -634,8 +634,6 @@ mod test {
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         let committee = fixture.committee();
         let previous_epoch = EpochRecord {
-            // If we can't find the recort then this we should be starting at epoch 0- use this
-            // filler.
             epoch: 0,
             committee: committee.bls_keys().iter().copied().collect(),
             next_committee: committee.bls_keys().iter().copied().collect(),
@@ -740,7 +738,7 @@ mod test {
                 .consensus_header_by_number(None, i as u64 + 1)
                 .await
                 .unwrap()
-                .unwrap();
+                .expect(&format!("something on {i}"));
             let output = outputs.get(i as usize).unwrap().consensus_header();
             assert_eq!(header_db.digest(), output.digest(), "consensus headers mismatch {i}");
         }

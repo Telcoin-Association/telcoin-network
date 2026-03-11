@@ -125,11 +125,17 @@ impl<DB: Database> CertificateFetcher<DB> {
             tokio::select! {
                 Some(command) = rx_certificate_fetcher.recv() => {
                     debug!(target: "primary::cert_fetcher", ?command, "received next command");
-                    self.handle_command(command)?;
+                    if let Err(e) = self.handle_command(command) {
+                        error!(target: "primary::cert_fetcher", ?e, "Error handling command, task will exit!");
+                        return Err(e);
+                    }
                 },
 
                 result = &mut self.fetch_task => {
-                    self.handle_fetch_completion(result)?;
+                    if let Err(e) = self.handle_fetch_completion(result) {
+                        error!(target: "primary::cert_fetcher", ?e, "Error on fetch completion, task will exit!");
+                        return Err(e);
+                    }
                 },
 
                 _ = &self.rx_shutdown => {

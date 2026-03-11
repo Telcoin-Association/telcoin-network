@@ -433,7 +433,7 @@ async fn test_leader_schedule_from_store() {
 
     let sub_dag = Arc::new(CommittedSubDag::new(vec![], Certificate::default(), 0, scores, None));
 
-    consensus_chain.write_subdag_for_test(0, sub_dag).await;
+    consensus_chain.write_subdag_for_test(1, sub_dag).await;
 
     // WHEN
     let schedule = LeaderSchedule::from_store(committee, &mut consensus_chain, 33).await;

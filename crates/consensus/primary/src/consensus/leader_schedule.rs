@@ -257,15 +257,15 @@ impl LeaderSchedule {
     ) -> Self {
         let table = consensus_chain
             .read_latest_commit_with_final_reputation_scores(committee.epoch())
-            .await
-            .map_or(LeaderSwapTable::default(), |subdag| {
-                LeaderSwapTable::new(
-                    &committee,
-                    subdag.leader_round(),
-                    &subdag.reputation_score,
-                    bad_nodes_percent_threshold,
-                )
-            });
+            .await;
+        let table = table.map_or(LeaderSwapTable::default(), |subdag| {
+            LeaderSwapTable::new(
+                &committee,
+                subdag.leader_round(),
+                &subdag.reputation_score,
+                bad_nodes_percent_threshold,
+            )
+        });
         // create the schedule
         Self::new(committee, table)
     }
