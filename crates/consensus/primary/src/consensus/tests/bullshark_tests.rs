@@ -799,7 +799,7 @@ async fn committed_round_after_restart() {
     let config = fixture.authorities().next().unwrap().consensus_config();
     let store = config.node_storage().clone();
     let temp_dir = TempDir::new().unwrap();
-    let consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).await.unwrap();
+    let consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).unwrap();
     let previous_epoch = EpochRecord {
         epoch: committee.epoch().saturating_sub(1),
         committee: committee.bls_keys().iter().copied().collect(),
@@ -1034,7 +1034,7 @@ async fn restart_with_new_committee() {
     let mut committee: Committee = fixture.committee();
     let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
     let temp_dir = TempDir::new().unwrap();
-    let consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).await.unwrap();
+    let consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).unwrap();
     let mut prev_epoch_digest = BlockHash::default();
 
     // Run for a few epochs.
