@@ -544,19 +544,23 @@ impl Debug for TaskManager {
 }
 
 impl reth_tasks::TaskSpawner for TaskSpawner {
-    fn spawn(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
+    fn spawn_task(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
         self.spawn_reth_task("reth-task", fut, false, false)
     }
 
-    fn spawn_critical(&self, name: &'static str, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
+    fn spawn_critical_task(
+        &self,
+        name: &'static str,
+        fut: BoxFuture<'static, ()>,
+    ) -> JoinHandle<()> {
         self.spawn_reth_task(name, fut, true, false)
     }
 
-    fn spawn_blocking(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
+    fn spawn_blocking_task(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
         self.spawn_reth_task("reth-blocking-task", fut, false, true)
     }
 
-    fn spawn_critical_blocking(
+    fn spawn_critical_blocking_task(
         &self,
         name: &'static str,
         fut: BoxFuture<'static, ()>,
