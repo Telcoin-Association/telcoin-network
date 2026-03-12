@@ -76,7 +76,9 @@ async fn test_epoch_boundary_inner(
         // no need to re-submit, etc.  If that becomes needed then the
         // missed txns may not be getting re-injected into the mempool.
         debug!(target: "epoch-test", "pending tx: {pending:?}");
-        timeout(Duration::from_secs(5), pending.watch()).await??;
+        // Txns may land right at an epoch boundary, get orphaned, and be re-injected into
+        // the next epoch. Allow two full epoch durations + startup buffer for confirmation.
+        timeout(Duration::from_secs((EPOCH_DURATION * 2 + 11) as u64), pending.watch()).await??;
     }
 
     // retrieve current committee
@@ -167,7 +169,7 @@ async fn loop_epochs(start: u32, iterations: u32) -> eyre::Result<()> {
     for i in start..start + iterations {
         let new_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
         if new_epoch_info == current_epoch_info && last_pause != i {
-            tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 2)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 3)).await;
             last_pause = i + 1;
             continue;
         }
@@ -181,7 +183,7 @@ async fn loop_epochs(start: u32, iterations: u32) -> eyre::Result<()> {
         current_epoch_info = new_epoch_info;
 
         // sleep for epoch duration
-        tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 2)).await;
     }
     Ok(())
 }
@@ -238,8 +240,10 @@ async fn test_epoch_sync_inner(
         let rpc_url = format!("http://127.0.0.1:{p}");
         let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
         for epoch in 0..=latest_epoch {
-            let (epoch_rec, cert): (EpochRecord, EpochCertificate) =
-                provider.raw_request("tn_epochRecord".into(), (epoch,)).await?;
+            let (epoch_rec, cert): (EpochRecord, EpochCertificate) = provider
+                .raw_request("tn_epochRecord".into(), (epoch,))
+                .await
+                .map_err(|e| eyre::eyre!("epoch record fail p {p}, epoch {epoch}: {e}"))?;
             assert!(
                 epoch_rec.verify_with_cert(&cert),
                 "invalid epoch record: {p} {}/{} {}!",

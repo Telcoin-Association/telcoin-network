@@ -14,10 +14,10 @@ use tn_reth::{
     payload::BuildArguments, recover_raw_transaction, test_utils::TransactionFactory,
     RethChainSpec, RethEnv,
 };
-use tn_storage::{open_db, tables::Batches};
+use tn_storage::{open_db, tables::NodeBatchesCache};
 use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator},
-    test_genesis, Address, Batch, BatchValidation, Bytes, Certificate, CertifiedBatch,
+    test_genesis, Address, Batch, BatchValidation, BlockHash, Bytes, Certificate, CertifiedBatch,
     CommittedSubDag, ConsensusOutput, Database, Encodable2718, GenesisAccount, ReputationScores,
     SealedBatch, TaskManager, U160, U256,
 };
@@ -143,7 +143,7 @@ async fn test_make_batch_el_to_cl() {
     for _ in 0..5 {
         let _ = tokio::time::sleep(Duration::from_secs(1)).await;
         // Ensure the batch is stored
-        if let Some((digest, wb)) = store.iter::<Batches>().next() {
+        if let Some((digest, wb)) = store.iter::<NodeBatchesCache>().next() {
             sealed_batch = Some(SealedBatch::new(wb, digest));
             break;
         }
@@ -179,12 +179,12 @@ async fn test_make_batch_el_to_cl() {
 
     // ensure enough time passes for store to pass
     let _ = tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    let first_batch = store.iter::<Batches>().next();
+    let first_batch = store.iter::<NodeBatchesCache>().next();
     debug!("first batch? {:?}", first_batch);
 
     // Ensure the batch is stored
     let batch_from_store = store
-        .get::<Batches>(&expected_batch.digest())
+        .get::<NodeBatchesCache>(&expected_batch.digest())
         .expect("store searched for batch")
         .expect("batch in store");
     assert_eq!(batch_from_store.beneficiary, address);
@@ -491,8 +491,8 @@ async fn test_canonical_notification_updates_pool() {
 
     // execute batch - create output for consistency
     let batch_digests = VecDeque::from([first_batch.digest()]);
-    let output = ConsensusOutput {
-        sub_dag: CommittedSubDag::new(
+    let output = ConsensusOutput::new(
+        CommittedSubDag::new(
             vec![Certificate::default()],
             Certificate::default(),
             0,
@@ -500,10 +500,12 @@ async fn test_canonical_notification_updates_pool() {
             None,
         )
         .into(),
+        BlockHash::default(),
+        0,
+        false,
         batch_digests,
-        batches: vec![CertifiedBatch { address, batches: vec![first_batch] }],
-        ..Default::default()
-    };
+        vec![CertifiedBatch { address, batches: vec![first_batch] }],
+    );
 
     // execute output to trigger canonical update
     let args = BuildArguments::new(reth_env.clone(), output, chain.sealed_genesis_header());

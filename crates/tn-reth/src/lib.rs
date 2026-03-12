@@ -1403,6 +1403,8 @@ impl RethEnv {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::*;
     use crate::{system_calls::ConsensusRegistry::ValidatorStatus, test_utils::TransactionFactory};
     use alloy::primitives::utils::parse_ether;
@@ -1415,7 +1417,12 @@ mod tests {
     };
 
     /// Helper function for creating a consensus output for tests.
-    fn consensus_output_for_tests(round: u32, epoch: u32, subdag_index: u64) -> ConsensusOutput {
+    fn consensus_output_for_tests(
+        round: u32,
+        epoch: u32,
+        subdag_index: u64,
+        close_epoch: bool,
+    ) -> ConsensusOutput {
         let mut leader = Certificate::default();
         // set signature for deterministic test results
         leader.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
@@ -1426,23 +1433,21 @@ mod tests {
         leader.header.epoch = epoch;
         let reputation_scores = ReputationScores::default();
         let previous_sub_dag = None;
-        ConsensusOutput {
-            sub_dag: CommittedSubDag::new(
-                vec![leader.clone(), Certificate::default()],
-                leader,
-                subdag_index,
-                reputation_scores,
-                previous_sub_dag,
-            )
-            .into(),
-            close_epoch: true,
-            batches: Default::default(),       // empty
-            batch_digests: Default::default(), // empty
-            parent_hash: ConsensusHeader::default().digest(),
-            number: subdag_index,
-            extra: Default::default(),
-            consensus_header_hash_cache: Default::default(),
-        }
+        let sub_dag = Arc::new(CommittedSubDag::new(
+            vec![leader.clone(), Certificate::default()],
+            leader,
+            subdag_index,
+            reputation_scores,
+            previous_sub_dag,
+        ));
+        ConsensusOutput::new(
+            sub_dag,
+            ConsensusHeader::default().digest(),
+            subdag_index,
+            close_epoch,
+            VecDeque::new(),
+            Vec::new(),
+        )
     }
 
     /// Build a block from TNPayload and transactions.
@@ -1637,8 +1642,7 @@ mod tests {
 
         // close epoch with deterministic signature as source of randomness
         // and execute the first block with txs for new validator to stake
-        let mut consensus_output = consensus_output_for_tests(2, expected_epoch, 1);
-        consensus_output.close_epoch = false;
+        let consensus_output = consensus_output_for_tests(2, expected_epoch, 1, false);
         let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
         let block1 = execute_payload_and_update_canonical_chain(
             &reth_env,
@@ -1649,14 +1653,14 @@ mod tests {
 
         // now close the first epoch
         expected_epoch += 1;
-        let consensus_output = consensus_output_for_tests(2, expected_epoch, 2);
+        let consensus_output = consensus_output_for_tests(2, expected_epoch, 2, true);
         let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
         let block2 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
         let canonical_header = block2.recovered_block.clone_sealed_header();
 
         // now close the second epoch so the new validator is active
         expected_epoch += 1;
-        let consensus_output = consensus_output_for_tests(2, expected_epoch, 3);
+        let consensus_output = consensus_output_for_tests(2, expected_epoch, 3, true);
         let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
         let block3 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
         let canonical_header = block3.recovered_block.clone_sealed_header();
@@ -1737,8 +1741,7 @@ mod tests {
             calldata,
         );
         expected_epoch += 1;
-        let mut consensus_output = consensus_output_for_tests(2, expected_epoch, 4);
-        consensus_output.close_epoch = false;
+        let consensus_output = consensus_output_for_tests(2, expected_epoch, 4, false);
         let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
         let block4 =
             execute_payload_and_update_canonical_chain(&reth_env, payload, vec![begin_exit_tx])?;
@@ -1746,7 +1749,7 @@ mod tests {
 
         // close epoch
         expected_epoch += 1;
-        let consensus_output = consensus_output_for_tests(2, expected_epoch, 5);
+        let consensus_output = consensus_output_for_tests(2, expected_epoch, 5, true);
         let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
         let block5 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
         let canonical_header = block5.recovered_block.clone_sealed_header();
@@ -1804,13 +1807,13 @@ mod tests {
 
         // close epoch again to exit validator
         expected_epoch += 1;
-        let consensus_output = consensus_output_for_tests(2, expected_epoch, 6);
+        let consensus_output = consensus_output_for_tests(2, expected_epoch, 6, true);
         let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
         let block6 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
         let canonical_header = block6.recovered_block.clone_sealed_header();
         // close epoch again
         expected_epoch += 1;
-        let consensus_output = consensus_output_for_tests(2, expected_epoch, 7);
+        let consensus_output = consensus_output_for_tests(2, expected_epoch, 7, true);
         let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
         let block7 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
         let canonical_header = block7.recovered_block.clone_sealed_header();

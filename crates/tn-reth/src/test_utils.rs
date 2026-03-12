@@ -648,6 +648,5 @@ pub async fn create_committee_from_state(epoch_state: EpochState) -> eyre::Resul
         committee_builder.add_authority(bls_key, info.validatorAddress);
     }
     let committee = committee_builder.build();
-    committee.load();
     Ok(committee)
 }

@@ -16,6 +16,7 @@ use std::{
 };
 use tn_config::Parameters;
 use tn_network_libp2p::types::NetworkEvent;
+use tn_storage::consensus::ConsensusChain;
 use tn_types::{
     BlockHash, BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput, Epoch,
     EpochRecord, EpochVote, Header, Round, TnReceiver, TnSender, CHANNEL_CAPACITY,
@@ -37,12 +38,16 @@ struct QueChanReceiver<T> {
     container: Arc<Mutex<Option<mpsc::Receiver<T>>>>,
     /// Flag to signal the sender that this receiver has been dropped.
     subscribed: Arc<AtomicBool>,
+    /// If true then never set subscribed to false.
+    always_subscribed: bool,
 }
 
 /// Use the Drop to decrement subs and signal unsubscribed.
 impl<T> Drop for QueChanReceiver<T> {
     fn drop(&mut self) {
-        self.subscribed.store(false, Ordering::Release);
+        if !self.always_subscribed {
+            self.subscribed.store(false, Ordering::Release);
+        }
         (*self.container.lock()) = self.receiver.take();
     }
 }
@@ -53,11 +58,14 @@ impl<T> Drop for QueChanReceiver<T> {
 #[derive(Debug)]
 pub struct QueChannel<T> {
     channel: mpsc::Sender<T>,
-    // Putting this in a lock is unfortunate but if want an mpsc under the hood is needed.
+    // Putting this in a lock is unfortunate but if we want an mpsc under the hood is needed.
     receiver: Arc<Mutex<Option<mpsc::Receiver<T>>>>,
     /// Tracks whether a receiver is currently subscribed.
     /// When `false`, `send()` and `try_send()` become no-ops.
     subscribed: Arc<AtomicBool>,
+    /// If true then set subscribed to false which will que messages even when no subscribers
+    /// active.
+    always_subscribed: bool,
 }
 
 impl<T> QueChannel<T> {
@@ -66,7 +74,15 @@ impl<T> QueChannel<T> {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         let receiver = Arc::new(Mutex::new(Some(rx)));
         let subscribed = Arc::new(AtomicBool::new(false));
-        Self { channel: tx, receiver, subscribed }
+        Self { channel: tx, receiver, subscribed, always_subscribed: false }
+    }
+
+    /// Create a new QueChannel that will que messages even when no subscribers.
+    pub fn new_always_subscribed() -> Self {
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let receiver = Arc::new(Mutex::new(Some(rx)));
+        let subscribed = Arc::new(AtomicBool::new(true));
+        Self { channel: tx, receiver, subscribed, always_subscribed: true }
     }
 
     /// Subscribe to receive messages on this channel.
@@ -86,6 +102,7 @@ impl<T> QueChannel<T> {
             receiver,
             container: self.receiver.clone(),
             subscribed: self.subscribed.clone(),
+            always_subscribed: self.always_subscribed,
         }
     }
 }
@@ -102,6 +119,7 @@ impl<T> Clone for QueChannel<T> {
             channel: self.channel.clone(),
             receiver: self.receiver.clone(),
             subscribed: self.subscribed.clone(),
+            always_subscribed: self.always_subscribed,
         }
     }
 }
@@ -246,7 +264,7 @@ impl ConsensusBusAppInner {
             tx_sync_status,
             new_epoch_votes: QueChannel::new(),
             tx_epoch_record,
-            primary_network_events: QueChannel::new(),
+            primary_network_events: QueChannel::new_always_subscribed(),
         }
     }
 
@@ -286,7 +304,7 @@ struct ConsensusBusEpochInner {
     committed_own_headers: QueChannel<(Round, Vec<Round>)>,
 
     /// Outputs the sequence of ordered certificates to the application layer.
-    sequence: QueChannel<CommittedSubDag>,
+    sequence: QueChannel<Arc<CommittedSubDag>>,
 
     /// Messages to the Certificate Manager.
     certificate_manager: QueChannel<CertificateManagerCommand>,
@@ -438,7 +456,7 @@ impl ConsensusBus {
 
     /// Outputs the sequence of ordered certificates from consensus.
     /// Can only be subscribed to once.
-    pub fn sequence(&self) -> &impl TnSender<CommittedSubDag> {
+    pub fn sequence(&self) -> &impl TnSender<Arc<CommittedSubDag>> {
         &self.inner_epoch.sequence
     }
 
@@ -594,7 +612,7 @@ impl ConsensusBus {
         self.inner_epoch.committed_own_headers.subscribe()
     }
 
-    pub fn subscribe_sequence(&self) -> impl TnReceiver<CommittedSubDag> {
+    pub fn subscribe_sequence(&self) -> impl TnReceiver<Arc<CommittedSubDag>> {
         self.inner_epoch.sequence.subscribe()
     }
 
@@ -674,20 +692,40 @@ impl ConsensusBus {
     /// Returns the ConsensusHeader that created the last executed block if it can be found.
     /// If we are not starting at genesis or a new epoch, then not finding this indicates a database
     /// issue.
-    pub fn last_executed_consensus_block<DB: tn_types::Database>(
+    pub async fn last_executed_consensus_block(
         &self,
-        db: &DB,
+        epoch: Option<Epoch>,
+        consensus_chain: &ConsensusChain,
     ) -> Option<ConsensusHeader> {
-        use tn_storage::ConsensusStore as _;
-        let last = self
+        let parent_beacon_block_root = self
             .recent_blocks()
             .borrow()
             .latest_execution_block()
             .header()
-            .parent_beacon_block_root
-            .and_then(|hash| db.get_consensus_by_hash(hash));
+            .parent_beacon_block_root;
+        if let Some(consensus_hash) = parent_beacon_block_root {
+            consensus_chain
+                .consensus_header_by_digest(epoch, consensus_hash)
+                .await
+                .unwrap_or_default()
+        } else {
+            None
+        }
+    }
 
-        last
+    /// Returns the ConsensusHeader that was processed.
+    /// If we are not starting at genesis or a new epoch, then not finding this indicates a database
+    /// issue.
+    pub async fn last_consensus_block(
+        &self,
+        epoch: Option<Epoch>,
+        consensus_chain: &ConsensusChain,
+    ) -> Option<ConsensusHeader> {
+        let latest_consensus = self.recent_blocks().borrow().latest_consensus_block_num_hash();
+        consensus_chain
+            .consensus_header_by_digest(epoch, latest_consensus.hash)
+            .await
+            .unwrap_or_default()
     }
 }
 
