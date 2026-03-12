@@ -278,7 +278,7 @@ impl<DB: Database> Consensus<DB> {
         consensus_bus: &ConsensusBus,
         protocol: Bullshark,
         task_manager: &TaskManager,
-        mut consensus_chain: ConsensusChain,
+        consensus_chain: ConsensusChain,
     ) {
         let rx_shutdown = consensus_config.shutdown().subscribe();
         // The consensus state (everything else is immutable).
@@ -294,10 +294,9 @@ impl<DB: Database> Consensus<DB> {
 
         // ignore previous epochs
         let latest_sub_dag = consensus_chain
-            .consensus_header_latest()
+            .latest_consensus_header_from_pack(current_epoch)
             .await
             .unwrap_or_default()
-            .filter(|h| h.sub_dag.leader_epoch() >= current_epoch)
             .map(|h| h.sub_dag);
 
         debug!(target: "epoch-manager", ?latest_sub_dag, "recovered latest subdag:");

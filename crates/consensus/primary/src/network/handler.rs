@@ -85,11 +85,14 @@ where
     /// active. This will put us in a "catch up" mode until we have caught up enough to rejoin
     /// consensus.
     async fn behind_consensus(&self, epoch: Epoch, round: Round, number: Option<u64>) -> bool {
+        // Need to be an active cvv to have fallen behind.
+        if !self.consensus_bus.is_active_cvv() {
+            return false;
+        }
         // Last consensus block we have executed, use this to determine if we are
         // too far behind.
         let (exec_number, exec_epoch, exec_round) = self
             .consensus_bus
-            //XXXX.last_consensus_block(Some(epoch), &self.consensus_chain)
             .last_consensus_block(None, &self.consensus_chain)
             .await
             .map(|h| (h.number, h.sub_dag.leader_epoch(), h.sub_dag.leader_round()))
@@ -105,7 +108,6 @@ where
         // the current DAG. Trying to ride the GC window exactly can lead to subtle races
         // (allow some time to get going).
         let gc_depth = self.consensus_config.parameters().gc_depth.saturating_sub(10);
-        let active_cvv = self.consensus_bus.is_active_cvv();
         // is our round outside the GC window
         // Will be false when not the same epoch (can't compare rounds) but
         // epoch_behind will work in that case.
@@ -126,9 +128,7 @@ where
         } else {
             epoch > exec_epoch
         };
-        // check if this node is inactive cvv and should be inactive (it is not
-        // caught up enough to be a CVV)
-        if active_cvv && (outside_gc_window || epoch_behind) {
+        if outside_gc_window || epoch_behind {
             // We seem to be too far behind to be an active CVV, try to go
             // inactive to catch up.
             warn!(
@@ -178,7 +178,7 @@ where
                 if let Some(committee) = self.get_committee(epoch) {
                     match cert.verify_cert(&committee) {
                         Ok(()) => {
-                            if self.consensus_bus.is_active_cvv() {
+                            if self.consensus_bus.is_cvv() {
                                 if self.behind_consensus(epoch, cert.header().round, None).await {
                                     warn!(target: "primary", "certificate indicates we are behind, go to catchup mode!");
                                     return Ok(());
@@ -790,7 +790,6 @@ where
 
     /// Retrieve the consensus header by number.
     async fn get_header_by_number(&self, number: u64) -> PrimaryNetworkResult<ConsensusHeader> {
-        // XXXX- need epoch for completness
         match self.consensus_chain.consensus_header_by_number(None, number).await {
             Ok(Some(header)) => Ok(header),
             _ => Err(PrimaryNetworkError::UnknownConsensusHeaderNumber(number)),
@@ -799,7 +798,6 @@ where
 
     /// Retrieve the consensus header by hash
     async fn get_header_by_hash(&self, hash: BlockHash) -> PrimaryNetworkResult<ConsensusHeader> {
-        // XXXX- need epoch for completness
         match self.consensus_chain.consensus_header_by_digest(None, hash).await {
             Ok(Some(header)) => Ok(header),
             _ => Err(PrimaryNetworkError::UnknownConsensusHeaderDigest(hash)),

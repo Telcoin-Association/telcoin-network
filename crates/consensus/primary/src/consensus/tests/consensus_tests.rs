@@ -27,8 +27,8 @@ use tokio::fs::create_dir_all;
 /// * no certificates re-commit happens
 /// * no certificates are skipped
 /// * no forks created
-//XXXX#[tokio::test]
-async fn _test_consensus_recovery_with_bullshark() {
+#[tokio::test]
+async fn test_consensus_recovery_with_bullshark() {
     // GIVEN
     let num_sub_dags_per_schedule = 3;
 
@@ -183,13 +183,13 @@ async fn _test_consensus_recovery_with_bullshark() {
     // * 4 certificates of round 1
     // * 1 certificate of round 2 (the leader)
     let mut consensus_index_counter = 2;
+    let mut pack_number = 1u64;
     let mut committed_output_before_crash: Vec<Certificate> = Vec::new();
 
     'main: while let Some(sub_dag) = rx_output.recv().await {
         assert_eq!(sub_dag.leader.round(), consensus_index_counter);
-        consensus_chain
-            .write_subdag_for_test(consensus_index_counter as u64, sub_dag.clone())
-            .await;
+        consensus_chain.write_subdag_for_test(pack_number, sub_dag.clone()).await;
+        pack_number += 1;
         for output in sub_dag.certificates() {
             assert!(output.round() <= 2);
 
@@ -217,10 +217,6 @@ async fn _test_consensus_recovery_with_bullshark() {
     );
 
     let cb = ConsensusBus::new();
-    //let path3 = temp_dir.path().join("3");
-    //create_dir_all(&path3).await.unwrap();
-    //XXXXlet mut consensus_chain = ConsensusChain::new_for_test(path3,
-    // committee.clone()).await.unwrap();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.recent_blocks().send_modify(|blocks| {
         blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
@@ -244,9 +240,8 @@ async fn _test_consensus_recovery_with_bullshark() {
     'main: while let Some(sub_dag) = rx_output.recv().await {
         score_with_crash = sub_dag.reputation_score.clone();
         assert_eq!(score_with_crash.total_authorities(), 4);
-        consensus_chain
-            .write_subdag_for_test(consensus_index_counter as u64, sub_dag.clone())
-            .await;
+        consensus_chain.write_subdag_for_test(pack_number, sub_dag.clone()).await;
+        pack_number += 1;
 
         for output in sub_dag.certificates() {
             assert!(output.round() >= 2);
@@ -259,7 +254,6 @@ async fn _test_consensus_recovery_with_bullshark() {
                 break 'main;
             }
         }
-        consensus_index_counter += 2;
     }
 
     // THEN compare the output from a non-Crashed consensus to the outputs produced by the

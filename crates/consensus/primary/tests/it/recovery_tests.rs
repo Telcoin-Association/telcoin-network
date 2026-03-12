@@ -33,7 +33,7 @@ async fn test_subdag_persists_restart() {
 
     // Phase 1: Write data
     {
-        let mut consensus_chain =
+        let consensus_chain =
             ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone())
                 .await
                 .unwrap();
@@ -89,7 +89,7 @@ async fn test_subdag_persists_multiple_writes() {
     // Create fixture for epoch 0 (use MemDatabase for certificate generation)
     let fixture_epoch0 = CommitteeFixture::builder(MemDatabase::default).build();
     let committee_epoch0 = fixture_epoch0.committee();
-    let mut consensus_chain =
+    let consensus_chain =
         ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture_epoch0.committee())
             .await
             .unwrap();
@@ -242,7 +242,7 @@ async fn test_last_committed_persists() {
 
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
-    let mut consensus_chain =
+    let consensus_chain =
         ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
 
     // Create and commit subdags

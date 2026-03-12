@@ -101,7 +101,7 @@ async fn test_consensus_store_read_latest_final_reputation_scores() {
     let temp_dir = TempDir::new().unwrap();
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
-    let mut consensus_chain =
+    let consensus_chain =
         ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
     consensus_chain
         .new_epoch(

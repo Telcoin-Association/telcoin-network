@@ -337,9 +337,6 @@ where
             let _ = HealthcheckServer::spawn(node_task_manager.get_spawner(), port).await;
         }
 
-        // Subscribe before the select so we don't miss a notification that fires during setup.
-        //XXXXlet node_shutdown_cancel = self.node_shutdown.subscribe();
-
         // await all tasks on epoch-task-manager or node shutdown
         let result = tokio::select! {
             // run long-living node tasks
@@ -352,12 +349,6 @@ where
 
             // loop through short-term epochs
             epoch_result = self.run_epochs(&engine, network_config, to_engine, gas_accumulator) => epoch_result,
-
-            /*XXXX// Cancel run_epochs immediately when node_shutdown fires.
-            // join_until_exit calls notify() early but doesn't return until cleanup finishes
-            // (potentially seconds later), so without this arm run_epoch can continue into
-            // a broken network after the Primary Network channel is closed.
-            _ = node_shutdown_cancel => Ok(()),*/
         };
         self.consensus_chain.persist_current().await?;
         node_task_manager.wait_for_task_shutdown().await;
@@ -684,7 +675,24 @@ where
                 ..Default::default()
             }
         } else {
-            return Err(eyre::eyre!("Missing previous epoch record"));
+            // The previous epoch record is missing. This can happen when a node restarts while
+            // catching up across multiple epoch boundaries - state sync feeds epoch-boundary
+            // consensus to the engine faster than the epoch record collector fetches the records
+            // from peers. Trigger the collector and wait up to 30 seconds for the record.
+            self.consensus_bus.requested_missing_epoch().send_replace(previous_epoch);
+            warn!(target: "epoch-manager", previous_epoch, current_epoch, "missing previous epoch record, waiting for epoch record collector");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                if let Ok(Some(rec)) = self.consensus_db.get::<EpochRecords>(&previous_epoch) {
+                    break rec;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(eyre::eyre!(
+                        "Missing previous epoch record for epoch {previous_epoch} after waiting"
+                    ));
+                }
+            }
         };
         self.consensus_chain.new_epoch(previous_epoch_rec, committee).await?;
         Ok(())
@@ -873,23 +881,16 @@ where
         // Expect complaints from join so swallow those errors...
         // If we timeout here something is not playing nice and shutting down so return the
         // timeout.
-        let _ = tokio::time::timeout(
+        tokio::time::timeout(
             Duration::from_millis(500),
             epoch_task_manager.wait_for_task_shutdown(),
         )
         .await?;
         if epoch_boundary_reached {
             // The epoch is over now and consensus should be shutdown.
-            // Do a sanity check that no "extra" consensus was produced
-            // past the epoch end and clean the DB if so otherwise we
-            // could produce invalid blocks with it and fork later.
-            // This should not really happen but it is dificult to guarentee
-            // it so deal with it.
-            while let Ok(_output) = consensus_output.try_recv() {
-                if current_epoch == _output.sub_dag().leader_epoch() {
-                    eprintln!("XXXX FOUND BOGUS OUTPUT!");
-                }
-            }
+            // Do a sanity clear of the consensus_output channel.
+            // Note we probably do not need this anymore but not harmful.
+            while let Ok(_output) = consensus_output.try_recv() {}
         } else if let Some(target_hash) =
             self.send_leftover_consensus_output_to_engine(&mut consensus_output, to_engine).await
         {
