@@ -84,7 +84,6 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
 ) -> eyre::Result<()> {
     let rx_shutdown = config.shutdown().subscribe();
     let mut rx_gossip_update = consensus_bus.last_published_consensus_num_hash().subscribe();
-    let mut started_chain = false;
     let (tx, mut rx) = tokio::sync::mpsc::channel(10_000);
     let db = config.node_storage().clone();
     // Get the epoch of our last executed consensus.
@@ -129,12 +128,10 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
                             current_fetch_epoch += 1;
                         }
                     }
-                    // Once we start fetching previous consensus output don't keep doing that.
-                    // Should be self-sustaining once started.
-                    if !started_chain {
-                        let _ = tx.send(next).await;
-                        started_chain = true;
-                    }
+                    // Each gossip event starts a backward traversal from the new tip.
+                    // The traversal terminates naturally when it reaches an already-executed
+                    // or already-cached block, ensuring new consensus blocks are always cached.
+                    let _ = tx.send(next).await;
                 }
             }
 
@@ -144,13 +141,13 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
                 if let Some(next) = get_consensus_header(Some(epoch), number, hash, &config, &consensus_bus, &network, &consensus_chain).await {
                     let _ = tx.send(next).await;
                 } else {
-                    // Chain ended. If it stopped at an unprocessed block (peer fetch failed),
-                    // reset started_chain so the next gossip event restarts the backward traversal.
+                    // Chain ended (either block already executed, or peer fetch failed).
+                    // If it stopped at an unprocessed block, log a warning; the next gossip
+                    // event will start a new traversal from the latest tip.
                     let processed = consensus_bus.recent_blocks().borrow().latest_consensus_block_num_hash().number;
                     if number > processed {
                         warn!(target: "state-sync", ?number, ?epoch, ?processed,
                             "backward chain fetch failed for unprocessed block - will retry on next gossip");
-                        started_chain = false;
                     }
                 }
             }
