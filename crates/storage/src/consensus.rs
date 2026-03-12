@@ -20,6 +20,7 @@ use tokio::sync::{
     mpsc::{self, Sender},
     oneshot,
 };
+use tracing::error;
 
 use crate::consensus_pack::{ConsensusPack, PackError, DATA_NAME};
 
@@ -29,22 +30,31 @@ impl ReadStream for File {}
 /// Simple enum for which of two saved consensus states we are using.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 enum ConsensusSlot {
+    /// Use the first save file.
     Slot1,
+    /// Use the second save file.
     Slot2,
 }
 
+/// Inner data to allow proper shared clones.
 #[derive(Debug)]
 struct LatestConsensusInner {
+    /// Epoch of the last saved output.
     epoch: Epoch,
+    /// Number of the last saved output.
     number: u64,
+    /// Track which slot/file to write to next.
     current_slot: ConsensusSlot,
 }
 
 /// Manage and persist the latest consensus state.
 #[derive(Debug, Clone)]
 struct LatestConsensus {
+    /// Shared state for clones.
     state: Arc<Mutex<LatestConsensusInner>>,
-    tx: Sender<LatestConsenusCommand>,
+    /// Sender for messages to the background thread.
+    tx: Sender<LatestConsensusCommand>,
+    /// Background thread join handle.
     handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
@@ -54,7 +64,7 @@ impl Drop for LatestConsensus {
             // If we are the last ConsensusPack then shutdown thread and wait for it persist and
             // exit.
             if let Some(handle) = self.handle.lock().take() {
-                if self.tx.try_send(LatestConsenusCommand::Shutdown).is_ok() {
+                if self.tx.try_send(LatestConsensusCommand::Shutdown).is_ok() {
                     let _ = handle.join();
                 }
             }
@@ -62,13 +72,18 @@ impl Drop for LatestConsensus {
     }
 }
 
-enum LatestConsenusCommand {
+/// Commands for the background thread.
+enum LatestConsensusCommand {
+    /// Save an update to the next slot.
     Update(Epoch, Epoch, u64, ConsensusSlot),
+    /// Fully persist the slot files.
     Persist(oneshot::Sender<()>),
+    /// Persist then shutdown the background thread.
     Shutdown,
 }
 
 impl LatestConsensus {
+    /// Read the Epoch and number from a slot file.
     fn read_slot(slot: &mut File) -> Result<(Epoch, u64), ConsensusChainError> {
         if slot.seek(SeekFrom::End(0))? == 0 {
             Ok((0, 0))
@@ -77,9 +92,9 @@ impl LatestConsensus {
             let mut buffer32_epoch = [0_u8; 4];
             let mut buffer32_crc = [0_u8; 4];
             let mut buffer64 = [0_u8; 8];
-            let _ = slot.read_exact(&mut buffer32_epoch);
-            let _ = slot.read_exact(&mut buffer64);
-            let _ = slot.read_exact(&mut buffer32_crc);
+            slot.read_exact(&mut buffer32_epoch)?;
+            slot.read_exact(&mut buffer64)?;
+            slot.read_exact(&mut buffer32_crc)?;
             let mut crc32_hasher = crc32fast::Hasher::new();
             crc32_hasher.update(&buffer32_epoch);
             crc32_hasher.update(&buffer64);
@@ -93,6 +108,7 @@ impl LatestConsensus {
         }
     }
 
+    /// Create a new latest consensus that saves files into base_path.
     fn new(base_path: &Path) -> Result<Self, ConsensusChainError> {
         let slot1_path = base_path.join("consensus_slot1");
         let slot2_path = base_path.join("consensus_slot2");
@@ -110,14 +126,18 @@ impl LatestConsensus {
 
         let (tx, mut rx) = mpsc::channel(1000);
         let handle = std::thread::spawn(move || {
+            fn sync_all_with_log(f: &File) {
+                if let Err(e) = f.sync_all() {
+                    error!(target: "consensus_chain", ?e, "failed to sync a file");
+                }
+            }
             while let Some(com) = rx.blocking_recv() {
                 match com {
-                    LatestConsenusCommand::Update(old_epoch, epoch, number, slot) => {
+                    LatestConsensusCommand::Update(old_epoch, epoch, number, slot) => {
                         let f = match slot {
                             ConsensusSlot::Slot1 => &mut slot1,
                             ConsensusSlot::Slot2 => &mut slot2,
                         };
-                        let _ = f.seek(SeekFrom::Start(0));
                         let mut buffer = [0_u8; 16];
                         buffer[0..4].copy_from_slice(&epoch.to_le_bytes());
                         buffer[4..12].copy_from_slice(&number.to_le_bytes());
@@ -126,19 +146,26 @@ impl LatestConsensus {
                         crc32_hasher.update(&number.to_le_bytes());
                         let crc32 = crc32_hasher.finalize();
                         buffer[12..16].copy_from_slice(&crc32.to_le_bytes());
-                        let _ = f.write_all(&buffer);
+                        if let Err(e) = f.seek(SeekFrom::Start(0)) {
+                            error!(target: "consensus_chain", ?e, ?slot, "failed to sync a latest consensus state file");
+                            continue;
+                        }
+                        if let Err(e) = f.write_all(&buffer) {
+                            error!(target: "consensus_chain", ?e, ?slot, "failed to write to a latest consensus state file");
+                            continue;
+                        }
                         if old_epoch != epoch {
-                            let _ = f.sync_all();
+                            sync_all_with_log(f);
                         }
                     }
-                    LatestConsenusCommand::Persist(tx) => {
-                        let _ = slot1.sync_all();
-                        let _ = slot2.sync_all();
+                    LatestConsensusCommand::Persist(tx) => {
+                        sync_all_with_log(&slot1);
+                        sync_all_with_log(&slot2);
                         let _ = tx.send(());
                     }
-                    LatestConsenusCommand::Shutdown => {
-                        let _ = slot1.sync_all();
-                        let _ = slot2.sync_all();
+                    LatestConsensusCommand::Shutdown => {
+                        sync_all_with_log(&slot1);
+                        sync_all_with_log(&slot2);
                         break;
                     }
                 }
@@ -190,6 +217,7 @@ impl LatestConsensus {
         Ok(me)
     }
 
+    /// Update the local state and send a message to save to disk in background.
     async fn update(&self, epoch: Epoch, number: u64) {
         let (old_epoch, current_slot) = {
             let mut state = self.state.lock();
@@ -203,37 +231,49 @@ impl LatestConsensus {
             let current_slot = state.current_slot;
             (old_epoch, current_slot)
         };
-        let _ = self
+        if let Err(e) = self
             .tx
-            .send(LatestConsenusCommand::Update(old_epoch, epoch, number, current_slot))
-            .await;
+            .send(LatestConsensusCommand::Update(old_epoch, epoch, number, current_slot))
+            .await
+        {
+            error!(target: "consensus_chain", ?e, "failed to send consensus latest update to background thread!");
+        }
     }
 
+    /// Persist the saved state fully to disk.
     async fn persist(&self) {
         let (tx, rx) = oneshot::channel();
-        let _ = self.tx.send(LatestConsenusCommand::Persist(tx)).await;
+        let _ = self.tx.send(LatestConsensusCommand::Persist(tx)).await;
         let _ = rx.await;
     }
 
+    /// Return the current Epoch.
     fn epoch(&self) -> Epoch {
         self.state.lock().epoch
     }
 
+    /// Return the current number.
     fn number(&self) -> u64 {
         self.state.lock().number
     }
 
+    /// Return the current slot value (for testing).
     #[cfg(test)]
     fn current_slot(&self) -> ConsensusSlot {
         self.state.lock().current_slot
     }
 }
 
+/// Implement a databse for consensus data.
 #[derive(Debug, Clone)]
 pub struct ConsensusChain {
+    /// Base path for files.
     base_path: PathBuf,
+    /// Current pack for the epoch being written.
     current_pack: Arc<Mutex<Option<ConsensusPack>>>,
+    /// Track the latest consensus that was saved.
     latest_consensus: LatestConsensus,
+    /// Simple cache of recent pack files.
     recent_packs: Arc<Mutex<VecDeque<ConsensusPack>>>,
 }
 
@@ -242,7 +282,7 @@ impl ConsensusChain {
     const PACK_CACHE_SIZE: usize = 10;
 
     /// Create a new empty consensus chain.
-    pub async fn new(base_path: PathBuf) -> Result<ConsensusChain, ConsensusChainError> {
+    pub fn new(base_path: PathBuf) -> Result<ConsensusChain, ConsensusChainError> {
         let latest_consensus = LatestConsensus::new(&base_path)?;
         // If we have a pack for the last epoch open it so we can read data early.
         let current_pack = Arc::new(Mutex::new(
@@ -257,7 +297,7 @@ impl ConsensusChain {
         base_path: PathBuf,
         committee: Committee,
     ) -> Result<ConsensusChain, ConsensusChainError> {
-        let me = Self::new(base_path).await?;
+        let me = Self::new(base_path)?;
         me.new_epoch(
             EpochRecord {
                 epoch: 0,
@@ -271,6 +311,8 @@ impl ConsensusChain {
         Ok(me)
     }
 
+    /// Move the writable state to a new epoch.
+    /// This will create a new pack file if needed.
     pub async fn new_epoch(
         &self,
         previous_epoch: EpochRecord,
@@ -326,10 +368,10 @@ impl ConsensusChain {
     ) -> Result<(), ConsensusChainError> {
         if let Some(pack) = &self.current_pack() {
             if consensus.number() > self.latest_consensus.number() {
-                self.latest_consensus
-                    .update(consensus.sub_dag().leader_epoch(), consensus.number())
-                    .await;
+                let epoch = consensus.sub_dag().leader_epoch();
+                let number = consensus.number();
                 pack.save_consensus_output(consensus).await?;
+                self.latest_consensus.update(epoch, number).await;
             }
             Ok(())
         } else {
@@ -659,7 +701,7 @@ mod test {
             ..Default::default()
         };
         // Create and load some data in initial file.
-        let consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).await.unwrap();
+        let consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).unwrap();
         consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
 
         let num_outputs = 1000;
@@ -683,7 +725,7 @@ mod test {
         //drop(consensus_chain);
 
         let temp_dir2 = TempDir::with_prefix("test_consensus_pack2").expect("temp dir");
-        let consensus_chain2 = ConsensusChain::new(temp_dir2.path().to_owned()).await.unwrap();
+        let consensus_chain2 = ConsensusChain::new(temp_dir2.path().to_owned()).unwrap();
         let stream = consensus_chain.get_epoch_stream(0).await.unwrap();
         consensus_chain2.stream_import(stream, 0, previous_epoch.clone()).await.unwrap();
         consensus_chain2.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
@@ -708,7 +750,7 @@ mod test {
             ..Default::default()
         };
         // Create and load some data in initial file.
-        let consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).await.unwrap();
+        let consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).unwrap();
         consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
 
         let num_outputs = 100;
@@ -792,7 +834,7 @@ mod test {
 
         consensus_chain.persist_current().await.expect("persist chain");
         drop(consensus_chain);
-        let consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).await.unwrap();
+        let consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).unwrap();
         consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
 
         // Check that last consenus held over a DB shutdown/restart.

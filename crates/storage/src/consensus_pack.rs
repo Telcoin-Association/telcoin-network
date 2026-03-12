@@ -24,7 +24,7 @@ use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     oneshot, watch,
 };
-use tracing::debug;
+use tracing::{debug, error};
 
 use crate::archive::{
     digest_index::index::HdxIndex,
@@ -184,7 +184,9 @@ impl Drop for ConsensusPack {
             // exit.
             if let Some(handle) = self.handle.lock().take() {
                 if self.tx.try_send(PackMessage::Shutdown).is_ok() {
-                    let _ = handle.join();
+                    if let Err(e) = handle.join() {
+                        error!(target: "consensus_pack", ?e, "Failed to join consensus pack thread");
+                    }
                 }
             }
         }
@@ -925,7 +927,7 @@ impl Inner {
         if number < self.epoch_meta.start_consensus_number {
             return Err(PackError::ConsensusNumberTooLow);
         }
-        if number > (self.epoch_meta.start_consensus_number + self.consensus_idx.len() as u64) {
+        if number >= (self.epoch_meta.start_consensus_number + self.consensus_idx.len() as u64) {
             return Err(PackError::ConsensusNumberTooHigh);
         }
         let pos = self

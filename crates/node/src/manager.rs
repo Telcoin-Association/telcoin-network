@@ -222,7 +222,7 @@ where
         // So we will panic for now, this will kill the node on startup for a critical error.
         let epochs_db_path = tn_datadir.epochs_db_path();
         let _ = std::fs::create_dir_all(&epochs_db_path);
-        let consensus_chain = ConsensusChain::new(epochs_db_path).await.expect("open consensus DB");
+        let consensus_chain = ConsensusChain::new(epochs_db_path).expect("open consensus DB");
         // shutdown long-running node components
         let node_shutdown = Notifier::new();
 
@@ -682,6 +682,7 @@ where
             self.consensus_bus.requested_missing_epoch().send_replace(previous_epoch);
             warn!(target: "epoch-manager", previous_epoch, current_epoch, "missing previous epoch record, waiting for epoch record collector");
             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            // TODO issue 573, clean this up.
             loop {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 if let Ok(Some(rec)) = self.consensus_db.get::<EpochRecords>(&previous_epoch) {
