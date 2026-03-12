@@ -143,6 +143,15 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
 
                 if let Some(next) = get_consensus_header(Some(epoch), number, hash, &config, &consensus_bus, &network, &consensus_chain).await {
                     let _ = tx.send(next).await;
+                } else {
+                    // Chain ended. If it stopped at an unprocessed block (peer fetch failed),
+                    // reset started_chain so the next gossip event restarts the backward traversal.
+                    let processed = consensus_bus.recent_blocks().borrow().latest_consensus_block_num_hash().number;
+                    if number > processed {
+                        warn!(target: "state-sync", ?number, ?epoch, ?processed,
+                            "backward chain fetch failed for unprocessed block - will retry on next gossip");
+                        started_chain = false;
+                    }
                 }
             }
 

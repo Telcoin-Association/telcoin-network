@@ -675,7 +675,24 @@ where
                 ..Default::default()
             }
         } else {
-            return Err(eyre::eyre!("Missing previous epoch record"));
+            // The previous epoch record is missing. This can happen when a node restarts while
+            // catching up across multiple epoch boundaries - state sync feeds epoch-boundary
+            // consensus to the engine faster than the epoch record collector fetches the records
+            // from peers. Trigger the collector and wait up to 30 seconds for the record.
+            self.consensus_bus.requested_missing_epoch().send_replace(previous_epoch);
+            warn!(target: "epoch-manager", previous_epoch, current_epoch, "missing previous epoch record, waiting for epoch record collector");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                if let Ok(Some(rec)) = self.consensus_db.get::<EpochRecords>(&previous_epoch) {
+                    break rec;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(eyre::eyre!(
+                        "Missing previous epoch record for epoch {previous_epoch} after waiting"
+                    ));
+                }
+            }
         };
         self.consensus_chain.new_epoch(previous_epoch_rec, committee).await?;
         Ok(())
