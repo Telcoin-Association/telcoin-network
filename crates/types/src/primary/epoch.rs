@@ -52,7 +52,7 @@ impl EpochRecord {
             encode(&IntentMessage::new(Intent::consensus(IntentScope::EpochBoundary), epoch_hash));
         let signature = signer.request_signature_direct(&intent);
 
-        EpochVote { epoch_hash, public_key: signer.public_key(), signature }
+        EpochVote { epoch: self.epoch, epoch_hash, public_key: signer.public_key(), signature }
     }
 
     /// Return true if cert contains a quorum of committee signatures for this EpochRecord.
@@ -102,6 +102,8 @@ impl EpochRecord {
 /// Note this is gossipped by the outgoing (previous committee).
 #[derive(PartialEq, Serialize, Deserialize, Copy, Clone, Debug, Default)]
 pub struct EpochVote {
+    /// The epoch this is voting for.
+    pub epoch: Epoch,
     /// The hash of the ['EpochRecord'].
     /// Store the hash not the record to keep gossip size down.
     /// Other nodes can request the record once vs recieving it many times.

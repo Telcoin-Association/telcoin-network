@@ -100,6 +100,11 @@ where
         self.inner.commit()
     }
 
+    /// Is this pack read only?
+    pub fn read_only(&self) -> bool {
+        self.inner.read_only
+    }
+
     /// Flush any in memory caches to file.
     /// Note this is only a flush not a commit, it does not do a sync on the files.
     pub fn flush(&mut self) -> Result<(), FlushError> {

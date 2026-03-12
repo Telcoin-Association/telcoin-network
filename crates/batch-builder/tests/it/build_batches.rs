@@ -14,7 +14,7 @@ use tn_reth::{
     payload::BuildArguments, recover_raw_transaction, test_utils::TransactionFactory,
     RethChainSpec, RethEnv,
 };
-use tn_storage::{open_db, tables::Batches};
+use tn_storage::{open_db, tables::NodeBatchesCache};
 use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator},
     test_genesis, Address, Batch, BatchValidation, BlockHash, Bytes, Certificate, CertifiedBatch,
@@ -143,7 +143,7 @@ async fn test_make_batch_el_to_cl() {
     for _ in 0..5 {
         let _ = tokio::time::sleep(Duration::from_secs(1)).await;
         // Ensure the batch is stored
-        if let Some((digest, wb)) = store.iter::<Batches>().next() {
+        if let Some((digest, wb)) = store.iter::<NodeBatchesCache>().next() {
             sealed_batch = Some(SealedBatch::new(wb, digest));
             break;
         }
@@ -179,12 +179,12 @@ async fn test_make_batch_el_to_cl() {
 
     // ensure enough time passes for store to pass
     let _ = tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    let first_batch = store.iter::<Batches>().next();
+    let first_batch = store.iter::<NodeBatchesCache>().next();
     debug!("first batch? {:?}", first_batch);
 
     // Ensure the batch is stored
     let batch_from_store = store
-        .get::<Batches>(&expected_batch.digest())
+        .get::<NodeBatchesCache>(&expected_batch.digest())
         .expect("store searched for batch")
         .expect("batch in store");
     assert_eq!(batch_from_store.beneficiary, address);

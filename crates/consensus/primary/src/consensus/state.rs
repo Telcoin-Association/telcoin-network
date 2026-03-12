@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
 };
 use tn_config::ConsensusConfig;
-use tn_storage::{CertificateStore, ConsensusStore};
+use tn_storage::{consensus::ConsensusChain, CertificateStore};
 use tn_types::{
     AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Committee, Database,
     Hash as _, Noticer, Round, TaskManager, Timestamp, TnReceiver, TnSender,
@@ -273,17 +273,17 @@ pub struct Consensus<DB> {
 }
 
 impl<DB: Database> Consensus<DB> {
-    pub fn spawn(
+    pub async fn spawn(
         consensus_config: ConsensusConfig<DB>,
         consensus_bus: &ConsensusBus,
         protocol: Bullshark,
         task_manager: &TaskManager,
+        consensus_chain: ConsensusChain,
     ) {
         let rx_shutdown = consensus_config.shutdown().subscribe();
         // The consensus state (everything else is immutable).
         let current_epoch = consensus_config.epoch();
-        let recovered_last_committed =
-            consensus_config.node_storage().read_last_committed(current_epoch);
+        let recovered_last_committed = consensus_chain.read_last_committed(current_epoch).await;
 
         debug!(target: "epoch-manager", ?recovered_last_committed, "recovered last committed for epoch {}", current_epoch);
         let last_committed_round = recovered_last_committed
@@ -293,10 +293,11 @@ impl<DB: Database> Consensus<DB> {
             .unwrap_or_else(|| 0);
 
         // ignore previous epochs
-        let latest_sub_dag = consensus_config
-            .node_storage()
-            .get_latest_sub_dag()
-            .filter(|subdag| subdag.leader_epoch() >= current_epoch);
+        let latest_sub_dag = consensus_chain
+            .latest_consensus_header_from_pack(current_epoch)
+            .await
+            .unwrap_or_default()
+            .map(|h| h.sub_dag);
 
         debug!(target: "epoch-manager", ?latest_sub_dag, "recovered latest subdag:");
         if let Some(sub_dag) = &latest_sub_dag {
