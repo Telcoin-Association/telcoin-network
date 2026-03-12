@@ -700,14 +700,14 @@ impl<const KSIZE: usize, S: BuildHasher + Default> Drop for HdxIndex<KSIZE, S> {
             if !std::thread::panicking() {
                 tracing::warn!("HdxIndex dropped with unsynced data - caller should call sync()");
             }
-            if let Err(e) = self.write_header() {
-                if !std::thread::panicking() {
-                    tracing::error!("HdxIndex: failed to write header on drop: {e}");
-                }
-            }
             if let Err(e) = self.save_bucket_cache() {
                 if !std::thread::panicking() {
                     tracing::error!("HdxIndex: failed to flush bucket cache on drop: {e}");
+                }
+            }
+            if let Err(e) = self.write_header() {
+                if !std::thread::panicking() {
+                    tracing::error!("HdxIndex: failed to write header on drop: {e}");
                 }
             }
             if let Err(e) = self.hdx_file.flush() {
@@ -752,8 +752,8 @@ impl<const KSIZE: usize, S: BuildHasher + Default> Index<B256> for HdxIndex<KSIZ
         if self.read_only {
             Err(CommitError::ReadOnly)
         } else {
-            self.write_header().map_err(CommitError::IndexFileSync)?;
             self.save_bucket_cache().map_err(CommitError::IndexFileSync)?;
+            self.write_header().map_err(CommitError::IndexFileSync)?;
             self.odx_file.sync_all().map_err(CommitError::IndexFileSync)?;
             self.hdx_file.sync_all().map_err(CommitError::IndexFileSync)?;
             self.synced = true;

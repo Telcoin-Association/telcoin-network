@@ -77,14 +77,13 @@ where
         file.read_exact(buffer)?;
         crc32_hasher.update(buffer);
         let calc_crc32 = crc32_hasher.finalize();
-        let val = decode::<V>(&buffer[..]);
         let mut buf_u32 = [0_u8; 4];
         file.read_exact(&mut buf_u32)?;
         let read_crc32 = u32::from_le_bytes(buf_u32);
         if calc_crc32 != read_crc32 {
             return Err(FetchError::CrcFailed);
         }
-        Ok(val)
+        Ok(decode::<V>(&buffer[..]))
     }
 }
 
