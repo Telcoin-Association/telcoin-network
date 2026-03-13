@@ -256,8 +256,7 @@ where
                     let latest_missing = *self.consensus_bus.requested_missing_epoch().borrow();
                     if epoch > latest_missing {
                         // Not sure we can sanity check this epoch.  However if it is bogus the code
-                        // to handle it should be fine and will reset requested_missing_epoch to
-                        // sanity.
+                        // to handle it should be fine, it stops when out of epochs.
                         self.consensus_bus.requested_missing_epoch().send_replace(epoch);
                     }
                 }
