@@ -3,7 +3,7 @@
 #[cfg(test)]
 use tn_test_utils as _;
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, time::Duration};
 
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus};
 use tn_storage::{tables::EpochRecords, EpochStore as _};
@@ -11,6 +11,9 @@ use tn_types::{
     BlsPublicKey, Database as TNDatabase, Epoch, EpochRecord, Noticer, TaskSpawner, B256,
 };
 use tracing::info;
+
+/// How long to wait before retrying a failed epoch record collection.
+const EPOCH_COLLECT_RETRY_SECS: u64 = 5;
 
 /// Return true if committee is compatable with epoch_rec_committee.
 /// These will usually be equal but it is possible for a validator to be
@@ -127,18 +130,17 @@ where
             let requested_epoch = *epoch_rx.borrow();
             if requested_epoch > last_epoch {
                 last_epoch = collect_epoch_records(last_epoch, &db, &primary_handle).await;
-                if last_epoch < requested_epoch {
-                    // Small sanity check in case someone sends a malicious large epoch restore to
-                    // sanity.
-                    consensus_bus.requested_missing_epoch().send_replace(last_epoch);
-                }
             }
-            // Wait until the watch is updated to indicate we have more work to do.
+            // Wait until the watch is updated or a retry timer fires.
+            // The retry timer ensures that a failed collection attempt (e.g. peers not yet
+            // connected at startup) is re-attempted automatically without requiring a new
+            // watch notification.
             tokio::select!(
                 _ = &node_shutdown => {
                     break;  // Break the outer loop.
                 },
                 _ = epoch_rx.changed() => { }
+                _ = tokio::time::sleep(Duration::from_secs(EPOCH_COLLECT_RETRY_SECS)) => { }
             );
         }
     });
