@@ -18,7 +18,7 @@ use std::{
 };
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::GossipMessage;
-use tn_storage::{tables::ConsensusBlocks, ConsensusStore, EpochStore, VoteDigestStore};
+use tn_storage::{consensus::ConsensusChain, CertificateStore, EpochStore, VoteDigestStore};
 use tn_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
@@ -55,6 +55,8 @@ pub(crate) struct RequestHandler<DB> {
     auth_last_vote: Arc<Mutex<AuthEquivocationMap>>,
     /// Track consensus headers until we hit a simple quorum then send on.
     consensus_certs: Arc<Mutex<HashMap<BlockHash, u32>>>,
+    /// Access to the consensus chain data.
+    consensus_chain: ConsensusChain,
 }
 
 impl<DB> RequestHandler<DB>
@@ -66,6 +68,7 @@ where
         consensus_config: ConsensusConfig<DB>,
         consensus_bus: ConsensusBus,
         state_sync: StateSynchronizer<DB>,
+        consensus_chain: ConsensusChain,
     ) -> Self {
         Self {
             consensus_config,
@@ -74,6 +77,7 @@ where
             requested_parents: Default::default(),
             auth_last_vote: Default::default(),
             consensus_certs: Default::default(),
+            consensus_chain,
         }
     }
 
@@ -81,11 +85,16 @@ where
     /// active. This will put us in a "catch up" mode until we have caught up enough to rejoin
     /// consensus.
     async fn behind_consensus(&self, epoch: Epoch, round: Round, number: Option<u64>) -> bool {
+        // Need to be an active cvv to have fallen behind.
+        if !self.consensus_bus.is_active_cvv() {
+            return false;
+        }
         // Last consensus block we have executed, use this to determine if we are
         // too far behind.
         let (exec_number, exec_epoch, exec_round) = self
             .consensus_bus
-            .last_executed_consensus_block(self.consensus_config.node_storage())
+            .last_consensus_block(None, &self.consensus_chain)
+            .await
             .map(|h| (h.number, h.sub_dag.leader_epoch(), h.sub_dag.leader_round()))
             .unwrap_or((0, 0, 0));
         // When empty outputs are skipped by execution, no new EVM block is produced.
@@ -99,7 +108,6 @@ where
         // the current DAG. Trying to ride the GC window exactly can lead to subtle races
         // (allow some time to get going).
         let gc_depth = self.consensus_config.parameters().gc_depth.saturating_sub(10);
-        let active_cvv = self.consensus_bus.is_active_cvv();
         // is our round outside the GC window
         // Will be false when not the same epoch (can't compare rounds) but
         // epoch_behind will work in that case.
@@ -120,9 +128,7 @@ where
         } else {
             epoch > exec_epoch
         };
-        // check if this node is inactive cvv and should be inactive (it is not
-        // caught up enough to be a CVV)
-        if active_cvv && (outside_gc_window || epoch_behind) {
+        if outside_gc_window || epoch_behind {
             // We seem to be too far behind to be an active CVV, try to go
             // inactive to catch up.
             warn!(
@@ -158,26 +164,26 @@ where
         let gossip = try_decode(data)?;
 
         match gossip {
-            PrimaryGossip::Certificate(cert) => {
+            PrimaryGossip::Certificate(mut cert) => {
                 ensure!(
                     topic.to_string().eq(&tn_config::LibP2pConfig::primary_topic()),
                     PrimaryNetworkError::InvalidTopic
                 );
                 // process certificate
-                let unverified_cert = cert.validate_received().map_err(CertManagerError::from)?;
+                cert.validate_received().map_err(CertManagerError::from)?;
 
-                let epoch = unverified_cert.header().epoch;
+                let epoch = cert.header().epoch;
                 // Early verify so we can detect we are behind.
                 // The verification is cached in the cert so this should not be too expensive.
                 if let Some(committee) = self.get_committee(epoch) {
-                    match unverified_cert.verify_cert(&committee) {
-                        Ok(cert) => {
-                            if self.consensus_bus.is_active_cvv() {
+                    match cert.verify_cert(&committee) {
+                        Ok(()) => {
+                            if self.consensus_bus.is_cvv() {
                                 if self.behind_consensus(epoch, cert.header().round, None).await {
                                     warn!(target: "primary", "certificate indicates we are behind, go to catchup mode!");
                                     return Ok(());
                                 }
-                                self.state_sync.process_peer_certificate(cert).await?;
+                                self.state_sync.process_peer_certificate(&mut cert).await?;
                             }
                         }
                         Err(e) => warn!(target: "primary", "Recieved invalid cert {e}"),
@@ -250,8 +256,7 @@ where
                     let latest_missing = *self.consensus_bus.requested_missing_epoch().borrow();
                     if epoch > latest_missing {
                         // Not sure we can sanity check this epoch.  However if it is bogus the code
-                        // to handle it should be fine and will reset requested_missing_epoch to
-                        // sanity.
+                        // to handle it should be fine, it stops when out of epochs.
                         self.consensus_bus.requested_missing_epoch().send_replace(epoch);
                     }
                 }
@@ -604,17 +609,41 @@ where
                     self.consensus_config.key_config(),
                 );
                 if vote.digest() != vote_info.vote_digest() {
+                    // Check if a certificate was already formed for this header author at this
+                    // round. If one exists, the old vote contributed to a real certificate, so
+                    // voting for a different header at the same round would be equivocation.
+                    // If no certificate exists, the old vote was never aggregated (e.g. the
+                    // proposer was killed before collecting enough votes, then restarted and
+                    // created a new header at the same round). In that case it is safe to
+                    // re-vote for the new header.
+                    let cert_exists = self
+                        .consensus_config
+                        .node_storage()
+                        .read_by_index(header.author(), header.round())
+                        .unwrap_or(None)
+                        .is_some();
+                    if cert_exists {
+                        warn!(
+                            "Authority {} submitted different header {:?} for voting",
+                            header.author(),
+                            header,
+                        );
+                        return Err(
+                            HeaderError::AlreadyVoted(header.digest(), header.round()).into()
+                        );
+                    }
+                    // No certificate was formed for the old vote — allow re-voting.
                     warn!(
-                        "Authority {} submitted different header {:?} for voting",
+                        "Authority {} re-proposing at round {} with a different header; \
+                         previous vote was for an uncertified header — allowing re-vote",
                         header.author(),
-                        header,
+                        header.round(),
                     );
-
-                    return Err(HeaderError::AlreadyVoted(header.digest(), header.round()).into());
+                    // Fall through to create and store the new vote below.
+                } else {
+                    debug!("Resending vote {vote:?} for {} at round {}", header, header.round());
+                    return Ok(PrimaryResponse::Vote(vote));
                 }
-
-                debug!("Resending vote {vote:?} for {} at round {}", header, header.round());
-                return Ok(PrimaryResponse::Vote(vote));
             }
         }
 
@@ -708,7 +737,7 @@ where
         }
 
         // try to accept
-        for parent in parents {
+        for parent in parents.iter_mut() {
             self.state_sync.process_peer_certificate(parent).await?;
         }
 
@@ -759,9 +788,9 @@ where
         hash: Option<BlockHash>,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
         let header = match (number, hash) {
-            (_, Some(hash)) => self.get_header_by_hash(hash)?,
-            (Some(number), _) => self.get_header_by_number(number)?,
-            (None, None) => self.get_latest_output()?,
+            (_, Some(hash)) => self.get_header_by_hash(hash).await?,
+            (Some(number), _) => self.get_header_by_number(number).await?,
+            (None, None) => self.get_latest_output().await?,
         };
 
         Ok(PrimaryResponse::ConsensusHeader(Arc::new(header)))
@@ -783,28 +812,28 @@ where
     }
 
     /// Retrieve the consensus header by number.
-    fn get_header_by_number(&self, number: u64) -> PrimaryNetworkResult<ConsensusHeader> {
-        match self.consensus_config.node_storage().get_consensus_by_number(number) {
-            Some(header) => Ok(header),
-            None => Err(PrimaryNetworkError::UnknownConsensusHeaderNumber(number)),
+    async fn get_header_by_number(&self, number: u64) -> PrimaryNetworkResult<ConsensusHeader> {
+        match self.consensus_chain.consensus_header_by_number(None, number).await {
+            Ok(Some(header)) => Ok(header),
+            _ => Err(PrimaryNetworkError::UnknownConsensusHeaderNumber(number)),
         }
     }
 
     /// Retrieve the consensus header by hash
-    fn get_header_by_hash(&self, hash: BlockHash) -> PrimaryNetworkResult<ConsensusHeader> {
-        match self.consensus_config.node_storage().get_consensus_by_hash(hash) {
-            Some(header) => Ok(header),
-            None => Err(PrimaryNetworkError::UnknownConsensusHeaderDigest(hash)),
+    async fn get_header_by_hash(&self, hash: BlockHash) -> PrimaryNetworkResult<ConsensusHeader> {
+        match self.consensus_chain.consensus_header_by_digest(None, hash).await {
+            Ok(Some(header)) => Ok(header),
+            _ => Err(PrimaryNetworkError::UnknownConsensusHeaderDigest(hash)),
         }
     }
 
     /// Retrieve the last record in consensus blocks table.
-    fn get_latest_output(&self) -> PrimaryNetworkResult<ConsensusHeader> {
-        self.consensus_config
-            .node_storage()
-            .last_record::<ConsensusBlocks>()
-            .map(|(_, header)| header)
-            .ok_or(PrimaryNetworkError::InvalidRequest("Consensus headers unavailable".to_string()))
+    async fn get_latest_output(&self) -> PrimaryNetworkResult<ConsensusHeader> {
+        if let Ok(Some(header)) = self.consensus_chain.consensus_header_latest().await {
+            Ok(header)
+        } else {
+            Err(PrimaryNetworkError::InvalidRequest("Consensus headers unavailable".to_string()))
+        }
     }
 
     /// Retrieve the consensus header by number.

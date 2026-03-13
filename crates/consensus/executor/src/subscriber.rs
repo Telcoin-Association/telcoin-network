@@ -4,7 +4,7 @@ use crate::{errors::SubscriberResult, SubscriberError};
 use futures::{stream::FuturesOrdered, StreamExt};
 use state_sync::{last_executed_consensus_block, save_consensus, spawn_state_sync};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 use tn_config::ConsensusConfig;
@@ -13,11 +13,12 @@ use tn_primary::{
     network::{ConsensusResult, PrimaryNetworkHandle},
     ConsensusBus, NodeMode,
 };
-use tn_storage::{tables::ConsensusBlocks, CertificateStore};
+use tn_storage::{consensus::ConsensusChain, CertificateStore};
 use tn_types::{
     encode, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash, BlsSigner as _,
     CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput, Database,
-    Hash as _, Noticer, TaskManager, TaskSpawner, Timestamp, TnReceiver, TnSender, B256,
+    Hash as _, Noticer, TaskManager, TaskSpawner, Timestamp, TimestampSec, TnReceiver, TnSender,
+    B256,
 };
 use tracing::{debug, error, info, instrument, warn};
 
@@ -47,6 +48,10 @@ struct Inner {
     committee: Committee,
     /// The client to request worker batches and build consensus output.
     client: LocalNetwork,
+    /// Access to the consensus chain data.
+    consensus_chain: ConsensusChain,
+    /// Epoch boundary time.
+    epoch_boundary: TimestampSec,
 }
 
 /// Spawn the subscriber in the correct mode based on the validator status for the current epoch.
@@ -56,6 +61,8 @@ pub fn spawn_subscriber<DB: Database>(
     consensus_bus: ConsensusBus,
     task_manager: &TaskManager,
     network_handle: PrimaryNetworkHandle,
+    consensus_chain: ConsensusChain,
+    epoch_boundary: TimestampSec,
 ) {
     let authority_id = config.authority_id();
     let committee = config.committee().clone();
@@ -66,7 +73,13 @@ pub fn spawn_subscriber<DB: Database>(
         consensus_bus,
         config,
         network_handle,
-        inner: Arc::new(Inner { authority_id, committee, client }),
+        inner: Arc::new(Inner {
+            authority_id,
+            committee,
+            client,
+            consensus_chain: consensus_chain.clone(),
+            epoch_boundary,
+        }),
     };
     match mode {
         // If we are active then partcipate in consensus.
@@ -75,7 +88,7 @@ pub fn spawn_subscriber<DB: Database>(
             let rx_sequence = subscriber.consensus_bus.subscribe_sequence();
             task_manager.spawn_critical_task("subscriber consensus", async move {
                 info!(target: "subscriber", "Starting subscriber: CVV");
-                if let Err(e) = subscriber.run(rx_shutdown, rx_sequence).await {
+                if let Err(e) = subscriber.run(rx_shutdown, rx_sequence, consensus_chain).await {
                     error!(target: "subscriber", "Error subscriber consensus: {e}");
                 }
             });
@@ -117,6 +130,11 @@ impl<DB: Database> Subscriber<DB> {
         &self,
         consensus_header: ConsensusHeader,
     ) -> SubscriberResult<()> {
+        if consensus_header.sub_dag.leader_epoch() > self.inner.committee.epoch() {
+            // Do not process past our epoch.  Can just NO-OP here to avoid producing bogus output
+            // before run_epoch() winds down.
+            return Ok(());
+        }
         let consensus_output = self
             .fetch_batches(
                 consensus_header.sub_dag.clone(),
@@ -126,9 +144,10 @@ impl<DB: Database> Subscriber<DB> {
             .await?;
 
         // If we want to rejoin consensus eventually then save certs.
-        let _ = self.config.node_storage().write(consensus_output.sub_dag.leader.clone());
-        let _ = self.config.node_storage().write_all(consensus_output.sub_dag.certificates.clone());
+        let _ = self.config.node_storage().write(consensus_output.sub_dag().leader.clone());
+        let _ = self.config.node_storage().write_all(consensus_output.sub_dag().certificates());
 
+        let mut consensus_chain = self.inner.consensus_chain.clone();
         // This save will essentially mark this consensus output as written in stone (added to the
         // consensus chain). This does NOT imply execution although it will be sent off for
         // execution.
@@ -136,6 +155,7 @@ impl<DB: Database> Subscriber<DB> {
             self.config.node_storage(),
             consensus_output.clone(),
             &self.inner.authority_id,
+            &mut consensus_chain,
         )
         .await?;
 
@@ -162,6 +182,7 @@ impl<DB: Database> Subscriber<DB> {
             self.consensus_bus.clone(),
             self.network_handle.clone(),
             tasks,
+            self.inner.consensus_chain.clone(),
         );
         while let Some(consensus_header) = rx_consensus_headers.recv().await {
             let consensus_header_number = consensus_header.number;
@@ -190,6 +211,7 @@ impl<DB: Database> Subscriber<DB> {
             self.consensus_bus.clone(),
             self.network_handle.clone(),
             tasks,
+            self.inner.consensus_chain.clone(),
         );
         let mut processed_count: u64 = 0;
         while let Some(consensus_header) = rx_consensus_headers.recv().await {
@@ -232,17 +254,20 @@ impl<DB: Database> Subscriber<DB> {
         // Load the consensus block associated with the latest executed EVM block.
         // This can lag when outputs were processed but execution was skipped (empty rounds).
         let last_executed_block =
-            last_executed_consensus_block(&self.consensus_bus, self.config.node_storage())
+            last_executed_consensus_block(&self.consensus_bus, &self.inner.consensus_chain)
+                .await
                 .unwrap_or_default();
 
         // Use the latest persisted consensus header as startup parent when it is newer.
         // replay_missed_consensus + wait_for_consensus_execution ensures this header has already
         // been processed by execution (including skipped rounds).
-        let (_, last_db_block) = self
-            .config
-            .node_storage()
-            .last_record::<ConsensusBlocks>()
-            .unwrap_or((last_executed_block.number, last_executed_block.clone()));
+        let last_db_block = self
+            .inner
+            .consensus_chain
+            .consensus_header_latest()
+            .await
+            .unwrap_or_default()
+            .unwrap_or(last_executed_block.clone());
         let parent = if last_db_block.number > last_executed_block.number {
             last_db_block
         } else {
@@ -263,7 +288,8 @@ impl<DB: Database> Subscriber<DB> {
     async fn run(
         self,
         rx_shutdown: Noticer,
-        mut rx_sequence: impl TnReceiver<CommittedSubDag>,
+        mut rx_sequence: impl TnReceiver<Arc<CommittedSubDag>>,
+        mut consensus_chain: ConsensusChain,
     ) -> SubscriberResult<()> {
         // It's important to have the futures in ordered fashion as we want
         // to guarantee that will deliver to the executor the certificates
@@ -275,12 +301,15 @@ impl<DB: Database> Subscriber<DB> {
 
         let (mut last_parent, mut last_number) = self.get_last_executed_consensus().await?;
 
+        let mut epoch_done = false;
         // rx_sequence is now passed as parameter to avoid race condition
         // Listen to sequenced consensus message and process them.
         loop {
             tokio::select! {
                 // Receive the ordered sequence of consensus messages from a consensus node.
-                Some(sub_dag) = rx_sequence.recv(), if waiting.len() < Self::MAX_PENDING_PAYLOADS => {
+                Some(sub_dag) = rx_sequence.recv(), if !epoch_done && waiting.len() < Self::MAX_PENDING_PAYLOADS => {
+                    // Once we cross epoch boundary then process this last output then we are done.
+                    if sub_dag.commit_timestamp() >= self.inner.epoch_boundary { epoch_done = true; }
                     debug!(target: "subscriber", subdag=?sub_dag.digest(), round=?sub_dag.leader_round(), "received committed subdag from consensus");
                     // We can schedule more then MAX_PENDING_PAYLOADS payloads but
                     // don't process more consensus messages when more
@@ -312,7 +341,7 @@ impl<DB: Database> Subscriber<DB> {
                     match output {
                         Ok(output) => {
                             debug!(target: "subscriber", output=?output.digest(), "saving next output");
-                            save_consensus(self.config.node_storage(), output.clone(), &self.inner.authority_id).await?;
+                            save_consensus(self.config.node_storage(), output.clone(), &self.inner.authority_id, &mut consensus_chain).await?;
                             debug!(target: "subscriber", "broadcasting output...");
                             if let Err(e) = self.consensus_bus.consensus_output().send(output).await {
                                 error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self.inner.authority_id, e);
@@ -358,48 +387,36 @@ impl<DB: Database> Subscriber<DB> {
     /// to execute.
     /// Note, an error here is BAD and will most likely cause node shutdown (clean).  Do
     /// not provide a bogus sub dag...
-    #[instrument(level = "debug", skip_all, fields(number, num_certs = deliver.len()))]
+    #[instrument(level = "debug", skip_all, fields(number))]
     async fn fetch_batches(
         &self,
-        deliver: CommittedSubDag,
+        sub_dag: Arc<CommittedSubDag>,
         parent_hash: B256,
         number: u64,
     ) -> SubscriberResult<ConsensusOutput> {
-        let num_blocks = deliver.num_primary_blocks();
-        let num_certs = deliver.len();
+        let num_blocks = sub_dag.num_primary_blocks();
+        let num_certs = sub_dag.len();
 
         if num_blocks == 0 {
             debug!(target: "subscriber", "No blocks to fetch, payload is empty");
-            return Ok(ConsensusOutput {
-                sub_dag: Arc::new(deliver),
-                parent_hash,
-                number,
-                ..Default::default()
-            });
+            return Ok(ConsensusOutput::new_with_subdag(sub_dag, parent_hash, number));
         }
-
-        let sub_dag = Arc::new(deliver);
-        let mut consensus_output = ConsensusOutput {
-            sub_dag: sub_dag.clone(),
-            batches: Vec::with_capacity(num_certs),
-            parent_hash,
-            number,
-            ..Default::default()
-        };
 
         let mut batch_set: HashSet<BlockHash> = HashSet::new();
 
-        for cert in &sub_dag.certificates {
+        let mut batch_digests = VecDeque::with_capacity(num_certs);
+        for cert in sub_dag.certificates() {
             for (digest, _) in cert.header().payload().iter() {
                 batch_set.insert(*digest);
-                consensus_output.batch_digests.push_back(*digest);
+                batch_digests.push_back(*digest);
             }
         }
 
         let mut fetched_batches = self.fetch_batches_from_peers(batch_set).await?;
 
+        let mut batches = Vec::with_capacity(num_certs);
         // map all fetched batches to their respective certificates for applying block rewards
-        for cert in &sub_dag.certificates {
+        for cert in sub_dag.certificates() {
             // create collection of batches to execute for this certificate
             let mut cert_batches = Vec::with_capacity(cert.header().payload().len());
 
@@ -418,18 +435,14 @@ impl<DB: Database> Subscriber<DB> {
             }
 
             // main collection for execution
-            consensus_output.batches.push(CertifiedBatch {
+            batches.push(CertifiedBatch {
                 address: self.authority_execution_address(cert.origin())?,
                 batches: cert_batches,
             });
         }
         // Count total transactions across all batches
-        let total_txs: usize = consensus_output
-            .batches
-            .iter()
-            .flat_map(|cb| cb.batches.iter())
-            .map(|b| b.transactions.len())
-            .sum();
+        let total_txs: usize =
+            batches.iter().flat_map(|cb| cb.batches.iter()).map(|b| b.transactions.len()).sum();
 
         // Metric: consensus_output_ready - tracks consensus output ready for execution
         info!(
@@ -437,13 +450,20 @@ impl<DB: Database> Subscriber<DB> {
             number = number,
             leader_round = sub_dag.leader_round(),
             num_certs = num_certs,
-            num_batches = consensus_output.batch_digests.len(),
+            num_batches = batch_digests.len(),
             total_txs = total_txs,
             "consensus output ready"
         );
 
         debug!(target: "subscriber", "returning output to subscriber");
-        Ok(consensus_output)
+        Ok(ConsensusOutput::new(
+            sub_dag.clone(),
+            parent_hash,
+            number,
+            false,
+            batch_digests,
+            batches,
+        ))
     }
 
     async fn fetch_batches_from_peers(

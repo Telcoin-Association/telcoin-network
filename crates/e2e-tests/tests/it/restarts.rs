@@ -341,7 +341,6 @@ fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
     };
     info!(target: "restart-test", "Ran restart tests 1: {res1:?}");
     let is_ok = res1.is_ok();
-
     // kill new child2 if successfully restarted
     let assert_str = match res1 {
         Ok(mut child2_restarted) => {
@@ -418,6 +417,19 @@ fn test_restartstt() -> eyre::Result<()> {
     do_restarts(2, false, "restarts")
 }
 
+/// Wait for `node` to reach at least `target_block`, polling every second for up to 30 seconds.
+fn wait_for_block(node: &str, target_block: u64) -> eyre::Result<()> {
+    for _ in 0..30 {
+        if let Ok(n) = get_block_number(node) {
+            if n >= target_block {
+                return Ok(());
+            }
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    Err(eyre::eyre!("Node {node} did not reach block {target_block} within 30 seconds"))
+}
+
 /// Run some test to make sure an observer is participating in the network.
 fn run_observer_tests(client_urls: &[String; 4], obs_url: &str) -> eyre::Result<()> {
     network_advancing(client_urls)?;
@@ -429,6 +441,13 @@ fn run_observer_tests(client_urls: &[String; 4], obs_url: &str) -> eyre::Result<
     test_blocks_same(client_urls)?;
     // Send to observer, validator confirms.
     send_and_confirm(obs_url, &client_urls[2], &key, to_account, 0)?;
+
+    // After the first transaction, EL block 1 exists on all validators. Wait for the observer
+    // to sync to that block before reading state from it — the observer starts at genesis and
+    // may not have caught up yet, which would cause the basefee baseline to be 0.
+    let target_block = get_block_number(&client_urls[0])?;
+    wait_for_block(obs_url, target_block)?;
+
     // Send to observer, validator confirms- second time.
     send_and_confirm(obs_url, &client_urls[3], &key, to_account, 1)?;
 

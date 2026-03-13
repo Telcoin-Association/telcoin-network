@@ -4,21 +4,23 @@
 use futures::future::join_all;
 use std::{
     collections::{BTreeSet, HashSet},
+    sync::Arc,
     time::Instant,
 };
 use tempfile::TempDir;
 use tn_primary::test_utils::temp_dir;
 use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_storage::{
+    consensus::ConsensusChain,
     mem_db::MemDatabase,
     open_db,
-    tables::{CertificateDigestByOrigin, CertificateDigestByRound, Certificates, ConsensusBlocks},
-    CertificateStore, ConsensusStore, ProposerStore,
+    tables::{CertificateDigestByOrigin, CertificateDigestByRound, Certificates},
+    CertificateStore, ProposerStore,
 };
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Database, Hash as _,
-    Header, HeaderBuilder, ReputationScores, Round,
+    AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Database, EpochRecord,
+    Hash as _, Header, HeaderBuilder, ReputationScores, Round,
 };
 
 fn create_header_for_round(round: Round) -> Header {
@@ -97,25 +99,39 @@ async fn test_proposer_store_reads() {
 async fn test_consensus_store_read_latest_final_reputation_scores() {
     // GIVEN
     let temp_dir = TempDir::new().unwrap();
-    let store = open_db(temp_dir.path());
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
+    consensus_chain
+        .new_epoch(
+            EpochRecord {
+                epoch: 0,
+                committee: committee.bls_keys().iter().copied().collect(),
+                next_committee: committee.bls_keys().iter().copied().collect(),
+                ..Default::default()
+            },
+            committee.clone(),
+        )
+        .await
+        .unwrap();
 
     // AND we add some commits without any final scores
     for sequence_number in 0..10 {
-        let sub_dag = CommittedSubDag::new(
+        let sub_dag = Arc::new(CommittedSubDag::new(
             vec![],
             Certificate::default(),
             sequence_number,
             ReputationScores::new(&committee),
             None,
-        );
+        ));
 
-        store.write_subdag_for_test(sequence_number, sub_dag);
+        consensus_chain.write_subdag_for_test(sequence_number, sub_dag).await;
     }
 
     // WHEN we try to read the final schedule. The one of sub dag sequence 12 should be returned
-    let commit = store.read_latest_commit_with_final_reputation_scores(committee.epoch());
+    let commit =
+        consensus_chain.read_latest_commit_with_final_reputation_scores(committee.epoch()).await;
 
     // THEN no commit is returned
     assert!(commit.is_none());
@@ -129,15 +145,22 @@ async fn test_consensus_store_read_latest_final_reputation_scores() {
             scores.final_of_schedule = true;
         }
 
-        let sub_dag =
-            CommittedSubDag::new(vec![], Certificate::default(), sequence_number, scores, None);
+        let sub_dag = Arc::new(CommittedSubDag::new(
+            vec![],
+            Certificate::default(),
+            sequence_number,
+            scores,
+            None,
+        ));
 
-        store.write_subdag_for_test(sequence_number, sub_dag);
+        consensus_chain.write_subdag_for_test(sequence_number, sub_dag).await;
     }
-    store.persist::<ConsensusBlocks>().await;
 
     // WHEN we try to read the final schedule. The one of sub dag sequence 20 should be returned
-    let commit = store.read_latest_commit_with_final_reputation_scores(committee.epoch()).unwrap();
+    let commit = consensus_chain
+        .read_latest_commit_with_final_reputation_scores(committee.epoch())
+        .await
+        .unwrap();
 
     assert!(commit.reputation_score.final_of_schedule);
 }
@@ -199,7 +222,7 @@ async fn test_write_all_and_read_all_by_store_type<DB: CertificateStore>(store: 
     let ids = certs.iter().map(|c| c.digest()).collect::<Vec<CertificateDigest>>();
 
     // store them in both main and secondary index
-    store.write_all(certs.clone()).unwrap();
+    store.write_all(certs.iter()).unwrap();
 
     // WHEN
     let result = store.read_all(ids).unwrap();
@@ -231,7 +254,7 @@ async fn test_certificate_store_next_round_number() {
         certs.push(c);
     }
 
-    store.write_all(certs).unwrap();
+    store.write_all(certs.iter()).unwrap();
 
     // THEN
     let mut i = 0;
@@ -254,7 +277,7 @@ async fn test_certificate_store_last_two_rounds() {
     let origin = certs[0].origin().clone();
 
     // store them in both main and secondary index
-    store.write_all(certs).unwrap();
+    store.write_all(certs.iter()).unwrap();
     store.persist::<CertificateDigestByRound>().await;
 
     // WHEN
@@ -314,7 +337,7 @@ async fn test_certificate_store_after_round() {
     tracing::debug!("Storing certificates");
 
     // store them in both main and secondary index
-    store.write_all(certs.clone()).unwrap();
+    store.write_all(certs.iter()).unwrap();
     store.persist::<CertificateDigestByRound>().await; // Let the writes settle
 
     tracing::debug!("Stored certificates: {} seconds", now.elapsed().as_secs_f32());
@@ -397,7 +420,7 @@ async fn test_certificate_store_notify_read() {
         }
 
         // and populate the rest with a write_all
-        store.write_all(certs).unwrap();
+        store.write_all(certs.iter()).unwrap();
 
         // now wait on handle an assert result for a single certificate
         let received_certificate =
@@ -425,7 +448,7 @@ async fn test_certificate_store_write_all_and_clear() {
     let certs = certificates(10);
 
     // store them in both main and secondary index
-    store.write_all(certs).unwrap();
+    store.write_all(certs.iter()).unwrap();
 
     // confirm store is not empty
     assert!(!store.is_empty_certs());
@@ -453,7 +476,7 @@ async fn test_certificate_store_delete_store() {
     let certs = certificates(10);
 
     // store them in both main and secondary index
-    store.write_all(certs.clone()).unwrap();
+    store.write_all(certs.iter()).unwrap();
 
     // WHEN now delete a couple of certificates
     let to_delete = certs.iter().take(2).map(|c| c.digest()).collect::<Vec<_>>();

@@ -11,12 +11,13 @@ use crate::{
     ConsensusBus,
 };
 use std::collections::{BTreeSet, HashMap};
+use tempfile::TempDir;
 use tn_config::{ConsensusConfig, NetworkConfig};
-use tn_storage::{mem_db::MemDatabase, CertificateStore, ConsensusStore as _};
+use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, CertificateStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    AuthorityIdentifier, BlockNumHash, ExecHeader, Notifier, SealedHeader, TaskManager, TnReceiver,
-    TnSender, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    AuthorityIdentifier, BlockHash, BlockNumHash, EpochRecord, ExecHeader, Notifier, SealedHeader,
+    TaskManager, TnReceiver, TnSender, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tracing::info;
 
@@ -423,9 +424,14 @@ async fn commit_one() {
     );
 
     let cb = ConsensusBus::new();
+    let temp_dir = TempDir::new().unwrap();
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), config.committee().clone())
+            .await
+            .unwrap();
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
-    Consensus::spawn(config, &cb, bullshark, &task_manager);
+    Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain).await;
     let cb_clone = cb.clone();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.recent_blocks().send_modify(|blocks| {
@@ -444,8 +450,8 @@ async fn commit_one() {
 
     // Ensure the first 4 ordered certificates are from round 1 (they are the parents of the
     // committed leader); then the leader's certificate should be committed.
-    let committed_sub_dag: CommittedSubDag = rx_output.recv().await.unwrap();
-    let mut sequence = committed_sub_dag.certificates.into_iter();
+    let committed_sub_dag: Arc<CommittedSubDag> = rx_output.recv().await.unwrap();
+    let mut sequence = committed_sub_dag.certificates.iter();
     for _ in 1..=4 {
         let output = sequence.next().unwrap();
         assert_eq!(output.round(), 1);
@@ -486,13 +492,18 @@ async fn dead_node() {
     );
 
     let cb = ConsensusBus::new();
+    let temp_dir = TempDir::new().unwrap();
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), config.committee().clone())
+            .await
+            .unwrap();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.recent_blocks().send_modify(|blocks| {
         blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
     });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
-    Consensus::spawn(config, &cb, bullshark, &task_manager);
+    Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain).await;
     let cb_clone = cb.clone();
     tokio::spawn(async move {
         let mut rx_primary = cb_clone.subscribe_committed_certificates();
@@ -509,7 +520,7 @@ async fn dead_node() {
 
     // We should commit 3 leaders (rounds 2, 4 and 6).
     let mut committed = Vec::new();
-    let mut committed_sub_dags: Vec<CommittedSubDag> = Vec::new();
+    let mut committed_sub_dags: Vec<Arc<CommittedSubDag>> = Vec::new();
     for _commit_rounds in 1..=4 {
         let committed_sub_dag = rx_output.recv().await.unwrap();
         committed.extend(committed_sub_dag.certificates.clone());
@@ -620,13 +631,18 @@ async fn not_enough_support() {
     );
 
     let cb = ConsensusBus::new();
+    let temp_dir = TempDir::new().unwrap();
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), config.committee().clone())
+            .await
+            .unwrap();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.recent_blocks().send_modify(|blocks| {
         blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
     });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
-    Consensus::spawn(config, &cb, bullshark, &task_manager);
+    Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain).await;
     let cb_clone = cb.clone();
     tokio::spawn(async move {
         let mut rx_primary = cb_clone.subscribe_committed_certificates();
@@ -640,8 +656,8 @@ async fn not_enough_support() {
     }
 
     // We should commit 2 leaders (rounds 2 and 4).
-    let committed_sub_dag: CommittedSubDag = rx_output.recv().await.unwrap();
-    let mut sequence = committed_sub_dag.certificates.into_iter();
+    let committed_sub_dag: Arc<CommittedSubDag> = rx_output.recv().await.unwrap();
+    let mut sequence = committed_sub_dag.certificates.iter();
     for _ in 1..=3 {
         let output = sequence.next().unwrap();
         assert_eq!(output.round(), 1);
@@ -653,8 +669,8 @@ async fn not_enough_support() {
     assert_eq!(committed_sub_dag.reputation_score.total_authorities(), 4);
     assert!(committed_sub_dag.reputation_score.all_zero());
 
-    let committed_sub_dag: CommittedSubDag = rx_output.recv().await.unwrap();
-    let mut sequence = committed_sub_dag.certificates.into_iter();
+    let committed_sub_dag: Arc<CommittedSubDag> = rx_output.recv().await.unwrap();
+    let mut sequence = committed_sub_dag.certificates.iter();
     for _ in 1..=3 {
         let output = sequence.next().unwrap();
         assert_eq!(output.round(), 2);
@@ -720,13 +736,18 @@ async fn missing_leader() {
     );
 
     let cb = ConsensusBus::new();
+    let temp_dir = TempDir::new().unwrap();
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), config.committee().clone())
+            .await
+            .unwrap();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.recent_blocks().send_modify(|blocks| {
         blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
     });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
-    Consensus::spawn(config, &cb, bullshark, &task_manager);
+    Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain).await;
     let cb_clone = cb.clone();
     tokio::spawn(async move {
         let mut rx_primary = cb_clone.subscribe_committed_certificates();
@@ -740,8 +761,8 @@ async fn missing_leader() {
     }
 
     // Ensure the commit sequence is as expected.
-    let committed_sub_dag: CommittedSubDag = rx_output.recv().await.unwrap();
-    let mut sequence = committed_sub_dag.certificates.into_iter();
+    let committed_sub_dag: Arc<CommittedSubDag> = rx_output.recv().await.unwrap();
+    let mut sequence = committed_sub_dag.certificates.iter();
     for _ in 1..=3 {
         let output = sequence.next().unwrap();
         assert_eq!(output.round(), 1);
@@ -777,7 +798,17 @@ async fn committed_round_after_restart() {
 
     let config = fixture.authorities().next().unwrap().consensus_config();
     let store = config.node_storage().clone();
+    let temp_dir = TempDir::new().unwrap();
+    let consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).unwrap();
+    let previous_epoch = EpochRecord {
+        epoch: committee.epoch().saturating_sub(1),
+        committee: committee.bls_keys().iter().copied().collect(),
+        next_committee: committee.bls_keys().iter().copied().collect(),
+        ..Default::default()
+    };
+    consensus_chain.new_epoch(previous_epoch, committee.clone()).await.unwrap();
 
+    let mut consensus_number = 0u64;
     for input_round in (1..=11usize).step_by(2) {
         let bullshark = Bullshark::new(
             committee.clone(),
@@ -794,14 +825,19 @@ async fn committed_round_after_restart() {
         let mut rx_primary = cb.subscribe_committed_certificates();
         let mut rx_output = cb.subscribe_sequence();
         let mut task_manager = TaskManager::default();
-        Consensus::spawn(config.clone(), &cb, bullshark, &task_manager);
+        Consensus::spawn(config.clone(), &cb, bullshark, &task_manager, consensus_chain.clone())
+            .await;
 
         // When `input_round` is 2 * r + 1, r > 1, the previous commit round would be 2 * (r - 1),
         // and the expected commit round after sending in certificates up to `input_round` would
         // be 2 * r.
 
         let last_committed_round = *cb.committed_round_updates().borrow() as usize;
-        assert_eq!(last_committed_round, input_round.saturating_sub(3));
+        assert_eq!(
+            last_committed_round,
+            input_round.saturating_sub(3),
+            "failed on input round {input_round}"
+        );
         info!("Consensus started at last_committed_round={last_committed_round}");
 
         // Feed certificates from two rounds into consensus.
@@ -815,9 +851,10 @@ async fn committed_round_after_restart() {
 
         // There should only be one new item in the output streams.
         if input_round > 1 {
+            consensus_number += 1;
             let committed = rx_output.recv().await.unwrap();
             info!("Received output from consensus, committed_round={}", committed.leader.round());
-            store.write_subdag_for_test(input_round as u64, committed);
+            consensus_chain.write_subdag_for_test(consensus_number, committed).await;
             let (round, _certs) = rx_primary.recv().await.unwrap();
             info!("Received committed certificates from consensus, committed_round={round}",);
         }
@@ -996,6 +1033,9 @@ async fn restart_with_new_committee() {
     let mut fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let mut committee: Committee = fixture.committee();
     let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let temp_dir = TempDir::new().unwrap();
+    let consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).unwrap();
+    let mut prev_epoch_digest = BlockHash::default();
 
     // Run for a few epochs.
     for epoch in 0..5 {
@@ -1018,13 +1058,28 @@ async fn restart_with_new_committee() {
         );
 
         let cb = ConsensusBus::new();
+        let last = consensus_chain.consensus_header_latest().await.unwrap_or_default();
+        let previous_epoch = EpochRecord {
+            epoch: committee.epoch().saturating_sub(1),
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            parent_hash: prev_epoch_digest,
+            final_consensus: BlockNumHash {
+                number: last.map(|l| l.number).unwrap_or_default(),
+                hash: BlockHash::default(),
+            },
+            ..Default::default()
+        };
+        prev_epoch_digest = previous_epoch.digest();
+        consensus_chain.new_epoch(previous_epoch, committee.clone()).await.unwrap();
         let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
         cb.recent_blocks().send_modify(|blocks| {
             blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
         });
         let mut rx_output = cb.subscribe_sequence();
         let mut task_manager = TaskManager::default();
-        Consensus::spawn(config.clone(), &cb, bullshark, &task_manager);
+        Consensus::spawn(config.clone(), &cb, bullshark, &task_manager, consensus_chain.clone())
+            .await;
         let cb_clone = cb.clone();
         tokio::spawn(async move {
             let mut rx_primary = cb_clone.subscribe_committed_certificates();
@@ -1064,7 +1119,7 @@ async fn restart_with_new_committee() {
         // Ensure the first 4 ordered certificates are from round 1 (they are the parents of the
         // committed leader); then the leader's certificate should be committed.
         let committed_sub_dag = rx_output.recv().await.unwrap();
-        let mut sequence = committed_sub_dag.certificates.into_iter();
+        let mut sequence = committed_sub_dag.certificates.iter();
         for _ in 1..=4 {
             let output = sequence.next().unwrap();
             assert_eq!(output.epoch(), epoch);

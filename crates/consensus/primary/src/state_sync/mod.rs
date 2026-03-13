@@ -63,7 +63,7 @@ where
     /// Process a certificate produced by the this node.
     pub(crate) async fn process_own_certificate(
         &self,
-        certificate: Certificate,
+        certificate: &mut Certificate,
     ) -> CertManagerResult<()> {
         self.certificate_validator.process_own_certificate(certificate).await
     }
@@ -71,7 +71,7 @@ where
     /// Process a certificate received from a peer.
     pub(crate) async fn process_peer_certificate(
         &self,
-        certificate: Certificate,
+        certificate: &mut Certificate,
     ) -> CertManagerResult<()> {
         self.certificate_validator.process_peer_certificate(certificate).await
     }

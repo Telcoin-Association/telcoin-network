@@ -340,10 +340,10 @@ mod tests {
         test_utils::{create_committee_from_state, TransactionFactory},
         RethChainSpec,
     };
-    use tn_storage::{open_db, tables::Batches};
+    use tn_storage::{open_db, tables::NodeBatchesCache};
     use tn_types::{
-        gas_accumulator::GasAccumulator, test_genesis, Bytes, Certificate, CommittedSubDag,
-        ConsensusOutput, Database, GenesisAccount, TaskManager, U160, U256,
+        gas_accumulator::GasAccumulator, test_genesis, BlockHash, Bytes, Certificate,
+        CommittedSubDag, ConsensusOutput, Database, GenesisAccount, TaskManager, U160, U256,
     };
     use tn_worker::{test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle};
     use tokio::time::timeout;
@@ -455,7 +455,7 @@ mod tests {
         for _ in 0..5 {
             let _ = tokio::time::sleep(Duration::from_secs(1)).await;
             // Ensure the block is stored
-            if let Some((_, wb)) = store.iter::<Batches>().next() {
+            if let Some((_, wb)) = store.iter::<NodeBatchesCache>().next() {
                 new_batch = Some(wb);
                 break;
             }
@@ -631,8 +631,7 @@ mod tests {
         leader_cert.header_mut_for_test().author = leader;
         let mut subdag = CommittedSubDag::default();
         subdag.leader = leader_cert;
-        let mut output = ConsensusOutput::default();
-        output.sub_dag = Arc::new(subdag);
+        let output = ConsensusOutput::new_with_subdag(Arc::new(subdag), BlockHash::default(), 0);
 
         // receive new blocks and return non-fatal errors
         // non-fatal errors cause the loop to break and wait for txpool updates

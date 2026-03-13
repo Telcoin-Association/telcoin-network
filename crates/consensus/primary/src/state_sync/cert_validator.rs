@@ -62,7 +62,7 @@ where
     /// Process a certificate produced by the this node.
     pub(super) async fn process_own_certificate(
         &self,
-        certificate: Certificate,
+        certificate: &mut Certificate,
     ) -> CertManagerResult<()> {
         self.process_certificate(certificate, false).await
     }
@@ -70,7 +70,7 @@ where
     /// Process a certificate received from a peer.
     pub(super) async fn process_peer_certificate(
         &self,
-        certificate: Certificate,
+        certificate: &mut Certificate,
     ) -> CertManagerResult<()> {
         self.process_certificate(certificate, true).await
     }
@@ -82,7 +82,7 @@ where
     /// Validate certificate.
     async fn process_certificate(
         &self,
-        mut certificate: Certificate,
+        certificate: &mut Certificate,
         external: bool,
     ) -> CertManagerResult<()> {
         // validate certificate standalone and forward to CertificateManager
@@ -114,18 +114,18 @@ where
         // scrutinize certificates received from peers
         if external {
             // update signature verification
-            certificate = self.validate_and_verify(certificate)?;
+            self.validate_and_verify(certificate)?;
         }
 
         debug!(target: "primary::cert_validator", round=certificate.round(), ?certificate, "processing certificate");
 
-        self.forward_verified_certs(certificate.round(), vec![certificate]).await
+        self.forward_verified_certs(certificate.round(), vec![certificate.clone()]).await
     }
 
     /// Validate and verify the certificate.
     ///
     /// This method validates the certificate and verifies signatures.
-    fn validate_and_verify(&self, certificate: Certificate) -> CertManagerResult<Certificate> {
+    fn validate_and_verify(&self, certificate: &mut Certificate) -> CertManagerResult<()> {
         // certificates outside gc can never be included in the DAG
         let gc_round = self.gc_round();
 
@@ -139,8 +139,8 @@ where
         }
 
         // validate certificate and verify signatures
-        let verified_cert = certificate.validate_and_verify(self.config.committee())?;
-        Ok(verified_cert)
+        certificate.validate_and_verify(self.config.committee())?;
+        Ok(())
     }
 
     /// Send to Certificate Manager for final processing.
@@ -363,20 +363,18 @@ where
     /// Spawns a single verification task for a chunk of certificates
     fn spawn_verification_task(
         &self,
-        certs: Vec<(usize, Certificate)>,
+        mut certs: Vec<(usize, Certificate)>,
     ) -> tokio::task::JoinHandle<CertManagerResult<Vec<(usize, Certificate)>>> {
         let validator = self.clone();
         // Don't have an equivelent on the task spawner.  Since this is a
         // strictly sync task even if we did it would not really do
         // anything special so Ok for now.
         tokio::task::spawn_blocking(move || {
-            let mut sanitized_certs = Vec::new();
-
-            for (idx, cert) in certs {
-                sanitized_certs.push((idx, validator.validate_and_verify(cert)?))
+            for (_idx, cert) in certs.iter_mut() {
+                validator.validate_and_verify(cert)?
             }
 
-            Ok(sanitized_certs)
+            Ok(certs)
         })
     }
 }
