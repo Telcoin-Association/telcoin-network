@@ -7,7 +7,7 @@ use std::{
 
 use tn_config::KeyConfig;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus};
-use tn_storage::consensus::ConsensusChain;
+use tn_storage::{consensus::ConsensusChain, epoch_records::EpochRecordDb};
 use tn_types::{
     BlsAggregateSignature, BlsPublicKey, BlsSignature, Epoch, EpochCertificate, EpochRecord,
     EpochVote, Noticer, TaskSpawner, TnReceiver as _, B256,
@@ -17,6 +17,29 @@ use tracing::{error, info, warn};
 
 type VoteQueue = VecDeque<(Epoch, Sender<EpochVote>, Option<Receiver<EpochVote>>)>;
 
+/// Both save and persist an epoch record and cert with logging.
+async fn save_and_persist_with_logs(
+    db: &EpochRecordDb,
+    epoch_record: EpochRecord,
+    cert: EpochCertificate,
+) {
+    let epoch = epoch_record.epoch;
+    if let Err(e) = db.save(epoch_record, cert).await {
+        error!(
+            target: "epoch-manager",
+            ?e,
+            "failed to save epoch record/cert after retrieval for epoch {epoch}",
+        );
+    } else if let Err(e) = db.persist().await {
+        error!(
+            target: "epoch-manager",
+            ?e,
+            "failed to persist epoch record/cert after retrieval for epoch {epoch}",
+        );
+    }
+}
+
+/// Collect and manage votes for a specific epoch record.
 async fn manage_epoch_votes(
     epoch_rec: EpochRecord,
     key_config: KeyConfig,
@@ -131,7 +154,23 @@ async fn manage_epoch_votes(
                 let signature: BlsSignature = aggregated_signature.to_signature();
                 let cert = EpochCertificate { epoch_hash, signature, signed_authorities };
                 if epoch_rec.verify_with_cert(&cert) {
-                    let _ = consensus_chain.epochs().save_certificate(cert.epoch_hash, cert).await;
+                    let epoch = epoch_rec.epoch;
+                    if let Err(e) =
+                        consensus_chain.epochs().save_certificate(cert.epoch_hash, cert).await
+                    {
+                        error!(
+                            target: "epoch-manager",
+                            ?e,
+                            "failed to save epoch cert after reaching quorum {epoch}",
+                        );
+                    }
+                    if let Err(e) = consensus_chain.epochs().persist().await {
+                        error!(
+                            target: "epoch-manager",
+                            ?e,
+                            "failed to persist epoch cert after reaching quorum {epoch}",
+                        );
+                    }
                 } else {
                     error!(
                         target: "epoch-manager",
@@ -165,27 +204,13 @@ async fn manage_epoch_votes(
                                 target: "epoch-manager",
                                 "Over wrote expected epoch record {epoch_hash} with verified epoch record {new_epoch_hash}",
                             );
-                            let new_epoch = new_epoch_rec.epoch;
-                            if let Err(e) = db.save(new_epoch_rec, cert).await {
-                                error!(
-                                    target: "epoch-manager",
-                                    ?e,
-                                    "failed to save epoch (different hash) record/cert after retrieval for epoch {new_epoch}",
-                                );
-                            }
+                            save_and_persist_with_logs(&db, new_epoch_rec, cert).await;
                         } else {
                             info!(
                                 target: "epoch-manager",
                                 "retrieved cert for epoch {}/{new_epoch_hash} from a peer", epoch_rec.epoch
                             );
-                            let new_epoch = new_epoch_rec.epoch;
-                            if let Err(e) = db.save(new_epoch_rec, cert).await {
-                                error!(
-                                    target: "epoch-manager",
-                                    ?e,
-                                    "failed to save epoch record/cert after retrieval for epoch {new_epoch}",
-                                );
-                            }
+                            save_and_persist_with_logs(&db, new_epoch_rec, cert).await;
                         }
                         got_epoch_record = true;
                         break;

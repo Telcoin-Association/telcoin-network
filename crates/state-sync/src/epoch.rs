@@ -118,6 +118,13 @@ async fn collect_epoch_records(
             break;
         }
     }
+    if let Err(e) = consensus_chain.epochs().persist().await {
+        error!(
+            target: "epoch-manager",
+            ?e,
+            "failed to persist downloaded epoch record/certs",
+        );
+    }
     result_epoch
 }
 
