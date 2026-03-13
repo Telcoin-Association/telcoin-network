@@ -12316,6 +12316,8 @@ dependencies = [
  "reth-provider",
  "reth-revm",
  "reth-rpc-eth-types",
+ "reth-tasks",
+ "reth-tokio-util",
  "reth-tracing",
  "reth-transaction-pool",
  "secp256k1 0.31.1",

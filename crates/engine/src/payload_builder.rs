@@ -5,7 +5,7 @@
 use crate::error::{EngineResult, TnEngineError};
 use tn_reth::{
     payload::{BuildArguments, TNPayload},
-    CanonicalInMemoryState, ExecutedBlockWithTrieUpdates, NewCanonicalChain, RethEnv,
+    CanonicalInMemoryState, ExecutedBlock, NewCanonicalChain, RethEnv,
 };
 use tn_types::{
     gas_accumulator::GasAccumulator, max_batch_gas, EngineUpdate, Hash as _, SealedHeader, B256,
@@ -163,7 +163,7 @@ pub fn execute_consensus_output(
 fn execute_payload(
     payload: TNPayload,
     transactions: &Vec<Vec<u8>>,
-    executed_blocks: &mut Vec<ExecutedBlockWithTrieUpdates>,
+    executed_blocks: &mut Vec<ExecutedBlock>,
     reth_env: &RethEnv,
     canonical_in_memory_state: &CanonicalInMemoryState,
 ) -> EngineResult<SealedHeader> {

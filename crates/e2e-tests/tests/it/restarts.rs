@@ -772,7 +772,8 @@ fn send_tel(
         gas,
         data: vec![/* contract code or other data */],
     };
-    let secret_key = SecretKey::from_slice(&const_hex::decode(key)?)?;
+    let decoded = const_hex::decode(key)?;
+    let secret_key = SecretKey::from_byte_array(decoded.as_slice().try_into()?)?;
     let ecdsa = new_transaction
         .ecdsa(&secret_key.secret_bytes())
         .map_err(|_| Report::msg("Failed to get ecdsa"))?;
@@ -793,7 +794,11 @@ fn send_tel(
 fn decode_key(key: &str) -> eyre::Result<(String, String, String)> {
     match const_hex::decode(key) {
         Ok(key) => {
-            match SecretKey::from_slice(&key) {
+            let key_array: [u8; 32] = key
+                .as_slice()
+                .try_into()
+                .map_err(|e: std::array::TryFromSliceError| Report::msg(e.to_string()))?;
+            match SecretKey::from_byte_array(key_array) {
                 Ok(secret_key) => {
                     let secp = Secp256k1::new();
                     let keypair = Keypair::from_secret_key(&secp, &secret_key);

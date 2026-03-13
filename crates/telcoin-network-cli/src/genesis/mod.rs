@@ -13,7 +13,7 @@ use tn_config::{
     GOVERNANCE_SAFE_ADDRESS,
 };
 use tn_reth::{system_calls::ConsensusRegistry, RethChainSpec, RethEnv};
-use tn_types::{keccak256, set_genesis_defaults, Address, GenesisAccount, U256};
+use tn_types::{keccak256, set_genesis_defaults, Address, ExecHeader, GenesisAccount, U256};
 use tracing::info;
 
 use crate::args::{clap_address_parser, clap_u256_parser_to_18_decimals, maybe_hex};
@@ -139,7 +139,7 @@ impl GenesisArgs {
     pub fn execute(&self, data_dir: PathBuf) -> eyre::Result<()> {
         info!(target: "genesis::ceremony", "Creating a new chain genesis with initial validators");
 
-        let chain = RethChainSpec::default();
+        let chain: RethChainSpec<ExecHeader> = RethChainSpec::default();
         // load network genesis
         let mut network_genesis =
             NetworkGenesis::new_from_path_and_genesis(&data_dir, chain.genesis().clone())?;

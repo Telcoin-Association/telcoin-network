@@ -45,6 +45,8 @@ reth-network-peers = { workspace = true }
 reth-network-api = { workspace = true }
 reth-discv4 = { workspace = true }
 reth-eth-wire = { workspace = true }
+reth-tasks = { workspace = true }
+reth-tokio-util = { workspace = true }
 reth-tracing = { workspace = true }
 
 rand = { workspace = true }

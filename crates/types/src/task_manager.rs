@@ -666,9 +666,9 @@ mod test {
         assert_eq!(spong_block.ping(2).await.unwrap(), 2);
 
         // Test the reth interface to the TaskSpawner.
-        use reth_tasks::TaskSpawner as _;
+        use reth_tasks::TaskSpawner as RethTaskSpawner;
         let (rsping_crit, mut rspong_crit) = new_ping_pong();
-        spawner.spawn_critical(
+        spawner.spawn_critical_task(
             "Crit",
             Box::pin(async move {
                 rsping_crit.run().await;
@@ -678,21 +678,27 @@ mod test {
         assert_eq!(rspong_crit.ping(2).await.unwrap(), 2);
 
         let (rsping_norm, mut rspong_norm) = new_ping_pong();
-        spawner.spawn(Box::pin(async move {
-            rsping_norm.run().await;
-        }));
+        RethTaskSpawner::spawn_task(
+            &spawner,
+            Box::pin(async move {
+                rsping_norm.run().await;
+            }),
+        );
         assert_eq!(rspong_norm.ping(1).await.unwrap(), 1);
         assert_eq!(rspong_norm.ping(2).await.unwrap(), 2);
 
         let (rsping_block, mut rspong_block) = new_ping_pong();
-        spawner.spawn_blocking(Box::pin(async move {
-            rsping_block.run().await;
-        }));
+        RethTaskSpawner::spawn_blocking_task(
+            &spawner,
+            Box::pin(async move {
+                rsping_block.run().await;
+            }),
+        );
         assert_eq!(rspong_block.ping(1).await.unwrap(), 1);
         assert_eq!(rspong_block.ping(2).await.unwrap(), 2);
 
         let (rsping_crit_block, mut rspong_crit_block) = new_ping_pong();
-        spawner.spawn_critical_blocking(
+        spawner.spawn_critical_blocking_task(
             "Crit block",
             Box::pin(async move {
                 rsping_crit_block.run().await;

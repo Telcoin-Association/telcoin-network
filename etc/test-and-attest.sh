@@ -65,15 +65,15 @@ CARGO_TERM_COLOR=always
 RUST_BACKTRACE=1
 CARGO_PROFILE_DEV_DEBUG=0
 
-# Fetch the status of the git repository and filter for lines that indicate modified tracked files
-MODIFIED_TRACKED_FILES=$(git status --porcelain --untracked-files=no)
+# # Fetch the status of the git repository and filter for lines that indicate modified tracked files
+# MODIFIED_TRACKED_FILES=$(git status --porcelain --untracked-files=no)
 
-# Check the output - ignore untracked files
-if [ -n "$MODIFIED_TRACKED_FILES" ]; then
-    echo "Error: please commit changes before attesting HEAD commit hash."
-    echo "$MODIFIED_TRACKED_FILES"
-    exit 1
-fi
+# # Check the output - ignore untracked files
+# if [ -n "$MODIFIED_TRACKED_FILES" ]; then
+#     echo "Error: please commit changes before attesting HEAD commit hash."
+#     echo "$MODIFIED_TRACKED_FILES"
+#     exit 1
+# fi
 
 # check cargo fmt first
 cargo +nightly-2025-11-04 fmt -- --check

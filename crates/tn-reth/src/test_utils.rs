@@ -72,7 +72,7 @@ impl RethEnv {
     /// Create an EVM-environment from state provider.
     pub fn tn_evm(&self, hash: BlockHash) -> eyre::Result<TNEvmTestType> {
         let header = self.header(hash)?.expect("provided hash in header table");
-        let state = self.state_by_block_hash(hash)?;
+        let state: Box<dyn reth_provider::StateProvider> = self.state_by_block_hash(hash)?;
         let db = State::builder()
             .with_database(StateProviderDatabase::new(state))
             .with_bundle_update()

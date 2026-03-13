@@ -5,7 +5,10 @@
 use crate::{basefee_address, calculate_gas_penalty, SYSTEM_ADDRESS};
 use reth_revm::{
     context::result::{EVMError, InvalidTransaction},
-    context_interface::{result::HaltReason, Block, ContextTr, JournalTr, Transaction},
+    context_interface::{
+        journaled_state::account::JournaledAccountTr, result::HaltReason, Block, ContextTr,
+        JournalTr, Transaction,
+    },
     handler::{
         instructions::InstructionProvider, EvmTr, FrameResult, FrameTr, Handler, PrecompileProvider,
     },
@@ -100,19 +103,17 @@ where
         // return gas to caller (minus penalty)
         if refund_amount > 0 {
             let caller = context.tx().caller();
-            let caller_account = context.journal_mut().load_account(caller)?;
             let refund = effective_gas_price.saturating_mul(refund_amount as u128);
-            caller_account.data.info.balance =
-                caller_account.data.info.balance.saturating_add(U256::from(refund));
+            context.journal_mut().load_account_mut(caller)?.incr_balance(U256::from(refund));
         }
 
         // transfer penalty to basefee address
         if penalty_gas > 0 {
-            let basefee_account = context.journal_mut().load_account(self.basefee_address)?;
-            basefee_account.data.mark_touch();
             let penalty = effective_gas_price.saturating_mul(penalty_gas as u128);
-            basefee_account.data.info.balance =
-                basefee_account.data.info.balance.saturating_add(U256::from(penalty));
+            context
+                .journal_mut()
+                .load_account_mut(self.basefee_address)?
+                .incr_balance(U256::from(penalty));
         }
 
         Ok(())
@@ -129,27 +130,23 @@ where
         let basefee = context.block().basefee() as u128;
         let effective_gas_price = context.tx().effective_gas_price(basefee);
         let gas = exec_result.gas();
+        let gas_used = gas.spent_sub_refunded() as u128;
 
         // transfer priority fee to coinbase/beneficiary
         // basefee amount of gas is redirected to governance multisig
         let coinbase_gas_price = effective_gas_price.saturating_sub(basefee);
-        let coinbase_account = context.journal_mut().load_account(beneficiary)?;
-        coinbase_account.data.mark_touch();
-
-        let gas_used = gas.spent_sub_refunded() as u128;
-        coinbase_account.data.info.balance = coinbase_account
-            .data
-            .info
-            .balance
-            .saturating_add(U256::from(coinbase_gas_price * gas_used));
+        context
+            .journal_mut()
+            .load_account_mut(beneficiary)?
+            .incr_balance(U256::from(coinbase_gas_price * gas_used));
 
         // send the base fee portion to a basefee account for later processing
         // (offchain).
-        let basefee_account = context.journal_mut().load_account(self.basefee_address)?;
-        basefee_account.data.mark_touch();
         debug!(target: "engine", ?basefee, ?gas_used, "allocating basefees {}", basefee * gas_used);
-        basefee_account.data.info.balance =
-            basefee_account.data.info.balance.saturating_add(U256::from(basefee * gas_used));
+        context
+            .journal_mut()
+            .load_account_mut(self.basefee_address)?
+            .incr_balance(U256::from(basefee * gas_used));
 
         Ok(())
     }

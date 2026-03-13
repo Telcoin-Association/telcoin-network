@@ -54,7 +54,7 @@ use reth::{
         server_types::eth::utils::recover_raw_transaction as reth_recover_raw_transaction,
     },
 };
-use reth_chain_state::ExecutedTrieUpdates;
+use reth_chain_state::ComputedTrieData;
 use reth_chainspec::{BaseFeeParams, EthChainSpec};
 use reth_db::{init_db, DatabaseEnv};
 use reth_db_common::init::init_genesis;
@@ -66,22 +66,18 @@ use reth_engine_tree::{
 use reth_errors::{BlockExecutionError, BlockValidationError};
 use reth_eth_wire::BlockHashNumber;
 use reth_evm::{
-    execute::{BlockBuilder, BlockBuilderOutcome},
+    execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionOutput},
     ConfigureEvm, EvmFactory,
 };
 use reth_evm_ethereum::EthEvmConfig;
-use reth_node_builder::{
-    DEFAULT_MAX_PROOF_TASK_CONCURRENCY, DEFAULT_MEMORY_BLOCK_BUFFER_TARGET,
-    DEFAULT_RESERVED_CPU_CORES,
-};
+use reth_node_builder::{DEFAULT_MEMORY_BLOCK_BUFFER_TARGET, DEFAULT_RESERVED_CPU_CORES};
 use reth_node_core::node_config::DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB;
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
-    writer::UnifiedStorageWriter,
     BlockIdReader as _, BlockNumReader, BlockReader, CanonChainTracker,
     CanonStateSubscriptions as _, ChainSpecProvider, ChainStateBlockReader, ChainStateBlockWriter,
-    DatabaseProviderFactory, HeaderProvider as _, ProviderFactory, StateProviderBox,
-    StateProviderFactory, StaticFileProviderFactory, TransactionVariant,
+    DBProvider, DatabaseProviderFactory, HeaderProvider as _, ProviderFactory, StateProviderBox,
+    StateProviderFactory, TransactionVariant,
 };
 use reth_revm::{
     cached::CachedReads,
@@ -111,10 +107,10 @@ use tn_config::{
     ISSUANCE_JSON,
 };
 use tn_types::{
-    gas_accumulator::RewardsCounter, Address, BlockBody, BlockHashOrNumber, BlockHeader as _,
-    BlockNumHash, BlockNumber, EngineUpdate, Epoch, ExecHeader, Genesis, GenesisAccount,
-    RecoveredBlock, Round, SealedBlock, SealedHeader, TaskManager, TaskSpawner, TransactionSigned,
-    B256, ETHEREUM_BLOCK_GAS_LIMIT_30M, U256,
+    gas_accumulator::RewardsCounter, Address, BlockBody, BlockHashOrNumber, BlockNumHash,
+    BlockNumber, EngineUpdate, Epoch, ExecHeader, Genesis, GenesisAccount, RecoveredBlock, Round,
+    SealedBlock, SealedHeader, TaskManager, TaskSpawner, TransactionSigned, B256,
+    ETHEREUM_BLOCK_GAS_LIMIT_30M, U256,
 };
 use tracing::{debug, error, info, warn};
 use traits::{TNPrimitives, TelcoinNode};
@@ -125,9 +121,7 @@ pub use reth::{
     chainspec::chain_value_parser, dirs::MaybePlatformPath, payload::BlobSidecars,
     rpc::builder::RpcServerHandle,
 };
-pub use reth_chain_state::{
-    CanonicalInMemoryState, ExecutedBlockWithTrieUpdates, NewCanonicalChain,
-};
+pub use reth_chain_state::{CanonicalInMemoryState, ExecutedBlock, NewCanonicalChain};
 pub use reth_chainspec::ChainSpec as RethChainSpec;
 pub use reth_cli_util::{parse_duration_from_secs, parse_socket_address};
 pub use reth_errors::{ProviderError, RethError};
@@ -136,7 +130,7 @@ pub use reth_node_core::{
     node_config::DEFAULT_PERSISTENCE_THRESHOLD,
 };
 pub use reth_primitives_traits::crypto::secp256k1::sign_message;
-pub use reth_provider::{CanonStateNotificationStream, ExecutionOutcome};
+pub use reth_provider::CanonStateNotificationStream;
 pub use reth_rpc_eth_types::EthApiError;
 pub use reth_tracing::{FileWorkerGuard, Layers};
 pub use reth_transaction_pool::{
@@ -324,9 +318,15 @@ impl RethConfig {
             max_capacity_cache_txns_pending_fetch: 0,
             net_if: None,
             tx_propagation_policy: TransactionPropagationKind::Trusted,
+            tx_ingress_policy: Default::default(),
             disable_tx_gossip: true,
             propagation_mode: TransactionPropagationMode::Max(0),
             required_block_hashes: vec![],
+            network_id: None,
+            enforce_enr_fork_id: false,
+            max_peers: None,
+            netrestrict: None,
+            p2p_secret_key_hex: None,
         };
 
         // Not using the Reth payload builder.
@@ -336,6 +336,7 @@ impl RethConfig {
             interval: Duration::from_secs(1),
             deadline: Duration::from_secs(1),
             max_payload_tasks: 0,
+            max_blobs_per_block: None,
         };
         let debug = DebugArgs {
             terminate: false,
@@ -351,12 +352,19 @@ impl RethConfig {
             invalid_block_hook: None,
             healthy_node_rpc_url: None,
             ethstats: None,
+            startup_sync_state_idle: false,
         };
         // No Reth dev options.
-        let dev = DevArgs { dev: false, block_max_transactions: None, block_time: None };
+        let dev = DevArgs {
+            dev: false,
+            block_max_transactions: None,
+            block_time: None,
+            dev_mnemonic: Default::default(),
+        };
         // Ignore Reth pruning for now.
         let pruning = PruningArgs {
             full: false,
+            minimal: false,
             block_interval: None,
             sender_recovery_full: false,
             sender_recovery_distance: None,
@@ -381,25 +389,37 @@ impl RethConfig {
         };
 
         // Parameters for configuring the engine driver.
-        #[allow(deprecated)] // last 3 fields are depracated
+        #[allow(deprecated)] // deprecated fields
         let engine = EngineArgs {
             persistence_threshold: DEFAULT_PERSISTENCE_THRESHOLD,
             memory_block_buffer_target: DEFAULT_MEMORY_BLOCK_BUFFER_TARGET,
             legacy_state_root_task_enabled: false,
             state_root_task_compare_updates: false,
-            caching_and_prewarming_disabled: false,
+            state_cache_disabled: false,
+            prewarming_disabled: false,
             state_provider_metrics: false,
             cross_block_cache_size: DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB,
             accept_execution_requests_hash: false,
-            max_proof_task_concurrency: DEFAULT_MAX_PROOF_TASK_CONCURRENCY,
+            multiproof_chunking_enabled: false,
+            multiproof_chunk_size: 0,
             reserved_cpu_cores: DEFAULT_RESERVED_CPU_CORES,
             state_root_fallback: false,
-            parallel_sparse_trie_disabled: true,
             precompile_cache_disabled: false,
             always_process_payload_attributes_on_canonical_head: false,
             allow_unwind_canonical_header: false,
+            storage_worker_count: None,
+            account_worker_count: None,
+            disable_proof_v2: false,
+            cache_metrics_disabled: false,
+            disable_trie_cache: false,
+            sparse_trie_prune_depth: Default::default(),
+            sparse_trie_max_storage_tries: Default::default(),
+            disable_sparse_trie_cache_pruning: false,
+            state_root_task_timeout: None,
+            // deprecated fields
             caching_and_prewarming_enabled: true,
             parallel_sparse_trie_enabled: false,
+            parallel_sparse_trie_disabled: true,
             precompile_cache_enabled: true,
         };
 
@@ -409,7 +429,7 @@ impl RethConfig {
         let mut this = NodeConfig {
             config: None,
             chain,
-            metrics: None,
+            metrics: Default::default(),
             instance,
             datadir,
             network,
@@ -422,6 +442,8 @@ impl RethConfig {
             pruning,
             engine,
             era,
+            static_files: Default::default(),
+            storage: Default::default(),
         };
         if with_unused_ports {
             this = this.with_unused_ports();
@@ -560,11 +582,15 @@ impl RethEnv {
     ) -> eyre::Result<ProviderFactory<TelcoinNode>> {
         // Initialize provider factory with static files
         let datadir = node_config.datadir();
+        let rocksdb_provider = reth_provider::providers::RocksDBProvider::new(datadir.data_dir())?;
+        let runtime = reth_tasks::Runtime::with_existing_handle(tokio::runtime::Handle::current())?;
         let provider_factory = ProviderFactory::new(
             database,
             Arc::clone(&node_config.chain),
             StaticFileProvider::read_write(datadir.static_files())?,
-        );
+            rocksdb_provider,
+            runtime,
+        )?;
 
         // Initialize genesis if needed
         let genesis_hash = init_genesis(&provider_factory)?;
@@ -607,7 +633,7 @@ impl RethEnv {
         &self,
         payload: TNPayload,
         transactions: &Vec<Vec<u8>>,
-    ) -> TnRethResult<ExecutedBlockWithTrieUpdates> {
+    ) -> TnRethResult<ExecutedBlock> {
         let parent_header = payload.parent_header.clone();
         debug!(target: "engine", ?parent_header, "retrieving state for next block");
         let state_provider =
@@ -678,17 +704,17 @@ impl RethEnv {
             builder.finish(&state_provider)?;
 
         debug!(target: "engine", hash=?block.hash(), "block builder outcome");
-        let block_num = block.number();
-        let res: ExecutedBlockWithTrieUpdates<TNPrimitives> = ExecutedBlockWithTrieUpdates::new(
+        let block_execution_output =
+            BlockExecutionOutput { result: execution_result, state: db.take_bundle() };
+        let computed_trie_data = ComputedTrieData {
+            hashed_state: Arc::new(hashed_state.into_sorted()),
+            trie_updates: Arc::new(trie_updates.into_sorted()),
+            anchored_trie_input: None,
+        };
+        let res: ExecutedBlock<TNPrimitives> = ExecutedBlock::new(
             Arc::new(block),
-            Arc::new(ExecutionOutcome::new(
-                db.take_bundle(),
-                vec![execution_result.receipts],
-                block_num,
-                Vec::new(),
-            )),
-            Arc::new(hashed_state),
-            ExecutedTrieUpdates::Present(Arc::new(trie_updates)),
+            Arc::new(block_execution_output),
+            computed_trie_data,
         );
 
         Ok(res)
@@ -731,7 +757,7 @@ impl RethEnv {
     /// It also clears the canonical in-memory state.
     pub fn finish_executing_output(
         &self,
-        blocks: Vec<ExecutedBlockWithTrieUpdates>,
+        blocks: Vec<ExecutedBlock>,
         engine_update: Option<(Round, BlockNumHash, tokio::sync::mpsc::Sender<EngineUpdate>)>,
     ) -> TnRethResult<()> {
         // NOTE: this makes all blocks canonical, commits them to the database,
@@ -749,10 +775,8 @@ impl RethEnv {
 
         // insert blocks to db
         let provider_rw = self.inner.blockchain_provider.database_provider_rw()?;
-        let static_file_provider = self.inner.blockchain_provider.static_file_provider();
-        UnifiedStorageWriter::from(&provider_rw, &static_file_provider)
-            .save_blocks(blocks.clone())?;
-        UnifiedStorageWriter::commit(provider_rw)?;
+        provider_rw.save_blocks(blocks.clone(), reth_provider::SaveBlocksMode::Full)?;
+        provider_rw.commit()?;
 
         // process update
         //
@@ -870,7 +894,7 @@ impl RethEnv {
 
     /// Return the execution header for hash if available.
     pub fn header(&self, hash: B256) -> TnRethResult<Option<ExecHeader>> {
-        Ok(self.inner.blockchain_provider.header(&hash)?)
+        Ok(self.inner.blockchain_provider.header(hash)?)
     }
 
     /// Return the execution header for block number if available.
@@ -883,7 +907,7 @@ impl RethEnv {
         let finalized_block_num_hash =
             self.inner.blockchain_provider.finalized_block_num_hash().unwrap_or_default();
         if let Some(finalized_block_num_hash) = finalized_block_num_hash {
-            Ok(self.inner.blockchain_provider.header(&finalized_block_num_hash.hash)?)
+            Ok(self.inner.blockchain_provider.header(finalized_block_num_hash.hash)?)
         } else {
             Ok(None)
         }
@@ -967,7 +991,8 @@ impl RethEnv {
         )
         .build();
 
-        let mut server = rpc_builder.build(modules_config, eth_api);
+        let engine_events = reth_tokio_util::EventSender::default();
+        let mut server = rpc_builder.build(modules_config, eth_api, engine_events);
         if let Err(e) = server.merge_configured(other) {
             tracing::error!(target: "tn::execution", "Error merging TN rpc module: {e:?}");
         }
@@ -998,6 +1023,8 @@ impl RethEnv {
                 datadir: MaybePlatformPath::from(db_path.as_ref().to_path_buf()),
                 // default static path should resolve to: `DEFAULT_ROOT_DIR/<CHAIN_ID>/static_files`
                 static_files_path: None,
+                rocksdb_path: None,
+                pprof_dumps_path: None,
             },
             chain,
             ..NodeConfig::default()
@@ -1450,7 +1477,7 @@ mod tests {
         reth_env: &RethEnv,
         payload: TNPayload,
         transactions: Vec<Vec<u8>>,
-    ) -> eyre::Result<ExecutedBlockWithTrieUpdates> {
+    ) -> eyre::Result<ExecutedBlock> {
         let block = reth_env.build_block_from_batch_payload(payload, &transactions)?;
         // update chain state - normally handled by tn_engine::payload_builder
         let canonical_header = block.recovered_block.clone_sealed_header();
