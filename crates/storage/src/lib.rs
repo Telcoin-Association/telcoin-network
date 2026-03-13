@@ -11,14 +11,15 @@ pub use stores::*;
 pub use redb::database::ReDB;
 use tables::{
     CertificateDigestByOrigin, CertificateDigestByRound, Certificates, ConsensusHeaderCache,
-    EpochCerts, EpochRecords, EpochRecordsIndex, KadProviderRecords, KadRecords,
-    KadWorkerProviderRecords, KadWorkerRecords, LastProposed, NodeBatchesCache, Payload, Votes,
+    KadProviderRecords, KadRecords, KadWorkerProviderRecords, KadWorkerRecords, LastProposed,
+    NodeBatchesCache, Payload, Votes,
 };
 // Always build redb, we use it as the default for persistant consensus data.
 pub mod archive;
 pub mod composite_db;
 pub mod consensus;
 pub mod consensus_pack;
+pub mod epoch_records;
 pub mod layered_db;
 #[cfg(feature = "reth-libmdbx")]
 pub mod mdbx;
@@ -51,9 +52,7 @@ const CERTIFICATE_DIGEST_BY_ORIGIN_CF: &str = "certificate_digest_by_origin";
 const PAYLOAD_CF: &str = "payload";
 const NODE_BATCHES_CACHE_CF: &str = "node_batches_cache";
 const CONSENSUS_HEADER_CACHE_CF: &str = "consensus_header_cache";
-const EPOCH_RECORDS_CF: &str = "epoch_record_by_number";
-const EPOCH_CERTS_CF: &str = "epoch_cert_by_number";
-const EPOCH_RECORDS_INDEX_CF: &str = "epoch_records_index";
+
 const KAD_RECORD_CF: &str = "kad_record";
 const KAD_PROVIDER_RECORD_CF: &str = "kad_provider_record";
 const KAD_WORKER_RECORD_CF: &str = "kad_worker_record";
@@ -79,7 +78,7 @@ pub mod tables {
     use super::{PayloadToken, ProposerKey};
     use tn_types::{
         AuthorityIdentifier, Batch, BlockHash, Certificate, CertificateDigest, ConsensusHeader,
-        Epoch, EpochCertificate, EpochRecord, Header, Round, TableHint, VoteInfo, WorkerId, B256,
+        Header, Round, TableHint, VoteInfo, WorkerId,
     };
 
     tables!(
@@ -93,10 +92,6 @@ pub mod tables {
         NodeBatchesCache;crate::NODE_BATCHES_CACHE_CF;TableHint::Cache;<BlockHash, Batch>,
         // This is a cache to store ConsensusHeaders during some sync operations, remove once in confirmed consensus output.
         ConsensusHeaderCache;crate::CONSENSUS_HEADER_CACHE_CF;TableHint::Cache;<u64, ConsensusHeader>,
-        // These tables are for the epoch chain not the normal consensus.
-        EpochRecords;crate::EPOCH_RECORDS_CF;TableHint::EpochChain;<Epoch, EpochRecord>,
-        EpochCerts;crate::EPOCH_CERTS_CF;TableHint::EpochChain;<B256, EpochCertificate>,
-        EpochRecordsIndex;crate::EPOCH_RECORDS_INDEX_CF;TableHint::EpochChain;<B256, Epoch>,
         // These are used for network storage and separate from consensus
         KadRecords;crate::KAD_RECORD_CF;TableHint::Kad;<BlockHash, Vec<u8>>,
         KadProviderRecords;crate::KAD_PROVIDER_RECORD_CF;TableHint::Kad;<BlockHash, Vec<u8>>,
@@ -164,10 +159,6 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatab
     db.open_table::<CertificateDigestByRound>().expect("failed to open table!");
     db.open_table::<CertificateDigestByOrigin>().expect("failed to open table!");
     db.open_table::<Payload>().expect("failed to open table!");
-    // Epoch chain tables
-    db.open_table::<EpochRecords>().expect("failed to open table!");
-    db.open_table::<EpochCerts>().expect("failed to open table!");
-    db.open_table::<EpochRecordsIndex>().expect("failed to open table!");
     // Kad tables
     db.open_table::<KadRecords>().expect("failed to open table!");
     db.open_table::<KadProviderRecords>().expect("failed to open table!");

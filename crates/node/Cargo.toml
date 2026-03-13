@@ -44,6 +44,7 @@ tn-engine = { workspace = true, features = ["test-utils"] }
 tn-test-utils = { workspace = true }
 tn-network-types = { workspace = true }
 tempfile = { workspace = true }
+tn-test-utils-committee = { workspace = true }
 
 [lints]
 workspace = true

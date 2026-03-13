@@ -22,7 +22,10 @@ use tokio::sync::{
 };
 use tracing::error;
 
-use crate::consensus_pack::{ConsensusPack, PackError, DATA_NAME};
+use crate::{
+    consensus_pack::{ConsensusPack, PackError, DATA_NAME},
+    epoch_records::{EpochDbError, EpochRecordDb},
+};
 
 pub trait ReadStream: Read + Seek + Send {}
 impl ReadStream for File {}
@@ -275,6 +278,7 @@ pub struct ConsensusChain {
     latest_consensus: LatestConsensus,
     /// Simple cache of recent pack files.
     recent_packs: Arc<Mutex<VecDeque<ConsensusPack>>>,
+    epochs: Arc<EpochRecordDb>,
 }
 
 impl ConsensusChain {
@@ -289,7 +293,8 @@ impl ConsensusChain {
             ConsensusPack::open_append_exists(&base_path, latest_consensus.epoch()).ok(),
         ));
         let recent_packs = Arc::new(Mutex::new(VecDeque::default()));
-        Ok(Self { base_path, current_pack, latest_consensus, recent_packs })
+        let epochs = Arc::new(EpochRecordDb::open_append(&base_path, 0)?);
+        Ok(Self { base_path, current_pack, latest_consensus, recent_packs, epochs })
     }
 
     /// Create a new empty consensus chain with a dummy epoch 0 pack ready.
@@ -336,6 +341,11 @@ impl ConsensusChain {
         pack.persist().await?; // Surface any open errors.
         *self.current_pack.lock() = Some(pack);
         Ok(())
+    }
+
+    /// Provide a reference to the epochs database.
+    pub fn epochs(&self) -> &EpochRecordDb {
+        &self.epochs
     }
 
     /// Populate an epoch pack from a stream.
@@ -614,6 +624,7 @@ pub enum ConsensusChainError {
     EpochMismatch,
     PrevCommitteeEpochMismatch,
     CrcError,
+    EpochDbError(EpochDbError),
 }
 
 impl Error for ConsensusChainError {}
@@ -630,6 +641,7 @@ impl Display for ConsensusChainError {
                 write!(f, "Current committee epoch and previous epoch not in sync")
             }
             ConsensusChainError::CrcError => write!(f, "Crc error"),
+            ConsensusChainError::EpochDbError(e) => write!(f, "Epoch DB Error: {e}"),
         }
     }
 }
@@ -643,6 +655,12 @@ impl From<PackError> for ConsensusChainError {
 impl From<std::io::Error> for ConsensusChainError {
     fn from(value: std::io::Error) -> Self {
         Self::IO(value)
+    }
+}
+
+impl From<EpochDbError> for ConsensusChainError {
+    fn from(value: EpochDbError) -> Self {
+        Self::EpochDbError(value)
     }
 }
 

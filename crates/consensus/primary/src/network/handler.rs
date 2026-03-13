@@ -18,7 +18,7 @@ use std::{
 };
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::GossipMessage;
-use tn_storage::{consensus::ConsensusChain, EpochStore, VoteDigestStore};
+use tn_storage::{consensus::ConsensusChain, VoteDigestStore};
 use tn_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
@@ -143,11 +143,11 @@ where
         }
     }
 
-    fn get_committee(&self, epoch: Epoch) -> Option<BTreeSet<BlsPublicKey>> {
+    async fn get_committee(&self, epoch: Epoch) -> Option<BTreeSet<BlsPublicKey>> {
         if epoch == self.consensus_config.committee().epoch() {
             Some(self.consensus_config.committee().bls_keys())
         } else {
-            self.consensus_config.node_storage().get_committee_keys(epoch)
+            self.consensus_chain.epochs().get_committee_keys(epoch).await
         }
     }
 
@@ -175,7 +175,7 @@ where
                 let epoch = cert.header().epoch;
                 // Early verify so we can detect we are behind.
                 // The verification is cached in the cert so this should not be too expensive.
-                if let Some(committee) = self.get_committee(epoch) {
+                if let Some(committee) = self.get_committee(epoch).await {
                     match cert.verify_cert(&committee) {
                         Ok(()) => {
                             if self.consensus_bus.is_cvv() {
@@ -212,7 +212,7 @@ where
                     // We have already dealt with this hash or we are past this output.
                     return Ok(());
                 }
-                if let Some(committee) = self.get_committee(epoch) {
+                if let Some(committee) = self.get_committee(epoch).await {
                     // If we do not have the committee to verify this message then just ignore for
                     // now. Another one will be along soon and we should be
                     // syncing epochs in the background.
@@ -274,7 +274,7 @@ where
                 );
                 // Verify committee membership if the epoch record is available
                 if let Some((epoch_rec, _)) =
-                    self.consensus_config.node_storage().get_epoch_by_hash(vote.epoch_hash)
+                    self.consensus_chain.epochs().get_epoch_by_hash(vote.epoch_hash).await
                 {
                     ensure!(
                         epoch_rec.committee.contains(&vote.public_key),
@@ -818,14 +818,14 @@ where
         &self,
         epoch: Epoch,
     ) -> PrimaryNetworkResult<(EpochRecord, EpochCertificate)> {
-        match self.consensus_config.node_storage().get_epoch_by_number(epoch) {
+        match self.consensus_chain.epochs().get_epoch_by_number(epoch).await {
             Some((record, Some(cert))) => Ok((record, cert)),
             Some((_record, None)) => {
                 // If we have the record but not the cert then wait a beat for it to show up.
                 for _ in 0..5 {
                     tokio::time::sleep(Duration::from_millis(300)).await;
                     if let Some((record, Some(cert))) =
-                        self.consensus_config.node_storage().get_epoch_by_number(epoch)
+                        self.consensus_chain.epochs().get_epoch_by_number(epoch).await
                     {
                         return Ok((record, cert));
                     }
@@ -841,14 +841,14 @@ where
         &self,
         hash: BlockHash,
     ) -> PrimaryNetworkResult<(EpochRecord, EpochCertificate)> {
-        match self.consensus_config.node_storage().get_epoch_by_hash(hash) {
+        match self.consensus_chain.epochs().get_epoch_by_hash(hash).await {
             Some((record, Some(cert))) => Ok((record, cert)),
             Some((_record, None)) => {
                 // If we have the record but not the cert then wait a beat for it to show up.
                 for _ in 0..5 {
                     tokio::time::sleep(Duration::from_millis(300)).await;
                     if let Some((record, Some(cert))) =
-                        self.consensus_config.node_storage().get_epoch_by_hash(hash)
+                        self.consensus_chain.epochs().get_epoch_by_hash(hash).await
                     {
                         return Ok((record, cert));
                     }

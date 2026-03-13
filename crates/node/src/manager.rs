@@ -41,10 +41,10 @@ use tn_storage::{
     consensus::ConsensusChain,
     open_db,
     tables::{
-        CertificateDigestByOrigin, CertificateDigestByRound, Certificates, EpochRecords,
-        LastProposed, NodeBatchesCache, Payload, Votes,
+        CertificateDigestByOrigin, CertificateDigestByRound, Certificates, LastProposed,
+        NodeBatchesCache, Payload, Votes,
     },
-    DatabaseType, EpochStore as _,
+    DatabaseType,
 };
 use tn_types::{
     gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash, BlockNumHash, BlsPublicKey,
@@ -307,7 +307,7 @@ where
             .subscribe(tn_config::LibP2pConfig::consensus_output_topic())
             .await?;
         state_sync::spawn_epoch_record_collector(
-            self.consensus_db.clone(),
+            self.consensus_chain.clone(),
             primary_network_handle.clone(),
             self.consensus_bus.clone(),
             node_task_manager.get_spawner(),
@@ -316,7 +316,7 @@ where
         .await?;
 
         spawn_epoch_vote_collector(
-            self.consensus_db.clone(),
+            self.consensus_chain.clone(),
             self.consensus_bus.clone(),
             self.key_config.clone(),
             primary_network_handle,
@@ -662,7 +662,8 @@ where
     async fn open_epoch_pack(&mut self, committee: Committee) -> eyre::Result<()> {
         let current_epoch = committee.epoch();
         let previous_epoch = current_epoch.saturating_sub(1);
-        let previous_epoch_rec = self.consensus_db.get::<EpochRecords>(&previous_epoch)?;
+        let previous_epoch_rec =
+            self.consensus_chain.epochs().record_by_epoch(previous_epoch).await;
         let previous_epoch_rec = if let Some(rec) = previous_epoch_rec {
             rec
         } else if previous_epoch == 0 {
@@ -685,7 +686,9 @@ where
             // TODO issue 573, clean this up.
             loop {
                 tokio::time::sleep(Duration::from_millis(200)).await;
-                if let Ok(Some(rec)) = self.consensus_db.get::<EpochRecords>(&previous_epoch) {
+                if let Some(rec) =
+                    self.consensus_chain.epochs().record_by_epoch(previous_epoch).await
+                {
                     break rec;
                 }
                 if tokio::time::Instant::now() >= deadline {
@@ -774,7 +777,7 @@ where
 
         // Produce a "dummy" epoch 0 EpochRecord if missing.
         // This will let us use simple code to find any epoch including 0 at startup.
-        if self.consensus_db.get_committee_keys(0).is_none() {
+        if self.consensus_chain.epochs().get_committee_keys(0).await.is_none() {
             if current_epoch != 0 {
                 return Err(eyre::eyre!(
                     "We have epoch 0 in our database if we are past epoch 0, on {current_epoch}"
@@ -789,7 +792,7 @@ where
                 EpochRecord { epoch: 0, committee, next_committee, ..Default::default() };
             // Save the "dummy" record, should be overwritten once epoch 0 closes.
             // This will NOT be signed.
-            self.consensus_db.save_epoch_record(&epoch_rec);
+            self.consensus_chain.epochs().save_record(epoch_rec).await?;
         }
 
         gas_accumulator.rewards_counter().set_committee(primary.current_committee().await);
@@ -967,12 +970,16 @@ where
             // use Some(_) (this means we have a certificate) instead of _ like in the general case.
             // Without this we never overwrite the dummy epoch 0 record with the proper record and
             // would break sync.
-            if let Some((epoch_rec, Some(_))) = self.consensus_db.get_epoch_by_number(epoch) {
+            if let Some((epoch_rec, Some(_))) =
+                self.consensus_chain.epochs().get_epoch_by_number(epoch).await
+            {
                 // We already have this record...
                 self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec));
                 return Ok(());
             }
-        } else if let Some((epoch_rec, _)) = self.consensus_db.get_epoch_by_number(epoch) {
+        } else if let Some((epoch_rec, _)) =
+            self.consensus_chain.epochs().get_epoch_by_number(epoch).await
+        {
             // We already have this record...
             self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec));
             return Ok(());
@@ -982,7 +989,7 @@ where
         let next_committee_keys = engine.validators_for_epoch(epoch + 1).await?;
         let parent_hash = if epoch == 0 {
             B256::default()
-        } else if let Some(prev) = self.consensus_db.get::<EpochRecords>(&(epoch - 1))? {
+        } else if let Some(prev) = self.consensus_chain.epochs().record_by_epoch(epoch - 1).await {
             if committee_keys != prev.next_committee {
                 error!(
                     target: "epoch-manager",
@@ -1018,7 +1025,7 @@ where
             final_consensus: BlockNumHash::new(last_consensus_header.number, target_hash),
         };
 
-        self.consensus_db.save_epoch_record(&epoch_rec);
+        self.consensus_chain.epochs().save_record(epoch_rec.clone()).await?;
         self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec));
         Ok(())
     }
@@ -1134,7 +1141,7 @@ where
             .await?;
 
         let engine_to_primary =
-            EngineToPrimaryRpc::new(primary.consensus_bus().await, self.consensus_db.clone());
+            EngineToPrimaryRpc::new(primary.consensus_bus().await, self.consensus_chain.clone());
         // only spawns one worker for now
         let worker = self
             .spawn_worker_node_components(
@@ -1273,7 +1280,7 @@ where
         engine: &ExecutionNode,
         epoch_task_spawner: TaskSpawner,
         initial_epoch: bool,
-        engine_to_primary: EngineToPrimaryRpc<DB>,
+        engine_to_primary: EngineToPrimaryRpc,
         gas_accumulator: GasAccumulator,
     ) -> eyre::Result<WorkerNode<DB>> {
         // only support one worker for now (with id 0) - otherwise, loop here

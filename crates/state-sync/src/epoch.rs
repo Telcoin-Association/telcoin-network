@@ -6,10 +6,8 @@ use tn_test_utils as _;
 use std::collections::BTreeSet;
 
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus};
-use tn_storage::{tables::EpochRecords, EpochStore as _};
-use tn_types::{
-    BlsPublicKey, Database as TNDatabase, Epoch, EpochRecord, Noticer, TaskSpawner, B256,
-};
+use tn_storage::consensus::ConsensusChain;
+use tn_types::{BlsPublicKey, Epoch, EpochRecord, Noticer, TaskSpawner, B256};
 use tracing::info;
 
 /// Return true if committee is compatable with epoch_rec_committee.
@@ -42,18 +40,15 @@ fn epoch_committee_valid(epoch_rec: &EpochRecord, committee: &BTreeSet<BlsPublic
 
 /// Asks peers for records from last_epoch to requested_epoch.
 /// Returns the Epoch that was last retrieved.
-async fn collect_epoch_records<DB>(
+async fn collect_epoch_records(
     last_epoch: Epoch,
-    db: &DB,
+    consensus_chain: &ConsensusChain,
     primary_handle: &PrimaryNetworkHandle,
-) -> Epoch
-where
-    DB: TNDatabase,
-{
+) -> Epoch {
     let mut result_epoch = last_epoch;
     for epoch in last_epoch.. {
         // If we already have epoch record AND it's certificate then continue.
-        if let Some((_, Some(_))) = db.get_epoch_by_number(epoch) {
+        if let Some((_, Some(_))) = consensus_chain.epochs().get_epoch_by_number(epoch).await {
             continue;
         }
         // Try to recover by downloading the epoch record and cert from a peer.
@@ -61,10 +56,14 @@ where
             Ok((epoch_rec, cert)) => {
                 let (parent_hash, committee) = if epoch == 0 {
                     // If we can't find the genesis committee something is very wrong.
-                    let committee =
-                        db.get_committee_keys(0).expect("always can retrieve epoch 0 committee");
+                    let committee = consensus_chain
+                        .epochs()
+                        .get_committee_keys(0)
+                        .await
+                        .expect("always can retrieve epoch 0 committee");
                     (B256::default(), committee)
-                } else if let Ok(Some(prev)) = db.get::<EpochRecords>(&(epoch - 1)) {
+                } else if let Some(prev) = consensus_chain.epochs().record_by_epoch(epoch - 1).await
+                {
                     (prev.digest(), prev.next_committee.iter().copied().collect())
                 } else {
                     // We are missing epoch records.
@@ -80,7 +79,9 @@ where
                     && epoch_rec.verify_with_cert(&cert)
                 {
                     let epoch_hash = epoch_rec.digest();
-                    db.save_epoch_record_with_cert(&epoch_rec, &cert);
+                    if let Err(_e) = consensus_chain.epochs().save(epoch_rec, cert).await {
+                        // XXXX
+                    }
                     result_epoch = epoch;
                     info!(
                         target: "epoch-manager",
@@ -106,27 +107,26 @@ where
 /// Spawn a long running task to collect missing epoch records.
 ///
 /// Most likely because a node is syncing.
-pub async fn spawn_epoch_record_collector<DB>(
-    db: DB,
+pub async fn spawn_epoch_record_collector(
+    consensus_chain: ConsensusChain,
     primary_handle: PrimaryNetworkHandle,
     consensus_bus: ConsensusBus,
     node_task_spawner: TaskSpawner,
     node_shutdown: Noticer,
-) -> eyre::Result<()>
-where
-    DB: TNDatabase,
-{
+) -> eyre::Result<()> {
     let mut epoch_rx = consensus_bus.requested_missing_epoch().subscribe();
     node_task_spawner.spawn_critical_task("Epoch Record Collector", async move {
-        let mut last_epoch = if let Some((last_epoch, _)) = db.last_record::<EpochRecords>() {
-            last_epoch
-        } else {
-            0
-        };
+        let mut last_epoch =
+            if let Some(last_epoch) = consensus_chain.epochs().latest_record().await {
+                last_epoch.epoch
+            } else {
+                0
+            };
         loop {
             let requested_epoch = *epoch_rx.borrow();
             if requested_epoch > last_epoch {
-                last_epoch = collect_epoch_records(last_epoch, &db, &primary_handle).await;
+                last_epoch =
+                    collect_epoch_records(last_epoch, &consensus_chain, &primary_handle).await;
                 if last_epoch < requested_epoch {
                     // Small sanity check in case someone sends a malicious large epoch restore to
                     // sanity.
