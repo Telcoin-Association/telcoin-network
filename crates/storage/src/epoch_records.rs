@@ -1,8 +1,8 @@
 //! Database for storing [`EpochRecord`] and [`EpochCertificate`] data.
 //!
 //! Two log files are maintained:
-//! - A records file containing [`EpochRecord`] entries, indexed by epoch number (position
-//!   index) and by digest (hash index).
+//! - A records file containing [`EpochRecord`] entries, indexed by epoch number (position index)
+//!   and by digest (hash index).
 //! - A certs file containing [`EpochCertificate`] entries, indexed by digest only.
 
 use std::{
@@ -32,13 +32,15 @@ use crate::archive::{
 };
 
 enum EpochDbMessage {
+    /// Save a "dummy" epoch 0 [`EpochRecord`] without a certificate.
+    SaveDummy0Record(EpochRecord),
     /// Save an [`EpochRecord`] without a certificate.
-    SaveRecord(EpochRecord, oneshot::Sender<Result<(), EpochDbError>>),
+    SaveRecord(EpochRecord),
     /// Save an [`EpochRecord`] and its corresponding [`EpochCertificate`].
     /// If the record is already stored, only the certificate is saved.
-    Save(EpochRecord, EpochCertificate, oneshot::Sender<Result<(), EpochDbError>>),
+    Save(EpochRecord, EpochCertificate),
     /// Save an [`EpochCertificate`] keyed by its record digest.
-    SaveCertificate(B256, EpochCertificate, oneshot::Sender<Result<(), EpochDbError>>),
+    SaveCertificate(B256, EpochCertificate),
     /// Retrieve an [`EpochRecord`] by epoch number.
     RecordByEpoch(Epoch, oneshot::Sender<Option<EpochRecord>>),
     /// Retrieve an [`EpochRecord`] by its digest.
@@ -81,14 +83,25 @@ fn run_db_loop(
 ) {
     while let Some(msg) = rx.blocking_recv() {
         match msg {
-            EpochDbMessage::SaveRecord(record, tx) => {
-                let _ = tx.send(inner.save_record(record));
+            EpochDbMessage::SaveDummy0Record(record) => {
+                if let Err(e) = inner.save_dummy_epoch0(record) {
+                    tx_error.send_replace(Some(e));
+                }
             }
-            EpochDbMessage::Save(record, cert, tx) => {
-                let _ = tx.send(inner.save(record, cert));
+            EpochDbMessage::SaveRecord(record) => {
+                if let Err(e) = inner.save_record(record) {
+                    tx_error.send_replace(Some(e));
+                }
             }
-            EpochDbMessage::SaveCertificate(digest, cert, tx) => {
-                let _ = tx.send(inner.save_certificate(digest, cert));
+            EpochDbMessage::Save(record, cert) => {
+                if let Err(e) = inner.save(record, cert) {
+                    tx_error.send_replace(Some(e));
+                }
+            }
+            EpochDbMessage::SaveCertificate(digest, cert) => {
+                if let Err(e) = inner.save_certificate(digest, cert) {
+                    tx_error.send_replace(Some(e));
+                }
             }
             EpochDbMessage::RecordByEpoch(epoch, tx) => {
                 let _ = tx.send(inner.record_by_epoch(epoch));
@@ -115,9 +128,6 @@ fn run_db_loop(
                 let _ = inner.persist();
                 break;
             }
-        }
-        if let Err(e) = inner.persist() {
-            tx_error.send_replace(Some(e));
         }
     }
 }
@@ -183,14 +193,24 @@ impl EpochRecordDb {
 
     /// Save an [`EpochRecord`] without a certificate.
     /// Returns `Ok(())` idempotently if the record is already stored.
-    pub async fn save_record(&self, record: EpochRecord) -> Result<(), EpochDbError> {
+    pub async fn save_dummy_epoch0(&self, record: EpochRecord) -> Result<(), EpochDbError> {
         self.get_error()?;
-        let (tx, rx) = oneshot::channel();
         self.tx
-            .send(EpochDbMessage::SaveRecord(record, tx))
+            .send(EpochDbMessage::SaveDummy0Record(record))
             .await
             .map_err(|_| EpochDbError::SendFailed)?;
-        rx.await.map_err(|_| EpochDbError::ReceiveFailed)?
+        Ok(())
+    }
+
+    /// Save an [`EpochRecord`] without a certificate.
+    /// Returns `Ok(())` idempotently if the record is already stored.
+    pub async fn save_record(&self, record: EpochRecord) -> Result<(), EpochDbError> {
+        self.get_error()?;
+        self.tx
+            .send(EpochDbMessage::SaveRecord(record))
+            .await
+            .map_err(|_| EpochDbError::SendFailed)?;
+        Ok(())
     }
 
     /// Save an [`EpochRecord`] and its [`EpochCertificate`] to the database.
@@ -201,12 +221,11 @@ impl EpochRecordDb {
         cert: EpochCertificate,
     ) -> Result<(), EpochDbError> {
         self.get_error()?;
-        let (tx, rx) = oneshot::channel();
         self.tx
-            .send(EpochDbMessage::Save(record, cert, tx))
+            .send(EpochDbMessage::Save(record, cert))
             .await
             .map_err(|_| EpochDbError::SendFailed)?;
-        rx.await.map_err(|_| EpochDbError::ReceiveFailed)?
+        Ok(())
     }
 
     /// Save an [`EpochCertificate`] keyed by `digest` (the corresponding [`EpochRecord`]'s digest).
@@ -217,12 +236,11 @@ impl EpochRecordDb {
         cert: EpochCertificate,
     ) -> Result<(), EpochDbError> {
         self.get_error()?;
-        let (tx, rx) = oneshot::channel();
         self.tx
-            .send(EpochDbMessage::SaveCertificate(digest, cert, tx))
+            .send(EpochDbMessage::SaveCertificate(digest, cert))
             .await
             .map_err(|_| EpochDbError::SendFailed)?;
-        rx.await.map_err(|_| EpochDbError::ReceiveFailed)?
+        Ok(())
     }
 
     /// Retrieve an [`EpochRecord`] by epoch number.
@@ -352,6 +370,8 @@ struct Inner {
     cert_digests: HdxIndex,
     /// The first epoch stored in this database.
     start_epoch: Epoch,
+    /// Store a dummy record for epoch 0 to allow chain to start.
+    dummy_epoch0: Option<EpochRecord>,
 }
 
 impl Inner {
@@ -509,7 +529,15 @@ impl Inner {
             start_epoch
         };
 
-        Ok(Self { records, certs, epoch_idx, record_digests, cert_digests, start_epoch })
+        Ok(Self {
+            records,
+            certs,
+            epoch_idx,
+            record_digests,
+            cert_digests,
+            start_epoch,
+            dummy_epoch0: None,
+        })
     }
 
     fn open_static<P: AsRef<Path>>(path: P, start_epoch: Epoch) -> Result<Self, EpochDbError> {
@@ -560,7 +588,27 @@ impl Inner {
             start_epoch
         };
 
-        Ok(Self { records, certs, epoch_idx, record_digests, cert_digests, start_epoch })
+        Ok(Self {
+            records,
+            certs,
+            epoch_idx,
+            record_digests,
+            cert_digests,
+            start_epoch,
+            dummy_epoch0: None,
+        })
+    }
+
+    /// Save an [`EpochRecord`] without a certificate.
+    /// Returns `Ok(())` idempotently if the record is already stored.
+    /// This saves a tempary epoch 0 zero record to allow the chain to start.
+    fn save_dummy_epoch0(&mut self, record: EpochRecord) -> Result<(), EpochDbError> {
+        if record.epoch == 0 {
+            self.dummy_epoch0 = Some(record);
+            Ok(())
+        } else {
+            Err(EpochDbError::EpochOutOfOrder(record.epoch, 0))
+        }
     }
 
     /// Save an [`EpochRecord`] without a certificate.
@@ -635,8 +683,12 @@ impl Inner {
         if epoch < self.start_epoch {
             return None;
         }
-        let pos = self.epoch_idx.load((epoch - self.start_epoch) as u64).ok()?;
-        self.records.fetch(pos).ok()
+        if epoch == 0 && self.epoch_idx.is_empty() {
+            self.dummy_epoch0.clone()
+        } else {
+            let pos = self.epoch_idx.load((epoch - self.start_epoch) as u64).ok()?;
+            self.records.fetch(pos).ok()
+        }
     }
 
     fn record_by_digest(&mut self, digest: B256) -> Option<EpochRecord> {
@@ -653,7 +705,11 @@ impl Inner {
         if epoch < self.start_epoch {
             return false;
         }
-        ((epoch - self.start_epoch) as u64) < self.epoch_idx.len() as u64
+        if epoch == 0 && self.epoch_idx.is_empty() {
+            self.dummy_epoch0.is_some()
+        } else {
+            ((epoch - self.start_epoch) as u64) < self.epoch_idx.len() as u64
+        }
     }
 
     fn contains_record_digest(&mut self, digest: B256) -> bool {
@@ -668,8 +724,12 @@ impl Inner {
         if self.epoch_idx.is_empty() {
             return None;
         }
-        let latest_epoch = self.start_epoch + self.epoch_idx.len() as Epoch - 1;
-        self.record_by_epoch(latest_epoch)
+        if self.epoch_idx.is_empty() {
+            self.dummy_epoch0.clone()
+        } else {
+            let latest_epoch = self.start_epoch + self.epoch_idx.len() as Epoch - 1;
+            self.record_by_epoch(latest_epoch)
+        }
     }
 
     fn persist(&mut self) -> Result<(), EpochDbError> {
@@ -741,7 +801,11 @@ impl From<io::Error> for EpochDbError {
 
 #[cfg(test)]
 mod test {
-    use std::{fs::OpenOptions, io::Seek as _, io::SeekFrom, sync::Arc};
+    use std::{
+        fs::OpenOptions,
+        io::{Seek as _, SeekFrom},
+        sync::Arc,
+    };
 
     use rand::{rngs::StdRng, SeedableRng as _};
     use roaring::RoaringBitmap;

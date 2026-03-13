@@ -488,6 +488,7 @@ impl ConsensusChain {
 
     /// Resolve when the current epoch is fully persisted to storage.
     pub async fn persist_current(&self) -> Result<(), ConsensusChainError> {
+        self.epochs.persist().await?;
         if let Some(pack) = &self.current_pack() {
             pack.persist().await?;
         }

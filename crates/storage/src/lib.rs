@@ -199,10 +199,6 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatab
     db.open_table::<CertificateDigestByRound>().expect("failed to open table!");
     db.open_table::<CertificateDigestByOrigin>().expect("failed to open table!");
     db.open_table::<Payload>().expect("failed to open table!");
-    // Epoch chain tables
-    db.open_table::<EpochRecords>().expect("failed to open table!");
-    db.open_table::<EpochCerts>().expect("failed to open table!");
-    db.open_table::<EpochRecordsIndex>().expect("failed to open table!");
     // Kad tables
     db.open_table::<KadRecords>().expect("failed to open table!");
     db.open_table::<KadProviderRecords>().expect("failed to open table!");

@@ -165,13 +165,27 @@ async fn manage_epoch_votes(
                                 target: "epoch-manager",
                                 "Over wrote expected epoch record {epoch_hash} with verified epoch record {new_epoch_hash}",
                             );
-                            let _ = db.save(new_epoch_rec, cert).await;
+                            let new_epoch = new_epoch_rec.epoch;
+                            if let Err(e) = db.save(new_epoch_rec, cert).await {
+                                error!(
+                                    target: "epoch-manager",
+                                    ?e,
+                                    "failed to save epoch (different hash) record/cert after retrieval for epoch {new_epoch}",
+                                );
+                            }
                         } else {
                             info!(
                                 target: "epoch-manager",
                                 "retrieved cert for epoch {}/{new_epoch_hash} from a peer", epoch_rec.epoch
                             );
-                            let _ = db.save(new_epoch_rec, cert).await;
+                            let new_epoch = new_epoch_rec.epoch;
+                            if let Err(e) = db.save(new_epoch_rec, cert).await {
+                                error!(
+                                    target: "epoch-manager",
+                                    ?e,
+                                    "failed to save epoch record/cert after retrieval for epoch {new_epoch}",
+                                );
+                            }
                         }
                         got_epoch_record = true;
                         break;

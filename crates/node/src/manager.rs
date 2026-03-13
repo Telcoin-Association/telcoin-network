@@ -777,7 +777,7 @@ where
 
         // Produce a "dummy" epoch 0 EpochRecord if missing.
         // This will let us use simple code to find any epoch including 0 at startup.
-        if self.consensus_chain.epochs().get_committee_keys(0).await.is_none() {
+        if !self.consensus_chain.epochs().contains_epoch(0).await {
             if current_epoch != 0 {
                 return Err(eyre::eyre!(
                     "We have epoch 0 in our database if we are past epoch 0, on {current_epoch}"
@@ -792,7 +792,7 @@ where
                 EpochRecord { epoch: 0, committee, next_committee, ..Default::default() };
             // Save the "dummy" record, should be overwritten once epoch 0 closes.
             // This will NOT be signed.
-            self.consensus_chain.epochs().save_record(epoch_rec).await?;
+            self.consensus_chain.epochs().save_dummy_epoch0(epoch_rec).await?;
         }
 
         gas_accumulator.rewards_counter().set_committee(primary.current_committee().await);

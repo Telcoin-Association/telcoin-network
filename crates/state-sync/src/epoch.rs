@@ -8,7 +8,7 @@ use std::{collections::BTreeSet, time::Duration};
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus};
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{BlsPublicKey, Epoch, EpochRecord, Noticer, TaskSpawner, B256};
-use tracing::info;
+use tracing::{error, info};
 
 /// How long to wait before retrying a failed epoch record collection.
 const EPOCH_COLLECT_RETRY_SECS: u64 = 5;
@@ -51,7 +51,7 @@ async fn collect_epoch_records(
     let mut result_epoch = last_epoch;
     for epoch in last_epoch.. {
         // If we already have epoch record AND it's certificate then continue.
-        if let Some((_, Some(_))) = consensus_chain.epochs().get_epoch_by_number(epoch).await {
+        if consensus_chain.epochs().contains_epoch(epoch).await {
             continue;
         }
         // Try to recover by downloading the epoch record and cert from a peer.
@@ -77,19 +77,33 @@ async fn collect_epoch_records(
                 };
                 // Verify the epoch has the expected parent and committee and is signed by
                 // that committee.
-                if parent_hash == epoch_rec.parent_hash
-                    && epoch_committee_valid(&epoch_rec, &committee)
-                    && epoch_rec.verify_with_cert(&cert)
-                {
+                let parents_match = parent_hash == epoch_rec.parent_hash;
+                let epoch_committee_valid = epoch_committee_valid(&epoch_rec, &committee);
+                let epoch_valid = epoch_rec.verify_with_cert(&cert);
+                if parents_match && epoch_committee_valid && epoch_valid {
                     let epoch_hash = epoch_rec.digest();
-                    if let Err(_e) = consensus_chain.epochs().save(epoch_rec, cert).await {
-                        // XXXX
+                    if let Err(e) = consensus_chain.epochs().save(epoch_rec, cert).await {
+                        error!(
+                            target: "epoch-manager",
+                            ?e,
+                            "failed to save epoch record/cert for epoch {epoch}",
+                        );
+                        return epoch - 1;
                     }
                     result_epoch = epoch;
                     info!(
                         target: "epoch-manager",
                         "retrieved cert for epoch {epoch}: {epoch_hash} from a peer",
                     );
+                } else {
+                    error!(
+                        target: "epoch-manager",
+                        ?parents_match,
+                        ?epoch_committee_valid,
+                        ?epoch_valid,
+                        "got an invalid epoch record, epoch {epoch}",
+                    );
+                    return epoch - 1;
                 }
             }
             Err(err) => {
