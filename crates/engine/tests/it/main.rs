@@ -6,7 +6,7 @@
 
 use assert_matches::assert_matches;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -28,8 +28,9 @@ use tn_test_utils::default_test_execution_node;
 use tn_types::{
     gas_accumulator::GasAccumulator, max_batch_gas, now, test_chain_spec_arc, test_genesis,
     Address, Batch, BlockHash, Bloom, Bytes, Certificate, CertifiedBatch, CommittedSubDag,
-    ConsensusOutput, Encodable2718, Hash as _, Notifier, ReputationScores, SealedBlock,
-    TaskManager, TransactionTrait as _, B256, EMPTY_WITHDRAWALS, MIN_PROTOCOL_BASE_FEE, U256,
+    ConsensusOutput, Encodable2718, GenesisAccount, Hash as _, Notifier, ReputationScores,
+    SealedBlock, TaskManager, TransactionTrait as _, B256, EMPTY_WITHDRAWALS,
+    MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tokio::{sync::oneshot, time::timeout};
 use tracing::debug;
@@ -2026,6 +2027,204 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
         };
         assert_eq!(block.withdrawals_root, Some(expected_withdrawals));
     }
+
+    Ok(())
+}
+
+/// Test that gas refunds (e.g. from SSTORE clearing) do not inflate the
+/// gas-limit penalty.
+///
+/// The contract at `contract_addr` has bytecode `0x600060005500` which
+/// stores 0 at slot 0. Genesis pre-loads slot 0 = 1, so calling the
+/// contract triggers an SSTORE refund (4,800 gas per EIP-3529).
+///
+/// The penalty should be based on pre-refund gas (`gas.spent()`), not
+/// post-refund gas (`gas.spent_sub_refunded()`). If the implementation
+/// mistakenly uses post-refund gas, the penalty will be larger and the
+/// governance safe balance will be higher than expected.
+#[tokio::test]
+async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
+    let tmp_dir = TempDir::new().expect("temp dir");
+    const TX_GAS_LIMIT: u64 = 500_000;
+    const PRIORITY_FEE: u64 = 10;
+
+    // EIP-3529 SSTORE refund: clearing a non-zero slot refunds 4,800 gas
+    const SSTORE_REFUND: u64 = 4_800;
+
+    // deploy a contract that clears storage slot 0
+    // bytecode: PUSH1 0x00, PUSH1 0x00, SSTORE
+    let contract_addr = Address::random();
+    let contract_bytecode = Bytes::from(vec![0x60, 0x00, 0x60, 0x00, 0x55]);
+    let mut contract_storage = BTreeMap::new();
+    contract_storage.insert(B256::ZERO, B256::with_last_byte(1));
+    let contract_account = GenesisAccount {
+        balance: U256::ZERO,
+        code: Some(contract_bytecode),
+        storage: Some(contract_storage),
+        ..Default::default()
+    };
+
+    // create genesis and seed the contract
+    let mut genesis = test_genesis();
+    genesis = genesis.extend_accounts(vec![(contract_addr, contract_account)]);
+
+    // create the transaction that calls the contract
+    let mut tx_factory = TransactionFactory::new_random();
+    let encoded_tx = tx_factory
+        .create_explicit_eip1559(
+            Some(genesis.config.chain_id),
+            None,
+            Some(PRIORITY_FEE as u128),
+            Some(MAX_FEE_PER_GAS as u128),
+            Some(TX_GAS_LIMIT),
+            Some(contract_addr),
+            Some(U256::ZERO),
+            None,
+            None,
+        )
+        .encoded_2718();
+
+    let mut batch = Batch {
+        transactions: vec![encoded_tx],
+        epoch: 0,
+        beneficiary: Address::ZERO, // updated later
+        base_fee_per_gas: MIN_PROTOCOL_BASE_FEE,
+        worker_id: 0,
+        received_at: None,
+    };
+
+    let all_batches = vec![batch.clone()];
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, all_batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution node
+    let gas_accumulator = GasAccumulator::new(1);
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &tmp_dir.path().join("exc-node"),
+        Some(gas_accumulator.rewards_counter()),
+    )?;
+
+    // create committee
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let authority_1 =
+        committee.authorities().first().expect("first in 4 auth committee for tests").id();
+    let batch_producer =
+        committee.authorities().get(2).expect("authority in committee").execution_address();
+
+    // set batch producer and execute
+    batch.beneficiary = batch_producer;
+    batch.base_fee_per_gas = MIN_PROTOCOL_BASE_FEE;
+    execute_test_batch(&mut batch);
+
+    // consensus output
+    let timestamp = now();
+    let mut leader = Certificate::default();
+    leader.update_created_at_for_test(timestamp);
+    leader.header_mut_for_test().author = authority_1;
+    let sub_dag_index = 1;
+    leader.header.round = sub_dag_index as u32;
+    let reputation_scores = ReputationScores::default();
+    let previous_sub_dag = None;
+    let batch_digest = batch.digest();
+    let batch_digests = VecDeque::from([batch_digest]);
+    let subdag = Arc::new(CommittedSubDag::new(
+        vec![leader.clone(), Certificate::default()],
+        leader,
+        sub_dag_index,
+        reputation_scores,
+        previous_sub_dag,
+    ));
+    let consensus_output = ConsensusOutput::new(
+        subdag.clone(),
+        BlockHash::default(),
+        0,
+        false,
+        batch_digests.clone(),
+        vec![CertifiedBatch { address: batch_producer, batches: vec![batch] }],
+    );
+
+    // execution
+    let rewards_counter = gas_accumulator.rewards_counter();
+    rewards_counter.set_committee(committee.clone());
+
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
+    let max_round = None;
+    let parent = chain.sealed_genesis_header();
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let reth_env = execution_node.get_reth_env().await;
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        max_round,
+        from_consensus,
+        parent,
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator.clone(),
+        engine_update_tx,
+    );
+
+    let broadcast_result = to_engine.send(consensus_output.clone()).await;
+    assert!(broadcast_result.is_ok());
+    drop(to_engine);
+
+    let (tx, rx) = oneshot::channel();
+    task_manager.spawn_task("test task eng", async move {
+        let res = engine.await;
+        let _ = tx.send(res);
+    });
+
+    let engine_task = timeout(Duration::from_secs(5), rx).await??;
+    assert_matches!(engine_task, Err(TnEngineError::ConsensusOutputStreamClosed));
+
+    // verify the block executed
+    let executed_blocks = reth_env.block_with_senders_range(1..=1)?;
+    assert_eq!(1, executed_blocks.len());
+    let block = &executed_blocks[0];
+
+    // gas_used in the block receipt is post-refund
+    let block_gas_used = block.gas_used;
+    // pre-refund gas = post-refund gas + SSTORE refund
+    let gas_spent = block_gas_used + SSTORE_REFUND;
+
+    debug!(target: "engine", ?block_gas_used, ?gas_spent, "block gas accounting");
+
+    // the penalty must be computed from pre-refund gas (gas_spent)
+    let penalty_gas = calculate_gas_penalty(TX_GAS_LIMIT, gas_spent);
+    assert!(penalty_gas > 0, "test requires a non-zero penalty");
+
+    // expected governance revenue = basefee * gas_used + penalty * effective_gas_price
+    let basefee = MIN_PROTOCOL_BASE_FEE;
+    let effective_gas_price =
+        std::cmp::min(MAX_FEE_PER_GAS, basefee.saturating_add(PRIORITY_FEE));
+    let expected_basefees = U256::from(basefee as u128 * block_gas_used as u128);
+    let expected_penalty = U256::from(penalty_gas as u128 * effective_gas_price as u128);
+    let expected_governance_revenue = expected_basefees + expected_penalty;
+
+    // check governance safe balance
+    let governance_safe_genesis_balance = chain
+        .genesis()
+        .alloc
+        .get(&GOVERNANCE_SAFE_ADDRESS)
+        .map(|acct| acct.balance)
+        .unwrap_or(U256::MAX);
+    let governance_safe = reth_env
+        .retrieve_account(&GOVERNANCE_SAFE_ADDRESS)?
+        .map(|acct| acct.balance)
+        .expect("governance safe has an account");
+    let actual_governance_revenue = governance_safe
+        .checked_sub(governance_safe_genesis_balance)
+        .expect("governance safe balance doesn't underflow");
+
+    assert_eq!(
+        expected_governance_revenue, actual_governance_revenue,
+        "governance revenue mismatch — penalty may be using post-refund gas instead of pre-refund gas"
+    );
 
     Ok(())
 }

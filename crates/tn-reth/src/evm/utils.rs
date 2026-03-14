@@ -1,19 +1,18 @@
 //! Utility functions used by EVM.
 
-use std::sync::LazyLock;
 use tracing::debug;
 
 /// Minimum gas limit threshold (10x minimum transaction cost)
 const MIN_GAS_LIMIT_THRESHOLD: u64 = 210_000;
 /// Precision for calculating usage ratio with 10^18.
 // 10^9 precision (1 billion) - sufficient for 0.001% granularity
-static PRECISION: LazyLock<u128> = LazyLock::new(|| 10_u128.pow(9));
+const PRECISION: u128 = 10_u128.pow(9);
 /// Usage ratio threshold below which penalties apply (used to calc 10%)
 // 10% threshold = 10^8 with 10^9 precision
-static THRESHOLD: LazyLock<u128> = LazyLock::new(|| 10_u128.pow(8));
+const THRESHOLD: u128 = 10_u128.pow(8);
 /// THRESHOLD squared
 // 10^16 for the denominator
-static THRESHOLD_SQUARED: LazyLock<u128> = LazyLock::new(|| 10_u128.pow(16));
+const THRESHOLD_SQUARED: u128 = 10_u128.pow(16);
 
 /// Calculate the gas penalty for inefficient gas limit estimation.
 ///
@@ -54,22 +53,22 @@ pub fn calculate_gas_penalty(gas_limit: u64, gas_used: u64) -> u64 {
     let gas_used_u128 = gas_used as u128;
 
     // calculate usage ratio with 10^9 precision
-    let usage_ratio_scaled = *PRECISION * gas_used_u128 / gas_limit_u128;
+    let usage_ratio_scaled = PRECISION * gas_used_u128 / gas_limit_u128;
 
     // no penalty if usage is above threshold
-    if usage_ratio_scaled >= *THRESHOLD {
-        debug!(target: "engine", ?gas_limit, ?gas_used, ?usage_ratio_scaled, threshold=?*THRESHOLD, "usage within acceptable range");
+    if usage_ratio_scaled >= THRESHOLD {
+        debug!(target: "engine", ?gas_limit, ?gas_used, ?usage_ratio_scaled, threshold=?THRESHOLD, "usage within acceptable range");
         return 0;
     }
 
     // calculate inefficiency (how far below 10% we are)
     let unused_gas = gas_limit_u128 - gas_used_u128;
-    let inefficiency_scaled = *THRESHOLD - usage_ratio_scaled;
+    let inefficiency_scaled = THRESHOLD - usage_ratio_scaled;
     // square values then calculate penalty
     let inefficiency_squared = inefficiency_scaled.pow(2);
 
     // this is safe: max value is ~6×10^23, well below u128 max
-    let penalty = (inefficiency_squared * unused_gas) / *THRESHOLD_SQUARED;
+    let penalty = (inefficiency_squared * unused_gas) / THRESHOLD_SQUARED;
     debug!(
         target: "engine",
         ?gas_limit,
