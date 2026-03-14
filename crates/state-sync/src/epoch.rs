@@ -51,7 +51,7 @@ async fn collect_epoch_records(
     let mut result_epoch = last_epoch;
     for epoch in last_epoch.. {
         // If we already have epoch record AND it's certificate then continue.
-        if consensus_chain.epochs().contains_epoch(epoch).await {
+        if let Some((_, Some(_))) = consensus_chain.epochs().get_epoch_by_number(epoch).await {
             continue;
         }
         // Try to recover by downloading the epoch record and cert from a peer.
@@ -147,7 +147,7 @@ pub async fn spawn_epoch_record_collector(
                 0
             };
         loop {
-            let requested_epoch = *epoch_rx.borrow();
+            let requested_epoch = *epoch_rx.borrow_and_update();
             if requested_epoch > last_epoch {
                 last_epoch =
                     collect_epoch_records(last_epoch, &consensus_chain, &primary_handle).await;

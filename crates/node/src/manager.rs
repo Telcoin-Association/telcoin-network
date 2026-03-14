@@ -659,7 +659,11 @@ where
     }
 
     /// Open/re-use if open the epoch pack files for the current epoch.
-    async fn open_epoch_pack(&mut self, committee: Committee) -> eyre::Result<()> {
+    async fn open_epoch_pack(
+        &mut self,
+        committee: Committee,
+        task_spawner: TaskSpawner,
+    ) -> eyre::Result<()> {
         let current_epoch = committee.epoch();
         let previous_epoch = current_epoch.saturating_sub(1);
         let previous_epoch_rec =
@@ -682,6 +686,26 @@ where
             // from peers. Trigger the collector and wait up to 30 seconds for the record.
             self.consensus_bus.requested_missing_epoch().send_replace(previous_epoch);
             warn!(target: "epoch-manager", previous_epoch, current_epoch, "missing previous epoch record, waiting for epoch record collector");
+
+            // Pre-dial committee peers before blocking so the epoch record collector can connect.
+            // Without this we deadlock: open_epoch_pack blocks here waiting for the record, but
+            // peer connections are only established in spawn_primary_network_for_epoch which runs
+            // after open_epoch_pack returns.
+            let primary_network_handle =
+                self.primary_network_handle.as_ref().expect("primary network");
+            if primary_network_handle.connected_peers_count().await.unwrap_or_default() == 0 {
+                let committee_keys: HashSet<BlsPublicKey> =
+                    committee.bls_keys().into_iter().collect();
+                let _ = primary_network_handle.inner_handle().new_epoch(committee_keys).await;
+                for bls_key in committee.bls_keys() {
+                    self.dial_peer_bls(
+                        primary_network_handle.inner_handle().clone(),
+                        bls_key,
+                        task_spawner.clone(),
+                    );
+                }
+            }
+
             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
             // TODO issue 573, clean this up.
             loop {
@@ -720,7 +744,13 @@ where
             self.get_committee_with_epoch_start_info(engine).await?;
         self.epoch_boundary = epoch_start + epoch_info.epochDuration as u64;
 
-        self.open_epoch_pack(committee.clone()).await?;
+        // The task manager that resets every epoch and manages
+        // short-running tasks for the lifetime of the epoch.
+        let mut epoch_task_manager = TaskManager::new(EPOCH_TASK_MANAGER);
+        // Do not wait long for tasks to exit, just drop them and move on to next epoch.
+        epoch_task_manager.set_join_wait(200);
+
+        self.open_epoch_pack(committee.clone(), epoch_task_manager.get_spawner()).await?;
         if epoch_mode.replay_consensus() {
             // If we are starting up then make sure that any consensus we previously validated goes
             // to the engine and is executed.  Otherwise we could miss consensus execution.
@@ -747,12 +777,6 @@ where
         }
 
         let node_ended = self.node_shutdown.subscribe();
-
-        // The task manager that resets every epoch and manages
-        // short-running tasks for the lifetime of the epoch.
-        let mut epoch_task_manager = TaskManager::new(EPOCH_TASK_MANAGER);
-        // Do not wait long for tasks to exit, just drop them and move on to next epoch.
-        epoch_task_manager.set_join_wait(200);
 
         // subscribe to output early to prevent missed messages
         let mut consensus_output = self.consensus_bus.subscribe_consensus_output();
