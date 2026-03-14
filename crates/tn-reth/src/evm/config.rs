@@ -132,7 +132,7 @@ impl ConfigureEvm for TnEvmConfig {
             number: U256::from(parent.number + 1),
             beneficiary: payload.beneficiary,
             timestamp: U256::from(payload.timestamp),
-            difficulty: U256::from(payload.batch_index),
+            difficulty: U256::from(payload.batch_index), // stored in final execution
             prevrandao: Some(payload.prev_randao()),
             gas_limit: payload.gas_limit,
             basefee: payload.base_fee_per_gas,

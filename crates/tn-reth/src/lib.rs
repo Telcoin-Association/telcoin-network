@@ -41,7 +41,8 @@ use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 use reth::{
     args::{
         DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, DiscoveryArgs, EngineArgs, EraArgs,
-        EraSourceArgs, NetworkArgs, PayloadBuilderArgs, PruningArgs, TxPoolArgs,
+        EraSourceArgs, MetricArgs, NetworkArgs, PayloadBuilderArgs, PruningArgs, StaticFilesArgs,
+        StorageArgs, TxPoolArgs,
     },
     builder::NodeConfig,
     network::transactions::{config::TransactionPropagationKind, TransactionPropagationMode},
@@ -423,13 +424,33 @@ impl RethConfig {
             precompile_cache_enabled: true,
         };
 
+        // metrics args
+        let metrics = MetricArgs {
+            prometheus: None,
+            push_gateway_url: None,
+            push_gateway_interval: Duration::from_mins(5), // reth default
+        };
+
+        // static files
+        let static_files = StaticFilesArgs {
+            blocks_per_file_headers: None,
+            blocks_per_file_transactions: None,
+            blocks_per_file_receipts: None,
+            blocks_per_file_transaction_senders: None,
+            blocks_per_file_account_change_sets: None,
+            blocks_per_file_storage_change_sets: None,
+        };
+
+        // storage
+        let storage = StorageArgs { v2: false };
+
         // Parameters to configure block history syncing.
         let era = EraArgs { enabled: false, source: EraSourceArgs { path: None, url: None } };
 
         let mut this = NodeConfig {
             config: None,
             chain,
-            metrics: Default::default(),
+            metrics,
             instance,
             datadir,
             network,
@@ -442,8 +463,8 @@ impl RethConfig {
             pruning,
             engine,
             era,
-            static_files: Default::default(),
-            storage: Default::default(),
+            static_files,
+            storage,
         };
         if with_unused_ports {
             this = this.with_unused_ports();
