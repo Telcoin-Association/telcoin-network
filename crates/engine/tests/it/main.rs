@@ -2200,8 +2200,7 @@ async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
 
     // expected governance revenue = basefee * gas_used + penalty * effective_gas_price
     let basefee = MIN_PROTOCOL_BASE_FEE;
-    let effective_gas_price =
-        std::cmp::min(MAX_FEE_PER_GAS, basefee.saturating_add(PRIORITY_FEE));
+    let effective_gas_price = std::cmp::min(MAX_FEE_PER_GAS, basefee.saturating_add(PRIORITY_FEE));
     let expected_basefees = U256::from(basefee as u128 * block_gas_used as u128);
     let expected_penalty = U256::from(penalty_gas as u128 * effective_gas_price as u128);
     let expected_governance_revenue = expected_basefees + expected_penalty;
