@@ -1,9 +1,11 @@
 //! The payload that contains all data from consensus to be executed.
 
 use crate::RethEnv;
-use serde::{Deserialize, Serialize};
 use reth_rpc_eth_api::helpers::pending_block::BuildPendingEnv;
-use tn_types::{Address, ConsensusOutput, ExecHeader, SealedHeader, WorkerId, B256, MIN_PROTOCOL_BASE_FEE};
+use serde::{Deserialize, Serialize};
+use tn_types::{
+    Address, ConsensusOutput, ExecHeader, SealedHeader, WorkerId, B256, MIN_PROTOCOL_BASE_FEE,
+};
 
 /// The type for building blocks that extend the canonical tip.
 #[derive(Debug)]
