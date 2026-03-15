@@ -110,6 +110,7 @@ reth-evm = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-execution-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-revm = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-rpc = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-rpc-eth-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-rpc-eth-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-provider = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }

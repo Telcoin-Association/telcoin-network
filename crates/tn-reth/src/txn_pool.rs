@@ -7,7 +7,6 @@ use reth::transaction_pool::{
     TransactionValidationTaskExecutor,
 };
 use reth_chainspec::ChainSpec;
-use reth_evm_ethereum::EthEvmConfig;
 use reth_node_builder::{NodeConfig, RethTransactionPoolConfig};
 use reth_primitives_traits::SignerRecoverable;
 use reth_provider::{
@@ -29,7 +28,7 @@ use tn_types::{
 };
 use tracing::{debug, info, trace};
 
-use crate::{error::TnRethResult, traits::TelcoinNode};
+use crate::{error::TnRethResult, evm::TnEvmConfig, traits::TelcoinNode};
 
 /// A pooled transaction id.
 pub type PoolTxnId = TransactionId;
@@ -72,9 +71,13 @@ pub trait TxPool {
 
 /// A telcoin network transaction pool.
 #[derive(Clone, Debug)]
-pub struct WorkerTxPool(EthTransactionPool<BlockchainProvider<TelcoinNode>, DiskFileBlobStore>);
+pub struct WorkerTxPool(
+    EthTransactionPool<BlockchainProvider<TelcoinNode>, DiskFileBlobStore, TnEvmConfig>,
+);
 
-impl From<WorkerTxPool> for EthTransactionPool<BlockchainProvider<TelcoinNode>, DiskFileBlobStore> {
+impl From<WorkerTxPool>
+    for EthTransactionPool<BlockchainProvider<TelcoinNode>, DiskFileBlobStore, TnEvmConfig>
+{
     fn from(value: WorkerTxPool) -> Self {
         value.0
     }
@@ -86,18 +89,19 @@ impl WorkerTxPool {
         node_config: &NodeConfig<ChainSpec>,
         task_spawner: &TaskSpawner,
         blockchain_provider: &BlockchainProvider<TelcoinNode>,
+        evm_config: &TnEvmConfig,
     ) -> eyre::Result<Self> {
-        let _head = node_config.lookup_head(blockchain_provider)?;
         let data_dir = node_config.datadir();
         let pool_config = node_config.txpool.pool_config();
         let blob_store = DiskFileBlobStore::open(data_dir.blobstore(), Default::default())?;
-        let evm_config = EthEvmConfig::new(node_config.chain.clone());
-        let validator =
-            TransactionValidationTaskExecutor::eth_builder(blockchain_provider.clone(), evm_config)
-                .kzg_settings(EnvKzgSettings::Default)
-                .with_local_transactions_config(pool_config.local_transactions_config.clone())
-                .with_additional_tasks(node_config.txpool.additional_validation_tasks)
-                .build_with_tasks(task_spawner.clone(), blob_store.clone());
+        let validator = TransactionValidationTaskExecutor::eth_builder(
+            blockchain_provider.clone(),
+            evm_config.clone(),
+        )
+        .kzg_settings(EnvKzgSettings::Default)
+        .with_local_transactions_config(pool_config.local_transactions_config.clone())
+        .with_additional_tasks(node_config.txpool.additional_validation_tasks)
+        .build_with_tasks(task_spawner.clone(), blob_store.clone());
 
         let transaction_pool =
             reth_transaction_pool::Pool::eth_pool(validator, blob_store, pool_config);

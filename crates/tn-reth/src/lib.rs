@@ -45,7 +45,9 @@ use reth::{
         StorageArgs, TxPoolArgs,
     },
     builder::NodeConfig,
-    network::transactions::{config::TransactionPropagationKind, TransactionPropagationMode},
+    network::transactions::{
+        config::TransactionPropagationKind, TransactionIngressPolicy, TransactionPropagationMode,
+    },
     rpc::{
         builder::{
             config::RethRpcServerConfig, RethRpcModule, RpcModuleBuilder, RpcModuleSelection,
@@ -70,14 +72,16 @@ use reth_evm::{
     execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionOutput},
     ConfigureEvm, EvmFactory,
 };
-use reth_evm_ethereum::EthEvmConfig;
-use reth_node_builder::{DEFAULT_MEMORY_BLOCK_BUFFER_TARGET, DEFAULT_RESERVED_CPU_CORES};
+use reth_node_builder::{
+    DEFAULT_MEMORY_BLOCK_BUFFER_TARGET, DEFAULT_RESERVED_CPU_CORES,
+    DEFAULT_SPARSE_TRIE_MAX_STORAGE_TRIES, DEFAULT_SPARSE_TRIE_PRUNE_DEPTH,
+};
 use reth_node_core::node_config::DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB;
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
     BlockIdReader as _, BlockNumReader, BlockReader, CanonChainTracker,
-    CanonStateSubscriptions as _, ChainSpecProvider, ChainStateBlockReader, ChainStateBlockWriter,
-    DBProvider, DatabaseProviderFactory, HeaderProvider as _, ProviderFactory, StateProviderBox,
+    CanonStateSubscriptions as _, ChainStateBlockReader, ChainStateBlockWriter, DBProvider,
+    DatabaseProviderFactory, HeaderProvider as _, ProviderFactory, StateProviderBox,
     StateProviderFactory, TransactionVariant,
 };
 use reth_revm::{
@@ -318,8 +322,8 @@ impl RethConfig {
             soft_limit_byte_size_pooled_transactions_response_on_pack_request: 0,
             max_capacity_cache_txns_pending_fetch: 0,
             net_if: None,
-            tx_propagation_policy: TransactionPropagationKind::Trusted,
-            tx_ingress_policy: Default::default(),
+            tx_propagation_policy: TransactionPropagationKind::None,
+            tx_ingress_policy: TransactionIngressPolicy::None,
             disable_tx_gossip: true,
             propagation_mode: TransactionPropagationMode::Max(0),
             required_block_hashes: vec![],
@@ -413,8 +417,8 @@ impl RethConfig {
             disable_proof_v2: false,
             cache_metrics_disabled: false,
             disable_trie_cache: false,
-            sparse_trie_prune_depth: Default::default(),
-            sparse_trie_max_storage_tries: Default::default(),
+            sparse_trie_prune_depth: DEFAULT_SPARSE_TRIE_PRUNE_DEPTH,
+            sparse_trie_max_storage_tries: DEFAULT_SPARSE_TRIE_MAX_STORAGE_TRIES,
             disable_sparse_trie_cache_pruning: false,
             state_root_task_timeout: None,
             // deprecated fields
@@ -626,6 +630,7 @@ impl RethEnv {
             &self.inner.node_config,
             &self.inner.task_spawner,
             &self.inner.blockchain_provider,
+            &self.inner.evm_config,
         )
     }
 
@@ -989,6 +994,7 @@ impl RethEnv {
         let transaction_pool: EthTransactionPool<
             BlockchainProvider<TelcoinNode>,
             DiskFileBlobStore,
+            TnEvmConfig,
         > = transaction_pool.into();
         let tn_execution = Arc::new(TNExecution);
         let rpc_builder = RpcModuleBuilder::default()
@@ -997,18 +1003,14 @@ impl RethEnv {
             .with_network(network.clone())
             .with_executor(Box::new(self.inner.task_spawner.clone()))
             .with_evm_config(self.inner.evm_config.clone())
-            // .with_events(self.inner.blockchain_provider.clone())
-            // .with_block_executor(self.evm_executor.clone())
             .with_consensus(tn_execution.clone());
 
-        // //.node_configure namespaces
         let modules_config = self.inner.node_config.rpc.transport_rpc_module_config();
         let eth_api = EthApi::builder(
             self.inner.blockchain_provider.clone(),
             transaction_pool,
             network,
-            // TODO: there is a trait definition blocking TNEvmConfig
-            EthEvmConfig::new(self.inner.blockchain_provider.chain_spec()),
+            self.inner.evm_config.clone(),
         )
         .build();
 
