@@ -57,7 +57,6 @@ use reth::{
         server_types::eth::utils::recover_raw_transaction as reth_recover_raw_transaction,
     },
 };
-use reth_chain_state::ComputedTrieData;
 use reth_chainspec::{BaseFeeParams, EthChainSpec};
 use reth_db::{init_db, DatabaseEnv};
 use reth_db_common::init::init_genesis;
@@ -126,7 +125,9 @@ pub use reth::{
     chainspec::chain_value_parser, dirs::MaybePlatformPath, payload::BlobSidecars,
     rpc::builder::RpcServerHandle,
 };
-pub use reth_chain_state::{CanonicalInMemoryState, ExecutedBlock, NewCanonicalChain};
+pub use reth_chain_state::{
+    CanonicalInMemoryState, DeferredTrieData, ExecutedBlock, NewCanonicalChain,
+};
 pub use reth_chainspec::ChainSpec as RethChainSpec;
 pub use reth_cli_util::{parse_duration_from_secs, parse_socket_address};
 pub use reth_errors::{ProviderError, RethError};
@@ -659,6 +660,8 @@ impl RethEnv {
         &self,
         payload: TNPayload,
         transactions: &Vec<Vec<u8>>,
+        anchor_hash: B256,
+        ancestors: &[DeferredTrieData],
     ) -> TnRethResult<ExecutedBlock> {
         let parent_header = payload.parent_header.clone();
         debug!(target: "engine", ?parent_header, "retrieving state for next block");
@@ -732,11 +735,12 @@ impl RethEnv {
         debug!(target: "engine", hash=?block.hash(), "block builder outcome");
         let block_execution_output =
             BlockExecutionOutput { result: execution_result, state: db.take_bundle() };
-        let computed_trie_data = ComputedTrieData {
-            hashed_state: Arc::new(hashed_state.into_sorted()),
-            trie_updates: Arc::new(trie_updates.into_sorted()),
-            anchored_trie_input: None,
-        };
+        let computed_trie_data = DeferredTrieData::sort_and_build_trie_input(
+            Arc::new(hashed_state),
+            Arc::new(trie_updates),
+            anchor_hash,
+            ancestors,
+        );
         let res: ExecutedBlock<TNPrimitives> = ExecutedBlock::new(
             Arc::new(block),
             Arc::new(block_execution_output),
@@ -1506,7 +1510,9 @@ mod tests {
         payload: TNPayload,
         transactions: Vec<Vec<u8>>,
     ) -> eyre::Result<ExecutedBlock> {
-        let block = reth_env.build_block_from_batch_payload(payload, &transactions)?;
+        let anchor_hash = payload.parent_header.hash();
+        let block =
+            reth_env.build_block_from_batch_payload(payload, &transactions, anchor_hash, &[])?;
         // update chain state - normally handled by tn_engine::payload_builder
         let canonical_header = block.recovered_block.clone_sealed_header();
         let canonical_in_memory_state =
