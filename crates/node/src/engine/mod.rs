@@ -110,6 +110,11 @@ impl ExecutionNode {
         guard.respawn_worker_network_tasks(network_handle).await
     }
 
+    /// Returns true if worker components have already been initialized.
+    pub async fn are_workers_initialized(&self) -> bool {
+        !self.internal.read().await.workers.is_empty()
+    }
+
     /// Batch maker
     pub async fn start_batch_builder(
         &self,

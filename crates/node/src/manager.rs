@@ -1321,7 +1321,10 @@ where
             network_handle.update_task_spawner(epoch_task_spawner.clone());
             // initialize worker components on startup
             // This will use the new epoch_task_spawner on network_handle.
-            if initial_epoch {
+            // Also initialize if workers are empty: this happens when the first epoch returns
+            // early from replay_missed_consensus (epoch boundary hit) before create_consensus
+            // is reached, leaving workers uninitialized.
+            if initial_epoch || !engine.are_workers_initialized().await {
                 engine
                     .initialize_worker_components(
                         worker_id,
