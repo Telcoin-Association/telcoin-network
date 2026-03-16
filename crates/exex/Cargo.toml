@@ -1,0 +1,24 @@
+[package]
+name = "tn-exex"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Execution Extensions (ExEx) plugin system for Telcoin Network."
+
+[dependencies]
+tn-reth = { workspace = true }
+tn-types = { workspace = true }
+reth-execution-types = { workspace = true }
+reth-provider = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+tokio-stream = { workspace = true }
+eyre = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

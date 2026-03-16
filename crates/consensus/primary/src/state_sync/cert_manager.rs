@@ -201,6 +201,9 @@ where
                 })
                 .map_err(|_| CertManagerError::FatalAppendParent)?;
 
+            // notify ExEx subscribers about peer certificate
+            let _ = self.consensus_bus.exex_peer_certificates().send(cert.clone());
+
             // send to consensus for processing into the DAG
             self.consensus_bus.new_certificates().send(cert).await.inspect_err(|e| {
                 error!(target: "primary::cert_manager", ?e, "failed to forward accepted certificate to consensus");

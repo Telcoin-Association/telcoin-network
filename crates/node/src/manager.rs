@@ -328,6 +328,73 @@ where
         // spawn task to update the latest execution results for consensus
         self.spawn_engine_update_task(engine_update_rx, &node_task_manager);
 
+        // Spawn ExEx manager and ExEx tasks if any are registered
+        if !self.builder.exex_fns.is_empty() {
+            let reth_env = engine.get_reth_env().await;
+            let canon_stream = reth_env.canonical_block_stream();
+
+            // Subscribe to ConsensusBus broadcast channels for ExEx
+            let rx_own_certs = self.consensus_bus.subscribe_exex_own_certificates();
+            let rx_peer_certs = self.consensus_bus.subscribe_exex_peer_certificates();
+            let rx_committed_sub_dags = self.consensus_bus.subscribe_exex_committed_sub_dags();
+
+            let mut exex_txs = Vec::new();
+            let mut event_rxs = Vec::new();
+
+            for (name, install_fn) in self.builder.exex_fns.drain(..) {
+                let (notif_tx, notif_rx) =
+                    mpsc::channel(tn_exex::exex_channel_capacity());
+                let (event_tx, event_rx) = mpsc::unbounded_channel();
+
+                let ctx = tn_exex::TnExExContext {
+                    notifications: notif_rx,
+                    events: event_tx,
+                    reth_env: reth_env.clone(),
+                };
+
+                let exex_fut = install_fn(ctx);
+                let exex_name = name.clone();
+                node_task_manager.get_spawner().spawn_critical_task(
+                    format!("exex-{name}"),
+                    async move {
+                        if let Err(e) = exex_fut.await {
+                            tracing::error!(
+                                target: "exex",
+                                exex = %exex_name,
+                                ?e,
+                                "ExEx task failed"
+                            );
+                        }
+                    },
+                );
+
+                exex_txs.push((name, notif_tx));
+                event_rxs.push(event_rx);
+            }
+
+            let (manager, _handle) = tn_exex::TnExExManager::new(
+                canon_stream,
+                rx_own_certs,
+                rx_peer_certs,
+                rx_committed_sub_dags,
+                exex_txs,
+                event_rxs,
+            );
+            node_task_manager.get_spawner().spawn_critical_task(
+                "exex-manager",
+                async move {
+                    if let Err(e) = manager.await {
+                        tracing::error!(
+                            target: "exex",
+                            ?e,
+                            "ExEx manager failed"
+                        );
+                    }
+                },
+            );
+            info!(target: "epoch-manager", "ExEx manager and tasks spawned");
+        }
+
         node_task_manager.update_tasks();
 
         info!(target: "epoch-manager", tasks=?node_task_manager, "NODE TASKS\n");

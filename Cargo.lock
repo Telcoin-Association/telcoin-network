@@ -3565,6 +3565,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "exex-lifecycle"
+version = "0.1.0"
+dependencies = [
+ "eyre",
+ "tn-exex",
+ "tn-types",
+ "tracing",
+]
+
+[[package]]
 name = "eyre"
 version = "0.6.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12068,6 +12078,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tn-exex"
+version = "0.1.0"
+dependencies = [
+ "eyre",
+ "futures",
+ "reth-execution-types",
+ "reth-provider",
+ "tn-reth",
+ "tn-types",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+]
+
+[[package]]
 name = "tn-faucet"
 version = "0.1.0"
 dependencies = [
@@ -12155,6 +12180,7 @@ dependencies = [
  "tn-config",
  "tn-engine",
  "tn-executor",
+ "tn-exex",
  "tn-faucet",
  "tn-network-libp2p",
  "tn-network-types",

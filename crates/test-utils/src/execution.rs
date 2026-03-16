@@ -93,8 +93,15 @@ fn execution_builder<CliExt: clap::Args + fmt::Debug>(
     let reth_db = RethEnv::new_database(&node_config, tmp_dir.join("db"))?;
     // TODO: this a temporary approach until upstream reth supports public rpc hooks
     let opt_faucet_args = None;
-    let builder =
-        TnBuilder { node_config, tn_config, opt_faucet_args, metrics: None, healthcheck, reth_db };
+    let builder = TnBuilder {
+        node_config,
+        tn_config,
+        opt_faucet_args,
+        metrics: None,
+        healthcheck,
+        reth_db,
+        exex_fns: vec![],
+    };
 
     Ok((builder, ext))
 }
@@ -134,6 +141,7 @@ pub fn faucet_test_execution_node(
         metrics: None,
         healthcheck,
         reth_db: reth_db.clone(),
+        exex_fns: vec![],
     };
 
     let engine = ExecutionNode::new(

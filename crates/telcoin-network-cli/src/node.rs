@@ -176,6 +176,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             metrics,
             healthcheck,
             reth_db,
+            exex_fns: vec![],
         };
 
         Ok(launcher(builder, ext, tn_datadir, key_config))
