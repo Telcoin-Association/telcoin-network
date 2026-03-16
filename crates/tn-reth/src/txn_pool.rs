@@ -28,7 +28,7 @@ use tn_types::{
 };
 use tracing::{debug, info, trace};
 
-use crate::{error::TnRethResult, traits::TelcoinNode};
+use crate::{error::TnRethResult, evm::TnEvmConfig, traits::TelcoinNode};
 
 /// A pooled transaction id.
 pub type PoolTxnId = TransactionId;
@@ -71,9 +71,13 @@ pub trait TxPool {
 
 /// A telcoin network transaction pool.
 #[derive(Clone, Debug)]
-pub struct WorkerTxPool(EthTransactionPool<BlockchainProvider<TelcoinNode>, DiskFileBlobStore>);
+pub struct WorkerTxPool(
+    EthTransactionPool<BlockchainProvider<TelcoinNode>, DiskFileBlobStore, TnEvmConfig>,
+);
 
-impl From<WorkerTxPool> for EthTransactionPool<BlockchainProvider<TelcoinNode>, DiskFileBlobStore> {
+impl From<WorkerTxPool>
+    for EthTransactionPool<BlockchainProvider<TelcoinNode>, DiskFileBlobStore, TnEvmConfig>
+{
     fn from(value: WorkerTxPool) -> Self {
         value.0
     }
@@ -85,17 +89,19 @@ impl WorkerTxPool {
         node_config: &NodeConfig<ChainSpec>,
         task_spawner: &TaskSpawner,
         blockchain_provider: &BlockchainProvider<TelcoinNode>,
+        evm_config: &TnEvmConfig,
     ) -> eyre::Result<Self> {
-        let head = node_config.lookup_head(blockchain_provider)?;
         let data_dir = node_config.datadir();
         let pool_config = node_config.txpool.pool_config();
         let blob_store = DiskFileBlobStore::open(data_dir.blobstore(), Default::default())?;
-        let validator = TransactionValidationTaskExecutor::eth_builder(blockchain_provider.clone())
-            .with_head_timestamp(head.timestamp)
-            .kzg_settings(EnvKzgSettings::Default)
-            .with_local_transactions_config(pool_config.local_transactions_config.clone())
-            .with_additional_tasks(node_config.txpool.additional_validation_tasks)
-            .build_with_tasks(task_spawner.clone(), blob_store.clone());
+        let validator = TransactionValidationTaskExecutor::eth_builder(
+            blockchain_provider.clone(),
+            evm_config.clone(),
+        )
+        .kzg_settings(EnvKzgSettings::Default)
+        .with_local_transactions_config(pool_config.local_transactions_config.clone())
+        .with_additional_tasks(node_config.txpool.additional_validation_tasks)
+        .build_with_tasks(task_spawner.clone(), blob_store.clone());
 
         let transaction_pool =
             reth_transaction_pool::Pool::eth_pool(validator, blob_store, pool_config);
@@ -318,21 +324,23 @@ impl BestTxns {
     pub fn exceeds_gas_limit(&mut self, pool_tx: &Arc<PoolTxn>, gas_limit: u64) {
         self.inner.mark_invalid(
             pool_tx,
-            InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), gas_limit),
+            &InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), gas_limit),
         );
     }
 
     /// When the best transactions are too large for a batch notify the pool.
     pub fn max_batch_size(&mut self, pool_tx: &Arc<PoolTxn>, tx_size: usize, max_size: usize) {
-        self.inner
-            .mark_invalid(pool_tx, InvalidPoolTransactionError::OversizedData(tx_size, max_size));
+        self.inner.mark_invalid(
+            pool_tx,
+            &InvalidPoolTransactionError::OversizedData { size: tx_size, limit: max_size },
+        );
     }
 
     /// Mark the EIP-4844 transaction as invalid.
     pub fn ignore_eip4844(&mut self, pool_tx: &Arc<PoolTxn>) {
         self.inner.mark_invalid(
             pool_tx,
-            InvalidPoolTransactionError::Eip4844(Eip4844PoolTransactionError::NoEip4844Blobs),
+            &InvalidPoolTransactionError::Eip4844(Eip4844PoolTransactionError::NoEip4844Blobs),
         );
     }
 }

@@ -163,7 +163,7 @@ where
         self.next_nonce = nonce + 1;
 
         // request signature and submit to txpool
-        self.executor.spawn(Box::pin(async move {
+        self.executor.spawn_task(Box::pin(async move {
             let digest = transaction.signature_hash();
             let response =
                 Self::request_kms_signature(kms_name, digest, chain_id, public_key).await;
@@ -296,7 +296,7 @@ where
 
         // create message from slice before consuming digest
         // this is needed to calculate `v` below
-        let message = Message::from_digest_slice(&digest.0)?;
+        let message = Message::from_digest(digest.0);
 
         // assemble digest for signature
         let digest = Some(Digest::Sha256(digest.0.to_vec()));
@@ -521,7 +521,7 @@ async fn submit_transaction(
     let recovered =
         tx.try_into_recovered().map_err(|_| EthApiError::InvalidTransactionSignature)?;
     let pool_tx = EthPooledTransaction::try_from_consensus(recovered)
-        .map_err(|_| EthApiError::TransactionConversionError)?;
+        .map_err(|_| EthApiError::InvalidTransactionSignature)?;
     let mut tx_events = pool.add_transaction_and_subscribe_local(pool_tx).await?;
 
     let tx_hash = tx_events.hash();

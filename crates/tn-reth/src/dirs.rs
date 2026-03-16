@@ -26,6 +26,8 @@ pub fn default_datadir_args() -> DatadirArgs {
             .expect("default datadir args always work"),
         // default static path should resolve to: `DEFAULT_ROOT_DIR/<CHAIN_ID>/static_files`
         static_files_path: None,
+        rocksdb_path: None,
+        pprof_dumps_path: None,
     }
 }
 
@@ -53,7 +55,12 @@ fn logs_dir() -> Option<PathBuf> {
 /// Turn a path (for instance a testing temp directory) into ['DatadirArgs'].
 pub fn path_to_datadir<P: AsRef<Path>>(path: P) -> DatadirArgs {
     let path = path.as_ref();
-    DatadirArgs { datadir: MaybePlatformPath::from(path.to_path_buf()), static_files_path: None }
+    DatadirArgs {
+        datadir: MaybePlatformPath::from(path.to_path_buf()),
+        static_files_path: None,
+        rocksdb_path: None,
+        pprof_dumps_path: None,
+    }
 }
 
 /// Wrapper around a Reth [ChainPath].
