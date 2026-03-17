@@ -18,8 +18,9 @@ use tn_config::Parameters;
 use tn_network_libp2p::types::NetworkEvent;
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{
-    BlockHash, BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput, Epoch,
-    EpochRecord, EpochVote, Header, Round, TnReceiver, TnSender, CHANNEL_CAPACITY,
+    deconstruct_nonce, BlockHash, BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader,
+    ConsensusOutput, Epoch, EpochRecord, EpochVote, Header, Round, TnReceiver, TnSender,
+    CHANNEL_CAPACITY,
 };
 use tokio::{
     sync::{
@@ -694,15 +695,12 @@ impl ConsensusBus {
     /// issue.
     pub async fn last_executed_consensus_block(
         &self,
-        epoch: Option<Epoch>,
         consensus_chain: &ConsensusChain,
     ) -> Option<ConsensusHeader> {
-        let parent_beacon_block_root = self
-            .recent_blocks()
-            .borrow()
-            .latest_execution_block()
-            .header()
-            .parent_beacon_block_root;
+        let _block = self.recent_blocks().borrow().latest_execution_block();
+        let header = _block.header();
+        let (epoch, _) = deconstruct_nonce(header.nonce.into());
+        let parent_beacon_block_root = header.parent_beacon_block_root;
         if let Some(consensus_hash) = parent_beacon_block_root {
             consensus_chain
                 .consensus_header_by_digest(epoch, consensus_hash)
@@ -718,10 +716,10 @@ impl ConsensusBus {
     /// issue.
     pub async fn last_consensus_block(
         &self,
-        epoch: Option<Epoch>,
         consensus_chain: &ConsensusChain,
     ) -> Option<ConsensusHeader> {
         let latest_consensus = self.recent_blocks().borrow().latest_consensus_block_num_hash();
+        let epoch = consensus_chain.epochs().number_to_epoch(latest_consensus.number);
         consensus_chain
             .consensus_header_by_digest(epoch, latest_consensus.hash)
             .await

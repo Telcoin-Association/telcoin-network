@@ -13,6 +13,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
     thread::JoinHandle,
+    time::Duration,
 };
 
 use parking_lot::Mutex;
@@ -64,16 +65,15 @@ enum EpochDbMessage {
 /// Errors from background writes are surfaced on the next call via [`get_error`].
 #[derive(Debug, Clone)]
 pub struct EpochRecordDb {
+    /// Channel to send commands to the background thread.
     tx: Sender<EpochDbMessage>,
+    /// Join handle for the background thread running commands.
     handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Track any errors that happened in the background.
     error: watch::Receiver<Option<EpochDbError>>,
-}
-
-fn clear_db_loop(mut rx: Receiver<EpochDbMessage>) {
-    rx.close();
-    while let Ok(msg) = rx.try_recv() {
-        drop(msg);
-    }
+    /// Vector to map epochs to the last consensus header number.
+    /// Used for quickly deducing an epoch for a given consensus header number.
+    final_numbers: Arc<Mutex<Vec<u64>>>,
 }
 
 fn run_db_loop(
@@ -149,38 +149,22 @@ impl EpochRecordDb {
     ///
     /// `start_epoch` is used when creating a brand-new database.  When reopening an
     /// existing database the start epoch is derived from the first stored record.
-    pub fn open_append<P: Into<PathBuf>>(
-        path: P,
-        start_epoch: Epoch,
-    ) -> Result<Self, EpochDbError> {
+    pub fn open<P: Into<PathBuf>>(path: P) -> Result<Self, EpochDbError> {
         let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
         let (tx_error, error) = watch::channel(None);
-        let handle = std::thread::spawn(move || match Inner::open_append(path, start_epoch) {
-            Ok(inner) => run_db_loop(inner, rx, tx_error),
-            Err(e) => {
-                tx_error.send_replace(Some(e));
-                clear_db_loop(rx);
-            }
-        });
-        Ok(Self { tx, handle: Arc::new(Mutex::new(Some(handle))), error })
-    }
-
-    /// Open an existing epoch records database at `path` in read-only mode.
-    ///
-    /// `start_epoch` must match what was used when the database was created.
-    pub fn open_static<P: Into<PathBuf>>(path: P, start_epoch: Epoch) -> Self {
-        let (tx, rx) = mpsc::channel(1000);
-        let path: PathBuf = path.into();
-        let (tx_error, error) = watch::channel(None);
-        let handle = std::thread::spawn(move || match Inner::open_static(path, start_epoch) {
-            Ok(inner) => run_db_loop(inner, rx, tx_error),
-            Err(e) => {
-                tx_error.send_replace(Some(e));
-                clear_db_loop(rx);
-            }
-        });
-        Self { tx, handle: Arc::new(Mutex::new(Some(handle))), error }
+        let inner = Inner::open_append(path, 0)?;
+        let mut final_numbers = Vec::with_capacity(inner.epoch_idx.len());
+        for epoch in inner.records.raw_iter().map_err(|_e| EpochDbError::CorruptDb)? {
+            final_numbers.push(epoch?.final_consensus.number);
+        }
+        let handle = std::thread::spawn(move || run_db_loop(inner, rx, tx_error));
+        Ok(Self {
+            tx,
+            handle: Arc::new(Mutex::new(Some(handle))),
+            error,
+            final_numbers: Arc::new(Mutex::new(final_numbers)),
+        })
     }
 
     /// Return any delayed error recorded by the background thread.
@@ -202,10 +186,28 @@ impl EpochRecordDb {
         Ok(())
     }
 
+    /// Update final_numbers with record data.
+    fn update_finals(&self, record: &EpochRecord) -> Result<(), EpochDbError> {
+        let epoch = record.epoch as usize;
+        let number = record.final_consensus.number;
+        let mut finals = self.final_numbers.lock();
+        let finals_len = finals.len();
+        if epoch > finals_len {
+            return Err(EpochDbError::EpochOutOfOrder(finals_len as u32, epoch as u32));
+        }
+        if epoch < finals_len {
+            finals[epoch] = number;
+        } else {
+            finals.push(number);
+        }
+        Ok(())
+    }
+
     /// Save an [`EpochRecord`] without a certificate.
     /// Returns `Ok(())` idempotently if the record is already stored.
     pub async fn save_record(&self, record: EpochRecord) -> Result<(), EpochDbError> {
         self.get_error()?;
+        self.update_finals(&record)?;
         self.tx
             .send(EpochDbMessage::SaveRecord(record))
             .await
@@ -221,6 +223,7 @@ impl EpochRecordDb {
         cert: EpochCertificate,
     ) -> Result<(), EpochDbError> {
         self.get_error()?;
+        self.update_finals(&record)?;
         self.tx
             .send(EpochDbMessage::Save(record, cert))
             .await
@@ -250,6 +253,26 @@ impl EpochRecordDb {
             rx.await.unwrap_or(None)
         } else {
             None
+        }
+    }
+
+    /// Retrieve an [`EpochRecord`] by epoch number.
+    /// This version will wait up to timeout time for the record to show up if not available.
+    pub async fn record_by_epoch_with_timeout(
+        &self,
+        epoch: Epoch,
+        timeout: Duration,
+    ) -> Option<EpochRecord> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        // TODO issue 573, clean this up.
+        loop {
+            if let Some(rec) = self.record_by_epoch(epoch).await {
+                return Some(rec);
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
         }
     }
 
@@ -351,6 +374,20 @@ impl EpochRecordDb {
         let cert = self.cert_by_digest(record.digest()).await;
         Some((record, cert))
     }
+
+    /// Find the epoch for a consensus header number.
+    /// None if the number is greater than expected.
+    pub fn number_to_epoch(&self, number: u64) -> Epoch {
+        let mut final_epoch = None;
+        for (epoch, final_number) in self.final_numbers.lock().iter().enumerate() {
+            if number <= *final_number {
+                return epoch as u32;
+            }
+            final_epoch = Some(epoch);
+        }
+        // if we are above the last saved record then we should be at the last saved + 1.
+        final_epoch.map(|e| e + 1).unwrap_or_default() as u32
+    }
 }
 
 pub const RECORDS_NAME: &str = Inner::RECORDS_NAME;
@@ -375,51 +412,15 @@ struct Inner {
 }
 
 impl Inner {
-    const RECORDS_NAME: &str = "epochs";
-    const CERTS_NAME: &str = "epoch_certs";
-    const EPOCH_POS_NAME: &str = "epochs_idx";
-    const RECORD_HASH_NAME: &str = "epochs_hash";
-    const CERT_HASH_NAME: &str = "epoch_certs_hash";
+    const RECORDS_NAME: &str = "epochs.pack";
+    const CERTS_NAME: &str = "epoch_certs.pack";
+    const EPOCH_POS_NAME: &str = "epochs.idx";
+    const RECORD_HASH_NAME: &str = "epochs.hash";
+    const CERT_HASH_NAME: &str = "epoch_certs.hash";
     /// Sentinel pack-header tag for the records file.
     const PACK_EPOCH: u64 = 0;
     /// Sentinel pack-header tag for the certs file.
     const CERT_PACK_EPOCH: u64 = 1;
-
-    /// Check whether the records file and its indexes appear to have been closed cleanly.
-    fn records_consistent(
-        records: &Pack<EpochRecord>,
-        epoch_idx: &mut PositionIndex,
-        record_digests: &HdxIndex,
-    ) -> bool {
-        let records_len = records.file_len();
-        if records_len != record_digests.data_file_length() {
-            return false;
-        }
-        if !epoch_idx.is_empty() {
-            let last_record = match epoch_idx.load(epoch_idx.len() as u64 - 1) {
-                Ok(p) => p,
-                Err(_) => return false,
-            };
-            let mut iter = match records.raw_iter() {
-                Ok(i) => i,
-                Err(_) => return false,
-            };
-            if iter.set_position(last_record).is_err() {
-                return false;
-            }
-            match (iter.next(), iter.next()) {
-                (Some(_), None) => iter.position().unwrap_or_default() == records_len,
-                _ => false,
-            }
-        } else {
-            true
-        }
-    }
-
-    /// Check whether the certs file and its index appear to have been closed cleanly.
-    fn certs_consistent(certs: &Pack<EpochCertificate>, cert_digests: &HdxIndex) -> bool {
-        certs.file_len() == cert_digests.data_file_length()
-    }
 
     /// Truncate records and its indexes back to a consistent state.
     fn heal_records(
@@ -522,65 +523,6 @@ impl Inner {
         Self::heal_certs(&mut certs, &cert_digests)?;
 
         // Derive start_epoch from the first stored record if present.
-        let start_epoch = if !epoch_idx.is_empty() {
-            let pos = epoch_idx.load(0).map_err(|e| EpochDbError::HeaderLoad(e.to_string()))?;
-            records.fetch(pos).map_err(|e| EpochDbError::HeaderLoad(e.to_string()))?.epoch
-        } else {
-            start_epoch
-        };
-
-        Ok(Self {
-            records,
-            certs,
-            epoch_idx,
-            record_digests,
-            cert_digests,
-            start_epoch,
-            dummy_epoch0: None,
-        })
-    }
-
-    fn open_static<P: AsRef<Path>>(path: P, start_epoch: Epoch) -> Result<Self, EpochDbError> {
-        let base_dir = path.as_ref();
-
-        let mut records =
-            Pack::<EpochRecord>::open(base_dir.join(Self::RECORDS_NAME), Self::PACK_EPOCH, true)?;
-        let certs = Pack::<EpochCertificate>::open(
-            base_dir.join(Self::CERTS_NAME),
-            Self::CERT_PACK_EPOCH,
-            true,
-        )?;
-
-        let mut epoch_idx = PositionIndex::open_pdx_file(
-            base_dir.join(Self::EPOCH_POS_NAME),
-            records.header(),
-            true,
-        )
-        .map_err(OpenError::IndexFileOpen)?;
-        let builder = BuildHasherDefault::<FxHasher>::default();
-        let record_digests = HdxIndex::open_hdx_file(
-            base_dir.join(Self::RECORD_HASH_NAME),
-            records.header(),
-            builder,
-            true,
-        )
-        .map_err(OpenError::IndexFileOpen)?;
-        let builder = BuildHasherDefault::<FxHasher>::default();
-        let cert_digests = HdxIndex::open_hdx_file(
-            base_dir.join(Self::CERT_HASH_NAME),
-            certs.header(),
-            builder,
-            true,
-        )
-        .map_err(OpenError::IndexFileOpen)?;
-
-        if !Self::records_consistent(&records, &mut epoch_idx, &record_digests)
-            || !Self::certs_consistent(&certs, &cert_digests)
-        {
-            return Err(EpochDbError::CorruptDb);
-        }
-
-        // Prefer the epoch from the first stored record over the caller-supplied hint.
         let start_epoch = if !epoch_idx.is_empty() {
             let pos = epoch_idx.load(0).map_err(|e| EpochDbError::HeaderLoad(e.to_string()))?;
             records.fetch(pos).map_err(|e| EpochDbError::HeaderLoad(e.to_string()))?.epoch
@@ -811,8 +753,8 @@ mod test {
     use roaring::RoaringBitmap;
     use tempfile::TempDir;
     use tn_types::{
-        BlsAggregateSignature, BlsKeypair, BlsPublicKey, BlsSignature, BlsSigner, Epoch,
-        EpochCertificate, EpochRecord, Signer as _, B256,
+        BlockNumHash, BlsAggregateSignature, BlsKeypair, BlsPublicKey, BlsSignature, BlsSigner,
+        Epoch, EpochCertificate, EpochRecord, Signer as _, B256,
     };
 
     use crate::epoch_records::{EpochRecordDb, RECORDS_NAME};
@@ -849,6 +791,7 @@ mod test {
             committee: committee.clone(),
             next_committee: committee,
             parent_hash,
+            final_consensus: BlockNumHash::new((epoch as u64 + 1) * 10, B256::default()),
             ..Default::default()
         };
 
@@ -872,7 +815,7 @@ mod test {
         let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
 
         // Create and populate an initial database.
-        let db = EpochRecordDb::open_append(temp_dir.path(), 0).expect("open db");
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
 
         let num_records: u32 = 20;
         let mut pairs = Vec::new();
@@ -907,7 +850,7 @@ mod test {
         drop(db);
 
         // Reopen in append mode and add more records.
-        let db = EpochRecordDb::open_append(temp_dir.path(), 0).expect("reopen db");
+        let db = EpochRecordDb::open(temp_dir.path()).expect("reopen db");
         for epoch in num_records..(num_records * 2) {
             let (record, cert) = make_test_pair(epoch, &signers, parent);
             parent = record.digest();
@@ -921,15 +864,24 @@ mod test {
         db.persist().await.expect("persist 2");
         drop(db);
 
-        // Open read-only and verify all records are still accessible.
-        let db = EpochRecordDb::open_static(temp_dir.path(), 0);
-        for (record, cert) in &pairs {
+        // Open and verify all records are still accessible.
+        let db = EpochRecordDb::open(temp_dir.path()).expect("db open");
+        for (record, cert) in pairs.iter() {
             let by_epoch = db.record_by_epoch(record.epoch).await.expect("static: record by epoch");
             assert_eq!(by_epoch.digest(), record.digest());
 
             let cert_back =
                 db.cert_by_digest(record.digest()).await.expect("static: cert by digest");
             assert_eq!(cert_back.epoch_hash, cert.epoch_hash);
+        }
+        assert!(!db.contains_epoch(num_records * 2).await);
+        for number in 0..pairs.len() * 10 {
+            let epoch = (number.saturating_sub(1) / 10) as u32;
+            assert_eq!(
+                epoch,
+                db.number_to_epoch(number as u64),
+                "failed to get epoch for {number}"
+            );
         }
         assert!(!db.contains_epoch(num_records * 2).await);
         drop(db);
@@ -946,7 +898,7 @@ mod test {
         drop(f);
 
         // Reopen should heal: last record is dropped, all others remain readable.
-        let db = EpochRecordDb::open_append(temp_dir.path(), 0).expect("open after damage");
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open after damage");
         for (record, _) in pairs.iter().take(pairs.len() - 1) {
             let by_epoch = db
                 .record_by_epoch(record.epoch)
@@ -980,7 +932,7 @@ mod test {
         f.set_len(extended_len + 100).expect("extend +100");
         drop(f);
 
-        let db = EpochRecordDb::open_append(temp_dir.path(), 0).expect("open after extend");
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open after extend");
         for (record, _) in &pairs {
             let by_epoch = db
                 .record_by_epoch(record.epoch)

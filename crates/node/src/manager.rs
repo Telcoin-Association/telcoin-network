@@ -47,11 +47,11 @@ use tn_storage::{
     DatabaseType,
 };
 use tn_types::{
-    gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash, BlockNumHash, BlsPublicKey,
-    CertifiedBatch, CommittedSubDag, Committee, CommitteeBuilder, ConsensusHeader, ConsensusOutput,
-    Database as TNDatabase, EngineUpdate, Epoch, EpochRecord, Multiaddr, NetworkPublicKey,
-    Notifier, TaskJoinError, TaskManager, TaskSpawner, TimestampSec, TnReceiver, B256,
-    MIN_PROTOCOL_BASE_FEE,
+    deconstruct_nonce, gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash,
+    BlockNumHash, BlsPublicKey, CertifiedBatch, CommittedSubDag, Committee, CommitteeBuilder,
+    ConsensusHeader, ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, EpochRecord,
+    Multiaddr, NetworkPublicKey, Notifier, TaskJoinError, TaskManager, TaskSpawner, TimestampSec,
+    TnReceiver, B256, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{
     quorum_waiter::QuorumWaiterTrait, Worker, WorkerNetwork, WorkerNetworkHandle, WorkerRequest,
@@ -164,7 +164,7 @@ pub async fn catchup_accumulator(
             .set_base_fee(block.base_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE));
 
         let nonce: u64 = block.nonce.into();
-        let (last_executed_epoch, last_executed_round) = RethEnv::deconstruct_nonce(nonce);
+        let (last_executed_epoch, last_executed_round) = deconstruct_nonce(nonce);
 
         let blocks =
             reth_env.blocks_for_range(epoch_state.epoch_info.blockHeight..=block.number)?;
@@ -706,20 +706,17 @@ where
                 }
             }
 
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-            // TODO issue 573, clean this up.
-            loop {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                if let Some(rec) =
-                    self.consensus_chain.epochs().record_by_epoch(previous_epoch).await
-                {
-                    break rec;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(eyre::eyre!(
-                        "Missing previous epoch record for epoch {previous_epoch} after waiting"
-                    ));
-                }
+            if let Some(rec) = self
+                .consensus_chain
+                .epochs()
+                .record_by_epoch_with_timeout(previous_epoch, Duration::from_secs(30))
+                .await
+            {
+                rec
+            } else {
+                return Err(eyre::eyre!(
+                    "Missing previous epoch record for epoch {previous_epoch} after waiting"
+                ));
             }
         };
         self.consensus_chain.new_epoch(previous_epoch_rec, committee).await?;
@@ -1618,10 +1615,10 @@ where
             // Round is set to 0 since we don't persist it; consensus number/hash still allows
             // wait_for_consensus_execution to resolve hash lookups.
             let consensus_hash = recent_block.parent_beacon_block_root.unwrap_or_default();
-            let (epoch, round) = RethEnv::deconstruct_nonce(recent_block.nonce.into());
+            let (epoch, round) = deconstruct_nonce(recent_block.nonce.into());
             let consensus_number = self
                 .consensus_chain
-                .consensus_header_by_digest(Some(epoch), consensus_hash)
+                .consensus_header_by_digest(epoch, consensus_hash)
                 .await?
                 .map(|h| h.number)
                 .unwrap_or_default();

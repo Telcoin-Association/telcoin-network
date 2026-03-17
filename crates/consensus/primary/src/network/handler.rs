@@ -93,7 +93,7 @@ where
         // too far behind.
         let (exec_number, exec_epoch, exec_round) = self
             .consensus_bus
-            .last_consensus_block(None, &self.consensus_chain)
+            .last_consensus_block(&self.consensus_chain)
             .await
             .map(|h| (h.number, h.sub_dag.leader_epoch(), h.sub_dag.leader_round()))
             .unwrap_or((0, 0, 0));
@@ -784,15 +784,10 @@ where
     /// Retrieve a consensus header from local storage.
     pub(super) async fn retrieve_consensus_header(
         &self,
-        number: Option<u64>,
-        hash: Option<BlockHash>,
+        number: u64,
+        hash: BlockHash,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
-        let header = match (number, hash) {
-            (_, Some(hash)) => self.get_header_by_hash(hash).await?,
-            (Some(number), _) => self.get_header_by_number(number).await?,
-            (None, None) => self.get_latest_output().await?,
-        };
-
+        let header = self.get_header_by_hash(number, hash).await?;
         Ok(PrimaryResponse::ConsensusHeader(Arc::new(header)))
     }
 
@@ -811,28 +806,16 @@ where
         Ok(PrimaryResponse::EpochRecord { record, certificate })
     }
 
-    /// Retrieve the consensus header by number.
-    async fn get_header_by_number(&self, number: u64) -> PrimaryNetworkResult<ConsensusHeader> {
-        match self.consensus_chain.consensus_header_by_number(None, number).await {
-            Ok(Some(header)) => Ok(header),
-            _ => Err(PrimaryNetworkError::UnknownConsensusHeaderNumber(number)),
-        }
-    }
-
     /// Retrieve the consensus header by hash
-    async fn get_header_by_hash(&self, hash: BlockHash) -> PrimaryNetworkResult<ConsensusHeader> {
-        match self.consensus_chain.consensus_header_by_digest(None, hash).await {
+    async fn get_header_by_hash(
+        &self,
+        number: u64,
+        hash: BlockHash,
+    ) -> PrimaryNetworkResult<ConsensusHeader> {
+        let epoch = self.consensus_chain.epochs().number_to_epoch(number);
+        match self.consensus_chain.consensus_header_by_digest(epoch, hash).await {
             Ok(Some(header)) => Ok(header),
             _ => Err(PrimaryNetworkError::UnknownConsensusHeaderDigest(hash)),
-        }
-    }
-
-    /// Retrieve the last record in consensus blocks table.
-    async fn get_latest_output(&self) -> PrimaryNetworkResult<ConsensusHeader> {
-        if let Ok(Some(header)) = self.consensus_chain.consensus_header_latest().await {
-            Ok(header)
-        } else {
-            Err(PrimaryNetworkError::InvalidRequest("Consensus headers unavailable".to_string()))
         }
     }
 

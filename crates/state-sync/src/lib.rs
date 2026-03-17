@@ -138,7 +138,7 @@ pub async fn last_executed_consensus_block(
     consensus_bus: &ConsensusBus,
     consensus_chain: &ConsensusChain,
 ) -> Option<ConsensusHeader> {
-    let last = consensus_bus.last_executed_consensus_block(None, consensus_chain).await;
+    let last = consensus_bus.last_executed_consensus_block(consensus_chain).await;
     debug!(target: "state-sync", ?last, "last executed consensus block");
     last
 }
@@ -169,7 +169,7 @@ pub async fn get_missing_consensus(
     if last_db_block.number > last_executed_block.number {
         for consensus_block_number in last_executed_block.number + 1..=last_db_block.number {
             if let Some(consensus_header) =
-                consensus_chain.consensus_header_by_number(None, consensus_block_number).await?
+                consensus_chain.consensus_header_by_number(consensus_block_number).await?
             {
                 debug!(target: "state-sync", ?consensus_header, "collecting unexecuted consensus header");
                 result.push(consensus_header);
@@ -193,7 +193,7 @@ async fn spawn_stream_consensus_headers<DB: Database>(
 
     let mut rx_last_consensus_header = consensus_bus.last_consensus_header().subscribe();
     let mut last_consensus_header =
-        consensus_bus.last_consensus_block(None, &consensus_chain).await.unwrap_or_default();
+        consensus_bus.last_consensus_block(&consensus_chain).await.unwrap_or_default();
     let mut last_consensus_height = last_consensus_header.number;
     let epoch = config.committee().epoch();
 

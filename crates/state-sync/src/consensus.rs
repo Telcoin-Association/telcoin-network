@@ -36,7 +36,7 @@ async fn get_consensus_header<DB: TNDatabase>(
         };
     }
     // request consensus from any peer
-    match network.request_consensus(None, Some(hash)).await {
+    match network.request_consensus(number, hash).await {
         Ok(header) => {
             if let Err(e) = db.insert::<ConsensusHeaderCache>(&header.number, &header) {
                 error!(target: "state-sync", ?e, "error saving a consensus header to cache storage!");
@@ -83,13 +83,12 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
     let mut rx_gossip_update = consensus_bus.last_published_consensus_num_hash().subscribe();
     let (tx, mut rx) = tokio::sync::mpsc::channel(10_000);
     // Get the epoch of our last executed consensus.
-    let mut current_fetch_epoch = if let Some(block) =
-        consensus_bus.last_executed_consensus_block(None, &consensus_chain).await
-    {
-        block.sub_dag.leader_epoch()
-    } else {
-        0
-    };
+    let mut current_fetch_epoch =
+        if let Some(block) = consensus_bus.last_executed_consensus_block(&consensus_chain).await {
+            block.sub_dag.leader_epoch()
+        } else {
+            0
+        };
     let (epochs_tx, epochs_rx) = tokio::sync::mpsc::channel(10_000);
     let epoch_queue = Arc::new(Mutex::new(epochs_rx));
     // spawn four critical workers that will fetch consensus outputs from an epoch work queue.
