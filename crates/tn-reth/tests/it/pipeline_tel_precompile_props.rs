@@ -9,7 +9,7 @@ use proptest::prelude::*;
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
 use tn_reth::{
     approveCall, burnCall, claimCall, mintCall, permitCall, transferCall, transferFromCall,
-    TIMELOCK_DURATION,
+    TELCOIN_PRECOMPILE_ADDRESS, TIMELOCK_DURATION,
 };
 use tn_types::U256;
 
@@ -32,6 +32,11 @@ proptest! {
 
         let user_before = env.get_balance(user_addr);
         let recipient_before = env.get_balance(recipient_addr);
+        let user_before_precompile = env.get_precompile_balance(user_addr);
+        let recipient_before_precompile = env.get_precompile_balance(recipient_addr);
+        // native balance check matches precompile method
+        assert_eq!(user_before, user_before_precompile);
+        assert_eq!(recipient_before, recipient_before_precompile);
 
         let tx = env.user_precompile_tx(
             transferCall { to: recipient_addr, amount: U256::from(amount) }.abi_encode(),
@@ -207,6 +212,7 @@ proptest! {
     fn prop_pipeline_burn_decrements_supply(amount in 1u64..1000u64) {
         let mut env = PipelineTestEnv::new();
         let supply_before = env.get_total_supply();
+        let precompile_balance_before = env.get_balance(TELCOIN_PRECOMPILE_ADDRESS);
 
         let burn_tx = env.governance_tx(
             burnCall { amount: U256::from(amount) }.abi_encode(),
@@ -215,11 +221,19 @@ proptest! {
         assert!(env.tx_succeeded(&block, 0), "burn tx should succeed");
 
         let supply_after = env.get_total_supply();
+        let precompile_balance_after = env.get_balance(TELCOIN_PRECOMPILE_ADDRESS);
         prop_assert_eq!(
             supply_after,
             supply_before - U256::from(amount),
             "total supply should decrease by burned amount"
         );
+        // burned from precompile address
+        prop_assert_eq!(
+            precompile_balance_after,
+            precompile_balance_before - U256::from(amount),
+            "total supply should decrease by burned amount"
+        );
+
     }
 }
 

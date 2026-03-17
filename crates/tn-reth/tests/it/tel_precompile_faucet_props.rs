@@ -8,6 +8,7 @@
 use alloy::sol_types::SolCall;
 use proptest::prelude::*;
 use reth_revm::primitives::{address, Address};
+use tn_config::GOVERNANCE_SAFE_ADDRESS as GOVERNANCE;
 use tn_reth::{claimCall, grantMintRoleCall, mintCall, revokeMintRoleCall};
 use tn_types::U256;
 

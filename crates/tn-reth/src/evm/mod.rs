@@ -29,6 +29,8 @@ pub(crate) use block::*;
 pub(crate) use config::*;
 pub(crate) use context::*;
 pub(crate) use factory::*;
+#[cfg(any(test, feature = "test-utils"))]
+pub use tel_precompile::test_utils as precompile_test_utils;
 #[cfg(not(feature = "faucet"))]
 pub use tel_precompile::TIMELOCK_DURATION;
 pub use tel_precompile::{

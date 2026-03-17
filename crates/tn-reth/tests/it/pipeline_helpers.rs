@@ -4,14 +4,15 @@
 //! this module exercises the full TN execution pipeline: transaction signing, EIP-2718 encoding,
 //! signature recovery, block building, state persistence, and finalization.
 
-use alloy::sol_types::SolCall;
+use alloy::{signers::local::PrivateKeySigner, sol_types::SolCall};
 use reth_revm::context::result::{ExecutionResult, Output};
 use secp256k1::rand::{rngs::StdRng, SeedableRng as _};
 use std::{collections::VecDeque, sync::Arc};
 use tempfile::TempDir;
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
 use tn_reth::{
-    allowanceCall, balanceOfCall, noncesCall, payload::TNPayload, totalSupplyCall, ExecutedBlock,
+    allowanceCall, balanceOfCall, noncesCall, payload::TNPayload,
+    test_utils::precompile_test_utils::GENESIS_SUPPLY, totalSupplyCall, ExecutedBlock,
     NewCanonicalChain, RethChainSpec, RethEnv, TELCOIN_PRECOMPILE_ADDRESS,
 };
 use tn_types::{
@@ -24,8 +25,7 @@ use tn_reth::test_utils::TransactionFactory;
 
 // --- Constants ---
 
-/// Genesis total supply: 100 billion (before 10^18 scaling).
-pub(crate) const GENESIS_SUPPLY: u128 = 100_000_000_000;
+// GENESIS_SUPPLY imported from tn_reth::test_utils::precompile_test_utils
 
 /// Minimal EVM contract that forwards any call (with value) to TELCOIN_PRECOMPILE_ADDRESS.
 /// Deployed at GOVERNANCE_SAFE_ADDRESS so the precompile sees caller == governance.
@@ -95,7 +95,6 @@ impl PipelineTestEnv {
 
         // Permit signer address (from known private key 0x01)
         let permit_signer_addr = {
-            use alloy::signers::local::PrivateKeySigner;
             let secret = tn_types::B256::new([
                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 1,

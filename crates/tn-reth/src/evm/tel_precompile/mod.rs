@@ -12,13 +12,10 @@
 //!   keccak256(abi.encode(spender, keccak256(abi.encode(owner, 2)))) = allowance
 //!   keccak256(abi.encode(owner, 4)) = nonces (EIP-2612 permit nonces)
 //!   slot 100 = totalSupply
-use alloy::{
-    primitives::address,
-    sol_types::SolCall,
-};
+use alloy::{primitives::address, sol_types::SolCall};
 use alloy_evm::precompiles::{DynPrecompile, PrecompileInput, PrecompilesMap};
 use reth_revm::precompile::{PrecompileError, PrecompileId, PrecompileResult};
-use tn_types::{Address, Bytes, U256};
+use tn_types::{Address, U256};
 
 mod burnable;
 mod eip2612;
@@ -27,19 +24,19 @@ mod erc20;
 mod faucet;
 mod helpers;
 #[cfg(any(test, feature = "test-utils"))]
-mod test_utils;
+pub mod test_utils;
+#[cfg(not(feature = "faucet"))]
+pub use burnable::mintCall;
 #[cfg(not(feature = "faucet"))]
 pub use burnable::TIMELOCK_DURATION;
 pub use burnable::{burnCall, claimCall, grantMintRoleCall, hasMintRoleCall, revokeMintRoleCall};
-#[cfg(not(feature = "faucet"))]
-pub use burnable::mintCall;
-#[cfg(feature = "faucet")]
-pub use faucet::mintCall;
 pub use eip2612::{noncesCall, permitCall, DOMAIN_SEPARATORCall};
 pub use erc20::{
     allowanceCall, approveCall, balanceOfCall, decimalsCall, nameCall, symbolCall, totalSupplyCall,
     transferCall, transferFromCall,
 };
+#[cfg(feature = "faucet")]
+pub use faucet::mintCall;
 
 /// The canonical address of the Telcoin precompile: `0x7e1`.
 ///

@@ -209,84 +209,9 @@ mod tests {
         test_utils::*,
     };
     use alloy::sol_types::SolCall;
-    use reth_revm::{
-        context::ContextTr as _,
-        primitives::{keccak256, KECCAK_EMPTY},
-        state::AccountInfo,
-    };
+    use reth_revm::primitives::keccak256;
     use tn_config::GOVERNANCE_SAFE_ADDRESS;
     use tn_types::{B256, U256};
-
-    /// Fixed secret key for permit signing tests.
-    const PERMIT_SECRET: B256 = B256::new([
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 1,
-    ]);
-
-    /// Derive the address corresponding to PERMIT_SECRET.
-    fn permit_signer_address() -> Address {
-        use alloy::signers::local::PrivateKeySigner;
-        let signer = PrivateKeySigner::from_slice(&PERMIT_SECRET.0).unwrap();
-        signer.address()
-    }
-
-    /// Fund the permit signer account in the test environment.
-    fn fund_permit_signer(env: &mut TestEnv) -> Address {
-        let addr = permit_signer_address();
-        env.evm.ctx.db_mut().insert_account_info(
-            addr,
-            AccountInfo {
-                balance: U256::from(10).pow(U256::from(18)),
-                nonce: 0,
-                code_hash: KECCAK_EMPTY,
-                code: None,
-                ..Default::default()
-            },
-        );
-        addr
-    }
-
-    /// Sign a permit message using PERMIT_SECRET.
-    fn sign_permit_test(
-        owner: Address,
-        spender: Address,
-        value: U256,
-        nonce: U256,
-        deadline: U256,
-        chain_id: u64,
-    ) -> (u8, B256, B256) {
-        use alloy::signers::{local::PrivateKeySigner, SignerSync};
-
-        let signer = PrivateKeySigner::from_slice(&PERMIT_SECRET.0).unwrap();
-
-        let domain_separator = compute_domain_separator(chain_id);
-
-        let struct_hash = {
-            let mut buf = [0u8; 6 * 32];
-            buf[0..32].copy_from_slice(&PERMIT_TYPEHASH.0);
-            buf[44..64].copy_from_slice(owner.as_slice());
-            buf[76..96].copy_from_slice(spender.as_slice());
-            buf[96..128].copy_from_slice(&value.to_be_bytes::<32>());
-            buf[128..160].copy_from_slice(&nonce.to_be_bytes::<32>());
-            buf[160..192].copy_from_slice(&deadline.to_be_bytes::<32>());
-            keccak256(buf)
-        };
-
-        let digest = {
-            let mut buf = [0u8; 66];
-            buf[0] = 0x19;
-            buf[1] = 0x01;
-            buf[2..34].copy_from_slice(&domain_separator.0);
-            buf[34..66].copy_from_slice(&struct_hash.0);
-            keccak256(buf)
-        };
-
-        let sig = signer.sign_hash_sync(&digest).unwrap();
-        let v = if sig.v() { 28u8 } else { 27u8 };
-        let r = B256::from(sig.r().to_be_bytes::<32>());
-        let s = B256::from(sig.s().to_be_bytes::<32>());
-        (v, r, s)
-    }
 
     #[test]
     fn test_typehash_values() {
@@ -304,11 +229,11 @@ mod tests {
     #[test]
     fn test_permit_sets_allowance() {
         let mut env = TestEnv::new();
-        let owner = fund_permit_signer(&mut env);
+        let owner = permit_signer_address();
         let value = U256::from(500);
         let deadline = U256::from(2000);
 
-        let (v, r, s) = sign_permit_test(owner, RECIPIENT, value, U256::ZERO, deadline, 1);
+        let (v, r, s) = sign_permit(owner, RECIPIENT, value, U256::ZERO, deadline, 1);
         let data = permitCall { owner, spender: RECIPIENT, value, deadline, v, r, s }.abi_encode();
         let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, data);
         assert_success(&result);
@@ -323,12 +248,12 @@ mod tests {
     #[test]
     fn test_permit_increments_nonce() {
         let mut env = TestEnv::new();
-        let owner = fund_permit_signer(&mut env);
+        let owner = permit_signer_address();
         let deadline = U256::from(2000);
 
         // First permit (nonce 0)
         let (v, r, s) =
-            sign_permit_test(owner, RECIPIENT, U256::from(100), U256::ZERO, deadline, 1);
+            sign_permit(owner, RECIPIENT, U256::from(100), U256::ZERO, deadline, 1);
         let data =
             permitCall { owner, spender: RECIPIENT, value: U256::from(100), deadline, v, r, s }
                 .abi_encode();
@@ -339,7 +264,7 @@ mod tests {
 
         // Second permit (nonce 1)
         let (v, r, s) =
-            sign_permit_test(owner, RECIPIENT, U256::from(200), U256::from(1), deadline, 1);
+            sign_permit(owner, RECIPIENT, U256::from(200), U256::from(1), deadline, 1);
         let data =
             permitCall { owner, spender: RECIPIENT, value: U256::from(200), deadline, v, r, s }
                 .abi_encode();
@@ -352,11 +277,11 @@ mod tests {
     #[test]
     fn test_permit_then_transfer_from() {
         let mut env = TestEnv::new();
-        let owner = fund_permit_signer(&mut env);
+        let owner = permit_signer_address();
         let value = U256::from(500);
         let deadline = U256::from(2000);
 
-        let (v, r, s) = sign_permit_test(owner, USER, value, U256::ZERO, deadline, 1);
+        let (v, r, s) = sign_permit(owner, USER, value, U256::ZERO, deadline, 1);
         let data = permitCall { owner, spender: USER, value, deadline, v, r, s }.abi_encode();
         assert_success(&env.exec_default(GOVERNANCE_SAFE_ADDRESS, data));
 
@@ -376,11 +301,11 @@ mod tests {
     #[test]
     fn test_permit_expired_deadline_fails() {
         let mut env = TestEnv::new();
-        let owner = fund_permit_signer(&mut env);
+        let owner = permit_signer_address();
         // Block timestamp is 1000, deadline is 999 (already expired)
         let deadline = U256::from(999);
         let (v, r, s) =
-            sign_permit_test(owner, RECIPIENT, U256::from(100), U256::ZERO, deadline, 1);
+            sign_permit(owner, RECIPIENT, U256::from(100), U256::ZERO, deadline, 1);
         let data =
             permitCall { owner, spender: RECIPIENT, value: U256::from(100), deadline, v, r, s }
                 .abi_encode();
@@ -391,12 +316,12 @@ mod tests {
     #[test]
     fn test_permit_wrong_signer_fails() {
         let mut env = TestEnv::new();
-        let signer_addr = fund_permit_signer(&mut env);
+        let signer_addr = permit_signer_address();
         let deadline = U256::from(2000);
 
         // Sign as the real signer address
         let (v, r, s) =
-            sign_permit_test(signer_addr, USER, U256::from(100), U256::ZERO, deadline, 1);
+            sign_permit(signer_addr, USER, U256::from(100), U256::ZERO, deadline, 1);
         // Submit with USER as the claimed owner — signature won't match
         let data = permitCall {
             owner: USER,
@@ -415,11 +340,11 @@ mod tests {
     #[test]
     fn test_permit_replay_fails() {
         let mut env = TestEnv::new();
-        let owner = fund_permit_signer(&mut env);
+        let owner = permit_signer_address();
         let deadline = U256::from(2000);
 
         let (v, r, s) =
-            sign_permit_test(owner, RECIPIENT, U256::from(100), U256::ZERO, deadline, 1);
+            sign_permit(owner, RECIPIENT, U256::from(100), U256::ZERO, deadline, 1);
         let data =
             permitCall { owner, spender: RECIPIENT, value: U256::from(100), deadline, v, r, s }
                 .abi_encode();
@@ -433,11 +358,11 @@ mod tests {
     #[test]
     fn test_permit_invalid_v_fails() {
         let mut env = TestEnv::new();
-        let owner = fund_permit_signer(&mut env);
+        let owner = permit_signer_address();
         let deadline = U256::from(2000);
 
         let (_, r, s) =
-            sign_permit_test(owner, RECIPIENT, U256::from(100), U256::ZERO, deadline, 1);
+            sign_permit(owner, RECIPIENT, U256::from(100), U256::ZERO, deadline, 1);
         let data =
             permitCall { owner, spender: RECIPIENT, value: U256::from(100), deadline, v: 26, r, s }
                 .abi_encode();
@@ -467,10 +392,10 @@ mod tests {
     #[test]
     fn test_permit_oog() {
         let mut env = TestEnv::new();
-        let owner = fund_permit_signer(&mut env);
+        let owner = permit_signer_address();
         let deadline = U256::from(2000);
         let (v, r, s) =
-            sign_permit_test(owner, RECIPIENT, U256::from(100), U256::ZERO, deadline, 1);
+            sign_permit(owner, RECIPIENT, U256::from(100), U256::ZERO, deadline, 1);
         let data =
             permitCall { owner, spender: RECIPIENT, value: U256::from(100), deadline, v, r, s }
                 .abi_encode();
