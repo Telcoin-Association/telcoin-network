@@ -312,6 +312,33 @@ impl PipelineTestEnv {
     pub(crate) fn tx_succeeded(&self, block: &ExecutedBlock, tx_index: usize) -> bool {
         block.execution_output.result.receipts[tx_index].success
     }
+
+    /// Create an encoded EIP-1559 native value transfer (no calldata).
+    pub(crate) fn native_transfer_tx(
+        factory: &mut TransactionFactory,
+        chain: &Arc<RethChainSpec>,
+        to: Address,
+        amount: U256,
+    ) -> Vec<u8> {
+        factory.create_eip1559_encoded(
+            chain.clone(),
+            Some(1_000_000),
+            MIN_PROTOCOL_BASE_FEE.into(),
+            Some(to),
+            amount,
+            Bytes::new(),
+        )
+    }
+}
+
+/// Extract the gas used by a single transaction within a block.
+pub(crate) fn tx_gas_used(block: &ExecutedBlock, tx_index: usize) -> u64 {
+    let cumulative = block.execution_output.result.receipts[tx_index].cumulative_gas_used;
+    if tx_index == 0 {
+        cumulative
+    } else {
+        cumulative - block.execution_output.result.receipts[tx_index - 1].cumulative_gas_used
+    }
 }
 
 // --- Consensus output helper ---
