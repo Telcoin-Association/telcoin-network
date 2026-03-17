@@ -73,8 +73,9 @@ impl ConfigureEvm for TnEvmConfig {
         let spec = reth_evm_ethereum::revm_spec(self.chain_spec(), header);
 
         // configure evm env based on parent block
-        let mut cfg_env =
-            CfgEnv::new().with_chain_id(self.chain_spec().chain().id()).with_spec(spec);
+        let mut cfg_env = CfgEnv::new()
+            .with_chain_id(self.chain_spec().chain().id())
+            .with_spec_and_mainnet_gas_params(spec);
 
         let blob_params = self.chain_spec().blob_params_at_timestamp(header.timestamp);
         if let Some(blob_params) = &blob_params {
@@ -118,8 +119,9 @@ impl ConfigureEvm for TnEvmConfig {
         );
 
         // configure evm env based on parent block
-        let mut cfg =
-            CfgEnv::new().with_chain_id(self.chain_spec().chain().id()).with_spec(spec_id);
+        let mut cfg = CfgEnv::new()
+            .with_chain_id(self.chain_spec().chain().id())
+            .with_spec_and_mainnet_gas_params(spec_id);
 
         let blob_params = self.chain_spec().blob_params_at_timestamp(payload.timestamp);
         if let Some(blob_params) = &blob_params {
@@ -130,7 +132,7 @@ impl ConfigureEvm for TnEvmConfig {
             number: U256::from(parent.number + 1),
             beneficiary: payload.beneficiary,
             timestamp: U256::from(payload.timestamp),
-            difficulty: U256::from(payload.batch_index),
+            difficulty: U256::from(payload.batch_index), // stored in final execution
             prevrandao: Some(payload.prev_randao()),
             gas_limit: payload.gas_limit,
             basefee: payload.base_fee_per_gas,

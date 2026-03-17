@@ -167,7 +167,7 @@ impl Faucet {
     {
         let (this, service) = Self::create(reth_env, pool, executor.clone(), config);
 
-        executor.spawn_critical("faucet cache", Box::pin(service));
+        executor.spawn_critical_task("faucet cache", Box::pin(service));
         this
     }
 
@@ -275,7 +275,7 @@ mod tests {
 
         // the message used to create test data
         let data = keccak256("this is a test");
-        let message_hash = data.0.as_slice();
+        let message_hash = data.0;
 
         // Try both recovery ids (0 or 1) to find the correct v value
         //
@@ -332,10 +332,9 @@ mod tests {
             let recid = RecoveryId::try_from(recovery_id).expect("Invalid recovery id");
             let recoverable_signature = RecoverableSignature::from_compact(&compact, recid)
                 .expect("creating recoverable signature");
-            if let Ok(recovered_key) = SECP256K1.recover_ecdsa(
-                Message::from_digest_slice(message_hash).expect("message from slice"),
-                &recoverable_signature,
-            ) {
+            if let Ok(recovered_key) =
+                SECP256K1.recover_ecdsa(Message::from_digest(message_hash), &recoverable_signature)
+            {
                 let recovered_pubkey = recovered_key.serialize();
                 // alternative approach:
                 // let uncomp_pubkey = recovered_key.serialize_uncompressed();
