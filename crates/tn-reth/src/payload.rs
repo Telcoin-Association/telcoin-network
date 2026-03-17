@@ -119,7 +119,7 @@ impl TNPayload {
     /// Method to create an instance of Self useful for tests.
     ///
     /// WARNING: only use this for tests. Data is invalid.
-    #[cfg(test)]
+    #[cfg(any(feature = "test-utils", test))]
     pub fn new_for_test(parent_header: SealedHeader, output: &ConsensusOutput) -> Self {
         use tn_types::{Hash as _, MIN_PROTOCOL_BASE_FEE};
 

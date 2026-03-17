@@ -22,12 +22,18 @@ mod config;
 mod context;
 mod factory;
 mod handler;
+mod tel_precompile;
 mod utils;
 use crate::evm::handler::TNEvmHandler;
 pub(crate) use block::*;
 pub(crate) use config::*;
 pub(crate) use context::*;
 pub(crate) use factory::*;
+pub use tel_precompile::{
+    add_telcoin_precompile, allowanceCall, approveCall, balanceOfCall, burnCall, claimCall,
+    decimalsCall, grantMintRoleCall, hasMintRoleCall, mintCall, nameCall, revokeMintRoleCall,
+    symbolCall, totalSupplyCall, transferCall, transferFromCall, TELCOIN_PRECOMPILE_ADDRESS,
+};
 pub use utils::calculate_gas_penalty;
 
 /// TN EVM implementation.

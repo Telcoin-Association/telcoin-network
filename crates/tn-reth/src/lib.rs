@@ -157,7 +157,12 @@ mod evm;
 pub mod rpc_server_args;
 pub mod system_calls;
 pub mod worker;
-pub use evm::calculate_gas_penalty;
+pub use evm::{
+    add_telcoin_precompile, allowanceCall, approveCall, balanceOfCall, burnCall,
+    calculate_gas_penalty, claimCall, decimalsCall, grantMintRoleCall, hasMintRoleCall, mintCall,
+    nameCall, revokeMintRoleCall, symbolCall, totalSupplyCall, transferCall, transferFromCall,
+    TELCOIN_PRECOMPILE_ADDRESS,
+};
 
 #[cfg(any(feature = "test-utils", test))]
 pub mod test_utils;
