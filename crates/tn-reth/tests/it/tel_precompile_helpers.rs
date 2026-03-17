@@ -21,7 +21,7 @@ use reth_revm::{
 use std::collections::HashMap;
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
 use tn_reth::{
-    add_telcoin_precompile, allowanceCall, balanceOfCall, totalSupplyCall,
+    add_telcoin_precompile, allowanceCall, balanceOfCall, noncesCall, totalSupplyCall,
     TELCOIN_PRECOMPILE_ADDRESS,
 };
 use tn_types::{Bytes, TxKind, U256};
@@ -57,11 +57,14 @@ pub(crate) struct TestEnv {
 
 impl TestEnv {
     pub(crate) fn new() -> Self {
-        Self::new_with_balances(
+        let mut env = Self::new_with_balances(
             U256::from(10).pow(U256::from(18)),
             U256::from(10).pow(U256::from(18)),
             U256::from(1000),
-        )
+        );
+        // Fund the permit signer
+        env.add_account(permit_signer_address(), U256::from(10).pow(U256::from(18)));
+        env
     }
 
     pub(crate) fn new_with_balances(
@@ -184,11 +187,93 @@ impl TestEnv {
         decode_u256(&result)
     }
 
+    pub(crate) fn get_nonce(&mut self, owner: Address) -> U256 {
+        let result = self.exec_default(GOVERNANCE, noncesCall { owner }.abi_encode());
+        decode_u256(&result)
+    }
+
     pub(crate) fn set_timestamp(&mut self, ts: u64) {
         let mut block = BlockEnv::default();
         block.timestamp = U256::from(ts);
         self.evm.ctx.set_block(block);
     }
+}
+
+// --- EIP-2612 permit test utilities ---
+
+/// Fixed secret key for permit signing in integration tests.
+pub(crate) const PERMIT_SECRET: tn_types::B256 = tn_types::B256::new([
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 1,
+]);
+
+/// Derive the address corresponding to PERMIT_SECRET.
+pub(crate) fn permit_signer_address() -> Address {
+    use alloy::signers::local::PrivateKeySigner;
+    let signer = PrivateKeySigner::from_slice(&PERMIT_SECRET.0).unwrap();
+    signer.address()
+}
+
+/// Sign a permit message using PERMIT_SECRET.
+pub(crate) fn sign_permit(
+    owner: Address,
+    spender: Address,
+    value: U256,
+    nonce: U256,
+    deadline: U256,
+    chain_id: u64,
+) -> (u8, tn_types::B256, tn_types::B256) {
+    use alloy::signers::{local::PrivateKeySigner, SignerSync};
+    use reth_revm::primitives::keccak256;
+
+    let signer = PrivateKeySigner::from_slice(&PERMIT_SECRET.0).unwrap();
+
+    // EIP-712 domain type hash
+    let eip712_domain_typehash = keccak256(
+        "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+    );
+    let permit_typehash = keccak256(
+        "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)",
+    );
+
+    // Domain separator
+    let domain_separator = {
+        let mut buf = [0u8; 5 * 32];
+        buf[0..32].copy_from_slice(&eip712_domain_typehash.0);
+        buf[32..64].copy_from_slice(&keccak256("Telcoin").0);
+        buf[64..96].copy_from_slice(&keccak256("1").0);
+        buf[96..128].copy_from_slice(&U256::from(chain_id).to_be_bytes::<32>());
+        buf[140..160].copy_from_slice(TELCOIN_PRECOMPILE_ADDRESS.as_slice());
+        keccak256(buf)
+    };
+
+    // Struct hash
+    let struct_hash = {
+        let mut buf = [0u8; 6 * 32];
+        buf[0..32].copy_from_slice(&permit_typehash.0);
+        buf[44..64].copy_from_slice(owner.as_slice());
+        buf[76..96].copy_from_slice(spender.as_slice());
+        buf[96..128].copy_from_slice(&value.to_be_bytes::<32>());
+        buf[128..160].copy_from_slice(&nonce.to_be_bytes::<32>());
+        buf[160..192].copy_from_slice(&deadline.to_be_bytes::<32>());
+        keccak256(buf)
+    };
+
+    // EIP-712 digest
+    let digest = {
+        let mut buf = [0u8; 66];
+        buf[0] = 0x19;
+        buf[1] = 0x01;
+        buf[2..34].copy_from_slice(&domain_separator.0);
+        buf[34..66].copy_from_slice(&struct_hash.0);
+        keccak256(buf)
+    };
+
+    let sig = signer.sign_hash_sync(&digest).unwrap();
+    let v = if sig.v() { 28u8 } else { 27u8 };
+    let r = tn_types::B256::from(sig.r().to_be_bytes::<32>());
+    let s = tn_types::B256::from(sig.s().to_be_bytes::<32>());
+    (v, r, s)
 }
 
 // --- Assertion helpers ---

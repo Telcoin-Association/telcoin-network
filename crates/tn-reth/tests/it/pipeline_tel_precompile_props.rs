@@ -6,10 +6,15 @@
 
 use alloy::sol_types::SolCall;
 use proptest::prelude::*;
-use tn_reth::{approveCall, burnCall, claimCall, mintCall, transferCall, transferFromCall};
+use tn_config::GOVERNANCE_SAFE_ADDRESS;
+use tn_reth::{
+    approveCall, burnCall, claimCall, mintCall, permitCall, transferCall, transferFromCall,
+    TIMELOCK_DURATION,
+};
 use tn_types::U256;
 
 use super::pipeline_helpers::*;
+use super::tel_precompile_helpers::{permit_signer_address, sign_permit};
 
 // ==============================
 // ERC-20 transfer properties
@@ -67,8 +72,6 @@ proptest! {
         let mut env = PipelineTestEnv::new();
         let user_addr = env.user_factory.address();
         let recipient_addr = env.recipient_factory.address();
-        let governance_addr = GOVERNANCE;
-
         let transfer_amt = U256::from(allowance_val) * U256::from(pct) / U256::from(100);
         if transfer_amt.is_zero() {
             return Ok(());
@@ -131,7 +134,7 @@ proptest! {
         let transfer_from_tx = env.recipient_precompile_tx(
             transferFromCall {
                 from: user_addr,
-                to: GOVERNANCE,
+                to: GOVERNANCE_SAFE_ADDRESS,
                 amount: U256::from(amount),
             }
             .abi_encode(),
@@ -172,7 +175,7 @@ proptest! {
 
         // Block 2 at T + TIMELOCK - 1: claim should fail (timelock not expired)
         let early_claim_tx = env.governance_tx(
-            claimCall { recipient: GOVERNANCE }.abi_encode(),
+            claimCall { recipient: GOVERNANCE_SAFE_ADDRESS }.abi_encode(),
         );
         let block2 = env.execute_block_at_timestamp(
             vec![early_claim_tx],
@@ -182,7 +185,7 @@ proptest! {
 
         // Block 3 at T + TIMELOCK + 1: claim should succeed
         let claim_tx = env.governance_tx(
-            claimCall { recipient: GOVERNANCE }.abi_encode(),
+            claimCall { recipient: GOVERNANCE_SAFE_ADDRESS }.abi_encode(),
         );
         let block3 = env.execute_block_at_timestamp(
             vec![claim_tx],
@@ -286,5 +289,70 @@ proptest! {
             supply_before,
             "total supply should be unchanged after failed mint"
         );
+    }
+}
+
+// ==============================
+// EIP-2612 Permit pipeline test
+// ==============================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(10))]
+
+    /// Full pipeline: sign permit off-chain, submit permit tx, then transferFrom in next block.
+    #[test]
+    fn prop_pipeline_permit_then_transfer_from(amount in 1u128..1_000_000u128) {
+        let mut env = PipelineTestEnv::new();
+        let owner = permit_signer_address();
+        let spender = env.recipient_factory.address();
+        let chain_id = env.chain_id();
+        let value = U256::from(amount);
+        let deadline = U256::from(env.block_timestamp + 1000);
+
+        // Get current nonce
+        let nonce = env.get_nonce(owner);
+
+        // Sign permit off-chain
+        let (v, r, s) = sign_permit(owner, spender, value, nonce, deadline, chain_id);
+
+        // Block 1: anyone submits the permit tx (user pays gas)
+        let permit_tx = env.user_precompile_tx(
+            permitCall { owner, spender, value, deadline, v, r, s }.abi_encode(),
+        );
+        let block1 = env.execute_block(vec![permit_tx]).expect("execute permit block");
+        assert!(env.tx_succeeded(&block1, 0), "permit tx should succeed");
+
+        // Verify allowance was set
+        let allowance = env.get_allowance(owner, spender);
+        prop_assert_eq!(allowance, value, "allowance should match permit value");
+
+        // Verify nonce incremented
+        let new_nonce = env.get_nonce(owner);
+        prop_assert_eq!(new_nonce, nonce + U256::from(1), "nonce should be incremented");
+
+        // Block 2: spender (recipient) calls transferFrom(owner → spender)
+        let owner_before = env.get_balance(owner);
+        let transfer_from_tx = env.recipient_precompile_tx(
+            transferFromCall {
+                from: owner,
+                to: spender,
+                amount: value,
+            }
+            .abi_encode(),
+        );
+        let block2 = env.execute_block(vec![transfer_from_tx]).expect("execute transferFrom block");
+        assert!(env.tx_succeeded(&block2, 0), "transferFrom tx should succeed");
+
+        // Verify owner balance decreased
+        let owner_after = env.get_balance(owner);
+        prop_assert_eq!(
+            owner_after,
+            owner_before - value,
+            "owner balance should decrease by transfer amount"
+        );
+
+        // Verify allowance consumed
+        let remaining = env.get_allowance(owner, spender);
+        prop_assert_eq!(remaining, U256::ZERO, "allowance should be consumed");
     }
 }

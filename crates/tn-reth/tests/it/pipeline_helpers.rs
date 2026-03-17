@@ -9,14 +9,15 @@ use reth_revm::context::result::{ExecutionResult, Output};
 use secp256k1::rand::{rngs::StdRng, SeedableRng as _};
 use std::{collections::VecDeque, sync::Arc};
 use tempfile::TempDir;
+use tn_config::GOVERNANCE_SAFE_ADDRESS;
 use tn_reth::{
-    allowanceCall, balanceOfCall, totalSupplyCall, ExecutedBlock, NewCanonicalChain, RethChainSpec,
-    RethEnv, TELCOIN_PRECOMPILE_ADDRESS,
+    allowanceCall, balanceOfCall, noncesCall, payload::TNPayload, totalSupplyCall, ExecutedBlock,
+    NewCanonicalChain, RethChainSpec, RethEnv, TELCOIN_PRECOMPILE_ADDRESS,
 };
 use tn_types::{
-    test_genesis, Address, BlsSignature, Bytes, Certificate, CommittedSubDag,
-    ConsensusHeader, ConsensusOutput, GenesisAccount, ReputationScores, SealedHeader,
-    SignatureVerificationState, TaskManager, U256, MIN_PROTOCOL_BASE_FEE,
+    test_genesis, Address, BlsSignature, Bytes, Certificate, CommittedSubDag, ConsensusHeader,
+    ConsensusOutput, GenesisAccount, ReputationScores, SealedHeader, SignatureVerificationState,
+    TaskManager, MIN_PROTOCOL_BASE_FEE, U256,
 };
 
 use tn_reth::test_utils::TransactionFactory;
@@ -25,12 +26,6 @@ use tn_reth::test_utils::TransactionFactory;
 
 /// Genesis total supply: 100 billion (before 10^18 scaling).
 pub(crate) const GENESIS_SUPPLY: u128 = 100_000_000_000;
-
-/// Timelock duration: 7 days in seconds.
-pub(crate) const TIMELOCK_DURATION: u64 = 7 * 24 * 60 * 60; // 604800s
-
-/// The governance safe address that the precompile checks for authorization.
-pub(crate) const GOVERNANCE: Address = tn_config::GOVERNANCE_SAFE_ADDRESS;
 
 /// Minimal EVM contract that forwards any call (with value) to TELCOIN_PRECOMPILE_ADDRESS.
 /// Deployed at GOVERNANCE_SAFE_ADDRESS so the precompile sees caller == governance.
@@ -46,10 +41,11 @@ pub(crate) const GOVERNANCE: Address = tn_config::GOVERNANCE_SAFE_ADDRESS;
 ///   JUMPDEST RETURNDATASIZE PUSH1 0 REVERT          // failure: revert with return data
 pub(crate) const GOVERNANCE_FORWARDER_BYTECODE: &[u8] = &[
     0x36, 0x60, 0x00, 0x60, 0x00, 0x37, // CALLDATASIZE PUSH1 0 PUSH1 0 CALLDATACOPY
-    0x60, 0x00, 0x60, 0x00, 0x36, 0x60, 0x00, 0x34, // PUSH1 0 PUSH1 0 CALLDATASIZE PUSH1 0 CALLVALUE
+    0x60, 0x00, 0x60, 0x00, 0x36, 0x60, 0x00,
+    0x34, // PUSH1 0 PUSH1 0 CALLDATASIZE PUSH1 0 CALLVALUE
     0x73, // PUSH20
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xe1, // TELCOIN_PRECOMPILE_ADDRESS
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x07, 0xe1, // TELCOIN_PRECOMPILE_ADDRESS
     0x5a, 0xf1, // GAS CALL
     0x3d, 0x60, 0x00, 0x60, 0x00, 0x3e, // RETURNDATASIZE PUSH1 0 PUSH1 0 RETURNDATACOPY
     0x15, 0x60, 0x33, 0x57, // ISZERO PUSH1 0x33 JUMPI
@@ -76,7 +72,7 @@ pub(crate) struct PipelineTestEnv {
     /// Current canonical header (updated after each block).
     pub(crate) canonical_header: SealedHeader,
     /// Monotonically increasing block timestamp.
-    block_timestamp: u64,
+    pub(crate) block_timestamp: u64,
     /// Monotonically increasing subdag index for consensus output.
     subdag_index: u64,
     _tmp_dir: TempDir,
@@ -94,10 +90,18 @@ impl PipelineTestEnv {
         let mut recipient_factory =
             TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(300));
 
-        let large_balance =
-            U256::from(10).pow(U256::from(18)) * U256::from(1_000_000_000u64); // 1B TEL
-        let genesis_supply_wei =
-            U256::from(GENESIS_SUPPLY) * U256::from(10).pow(U256::from(18));
+        let large_balance = U256::from(10).pow(U256::from(18)) * U256::from(1_000_000_000u64); // 1B TEL
+        let genesis_supply_wei = U256::from(GENESIS_SUPPLY) * U256::from(10).pow(U256::from(18));
+
+        // Permit signer address (from known private key 0x01)
+        let permit_signer_addr = {
+            use alloy::signers::local::PrivateKeySigner;
+            let secret = tn_types::B256::new([
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 1,
+            ]);
+            PrivateKeySigner::from_slice(&secret.0).unwrap().address()
+        };
 
         // Build genesis with funded accounts + governance forwarder + precompile storage
         let genesis = test_genesis().extend_accounts(vec![
@@ -105,9 +109,11 @@ impl PipelineTestEnv {
             (governance_factory.address(), GenesisAccount::default().with_balance(large_balance)),
             (user_factory.address(), GenesisAccount::default().with_balance(large_balance)),
             (recipient_factory.address(), GenesisAccount::default().with_balance(large_balance)),
+            // Fund the permit signer
+            (permit_signer_addr, GenesisAccount::default().with_balance(large_balance)),
             // Deploy forwarder contract at GOVERNANCE_SAFE_ADDRESS
             (
-                GOVERNANCE,
+                GOVERNANCE_SAFE_ADDRESS,
                 GenesisAccount::default()
                     .with_balance(large_balance)
                     .with_code(Some(Bytes::from_static(GOVERNANCE_FORWARDER_BYTECODE))),
@@ -167,10 +173,7 @@ impl PipelineTestEnv {
     /// Execute a block containing the given encoded transactions.
     ///
     /// Mirrors the 5-step execute-finalize pipeline from `lib.rs:1513-1531`.
-    pub(crate) fn execute_block(
-        &mut self,
-        txs: Vec<Vec<u8>>,
-    ) -> eyre::Result<ExecutedBlock> {
+    pub(crate) fn execute_block(&mut self, txs: Vec<Vec<u8>>) -> eyre::Result<ExecutedBlock> {
         self.execute_block_at_timestamp(txs, self.block_timestamp)
     }
 
@@ -181,27 +184,16 @@ impl PipelineTestEnv {
         timestamp: u64,
     ) -> eyre::Result<ExecutedBlock> {
         // 1. Create consensus output with controlled timestamp
-        let output = consensus_output_for_test(
-            self.subdag_index as u32,
-            0,
-            self.subdag_index,
-            timestamp,
-        );
+        let output =
+            consensus_output_for_test(self.subdag_index as u32, 0, self.subdag_index, timestamp);
 
         // 2. Build TNPayload
-        let payload = tn_reth::payload::TNPayload::new_for_test(
-            self.canonical_header.clone(),
-            &output,
-        );
+        let payload = TNPayload::new_for_test(self.canonical_header.clone(), &output);
 
         // 3. Build and execute block
         let anchor_hash = self.canonical_header.hash();
-        let block = self.reth_env.build_block_from_batch_payload(
-            payload,
-            &txs,
-            anchor_hash,
-            &[],
-        )?;
+        let block =
+            self.reth_env.build_block_from_batch_payload(payload, &txs, anchor_hash, &[])?;
 
         // 4. Update canonical in-memory state
         let canonical_header = block.recovered_block.clone_sealed_header();
@@ -243,7 +235,7 @@ impl PipelineTestEnv {
             self.chain.clone(),
             Some(1_000_000),
             MIN_PROTOCOL_BASE_FEE.into(),
-            Some(GOVERNANCE),
+            Some(GOVERNANCE_SAFE_ADDRESS),
             U256::ZERO,
             Bytes::from(calldata),
         )
@@ -284,6 +276,17 @@ impl PipelineTestEnv {
     pub(crate) fn get_precompile_balance(&self, account: Address) -> U256 {
         let calldata = balanceOfCall { account }.abi_encode();
         self.read_precompile_u256(calldata)
+    }
+
+    /// Read nonces(owner) from the precompile.
+    pub(crate) fn get_nonce(&self, owner: Address) -> U256 {
+        let calldata = noncesCall { owner }.abi_encode();
+        self.read_precompile_u256(calldata)
+    }
+
+    /// Return the chain ID from the chain spec.
+    pub(crate) fn chain_id(&self) -> u64 {
+        self.chain.chain().id()
     }
 
     /// Execute a read-only system call to the precompile and decode a U256 result.

@@ -29,10 +29,13 @@ pub(crate) use block::*;
 pub(crate) use config::*;
 pub(crate) use context::*;
 pub(crate) use factory::*;
+#[cfg(not(feature = "faucet"))]
+pub use tel_precompile::TIMELOCK_DURATION;
 pub use tel_precompile::{
     add_telcoin_precompile, allowanceCall, approveCall, balanceOfCall, burnCall, claimCall,
-    decimalsCall, grantMintRoleCall, hasMintRoleCall, mintCall, nameCall, revokeMintRoleCall,
-    symbolCall, totalSupplyCall, transferCall, transferFromCall, TELCOIN_PRECOMPILE_ADDRESS,
+    decimalsCall, grantMintRoleCall, hasMintRoleCall, mintCall, nameCall, noncesCall, permitCall,
+    revokeMintRoleCall, symbolCall, totalSupplyCall, transferCall, transferFromCall,
+    DOMAIN_SEPARATORCall, TELCOIN_PRECOMPILE_ADDRESS,
 };
 pub use utils::calculate_gas_penalty;
 

@@ -10,8 +10,9 @@ use alloy::sol_types::SolCall;
 use proptest::prelude::*;
 use tn_reth::{
     allowanceCall, approveCall, balanceOfCall, burnCall, claimCall, decimalsCall,
-    grantMintRoleCall, hasMintRoleCall, mintCall, nameCall, revokeMintRoleCall, symbolCall,
-    totalSupplyCall, transferCall, transferFromCall,
+    grantMintRoleCall, hasMintRoleCall, mintCall, nameCall, noncesCall, permitCall,
+    revokeMintRoleCall, symbolCall, totalSupplyCall, transferCall, transferFromCall,
+    DOMAIN_SEPARATORCall,
 };
 use tn_types::{Address, U256};
 
@@ -334,6 +335,9 @@ fn known_selectors() -> Vec<[u8; 4]> {
         symbolCall::SELECTOR,
         decimalsCall::SELECTOR,
         mintCall::SELECTOR,
+        permitCall::SELECTOR,
+        noncesCall::SELECTOR,
+        DOMAIN_SEPARATORCall::SELECTOR,
     ]
 }
 
@@ -429,4 +433,93 @@ fn test_total_supply_reflects_operations() {
     // Burn
     env.exec_default(GOVERNANCE, burnCall { amount: U256::from(400) }.abi_encode()).unwrap();
     assert_eq!(env.get_total_supply(), genesis + U256::from(1000) - U256::from(400));
+}
+
+// ==============================
+// EIP-2612 Permit properties
+// ==============================
+
+proptest! {
+    /// After a valid permit, the allowance equals the permitted value.
+    #[test]
+    fn prop_permit_sets_allowance(value in 1u128..1_000_000_000_000_000_000u128) {
+        let mut env = TestEnv::new();
+        let owner = permit_signer_address();
+        let deadline = U256::from(2000);
+        let (v, r, s) = sign_permit(owner, RECIPIENT, U256::from(value), U256::ZERO, deadline, 1);
+        let data = permitCall {
+            owner, spender: RECIPIENT, value: U256::from(value), deadline, v, r, s,
+        }.abi_encode();
+        assert_success(&env.exec_default(GOVERNANCE, data));
+
+        let allowance = env.get_allowance(owner, RECIPIENT);
+        prop_assert_eq!(allowance, U256::from(value), "allowance mismatch after permit");
+    }
+
+    /// Multiple permits monotonically increment the nonce.
+    #[test]
+    fn prop_permit_nonce_monotonic(count in 1u32..5u32) {
+        let mut env = TestEnv::new();
+        let owner = permit_signer_address();
+        let deadline = U256::from(2000);
+
+        for i in 0..count {
+            let nonce = U256::from(i);
+            let (v, r, s) = sign_permit(owner, RECIPIENT, U256::from(100u128), nonce, deadline, 1);
+            let data = permitCall {
+                owner, spender: RECIPIENT, value: U256::from(100u128), deadline, v, r, s,
+            }.abi_encode();
+            assert_success(&env.exec_default(GOVERNANCE, data));
+
+            let current_nonce = env.get_nonce(owner);
+            prop_assert_eq!(current_nonce, U256::from(i + 1), "nonce should be {}", i + 1);
+        }
+    }
+
+    /// Replaying a permit signature fails.
+    #[test]
+    fn prop_permit_replay_fails(value in 1u128..1_000_000_000_000_000_000u128) {
+        let mut env = TestEnv::new();
+        let owner = permit_signer_address();
+        let deadline = U256::from(2000);
+        let (v, r, s) = sign_permit(owner, RECIPIENT, U256::from(value), U256::ZERO, deadline, 1);
+        let data = permitCall {
+            owner, spender: RECIPIENT, value: U256::from(value), deadline, v, r, s,
+        }.abi_encode();
+
+        assert_success(&env.exec_default(GOVERNANCE, data.clone()));
+        assert_not_success(&env.exec_default(GOVERNANCE, data));
+    }
+
+    /// Permit with expired deadline always fails.
+    #[test]
+    fn prop_permit_expired_deadline_fails(value in 1u128..1_000_000_000_000_000_000u128) {
+        let mut env = TestEnv::new();
+        let owner = permit_signer_address();
+        // Block timestamp is 1000; deadline is 0..999
+        let deadline = U256::from(999u64);
+        let (v, r, s) = sign_permit(owner, RECIPIENT, U256::from(value), U256::ZERO, deadline, 1);
+        let data = permitCall {
+            owner, spender: RECIPIENT, value: U256::from(value), deadline, v, r, s,
+        }.abi_encode();
+
+        assert_not_success(&env.exec_default(GOVERNANCE, data));
+    }
+
+    /// Permit with wrong signer (USER as owner) always fails.
+    #[test]
+    fn prop_permit_wrong_signer_fails(value in 1u128..1_000_000_000_000_000_000u128) {
+        let mut env = TestEnv::new();
+        let signer_addr = permit_signer_address();
+        let deadline = U256::from(2000);
+
+        // Sign with the actual signer
+        let (v, r, s) = sign_permit(signer_addr, RECIPIENT, U256::from(value), U256::ZERO, deadline, 1);
+        // Submit with USER as the claimed owner
+        let data = permitCall {
+            owner: USER, spender: RECIPIENT, value: U256::from(value), deadline, v, r, s,
+        }.abi_encode();
+
+        assert_not_success(&env.exec_default(GOVERNANCE, data));
+    }
 }

@@ -70,7 +70,7 @@ proptest = { workspace = true }
 [features]
 default = []
 faucet = []
-test-utils = ["secp256k1"]
+test-utils = ["dep:secp256k1"]
 
 [lints]
 workspace = true

@@ -4,10 +4,11 @@
 //!   keccak256(abi.encode(recipient, 0)) = pending mint amount
 //!   keccak256(abi.encode(recipient, 1)) = unlock timestamp
 //!   keccak256(abi.encode(spender, keccak256(abi.encode(owner, 2)))) = allowance
+//!   keccak256(abi.encode(owner, 4)) = nonces (EIP-2612 permit nonces)
 //!   slot 100 = totalSupply
 
 use alloy::{
-    primitives::address,
+    primitives::{address, Signature},
     sol,
     sol_types::{SolCall, SolEvent},
 };
@@ -15,6 +16,7 @@ use alloy_evm::{
     precompiles::{DynPrecompile, PrecompileInput, PrecompilesMap},
     EvmInternals,
 };
+use reth_primitives_traits::crypto::SECP256K1N_HALF;
 use reth_revm::{
     precompile::{PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult},
     primitives::keccak256,
@@ -53,13 +55,18 @@ sol! {
     event Mint(address indexed recipient, uint256 amount, uint256 unlockTimestamp);
     event Claim(address indexed recipient, uint256 amount);
     event Burn(uint256 amount);
+    function permit(address owner, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external;
+    function nonces(address owner) external view returns (uint256);
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
 }
 
+// only mint to governance safe
 #[cfg(not(feature = "faucet"))]
 sol! {
     function mint(uint256 amount) external;
 }
 
+// faucet mints on the fly
 #[cfg(feature = "faucet")]
 sol! {
     function mint(address recipient, uint256 amount) external;
@@ -85,13 +92,25 @@ pub const TELCOIN_PRECOMPILE_ADDRESS: Address =
 /// This value is set at **compile time**. A production binary must never be built with
 /// `feature = "faucet"` enabled, or the timelock protection is silently disabled.
 #[cfg(not(feature = "faucet"))]
-const TIMELOCK_DURATION: u64 = 7 * 24 * 60 * 60; // 604800
+pub const TIMELOCK_DURATION: u64 = 7 * 24 * 60 * 60; // 604800s = 7 days
 
 /// Fixed storage slot (100) that holds the total circulating supply of TEL.
 ///
 /// Incremented on [`handle_claim`] and decremented on [`handle_burn`].
 /// This is a plain slot (not a mapping), so it can be read directly without hashing.
 const TOTAL_SUPPLY_SLOT: U256 = U256::from_limbs([100, 0, 0, 0]);
+
+/// EIP-712 domain type hash: `keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")`.
+const EIP712_DOMAIN_TYPEHASH: B256 = B256::new([
+    0x8b, 0x73, 0xc3, 0xc6, 0x9b, 0xb8, 0xfe, 0x3d, 0x51, 0x2e, 0xcc, 0x4c, 0xf7, 0x59, 0xcc, 0x79,
+    0x23, 0x9f, 0x7b, 0x17, 0x9b, 0x0f, 0xfa, 0xca, 0xa9, 0xa7, 0x5d, 0x52, 0x2b, 0x39, 0x40, 0x0f,
+]);
+
+/// EIP-2612 permit type hash: `keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)")`.
+const PERMIT_TYPEHASH: B256 = B256::new([
+    0x6e, 0x71, 0xed, 0xae, 0x12, 0xb1, 0xb9, 0x7f, 0x4d, 0x1f, 0x60, 0x37, 0x0f, 0xef, 0x10, 0x10,
+    0x5f, 0xa2, 0xfa, 0xae, 0x01, 0x26, 0x11, 0x4a, 0x16, 0x9c, 0x64, 0x84, 0x5d, 0x61, 0x26, 0xc9,
+]);
 
 /// Registers the Telcoin ERC20 precompile at [`TELCOIN_PRECOMPILE_ADDRESS`] in the given map.
 pub fn add_telcoin_precompile(map: &mut PrecompilesMap) {
@@ -109,6 +128,7 @@ pub fn add_telcoin_precompile(map: &mut PrecompilesMap) {
 //   1 → unlock timestamps     (mapping: address → uint256)
 //   2 → allowances            (mapping: address → mapping(address → uint256))
 //   3 → mint roles            (mapping: address → bool)  [faucet feature only]
+//   4 → nonces                (mapping: address → uint256)  [EIP-2612 permit]
 // 100 → totalSupply           (plain slot)
 
 /// Compute the storage slot for a recipient's pending mint amount.
@@ -154,6 +174,29 @@ fn allowance_slot(owner: Address, spender: Address) -> U256 {
     U256::from_be_bytes(keccak256(outer_buf).0)
 }
 
+/// Compute the storage slot for an owner's EIP-2612 permit nonce.
+///
+/// Layout: `keccak256(abi.encode(owner, 4))` — `mapping(address => uint256)` at slot 4.
+fn nonce_slot(owner: Address) -> U256 {
+    let mut buf = [0u8; 64];
+    buf[12..32].copy_from_slice(owner.as_slice());
+    buf[63] = 4; // slot index 4
+    U256::from_be_bytes(keccak256(buf).0)
+}
+
+/// Compute the EIP-712 domain separator for the given chain ID.
+///
+/// `keccak256(abi.encode(EIP712_DOMAIN_TYPEHASH, keccak256("Telcoin"), keccak256("1"), chainId, TELCOIN_PRECOMPILE_ADDRESS))`
+fn compute_domain_separator(chain_id: u64) -> B256 {
+    let mut buf = [0u8; 5 * 32];
+    buf[0..32].copy_from_slice(&EIP712_DOMAIN_TYPEHASH.0);
+    buf[32..64].copy_from_slice(&keccak256("Telcoin").0);
+    buf[64..96].copy_from_slice(&keccak256("1").0);
+    buf[96..128].copy_from_slice(&U256::from(chain_id).to_be_bytes::<32>());
+    buf[140..160].copy_from_slice(TELCOIN_PRECOMPILE_ADDRESS.as_slice());
+    keccak256(buf)
+}
+
 /// Compute the storage slot for a dynamically granted mint role.
 ///
 /// Layout: `keccak256(abi.encode(address, 3))` — `mapping(address => bool)` at slot 3.
@@ -192,7 +235,7 @@ fn has_mint_role(
             .sload(TELCOIN_PRECOMPILE_ADDRESS, slot)
             .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}").into()))?
             .data;
-        return Ok(!val.is_zero());
+        Ok(!val.is_zero())
     }
 
     #[cfg(not(feature = "faucet"))]
@@ -231,7 +274,8 @@ fn abi_encode_uint256(val: U256) -> Bytes {
 /// Returns `[offset (0x20)] [length] [padded UTF-8 data]` per the Solidity ABI spec.
 fn abi_encode_string(s: &str) -> Bytes {
     let s_bytes = s.as_bytes();
-    let padded_len = (s_bytes.len() + 31) / 32 * 32;
+    let padded_len = s_bytes.len().div_ceil(32) * 32;
+
     // offset (32) + length (32) + padded data
     let mut buf = Vec::with_capacity(64 + padded_len);
     // Offset to string data (0x20 = 32)
@@ -311,6 +355,12 @@ fn telcoin_precompile(mut input: PrecompileInput<'_>) -> PrecompileResult {
             }
             handle_transfer_from(&mut input.internals, calldata, input.caller, input.gas)
         }
+        permitCall::SELECTOR => {
+            if input.is_static {
+                return Err(PrecompileError::Other("Cannot modify state in static context".into()));
+            }
+            handle_permit(&mut input.internals, calldata, input.gas)
+        }
         // Read-only functions
         nameCall::SELECTOR => handle_name(input.gas),
         symbolCall::SELECTOR => handle_symbol(input.gas),
@@ -318,6 +368,8 @@ fn telcoin_precompile(mut input: PrecompileInput<'_>) -> PrecompileResult {
         totalSupplyCall::SELECTOR => handle_total_supply(&mut input.internals, input.gas),
         balanceOfCall::SELECTOR => handle_balance_of(&mut input.internals, calldata, input.gas),
         allowanceCall::SELECTOR => handle_allowance(&mut input.internals, calldata, input.gas),
+        noncesCall::SELECTOR => handle_nonces(&mut input.internals, calldata, input.gas),
+        DOMAIN_SEPARATORCall::SELECTOR => handle_domain_separator(&mut input.internals, input.gas),
         // Faucet feature: role management
         #[cfg(feature = "faucet")]
         grantMintRoleCall::SELECTOR => {
@@ -436,12 +488,157 @@ fn handle_allowance(
     Ok(PrecompileOutput::new(GAS_COST, abi_encode_uint256(value)))
 }
 
+// --- EIP-2612 permit handlers ---
+
+/// `nonces(address owner)` → returns the current permit nonce for `owner`.
+fn handle_nonces(
+    internals: &mut EvmInternals<'_>,
+    calldata: &[u8],
+    gas_limit: u64,
+) -> PrecompileResult {
+    const GAS_COST: u64 = 2_100;
+    if gas_limit < GAS_COST {
+        return Err(PrecompileError::OutOfGas);
+    }
+    if calldata.len() < 32 {
+        return Err(PrecompileError::Other("nonces: expected 32 bytes (address)".into()));
+    }
+    let owner = Address::from_slice(&calldata[12..32]);
+    let nonce = internals
+        .sload(TELCOIN_PRECOMPILE_ADDRESS, nonce_slot(owner))
+        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}").into()))?
+        .data;
+    Ok(PrecompileOutput::new(GAS_COST, abi_encode_uint256(nonce)))
+}
+
+/// `DOMAIN_SEPARATOR()` → returns the EIP-712 domain separator for the current chain.
+fn handle_domain_separator(internals: &mut EvmInternals<'_>, gas_limit: u64) -> PrecompileResult {
+    const GAS_COST: u64 = 2_600;
+    if gas_limit < GAS_COST {
+        return Err(PrecompileError::OutOfGas);
+    }
+    let ds = compute_domain_separator(internals.chain_id());
+    Ok(PrecompileOutput::new(GAS_COST, Bytes::copy_from_slice(&ds.0)))
+}
+
+/// `permit(address owner, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s)`
+///
+/// EIP-2612 gasless approval. Verifies an off-chain signature from `owner` and sets
+/// `allowance[owner][spender] = value`. Increments the owner's nonce to prevent replay.
+///
+/// Emits `Approval(owner, spender, value)`.
+fn handle_permit(
+    internals: &mut EvmInternals<'_>,
+    calldata: &[u8],
+    gas_limit: u64,
+) -> PrecompileResult {
+    const GAS_COST: u64 = 72_000;
+    if gas_limit < GAS_COST {
+        return Err(PrecompileError::OutOfGas);
+    }
+    if calldata.len() < 224 {
+        return Err(PrecompileError::Other(
+            "permit: expected 224 bytes (address,address,uint256,uint256,uint8,bytes32,bytes32)"
+                .into(),
+        ));
+    }
+
+    let owner = Address::from_slice(&calldata[12..32]);
+    let spender = Address::from_slice(&calldata[44..64]);
+    if spender == Address::ZERO {
+        return Err(PrecompileError::Other("permit: cannot approve address(0)".into()));
+    }
+    let value = U256::from_be_slice(&calldata[64..96]);
+    let deadline = U256::from_be_slice(&calldata[96..128]);
+    let v = calldata[159];
+    let r = U256::from_be_slice(&calldata[160..192]);
+    let s = U256::from_be_slice(&calldata[192..224]);
+    // Validate s
+    if s > SECP256K1N_HALF {
+        return Err(PrecompileError::Other("permit: signature malleability".into()));
+    }
+
+    // Check deadline
+    let current_ts = internals.block_timestamp();
+    if current_ts > deadline {
+        return Err(PrecompileError::Other("permit: expired deadline".into()));
+    }
+
+    // Validate v
+    if v != 27 && v != 28 {
+        return Err(PrecompileError::Other("permit: invalid v value".into()));
+    }
+
+    // Load current nonce
+    let nonce_s = nonce_slot(owner);
+    let nonce = internals
+        .sload(TELCOIN_PRECOMPILE_ADDRESS, nonce_s)
+        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}").into()))?
+        .data;
+
+    // Compute EIP-712 struct hash
+    let struct_hash = {
+        let mut buf = [0u8; 6 * 32];
+        buf[0..32].copy_from_slice(&PERMIT_TYPEHASH.0);
+        buf[44..64].copy_from_slice(owner.as_slice());
+        buf[76..96].copy_from_slice(spender.as_slice());
+        buf[96..128].copy_from_slice(&value.to_be_bytes::<32>());
+        buf[128..160].copy_from_slice(&nonce.to_be_bytes::<32>());
+        buf[160..192].copy_from_slice(&deadline.to_be_bytes::<32>());
+        keccak256(buf)
+    };
+
+    // Compute EIP-712 digest
+    let digest = {
+        let domain_separator = compute_domain_separator(internals.chain_id());
+        let mut buf = [0u8; 2 + 32 + 32];
+        buf[0] = 0x19;
+        buf[1] = 0x01;
+        buf[2..34].copy_from_slice(&domain_separator.0);
+        buf[34..66].copy_from_slice(&struct_hash.0);
+        keccak256(buf)
+    };
+
+    // Recover signer and verify
+    let sig = Signature::new(r, s, v == 28);
+    let recovered = sig
+        .recover_address_from_prehash(&digest)
+        .map_err(|_| PrecompileError::Other("permit: invalid signature".into()))?;
+    if recovered != owner {
+        return Err(PrecompileError::Other("permit: signer != owner".into()));
+    }
+
+    // Increment nonce
+    internals
+        .sstore(TELCOIN_PRECOMPILE_ADDRESS, nonce_s, nonce + U256::from(1))
+        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}").into()))?;
+
+    // Set allowance
+    let slot = allowance_slot(owner, spender);
+    internals
+        .sstore(TELCOIN_PRECOMPILE_ADDRESS, slot, value)
+        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}").into()))?;
+
+    // Emit Approval(owner, spender, value)
+    let log = reth_revm::primitives::Log::new(
+        TELCOIN_PRECOMPILE_ADDRESS,
+        vec![Approval::SIGNATURE_HASH, address_to_topic(owner), address_to_topic(spender)],
+        value.to_be_bytes_vec().into(),
+    )
+    .ok_or_else(|| PrecompileError::Other("Failed to create Approval log".into()))?;
+    internals.log(log);
+
+    Ok(PrecompileOutput::new(GAS_COST, Bytes::new()))
+}
+
 // --- ERC20 state-mutating handlers ---
 
 /// `transfer(address to, uint256 amount)` → moves native balance from `caller` to `to`.
 ///
 /// Emits `Transfer(caller, to, amount)`. Returns ABI-encoded `true` on success.
 /// Fails if `caller`'s balance is insufficient.
+///
+/// Allow transfers to this address for `burn`.
 fn handle_transfer(
     internals: &mut EvmInternals<'_>,
     calldata: &[u8],
@@ -509,6 +706,9 @@ fn handle_approve(
     }
 
     let spender = Address::from_slice(&calldata[12..32]);
+    if spender == Address::ZERO {
+        return Err(PrecompileError::Other("approve: cannot approve address(0)".into()));
+    }
     let amount = U256::from_be_slice(&calldata[32..64]);
 
     // Store allowance
@@ -1062,7 +1262,6 @@ mod tests {
     type TestResult =
         Result<ExecutionResult, EVMError<core::convert::Infallible, InvalidTransaction>>;
 
-    const GOVERNANCE: Address = GOVERNANCE_SAFE_ADDRESS;
     const USER: Address = address!("1111100000000000000000000000000000000001");
     const RECIPIENT: Address = address!("2222222000000000000000000000000000000002");
 
@@ -1076,7 +1275,7 @@ mod tests {
             let mut db = InMemoryDB::default();
 
             db.insert_account_info(
-                GOVERNANCE,
+                GOVERNANCE_SAFE_ADDRESS,
                 AccountInfo {
                     balance: U256::from(10).pow(U256::from(18)),
                     nonce: 0,
@@ -1206,7 +1405,7 @@ mod tests {
         let data = mintCall { amount: U256::from(500) }.abi_encode();
         #[cfg(feature = "faucet")]
         let data = mintCall { recipient: RECIPIENT, amount: U256::from(500) }.abi_encode();
-        let result = env.exec_default(GOVERNANCE, data);
+        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, data);
         assert_success(&result);
     }
 
@@ -1214,8 +1413,15 @@ mod tests {
     #[cfg(not(feature = "faucet"))]
     fn test_claim_before_timelock_halts() {
         let mut env = TestEnv::new();
-        env.exec_default(GOVERNANCE, mintCall { amount: U256::from(500) }.abi_encode()).unwrap();
-        let result = env.exec_default(GOVERNANCE, claimCall { recipient: GOVERNANCE }.abi_encode());
+        env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            mintCall { amount: U256::from(500) }.abi_encode(),
+        )
+        .unwrap();
+        let result = env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            claimCall { recipient: GOVERNANCE_SAFE_ADDRESS }.abi_encode(),
+        );
         assert_not_success(&result);
     }
 
@@ -1223,17 +1429,26 @@ mod tests {
     #[cfg(not(feature = "faucet"))]
     fn test_claim_after_timelock_succeeds() {
         let mut env = TestEnv::new();
-        env.exec_default(GOVERNANCE, mintCall { amount: U256::from(500) }.abi_encode()).unwrap();
+        env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            mintCall { amount: U256::from(500) }.abi_encode(),
+        )
+        .unwrap();
         env.set_timestamp(1000 + TIMELOCK_DURATION + 1);
-        let result = env.exec_default(GOVERNANCE, claimCall { recipient: GOVERNANCE }.abi_encode());
+        let result = env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            claimCall { recipient: GOVERNANCE_SAFE_ADDRESS }.abi_encode(),
+        );
         assert_success(&result);
     }
 
     #[test]
     fn test_burn_succeeds() {
         let mut env = TestEnv::new();
-        let result =
-            env.exec_default(GOVERNANCE, burnCall { amount: U256::from(200) }.abi_encode());
+        let result = env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            burnCall { amount: U256::from(200) }.abi_encode(),
+        );
         assert_success(&result);
     }
 
@@ -1242,11 +1457,23 @@ mod tests {
     fn test_total_supply_after_claim_and_burn() {
         let mut env = TestEnv::new();
         let genesis = U256::from(100_000_000_000u128) * U256::from(10).pow(U256::from(18));
-        env.exec_default(GOVERNANCE, mintCall { amount: U256::from(500) }.abi_encode()).unwrap();
+        env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            mintCall { amount: U256::from(500) }.abi_encode(),
+        )
+        .unwrap();
         env.set_timestamp(1000 + TIMELOCK_DURATION + 1);
-        env.exec_default(GOVERNANCE, claimCall { recipient: GOVERNANCE }.abi_encode()).unwrap();
-        env.exec_default(GOVERNANCE, burnCall { amount: U256::from(200) }.abi_encode()).unwrap();
-        let result = env.exec_default(GOVERNANCE, totalSupplyCall {}.abi_encode());
+        env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            claimCall { recipient: GOVERNANCE_SAFE_ADDRESS }.abi_encode(),
+        )
+        .unwrap();
+        env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            burnCall { amount: U256::from(200) }.abi_encode(),
+        )
+        .unwrap();
+        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, totalSupplyCall {}.abi_encode());
         assert_eq!(decode_u256(&result), genesis + U256::from(500) - U256::from(200));
     }
 
@@ -1255,11 +1482,21 @@ mod tests {
     fn test_balance_of() {
         let mut env = TestEnv::new();
         let initial_balance = U256::from(10).pow(U256::from(18));
-        env.exec_default(GOVERNANCE, mintCall { amount: U256::from(500) }.abi_encode()).unwrap();
+        env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            mintCall { amount: U256::from(500) }.abi_encode(),
+        )
+        .unwrap();
         env.set_timestamp(1000 + TIMELOCK_DURATION + 1);
-        env.exec_default(GOVERNANCE, claimCall { recipient: GOVERNANCE }.abi_encode()).unwrap();
-        let result =
-            env.exec_default(GOVERNANCE, balanceOfCall { account: GOVERNANCE }.abi_encode());
+        env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            claimCall { recipient: GOVERNANCE_SAFE_ADDRESS }.abi_encode(),
+        )
+        .unwrap();
+        let result = env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            balanceOfCall { account: GOVERNANCE_SAFE_ADDRESS }.abi_encode(),
+        );
         assert_eq!(decode_u256(&result), initial_balance + U256::from(500));
     }
 
@@ -1277,7 +1514,7 @@ mod tests {
     fn test_approve() {
         let mut env = TestEnv::new();
         let result = env.exec_default(
-            GOVERNANCE,
+            GOVERNANCE_SAFE_ADDRESS,
             approveCall { spender: USER, amount: U256::from(200) }.abi_encode(),
         );
         assert!(decode_bool(&result));
@@ -1287,14 +1524,18 @@ mod tests {
     fn test_transfer_from() {
         let mut env = TestEnv::new();
         env.exec_default(
-            GOVERNANCE,
+            GOVERNANCE_SAFE_ADDRESS,
             approveCall { spender: USER, amount: U256::from(200) }.abi_encode(),
         )
         .unwrap();
         let result = env.exec_default(
             USER,
-            transferFromCall { from: GOVERNANCE, to: RECIPIENT, amount: U256::from(150) }
-                .abi_encode(),
+            transferFromCall {
+                from: GOVERNANCE_SAFE_ADDRESS,
+                to: RECIPIENT,
+                amount: U256::from(150),
+            }
+            .abi_encode(),
         );
         assert!(decode_bool(&result));
     }
@@ -1302,7 +1543,7 @@ mod tests {
     #[test]
     fn test_name() {
         let mut env = TestEnv::new();
-        let result = env.exec_default(GOVERNANCE, nameCall {}.abi_encode());
+        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, nameCall {}.abi_encode());
         let bytes = extract_output_bytes(&result);
         let len = U256::from_be_slice(&bytes[32..64]).to::<usize>();
         assert_eq!(std::str::from_utf8(&bytes[64..64 + len]).unwrap(), "Telcoin");
@@ -1311,7 +1552,7 @@ mod tests {
     #[test]
     fn test_symbol() {
         let mut env = TestEnv::new();
-        let result = env.exec_default(GOVERNANCE, symbolCall {}.abi_encode());
+        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, symbolCall {}.abi_encode());
         let bytes = extract_output_bytes(&result);
         let len = U256::from_be_slice(&bytes[32..64]).to::<usize>();
         assert_eq!(std::str::from_utf8(&bytes[64..64 + len]).unwrap(), "TEL");
@@ -1320,7 +1561,7 @@ mod tests {
     #[test]
     fn test_decimals() {
         let mut env = TestEnv::new();
-        let result = env.exec_default(GOVERNANCE, decimalsCall {}.abi_encode());
+        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, decimalsCall {}.abi_encode());
         assert_eq!(decode_u256(&result), U256::from(18));
     }
 
@@ -1369,7 +1610,7 @@ mod tests {
         let mut env = TestEnv::new();
         fund_faucet(&mut env);
         let data = grantMintRoleCall { addr: FAUCET }.abi_encode();
-        let result = env.exec_default(GOVERNANCE, data);
+        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, data);
         assert_success(&result);
     }
 
@@ -1378,7 +1619,8 @@ mod tests {
     fn test_faucet_mint() {
         let mut env = TestEnv::new();
         fund_faucet(&mut env);
-        env.exec_default(GOVERNANCE, grantMintRoleCall { addr: FAUCET }.abi_encode()).unwrap();
+        env.exec_default(GOVERNANCE_SAFE_ADDRESS, grantMintRoleCall { addr: FAUCET }.abi_encode())
+            .unwrap();
         let data = mintCall { recipient: RECIPIENT, amount: U256::from(1000) }.abi_encode();
         let result = env.exec_default(FAUCET, data);
         assert_success(&result);
@@ -1389,9 +1631,10 @@ mod tests {
     fn test_revoke_mint_role() {
         let mut env = TestEnv::new();
         fund_faucet(&mut env);
-        env.exec_default(GOVERNANCE, grantMintRoleCall { addr: FAUCET }.abi_encode()).unwrap();
+        env.exec_default(GOVERNANCE_SAFE_ADDRESS, grantMintRoleCall { addr: FAUCET }.abi_encode())
+            .unwrap();
         let data = revokeMintRoleCall { addr: FAUCET }.abi_encode();
-        let result = env.exec_default(GOVERNANCE, data);
+        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, data);
         assert_success(&result);
     }
 
@@ -1400,8 +1643,10 @@ mod tests {
     fn test_faucet_mint_after_revoke_fails() {
         let mut env = TestEnv::new();
         fund_faucet(&mut env);
-        env.exec_default(GOVERNANCE, grantMintRoleCall { addr: FAUCET }.abi_encode()).unwrap();
-        env.exec_default(GOVERNANCE, revokeMintRoleCall { addr: FAUCET }.abi_encode()).unwrap();
+        env.exec_default(GOVERNANCE_SAFE_ADDRESS, grantMintRoleCall { addr: FAUCET }.abi_encode())
+            .unwrap();
+        env.exec_default(GOVERNANCE_SAFE_ADDRESS, revokeMintRoleCall { addr: FAUCET }.abi_encode())
+            .unwrap();
         let data = mintCall { recipient: RECIPIENT, amount: U256::from(1000) }.abi_encode();
         let result = env.exec_default(FAUCET, data);
         assert_not_success(&result);
@@ -1412,14 +1657,17 @@ mod tests {
     fn test_faucet_mint_directly_credits() {
         let mut env = TestEnv::new();
         fund_faucet(&mut env);
-        env.exec_default(GOVERNANCE, grantMintRoleCall { addr: FAUCET }.abi_encode()).unwrap();
+        env.exec_default(GOVERNANCE_SAFE_ADDRESS, grantMintRoleCall { addr: FAUCET }.abi_encode())
+            .unwrap();
         let result = env.exec_default(
             FAUCET,
             mintCall { recipient: RECIPIENT, amount: U256::from(500) }.abi_encode(),
         );
         assert_success(&result);
-        let result =
-            env.exec_default(GOVERNANCE, balanceOfCall { account: RECIPIENT }.abi_encode());
+        let result = env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            balanceOfCall { account: RECIPIENT }.abi_encode(),
+        );
         assert_eq!(decode_u256(&result), U256::from(500));
     }
 
@@ -1429,13 +1677,14 @@ mod tests {
         let mut env = TestEnv::new();
         fund_faucet(&mut env);
         let genesis = U256::from(100_000_000_000u128) * U256::from(10).pow(U256::from(18));
-        env.exec_default(GOVERNANCE, grantMintRoleCall { addr: FAUCET }.abi_encode()).unwrap();
+        env.exec_default(GOVERNANCE_SAFE_ADDRESS, grantMintRoleCall { addr: FAUCET }.abi_encode())
+            .unwrap();
         env.exec_default(
             FAUCET,
             mintCall { recipient: RECIPIENT, amount: U256::from(500) }.abi_encode(),
         )
         .unwrap();
-        let result = env.exec_default(GOVERNANCE, totalSupplyCall {}.abi_encode());
+        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, totalSupplyCall {}.abi_encode());
         assert_eq!(decode_u256(&result), genesis + U256::from(500));
     }
 
@@ -1444,7 +1693,8 @@ mod tests {
     fn test_faucet_double_mint_is_additive() {
         let mut env = TestEnv::new();
         fund_faucet(&mut env);
-        env.exec_default(GOVERNANCE, grantMintRoleCall { addr: FAUCET }.abi_encode()).unwrap();
+        env.exec_default(GOVERNANCE_SAFE_ADDRESS, grantMintRoleCall { addr: FAUCET }.abi_encode())
+            .unwrap();
         env.exec_default(
             FAUCET,
             mintCall { recipient: RECIPIENT, amount: U256::from(500) }.abi_encode(),
@@ -1455,8 +1705,10 @@ mod tests {
             mintCall { recipient: RECIPIENT, amount: U256::from(300) }.abi_encode(),
         )
         .unwrap();
-        let result =
-            env.exec_default(GOVERNANCE, balanceOfCall { account: RECIPIENT }.abi_encode());
+        let result = env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            balanceOfCall { account: RECIPIENT }.abi_encode(),
+        );
         assert_eq!(decode_u256(&result), U256::from(800));
     }
 
@@ -1465,13 +1717,15 @@ mod tests {
     fn test_faucet_claim_after_mint_fails() {
         let mut env = TestEnv::new();
         fund_faucet(&mut env);
-        env.exec_default(GOVERNANCE, grantMintRoleCall { addr: FAUCET }.abi_encode()).unwrap();
+        env.exec_default(GOVERNANCE_SAFE_ADDRESS, grantMintRoleCall { addr: FAUCET }.abi_encode())
+            .unwrap();
         env.exec_default(
             FAUCET,
             mintCall { recipient: RECIPIENT, amount: U256::from(500) }.abi_encode(),
         )
         .unwrap();
-        let result = env.exec_default(GOVERNANCE, claimCall { recipient: RECIPIENT }.abi_encode());
+        let result = env
+            .exec_default(GOVERNANCE_SAFE_ADDRESS, claimCall { recipient: RECIPIENT }.abi_encode());
         assert_not_success(&result);
     }
 
@@ -1480,14 +1734,17 @@ mod tests {
     fn test_faucet_balance_of() {
         let mut env = TestEnv::new();
         fund_faucet(&mut env);
-        env.exec_default(GOVERNANCE, grantMintRoleCall { addr: FAUCET }.abi_encode()).unwrap();
+        env.exec_default(GOVERNANCE_SAFE_ADDRESS, grantMintRoleCall { addr: FAUCET }.abi_encode())
+            .unwrap();
         env.exec_default(
             FAUCET,
             mintCall { recipient: RECIPIENT, amount: U256::from(750) }.abi_encode(),
         )
         .unwrap();
-        let result =
-            env.exec_default(GOVERNANCE, balanceOfCall { account: RECIPIENT }.abi_encode());
+        let result = env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            balanceOfCall { account: RECIPIENT }.abi_encode(),
+        );
         assert_eq!(decode_u256(&result), U256::from(750));
     }
 
@@ -1497,14 +1754,19 @@ mod tests {
         let mut env = TestEnv::new();
         fund_faucet(&mut env);
         let genesis = U256::from(100_000_000_000u128) * U256::from(10).pow(U256::from(18));
-        env.exec_default(GOVERNANCE, grantMintRoleCall { addr: FAUCET }.abi_encode()).unwrap();
+        env.exec_default(GOVERNANCE_SAFE_ADDRESS, grantMintRoleCall { addr: FAUCET }.abi_encode())
+            .unwrap();
         env.exec_default(
             FAUCET,
             mintCall { recipient: RECIPIENT, amount: U256::from(500) }.abi_encode(),
         )
         .unwrap();
-        env.exec_default(GOVERNANCE, burnCall { amount: U256::from(200) }.abi_encode()).unwrap();
-        let result = env.exec_default(GOVERNANCE, totalSupplyCall {}.abi_encode());
+        env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            burnCall { amount: U256::from(200) }.abi_encode(),
+        )
+        .unwrap();
+        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, totalSupplyCall {}.abi_encode());
         assert_eq!(decode_u256(&result), genesis + U256::from(500) - U256::from(200));
     }
 
@@ -1515,7 +1777,7 @@ mod tests {
     #[test]
     fn test_input_too_short() {
         let mut env = TestEnv::new();
-        let result = env.exec_default(GOVERNANCE, vec![0xAB, 0xCD]);
+        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, vec![0xAB, 0xCD]);
         assert_not_success(&result);
     }
 
@@ -1524,7 +1786,7 @@ mod tests {
         let mut env = TestEnv::new();
         let mut data = vec![0xDE, 0xAD, 0xBE, 0xEF];
         data.extend_from_slice(&[0u8; 32]);
-        let result = env.exec_default(GOVERNANCE, data);
+        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, data);
         assert_not_success(&result);
     }
 
@@ -1541,7 +1803,7 @@ mod tests {
             let full = mintCall { recipient: RECIPIENT, amount: U256::from(500) }.abi_encode();
             full[..4 + 32].to_vec()
         };
-        let result = env.exec_default(GOVERNANCE, short);
+        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, short);
         assert_not_success(&result);
     }
 
@@ -1550,23 +1812,24 @@ mod tests {
         let mut env = TestEnv::new();
         let full = balanceOfCall { account: RECIPIENT }.abi_encode();
         let short = full[..4 + 16].to_vec();
-        let result = env.exec_default(GOVERNANCE, short);
+        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, short);
         assert_not_success(&result);
     }
 
     #[test]
     fn test_allowance_short_calldata() {
         let mut env = TestEnv::new();
-        let full = allowanceCall { owner: GOVERNANCE, spender: USER }.abi_encode();
+        let full = allowanceCall { owner: GOVERNANCE_SAFE_ADDRESS, spender: USER }.abi_encode();
         let short = full[..4 + 32].to_vec();
-        let result = env.exec_default(GOVERNANCE, short);
+        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, short);
         assert_not_success(&result);
     }
 
     #[test]
     fn test_claim_no_pending_mint() {
         let mut env = TestEnv::new();
-        let result = env.exec_default(GOVERNANCE, claimCall { recipient: RECIPIENT }.abi_encode());
+        let result = env
+            .exec_default(GOVERNANCE_SAFE_ADDRESS, claimCall { recipient: RECIPIENT }.abi_encode());
         assert_not_success(&result);
     }
 
@@ -1574,20 +1837,26 @@ mod tests {
     #[cfg(not(feature = "faucet"))]
     fn test_claim_already_claimed() {
         let mut env = TestEnv::new();
-        env.exec_default(GOVERNANCE, mintCall { amount: U256::from(500) }.abi_encode()).unwrap();
+        env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            mintCall { amount: U256::from(500) }.abi_encode(),
+        )
+        .unwrap();
         env.set_timestamp(1000 + TIMELOCK_DURATION + 1);
-        let claim_data = claimCall { recipient: GOVERNANCE }.abi_encode();
-        let result = env.exec_default(GOVERNANCE, claim_data.clone());
+        let claim_data = claimCall { recipient: GOVERNANCE_SAFE_ADDRESS }.abi_encode();
+        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, claim_data.clone());
         assert_success(&result);
-        let result2 = env.exec_default(GOVERNANCE, claim_data);
+        let result2 = env.exec_default(GOVERNANCE_SAFE_ADDRESS, claim_data);
         assert_not_success(&result2);
     }
 
     #[test]
     fn test_burn_insufficient_balance() {
         let mut env = TestEnv::new();
-        let result =
-            env.exec_default(GOVERNANCE, burnCall { amount: U256::from(2000) }.abi_encode());
+        let result = env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            burnCall { amount: U256::from(2000) }.abi_encode(),
+        );
         assert_not_success(&result);
     }
 
@@ -1604,14 +1873,18 @@ mod tests {
     fn test_transfer_from_insufficient_allowance() {
         let mut env = TestEnv::new();
         env.exec_default(
-            GOVERNANCE,
+            GOVERNANCE_SAFE_ADDRESS,
             approveCall { spender: USER, amount: U256::from(100) }.abi_encode(),
         )
         .unwrap();
         let result = env.exec_default(
             USER,
-            transferFromCall { from: GOVERNANCE, to: RECIPIENT, amount: U256::from(200) }
-                .abi_encode(),
+            transferFromCall {
+                from: GOVERNANCE_SAFE_ADDRESS,
+                to: RECIPIENT,
+                amount: U256::from(200),
+            }
+            .abi_encode(),
         );
         assert_not_success(&result);
     }
@@ -1625,7 +1898,7 @@ mod tests {
         let data = mintCall { amount: U256::from(500) }.abi_encode();
         #[cfg(feature = "faucet")]
         let data = mintCall { recipient: RECIPIENT, amount: U256::from(500) }.abi_encode();
-        let result = env.exec(GOVERNANCE, data, 21_000);
+        let result = env.exec(GOVERNANCE_SAFE_ADDRESS, data, 21_000);
         assert_not_success(&result);
     }
 
@@ -1633,10 +1906,14 @@ mod tests {
     #[cfg(not(feature = "faucet"))]
     fn test_claim_oog() {
         let mut env = TestEnv::new();
-        env.exec_default(GOVERNANCE, mintCall { amount: U256::from(500) }.abi_encode()).unwrap();
+        env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            mintCall { amount: U256::from(500) }.abi_encode(),
+        )
+        .unwrap();
         env.set_timestamp(1000 + TIMELOCK_DURATION + 1);
-        let data = claimCall { recipient: GOVERNANCE }.abi_encode();
-        let result = env.exec(GOVERNANCE, data, 21_000);
+        let data = claimCall { recipient: GOVERNANCE_SAFE_ADDRESS }.abi_encode();
+        let result = env.exec(GOVERNANCE_SAFE_ADDRESS, data, 21_000);
         assert_not_success(&result);
     }
 
@@ -1644,7 +1921,7 @@ mod tests {
     fn test_burn_oog() {
         let mut env = TestEnv::new();
         let data = burnCall { amount: U256::from(100) }.abi_encode();
-        let result = env.exec(GOVERNANCE, data, 21_000);
+        let result = env.exec(GOVERNANCE_SAFE_ADDRESS, data, 21_000);
         assert_not_success(&result);
     }
 
@@ -1660,7 +1937,7 @@ mod tests {
     fn test_name_oog() {
         let mut env = TestEnv::new();
         let data = nameCall {}.abi_encode();
-        let result = env.exec(GOVERNANCE, data, 21_000);
+        let result = env.exec(GOVERNANCE_SAFE_ADDRESS, data, 21_000);
         assert_not_success(&result);
     }
 
@@ -1668,7 +1945,7 @@ mod tests {
     fn test_total_supply_oog() {
         let mut env = TestEnv::new();
         let data = totalSupplyCall {}.abi_encode();
-        let result = env.exec(GOVERNANCE, data, 21_000);
+        let result = env.exec(GOVERNANCE_SAFE_ADDRESS, data, 21_000);
         assert_not_success(&result);
     }
 
@@ -1682,7 +1959,7 @@ mod tests {
             .db_mut()
             .insert_account_storage(TELCOIN_PRECOMPILE_ADDRESS, U256::from(100), U256::ZERO)
             .unwrap();
-        let result = env.exec_default(GOVERNANCE, totalSupplyCall {}.abi_encode());
+        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, totalSupplyCall {}.abi_encode());
         assert_eq!(decode_u256(&result), U256::ZERO);
     }
 
@@ -1691,12 +1968,26 @@ mod tests {
     fn test_double_mint_overwrites() {
         let mut env = TestEnv::new();
         let initial_balance = U256::from(10).pow(U256::from(18));
-        env.exec_default(GOVERNANCE, mintCall { amount: U256::from(500) }.abi_encode()).unwrap();
-        env.exec_default(GOVERNANCE, mintCall { amount: U256::from(300) }.abi_encode()).unwrap();
+        env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            mintCall { amount: U256::from(500) }.abi_encode(),
+        )
+        .unwrap();
+        env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            mintCall { amount: U256::from(300) }.abi_encode(),
+        )
+        .unwrap();
         env.set_timestamp(1000 + TIMELOCK_DURATION + 1);
-        env.exec_default(GOVERNANCE, claimCall { recipient: GOVERNANCE }.abi_encode()).unwrap();
-        let result =
-            env.exec_default(GOVERNANCE, balanceOfCall { account: GOVERNANCE }.abi_encode());
+        env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            claimCall { recipient: GOVERNANCE_SAFE_ADDRESS }.abi_encode(),
+        )
+        .unwrap();
+        let result = env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            balanceOfCall { account: GOVERNANCE_SAFE_ADDRESS }.abi_encode(),
+        );
         assert_eq!(decode_u256(&result), initial_balance + U256::from(300));
     }
 
@@ -1704,13 +1995,13 @@ mod tests {
     fn test_allowance_after_approve() {
         let mut env = TestEnv::new();
         env.exec_default(
-            GOVERNANCE,
+            GOVERNANCE_SAFE_ADDRESS,
             approveCall { spender: USER, amount: U256::from(200) }.abi_encode(),
         )
         .unwrap();
         let result = env.exec_default(
-            GOVERNANCE,
-            allowanceCall { owner: GOVERNANCE, spender: USER }.abi_encode(),
+            GOVERNANCE_SAFE_ADDRESS,
+            allowanceCall { owner: GOVERNANCE_SAFE_ADDRESS, spender: USER }.abi_encode(),
         );
         assert_eq!(decode_u256(&result), U256::from(200));
     }
@@ -1719,19 +2010,23 @@ mod tests {
     fn test_transfer_from_decrements_allowance() {
         let mut env = TestEnv::new();
         env.exec_default(
-            GOVERNANCE,
+            GOVERNANCE_SAFE_ADDRESS,
             approveCall { spender: USER, amount: U256::from(200) }.abi_encode(),
         )
         .unwrap();
         env.exec_default(
             USER,
-            transferFromCall { from: GOVERNANCE, to: RECIPIENT, amount: U256::from(50) }
-                .abi_encode(),
+            transferFromCall {
+                from: GOVERNANCE_SAFE_ADDRESS,
+                to: RECIPIENT,
+                amount: U256::from(50),
+            }
+            .abi_encode(),
         )
         .unwrap();
         let result = env.exec_default(
-            GOVERNANCE,
-            allowanceCall { owner: GOVERNANCE, spender: USER }.abi_encode(),
+            GOVERNANCE_SAFE_ADDRESS,
+            allowanceCall { owner: GOVERNANCE_SAFE_ADDRESS, spender: USER }.abi_encode(),
         );
         assert_eq!(decode_u256(&result), U256::from(150));
     }
@@ -1740,7 +2035,8 @@ mod tests {
     fn test_balance_of_unfunded() {
         let mut env = TestEnv::new();
         let nobody = address!("0000000000000000000000000000000000099999");
-        let result = env.exec_default(GOVERNANCE, balanceOfCall { account: nobody }.abi_encode());
+        let result = env
+            .exec_default(GOVERNANCE_SAFE_ADDRESS, balanceOfCall { account: nobody }.abi_encode());
         assert_eq!(decode_u256(&result), U256::ZERO);
     }
 
@@ -1751,17 +2047,24 @@ mod tests {
     #[test]
     fn test_transfer_from_infinite_allowance_not_decremented() {
         let mut env = TestEnv::new();
-        env.exec_default(GOVERNANCE, approveCall { spender: USER, amount: U256::MAX }.abi_encode())
-            .unwrap();
+        env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            approveCall { spender: USER, amount: U256::MAX }.abi_encode(),
+        )
+        .unwrap();
         env.exec_default(
             USER,
-            transferFromCall { from: GOVERNANCE, to: RECIPIENT, amount: U256::from(50) }
-                .abi_encode(),
+            transferFromCall {
+                from: GOVERNANCE_SAFE_ADDRESS,
+                to: RECIPIENT,
+                amount: U256::from(50),
+            }
+            .abi_encode(),
         )
         .unwrap();
         let result = env.exec_default(
-            GOVERNANCE,
-            allowanceCall { owner: GOVERNANCE, spender: USER }.abi_encode(),
+            GOVERNANCE_SAFE_ADDRESS,
+            allowanceCall { owner: GOVERNANCE_SAFE_ADDRESS, spender: USER }.abi_encode(),
         );
         assert_eq!(decode_u256(&result), U256::MAX);
     }
@@ -1780,14 +2083,18 @@ mod tests {
     fn test_transfer_from_to_zero_address_fails() {
         let mut env = TestEnv::new();
         env.exec_default(
-            GOVERNANCE,
+            GOVERNANCE_SAFE_ADDRESS,
             approveCall { spender: USER, amount: U256::from(200) }.abi_encode(),
         )
         .unwrap();
         let result = env.exec_default(
             USER,
-            transferFromCall { from: GOVERNANCE, to: Address::ZERO, amount: U256::from(100) }
-                .abi_encode(),
+            transferFromCall {
+                from: GOVERNANCE_SAFE_ADDRESS,
+                to: Address::ZERO,
+                amount: U256::from(100),
+            }
+            .abi_encode(),
         );
         assert_not_success(&result);
     }
@@ -1797,7 +2104,7 @@ mod tests {
     fn test_zero_amount_mint_fails() {
         let mut env = TestEnv::new();
         let result = env.exec_default(
-            GOVERNANCE,
+            GOVERNANCE_SAFE_ADDRESS,
             mintCall { recipient: RECIPIENT, amount: U256::ZERO }.abi_encode(),
         );
         assert_not_success(&result);
@@ -1807,14 +2114,21 @@ mod tests {
     #[cfg(not(feature = "faucet"))]
     fn test_zero_amount_mint_does_not_overwrite_pending() {
         let mut env = TestEnv::new();
-        env.exec_default(GOVERNANCE, mintCall { amount: U256::from(500) }.abi_encode()).unwrap();
+        env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            mintCall { amount: U256::from(500) }.abi_encode(),
+        )
+        .unwrap();
         // Zero-amount mint succeeds and cancels the pending mint
-        let result = env.exec_default(GOVERNANCE, mintCall { amount: U256::ZERO }.abi_encode());
+        let result =
+            env.exec_default(GOVERNANCE_SAFE_ADDRESS, mintCall { amount: U256::ZERO }.abi_encode());
         assert_success(&result);
         env.set_timestamp(1000 + TIMELOCK_DURATION + 1);
         // Claim fails because pending was overwritten to zero
-        let claim_result =
-            env.exec_default(GOVERNANCE, claimCall { recipient: GOVERNANCE }.abi_encode());
+        let claim_result = env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            claimCall { recipient: GOVERNANCE_SAFE_ADDRESS }.abi_encode(),
+        );
         assert_not_success(&claim_result);
     }
 
@@ -1833,7 +2147,7 @@ mod tests {
     #[cfg(feature = "faucet")]
     fn test_revoke_role_unauthorized() {
         let mut env = TestEnv::new();
-        let data = revokeMintRoleCall { addr: GOVERNANCE }.abi_encode();
+        let data = revokeMintRoleCall { addr: GOVERNANCE_SAFE_ADDRESS }.abi_encode();
         let result = env.exec_default(USER, data);
         assert_not_success(&result);
     }
@@ -1842,8 +2156,8 @@ mod tests {
     #[cfg(feature = "faucet")]
     fn test_has_mint_role_governance() {
         let mut env = TestEnv::new();
-        let data = hasMintRoleCall { addr: GOVERNANCE }.abi_encode();
-        let result = env.exec_default(GOVERNANCE, data);
+        let data = hasMintRoleCall { addr: GOVERNANCE_SAFE_ADDRESS }.abi_encode();
+        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, data);
         assert!(decode_bool(&result));
     }
 
@@ -1853,7 +2167,323 @@ mod tests {
         let mut env = TestEnv::new();
         let random = address!("0000000000000000000000000000000000ABCDEF");
         let data = hasMintRoleCall { addr: random }.abi_encode();
-        let result = env.exec_default(GOVERNANCE, data);
+        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, data);
         assert!(!decode_bool(&result));
+    }
+
+    // ==============================
+    // Group E: EIP-2612 Permit
+    // ==============================
+
+    /// Fixed secret key for permit signing tests.
+    const PERMIT_SECRET: B256 = B256::new([
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 1,
+    ]);
+
+    /// Derive the address corresponding to PERMIT_SECRET.
+    fn permit_signer_address() -> Address {
+        use alloy::signers::local::PrivateKeySigner;
+        let signer = PrivateKeySigner::from_slice(&PERMIT_SECRET.0).unwrap();
+        signer.address()
+    }
+
+    /// Fund the permit signer account in the test environment.
+    fn fund_permit_signer(env: &mut TestEnv) -> Address {
+        let addr = permit_signer_address();
+        env.evm.ctx.db_mut().insert_account_info(
+            addr,
+            AccountInfo {
+                balance: U256::from(10).pow(U256::from(18)),
+                nonce: 0,
+                code_hash: KECCAK_EMPTY,
+                code: None,
+                ..Default::default()
+            },
+        );
+        addr
+    }
+
+    /// Sign a permit message using PERMIT_SECRET.
+    fn sign_permit_test(
+        owner: Address,
+        spender: Address,
+        value: U256,
+        nonce: U256,
+        deadline: U256,
+        chain_id: u64,
+    ) -> (u8, B256, B256) {
+        use alloy::signers::{local::PrivateKeySigner, SignerSync};
+
+        let signer = PrivateKeySigner::from_slice(&PERMIT_SECRET.0).unwrap();
+
+        let domain_separator = compute_domain_separator(chain_id);
+
+        let struct_hash = {
+            let mut buf = [0u8; 6 * 32];
+            buf[0..32].copy_from_slice(&PERMIT_TYPEHASH.0);
+            buf[44..64].copy_from_slice(owner.as_slice());
+            buf[76..96].copy_from_slice(spender.as_slice());
+            buf[96..128].copy_from_slice(&value.to_be_bytes::<32>());
+            buf[128..160].copy_from_slice(&nonce.to_be_bytes::<32>());
+            buf[160..192].copy_from_slice(&deadline.to_be_bytes::<32>());
+            keccak256(buf)
+        };
+
+        let digest = {
+            let mut buf = [0u8; 66];
+            buf[0] = 0x19;
+            buf[1] = 0x01;
+            buf[2..34].copy_from_slice(&domain_separator.0);
+            buf[34..66].copy_from_slice(&struct_hash.0);
+            keccak256(buf)
+        };
+
+        let sig = signer.sign_hash_sync(&digest).unwrap();
+        let v = if sig.v() { 28u8 } else { 27u8 };
+        let r = B256::from(sig.r().to_be_bytes::<32>());
+        let s = B256::from(sig.s().to_be_bytes::<32>());
+        (v, r, s)
+    }
+
+    #[test]
+    fn test_typehash_values() {
+        let domain_hash = keccak256(
+            "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+        );
+        assert_eq!(domain_hash, EIP712_DOMAIN_TYPEHASH);
+
+        let permit_hash = keccak256(
+            "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)",
+        );
+        assert_eq!(permit_hash, PERMIT_TYPEHASH);
+    }
+
+    #[test]
+    fn test_permit_sets_allowance() {
+        let mut env = TestEnv::new();
+        let owner = fund_permit_signer(&mut env);
+        let value = U256::from(500);
+        let deadline = U256::from(2000);
+
+        let (v, r, s) = sign_permit_test(owner, RECIPIENT, value, U256::ZERO, deadline, 1);
+        let data = permitCall { owner, spender: RECIPIENT, value, deadline, v, r, s }.abi_encode();
+        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, data);
+        assert_success(&result);
+
+        let result = env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            allowanceCall { owner, spender: RECIPIENT }.abi_encode(),
+        );
+        assert_eq!(decode_u256(&result), value);
+    }
+
+    #[test]
+    fn test_permit_increments_nonce() {
+        let mut env = TestEnv::new();
+        let owner = fund_permit_signer(&mut env);
+        let deadline = U256::from(2000);
+
+        // First permit (nonce 0)
+        let (v, r, s) =
+            sign_permit_test(owner, RECIPIENT, U256::from(100), U256::ZERO, deadline, 1);
+        let data =
+            permitCall { owner, spender: RECIPIENT, value: U256::from(100), deadline, v, r, s }
+                .abi_encode();
+        assert_success(&env.exec_default(GOVERNANCE_SAFE_ADDRESS, data));
+
+        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, noncesCall { owner }.abi_encode());
+        assert_eq!(decode_u256(&result), U256::from(1));
+
+        // Second permit (nonce 1)
+        let (v, r, s) =
+            sign_permit_test(owner, RECIPIENT, U256::from(200), U256::from(1), deadline, 1);
+        let data =
+            permitCall { owner, spender: RECIPIENT, value: U256::from(200), deadline, v, r, s }
+                .abi_encode();
+        assert_success(&env.exec_default(GOVERNANCE_SAFE_ADDRESS, data));
+
+        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, noncesCall { owner }.abi_encode());
+        assert_eq!(decode_u256(&result), U256::from(2));
+    }
+
+    #[test]
+    fn test_permit_then_transfer_from() {
+        let mut env = TestEnv::new();
+        let owner = fund_permit_signer(&mut env);
+        let value = U256::from(500);
+        let deadline = U256::from(2000);
+
+        let (v, r, s) = sign_permit_test(owner, USER, value, U256::ZERO, deadline, 1);
+        let data = permitCall { owner, spender: USER, value, deadline, v, r, s }.abi_encode();
+        assert_success(&env.exec_default(GOVERNANCE_SAFE_ADDRESS, data));
+
+        let result = env.exec_default(
+            USER,
+            transferFromCall { from: owner, to: RECIPIENT, amount: U256::from(200) }.abi_encode(),
+        );
+        assert!(decode_bool(&result));
+
+        let result = env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            allowanceCall { owner, spender: USER }.abi_encode(),
+        );
+        assert_eq!(decode_u256(&result), value - U256::from(200));
+    }
+
+    #[test]
+    fn test_permit_expired_deadline_fails() {
+        let mut env = TestEnv::new();
+        let owner = fund_permit_signer(&mut env);
+        // Block timestamp is 1000, deadline is 999 (already expired)
+        let deadline = U256::from(999);
+        let (v, r, s) =
+            sign_permit_test(owner, RECIPIENT, U256::from(100), U256::ZERO, deadline, 1);
+        let data =
+            permitCall { owner, spender: RECIPIENT, value: U256::from(100), deadline, v, r, s }
+                .abi_encode();
+        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, data);
+        assert_not_success(&result);
+    }
+
+    #[test]
+    fn test_permit_wrong_signer_fails() {
+        let mut env = TestEnv::new();
+        let signer_addr = fund_permit_signer(&mut env);
+        let deadline = U256::from(2000);
+
+        // Sign as the real signer address
+        let (v, r, s) =
+            sign_permit_test(signer_addr, USER, U256::from(100), U256::ZERO, deadline, 1);
+        // Submit with USER as the claimed owner — signature won't match
+        let data = permitCall {
+            owner: USER,
+            spender: RECIPIENT,
+            value: U256::from(100),
+            deadline,
+            v,
+            r,
+            s,
+        }
+        .abi_encode();
+        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, data);
+        assert_not_success(&result);
+    }
+
+    #[test]
+    fn test_permit_replay_fails() {
+        let mut env = TestEnv::new();
+        let owner = fund_permit_signer(&mut env);
+        let deadline = U256::from(2000);
+
+        let (v, r, s) =
+            sign_permit_test(owner, RECIPIENT, U256::from(100), U256::ZERO, deadline, 1);
+        let data =
+            permitCall { owner, spender: RECIPIENT, value: U256::from(100), deadline, v, r, s }
+                .abi_encode();
+
+        // First call succeeds
+        assert_success(&env.exec_default(GOVERNANCE_SAFE_ADDRESS, data.clone()));
+        // Replay fails (nonce incremented)
+        assert_not_success(&env.exec_default(GOVERNANCE_SAFE_ADDRESS, data));
+    }
+
+    #[test]
+    fn test_permit_invalid_v_fails() {
+        let mut env = TestEnv::new();
+        let owner = fund_permit_signer(&mut env);
+        let deadline = U256::from(2000);
+
+        let (_, r, s) =
+            sign_permit_test(owner, RECIPIENT, U256::from(100), U256::ZERO, deadline, 1);
+        let data =
+            permitCall { owner, spender: RECIPIENT, value: U256::from(100), deadline, v: 26, r, s }
+                .abi_encode();
+        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, data);
+        assert_not_success(&result);
+    }
+
+    #[test]
+    fn test_permit_short_calldata_fails() {
+        let mut env = TestEnv::new();
+        let full = permitCall {
+            owner: GOVERNANCE_SAFE_ADDRESS,
+            spender: USER,
+            value: U256::from(100),
+            deadline: U256::from(2000),
+            v: 27,
+            r: B256::ZERO,
+            s: B256::ZERO,
+        }
+        .abi_encode();
+        // Truncate to less than 228 bytes (4 selector + 224 calldata)
+        let short = full[..4 + 192].to_vec();
+        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, short);
+        assert_not_success(&result);
+    }
+
+    #[test]
+    fn test_permit_oog() {
+        let mut env = TestEnv::new();
+        let owner = fund_permit_signer(&mut env);
+        let deadline = U256::from(2000);
+        let (v, r, s) =
+            sign_permit_test(owner, RECIPIENT, U256::from(100), U256::ZERO, deadline, 1);
+        let data =
+            permitCall { owner, spender: RECIPIENT, value: U256::from(100), deadline, v, r, s }
+                .abi_encode();
+        let result = env.exec(GOVERNANCE_SAFE_ADDRESS, data, 21_000);
+        assert_not_success(&result);
+    }
+
+    #[test]
+    fn test_nonces_initial_zero() {
+        let mut env = TestEnv::new();
+        let result =
+            env.exec_default(GOVERNANCE_SAFE_ADDRESS, noncesCall { owner: USER }.abi_encode());
+        assert_eq!(decode_u256(&result), U256::ZERO);
+    }
+
+    #[test]
+    fn test_nonces_short_calldata_fails() {
+        let mut env = TestEnv::new();
+        let full = noncesCall { owner: USER }.abi_encode();
+        let short = full[..4 + 16].to_vec();
+        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, short);
+        assert_not_success(&result);
+    }
+
+    #[test]
+    fn test_domain_separator_returns_value() {
+        let mut env = TestEnv::new();
+        let result =
+            env.exec_default(GOVERNANCE_SAFE_ADDRESS, DOMAIN_SEPARATORCall {}.abi_encode());
+        let bytes = extract_output_bytes(&result);
+        assert_eq!(bytes.len(), 32);
+        let expected = compute_domain_separator(1);
+        assert_eq!(B256::from_slice(&bytes), expected);
+    }
+
+    #[test]
+    fn test_domain_separator_deterministic() {
+        let mut env = TestEnv::new();
+        let r1 = env.exec_default(GOVERNANCE_SAFE_ADDRESS, DOMAIN_SEPARATORCall {}.abi_encode());
+        let r2 = env.exec_default(GOVERNANCE_SAFE_ADDRESS, DOMAIN_SEPARATORCall {}.abi_encode());
+        assert_eq!(extract_output_bytes(&r1), extract_output_bytes(&r2));
+    }
+
+    #[test]
+    fn test_const_typehash_matches() {
+        // eip712
+        let eip712_domain_typehash_expected = keccak256(
+            "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+        );
+        assert_eq!(EIP712_DOMAIN_TYPEHASH, eip712_domain_typehash_expected);
+
+        // eip2612
+        let permit_typehash = keccak256(
+            "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)",
+        );
+        assert_eq!(PERMIT_TYPEHASH, permit_typehash);
     }
 }
