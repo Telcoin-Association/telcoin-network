@@ -14,7 +14,7 @@
 //! that protects against malicious mints.
 use alloy::{
     sol,
-    sol_types::SolEvent,
+    sol_types::{SolEvent, SolValue},
 };
 use alloy_evm::EvmInternals;
 use reth_revm::{
@@ -28,7 +28,6 @@ use crate::{
     evm::tel_precompile::{
         burnable::{has_mint_role, Mint},
         erc20::Transfer,
-        helpers::{abi_encode_bool, address_to_topic},
         TOTAL_SUPPLY_SLOT,
     },
     TELCOIN_PRECOMPILE_ADDRESS,
@@ -112,7 +111,7 @@ pub(super) fn handle_mint_faucet(
 
     let log = reth_revm::primitives::Log::new(
         TELCOIN_PRECOMPILE_ADDRESS,
-        vec![topic0, address_to_topic(recipient)],
+        vec![topic0, recipient.into_word()],
         log_data.into(),
     )
     .ok_or_else(|| PrecompileError::Other("Failed to create Mint log".into()))?;
@@ -121,11 +120,7 @@ pub(super) fn handle_mint_faucet(
     // Emit Transfer(address(0), recipient, amount) — ERC20 mint event
     let transfer_log = reth_revm::primitives::Log::new(
         TELCOIN_PRECOMPILE_ADDRESS,
-        vec![
-            Transfer::SIGNATURE_HASH,
-            address_to_topic(Address::ZERO),
-            address_to_topic(recipient),
-        ],
+        vec![Transfer::SIGNATURE_HASH, Address::ZERO.into_word(), recipient.into_word()],
         amount.to_be_bytes_vec().into(),
     )
     .ok_or_else(|| PrecompileError::Other("Failed to create Transfer log".into()))?;
@@ -202,7 +197,7 @@ pub(super) fn handle_has_mint_role(
     }
     let addr = Address::from_slice(&calldata[12..32]);
     let has_role = has_mint_role(internals, addr)?;
-    Ok(PrecompileOutput::new(GAS_COST, abi_encode_bool(has_role)))
+    Ok(PrecompileOutput::new(GAS_COST, Bytes::from(has_role.abi_encode())))
 }
 
 #[cfg(test)]
@@ -215,6 +210,7 @@ mod tests {
     };
     use alloy::sol_types::SolCall;
     use reth_revm::{
+        context::ContextTr as _,
         primitives::{address, KECCAK_EMPTY},
         state::AccountInfo,
     };

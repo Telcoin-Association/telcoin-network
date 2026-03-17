@@ -26,7 +26,7 @@ use tn_types::{Address, Bytes, U256};
 use crate::{
     evm::tel_precompile::{
         erc20::Transfer,
-        helpers::{address_to_topic, amount_slot, timestamp_slot},
+        helpers::{amount_slot, timestamp_slot},
         TOTAL_SUPPLY_SLOT,
     },
     TELCOIN_PRECOMPILE_ADDRESS,
@@ -176,7 +176,7 @@ pub(super) fn handle_mint(
 
     let log = reth_revm::primitives::Log::new(
         TELCOIN_PRECOMPILE_ADDRESS,
-        vec![topic0, address_to_topic(recipient)],
+        vec![topic0, recipient.into_word()],
         log_data.into(),
     )
     .ok_or_else(|| PrecompileError::Other("Failed to create Mint log".into()))?;
@@ -270,7 +270,7 @@ pub(super) fn handle_claim(
     let topic0 = Claim::SIGNATURE_HASH;
     let log = reth_revm::primitives::Log::new(
         TELCOIN_PRECOMPILE_ADDRESS,
-        vec![topic0, address_to_topic(recipient)],
+        vec![topic0, recipient.into_word()],
         amount.to_be_bytes_vec().into(),
     )
     .ok_or_else(|| PrecompileError::Other("Failed to create Claim log".into()))?;
@@ -281,8 +281,8 @@ pub(super) fn handle_claim(
         TELCOIN_PRECOMPILE_ADDRESS,
         vec![
             Transfer::SIGNATURE_HASH,
-            address_to_topic(Address::ZERO),
-            address_to_topic(recipient),
+            Address::ZERO.into_word(),
+            recipient.into_word(),
         ],
         amount.to_be_bytes_vec().into(),
     )
@@ -354,8 +354,8 @@ pub(super) fn handle_burn(
         TELCOIN_PRECOMPILE_ADDRESS,
         vec![
             Transfer::SIGNATURE_HASH,
-            address_to_topic(TELCOIN_PRECOMPILE_ADDRESS),
-            address_to_topic(Address::ZERO),
+            TELCOIN_PRECOMPILE_ADDRESS.into_word(),
+            Address::ZERO.into_word(),
         ],
         amount.to_be_bytes_vec().into(),
     )

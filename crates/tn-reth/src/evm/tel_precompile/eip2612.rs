@@ -14,11 +14,11 @@
 use crate::{
     evm::tel_precompile::{
         erc20::Approval,
-        helpers::{abi_encode_uint256, address_to_topic, allowance_slot, nonce_slot},
+        helpers::{allowance_slot, nonce_slot},
     },
     TELCOIN_PRECOMPILE_ADDRESS,
 };
-use alloy::{primitives::Signature, sol, sol_types::SolEvent};
+use alloy::{primitives::Signature, sol, sol_types::{SolEvent, SolValue}};
 use alloy_evm::EvmInternals;
 use reth_primitives_traits::crypto::SECP256K1N_HALF;
 use reth_revm::{
@@ -82,7 +82,7 @@ pub(super) fn handle_nonces(
         .sload(TELCOIN_PRECOMPILE_ADDRESS, nonce_slot(owner))
         .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}").into()))?
         .data;
-    Ok(PrecompileOutput::new(GAS_COST, abi_encode_uint256(nonce)))
+    Ok(PrecompileOutput::new(GAS_COST, Bytes::from(nonce.abi_encode())))
 }
 
 /// `DOMAIN_SEPARATOR()` → returns the EIP-712 domain separator for the current chain.
@@ -199,7 +199,7 @@ pub(super) fn handle_permit(
     // Emit Approval(owner, spender, value)
     let log = reth_revm::primitives::Log::new(
         TELCOIN_PRECOMPILE_ADDRESS,
-        vec![Approval::SIGNATURE_HASH, address_to_topic(owner), address_to_topic(spender)],
+        vec![Approval::SIGNATURE_HASH, owner.into_word(), spender.into_word()],
         value.to_be_bytes_vec().into(),
     )
     .ok_or_else(|| PrecompileError::Other("Failed to create Approval log".into()))?;

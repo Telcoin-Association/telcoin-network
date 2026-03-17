@@ -6,17 +6,14 @@
 //! storage slots.
 //!
 //! Emits standard `Transfer` and `Approval` events from [`TELCOIN_PRECOMPILE_ADDRESS`].
-use alloy::{sol, sol_types::SolEvent};
+use alloy::{sol, sol_types::{SolEvent, SolValue}};
 use alloy_evm::EvmInternals;
 use reth_revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
-use tn_types::{Address, U256};
+use tn_types::{Address, Bytes, U256};
 
 use crate::{
     evm::tel_precompile::{
-        helpers::{
-            abi_encode_bool, abi_encode_string, abi_encode_uint256, address_to_topic,
-            allowance_slot,
-        },
+        helpers::allowance_slot,
         TOTAL_SUPPLY_SLOT,
     },
     TELCOIN_PRECOMPILE_ADDRESS,
@@ -58,7 +55,7 @@ pub(super) fn handle_name(gas_limit: u64) -> PrecompileResult {
     if gas_limit < GAS_COST {
         return Err(PrecompileError::OutOfGas);
     }
-    Ok(PrecompileOutput::new(GAS_COST, abi_encode_string("Telcoin")))
+    Ok(PrecompileOutput::new(GAS_COST, Bytes::from("Telcoin".abi_encode())))
 }
 
 /// `symbol()` → returns ABI-encoded `"TEL"`. Pure; no storage access.
@@ -67,7 +64,7 @@ pub(super) fn handle_symbol(gas_limit: u64) -> PrecompileResult {
     if gas_limit < GAS_COST {
         return Err(PrecompileError::OutOfGas);
     }
-    Ok(PrecompileOutput::new(GAS_COST, abi_encode_string("TEL")))
+    Ok(PrecompileOutput::new(GAS_COST, Bytes::from("TEL".abi_encode())))
 }
 
 /// `decimals()` → returns ABI-encoded `18`. Pure; no storage access.
@@ -76,7 +73,7 @@ pub(super) fn handle_decimals(gas_limit: u64) -> PrecompileResult {
     if gas_limit < GAS_COST {
         return Err(PrecompileError::OutOfGas);
     }
-    Ok(PrecompileOutput::new(GAS_COST, abi_encode_uint256(U256::from(18))))
+    Ok(PrecompileOutput::new(GAS_COST, Bytes::from(U256::from(18).abi_encode())))
 }
 
 /// `totalSupply()` → reads [`TOTAL_SUPPLY_SLOT`] (slot 100) and returns the current circulating
@@ -93,7 +90,7 @@ pub(super) fn handle_total_supply(
         .sload(TELCOIN_PRECOMPILE_ADDRESS, TOTAL_SUPPLY_SLOT)
         .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}").into()))?
         .data;
-    Ok(PrecompileOutput::new(GAS_COST, abi_encode_uint256(supply)))
+    Ok(PrecompileOutput::new(GAS_COST, Bytes::from(supply.abi_encode())))
 }
 
 /// `balanceOf(address)` → returns the **native account balance** of the given address.
@@ -119,7 +116,7 @@ pub(super) fn handle_balance_of(
         .data
         .info
         .balance;
-    Ok(PrecompileOutput::new(GAS_COST, abi_encode_uint256(balance)))
+    Ok(PrecompileOutput::new(GAS_COST, Bytes::from(balance.abi_encode())))
 }
 
 /// `allowance(address owner, address spender)` → reads the ERC-20 allowance from precompile
@@ -145,7 +142,7 @@ pub(super) fn handle_allowance(
         .sload(TELCOIN_PRECOMPILE_ADDRESS, slot)
         .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}").into()))?
         .data;
-    Ok(PrecompileOutput::new(GAS_COST, abi_encode_uint256(value)))
+    Ok(PrecompileOutput::new(GAS_COST, Bytes::from(value.abi_encode())))
 }
 
 // --- ERC20 state-mutating handlers ---
@@ -189,13 +186,13 @@ pub(super) fn handle_transfer(
     // Emit Transfer(from, to, value)
     let log = reth_revm::primitives::Log::new(
         TELCOIN_PRECOMPILE_ADDRESS,
-        vec![Transfer::SIGNATURE_HASH, address_to_topic(caller), address_to_topic(to)],
+        vec![Transfer::SIGNATURE_HASH, caller.into_word(), to.into_word()],
         amount.to_be_bytes_vec().into(),
     )
     .ok_or_else(|| PrecompileError::Other("Failed to create Transfer log".into()))?;
     internals.log(log);
 
-    Ok(PrecompileOutput::new(GAS_COST, abi_encode_bool(true)))
+    Ok(PrecompileOutput::new(GAS_COST, Bytes::from(true.abi_encode())))
 }
 
 /// `approve(address spender, uint256 amount)` → sets allowance for `spender` to spend `caller`'s
@@ -237,13 +234,13 @@ pub(super) fn handle_approve(
     // Emit Approval(owner, spender, value)
     let log = reth_revm::primitives::Log::new(
         TELCOIN_PRECOMPILE_ADDRESS,
-        vec![Approval::SIGNATURE_HASH, address_to_topic(caller), address_to_topic(spender)],
+        vec![Approval::SIGNATURE_HASH, caller.into_word(), spender.into_word()],
         amount.to_be_bytes_vec().into(),
     )
     .ok_or_else(|| PrecompileError::Other("Failed to create Approval log".into()))?;
     internals.log(log);
 
-    Ok(PrecompileOutput::new(GAS_COST, abi_encode_bool(true)))
+    Ok(PrecompileOutput::new(GAS_COST, Bytes::from(true.abi_encode())))
 }
 
 /// `transferFrom(address from, address to, uint256 amount)` → spends allowance and transfers.
@@ -303,7 +300,7 @@ pub(super) fn handle_transfer_from(
     // Emit Approval(from, caller, new_allowance) — updated allowance after spend
     let approval_log = reth_revm::primitives::Log::new(
         TELCOIN_PRECOMPILE_ADDRESS,
-        vec![Approval::SIGNATURE_HASH, address_to_topic(from), address_to_topic(caller)],
+        vec![Approval::SIGNATURE_HASH, from.into_word(), caller.into_word()],
         new_allowance.to_be_bytes_vec().into(),
     )
     .ok_or_else(|| PrecompileError::Other("Failed to create Approval log".into()))?;
@@ -323,13 +320,13 @@ pub(super) fn handle_transfer_from(
     // Emit Transfer(from, to, value)
     let log = reth_revm::primitives::Log::new(
         TELCOIN_PRECOMPILE_ADDRESS,
-        vec![Transfer::SIGNATURE_HASH, address_to_topic(from), address_to_topic(to)],
+        vec![Transfer::SIGNATURE_HASH, from.into_word(), to.into_word()],
         amount.to_be_bytes_vec().into(),
     )
     .ok_or_else(|| PrecompileError::Other("Failed to create Transfer log".into()))?;
     internals.log(log);
 
-    Ok(PrecompileOutput::new(GAS_COST, abi_encode_bool(true)))
+    Ok(PrecompileOutput::new(GAS_COST, Bytes::from(true.abi_encode())))
 }
 
 #[cfg(test)]

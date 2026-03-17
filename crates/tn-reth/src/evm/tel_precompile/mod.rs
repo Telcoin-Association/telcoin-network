@@ -62,7 +62,7 @@ mod erc20;
 /// Testnet faucet: instant minting with role management (compiled with `faucet` feature).
 #[cfg(feature = "faucet")]
 mod faucet;
-/// Storage-slot computation and ABI encoding utilities.
+/// Storage-slot computation utilities.
 mod helpers;
 /// In-memory EVM test harness (available in tests and with `test-utils` feature).
 #[cfg(any(test, feature = "test-utils"))]
