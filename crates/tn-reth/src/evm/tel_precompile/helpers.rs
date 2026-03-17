@@ -1,4 +1,7 @@
-//! Helpers
+//! Storage-slot computation and ABI encoding utilities for the TEL precompile.
+//!
+//! Provides deterministic slot derivation following Solidity's storage layout for mappings,
+//! plus minimal hand-rolled ABI encoders for the small set of return types the precompile needs.
 use reth_revm::primitives::keccak256;
 use tn_types::{Address, Bytes, B256, U256};
 

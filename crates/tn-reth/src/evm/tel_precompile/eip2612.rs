@@ -1,4 +1,16 @@
-//! TODO
+//! EIP-2612 permit support for gasless ERC-20 approvals.
+//!
+//! Implements `permit(owner, spender, value, deadline, v, r, s)` which verifies an EIP-712
+//! typed-data signature and sets `allowance[owner][spender] = value` without requiring a
+//! transaction from `owner`. Also exposes `nonces(owner)` and `DOMAIN_SEPARATOR()` as
+//! read-only queries.
+//!
+//! # Security considerations
+//!
+//! - Signatures use EIP-712 structured data with a chain-specific domain separator.
+//! - Nonces are monotonically incremented to prevent replay attacks.
+//! - The `s` value is checked against `SECP256K1N_HALF` to prevent signature malleability.
+//! - `v` must be exactly 27 or 28.
 use crate::{
     evm::tel_precompile::{
         erc20::Approval,
@@ -15,20 +27,15 @@ use reth_revm::{
 };
 use tn_types::{Address, Bytes, B256, U256};
 
-// ABI definitions for the Telcoin precompile's external interface.
+// EIP-2612 ABI definitions.
 //
-// This generates selector constants and encoding/decoding types for each function and event.
-// The interface combines a custom mint/claim/burn lifecycle with a standard ERC-20 surface,
-// plus optional role-management functions gated behind the `faucet` feature.
-//
-// Security notes:
-// - `mint` creates a pending mint subject to a timelock; it does NOT credit tokens immediately.
-// - `claim` is permissionless — anyone can trigger it once the timelock expires.
-// - `burn` destroys tokens held by the precompile account; only governance may call it.
-// - `grantMintRole` / `revokeMintRole` are only compiled with `feature = "faucet"`.
+// Generates selector constants and Rust encoding/decoding types for the permit interface.
 sol! {
+    /// Set `allowance[owner][spender] = value` using an off-chain EIP-712 signature.
     function permit(address owner, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external;
+    /// Return the current permit nonce for `owner` (monotonically increasing).
     function nonces(address owner) external view returns (uint256);
+    /// Return the EIP-712 domain separator for the current chain.
     function DOMAIN_SEPARATOR() external view returns (bytes32);
 }
 

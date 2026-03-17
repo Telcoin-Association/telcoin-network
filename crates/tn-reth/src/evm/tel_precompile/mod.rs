@@ -1,32 +1,79 @@
-//! TEL erc20 precompile.
+//! Native TEL ERC-20 precompile.
 //!
+//! Implements an ERC-20-compatible interface for Telcoin's native token directly at the EVM
+//! precompile level. Unlike a standard Solidity contract, this precompile operates on **native
+//! account balances** — `balanceOf(addr)` returns the same value as `addr.balance`. Token
+//! transfers move native wei between accounts, making TEL simultaneously the chain's gas token
+//! and its primary ERC-20.
 //!
-//! TODOOOOOOOOOOO
+//! The precompile is registered as a [`DynPrecompile`] inside a [`PrecompilesMap`] at
+//! [`TELCOIN_PRECOMPILE_ADDRESS`] (`0x7e1`). Any `CALL`/`STATICCALL` targeting that address is
+//! intercepted and routed to [`telcoin_precompile`] instead of executing bytecode.
 //!
+//! # Module structure
 //!
-//! Telcoin precompile registered as a [`DynPrecompile`] inside a [`PrecompilesMap`].
+//! | Module       | Responsibility |
+//! |--------------|----------------|
+//! | [`erc20`]    | Standard ERC-20 view and transfer functions |
+//! | [`eip2612`]  | EIP-2612 `permit` (gasless approvals) |
+//! | [`burnable`] | Timelocked `mint` / `claim` / `burn` lifecycle (production) |
+//! | [`faucet`]   | Instant `mint` with role management (testnet, `faucet` feature) |
+//! | [`helpers`]  | Storage-slot computation and ABI encoding utilities |
+//! | [`test_utils`] | In-memory EVM test harness (test/test-utils only) |
 //!
-//! Storage layout at TELCOIN_PRECOMPILE_ADDRESS:
-//!   keccak256(abi.encode(recipient, 0)) = pending mint amount
-//!   keccak256(abi.encode(recipient, 1)) = unlock timestamp
-//!   keccak256(abi.encode(spender, keccak256(abi.encode(owner, 2)))) = allowance
-//!   keccak256(abi.encode(owner, 4)) = nonces (EIP-2612 permit nonces)
-//!   slot 100 = totalSupply
+//! # Storage layout
+//!
+//! All precompile-managed state is stored under [`TELCOIN_PRECOMPILE_ADDRESS`] using
+//! Solidity-compatible mapping layouts:
+//!
+//! | Base slot | Type | Description |
+//! |-----------|------|-------------|
+//! | 0 | `mapping(address => uint256)` | Pending mint amounts |
+//! | 1 | `mapping(address => uint256)` | Unlock timestamps |
+//! | 2 | `mapping(address => mapping(address => uint256))` | ERC-20 allowances |
+//! | 3 | `mapping(address => bool)` | Mint roles (faucet feature only) |
+//! | 4 | `mapping(address => uint256)` | EIP-2612 permit nonces |
+//! | 100 | `uint256` | Total circulating supply |
+//!
+//! # Access control
+//!
+//! - **Governance** ([`GOVERNANCE_SAFE_ADDRESS`](tn_config::GOVERNANCE_SAFE_ADDRESS)): can `mint`,
+//!   `claim`, `burn`, and (with faucet) `grantMintRole`/`revokeMintRole`.
+//! - **Mint-role holders** (faucet only): can call the faucet `mint(address, uint256)`.
+//! - **Any account**: can `transfer`, `approve`, `transferFrom`, `permit`, and call all view
+//!   functions. `claim` is also permissionless once the timelock expires.
+//!
+//! # Feature flags
+//!
+//! - **`faucet`**: Replaces the timelocked `mint(uint256)` with an instant
+//!   `mint(address, uint256)` and adds role-management functions. **Must never be enabled in
+//!   production builds** — it removes the timelock safety window.
 use alloy::{primitives::address, sol_types::SolCall};
 use alloy_evm::precompiles::{DynPrecompile, PrecompileInput, PrecompilesMap};
 use reth_revm::precompile::{PrecompileError, PrecompileId, PrecompileResult};
 use tn_types::{Address, U256};
 
+/// Timelocked mint/claim lifecycle and token burning.
 mod burnable;
+/// EIP-2612 gasless permit approvals.
 mod eip2612;
+/// Standard ERC-20 view and transfer functions.
 mod erc20;
+/// Testnet faucet: instant minting with role management (compiled with `faucet` feature).
 #[cfg(feature = "faucet")]
 mod faucet;
+/// Storage-slot computation and ABI encoding utilities.
 mod helpers;
+/// In-memory EVM test harness (available in tests and with `test-utils` feature).
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
+
+// --- Re-exports for external consumers ---
+
+/// Production `mint(uint256)` call type (timelocked, governance-only).
 #[cfg(not(feature = "faucet"))]
 pub use burnable::mintCall;
+/// Production timelock duration constant (7 days).
 #[cfg(not(feature = "faucet"))]
 pub use burnable::TIMELOCK_DURATION;
 pub use burnable::{burnCall, claimCall, grantMintRoleCall, hasMintRoleCall, revokeMintRoleCall};
@@ -35,6 +82,7 @@ pub use erc20::{
     allowanceCall, approveCall, balanceOfCall, decimalsCall, nameCall, symbolCall, totalSupplyCall,
     transferCall, transferFromCall,
 };
+/// Faucet `mint(address, uint256)` call type (instant, role-gated).
 #[cfg(feature = "faucet")]
 pub use faucet::mintCall;
 

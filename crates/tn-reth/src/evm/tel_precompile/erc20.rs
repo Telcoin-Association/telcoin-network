@@ -1,4 +1,11 @@
-//! ERC20 functions
+//! Standard ERC-20 view and state-mutating functions for the TEL precompile.
+//!
+//! Provides `name`, `symbol`, `decimals`, `totalSupply`, `balanceOf`, `allowance`,
+//! `transfer`, `approve`, and `transferFrom`. Balances are stored as **native account
+//! balances** (not in precompile storage), while allowances and total supply use precompile
+//! storage slots.
+//!
+//! Emits standard `Transfer` and `Approval` events from [`TELCOIN_PRECOMPILE_ADDRESS`].
 use alloy::{sol, sol_types::SolEvent};
 use alloy_evm::EvmInternals;
 use reth_revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
@@ -15,28 +22,31 @@ use crate::{
     TELCOIN_PRECOMPILE_ADDRESS,
 };
 
-// ABI definitions for the Telcoin precompile's external interface.
+// Standard ERC-20 ABI definitions.
 //
-// This generates selector constants and encoding/decoding types for each function and event.
-// The interface combines a custom mint/claim/burn lifecycle with a standard ERC-20 surface,
-// plus optional role-management functions gated behind the `faucet` feature.
-//
-// Security notes:
-// - `mint` creates a pending mint subject to a timelock; it does NOT credit tokens immediately.
-// - `claim` is permissionless — anyone can trigger it once the timelock expires.
-// - `burn` destroys tokens held by the precompile account; only governance may call it.
-// - `grantMintRole` / `revokeMintRole` are only compiled with `feature = "faucet"`.
+// Generates selector constants and Rust encoding/decoding types for the ERC-20 interface.
 sol! {
+    /// Returns the token name: `"Telcoin"`.
     function name() external view returns (string);
+    /// Returns the token symbol: `"TEL"`.
     function symbol() external view returns (string);
+    /// Returns the number of decimals: `18`.
     function decimals() external view returns (uint8);
+    /// Returns the total circulating supply of TEL (from storage slot 100).
     function totalSupply() external view returns (uint256);
+    /// Returns the native account balance of `account` (TEL = native token).
     function balanceOf(address account) external view returns (uint256);
+    /// Transfer `amount` TEL from caller to `to`.
     function transfer(address to, uint256 amount) external returns (bool);
+    /// Set the allowance for `spender` to spend caller's tokens.
     function approve(address spender, uint256 amount) external returns (bool);
+    /// Transfer `amount` TEL from `from` to `to`, spending caller's allowance.
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    /// Returns the remaining allowance that `spender` can spend on behalf of `owner`.
     function allowance(address owner, address spender) external view returns (uint256);
+    /// Emitted on `transfer` and `transferFrom`.
     event Transfer(address indexed from, address indexed to, uint256 value);
+    /// Emitted on `approve` and `permit`.
     event Approval(address indexed owner, address indexed spender, uint256 value);
 }
 

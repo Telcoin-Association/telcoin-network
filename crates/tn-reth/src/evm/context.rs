@@ -16,7 +16,7 @@ use reth_revm::{
 pub(crate) type TNEvmContext<DB> = Context<BlockEnv, TxEnv, CfgEnv, DB>;
 
 /// Convenience type for TN mainnet's EVM.
-pub(crate) type MainnetEvm<CTX, INSP = ()> =
+pub(crate) type TelcoinEvm<CTX, INSP = ()> =
     Evm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, PrecompilesMap, EthFrame<EthInterpreter>>;
 
 /// Trait used to initialize Context with default mainnet types.
@@ -30,9 +30,9 @@ pub(crate) trait TNContext {
 pub(crate) trait TNContextBuilder {
     type Context;
     /// Return `Evm` for execution without inspector.
-    fn _build(self) -> MainnetEvm<Self::Context>;
+    fn _build(self) -> TelcoinEvm<Self::Context>;
     /// Return `Evm` for execution with inspector.
-    fn build_with_inspector<I>(self, inspector: I) -> MainnetEvm<Self::Context, I>;
+    fn build_with_inspector<I>(self, inspector: I) -> TelcoinEvm<Self::Context, I>;
 }
 
 impl TNContext for Context<BlockEnv, TxEnv, CfgEnv, EmptyDB, Journal<EmptyDB>, ()> {
@@ -54,7 +54,7 @@ where
 {
     type Context = Self;
 
-    fn _build(self) -> MainnetEvm<Self::Context> {
+    fn _build(self) -> TelcoinEvm<Self::Context> {
         Evm {
             ctx: self,
             inspector: (),
@@ -64,7 +64,7 @@ where
         }
     }
 
-    fn build_with_inspector<I>(self, inspector: I) -> MainnetEvm<Self::Context, I> {
+    fn build_with_inspector<I>(self, inspector: I) -> TelcoinEvm<Self::Context, I> {
         Evm {
             ctx: self,
             inspector,

@@ -1,4 +1,17 @@
-//! TOODDDOO
+//! Timelocked mint/claim lifecycle and token burning.
+//!
+//! Implements the production token-issuance flow:
+//! 1. **`mint(uint256)`** — governance creates a pending mint with a 7-day timelock.
+//! 2. **`claim(address)`** — anyone can finalize the mint after the timelock expires,
+//!    crediting the recipient's native balance and incrementing `totalSupply`.
+//! 3. **`burn(uint256)`** — governance destroys tokens held by the precompile account.
+//!
+//! The timelock provides a safety window for governance to cancel malicious mints before
+//! tokens enter circulation. A second `mint` call **overwrites** any pending mint, which
+//! can be used to cancel by minting amount zero.
+//!
+//! With `feature = "faucet"`, the `mint` function signature changes to `mint(address, uint256)`
+//! and bypasses the timelock entirely (see [`faucet`](super::faucet) module).
 //!
 
 use alloy::{
@@ -21,31 +34,33 @@ use crate::{
 #[cfg(feature = "faucet")]
 use crate::evm::tel_precompile::faucet::mint_role_slot;
 
-// ABI definitions for the Telcoin precompile's external interface.
+// Mint/claim/burn ABI definitions.
 //
-// This generates selector constants and encoding/decoding types for each function and event.
-// The interface combines a custom mint/claim/burn lifecycle with a standard ERC-20 surface,
-// plus optional role-management functions gated behind the `faucet` feature.
-//
-// Security notes:
-// - `mint` creates a pending mint subject to a timelock; it does NOT credit tokens immediately.
-// - `claim` is permissionless — anyone can trigger it once the timelock expires.
-// - `burn` destroys tokens held by the precompile account; only governance may call it.
-// - `grantMintRole` / `revokeMintRole` are only compiled with `feature = "faucet"`.
+// Generates selector constants and Rust encoding/decoding types for the token lifecycle
+// and role management interface.
 sol! {
+    /// Finalize a pending mint after the timelock expires. Permissionless.
     function claim(address recipient) external;
+    /// Destroy `amount` tokens held by the precompile account. Governance-only.
     function burn(uint256 amount) external;
+    /// Grant `addr` the ability to call `mint`. Governance-only. Faucet feature only.
     function grantMintRole(address addr) external;
+    /// Revoke `addr`'s mint role. Governance-only. Faucet feature only.
     function revokeMintRole(address addr) external;
+    /// Query whether `addr` has the mint role. Read-only. Faucet feature only.
     function hasMintRole(address addr) external view returns (bool);
+    /// Emitted when a new mint is created (pending or instant depending on feature).
     event Mint(address indexed recipient, uint256 amount, uint256 unlockTimestamp);
+    /// Emitted when a pending mint is finalized via `claim`.
     event Claim(address indexed recipient, uint256 amount);
+    /// Emitted when tokens are burned.
     event Burn(uint256 amount);
 }
 
-// only mint to governance safe
+// Production `mint` ABI: takes only an amount, always mints to governance with a timelock.
 #[cfg(not(feature = "faucet"))]
 sol! {
+    /// Create a timelocked pending mint of `amount` tokens to governance.
     function mint(uint256 amount) external;
 }
 

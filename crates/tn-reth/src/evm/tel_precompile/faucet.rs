@@ -1,4 +1,17 @@
-//! Testnet faucet mints on the fly
+//! Testnet faucet: instant minting with dynamic role management.
+//!
+//! Compiled only with `feature = "faucet"`. Replaces the timelocked `mint(uint256)` from
+//! [`burnable`](super::burnable) with `mint(address, uint256)` that directly credits the
+//! recipient's native balance — no pending state, no timelock, no separate `claim` step.
+//!
+//! Also provides governance-controlled role management:
+//! - `grantMintRole(address)` — allows an address to call `mint`.
+//! - `revokeMintRole(address)` — removes that permission.
+//! - `hasMintRole(address)` — read-only query.
+//!
+//! # Security warning
+//! This module **must never be enabled in production**. It removes the 7-day timelock
+//! that protects against malicious mints.
 use alloy::{
     sol,
     sol_types::SolEvent,
@@ -21,8 +34,9 @@ use crate::{
     TELCOIN_PRECOMPILE_ADDRESS,
 };
 
-// faucet mints on the fly
+// Faucet `mint` ABI: takes a recipient and amount, credits instantly without timelock.
 sol! {
+    /// Instantly mint `amount` tokens to `recipient`. Requires mint role.
     function mint(address recipient, uint256 amount) external;
 }
 
