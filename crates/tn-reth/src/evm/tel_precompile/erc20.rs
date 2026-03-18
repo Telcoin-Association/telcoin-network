@@ -326,7 +326,7 @@ pub(super) fn handle_transfer_from(
 mod tests {
     use super::*;
     #[cfg(not(feature = "faucet"))]
-    use crate::evm::tel_precompile::burnable::{claimCall, mintCall, TIMELOCK_DURATION};
+    use crate::evm::tel_precompile::burnable::{claimCall, TIMELOCK_DURATION};
     use crate::evm::tel_precompile::test_utils::*;
     use alloy::sol_types::SolCall;
     use reth_revm::{context::ContextTr as _, primitives::address};
@@ -338,11 +338,7 @@ mod tests {
     fn test_balance_of() {
         let mut env = TestEnv::new();
         let initial_balance = env.get_balance(GOVERNANCE_SAFE_ADDRESS);
-        env.exec_default(
-            GOVERNANCE_SAFE_ADDRESS,
-            mintCall { amount: U256::from(500) }.abi_encode(),
-        )
-        .unwrap();
+        env.mint(GOVERNANCE_SAFE_ADDRESS, GOVERNANCE_SAFE_ADDRESS, U256::from(500)).unwrap();
         env.set_timestamp(1000 + TIMELOCK_DURATION + 1);
         env.exec_default(
             GOVERNANCE_SAFE_ADDRESS,

@@ -24,7 +24,7 @@ use crate::evm::tel_precompile::faucet::mint_role_slot;
 use crate::{
     evm::tel_precompile::{
         erc20::Transfer,
-        helpers::{amount_slot, balance_incr, timestamp_slot, transfer_balance},
+        helpers::{amount_slot, balance_decr, balance_incr, timestamp_slot},
         TOTAL_SUPPLY_SLOT,
     },
     TELCOIN_PRECOMPILE_ADDRESS,
@@ -287,8 +287,7 @@ pub(super) fn handle_claim(
 
 /// `burn(uint256 amount)` — destroys tokens held by the precompile account.
 ///
-/// Transfers `amount` from the precompile's native balance to `address(0)` (effectively
-/// destroying it), then decrements `totalSupply`.
+/// Decrements the precompile's native balance by `amount`, then decrements `totalSupply`.
 ///
 /// # Access control
 /// Governance-only via [`has_governance_role`].
@@ -311,11 +310,9 @@ pub(super) fn handle_burn(
 
     let amount = U256::from_be_slice(&calldata[0..32]);
 
-    // Transfer from precompile to zero address (burn)
-    if let Some(error) =
-        transfer_balance(internals, TELCOIN_PRECOMPILE_ADDRESS, Address::ZERO, amount)?
-    {
-        return Err(PrecompileError::Other(format!("burn transfer error: {error}")));
+    // Decrement precompile balance (destroy tokens)
+    if let Some(error) = balance_decr(internals, TELCOIN_PRECOMPILE_ADDRESS, amount)? {
+        return Err(PrecompileError::Other(format!("burn error: {error}")));
     }
 
     // Decrement totalSupply
@@ -369,13 +366,7 @@ mod tests {
     #[test]
     fn test_mint_succeeds() {
         let mut env = TestEnv::new();
-        #[cfg(not(feature = "faucet"))]
-        let data = mintCall { amount: U256::from(500) }.abi_encode();
-        #[cfg(feature = "faucet")]
-        let data =
-            crate::evm::tel_precompile::mintCall { recipient: RECIPIENT, amount: U256::from(500) }
-                .abi_encode();
-        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, data);
+        let result = env.mint(GOVERNANCE_SAFE_ADDRESS, RECIPIENT, U256::from(500));
         assert_success(&result);
     }
 
@@ -383,11 +374,7 @@ mod tests {
     #[cfg(not(feature = "faucet"))]
     fn test_claim_before_timelock_halts() {
         let mut env = TestEnv::new();
-        env.exec_default(
-            GOVERNANCE_SAFE_ADDRESS,
-            mintCall { amount: U256::from(500) }.abi_encode(),
-        )
-        .unwrap();
+        env.mint(GOVERNANCE_SAFE_ADDRESS, GOVERNANCE_SAFE_ADDRESS, U256::from(500)).unwrap();
         let result = env.exec_default(
             GOVERNANCE_SAFE_ADDRESS,
             claimCall { recipient: GOVERNANCE_SAFE_ADDRESS }.abi_encode(),
@@ -399,11 +386,7 @@ mod tests {
     #[cfg(not(feature = "faucet"))]
     fn test_claim_after_timelock_succeeds() {
         let mut env = TestEnv::new();
-        env.exec_default(
-            GOVERNANCE_SAFE_ADDRESS,
-            mintCall { amount: U256::from(500) }.abi_encode(),
-        )
-        .unwrap();
+        env.mint(GOVERNANCE_SAFE_ADDRESS, GOVERNANCE_SAFE_ADDRESS, U256::from(500)).unwrap();
         env.set_timestamp(1000 + TIMELOCK_DURATION + 1);
         let result = env.exec_default(
             GOVERNANCE_SAFE_ADDRESS,
@@ -427,11 +410,7 @@ mod tests {
     fn test_total_supply_after_claim_and_burn() {
         let mut env = TestEnv::new();
         let genesis = U256::from(100_000_000_000u128) * U256::from(10).pow(U256::from(18));
-        env.exec_default(
-            GOVERNANCE_SAFE_ADDRESS,
-            mintCall { amount: U256::from(500) }.abi_encode(),
-        )
-        .unwrap();
+        env.mint(GOVERNANCE_SAFE_ADDRESS, GOVERNANCE_SAFE_ADDRESS, U256::from(500)).unwrap();
         env.set_timestamp(1000 + TIMELOCK_DURATION + 1);
         env.exec_default(
             GOVERNANCE_SAFE_ADDRESS,
@@ -479,11 +458,7 @@ mod tests {
     #[cfg(not(feature = "faucet"))]
     fn test_claim_already_claimed() {
         let mut env = TestEnv::new();
-        env.exec_default(
-            GOVERNANCE_SAFE_ADDRESS,
-            mintCall { amount: U256::from(500) }.abi_encode(),
-        )
-        .unwrap();
+        env.mint(GOVERNANCE_SAFE_ADDRESS, GOVERNANCE_SAFE_ADDRESS, U256::from(500)).unwrap();
         env.set_timestamp(1000 + TIMELOCK_DURATION + 1);
         let claim_data = claimCall { recipient: GOVERNANCE_SAFE_ADDRESS }.abi_encode();
         let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, claim_data.clone());
@@ -564,16 +539,8 @@ mod tests {
     fn test_double_mint_overwrites() {
         let mut env = TestEnv::new();
         let initial_balance = U256::from(10).pow(U256::from(18));
-        env.exec_default(
-            GOVERNANCE_SAFE_ADDRESS,
-            mintCall { amount: U256::from(500) }.abi_encode(),
-        )
-        .unwrap();
-        env.exec_default(
-            GOVERNANCE_SAFE_ADDRESS,
-            mintCall { amount: U256::from(300) }.abi_encode(),
-        )
-        .unwrap();
+        env.mint(GOVERNANCE_SAFE_ADDRESS, GOVERNANCE_SAFE_ADDRESS, U256::from(500)).unwrap();
+        env.mint(GOVERNANCE_SAFE_ADDRESS, GOVERNANCE_SAFE_ADDRESS, U256::from(300)).unwrap();
         env.set_timestamp(1000 + TIMELOCK_DURATION + 1);
         env.exec_default(
             GOVERNANCE_SAFE_ADDRESS,
@@ -591,14 +558,9 @@ mod tests {
     #[cfg(not(feature = "faucet"))]
     fn test_zero_amount_mint_overwrites_pending() {
         let mut env = TestEnv::new();
-        env.exec_default(
-            GOVERNANCE_SAFE_ADDRESS,
-            mintCall { amount: U256::from(500) }.abi_encode(),
-        )
-        .unwrap();
+        env.mint(GOVERNANCE_SAFE_ADDRESS, GOVERNANCE_SAFE_ADDRESS, U256::from(500)).unwrap();
         // Zero-amount mint succeeds and cancels the pending mint
-        let result =
-            env.exec_default(GOVERNANCE_SAFE_ADDRESS, mintCall { amount: U256::ZERO }.abi_encode());
+        let result = env.mint(GOVERNANCE_SAFE_ADDRESS, GOVERNANCE_SAFE_ADDRESS, U256::ZERO);
         assert_success(&result);
         env.set_timestamp(1000 + TIMELOCK_DURATION + 1);
         // Claim fails because pending was overwritten to zero

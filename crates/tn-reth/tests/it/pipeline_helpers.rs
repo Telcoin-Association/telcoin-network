@@ -5,6 +5,7 @@
 //! signature recovery, block building, state persistence, and finalization.
 
 use alloy::{signers::local::PrivateKeySigner, sol_types::SolCall};
+use tn_reth::mintCall;
 use reth_revm::context::result::{ExecutionResult, Output};
 use secp256k1::rand::{rngs::StdRng, SeedableRng as _};
 use std::{
@@ -275,6 +276,19 @@ impl PipelineTestEnv {
             U256::ZERO,
             Bytes::from(calldata),
         )
+    }
+
+    /// Create an encoded governance mint tx targeting the forwarder.
+    ///
+    /// In production mode, `recipient` is unused (mint always targets governance).
+    /// In faucet mode, `recipient` is the mint target.
+    #[allow(unused_variables)]
+    pub(crate) fn governance_mint_tx(&mut self, recipient: Address, amount: U256) -> Vec<u8> {
+        #[cfg(not(feature = "faucet"))]
+        let data = mintCall { amount }.abi_encode();
+        #[cfg(feature = "faucet")]
+        let data = mintCall { recipient, amount }.abi_encode();
+        self.governance_tx(data)
     }
 
     /// Create an encoded user tx targeting the precompile.

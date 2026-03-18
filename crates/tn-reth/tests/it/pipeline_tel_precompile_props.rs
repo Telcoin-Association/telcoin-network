@@ -170,9 +170,7 @@ proptest! {
 
         // Block 1 at T: governance mints via forwarder
         let mint_ts = 1_000_000u64;
-        let mint_tx = env.governance_tx(
-            mintCall { amount: U256::from(amount) }.abi_encode(),
-        );
+        let mint_tx = env.governance_mint_tx(GOVERNANCE_SAFE_ADDRESS, U256::from(amount));
         let block1 = env.execute_block_at_timestamp(vec![mint_tx], mint_ts)
             .expect("execute mint block");
         assert!(env.tx_succeeded(&block1, 0), "mint tx should succeed");
@@ -509,16 +507,12 @@ proptest! {
         let mint_ts = 1_000_000u64;
 
         // Block 1: mint non-zero
-        let tx1 = env.governance_tx(
-            mintCall { amount: U256::from(amount) }.abi_encode(),
-        );
+        let tx1 = env.governance_mint_tx(GOVERNANCE_SAFE_ADDRESS, U256::from(amount));
         let block1 = env.execute_block_at_timestamp(vec![tx1], mint_ts).expect("execute mint block");
         assert!(env.tx_succeeded(&block1, 0), "mint should succeed");
 
         // Block 2: mint zero (cancels pending)
-        let tx2 = env.governance_tx(
-            mintCall { amount: U256::ZERO }.abi_encode(),
-        );
+        let tx2 = env.governance_mint_tx(GOVERNANCE_SAFE_ADDRESS, U256::ZERO);
         let block2 = env.execute_block_at_timestamp(vec![tx2], mint_ts + 1).expect("execute zero mint");
         assert!(env.tx_succeeded(&block2, 0), "zero mint should succeed");
 
@@ -937,7 +931,7 @@ proptest! {
         let mint_ts = 1_000_000u64;
 
         // Block 1: mint
-        let tx1 = env.governance_tx(mintCall { amount: U256::from(amount) }.abi_encode());
+        let tx1 = env.governance_mint_tx(GOVERNANCE_SAFE_ADDRESS, U256::from(amount));
         let block1 = env.execute_block_at_timestamp(vec![tx1], mint_ts).expect("mint block");
         assert!(env.tx_succeeded(&block1, 0));
 
@@ -968,12 +962,12 @@ proptest! {
         let supply_before = env.get_total_supply();
 
         // Block 1: mint first
-        let tx1 = env.governance_tx(mintCall { amount: U256::from(first) }.abi_encode());
+        let tx1 = env.governance_mint_tx(GOVERNANCE_SAFE_ADDRESS, U256::from(first));
         let block1 = env.execute_block_at_timestamp(vec![tx1], mint_ts).expect("mint 1");
         assert!(env.tx_succeeded(&block1, 0));
 
         // Block 2: mint second (overwrites first, resets timelock)
-        let tx2 = env.governance_tx(mintCall { amount: U256::from(second) }.abi_encode());
+        let tx2 = env.governance_mint_tx(GOVERNANCE_SAFE_ADDRESS, U256::from(second));
         let block2 = env.execute_block_at_timestamp(vec![tx2], mint_ts + 1).expect("mint 2");
         assert!(env.tx_succeeded(&block2, 0));
 
@@ -1000,7 +994,7 @@ proptest! {
         let mut env = PipelineTestEnv::new();
         let mint_ts = 1_000_000u64;
 
-        let tx1 = env.governance_tx(mintCall { amount: U256::from(amount) }.abi_encode());
+        let tx1 = env.governance_mint_tx(GOVERNANCE_SAFE_ADDRESS, U256::from(amount));
         let block1 = env.execute_block_at_timestamp(vec![tx1], mint_ts).expect("mint block");
         assert!(env.tx_succeeded(&block1, 0));
 
@@ -1024,7 +1018,7 @@ proptest! {
         let gov_balance_before = env.get_balance(GOVERNANCE_SAFE_ADDRESS);
 
         // Block 1: governance mints
-        let tx1 = env.governance_tx(mintCall { amount: U256::from(amount) }.abi_encode());
+        let tx1 = env.governance_mint_tx(GOVERNANCE_SAFE_ADDRESS, U256::from(amount));
         let block1 = env.execute_block_at_timestamp(vec![tx1], mint_ts).expect("mint block");
         assert!(env.tx_succeeded(&block1, 0));
 
@@ -1074,7 +1068,7 @@ proptest! {
         let mint_ts = 1_000_000u64;
 
         // Block 1: mint
-        let tx1 = env.governance_tx(mintCall { amount: U256::from(mint_amount) }.abi_encode());
+        let tx1 = env.governance_mint_tx(GOVERNANCE_SAFE_ADDRESS, U256::from(mint_amount));
         let block1 = env.execute_block_at_timestamp(vec![tx1], mint_ts).expect("mint");
         assert!(env.tx_succeeded(&block1, 0));
 

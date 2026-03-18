@@ -141,3 +141,26 @@ pub(super) fn balance_incr(
     acc.mark_touch();
     Ok(())
 }
+
+/// Decrement the native balance of an address (used for burning).
+///
+/// Returns `Ok(None)` on success, `Ok(Some(msg))` if the address has insufficient balance.
+pub(super) fn balance_decr(
+    internals: &mut EvmInternals<'_>,
+    addr: Address,
+    amount: U256,
+) -> Result<Option<String>, PrecompileError> {
+    if amount.is_zero() {
+        return Ok(None);
+    }
+    let acc = internals
+        .load_account(addr)
+        .map_err(|e| PrecompileError::Other(format!("load_account failed: {e:?}")))?
+        .data;
+    if acc.info.balance < amount {
+        return Ok(Some("insufficient balance".to_string()));
+    }
+    acc.info.balance -= amount;
+    acc.mark_touch();
+    Ok(None)
+}

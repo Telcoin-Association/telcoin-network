@@ -224,6 +224,19 @@ impl TestEnv {
         self.exec(caller, calldata, 100_000)
     }
 
+    /// Mint tokens via the precompile.
+    ///
+    /// In production mode, creates a timelocked pending mint to governance (ignores `recipient`).
+    /// In faucet mode, directly credits `recipient`.
+    pub fn mint(&mut self, caller: Address, recipient: Address, amount: U256) -> TestResult {
+        let _ = recipient; // unused in production mode; suppress warning in faucet mode via cfg
+        #[cfg(not(feature = "faucet"))]
+        let data = super::burnable::mintCall { amount }.abi_encode();
+        #[cfg(feature = "faucet")]
+        let data = super::faucet::mintCall { recipient, amount }.abi_encode();
+        self.exec_default(caller, data)
+    }
+
     /// Query `balanceOf(account)` via the precompile and decode the result.
     pub fn get_balance(&mut self, account: Address) -> U256 {
         let result =

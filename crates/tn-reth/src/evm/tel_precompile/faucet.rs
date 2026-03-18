@@ -246,8 +246,7 @@ mod tests {
         fund_faucet(&mut env);
         env.exec_default(GOVERNANCE_SAFE_ADDRESS, grantMintRoleCall { addr: FAUCET }.abi_encode())
             .unwrap();
-        let data = mintCall { recipient: RECIPIENT, amount: U256::from(1000) }.abi_encode();
-        let result = env.exec_default(FAUCET, data);
+        let result = env.mint(FAUCET, RECIPIENT, U256::from(1000));
         assert_success(&result);
     }
 
@@ -289,10 +288,7 @@ mod tests {
         fund_faucet(&mut env);
         env.exec_default(GOVERNANCE_SAFE_ADDRESS, grantMintRoleCall { addr: FAUCET }.abi_encode())
             .unwrap();
-        let result = env.exec_default(
-            FAUCET,
-            mintCall { recipient: RECIPIENT, amount: U256::from(500) }.abi_encode(),
-        );
+        let result = env.mint(FAUCET, RECIPIENT, U256::from(500));
         assert_success(&result);
         let balance = env.get_balance(RECIPIENT);
         assert_eq!(balance, U256::from(500));
@@ -305,11 +301,7 @@ mod tests {
         let genesis = U256::from(100_000_000_000u128) * U256::from(10).pow(U256::from(18));
         env.exec_default(GOVERNANCE_SAFE_ADDRESS, grantMintRoleCall { addr: FAUCET }.abi_encode())
             .unwrap();
-        env.exec_default(
-            FAUCET,
-            mintCall { recipient: RECIPIENT, amount: U256::from(500) }.abi_encode(),
-        )
-        .unwrap();
+        env.mint(FAUCET, RECIPIENT, U256::from(500)).unwrap();
         let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, totalSupplyCall {}.abi_encode());
         assert_eq!(decode_u256(&result), genesis + U256::from(500));
     }
@@ -320,16 +312,8 @@ mod tests {
         fund_faucet(&mut env);
         env.exec_default(GOVERNANCE_SAFE_ADDRESS, grantMintRoleCall { addr: FAUCET }.abi_encode())
             .unwrap();
-        env.exec_default(
-            FAUCET,
-            mintCall { recipient: RECIPIENT, amount: U256::from(500) }.abi_encode(),
-        )
-        .unwrap();
-        env.exec_default(
-            FAUCET,
-            mintCall { recipient: RECIPIENT, amount: U256::from(300) }.abi_encode(),
-        )
-        .unwrap();
+        env.mint(FAUCET, RECIPIENT, U256::from(500)).unwrap();
+        env.mint(FAUCET, RECIPIENT, U256::from(300)).unwrap();
         let result = env.exec_default(
             GOVERNANCE_SAFE_ADDRESS,
             balanceOfCall { account: RECIPIENT }.abi_encode(),
@@ -343,11 +327,7 @@ mod tests {
         fund_faucet(&mut env);
         env.exec_default(GOVERNANCE_SAFE_ADDRESS, grantMintRoleCall { addr: FAUCET }.abi_encode())
             .unwrap();
-        env.exec_default(
-            FAUCET,
-            mintCall { recipient: RECIPIENT, amount: U256::from(500) }.abi_encode(),
-        )
-        .unwrap();
+        env.mint(FAUCET, RECIPIENT, U256::from(500)).unwrap();
         let result = env
             .exec_default(GOVERNANCE_SAFE_ADDRESS, claimCall { recipient: RECIPIENT }.abi_encode());
         assert_not_success(&result);
@@ -359,11 +339,7 @@ mod tests {
         fund_faucet(&mut env);
         env.exec_default(GOVERNANCE_SAFE_ADDRESS, grantMintRoleCall { addr: FAUCET }.abi_encode())
             .unwrap();
-        env.exec_default(
-            FAUCET,
-            mintCall { recipient: RECIPIENT, amount: U256::from(750) }.abi_encode(),
-        )
-        .unwrap();
+        env.mint(FAUCET, RECIPIENT, U256::from(750)).unwrap();
         let result = env.exec_default(
             GOVERNANCE_SAFE_ADDRESS,
             balanceOfCall { account: RECIPIENT }.abi_encode(),
@@ -378,11 +354,7 @@ mod tests {
         let genesis = U256::from(100_000_000_000u128) * U256::from(10).pow(U256::from(18));
         env.exec_default(GOVERNANCE_SAFE_ADDRESS, grantMintRoleCall { addr: FAUCET }.abi_encode())
             .unwrap();
-        env.exec_default(
-            FAUCET,
-            mintCall { recipient: RECIPIENT, amount: U256::from(500) }.abi_encode(),
-        )
-        .unwrap();
+        env.mint(FAUCET, RECIPIENT, U256::from(500)).unwrap();
         env.exec_default(
             GOVERNANCE_SAFE_ADDRESS,
             burnCall { amount: U256::from(200) }.abi_encode(),
@@ -395,10 +367,7 @@ mod tests {
     #[test]
     fn test_zero_amount_mint_fails() {
         let mut env = TestEnv::new();
-        let result = env.exec_default(
-            GOVERNANCE_SAFE_ADDRESS,
-            mintCall { recipient: RECIPIENT, amount: U256::ZERO }.abi_encode(),
-        );
+        let result = env.mint(GOVERNANCE_SAFE_ADDRESS, RECIPIENT, U256::ZERO);
         assert_not_success(&result);
     }
 

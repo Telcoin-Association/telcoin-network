@@ -41,10 +41,7 @@ proptest! {
         grant_faucet_role(&mut env);
 
         let balance_before = env.get_balance(RECIPIENT);
-        let result = env.exec_default(
-            FAUCET,
-            mintCall { recipient: RECIPIENT, amount: U256::from(amount) }.abi_encode(),
-        );
+        let result = env.mint(FAUCET, RECIPIENT, U256::from(amount));
         assert_success(&result);
 
         let balance_after = env.get_balance(RECIPIENT);
@@ -61,10 +58,7 @@ proptest! {
         grant_faucet_role(&mut env);
 
         let supply_before = env.get_total_supply();
-        let result = env.exec_default(
-            FAUCET,
-            mintCall { recipient: RECIPIENT, amount: U256::from(amount) }.abi_encode(),
-        );
+        let result = env.mint(FAUCET, RECIPIENT, U256::from(amount));
         assert_success(&result);
 
         let supply_after = env.get_total_supply();
@@ -84,14 +78,8 @@ proptest! {
         grant_faucet_role(&mut env);
 
         let balance_before = env.get_balance(RECIPIENT);
-        env.exec_default(
-            FAUCET,
-            mintCall { recipient: RECIPIENT, amount: U256::from(a1) }.abi_encode(),
-        ).unwrap();
-        env.exec_default(
-            FAUCET,
-            mintCall { recipient: RECIPIENT, amount: U256::from(a2) }.abi_encode(),
-        ).unwrap();
+        env.mint(FAUCET, RECIPIENT, U256::from(a1)).unwrap();
+        env.mint(FAUCET, RECIPIENT, U256::from(a2)).unwrap();
 
         let balance_after = env.get_balance(RECIPIENT);
         prop_assert_eq!(
@@ -105,10 +93,7 @@ proptest! {
     fn prop_faucet_zero_mint_fails(_ in 0u8..1) {
         let mut env = new_faucet_env();
         grant_faucet_role(&mut env);
-        let result = env.exec_default(
-            FAUCET,
-            mintCall { recipient: RECIPIENT, amount: U256::ZERO }.abi_encode(),
-        );
+        let result = env.mint(FAUCET, RECIPIENT, U256::ZERO);
         assert_not_success(&result);
     }
 
@@ -129,10 +114,7 @@ proptest! {
     fn prop_faucet_grant_enables_mint(amount in 1u128..1_000_000_000_000_000_000u128) {
         let mut env = new_faucet_env();
         grant_faucet_role(&mut env);
-        let result = env.exec_default(
-            FAUCET,
-            mintCall { recipient: RECIPIENT, amount: U256::from(amount) }.abi_encode(),
-        );
+        let result = env.mint(FAUCET, RECIPIENT, U256::from(amount));
         assert_success(&result);
     }
 
@@ -178,10 +160,7 @@ proptest! {
     fn prop_faucet_claim_after_mint_fails(amount in 1u128..1_000_000_000_000_000_000u128) {
         let mut env = new_faucet_env();
         grant_faucet_role(&mut env);
-        env.exec_default(
-            FAUCET,
-            mintCall { recipient: RECIPIENT, amount: U256::from(amount) }.abi_encode(),
-        ).unwrap();
+        env.mint(FAUCET, RECIPIENT, U256::from(amount)).unwrap();
         let result = env.exec_default(
             GOVERNANCE,
             claimCall { recipient: RECIPIENT }.abi_encode(),

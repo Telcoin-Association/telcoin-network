@@ -217,7 +217,7 @@ proptest! {
         let mut env = TestEnv::new();
         let supply_before = env.get_total_supply();
 
-        env.exec_default(GOVERNANCE_SAFE_ADDRESS, mintCall { amount: U256::from(amount) }.abi_encode()).unwrap();
+        env.mint(GOVERNANCE_SAFE_ADDRESS, GOVERNANCE_SAFE_ADDRESS, U256::from(amount)).unwrap();
         env.set_timestamp(1000 + TIMELOCK_DURATION + 1);
         let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, claimCall { recipient: GOVERNANCE_SAFE_ADDRESS }.abi_encode());
         assert_success(&result);
@@ -236,7 +236,7 @@ proptest! {
         offset in 0u64..TIMELOCK_DURATION
     ) {
         let mut env = TestEnv::new();
-        env.exec_default(GOVERNANCE_SAFE_ADDRESS, mintCall { amount: U256::from(amount) }.abi_encode()).unwrap();
+        env.mint(GOVERNANCE_SAFE_ADDRESS, GOVERNANCE_SAFE_ADDRESS, U256::from(amount)).unwrap();
         env.set_timestamp(1000 + offset);
         let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, claimCall { recipient: GOVERNANCE_SAFE_ADDRESS }.abi_encode());
         assert_not_success(&result);
@@ -251,8 +251,8 @@ proptest! {
         let mut env = TestEnv::new();
         let supply_before = env.get_total_supply();
 
-        env.exec_default(GOVERNANCE_SAFE_ADDRESS, mintCall { amount: U256::from(a1) }.abi_encode()).unwrap();
-        env.exec_default(GOVERNANCE_SAFE_ADDRESS, mintCall { amount: U256::from(a2) }.abi_encode()).unwrap();
+        env.mint(GOVERNANCE_SAFE_ADDRESS, GOVERNANCE_SAFE_ADDRESS, U256::from(a1)).unwrap();
+        env.mint(GOVERNANCE_SAFE_ADDRESS, GOVERNANCE_SAFE_ADDRESS, U256::from(a2)).unwrap();
         env.set_timestamp(1000 + TIMELOCK_DURATION + 1);
         let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, claimCall { recipient: GOVERNANCE_SAFE_ADDRESS }.abi_encode());
         assert_success(&result);
@@ -268,8 +268,8 @@ proptest! {
     #[test]
     fn prop_zero_mint_cancels_pending(amount in 1u128..1_000_000_000_000_000_000u128) {
         let mut env = TestEnv::new();
-        env.exec_default(GOVERNANCE_SAFE_ADDRESS, mintCall { amount: U256::from(amount) }.abi_encode()).unwrap();
-        env.exec_default(GOVERNANCE_SAFE_ADDRESS, mintCall { amount: U256::ZERO }.abi_encode()).unwrap();
+        env.mint(GOVERNANCE_SAFE_ADDRESS, GOVERNANCE_SAFE_ADDRESS, U256::from(amount)).unwrap();
+        env.mint(GOVERNANCE_SAFE_ADDRESS, GOVERNANCE_SAFE_ADDRESS, U256::ZERO).unwrap();
         env.set_timestamp(1000 + TIMELOCK_DURATION + 1);
         let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, claimCall { recipient: GOVERNANCE_SAFE_ADDRESS }.abi_encode());
         assert_not_success(&result);
@@ -426,8 +426,7 @@ fn test_total_supply_reflects_operations() {
     assert_eq!(env.get_total_supply(), genesis);
 
     // Mint + claim
-    env.exec_default(GOVERNANCE_SAFE_ADDRESS, mintCall { amount: U256::from(1000) }.abi_encode())
-        .unwrap();
+    env.mint(GOVERNANCE_SAFE_ADDRESS, GOVERNANCE_SAFE_ADDRESS, U256::from(1000)).unwrap();
     env.set_timestamp(1000 + TIMELOCK_DURATION + 1);
     env.exec_default(
         GOVERNANCE_SAFE_ADDRESS,
