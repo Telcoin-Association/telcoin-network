@@ -5,8 +5,8 @@
 
 use crate::{
     engine::{ExecutionNode, TnBuilder},
-    epoch_votes::spawn_epoch_vote_collector,
     health::HealthcheckServer,
+    manager::spawn_epoch_vote_collector,
     primary::PrimaryNode,
     worker::{worker_task_manager_name, WorkerNode},
     EngineToPrimaryRpc,
@@ -67,7 +67,7 @@ const NODE_TASK_MANAGER: &str = "Node Task Manager";
 const EPOCH_TASK_MANAGER: &str = "Epoch Task Manager";
 
 /// The worker's base task manager name. This is used by `fn worker_task_manager_name(id)`.
-pub(super) const WORKER_TASK_BASE: &str = "Worker Task";
+pub(crate) const WORKER_TASK_BASE: &str = "Worker Task";
 
 /// Modes for an epoch.
 #[derive(Debug, Copy, Clone)]

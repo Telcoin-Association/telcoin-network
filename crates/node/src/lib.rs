@@ -13,13 +13,13 @@ use tn_types::{BlockHash, ConsensusHeader, Epoch, EpochCertificate, EpochRecord}
 use tokio::task::JoinHandle;
 
 pub mod engine;
-mod epoch_votes;
 mod error;
 mod health;
 mod manager;
 pub mod primary;
 pub mod worker;
 pub use manager::catchup_accumulator;
+//pub use manager::*;
 
 #[cfg(test)]
 use tempfile as _;
