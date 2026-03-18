@@ -19,7 +19,6 @@ mod manager;
 pub mod primary;
 pub mod worker;
 pub use manager::catchup_accumulator;
-//pub use manager::*;
 
 #[cfg(test)]
 use tempfile as _;
