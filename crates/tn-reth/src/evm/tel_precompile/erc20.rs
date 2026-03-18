@@ -286,24 +286,12 @@ pub(super) fn handle_transfer_from(
     }
 
     // Decrement allowance (skip for infinite approval)
-    let new_allowance = if current_allowance != U256::MAX {
+    if current_allowance != U256::MAX {
         let new_allowance = current_allowance - amount;
         internals
             .sstore(TELCOIN_PRECOMPILE_ADDRESS, slot, new_allowance)
             .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}")))?;
-        new_allowance
-    } else {
-        current_allowance
     };
-
-    // Emit Approval(from, caller, new_allowance) — updated allowance after spend
-    let approval_log = reth_revm::primitives::Log::new(
-        TELCOIN_PRECOMPILE_ADDRESS,
-        vec![Approval::SIGNATURE_HASH, from.into_word(), caller.into_word()],
-        new_allowance.to_be_bytes_vec().into(),
-    )
-    .ok_or_else(|| PrecompileError::Other("Failed to create Approval log".into()))?;
-    internals.log(approval_log);
 
     // Transfer native balance
     if let Some(error) = transfer_balance(internals, from, to, amount)? {

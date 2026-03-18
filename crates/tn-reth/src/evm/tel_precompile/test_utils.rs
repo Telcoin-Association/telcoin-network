@@ -216,6 +216,8 @@ impl TestEnv {
                 .unwrap(),
         );
         *nonce += 1;
+        // use mainnet handler with default gas to 0 for simpler test logic
+        // pipeline tests use TN tools and account for gas usage
         MainnetHandler::default().run(&mut self.evm)
     }
 

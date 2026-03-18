@@ -41,7 +41,7 @@
 //!   `claim`, `burn`, and (with faucet) `grantMintRole`/`revokeMintRole`.
 //! - **Mint-role holders** (faucet only): can call the faucet `mint(address, uint256)`.
 //! - **Any account**: can `transfer`, `approve`, `transferFrom`, `permit`, and call all view
-//!   functions. `claim` is also permissionless once the timelock expires.
+//!   functions.
 //!
 //! # Feature flags
 //!

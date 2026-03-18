@@ -115,6 +115,9 @@ pub(super) fn handle_permit(
     }
 
     let owner = Address::from_slice(&calldata[12..32]);
+    if owner == Address::ZERO {
+        return Err(PrecompileError::Other("permit: owner cannot be address(0)".into()));
+    }
     let spender = Address::from_slice(&calldata[44..64]);
     if spender == Address::ZERO {
         return Err(PrecompileError::Other("permit: cannot approve address(0)".into()));

@@ -2,8 +2,8 @@
 //!
 //! Implements the production token-issuance flow:
 //! 1. **`mint(uint256)`** — governance creates a pending mint with a 7-day timelock.
-//! 2. **`claim(address)`** — anyone can finalize the mint after the timelock expires, crediting the
-//!    recipient's native balance and incrementing `totalSupply`.
+//! 2. **`claim(address)`** — only governance can finalize the mint after the timelock expires,
+//!     crediting governance safe's native balance and incrementing `totalSupply`.
 //! 3. **`burn(uint256)`** — governance destroys tokens held by the precompile account.
 //!
 //! The timelock provides a safety window for governance to cancel malicious mints before
@@ -35,7 +35,7 @@ use crate::{
 // Generates selector constants and Rust encoding/decoding types for the token lifecycle
 // and role management interface.
 sol! {
-    /// Finalize a pending mint after the timelock expires. Permissionless.
+    /// Finalize a pending mint after the timelock expires.
     function claim(address recipient) external;
     /// Destroy `amount` tokens held by the precompile account. Governance-only.
     function burn(uint256 amount) external;
