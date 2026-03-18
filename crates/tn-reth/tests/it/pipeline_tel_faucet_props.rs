@@ -7,8 +7,9 @@ use super::pipeline_helpers::*;
 use alloy::sol_types::SolCall;
 use proptest::prelude::*;
 use secp256k1::rand::{rngs::StdRng, SeedableRng as _};
-use tn_reth::test_utils::TransactionFactory;
-use tn_reth::{grantMintRoleCall, mintCall, revokeMintRoleCall, transferCall};
+use tn_reth::{
+    grantMintRoleCall, mintCall, revokeMintRoleCall, test_utils::TransactionFactory, transferCall,
+};
 use tn_types::U256;
 
 /// Setup: fund the faucet address by transferring from user, then grant mint role.

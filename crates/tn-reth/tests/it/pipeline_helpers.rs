@@ -5,7 +5,6 @@
 //! signature recovery, block building, state persistence, and finalization.
 
 use alloy::{signers::local::PrivateKeySigner, sol_types::SolCall};
-use tn_reth::mintCall;
 use reth_revm::context::result::{ExecutionResult, Output};
 use secp256k1::rand::{rngs::StdRng, SeedableRng as _};
 use std::{
@@ -14,11 +13,11 @@ use std::{
 };
 use tempfile::TempDir;
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
-use tn_reth::test_utils::TransactionFactory;
 use tn_reth::{
-    allowanceCall, balanceOfCall, noncesCall, payload::TNPayload,
-    test_utils::precompile_test_utils::GENESIS_SUPPLY, totalSupplyCall,
-    ExecutedBlockWithTrieUpdates, NewCanonicalChain, RethChainSpec, RethEnv,
+    allowanceCall, balanceOfCall, mintCall, noncesCall,
+    payload::TNPayload,
+    test_utils::{precompile_test_utils::GENESIS_SUPPLY, TransactionFactory},
+    totalSupplyCall, ExecutedBlockWithTrieUpdates, NewCanonicalChain, RethChainSpec, RethEnv,
     TELCOIN_PRECOMPILE_ADDRESS,
 };
 use tn_types::{

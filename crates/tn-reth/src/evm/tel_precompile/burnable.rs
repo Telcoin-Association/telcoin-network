@@ -3,7 +3,7 @@
 //! Implements the production token-issuance flow:
 //! 1. **`mint(uint256)`** — governance creates a pending mint with a 7-day timelock.
 //! 2. **`claim(address)`** — only governance can finalize the mint after the timelock expires,
-//!     crediting governance safe's native balance and incrementing `totalSupply`.
+//!    crediting governance safe's native balance and incrementing `totalSupply`.
 //! 3. **`burn(uint256)`** — governance destroys tokens held by the precompile account.
 //!
 //! The timelock provides a safety window for governance to cancel malicious mints before
