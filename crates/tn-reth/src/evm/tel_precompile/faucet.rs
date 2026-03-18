@@ -10,7 +10,7 @@
 //! - `hasMintRole(address)` — read-only query.
 //!
 //! # Security warning
-//! This module **must never be enabled in production**. It removes the 7-day timelock
+//! This module **must never be enabled in mainnet**. It removes the 7-day timelock
 //! that protects against malicious mints.
 use alloy::{
     sol,

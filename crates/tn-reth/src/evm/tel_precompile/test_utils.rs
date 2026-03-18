@@ -27,7 +27,7 @@ use tn_types::{Bytes, TxKind, B256, U256};
 
 /// EVM context type used by the test harness, backed by an [`InMemoryDB`].
 ///
-/// Resolves to the same `Context<BlockEnv, TxEnv, CfgEnv, InMemoryDB>` that production
+/// Resolves to the same `Context<BlockEnv, TxEnv, CfgEnv, InMemoryDB>` that mainnet
 /// code uses, but with an in-memory database for isolation.
 pub type TestCtx = TNEvmContext<InMemoryDB>;
 
@@ -228,10 +228,10 @@ impl TestEnv {
 
     /// Mint tokens via the precompile.
     ///
-    /// In production mode, creates a timelocked pending mint to governance (ignores `recipient`).
+    /// In mainnet mode, creates a timelocked pending mint to governance (ignores `recipient`).
     /// In faucet mode, directly credits `recipient`.
     pub fn mint(&mut self, caller: Address, recipient: Address, amount: U256) -> TestResult {
-        let _ = recipient; // unused in production mode; suppress warning in faucet mode via cfg
+        let _ = recipient; // unused in mainnet mode; suppress warning in faucet mode via cfg
         #[cfg(not(feature = "faucet"))]
         let data = super::burnable::mintCall { amount }.abi_encode();
         #[cfg(feature = "faucet")]

@@ -11,7 +11,7 @@ The precompile is registered as a `DynPrecompile` inside reth's `PrecompilesMap`
 | `mod.rs`        | Top-level dispatcher: selector → handler routing, precompile registration                                                     |
 | `erc20.rs`      | Standard ERC-20: `name`, `symbol`, `decimals`, `totalSupply`, `balanceOf`, `transfer`, `approve`, `transferFrom`, `allowance` |
 | `eip2612.rs`    | EIP-2612 `permit` (gasless approvals), `nonces`, `DOMAIN_SEPARATOR`                                                           |
-| `burnable.rs`   | Timelocked `mint`/`claim` lifecycle + `burn` (production)                                                                     |
+| `burnable.rs`   | Timelocked `mint`/`claim` lifecycle + `burn` (mainnet)                                                                        |
 | `faucet.rs`     | Instant `mint` with role management (testnet, `faucet` feature)                                                               |
 | `helpers.rs`    | Storage slot derivation + minimal ABI encoders                                                                                |
 | `test_utils.rs` | In-memory EVM test harness (gated behind `#[cfg(test)]` / `test-utils` feature)                                               |
@@ -35,7 +35,7 @@ Slot derivation follows standard Solidity rules — e.g., `allowance[owner][spen
 
 ## Token lifecycle
 
-### Production (`!faucet`)
+### mainnet (`!faucet`)
 
 ```
 mint(amount)  →  pending_amount[governance] = amount
@@ -67,7 +67,7 @@ No pending state, no timelock. Mint roles can be granted/revoked by governance.
 
 | Function                                        | Who can call                                       |
 | ----------------------------------------------- | -------------------------------------------------- |
-| `mint` (production)                             | Governance only                                    |
+| `mint` (mainnet)                                | Governance only                                    |
 | `mint` (faucet)                                 | Governance + dynamically granted mint-role holders |
 | `claim`                                         | Anyone (after timelock)                            |
 | `burn`                                          | Governance only                                    |
@@ -81,7 +81,7 @@ Governance is identified by `GOVERNANCE_SAFE_ADDRESS` from `tn-config`.
 
 ### Timelock bypass (`faucet` feature)
 
-The `faucet` feature **removes the 7-day timelock** on minting. A production binary must never be compiled with this feature enabled. The feature is set at compile time — there is no runtime toggle.
+The `faucet` feature **removes the 7-day timelock** on minting. A mainnet binary must never be compiled with this feature enabled. The feature is set at compile time — there is no runtime toggle.
 
 ### ERC-20 approve race condition
 
@@ -169,7 +169,7 @@ These costs do **not** include the base transaction cost (21,000) or calldata co
 
 **Status: OK** — 2.93× headroom. SSTORE is warm (same slot as prior SLOAD). Skipped entirely for infinite allowance.
 
-### `mint` (production) — 41,000 gas
+### `mint` (mainnet) — 41,000 gas
 
 | Operation             | Access          | Gas        |
 | --------------------- | --------------- | ---------- |
@@ -266,7 +266,7 @@ These costs do **not** include the base transaction cost (21,000) or calldata co
 Test infrastructure lives in `test_utils.rs` and is the single source of truth for both unit tests (in each module's `#[cfg(test)] mod tests`) and integration tests (in `crates/tn-reth/tests/it/`).
 
 ```bash
-# Unit tests (production mint)
+# Unit tests (mainnet mint)
 cargo test -p tn-reth --lib tel_precompile
 
 # Unit tests (faucet mint)

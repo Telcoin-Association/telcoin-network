@@ -1,6 +1,6 @@
 //! Timelocked mint/claim lifecycle and token burning.
 //!
-//! Implements the production token-issuance flow:
+//! Implements the mainnet token-issuance flow:
 //! 1. **`mint(uint256)`** — governance creates a pending mint with a 7-day timelock.
 //! 2. **`claim(address)`** — only governance can finalize the mint after the timelock expires,
 //!    crediting governance safe's native balance and incrementing `totalSupply`.
@@ -53,7 +53,7 @@ sol! {
     event Burn(uint256 amount);
 }
 
-// Production `mint` ABI: takes only an amount, always mints to governance with a timelock.
+// mainnet `mint` ABI: takes only an amount, always mints to governance with a timelock.
 #[cfg(not(feature = "faucet"))]
 sol! {
     /// Create a timelocked pending mint of `amount` tokens to governance.
@@ -62,12 +62,12 @@ sol! {
 
 /// Timelock duration applied to new mints before they can be claimed.
 ///
-/// - **Production** (`!faucet`): 7 days (604 800 seconds). Provides a window for governance to
-///   cancel malicious mints before tokens enter circulation.
+/// - **mainnet** (`!faucet`): 7 days (604 800 seconds). Provides a window for governance to cancel
+///   malicious mints before tokens enter circulation.
 /// - **Testnet / faucet** (`faucet`): 0 seconds. Allows instant claim for development convenience.
 ///
 /// # Security invariant
-/// This value is set at **compile time**. A production binary must never be built with
+/// This value is set at **compile time**. A mainnet binary must never be built with
 /// `feature = "faucet"` enabled, or the timelock protection is silently disabled.
 #[cfg(not(feature = "faucet"))]
 pub const TIMELOCK_DURATION: u64 = 7 * 24 * 60 * 60; // 604800s = 7 days
@@ -80,7 +80,7 @@ pub const TIMELOCK_DURATION: u64 = 7 * 24 * 60 * 60; // 604800s = 7 days
 ///    previously called `grantMintRole(caller)`.
 ///
 /// # Security note
-/// Without the `faucet` feature, only governance can mint. This is the production invariant.
+/// Without the `faucet` feature, only governance can mint. This is the mainnet invariant.
 pub(super) fn has_mint_role(
     #[cfg(feature = "faucet")] internals: &mut EvmInternals<'_>,
     #[cfg(not(feature = "faucet"))] _internals: &mut EvmInternals<'_>,
@@ -121,7 +121,7 @@ pub(super) fn has_governance_role(caller: Address) -> bool {
 /// **Does not credit the balance** — that happens in [`handle_claim`] after the timelock expires.
 ///
 /// # Access control
-/// Requires [`has_mint_role`] — only governance qualifies in production.
+/// Requires [`has_mint_role`] — only governance qualifies in mainnet.
 ///
 /// # Security notes
 /// - The recipient is always [`GOVERNANCE_SAFE_ADDRESS`]; callers cannot choose a target.

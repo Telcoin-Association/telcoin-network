@@ -16,7 +16,7 @@
 //! |--------------|----------------|
 //! | [`erc20`]    | Standard ERC-20 view and transfer functions |
 //! | [`eip2612`]  | EIP-2612 `permit` (gasless approvals) |
-//! | [`burnable`] | Timelocked `mint` / `claim` / `burn` lifecycle (production) |
+//! | [`burnable`] | Timelocked `mint` / `claim` / `burn` lifecycle (mainnet) |
 //! | [`faucet`]   | Instant `mint` with role management (testnet, `faucet` feature) |
 //! | [`helpers`]  | Storage-slot computation and ABI encoding utilities |
 //! | [`test_utils`] | In-memory EVM test harness (test/test-utils only) |
@@ -46,8 +46,8 @@
 //! # Feature flags
 //!
 //! - **`faucet`**: Replaces the timelocked `mint(uint256)` with an instant `mint(address, uint256)`
-//!   and adds role-management functions. **Must never be enabled in production builds** — it
-//!   removes the timelock safety window.
+//!   and adds role-management functions. **Must never be enabled in mainnet builds** — it removes
+//!   the timelock safety window.
 use alloy::{primitives::address, sol_types::SolCall};
 use alloy_evm::precompiles::{DynPrecompile, PrecompileInput, PrecompilesMap};
 use reth_revm::precompile::{PrecompileError, PrecompileId, PrecompileResult};
@@ -70,10 +70,10 @@ pub mod test_utils;
 
 // --- Re-exports for external consumers ---
 
-/// Production `mint(uint256)` call type (timelocked, governance-only).
+/// mainnet `mint(uint256)` call type (timelocked, governance-only).
 #[cfg(not(feature = "faucet"))]
 pub use burnable::mintCall;
-/// Production timelock duration constant (7 days).
+/// mainnet timelock duration constant (7 days).
 #[cfg(not(feature = "faucet"))]
 pub use burnable::TIMELOCK_DURATION;
 pub use burnable::{burnCall, claimCall, grantMintRoleCall, hasMintRoleCall, revokeMintRoleCall};
