@@ -137,7 +137,8 @@ pub(super) fn balance_incr(
         .load_account(addr)
         .map_err(|e| PrecompileError::Other(format!("load_account failed: {e:?}")))?
         .data;
-    acc.info
+    acc.info.balance = acc
+        .info
         .balance
         .checked_add(amount)
         .ok_or(PrecompileError::Other("balance overflow".into()))?;
