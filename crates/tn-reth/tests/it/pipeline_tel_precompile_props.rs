@@ -1016,7 +1016,7 @@ proptest! {
         );
     }
 
-    /// Non-governance user can call claim after timelock (permissionless).
+    /// Only governance can call claim after timelock (permissioned).
     #[test]
     fn prop_pipeline_permissionless_claim(amount in 1u128..1_000_000u128) {
         let mut env = PipelineTestEnv::new();
@@ -1034,7 +1034,7 @@ proptest! {
             claimCall { recipient: GOVERNANCE_SAFE_ADDRESS }.abi_encode(),
         );
         let block2 = env.execute_block_at_timestamp(vec![tx2], claim_ts).expect("claim block");
-        assert!(env.tx_succeeded(&block2, 0), "permissionless claim should succeed");
+        assert!(!env.tx_succeeded(&block2, 0), "permissionless claim should succeed");
 
         // Governance balance should increase (minus gas from mint tx only)
         let gov_balance_after = env.get_balance(GOVERNANCE_SAFE_ADDRESS);

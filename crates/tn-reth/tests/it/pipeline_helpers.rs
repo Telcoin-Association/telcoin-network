@@ -7,7 +7,10 @@
 use alloy::{signers::local::PrivateKeySigner, sol_types::SolCall};
 use reth_revm::context::result::{ExecutionResult, Output};
 use secp256k1::rand::{rngs::StdRng, SeedableRng as _};
-use std::{collections::VecDeque, sync::Arc};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Condvar, Mutex},
+};
 use tempfile::TempDir;
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
 use tn_reth::test_utils::TransactionFactory;
@@ -22,6 +25,35 @@ use tn_types::{
     ConsensusOutput, GenesisAccount, ReputationScores, SealedHeader, SignatureVerificationState,
     TaskManager, MIN_PROTOCOL_BASE_FEE, U256,
 };
+
+// --- Concurrency limiter ---
+
+/// Limits concurrent MDBX database environments to avoid exhausting OS memory-mapping limits
+/// when `cargo test` runs all pipeline tests in parallel.
+static DB_LIMIT: (Mutex<u32>, Condvar) = (Mutex::new(0), Condvar::new());
+const MAX_CONCURRENT_DBS: u32 = 4;
+
+struct DbPermit;
+
+impl DbPermit {
+    fn acquire() -> Self {
+        let (lock, cvar) = &DB_LIMIT;
+        let mut count = lock.lock().unwrap();
+        while *count >= MAX_CONCURRENT_DBS {
+            count = cvar.wait(count).unwrap();
+        }
+        *count += 1;
+        DbPermit
+    }
+}
+
+impl Drop for DbPermit {
+    fn drop(&mut self) {
+        let (lock, cvar) = &DB_LIMIT;
+        *lock.lock().unwrap() -= 1;
+        cvar.notify_one();
+    }
+}
 
 // --- Constants ---
 
@@ -75,6 +107,7 @@ pub(crate) struct PipelineTestEnv {
     pub(crate) block_timestamp: u64,
     /// Monotonically increasing subdag index for consensus output.
     subdag_index: u64,
+    _db_permit: DbPermit,
     _tmp_dir: TempDir,
     _task_manager: TaskManager,
     _runtime: tokio::runtime::Runtime,
@@ -83,6 +116,8 @@ pub(crate) struct PipelineTestEnv {
 impl PipelineTestEnv {
     /// Create a new pipeline test environment with 3 funded EOAs and a governance forwarder.
     pub(crate) fn new() -> Self {
+        let db_permit = DbPermit::acquire();
+
         let mut governance_factory =
             TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(100));
         let mut user_factory =
@@ -163,6 +198,7 @@ impl PipelineTestEnv {
             canonical_header,
             block_timestamp,
             subdag_index: 1,
+            _db_permit: db_permit,
             _tmp_dir: tmp_dir,
             _task_manager: task_manager,
             _runtime: runtime,
