@@ -9,13 +9,13 @@ use alloy::sol_types::SolCall;
 use alloy_evm::precompiles::PrecompilesMap;
 use reth_revm::{
     context::{
-        result::{EVMError, ExecutionResult, InvalidTransaction, Output},
+        result::{EVMError, ExecutionResult, InvalidTransaction},
         BlockEnv, Context, ContextSetters, Evm, FrameStack, TxEnv,
     },
     db::InMemoryDB,
     handler::{instructions::EthInstructions, EthPrecompiles, Handler, MainnetHandler},
     inspector::NoOpInspector,
-    primitives::{address, keccak256, Address, KECCAK_EMPTY},
+    primitives::{address, Address, KECCAK_EMPTY},
     state::AccountInfo,
     MainContext,
 };
@@ -59,6 +59,11 @@ pub const GENESIS_SUPPLY: u128 = 100_000_000_000; // 100B
 
 // --- EIP-2612 permit test utilities ---
 
+/// Telcoin chain ID used for test EIP-712 domain construction.
+///
+/// Matches the adiri testnet chain ID (2017) used throughout the codebase.
+pub const TEST_CHAIN_ID: u64 = 2017;
+
 /// Fixed secp256k1 private key (`0x01`) used for EIP-2612 permit signing in tests.
 ///
 /// The corresponding address is derived by [`permit_signer_address`]. This key is
@@ -76,8 +81,8 @@ pub fn permit_signer_address() -> Address {
 
 /// Produce an EIP-2612 permit signature using [`PERMIT_SECRET`].
 ///
-/// Computes the EIP-712 domain separator and struct hash, then signs the resulting digest.
-/// Returns `(v, r, s)` suitable for passing to the `permit` precompile function.
+/// Computes the EIP-712 signing hash via alloy's `SolStruct` derive and signs the resulting
+/// digest. Returns `(v, r, s)` suitable for passing to the `permit` precompile function.
 pub fn sign_permit(
     owner: Address,
     spender: Address,
@@ -86,50 +91,17 @@ pub fn sign_permit(
     deadline: U256,
     chain_id: u64,
 ) -> (u8, B256, B256) {
-    use alloy::signers::{local::PrivateKeySigner, SignerSync};
+    use super::eip2612::{tel_eip712_domain, Permit};
+    use alloy::{
+        signers::{local::PrivateKeySigner, SignerSync},
+        sol_types::SolStruct,
+    };
 
     let signer = PrivateKeySigner::from_slice(&PERMIT_SECRET.0).unwrap();
 
-    // EIP-712 domain type hash
-    let eip712_domain_typehash = keccak256(
-        "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
-    );
-    let permit_typehash = keccak256(
-        "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)",
-    );
-
-    // Domain separator
-    let domain_separator = {
-        let mut buf = [0u8; 5 * 32];
-        buf[0..32].copy_from_slice(&eip712_domain_typehash.0);
-        buf[32..64].copy_from_slice(&keccak256("Telcoin").0);
-        buf[64..96].copy_from_slice(&keccak256("1").0);
-        buf[96..128].copy_from_slice(&U256::from(chain_id).to_be_bytes::<32>());
-        buf[140..160].copy_from_slice(TELCOIN_PRECOMPILE_ADDRESS.as_slice());
-        keccak256(buf)
-    };
-
-    // Struct hash
-    let struct_hash = {
-        let mut buf = [0u8; 6 * 32];
-        buf[0..32].copy_from_slice(&permit_typehash.0);
-        buf[44..64].copy_from_slice(owner.as_slice());
-        buf[76..96].copy_from_slice(spender.as_slice());
-        buf[96..128].copy_from_slice(&value.to_be_bytes::<32>());
-        buf[128..160].copy_from_slice(&nonce.to_be_bytes::<32>());
-        buf[160..192].copy_from_slice(&deadline.to_be_bytes::<32>());
-        keccak256(buf)
-    };
-
-    // EIP-712 digest
-    let digest = {
-        let mut buf = [0u8; 66];
-        buf[0] = 0x19;
-        buf[1] = 0x01;
-        buf[2..34].copy_from_slice(&domain_separator.0);
-        buf[34..66].copy_from_slice(&struct_hash.0);
-        keccak256(buf)
-    };
+    let domain = tel_eip712_domain(chain_id);
+    let permit = Permit { owner, spender, value, nonce, deadline };
+    let digest = permit.eip712_signing_hash(&domain);
 
     let sig = signer.sign_hash_sync(&digest).unwrap();
     let v = if sig.v() { 28u8 } else { 27u8 };
@@ -182,35 +154,17 @@ impl TestEnv {
 
         db.insert_account_info(
             GOVERNANCE_SAFE_ADDRESS,
-            AccountInfo {
-                balance: governance_bal,
-                nonce: 0,
-                code_hash: KECCAK_EMPTY,
-                code: None,
-                ..Default::default()
-            },
+            AccountInfo { balance: governance_bal, nonce: 0, code_hash: KECCAK_EMPTY, code: None },
         );
 
         db.insert_account_info(
             USER,
-            AccountInfo {
-                balance: user_bal,
-                nonce: 0,
-                code_hash: KECCAK_EMPTY,
-                code: None,
-                ..Default::default()
-            },
+            AccountInfo { balance: user_bal, nonce: 0, code_hash: KECCAK_EMPTY, code: None },
         );
 
         db.insert_account_info(
             TELCOIN_PRECOMPILE_ADDRESS,
-            AccountInfo {
-                balance: precompile_bal,
-                nonce: 0,
-                code_hash: KECCAK_EMPTY,
-                code: None,
-                ..Default::default()
-            },
+            AccountInfo { balance: precompile_bal, nonce: 0, code_hash: KECCAK_EMPTY, code: None },
         );
 
         db.insert_account_storage(
@@ -220,12 +174,11 @@ impl TestEnv {
         )
         .unwrap();
 
-        let mut block = BlockEnv::default();
-        block.timestamp = U256::from(1000);
+        let block = BlockEnv { timestamp: U256::from(1000), ..Default::default() };
         let context = Context::mainnet().with_db(db).with_block(block);
 
         let mut precompiles = PrecompilesMap::from(EthPrecompiles::default());
-        add_telcoin_precompile(&mut precompiles);
+        add_telcoin_precompile(&mut precompiles, TEST_CHAIN_ID);
 
         let evm = Evm {
             ctx: context,
@@ -242,13 +195,7 @@ impl TestEnv {
     pub fn add_account(&mut self, addr: Address, balance: U256) {
         self.evm.ctx.journaled_state.database.insert_account_info(
             addr,
-            AccountInfo {
-                balance,
-                nonce: 0,
-                code_hash: KECCAK_EMPTY,
-                code: None,
-                ..Default::default()
-            },
+            AccountInfo { balance, nonce: 0, code_hash: KECCAK_EMPTY, code: None },
         );
     }
 
@@ -305,9 +252,14 @@ impl TestEnv {
 
     /// Override the block timestamp for subsequent calls. Useful for testing timelocks.
     pub fn set_timestamp(&mut self, ts: u64) {
-        let mut block = BlockEnv::default();
-        block.timestamp = U256::from(ts);
+        let block = BlockEnv { timestamp: U256::from(ts), ..Default::default() };
         self.evm.ctx.set_block(block);
+    }
+}
+
+impl Default for TestEnv {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -327,9 +279,8 @@ pub fn assert_success(result: &TestResult) -> &ExecutionResult {
 /// Accepts `Err(...)`, `Ok(Revert { .. })`, or `Ok(Halt { .. })`. Panics only on
 /// `Ok(Success { .. })`.
 pub fn assert_not_success(result: &TestResult) {
-    match result {
-        Ok(ExecutionResult::Success { .. }) => panic!("expected non-success, got Success"),
-        _ => {}
+    if let Ok(ExecutionResult::Success { .. }) = result {
+        panic!("expected non-success, got Success")
     }
 }
 
@@ -338,12 +289,10 @@ pub fn assert_not_success(result: &TestResult) {
 /// Panics if the result is not a success.
 pub fn extract_output_bytes(result: &TestResult) -> Bytes {
     let r = assert_success(result);
-    match r {
-        ExecutionResult::Success { output, .. } => match output {
-            Output::Call(b) => b.clone(),
-            Output::Create(b, _) => b.clone(),
-        },
-        _ => unreachable!(),
+    if let ExecutionResult::Success { output, .. } = r {
+        output.data().clone()
+    } else {
+        unreachable!()
     }
 }
 

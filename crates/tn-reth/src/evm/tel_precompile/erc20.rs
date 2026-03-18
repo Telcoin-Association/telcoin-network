@@ -6,14 +6,17 @@
 //! storage slots.
 //!
 //! Emits standard `Transfer` and `Approval` events from [`TELCOIN_PRECOMPILE_ADDRESS`].
-use alloy::{sol, sol_types::{SolEvent, SolValue}};
+use alloy::{
+    sol,
+    sol_types::{SolEvent, SolValue},
+};
 use alloy_evm::EvmInternals;
 use reth_revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
 use tn_types::{Address, Bytes, U256};
 
 use crate::{
     evm::tel_precompile::{
-        helpers::allowance_slot,
+        helpers::{allowance_slot, transfer_balance},
         TOTAL_SUPPLY_SLOT,
     },
     TELCOIN_PRECOMPILE_ADDRESS,
@@ -88,7 +91,7 @@ pub(super) fn handle_total_supply(
     }
     let supply = internals
         .sload(TELCOIN_PRECOMPILE_ADDRESS, TOTAL_SUPPLY_SLOT)
-        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}").into()))?
+        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}")))?
         .data;
     Ok(PrecompileOutput::new(GAS_COST, Bytes::from(supply.abi_encode())))
 }
@@ -112,7 +115,7 @@ pub(super) fn handle_balance_of(
     let addr = Address::from_slice(&calldata[12..32]);
     let balance = internals
         .load_account(addr)
-        .map_err(|e| PrecompileError::Other(format!("load_account failed: {e:?}").into()))?
+        .map_err(|e| PrecompileError::Other(format!("load_account failed: {e:?}")))?
         .data
         .info
         .balance;
@@ -140,7 +143,7 @@ pub(super) fn handle_allowance(
     let slot = allowance_slot(owner, spender);
     let value = internals
         .sload(TELCOIN_PRECOMPILE_ADDRESS, slot)
-        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}").into()))?
+        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}")))?
         .data;
     Ok(PrecompileOutput::new(GAS_COST, Bytes::from(value.abi_encode())))
 }
@@ -175,12 +178,8 @@ pub(super) fn handle_transfer(
     }
 
     // Transfer native balance
-    let transfer_result = internals
-        .transfer(caller, to, amount)
-        .map_err(|e| PrecompileError::Other(format!("transfer failed: {e:?}").into()))?;
-
-    if let Some(error) = transfer_result {
-        return Err(PrecompileError::Other(format!("transfer error: {error:?}").into()));
+    if let Some(error) = transfer_balance(internals, caller, to, amount)? {
+        return Err(PrecompileError::Other(format!("transfer error: {error}")));
     }
 
     // Emit Transfer(from, to, value)
@@ -229,7 +228,7 @@ pub(super) fn handle_approve(
     let slot = allowance_slot(caller, spender);
     internals
         .sstore(TELCOIN_PRECOMPILE_ADDRESS, slot, amount)
-        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}").into()))?;
+        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}")))?;
 
     // Emit Approval(owner, spender, value)
     let log = reth_revm::primitives::Log::new(
@@ -279,7 +278,7 @@ pub(super) fn handle_transfer_from(
     let slot = allowance_slot(from, caller);
     let current_allowance = internals
         .sload(TELCOIN_PRECOMPILE_ADDRESS, slot)
-        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}").into()))?
+        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}")))?
         .data;
 
     if current_allowance < amount {
@@ -291,7 +290,7 @@ pub(super) fn handle_transfer_from(
         let new_allowance = current_allowance - amount;
         internals
             .sstore(TELCOIN_PRECOMPILE_ADDRESS, slot, new_allowance)
-            .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}").into()))?;
+            .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}")))?;
         new_allowance
     } else {
         current_allowance
@@ -307,14 +306,8 @@ pub(super) fn handle_transfer_from(
     internals.log(approval_log);
 
     // Transfer native balance
-    let transfer_result = internals
-        .transfer(from, to, amount)
-        .map_err(|e| PrecompileError::Other(format!("transfer failed: {e:?}").into()))?;
-
-    if let Some(error) = transfer_result {
-        return Err(PrecompileError::Other(
-            format!("transferFrom transfer error: {error:?}").into(),
-        ));
+    if let Some(error) = transfer_balance(internals, from, to, amount)? {
+        return Err(PrecompileError::Other(format!("transferFrom transfer error: {error}")));
     }
 
     // Emit Transfer(from, to, value)
@@ -344,7 +337,7 @@ mod tests {
     #[cfg(not(feature = "faucet"))]
     fn test_balance_of() {
         let mut env = TestEnv::new();
-        let initial_balance = U256::from(10).pow(U256::from(18));
+        let initial_balance = env.get_balance(GOVERNANCE_SAFE_ADDRESS);
         env.exec_default(
             GOVERNANCE_SAFE_ADDRESS,
             mintCall { amount: U256::from(500) }.abi_encode(),
@@ -505,7 +498,7 @@ mod tests {
         env.evm
             .ctx
             .db_mut()
-            .insert_account_storage(crate::TELCOIN_PRECOMPILE_ADDRESS, U256::from(100), U256::ZERO)
+            .insert_account_storage(TELCOIN_PRECOMPILE_ADDRESS, U256::from(100), U256::ZERO)
             .unwrap();
         let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, totalSupplyCall {}.abi_encode());
         assert_eq!(decode_u256(&result), U256::ZERO);

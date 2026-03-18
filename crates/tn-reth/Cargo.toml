@@ -66,6 +66,7 @@ secp256k1 = { workspace = true, optional = true }
 tn-types = { workspace = true, features = ["test-utils"] }
 secp256k1 = { workspace = true }
 proptest = { workspace = true }
+tn-reth = { workspace = true, features = ["test-utils"] }
 
 [features]
 default = []

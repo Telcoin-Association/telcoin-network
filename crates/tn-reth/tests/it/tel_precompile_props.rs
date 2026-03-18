@@ -12,12 +12,15 @@ use tn_config::GOVERNANCE_SAFE_ADDRESS;
 use tn_reth::{
     allowanceCall, approveCall, balanceOfCall, burnCall, claimCall, decimalsCall,
     grantMintRoleCall, hasMintRoleCall, mintCall, nameCall, noncesCall, permitCall,
-    revokeMintRoleCall, symbolCall, totalSupplyCall, transferCall, transferFromCall,
-    DOMAIN_SEPARATORCall, TIMELOCK_DURATION,
+    revokeMintRoleCall, symbolCall,
+    test_utils::precompile_test_utils::{
+        assert_not_success, assert_success, decode_bool, decode_u256, extract_output_bytes,
+        permit_signer_address, sign_permit, TestEnv, GENESIS_SUPPLY, RECIPIENT, TEST_CHAIN_ID,
+        USER,
+    },
+    totalSupplyCall, transferCall, transferFromCall, DOMAIN_SEPARATORCall, TIMELOCK_DURATION,
 };
 use tn_types::{Address, U256};
-
-use super::tel_precompile_helpers::*;
 
 // ==============================
 // ERC-20 transfer properties
@@ -450,7 +453,7 @@ proptest! {
         let mut env = TestEnv::new();
         let owner = permit_signer_address();
         let deadline = U256::from(2000);
-        let (v, r, s) = sign_permit(owner, RECIPIENT, U256::from(value), U256::ZERO, deadline, 1);
+        let (v, r, s) = sign_permit(owner, RECIPIENT, U256::from(value), U256::ZERO, deadline, TEST_CHAIN_ID);
         let data = permitCall {
             owner, spender: RECIPIENT, value: U256::from(value), deadline, v, r, s,
         }.abi_encode();
@@ -469,7 +472,7 @@ proptest! {
 
         for i in 0..count {
             let nonce = U256::from(i);
-            let (v, r, s) = sign_permit(owner, RECIPIENT, U256::from(100u128), nonce, deadline, 1);
+            let (v, r, s) = sign_permit(owner, RECIPIENT, U256::from(100u128), nonce, deadline, TEST_CHAIN_ID);
             let data = permitCall {
                 owner, spender: RECIPIENT, value: U256::from(100u128), deadline, v, r, s,
             }.abi_encode();
@@ -486,7 +489,7 @@ proptest! {
         let mut env = TestEnv::new();
         let owner = permit_signer_address();
         let deadline = U256::from(2000);
-        let (v, r, s) = sign_permit(owner, RECIPIENT, U256::from(value), U256::ZERO, deadline, 1);
+        let (v, r, s) = sign_permit(owner, RECIPIENT, U256::from(value), U256::ZERO, deadline, TEST_CHAIN_ID);
         let data = permitCall {
             owner, spender: RECIPIENT, value: U256::from(value), deadline, v, r, s,
         }.abi_encode();
@@ -502,7 +505,7 @@ proptest! {
         let owner = permit_signer_address();
         // Block timestamp is 1000; deadline is 0..999
         let deadline = U256::from(999u64);
-        let (v, r, s) = sign_permit(owner, RECIPIENT, U256::from(value), U256::ZERO, deadline, 1);
+        let (v, r, s) = sign_permit(owner, RECIPIENT, U256::from(value), U256::ZERO, deadline, TEST_CHAIN_ID);
         let data = permitCall {
             owner, spender: RECIPIENT, value: U256::from(value), deadline, v, r, s,
         }.abi_encode();
@@ -518,7 +521,7 @@ proptest! {
         let deadline = U256::from(2000);
 
         // Sign with the actual signer
-        let (v, r, s) = sign_permit(signer_addr, RECIPIENT, U256::from(value), U256::ZERO, deadline, 1);
+        let (v, r, s) = sign_permit(signer_addr, RECIPIENT, U256::from(value), U256::ZERO, deadline, TEST_CHAIN_ID);
         // Submit with USER as the claimed owner
         let data = permitCall {
             owner: USER, spender: RECIPIENT, value: U256::from(value), deadline, v, r, s,

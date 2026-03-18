@@ -9,10 +9,13 @@ use alloy::sol_types::SolCall;
 use proptest::prelude::*;
 use reth_revm::primitives::{address, Address};
 use tn_config::GOVERNANCE_SAFE_ADDRESS as GOVERNANCE;
-use tn_reth::{claimCall, grantMintRoleCall, mintCall, revokeMintRoleCall};
+use tn_reth::{
+    claimCall, grantMintRoleCall, mintCall, revokeMintRoleCall,
+    test_utils::precompile_test_utils::{
+        assert_not_success, assert_success, TestEnv, RECIPIENT, USER,
+    },
+};
 use tn_types::U256;
-
-use super::tel_precompile_helpers::*;
 
 const FAUCET: Address = address!("0000000000000000000000000000000000000F00");
 

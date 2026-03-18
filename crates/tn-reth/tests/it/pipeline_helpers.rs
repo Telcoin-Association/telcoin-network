@@ -10,18 +10,18 @@ use secp256k1::rand::{rngs::StdRng, SeedableRng as _};
 use std::{collections::VecDeque, sync::Arc};
 use tempfile::TempDir;
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
+use tn_reth::test_utils::TransactionFactory;
 use tn_reth::{
     allowanceCall, balanceOfCall, noncesCall, payload::TNPayload,
-    test_utils::precompile_test_utils::GENESIS_SUPPLY, totalSupplyCall, ExecutedBlock,
-    NewCanonicalChain, RethChainSpec, RethEnv, TELCOIN_PRECOMPILE_ADDRESS,
+    test_utils::precompile_test_utils::GENESIS_SUPPLY, totalSupplyCall,
+    ExecutedBlockWithTrieUpdates, NewCanonicalChain, RethChainSpec, RethEnv,
+    TELCOIN_PRECOMPILE_ADDRESS,
 };
 use tn_types::{
     test_genesis, Address, BlsSignature, Bytes, Certificate, CommittedSubDag, ConsensusHeader,
     ConsensusOutput, GenesisAccount, ReputationScores, SealedHeader, SignatureVerificationState,
     TaskManager, MIN_PROTOCOL_BASE_FEE, U256,
 };
-
-use tn_reth::test_utils::TransactionFactory;
 
 // --- Constants ---
 
@@ -172,7 +172,10 @@ impl PipelineTestEnv {
     /// Execute a block containing the given encoded transactions.
     ///
     /// Mirrors the 5-step execute-finalize pipeline from `lib.rs:1513-1531`.
-    pub(crate) fn execute_block(&mut self, txs: Vec<Vec<u8>>) -> eyre::Result<ExecutedBlock> {
+    pub(crate) fn execute_block(
+        &mut self,
+        txs: Vec<Vec<u8>>,
+    ) -> eyre::Result<ExecutedBlockWithTrieUpdates> {
         self.execute_block_at_timestamp(txs, self.block_timestamp)
     }
 
@@ -181,7 +184,7 @@ impl PipelineTestEnv {
         &mut self,
         txs: Vec<Vec<u8>>,
         timestamp: u64,
-    ) -> eyre::Result<ExecutedBlock> {
+    ) -> eyre::Result<ExecutedBlockWithTrieUpdates> {
         // 1. Create consensus output with controlled timestamp
         let output =
             consensus_output_for_test(self.subdag_index as u32, 0, self.subdag_index, timestamp);
@@ -190,9 +193,7 @@ impl PipelineTestEnv {
         let payload = TNPayload::new_for_test(self.canonical_header.clone(), &output);
 
         // 3. Build and execute block
-        let anchor_hash = self.canonical_header.hash();
-        let block =
-            self.reth_env.build_block_from_batch_payload(payload, &txs, anchor_hash, &[])?;
+        let block = self.reth_env.build_block_from_batch_payload(payload, &txs)?;
 
         // 4. Update canonical in-memory state
         let canonical_header = block.recovered_block.clone_sealed_header();
@@ -309,8 +310,12 @@ impl PipelineTestEnv {
 
     /// Check if a transaction in the most recent block succeeded.
     /// Looks at the receipt status for the given tx index.
-    pub(crate) fn tx_succeeded(&self, block: &ExecutedBlock, tx_index: usize) -> bool {
-        block.execution_output.result.receipts[tx_index].success
+    pub(crate) fn tx_succeeded(
+        &self,
+        block: &ExecutedBlockWithTrieUpdates,
+        tx_index: usize,
+    ) -> bool {
+        block.execution_output.receipts[0][tx_index].success
     }
 
     /// Create an encoded EIP-1559 native value transfer (no calldata).
@@ -332,12 +337,12 @@ impl PipelineTestEnv {
 }
 
 /// Extract the gas used by a single transaction within a block.
-pub(crate) fn tx_gas_used(block: &ExecutedBlock, tx_index: usize) -> u64 {
-    let cumulative = block.execution_output.result.receipts[tx_index].cumulative_gas_used;
+pub(crate) fn tx_gas_used(block: &ExecutedBlockWithTrieUpdates, tx_index: usize) -> u64 {
+    let cumulative = block.execution_output.receipts[0][tx_index].cumulative_gas_used;
     if tx_index == 0 {
         cumulative
     } else {
-        cumulative - block.execution_output.result.receipts[tx_index - 1].cumulative_gas_used
+        cumulative - block.execution_output.receipts[0][tx_index - 1].cumulative_gas_used
     }
 }
 

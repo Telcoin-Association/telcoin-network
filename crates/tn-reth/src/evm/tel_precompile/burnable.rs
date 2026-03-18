@@ -2,8 +2,8 @@
 //!
 //! Implements the production token-issuance flow:
 //! 1. **`mint(uint256)`** — governance creates a pending mint with a 7-day timelock.
-//! 2. **`claim(address)`** — anyone can finalize the mint after the timelock expires,
-//!    crediting the recipient's native balance and incrementing `totalSupply`.
+//! 2. **`claim(address)`** — anyone can finalize the mint after the timelock expires, crediting the
+//!    recipient's native balance and incrementing `totalSupply`.
 //! 3. **`burn(uint256)`** — governance destroys tokens held by the precompile account.
 //!
 //! The timelock provides a safety window for governance to cancel malicious mints before
@@ -12,27 +12,23 @@
 //!
 //! With `feature = "faucet"`, the `mint` function signature changes to `mint(address, uint256)`
 //! and bypasses the timelock entirely (see [`faucet`](super::faucet) module).
-//!
 
-use alloy::{
-    sol,
-    sol_types::SolEvent,
-};
+use alloy::{sol, sol_types::SolEvent};
 use alloy_evm::EvmInternals;
 use reth_revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
 use tn_types::{Address, Bytes, U256};
 
+#[cfg(feature = "faucet")]
+use crate::evm::tel_precompile::faucet::mint_role_slot;
 use crate::{
     evm::tel_precompile::{
         erc20::Transfer,
-        helpers::{amount_slot, timestamp_slot},
+        helpers::{amount_slot, balance_incr, timestamp_slot, transfer_balance},
         TOTAL_SUPPLY_SLOT,
     },
     TELCOIN_PRECOMPILE_ADDRESS,
 };
-#[cfg(feature = "faucet")]
-use crate::evm::tel_precompile::faucet::mint_role_slot;
 
 // Mint/claim/burn ABI definitions.
 //
@@ -90,7 +86,8 @@ pub(super) fn has_mint_role(
     #[cfg(not(feature = "faucet"))] _internals: &mut EvmInternals<'_>,
     caller: Address,
 ) -> Result<bool, PrecompileError> {
-    if caller == GOVERNANCE_SAFE_ADDRESS {
+    // only allow governance to call mint
+    if has_governance_role(caller) {
         return Ok(true);
     }
 
@@ -100,7 +97,7 @@ pub(super) fn has_mint_role(
         let slot = mint_role_slot(caller);
         let val = internals
             .sload(TELCOIN_PRECOMPILE_ADDRESS, slot)
-            .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}").into()))?
+            .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}")))?
             .data;
         Ok(!val.is_zero())
     }
@@ -113,7 +110,7 @@ pub(super) fn has_mint_role(
 ///
 /// Only [`GOVERNANCE_SAFE_ADDRESS`] may burn. Unlike mint roles, burn authority is never
 /// dynamically grantable — not even with the `faucet` feature.
-pub(super) fn has_burn_role(caller: Address) -> bool {
+pub(super) fn has_governance_role(caller: Address) -> bool {
     caller == GOVERNANCE_SAFE_ADDRESS
 }
 
@@ -160,13 +157,13 @@ pub(super) fn handle_mint(
     let amt_slot = amount_slot(recipient);
     internals
         .sstore(TELCOIN_PRECOMPILE_ADDRESS, amt_slot, amount)
-        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}").into()))?;
+        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}")))?;
 
     // Store unlock timestamp at keccak256(recipient, 1)
     let ts_slot = timestamp_slot(recipient);
     internals
         .sstore(TELCOIN_PRECOMPILE_ADDRESS, ts_slot, unlock_ts)
-        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}").into()))?;
+        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}")))?;
 
     // Emit Mint(address recipient, uint256 amount, uint256 unlockTimestamp)
     let topic0 = Mint::SIGNATURE_HASH;
@@ -186,7 +183,6 @@ pub(super) fn handle_mint(
 }
 
 /// `claim(address recipient)` — finalizes a pending mint after the timelock expires.
-
 ///
 /// Flow:
 /// 1. Loads pending `amount` and `unlock_ts` from precompile storage.
@@ -197,16 +193,19 @@ pub(super) fn handle_mint(
 /// 6. Emits `Claim(recipient, amount)` and `Transfer(address(0), recipient, amount)`.
 ///
 /// # Access control
-/// **Permissionless** — anyone can call `claim` on behalf of any recipient once the
-/// timelock has passed.
+/// Governance-only via [`has_governance_role`].
 pub(super) fn handle_claim(
     internals: &mut EvmInternals<'_>,
     calldata: &[u8],
+    caller: Address,
     gas_limit: u64,
 ) -> PrecompileResult {
     const GAS_COST: u64 = 25_000;
     if gas_limit < GAS_COST {
         return Err(PrecompileError::OutOfGas);
+    }
+    if !has_governance_role(caller) {
+        return Err(PrecompileError::Other("unauthorized".into()));
     }
     if calldata.len() < 32 {
         return Err(PrecompileError::Other("claim: expected 32 bytes (address)".into()));
@@ -218,7 +217,7 @@ pub(super) fn handle_claim(
     let amt_slot = amount_slot(recipient);
     let amount = internals
         .sload(TELCOIN_PRECOMPILE_ADDRESS, amt_slot)
-        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}").into()))?
+        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}")))?
         .data;
 
     if amount.is_zero() {
@@ -229,7 +228,7 @@ pub(super) fn handle_claim(
     let ts_slot = timestamp_slot(recipient);
     let unlock_ts = internals
         .sload(TELCOIN_PRECOMPILE_ADDRESS, ts_slot)
-        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}").into()))?
+        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}")))?
         .data;
 
     // Check timelock
@@ -239,22 +238,20 @@ pub(super) fn handle_claim(
     }
 
     // Credit recipient
-    internals
-        .balance_incr(recipient, amount)
-        .map_err(|e| PrecompileError::Other(format!("balance_incr failed: {e:?}").into()))?;
+    balance_incr(internals, recipient, amount)?;
 
     // Clear storage
     internals
         .sstore(TELCOIN_PRECOMPILE_ADDRESS, amt_slot, U256::ZERO)
-        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}").into()))?;
+        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}")))?;
     internals
         .sstore(TELCOIN_PRECOMPILE_ADDRESS, ts_slot, U256::ZERO)
-        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}").into()))?;
+        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}")))?;
 
     // Increment totalSupply
     let current_supply = internals
         .sload(TELCOIN_PRECOMPILE_ADDRESS, TOTAL_SUPPLY_SLOT)
-        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}").into()))?
+        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}")))?
         .data;
     internals
         .sstore(
@@ -264,7 +261,7 @@ pub(super) fn handle_claim(
                 .checked_add(amount)
                 .ok_or_else(|| PrecompileError::Other("claim: total supply overflow".into()))?,
         )
-        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}").into()))?;
+        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}")))?;
 
     // Emit Claim(address recipient, uint256 amount)
     let topic0 = Claim::SIGNATURE_HASH;
@@ -279,11 +276,7 @@ pub(super) fn handle_claim(
     // Emit Transfer(address(0), recipient, amount) — ERC20 mint event
     let transfer_log = reth_revm::primitives::Log::new(
         TELCOIN_PRECOMPILE_ADDRESS,
-        vec![
-            Transfer::SIGNATURE_HASH,
-            Address::ZERO.into_word(),
-            recipient.into_word(),
-        ],
+        vec![Transfer::SIGNATURE_HASH, Address::ZERO.into_word(), recipient.into_word()],
         amount.to_be_bytes_vec().into(),
     )
     .ok_or_else(|| PrecompileError::Other("Failed to create Transfer log".into()))?;
@@ -298,7 +291,7 @@ pub(super) fn handle_claim(
 /// destroying it), then decrements `totalSupply`.
 ///
 /// # Access control
-/// Governance-only via [`has_burn_role`].
+/// Governance-only via [`has_governance_role`].
 pub(super) fn handle_burn(
     internals: &mut EvmInternals<'_>,
     calldata: &[u8],
@@ -309,7 +302,7 @@ pub(super) fn handle_burn(
     if gas_limit < GAS_COST {
         return Err(PrecompileError::OutOfGas);
     }
-    if !has_burn_role(caller) {
+    if !has_governance_role(caller) {
         return Err(PrecompileError::Other("unauthorized".into()));
     }
     if calldata.len() < 32 {
@@ -319,25 +312,23 @@ pub(super) fn handle_burn(
     let amount = U256::from_be_slice(&calldata[0..32]);
 
     // Transfer from precompile to zero address (burn)
-    let transfer_result = internals
-        .transfer(TELCOIN_PRECOMPILE_ADDRESS, Address::ZERO, amount)
-        .map_err(|e| PrecompileError::Other(format!("transfer failed: {e:?}").into()))?;
-
-    if let Some(error) = transfer_result {
-        return Err(PrecompileError::Other(format!("burn transfer error: {error:?}").into()));
+    if let Some(error) =
+        transfer_balance(internals, TELCOIN_PRECOMPILE_ADDRESS, Address::ZERO, amount)?
+    {
+        return Err(PrecompileError::Other(format!("burn transfer error: {error}")));
     }
 
     // Decrement totalSupply
     let current_supply = internals
         .sload(TELCOIN_PRECOMPILE_ADDRESS, TOTAL_SUPPLY_SLOT)
-        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}").into()))?
+        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}")))?
         .data;
     let new_supply = current_supply
         .checked_sub(amount)
         .ok_or_else(|| PrecompileError::Other("burn: total supply underflow".into()))?;
     internals
         .sstore(TELCOIN_PRECOMPILE_ADDRESS, TOTAL_SUPPLY_SLOT, new_supply)
-        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}").into()))?;
+        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}")))?;
 
     // Emit Burn(uint256 amount)
     let topic0 = Burn::SIGNATURE_HASH;
@@ -368,9 +359,9 @@ pub(super) fn handle_burn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::evm::tel_precompile::test_utils::*;
     #[cfg(not(feature = "faucet"))]
     use crate::evm::tel_precompile::erc20::{balanceOfCall, totalSupplyCall};
+    use crate::evm::tel_precompile::test_utils::*;
     use alloy::sol_types::SolCall;
     use tn_config::GOVERNANCE_SAFE_ADDRESS;
     use tn_types::U256;
@@ -381,11 +372,9 @@ mod tests {
         #[cfg(not(feature = "faucet"))]
         let data = mintCall { amount: U256::from(500) }.abi_encode();
         #[cfg(feature = "faucet")]
-        let data = crate::evm::tel_precompile::mintCall {
-            recipient: RECIPIENT,
-            amount: U256::from(500),
-        }
-        .abi_encode();
+        let data =
+            crate::evm::tel_precompile::mintCall { recipient: RECIPIENT, amount: U256::from(500) }
+                .abi_encode();
         let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, data);
         assert_success(&result);
     }
@@ -464,11 +453,9 @@ mod tests {
         #[cfg(not(feature = "faucet"))]
         let data = mintCall { amount: U256::from(100) }.abi_encode();
         #[cfg(feature = "faucet")]
-        let data = crate::evm::tel_precompile::mintCall {
-            recipient: RECIPIENT,
-            amount: U256::from(100),
-        }
-        .abi_encode();
+        let data =
+            crate::evm::tel_precompile::mintCall { recipient: RECIPIENT, amount: U256::from(100) }
+                .abi_encode();
         let result = env.exec_default(USER, data);
         assert_not_success(&result);
     }
@@ -542,11 +529,9 @@ mod tests {
         #[cfg(not(feature = "faucet"))]
         let data = mintCall { amount: U256::from(500) }.abi_encode();
         #[cfg(feature = "faucet")]
-        let data = crate::evm::tel_precompile::mintCall {
-            recipient: RECIPIENT,
-            amount: U256::from(500),
-        }
-        .abi_encode();
+        let data =
+            crate::evm::tel_precompile::mintCall { recipient: RECIPIENT, amount: U256::from(500) }
+                .abi_encode();
         let result = env.exec(GOVERNANCE_SAFE_ADDRESS, data, 21_000);
         assert_not_success(&result);
     }
@@ -604,7 +589,7 @@ mod tests {
 
     #[test]
     #[cfg(not(feature = "faucet"))]
-    fn test_zero_amount_mint_does_not_overwrite_pending() {
+    fn test_zero_amount_mint_overwrites_pending() {
         let mut env = TestEnv::new();
         env.exec_default(
             GOVERNANCE_SAFE_ADDRESS,

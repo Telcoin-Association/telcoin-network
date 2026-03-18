@@ -3,23 +3,18 @@
 //! These tests exercise faucet-specific functionality through the complete TN pipeline:
 //! mint role management, direct minting, and supply accounting.
 
+use super::pipeline_helpers::*;
 use alloy::sol_types::SolCall;
 use proptest::prelude::*;
 use secp256k1::rand::{rngs::StdRng, SeedableRng as _};
-use tn_reth::{
-    grantMintRoleCall, mintCall, revokeMintRoleCall, transferCall, TELCOIN_PRECOMPILE_ADDRESS,
-};
-use tn_types::{Bytes, Encodable2718, U256, MIN_PROTOCOL_BASE_FEE};
-
 use tn_reth::test_utils::TransactionFactory;
-
-use super::pipeline_helpers::*;
+use tn_reth::{grantMintRoleCall, mintCall, revokeMintRoleCall, transferCall};
+use tn_types::U256;
 
 /// Setup: fund the faucet address by transferring from user, then grant mint role.
 /// Returns the faucet factory.
 fn setup_faucet(env: &mut PipelineTestEnv) -> TransactionFactory {
-    let mut faucet_factory =
-        TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(400));
+    let faucet_factory = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(400));
     let faucet_addr = faucet_factory.address();
 
     // Block 1: user transfers gas money to faucet
@@ -34,9 +29,7 @@ fn setup_faucet(env: &mut PipelineTestEnv) -> TransactionFactory {
     assert!(env.tx_succeeded(&block, 0), "fund faucet tx should succeed");
 
     // Block 2: governance grants mint role to faucet via forwarder
-    let grant_tx = env.governance_tx(
-        grantMintRoleCall { addr: faucet_addr }.abi_encode(),
-    );
+    let grant_tx = env.governance_tx(grantMintRoleCall { addr: faucet_addr }.abi_encode());
     let block = env.execute_block(vec![grant_tx]).expect("grant mint role");
     assert!(env.tx_succeeded(&block, 0), "grant mint role tx should succeed");
 

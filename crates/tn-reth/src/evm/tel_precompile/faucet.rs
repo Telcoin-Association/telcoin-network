@@ -28,6 +28,7 @@ use crate::{
     evm::tel_precompile::{
         burnable::{has_mint_role, Mint},
         erc20::Transfer,
+        helpers::balance_incr,
         TOTAL_SUPPLY_SLOT,
     },
     TELCOIN_PRECOMPILE_ADDRESS,
@@ -84,14 +85,12 @@ pub(super) fn handle_mint_faucet(
     let recipient = Address::from_slice(&calldata[12..32]);
 
     // Directly credit recipient's native balance
-    internals
-        .balance_incr(recipient, amount)
-        .map_err(|e| PrecompileError::Other(format!("balance_incr failed: {e:?}").into()))?;
+    balance_incr(internals, recipient, amount)?;
 
     // Increment totalSupply
     let current_supply = internals
         .sload(TELCOIN_PRECOMPILE_ADDRESS, TOTAL_SUPPLY_SLOT)
-        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}").into()))?
+        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}")))?
         .data;
     internals
         .sstore(
@@ -101,7 +100,7 @@ pub(super) fn handle_mint_faucet(
                 .checked_add(amount)
                 .ok_or_else(|| PrecompileError::Other("mint: total supply overflow".into()))?,
         )
-        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}").into()))?;
+        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}")))?;
 
     // Emit Mint(address recipient, uint256 amount, uint256 unlockTimestamp=0)
     let topic0 = Mint::SIGNATURE_HASH;
@@ -151,7 +150,7 @@ pub(super) fn handle_grant_mint_role(
     let slot = mint_role_slot(addr);
     internals
         .sstore(TELCOIN_PRECOMPILE_ADDRESS, slot, U256::from(1))
-        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}").into()))?;
+        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}")))?;
     Ok(PrecompileOutput::new(GAS_COST, Bytes::new()))
 }
 
@@ -177,7 +176,7 @@ pub(super) fn handle_revoke_mint_role(
     let slot = mint_role_slot(addr);
     internals
         .sstore(TELCOIN_PRECOMPILE_ADDRESS, slot, U256::ZERO)
-        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}").into()))?;
+        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}")))?;
     Ok(PrecompileOutput::new(GAS_COST, Bytes::new()))
 }
 
@@ -267,8 +266,16 @@ mod tests {
     fn test_faucet_mint_after_revoke_fails() {
         let mut env = TestEnv::new();
         fund_faucet(&mut env);
+        // grant mint role
         env.exec_default(GOVERNANCE_SAFE_ADDRESS, grantMintRoleCall { addr: FAUCET }.abi_encode())
             .unwrap();
+
+        // sanity check
+        let data = hasMintRoleCall { addr: GOVERNANCE_SAFE_ADDRESS }.abi_encode();
+        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, data);
+        assert!(decode_bool(&result));
+
+        // assert mint attempt fails after revoking role
         env.exec_default(GOVERNANCE_SAFE_ADDRESS, revokeMintRoleCall { addr: FAUCET }.abi_encode())
             .unwrap();
         let data = mintCall { recipient: RECIPIENT, amount: U256::from(1000) }.abi_encode();
@@ -287,11 +294,8 @@ mod tests {
             mintCall { recipient: RECIPIENT, amount: U256::from(500) }.abi_encode(),
         );
         assert_success(&result);
-        let result = env.exec_default(
-            GOVERNANCE_SAFE_ADDRESS,
-            balanceOfCall { account: RECIPIENT }.abi_encode(),
-        );
-        assert_eq!(decode_u256(&result), U256::from(500));
+        let balance = env.get_balance(RECIPIENT);
+        assert_eq!(balance, U256::from(500));
     }
 
     #[test]

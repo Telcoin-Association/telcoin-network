@@ -1,7 +1,8 @@
 //! Storage-slot computation utilities for the TEL precompile.
 //!
 //! Provides deterministic slot derivation following Solidity's storage layout for mappings.
-use reth_revm::primitives::keccak256;
+use alloy_evm::EvmInternals;
+use reth_revm::{precompile::PrecompileError, primitives::keccak256};
 use tn_types::{Address, U256};
 
 // --- Storage slot helpers ---
@@ -68,3 +69,75 @@ pub(super) fn nonce_slot(owner: Address) -> U256 {
     U256::from_be_bytes(keccak256(buf).0)
 }
 
+// --- Balance manipulation helpers ---
+//
+// alloy-evm 0.21.2 does not expose `transfer` or `balance_incr` on `EvmInternals`.
+// These helpers implement the equivalent operations using `load_account`.
+
+/// Transfer native balance from one address to another.
+///
+/// Returns `Ok(None)` on success, `Ok(Some(msg))` if the sender has insufficient balance.
+pub(super) fn transfer_balance(
+    internals: &mut EvmInternals<'_>,
+    from: Address,
+    to: Address,
+    amount: U256,
+) -> Result<Option<String>, PrecompileError> {
+    if amount.is_zero() {
+        return Ok(None);
+    }
+
+    // Self-transfer: just verify sufficient balance, no mutation needed.
+    if from == to {
+        let balance = internals
+            .load_account(from)
+            .map_err(|e| PrecompileError::Other(format!("load_account failed: {e:?}")))?
+            .data
+            .info
+            .balance;
+        if balance < amount {
+            return Ok(Some("insufficient balance".to_string()));
+        }
+        return Ok(None);
+    }
+
+    // Check and deduct from sender
+    {
+        let from_acc = internals
+            .load_account(from)
+            .map_err(|e| PrecompileError::Other(format!("load_account failed: {e:?}")))?
+            .data;
+        if from_acc.info.balance < amount {
+            return Ok(Some("insufficient balance".to_string()));
+        }
+        from_acc.info.balance -= amount;
+        from_acc.mark_touch();
+    }
+
+    // Credit receiver
+    {
+        let to_acc = internals
+            .load_account(to)
+            .map_err(|e| PrecompileError::Other(format!("load_account failed: {e:?}")))?
+            .data;
+        to_acc.info.balance += amount;
+        to_acc.mark_touch();
+    }
+
+    Ok(None)
+}
+
+/// Increment the native balance of an address (used for minting).
+pub(super) fn balance_incr(
+    internals: &mut EvmInternals<'_>,
+    addr: Address,
+    amount: U256,
+) -> Result<(), PrecompileError> {
+    let acc = internals
+        .load_account(addr)
+        .map_err(|e| PrecompileError::Other(format!("load_account failed: {e:?}")))?
+        .data;
+    acc.info.balance += amount;
+    acc.mark_touch();
+    Ok(())
+}

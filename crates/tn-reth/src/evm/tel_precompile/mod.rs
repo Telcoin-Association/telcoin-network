@@ -45,9 +45,9 @@
 //!
 //! # Feature flags
 //!
-//! - **`faucet`**: Replaces the timelocked `mint(uint256)` with an instant
-//!   `mint(address, uint256)` and adds role-management functions. **Must never be enabled in
-//!   production builds** — it removes the timelock safety window.
+//! - **`faucet`**: Replaces the timelocked `mint(uint256)` with an instant `mint(address, uint256)`
+//!   and adds role-management functions. **Must never be enabled in production builds** — it
+//!   removes the timelock safety window.
 use alloy::{primitives::address, sol_types::SolCall};
 use alloy_evm::precompiles::{DynPrecompile, PrecompileInput, PrecompilesMap};
 use reth_revm::precompile::{PrecompileError, PrecompileId, PrecompileResult};
@@ -103,18 +103,21 @@ pub const TELCOIN_PRECOMPILE_ADDRESS: Address =
 const TOTAL_SUPPLY_SLOT: U256 = U256::from_limbs([100, 0, 0, 0]);
 
 /// Registers the Telcoin ERC20 precompile at [`TELCOIN_PRECOMPILE_ADDRESS`] in the given map.
-pub fn add_telcoin_precompile(map: &mut PrecompilesMap) {
-    map.extend_precompiles([(
-        TELCOIN_PRECOMPILE_ADDRESS,
-        DynPrecompile::new_stateful(PrecompileId::Custom("telcoin".into()), telcoin_precompile),
-    )]);
+///
+/// `chain_id` is captured and forwarded to EIP-2612 permit/domain_separator handlers since
+/// `EvmInternals` in alloy-evm 0.21.2 does not expose the chain configuration.
+pub fn add_telcoin_precompile(map: &mut PrecompilesMap, chain_id: u64) {
+    map.apply_precompile(&TELCOIN_PRECOMPILE_ADDRESS, move |_| {
+        Some(DynPrecompile::new_stateful(PrecompileId::Custom("telcoin".into()), move |input| {
+            telcoin_precompile(input, chain_id)
+        }))
+    });
 }
 
 /// Top-level dispatcher for the Telcoin precompile.
 ///
 /// Extracts the 4-byte selector from calldata and routes to the matching handler.
-/// State-mutating selectors are rejected when `input.is_static` is set (STATICCALL).
-fn telcoin_precompile(mut input: PrecompileInput<'_>) -> PrecompileResult {
+fn telcoin_precompile(mut input: PrecompileInput<'_>, chain_id: u64) -> PrecompileResult {
     if input.data.len() < 4 {
         return Err(PrecompileError::Other("Invalid input: too short".into()));
     }
@@ -126,53 +129,25 @@ fn telcoin_precompile(mut input: PrecompileInput<'_>) -> PrecompileResult {
         // State-mutating functions
         #[cfg(not(feature = "faucet"))]
         burnable::mintCall::SELECTOR => {
-            if input.is_static {
-                return Err(PrecompileError::Other("Cannot modify state in static context".into()));
-            }
             burnable::handle_mint(&mut input.internals, calldata, input.caller, input.gas)
         }
-        #[cfg(feature = "faucet")]
-        faucet::mintCall::SELECTOR => {
-            if input.is_static {
-                return Err(PrecompileError::Other("Cannot modify state in static context".into()));
-            }
-            faucet::handle_mint_faucet(&mut input.internals, calldata, input.caller, input.gas)
-        }
         burnable::claimCall::SELECTOR => {
-            if input.is_static {
-                return Err(PrecompileError::Other("Cannot modify state in static context".into()));
-            }
-            burnable::handle_claim(&mut input.internals, calldata, input.gas)
+            burnable::handle_claim(&mut input.internals, calldata, input.caller, input.gas)
         }
         burnable::burnCall::SELECTOR => {
-            if input.is_static {
-                return Err(PrecompileError::Other("Cannot modify state in static context".into()));
-            }
             burnable::handle_burn(&mut input.internals, calldata, input.caller, input.gas)
         }
         erc20::transferCall::SELECTOR => {
-            if input.is_static {
-                return Err(PrecompileError::Other("Cannot modify state in static context".into()));
-            }
             erc20::handle_transfer(&mut input.internals, calldata, input.caller, input.gas)
         }
         erc20::approveCall::SELECTOR => {
-            if input.is_static {
-                return Err(PrecompileError::Other("Cannot modify state in static context".into()));
-            }
             erc20::handle_approve(&mut input.internals, calldata, input.caller, input.gas)
         }
         erc20::transferFromCall::SELECTOR => {
-            if input.is_static {
-                return Err(PrecompileError::Other("Cannot modify state in static context".into()));
-            }
             erc20::handle_transfer_from(&mut input.internals, calldata, input.caller, input.gas)
         }
         eip2612::permitCall::SELECTOR => {
-            if input.is_static {
-                return Err(PrecompileError::Other("Cannot modify state in static context".into()));
-            }
-            eip2612::handle_permit(&mut input.internals, calldata, input.gas)
+            eip2612::handle_permit(&mut input.internals, calldata, input.gas, chain_id)
         }
         // Read-only functions
         erc20::nameCall::SELECTOR => erc20::handle_name(input.gas),
@@ -191,27 +166,27 @@ fn telcoin_precompile(mut input: PrecompileInput<'_>) -> PrecompileResult {
             eip2612::handle_nonces(&mut input.internals, calldata, input.gas)
         }
         eip2612::DOMAIN_SEPARATORCall::SELECTOR => {
-            eip2612::handle_domain_separator(&mut input.internals, input.gas)
+            eip2612::handle_domain_separator(input.gas, chain_id)
         }
         // Faucet feature: role management
         #[cfg(feature = "faucet")]
         grantMintRoleCall::SELECTOR => {
-            if input.is_static {
-                return Err(PrecompileError::Other("Cannot modify state in static context".into()));
-            }
             faucet::handle_grant_mint_role(&mut input.internals, calldata, input.caller, input.gas)
         }
         #[cfg(feature = "faucet")]
         revokeMintRoleCall::SELECTOR => {
-            if input.is_static {
-                return Err(PrecompileError::Other("Cannot modify state in static context".into()));
-            }
             faucet::handle_revoke_mint_role(&mut input.internals, calldata, input.caller, input.gas)
         }
         #[cfg(feature = "faucet")]
         hasMintRoleCall::SELECTOR => {
             faucet::handle_has_mint_role(&mut input.internals, calldata, input.gas)
         }
+        // faucet state mutation
+        #[cfg(feature = "faucet")]
+        faucet::mintCall::SELECTOR => {
+            faucet::handle_mint_faucet(&mut input.internals, calldata, input.caller, input.gas)
+        }
+
         _ => Err(PrecompileError::Other("Unknown function selector".into())),
     }
 }

@@ -4,17 +4,16 @@
 //! tx signing → EIP-2718 encoding → signature recovery → block building →
 //! EVM dispatch → precompile execution → state persistence → state reads.
 
+use super::pipeline_helpers::*;
 use alloy::sol_types::SolCall;
 use proptest::prelude::*;
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
 use tn_reth::{
-    approveCall, burnCall, claimCall, mintCall, permitCall, transferCall, transferFromCall,
-    TELCOIN_PRECOMPILE_ADDRESS, TIMELOCK_DURATION,
+    approveCall, burnCall, claimCall, mintCall, permitCall,
+    test_utils::precompile_test_utils::{permit_signer_address, sign_permit},
+    transferCall, transferFromCall, TELCOIN_PRECOMPILE_ADDRESS, TIMELOCK_DURATION,
 };
 use tn_types::U256;
-
-use super::pipeline_helpers::*;
-use super::tel_precompile_helpers::{permit_signer_address, sign_permit};
 
 // ==============================
 // ERC-20 transfer properties

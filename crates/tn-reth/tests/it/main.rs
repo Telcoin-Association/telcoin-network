@@ -3,17 +3,18 @@
 #![allow(unused_crate_dependencies)]
 
 mod economics_props;
-#[cfg(feature = "test-utils")]
 mod pipeline_helpers;
-#[cfg(all(feature = "test-utils", feature = "faucet"))]
+
+// testnet
+#[cfg(feature = "faucet")]
 mod pipeline_tel_faucet_props;
-#[cfg(all(feature = "test-utils", not(feature = "faucet")))]
-mod pipeline_tel_precompile_props;
-#[cfg(all(feature = "test-utils", feature = "faucet"))]
+#[cfg(feature = "faucet")]
 mod tel_precompile_faucet_props;
-#[cfg(feature = "test-utils")]
-mod tel_precompile_helpers;
-#[cfg(all(feature = "test-utils", not(feature = "faucet")))]
+
+// mainnet
+#[cfg(not(feature = "faucet"))]
+mod pipeline_tel_precompile_props;
+#[cfg(not(feature = "faucet"))]
 mod tel_precompile_props;
 
 fn main() {}

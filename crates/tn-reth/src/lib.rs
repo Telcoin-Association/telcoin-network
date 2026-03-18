@@ -19,7 +19,10 @@
 
 // Used in tests
 #[cfg(test)]
-use proptest as _;
+mod clippy {
+    use proptest as _;
+    use tn_reth as _;
+}
 
 use crate::{
     evm::TNEvm,
