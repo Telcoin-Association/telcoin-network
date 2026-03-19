@@ -30,7 +30,7 @@ where
 {
     /// Create a new instance of Self.
     pub(super) fn new(config: ConsensusConfig<DB>, consensus_bus: ConsensusBus) -> Self {
-        let rx_committed_round_updates = consensus_bus.committed_round_updates().subscribe();
+        let rx_committed_round_updates = consensus_bus.app().committed_round_updates().subscribe();
         Self { config, consensus_bus, rx_committed_round_updates }
     }
 

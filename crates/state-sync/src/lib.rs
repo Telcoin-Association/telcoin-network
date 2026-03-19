@@ -12,7 +12,7 @@ use tn_test_utils_committee as _;
 
 use std::time::Duration;
 use tn_config::ConsensusConfig;
-use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus, NodeMode};
+use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode};
 use tn_storage::{
     consensus::ConsensusChain,
     tables::{ConsensusHeaderCache, NodeBatchesCache},
@@ -30,7 +30,7 @@ use consensus::spawn_track_recent_consensus;
 /// Sets some bus defaults.
 /// Call this somewhere when starting an epoch.
 pub async fn prime_consensus<DB: Database>(
-    consensus_bus: &ConsensusBus,
+    consensus_bus: &ConsensusBusApp,
     config: &ConsensusConfig<DB>,
     consensus_chain: ConsensusChain,
 ) {
@@ -59,7 +59,7 @@ pub async fn prime_consensus<DB: Database>(
 /// Spawn the state sync tasks.
 pub fn spawn_state_sync<DB: Database>(
     config: ConsensusConfig<DB>,
-    consensus_bus: ConsensusBus,
+    consensus_bus: ConsensusBusApp,
     network: PrimaryNetworkHandle,
     task_spawner: TaskSpawner,
     consensus_chain: ConsensusChain,
@@ -135,7 +135,7 @@ pub async fn save_consensus<DB: Database>(
 /// If we are not starting at genesis or a new epoch, then not finding this indicates a database
 /// issue.
 pub async fn last_executed_consensus_block(
-    consensus_bus: &ConsensusBus,
+    consensus_bus: &ConsensusBusApp,
     consensus_chain: &ConsensusChain,
 ) -> Option<ConsensusHeader> {
     let last = consensus_bus.last_executed_consensus_block(consensus_chain).await;
@@ -146,7 +146,7 @@ pub async fn last_executed_consensus_block(
 /// Collect and return any consensus headers that were not executed before last shutdown.
 /// This will be consensus that was reached but had not executed before a shutdown.
 pub async fn get_missing_consensus(
-    consensus_bus: &ConsensusBus,
+    consensus_bus: &ConsensusBusApp,
     consensus_chain: &ConsensusChain,
 ) -> eyre::Result<Vec<ConsensusHeader>> {
     let mut result = Vec::new();
@@ -186,7 +186,7 @@ pub async fn get_missing_consensus(
 /// This should only be used when NOT participating in active consensus.
 async fn spawn_stream_consensus_headers<DB: Database>(
     config: ConsensusConfig<DB>,
-    consensus_bus: ConsensusBus,
+    consensus_bus: ConsensusBusApp,
     consensus_chain: ConsensusChain,
 ) -> eyre::Result<()> {
     let rx_shutdown = config.shutdown().subscribe();
@@ -262,7 +262,7 @@ async fn spawn_stream_consensus_headers<DB: Database>(
 /// Queries peers for latest height and downloads and executes any missing consensus output.
 /// Returns the last ConsensusHeader that was applied on success.
 async fn catch_up_consensus_from_to<DB: Database>(
-    consensus_bus: &ConsensusBus,
+    consensus_bus: &ConsensusBusApp,
     from: ConsensusHeader,
     max_consensus: ConsensusHeader,
     db: &DB,

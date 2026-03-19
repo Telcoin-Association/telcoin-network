@@ -6,7 +6,7 @@ use std::{
 };
 
 use tn_config::KeyConfig;
-use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus};
+use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
 use tn_storage::{consensus::ConsensusChain, epoch_records::EpochRecordDb};
 use tn_types::{
     BlsAggregateSignature, BlsPublicKey, BlsSignature, Epoch, EpochCertificate, EpochRecord,
@@ -288,7 +288,7 @@ async fn handle_new_vote(vote: EpochVote, vote_queues: &mut VoteQueue) {
 /// `EpochRecord`s via a `watch` channel and collects votes for each epoch.
 pub(crate) fn spawn_epoch_vote_collector(
     consensus_chain: ConsensusChain,
-    consensus_bus: ConsensusBus,
+    consensus_bus: ConsensusBusApp,
     key_config: KeyConfig,
     primary_network: PrimaryNetworkHandle,
     node_task_spawner: TaskSpawner,
@@ -343,7 +343,10 @@ mod epoch_vote_collector_tests {
     use rand::{rngs::StdRng, SeedableRng as _};
     use tempfile::TempDir;
     use tn_network_libp2p::types::{MessageId, NetworkCommand};
-    use tn_primary::network::{PrimaryRequest, PrimaryResponse};
+    use tn_primary::{
+        network::{PrimaryRequest, PrimaryResponse},
+        ConsensusBus,
+    };
     use tn_storage::mem_db::MemDatabase;
     use tn_test_utils_committee::CommitteeFixture;
     use tn_types::{BlsKeypair, Notifier, TaskManager, TnSender as _};
@@ -400,7 +403,7 @@ mod epoch_vote_collector_tests {
 
         spawn_epoch_vote_collector(
             consensus_chain.clone(),
-            consensus_bus.clone(),
+            consensus_bus.app().clone(),
             key_config,
             primary_network,
             task_manager.get_spawner(),
@@ -416,12 +419,12 @@ mod epoch_vote_collector_tests {
         let vote4 = epoch_rec.sign_vote(&kc4);
 
         // Buffer the votes in the channel (channel is already subscribed)
-        consensus_bus.new_epoch_votes().send(vote2).await.unwrap();
-        consensus_bus.new_epoch_votes().send(vote3).await.unwrap();
-        consensus_bus.new_epoch_votes().send(vote4).await.unwrap();
+        consensus_bus.app().new_epoch_votes().send(vote2).await.unwrap();
+        consensus_bus.app().new_epoch_votes().send(vote3).await.unwrap();
+        consensus_bus.app().new_epoch_votes().send(vote4).await.unwrap();
 
         // Send the epoch record — collector wakes up, self-signs, reads buffered votes
-        consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec.clone()));
+        consensus_bus.app().epoch_record_watch().send_replace(Some(epoch_rec.clone()));
 
         // Wait for collector to aggregate and store
         tokio::time::sleep(Duration::from_millis(500)).await;

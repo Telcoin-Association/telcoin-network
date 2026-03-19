@@ -198,8 +198,8 @@ impl NodeMode {
 /// The thread-safe inner type that holds all the channels for inner-consensus
 /// communication between different tasks.
 /// This contains things that exist for the app lifetime.
-#[derive(Clone, Debug)]
-struct ConsensusBusAppInner {
+#[derive(Debug)]
+pub struct ConsensusBusAppInner {
     /// Outputs the highest committed round & corresponding gc_round in the consensus.
     tx_committed_round_updates: watch::Sender<Round>,
 
@@ -234,8 +234,27 @@ struct ConsensusBusAppInner {
     primary_network_events: QueChannel<NetworkEvent<crate::network::Req, crate::network::Res>>,
 }
 
-impl ConsensusBusAppInner {
-    fn new(recent_blocks: u32) -> Self {
+/// The thread-safe inner type that holds all the channels for inner-consensus
+/// communication between different tasks.
+/// This contains things that exist for the app lifetime.
+#[derive(Clone, Debug)]
+pub struct ConsensusBusApp {
+    /// Inner reference for quick clones.
+    inner: Arc<ConsensusBusAppInner>,
+}
+
+impl ConsensusBusApp {
+    /// Create a new application consensus bus.
+    pub fn new() -> Self {
+        // Using default GC depth for blocks to keep in memory.  This should
+        // allow for twice the blocks as would be needed for a margin of safety
+        // (some testing liked this).  Using the default to not overly complicate
+        // creation of the bus.
+        // This is basically for testing.
+        Self::new_with_recent_blocks(Parameters::default_gc_depth())
+    }
+
+    pub fn new_with_recent_blocks(recent_blocks: u32) -> Self {
         let (tx_committed_round_updates, _) = watch::channel(Round::default());
 
         let (tx_requested_missing_epoch, _) = watch::channel(Epoch::default());
@@ -253,280 +272,114 @@ impl ConsensusBusAppInner {
         let (tx_epoch_record, _) = watch::channel(None);
 
         Self {
-            tx_committed_round_updates,
-            tx_requested_missing_epoch,
+            inner: Arc::new(ConsensusBusAppInner {
+                tx_committed_round_updates,
+                tx_requested_missing_epoch,
 
-            tx_primary_round_updates,
-            tx_recent_blocks,
-            tx_last_consensus_header,
-            tx_last_published_consensus_num_hash,
-            consensus_header,
-            consensus_output,
-            tx_sync_status,
-            new_epoch_votes: QueChannel::new(),
-            tx_epoch_record,
-            primary_network_events: QueChannel::new_always_subscribed(),
+                tx_primary_round_updates,
+                tx_recent_blocks,
+                tx_last_consensus_header,
+                tx_last_published_consensus_num_hash,
+                consensus_header,
+                consensus_output,
+                tx_sync_status,
+                new_epoch_votes: QueChannel::new(),
+                tx_epoch_record,
+                primary_network_events: QueChannel::new_always_subscribed(),
+            }),
         }
     }
 
     /// Reset for a new epoch.
     /// This is primarily so we can resubscribe to "one-time" subscription channels.
-    fn reset_for_epoch(&self) {
-        self.tx_committed_round_updates.send_replace(Round::default());
-        self.tx_primary_round_updates.send_replace(0u32);
-    }
-}
-
-/// The thread-safe inner type that holds all the channels for inner-consensus
-/// communication between different tasks.
-/// These are things that are refreshed each Epoch.
-#[derive(Clone, Debug)]
-struct ConsensusBusEpochInner {
-    /// New certificates from the primary. The primary should send us new certificates
-    /// only if it already sent us its whole history.
-    new_certificates: QueChannel<Certificate>,
-    /// Outputs the sequence of ordered certificates to the primary (for cleanup and feedback).
-    committed_certificates: QueChannel<(Round, Vec<Certificate>)>,
-
-    /// Sends missing certificates to the `CertificateFetcher`.
-    /// Receives certificates with missing parents from the `Synchronizer`.
-    certificate_fetcher: QueChannel<CertificateFetcherCommand>,
-    /// Send valid a quorum of certificates' ids to the `Proposer` (along with their round).
-    /// Receives the parents to include in the next header (along with their round number) from
-    /// `Synchronizer`.
-    parents: QueChannel<(Vec<Certificate>, Round)>,
-    /// Receives the batches' digests from our workers.
-    our_digests: QueChannel<OurDigestMessage>,
-    /// Sends newly created headers to the `Certifier`.
-    headers: QueChannel<Header>,
-    /// Updates when headers were committed by consensus.
-    ///
-    /// NOTE: this does not mean the header was executed yet.
-    committed_own_headers: QueChannel<(Round, Vec<Round>)>,
-
-    /// Outputs the sequence of ordered certificates to the application layer.
-    sequence: QueChannel<Arc<CommittedSubDag>>,
-
-    /// Messages to the Certificate Manager.
-    certificate_manager: QueChannel<CertificateManagerCommand>,
-}
-
-impl ConsensusBusEpochInner {
-    fn new() -> Self {
-        Self {
-            new_certificates: QueChannel::new(),
-            committed_certificates: QueChannel::new(),
-            certificate_fetcher: QueChannel::new(),
-            parents: QueChannel::new(),
-            our_digests: QueChannel::new(),
-            headers: QueChannel::new(),
-            committed_own_headers: QueChannel::new(),
-            sequence: QueChannel::new(),
-            certificate_manager: QueChannel::new(),
-        }
-    }
-}
-
-/// The type that holds the collection of send/sync channels for
-/// inter-task communication during consensus.
-#[derive(Clone, Debug)]
-pub struct ConsensusBus {
-    /// The inner type to make this thread-safe and cheap to own.
-    /// This is for stuff that lasts the app lifetime.
-    inner_app: Arc<ConsensusBusAppInner>,
-    /// The inner type to make this thread-safe and cheap to own.
-    /// This is for stuff that lasts an epoch lifetime.
-    inner_epoch: Arc<ConsensusBusEpochInner>,
-}
-
-impl Default for ConsensusBus {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// This contains the shared consensus channels.
-/// A new bus can be created with new() but there should only ever be one created (except for
-/// tests). This allows us to not create and pass channels all over the place ad-hoc.
-/// It also makes it much easier to find where channels are fed and consumed.
-impl ConsensusBus {
-    /// Create a new consensus bus.
-    pub fn new() -> Self {
-        // Using default GC depth for blocks to keep in memory.  This should
-        // allow for twice the blocks as would be needed for a margin of safety
-        // (some testing liked this).  Using the default to not overly complicate
-        // creation of the bus.
-        // This is basically for testing.
-        Self::new_with_args(Parameters::default_gc_depth())
-    }
-
-    /// Create a new consensus bus.
-    /// Store recent_blocks number of the last generated execution blocks.
-    pub fn new_with_args(recent_blocks: u32) -> Self {
-        let inner_app = Arc::new(ConsensusBusAppInner::new(recent_blocks));
-        let inner_epoch = Arc::new(ConsensusBusEpochInner::new());
-        Self { inner_app, inner_epoch }
-    }
-
-    /// Reset for a new epoch.
-    /// This is primarily so we can resubscribe to "one-time" subscription channels.
-    pub fn reset_for_epoch(&mut self) {
-        self.inner_app.reset_for_epoch();
-        let inner_epoch = Arc::new(ConsensusBusEpochInner::new());
-        self.inner_epoch = inner_epoch;
-    }
-
-    /// New certificates.
-    ///
-    /// New certificates from the primary. The primary should send us new certificates
-    /// only if it already sent us its whole history.
-    /// Can only be subscribed to once.
-    pub fn new_certificates(&self) -> &impl TnSender<Certificate> {
-        &self.inner_epoch.new_certificates
-    }
-
-    /// Outputs the sequence of ordered certificates to the primary (for cleanup and feedback).
-    /// Can only be subscribed to once.
-    pub fn committed_certificates(&self) -> &impl TnSender<(Round, Vec<Certificate>)> {
-        &self.inner_epoch.committed_certificates
-    }
-
-    /// Missing certificates.
-    ///
-    /// Sends missing certificates to the `CertificateFetcher`.
-    /// Receives certificates with missing parents from the `Synchronizer`.
-    /// Can only be subscribed to once.
-    pub fn certificate_fetcher(&self) -> &impl TnSender<CertificateFetcherCommand> {
-        &self.inner_epoch.certificate_fetcher
-    }
-
-    /// Valid quorum of certificates' ids.
-    ///
-    /// Sends a valid quorum of certificates' ids to the `Proposer` (along with their round).
-    /// Receives the parents to include in the next header (along with their round number) from
-    /// `Synchronizer`.
-    /// Can only be subscribed to once.
-    pub fn parents(&self) -> &impl TnSender<(Vec<Certificate>, Round)> {
-        &self.inner_epoch.parents
+    pub fn reset_for_epoch(&self) {
+        self.inner.tx_committed_round_updates.send_replace(Round::default());
+        self.inner.tx_primary_round_updates.send_replace(0u32);
     }
 
     /// Contains the highest committed round & corresponding gc_round for consensus.
     pub fn committed_round_updates(&self) -> &watch::Sender<Round> {
-        &self.inner_app.tx_committed_round_updates
+        &self.inner.tx_committed_round_updates
     }
 
     /// Returns the current committed round value.
     pub fn committed_round(&self) -> Round {
-        *self.inner_app.tx_committed_round_updates.borrow()
+        *self.inner.tx_committed_round_updates.borrow()
     }
 
     /// Contains the last requested epoch to retrieve a record.
     pub fn requested_missing_epoch(&self) -> &watch::Sender<Epoch> {
-        &self.inner_app.tx_requested_missing_epoch
+        &self.inner.tx_requested_missing_epoch
     }
 
     /// Signals a new round
     pub fn primary_round_updates(&self) -> &watch::Sender<Round> {
-        &self.inner_app.tx_primary_round_updates
+        &self.inner.tx_primary_round_updates
     }
 
     /// Returns the current primary round value.
     pub fn primary_round(&self) -> Round {
-        *self.inner_app.tx_primary_round_updates.borrow()
-    }
-
-    /// Batches' digests from our workers.
-    /// Can only be subscribed to once.
-    pub fn our_digests(&self) -> &impl TnSender<OurDigestMessage> {
-        &self.inner_epoch.our_digests
-    }
-
-    /// Sends newly created headers to the `Certifier`.
-    /// Can only be subscribed to once.
-    pub fn headers(&self) -> &impl TnSender<Header> {
-        &self.inner_epoch.headers
-    }
-
-    /// Updates when headers are committed by consensus.
-    ///
-    /// NOTE: this does not mean the header was executed yet.
-    /// Can only be subscribed to once.
-    pub fn committed_own_headers(&self) -> &impl TnSender<(Round, Vec<Round>)> {
-        &self.inner_epoch.committed_own_headers
-    }
-
-    /// Outputs the sequence of ordered certificates from consensus.
-    /// Can only be subscribed to once.
-    pub fn sequence(&self) -> &impl TnSender<Arc<CommittedSubDag>> {
-        &self.inner_epoch.sequence
-    }
-
-    /// Channel for forwarding newly received certificates for verification.
-    ///
-    /// These channels are used to communicate with the long-running CertificateManager task.
-    /// Can only be subscribed to once.
-    pub(crate) fn certificate_manager(&self) -> &impl TnSender<CertificateManagerCommand> {
-        &self.inner_epoch.certificate_manager
+        *self.inner.tx_primary_round_updates.borrow()
     }
 
     /// Track recent blocks.
     pub fn recent_blocks(&self) -> &watch::Sender<RecentBlocks> {
-        &self.inner_app.tx_recent_blocks
+        &self.inner.tx_recent_blocks
     }
 
     /// Returns the latest executed block's number and hash.
     pub fn latest_execution_block_num_hash(&self) -> BlockNumHash {
-        self.inner_app.tx_recent_blocks.borrow().latest_execution_block_num_hash()
+        self.inner.tx_recent_blocks.borrow().latest_execution_block_num_hash()
     }
 
     /// Returns the last consensus round processed by the engine.
     pub fn last_consensus_round(&self) -> Round {
-        self.inner_app.tx_recent_blocks.borrow().last_consensus_round()
+        self.inner.tx_recent_blocks.borrow().last_consensus_round()
     }
 
     /// Returns the maximum number of recent blocks that can be held.
     pub fn recent_blocks_capacity(&self) -> u64 {
-        self.inner_app.tx_recent_blocks.borrow().block_capacity()
+        self.inner.tx_recent_blocks.borrow().block_capacity()
     }
 
     /// Track the latest consensus header we have seen.
     /// Note, this should be a valid header (authenticated by it's epoch's committee).
     pub fn last_consensus_header(&self) -> &watch::Sender<Option<ConsensusHeader>> {
-        &self.inner_app.tx_last_consensus_header
+        &self.inner.tx_last_consensus_header
     }
 
     /// Track the latest published consensus header block number and hash seen on the gossip
     /// network. This value will have been verified and can be trusted to be the correct hash
     /// for block number.  DO NOT send unverified values to this watch.
     pub fn last_published_consensus_num_hash(&self) -> &watch::Sender<(u64, BlockHash)> {
-        &self.inner_app.tx_last_published_consensus_num_hash
+        &self.inner.tx_last_published_consensus_num_hash
     }
 
     /// Returns the latest verified consensus block number and hash from gossip.
     pub fn published_consensus_num_hash(&self) -> (u64, BlockHash) {
-        *self.inner_app.tx_last_published_consensus_num_hash.borrow()
+        *self.inner.tx_last_published_consensus_num_hash.borrow()
     }
 
     /// Broadcast channel with consensus output (includes the consensus chain block).
     /// This also provides the ConsesusHeader, use this for block execution.
     pub fn consensus_output(&self) -> &impl TnSender<ConsensusOutput> {
-        &self.inner_app.consensus_output
+        &self.inner.consensus_output
     }
 
     /// Broadcast channel with consensus header.
     /// This is useful pre-consensus output when not participating in consensus.
     pub fn consensus_header(&self) -> &impl TnSender<ConsensusHeader> {
-        &self.inner_app.consensus_header
+        &self.inner.consensus_header
     }
 
     /// Status of initial sync operation.
     pub fn node_mode(&self) -> &watch::Sender<NodeMode> {
-        &self.inner_app.tx_sync_status
+        &self.inner.tx_sync_status
     }
 
     /// Returns the current node mode.
     pub fn current_node_mode(&self) -> NodeMode {
-        *self.inner_app.tx_sync_status.borrow()
+        *self.inner.tx_sync_status.borrow()
     }
 
     /// Returns true if this node is a CVV (active or inactive).
@@ -534,7 +387,7 @@ impl ConsensusBus {
     /// A CVV is a staked node that can participate in a committee,
     /// regardless of whether it's currently active or catching up.
     pub fn is_cvv(&self) -> bool {
-        self.inner_app.tx_sync_status.borrow().is_cvv()
+        self.inner.tx_sync_status.borrow().is_cvv()
     }
 
     /// Returns true if this node is an active CVV (Committee Voting Validator).
@@ -542,7 +395,7 @@ impl ConsensusBus {
     /// This is a helper method that borrows the node mode watch channel
     /// and checks if the node is actively participating in consensus.
     pub fn is_active_cvv(&self) -> bool {
-        self.inner_app.tx_sync_status.borrow().is_active_cvv()
+        self.inner.tx_sync_status.borrow().is_active_cvv()
     }
 
     /// Returns true if this node is an inactive CVV.
@@ -550,95 +403,54 @@ impl ConsensusBus {
     /// An inactive CVV is a staked node that is catching up to rejoin
     /// the committee after a failure during the epoch.
     pub fn is_cvv_inactive(&self) -> bool {
-        self.inner_app.tx_sync_status.borrow().is_cvv_inactive()
+        self.inner.tx_sync_status.borrow().is_cvv_inactive()
     }
 
     /// Return the channel for primary network events.
     pub fn primary_network_events(
         &self,
     ) -> &impl TnSender<NetworkEvent<crate::network::Req, crate::network::Res>> {
-        &self.inner_app.primary_network_events
+        &self.inner.primary_network_events
     }
 
     /// Return the channel for primary network events.  Returns a concrete clone.
     pub fn primary_network_events_cloned(
         &self,
     ) -> QueChannel<NetworkEvent<crate::network::Req, crate::network::Res>> {
-        self.inner_app.primary_network_events.clone()
+        self.inner.primary_network_events.clone()
     }
 
     /// New epoch certs as they are recieved.
     pub fn new_epoch_votes(&self) -> &impl TnSender<EpochVote> {
-        &self.inner_app.new_epoch_votes
+        &self.inner.new_epoch_votes
     }
 
     /// Watch channel for the current epoch record.
     /// The epoch vote collector observes this to know when a new epoch starts.
     pub fn epoch_record_watch(&self) -> &watch::Sender<Option<EpochRecord>> {
-        &self.inner_app.tx_epoch_record
+        &self.inner.tx_epoch_record
     }
 
-    //
-    //=== Channel subscription methods
-    //
-    // These must be called in synchronous spawn() methods, BEFORE spawning async tasks.
-    // This ensures the channel is active before any messages are sent.
-    //
-
-    pub fn subscribe_new_certificates(&self) -> impl TnReceiver<Certificate> {
-        self.inner_epoch.new_certificates.subscribe()
-    }
-
-    pub fn subscribe_committed_certificates(&self) -> impl TnReceiver<(Round, Vec<Certificate>)> {
-        self.inner_epoch.committed_certificates.subscribe()
-    }
-
-    pub fn subscribe_certificate_fetcher(&self) -> impl TnReceiver<CertificateFetcherCommand> {
-        self.inner_epoch.certificate_fetcher.subscribe()
-    }
-
-    pub fn subscribe_parents(&self) -> impl TnReceiver<(Vec<Certificate>, Round)> {
-        self.inner_epoch.parents.subscribe()
-    }
-
-    pub fn subscribe_our_digests(&self) -> impl TnReceiver<OurDigestMessage> {
-        self.inner_epoch.our_digests.subscribe()
-    }
-
-    pub fn subscribe_headers(&self) -> impl TnReceiver<Header> {
-        self.inner_epoch.headers.subscribe()
-    }
-
-    pub fn subscribe_committed_own_headers(&self) -> impl TnReceiver<(Round, Vec<Round>)> {
-        self.inner_epoch.committed_own_headers.subscribe()
-    }
-
-    pub fn subscribe_sequence(&self) -> impl TnReceiver<Arc<CommittedSubDag>> {
-        self.inner_epoch.sequence.subscribe()
-    }
-
-    pub(crate) fn subscribe_certificate_manager(
-        &self,
-    ) -> impl TnReceiver<CertificateManagerCommand> {
-        self.inner_epoch.certificate_manager.subscribe()
-    }
-
+    /// Provide a subscriber (Receiver) for new_epoch_votes.
     pub fn subscribe_new_epoch_votes(&self) -> impl TnReceiver<EpochVote> {
-        self.inner_app.new_epoch_votes.subscribe()
+        self.inner.new_epoch_votes.subscribe()
     }
 
+    /// Provide a subscriber (Receiver) for primary network events.
     pub fn subscribe_primary_network_events(
         &self,
     ) -> impl TnReceiver<NetworkEvent<crate::network::Req, crate::network::Res>> {
-        self.inner_app.primary_network_events.subscribe()
+        self.inner.primary_network_events.subscribe()
     }
 
+    /// Provide a subscription (Receiver) for consensus output.
     pub fn subscribe_consensus_output(&self) -> impl TnReceiver<ConsensusOutput> {
-        self.inner_app.consensus_output.subscribe()
+        self.inner.consensus_output.subscribe()
     }
 
+    /// Provide a subscription(Receiver) to consensus_headers.
     pub fn subscribe_consensus_header(&self) -> impl TnReceiver<ConsensusHeader> {
-        self.inner_app.consensus_header.subscribe()
+        self.inner.consensus_header.subscribe()
     }
 
     /// Will resolve once we have executed block.
@@ -724,6 +536,264 @@ impl ConsensusBus {
             .consensus_header_by_digest(epoch, latest_consensus.hash)
             .await
             .unwrap_or_default()
+    }
+}
+
+impl Default for ConsensusBusApp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The thread-safe inner type that holds all the channels for inner-consensus
+/// communication between different tasks.
+/// These are things that are refreshed each Epoch.
+#[derive(Clone, Debug)]
+struct ConsensusBusEpochInner {
+    /// New certificates from the primary. The primary should send us new certificates
+    /// only if it already sent us its whole history.
+    new_certificates: QueChannel<Certificate>,
+    /// Outputs the sequence of ordered certificates to the primary (for cleanup and feedback).
+    committed_certificates: QueChannel<(Round, Vec<Certificate>)>,
+
+    /// Sends missing certificates to the `CertificateFetcher`.
+    /// Receives certificates with missing parents from the `Synchronizer`.
+    certificate_fetcher: QueChannel<CertificateFetcherCommand>,
+    /// Send valid a quorum of certificates' ids to the `Proposer` (along with their round).
+    /// Receives the parents to include in the next header (along with their round number) from
+    /// `Synchronizer`.
+    parents: QueChannel<(Vec<Certificate>, Round)>,
+    /// Receives the batches' digests from our workers.
+    our_digests: QueChannel<OurDigestMessage>,
+    /// Sends newly created headers to the `Certifier`.
+    headers: QueChannel<Header>,
+    /// Updates when headers were committed by consensus.
+    ///
+    /// NOTE: this does not mean the header was executed yet.
+    committed_own_headers: QueChannel<(Round, Vec<Round>)>,
+
+    /// Outputs the sequence of ordered certificates to the application layer.
+    sequence: QueChannel<Arc<CommittedSubDag>>,
+
+    /// Messages to the Certificate Manager.
+    certificate_manager: QueChannel<CertificateManagerCommand>,
+}
+
+impl ConsensusBusEpochInner {
+    fn new() -> Self {
+        Self {
+            new_certificates: QueChannel::new(),
+            committed_certificates: QueChannel::new(),
+            certificate_fetcher: QueChannel::new(),
+            parents: QueChannel::new(),
+            our_digests: QueChannel::new(),
+            headers: QueChannel::new(),
+            committed_own_headers: QueChannel::new(),
+            sequence: QueChannel::new(),
+            certificate_manager: QueChannel::new(),
+        }
+    }
+}
+
+/// The type that holds the collection of send/sync channels for
+/// inter-task communication during consensus.
+#[derive(Clone, Debug)]
+pub struct ConsensusBus {
+    /// The inner type to make this thread-safe and cheap to own.
+    /// This is for stuff that lasts the app lifetime.
+    /// Note do not need an Arc because ConsensusBusApp is internally Arced.
+    inner_app: ConsensusBusApp,
+    /// The inner type to make this thread-safe and cheap to own.
+    /// This is for stuff that lasts an epoch lifetime.
+    inner_epoch: Arc<ConsensusBusEpochInner>,
+}
+
+impl Default for ConsensusBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// This contains the shared consensus channels.
+/// A new bus can be created with new() but there should only ever be one created (except for
+/// tests). This allows us to not create and pass channels all over the place ad-hoc.
+/// It also makes it much easier to find where channels are fed and consumed.
+impl ConsensusBus {
+    /// Create a new consensus bus.
+    pub fn new() -> Self {
+        // Using default GC depth for blocks to keep in memory.  This should
+        // allow for twice the blocks as would be needed for a margin of safety
+        // (some testing liked this).  Using the default to not overly complicate
+        // creation of the bus.
+        // This is basically for testing.
+        Self::new_with_args(Parameters::default_gc_depth())
+    }
+
+    /// Create a new consensus bus.
+    /// Store recent_blocks number of the last generated execution blocks.
+    pub fn new_with_args(recent_blocks: u32) -> Self {
+        let inner_app = ConsensusBusApp::new_with_recent_blocks(recent_blocks);
+        let inner_epoch = Arc::new(ConsensusBusEpochInner::new());
+        Self { inner_app, inner_epoch }
+    }
+
+    /// Create a new consensus bus.
+    /// Store recent_blocks number of the last generated execution blocks.
+    pub fn new_with_app(inner_app: ConsensusBusApp) -> Self {
+        let inner_epoch = Arc::new(ConsensusBusEpochInner::new());
+        Self { inner_app, inner_epoch }
+    }
+
+    /// Return a reference to the contained ConsensusBusApp.
+    pub fn app(&self) -> &ConsensusBusApp {
+        &self.inner_app
+    }
+
+    /// New certificates.
+    ///
+    /// New certificates from the primary. The primary should send us new certificates
+    /// only if it already sent us its whole history.
+    /// Can only be subscribed to once.
+    pub fn new_certificates(&self) -> &impl TnSender<Certificate> {
+        &self.inner_epoch.new_certificates
+    }
+
+    /// Outputs the sequence of ordered certificates to the primary (for cleanup and feedback).
+    /// Can only be subscribed to once.
+    pub fn committed_certificates(&self) -> &impl TnSender<(Round, Vec<Certificate>)> {
+        &self.inner_epoch.committed_certificates
+    }
+
+    /// Missing certificates.
+    ///
+    /// Sends missing certificates to the `CertificateFetcher`.
+    /// Receives certificates with missing parents from the `Synchronizer`.
+    /// Can only be subscribed to once.
+    pub fn certificate_fetcher(&self) -> &impl TnSender<CertificateFetcherCommand> {
+        &self.inner_epoch.certificate_fetcher
+    }
+
+    /// Valid quorum of certificates' ids.
+    ///
+    /// Sends a valid quorum of certificates' ids to the `Proposer` (along with their round).
+    /// Receives the parents to include in the next header (along with their round number) from
+    /// `Synchronizer`.
+    /// Can only be subscribed to once.
+    pub fn parents(&self) -> &impl TnSender<(Vec<Certificate>, Round)> {
+        &self.inner_epoch.parents
+    }
+
+    /// Batches' digests from our workers.
+    /// Can only be subscribed to once.
+    pub fn our_digests(&self) -> &impl TnSender<OurDigestMessage> {
+        &self.inner_epoch.our_digests
+    }
+
+    /// Sends newly created headers to the `Certifier`.
+    /// Can only be subscribed to once.
+    pub fn headers(&self) -> &impl TnSender<Header> {
+        &self.inner_epoch.headers
+    }
+
+    /// Updates when headers are committed by consensus.
+    ///
+    /// NOTE: this does not mean the header was executed yet.
+    /// Can only be subscribed to once.
+    pub fn committed_own_headers(&self) -> &impl TnSender<(Round, Vec<Round>)> {
+        &self.inner_epoch.committed_own_headers
+    }
+
+    /// Outputs the sequence of ordered certificates from consensus.
+    /// Can only be subscribed to once.
+    pub fn sequence(&self) -> &impl TnSender<Arc<CommittedSubDag>> {
+        &self.inner_epoch.sequence
+    }
+
+    /// Channel for forwarding newly received certificates for verification.
+    ///
+    /// These channels are used to communicate with the long-running CertificateManager task.
+    /// Can only be subscribed to once.
+    pub(crate) fn certificate_manager(&self) -> &impl TnSender<CertificateManagerCommand> {
+        &self.inner_epoch.certificate_manager
+    }
+
+    /// Returns true if this node is a CVV (active or inactive).
+    ///
+    /// A CVV is a staked node that can participate in a committee,
+    /// regardless of whether it's currently active or catching up.
+    pub fn is_cvv(&self) -> bool {
+        self.inner_app.is_cvv()
+    }
+
+    /// Returns true if this node is an active CVV (Committee Voting Validator).
+    ///
+    /// This is a helper method that borrows the node mode watch channel
+    /// and checks if the node is actively participating in consensus.
+    pub fn is_active_cvv(&self) -> bool {
+        self.inner_app.is_active_cvv()
+    }
+
+    /// Returns true if this node is an inactive CVV.
+    ///
+    /// An inactive CVV is a staked node that is catching up to rejoin
+    /// the committee after a failure during the epoch.
+    pub fn is_cvv_inactive(&self) -> bool {
+        self.inner_app.is_cvv_inactive()
+    }
+
+    //
+    //=== Channel subscription methods
+    //
+    // These must be called in synchronous spawn() methods, BEFORE spawning async tasks.
+    // This ensures the channel is active before any messages are sent.
+    //
+
+    /// Subscribe to new certificates from the primary.
+    pub fn subscribe_new_certificates(&self) -> impl TnReceiver<Certificate> {
+        self.inner_epoch.new_certificates.subscribe()
+    }
+
+    /// Subscribe to the sequence of ordered certificates to the primary (for cleanup and feedback).
+    pub fn subscribe_committed_certificates(&self) -> impl TnReceiver<(Round, Vec<Certificate>)> {
+        self.inner_epoch.committed_certificates.subscribe()
+    }
+
+    /// Subscribe to certificates with missing parents from the `Synchronizer`.
+    pub fn subscribe_certificate_fetcher(&self) -> impl TnReceiver<CertificateFetcherCommand> {
+        self.inner_epoch.certificate_fetcher.subscribe()
+    }
+
+    /// Subscribe to a valid quorum of certificates' ids to the `Proposer` (along with their round).
+    pub fn subscribe_parents(&self) -> impl TnReceiver<(Vec<Certificate>, Round)> {
+        self.inner_epoch.parents.subscribe()
+    }
+
+    /// Subscribe to batches' digests from our workers.
+    pub fn subscribe_our_digests(&self) -> impl TnReceiver<OurDigestMessage> {
+        self.inner_epoch.our_digests.subscribe()
+    }
+
+    /// Subscribe to newly created headers.
+    pub fn subscribe_headers(&self) -> impl TnReceiver<Header> {
+        self.inner_epoch.headers.subscribe()
+    }
+
+    /// Subscribe to updates when headers were committed by consensus.
+    /// NOTE: this does not mean the header was executed yet.
+    pub fn subscribe_committed_own_headers(&self) -> impl TnReceiver<(Round, Vec<Round>)> {
+        self.inner_epoch.committed_own_headers.subscribe()
+    }
+
+    /// Subscribe to sequence of ordered certificates to the application layer.
+    pub fn subscribe_sequence(&self) -> impl TnReceiver<Arc<CommittedSubDag>> {
+        self.inner_epoch.sequence.subscribe()
+    }
+
+    /// Subscribe to messages intended for the Certificate Manager.
+    pub(crate) fn subscribe_certificate_manager(
+        &self,
+    ) -> impl TnReceiver<CertificateManagerCommand> {
+        self.inner_epoch.certificate_manager.subscribe()
     }
 }
 

@@ -434,7 +434,7 @@ async fn commit_one() {
     Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain).await;
     let cb_clone = cb.clone();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    cb.recent_blocks().send_modify(|blocks| {
+    cb.app().recent_blocks().send_modify(|blocks| {
         blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
     });
     tokio::spawn(async move {
@@ -498,7 +498,7 @@ async fn dead_node() {
             .await
             .unwrap();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    cb.recent_blocks().send_modify(|blocks| {
+    cb.app().recent_blocks().send_modify(|blocks| {
         blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
     });
     let mut rx_output = cb.subscribe_sequence();
@@ -637,7 +637,7 @@ async fn not_enough_support() {
             .await
             .unwrap();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    cb.recent_blocks().send_modify(|blocks| {
+    cb.app().recent_blocks().send_modify(|blocks| {
         blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
     });
     let mut rx_output = cb.subscribe_sequence();
@@ -742,7 +742,7 @@ async fn missing_leader() {
             .await
             .unwrap();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    cb.recent_blocks().send_modify(|blocks| {
+    cb.app().recent_blocks().send_modify(|blocks| {
         blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
     });
     let mut rx_output = cb.subscribe_sequence();
@@ -819,7 +819,7 @@ async fn committed_round_after_restart() {
 
         let cb = ConsensusBus::new();
         let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-        cb.recent_blocks().send_modify(|blocks| {
+        cb.app().recent_blocks().send_modify(|blocks| {
             blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
         });
         let mut rx_primary = cb.subscribe_committed_certificates();
@@ -832,7 +832,7 @@ async fn committed_round_after_restart() {
         // and the expected commit round after sending in certificates up to `input_round` would
         // be 2 * r.
 
-        let last_committed_round = *cb.committed_round_updates().borrow() as usize;
+        let last_committed_round = *cb.app().committed_round_updates().borrow() as usize;
         assert_eq!(
             last_committed_round,
             input_round.saturating_sub(3),
@@ -861,7 +861,10 @@ async fn committed_round_after_restart() {
 
         // After sending inputs up to round 2 * r + 1 to consensus, round 2 * r should have been
         // committed.
-        assert_eq!(*cb.committed_round_updates().borrow() as usize, input_round.saturating_sub(1),);
+        assert_eq!(
+            *cb.app().committed_round_updates().borrow() as usize,
+            input_round.saturating_sub(1),
+        );
         info!("Committed round adanced to {}", input_round.saturating_sub(1));
 
         // Shutdown consensus and wait for it to stop.
@@ -1073,7 +1076,7 @@ async fn restart_with_new_committee() {
         prev_epoch_digest = previous_epoch.digest();
         consensus_chain.new_epoch(previous_epoch, committee.clone()).await.unwrap();
         let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-        cb.recent_blocks().send_modify(|blocks| {
+        cb.app().recent_blocks().send_modify(|blocks| {
             blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
         });
         let mut rx_output = cb.subscribe_sequence();

@@ -12,7 +12,7 @@ use crate::{
 use eyre::eyre;
 use tn_config::{KeyConfig, NetworkConfig, TelcoinDirs};
 use tn_network_libp2p::{types::NetworkEvent, ConsensusNetwork};
-use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus, NodeMode, QueChannel};
+use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode, QueChannel};
 use tn_reth::{system_calls::EpochState, RethDb, RethEnv};
 use tn_storage::{consensus::ConsensusChain, open_db, DatabaseType};
 use tn_types::{
@@ -59,7 +59,7 @@ pub(crate) struct EpochManager<P, DB> {
     /// Consensus DB, keep for entire execution.
     consensus_db: DB,
     /// ConsensusBus for the application life.
-    consensus_bus: ConsensusBus,
+    consensus_bus: ConsensusBusApp,
     /// Persistent event stream for worker network events.
     worker_event_stream: QueChannel<NetworkEvent<WorkerRequest, WorkerResponse>>,
 
@@ -167,7 +167,8 @@ where
 
         let reth_db = builder.reth_db.clone();
 
-        let consensus_bus = ConsensusBus::new_with_args(builder.tn_config.parameters.gc_depth);
+        let consensus_bus =
+            ConsensusBusApp::new_with_recent_blocks(builder.tn_config.parameters.gc_depth);
         if builder.tn_config.observer {
             // Don't risk keeping the default CVV active mode...
             consensus_bus.node_mode().send_replace(NodeMode::Observer);

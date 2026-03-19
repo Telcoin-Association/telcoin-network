@@ -5,7 +5,9 @@
 
 use std::{sync::Arc, time::Duration};
 
-use crate::{proposer::OurDigestMessage, state_sync::StateSynchronizer, ConsensusBus};
+use crate::{
+    proposer::OurDigestMessage, state_sync::StateSynchronizer, ConsensusBus, ConsensusBusApp,
+};
 use handler::RequestHandler;
 pub use message::{MissingCertificatesRequest, PrimaryRequest, PrimaryResponse};
 use message::{PrimaryGossip, PrimaryRPCError};
@@ -272,7 +274,7 @@ where
         network_events: Events,
         network_handle: PrimaryNetworkHandle,
         consensus_config: ConsensusConfig<DB>,
-        consensus_bus: ConsensusBus,
+        consensus_bus: ConsensusBusApp,
         state_sync: StateSynchronizer<DB>,
         task_spawner: TaskSpawner,
         consensus_chain: ConsensusChain,

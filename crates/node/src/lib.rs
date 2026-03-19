@@ -6,7 +6,7 @@
 use engine::TnBuilder;
 use manager::EpochManager;
 use tn_config::{KeyConfig, TelcoinDirs};
-use tn_primary::ConsensusBus;
+use tn_primary::ConsensusBusApp;
 use tn_rpc::EngineToPrimary;
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{BlockHash, ConsensusHeader, Epoch, EpochCertificate, EpochRecord};
@@ -57,13 +57,13 @@ where
 #[derive(Debug)]
 pub struct EngineToPrimaryRpc {
     /// Container for consensus channels.
-    consensus_bus: ConsensusBus,
+    consensus_bus: ConsensusBusApp,
     /// Consensus Chain DB
     consensus_chain: ConsensusChain,
 }
 
 impl EngineToPrimaryRpc {
-    pub fn new(consensus_bus: ConsensusBus, consensus_chain: ConsensusChain) -> Self {
+    pub fn new(consensus_bus: ConsensusBusApp, consensus_chain: ConsensusChain) -> Self {
         Self { consensus_bus, consensus_chain }
     }
 

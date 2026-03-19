@@ -5,7 +5,7 @@ use tn_test_utils as _;
 
 use std::{collections::BTreeSet, time::Duration};
 
-use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus};
+use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{BlsPublicKey, Epoch, EpochRecord, Noticer, TaskSpawner, B256};
 use tracing::{error, info};
@@ -47,7 +47,7 @@ async fn collect_epoch_records(
     last_epoch: Epoch,
     consensus_chain: &ConsensusChain,
     primary_handle: &PrimaryNetworkHandle,
-    consensus_bus: &ConsensusBus,
+    consensus_bus: &ConsensusBusApp,
 ) -> Epoch {
     let mut result_epoch = last_epoch;
     // Track the highest final_consensus seen across all downloaded epoch records.
@@ -162,7 +162,7 @@ async fn collect_epoch_records(
 pub async fn spawn_epoch_record_collector(
     consensus_chain: ConsensusChain,
     primary_handle: PrimaryNetworkHandle,
-    consensus_bus: ConsensusBus,
+    consensus_bus: ConsensusBusApp,
     node_task_spawner: TaskSpawner,
     node_shutdown: Noticer,
 ) -> eyre::Result<()> {

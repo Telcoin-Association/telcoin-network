@@ -11,7 +11,7 @@ use tn_config::ConsensusConfig;
 use tn_network_types::{local::LocalNetwork, PrimaryToWorkerClient};
 use tn_primary::{
     network::{ConsensusResult, PrimaryNetworkHandle},
-    ConsensusBus, NodeMode,
+    ConsensusBus, ConsensusBusApp, NodeMode,
 };
 use tn_storage::{consensus::ConsensusChain, CertificateStore};
 use tn_types::{
@@ -28,7 +28,7 @@ use tracing::{debug, error, info, instrument, warn};
 #[derive(Clone, Debug)]
 pub struct Subscriber<DB> {
     /// Used to get the sequence receiver
-    consensus_bus: ConsensusBus,
+    consensus_bus: ConsensusBusApp,
     /// Consensus configuration (contains the consensus DB)
     config: ConsensusConfig<DB>,
     /// The handle to the network.
@@ -67,10 +67,10 @@ pub fn spawn_subscriber<DB: Database>(
     let authority_id = config.authority_id();
     let committee = config.committee().clone();
     let client = config.local_network().clone();
-    let mode = consensus_bus.current_node_mode();
+    let mode = consensus_bus.app().current_node_mode();
     info!(target: "tn::observer", node_mode = ?mode, "subscriber starting in mode");
     let subscriber = Subscriber {
-        consensus_bus,
+        consensus_bus: consensus_bus.app().clone(),
         config,
         network_handle,
         inner: Arc::new(Inner {
@@ -85,7 +85,7 @@ pub fn spawn_subscriber<DB: Database>(
         // If we are active then partcipate in consensus.
         NodeMode::CvvActive => {
             // Subscribe before spawning so the channel is active before any messages are sent.
-            let rx_sequence = subscriber.consensus_bus.subscribe_sequence();
+            let rx_sequence = consensus_bus.subscribe_sequence();
             task_manager.spawn_critical_task("subscriber consensus", async move {
                 info!(target: "subscriber", "Starting subscriber: CVV");
                 if let Err(e) = subscriber.run(rx_shutdown, rx_sequence, consensus_chain).await {

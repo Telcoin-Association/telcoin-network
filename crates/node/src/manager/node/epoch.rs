@@ -21,7 +21,7 @@ use tn_config::{Config, ConfigFmt, ConfigTrait as _, ConsensusConfig, NetworkCon
 use tn_network_libp2p::{error::NetworkError, types::NetworkHandle, TNMessage};
 use tn_primary::{
     network::{PrimaryNetwork, PrimaryNetworkHandle},
-    NodeMode, StateSynchronizer,
+    ConsensusBus, NodeMode, StateSynchronizer,
 };
 use tn_reth::{
     bytes_to_txn,
@@ -88,6 +88,9 @@ where
     ) -> eyre::Result<RunEpochMode> {
         info!(target: "epoch-manager", "Starting epoch");
 
+        // Create a new bus wrapping the application channels and adding the epoch specific
+        // channels.
+        let consensus_bus = ConsensusBus::new_with_app(self.consensus_bus.clone());
         self.last_consensus_header = None;
         // We have not created this epoch's primary yet (no committee) so get it from chain
         // ourselves... Note, any consensus output to replay should be in the same epoch...
@@ -140,6 +143,7 @@ where
                 network_config,
                 epoch_mode.initial_epoch(),
                 gas_accumulator.clone(),
+                consensus_bus.clone(),
             )
             .await?;
         // consensus config for shutdown subscribers
@@ -728,22 +732,25 @@ where
         network_config: &NetworkConfig,
         initial_epoch: bool,
         gas_accumulator: GasAccumulator,
+        consensus_bus: ConsensusBus,
     ) -> eyre::Result<(PrimaryNode<DB>, WorkerNode<DB>)> {
         // create config for consensus
         let (consensus_config, preload_keys) =
             self.configure_consensus(engine, network_config).await?;
-        let _mode = self.identify_node_mode(&consensus_config).await?;
+        let _mode = self.identify_node_mode(&consensus_config, &consensus_bus).await?;
 
+        let consensus_bus_app = consensus_bus.app().clone();
         let primary = self
             .create_primary_node_components(
                 &consensus_config,
                 epoch_task_manager.get_spawner(),
                 initial_epoch,
+                consensus_bus,
             )
             .await?;
 
         let engine_to_primary =
-            EngineToPrimaryRpc::new(primary.consensus_bus().await, self.consensus_chain.clone());
+            EngineToPrimaryRpc::new(consensus_bus_app, self.consensus_chain.clone());
         // only spawns one worker for now
         let worker = self
             .spawn_worker_node_components(
@@ -841,10 +848,11 @@ where
         consensus_config: &ConsensusConfig<DB>,
         epoch_task_spawner: TaskSpawner,
         initial_epoch: bool,
+        consensus_bus: ConsensusBus,
     ) -> eyre::Result<PrimaryNode<DB>> {
         let state_sync = StateSynchronizer::new(
             consensus_config.clone(),
-            self.consensus_bus.clone(),
+            consensus_bus.clone(),
             epoch_task_spawner.clone(),
         );
         let network_handle = self
@@ -860,13 +868,14 @@ where
             epoch_task_spawner.clone(),
             &network_handle,
             initial_epoch,
+            consensus_bus.clone(),
         )
         .await?;
 
         // spawn primary - create node and spawn network
         let primary = PrimaryNode::new(
             consensus_config.clone(),
-            self.consensus_bus.clone(),
+            consensus_bus,
             network_handle,
             state_sync,
             self.epoch_boundary,
@@ -952,6 +961,7 @@ where
         epoch_task_spawner: TaskSpawner,
         network_handle: &PrimaryNetworkHandle,
         initial_epoch: bool,
+        consensus_bus: ConsensusBus,
     ) -> eyre::Result<()> {
         // get event streams for the primary network handler
         let rx_event_stream = self.consensus_bus.subscribe_primary_network_events();
@@ -1048,7 +1058,7 @@ where
             rx_event_stream,
             network_handle.clone(),
             consensus_config.clone(),
-            self.consensus_bus.clone(),
+            consensus_bus.app().clone(),
             state_sync,
             epoch_task_spawner.clone(), // tasks should abort with epoch
             self.consensus_chain.clone(),
@@ -1195,6 +1205,7 @@ where
     async fn identify_node_mode(
         &self,
         consensus_config: &ConsensusConfig<DB>,
+        consensus_bus: &ConsensusBus,
     ) -> eyre::Result<NodeMode> {
         if self.consensus_bus.is_cvv_inactive() {
             // If we have an inactive mode then it was set so keep it for now.
@@ -1206,7 +1217,7 @@ where
             .map(|id| consensus_config.in_committee(&id))
             .unwrap_or(false);
         state_sync::prime_consensus(
-            &self.consensus_bus,
+            consensus_bus.app(),
             consensus_config,
             self.consensus_chain.clone(),
         )
