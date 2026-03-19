@@ -164,12 +164,12 @@ proptest! {
 
     /// Governance mint → wait for timelock → claim succeeds and increases supply.
     #[test]
-    fn prop_pipeline_mint_timelock_claim(amount in 1u128..1_000_000u128) {
+    fn prop_pipeline_mint_timelock_claim(
+        amount in 1u128..1_000_000u128,
+        mint_ts in 1_000u64..100_000_000u64,
+    ) {
         let mut env = PipelineTestEnv::new();
         let supply_before = env.get_total_supply();
-
-        // Block 1 at T: governance mints via forwarder
-        let mint_ts = 1_000_000u64;
         let mint_tx = env.governance_mint_tx(GOVERNANCE_SAFE_ADDRESS, U256::from(amount));
         let block1 = env.execute_block_at_timestamp(vec![mint_tx], mint_ts)
             .expect("execute mint block");
@@ -206,7 +206,7 @@ proptest! {
 
     /// Governance burn decreases total supply.
     #[test]
-    fn prop_pipeline_burn_decrements_supply(amount in 1u64..1000u64) {
+    fn prop_pipeline_burn_decrements_supply(amount in 1u128..1_000_000u128) {
         let mut env = PipelineTestEnv::new();
         let supply_before = env.get_total_supply();
         let precompile_balance_before = env.get_balance(TELCOIN_PRECOMPILE_ADDRESS);
@@ -502,9 +502,11 @@ proptest! {
 
     /// mint(amount) then mint(0) cancels the pending mint (claim fails).
     #[test]
-    fn prop_pipeline_mint_zero_cancels_pending(amount in 1u128..1_000_000u128) {
+    fn prop_pipeline_mint_zero_cancels_pending(
+        amount in 1u128..1_000_000u128,
+        mint_ts in 1_000u64..100_000_000u64,
+    ) {
         let mut env = PipelineTestEnv::new();
-        let mint_ts = 1_000_000u64;
 
         // Block 1: mint non-zero
         let tx1 = env.governance_mint_tx(GOVERNANCE_SAFE_ADDRESS, U256::from(amount));
@@ -827,12 +829,15 @@ proptest! {
 
     /// Permit signed for wrong chain_id fails.
     #[test]
-    fn prop_pipeline_permit_wrong_chain_id(amount in 1u128..1_000_000u128) {
+    fn prop_pipeline_permit_wrong_chain_id(
+        amount in 1u128..1_000_000u128,
+        chain_id_offset in 1u64..1000u64,
+    ) {
         let mut env = PipelineTestEnv::new();
         let owner = permit_signer_address();
         let spender = env.recipient_factory.address();
         let correct_chain_id = env.chain_id();
-        let wrong_chain_id = correct_chain_id + 1;
+        let wrong_chain_id = correct_chain_id + chain_id_offset;
         let value = U256::from(amount);
         let deadline = U256::from(env.block_timestamp + 1000);
         let nonce = env.get_nonce(owner);
@@ -871,7 +876,10 @@ proptest! {
 
     /// Permit with invalid v (not 27 or 28) fails.
     #[test]
-    fn prop_pipeline_permit_invalid_v(amount in 1u128..1_000_000u128) {
+    fn prop_pipeline_permit_invalid_v(
+        amount in 1u128..1_000_000u128,
+        v_val in (0u8..=255u8).prop_filter("must be invalid", |v| *v != 27 && *v != 28),
+    ) {
         let mut env = PipelineTestEnv::new();
         let owner = permit_signer_address();
         let spender = env.recipient_factory.address();
@@ -881,9 +889,8 @@ proptest! {
         let nonce = env.get_nonce(owner);
 
         let (_, r, s) = sign_permit(owner, spender, value, nonce, deadline, chain_id);
-        // Use v = 26 (invalid)
         let tx = env.user_precompile_tx(
-            permitCall { owner, spender, value, deadline, v: 26, r, s }.abi_encode(),
+            permitCall { owner, spender, value, deadline, v: v_val, r, s }.abi_encode(),
         );
         let block = env.execute_block(vec![tx]).expect("execute permit block");
         assert!(!env.tx_succeeded(&block, 0), "permit with invalid v should fail");
@@ -891,13 +898,16 @@ proptest! {
 
     /// 3 permits across 3 blocks yield nonces 0, 1, 2.
     #[test]
-    fn prop_pipeline_permit_nonce_monotonic_across_blocks(amount in 1u128..1_000_000u128) {
+    fn prop_pipeline_permit_nonce_monotonic_across_blocks(
+        amount in 1u128..1_000_000u128,
+        num_permits in 2u64..6u64,
+    ) {
         let mut env = PipelineTestEnv::new();
         let owner = permit_signer_address();
         let spender = env.recipient_factory.address();
         let chain_id = env.chain_id();
 
-        for expected_nonce in 0u64..3 {
+        for expected_nonce in 0u64..num_permits {
             let nonce = env.get_nonce(owner);
             prop_assert_eq!(nonce, U256::from(expected_nonce), "nonce mismatch before permit");
 
@@ -913,7 +923,7 @@ proptest! {
         }
 
         let final_nonce = env.get_nonce(owner);
-        prop_assert_eq!(final_nonce, U256::from(3), "final nonce should be 3");
+        prop_assert_eq!(final_nonce, U256::from(num_permits), "final nonce should match num_permits");
     }
 }
 
@@ -926,9 +936,11 @@ proptest! {
 
     /// Claim succeeds, second claim of same recipient fails (storage cleared).
     #[test]
-    fn prop_pipeline_double_claim_fails(amount in 1u128..1_000_000u128) {
+    fn prop_pipeline_double_claim_fails(
+        amount in 1u128..1_000_000u128,
+        mint_ts in 1_000u64..100_000_000u64,
+    ) {
         let mut env = PipelineTestEnv::new();
-        let mint_ts = 1_000_000u64;
 
         // Block 1: mint
         let tx1 = env.governance_mint_tx(GOVERNANCE_SAFE_ADDRESS, U256::from(amount));
@@ -956,9 +968,9 @@ proptest! {
     fn prop_pipeline_mint_overwrite_latest_only(
         first in 1u128..500_000u128,
         second in 500_001u128..1_000_000u128,
+        mint_ts in 1_000u64..100_000_000u64,
     ) {
         let mut env = PipelineTestEnv::new();
-        let mint_ts = 1_000_000u64;
         let supply_before = env.get_total_supply();
 
         // Block 1: mint first
@@ -990,9 +1002,11 @@ proptest! {
     /// Claim at exact timelock boundary (mint_ts + TIMELOCK_DURATION) succeeds.
     /// The check is `current_ts < unlock_ts`, so `current_ts == unlock_ts` passes.
     #[test]
-    fn prop_pipeline_claim_at_exact_timelock_boundary(amount in 1u128..1_000_000u128) {
+    fn prop_pipeline_claim_at_exact_timelock_boundary(
+        amount in 1u128..1_000_000u128,
+        mint_ts in 1_000u64..100_000_000u64,
+    ) {
         let mut env = PipelineTestEnv::new();
-        let mint_ts = 1_000_000u64;
 
         let tx1 = env.governance_mint_tx(GOVERNANCE_SAFE_ADDRESS, U256::from(amount));
         let block1 = env.execute_block_at_timestamp(vec![tx1], mint_ts).expect("mint block");
@@ -1012,9 +1026,11 @@ proptest! {
 
     /// Only governance can call claim after timelock (permissioned).
     #[test]
-    fn prop_pipeline_permissioned_claim(amount in 1u128..1_000_000u128) {
+    fn prop_pipeline_permissioned_claim(
+        amount in 1u128..1_000_000u128,
+        mint_ts in 1_000u64..100_000_000u64,
+    ) {
         let mut env = PipelineTestEnv::new();
-        let mint_ts = 1_000_000u64;
         let gov_balance_before = env.get_balance(GOVERNANCE_SAFE_ADDRESS);
 
         // Block 1: governance mints
@@ -1062,10 +1078,10 @@ proptest! {
     fn prop_pipeline_supply_invariant(
         mint_amount in 1u128..1_000_000u128,
         burn_amount in 1u64..500u64,
+        mint_ts in 1_000u64..100_000_000u64,
     ) {
         let mut env = PipelineTestEnv::new();
         let supply_initial = env.get_total_supply();
-        let mint_ts = 1_000_000u64;
 
         // Block 1: mint
         let tx1 = env.governance_mint_tx(GOVERNANCE_SAFE_ADDRESS, U256::from(mint_amount));
@@ -1247,7 +1263,10 @@ proptest! {
 
     /// Claim reverts when adding `amount` to governance balance would overflow U256.
     #[test]
-    fn prop_pipeline_claim_balance_overflow(amount in 1u128..1_000_000u128) {
+    fn prop_pipeline_claim_balance_overflow(
+        amount in 1u128..1_000_000u128,
+        mint_ts in 1_000u64..100_000_000u64,
+    ) {
         let large_balance = U256::from(10).pow(U256::from(18)) * U256::from(1_000_000_000u64);
         let genesis_supply_wei = U256::from(GENESIS_SUPPLY) * U256::from(10).pow(U256::from(18));
         let precompile_balance = U256::from(10).pow(U256::from(18)) * U256::from(1000u64);
@@ -1264,7 +1283,6 @@ proptest! {
             large_balance,
         );
         let supply_before = env.get_total_supply();
-        let mint_ts = 1_000_000u64;
 
         // Block 1: mint
         let mint_tx = env.governance_mint_tx(GOVERNANCE_SAFE_ADDRESS, U256::from(amount));
@@ -1291,7 +1309,10 @@ proptest! {
 
     /// Claim reverts when totalSupply + amount would overflow U256.
     #[test]
-    fn prop_pipeline_claim_total_supply_overflow(amount in 1u128..1_000_000u128) {
+    fn prop_pipeline_claim_total_supply_overflow(
+        amount in 1u128..1_000_000u128,
+        mint_ts in 1_000u64..100_000_000u64,
+    ) {
         let large_balance = U256::from(10).pow(U256::from(18)) * U256::from(1_000_000_000u64);
         let precompile_balance = U256::from(10).pow(U256::from(18)) * U256::from(1000u64);
 
@@ -1307,7 +1328,6 @@ proptest! {
             large_balance,
         );
         let supply_before = env.get_total_supply();
-        let mint_ts = 1_000_000u64;
 
         // Block 1: mint
         let mint_tx = env.governance_mint_tx(GOVERNANCE_SAFE_ADDRESS, U256::from(amount));
@@ -1378,7 +1398,10 @@ proptest! {
 
     /// Permit reverts when s > SECP256K1N_HALF (signature malleability).
     #[test]
-    fn prop_pipeline_permit_signature_malleability(amount in 1u128..1_000_000u128) {
+    fn prop_pipeline_permit_signature_malleability(
+        amount in 1u128..1_000_000u128,
+        s_shift in 0u128..1_000_000_000u128,
+    ) {
         let mut env = PipelineTestEnv::new();
         let owner = permit_signer_address();
         let spender = env.recipient_factory.address();
@@ -1387,9 +1410,9 @@ proptest! {
         let deadline = U256::from(env.block_timestamp + 1000);
         let nonce = env.get_nonce(owner);
 
-        // Get a valid signature, then replace s with U256::MAX (definitely > SECP256K1N_HALF)
+        // Get a valid signature, then replace s with a value > SECP256K1N_HALF
         let (v, r, _) = sign_permit(owner, spender, value, nonce, deadline, chain_id);
-        let malleable_s = B256::from(U256::MAX);
+        let malleable_s = B256::from(U256::MAX - U256::from(s_shift));
 
         let tx = env.user_precompile_tx(
             permitCall { owner, spender, value, deadline, v, r, s: malleable_s }.abi_encode(),

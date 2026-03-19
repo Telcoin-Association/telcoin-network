@@ -170,9 +170,15 @@ impl PipelineTestEnv {
         // Build genesis with funded accounts + governance forwarder + precompile storage
         let genesis = test_genesis().extend_accounts(vec![
             // Fund all 3 factory EOAs
-            (governance_factory.address(), GenesisAccount::default().with_balance(governance_eoa_balance)),
+            (
+                governance_factory.address(),
+                GenesisAccount::default().with_balance(governance_eoa_balance),
+            ),
             (user_factory.address(), GenesisAccount::default().with_balance(user_balance)),
-            (recipient_factory.address(), GenesisAccount::default().with_balance(recipient_balance)),
+            (
+                recipient_factory.address(),
+                GenesisAccount::default().with_balance(recipient_balance),
+            ),
             // Fund the permit signer
             (permit_signer_addr, GenesisAccount::default().with_balance(large_balance)),
             // Deploy forwarder contract at GOVERNANCE_SAFE_ADDRESS
@@ -185,17 +191,15 @@ impl PipelineTestEnv {
             // Precompile account with balance and total supply storage
             (
                 TELCOIN_PRECOMPILE_ADDRESS,
-                GenesisAccount::default()
-                    .with_balance(precompile_balance)
-                    .with_storage(Some({
-                        let mut storage = std::collections::BTreeMap::new();
-                        // Slot 100 = totalSupply
-                        storage.insert(
-                            tn_types::B256::from(U256::from(100)),
-                            tn_types::B256::from(total_supply),
-                        );
-                        storage
-                    })),
+                GenesisAccount::default().with_balance(precompile_balance).with_storage(Some({
+                    let mut storage = std::collections::BTreeMap::new();
+                    // Slot 100 = totalSupply
+                    storage.insert(
+                        tn_types::B256::from(U256::from(100)),
+                        tn_types::B256::from(total_supply),
+                    );
+                    storage
+                })),
             ),
         ]);
 
