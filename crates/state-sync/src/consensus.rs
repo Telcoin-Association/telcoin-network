@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use tn_config::ConsensusConfig;
-use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus};
+use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
 use tn_storage::{consensus::ConsensusChain, tables::ConsensusHeaderCache};
 use tn_types::{Database as TNDatabase, Epoch, EpochRecord, TaskSpawner, B256};
 use tokio::sync::{mpsc::Receiver, Mutex, Semaphore, SemaphorePermit};
@@ -18,7 +18,7 @@ async fn get_consensus_header<DB: TNDatabase>(
     number: u64,
     hash: B256,
     config: &ConsensusConfig<DB>,
-    consensus_bus: &ConsensusBus,
+    consensus_bus: &ConsensusBusApp,
     network: &PrimaryNetworkHandle,
     _consensus_chain: &ConsensusChain,
 ) -> Option<(Epoch, u64, B256)> {
@@ -74,7 +74,7 @@ async fn get_consensus_header<DB: TNDatabase>(
 /// consensus_bus up to date. This should only be used when NOT participating in active consensus.
 pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
     config: ConsensusConfig<DB>,
-    consensus_bus: ConsensusBus,
+    consensus_bus: ConsensusBusApp,
     network: PrimaryNetworkHandle,
     task_spawner: TaskSpawner,
     consensus_chain: ConsensusChain,
@@ -158,7 +158,7 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
 /// This should only be used when NOT participating in active consensus.
 async fn spawn_fetch_consensus<DB: TNDatabase>(
     config: ConsensusConfig<DB>,
-    consensus_bus: ConsensusBus,
+    consensus_bus: ConsensusBusApp,
     network: PrimaryNetworkHandle,
     epoch_queue: Arc<Mutex<Receiver<EpochRecord>>>,
     worker: u32, // Worker number for logging.

@@ -193,7 +193,7 @@ async fn test_accept_pending_certs() -> eyre::Result<()> {
     );
 
     // try to accept
-    cb.committed_round_updates().send_replace(5); // Set this to 5 since we are not using the machinery to keep it up to date in this test.
+    cb.app().committed_round_updates().send_replace(5); // Set this to 5 since we are not using the machinery to keep it up to date in this test.
     let err = validator.process_peer_certificate(&mut cert).await;
     assert_matches!(err, Err(CertManagerError::Certificate(
         CertificateError::TooNew(d, wrong, correct))
@@ -253,7 +253,7 @@ async fn test_gc_pending_certs() -> eyre::Result<()> {
     // update consensus rounds
     // commit at round 8, so round 3 becomes the GC round
     let commit_round = 8;
-    cb.committed_round_updates().send_replace(commit_round);
+    cb.app().committed_round_updates().send_replace(commit_round);
 
     // wait for certs to storage
     timeout(Duration::from_secs(3), certificate_store.notify_read(last_digest)).await??;

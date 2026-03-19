@@ -76,7 +76,10 @@ where
     }
 
     fn gc_round(&self) -> Round {
-        gc_round(self.consensus_bus.committed_round(), self.config.config().parameters.gc_depth)
+        gc_round(
+            self.consensus_bus.app().committed_round(),
+            self.config.config().parameters.gc_depth,
+        )
     }
 
     /// Validate certificate.
@@ -150,7 +153,7 @@ where
         certificates: Vec<Certificate>,
     ) -> CertManagerResult<()> {
         let highest_received_round =
-            self.consensus_bus.committed_round_updates().borrow().max(highest_round);
+            self.consensus_bus.app().committed_round_updates().borrow().max(highest_round);
 
         // A well-signed certificate from round r provides important information about network
         // progress, even before its contents are fully validated. The certificate's signatures
@@ -174,7 +177,7 @@ where
         // return error if certificate round is too far ahead
         //
         // trigger certificate fetching
-        let highest_processed_round = self.consensus_bus.committed_round();
+        let highest_processed_round = self.consensus_bus.app().committed_round();
         for cert in &certificates {
             // Initiate asynchronous batch downloads for any payloads referenced in this certificate
             // that are not yet available locally. This step is critical for maintaining data

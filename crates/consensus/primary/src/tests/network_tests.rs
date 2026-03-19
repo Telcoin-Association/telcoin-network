@@ -84,11 +84,12 @@ async fn create_test_types(path: &Path) -> TestTypes {
     // set the latest execution result to genesis - test headers are proposed for round 1
     let mut recent = RecentBlocks::new(1);
     recent.push_latest(0, BlockNumHash::new(0, B256::default()), Some(parent.clone()));
-    cb.recent_blocks().send_replace(recent);
+    cb.app().recent_blocks().send_replace(recent);
 
     let consensus_chain =
         ConsensusChain::new_for_test(path.to_owned(), committee.committee()).await.unwrap();
-    let handler = RequestHandler::new(config.clone(), cb.clone(), synchronizer, consensus_chain);
+    let handler =
+        RequestHandler::new(config.clone(), cb.app().clone(), synchronizer, consensus_chain);
     TestTypes { committee, handler, parent, task_manager }
 }
 

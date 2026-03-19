@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Tests for ConsensusBus helper methods.
 
-use crate::{consensus_bus::QueChannel, ConsensusBus, NodeMode};
+use crate::{consensus_bus::QueChannel, ConsensusBus, ConsensusBusApp, NodeMode};
 use tn_types::{EpochRecord, TnReceiver, TnSender};
 
 #[tokio::test]
 async fn test_is_cvv() {
-    let bus = ConsensusBus::new();
+    let bus = ConsensusBusApp::new();
     // Default is CvvActive, which is a CVV
     assert!(bus.is_cvv());
 
@@ -26,7 +26,7 @@ async fn test_is_active_cvv_default() {
 
 #[tokio::test]
 async fn test_is_active_cvv_after_change() {
-    let bus = ConsensusBus::new();
+    let bus = ConsensusBusApp::new();
     bus.node_mode().send_replace(NodeMode::Observer);
     assert!(!bus.is_active_cvv());
 
@@ -39,7 +39,7 @@ async fn test_is_active_cvv_after_change() {
 
 #[tokio::test]
 async fn test_is_cvv_inactive() {
-    let bus = ConsensusBus::new();
+    let bus = ConsensusBusApp::new();
     // Default is CvvActive, not inactive
     assert!(!bus.is_cvv_inactive());
 
@@ -56,19 +56,19 @@ async fn test_is_cvv_inactive() {
 #[tokio::test]
 async fn test_committed_round_default() {
     let bus = ConsensusBus::new();
-    assert_eq!(bus.committed_round(), 0);
+    assert_eq!(bus.app().committed_round(), 0);
 }
 
 #[tokio::test]
 async fn test_committed_round_after_update() {
     let bus = ConsensusBus::new();
-    bus.committed_round_updates().send_replace(42);
-    assert_eq!(bus.committed_round(), 42);
+    bus.app().committed_round_updates().send_replace(42);
+    assert_eq!(bus.app().committed_round(), 42);
 }
 
 #[tokio::test]
 async fn test_latest_block_num_hash_default() {
-    let bus = ConsensusBus::new();
+    let bus = ConsensusBusApp::new();
     let num_hash = bus.latest_execution_block_num_hash();
     // Default is empty, so number should be 0
     assert_eq!(num_hash.number, 0);
@@ -77,26 +77,26 @@ async fn test_latest_block_num_hash_default() {
 #[tokio::test]
 async fn test_primary_round_default() {
     let bus = ConsensusBus::new();
-    assert_eq!(bus.primary_round(), 0);
+    assert_eq!(bus.app().primary_round(), 0);
 }
 
 #[tokio::test]
 async fn test_primary_round_after_update() {
     let bus = ConsensusBus::new();
-    bus.primary_round_updates().send_replace(100);
-    assert_eq!(bus.primary_round(), 100);
+    bus.app().primary_round_updates().send_replace(100);
+    assert_eq!(bus.app().primary_round(), 100);
 }
 
 #[tokio::test]
 async fn test_recent_blocks_capacity() {
-    let bus = ConsensusBus::new();
+    let bus = ConsensusBusApp::new();
     // Default gc_depth is used for capacity
     assert!(bus.recent_blocks_capacity() > 0);
 }
 
 #[tokio::test]
 async fn test_recent_blocks_capacity_custom() {
-    let bus = ConsensusBus::new_with_args(100);
+    let bus = ConsensusBusApp::new_with_recent_blocks(100);
     assert_eq!(bus.recent_blocks_capacity(), 100);
 }
 
@@ -174,16 +174,16 @@ async fn test_que_channel_resubscribe_after_drop() {
 async fn test_epoch_record_watch_default() {
     let bus = ConsensusBus::new();
     // Default is None
-    assert!(bus.epoch_record_watch().borrow().is_none());
+    assert!(bus.app().epoch_record_watch().borrow().is_none());
 }
 
 #[tokio::test]
 async fn test_epoch_record_watch_send_and_receive() {
     let bus = ConsensusBus::new();
-    let mut rx = bus.epoch_record_watch().subscribe();
+    let mut rx = bus.app().epoch_record_watch().subscribe();
 
     let epoch_rec = EpochRecord { epoch: 1, ..Default::default() };
-    bus.epoch_record_watch().send_replace(Some(epoch_rec.clone()));
+    bus.app().epoch_record_watch().send_replace(Some(epoch_rec.clone()));
 
     rx.changed().await.unwrap();
     let received = rx.borrow_and_update().clone();
@@ -194,17 +194,17 @@ async fn test_epoch_record_watch_send_and_receive() {
 #[tokio::test]
 async fn test_epoch_record_watch_updates() {
     let bus = ConsensusBus::new();
-    let mut rx = bus.epoch_record_watch().subscribe();
+    let mut rx = bus.app().epoch_record_watch().subscribe();
 
     // Send first epoch record
     let epoch_rec1 = EpochRecord { epoch: 1, ..Default::default() };
-    bus.epoch_record_watch().send_replace(Some(epoch_rec1));
+    bus.app().epoch_record_watch().send_replace(Some(epoch_rec1));
     rx.changed().await.unwrap();
     assert_eq!(rx.borrow_and_update().as_ref().unwrap().epoch, 1);
 
     // Send second epoch record
     let epoch_rec2 = EpochRecord { epoch: 2, ..Default::default() };
-    bus.epoch_record_watch().send_replace(Some(epoch_rec2));
+    bus.app().epoch_record_watch().send_replace(Some(epoch_rec2));
     rx.changed().await.unwrap();
     assert_eq!(rx.borrow_and_update().as_ref().unwrap().epoch, 2);
 }
