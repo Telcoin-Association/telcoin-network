@@ -697,8 +697,8 @@ impl ConsensusBus {
         &self,
         consensus_chain: &ConsensusChain,
     ) -> Option<ConsensusHeader> {
-        let _block = self.recent_blocks().borrow().latest_execution_block();
-        let header = _block.header();
+        let block = self.recent_blocks().borrow().latest_execution_block();
+        let header = block.header();
         let (epoch, _) = deconstruct_nonce(header.nonce.into());
         let parent_beacon_block_root = header.parent_beacon_block_root;
         if let Some(consensus_hash) = parent_beacon_block_root {
