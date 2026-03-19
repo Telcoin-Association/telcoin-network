@@ -70,9 +70,6 @@ pub(super) fn nonce_slot(owner: Address) -> U256 {
 }
 
 // --- Balance manipulation helpers ---
-//
-// alloy-evm 0.21.2 does not expose `transfer` or `balance_incr` on `EvmInternals`.
-// These helpers implement the equivalent operations using `load_account`.
 
 /// Transfer native balance from one address to another.
 ///
@@ -91,7 +88,7 @@ pub(super) fn transfer_balance(
     if from == to {
         let balance = internals
             .load_account(from)
-            .map_err(|e| PrecompileError::Other(format!("load_account failed: {e:?}")))?
+            .map_err(|e| PrecompileError::Other(format!("load_account failed: {e:?}").into()))?
             .data
             .info
             .balance;
@@ -101,30 +98,13 @@ pub(super) fn transfer_balance(
         return Ok(None);
     }
 
-    // Check and deduct from sender
+    match internals
+        .transfer(from, to, amount)
+        .map_err(|e| PrecompileError::Other(format!("transfer failed: {e:?}").into()))?
     {
-        let from_acc = internals
-            .load_account(from)
-            .map_err(|e| PrecompileError::Other(format!("load_account failed: {e:?}")))?
-            .data;
-        if from_acc.info.balance < amount {
-            return Ok(Some("insufficient balance".to_string()));
-        }
-        from_acc.info.balance -= amount;
-        from_acc.mark_touch();
+        Some(err) => Ok(Some(format!("{err:?}"))),
+        None => Ok(None),
     }
-
-    // Credit receiver
-    {
-        let to_acc = internals
-            .load_account(to)
-            .map_err(|e| PrecompileError::Other(format!("load_account failed: {e:?}")))?
-            .data;
-        to_acc.info.balance += amount;
-        to_acc.mark_touch();
-    }
-
-    Ok(None)
 }
 
 /// Increment the native balance of an address (used for minting).
@@ -133,17 +113,9 @@ pub(super) fn balance_incr(
     addr: Address,
     amount: U256,
 ) -> Result<(), PrecompileError> {
-    let acc = internals
-        .load_account(addr)
-        .map_err(|e| PrecompileError::Other(format!("load_account failed: {e:?}")))?
-        .data;
-    acc.info.balance = acc
-        .info
-        .balance
-        .checked_add(amount)
-        .ok_or(PrecompileError::Other("balance overflow".into()))?;
-    acc.mark_touch();
-    Ok(())
+    internals
+        .balance_incr(addr, amount)
+        .map_err(|e| PrecompileError::Other(format!("balance_incr failed: {e:?}").into()))
 }
 
 /// Decrement the native balance of an address (used for burning).
@@ -157,14 +129,17 @@ pub(super) fn balance_decr(
     if amount.is_zero() {
         return Ok(None);
     }
-    let acc = internals
+    let balance = internals
         .load_account(addr)
-        .map_err(|e| PrecompileError::Other(format!("load_account failed: {e:?}")))?
-        .data;
-    if acc.info.balance < amount {
+        .map_err(|e| PrecompileError::Other(format!("load_account failed: {e:?}").into()))?
+        .data
+        .info
+        .balance;
+    if balance < amount {
         return Ok(Some("insufficient balance".to_string()));
     }
-    acc.info.balance -= amount;
-    acc.mark_touch();
+    internals
+        .set_balance(addr, balance - amount)
+        .map_err(|e| PrecompileError::Other(format!("set_balance failed: {e:?}").into()))?;
     Ok(None)
 }

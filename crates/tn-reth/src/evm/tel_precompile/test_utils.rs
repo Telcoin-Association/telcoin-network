@@ -154,17 +154,35 @@ impl TestEnv {
 
         db.insert_account_info(
             GOVERNANCE_SAFE_ADDRESS,
-            AccountInfo { balance: governance_bal, nonce: 0, code_hash: KECCAK_EMPTY, code: None },
+            AccountInfo {
+                balance: governance_bal,
+                nonce: 0,
+                code_hash: KECCAK_EMPTY,
+                code: None,
+                ..Default::default()
+            },
         );
 
         db.insert_account_info(
             USER,
-            AccountInfo { balance: user_bal, nonce: 0, code_hash: KECCAK_EMPTY, code: None },
+            AccountInfo {
+                balance: user_bal,
+                nonce: 0,
+                code_hash: KECCAK_EMPTY,
+                code: None,
+                ..Default::default()
+            },
         );
 
         db.insert_account_info(
             TELCOIN_PRECOMPILE_ADDRESS,
-            AccountInfo { balance: precompile_bal, nonce: 0, code_hash: KECCAK_EMPTY, code: None },
+            AccountInfo {
+                balance: precompile_bal,
+                nonce: 0,
+                code_hash: KECCAK_EMPTY,
+                code: None,
+                ..Default::default()
+            },
         );
 
         db.insert_account_storage(
@@ -195,7 +213,13 @@ impl TestEnv {
     pub fn add_account(&mut self, addr: Address, balance: U256) {
         self.evm.ctx.journaled_state.database.insert_account_info(
             addr,
-            AccountInfo { balance, nonce: 0, code_hash: KECCAK_EMPTY, code: None },
+            AccountInfo {
+                balance,
+                nonce: 0,
+                code_hash: KECCAK_EMPTY,
+                code: None,
+                ..Default::default()
+            },
         );
     }
 

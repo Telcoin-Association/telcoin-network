@@ -75,7 +75,7 @@ pub(super) fn handle_nonces(
     let owner = Address::from_slice(&calldata[12..32]);
     let nonce = internals
         .sload(TELCOIN_PRECOMPILE_ADDRESS, nonce_slot(owner))
-        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}")))?
+        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}").into()))?
         .data;
     Ok(PrecompileOutput::new(GAS_COST, Bytes::from(nonce.abi_encode())))
 }
@@ -147,7 +147,7 @@ pub(super) fn handle_permit(
     let nonce_s = nonce_slot(owner);
     let nonce = internals
         .sload(TELCOIN_PRECOMPILE_ADDRESS, nonce_s)
-        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}")))?
+        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}").into()))?
         .data;
 
     // Compute EIP-712 signing digest
@@ -167,13 +167,13 @@ pub(super) fn handle_permit(
     // Increment nonce
     internals
         .sstore(TELCOIN_PRECOMPILE_ADDRESS, nonce_s, nonce + U256::from(1))
-        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}")))?;
+        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}").into()))?;
 
     // Set allowance
     let slot = allowance_slot(owner, spender);
     internals
         .sstore(TELCOIN_PRECOMPILE_ADDRESS, slot, value)
-        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}")))?;
+        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}").into()))?;
 
     // Emit Approval(owner, spender, value)
     let log = reth_revm::primitives::Log::new(

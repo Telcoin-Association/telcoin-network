@@ -90,7 +90,7 @@ pub(super) fn handle_mint_faucet(
     // Increment totalSupply
     let current_supply = internals
         .sload(TELCOIN_PRECOMPILE_ADDRESS, TOTAL_SUPPLY_SLOT)
-        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}")))?
+        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}").into()))?
         .data;
     internals
         .sstore(
@@ -100,7 +100,7 @@ pub(super) fn handle_mint_faucet(
                 .checked_add(amount)
                 .ok_or_else(|| PrecompileError::Other("mint: total supply overflow".into()))?,
         )
-        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}")))?;
+        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}").into()))?;
 
     // Emit Mint(address recipient, uint256 amount, uint256 unlockTimestamp=0)
     let topic0 = Mint::SIGNATURE_HASH;
@@ -150,7 +150,7 @@ pub(super) fn handle_grant_mint_role(
     let slot = mint_role_slot(addr);
     internals
         .sstore(TELCOIN_PRECOMPILE_ADDRESS, slot, U256::from(1))
-        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}")))?;
+        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}").into()))?;
     Ok(PrecompileOutput::new(GAS_COST, Bytes::new()))
 }
 
@@ -176,7 +176,7 @@ pub(super) fn handle_revoke_mint_role(
     let slot = mint_role_slot(addr);
     internals
         .sstore(TELCOIN_PRECOMPILE_ADDRESS, slot, U256::ZERO)
-        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}")))?;
+        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}").into()))?;
     Ok(PrecompileOutput::new(GAS_COST, Bytes::new()))
 }
 

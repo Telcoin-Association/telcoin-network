@@ -97,7 +97,7 @@ pub(super) fn has_mint_role(
         let slot = mint_role_slot(caller);
         let val = internals
             .sload(TELCOIN_PRECOMPILE_ADDRESS, slot)
-            .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}")))?
+            .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}").into()))?
             .data;
         Ok(!val.is_zero())
     }
@@ -157,13 +157,13 @@ pub(super) fn handle_mint(
     let amt_slot = amount_slot(recipient);
     internals
         .sstore(TELCOIN_PRECOMPILE_ADDRESS, amt_slot, amount)
-        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}")))?;
+        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}").into()))?;
 
     // Store unlock timestamp at keccak256(recipient, 1)
     let ts_slot = timestamp_slot(recipient);
     internals
         .sstore(TELCOIN_PRECOMPILE_ADDRESS, ts_slot, unlock_ts)
-        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}")))?;
+        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}").into()))?;
 
     // Emit Mint(address recipient, uint256 amount, uint256 unlockTimestamp)
     let topic0 = Mint::SIGNATURE_HASH;
@@ -217,7 +217,7 @@ pub(super) fn handle_claim(
     let amt_slot = amount_slot(recipient);
     let amount = internals
         .sload(TELCOIN_PRECOMPILE_ADDRESS, amt_slot)
-        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}")))?
+        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}").into()))?
         .data;
 
     if amount.is_zero() {
@@ -228,7 +228,7 @@ pub(super) fn handle_claim(
     let ts_slot = timestamp_slot(recipient);
     let unlock_ts = internals
         .sload(TELCOIN_PRECOMPILE_ADDRESS, ts_slot)
-        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}")))?
+        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}").into()))?
         .data;
 
     // Check timelock
@@ -243,15 +243,15 @@ pub(super) fn handle_claim(
     // Clear storage
     internals
         .sstore(TELCOIN_PRECOMPILE_ADDRESS, amt_slot, U256::ZERO)
-        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}")))?;
+        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}").into()))?;
     internals
         .sstore(TELCOIN_PRECOMPILE_ADDRESS, ts_slot, U256::ZERO)
-        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}")))?;
+        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}").into()))?;
 
     // Increment totalSupply
     let current_supply = internals
         .sload(TELCOIN_PRECOMPILE_ADDRESS, TOTAL_SUPPLY_SLOT)
-        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}")))?
+        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}").into()))?
         .data;
     internals
         .sstore(
@@ -261,7 +261,7 @@ pub(super) fn handle_claim(
                 .checked_add(amount)
                 .ok_or_else(|| PrecompileError::Other("claim: total supply overflow".into()))?,
         )
-        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}")))?;
+        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}").into()))?;
 
     // Emit Claim(address recipient, uint256 amount)
     let topic0 = Claim::SIGNATURE_HASH;
@@ -312,20 +312,20 @@ pub(super) fn handle_burn(
 
     // Decrement precompile balance (destroy tokens)
     if let Some(error) = balance_decr(internals, TELCOIN_PRECOMPILE_ADDRESS, amount)? {
-        return Err(PrecompileError::Other(format!("burn error: {error}")));
+        return Err(PrecompileError::Other(format!("burn error: {error}").into()));
     }
 
     // Decrement totalSupply
     let current_supply = internals
         .sload(TELCOIN_PRECOMPILE_ADDRESS, TOTAL_SUPPLY_SLOT)
-        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}")))?
+        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}").into()))?
         .data;
     let new_supply = current_supply
         .checked_sub(amount)
         .ok_or_else(|| PrecompileError::Other("burn: total supply underflow".into()))?;
     internals
         .sstore(TELCOIN_PRECOMPILE_ADDRESS, TOTAL_SUPPLY_SLOT, new_supply)
-        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}")))?;
+        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}").into()))?;
 
     // Emit Burn(uint256 amount)
     let topic0 = Burn::SIGNATURE_HASH;

@@ -91,7 +91,7 @@ pub(super) fn handle_total_supply(
     }
     let supply = internals
         .sload(TELCOIN_PRECOMPILE_ADDRESS, TOTAL_SUPPLY_SLOT)
-        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}")))?
+        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}").into()))?
         .data;
     Ok(PrecompileOutput::new(GAS_COST, Bytes::from(supply.abi_encode())))
 }
@@ -115,7 +115,7 @@ pub(super) fn handle_balance_of(
     let addr = Address::from_slice(&calldata[12..32]);
     let balance = internals
         .load_account(addr)
-        .map_err(|e| PrecompileError::Other(format!("load_account failed: {e:?}")))?
+        .map_err(|e| PrecompileError::Other(format!("load_account failed: {e:?}").into()))?
         .data
         .info
         .balance;
@@ -143,7 +143,7 @@ pub(super) fn handle_allowance(
     let slot = allowance_slot(owner, spender);
     let value = internals
         .sload(TELCOIN_PRECOMPILE_ADDRESS, slot)
-        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}")))?
+        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}").into()))?
         .data;
     Ok(PrecompileOutput::new(GAS_COST, Bytes::from(value.abi_encode())))
 }
@@ -179,7 +179,7 @@ pub(super) fn handle_transfer(
 
     // Transfer native balance
     if let Some(error) = transfer_balance(internals, caller, to, amount)? {
-        return Err(PrecompileError::Other(format!("transfer error: {error}")));
+        return Err(PrecompileError::Other(format!("transfer error: {error}").into()));
     }
 
     // Emit Transfer(from, to, value)
@@ -228,7 +228,7 @@ pub(super) fn handle_approve(
     let slot = allowance_slot(caller, spender);
     internals
         .sstore(TELCOIN_PRECOMPILE_ADDRESS, slot, amount)
-        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}")))?;
+        .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}").into()))?;
 
     // Emit Approval(owner, spender, value)
     let log = reth_revm::primitives::Log::new(
@@ -278,7 +278,7 @@ pub(super) fn handle_transfer_from(
     let slot = allowance_slot(from, caller);
     let current_allowance = internals
         .sload(TELCOIN_PRECOMPILE_ADDRESS, slot)
-        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}")))?
+        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}").into()))?
         .data;
 
     if current_allowance < amount {
@@ -290,12 +290,12 @@ pub(super) fn handle_transfer_from(
         let new_allowance = current_allowance - amount;
         internals
             .sstore(TELCOIN_PRECOMPILE_ADDRESS, slot, new_allowance)
-            .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}")))?;
+            .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}").into()))?;
     };
 
     // Transfer native balance
     if let Some(error) = transfer_balance(internals, from, to, amount)? {
-        return Err(PrecompileError::Other(format!("transferFrom transfer error: {error}")));
+        return Err(PrecompileError::Other(format!("transferFrom transfer error: {error}").into()));
     }
 
     // Emit Transfer(from, to, value)
