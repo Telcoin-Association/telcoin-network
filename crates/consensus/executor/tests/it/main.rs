@@ -37,8 +37,8 @@ async fn test_output_to_header() -> eyre::Result<()> {
             .unwrap();
 
     // subscribe to channels early
-    let rx_consensus_headers = consensus_bus.last_consensus_header().subscribe();
-    let mut consensus_output = consensus_bus.subscribe_consensus_output();
+    let rx_consensus_headers = consensus_bus.app().last_consensus_header().subscribe();
+    let mut consensus_output = consensus_bus.app().subscribe_consensus_output();
 
     let (tx, mut rx) = mpsc::channel(5);
     tokio::spawn(async move {
@@ -86,7 +86,7 @@ async fn test_output_to_header() -> eyre::Result<()> {
     );
 
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    consensus_bus.recent_blocks().send_modify(|blocks| {
+    consensus_bus.app().recent_blocks().send_modify(|blocks| {
         blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
     });
     let task_manager = TaskManager::default();
@@ -144,7 +144,7 @@ async fn test_executor_output_ordering() -> eyre::Result<()> {
     let mut consensus_chain =
         ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
 
-    let mut consensus_output = consensus_bus.subscribe_consensus_output();
+    let mut consensus_output = consensus_bus.app().subscribe_consensus_output();
 
     let (tx, mut rx) = mpsc::channel(5);
     tokio::spawn(async move {
@@ -188,7 +188,7 @@ async fn test_executor_output_ordering() -> eyre::Result<()> {
     );
 
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    consensus_bus.recent_blocks().send_modify(|blocks| {
+    consensus_bus.app().recent_blocks().send_modify(|blocks| {
         blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
     });
     let task_manager2 = TaskManager::default();
@@ -243,7 +243,7 @@ async fn test_executor_batch_fetching() -> eyre::Result<()> {
     let mut consensus_chain =
         ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
 
-    let mut consensus_output = consensus_bus.subscribe_consensus_output();
+    let mut consensus_output = consensus_bus.app().subscribe_consensus_output();
 
     let (tx, mut rx) = mpsc::channel(5);
     tokio::spawn(async move {
@@ -287,7 +287,7 @@ async fn test_executor_batch_fetching() -> eyre::Result<()> {
     );
 
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    consensus_bus.recent_blocks().send_modify(|blocks| {
+    consensus_bus.app().recent_blocks().send_modify(|blocks| {
         blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
     });
     let task_manager2 = TaskManager::default();

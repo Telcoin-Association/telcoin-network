@@ -211,7 +211,7 @@ impl<DB: Database> Proposer<DB> {
             current_epoch,
             digests.iter().map(|m| (m.digest, m.worker_id)).collect(),
             parents.iter().map(|x| x.digest()).collect(),
-            consensus_bus.latest_execution_block_num_hash(),
+            consensus_bus.app().latest_execution_block_num_hash(),
         );
 
         // Metric: header_proposed - tracks header proposals
@@ -408,7 +408,7 @@ impl<DB: Database> Proposer<DB> {
                 // late (or just joined the network).
                 self.round = round;
                 // broadcast new round
-                self.consensus_bus.primary_round_updates().send_replace(self.round);
+                self.consensus_bus.app().primary_round_updates().send_replace(self.round);
                 self.last_parents = parents;
                 // Reset advance flag.
                 self.advance_round = false;
@@ -551,11 +551,11 @@ impl<DB: Database> Proposer<DB> {
     fn propose_next_header(&mut self) -> ProposerResult<PendingHeaderTask> {
         // Advance to the next round.
         self.round += 1;
-        let updated_round = self.consensus_bus.primary_round() + 1;
+        let updated_round = self.consensus_bus.app().primary_round() + 1;
         if updated_round > self.round {
             self.round = updated_round;
         }
-        self.consensus_bus.primary_round_updates().send_replace(self.round);
+        self.consensus_bus.app().primary_round_updates().send_replace(self.round);
 
         debug!(target: "primary::proposer", authority=?self.authority_id, round=self.round, "advanced round - proposing next block...");
 
@@ -643,7 +643,7 @@ impl<DB: Database> Proposer<DB> {
     }
 
     pub(crate) fn spawn(mut self, task_manager: &TaskManager) {
-        if self.consensus_bus.node_mode().borrow().is_active_cvv() {
+        if self.consensus_bus.is_active_cvv() {
             // Subscribe before spawning so channels are active before any messages are sent.
             let rx_our_digests = self.consensus_bus.subscribe_our_digests();
             let rx_parents = self.consensus_bus.subscribe_parents();

@@ -8,7 +8,7 @@ use crate::{
     error::{CertManagerError, PrimaryNetworkError, PrimaryNetworkResult},
     network::message::PrimaryGossip,
     state_sync::{CertificateCollector, StateSynchronizer},
-    ConsensusBus, NodeMode,
+    ConsensusBusApp, NodeMode,
 };
 use parking_lot::Mutex;
 use std::{
@@ -40,7 +40,7 @@ pub(crate) struct RequestHandler<DB> {
     /// Consensus config with access to database.
     consensus_config: ConsensusConfig<DB>,
     /// Inner-processs channel bus.
-    consensus_bus: ConsensusBus,
+    consensus_bus: ConsensusBusApp,
     /// Synchronize state between peers.
     state_sync: StateSynchronizer<DB>,
     /// The digests of parents that are currently being requested from peers.
@@ -66,7 +66,7 @@ where
     /// Create a new instance of Self.
     pub(crate) fn new(
         consensus_config: ConsensusConfig<DB>,
-        consensus_bus: ConsensusBus,
+        consensus_bus: ConsensusBusApp,
         state_sync: StateSynchronizer<DB>,
         consensus_chain: ConsensusChain,
     ) -> Self {

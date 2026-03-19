@@ -49,7 +49,7 @@ async fn test_sync_batches_drops_old_rounds() -> eyre::Result<()> {
 
     // update round
     let committed_round = 30;
-    cb.committed_round_updates().send_replace(committed_round);
+    cb.app().committed_round_updates().send_replace(committed_round);
 
     let expected_digest = test_header.digest();
     let expected_round = test_header.round();

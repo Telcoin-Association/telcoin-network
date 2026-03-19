@@ -1,12 +1,12 @@
-//! The epoch manager type.
+//! The impl for node manager type's epoch functions.
 //!
 //! This oversees the tasks that run for each epoch. Some consensus-related
 //! tasks run for one epoch. Other resources are shared across epochs.
+//! This file defines the struct and the epoch scoped code.
 
 use crate::{
-    engine::{ExecutionNode, TnBuilder},
-    epoch_votes::spawn_epoch_vote_collector,
-    health::HealthcheckServer,
+    engine::ExecutionNode,
+    manager::EpochManager,
     primary::PrimaryNode,
     worker::{worker_task_manager_name, WorkerNode},
     EngineToPrimaryRpc,
@@ -17,17 +17,11 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tn_config::{
-    Config, ConfigFmt, ConfigTrait as _, ConsensusConfig, KeyConfig, NetworkConfig, TelcoinDirs,
-};
-use tn_network_libp2p::{
-    error::NetworkError,
-    types::{NetworkEvent, NetworkHandle},
-    ConsensusNetwork, TNMessage,
-};
+use tn_config::{Config, ConfigFmt, ConfigTrait as _, ConsensusConfig, NetworkConfig, TelcoinDirs};
+use tn_network_libp2p::{error::NetworkError, types::NetworkHandle, TNMessage};
 use tn_primary::{
     network::{PrimaryNetwork, PrimaryNetworkHandle},
-    ConsensusBus, NodeMode, QueChannel, StateSynchronizer,
+    ConsensusBus, NodeMode, StateSynchronizer,
 };
 use tn_reth::{
     bytes_to_txn,
@@ -35,43 +29,27 @@ use tn_reth::{
         ConsensusRegistry::{self, EpochInfo},
         EpochState,
     },
-    RethDb, RethEnv,
 };
-use tn_storage::{
-    consensus::ConsensusChain,
-    open_db,
-    tables::{
-        CertificateDigestByOrigin, CertificateDigestByRound, Certificates, LastProposed,
-        NodeBatchesCache, Payload, Votes,
-    },
-    DatabaseType,
+use tn_storage::tables::{
+    CertificateDigestByOrigin, CertificateDigestByRound, Certificates, LastProposed,
+    NodeBatchesCache, Payload, Votes,
 };
 use tn_types::{
-    deconstruct_nonce, gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash,
-    BlockNumHash, BlsPublicKey, CertifiedBatch, CommittedSubDag, Committee, CommitteeBuilder,
-    ConsensusHeader, ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, EpochRecord,
-    Multiaddr, NetworkPublicKey, Notifier, TaskJoinError, TaskManager, TaskSpawner, TimestampSec,
-    TnReceiver, B256, MIN_PROTOCOL_BASE_FEE,
+    gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash, BlockNumHash, BlsPublicKey,
+    CertifiedBatch, CommittedSubDag, Committee, CommitteeBuilder, ConsensusOutput,
+    Database as TNDatabase, Epoch, EpochRecord, Multiaddr, NetworkPublicKey, Notifier,
+    TaskJoinError, TaskManager, TaskSpawner, TnReceiver, B256,
 };
-use tn_worker::{
-    quorum_waiter::QuorumWaiterTrait, Worker, WorkerNetwork, WorkerNetworkHandle, WorkerRequest,
-    WorkerResponse,
-};
-use tokio::sync::mpsc::{self};
+use tn_worker::{quorum_waiter::QuorumWaiterTrait, Worker, WorkerNetwork, WorkerNetworkHandle};
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, info_span, warn, Instrument};
-
-/// The long-running task manager name.
-const NODE_TASK_MANAGER: &str = "Node Task Manager";
 
 /// The epoch-specific task manager name.
 const EPOCH_TASK_MANAGER: &str = "Epoch Task Manager";
 
-/// The worker's base task manager name. This is used by `fn worker_task_manager_name(id)`.
-pub(super) const WORKER_TASK_BASE: &str = "Worker Task";
-
 /// Modes for an epoch.
 #[derive(Debug, Copy, Clone)]
-enum RunEpochMode {
+pub(crate) enum RunEpochMode {
     /// This is the initial epoch when the system starts, will need to get established.
     Initial,
     /// We re-ran an epoch as a result of a node change (CVV is to far behind or CVV has caught up
@@ -94,386 +72,226 @@ impl RunEpochMode {
     }
 }
 
-/// The long-running type that oversees epoch transitions.
-#[derive(Debug)]
-pub(crate) struct EpochManager<P, DB> {
-    /// The builder for node configuration
-    builder: TnBuilder,
-    /// The data directory
-    tn_datadir: P,
-    /// Primary network handle.
-    primary_network_handle: Option<PrimaryNetworkHandle>,
-    /// Worker network handle.
-    worker_network_handle: Option<WorkerNetworkHandle>,
-    /// Key config - loaded once for application lifetime.
-    key_config: KeyConfig,
-    /// The epoch manager's [Notifier] to shutdown all node processes.
-    node_shutdown: Notifier,
-    /// The timestamp to close the current epoch.
-    ///
-    /// The manager monitors leader timestamps for the epoch boundary.
-    /// If the timestamp of the leader is >= the epoch_boundary then the
-    /// manager closes the epoch after the engine executes all data.
-    epoch_boundary: TimestampSec,
-    /// Reth DB, keep for entire execution.
-    reth_db: RethDb,
-    /// Consensus DB, keep for entire execution.
-    consensus_db: DB,
-    /// ConsensusBus for the application life.
-    consensus_bus: ConsensusBus,
-    /// Persistent event stream for worker network events.
-    worker_event_stream: QueChannel<NetworkEvent<WorkerRequest, WorkerResponse>>,
-
-    /// The last consenses header for a closing epoch.
-    last_consensus_header: Option<ConsensusHeader>,
-
-    /// Access to the epoch pack files storing consensus data.
-    consensus_chain: ConsensusChain,
-}
-
-/// Restore the [`GasAccumulator`] state after a mid-epoch restart.
-///
-/// This is the first of three recovery stages (see the module docs on
-/// [`tn_types::gas_accumulator`] for the full picture). It runs once at startup, before
-/// execution resumes, and performs the following:
-///
-/// 1. **Base fee** — sets worker 0's base fee from the finalized reth header. In a multi-worker
-///    configuration this will need per-worker restoration.
-/// 2. **Gas stats** — iterates every reth block from the epoch's start height through the finalized
-///    tip, extracting the worker id from each block's `difficulty` field and calling
-///    [`GasAccumulator::inc_block`] to rebuild per-worker gas totals.
-/// 3. **Leader counts** — walks the consensus DB in reverse, counting each leader's committed
-///    blocks for rounds that have already been executed (i.e. `leader_round <=
-///    last_executed_round`). Rounds beyond the last executed round are intentionally skipped
-///    because [`EpochManager::replay_missed_consensus`] will re-execute them, which increments
-///    leader counts through the normal payload-builder path.
-///
-/// If there is no finalized header (fresh genesis), this is a no-op.
-pub async fn catchup_accumulator(
-    reth_env: RethEnv,
-    gas_accumulator: &GasAccumulator,
-    consensus_chain: &mut ConsensusChain,
-) -> eyre::Result<()> {
-    if let Some(block) = reth_env.finalized_header()? {
-        let epoch_state = reth_env.epoch_state_from_canonical_tip()?;
-
-        // Note WORKER: In a single worker world this should be suffecient to set the base fee.
-        // In a multi-worker world (future) this will NOT work and needs updating.
-        gas_accumulator
-            .base_fee(0)
-            .set_base_fee(block.base_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE));
-
-        let nonce: u64 = block.nonce.into();
-        let (last_executed_epoch, last_executed_round) = deconstruct_nonce(nonce);
-
-        let blocks =
-            reth_env.blocks_for_range(epoch_state.epoch_info.blockHeight..=block.number)?;
-
-        // loop through blocks to accumulate gas stats
-        for current in blocks {
-            let gas = current.gas_used;
-            let limit = current.gas_limit;
-
-            // difficulty contains the worker id and batch index:
-            // `U256::from(payload.batch_index << 16 | payload.worker_id as usize)`
-            let lower64 = current.difficulty.into_limbs()[0];
-            let worker_id = (lower64 & 0xffff) as u16;
-            gas_accumulator.inc_block(worker_id, gas, limit);
-        }
-
-        // count leaders from consensus db for the current epoch
-        // NOTE: replay_missed_consensus catches up rounds above last_executed_round.
-        if last_executed_round > 0 && last_executed_epoch == epoch_state.epoch {
-            consensus_chain
-                .count_leaders(last_executed_round, gas_accumulator.rewards_counter().clone())
-                .await?;
-        }
-    };
-
-    Ok(())
-}
-
-/// Create a consensus DB that lives for program lifetime.
-pub(crate) fn open_consensus_db<P: TelcoinDirs + 'static>(tn_datadir: &P) -> DatabaseType {
-    let consensus_db_path = tn_datadir.consensus_db_path();
-
-    // ensure dir exists
-    let _ = std::fs::create_dir_all(&consensus_db_path);
-    let db = open_db(&consensus_db_path);
-
-    info!(target: "epoch-manager", ?consensus_db_path, "opened consensus storage");
-
-    db
-}
-
 impl<P, DB> EpochManager<P, DB>
 where
     P: TelcoinDirs + Clone + 'static,
     DB: TNDatabase,
 {
-    /// Create a new instance of [Self].
-    pub(crate) async fn new(
-        builder: TnBuilder,
-        tn_datadir: P,
-        consensus_db: DB,
-        key_config: KeyConfig,
-    ) -> Self {
-        // Note this can only fail if the consensus DB is very broken (bad path for instance).
-        // So we will panic for now, this will kill the node on startup for a critical error.
-        let epochs_db_path = tn_datadir.epochs_db_path();
-        let _ = std::fs::create_dir_all(&epochs_db_path);
-        let consensus_chain = ConsensusChain::new(epochs_db_path).expect("open consensus DB");
-        // shutdown long-running node components
-        let node_shutdown = Notifier::new();
-
-        let reth_db = builder.reth_db.clone();
-
-        let consensus_bus = ConsensusBus::new_with_args(builder.tn_config.parameters.gc_depth);
-        if builder.tn_config.observer {
-            // Don't risk keeping the default CVV active mode...
-            consensus_bus.node_mode().send_replace(NodeMode::Observer);
-        }
-        let worker_event_stream = QueChannel::new();
-
-        Self {
-            builder,
-            tn_datadir,
-            primary_network_handle: None,
-            worker_network_handle: None,
-            key_config,
-            node_shutdown,
-            epoch_boundary: Default::default(),
-            reth_db,
-            consensus_db,
-            consensus_bus,
-            worker_event_stream,
-            last_consensus_header: None,
-            consensus_chain,
-        }
-    }
-
-    /// Run the node, handling epoch transitions.
-    pub(crate) async fn run(&mut self) -> eyre::Result<()> {
-        // Surface any errors that may have been triggered on create.
-        self.consensus_chain.persist_current().await?;
-        // Main task manager that manages tasks across epochs.
-        // Long-running tasks for the lifetime of the node.
-        let mut node_task_manager = TaskManager::new(NODE_TASK_MANAGER);
-        let node_task_spawner = node_task_manager.get_spawner();
-
-        info!(target: "epoch-manager", "starting node and launching first epoch");
-
-        // create channels for engine that survive the lifetime of the node
-        let (to_engine, for_engine) = mpsc::channel(1000);
-
-        // Create our epoch gas accumulator, we currently have one worker.
-        // All nodes have to agree on the worker count, do not change this for an existing chain.
-        let gas_accumulator = GasAccumulator::new(1);
-        // create channel for engine updates to consensus
-        let (engine_update_tx, engine_update_rx) = mpsc::channel(64);
-
-        // create the engine
-        let engine = self.create_engine(&node_task_manager, &gas_accumulator)?;
-        engine
-            .start_engine(
-                for_engine,
-                self.node_shutdown.subscribe(),
-                gas_accumulator.clone(),
-                engine_update_tx,
-            )
-            .await?;
-
-        // retrieve epoch information from canonical tip on startup
-        let EpochState { epoch, .. } = engine.epoch_state_from_canonical_tip().await?;
-        debug!(target: "epoch-manager", ?epoch, "retrieved epoch state from canonical tip");
-        catchup_accumulator(
-            engine.get_reth_env().await,
-            &gas_accumulator,
-            &mut self.consensus_chain,
-        )
-        .await?;
-
-        // read the network config or use the default
-        let network_config = NetworkConfig::read_config(&self.tn_datadir)?;
-        self.spawn_node_networks(node_task_spawner, &network_config).await?;
-        let primary_network_handle =
-            self.primary_network_handle.as_ref().expect("primary network").clone();
-        primary_network_handle
-            .inner_handle()
-            .subscribe(tn_config::LibP2pConfig::epoch_vote_topic())
-            .await?;
-        primary_network_handle
-            .inner_handle()
-            .subscribe(tn_config::LibP2pConfig::consensus_output_topic())
-            .await?;
-        state_sync::spawn_epoch_record_collector(
-            self.consensus_chain.clone(),
-            primary_network_handle.clone(),
-            self.consensus_bus.clone(),
-            node_task_manager.get_spawner(),
-            self.node_shutdown.subscribe(),
-        )
-        .await?;
-
-        spawn_epoch_vote_collector(
-            self.consensus_chain.clone(),
-            self.consensus_bus.clone(),
-            self.key_config.clone(),
-            primary_network_handle,
-            node_task_manager.get_spawner(),
-            self.node_shutdown.subscribe(),
-        );
-
-        self.try_restore_state(&engine).await?;
-        // spawn task to update the latest execution results for consensus
-        self.spawn_engine_update_task(engine_update_rx, &node_task_manager);
-
-        node_task_manager.update_tasks();
-
-        info!(target: "epoch-manager", tasks=?node_task_manager, "NODE TASKS\n");
-
-        // spawn node healthcheck service if enabled
-        if let Some(port) = self.builder.healthcheck {
-            let _ = HealthcheckServer::spawn(node_task_manager.get_spawner(), port).await;
-        }
-
-        // await all tasks on epoch-task-manager or node shutdown
-        let result = tokio::select! {
-            // run long-living node tasks
-            res = node_task_manager.until_exit(self.node_shutdown.clone()) => {
-                match res {
-                    Ok(()) => Ok(()),
-                    Err(e) => Err(eyre!("Node task shutdown: {e}")),
-                }
-            }
-
-            // loop through short-term epochs
-            epoch_result = self.run_epochs(&engine, network_config, to_engine, gas_accumulator) => epoch_result,
-        };
-        self.consensus_chain.persist_current().await?;
-        node_task_manager.wait_for_task_shutdown().await;
-
-        result
-    }
-
-    /// Startup for the node. This creates all components on startup before starting the first
-    /// epoch.
-    ///
-    /// This will create the long-running primary/worker [ConsensusNetwork]s for p2p swarm.
-    async fn spawn_node_networks(
-        &mut self,
-        node_task_spawner: TaskSpawner,
-        network_config: &NetworkConfig,
-    ) -> eyre::Result<()> {
-        //
-        //=== PRIMARY
-        //
-
-        // create long-running network task for primary
-        let primary_network = ConsensusNetwork::new_for_primary(
-            network_config,
-            self.consensus_bus.primary_network_events_cloned(),
-            self.key_config.clone(),
-            self.consensus_db.clone(),
-            node_task_spawner.clone(),
-            self.builder.tn_config.node_info.primary_network_address().clone(),
-        )?;
-        let primary_network_handle = primary_network.network_handle();
-        let node_shutdown = self.node_shutdown.subscribe();
-
-        // spawn long-running primary network task
-        node_task_spawner.spawn_critical_task("Primary Network", async move {
-            tokio::select!(
-                _ = &node_shutdown => {
-                    Ok(())
-                },
-                res = primary_network.run() => {
-                    warn!(target: "epoch-manager", ?res, "primary network stopped");
-                    res
-                },
-            )
-        });
-
-        // primary network handle
-        self.primary_network_handle = Some(PrimaryNetworkHandle::new(primary_network_handle));
-
-        // create long-running network task for worker
-        let worker_network = ConsensusNetwork::new_for_worker(
-            network_config,
-            self.worker_event_stream.clone(),
-            self.key_config.clone(),
-            self.consensus_db.clone(),
-            node_task_spawner.clone(),
-            self.builder.tn_config.node_info.worker_network_address().clone(),
-        )?;
-        let worker_network_handle = worker_network.network_handle();
-        let node_shutdown = self.node_shutdown.subscribe();
-
-        // spawn long-running primary network task
-        node_task_spawner.spawn_critical_task("Worker Network", async move {
-            tokio::select!(
-                _ = &node_shutdown => {
-                    Ok(())
-                }
-                res = worker_network.run() => {
-                    warn!(target: "epoch-manager", ?res, "worker network stopped");
-                    res
-                }
-            )
-        });
-
-        // set temporary task spawner - this is updated with each epoch
-        self.worker_network_handle = Some(WorkerNetworkHandle::new(
-            worker_network_handle,
-            node_task_spawner.clone(),
-            network_config.libp2p_config().max_rpc_message_size,
-        ));
-
-        Ok(())
-    }
-
-    /// Execute a loop to start new epochs until shutdown.
-    async fn run_epochs(
+    /// Run a single epoch.
+    pub(crate) async fn run_epoch(
         &mut self,
         engine: &ExecutionNode,
-        network_config: NetworkConfig,
-        to_engine: mpsc::Sender<ConsensusOutput>,
+        network_config: &NetworkConfig,
+        to_engine: &mpsc::Sender<ConsensusOutput>,
+        epoch_mode: RunEpochMode,
         gas_accumulator: GasAccumulator,
-    ) -> eyre::Result<()> {
-        // initialize long-running components for node startup
-        let mut run_epoch_mode = RunEpochMode::Initial;
+    ) -> eyre::Result<RunEpochMode> {
+        info!(target: "epoch-manager", "Starting epoch");
 
-        let node_ended_sub = self.node_shutdown.subscribe();
+        // Create a new bus wrapping the application channels and adding the epoch specific
+        // channels.
+        let consensus_bus = ConsensusBus::new_with_app(self.consensus_bus.clone());
+        self.last_consensus_header = None;
+        // We have not created this epoch's primary yet (no committee) so get it from chain
+        // ourselves... Note, any consensus output to replay should be in the same epoch...
+        let (committee, epoch_info, epoch_start) =
+            self.get_committee_with_epoch_start_info(engine).await?;
+        self.epoch_boundary = epoch_start + epoch_info.epochDuration as u64;
 
-        // loop through epochs
-        loop {
-            let epoch_result = self
-                .run_epoch(
-                    engine,
-                    &network_config,
-                    &to_engine,
-                    run_epoch_mode,
-                    gas_accumulator.clone(),
-                )
-                .await;
+        // The task manager that resets every epoch and manages
+        // short-running tasks for the lifetime of the epoch.
+        let mut epoch_task_manager = TaskManager::new(EPOCH_TASK_MANAGER);
+        // Do not wait long for tasks to exit, just drop them and move on to next epoch.
+        epoch_task_manager.set_join_wait(200);
 
-            // ensure no errors
-            run_epoch_mode = epoch_result.inspect_err(|e| {
-                error!(target: "epoch-manager", ?e, "epoch returned error");
-            })?;
-
-            self.consensus_bus.reset_for_epoch();
-
-            // Need a yield point so the task can be ended by the wrapping select when the node is
-            // exiting.
-            tokio::task::yield_now().await;
-
-            // Make sure we don't start a new epoch when we are shutting down.
-            if node_ended_sub.noticed() {
-                break Ok(());
+        self.open_epoch_pack(committee.clone(), epoch_task_manager.get_spawner()).await?;
+        if epoch_mode.replay_consensus() {
+            // If we are starting up then make sure that any consensus we previously validated goes
+            // to the engine and is executed.  Otherwise we could miss consensus execution.
+            gas_accumulator.rewards_counter().set_committee(committee.clone());
+            if let Some(target_hash) = self.replay_missed_consensus(committee, to_engine).await? {
+                // If things go down at exactly the wrong time we might have to replay the epoch end
+                // so account for that.
+                self.close_epoch(None, &gas_accumulator, target_hash).await?;
+                return Ok(RunEpochMode::NewEpoch);
             }
-            info!(target: "epoch-manager", "looping run epoch");
         }
+        // If we are restarting the epoch not on a boundary
+        // and we sent some consensus output to the engine
+        // then we need to pause for the engine to execute.
+        // If we don't we can have races when the epoch restarts
+        // that will send consensus to the engine more than once.
+        if let Ok(Some(last_consensus_header)) =
+            self.consensus_chain.consensus_header_latest().await
+        {
+            let last_consensus_digest = last_consensus_header.digest();
+            info!(target: "epoch-manager", "Waiting for execution of consensus {last_consensus_digest}");
+            self.consensus_bus.wait_for_consensus_execution(last_consensus_digest).await?;
+            info!(target: "epoch-manager", "Confirmed execution of consensus {last_consensus_digest}");
+        }
+
+        let node_ended = self.node_shutdown.subscribe();
+
+        // subscribe to output early to prevent missed messages
+        let mut consensus_output = self.consensus_bus.subscribe_consensus_output();
+
+        // create primary and worker nodes
+        let (primary, worker_node) = self
+            .create_consensus(
+                engine,
+                &epoch_task_manager,
+                network_config,
+                epoch_mode.initial_epoch(),
+                gas_accumulator.clone(),
+                consensus_bus.clone(),
+            )
+            .await?;
+        // consensus config for shutdown subscribers
+        let consensus_shutdown = primary.shutdown_signal().await;
+        let epoch_shutdown_rx = consensus_shutdown.subscribe();
+
+        // This needs to be created early so required machinery for other tasks exists when needed.
+        let mut worker = worker_node.new_worker().await?;
+        let current_epoch = primary.current_committee().await.epoch();
+
+        // Produce a "dummy" epoch 0 EpochRecord if missing.
+        // This will let us use simple code to find any epoch including 0 at startup.
+        if !self.consensus_chain.epochs().contains_epoch(0).await {
+            if current_epoch != 0 {
+                return Err(eyre::eyre!(
+                    "We have epoch 0 in our database if we are past epoch 0, on {current_epoch}"
+                ));
+            }
+            // No keys for epoch 0, fix that.
+            // We are on epoch 0 so load up that committee in Db as well.
+            let committee: Vec<BlsPublicKey> =
+                primary.current_committee().await.bls_keys().iter().copied().collect();
+            let next_committee = committee.clone();
+            let epoch_rec =
+                EpochRecord { epoch: 0, committee, next_committee, ..Default::default() };
+            // Save the "dummy" record, should be overwritten once epoch 0 closes.
+            // This will NOT be signed.
+            self.consensus_chain.epochs().save_dummy_epoch0(epoch_rec).await?;
+        }
+
+        gas_accumulator.rewards_counter().set_committee(primary.current_committee().await);
+        // start primary
+        primary.start(&epoch_task_manager, self.consensus_chain.clone()).await?;
+
+        let worker_task_manager_name = worker_task_manager_name(worker_node.id().await);
+        // start batch builder
+        worker.spawn_batch_builder(&worker_task_manager_name, &epoch_task_manager);
+
+        let batch_builder_task_spawner = epoch_task_manager.get_spawner();
+        engine
+            .start_batch_builder(
+                worker.id(),
+                worker.batches_tx(),
+                &batch_builder_task_spawner,
+                gas_accumulator.base_fee(worker.id()),
+                current_epoch,
+            )
+            .await?;
+
+        self.orphan_batches(&epoch_task_manager, engine.clone(), worker.clone(), current_epoch)
+            .await?;
+
+        // update tasks
+        epoch_task_manager.update_tasks();
+
+        info!(target: "epoch-manager", tasks=?epoch_task_manager, "EPOCH TASKS\n");
+
+        // await the epoch boundary or the epoch task manager exiting
+        // this can also happen due to committee nodes re-syncing and errors
+        let consensus_shutdown_clone = consensus_shutdown.clone();
+
+        // indicate if the node is restarting to join the committe or if the epoch is changed and
+        // tables should be cleared
+        let mut clear_tables_for_next_epoch = false;
+
+        let mut epoch_boundary_reached = false;
+        tokio::select! {
+            _ = node_ended => {
+                info!(target: "epoch-manager", "node exiting, epoch ending");
+            },
+            // wait for epoch boundary to transition
+            res = self.wait_for_epoch_boundary(to_engine, &mut consensus_output) => {
+                // toggle bool to clear tables
+                clear_tables_for_next_epoch = true;
+                let target_hash = res.inspect_err(|e| {
+                    error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
+                })?;
+                self.close_epoch(Some(consensus_shutdown.clone()), &gas_accumulator, target_hash)
+                    .await?;
+
+                // Write the epoch record to DB and save in manager for next epoch.
+                self.write_epoch_record(&primary, engine).await?;
+
+                info!(target: "epoch-manager", "epoch boundary success - clearing consensus db tables for next epoch");
+                epoch_boundary_reached = true;
+            },
+
+            // return any errors
+            res = epoch_task_manager.until_task_ends(consensus_shutdown_clone) => {
+                match res {
+                    Ok(()) => info!(target: "epoch-manager", "epoch task manager exited - likely syncing with committee"),
+                    // There are times when the epoch task manager can exit with Ok...
+                    Err(TaskJoinError::CriticalExitOk(task)) => {
+                        // It is possible for the epoch to get a shutdown signal before the join.
+                        // In that case it will not reconize the Ok task exit so we double check it here
+                        // with a noticer that was aquired much earlier on epoch startup.
+                        if epoch_shutdown_rx.noticed() {
+                            info!(target: "epoch-manager", "epoch task manager exited - likely syncing with committee");
+                        } else {
+                            error!(target: "epoch-manager", ?task, "failed to reach epoch boundary");
+                            return Err(TaskJoinError::CriticalExitOk(task).into());
+                        }
+                    }
+                    Err(e) => {
+                        error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
+                        return Err(e.into());
+                    }
+                }
+            },
+        }
+
+        let mut res = RunEpochMode::NewEpoch;
+        // If the select exitted because of a join() then do not join() again- we are already
+        // shutting down.
+        consensus_shutdown.notify();
+        // abort all epoch-related tasks
+        epoch_task_manager.abort_all_tasks();
+        // Expect complaints from join so swallow those errors...
+        // If we timeout here something is not playing nice and shutting down so return the
+        // timeout.
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            epoch_task_manager.wait_for_task_shutdown(),
+        )
+        .await?;
+        if epoch_boundary_reached {
+            // The epoch is over now and consensus should be shutdown.
+            // Do a sanity clear of the consensus_output channel.
+            // Note we probably do not need this anymore but not harmful.
+            while let Ok(_output) = consensus_output.try_recv() {}
+        } else if let Some(target_hash) =
+            self.send_leftover_consensus_output_to_engine(&mut consensus_output, to_engine).await
+        {
+            // If things go down at exactly the wrong time we might have reached the epoch end
+            // so account for that.
+            self.close_epoch(None, &gas_accumulator, target_hash).await?;
+            res = RunEpochMode::NewEpoch;
+            clear_tables_for_next_epoch = true;
+        } else {
+            res = RunEpochMode::ModeChange;
+        }
+
+        // clear tables
+        if clear_tables_for_next_epoch {
+            self.clear_consensus_db_for_next_epoch()?;
+        }
+
+        Ok(res)
     }
 
     /// Collect any batches that never got into consensus (at epoch change or node restart) and
@@ -723,219 +541,6 @@ where
         Ok(())
     }
 
-    /// Run a single epoch.
-    async fn run_epoch(
-        &mut self,
-        engine: &ExecutionNode,
-        network_config: &NetworkConfig,
-        to_engine: &mpsc::Sender<ConsensusOutput>,
-        epoch_mode: RunEpochMode,
-        gas_accumulator: GasAccumulator,
-    ) -> eyre::Result<RunEpochMode> {
-        info!(target: "epoch-manager", "Starting epoch");
-
-        self.last_consensus_header = None;
-        // We have not created this epoch's primary yet (no committee) so get it from chain
-        // ourselves... Note, any consensus output to replay should be in the same epoch...
-        let (committee, epoch_info, epoch_start) =
-            self.get_committee_with_epoch_start_info(engine).await?;
-        self.epoch_boundary = epoch_start + epoch_info.epochDuration as u64;
-
-        // The task manager that resets every epoch and manages
-        // short-running tasks for the lifetime of the epoch.
-        let mut epoch_task_manager = TaskManager::new(EPOCH_TASK_MANAGER);
-        // Do not wait long for tasks to exit, just drop them and move on to next epoch.
-        epoch_task_manager.set_join_wait(200);
-
-        self.open_epoch_pack(committee.clone(), epoch_task_manager.get_spawner()).await?;
-        if epoch_mode.replay_consensus() {
-            // If we are starting up then make sure that any consensus we previously validated goes
-            // to the engine and is executed.  Otherwise we could miss consensus execution.
-            gas_accumulator.rewards_counter().set_committee(committee.clone());
-            if let Some(target_hash) = self.replay_missed_consensus(committee, to_engine).await? {
-                // If things go down at exactly the wrong time we might have to replay the epoch end
-                // so account for that.
-                self.close_epoch(None, &gas_accumulator, target_hash).await?;
-                return Ok(RunEpochMode::NewEpoch);
-            }
-        }
-        // If we are restarting the epoch not on a boundary
-        // and we sent some consensus output to the engine
-        // then we need to pause for the engine to execute.
-        // If we don't we can have races when the epoch restarts
-        // that will send consensus to the engine more than once.
-        if let Ok(Some(last_consensus_header)) =
-            self.consensus_chain.consensus_header_latest().await
-        {
-            let last_consensus_digest = last_consensus_header.digest();
-            info!(target: "epoch-manager", "Waiting for execution of consensus {last_consensus_digest}");
-            self.consensus_bus.wait_for_consensus_execution(last_consensus_digest).await?;
-            info!(target: "epoch-manager", "Confirmed execution of consensus {last_consensus_digest}");
-        }
-
-        let node_ended = self.node_shutdown.subscribe();
-
-        // subscribe to output early to prevent missed messages
-        let mut consensus_output = self.consensus_bus.subscribe_consensus_output();
-
-        // create primary and worker nodes
-        let (primary, worker_node) = self
-            .create_consensus(
-                engine,
-                &epoch_task_manager,
-                network_config,
-                epoch_mode.initial_epoch(),
-                gas_accumulator.clone(),
-            )
-            .await?;
-        // consensus config for shutdown subscribers
-        let consensus_shutdown = primary.shutdown_signal().await;
-        let epoch_shutdown_rx = consensus_shutdown.subscribe();
-
-        // This needs to be created early so required machinery for other tasks exists when needed.
-        let mut worker = worker_node.new_worker().await?;
-        let current_epoch = primary.current_committee().await.epoch();
-
-        // Produce a "dummy" epoch 0 EpochRecord if missing.
-        // This will let us use simple code to find any epoch including 0 at startup.
-        if !self.consensus_chain.epochs().contains_epoch(0).await {
-            if current_epoch != 0 {
-                return Err(eyre::eyre!(
-                    "We have epoch 0 in our database if we are past epoch 0, on {current_epoch}"
-                ));
-            }
-            // No keys for epoch 0, fix that.
-            // We are on epoch 0 so load up that committee in Db as well.
-            let committee: Vec<BlsPublicKey> =
-                primary.current_committee().await.bls_keys().iter().copied().collect();
-            let next_committee = committee.clone();
-            let epoch_rec =
-                EpochRecord { epoch: 0, committee, next_committee, ..Default::default() };
-            // Save the "dummy" record, should be overwritten once epoch 0 closes.
-            // This will NOT be signed.
-            self.consensus_chain.epochs().save_dummy_epoch0(epoch_rec).await?;
-        }
-
-        gas_accumulator.rewards_counter().set_committee(primary.current_committee().await);
-        // start primary
-        primary.start(&epoch_task_manager, self.consensus_chain.clone()).await?;
-
-        let worker_task_manager_name = worker_task_manager_name(worker_node.id().await);
-        // start batch builder
-        worker.spawn_batch_builder(&worker_task_manager_name, &epoch_task_manager);
-
-        let batch_builder_task_spawner = epoch_task_manager.get_spawner();
-        engine
-            .start_batch_builder(
-                worker.id(),
-                worker.batches_tx(),
-                &batch_builder_task_spawner,
-                gas_accumulator.base_fee(worker.id()),
-                current_epoch,
-            )
-            .await?;
-
-        self.orphan_batches(&epoch_task_manager, engine.clone(), worker.clone(), current_epoch)
-            .await?;
-
-        // update tasks
-        epoch_task_manager.update_tasks();
-
-        info!(target: "epoch-manager", tasks=?epoch_task_manager, "EPOCH TASKS\n");
-
-        // await the epoch boundary or the epoch task manager exiting
-        // this can also happen due to committee nodes re-syncing and errors
-        let consensus_shutdown_clone = consensus_shutdown.clone();
-
-        // indicate if the node is restarting to join the committe or if the epoch is changed and
-        // tables should be cleared
-        let mut clear_tables_for_next_epoch = false;
-
-        let mut epoch_boundary_reached = false;
-        tokio::select! {
-            _ = node_ended => {
-                info!(target: "epoch-manager", "node exiting, epoch ending");
-            },
-            // wait for epoch boundary to transition
-            res = self.wait_for_epoch_boundary(to_engine, &mut consensus_output) => {
-                // toggle bool to clear tables
-                clear_tables_for_next_epoch = true;
-                let target_hash = res.inspect_err(|e| {
-                    error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
-                })?;
-                self.close_epoch(Some(consensus_shutdown.clone()), &gas_accumulator, target_hash)
-                    .await?;
-
-                // Write the epoch record to DB and save in manager for next epoch.
-                self.write_epoch_record(&primary, engine).await?;
-
-                info!(target: "epoch-manager", "epoch boundary success - clearing consensus db tables for next epoch");
-                epoch_boundary_reached = true;
-            },
-
-            // return any errors
-            res = epoch_task_manager.until_task_ends(consensus_shutdown_clone) => {
-                match res {
-                    Ok(()) => info!(target: "epoch-manager", "epoch task manager exited - likely syncing with committee"),
-                    // There are times when the epoch task manager can exit with Ok...
-                    Err(TaskJoinError::CriticalExitOk(task)) => {
-                        // It is possible for the epoch to get a shutdown signal before the join.
-                        // In that case it will not reconize the Ok task exit so we double check it here
-                        // with a noticer that was aquired much earlier on epoch startup.
-                        if epoch_shutdown_rx.noticed() {
-                            info!(target: "epoch-manager", "epoch task manager exited - likely syncing with committee");
-                        } else {
-                            error!(target: "epoch-manager", ?task, "failed to reach epoch boundary");
-                            return Err(TaskJoinError::CriticalExitOk(task).into());
-                        }
-                    }
-                    Err(e) => {
-                        error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
-                        return Err(e.into());
-                    }
-                }
-            },
-        }
-
-        let mut res = RunEpochMode::NewEpoch;
-        // If the select exitted because of a join() then do not join() again- we are already
-        // shutting down.
-        consensus_shutdown.notify();
-        // abort all epoch-related tasks
-        epoch_task_manager.abort_all_tasks();
-        // Expect complaints from join so swallow those errors...
-        // If we timeout here something is not playing nice and shutting down so return the
-        // timeout.
-        tokio::time::timeout(
-            Duration::from_millis(500),
-            epoch_task_manager.wait_for_task_shutdown(),
-        )
-        .await?;
-        if epoch_boundary_reached {
-            // The epoch is over now and consensus should be shutdown.
-            // Do a sanity clear of the consensus_output channel.
-            // Note we probably do not need this anymore but not harmful.
-            while let Ok(_output) = consensus_output.try_recv() {}
-        } else if let Some(target_hash) =
-            self.send_leftover_consensus_output_to_engine(&mut consensus_output, to_engine).await
-        {
-            // If things go down at exactly the wrong time we might have reached the epoch end
-            // so account for that.
-            self.close_epoch(None, &gas_accumulator, target_hash).await?;
-            res = RunEpochMode::NewEpoch;
-            clear_tables_for_next_epoch = true;
-        } else {
-            res = RunEpochMode::ModeChange;
-        }
-
-        // clear tables
-        if clear_tables_for_next_epoch {
-            self.clear_consensus_db_for_next_epoch()?;
-        }
-
-        Ok(res)
-    }
-
     async fn process_output(
         &mut self,
         to_engine: &mpsc::Sender<ConsensusOutput>,
@@ -1117,26 +722,6 @@ where
         Ok(())
     }
 
-    /// Helper method to create all engine components.
-    fn create_engine(
-        &self,
-        engine_task_manager: &TaskManager,
-        gas_accumulator: &GasAccumulator,
-    ) -> eyre::Result<ExecutionNode> {
-        // create execution components (ie - reth env)
-        let basefee_address = self.builder.tn_config.parameters.basefee_address;
-        let reth_env = RethEnv::new(
-            &self.builder.node_config,
-            engine_task_manager,
-            self.reth_db.clone(),
-            basefee_address,
-            gas_accumulator.rewards_counter(),
-        )?;
-        let engine = ExecutionNode::new(&self.builder, reth_env)?;
-
-        Ok(engine)
-    }
-
     /// Helper method to create all consensus-related components for this epoch.
     ///
     /// Consensus components are short-lived and only relevant for the current epoch.
@@ -1147,22 +732,25 @@ where
         network_config: &NetworkConfig,
         initial_epoch: bool,
         gas_accumulator: GasAccumulator,
+        consensus_bus: ConsensusBus,
     ) -> eyre::Result<(PrimaryNode<DB>, WorkerNode<DB>)> {
         // create config for consensus
         let (consensus_config, preload_keys) =
             self.configure_consensus(engine, network_config).await?;
-        let _mode = self.identify_node_mode(&consensus_config).await?;
+        let _mode = self.identify_node_mode(&consensus_config, &consensus_bus).await?;
 
+        let consensus_bus_app = consensus_bus.app().clone();
         let primary = self
             .create_primary_node_components(
                 &consensus_config,
                 epoch_task_manager.get_spawner(),
                 initial_epoch,
+                consensus_bus,
             )
             .await?;
 
         let engine_to_primary =
-            EngineToPrimaryRpc::new(primary.consensus_bus().await, self.consensus_chain.clone());
+            EngineToPrimaryRpc::new(consensus_bus_app, self.consensus_chain.clone());
         // only spawns one worker for now
         let worker = self
             .spawn_worker_node_components(
@@ -1260,10 +848,11 @@ where
         consensus_config: &ConsensusConfig<DB>,
         epoch_task_spawner: TaskSpawner,
         initial_epoch: bool,
+        consensus_bus: ConsensusBus,
     ) -> eyre::Result<PrimaryNode<DB>> {
         let state_sync = StateSynchronizer::new(
             consensus_config.clone(),
-            self.consensus_bus.clone(),
+            consensus_bus.clone(),
             epoch_task_spawner.clone(),
         );
         let network_handle = self
@@ -1279,13 +868,14 @@ where
             epoch_task_spawner.clone(),
             &network_handle,
             initial_epoch,
+            consensus_bus.clone(),
         )
         .await?;
 
         // spawn primary - create node and spawn network
         let primary = PrimaryNode::new(
             consensus_config.clone(),
-            self.consensus_bus.clone(),
+            consensus_bus,
             network_handle,
             state_sync,
             self.epoch_boundary,
@@ -1371,6 +961,7 @@ where
         epoch_task_spawner: TaskSpawner,
         network_handle: &PrimaryNetworkHandle,
         initial_epoch: bool,
+        consensus_bus: ConsensusBus,
     ) -> eyre::Result<()> {
         // get event streams for the primary network handler
         let rx_event_stream = self.consensus_bus.subscribe_primary_network_events();
@@ -1467,7 +1058,7 @@ where
             rx_event_stream,
             network_handle.clone(),
             consensus_config.clone(),
-            self.consensus_bus.clone(),
+            consensus_bus.app().clone(),
             state_sync,
             epoch_task_spawner.clone(), // tasks should abort with epoch
             self.consensus_chain.clone(),
@@ -1605,32 +1196,6 @@ where
         Ok(())
     }
 
-    /// Helper method to restore execution state for the consensus components.
-    async fn try_restore_state(&self, engine: &ExecutionNode) -> eyre::Result<()> {
-        // prime the recent_blocks watch with latest executed blocks
-        let block_capacity = self.consensus_bus.recent_blocks_capacity();
-
-        for recent_block in engine.last_executed_output_blocks(block_capacity).await? {
-            // On restore, use the block's consensus hash from parent_beacon_block_root.
-            // Round is set to 0 since we don't persist it; consensus number/hash still allows
-            // wait_for_consensus_execution to resolve hash lookups.
-            let consensus_hash = recent_block.parent_beacon_block_root.unwrap_or_default();
-            let (epoch, round) = deconstruct_nonce(recent_block.nonce.into());
-            let consensus_number = self
-                .consensus_chain
-                .consensus_header_by_digest(epoch, consensus_hash)
-                .await?
-                .map(|h| h.number)
-                .unwrap_or_default();
-            let consensus_num_hash = BlockNumHash::new(consensus_number, consensus_hash);
-            self.consensus_bus.recent_blocks().send_modify(|blocks| {
-                blocks.push_latest(round, consensus_num_hash, Some(recent_block))
-            });
-        }
-
-        Ok(())
-    }
-
     /// Helper method to identify the node's mode:
     /// - "Committee-voting Validator" (CVV)
     /// - "Committee-voting Validator Inactive" (CVVInactive - syncing to rejoin)
@@ -1640,6 +1205,7 @@ where
     async fn identify_node_mode(
         &self,
         consensus_config: &ConsensusConfig<DB>,
+        consensus_bus: &ConsensusBus,
     ) -> eyre::Result<NodeMode> {
         if self.consensus_bus.is_cvv_inactive() {
             // If we have an inactive mode then it was set so keep it for now.
@@ -1651,7 +1217,7 @@ where
             .map(|id| consensus_config.in_committee(&id))
             .unwrap_or(false);
         state_sync::prime_consensus(
-            &self.consensus_bus,
+            consensus_bus.app(),
             consensus_config,
             self.consensus_chain.clone(),
         )
@@ -1668,26 +1234,6 @@ where
         self.consensus_bus.node_mode().send_modify(|v| *v = mode);
 
         Ok(mode)
-    }
-
-    /// Spawn a task to update `ConsensusBus::recent_blocks` every time the engine processes a
-    /// consensus output (with or without blocks).
-    fn spawn_engine_update_task(
-        &self,
-        mut engine_update: mpsc::Receiver<EngineUpdate>,
-        task_manager: &TaskManager,
-    ) {
-        let consensus_bus = self.consensus_bus.clone();
-        task_manager.spawn_critical_task("engine updates for consensus", async move {
-            while let Some((latest_round, consensus_num_hash, latest_executed_block)) =
-                engine_update.recv().await
-            {
-                consensus_bus.recent_blocks().send_modify(|blocks| {
-                    blocks.push_latest(latest_round, consensus_num_hash, latest_executed_block)
-                });
-            }
-            error!(target: "engine", "engine updates ended, node will exit");
-        });
     }
 
     /// Clear the epoch-related tables for consensus.
