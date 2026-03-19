@@ -7,7 +7,7 @@ use std::{
     error::Error,
     fmt::Display,
     hash::BuildHasherDefault,
-    io::{self, Read, Seek},
+    io::{self},
     path::{Path, PathBuf},
     sync::Arc,
     thread::JoinHandle,
@@ -20,9 +20,12 @@ use tn_types::{
     CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput, Epoch,
     EpochRecord, Round, B256,
 };
-use tokio::sync::{
-    mpsc::{self, Receiver, Sender},
-    oneshot, watch,
+use tokio::{
+    io::{AsyncRead, AsyncSeek},
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        oneshot, watch,
+    },
 };
 use tracing::{debug, error};
 
@@ -32,7 +35,7 @@ use crate::archive::{
     fxhasher::FxHasher,
     index::Index as _,
     pack::{Pack, DATA_HEADER_BYTES},
-    pack_iter::PackIter,
+    pack_iter::AsyncPackIter,
     position_index::index::PositionIndex,
 };
 
@@ -247,7 +250,10 @@ impl ConsensusPack {
     }
 
     /// Create a new set of epoch static files to write consensus output into.
-    pub fn stream_import<P: Into<PathBuf>, R: Read + Seek + Send + 'static>(
+    pub async fn stream_import<
+        P: Into<PathBuf>,
+        R: AsyncRead + AsyncSeek + Unpin, /* XXXXSend + 'static */
+    >(
         path: P,
         stream: R,
         epoch: Epoch,
@@ -256,8 +262,10 @@ impl ConsensusPack {
         let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
         let (tx_error, error) = watch::channel(None);
+        let inner = Inner::stream_import(path, stream, epoch, &previous_epoch).await?;
         let handle = std::thread::spawn(move || {
-            match Inner::stream_import(path, stream, epoch, &previous_epoch) {
+            run_pack_loop(inner, rx, tx_error);
+            /*XXXXmatch Inner::stream_import(path, stream, epoch, &previous_epoch).await {
                 Ok(inner) => {
                     run_pack_loop(inner, rx, tx_error);
                 }
@@ -265,7 +273,7 @@ impl ConsensusPack {
                     clear_pack_loop(rx);
                     tx_error.send_replace(Some(e));
                 }
-            }
+            }*/
         });
         Ok(Self { tx, handle: Arc::new(Mutex::new(Some(handle))), error, epoch })
     }
@@ -672,7 +680,7 @@ impl Inner {
     }
 
     /// Create a new set of epoch static files to write consensus output into.
-    fn stream_import<P: AsRef<Path>, R: Read + Seek>(
+    async fn stream_import<P: AsRef<Path>, R: AsyncRead + AsyncSeek + Unpin>(
         path: P,
         stream: R,
         epoch: Epoch,
@@ -680,10 +688,11 @@ impl Inner {
     ) -> Result<Self, PackError> {
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
         let _ = std::fs::create_dir_all(&base_dir);
-        let mut stream_iter = PackIter::<PackRecord, R>::open(stream, epoch as u64)
+        let mut stream_iter = AsyncPackIter::<PackRecord, R>::open(stream, epoch as u64)
+            .await
             .map_err(|e| PackError::ReadError(e.to_string()))?;
         let mut data = Pack::open(base_dir.join(Self::DATA_NAME), epoch as u64, false)?;
-        let epoch_meta = if let Some(Ok(meta)) = stream_iter.next() {
+        let epoch_meta = if let Some(Ok(meta)) = stream_iter.next().await {
             meta.into_epoch()?
         } else {
             return Err(PackError::NotEpoch);
@@ -717,7 +726,7 @@ impl Inner {
         .map_err(OpenError::IndexFileOpen)?;
         let mut parent_digest = previous_epoch.final_consensus.hash;
         let mut batches = HashSet::new();
-        for record in stream_iter {
+        while let Some(record) = stream_iter.next().await {
             let record = record.map_err(|e| PackError::ReadError(e.to_string()))?;
             match record {
                 PackRecord::EpochMeta(_epoch_meta) => {
@@ -1320,10 +1329,13 @@ pub(crate) mod test {
         // Make sure we can stream the file to create another pack file.
         {
             let temp_dir2 = TempDir::with_prefix("test_consensus_pack").expect("temp dir");
-            let stream = File::open(temp_dir.path().join("epoch-0").join(Inner::DATA_NAME))
-                .expect("log file");
+            let stream =
+                tokio::fs::File::open(temp_dir.path().join("epoch-0").join(Inner::DATA_NAME))
+                    .await
+                    .expect("log file");
             let pack =
                 ConsensusPack::stream_import(temp_dir2.path(), stream, 0, previous_epoch.clone())
+                    .await
                     .expect("open pack");
             tokio::time::sleep(Duration::from_secs(2)).await;
             for i in 0..num_outputs {
