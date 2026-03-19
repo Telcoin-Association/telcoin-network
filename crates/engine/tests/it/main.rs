@@ -35,6 +35,14 @@ use tn_types::{
 use tokio::{sync::oneshot, time::timeout};
 use tracing::debug;
 
+/// Limit potential for memory exhaustion via creating to many reth mdbx DBs.
+/// Each DB has a very large memory space allocation (shared memory) so running
+/// all tests in parrellel can exhaust it.
+/// Note: If MDBX is replaced in Reth then this can go away.
+/// Note: replacing this with a semaphore to allow some parrellel execution
+/// would also work but for now just using a Mutex (std has no semephore...).
+pub static IT_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The const used for EIP-4788 and EIP-2935
 const HISTORY_BUFFER_LENGTH: u64 = 8191;
 /// The amount of gas to transfer native tokens between EOAs. This is the expected cost for all test
@@ -106,6 +114,7 @@ fn assert_eip2935(reth_env: &RethEnv, block: &SealedBlock) -> eyre::Result<()> {
 /// and close_epoch is false (the default).
 #[tokio::test]
 async fn test_empty_output_skips_execution() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
     let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
     let tmp_dir = TempDir::new().expect("temp dir");
     // execution node components
@@ -208,6 +217,7 @@ async fn test_empty_output_skips_execution() -> eyre::Result<()> {
 /// no batches but close_epoch is true.
 #[tokio::test]
 async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
     let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
     let tmp_dir = TempDir::new().expect("temp dir");
     // execution node components
@@ -382,6 +392,7 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
 /// for empty non-epoch-closing output.
 #[tokio::test]
 async fn test_empty_output_increments_leader_count() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
     let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
     let tmp_dir = TempDir::new().expect("temp dir");
     // execution node components
@@ -505,6 +516,7 @@ async fn test_empty_output_increments_leader_count() -> eyre::Result<()> {
 /// block rewards go to the correct addresses at the end of an epoch.
 #[tokio::test]
 async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
     let tmp_dir = TempDir::new().expect("temp dir");
     // create batches for consensus output
     let chain = test_chain_spec_arc();
@@ -982,6 +994,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
 /// block rewards go to the correct addresses at the end of an epoch.
 #[tokio::test]
 async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
     let tmp_dir = TempDir::new().unwrap();
     // create batches for consensus output
     let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
@@ -1514,6 +1527,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
 
 #[tokio::test]
 async fn test_max_round_terminates_early() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
     let tmp_dir = TempDir::new().unwrap();
     // create batches for consensus output
     let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
@@ -1697,6 +1711,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_simple_basefee_penalty() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
     let tmp_dir = TempDir::new().expect("temp dir");
     const TX_GAS_LIMIT: u64 = 15_000_000;
     const PRIORITY_FEE: u64 = 10;
@@ -2044,6 +2059,7 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
 /// governance safe balance will be higher than expected.
 #[tokio::test]
 async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
     let tmp_dir = TempDir::new().expect("temp dir");
     const TX_GAS_LIMIT: u64 = 500_000;
     const PRIORITY_FEE: u64 = 10;

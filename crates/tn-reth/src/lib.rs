@@ -111,10 +111,10 @@ use tn_config::{
     ISSUANCE_JSON,
 };
 use tn_types::{
-    gas_accumulator::RewardsCounter, Address, BlockBody, BlockHashOrNumber, BlockNumHash,
-    BlockNumber, EngineUpdate, Epoch, ExecHeader, Genesis, GenesisAccount, RecoveredBlock, Round,
-    SealedBlock, SealedHeader, TaskManager, TaskSpawner, TransactionSigned, B256,
-    ETHEREUM_BLOCK_GAS_LIMIT_30M, U256,
+    deconstruct_nonce, gas_accumulator::RewardsCounter, Address, BlockBody, BlockHashOrNumber,
+    BlockNumHash, BlockNumber, EngineUpdate, Epoch, ExecHeader, Genesis, GenesisAccount,
+    RecoveredBlock, Round, SealedBlock, SealedHeader, TaskManager, TaskSpawner, TransactionSigned,
+    B256, ETHEREUM_BLOCK_GAS_LIMIT_30M, U256,
 };
 use tracing::{debug, error, info, warn};
 use traits::{TNPrimitives, TelcoinNode};
@@ -814,7 +814,7 @@ impl RethEnv {
         let chain_update = NewCanonicalChain::Commit { new: blocks };
         let canonical_head = chain_update.tip();
         let (epoch, round) =
-            Self::deconstruct_nonce(<FixedBytes<8> as Into<u64>>::into(canonical_head.nonce));
+            deconstruct_nonce(<FixedBytes<8> as Into<u64>>::into(canonical_head.nonce));
         info!(
             target: "engine",
             "canonical head for epoch {:?} round {:?}: {:?} - {:?}",
@@ -842,13 +842,6 @@ impl RethEnv {
         self.canonical_in_memory_state().notify_canon_state(notification);
 
         Ok(())
-    }
-
-    /// Helper to deconstruct block nonce into epoch and round.
-    pub fn deconstruct_nonce(nonce: u64) -> (u32, u32) {
-        let epoch = (nonce >> 32) as u32; // Extract the upper 32 bits
-        let round = nonce as u32; // Extract the lower 32 bits (truncates upper bits)
-        (epoch, round)
     }
 
     /// Look up and return the sealed header for hash.

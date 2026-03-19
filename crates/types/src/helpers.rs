@@ -87,3 +87,10 @@ pub fn public_key_to_address(public: PublicKey) -> crate::Address {
     let hash = crate::keccak256(&public.serialize_uncompressed()[1..]);
     crate::Address::from_slice(&hash[12..])
 }
+
+/// Helper to deconstruct block nonce into epoch and round.
+pub fn deconstruct_nonce(nonce: u64) -> (u32, u32) {
+    let epoch = (nonce >> 32) as u32; // Extract the upper 32 bits
+    let round = nonce as u32; // Extract the lower 32 bits (truncates upper bits)
+    (epoch, round)
+}
