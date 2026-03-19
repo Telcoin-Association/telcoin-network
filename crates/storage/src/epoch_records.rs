@@ -70,7 +70,7 @@ pub struct EpochRecordDb {
     /// Join handle for the background thread running commands.
     handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     /// Track any errors that happened in the background.
-    error: watch::Receiver<Option<EpochDbError>>,
+    error: watch::Sender<Option<EpochDbError>>,
     /// Vector to map epochs to the last consensus header number.
     /// Used for quickly deducing an epoch for a given consensus header number.
     final_numbers: Arc<Mutex<Vec<u64>>>,
@@ -152,12 +152,13 @@ impl EpochRecordDb {
     pub fn open<P: Into<PathBuf>>(path: P) -> Result<Self, EpochDbError> {
         let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
-        let (tx_error, error) = watch::channel(None);
+        let (error, _) = watch::channel(None);
         let inner = Inner::open_append(path, 0)?;
         let mut final_numbers = Vec::with_capacity(inner.epoch_idx.len());
         for epoch in inner.records.raw_iter().map_err(|_e| EpochDbError::CorruptDb)? {
             final_numbers.push(epoch?.final_consensus.number);
         }
+        let tx_error = error.clone();
         let handle = std::thread::spawn(move || run_db_loop(inner, rx, tx_error));
         Ok(Self {
             tx,
@@ -168,8 +169,9 @@ impl EpochRecordDb {
     }
 
     /// Return any delayed error recorded by the background thread.
+    /// Also clears the error.
     pub fn get_error(&self) -> Result<(), EpochDbError> {
-        match &*self.error.borrow() {
+        match self.error.send_replace(None) {
             Some(e) => Err(e.clone()),
             None => Ok(()),
         }
@@ -442,17 +444,13 @@ impl Inner {
                 if let Ok(last_record) = epoch_idx.load(idx) {
                     let size_res = records.record_size(last_record);
                     if size_res.is_ok() {
-                        if idx != start_idx {
-                            epoch_idx.truncate_to_index(idx)?;
-                        }
+                        epoch_idx.truncate_to_index(idx)?;
                         new_len = last_record + size_res.unwrap_or_default() as u64;
                         break;
                     }
                 }
                 if idx == 0 {
-                    if idx != start_idx {
-                        epoch_idx.truncate_all()?;
-                    }
+                    epoch_idx.truncate_all()?;
                     break;
                 }
                 idx -= 1;
@@ -663,9 +661,6 @@ impl Inner {
     }
 
     fn latest_record(&mut self) -> Option<EpochRecord> {
-        if self.epoch_idx.is_empty() {
-            return None;
-        }
         if self.epoch_idx.is_empty() {
             self.dummy_epoch0.clone()
         } else {
