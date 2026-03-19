@@ -130,7 +130,7 @@ impl BestTestTransactions {
 }
 
 impl BestTransactions for BestTestTransactions {
-    fn mark_invalid(&mut self, tx: &Self::Item, _kind: InvalidPoolTransactionError) {
+    fn mark_invalid(&mut self, tx: &Self::Item, _kind: &InvalidPoolTransactionError) {
         Self::mark_invalid(self, tx)
     }
 

@@ -7,22 +7,45 @@ use std::{
 
 use tn_config::KeyConfig;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus};
-use tn_storage::{tables::EpochCerts, EpochStore as _};
+use tn_storage::{consensus::ConsensusChain, epoch_records::EpochRecordDb};
 use tn_types::{
-    BlsAggregateSignature, BlsPublicKey, BlsSignature, Database as TNDatabase, Epoch,
-    EpochCertificate, EpochRecord, EpochVote, Noticer, TaskSpawner, TnReceiver as _, B256,
+    BlsAggregateSignature, BlsPublicKey, BlsSignature, Epoch, EpochCertificate, EpochRecord,
+    EpochVote, Noticer, TaskSpawner, TnReceiver as _, B256,
 };
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::{error, info, warn};
 
 type VoteQueue = VecDeque<(Epoch, Sender<EpochVote>, Option<Receiver<EpochVote>>)>;
 
-async fn manage_epoch_votes<DB: TNDatabase>(
+/// Both save and persist an epoch record and cert with logging.
+async fn save_and_persist_with_logs(
+    db: &EpochRecordDb,
+    epoch_record: EpochRecord,
+    cert: EpochCertificate,
+) {
+    let epoch = epoch_record.epoch;
+    if let Err(e) = db.save(epoch_record, cert).await {
+        error!(
+            target: "epoch-manager",
+            ?e,
+            "failed to save epoch record/cert after retrieval for epoch {epoch}",
+        );
+    } else if let Err(e) = db.persist().await {
+        error!(
+            target: "epoch-manager",
+            ?e,
+            "failed to persist epoch record/cert after retrieval for epoch {epoch}",
+        );
+    }
+}
+
+/// Collect and manage votes for a specific epoch record.
+async fn manage_epoch_votes(
     epoch_rec: EpochRecord,
     key_config: KeyConfig,
     primary_network: PrimaryNetworkHandle,
     mut vote_rx: Receiver<EpochVote>,
-    consensus_db: DB,
+    consensus_chain: ConsensusChain,
 ) {
     let epoch_hash = epoch_rec.digest();
     let mut committee_keys: HashSet<BlsPublicKey> = epoch_rec.committee.iter().copied().collect();
@@ -131,7 +154,23 @@ async fn manage_epoch_votes<DB: TNDatabase>(
                 let signature: BlsSignature = aggregated_signature.to_signature();
                 let cert = EpochCertificate { epoch_hash, signature, signed_authorities };
                 if epoch_rec.verify_with_cert(&cert) {
-                    let _ = consensus_db.insert::<EpochCerts>(&cert.epoch_hash, &cert);
+                    let epoch = epoch_rec.epoch;
+                    if let Err(e) =
+                        consensus_chain.epochs().save_certificate(cert.epoch_hash, cert).await
+                    {
+                        error!(
+                            target: "epoch-manager",
+                            ?e,
+                            "failed to save epoch cert after reaching quorum {epoch}",
+                        );
+                    }
+                    if let Err(e) = consensus_chain.epochs().persist().await {
+                        error!(
+                            target: "epoch-manager",
+                            ?e,
+                            "failed to persist epoch cert after reaching quorum {epoch}",
+                        );
+                    }
                 } else {
                     error!(
                         target: "epoch-manager",
@@ -151,7 +190,7 @@ async fn manage_epoch_votes<DB: TNDatabase>(
             target: "epoch-manager",
             "failed to reach quorum on epoch close for {epoch_hash} {epoch_rec:?}",
         );
-        let db = consensus_db.clone();
+        let db = consensus_chain.epochs().clone();
         let network = primary_network.clone();
         // Try to recover by downloading the epoch record and cert from a peer
         let mut got_epoch_record = false;
@@ -165,13 +204,13 @@ async fn manage_epoch_votes<DB: TNDatabase>(
                                 target: "epoch-manager",
                                 "Over wrote expected epoch record {epoch_hash} with verified epoch record {new_epoch_hash}",
                             );
-                            db.save_epoch_record_with_cert(&new_epoch_rec, &cert);
+                            save_and_persist_with_logs(&db, new_epoch_rec, cert).await;
                         } else {
                             info!(
                                 target: "epoch-manager",
                                 "retrieved cert for epoch {}/{new_epoch_hash} from a peer", epoch_rec.epoch
                             );
-                            let _ = db.insert::<EpochCerts>(&new_epoch_hash, &cert);
+                            save_and_persist_with_logs(&db, new_epoch_rec, cert).await;
                         }
                         got_epoch_record = true;
                         break;
@@ -247,8 +286,8 @@ async fn handle_new_vote(vote: EpochVote, vote_queues: &mut VoteQueue) {
 /// This actor subscribes once to the `new_epoch_votes` channel and never drops the receiver,
 /// eliminating the gap at epoch boundaries where votes could be lost. It watches for new
 /// `EpochRecord`s via a `watch` channel and collects votes for each epoch.
-pub(crate) fn spawn_epoch_vote_collector<DB: TNDatabase>(
-    consensus_db: DB,
+pub(crate) fn spawn_epoch_vote_collector(
+    consensus_chain: ConsensusChain,
     consensus_bus: ConsensusBus,
     key_config: KeyConfig,
     primary_network: PrimaryNetworkHandle,
@@ -290,7 +329,7 @@ pub(crate) fn spawn_epoch_vote_collector<DB: TNDatabase>(
                         key_config.clone(),
                         primary_network.clone(),
                         epoch_vote_rx,
-                        consensus_db.clone(),
+                        consensus_chain.clone(),
                     ),
                 );
             }
@@ -302,9 +341,11 @@ pub(crate) fn spawn_epoch_vote_collector<DB: TNDatabase>(
 mod epoch_vote_collector_tests {
     use super::*;
     use rand::{rngs::StdRng, SeedableRng as _};
+    use tempfile::TempDir;
     use tn_network_libp2p::types::{MessageId, NetworkCommand};
     use tn_primary::network::{PrimaryRequest, PrimaryResponse};
     use tn_storage::mem_db::MemDatabase;
+    use tn_test_utils_committee::CommitteeFixture;
     use tn_types::{BlsKeypair, Notifier, TaskManager, TnSender as _};
 
     /// Happy path: committee of 4, node signs + receives 3 peer votes → cert stored.
@@ -333,7 +374,14 @@ mod epoch_vote_collector_tests {
         let epoch_hash = epoch_rec.digest();
 
         let consensus_bus = ConsensusBus::new();
-        let db = MemDatabase::default();
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let temp_dir =
+            TempDir::with_prefix("test_collector_reaches_quorum_and_stores_cert").unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone())
+                .await
+                .unwrap();
 
         // Mock network: drain commands and reply to Publish
         let (net_tx, mut net_rx) =
@@ -351,7 +399,7 @@ mod epoch_vote_collector_tests {
         let node_shutdown = Notifier::new();
 
         spawn_epoch_vote_collector(
-            db.clone(),
+            consensus_chain.clone(),
             consensus_bus.clone(),
             key_config,
             primary_network,
@@ -379,7 +427,7 @@ mod epoch_vote_collector_tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Verify cert is in DB
-        let cert = db.get::<EpochCerts>(&epoch_hash).expect("db read").expect("cert missing");
+        let cert = consensus_chain.epochs().cert_by_digest(epoch_hash).await.expect("cert missing");
         assert_eq!(cert.epoch_hash, epoch_hash);
         assert!(epoch_rec.verify_with_cert(&cert), "cert should verify against epoch record");
 

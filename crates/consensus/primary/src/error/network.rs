@@ -37,9 +37,6 @@ pub(crate) enum PrimaryNetworkError {
     Internal(String),
     /// Unknown consensus header.
     #[error("Unknown consensus header: {0}")]
-    UnknownConsensusHeaderNumber(u64),
-    /// Unknown consensus header.
-    #[error("Unknown consensus header: {0}")]
     UnknownConsensusHeaderDigest(BlockHash),
     /// Unknown consensus header certificate.
     #[error("Unknown consensus header certificate for: {0}")]
@@ -107,7 +104,6 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
                 | CertManagerError::ChannelClosed
                 | CertManagerError::TNSend(_) => None,
             },
-            PrimaryNetworkError::UnknownConsensusHeaderNumber(_)
             | PrimaryNetworkError::InvalidRequest(_)
             | PrimaryNetworkError::UnknownConsensusHeaderDigest(_)
             | PrimaryNetworkError::UnknownConsensusHeaderCert(_) => Some(Penalty::Mild),

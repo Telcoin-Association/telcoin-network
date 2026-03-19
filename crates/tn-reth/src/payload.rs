@@ -1,8 +1,11 @@
 //! The payload that contains all data from consensus to be executed.
 
 use crate::RethEnv;
+use reth_rpc_eth_api::helpers::pending_block::BuildPendingEnv;
 use serde::{Deserialize, Serialize};
-use tn_types::{Address, ConsensusOutput, SealedHeader, WorkerId, B256};
+use tn_types::{
+    Address, ConsensusOutput, ExecHeader, SealedHeader, WorkerId, B256, MIN_PROTOCOL_BASE_FEE,
+};
 
 /// The type for building blocks that extend the canonical tip.
 #[derive(Debug)]
@@ -143,5 +146,24 @@ impl TNPayload {
             mix_hash,
             0,
         )
+    }
+}
+
+impl BuildPendingEnv<ExecHeader> for TNPayload {
+    fn build_pending_env(parent: &SealedHeader<ExecHeader>) -> Self {
+        Self {
+            parent_header: parent.clone(),
+            beneficiary: Address::ZERO,
+            nonce: 0,
+            batch_index: 0,
+            timestamp: parent.timestamp + 1,
+            batch_digest: B256::ZERO,
+            consensus_header_digest: B256::ZERO,
+            base_fee_per_gas: parent.base_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE),
+            gas_limit: parent.gas_limit,
+            mix_hash: B256::ZERO,
+            close_epoch: None,
+            worker_id: 0,
+        }
     }
 }

@@ -167,34 +167,24 @@ impl PrimaryNetworkHandle {
     pub async fn request_consensus_from_peer(
         &self,
         peer: BlsPublicKey,
-        number: Option<u64>,
-        hash: Option<BlockHash>,
+        number: u64,
+        hash: BlockHash,
     ) -> NetworkResult<ConsensusHeader> {
         let request = PrimaryRequest::ConsensusHeader { number, hash };
         let res = self.handle.send_request(request, peer).await?;
         let res = res.await??;
         match res {
-            PrimaryResponse::ConsensusHeader(header) => match (hash, number) {
-                (Some(hash), _) => {
-                    if header.digest() == hash {
-                        Ok(Arc::unwrap_or_clone(header))
-                    } else {
-                        Err(NetworkError::RPCError(
-                            "Got wrong response, header does not match hash!".to_string(),
-                        ))
-                    }
+            PrimaryResponse::ConsensusHeader(header) => {
+                if header.digest() == hash && header.number == number {
+                    Ok(Arc::unwrap_or_clone(header))
+                } else {
+                    Err(NetworkError::RPCError(format!(
+                        "Returned header does not match number {number}/{} or hash {hash}/{}!",
+                        header.number,
+                        header.digest()
+                    )))
                 }
-                (_, Some(number)) => {
-                    if header.number == number {
-                        Ok(Arc::unwrap_or_clone(header))
-                    } else {
-                        Err(NetworkError::RPCError(
-                            "Got wrong response, number does not match header!".to_string(),
-                        ))
-                    }
-                }
-                _ => Ok(Arc::unwrap_or_clone(header)),
-            },
+            }
             PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
             _ => Err(NetworkError::RPCError(
                 "Got wrong response, not a consensus header!".to_string(),
@@ -206,8 +196,8 @@ impl PrimaryNetworkHandle {
     /// Will verify the returned header matches hash if provided (strong) or number if not (weak).
     pub async fn request_consensus(
         &self,
-        number: Option<u64>,
-        hash: Option<BlockHash>,
+        number: u64,
+        hash: BlockHash,
     ) -> NetworkResult<ConsensusHeader> {
         let request = PrimaryRequest::ConsensusHeader { number, hash };
         // Try up to three times (from three peers) to get consensus.
@@ -216,22 +206,14 @@ impl PrimaryNetworkHandle {
             let res = self.handle.send_request_any(request.clone()).await?;
             let res = res.await?;
             if let Ok(PrimaryResponse::ConsensusHeader(header)) = res {
-                match (hash, number) {
-                    (Some(hash), _) => {
-                        if header.digest() == hash {
-                            return Ok(Arc::unwrap_or_clone(header));
-                        }
-                    }
-                    (_, Some(number)) => {
-                        if header.number == number {
-                            return Ok(Arc::unwrap_or_clone(header));
-                        }
-                    }
-                    _ => {
-                        return Err(NetworkError::RPCError(
-                            "Must provide hash or number!".to_string(),
-                        ));
-                    }
+                if header.digest() == hash && header.number == number {
+                    return Ok(Arc::unwrap_or_clone(header));
+                } else {
+                    return Err(NetworkError::RPCError(format!(
+                        "Returned header does not match number {number}/{} or hash {hash}/{}!",
+                        header.number,
+                        header.digest()
+                    )));
                 }
             }
         }
@@ -421,8 +403,8 @@ where
     fn process_consensus_output_request(
         &self,
         peer: BlsPublicKey,
-        number: Option<u64>,
-        hash: Option<BlockHash>,
+        number: u64,
+        hash: BlockHash,
         channel: ResponseChannel<PrimaryResponse>,
         cancel: oneshot::Receiver<()>,
     ) {

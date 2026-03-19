@@ -126,6 +126,7 @@ where
 {
     type DB = DB;
     type Tx = TxEnv;
+    type BlockEnv = BlockEnv;
     type Error = EVMError<DB::Error>;
     type HaltReason = HaltReason;
     type Spec = SpecId;

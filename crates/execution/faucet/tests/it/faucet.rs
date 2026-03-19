@@ -68,7 +68,7 @@ impl EngineToPrimary for EmptyEngToPrimary {
         ConsensusHeader::default()
     }
 
-    fn epoch(
+    async fn epoch(
         &self,
         _epoch: Option<tn_types::Epoch>,
         _hash: Option<tn_types::BlockHash>,
