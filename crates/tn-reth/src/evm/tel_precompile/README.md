@@ -51,7 +51,7 @@ burn(amount)  →  precompile.balance -= amount  (sent to address(0))
 ```
 
 - **`mint`**: Governance-only. Creates a pending mint with a 7-day timelock. A second `mint` overwrites the previous pending amount (can be used to cancel by minting 0).
-- **`claim`**: Permissionless. Anyone can finalize a pending mint once the timelock expires.
+- **`claim`**: Permissioned. Only governance safe can claim mint.
 - **`burn`**: Governance-only. Destroys tokens held by the precompile's own account.
 
 ### Testnet (`faucet` feature)
