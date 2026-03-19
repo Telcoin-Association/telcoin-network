@@ -116,6 +116,37 @@ pub(crate) struct PipelineTestEnv {
 impl PipelineTestEnv {
     /// Create a new pipeline test environment with 3 funded EOAs and a governance forwarder.
     pub(crate) fn new() -> Self {
+        let large_balance = U256::from(10).pow(U256::from(18)) * U256::from(1_000_000_000u64); // 1B TEL
+        let genesis_supply_wei = U256::from(GENESIS_SUPPLY) * U256::from(10).pow(U256::from(18));
+        let precompile_balance = U256::from(10).pow(U256::from(18)) * U256::from(1000u64);
+
+        Self::new_with_custom_state(
+            genesis_supply_wei,
+            precompile_balance,
+            large_balance,
+            large_balance,
+            large_balance,
+            large_balance,
+        )
+    }
+
+    /// Create a new pipeline test environment with customizable genesis state.
+    ///
+    /// Parameters:
+    /// - `total_supply`: value stored in slot 100 (already in wei)
+    /// - `precompile_balance`: native balance of TELCOIN_PRECOMPILE_ADDRESS
+    /// - `governance_safe_balance`: native balance of GOVERNANCE_SAFE_ADDRESS (forwarder)
+    /// - `governance_eoa_balance`: native balance of governance factory EOA
+    /// - `user_balance`: native balance of user factory EOA
+    /// - `recipient_balance`: native balance of recipient factory EOA
+    pub(crate) fn new_with_custom_state(
+        total_supply: U256,
+        precompile_balance: U256,
+        governance_safe_balance: U256,
+        governance_eoa_balance: U256,
+        user_balance: U256,
+        recipient_balance: U256,
+    ) -> Self {
         let db_permit = DbPermit::acquire();
 
         let mut governance_factory =
@@ -125,8 +156,7 @@ impl PipelineTestEnv {
         let mut recipient_factory =
             TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(300));
 
-        let large_balance = U256::from(10).pow(U256::from(18)) * U256::from(1_000_000_000u64); // 1B TEL
-        let genesis_supply_wei = U256::from(GENESIS_SUPPLY) * U256::from(10).pow(U256::from(18));
+        let large_balance = U256::from(10).pow(U256::from(18)) * U256::from(1_000_000_000u64);
 
         // Permit signer address (from known private key 0x01)
         let permit_signer_addr = {
@@ -140,29 +170,29 @@ impl PipelineTestEnv {
         // Build genesis with funded accounts + governance forwarder + precompile storage
         let genesis = test_genesis().extend_accounts(vec![
             // Fund all 3 factory EOAs
-            (governance_factory.address(), GenesisAccount::default().with_balance(large_balance)),
-            (user_factory.address(), GenesisAccount::default().with_balance(large_balance)),
-            (recipient_factory.address(), GenesisAccount::default().with_balance(large_balance)),
+            (governance_factory.address(), GenesisAccount::default().with_balance(governance_eoa_balance)),
+            (user_factory.address(), GenesisAccount::default().with_balance(user_balance)),
+            (recipient_factory.address(), GenesisAccount::default().with_balance(recipient_balance)),
             // Fund the permit signer
             (permit_signer_addr, GenesisAccount::default().with_balance(large_balance)),
             // Deploy forwarder contract at GOVERNANCE_SAFE_ADDRESS
             (
                 GOVERNANCE_SAFE_ADDRESS,
                 GenesisAccount::default()
-                    .with_balance(large_balance)
+                    .with_balance(governance_safe_balance)
                     .with_code(Some(Bytes::from_static(GOVERNANCE_FORWARDER_BYTECODE))),
             ),
             // Precompile account with balance and total supply storage
             (
                 TELCOIN_PRECOMPILE_ADDRESS,
                 GenesisAccount::default()
-                    .with_balance(U256::from(10).pow(U256::from(18)) * U256::from(1000u64))
+                    .with_balance(precompile_balance)
                     .with_storage(Some({
                         let mut storage = std::collections::BTreeMap::new();
                         // Slot 100 = totalSupply
                         storage.insert(
                             tn_types::B256::from(U256::from(100)),
-                            tn_types::B256::from(genesis_supply_wei),
+                            tn_types::B256::from(total_supply),
                         );
                         storage
                     })),

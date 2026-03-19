@@ -178,3 +178,52 @@ proptest! {
         );
     }
 }
+
+// ==============================
+// Arithmetic overflow
+// ==============================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(10))]
+
+    /// Faucet mint reverts when totalSupply + amount would overflow U256.
+    #[test]
+    fn prop_pipeline_faucet_mint_total_supply_overflow(amount in 1u128..1_000_000u128) {
+        let large_balance = U256::from(10).pow(U256::from(18)) * U256::from(1_000_000_000u64);
+        let precompile_balance = U256::from(10).pow(U256::from(18)) * U256::from(1000u64);
+
+        // Set totalSupply so that adding `amount` overflows U256
+        let total_supply = U256::MAX - U256::from(amount) + U256::from(1);
+
+        let mut env = PipelineTestEnv::new_with_custom_state(
+            total_supply,
+            precompile_balance,
+            large_balance,
+            large_balance,
+            large_balance,
+            large_balance,
+        );
+        let mut faucet = setup_faucet(&mut env);
+        let recipient_addr = env.recipient_factory.address();
+
+        let supply_before = env.get_total_supply();
+
+        // Faucet mint — balance_incr succeeds first (modifies state via EvmInternals),
+        // then totalSupply overflow triggers PrecompileError
+        let mint_tx = faucet_precompile_tx(
+            &mut faucet,
+            &env,
+            mintCall { recipient: recipient_addr, amount: U256::from(amount) }.abi_encode(),
+        );
+        let block = env.execute_block(vec![mint_tx]).expect("execute faucet mint");
+        assert!(!env.tx_succeeded(&block, 0), "faucet mint should fail due to total supply overflow");
+
+        // totalSupply must remain unchanged — the sstore was never executed
+        let supply_after = env.get_total_supply();
+        prop_assert_eq!(
+            supply_after,
+            supply_before,
+            "total supply should be unchanged after failed mint"
+        );
+    }
+}

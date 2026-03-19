@@ -10,10 +10,10 @@ use proptest::prelude::*;
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
 use tn_reth::{
     approveCall, burnCall, claimCall, mintCall, permitCall,
-    test_utils::precompile_test_utils::{permit_signer_address, sign_permit},
+    test_utils::precompile_test_utils::{permit_signer_address, sign_permit, GENESIS_SUPPLY},
     transferCall, transferFromCall, TELCOIN_PRECOMPILE_ADDRESS, TIMELOCK_DURATION,
 };
-use tn_types::U256;
+use tn_types::{B256, U256};
 
 // ==============================
 // ERC-20 transfer properties
@@ -1235,5 +1235,172 @@ proptest! {
             supply_before,
             "totalSupply should be unaffected by transfers and approvals"
         );
+    }
+}
+
+// ==============================
+// Category 10: Arithmetic overflow/underflow & signature malleability
+// ==============================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(10))]
+
+    /// Claim reverts when adding `amount` to governance balance would overflow U256.
+    #[test]
+    fn prop_pipeline_claim_balance_overflow(amount in 1u128..1_000_000u128) {
+        let large_balance = U256::from(10).pow(U256::from(18)) * U256::from(1_000_000_000u64);
+        let genesis_supply_wei = U256::from(GENESIS_SUPPLY) * U256::from(10).pow(U256::from(18));
+        let precompile_balance = U256::from(10).pow(U256::from(18)) * U256::from(1000u64);
+
+        // Set governance safe balance so that adding `amount` overflows U256
+        let gov_safe_balance = U256::MAX - U256::from(amount) + U256::from(1);
+
+        let mut env = PipelineTestEnv::new_with_custom_state(
+            genesis_supply_wei,
+            precompile_balance,
+            gov_safe_balance,
+            large_balance,
+            large_balance,
+            large_balance,
+        );
+        let supply_before = env.get_total_supply();
+        let mint_ts = 1_000_000u64;
+
+        // Block 1: mint
+        let mint_tx = env.governance_mint_tx(GOVERNANCE_SAFE_ADDRESS, U256::from(amount));
+        let block1 = env.execute_block_at_timestamp(vec![mint_tx], mint_ts)
+            .expect("execute mint block");
+        assert!(env.tx_succeeded(&block1, 0), "mint tx should succeed");
+
+        // Block 2: claim after timelock — should fail (balance overflow)
+        let claim_ts = mint_ts + TIMELOCK_DURATION + 1;
+        let claim_tx = env.governance_tx(
+            claimCall { recipient: GOVERNANCE_SAFE_ADDRESS }.abi_encode(),
+        );
+        let block2 = env.execute_block_at_timestamp(vec![claim_tx], claim_ts)
+            .expect("execute claim block");
+        assert!(!env.tx_succeeded(&block2, 0), "claim should fail due to balance overflow");
+
+        let supply_after = env.get_total_supply();
+        prop_assert_eq!(
+            supply_after,
+            supply_before,
+            "total supply should be unchanged after failed claim"
+        );
+    }
+
+    /// Claim reverts when totalSupply + amount would overflow U256.
+    #[test]
+    fn prop_pipeline_claim_total_supply_overflow(amount in 1u128..1_000_000u128) {
+        let large_balance = U256::from(10).pow(U256::from(18)) * U256::from(1_000_000_000u64);
+        let precompile_balance = U256::from(10).pow(U256::from(18)) * U256::from(1000u64);
+
+        // Set totalSupply so that adding `amount` overflows U256
+        let total_supply = U256::MAX - U256::from(amount) + U256::from(1);
+
+        let mut env = PipelineTestEnv::new_with_custom_state(
+            total_supply,
+            precompile_balance,
+            large_balance,
+            large_balance,
+            large_balance,
+            large_balance,
+        );
+        let supply_before = env.get_total_supply();
+        let mint_ts = 1_000_000u64;
+
+        // Block 1: mint
+        let mint_tx = env.governance_mint_tx(GOVERNANCE_SAFE_ADDRESS, U256::from(amount));
+        let block1 = env.execute_block_at_timestamp(vec![mint_tx], mint_ts)
+            .expect("execute mint block");
+        assert!(env.tx_succeeded(&block1, 0), "mint tx should succeed");
+
+        // Block 2: claim after timelock — balance_incr succeeds (gov balance is normal),
+        // but totalSupply overflow triggers
+        let claim_ts = mint_ts + TIMELOCK_DURATION + 1;
+        let claim_tx = env.governance_tx(
+            claimCall { recipient: GOVERNANCE_SAFE_ADDRESS }.abi_encode(),
+        );
+        let block2 = env.execute_block_at_timestamp(vec![claim_tx], claim_ts)
+            .expect("execute claim block");
+        assert!(!env.tx_succeeded(&block2, 0), "claim should fail due to total supply overflow");
+
+        let supply_after = env.get_total_supply();
+        prop_assert_eq!(
+            supply_after,
+            supply_before,
+            "total supply should be unchanged after failed claim"
+        );
+    }
+
+    /// Burn reverts when totalSupply < amount (underflow).
+    #[test]
+    fn prop_pipeline_burn_total_supply_underflow(burn_extra in 1u64..1000u64) {
+        let large_balance = U256::from(10).pow(U256::from(18)) * U256::from(1_000_000_000u64);
+        let precompile_balance = U256::from(10).pow(U256::from(18)) * U256::from(1000u64);
+
+        // Set totalSupply to 100 — burn will try to subtract more than this
+        let total_supply = U256::from(100);
+
+        let mut env = PipelineTestEnv::new_with_custom_state(
+            total_supply,
+            precompile_balance,
+            large_balance,
+            large_balance,
+            large_balance,
+            large_balance,
+        );
+        let supply_before = env.get_total_supply();
+        let precompile_before = env.get_balance(TELCOIN_PRECOMPILE_ADDRESS);
+
+        // Burn 100 + burn_extra — balance_decr passes (precompile has plenty),
+        // then totalSupply underflow triggers
+        let burn_amount = U256::from(100u64 + u64::from(burn_extra));
+        let burn_tx = env.governance_tx(
+            burnCall { amount: burn_amount }.abi_encode(),
+        );
+        let block = env.execute_block(vec![burn_tx]).expect("execute burn block");
+        assert!(!env.tx_succeeded(&block, 0), "burn should fail due to total supply underflow");
+
+        let supply_after = env.get_total_supply();
+        let precompile_after = env.get_balance(TELCOIN_PRECOMPILE_ADDRESS);
+        prop_assert_eq!(
+            supply_after,
+            supply_before,
+            "total supply should be unchanged after failed burn"
+        );
+        prop_assert_eq!(
+            precompile_after,
+            precompile_before,
+            "precompile balance should be unchanged after failed burn"
+        );
+    }
+
+    /// Permit reverts when s > SECP256K1N_HALF (signature malleability).
+    #[test]
+    fn prop_pipeline_permit_signature_malleability(amount in 1u128..1_000_000u128) {
+        let mut env = PipelineTestEnv::new();
+        let owner = permit_signer_address();
+        let spender = env.recipient_factory.address();
+        let chain_id = env.chain_id();
+        let value = U256::from(amount);
+        let deadline = U256::from(env.block_timestamp + 1000);
+        let nonce = env.get_nonce(owner);
+
+        // Get a valid signature, then replace s with U256::MAX (definitely > SECP256K1N_HALF)
+        let (v, r, _) = sign_permit(owner, spender, value, nonce, deadline, chain_id);
+        let malleable_s = B256::from(U256::MAX);
+
+        let tx = env.user_precompile_tx(
+            permitCall { owner, spender, value, deadline, v, r, s: malleable_s }.abi_encode(),
+        );
+        let block = env.execute_block(vec![tx]).expect("execute permit block");
+        assert!(!env.tx_succeeded(&block, 0), "permit with malleable s should fail");
+
+        // Verify nonce and allowance unchanged
+        let nonce_after = env.get_nonce(owner);
+        let allowance_after = env.get_allowance(owner, spender);
+        prop_assert_eq!(nonce_after, nonce, "nonce should be unchanged after failed permit");
+        prop_assert_eq!(allowance_after, U256::ZERO, "allowance should be unchanged after failed permit");
     }
 }
