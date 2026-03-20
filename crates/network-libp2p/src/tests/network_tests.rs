@@ -885,10 +885,11 @@ async fn test_score_decay_and_reconnection() -> eyre::Result<()> {
     let default_score = network_config.peer_config_mut().score_config.default_score;
 
     // Set up multiple peers with the custom config
-    let (peer1, mut other_peers, _) = create_test_peers::<TestWorkerRequest, TestWorkerResponse>(
-        NonZeroUsize::new(4).unwrap(),
-        Some(network_config.clone()),
-    );
+    let (peer1, mut other_peers, _task_manager) =
+        create_test_peers::<TestWorkerRequest, TestWorkerResponse>(
+            NonZeroUsize::new(4).unwrap(),
+            Some(network_config.clone()),
+        );
 
     let peer2 = other_peers.remove(0);
     let TestPeer { config: config_1, network_handle: peer1, network, .. } = peer1;
