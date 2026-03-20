@@ -49,13 +49,7 @@ async fn test_genesis_with_its() -> eyre::Result<()> {
     std::thread::sleep(std::time::Duration::from_secs(5));
     // spawn testnet for RPC calls
     let temp_path = tempfile::TempDir::with_suffix("genesis_with_its").expect("tempdir is okay");
-    spawn_local_testnet(
-        temp_path.path(),
-        #[cfg(feature = "faucet")]
-        "0x0000000000000000000000000000000000000000",
-        None,
-    )
-    .expect("failed to spawn testnet");
+    spawn_local_testnet(temp_path.path(), None).expect("failed to spawn testnet");
     let rpc_url = "http://127.0.0.1:8545".to_string();
     let client = wait_for_rpc(&rpc_url).await;
 
@@ -193,13 +187,7 @@ async fn test_genesis_with_consensus_registry_accounts() -> eyre::Result<()> {
     // spawn testnet for RPC calls
     let temp_path = tempfile::TempDir::with_suffix("genesis_with_consensus_registry_accounts")
         .expect("tempdir is okay");
-    spawn_local_testnet(
-        temp_path.path(),
-        #[cfg(feature = "faucet")]
-        "0x0000000000000000000000000000000000000000",
-        None,
-    )
-    .expect("failed to spawn testnet");
+    spawn_local_testnet(temp_path.path(), None).expect("failed to spawn testnet");
     let rpc_url = "http://127.0.0.1:8545".to_string();
     let client = wait_for_rpc(&rpc_url).await;
 

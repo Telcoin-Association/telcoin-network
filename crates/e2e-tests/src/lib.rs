@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     sync::OnceLock,
 };
-use telcoin_network_cli::{genesis::GenesisArgs, keytool::KeyArgs, node::NodeCommand};
+use telcoin_network_cli::{genesis::GenesisArgs, keytool::KeyArgs, node::NodeCommand, NoArgs};
 use tn_config::{Config, ConfigFmt, ConfigTrait, KeyConfig};
 use tn_node::launch_node;
 use tn_types::{test_utils::CommandParser, Address, Genesis, GenesisAccount};
@@ -52,7 +52,7 @@ fn create_observer_info(datadir: PathBuf, passphrase: Option<String>) -> eyre::R
     keys_command.args.execute(datadir, passphrase)
 }
 
-/// Create validator info, genesis ceremony, and spawn node command with faucet active.
+/// Create validator info, genesis ceremony, and configure local testnet.
 pub fn config_local_testnet(
     temp_path: &Path,
     passphrase: Option<String>,
@@ -137,10 +137,9 @@ pub fn config_local_testnet(
     Ok(())
 }
 
-/// Create validator info, genesis ceremony, and spawn node command with faucet active.
+/// Create validator info, genesis ceremony, and spawn node command.
 pub fn spawn_local_testnet(
     temp_path: &Path,
-    #[cfg(feature = "faucet")] faucet_contract_address: &str,
     accounts: Option<Vec<(Address, GenesisAccount)>>,
 ) -> eyre::Result<()> {
     config_local_testnet(temp_path, None, accounts)?;
@@ -150,17 +149,6 @@ pub fn spawn_local_testnet(
         let dir = temp_path.join(v);
         let instance = v.chars().last().expect("validator instance").to_string();
 
-        #[cfg(feature = "faucet")]
-        let command = NodeCommand::<tn_faucet::FaucetArgs>::parse_from([
-            "tn",
-            "--http",
-            "--instance",
-            &instance,
-            "--google-kms",
-            "--faucet-contract",
-            faucet_contract_address,
-        ]);
-        #[cfg(not(feature = "faucet"))]
         let command = NodeCommand::parse_from(["tn", "--http", "--instance", &instance]);
 
         let key_config = KeyConfig::read_config(&dir, Some("it_test_pass".to_string()))?;
@@ -174,8 +162,7 @@ pub fn spawn_local_testnet(
 
             runtime.block_on(async move {
                 let err = command
-                    .execute(dir, key_config, |mut builder, faucet_args, tn_datadir, passphrase| {
-                        builder.opt_faucet_args = Some(faucet_args);
+                    .execute(dir, key_config, |builder, _: NoArgs, tn_datadir, passphrase| {
                         launch_node(builder, tn_datadir, passphrase)
                     })
                     .expect("execute to succeed")
