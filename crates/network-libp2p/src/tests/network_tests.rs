@@ -672,7 +672,7 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     tn_types::test_utils::init_test_tracing();
     // Create a custom config with very low peer limits for testing
@@ -774,7 +774,9 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
 
     // connect peer2
     tokio::spawn(async move {
-        peer2_network.run().await.expect("nvv network run failed!");
+        if let Err(e) = peer2_network.run().await {
+            error!(target: "network", ?e, "peer2 network run failed");
+        }
     });
 
     peer2.start_listening(peer2_config.primary_address()).await?;
@@ -804,7 +806,9 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     } = nvv_peer;
 
     tokio::spawn(async move {
-        network.run().await.expect("nvv network run failed!");
+        if let Err(e) = network.run().await {
+            error!(target: "network", ?e, "nvv network run failed");
+        }
     });
 
     nvv.start_listening(nvv_config.primary_address()).await?;

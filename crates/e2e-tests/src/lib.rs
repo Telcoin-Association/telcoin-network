@@ -145,6 +145,8 @@ pub fn spawn_local_testnet(
     config_local_testnet(temp_path, None, accounts)?;
 
     let validators = ["validator-1", "validator-2", "validator-3", "validator-4"];
+    let (tx, rx) = std::sync::mpsc::channel();
+
     for v in validators.into_iter() {
         let dir = temp_path.join(v);
         let instance = v.chars().last().expect("validator instance").to_string();
@@ -152,7 +154,10 @@ pub fn spawn_local_testnet(
         let command = NodeCommand::parse_from(["tn", "--http", "--instance", &instance]);
 
         let key_config = KeyConfig::read_config(&dir, Some("it_test_pass".to_string()))?;
-        std::thread::spawn(|| {
+        let tx = tx.clone();
+        let name = v.to_string();
+
+        std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .thread_name("telcoin-network")
                 .enable_io()
@@ -161,15 +166,31 @@ pub fn spawn_local_testnet(
                 .expect("can build tokio runtime");
 
             runtime.block_on(async move {
-                let err = command
-                    .execute(dir, key_config, |builder, _: NoArgs, tn_datadir, passphrase| {
+                match command.execute(
+                    dir,
+                    key_config,
+                    |builder, _: NoArgs, tn_datadir, passphrase| {
                         launch_node(builder, tn_datadir, passphrase)
-                    })
-                    .expect("execute to succeed")
-                    .await;
-                error!("{:?}", err);
+                    },
+                ) {
+                    Ok(handle) => {
+                        let err = handle.await;
+                        error!("{name} exited: {err:?}");
+                    }
+                    Err(e) => {
+                        let msg = format!("{name} failed to start: {e:?}");
+                        error!("{msg}");
+                        let _ = tx.send(msg);
+                    }
+                }
             });
         });
+    }
+
+    // Give threads a moment to fail fast, then check for early errors
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    if let Ok(err) = rx.try_recv() {
+        eyre::bail!("Node startup failed: {err}");
     }
 
     Ok(())

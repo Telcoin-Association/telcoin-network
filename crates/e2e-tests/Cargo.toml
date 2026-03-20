@@ -32,6 +32,7 @@ escargot = { workspace = true }
 tn-reth = { workspace = true, features = ["test-utils"] }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 rand_chacha = { workspace = true }
 alloy = { workspace = true }
 rand = { workspace = true }

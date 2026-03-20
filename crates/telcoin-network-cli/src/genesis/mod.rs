@@ -7,9 +7,9 @@ use secp256k1::{
     rand::{rngs::StdRng, SeedableRng},
     Secp256k1,
 };
-use std::{collections::BTreeMap, path::PathBuf, str::FromStr as _, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 use tn_config::{
-    Config, ConfigFmt, ConfigTrait, NetworkGenesis, Parameters, TelcoinDirs as _, DEPLOYMENTS_JSON,
+    Config, ConfigFmt, ConfigTrait, NetworkGenesis, Parameters, TelcoinDirs as _,
     GOVERNANCE_SAFE_ADDRESS,
 };
 use tn_reth::{system_calls::ConsensusRegistry, RethChainSpec, RethEnv};
@@ -189,24 +189,8 @@ impl GenesisArgs {
                 )
             })?
         };
-        // use embedded ITS config from submodule, passing in decremented ITEL balance
-        let genesis_stake = self
-            .initial_stake
-            .checked_mul(U256::from(validators.len()))
-            .expect("initial validators' stake");
-        let itel_balance =
-            U256::from(clap_u256_parser_to_18_decimals("100_000_000_000")? - genesis_stake);
-
-        let itel_address_str: String =
-            RethEnv::fetch_value_from_json_str(DEPLOYMENTS_JSON, Some("its.InterchainTEL"))?
-                .as_str()
-                .expect("invalid json string")
-                .to_string();
-        let itel_address = Address::from_str(&itel_address_str)?;
         let precompiles =
-            NetworkGenesis::fetch_precompile_genesis_accounts(itel_address, itel_balance)
-                .expect("precompile fetch error");
-
+            NetworkGenesis::fetch_precompile_genesis_accounts().expect("precompile fetch error");
         let mut updated_genesis = genesis_with_consensus_registry.extend_accounts(precompiles);
         // Changed a default config setting so update and save.
         if let Some(acct_str) = &self.dev_funded_account {
