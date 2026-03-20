@@ -487,6 +487,11 @@ where
         let previous_epoch_rec =
             self.consensus_chain.epochs().record_by_epoch(previous_epoch).await;
         let previous_epoch_rec = if let Some(rec) = previous_epoch_rec {
+            // Even when the record is found, proactively trigger the epoch record
+            // collector so it backfills any epoch certs that are missing (e.g. when
+            // quorum failed AND the peer-fetch in manage_epoch_votes also failed because
+            // the network channels had already closed after epoch shutdown).
+            self.consensus_bus.requested_missing_epoch().send_replace(previous_epoch);
             rec
         } else if previous_epoch == 0 {
             EpochRecord {

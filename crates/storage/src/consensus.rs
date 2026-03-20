@@ -16,9 +16,13 @@ use tn_types::{
     gas_accumulator::RewardsCounter, AuthorityIdentifier, BlockHash, BlockNumHash, CommittedSubDag,
     Committee, ConsensusHeader, ConsensusOutput, Epoch, EpochRecord, Round, B256,
 };
-use tokio::sync::{
-    mpsc::{self, Sender},
-    oneshot,
+use tokio::{
+    fs::File as AsyncFile,
+    io::{AsyncRead, AsyncSeek},
+    sync::{
+        mpsc::{self, Sender},
+        oneshot,
+    },
 };
 use tracing::error;
 
@@ -27,8 +31,8 @@ use crate::{
     epoch_records::{EpochDbError, EpochRecordDb},
 };
 
-pub trait ReadStream: Read + Seek + Send {}
-impl ReadStream for File {}
+pub trait ReadStream: AsyncRead + AsyncSeek + Unpin {}
+impl ReadStream for AsyncFile {}
 
 /// Simple enum for which of two saved consensus states we are using.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -349,13 +353,14 @@ impl ConsensusChain {
 
     /// Populate an epoch pack from a stream.
     /// This will resolve once the stream has been written.
-    pub async fn stream_import<R: Read + Seek + Send + 'static>(
+    pub async fn stream_import<R: AsyncRead + AsyncSeek + Unpin>(
         &self,
         stream: R,
         epoch: Epoch,
         previous_epoch: EpochRecord,
     ) -> Result<(), ConsensusChainError> {
-        let pack = ConsensusPack::stream_import(&self.base_path, stream, epoch, previous_epoch)?;
+        let pack =
+            ConsensusPack::stream_import(&self.base_path, stream, epoch, previous_epoch).await?;
         Ok(pack.persist().await?)
     }
 
@@ -365,7 +370,7 @@ impl ConsensusChain {
         epoch: Epoch,
     ) -> Result<Box<dyn ReadStream>, ConsensusChainError> {
         let base_dir = self.base_path.join(format!("epoch-{epoch}"));
-        let stream = File::open(base_dir.join(DATA_NAME))?;
+        let stream = AsyncFile::open(base_dir.join(DATA_NAME)).await?;
         Ok(Box::new(stream))
     }
 

@@ -3,6 +3,7 @@
 
 use serde::{de::DeserializeOwned, Serialize};
 use tn_types::{encode_into_buffer, try_decode};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncSeek, AsyncSeekExt as _};
 
 use crate::archive::{
     error::{
@@ -409,11 +410,30 @@ impl DataHeader {
     ) -> Result<Self, LoadHeaderError> {
         source.rewind()?;
         let mut buffer = [0_u8; DATA_HEADER_BYTES];
+        source.read_exact(&mut buffer[..])?;
+        Self::load_header_from_buffer(buffer, uid_idx)
+    }
+
+    /// Load a DataHeader from source.
+    pub(crate) async fn load_header_async<R: AsyncRead + AsyncSeek + Unpin>(
+        source: &mut R,
+        uid_idx: u64,
+    ) -> Result<Self, LoadHeaderError> {
+        source.rewind().await?;
+        let mut buffer = [0_u8; DATA_HEADER_BYTES];
+        source.read_exact(&mut buffer[..]).await?;
+        Self::load_header_from_buffer(buffer, uid_idx)
+    }
+
+    /// Load a DataHeader from source.
+    pub(crate) fn load_header_from_buffer(
+        buffer: [u8; DATA_HEADER_BYTES],
+        uid_idx: u64,
+    ) -> Result<Self, LoadHeaderError> {
         let mut buf16 = [0_u8; 2];
         let mut buf32 = [0_u8; 4];
         let mut buf64 = [0_u8; 8];
         let mut pos = 0;
-        source.read_exact(&mut buffer[..])?;
         let mut crc32_hasher = crc32fast::Hasher::new();
         crc32_hasher.update(&buffer[..(DATA_HEADER_BYTES - 4)]);
         let calc_crc32 = crc32_hasher.finalize();
