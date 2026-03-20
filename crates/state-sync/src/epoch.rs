@@ -57,6 +57,9 @@ async fn collect_epoch_records(
     for epoch in last_epoch.. {
         // If we already have epoch record AND it's certificate then continue.
         if let Some((_, Some(_))) = consensus_chain.epochs().get_epoch_by_number(epoch).await {
+            // Advance result_epoch so we correctly track the last confirmed epoch,
+            // allowing last_epoch to advance past already-complete epochs on future calls.
+            result_epoch = epoch;
             continue;
         }
         // Try to recover by downloading the epoch record and cert from a peer.
@@ -168,12 +171,12 @@ pub async fn spawn_epoch_record_collector(
 ) -> eyre::Result<()> {
     let mut epoch_rx = consensus_bus.requested_missing_epoch().subscribe();
     node_task_spawner.spawn_critical_task("Epoch Record Collector", async move {
-        let mut last_epoch =
-            if let Some(last_epoch) = consensus_chain.epochs().latest_record().await {
-                last_epoch.epoch
-            } else {
-                0
-            };
+        // Always start from epoch 0 so any gaps (epochs whose certs were never
+        // saved, e.g. because the node was killed during a failed-quorum recovery)
+        // are back-filled on restart.  Epochs that already have both a record and
+        // a certificate are skipped immediately by get_epoch_by_number, so this
+        // is cheap for nodes that are fully caught up.
+        let mut last_epoch: Epoch = 0;
         loop {
             let requested_epoch = *epoch_rx.borrow_and_update();
             if requested_epoch > last_epoch {

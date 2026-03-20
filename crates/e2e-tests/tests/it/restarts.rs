@@ -445,7 +445,9 @@ fn run_observer_tests(client_urls: &[String; 4], obs_url: &str) -> eyre::Result<
     // After the first transaction, EL block 1 exists on all validators. Wait for the observer
     // to sync to that block before reading state from it — the observer starts at genesis and
     // may not have caught up yet, which would cause the basefee baseline to be 0.
-    let target_block = get_block_number(&client_urls[0])?;
+    // Use client_urls[2] since send_and_confirm already verified that validator's state,
+    // guaranteeing it has executed the TX block. client_urls[0] may lag slightly.
+    let target_block = get_block_number(&client_urls[2])?;
     wait_for_block(obs_url, target_block)?;
 
     // Send to observer, validator confirms- second time.
