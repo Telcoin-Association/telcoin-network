@@ -1,8 +1,8 @@
 //! The factory to create EVM environments.
 
 use super::{
-    TNBlockExecutionCtx, TNBlockExecutor, TNContext as _, TNContextBuilder as _, TNEvm,
-    TNEvmContext,
+    tel_precompile::add_telcoin_precompile, TNBlockExecutionCtx, TNBlockExecutor, TNContext as _,
+    TNContextBuilder as _, TNEvm, TNEvmContext,
 };
 use alloy_evm::Database;
 use reth_evm::{
@@ -44,15 +44,20 @@ impl EvmFactory for TNEvmFactory {
     // the `NoOpInspector` is part of the trait
     fn create_evm<DB: Database>(&self, db: DB, input: EvmEnv) -> Self::Evm<DB, NoOpInspector> {
         let spec_id = input.cfg_env.spec;
+        let chain_id = input.cfg_env.chain_id;
         TNEvm {
             inner: Context::tn()
                 .with_block(input.block_env)
                 .with_cfg(input.cfg_env)
                 .with_db(db)
                 .build_with_inspector(NoOpInspector)
-                .with_precompiles(PrecompilesMap::from_static(Precompiles::new(
-                    PrecompileSpecId::from_spec_id(spec_id),
-                ))),
+                .with_precompiles({
+                    let mut map = PrecompilesMap::from_static(Precompiles::new(
+                        PrecompileSpecId::from_spec_id(spec_id),
+                    ));
+                    add_telcoin_precompile(&mut map, chain_id);
+                    map
+                }),
             inspect: false,
         }
     }
@@ -64,15 +69,20 @@ impl EvmFactory for TNEvmFactory {
         inspector: I,
     ) -> Self::Evm<DB, I> {
         let spec_id = input.cfg_env.spec;
+        let chain_id = input.cfg_env.chain_id;
         TNEvm {
             inner: Context::tn()
                 .with_block(input.block_env)
                 .with_cfg(input.cfg_env)
                 .with_db(db)
                 .build_with_inspector(inspector)
-                .with_precompiles(PrecompilesMap::from_static(Precompiles::new(
-                    PrecompileSpecId::from_spec_id(spec_id),
-                ))),
+                .with_precompiles({
+                    let mut map = PrecompilesMap::from_static(Precompiles::new(
+                        PrecompileSpecId::from_spec_id(spec_id),
+                    ));
+                    add_telcoin_precompile(&mut map, chain_id);
+                    map
+                }),
             inspect: true,
         }
     }

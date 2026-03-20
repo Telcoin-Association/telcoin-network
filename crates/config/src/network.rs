@@ -3,7 +3,7 @@
 use crate::{ConfigFmt, ConfigTrait, TelcoinDirs};
 use libp2p::{kad::K_VALUE, request_response::ProtocolSupport, StreamProtocol};
 use serde::{Deserialize, Serialize};
-use std::{num::NonZeroUsize, sync::OnceLock, time::Duration};
+use std::{num::NonZeroUsize, time::Duration};
 use tn_types::Round;
 
 impl ConfigTrait for NetworkConfig {}
@@ -443,11 +443,7 @@ impl ScoreConfig {
     /// Calculate the halflife decay constant =
     /// -(2.0f64.ln()) / self.score_halflife
     pub fn halflife_decay(&self) -> f64 {
-        // static cache that persists
-        static CACHE: OnceLock<f64> = OnceLock::new();
-
-        // return the cached value if it exists
-        *CACHE.get_or_init(|| -(2.0f64.ln()) / self.score_halflife)
+        -(2.0f64.ln()) / self.score_halflife
     }
 }
 

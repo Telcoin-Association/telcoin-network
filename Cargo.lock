@@ -12250,6 +12250,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tn-config",
+ "tn-reth",
  "tn-types",
  "tn-worker",
  "tokio",

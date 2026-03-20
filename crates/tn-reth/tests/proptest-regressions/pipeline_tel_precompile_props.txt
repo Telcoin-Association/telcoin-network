@@ -1,0 +1,30 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2210ab9621b7fbc85f8c8dff1bb42e9d7d5f4ec2e2e0a6a156d0c13d38b1ce8d # shrinks to seed = 0
+cc 1a3f38c94493f05f8c8772e04375ea71dabd8c88b64fa946cf45af87608845d6 # shrinks to amount = 34
+cc adc5bc722623da9493ad77b0bee481d6009ca15b422df4272217b5560579415f # shrinks to amount = 721
+cc 19b28293dd76f394da14293a9ee1b857f169dc439249cbf945c462bb2e75f367 # shrinks to amount = 72
+cc 1ad89581d963fba432176613c4bffd71c43d9f5fa256bb9eb246fc9708229709 # shrinks to amount = 252
+cc 35302738ddd60a4c8914358d3a8497b7720db6351f496cd7617378b13f56f42e # shrinks to amount = 655
+cc 8387c8f960e45c1d3f4b12b9f7fe618177c229e414aaa63278b75d8ef0b0a0be # shrinks to amount = 2
+cc f09dcd9c263affe7bc46e933d1c6a631944e7973e8d1b6a73db4e8bae8ddb005 # shrinks to amount = 1
+cc 26f8d8ed903dde25e3c89f7b2502985ecbe160bf0e99e8255a67932c68e6bd76 # shrinks to amount = 301
+cc e6255c11372282b74073d9fd0f4ed0a5214dd321eeca5b433d4e32141afbc1e1 # shrinks to amount = 5
+cc cd3634f1830ce3c8f4888f608a0531ee942aa92206ddfcafdb2dac99c509cdca # shrinks to amount = 271
+cc c1dc202760f5c0bca8af343cf98cfb8d0da923232deb40661ffd05c0022a8593 # shrinks to transfer_amount = 1
+cc 5ed1289731727176b265067ace8670984143e53298d9efdceafa22b8e144f551 # shrinks to amount = 1028
+cc 75039e4207aae1a25b76c39e213de6ea8658e69940038a6d224ad8b676a1f61a # shrinks to amount = 3971
+cc 47dc7d48668335095f6a04a1db166e475378b1db2793382b3d73d366231196a2 # shrinks to amount = 1780
+cc ab9ade684f8c0b9d0b981a1ad2015c6bfa948bd74affb431a7ac5ef81454b52f # shrinks to amount = 10296
+cc b76e167e218613598bcb6f1e1bacdd46eb0bc23b2eda5d03351a6c5c615eae26 # shrinks to amount = 1
+cc 567479980ceae11cec8efdfa78f337e2fd835d014a64ded887c55cbd55889c46 # shrinks to amount = 3297
+cc 90165309f67b7ce67bad4d8e1e3f653817cefc7c63936c80e026b561c3555c5d # shrinks to amount = 3570
+cc 3a0ff522834287ef8a5d4cffcc554430f29ce6610d783906d9b98d0bd0f06e9a # shrinks to allowance_val = 39117, pct = 14
+cc e69a46f44d9fd82804d91ec8d2e4f77b037cf1421635badf3aeca64acfe895e5 # shrinks to amount = 150831
+cc 0ac4f44da62092d589cb4eda5c671e68949f708fe76f91cf2259212dbea02339 # shrinks to a1 = 282114, a2 = 407924
+cc 42d942a4a4a00793e8c2c77ab421338e9ed2dee725966e674a4d18c417be58e7 # shrinks to first = 6105, second = 591823
+cc 902851e15468b9cf4b49e27ed5f31496683cb17502de99ea7e44a1c0d9dedbd9 # shrinks to first = 411, second = 549995

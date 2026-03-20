@@ -19,7 +19,10 @@
 
 // Used in tests
 #[cfg(test)]
-use proptest as _;
+mod clippy {
+    use proptest as _;
+    use tn_reth as _;
+}
 
 use crate::{
     evm::TNEvm,
@@ -157,7 +160,14 @@ mod evm;
 pub mod rpc_server_args;
 pub mod system_calls;
 pub mod worker;
-pub use evm::calculate_gas_penalty;
+#[cfg(not(feature = "faucet"))]
+pub use evm::TIMELOCK_DURATION;
+pub use evm::{
+    add_telcoin_precompile, allowanceCall, approveCall, balanceOfCall, burnCall,
+    calculate_gas_penalty, claimCall, decimalsCall, grantMintRoleCall, hasMintRoleCall, mintCall,
+    nameCall, noncesCall, permitCall, revokeMintRoleCall, symbolCall, totalSupplyCall,
+    transferCall, transferFromCall, DOMAIN_SEPARATORCall, TELCOIN_PRECOMPILE_ADDRESS,
+};
 
 #[cfg(any(feature = "test-utils", test))]
 pub mod test_utils;

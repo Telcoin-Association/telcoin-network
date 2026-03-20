@@ -27,6 +27,21 @@ use tn_reth::{
 use tn_types::{address, Address, Bytes, FromHex, GenesisAccount, U256};
 use tracing::debug;
 
+async fn wait_for_rpc(url: &str) -> HttpClient {
+    let client = HttpClientBuilder::default().build(url).expect("couldn't build rpc client");
+    let max_attempts = 60;
+    for attempt in 0..max_attempts {
+        match client.request::<String, _>("eth_blockNumber", rpc_params!()).await {
+            Ok(_) => return client,
+            Err(_) if attempt < max_attempts - 1 => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(e) => panic!("RPC at {url} not available after {max_attempts} attempts: {e}"),
+        }
+    }
+    unreachable!()
+}
+
 #[tokio::test]
 async fn test_genesis_with_its() -> eyre::Result<()> {
     let _guard = IT_TEST_MUTEX.lock();
@@ -41,11 +56,8 @@ async fn test_genesis_with_its() -> eyre::Result<()> {
         None,
     )
     .expect("failed to spawn testnet");
-    // allow time for nodes to start
-    tokio::time::sleep(Duration::from_secs(10)).await;
-
     let rpc_url = "http://127.0.0.1:8545".to_string();
-    let client = HttpClientBuilder::default().build(&rpc_url).expect("couldn't build rpc client");
+    let client = wait_for_rpc(&rpc_url).await;
 
     let itel_address =
         RethEnv::fetch_value_from_json_str(DEPLOYMENTS_JSON, Some("its.InterchainTEL"))?
@@ -188,11 +200,8 @@ async fn test_genesis_with_consensus_registry_accounts() -> eyre::Result<()> {
         None,
     )
     .expect("failed to spawn testnet");
-    // allow time for nodes to start
-    tokio::time::sleep(Duration::from_secs(10)).await;
-
     let rpc_url = "http://127.0.0.1:8545".to_string();
-    let client = HttpClientBuilder::default().build(&rpc_url).expect("couldn't build rpc client");
+    let client = wait_for_rpc(&rpc_url).await;
 
     // sanity check onchain spawned both registry & issuance in genesis
     let returned_registry_bytecode: String = client

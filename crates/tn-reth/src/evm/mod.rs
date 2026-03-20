@@ -22,12 +22,23 @@ mod config;
 mod context;
 mod factory;
 mod handler;
+mod tel_precompile;
 mod utils;
 use crate::evm::handler::TNEvmHandler;
 pub(crate) use block::*;
 pub(crate) use config::*;
 pub(crate) use context::*;
 pub(crate) use factory::*;
+#[cfg(any(test, feature = "test-utils"))]
+pub use tel_precompile::test_utils as precompile_test_utils;
+#[cfg(not(feature = "faucet"))]
+pub use tel_precompile::TIMELOCK_DURATION;
+pub use tel_precompile::{
+    add_telcoin_precompile, allowanceCall, approveCall, balanceOfCall, burnCall, claimCall,
+    decimalsCall, grantMintRoleCall, hasMintRoleCall, mintCall, nameCall, noncesCall, permitCall,
+    revokeMintRoleCall, symbolCall, totalSupplyCall, transferCall, transferFromCall,
+    DOMAIN_SEPARATORCall, TELCOIN_PRECOMPILE_ADDRESS,
+};
 pub use utils::calculate_gas_penalty;
 
 /// TN EVM implementation.
