@@ -34,14 +34,7 @@ impl ExportStakingArgs {
     /// Loads `node-info.yaml` and builds the calldata from the BLS public key
     /// and proof of possession, matching what `--calldata` prints.
     pub fn stake_calldata(&self) -> eyre::Result<Vec<u8>> {
-        let path = if self.node_info.is_dir() {
-            self.node_info.join("node-info.yaml")
-        } else {
-            self.node_info.clone()
-        };
-
-        let node_info = Config::load_from_path::<NodeInfo>(&path, ConfigFmt::YAML)?;
-
+        let node_info = self.load_node_info()?;
         let compressed = node_info.bls_public_key.to_bytes();
         let uncompressed_pk = node_info.bls_public_key.serialize();
         let uncompressed_sig = node_info.proof_of_possession.serialize();
@@ -66,14 +59,7 @@ impl ExportStakingArgs {
             return Ok(());
         }
 
-        // resolve path: append node-info.yaml if a directory is given
-        let path = if self.node_info.is_dir() {
-            self.node_info.join("node-info.yaml")
-        } else {
-            self.node_info.clone()
-        };
-
-        let node_info = Config::load_from_path::<NodeInfo>(&path, ConfigFmt::YAML)?;
+        let node_info = self.load_node_info()?;
 
         // compressed BLS pubkey (96 bytes) - used as blsPubkey param
         let compressed = node_info.bls_public_key.to_bytes();
@@ -105,5 +91,15 @@ impl ExportStakingArgs {
         }
 
         Ok(())
+    }
+
+    /// Load node info from fs.
+    fn load_node_info(&self) -> eyre::Result<NodeInfo> {
+        let path = if self.node_info.is_dir() {
+            self.node_info.join("node-info.yaml")
+        } else {
+            self.node_info.clone()
+        };
+        Config::load_from_path::<NodeInfo>(&path, ConfigFmt::YAML)
     }
 }

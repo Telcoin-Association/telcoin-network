@@ -53,12 +53,14 @@ fn execute_and_commit(
     payload: TNPayload,
     transactions: Vec<Vec<u8>>,
 ) -> eyre::Result<SealedHeader> {
-    let block = reth_env.build_block_from_batch_payload(payload, &transactions)?;
+    let anchor_hash = payload.parent_header.hash();
+    let block =
+        reth_env.build_block_from_batch_payload(payload, &transactions, anchor_hash, &[])?;
     let header = block.recovered_block.clone_sealed_header();
     let state = reth_env.canonical_in_memory_state();
     state.update_chain(NewCanonicalChain::Commit { new: vec![block.clone()] });
     state.set_canonical_head(header.clone());
-    reth_env.finish_executing_output(vec![block])?;
+    reth_env.finish_executing_output(vec![block], None)?;
     reth_env.finalize_block(header.clone())?;
     Ok(header)
 }
