@@ -250,10 +250,7 @@ impl ConsensusPack {
     }
 
     /// Create a new set of epoch static files to write consensus output into.
-    pub async fn stream_import<
-        P: Into<PathBuf>,
-        R: AsyncRead + AsyncSeek + Unpin, /* XXXXSend + 'static */
-    >(
+    pub async fn stream_import<P: Into<PathBuf>, R: AsyncRead + AsyncSeek + Unpin>(
         path: P,
         stream: R,
         epoch: Epoch,
@@ -265,15 +262,6 @@ impl ConsensusPack {
         let inner = Inner::stream_import(path, stream, epoch, &previous_epoch).await?;
         let handle = std::thread::spawn(move || {
             run_pack_loop(inner, rx, tx_error);
-            /*XXXXmatch Inner::stream_import(path, stream, epoch, &previous_epoch).await {
-                Ok(inner) => {
-                    run_pack_loop(inner, rx, tx_error);
-                }
-                Err(e) => {
-                    clear_pack_loop(rx);
-                    tx_error.send_replace(Some(e));
-                }
-            }*/
         });
         Ok(Self { tx, handle: Arc::new(Mutex::new(Some(handle))), error, epoch })
     }
