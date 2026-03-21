@@ -196,6 +196,25 @@ pub fn spawn_local_testnet(
     Ok(())
 }
 
+/// Configure a command to write stdout to a per-node log file under `test_logs/`.
+///
+/// Logs are written to `crates/e2e-tests/test_logs/<test>/node<instance>-run<run>.log`.
+pub fn setup_log_dir(
+    command: &mut std::process::Command,
+    instance: impl std::fmt::Display,
+    test: &str,
+    run: u32,
+) {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+    let log_dir = std::path::PathBuf::from(manifest_dir).join("test_logs");
+    let test_dir = log_dir.join(test);
+    std::fs::create_dir_all(&test_dir).expect("failed to create test log dir");
+    let out_file = std::fs::File::create(test_dir.join(format!("node{instance}-run{run}.log")))
+        .expect("valid log file");
+    let stdout: std::process::Stdio = out_file.into();
+    command.stdout(stdout);
+}
+
 /// Helper to retrieve and build the main project binary.
 pub fn get_telcoin_network_binary() -> &'static CargoRun {
     info!("building main binary for e2e tests");

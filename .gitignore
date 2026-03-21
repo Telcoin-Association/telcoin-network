@@ -21,3 +21,6 @@ local-validators
 
 # Ignore generated credentials from google-github-actions/auth
 gha-creds-*.json
+
+# e2e test logs
+test_logs/

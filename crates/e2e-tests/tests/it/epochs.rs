@@ -6,20 +6,13 @@ use alloy::{
     sol_types::SolCall,
 };
 use clap::Parser as _;
-use e2e_tests::{create_validator_info, IT_TEST_MUTEX};
+use e2e_tests::{create_validator_info, setup_log_dir, IT_TEST_MUTEX};
 use nix::{
     sys::signal::{self, Signal},
     unistd::Pid,
 };
 use rand::{rngs::StdRng, SeedableRng as _};
-use std::{
-    fs::File,
-    panic,
-    path::Path,
-    process::{Child, Command, Stdio},
-    sync::Arc,
-    time::Duration,
-};
+use std::{panic, path::Path, process::Child, sync::Arc, time::Duration};
 use telcoin_network_cli::genesis::GenesisArgs;
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, NodeInfo};
 use tn_reth::{
@@ -532,17 +525,6 @@ fn config_committee(
     }
 
     Ok(genesis)
-}
-
-fn setup_log_dir(command: &mut Command, instance: &str, test: &str, run: u32) {
-    if let Ok(log_dir) = std::env::var("TEST_RESTARTS_LOG") {
-        let _ = std::fs::create_dir(format!("{log_dir}/"));
-        let _ = std::fs::create_dir(format!("{log_dir}/{test}/"));
-        let out_file = File::create(format!("{log_dir}/{test}/node{instance}-run{run}.log"))
-            .expect("valid log file");
-        let stdout: Stdio = out_file.into();
-        command.stdout(stdout);
-    }
 }
 
 /// Start the network using the node cli command.

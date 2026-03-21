@@ -1,5 +1,5 @@
 use alloy::primitives::address;
-use e2e_tests::{config_local_testnet, IT_TEST_MUTEX};
+use e2e_tests::{config_local_testnet, setup_log_dir, IT_TEST_MUTEX};
 use escargot::CargoRun;
 use ethereum_tx_sign::{LegacyTransaction, Transaction};
 use eyre::Report;
@@ -14,14 +14,7 @@ use nix::{
 };
 use secp256k1::{Keypair, Secp256k1, SecretKey};
 use serde_json::Value;
-use std::{
-    collections::HashMap,
-    fmt::Debug,
-    fs::File,
-    path::Path,
-    process::{Child, Command, Stdio},
-    time::Duration,
-};
+use std::{collections::HashMap, fmt::Debug, path::Path, process::Child, time::Duration};
 use tn_types::{get_available_tcp_port, keccak256, test_utils::init_test_tracing, Address};
 use tokio::runtime::Builder;
 use tracing::{error, info};
@@ -408,9 +401,6 @@ fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
 }
 
 /// Test a restart case with a short delay, the stopped node should rejoin consensus.
-/// Note set the TEST_RESTARTS_LOG env variable to a directory when running this test
-/// in order to get each nodes logs broken out by test/node/run.  This can make debugging
-/// restart tests easier vs having all the logs jumbled together.
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restartstt() -> eyre::Result<()> {
@@ -461,9 +451,6 @@ fn run_observer_tests(client_urls: &[String; 4], obs_url: &str) -> eyre::Result<
 }
 
 /// Test an observer node can submit txns.
-/// Note set the TEST_RESTARTS_LOG env variable to a directory when running this test
-/// in order to get each nodes logs broken out by test/node/run.  This can make debugging
-/// restart tests easier vs having all the logs jumbled together.
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restarts_observer() -> eyre::Result<()> {
@@ -519,9 +506,6 @@ fn test_restarts_observer() -> eyre::Result<()> {
 
 /// Test a restart case with a long delay, the stopped node should not rejoin consensus but follow
 /// the consensus chain.
-/// Note set the TEST_RESTARTS_LOG env variable to a directory when running this test
-/// in order to get each nodes logs broken out by test/node/run.  This can make debugging
-/// restart tests easier vs having all the logs jumbled together.
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restarts_delayed() -> eyre::Result<()> {
@@ -530,24 +514,10 @@ fn test_restarts_delayed() -> eyre::Result<()> {
 
 /// Test a restart case with a long delay, the stopped node should not rejoin consensus but follow
 /// the consensus chain.  Lag the restarted validator.
-/// Note set the TEST_RESTARTS_LOG env variable to a directory when running this test
-/// in order to get each nodes logs broken out by test/node/run.  This can make debugging
-/// restart tests easier vs having all the logs jumbled together.
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restarts_lagged_delayed() -> eyre::Result<()> {
     do_restarts(70, true, "restarts_lagged_delayed")
-}
-
-fn setup_log_dir(command: &mut Command, instance: usize, test: &str, run: u32) {
-    if let Ok(log_dir) = std::env::var("TEST_RESTARTS_LOG") {
-        let _ = std::fs::create_dir(format!("{log_dir}/"));
-        let _ = std::fs::create_dir(format!("{log_dir}/{test}/"));
-        let out_file = File::create(format!("{log_dir}/{test}/node{instance}-run{run}.log"))
-            .expect("valid log file");
-        let stdout: Stdio = out_file.into();
-        command.stdout(stdout);
-    }
 }
 
 /// Start a process running a validator node.
