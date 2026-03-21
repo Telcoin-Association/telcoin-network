@@ -23,7 +23,9 @@ max-threads = 1
 [[profile.default.overrides]]
 filter = "package(e2e-tests)"
 test-group = "e2e-serial"
+slow-timeout = { period = "120s", terminate-after = 3 }
 
 [[profile.ci.overrides]]
 filter = "package(e2e-tests)"
 test-group = "e2e-serial"
+slow-timeout = { period = "120s", terminate-after = 3 }

@@ -634,17 +634,15 @@ fn get_positive_balance_with_retry(node: &str, address: &str) -> eyre::Result<u1
 }
 
 /// Retry up to 30 times to retrieve an account balance > above.
-///
-/// Max time to get balance is 1min.
 fn get_balance_above_with_retry(node: &str, address: &str, above: u128) -> eyre::Result<u128> {
     let mut bal = get_balance(node, address, 5)?;
     let mut i = 0;
-    while i < 45 && bal <= above {
+    while i < 30 && bal <= above {
         std::thread::sleep(Duration::from_millis(1200));
         i += 1;
         bal = get_balance(node, address, 5)?;
     }
-    if i == 45 && bal <= above {
+    if i == 30 && bal <= above {
         error!(target:"restart-test", "get_balance_above_with_retry i == 30 - returning error!!");
         Err(Report::msg(format!("Failed to get a balance {bal} for {address} above {above}")))
     } else {
@@ -828,13 +826,18 @@ where
     let runtime = Builder::new_current_thread().enable_io().enable_time().build()?;
 
     let resp = runtime.block_on(async move {
-        let client = HttpClientBuilder::default().build(node).expect("couldn't build rpc client");
+        let client = HttpClientBuilder::default()
+            .request_timeout(Duration::from_secs(10))
+            .build(node)
+            .expect("couldn't build rpc client");
         let mut resp = client.request(command, params.clone()).await;
         let mut i = 0;
         while i < retries && resp.is_err() {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            let client =
-                HttpClientBuilder::default().build(node).expect("couldn't build rpc client");
+            let client = HttpClientBuilder::default()
+                .request_timeout(Duration::from_secs(10))
+                .build(node)
+                .expect("couldn't build rpc client");
             resp = client.request(command, params.clone()).await;
             i += 1;
         }
