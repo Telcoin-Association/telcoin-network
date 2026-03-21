@@ -62,14 +62,35 @@ Output modes:
 
 #### 3. Stake on-chain
 
-Pass the exported values to the `ConsensusRegistry.stake()` contract.
-Use `--calldata` mode to get pre-encoded calldata suitable for direct transaction submission:
+**Prerequisite:** Governance must have minted a ConsensusNFT for your execution address before you can stake.
 
-The calldata can be used to submit the transaction with tools like `cast`:
+The `ConsensusRegistry` is deployed at a fixed system address:
+
+```bash
+CONSENSUS_REGISTRY=0x07E17e17E17e17E17e17E17E17E17e17e17E17e1
+```
+
+The `stake()` function is payable.
+Users must send the exact required stake amount as the transaction value.
+Query the current required stake amount:
+
+```bash
+cast call $CONSENSUS_REGISTRY "getCurrentStakeConfig()(uint256,uint256,uint256,uint32)" --rpc-url RPC_URL
+```
+
+The first value returned is `stakeAmount` (in wei). Use it as the `--value` in the stake transaction:
 
 ```bash
 CALLDATA=$(telcoin-network keytool export-staking-args --node-info DATADIR/node-info.yaml --calldata)
-cast send $CONSENSUS_REGISTRY_ADDRESS $CALLDATA --trezor --rpc-url RPC_URL
+cast send $CONSENSUS_REGISTRY $CALLDATA --value <STAKE_AMOUNT> --trezor --rpc-url RPC_URL
+```
+
+Other signing options: `--ledger` for Ledger hardware wallets, `--interactive` to enter a private key securely at a prompt.
+
+After staking, signal that your validator is ready for committee selection:
+
+```bash
+cast send $CONSENSUS_REGISTRY "activate()" --trezor --rpc-url RPC_URL
 ```
 
 #### 4. Start the validator node
