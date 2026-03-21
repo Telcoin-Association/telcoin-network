@@ -1,5 +1,5 @@
 use alloy::primitives::address;
-use e2e_tests::{config_local_testnet, setup_log_dir, IT_TEST_MUTEX};
+use e2e_tests::{config_local_testnet, setup_log_dir};
 use escargot::CargoRun;
 use ethereum_tx_sign::{LegacyTransaction, Transaction};
 use eyre::Report;
@@ -286,7 +286,6 @@ fn network_advancing(client_urls: &[String; 4]) -> eyre::Result<()> {
 }
 
 fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
-    let _guard = IT_TEST_MUTEX.lock();
     init_test_tracing();
     info!(target: "restart-test", "do_restarts, delay: {delay}");
     // the tmp dir should be removed once tmp_quard is dropped
@@ -454,7 +453,6 @@ fn run_observer_tests(client_urls: &[String; 4], obs_url: &str) -> eyre::Result<
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restarts_observer() -> eyre::Result<()> {
-    let _guard = IT_TEST_MUTEX.lock();
     init_test_tracing();
     info!(target: "restart-test", "do_restarts_observer");
     // the tmp dir should be removed once tmp_quard is dropped
@@ -855,7 +853,6 @@ where
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_observer_late_join_catchup() -> eyre::Result<()> {
-    let _guard = IT_TEST_MUTEX.lock();
     init_test_tracing();
     info!(target: "restart-test", "test_observer_late_join_catchup");
     let tmp_guard = tempfile::TempDir::new().expect("tempdir is okay");
@@ -940,7 +937,6 @@ fn test_observer_late_join_catchup() -> eyre::Result<()> {
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_observer_reconnect_after_pause() -> eyre::Result<()> {
-    let _guard = IT_TEST_MUTEX.lock();
     init_test_tracing();
     info!(target: "restart-test", "test_observer_reconnect_after_pause");
     let tmp_guard = tempfile::TempDir::new().expect("tempdir is okay");

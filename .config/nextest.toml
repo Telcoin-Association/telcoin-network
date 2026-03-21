@@ -14,18 +14,17 @@ retries = 2
 fail-fast = true
 test-threads = "num-cpus"
 
-# E2E tests use hardcoded ports (8545, 8540-8545) and must run serially.
-# IT_TEST_MUTEX only works within a single process; nextest runs each test
-# in its own process, so we use a test group to enforce serialization.
-[test-groups.e2e-serial]
-max-threads = 1
+# E2E tests use dynamic ports and can run in parallel.
+# Limit concurrency since each test spawns 4-6 node processes.
+[test-groups.e2e]
+max-threads = 4
 
 [[profile.default.overrides]]
 filter = "package(e2e-tests)"
-test-group = "e2e-serial"
+test-group = "e2e"
 slow-timeout = { period = "120s", terminate-after = 3 }
 
 [[profile.ci.overrides]]
 filter = "package(e2e-tests)"
-test-group = "e2e-serial"
+test-group = "e2e"
 slow-timeout = { period = "120s", terminate-after = 3 }

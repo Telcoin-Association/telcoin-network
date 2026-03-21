@@ -5,7 +5,7 @@
 //! because the proxy version may be re-prioritized later.
 use alloy::{network::EthereumWallet, providers::ProviderBuilder};
 use core::panic;
-use e2e_tests::{spawn_local_testnet, IT_TEST_MUTEX};
+use e2e_tests::spawn_local_testnet;
 use eyre::OptionExt;
 use jsonrpsee::{
     core::client::ClientT,
@@ -51,10 +51,6 @@ async fn wait_for_rpc(url: &str) -> eyre::Result<HttpClient> {
 
 #[tokio::test]
 async fn test_precompile_genesis_accounts() -> eyre::Result<()> {
-    let _guard = IT_TEST_MUTEX.lock();
-    // sleep for other tests to cleanup
-    std::thread::sleep(std::time::Duration::from_secs(5));
-
     //
     // TODO: Issue #584: LZ adapter + safe
     //
@@ -92,9 +88,6 @@ async fn test_precompile_genesis_accounts() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_genesis_with_consensus_registry_accounts() -> eyre::Result<()> {
-    let _guard = IT_TEST_MUTEX.lock();
-    // sleep for other tests to cleanup
-    std::thread::sleep(std::time::Duration::from_secs(5));
     // fetch registry, blsg1, and issuance bytecodes
     let registry_runtimecode_binding = RethEnv::fetch_value_from_json_str(
         CONSENSUS_REGISTRY_JSON,
@@ -122,8 +115,8 @@ async fn test_genesis_with_consensus_registry_accounts() -> eyre::Result<()> {
     // spawn testnet for RPC calls
     let temp_path = tempfile::TempDir::with_suffix("genesis_with_consensus_registry_accounts")
         .expect("tempdir is okay");
-    spawn_local_testnet(temp_path.path(), None)?;
-    let rpc_url = "http://127.0.0.1:8545".to_string();
+    let client_urls = spawn_local_testnet(temp_path.path(), None)?;
+    let rpc_url = client_urls[0].clone();
     let client = wait_for_rpc(&rpc_url).await?;
 
     // sanity check onchain spawned both registry & issuance in genesis

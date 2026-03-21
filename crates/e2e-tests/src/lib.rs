@@ -18,8 +18,6 @@ use tn_types::{test_utils::CommandParser, Address, Genesis, GenesisAccount};
 use tracing::{error, info};
 // unused deps warnings
 
-/// Limit potential for port collisions.
-pub static IT_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Only compile main bin once for all tests.
 pub static TELCOIN_BINARY: OnceLock<CargoRun> = OnceLock::new();
 
@@ -141,17 +139,32 @@ pub fn config_local_testnet(
 pub fn spawn_local_testnet(
     temp_path: &Path,
     accounts: Option<Vec<(Address, GenesisAccount)>>,
-) -> eyre::Result<()> {
+) -> eyre::Result<Vec<String>> {
     config_local_testnet(temp_path, None, accounts)?;
 
     let validators = ["validator-1", "validator-2", "validator-3", "validator-4"];
     let (tx, rx) = std::sync::mpsc::channel();
+    let mut client_urls = Vec::new();
 
     for v in validators.into_iter() {
         let dir = temp_path.join(v);
-        let instance = v.chars().last().expect("validator instance").to_string();
+        let instance: u16 = v.chars().last().expect("validator instance").to_digit(10).expect("instance digit") as u16;
+        let rpc_port = tn_types::get_available_tcp_port("127.0.0.1")
+            .expect("Failed to get an ephemeral rpc port");
+        // reth's adjust_instance_ports does: http_port -= instance - 1
+        // So pass rpc_port + (instance - 1) to compensate, making node listen on rpc_port
+        let http_port_arg = rpc_port + instance - 1;
 
-        let command = NodeCommand::parse_from(["tn", "--http", "--instance", &instance]);
+        client_urls.push(format!("http://127.0.0.1:{rpc_port}"));
+
+        let command = NodeCommand::parse_from([
+            "tn",
+            "--http",
+            "--http.port",
+            &http_port_arg.to_string(),
+            "--instance",
+            &instance.to_string(),
+        ]);
 
         let key_config = KeyConfig::read_config(&dir, Some("it_test_pass".to_string()))?;
         let tx = tx.clone();
@@ -193,7 +206,7 @@ pub fn spawn_local_testnet(
         eyre::bail!("Node startup failed: {err}");
     }
 
-    Ok(())
+    Ok(client_urls)
 }
 
 /// Configure a command to write stdout to a per-node log file under `test_logs/`.
@@ -226,6 +239,7 @@ pub fn get_telcoin_network_binary() -> &'static CargoRun {
 
         CargoBuild::new()
             .bin("telcoin-network")
+            .features("tn-storage/test-utils")
             .manifest_path(workspace_root.join("Cargo.toml"))
             .target_dir(workspace_root.join("target"))
             .current_target()
