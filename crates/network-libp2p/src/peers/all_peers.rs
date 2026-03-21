@@ -690,9 +690,7 @@ impl AllPeers {
 
     /// Collect connected peers to exchange with disconnecting peer.
     pub(super) fn peer_exchange(&self) -> PeerExchangeMap {
-        self.peers
-            .iter()
-            .filter_map(|(_id, peer)| {
+        self.peers.values().filter_map(|peer| {
                 if peer.connection_status().is_connected() {
                     peer.bls_public_key().and_then(|key| peer.exchange_info().map(|ei| (key, ei)))
                 } else {
