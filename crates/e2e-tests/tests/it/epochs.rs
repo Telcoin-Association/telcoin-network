@@ -1,5 +1,6 @@
 //! Test the epoch boundary and validator shuffles.
 
+use super::common::ProcessGuard;
 use alloy::{
     primitives::utils::parse_ether,
     providers::{Provider, ProviderBuilder},
@@ -7,10 +8,6 @@ use alloy::{
 };
 use clap::Parser as _;
 use e2e_tests::{create_validator_info, setup_log_dir, NodeEndpoints};
-use nix::{
-    sys::signal::{self, Signal},
-    unistd::Pid,
-};
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::{path::Path, process::Child, sync::Arc, time::Duration};
 use telcoin_network_cli::genesis::GenesisArgs;
@@ -25,14 +22,16 @@ use tn_types::{
     Genesis, GenesisAccount, U256,
 };
 use tokio::time::{timeout, Instant};
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 
 const NEW_VALIDATOR: &str = "new-validator";
 const NODE_PASSWORD: &str = "sup3rsecuur";
 const INITIAL_STAKE_AMOUNT: &str = "1_000_000";
 const MIN_EPOCHS_TO_TEST: usize = 6;
-// 3s is too aggressive
-const EPOCH_DURATION: u64 = 5;
+// Epoch init creates HDX index files per epoch (open_epoch_pack → new_epoch →
+// ConsensusPack::open_append). With test-utils, these are ~1.3MB each (vs ~130MB in prod).
+// 10s provides margin for parallel test execution and CI load variance.
+const EPOCH_DURATION: u64 = 10;
 
 async fn test_epoch_boundary_inner(
     genesis: Genesis,
@@ -190,10 +189,11 @@ async fn loop_epochs(start: u32, iterations: u32, rpc_url: &str) -> eyre::Result
 }
 
 async fn test_epoch_sync_inner(
-    child: Arc<std::sync::Mutex<Child>>,
+    guard: &mut ProcessGuard,
+    kill_idx: usize,
     nodes_to_start: &[(&str, Address)],
     temp_path: &Path,
-    endpoints: &[NodeEndpoints],
+    endpoints: &mut Vec<NodeEndpoints>,
 ) -> eyre::Result<()> {
     // create rpc client for node1 default rpc address
     let rpc_url = &endpoints[0].http_url;
@@ -218,8 +218,9 @@ async fn test_epoch_sync_inner(
     // Go through at least 5 epochs.
     loop_epochs(0, 5, &endpoints[0].http_url).await?;
     // Kill a node
-    send_term(&mut *child.lock().unwrap());
-    let _ = child.lock().unwrap().wait();
+    if let Some(mut taken) = guard.take(kill_idx) {
+        super::common::kill_child(&mut taken);
+    }
 
     // Make sure the node really is down.
     let killed_url = &endpoints[2].http_url;
@@ -228,10 +229,12 @@ async fn test_epoch_sync_inner(
 
     loop_epochs(5, 5, &endpoints[0].http_url).await?;
     // Restart the node
-    let (mut new_children, _new_urls) =
+    let (mut new_children, mut new_endpoints) =
         start_nodes(temp_path, nodes_to_start, "epoch_sync", 2)?;
     let new_child = new_children.pop().expect("child");
-    *child.lock().expect("poison") = new_child;
+    guard.replace(kill_idx, new_child);
+    // Update the endpoint for the restarted node (new dynamic ports)
+    endpoints[kill_idx] = new_endpoints.pop().expect("endpoint");
     loop_epochs(10, 5, &endpoints[0].http_url).await?;
 
     tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION * 2)).await;
@@ -243,10 +246,10 @@ async fn test_epoch_sync_inner(
     for ep in endpoints {
         let provider = ProviderBuilder::new().connect_http(ep.http_url.parse()?);
         for epoch in 0..=latest_epoch {
-            let (epoch_rec, cert): (EpochRecord, EpochCertificate) = provider
-                .raw_request("tn_epochRecord".into(), (epoch,))
-                .await
-                .map_err(|e| eyre::eyre!("epoch record fail {}, epoch {epoch}: {e}", ep.http_url))?;
+            let (epoch_rec, cert): (EpochRecord, EpochCertificate) =
+                provider.raw_request("tn_epochRecord".into(), (epoch,)).await.map_err(|e| {
+                    eyre::eyre!("epoch record fail {}, epoch {epoch}: {e}", ep.http_url)
+                })?;
             assert!(
                 epoch_rec.verify_with_cert(&cert),
                 "invalid epoch record: {} {}/{} {}!",
@@ -261,62 +264,11 @@ async fn test_epoch_sync_inner(
     Ok(())
 }
 
-/// RAII guard that kills child processes on drop (including during panic unwinding).
-/// This avoids global `panic::set_hook` which causes cross-test contamination in parallel runs.
-struct ProcessGuard {
-    procs: Vec<Arc<std::sync::Mutex<Child>>>,
-}
-
-impl Drop for ProcessGuard {
-    fn drop(&mut self) {
-        kill_procs(&self.procs);
-    }
-}
-
-fn kill_procs(procs: &Vec<Arc<std::sync::Mutex<Child>>>) {
-    for proc in procs {
-        kill_child(&mut *proc.lock().unwrap());
-    }
-}
-
-/// Helper function to shutdown child processes and log errors.
-fn kill_child(child: &mut Child) {
-    send_term(child);
-
-    for _ in 0..5 {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                info!(target: "epoch-test", "child exited");
-                return;
-            }
-            Ok(None) => {}
-            Err(e) => error!(target: "epoch-test", "error waiting on child to exit: {e}"),
-        }
-        std::thread::sleep(Duration::from_millis(1200));
-    }
-    // The child is not exiting...
-    // The code below will send SIGKILL without the use of nix.
-    if let Err(e) = child.kill() {
-        error!(target: "epoch-test", ?e, "error killing child");
-    }
-    // Hopefully it will exit now...
-    if let Err(e) = child.wait() {
-        error!(target: "epoch-test", ?e, "error waiting for child to die");
-    }
-}
-
-/// Send SIGTERM to child, can use this to pre-send TERM to all children when shutting down.
-fn send_term(child: &mut Child) {
-    if let Err(e) = signal::kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM) {
-        tracing::error!(target: "epoch-test", ?e, "error killing child");
-    }
-}
-
 #[ignore = "only run independently from all other it tests"]
 #[tokio::test]
 /// Test a new node joining the network and being shuffled into the committee.
 async fn test_epoch_boundary() -> eyre::Result<()> {
-    tn_types::test_utils::init_test_tracing();
+    let _permit = super::common::acquire_test_permit();
     // create validator and governance wallets for adding new validator later
     let mut new_validator = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(6));
     let mut committee = vec![
@@ -343,19 +295,18 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
     // start nodes (committee + new validator)
     committee.push((NEW_VALIDATOR, new_validator.address()));
     let (procs, endpoints) = start_nodes(temp_path, &committee, "epoch_boundary", 1)?;
-    let procs: Vec<Arc<std::sync::Mutex<Child>>> =
-        procs.into_iter().map(|c| Arc::new(std::sync::Mutex::new(c))).collect();
     // Guard ensures processes are killed on drop (normal return, error, or panic).
-    let _guard = ProcessGuard { procs };
+    let _guard = ProcessGuard::new(procs);
 
-    test_epoch_boundary_inner(genesis, governance_wallet, temp_path, &mut new_validator, &endpoints).await
+    test_epoch_boundary_inner(genesis, governance_wallet, temp_path, &mut new_validator, &endpoints)
+        .await
 }
 
 #[ignore = "only run independently from all other it tests"]
 #[tokio::test]
 /// Test that sync works to fill in missing epochs.
 async fn test_epoch_sync() -> eyre::Result<()> {
-    tn_types::test_utils::init_test_tracing();
+    let _permit = super::common::acquire_test_permit();
     // create validator and governance wallets for adding new validator later
     let new_validator = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(6));
     let mut committee = vec![
@@ -381,17 +332,16 @@ async fn test_epoch_sync() -> eyre::Result<()> {
 
     // start nodes (committee + new validator)
     committee.push((NEW_VALIDATOR, new_validator.address()));
-    let (procs, endpoints) = start_nodes(temp_path, &committee, "epoch_sync", 1)?;
-    let procs: Vec<Arc<std::sync::Mutex<Child>>> =
-        procs.into_iter().map(|c| Arc::new(std::sync::Mutex::new(c))).collect();
+    let (procs, mut endpoints) = start_nodes(temp_path, &committee, "epoch_sync", 1)?;
     // Guard ensures processes are killed on drop (normal return, error, or panic).
-    let _guard = ProcessGuard { procs: procs.clone() };
+    let mut guard = ProcessGuard::new(procs);
 
     test_epoch_sync_inner(
-        procs[2].clone(),
+        &mut guard,
+        2,
         &[("validator-3", Address::from_slice(&[0x33; 20]))],
         temp_path,
-        &endpoints,
+        &mut endpoints,
     )
     .await
 }

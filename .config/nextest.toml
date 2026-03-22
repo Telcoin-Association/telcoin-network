@@ -17,7 +17,7 @@ test-threads = "num-cpus"
 # E2E tests use dynamic ports and can run in parallel.
 # Limit concurrency since each test spawns 4-6 node processes.
 [test-groups.e2e]
-max-threads = 4
+max-threads = 2
 
 [[profile.default.overrides]]
 filter = "package(e2e-tests)"

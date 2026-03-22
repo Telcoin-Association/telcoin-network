@@ -20,8 +20,6 @@ use tracing::{debug, info};
 
 #[tokio::test]
 async fn test_faucet_drip_tel_and_xyz_e2e() -> eyre::Result<()> {
-    tn_types::test_utils::init_test_tracing();
-
     // faucet interface
     sol!(
         #[allow(clippy::too_many_arguments)]

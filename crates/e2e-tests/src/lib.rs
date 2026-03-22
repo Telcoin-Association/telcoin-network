@@ -22,9 +22,13 @@ use tracing::{error, info};
 pub static TELCOIN_BINARY: OnceLock<CargoRun> = OnceLock::new();
 
 /// RPC endpoints for a single node across all transports.
+#[derive(Debug)]
 pub struct NodeEndpoints {
+    /// HTTP transport address.
     pub http_url: String,
+    /// WS transport address.
     pub ws_url: String,
+    /// IPS transport address.
     pub ipc_path: String,
 }
 
@@ -155,7 +159,9 @@ pub fn spawn_local_testnet(
 
     for v in validators.into_iter() {
         let dir = temp_path.join(v);
-        let instance: u16 = v.chars().last().expect("validator instance").to_digit(10).expect("instance digit") as u16;
+        let instance: u16 =
+            v.chars().last().expect("validator instance").to_digit(10).expect("instance digit")
+                as u16;
         let rpc_port = tn_types::get_available_tcp_port("127.0.0.1")
             .expect("Failed to get an ephemeral rpc port");
         // reth's adjust_instance_ports does: http_port -= instance - 1
@@ -248,17 +254,15 @@ pub async fn verify_all_transports(endpoint: &NodeEndpoints) -> eyre::Result<()>
     http_provider.get_chain_id().await?;
 
     // WS
-    let ws_provider: RootProvider<Ethereum> =
-        RootProvider::connect(&endpoint.ws_url).await.map_err(|e| {
-            eyre::eyre!("WS connect failed for {}: {e}", endpoint.ws_url)
-        })?;
+    let ws_provider: RootProvider<Ethereum> = RootProvider::connect(&endpoint.ws_url)
+        .await
+        .map_err(|e| eyre::eyre!("WS connect failed for {}: {e}", endpoint.ws_url))?;
     ws_provider.get_chain_id().await?;
 
     // IPC
-    let ipc_provider: RootProvider<Ethereum> =
-        RootProvider::connect(&endpoint.ipc_path).await.map_err(|e| {
-            eyre::eyre!("IPC connect failed for {}: {e}", endpoint.ipc_path)
-        })?;
+    let ipc_provider: RootProvider<Ethereum> = RootProvider::connect(&endpoint.ipc_path)
+        .await
+        .map_err(|e| eyre::eyre!("IPC connect failed for {}: {e}", endpoint.ipc_path))?;
     ipc_provider.get_chain_id().await?;
 
     Ok(())
@@ -272,7 +276,7 @@ pub fn setup_log_dir(
     instance: impl std::fmt::Display,
     test: &str,
     run: u32,
-) {
+) -> std::path::PathBuf {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let log_dir = std::path::PathBuf::from(manifest_dir).join("test_logs");
     let test_dir = log_dir.join(test);
@@ -281,6 +285,15 @@ pub fn setup_log_dir(
         .expect("valid log file");
     let stdout: std::process::Stdio = out_file.into();
     command.stdout(stdout);
+
+    // Capture stderr (panics, error-level output) to a separate log file
+    let err_file =
+        std::fs::File::create(test_dir.join(format!("node{instance}-run{run}.stderr.log")))
+            .expect("valid stderr log file");
+    let stderr: std::process::Stdio = err_file.into();
+    command.stderr(stderr);
+
+    test_dir
 }
 
 /// Helper to retrieve and build the main project binary.

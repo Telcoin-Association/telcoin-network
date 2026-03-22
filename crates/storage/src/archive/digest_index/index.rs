@@ -263,6 +263,13 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     /// Each bucket element is a (KSIZE bytes, u64)- (digest, record_pos).
     pub const BUCKET_ELEMENT_SIZE: usize = KSIZE + 8;
     /// Number of buckets to allocate in a fresh index.
+    /// Test builds use fewer buckets to avoid ~130MB of zero-initialized file I/O per HDX file
+    /// during epoch init (open_epoch_pack → ConsensusPack::open_append). The index auto-grows
+    /// via split_one_bucket() if capacity is exceeded.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub const INITIAL_BUCKETS: usize = 1_000;
+    /// Number of buckets to allocate in a fresh index.
+    #[cfg(not(any(test, feature = "test-utils")))]
     pub const INITIAL_BUCKETS: usize = 100_000;
     /// Number of elements each bucket can hold before overflowing.
     pub const BUCKET_ELEMENTS: usize = 32;

@@ -14,7 +14,13 @@ use tn_types::B256;
 
 /// Number of bits to set per input in Ethereum bloom filter.
 const BLOOM_BITS_PER_ITEM: usize = 8;
-/// Size of the bloom filter in bytes- 2M.
+/// Size of the bloom filter in bytes.
+/// Test builds use a smaller bloom (64KB) to reduce file I/O during epoch init.
+/// Higher false-positive rate is acceptable for tests.
+#[cfg(any(test, feature = "test-utils"))]
+pub const BLOOM_SIZE_BYTES: usize = 64 * 1024;
+/// Size of the bloom filter in bytes.
+#[cfg(not(any(test, feature = "test-utils")))]
 pub const BLOOM_SIZE_BYTES: usize = 2 * 1024 * 1024;
 /// Size of the bloom filter in bits
 const BLOOM_SIZE_BITS: usize = BLOOM_SIZE_BYTES * 8;
