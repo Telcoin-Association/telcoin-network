@@ -51,6 +51,7 @@ async fn wait_for_rpc(url: &str) -> eyre::Result<HttpClient> {
 
 #[tokio::test]
 async fn test_precompile_genesis_accounts() -> eyre::Result<()> {
+    let _permit = super::common::acquire_test_permit();
     //
     // TODO: Issue #584: LZ adapter + safe
     //
@@ -88,6 +89,7 @@ async fn test_precompile_genesis_accounts() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_genesis_with_consensus_registry_accounts() -> eyre::Result<()> {
+    let _permit = super::common::acquire_test_permit();
     // fetch registry, blsg1, and issuance bytecodes
     let registry_runtimecode_binding = RethEnv::fetch_value_from_json_str(
         CONSENSUS_REGISTRY_JSON,
@@ -113,8 +115,7 @@ async fn test_genesis_with_consensus_registry_accounts() -> eyre::Result<()> {
         issuance_json_val.as_str().ok_or_eyre("fetch issuance runtime code")?;
 
     // spawn testnet for RPC calls
-    let temp_path = tempfile::TempDir::with_suffix("genesis_with_consensus_registry_accounts")
-        .expect("tempdir is okay");
+    let temp_path = tempfile::TempDir::with_suffix("genesis_reg").expect("tempdir is okay");
     let endpoints = spawn_local_testnet(temp_path.path(), None)?;
     let rpc_url = endpoints[0].http_url.clone();
     let client = wait_for_rpc(&rpc_url).await?;
