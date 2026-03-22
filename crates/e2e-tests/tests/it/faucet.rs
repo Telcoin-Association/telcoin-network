@@ -5,7 +5,7 @@
 //! and stablecoins via ERC20 mint. Rate limiting is handled by the contract's `_checkDrip()`.
 
 use alloy::{network::EthereumWallet, providers::ProviderBuilder, sol_types::SolCall};
-use e2e_tests::{ensure_account_balance_infinite_loop, spawn_local_testnet};
+use e2e_tests::{ensure_account_balance_infinite_loop, spawn_local_testnet, verify_all_transports};
 use futures::{stream::FuturesUnordered, StreamExt};
 use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_params};
 use std::{str::FromStr, sync::Arc, time::Duration};
@@ -271,7 +271,7 @@ async fn test_faucet_drip_tel_and_xyz_e2e() -> eyre::Result<()> {
 
     // create and launch validator nodes on local network
     let faucet_tmp_dir = tempfile::TempDir::new().unwrap();
-    let client_urls = spawn_local_testnet(faucet_tmp_dir.path(), Some(genesis_accounts))?;
+    let endpoints = spawn_local_testnet(faucet_tmp_dir.path(), Some(genesis_accounts))?;
     let genesis_file = faucet_tmp_dir.path().join("shared-genesis/genesis/genesis.yaml");
     let genesis: Genesis = Config::load_from_path(&genesis_file, ConfigFmt::YAML)?;
     let chain: Arc<RethChainSpec> = Arc::new(genesis.clone().into());
@@ -280,7 +280,10 @@ async fn test_faucet_drip_tel_and_xyz_e2e() -> eyre::Result<()> {
 
     tokio::time::sleep(Duration::from_secs(15)).await;
 
-    let rpc_url = client_urls[0].clone();
+    // verify all three transports (HTTP, WS, IPC) are reachable
+    verify_all_transports(&endpoints[0]).await?;
+
+    let rpc_url = endpoints[0].http_url.clone();
     let client = HttpClientBuilder::default().build(&rpc_url)?;
 
     // assert deployer starting balance is properly seeded

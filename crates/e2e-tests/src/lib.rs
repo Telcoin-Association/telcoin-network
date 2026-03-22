@@ -21,6 +21,13 @@ use tracing::{error, info};
 /// Only compile main bin once for all tests.
 pub static TELCOIN_BINARY: OnceLock<CargoRun> = OnceLock::new();
 
+/// RPC endpoints for a single node across all transports.
+pub struct NodeEndpoints {
+    pub http_url: String,
+    pub ws_url: String,
+    pub ipc_path: String,
+}
+
 /// Execute genesis ceremony inside tempdir
 pub fn create_validator_info(
     dir: &Path,
@@ -139,12 +146,12 @@ pub fn config_local_testnet(
 pub fn spawn_local_testnet(
     temp_path: &Path,
     accounts: Option<Vec<(Address, GenesisAccount)>>,
-) -> eyre::Result<Vec<String>> {
+) -> eyre::Result<Vec<NodeEndpoints>> {
     config_local_testnet(temp_path, None, accounts)?;
 
     let validators = ["validator-1", "validator-2", "validator-3", "validator-4"];
     let (tx, rx) = std::sync::mpsc::channel();
-    let mut client_urls = Vec::new();
+    let mut endpoints = Vec::new();
 
     for v in validators.into_iter() {
         let dir = temp_path.join(v);
@@ -155,13 +162,33 @@ pub fn spawn_local_testnet(
         // So pass rpc_port + (instance - 1) to compensate, making node listen on rpc_port
         let http_port_arg = rpc_port + instance - 1;
 
-        client_urls.push(format!("http://127.0.0.1:{rpc_port}"));
+        // WS - dynamic port, compensate for adjust_instance_ports: ws_port += instance * 2 - 2
+        let ws_port = tn_types::get_available_tcp_port("127.0.0.1")
+            .expect("Failed to get an ephemeral ws port");
+        let ws_port_arg = ws_port - (instance * 2 - 2);
+
+        // IPC - unique path under temp_path to avoid cross-test conflicts
+        // adjust_instance_ports appends "-{instance}" to ipcpath
+        let ipc_base = temp_path.join(format!("{v}.ipc"));
+        let ipc_base_str = ipc_base.to_string_lossy().to_string();
+        let actual_ipc_path = format!("{ipc_base_str}-{instance}");
+
+        endpoints.push(NodeEndpoints {
+            http_url: format!("http://127.0.0.1:{rpc_port}"),
+            ws_url: format!("ws://127.0.0.1:{ws_port}"),
+            ipc_path: actual_ipc_path,
+        });
 
         let command = NodeCommand::parse_from([
             "tn",
             "--http",
             "--http.port",
             &http_port_arg.to_string(),
+            "--ws",
+            "--ws.port",
+            &ws_port_arg.to_string(),
+            "--ipcpath",
+            &ipc_base_str,
             "--instance",
             &instance.to_string(),
         ]);
@@ -206,7 +233,35 @@ pub fn spawn_local_testnet(
         eyre::bail!("Node startup failed: {err}");
     }
 
-    Ok(client_urls)
+    Ok(endpoints)
+}
+
+/// Verify HTTP, WS, and IPC transports are all reachable for a node.
+pub async fn verify_all_transports(endpoint: &NodeEndpoints) -> eyre::Result<()> {
+    use alloy::{
+        network::Ethereum,
+        providers::{Provider, ProviderBuilder, RootProvider},
+    };
+
+    // HTTP
+    let http_provider = ProviderBuilder::new().connect_http(endpoint.http_url.parse()?);
+    http_provider.get_chain_id().await?;
+
+    // WS
+    let ws_provider: RootProvider<Ethereum> =
+        RootProvider::connect(&endpoint.ws_url).await.map_err(|e| {
+            eyre::eyre!("WS connect failed for {}: {e}", endpoint.ws_url)
+        })?;
+    ws_provider.get_chain_id().await?;
+
+    // IPC
+    let ipc_provider: RootProvider<Ethereum> =
+        RootProvider::connect(&endpoint.ipc_path).await.map_err(|e| {
+            eyre::eyre!("IPC connect failed for {}: {e}", endpoint.ipc_path)
+        })?;
+    ipc_provider.get_chain_id().await?;
+
+    Ok(())
 }
 
 /// Configure a command to write stdout to a per-node log file under `test_logs/`.

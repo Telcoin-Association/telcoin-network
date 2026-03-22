@@ -530,6 +530,12 @@ fn start_validator(
     let data_dir = base_dir.join(format!("validator-{}", instance + 1));
     // The instance option will still change a set port so account for that.
     rpc_port += instance as u16;
+    // WS port: allocate a dynamic port and compensate for adjust_instance_ports
+    // which does: ws_port += (instance_1based) * 2 - 2 = instance_0based * 2
+    let ws_port = get_available_tcp_port("127.0.0.1").expect("ws port");
+    let ws_port_arg = ws_port - (instance as u16 * 2);
+    // IPC: use temp-dir-based path to avoid cross-test conflicts
+    let ipc_path = base_dir.join(format!("validator-{}.ipc", instance + 1));
     let mut command = bin.command();
 
     command
@@ -542,6 +548,11 @@ fn start_validator(
         .arg("--http")
         .arg("--http.port")
         .arg(format!("{rpc_port}"))
+        .arg("--ws")
+        .arg("--ws.port")
+        .arg(format!("{ws_port_arg}"))
+        .arg("--ipcpath")
+        .arg(ipc_path.to_string_lossy().as_ref())
         .arg("--node-name")
         .arg(format!("{test}-node{instance}"));
 
@@ -562,6 +573,12 @@ fn start_observer(
     let data_dir = base_dir.join("observer");
     // The instance option will still change a set port so account for that.
     rpc_port += instance as u16;
+    // WS port: allocate a dynamic port and compensate for adjust_instance_ports
+    // which does: ws_port += (instance_1based) * 2 - 2 = instance_0based * 2
+    let ws_port = get_available_tcp_port("127.0.0.1").expect("ws port");
+    let ws_port_arg = ws_port - (instance as u16 * 2);
+    // IPC: use temp-dir-based path to avoid cross-test conflicts
+    let ipc_path = base_dir.join("observer.ipc");
     let mut command = bin.command();
     command
         .env("TN_BLS_PASSPHRASE", "restart_test")
@@ -574,6 +591,11 @@ fn start_observer(
         .arg("--http")
         .arg("--http.port")
         .arg(format!("{rpc_port}"))
+        .arg("--ws")
+        .arg("--ws.port")
+        .arg(format!("{ws_port_arg}"))
+        .arg("--ipcpath")
+        .arg(ipc_path.to_string_lossy().as_ref())
         .arg("--node-name")
         .arg(format!("{test}-node{instance}"));
 
