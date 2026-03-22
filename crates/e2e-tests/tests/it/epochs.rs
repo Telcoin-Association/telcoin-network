@@ -135,17 +135,37 @@ async fn test_epoch_boundary_inner(
     }
 
     if shuffled {
-        // Do a check to make sure all the nodes have valid (certified) Epoch Records.
+        // Verify all nodes have valid (certified) Epoch Records.
+        // Poll each epoch individually — certificates are produced asynchronously
+        // after epoch boundaries via quorum voting.
         // TODO issue 375, should use tn_latestConsensusHeader RPC for this when fixed.
         for ep in endpoints {
             let provider = ProviderBuilder::new().connect_http(ep.http_url.parse()?);
             for epoch in 0..=latest_epoch {
-                let (epoch_rec, cert): (EpochRecord, EpochCertificate) =
-                    provider.raw_request("tn_epochRecord".into(), (epoch,)).await?;
+                let deadline = Instant::now() + Duration::from_secs(EPOCH_DURATION * 3);
+                let (epoch_rec, cert) = loop {
+                    match provider
+                        .raw_request::<_, (EpochRecord, EpochCertificate)>(
+                            "tn_epochRecord".into(),
+                            (epoch,),
+                        )
+                        .await
+                    {
+                        Ok(result) => break result,
+                        Err(_) if Instant::now() < deadline => {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                        Err(e) => {
+                            return Err(eyre::eyre!(
+                                "epoch record not available for epoch {epoch} on {}: {e}",
+                                ep.http_url
+                            ));
+                        }
+                    }
+                };
                 assert!(epoch_rec.verify_with_cert(&cert), "invalid epoch record!");
             }
         }
-
         Ok(())
     } else {
         // return error if loop didn't return
@@ -237,19 +257,36 @@ async fn test_epoch_sync_inner(
     endpoints[kill_idx] = new_endpoints.pop().expect("endpoint");
     loop_epochs(10, 5, &endpoints[0].http_url).await?;
 
-    tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION * 2)).await;
-
-    // Do a check to make sure all the nodes have valid (certified) Epoch Records.
+    // Verify all nodes have valid (certified) Epoch Records.
     // The node that was down should also have all these records after syncing.
+    // Poll each epoch individually — certificates are produced asynchronously
+    // after epoch boundaries via quorum voting.
     // TODO issue 375, should use tn_latestConsensusHeader RPC for this when fixed.
     let latest_epoch = 15;
     for ep in endpoints {
         let provider = ProviderBuilder::new().connect_http(ep.http_url.parse()?);
         for epoch in 0..=latest_epoch {
-            let (epoch_rec, cert): (EpochRecord, EpochCertificate) =
-                provider.raw_request("tn_epochRecord".into(), (epoch,)).await.map_err(|e| {
-                    eyre::eyre!("epoch record fail {}, epoch {epoch}: {e}", ep.http_url)
-                })?;
+            let deadline = Instant::now() + Duration::from_secs(EPOCH_DURATION * 3);
+            let (epoch_rec, cert) = loop {
+                match provider
+                    .raw_request::<_, (EpochRecord, EpochCertificate)>(
+                        "tn_epochRecord".into(),
+                        (epoch,),
+                    )
+                    .await
+                {
+                    Ok(result) => break result,
+                    Err(_) if Instant::now() < deadline => {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    Err(e) => {
+                        return Err(eyre::eyre!(
+                            "epoch record not available for epoch {epoch} on {}: {e}",
+                            ep.http_url
+                        ));
+                    }
+                }
+            };
             assert!(
                 epoch_rec.verify_with_cert(&cert),
                 "invalid epoch record: {} {}/{} {}!",
