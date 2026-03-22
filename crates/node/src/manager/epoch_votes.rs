@@ -76,7 +76,7 @@ async fn manage_epoch_votes(
     let mut reached_quorum = false;
     let mut timeout = Duration::from_millis(2500);
     let mut timeouts = 0;
-    let mut alt_recs: HashMap<B256, usize> = HashMap::default();
+    let mut alt_recs: HashMap<B256, HashSet<BlsPublicKey>> = HashMap::default();
     let mut committee_keys: HashSet<BlsPublicKey> = epoch_rec.committee.iter().copied().collect();
     let committee_size = committee_keys.len() as u64;
     let quorum = epoch_rec.super_quorum();
@@ -110,11 +110,11 @@ async fn manage_epoch_votes(
                                 }
                             }
                         } else if vote.epoch_hash != epoch_hash {
-                            // Track votes for alternative epoch records
+                            // Track votes for alternative epoch records using unique voter sets
                             if epoch_rec.committee.contains(&vote.public_key) {
-                                let votes =
-                                    *alt_recs.get(&vote.epoch_hash).unwrap_or(&0);
-                                if votes + 1 >= quorum {
+                                let voters = alt_recs.entry(vote.epoch_hash).or_default();
+                                voters.insert(vote.public_key);
+                                if voters.len() >= quorum {
                                     error!(
                                         target: "epoch-manager",
                                         "Reached quorum on epoch record {} instead of {}.",
@@ -123,7 +123,6 @@ async fn manage_epoch_votes(
                                     );
                                     break;
                                 }
-                                alt_recs.insert(vote.epoch_hash, votes + 1);
                             }
                         }
                     }
@@ -431,6 +430,117 @@ mod epoch_vote_collector_tests {
 
         // Verify cert is in DB
         let cert = consensus_chain.epochs().cert_by_digest(epoch_hash).await.expect("cert missing");
+        assert_eq!(cert.epoch_hash, epoch_hash);
+        assert!(epoch_rec.verify_with_cert(&cert), "cert should verify against epoch record");
+
+        // Shutdown
+        node_shutdown.notify();
+    }
+
+    /// Duplicate votes from the same validator for an alt epoch record must not inflate the count.
+    /// Before the fix, 4 duplicate alt votes from kp2 would reach quorum (4 >= 3) and break
+    /// before correct votes were processed. After the fix, HashSet deduplicates to 1 unique voter.
+    #[tokio::test]
+    async fn test_duplicate_alt_votes_do_not_inflate_count() {
+        let mut rng = StdRng::from_os_rng();
+        let kp1 = BlsKeypair::generate(&mut rng);
+        let kp2 = BlsKeypair::generate(&mut rng);
+        let kp3 = BlsKeypair::generate(&mut rng);
+        let kp4 = BlsKeypair::generate(&mut rng);
+        let pk1 = *kp1.public();
+        let pk2 = *kp2.public();
+        let pk3 = *kp3.public();
+        let pk4 = *kp4.public();
+
+        // Node is kp1
+        let key_config = KeyConfig::new_with_testing_key(kp1);
+
+        // Committee of 4: super_quorum = (4*2)/3 + 1 = 3
+        let committee = vec![pk1, pk2, pk3, pk4];
+
+        // The "correct" epoch record
+        let epoch_rec = EpochRecord {
+            epoch: 0,
+            committee: committee.clone(),
+            next_committee: committee.clone(),
+            ..Default::default()
+        };
+        let epoch_hash = epoch_rec.digest();
+
+        // An "alt" epoch record — same epoch & committee but different next_committee → different
+        // digest
+        let alt_epoch_rec = EpochRecord {
+            epoch: 0,
+            committee: committee.clone(),
+            next_committee: vec![pk4, pk3, pk2, pk1], // reversed order → different digest
+            ..Default::default()
+        };
+        assert_ne!(alt_epoch_rec.digest(), epoch_hash, "alt record must have a different digest");
+
+        let consensus_bus = ConsensusBus::new();
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let com = fixture.committee();
+        let temp_dir =
+            TempDir::with_prefix("test_duplicate_alt_votes_do_not_inflate_count").unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), com.clone()).await.unwrap();
+
+        // Mock network: drain commands and reply to Publish
+        let (net_tx, mut net_rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(100);
+        let primary_network = PrimaryNetworkHandle::new_for_test(net_tx);
+        tokio::spawn(async move {
+            while let Some(cmd) = net_rx.recv().await {
+                if let NetworkCommand::Publish { reply, .. } = cmd {
+                    let _ = reply.send(Ok(MessageId::new(b"test")));
+                }
+            }
+        });
+
+        let task_manager = TaskManager::default();
+        let node_shutdown = Notifier::new();
+
+        spawn_epoch_vote_collector(
+            consensus_chain.clone(),
+            consensus_bus.app().clone(),
+            key_config,
+            primary_network,
+            task_manager.get_spawner(),
+            node_shutdown.subscribe(),
+        );
+
+        // kp2 signs a vote for the ALT epoch record
+        let kc2 = KeyConfig::new_with_testing_key(kp2);
+        let alt_vote = alt_epoch_rec.sign_vote(&kc2);
+
+        // Buffer 4 duplicate alt votes from kp2 — before the fix this would inflate count to 4 >=
+        // quorum(3)
+        for _ in 0..4 {
+            consensus_bus.app().new_epoch_votes().send(alt_vote).await.unwrap();
+        }
+
+        // Buffer correct votes from kp3 and kp4
+        let kc3 = KeyConfig::new_with_testing_key(kp3);
+        let kc4 = KeyConfig::new_with_testing_key(kp4);
+        let vote3 = epoch_rec.sign_vote(&kc3);
+        let vote4 = epoch_rec.sign_vote(&kc4);
+        consensus_bus.app().new_epoch_votes().send(vote3).await.unwrap();
+        consensus_bus.app().new_epoch_votes().send(vote4).await.unwrap();
+
+        // Send the correct epoch record — collector wakes up, self-signs, reads buffered votes
+        consensus_bus.app().epoch_record_watch().send_replace(Some(epoch_rec.clone()));
+
+        // Wait for collector to aggregate and store.
+        // After reaching quorum the collector waits up to 1s for more votes before aggregating.
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+
+        // Verify cert IS stored for the correct epoch hash
+        // Quorum is kp1 (self-sign) + kp3 + kp4 = 3 >= 3
+        let cert = consensus_chain
+            .epochs()
+            .cert_by_digest(epoch_hash)
+            .await
+            .expect("cert should be stored for correct epoch record");
         assert_eq!(cert.epoch_hash, epoch_hash);
         assert!(epoch_rec.verify_with_cert(&cert), "cert should verify against epoch record");
 
