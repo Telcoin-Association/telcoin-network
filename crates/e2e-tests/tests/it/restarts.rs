@@ -619,9 +619,7 @@ fn get_block(node: &str, block_number: Option<u64>) -> eyre::Result<HashMap<Stri
         retries += 1;
     }
     result.ok_or_else(|| {
-        eyre::eyre!(
-            "eth_getBlockByNumber returned null after retries for {debug_params} on {node}"
-        )
+        eyre::eyre!("eth_getBlockByNumber returned null after retries for {debug_params} on {node}")
     })
 }
 
