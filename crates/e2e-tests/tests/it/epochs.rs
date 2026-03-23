@@ -534,28 +534,17 @@ fn start_nodes(
     let mut endpoints = Vec::new();
     for (v, _) in validators.iter() {
         let dir = temp_path.join(v);
-        let mut instance = v.chars().last().expect("validator instance").to_string();
 
-        // assign instance for "new-validator"
-        if instance == "r" {
-            instance = "6".to_string();
+        if *v == "new-validator" {
             info!(target: "epoch-test", ?v, "starting new validator");
         }
 
-        // Get a dynamic port for RPC.
-        // Reth's adjust_instance_ports does: http_port -= instance - 1
-        // So to make the node listen on `rpc_port`, pass `rpc_port + instance - 1`.
+        // Get dynamic ports for RPC - OS assigns ports, no instance compensation needed
         let rpc_port = get_available_tcp_port("127.0.0.1").expect("available tcp port");
-        let instance_1based: u16 = instance.parse().expect("valid instance number");
-        let adjusted_port = rpc_port + instance_1based - 1;
-
-        // WS - dynamic port, compensate for adjust_instance_ports: ws_port += instance * 2 - 2
         let ws_port = get_available_tcp_port("127.0.0.1").expect("ws port");
-        let ws_adjusted = ws_port - (instance_1based * 2 - 2);
 
         // IPC - unique path under temp dir to avoid cross-test conflicts
-        let ipc_base = temp_path.join(format!("{v}.ipc"));
-        let actual_ipc = format!("{}-{instance_1based}", ipc_base.display());
+        let ipc_path = temp_path.join(format!("{v}.ipc"));
 
         let mut command = bin.command();
         command
@@ -565,24 +554,22 @@ fn start_nodes(
             .arg("node")
             .arg("--datadir")
             .arg(&*dir.to_string_lossy())
-            .arg("--instance")
-            .arg(&instance)
             .arg("--http")
             .arg("--http.port")
-            .arg(adjusted_port.to_string())
+            .arg(rpc_port.to_string())
             .arg("--ws")
             .arg("--ws.port")
-            .arg(ws_adjusted.to_string())
+            .arg(ws_port.to_string())
             .arg("--ipcpath")
-            .arg(ipc_base.to_string_lossy().as_ref());
+            .arg(ipc_path.to_string_lossy().as_ref());
 
-        setup_log_dir(&mut command, &instance, test, run);
+        setup_log_dir(&mut command, v, test, run);
 
         children.push(command.spawn().expect("failed to execute"));
         endpoints.push(NodeEndpoints {
             http_url: format!("http://127.0.0.1:{rpc_port}"),
             ws_url: format!("ws://127.0.0.1:{ws_port}"),
-            ipc_path: actual_ipc,
+            ipc_path: ipc_path.to_string_lossy().to_string(),
         });
     }
 

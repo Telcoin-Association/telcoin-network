@@ -159,44 +159,32 @@ pub fn spawn_local_testnet(
 
     for v in validators.into_iter() {
         let dir = temp_path.join(v);
-        let instance: u16 =
-            v.chars().last().expect("validator instance").to_digit(10).expect("instance digit")
-                as u16;
         let rpc_port = tn_types::get_available_tcp_port("127.0.0.1")
             .expect("Failed to get an ephemeral rpc port");
-        // reth's adjust_instance_ports does: http_port -= instance - 1
-        // So pass rpc_port + (instance - 1) to compensate, making node listen on rpc_port
-        let http_port_arg = rpc_port + instance - 1;
 
-        // WS - dynamic port, compensate for adjust_instance_ports: ws_port += instance * 2 - 2
         let ws_port = tn_types::get_available_tcp_port("127.0.0.1")
             .expect("Failed to get an ephemeral ws port");
-        let ws_port_arg = ws_port - (instance * 2 - 2);
 
         // IPC - unique path under temp_path to avoid cross-test conflicts
-        // adjust_instance_ports appends "-{instance}" to ipcpath
-        let ipc_base = temp_path.join(format!("{v}.ipc"));
-        let ipc_base_str = ipc_base.to_string_lossy().to_string();
-        let actual_ipc_path = format!("{ipc_base_str}-{instance}");
+        let ipc_path = temp_path.join(format!("{v}.ipc"));
+        let ipc_path_str = ipc_path.to_string_lossy().to_string();
 
         endpoints.push(NodeEndpoints {
             http_url: format!("http://127.0.0.1:{rpc_port}"),
             ws_url: format!("ws://127.0.0.1:{ws_port}"),
-            ipc_path: actual_ipc_path,
+            ipc_path: ipc_path_str.clone(),
         });
 
         let command = NodeCommand::parse_from([
             "tn",
             "--http",
             "--http.port",
-            &http_port_arg.to_string(),
+            &rpc_port.to_string(),
             "--ws",
             "--ws.port",
-            &ws_port_arg.to_string(),
+            &ws_port.to_string(),
             "--ipcpath",
-            &ipc_base_str,
-            "--instance",
-            &instance.to_string(),
+            &ipc_path_str,
         ]);
 
         let key_config = KeyConfig::read_config(&dir, Some("it_test_pass".to_string()))?;

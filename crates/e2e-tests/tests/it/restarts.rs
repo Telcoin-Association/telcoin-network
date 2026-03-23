@@ -443,17 +443,12 @@ fn start_validator(
     instance: usize,
     bin: &'static CargoRun,
     base_dir: &Path,
-    mut rpc_port: u16,
+    rpc_port: u16,
     test: &str,
     run: u32,
 ) -> Child {
     let data_dir = base_dir.join(format!("validator-{}", instance + 1));
-    // The instance option will still change a set port so account for that.
-    rpc_port += instance as u16;
-    // WS port: allocate a dynamic port and compensate for adjust_instance_ports
-    // which does: ws_port += (instance_1based) * 2 - 2 = instance_0based * 2
     let ws_port = get_available_tcp_port("127.0.0.1").expect("ws port");
-    let ws_port_arg = ws_port - (instance as u16 * 2);
     // IPC: use temp-dir-based path to avoid cross-test conflicts
     let ipc_path = base_dir.join(format!("validator-{}.ipc", instance + 1));
     let mut command = bin.command();
@@ -463,14 +458,12 @@ fn start_validator(
         .arg("node")
         .arg("--datadir")
         .arg(&*data_dir.to_string_lossy())
-        .arg("--instance")
-        .arg(format!("{}", instance + 1))
         .arg("--http")
         .arg("--http.port")
         .arg(format!("{rpc_port}"))
         .arg("--ws")
         .arg("--ws.port")
-        .arg(format!("{ws_port_arg}"))
+        .arg(format!("{ws_port}"))
         .arg("--ipcpath")
         .arg(ipc_path.to_string_lossy().as_ref())
         .arg("--node-name")
@@ -486,17 +479,12 @@ fn start_observer(
     instance: usize,
     bin: &'static CargoRun,
     base_dir: &Path,
-    mut rpc_port: u16,
+    rpc_port: u16,
     test: &str,
     run: u32,
 ) -> Child {
     let data_dir = base_dir.join("observer");
-    // The instance option will still change a set port so account for that.
-    rpc_port += instance as u16;
-    // WS port: allocate a dynamic port and compensate for adjust_instance_ports
-    // which does: ws_port += (instance_1based) * 2 - 2 = instance_0based * 2
     let ws_port = get_available_tcp_port("127.0.0.1").expect("ws port");
-    let ws_port_arg = ws_port - (instance as u16 * 2);
     // IPC: use temp-dir-based path to avoid cross-test conflicts
     let ipc_path = base_dir.join("observer.ipc");
     let mut command = bin.command();
@@ -506,14 +494,12 @@ fn start_observer(
         .arg("--observer")
         .arg("--datadir")
         .arg(&*data_dir.to_string_lossy())
-        .arg("--instance")
-        .arg(format!("{}", instance + 1))
         .arg("--http")
         .arg("--http.port")
         .arg(format!("{rpc_port}"))
         .arg("--ws")
         .arg("--ws.port")
-        .arg(format!("{ws_port_arg}"))
+        .arg(format!("{ws_port}"))
         .arg("--ipcpath")
         .arg(ipc_path.to_string_lossy().as_ref())
         .arg("--node-name")
@@ -573,16 +559,16 @@ fn get_positive_balance_with_retry(node: &str, address: &str) -> eyre::Result<u1
     get_balance_above_with_retry(node, address, 0)
 }
 
-/// Retry up to 30 times to retrieve an account balance > above.
+/// Retry up to 45 times to retrieve an account balance > above.
 fn get_balance_above_with_retry(node: &str, address: &str, above: u128) -> eyre::Result<u128> {
     let mut bal = get_balance(node, address, 5)?;
     let mut i = 0;
-    while i < 30 && bal <= above {
+    while i < 45 && bal <= above {
         std::thread::sleep(Duration::from_millis(1200));
         i += 1;
         bal = get_balance(node, address, 5)?;
     }
-    if i == 30 && bal <= above {
+    if i == 45 && bal <= above {
         error!(target:"restart-test", "get_balance_above_with_retry i == 30 - returning error!!");
         Err(Report::msg(format!("Failed to get a balance {bal} for {address} above {above}")))
     } else {

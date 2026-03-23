@@ -128,14 +128,15 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatab
 
     use crate::mdbx::database::MEGABYTE;
 
-    // Test builds use minimal database sizes to allow parallel test execution
+    // Test builds use smaller database sizes to allow parallel test execution.
+    // These must still be large enough for long-running e2e tests (70s+ restart scenarios).
     cfg_if::cfg_if! {
         if #[cfg(any(test, feature = "test-utils"))] {
-            const EPOCH_MAX: usize = 4 * MEGABYTE;
+            const EPOCH_MAX: usize = 16 * MEGABYTE;
             const KAD_MAX: usize = 4 * MEGABYTE;
-            const CACHE_MAX: usize = 8 * MEGABYTE;
-            const GROWTH: usize = 2 * MEGABYTE;
-            const CACHE_GROWTH: usize = 2 * MEGABYTE;
+            const CACHE_MAX: usize = 32 * MEGABYTE;
+            const GROWTH: usize = 4 * MEGABYTE;
+            const CACHE_GROWTH: usize = 8 * MEGABYTE;
         } else {
             const EPOCH_MAX: usize = 128 * MEGABYTE;
             const KAD_MAX: usize = 64 * MEGABYTE;
