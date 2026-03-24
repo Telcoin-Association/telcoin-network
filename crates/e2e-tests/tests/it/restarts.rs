@@ -209,10 +209,9 @@ fn run_restart_tests2(client_urls: &[String; 4]) -> eyre::Result<()> {
             max_block = max_block.max(n);
         }
     }
-    if max_block > 0 {
-        for url in client_urls.iter() {
-            wait_for_block(url, max_block)?;
-        }
+    assert!(max_block > 0, "max block is 0");
+    for url in client_urls.iter() {
+        wait_for_block(url, max_block)?;
     }
 
     test_blocks_same(client_urls)?;
