@@ -1468,8 +1468,8 @@ mod tests {
     use rand::{rngs::StdRng, SeedableRng as _};
     use tempfile::TempDir;
     use tn_types::{
-        generate_proof_of_possession_bls, BlsKeypair, BlsSignature, Certificate, CommittedSubDag,
-        ConsensusHeader, ConsensusOutput, NodeP2pInfo, ReputationScores,
+        generate_proof_of_possession_bls_for_test, BlsKeypair, BlsSignature, Certificate,
+        CommittedSubDag, ConsensusHeader, ConsensusOutput, NodeP2pInfo, ReputationScores,
         SignatureVerificationState,
     };
 
@@ -1563,8 +1563,8 @@ mod tests {
                 let mut rng = StdRng::seed_from_u64(i as u64);
                 let bls = BlsKeypair::generate(&mut rng);
                 let bls_pubkey = bls.public();
-                let pop =
-                    generate_proof_of_possession_bls(&bls, addr).expect("pop generation failed");
+                let pop = generate_proof_of_possession_bls_for_test(&bls, addr)
+                    .expect("pop generation failed");
                 NodeInfo {
                     name: format!("validator-{i}"),
                     bls_public_key: *bls_pubkey,

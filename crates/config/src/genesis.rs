@@ -279,7 +279,7 @@ mod tests {
     use crate::NodeInfo;
     use rand::{rngs::StdRng, SeedableRng};
     use tn_types::{
-        generate_proof_of_possession_bls, Address, BlsKeypair, Multiaddr, NetworkKeypair,
+        generate_proof_of_possession_bls_for_test, Address, BlsKeypair, Multiaddr, NetworkKeypair,
         NodeP2pInfo,
     };
 
@@ -293,7 +293,7 @@ mod tests {
             let worker_network_keypair = NetworkKeypair::generate_ed25519();
             let address = Address::from_raw_public_key(&[0; 64]);
             let proof_of_possession =
-                generate_proof_of_possession_bls(&bls_keypair, &address).unwrap();
+                generate_proof_of_possession_bls_for_test(&bls_keypair, &address).unwrap();
             let primary_network_address = Multiaddr::empty();
             let worker_network_address = Multiaddr::empty();
             let primary_info = NodeP2pInfo::new(
@@ -330,7 +330,7 @@ mod tests {
 
             // generate proof with wrong chain spec
             let proof_of_possession =
-                generate_proof_of_possession_bls(&bls_keypair, &wrong_address).unwrap();
+                generate_proof_of_possession_bls_for_test(&bls_keypair, &wrong_address).unwrap();
             let primary_network_address = Multiaddr::empty();
             let worker_network_address = Multiaddr::empty();
             let primary_info = NodeP2pInfo::new(
