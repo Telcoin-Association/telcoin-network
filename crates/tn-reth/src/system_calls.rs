@@ -175,6 +175,8 @@ sol!(
         function activate() external override whenNotPaused;
         /// Initiate exit from protocol.
         function beginExit() external override whenNotPaused;
+        /// Burn the validator's NFT and forcibly eject from all committees.
+        function burn(address validatorAddress) external;
         /// Retrieve the claimable rewards accrued for a given validator address.
         function getRewards(address validatorAddress) public view virtual returns (uint256);
         /// Returns the next committee size

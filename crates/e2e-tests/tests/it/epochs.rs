@@ -28,8 +28,8 @@ use tn_reth::{
     RethChainSpec,
 };
 use tn_types::{
-    test_utils::CommandParser, Address, EpochCertificate, EpochRecord, Genesis, GenesisAccount,
-    U256,
+    test_utils::CommandParser, Address, BlsPublicKey, EpochCertificate, EpochRecord, Genesis,
+    GenesisAccount, U256,
 };
 use tokio::time::timeout;
 use tracing::{debug, error, info};
@@ -277,7 +277,7 @@ async fn test_epoch_sync_inner(
     Ok(())
 }
 
-async fn test_epoch_record_validator_ejection_inner(
+async fn test_epoch_record_validator_voluntary_exit_inner(
     genesis: Genesis,
     mut governance_wallet: TransactionFactory,
     temp_path: &Path,
@@ -354,6 +354,14 @@ async fn test_epoch_record_validator_ejection_inner(
         ));
     }
 
+    // capture the exiting validator's BLS key and current epoch before exit
+    let validator_info =
+        consensus_registry.getValidator(exiting_validator.address()).call().await?;
+    let exiting_bls_key = BlsPublicKey::from_literal_bytes(validator_info.blsPubkey.as_ref())
+        .map_err(|e| eyre::eyre!("failed to decode exiting validator BLS key: {e:?}"))?;
+    let pre_exit_epoch = latest_epoch;
+    info!(target: "epoch-test", pre_exit_epoch, "captured BLS key and epoch before voluntary exit");
+
     // request validator exit
     let calldata = ConsensusRegistry::beginExitCall {}.abi_encode().into();
     let begin_exit_tx = exiting_validator.create_eip1559_encoded(
@@ -413,6 +421,21 @@ async fn test_epoch_record_validator_ejection_inner(
             current_epoch_info = new_epoch_info;
         }
     }
+
+    // verify historic epoch record from pre-exit epoch is still valid
+    // and contains the exited validator's BLS key
+    let (pre_exit_record, pre_exit_cert): (EpochRecord, EpochCertificate) =
+        provider.raw_request("tn_epochRecord".into(), (pre_exit_epoch,)).await?;
+    assert!(
+        pre_exit_record.committee.contains(&exiting_bls_key),
+        "exited validator BLS key should be in pre-exit epoch {} committee",
+        pre_exit_epoch
+    );
+    assert!(
+        pre_exit_record.verify_with_cert(&pre_exit_cert),
+        "pre-exit epoch record should still verify after validator exit"
+    );
+    info!(target: "epoch-test", pre_exit_epoch, "historic epoch record verified after voluntary exit");
 
     verify_epoch_records_for_nodes(8540, 8545, 0, latest_epoch).await?;
 
@@ -560,8 +583,8 @@ async fn test_epoch_sync() -> eyre::Result<()> {
 
 #[ignore = "only run independently from all other it tests"]
 #[tokio::test]
-/// Test epoch record validation while a validator exits the committee.
-async fn test_epoch_record_validator_ejection() -> eyre::Result<()> {
+/// Test epoch record validation while a validator voluntarily exits the committee via `beginExit()`.
+async fn test_epoch_record_validator_voluntary_exit() -> eyre::Result<()> {
     let _guard = IT_TEST_MUTEX.lock();
     tn_types::test_utils::init_test_tracing();
 
@@ -578,7 +601,7 @@ async fn test_epoch_record_validator_ejection() -> eyre::Result<()> {
     ];
 
     // setup genesis
-    let temp_dir = tempfile::TempDir::with_prefix("epoch_record_validator_ejection")?;
+    let temp_dir = tempfile::TempDir::with_prefix("epoch_record_validator_voluntary_exit")?;
     let temp_path = temp_dir.path();
 
     let governance_wallet =
@@ -593,7 +616,7 @@ async fn test_epoch_record_validator_ejection() -> eyre::Result<()> {
 
     // start nodes (committee + new validator)
     committee.push((NEW_VALIDATOR, new_validator.address()));
-    let procs = start_nodes(temp_path, &committee, "epoch_record_validator_ejection", 1)?;
+    let procs = start_nodes(temp_path, &committee, "epoch_record_validator_voluntary_exit", 1)?;
     let procs: Vec<Arc<std::sync::Mutex<Child>>> =
         procs.into_iter().map(|c| Arc::new(std::sync::Mutex::new(c))).collect();
     let procs_clone = procs.clone();
@@ -604,12 +627,418 @@ async fn test_epoch_record_validator_ejection() -> eyre::Result<()> {
         org_panic(a);
     }));
 
-    let r = test_epoch_record_validator_ejection_inner(
+    let r = test_epoch_record_validator_voluntary_exit_inner(
         genesis,
         governance_wallet,
         temp_path,
         &mut new_validator,
         &mut exiting_validator,
+    )
+    .await;
+    kill_procs(&procs);
+    r
+}
+
+/// Inner test for forced ejection via `burn()` mid-epoch.
+///
+/// Calls `burn(targetValidatorAddress)` from governance wallet mid-epoch and verifies
+/// epoch records across all nodes. When `burn()` calls `_eject()` (swap-and-pop),
+/// it modifies the on-chain committee for epochs N, N+1, and N+2. This can cause
+/// `write_epoch_record()` to fail because `validators_for_epoch(N)` returns a different
+/// committee than `prev.next_committee`.
+async fn test_epoch_record_validator_forced_ejection_inner(
+    genesis: Genesis,
+    mut governance_wallet: TransactionFactory,
+    temp_path: &Path,
+    new_validator: &mut TransactionFactory,
+    target_validator_address: Address,
+) -> eyre::Result<()> {
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let txs = generate_new_validator_txs(
+        temp_path,
+        chain.clone(),
+        new_validator,
+        &mut governance_wallet,
+    )?;
+
+    // create rpc client for node1 default rpc address
+    let rpc_url = "http://127.0.0.1:8545".to_string();
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+
+    // wait for node rpc to become available
+    timeout(std::time::Duration::from_secs(20), async {
+        let mut result = provider.get_chain_id().await;
+        while let Err(e) = result {
+            debug!(target: "epoch-test", "provider error getting chain id: {e:?}");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            result = provider.get_chain_id().await;
+        }
+    })
+    .await?;
+
+    // submit txs to: issue NFT, stake, and activate new validator
+    for tx in txs {
+        let pending = provider.send_raw_transaction(&tx).await?;
+        debug!(target: "epoch-test", "pending tx: {pending:?}");
+        timeout(Duration::from_secs(5), pending.watch()).await??;
+    }
+
+    // retrieve current committee
+    let consensus_registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &provider);
+    let mut current_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
+    let mut latest_epoch = consensus_registry.getCurrentEpoch().call().await?;
+
+    tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
+
+    // Wait until the new validator AND target validator are both in committee
+    let mut ready_for_burn = false;
+    for _ in 0..30 {
+        let new_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
+        if new_epoch_info == current_epoch_info {
+            tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
+            continue;
+        }
+
+        latest_epoch = consensus_registry.getCurrentEpoch().call().await?;
+        let new_validator_in_committee =
+            new_epoch_info.committee.contains(&new_validator.address());
+        let target_in_committee =
+            new_epoch_info.committee.contains(&target_validator_address);
+        current_epoch_info = new_epoch_info;
+
+        if new_validator_in_committee && target_in_committee {
+            ready_for_burn = true;
+            break;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
+    }
+
+    if !ready_for_burn {
+        return Err(eyre::eyre!(
+            "new validator and target validator were never both in committee"
+        ));
+    }
+
+    info!(target: "epoch-test", latest_epoch, "both validators in committee, calling burn() mid-epoch");
+
+    // call burn(targetValidatorAddress) from governance wallet mid-epoch
+    let calldata =
+        ConsensusRegistry::burnCall { validatorAddress: target_validator_address }
+            .abi_encode()
+            .into();
+    let burn_tx = governance_wallet.create_eip1559_encoded(
+        chain.clone(),
+        None,
+        100,
+        Some(CONSENSUS_REGISTRY_ADDRESS),
+        U256::ZERO,
+        calldata,
+    );
+    let pending = provider.send_raw_transaction(&burn_tx).await?;
+    timeout(Duration::from_secs(5), pending.watch()).await??;
+    info!(target: "epoch-test", "burn tx confirmed");
+
+    // wait for 3 more epoch closures to observe whether nodes survive the committee mismatch
+    for i in 0..3 {
+        tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
+        let new_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
+        if new_epoch_info != current_epoch_info {
+            latest_epoch = consensus_registry.getCurrentEpoch().call().await?;
+            current_epoch_info = new_epoch_info;
+            info!(target: "epoch-test", latest_epoch, i, "epoch advanced after burn");
+        }
+    }
+
+    // if nodes crashed due to committee mismatch in write_epoch_record, this will fail
+    verify_epoch_records_for_nodes(8540, 8545, 0, latest_epoch).await?;
+
+    Ok(())
+}
+
+#[ignore = "only run independently from all other it tests"]
+#[tokio::test]
+/// Test epoch record validation when a validator is forcibly ejected via `burn()` mid-epoch.
+///
+/// This exposes whether the committee mismatch between `prev.next_committee` and the
+/// on-chain committee (modified by swap-and-pop) causes nodes to crash at
+/// `write_epoch_record()`.
+async fn test_epoch_record_validator_forced_ejection() -> eyre::Result<()> {
+    let _guard = IT_TEST_MUTEX.lock();
+    tn_types::test_utils::init_test_tracing();
+
+    let mut new_validator = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(6));
+    let target_validator =
+        TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(77));
+    let mut committee = vec![
+        ("validator-1", Address::from_slice(&[0x11; 20])),
+        ("validator-2", target_validator.address()),
+        ("validator-3", Address::from_slice(&[0x33; 20])),
+        ("validator-4", Address::from_slice(&[0x44; 20])),
+        ("validator-5", Address::from_slice(&[0x55; 20])),
+    ];
+
+    let temp_dir = tempfile::TempDir::with_prefix("epoch_record_forced_ejection")?;
+    let temp_path = temp_dir.path();
+
+    let governance_wallet =
+        TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
+    let genesis = create_genesis_for_ejection_test(
+        temp_path,
+        new_validator.address(),
+        governance_wallet.address(),
+        target_validator.address(),
+        &committee,
+    )?;
+
+    committee.push((NEW_VALIDATOR, new_validator.address()));
+    let procs = start_nodes(temp_path, &committee, "epoch_record_forced_ejection", 1)?;
+    let procs: Vec<Arc<std::sync::Mutex<Child>>> =
+        procs.into_iter().map(|c| Arc::new(std::sync::Mutex::new(c))).collect();
+    let procs_clone = procs.clone();
+    let org_panic = panic::take_hook();
+    panic::set_hook(Box::new(move |a| {
+        kill_procs(&procs_clone);
+        org_panic(a);
+    }));
+
+    let r = test_epoch_record_validator_forced_ejection_inner(
+        genesis,
+        governance_wallet,
+        temp_path,
+        &mut new_validator,
+        target_validator.address(),
+    )
+    .await;
+    kill_procs(&procs);
+    r
+}
+
+/// Inner test for forced ejection historic record validity.
+///
+/// Verifies that epoch records signed by a validator who was later forcefully ejected
+/// via `burn()` remain cryptographically verifiable. Also checks that post-burn epoch
+/// records do not contain the burned validator's BLS key.
+async fn test_epoch_record_forced_ejection_historic_inner(
+    genesis: Genesis,
+    mut governance_wallet: TransactionFactory,
+    temp_path: &Path,
+    new_validator: &mut TransactionFactory,
+    target_validator_address: Address,
+) -> eyre::Result<()> {
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let txs = generate_new_validator_txs(
+        temp_path,
+        chain.clone(),
+        new_validator,
+        &mut governance_wallet,
+    )?;
+
+    // create rpc client for node1 default rpc address
+    let rpc_url = "http://127.0.0.1:8545".to_string();
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+
+    // wait for node rpc to become available
+    timeout(std::time::Duration::from_secs(20), async {
+        let mut result = provider.get_chain_id().await;
+        while let Err(e) = result {
+            debug!(target: "epoch-test", "provider error getting chain id: {e:?}");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            result = provider.get_chain_id().await;
+        }
+    })
+    .await?;
+
+    // submit txs to: issue NFT, stake, and activate new validator
+    for tx in txs {
+        let pending = provider.send_raw_transaction(&tx).await?;
+        debug!(target: "epoch-test", "pending tx: {pending:?}");
+        timeout(Duration::from_secs(5), pending.watch()).await??;
+    }
+
+    // retrieve current committee
+    let consensus_registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &provider);
+    let mut current_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
+    let mut latest_epoch = consensus_registry.getCurrentEpoch().call().await?;
+
+    tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
+
+    // Wait until the new validator AND target validator are both in committee
+    let mut ready_for_burn = false;
+    for _ in 0..30 {
+        let new_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
+        if new_epoch_info == current_epoch_info {
+            tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
+            continue;
+        }
+
+        latest_epoch = consensus_registry.getCurrentEpoch().call().await?;
+        let new_validator_in_committee =
+            new_epoch_info.committee.contains(&new_validator.address());
+        let target_in_committee =
+            new_epoch_info.committee.contains(&target_validator_address);
+        current_epoch_info = new_epoch_info;
+
+        if new_validator_in_committee && target_in_committee {
+            ready_for_burn = true;
+            break;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
+    }
+
+    if !ready_for_burn {
+        return Err(eyre::eyre!(
+            "new validator and target validator were never both in committee"
+        ));
+    }
+
+    // let several epochs pass so epoch records exist with target validator's signature
+    let mut pre_burn_epochs_with_target = Vec::new();
+    for _ in 0..3 {
+        tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
+        let new_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
+        if new_epoch_info != current_epoch_info {
+            latest_epoch = consensus_registry.getCurrentEpoch().call().await?;
+            if new_epoch_info.committee.contains(&target_validator_address) {
+                pre_burn_epochs_with_target.push(latest_epoch);
+            }
+            current_epoch_info = new_epoch_info;
+        }
+    }
+
+    // capture the target validator's BLS key before burn
+    let validator_info =
+        consensus_registry.getValidator(target_validator_address).call().await?;
+    let target_bls_key = BlsPublicKey::from_literal_bytes(validator_info.blsPubkey.as_ref())
+        .map_err(|e| eyre::eyre!("failed to decode target validator BLS key: {e:?}"))?;
+
+    let burn_epoch = latest_epoch;
+    info!(target: "epoch-test", burn_epoch, "calling burn() on target validator");
+
+    // call burn(targetValidatorAddress) from governance wallet
+    let calldata =
+        ConsensusRegistry::burnCall { validatorAddress: target_validator_address }
+            .abi_encode()
+            .into();
+    let burn_tx = governance_wallet.create_eip1559_encoded(
+        chain.clone(),
+        None,
+        100,
+        Some(CONSENSUS_REGISTRY_ADDRESS),
+        U256::ZERO,
+        calldata,
+    );
+    let pending = provider.send_raw_transaction(&burn_tx).await?;
+    timeout(Duration::from_secs(5), pending.watch()).await??;
+    info!(target: "epoch-test", "burn tx confirmed");
+
+    // wait for burn to settle and 3 more epoch closures
+    for _ in 0..3 {
+        tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
+        let new_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
+        if new_epoch_info != current_epoch_info {
+            latest_epoch = consensus_registry.getCurrentEpoch().call().await?;
+            current_epoch_info = new_epoch_info;
+        }
+    }
+
+    // verify historic (pre-burn) epoch records where the target was in the committee
+    for epoch in &pre_burn_epochs_with_target {
+        let (epoch_rec, cert): (EpochRecord, EpochCertificate) =
+            provider.raw_request("tn_epochRecord".into(), (*epoch,)).await?;
+        assert!(
+            epoch_rec.committee.contains(&target_bls_key),
+            "target validator BLS key should be in pre-burn epoch {} committee",
+            epoch
+        );
+        assert!(
+            epoch_rec.verify_with_cert(&cert),
+            "pre-burn epoch {} record should still verify after forced ejection",
+            epoch
+        );
+        info!(target: "epoch-test", epoch, "pre-burn historic epoch record verified");
+    }
+
+    // verify post-burn epoch records do NOT contain the target's BLS key
+    // the target should be removed within a few epochs after burn
+    let post_burn_start = burn_epoch + 3; // allow ejection pipeline to complete
+    if post_burn_start <= latest_epoch {
+        for epoch in post_burn_start..=latest_epoch {
+            let response: Result<(EpochRecord, EpochCertificate), _> =
+                provider.raw_request("tn_epochRecord".into(), (epoch,)).await;
+            if let Ok((epoch_rec, cert)) = response {
+                assert!(
+                    !epoch_rec.committee.contains(&target_bls_key),
+                    "target validator BLS key should NOT be in post-burn epoch {} committee",
+                    epoch
+                );
+                assert!(
+                    epoch_rec.verify_with_cert(&cert),
+                    "post-burn epoch {} record should verify",
+                    epoch
+                );
+                info!(target: "epoch-test", epoch, "post-burn epoch record verified without target");
+            }
+        }
+    }
+
+    // verify all epoch records across all nodes
+    verify_epoch_records_for_nodes(8540, 8545, 0, latest_epoch).await?;
+
+    Ok(())
+}
+
+#[ignore = "only run independently from all other it tests"]
+#[tokio::test]
+/// Test that epoch records signed by a validator who was later forcefully ejected via `burn()`
+/// remain cryptographically verifiable. Also verifies post-burn records exclude the burned
+/// validator.
+async fn test_epoch_record_forced_ejection_historic() -> eyre::Result<()> {
+    let _guard = IT_TEST_MUTEX.lock();
+    tn_types::test_utils::init_test_tracing();
+
+    let mut new_validator = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(6));
+    let target_validator =
+        TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(77));
+    let mut committee = vec![
+        ("validator-1", Address::from_slice(&[0x11; 20])),
+        ("validator-2", target_validator.address()),
+        ("validator-3", Address::from_slice(&[0x33; 20])),
+        ("validator-4", Address::from_slice(&[0x44; 20])),
+        ("validator-5", Address::from_slice(&[0x55; 20])),
+    ];
+
+    let temp_dir = tempfile::TempDir::with_prefix("epoch_record_forced_ejection_historic")?;
+    let temp_path = temp_dir.path();
+
+    let governance_wallet =
+        TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
+    let genesis = create_genesis_for_ejection_test(
+        temp_path,
+        new_validator.address(),
+        governance_wallet.address(),
+        target_validator.address(),
+        &committee,
+    )?;
+
+    committee.push((NEW_VALIDATOR, new_validator.address()));
+    let procs = start_nodes(temp_path, &committee, "epoch_record_forced_ejection_historic", 1)?;
+    let procs: Vec<Arc<std::sync::Mutex<Child>>> =
+        procs.into_iter().map(|c| Arc::new(std::sync::Mutex::new(c))).collect();
+    let procs_clone = procs.clone();
+    let org_panic = panic::take_hook();
+    panic::set_hook(Box::new(move |a| {
+        kill_procs(&procs_clone);
+        org_panic(a);
+    }));
+
+    let r = test_epoch_record_forced_ejection_historic_inner(
+        genesis,
+        governance_wallet,
+        temp_path,
+        &mut new_validator,
+        target_validator.address(),
     )
     .await;
     kill_procs(&procs);
