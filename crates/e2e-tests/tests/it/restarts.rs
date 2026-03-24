@@ -32,8 +32,8 @@ fn send_and_confirm(
     nonce: u128,
 ) -> eyre::Result<()> {
     let basefee_address = address!("0x9999999999999999999999999999999999999999");
-    let current = get_balance(node, &to_account.to_string(), 1)?;
-    let current_basefee = get_balance(node, &basefee_address.to_string(), 1)?;
+    let current = get_balance(node_test, &to_account.to_string(), 1)?;
+    let current_basefee = get_balance(node_test, &basefee_address.to_string(), 1)?;
     let amount = 10 * WEI_PER_TEL; // 10 TEL
     let expected = current + amount;
     send_tel(node, key, to_account, amount, 250, 21000, nonce)?;

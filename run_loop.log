@@ -1,0 +1,162 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.47s
+────────────
+ Nextest run ID 28e6c5db-c198-408e-891f-d688e6ddbb8e with nextest profile: default
+    Starting 8 tests across 2 binaries (3 tests skipped)
+        PASS [  95.284s] (1/8) e2e-tests::it epochs::test_epoch_boundary
+        PASS [  13.683s] (2/8) e2e-tests::it restarts::test_observer_late_join_catchup
+        SLOW [>120.000s] (─────) e2e-tests::it epochs::test_epoch_sync
+        PASS [  30.487s] (3/8) e2e-tests::it restarts::test_observer_reconnect_after_pause
+        PASS [ 167.760s] (4/8) e2e-tests::it epochs::test_epoch_sync
+        SLOW [>120.000s] (─────) e2e-tests::it restarts::test_restarts_delayed
+        PASS [ 145.261s] (5/8) e2e-tests::it restarts::test_restarts_delayed
+        SLOW [>120.000s] (─────) e2e-tests::it restarts::test_restarts_lagged_delayed
+        PASS [ 132.126s] (6/8) e2e-tests::it restarts::test_restarts_lagged_delayed
+        PASS [  17.173s] (7/8) e2e-tests::it restarts::test_restarts_observer
+        PASS [  54.332s] (8/8) e2e-tests::it restarts::test_restartstt
+────────────
+     Summary [ 354.218s] 8 tests run: 8 passed (3 slow), 3 skipped
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.51s
+────────────
+ Nextest run ID 252ca357-72a9-43a3-8e68-0b9a1334798b with nextest profile: default
+    Starting 8 tests across 2 binaries (3 tests skipped)
+        PASS [  86.174s] (1/8) e2e-tests::it epochs::test_epoch_boundary
+        PASS [  13.045s] (2/8) e2e-tests::it restarts::test_observer_late_join_catchup
+        SLOW [>120.000s] (─────) e2e-tests::it epochs::test_epoch_sync
+        PASS [  31.949s] (3/8) e2e-tests::it restarts::test_observer_reconnect_after_pause
+        PASS [ 167.607s] (4/8) e2e-tests::it epochs::test_epoch_sync
+        SLOW [>120.000s] (─────) e2e-tests::it restarts::test_restarts_delayed
+        PASS [ 133.479s] (5/8) e2e-tests::it restarts::test_restarts_delayed
+        PASS [  21.852s] (6/8) e2e-tests::it restarts::test_restarts_observer
+        SLOW [>120.000s] (─────) e2e-tests::it restarts::test_restarts_lagged_delayed
+        PASS [ 160.029s] (7/8) e2e-tests::it restarts::test_restarts_lagged_delayed
+        PASS [  53.138s] (8/8) e2e-tests::it restarts::test_restartstt
+────────────
+     Summary [ 339.641s] 8 tests run: 8 passed (3 slow), 3 skipped
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.51s
+────────────
+ Nextest run ID 24c80a37-a582-41f3-b788-e2e4920be368 with nextest profile: default
+    Starting 8 tests across 2 binaries (3 tests skipped)
+        PASS [  95.766s] (1/8) e2e-tests::it epochs::test_epoch_boundary
+        PASS [  14.031s] (2/8) e2e-tests::it restarts::test_observer_late_join_catchup
+        SLOW [>120.000s] (─────) e2e-tests::it epochs::test_epoch_sync
+        PASS [  29.337s] (3/8) e2e-tests::it restarts::test_observer_reconnect_after_pause
+        PASS [ 168.214s] (4/8) e2e-tests::it epochs::test_epoch_sync
+        SLOW [>120.000s] (─────) e2e-tests::it restarts::test_restarts_delayed
+        PASS [ 145.822s] (5/8) e2e-tests::it restarts::test_restarts_delayed
+        SLOW [>120.000s] (─────) e2e-tests::it restarts::test_restarts_lagged_delayed
+        PASS [ 131.225s] (6/8) e2e-tests::it restarts::test_restarts_lagged_delayed
+        PASS [  15.998s] (7/8) e2e-tests::it restarts::test_restarts_observer
+        PASS [  52.010s] (8/8) e2e-tests::it restarts::test_restartstt
+────────────
+     Summary [ 351.449s] 8 tests run: 8 passed (3 slow), 3 skipped
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.51s
+────────────
+ Nextest run ID de02f3ba-b8e8-4981-b77b-afd5ac05a79a with nextest profile: default
+    Starting 8 tests across 2 binaries (3 tests skipped)
+        PASS [  95.675s] (1/8) e2e-tests::it epochs::test_epoch_boundary
+        PASS [  17.080s] (2/8) e2e-tests::it restarts::test_observer_late_join_catchup
+        SLOW [>120.000s] (─────) e2e-tests::it epochs::test_epoch_sync
+        PASS [  29.554s] (3/8) e2e-tests::it restarts::test_observer_reconnect_after_pause
+        PASS [ 167.998s] (4/8) e2e-tests::it epochs::test_epoch_sync
+        SLOW [>120.000s] (─────) e2e-tests::it restarts::test_restarts_delayed
+        SLOW [>120.000s] (─────) e2e-tests::it restarts::test_restarts_lagged_delayed
+        PASS [ 160.266s] (5/8) e2e-tests::it restarts::test_restarts_delayed
+        PASS [  15.155s] (6/8) e2e-tests::it restarts::test_restarts_observer
+        PASS [ 169.184s] (7/8) e2e-tests::it restarts::test_restarts_lagged_delayed
+        PASS [  59.308s] (8/8) e2e-tests::it restarts::test_restartstt
+────────────
+     Summary [ 377.042s] 8 tests run: 8 passed (3 slow), 3 skipped
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.51s
+────────────
+ Nextest run ID f9ef9bbe-3175-4e09-bd38-1236fa23868b with nextest profile: default
+    Starting 8 tests across 2 binaries (3 tests skipped)
+        PASS [  94.834s] (1/8) e2e-tests::it epochs::test_epoch_boundary
+        PASS [  16.869s] (2/8) e2e-tests::it restarts::test_observer_late_join_catchup
+        SLOW [>120.000s] (─────) e2e-tests::it epochs::test_epoch_sync
+        PASS [  30.448s] (3/8) e2e-tests::it restarts::test_observer_reconnect_after_pause
+        PASS [ 166.151s] (4/8) e2e-tests::it epochs::test_epoch_sync
+        SLOW [>120.000s] (─────) e2e-tests::it restarts::test_restarts_delayed
+        PASS [ 131.932s] (5/8) e2e-tests::it restarts::test_restarts_delayed
+        SLOW [>120.000s] (─────) e2e-tests::it restarts::test_restarts_lagged_delayed
+        PASS [  14.877s] (6/8) e2e-tests::it restarts::test_restarts_observer
+        PASS [ 145.525s] (7/8) e2e-tests::it restarts::test_restarts_lagged_delayed
+        PASS [  54.192s] (8/8) e2e-tests::it restarts::test_restartstt
+────────────
+     Summary [ 343.156s] 8 tests run: 8 passed (3 slow), 3 skipped
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.50s
+────────────
+ Nextest run ID b580721e-c101-472e-a422-cc349515426a with nextest profile: default
+    Starting 8 tests across 2 binaries (3 tests skipped)
+        PASS [  87.010s] (1/8) e2e-tests::it epochs::test_epoch_boundary
+        PASS [  14.420s] (2/8) e2e-tests::it restarts::test_observer_late_join_catchup
+        SLOW [>120.000s] (─────) e2e-tests::it epochs::test_epoch_sync
+        PASS [  31.086s] (3/8) e2e-tests::it restarts::test_observer_reconnect_after_pause
+        PASS [ 167.549s] (4/8) e2e-tests::it epochs::test_epoch_sync
+        SLOW [>120.000s] (─────) e2e-tests::it restarts::test_restarts_delayed
+        PASS [ 145.749s] (5/8) e2e-tests::it restarts::test_restarts_delayed
+        SLOW [>120.000s] (─────) e2e-tests::it restarts::test_restarts_lagged_delayed
+        PASS [  18.450s] (6/8) e2e-tests::it restarts::test_restarts_observer
+        PASS [ 136.434s] (7/8) e2e-tests::it restarts::test_restarts_lagged_delayed
+        PASS [  55.305s] (8/8) e2e-tests::it restarts::test_restartstt
+────────────
+     Summary [ 352.021s] 8 tests run: 8 passed (3 slow), 3 skipped
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.51s
+────────────
+ Nextest run ID dc9746a3-00e3-4551-bb89-59f69faff17e with nextest profile: default
+    Starting 8 tests across 2 binaries (3 tests skipped)
+        PASS [  95.618s] (1/8) e2e-tests::it epochs::test_epoch_boundary
+        PASS [  16.915s] (2/8) e2e-tests::it restarts::test_observer_late_join_catchup
+        SLOW [>120.000s] (─────) e2e-tests::it epochs::test_epoch_sync
+        PASS [  29.818s] (3/8) e2e-tests::it restarts::test_observer_reconnect_after_pause
+        PASS [ 168.655s] (4/8) e2e-tests::it epochs::test_epoch_sync
+        SLOW [>120.000s] (─────) e2e-tests::it restarts::test_restarts_delayed
+        SLOW [>120.000s] (─────) e2e-tests::it restarts::test_restarts_lagged_delayed
+        PASS [ 154.250s] (5/8) e2e-tests::it restarts::test_restarts_delayed
+        PASS [  18.654s] (6/8) e2e-tests::it restarts::test_restarts_observer
+        PASS [ 156.735s] (7/8) e2e-tests::it restarts::test_restarts_lagged_delayed
+        PASS [  56.738s] (8/8) e2e-tests::it restarts::test_restartstt
+────────────
+     Summary [ 372.000s] 8 tests run: 8 passed (3 slow), 3 skipped
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.51s
+────────────
+ Nextest run ID 9abff2a2-e508-43b9-b8e9-db22a1173d9e with nextest profile: default
+    Starting 8 tests across 2 binaries (3 tests skipped)
+        PASS [  95.382s] (1/8) e2e-tests::it epochs::test_epoch_boundary
+        PASS [  17.977s] (2/8) e2e-tests::it restarts::test_observer_late_join_catchup
+        SLOW [>120.000s] (─────) e2e-tests::it epochs::test_epoch_sync
+        PASS [  33.227s] (3/8) e2e-tests::it restarts::test_observer_reconnect_after_pause
+        PASS [ 165.902s] (4/8) e2e-tests::it epochs::test_epoch_sync
+        SLOW [>120.000s] (─────) e2e-tests::it restarts::test_restarts_delayed
+        SLOW [>120.000s] (─────) e2e-tests::it restarts::test_restarts_lagged_delayed
+        PASS [ 164.592s] (5/8) e2e-tests::it restarts::test_restarts_delayed
+        PASS [  18.729s] (6/8) e2e-tests::it restarts::test_restarts_observer
+        PASS [ 183.134s] (7/8) e2e-tests::it restarts::test_restarts_lagged_delayed
+        FAIL [ 115.318s] (8/8) e2e-tests::it restarts::test_restartstt
+  stdout ───
+
+    running 1 test
+    2026-03-24T18:03:53.611035Z ERROR restart-tests: rpc call failed error=Transport(Http(Stream(hyper_util::client::legacy::Error(Connect, ConnectError("tcp connect error", 127.0.0.1:55402, Os { code: 61, kind: ConnectionRefused, message: "Connection refused" }))))) command="eth_getBalance" node="http://127.0.0.1:55402" debug_params="0x7EA53082328F761a2b162612cA3ab99cE3Ce308E"
+    2026-03-24T18:04:06.672096Z ERROR restart-tests: rpc call failed error=Transport(Http(Stream(hyper_util::client::legacy::Error(Connect, ConnectError("tcp connect error", 127.0.0.1:55398, Os { code: 61, kind: ConnectionRefused, message: "Connection refused" }))))) command="eth_getBalance" node="http://127.0.0.1:55398" debug_params="0x7EA53082328F761a2b162612cA3ab99cE3Ce308E"
+    2026-03-24T18:04:11.688190Z ERROR restart-tests: rpc call failed error=Transport(Http(Stream(hyper_util::client::legacy::Error(Connect, ConnectError("tcp connect error", 127.0.0.1:55400, Os { code: 61, kind: ConnectionRefused, message: "Connection refused" }))))) command="eth_getBalance" node="http://127.0.0.1:55400" debug_params="0x7EA53082328F761a2b162612cA3ab99cE3Ce308E"
+    2026-03-24T18:04:16.703054Z ERROR restart-tests: rpc call failed error=Transport(Http(Stream(hyper_util::client::legacy::Error(Connect, ConnectError("tcp connect error", 127.0.0.1:55402, Os { code: 61, kind: ConnectionRefused, message: "Connection refused" }))))) command="eth_getBalance" node="http://127.0.0.1:55402" debug_params="0x7EA53082328F761a2b162612cA3ab99cE3Ce308E"
+    2026-03-24T18:04:21.716908Z ERROR restart-tests: rpc call failed error=Transport(Http(Stream(hyper_util::client::legacy::Error(Connect, ConnectError("tcp connect error", 127.0.0.1:55404, Os { code: 61, kind: ConnectionRefused, message: "Connection refused" }))))) command="eth_getBalance" node="http://127.0.0.1:55404" debug_params="0x7EA53082328F761a2b162612cA3ab99cE3Ce308E"
+    test restarts::test_restartstt has been running for over 60 seconds
+    test restarts::test_restartstt ... FAILED
+
+    failures:
+
+    failures:
+        restarts::test_restartstt
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 10 filtered out; finished in 115.30s
+
+  stderr ───
+    Error: Node http://127.0.0.1:55402 did not reach block 3 within 60 seconds
+
+    Location:
+        crates/e2e-tests/tests/it/restarts.rs:370:9
+
+────────────
+     Summary [ 445.228s] 8 tests run: 7 passed (3 slow), 1 failed, 3 skipped
+        FAIL [ 115.318s] (8/8) e2e-tests::it restarts::test_restartstt
+error: test run failed
