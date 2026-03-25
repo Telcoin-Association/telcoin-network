@@ -154,7 +154,8 @@ impl std::fmt::Display for BlsAggregateSignature {
 /// `intent || message` (See more at [IntentMessage] and [Intent]).
 /// The message is constructed as: EIP2537([BlsPublicKey]) || [Address].
 /// Where the public key is uncompressed with G2 point coordinates padded to 64-byte EVM words
-/// This is only for testing because it takes a private key.  For prod code use KeyConfig.generate_proof_of_possesion().
+/// This is only for testing because it takes a private key.  For prod code use
+/// KeyConfig.generate_proof_of_possesion().
 pub fn generate_proof_of_possession_bls_for_test(
     keypair: &BlsKeypair,
     address: &Address,

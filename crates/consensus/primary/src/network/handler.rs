@@ -27,12 +27,15 @@ use tn_types::{
     Header, HeaderDigest, ProtocolSignature, Round, SignatureVerificationState, TnSender as _,
     Vote,
 };
+use tokio::sync::Mutex as TokioMutex;
 use tracing::{debug, error, info, warn};
 
 /// Map to hold vote info to detect invalid votes, equivocation and cache responses in case of
 /// rerequests.
-type AuthEquivocationMap =
-    BTreeMap<AuthorityIdentifier, (Epoch, Round, HeaderDigest, Option<PrimaryResponse>)>;
+type AuthEquivocationMap = HashMap<
+    AuthorityIdentifier,
+    TokioMutex<Option<(Epoch, Round, HeaderDigest, Option<PrimaryResponse>)>>,
+>;
 
 /// The type that handles requests from peers.
 #[derive(Clone, Debug)]
@@ -52,7 +55,7 @@ pub(crate) struct RequestHandler<DB> {
     requested_parents: Arc<Mutex<BTreeMap<(Round, CertificateDigest), AuthorityIdentifier>>>,
     /// Map of the last epoch and round each authority requested a vote for.
     /// Used to stop validator equivocation early.
-    auth_last_vote: Arc<Mutex<AuthEquivocationMap>>,
+    auth_last_vote: Arc<AuthEquivocationMap>,
     /// Track consensus headers until we hit a simple quorum then send on.
     consensus_certs: Arc<Mutex<HashMap<BlockHash, u32>>>,
     /// Access to the consensus chain data.
@@ -70,12 +73,18 @@ where
         state_sync: StateSynchronizer<DB>,
         consensus_chain: ConsensusChain,
     ) -> Self {
+        let mut auth_last_vote: AuthEquivocationMap = Default::default();
+        // Preload with each committee auth id.
+        // This is so we can lock each authority individually when processing votes.
+        for auth in consensus_config.committee().authorities() {
+            auth_last_vote.insert(auth.id(), TokioMutex::new(None));
+        }
         Self {
             consensus_config,
             consensus_bus,
             state_sync,
             requested_parents: Default::default(),
-            auth_last_vote: Default::default(),
+            auth_last_vote: Arc::new(auth_last_vote),
             consensus_certs: Default::default(),
             consensus_chain,
         }
@@ -324,11 +333,14 @@ where
                 return Ok(PrimaryResponse::Vote(vote));
             }
         }
-        {
+        // We have already verified committee membership with the peer check but this will double
+        // check. Each committee member has it's own lock so different authorities can be
+        // voted on in parallel but only one vote for an authority can proceed at a time.
+        if let Some(auth_lock) = self.auth_last_vote.get(header.author()) {
             // Check for validator equivocation early and reject if so
-            let mut auth_last_vote = self.auth_last_vote.lock();
+            let mut auth_last_vote = auth_lock.lock().await;
             if let Some((last_epoch, last_round, last_digest, last_response)) =
-                auth_last_vote.remove(&header.author)
+                auth_last_vote.take()
             {
                 if last_digest == header.digest() {
                     match last_response {
@@ -339,29 +351,23 @@ where
                             if parents.len() == missing.len() {
                                 for parent in parents.iter().map(|p| p.digest()) {
                                     if !missing.contains(&parent) {
-                                        auth_last_vote.insert(
-                                            header.author().clone(),
-                                            (
-                                                last_epoch,
-                                                last_round,
-                                                last_digest,
-                                                Some(PrimaryResponse::MissingParents(missing)),
-                                            ),
-                                        );
+                                        *auth_last_vote = Some((
+                                            last_epoch,
+                                            last_round,
+                                            last_digest,
+                                            Some(PrimaryResponse::MissingParents(missing)),
+                                        ));
                                         return Err(HeaderError::InvalidParents.into());
                                     }
                                 }
                             } else {
                                 let missing_len = missing.len();
-                                auth_last_vote.insert(
-                                    header.author().clone(),
-                                    (
-                                        last_epoch,
-                                        last_round,
-                                        last_digest,
-                                        Some(PrimaryResponse::MissingParents(missing)),
-                                    ),
-                                );
+                                *auth_last_vote = Some((
+                                    last_epoch,
+                                    last_round,
+                                    last_digest,
+                                    Some(PrimaryResponse::MissingParents(missing)),
+                                ));
                                 return Err(HeaderError::WrongNumberOfParents(
                                     missing_len,
                                     parents.len(),
@@ -374,10 +380,7 @@ where
                 } else if header.epoch() < last_epoch
                     || (last_epoch == header.epoch() && last_round >= header.round())
                 {
-                    auth_last_vote.insert(
-                        header.author().clone(),
-                        (last_epoch, last_round, last_digest, None),
-                    );
+                    *auth_last_vote = Some((last_epoch, last_round, last_digest, None));
                     return Err(HeaderError::AlreadyVotedForLaterRound {
                         theirs: header.round(),
                         ours: last_round,
@@ -385,22 +388,23 @@ where
                     .into());
                 }
             }
+            let epoch = header.epoch();
+            let round = header.round();
+            let digest = header.digest();
+            let res = self.vote_inner(header, parents).await;
+            // Do this to cache the "full" response.
+            // If pulling from the cache it is fine to already be converted
+            // but sometimes we want the full error (basically tests) so return
+            // res when we have a non-converted error.
+            let cached_res: PrimaryResponse = match &res {
+                Ok(msg) => msg.clone(),
+                Err(e) => PrimaryResponse::into_error_ref(e),
+            };
+            *auth_last_vote = Some((epoch, round, digest, Some(cached_res)));
+            res
+        } else {
+            Err(HeaderError::UnknownAuthority(header.author().to_string()).into())
         }
-        let author = header.author().clone();
-        let epoch = header.epoch();
-        let round = header.round();
-        let digest = header.digest();
-        let res = self.vote_inner(header, parents).await;
-        // Do this to cache the "full" response.
-        // If pulling from the cache it is fine to already be converted
-        // but sometimes we want the full error (basically tests) so return
-        // res when we have a non-converted error.
-        let cached_res: PrimaryResponse = match &res {
-            Ok(msg) => msg.clone(),
-            Err(e) => PrimaryResponse::into_error_ref(e),
-        };
-        self.auth_last_vote.lock().insert(author, (epoch, round, digest, Some(cached_res)));
-        res
     }
 
     /// Evaluate request to possibly issue a vote in support of peer's header.
