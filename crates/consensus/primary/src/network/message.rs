@@ -268,6 +268,7 @@ impl PrimaryResponse {
             | PrimaryNetworkError::InvalidTopic
             | PrimaryNetworkError::UnknownConsensusHeaderDigest(_)
             | PrimaryNetworkError::UnknownConsensusHeaderCert(_)
+            | PrimaryNetworkError::Timeout(_)
             | PrimaryNetworkError::InvalidEpochRequest => {
                 Self::Error(PrimaryRPCError(error.to_string()))
             }

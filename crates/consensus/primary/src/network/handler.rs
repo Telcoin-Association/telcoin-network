@@ -391,7 +391,12 @@ where
             let epoch = header.epoch();
             let round = header.round();
             let digest = header.digest();
-            let res = self.vote_inner(header, parents).await;
+            // Use a timeout for a sanity check.  Should be able to process a vote request within header delay...
+            let res = tokio::time::timeout(
+                self.consensus_config.config().parameters.max_header_delay,
+                self.vote_inner(header, parents),
+            )
+            .await?;
             // Do this to cache the "full" response.
             // If pulling from the cache it is fine to already be converted
             // but sometimes we want the full error (basically tests) so return
