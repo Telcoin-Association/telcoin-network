@@ -1,4 +1,4 @@
 [submodule "tn-contracts"]
 	path = tn-contracts
 	url = https://github.com/Telcoin-Association/tn-contracts.git
-	branch = update-faucet-precompile
+	branch = master

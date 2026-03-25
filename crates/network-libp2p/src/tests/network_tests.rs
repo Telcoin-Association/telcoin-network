@@ -185,6 +185,29 @@ where
     TestTypes { peer1, peer2, _task_manager: task_manager }
 }
 
+/// Wait for a peer's BLS key to be discovered via kademlia.
+///
+/// Polls `connected_peers()` until the expected BLS key appears,
+/// indicating the kademlia record exchange has completed and the
+/// `peer_to_bls` mapping is established.
+async fn wait_for_peer_discovery<Req: TNMessage, Res: TNMessage>(
+    handle: &NetworkHandle<Req, Res>,
+    expected_bls: BlsPublicKey,
+    timeout_duration: Duration,
+) -> eyre::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout_duration;
+    loop {
+        let peers = handle.connected_peers().await?;
+        if peers.contains(&expected_bls) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(eyre!("timed out waiting for peer BLS key discovery via kademlia"));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test]
 async fn test_valid_req_restt() -> eyre::Result<()> {
     // start honest peer1 network
@@ -225,11 +248,12 @@ async fn test_valid_req_restt() -> eyre::Result<()> {
         .await?;
     peer1.dial_by_bls(config_2.key_config().primary_public_key()).await?;
 
-    // Wait a beat for peer2 to recieve peer1 bls key.
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
     // send request and wait for response
     let max_time = Duration::from_secs(5);
+
+    // wait for peer2 to discover peer1's BLS key via kademlia
+    wait_for_peer_discovery(&peer2, config_1.key_config().primary_public_key(), max_time).await?;
+
     let response_from_peer =
         peer1.send_request(batch_req.clone(), config_2.key_config().primary_public_key()).await?;
     let event =
@@ -290,6 +314,14 @@ async fn test_valid_req_res_connection_closed_cleanup() -> eyre::Result<()> {
     // expect no pending requests yet
     let count = peer1.get_pending_request_count().await?;
     assert_eq!(count, 0);
+
+    // wait for peer2 to discover peer1's BLS key via kademlia
+    wait_for_peer_discovery(
+        &peer2,
+        config_1.key_config().primary_public_key(),
+        Duration::from_secs(5),
+    )
+    .await?;
 
     // send request and wait for response
     let _reply = peer1.send_request_direct(batch_req.clone(), peer2_id).await?;
@@ -362,6 +394,10 @@ async fn test_valid_req_res_inbound_failure() -> eyre::Result<()> {
 
     // send request and wait for response
     let max_time = Duration::from_secs(5);
+
+    // wait for peer2 to discover peer1's BLS key via kademlia
+    wait_for_peer_discovery(&peer2, config_1.key_config().primary_public_key(), max_time).await?;
+
     let _response = peer1.send_request_direct(batch_req.clone(), peer2_id).await?;
 
     // peer1 has a pending_request now
@@ -434,6 +470,14 @@ async fn test_outbound_failure_malicious_request() -> eyre::Result<()> {
     malicious_peer.add_explicit_peer(honest_bls, honest_peer_net, honest_peer_addr.clone()).await?;
     malicious_peer.dial_by_bls(honest_bls).await?;
 
+    // wait for honest peer to discover malicious peer's BLS key via kademlia
+    wait_for_peer_discovery(
+        &honest_peer,
+        config_1.key_config().primary_public_key(),
+        Duration::from_secs(5),
+    )
+    .await?;
+
     // sleep for heartbeat
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
 
@@ -498,11 +542,13 @@ async fn test_outbound_failure_malicious_response() -> eyre::Result<()> {
         .add_explicit_peer(mal_bls, config_2.primary_networkkey(), malicious_peer_addr.clone())
         .await?;
     honest_peer.dial_by_bls(mal_bls).await?;
-    // Wait a beat for malicious to recieve honest's bls key.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // wait for malicious peer to discover honest peer's BLS key via kademlia
+    let max_time = Duration::from_secs(2);
+    wait_for_peer_discovery(&malicious_peer, config_1.key_config().primary_public_key(), max_time)
+        .await?;
 
     // send request and wait for malicious response
-    let max_time = Duration::from_secs(2);
     let honest_req = TestPrimaryRequest::Vote {
         header: Header::default(),
         parents: vec![Certificate::default()],

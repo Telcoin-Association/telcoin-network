@@ -21,6 +21,7 @@ dashmap = { workspace = true }
 # For the persist async implemetation.
 tokio = { workspace = true, features = [ "sync", "fs" ] }
 crc32fast = "1.5.0"
+cfg-if = { workspace = true }
 serde = { workspace = true }
 
 # redb backend
@@ -44,6 +45,7 @@ roaring = { workspace = true }
 redb = []
 reth-libmdbx = ["dep:reth-libmdbx", "dep:page_size"]
 default = ["reth-libmdbx"]
+test-utils = []
 
 [lints]
 workspace = true
