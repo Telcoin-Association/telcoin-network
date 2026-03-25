@@ -215,7 +215,7 @@ async fn spawn_stream_consensus_headers<DB: Database>(
                     // delay to let the traversal finish rather than waiting for the next gossip
                     // update (which may never come for an older epoch's blocks).
                     let mut no_progress_count = 0u32;
-                    const MAX_NO_PROGRESS: u32 = 50; // 50 * 100ms = 5 seconds max wait
+                    const MAX_NO_PROGRESS: u32 = 600; // 600 * 100ms = 60 seconds max wait
                     loop {
                         let prev_height = last_consensus_height;
                         last_consensus_header = catch_up_consensus_from_to(
@@ -246,6 +246,10 @@ async fn spawn_stream_consensus_headers<DB: Database>(
                                 _ = &rx_shutdown => return Ok(()),
                             }
                         } else {
+                            if no_progress_count > 0 {
+                                info!(target: "state-sync", ?epoch, last_consensus_height, no_progress_count,
+                                    "catch-up made progress after retries");
+                            }
                             no_progress_count = 0; // Progress was made, reset counter.
                         }
                     }
