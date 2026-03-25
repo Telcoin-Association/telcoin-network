@@ -25,7 +25,7 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
-use tn_reth::{CanonStateNotificationStream, RethEnv, TxPool as _, WorkerTxPool};
+use tn_reth::{CanonStateNotificationStream, ChangedAccount, RethEnv, TxPool as _, WorkerTxPool};
 use tn_types::{
     error::BlockSealError, gas_accumulator::BaseFeeContainer, Address, BatchBuilderArgs,
     BatchSender, Epoch, SealedBlock, TaskSpawner, TxHash, WorkerId,
@@ -38,8 +38,17 @@ mod error;
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
 
+/// The result of a successful batch build containing data needed to update the pool.
+#[derive(Debug)]
+struct MinedBatchResult {
+    /// Collection of transactions included in the accepted batch.
+    mined_transactions: Vec<TxHash>,
+    /// Account changes used to update the pool after mining a batch.
+    changed_accounts: Vec<ChangedAccount>,
+}
+
 /// Type alias for the blocking task that locks the tx pool and builds the next batch.
-type BuildResult = oneshot::Receiver<BatchBuilderResult<Vec<TxHash>>>;
+type BuildResult = oneshot::Receiver<BatchBuilderResult<MinedBatchResult>>;
 
 /// The type that builds blocks for workers to propose.
 ///
@@ -147,7 +156,7 @@ impl BatchBuilder {
             let (ack, rx) = oneshot::channel();
 
             // this is safe to call without a semaphore bc it's held as a single `Option`
-            let BatchBuilderOutput { batch, mined_transactions } = build_batch(build_args, worker_id, base_fee);
+            let BatchBuilderOutput { batch, mined_transactions, changed_accounts } = build_batch(build_args, worker_id, base_fee);
             let batch = batch.seal_slow();
             span.record("batch", batch.digest().to_string());
 
@@ -166,7 +175,7 @@ impl BatchBuilder {
                         Ok(_) => {
                             debug!(target: "worker::batch-builder", ?res, "received ack");
                             // signal to Self that this task is complete
-                            if let Err(e) = result.send(Ok(mined_transactions)) {
+                            if let Err(e) = result.send(Ok(MinedBatchResult { mined_transactions, changed_accounts })) {
                                 error!(target: "worker::batch_builder", ?e, "failed to send block builder result to block builder task");
                             }
                         }
@@ -186,7 +195,7 @@ impl BatchBuilder {
                                     //
                                     // return empty vec to indicate no transactions mined
                                     // NOTE: this will apply no changes to transaction pool
-                                    Ok(vec![])
+                                    Ok(MinedBatchResult { mined_transactions: vec![], changed_accounts: vec![] })
                                 }
                             };
 
@@ -239,6 +248,8 @@ impl Future for BatchBuilder {
         loop {
             // This is used as a "wake up" when canonical state updates.
             while let Poll::Ready(Some(latest)) = this.state_changed.poll_next_unpin(cx) {
+                // NOTE: separate background task applies these changes to the pool
+                // regardless of pending_task
                 this.last_canonical_update = latest.tip().sealed_block().clone()
             }
 
@@ -271,7 +282,7 @@ impl Future for BatchBuilder {
                     Poll::Ready(res) => {
                         debug!(target: "block-builder", ?res, "pending task complete");
                         // ensure no fatal errors
-                        let mined_transactions = res??;
+                        let MinedBatchResult { mined_transactions, changed_accounts } = res??;
 
                         // NOTE: empty vec returned for non-fatal error during block proposal
                         if mined_transactions.is_empty() {
@@ -296,7 +307,7 @@ impl Future for BatchBuilder {
                             base_fee_per_gas,
                             Some(u128::MAX), // set max fee for blobs
                             mined_transactions,
-                            vec![],
+                            changed_accounts,
                         );
 
                         // loop again to check for any other pending transactions
