@@ -391,7 +391,8 @@ where
             let epoch = header.epoch();
             let round = header.round();
             let digest = header.digest();
-            // Use a timeout for a sanity check.  Should be able to process a vote request within header delay...
+            // Use a timeout for a sanity check.  Should be able to process a vote request within
+            // header delay...
             let res = tokio::time::timeout(
                 self.consensus_config.config().parameters.max_header_delay,
                 self.vote_inner(header, parents),
