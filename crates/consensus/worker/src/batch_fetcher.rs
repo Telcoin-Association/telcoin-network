@@ -32,7 +32,10 @@ impl<DB: Database> BatchFetcher<DB> {
     /// Bulk fetches payload from local storage and remote workers.
     /// This function performs infinite retries and until all batches are available.
     #[instrument(level = "debug", skip_all, fields(num_digests = digests.len()))]
-    pub(crate) async fn fetch(&self, digests: HashSet<BlockHash>) -> HashMap<BlockHash, Batch> {
+    pub(crate) async fn fetch(
+        &self,
+        digests: HashSet<BlockHash>,
+    ) -> Result<HashMap<BlockHash, Batch>, RequestBatchesError> {
         debug!(target: "batch_fetcher", "Attempting to fetch {} digests from peers", digests.len(),);
 
         let mut remaining_digests = digests;
@@ -40,14 +43,14 @@ impl<DB: Database> BatchFetcher<DB> {
 
         loop {
             if remaining_digests.is_empty() {
-                return fetched_batches;
+                return Ok(fetched_batches);
             }
 
             // Fetch from local storage.
             fetched_batches.extend(self.fetch_local(remaining_digests.clone()).await);
             remaining_digests.retain(|d| !fetched_batches.contains_key(d));
             if remaining_digests.is_empty() {
-                return fetched_batches;
+                return Ok(fetched_batches);
             }
 
             // Fetch from peers.
@@ -65,19 +68,19 @@ impl<DB: Database> BatchFetcher<DB> {
                         updated_new_batches.insert(*digest, batch.clone());
                         // Also persist the batches, so they are available after restarts.
                         if let Err(e) = txn.insert::<NodeBatchesCache>(digest, &batch) {
-                            tracing::error!(target: "batch_fetcher", "failed to insert batch! We can not continue.. {e}");
-                            panic!("failed to insert batch! We can not continue.. {e}");
+                            tracing::error!(target: "batch_fetcher", "failed to insert batch! DB write failure! {e}");
+                            return Err(RequestBatchesError::DBInsert(e.to_string()));
                         }
                     }
                     if let Err(e) = txn.commit() {
-                        tracing::error!(target: "batch_fetcher", "failed to commit batch! We can not continue.. {e}");
-                        panic!("failed to commit batch! We can not continue.. {e}");
+                        tracing::error!(target: "batch_fetcher", "failed to commit batch! DB commit failure {e}");
+                        return Err(RequestBatchesError::DBCommit(e.to_string()));
                     }
                     fetched_batches
                         .extend(updated_new_batches.iter().map(|(d, b)| (*d, (*b).clone())));
 
                     if remaining_digests.is_empty() {
-                        return fetched_batches;
+                        return Ok(fetched_batches);
                     }
                 }
                 Err(_) => {
@@ -116,7 +119,7 @@ impl<DB: Database> BatchFetcher<DB> {
         &self,
         digests_to_fetch: &HashSet<BlockHash>,
         timeout: Duration,
-    ) -> Result<HashMap<BlockHash, Batch>, RequestBatchesNetworkError> {
+    ) -> Result<HashMap<BlockHash, Batch>, RequestBatchesError> {
         let mut fetched_batches = HashMap::new();
         if digests_to_fetch.is_empty() {
             return Ok(fetched_batches);
@@ -138,11 +141,15 @@ impl<DB: Database> BatchFetcher<DB> {
 
 /// Possible errors when requesting batches.
 #[derive(Debug, Error)]
-enum RequestBatchesNetworkError {
+pub(crate) enum RequestBatchesError {
     #[error(transparent)]
     Timeout(#[from] Elapsed),
     #[error(transparent)]
     Network(#[from] NetworkError),
+    #[error("DB Insert Error {0}")]
+    DBInsert(String),
+    #[error("DB Commit Error {0}")]
+    DBCommit(String),
 }
 
 // Utility trait to add a timeout to a batch request.
@@ -152,7 +159,7 @@ trait RequestBatchesNetwork: Send + Sync + std::fmt::Debug {
         &self,
         batch_digests: Vec<BlockHash>,
         timeout: Duration,
-    ) -> Result<Vec<Batch>, RequestBatchesNetworkError>;
+    ) -> Result<Vec<Batch>, RequestBatchesError>;
 }
 
 #[async_trait]
@@ -161,7 +168,7 @@ impl RequestBatchesNetwork for WorkerNetworkHandle {
         &self,
         batch_digests: Vec<BlockHash>,
         timeout: Duration,
-    ) -> Result<Vec<Batch>, RequestBatchesNetworkError> {
+    ) -> Result<Vec<Batch>, RequestBatchesError> {
         let res = tokio::time::timeout(timeout, self.request_batches(batch_digests)).await??;
         Ok(res)
     }
