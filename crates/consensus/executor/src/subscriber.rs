@@ -6,6 +6,7 @@ use state_sync::{last_executed_consensus_block, save_consensus, spawn_state_sync
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
+    time::Duration,
 };
 use tn_config::ConsensusConfig;
 use tn_network_types::{local::LocalNetwork, PrimaryToWorkerClient};
@@ -305,7 +306,12 @@ impl<DB: Database> Subscriber<DB> {
         // rx_sequence is now passed as parameter to avoid race condition
         // Listen to sequenced consensus message and process them.
         loop {
+            // Use biased select so shutdown is checked last. This ensures that if a
+            // completed output and shutdown are both ready, the output is saved first,
+            // preventing loss of committed consensus data during graceful shutdown.
             tokio::select! {
+                biased;
+
                 // Receive the ordered sequence of consensus messages from a consensus node.
                 Some(sub_dag) = rx_sequence.recv(), if !epoch_done && waiting.len() < Self::MAX_PENDING_PAYLOADS => {
                     // Once we cross epoch boundary then process this last output then we are done.
@@ -358,6 +364,31 @@ impl<DB: Database> Subscriber<DB> {
                 },
 
                 _ = &rx_shutdown => {
+                    // Drain any pending consensus outputs to prevent data loss.
+                    // Without this, committed subdags whose batch downloads are in-flight
+                    // would be lost on restart, causing consensus chain divergence.
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+                    while !waiting.is_empty() {
+                        tokio::select! {
+                            Some(output) = waiting.next() => {
+                                if let Ok(output) = output {
+                                    if let Err(e) = save_consensus(
+                                        self.config.node_storage(),
+                                        output,
+                                        &self.inner.authority_id,
+                                        &mut consensus_chain,
+                                    ).await {
+                                        warn!(target: "subscriber", "error saving consensus during shutdown: {e}");
+                                        break;
+                                    }
+                                }
+                            }
+                            _ = tokio::time::sleep_until(deadline) => {
+                                warn!(target: "subscriber", "timed out draining pending consensus during shutdown");
+                                break;
+                            }
+                        }
+                    }
                     return Ok(())
                 }
 

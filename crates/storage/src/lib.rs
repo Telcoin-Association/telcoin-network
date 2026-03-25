@@ -128,12 +128,30 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatab
 
     use crate::mdbx::database::MEGABYTE;
 
+    // Test builds use smaller database sizes to allow parallel test execution.
+    // These must still be large enough for long-running e2e tests (70s+ restart scenarios).
+    cfg_if::cfg_if! {
+        if #[cfg(any(test, feature = "test-utils"))] {
+            const EPOCH_MAX: usize = 16 * MEGABYTE;
+            const KAD_MAX: usize = 4 * MEGABYTE;
+            const CACHE_MAX: usize = 32 * MEGABYTE;
+            const GROWTH: usize = 4 * MEGABYTE;
+            const CACHE_GROWTH: usize = 8 * MEGABYTE;
+        } else {
+            const EPOCH_MAX: usize = 128 * MEGABYTE;
+            const KAD_MAX: usize = 64 * MEGABYTE;
+            const CACHE_MAX: usize = 512 * MEGABYTE;
+            const GROWTH: usize = 8 * MEGABYTE;
+            const CACHE_GROWTH: usize = 64 * MEGABYTE;
+        }
+    }
+
     let store_path = store_path.as_ref();
-    let epoch_db = MdbxDatabase::open(store_path.join("epoch"), 8, 128 * MEGABYTE, 8 * MEGABYTE)
+    let epoch_db = MdbxDatabase::open(store_path.join("epoch"), 8, EPOCH_MAX, GROWTH)
         .expect("Cannot open database (epoch)");
-    let kad_db = MdbxDatabase::open(store_path.join("kad"), 8, 64 * MEGABYTE, 8 * MEGABYTE)
+    let kad_db = MdbxDatabase::open(store_path.join("kad"), 8, KAD_MAX, GROWTH)
         .expect("Cannot open database (kad)");
-    let cache_db = MdbxDatabase::open(store_path.join("cache"), 4, 512 * MEGABYTE, 64 * MEGABYTE)
+    let cache_db = MdbxDatabase::open(store_path.join("cache"), 4, CACHE_MAX, CACHE_GROWTH)
         .expect("Cannot open database (cache)");
 
     let db = CompositeDatabase::open(epoch_db, kad_db, cache_db);

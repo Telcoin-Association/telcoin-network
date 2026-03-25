@@ -18,7 +18,6 @@ indexmap = { workspace = true }
 tn-node = { workspace = true }
 tn-reth = { workspace = true, features = ["test-utils"] }
 tn-types = { workspace = true }
-tn-faucet = { workspace = true }
 tn-config = { workspace = true }
 tn-test-utils-committee = { workspace = true }
 telcoin-network-cli = { workspace = true }

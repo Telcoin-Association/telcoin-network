@@ -21,7 +21,7 @@ tn-primary = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros"] }
-tn-storage = { workspace = true }
+tn-storage = { workspace = true, features = ["test-utils"] }
 tn-test-utils-committee = { workspace = true }
 tn-test-utils = { workspace = true }
 rand = { workspace = true }
