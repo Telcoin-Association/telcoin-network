@@ -27,8 +27,8 @@ use std::{
 };
 use tn_reth::{CanonStateNotificationStream, ChangedAccount, RethEnv, TxPool as _, WorkerTxPool};
 use tn_types::{
-    error::BlockSealError, gas_accumulator::BaseFeeContainer, Address, BatchBuilderArgs,
-    BatchSender, Epoch, SealedBlock, TaskSpawner, TxHash, WorkerId,
+    error::BlockSealError, Address, BatchBuilderArgs, BatchSender, Epoch, SealedBlock, TaskSpawner,
+    TxHash, WorkerId,
 };
 use tokio::{sync::oneshot, time::Interval};
 use tracing::{debug, error, field, info_span, Instrument};
@@ -88,8 +88,8 @@ pub struct BatchBuilder {
     task_spawner: TaskSpawner,
     /// Worker id this batch builder belongs too.
     worker_id: WorkerId,
-    /// The current base fee for this worker.
-    base_fee: BaseFeeContainer,
+    /// The base fee for this epoch. Constant for the batch builder's lifetime.
+    base_fee: u64,
     /// The epoch we are building batches for.
     epoch: Epoch,
 }
@@ -105,7 +105,7 @@ impl BatchBuilder {
         max_delay: Duration,
         task_spawner: TaskSpawner,
         worker_id: WorkerId,
-        base_fee: BaseFeeContainer,
+        base_fee: u64,
         epoch: Epoch,
     ) -> Self {
         let max_delay_interval = tokio::time::interval(max_delay);
@@ -146,7 +146,7 @@ impl BatchBuilder {
         let build_args = BatchBuilderArgs::new(pool.clone(), self.address, self.epoch);
         let (result, done) = oneshot::channel();
         let worker_id = self.worker_id;
-        let base_fee = self.base_fee.base_fee();
+        let base_fee = self.base_fee;
 
         let span = info_span!(target: "telcoin", "propose-batch", batch = field::Empty, worker_id, base_fee, epoch = self.epoch);
         let span_clone = span.clone();
@@ -354,7 +354,8 @@ mod tests {
     use tn_storage::{open_db, tables::NodeBatchesCache};
     use tn_types::{
         gas_accumulator::GasAccumulator, test_genesis, BlockHash, Bytes, Certificate,
-        CommittedSubDag, ConsensusOutput, Database, GenesisAccount, TaskManager, U160, U256,
+        CommittedSubDag, ConsensusOutput, Database, GenesisAccount, TaskManager,
+        MIN_PROTOCOL_BASE_FEE, U160, U256,
     };
     use tn_worker::{test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle};
     use tokio::time::timeout;
@@ -410,7 +411,7 @@ mod tests {
             Duration::from_secs(1),
             task_manager.get_spawner(),
             0,
-            BaseFeeContainer::default(),
+            MIN_PROTOCOL_BASE_FEE,
             0,
         );
 
@@ -564,7 +565,7 @@ mod tests {
             Duration::from_millis(1),
             task_manager.get_spawner(),
             0,
-            BaseFeeContainer::default(),
+            MIN_PROTOCOL_BASE_FEE,
             0,
         );
 
@@ -728,7 +729,7 @@ mod tests {
             Duration::from_secs(1),
             task_manager.get_spawner(),
             0,
-            BaseFeeContainer::default(),
+            MIN_PROTOCOL_BASE_FEE,
             0,
         );
 

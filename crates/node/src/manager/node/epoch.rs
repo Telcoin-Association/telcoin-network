@@ -188,7 +188,7 @@ where
                 worker.id(),
                 worker.batches_tx(),
                 &batch_builder_task_spawner,
-                gas_accumulator.base_fee(worker.id()),
+                gas_accumulator.base_fee(worker.id()).base_fee(),
                 current_epoch,
             )
             .await?;

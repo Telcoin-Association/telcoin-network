@@ -91,7 +91,7 @@ impl ExecutionNodeInner {
         worker_id: WorkerId,
         block_provider_sender: BatchSender,
         epoch_task_spawner: &TaskSpawner,
-        base_fee: BaseFeeContainer,
+        base_fee: u64,
         epoch: Epoch,
     ) -> eyre::Result<()> {
         // check for worker components and initialize if they're missing
