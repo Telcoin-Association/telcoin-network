@@ -393,6 +393,12 @@ fn run_observer_tests(client_urls: &[String; 4], obs_url: &str) -> eyre::Result<
     // Send to observer, validator confirms- second time.
     send_and_confirm(obs_url, &client_urls[3], &key, to_account, 1)?;
 
+    // Wait for the observer to sync the second transaction's block before reading
+    // its baseline balance. client_urls[3] confirmed the second tx, so use its
+    // block height as the sync target.
+    let target_block = get_block_number(&client_urls[3])?;
+    wait_for_block(obs_url, target_block)?;
+
     // Send to a validator, observer sees transfer.
     send_and_confirm(&client_urls[0], obs_url, &key, to_account, 2)?;
 

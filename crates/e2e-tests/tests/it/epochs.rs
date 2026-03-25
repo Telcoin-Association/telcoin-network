@@ -173,7 +173,7 @@ async fn test_epoch_boundary_inner(
     }
 }
 
-async fn loop_epochs(start: u32, iterations: u32, rpc_url: &str) -> eyre::Result<()> {
+async fn loop_epochs(start: u32, iterations: u32, rpc_url: &str) -> eyre::Result<u32> {
     // create rpc client for node1 default rpc address
     let rpc_url = rpc_url.to_string();
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
@@ -205,7 +205,7 @@ async fn loop_epochs(start: u32, iterations: u32, rpc_url: &str) -> eyre::Result
         last_epoch_block_height = new_epoch_info.blockHeight;
         current_epoch_info = new_epoch_info;
     }
-    Ok(())
+    Ok(current_epoch_info.epochId)
 }
 
 async fn test_epoch_sync_inner(
@@ -255,14 +255,14 @@ async fn test_epoch_sync_inner(
     guard.replace(kill_idx, new_child);
     // Update the endpoint for the restarted node (new dynamic ports)
     endpoints[kill_idx] = new_endpoints.pop().expect("endpoint");
-    loop_epochs(10, 5, &endpoints[0].http_url).await?;
+    let current_epoch = loop_epochs(10, 5, &endpoints[0].http_url).await?;
 
     // Verify all nodes have valid (certified) Epoch Records.
     // The node that was down should also have all these records after syncing.
     // Poll each epoch individually — certificates are produced asynchronously
     // after epoch boundaries via quorum voting.
     // TODO issue 375, should use tn_latestConsensusHeader RPC for this when fixed.
-    let latest_epoch = 15;
+    let latest_epoch = current_epoch - 1;
     for ep in endpoints {
         let provider = ProviderBuilder::new().connect_http(ep.http_url.parse()?);
         for epoch in 0..=latest_epoch {
