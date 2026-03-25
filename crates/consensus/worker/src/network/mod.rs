@@ -202,7 +202,7 @@ impl WorkerNetworkHandle {
                     .push(*batch);
             }
             let mut futures = FuturesUnordered::new();
-            for (peer, batch_digests) in peers.iter().zip(batch_of_batches.into_iter()) {
+            for (peer, batch_digests) in peers.iter().zip(batch_of_batches) {
                 if !batch_digests.is_empty() {
                     futures.push(self.request_batches_from_peer(
                         *peer,

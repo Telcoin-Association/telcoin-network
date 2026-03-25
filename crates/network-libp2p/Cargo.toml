@@ -41,7 +41,7 @@ tempfile = { workspace = true }
 tn-reth = { workspace = true, features = ["test-utils"] }
 eyre = { workspace = true }
 assert_matches = { workspace = true }
-tn-storage = { workspace = true }
+tn-storage = { workspace = true, features = ["test-utils"] }
 tn-test-utils = { workspace = true }
 tn-types = { workspace = true, features = ["test-utils"] }
 tn-config = { workspace = true, features = ["test-utils"] }

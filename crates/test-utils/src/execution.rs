@@ -5,7 +5,6 @@ use core::fmt;
 use std::{path::Path, str::FromStr, sync::Arc};
 use telcoin_network_cli::{node::NodeCommand, NoArgs};
 use tn_config::Config;
-use tn_faucet::FaucetArgs;
 use tn_node::engine::{ExecutionNode, TnBuilder};
 use tn_reth::{RethChainSpec, RethCommand, RethConfig, RethEnv};
 use tn_types::{
@@ -91,63 +90,9 @@ fn execution_builder<CliExt: clap::Args + fmt::Debug>(
         RethConfig::new(reth_command, instance, tmp_dir, true, Arc::new(tn_config.chain_spec()));
     // create engine node
     let reth_db = RethEnv::new_database(&node_config, tmp_dir.join("db"))?;
-    // TODO: this a temporary approach until upstream reth supports public rpc hooks
-    let opt_faucet_args = None;
-    let builder =
-        TnBuilder { node_config, tn_config, opt_faucet_args, metrics: None, healthcheck, reth_db };
+    let builder = TnBuilder { node_config, tn_config, metrics: None, healthcheck, reth_db };
 
     Ok((builder, ext))
-}
-
-/// Convenience function for creating engine node using tempdir and optional args.
-/// Defaults if params not provided:
-/// - opt_authority_identifier: `AuthorityIdentifier(1)`
-/// - opt_chain: `adiri`
-/// - opt_address: `0x1111111111111111111111111111111111111111`
-// #[cfg(feature = "faucet")]
-pub fn faucet_test_execution_node(
-    google_kms: bool,
-    opt_chain: Option<Arc<RethChainSpec>>,
-    opt_address: Option<Address>,
-    faucet_proxy_address: Address,
-    tmp_dir: &Path,
-) -> eyre::Result<TestExecutionNode> {
-    let faucet_args = ["--google-kms"];
-
-    // TODO: support non-google-kms faucet
-    let extended_args = if google_kms { Some(faucet_args.to_vec()) } else { None };
-    // always include default expected faucet derived from `TransactionFactory::default`
-    let faucet = faucet_proxy_address.to_string();
-    let extended_args =
-        extended_args.map(|opt| [opt, vec!["--faucet-contract", &faucet]].concat().to_vec());
-
-    // execution builder + faucet args
-    let (builder, faucet) =
-        execution_builder::<FaucetArgs>(opt_chain.clone(), opt_address, extended_args, tmp_dir)?;
-
-    // replace default builder's faucet args
-    let TnBuilder { node_config, tn_config, healthcheck, reth_db, .. } = builder;
-    let builder = TnBuilder {
-        node_config: node_config.clone(),
-        tn_config,
-        opt_faucet_args: Some(faucet),
-        metrics: None,
-        healthcheck,
-        reth_db: reth_db.clone(),
-    };
-
-    let engine = ExecutionNode::new(
-        &builder,
-        RethEnv::new(
-            &node_config,
-            &TaskManager::default(),
-            reth_db,
-            None,
-            RewardsCounter::default(),
-        )?,
-    )?;
-
-    Ok(engine)
 }
 
 /// Optional parameters to pass to the `execute_test_batch` function.

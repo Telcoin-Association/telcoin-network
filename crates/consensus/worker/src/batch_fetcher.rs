@@ -103,7 +103,7 @@ impl<DB: Database> BatchFetcher<DB> {
         // are available.
         debug!(target: "batch_fetcher", "Local attempt to fetch {} digests", digests.len());
         if let Ok(local_batches) = self.batch_store.multi_get::<NodeBatchesCache>(digests.iter()) {
-            for (digest, batch) in digests.into_iter().zip(local_batches.into_iter()) {
+            for (digest, batch) in digests.into_iter().zip(local_batches) {
                 if let Some(batch) = batch {
                     fetched_batches.insert(digest, batch);
                 }

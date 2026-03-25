@@ -11,17 +11,26 @@ use std::{
     path::{Path, PathBuf},
     sync::OnceLock,
 };
-use telcoin_network_cli::{genesis::GenesisArgs, keytool::KeyArgs, node::NodeCommand};
+use telcoin_network_cli::{genesis::GenesisArgs, keytool::KeyArgs, node::NodeCommand, NoArgs};
 use tn_config::{Config, ConfigFmt, ConfigTrait, KeyConfig};
 use tn_node::launch_node;
 use tn_types::{test_utils::CommandParser, Address, Genesis, GenesisAccount};
 use tracing::{error, info};
 // unused deps warnings
 
-/// Limit potential for port collisions.
-pub static IT_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Only compile main bin once for all tests.
 pub static TELCOIN_BINARY: OnceLock<CargoRun> = OnceLock::new();
+
+/// RPC endpoints for a single node across all transports.
+#[derive(Debug)]
+pub struct NodeEndpoints {
+    /// HTTP transport address.
+    pub http_url: String,
+    /// WS transport address.
+    pub ws_url: String,
+    /// IPS transport address.
+    pub ipc_path: String,
+}
 
 /// Execute genesis ceremony inside tempdir
 pub fn create_validator_info(
@@ -52,7 +61,7 @@ fn create_observer_info(datadir: PathBuf, passphrase: Option<String>) -> eyre::R
     keys_command.args.execute(datadir, passphrase)
 }
 
-/// Create validator info, genesis ceremony, and spawn node command with faucet active.
+/// Create validator info, genesis ceremony, and configure local testnet.
 pub fn config_local_testnet(
     temp_path: &Path,
     passphrase: Option<String>,
@@ -137,34 +146,52 @@ pub fn config_local_testnet(
     Ok(())
 }
 
-/// Create validator info, genesis ceremony, and spawn node command with faucet active.
+/// Create validator info, genesis ceremony, and spawn node command.
 pub fn spawn_local_testnet(
     temp_path: &Path,
-    #[cfg(feature = "faucet")] faucet_contract_address: &str,
     accounts: Option<Vec<(Address, GenesisAccount)>>,
-) -> eyre::Result<()> {
+) -> eyre::Result<Vec<NodeEndpoints>> {
     config_local_testnet(temp_path, None, accounts)?;
 
     let validators = ["validator-1", "validator-2", "validator-3", "validator-4"];
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut endpoints = Vec::new();
+
     for v in validators.into_iter() {
         let dir = temp_path.join(v);
-        let instance = v.chars().last().expect("validator instance").to_string();
+        let rpc_port = tn_types::get_available_tcp_port("127.0.0.1")
+            .expect("Failed to get an ephemeral rpc port");
 
-        #[cfg(feature = "faucet")]
-        let command = NodeCommand::<tn_faucet::FaucetArgs>::parse_from([
+        let ws_port = tn_types::get_available_tcp_port("127.0.0.1")
+            .expect("Failed to get an ephemeral ws port");
+
+        // IPC - unique path under temp_path to avoid cross-test conflicts
+        let ipc_path = temp_path.join(format!("{v}.ipc"));
+        let ipc_path_str = ipc_path.to_string_lossy().to_string();
+
+        endpoints.push(NodeEndpoints {
+            http_url: format!("http://127.0.0.1:{rpc_port}"),
+            ws_url: format!("ws://127.0.0.1:{ws_port}"),
+            ipc_path: ipc_path_str.clone(),
+        });
+
+        let command = NodeCommand::parse_from([
             "tn",
             "--http",
-            "--instance",
-            &instance,
-            "--google-kms",
-            "--faucet-contract",
-            faucet_contract_address,
+            "--http.port",
+            &rpc_port.to_string(),
+            "--ws",
+            "--ws.port",
+            &ws_port.to_string(),
+            "--ipcpath",
+            &ipc_path_str,
         ]);
-        #[cfg(not(feature = "faucet"))]
-        let command = NodeCommand::parse_from(["tn", "--http", "--instance", &instance]);
 
         let key_config = KeyConfig::read_config(&dir, Some("it_test_pass".to_string()))?;
-        std::thread::spawn(|| {
+        let tx = tx.clone();
+        let name = v.to_string();
+
+        std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .thread_name("telcoin-network")
                 .enable_io()
@@ -173,19 +200,88 @@ pub fn spawn_local_testnet(
                 .expect("can build tokio runtime");
 
             runtime.block_on(async move {
-                let err = command
-                    .execute(dir, key_config, |mut builder, faucet_args, tn_datadir, passphrase| {
-                        builder.opt_faucet_args = Some(faucet_args);
+                match command.execute(
+                    dir,
+                    key_config,
+                    |builder, _: NoArgs, tn_datadir, passphrase| {
                         launch_node(builder, tn_datadir, passphrase)
-                    })
-                    .expect("execute to succeed")
-                    .await;
-                error!("{:?}", err);
+                    },
+                ) {
+                    Ok(handle) => {
+                        let err = handle.await;
+                        error!("{name} exited: {err:?}");
+                    }
+                    Err(e) => {
+                        let msg = format!("{name} failed to start: {e:?}");
+                        error!("{msg}");
+                        let _ = tx.send(msg);
+                    }
+                }
             });
         });
     }
 
+    // Give threads a moment to fail fast, then check for early errors
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    if let Ok(err) = rx.try_recv() {
+        eyre::bail!("Node startup failed: {err}");
+    }
+
+    Ok(endpoints)
+}
+
+/// Verify HTTP, WS, and IPC transports are all reachable for a node.
+pub async fn verify_all_transports(endpoint: &NodeEndpoints) -> eyre::Result<()> {
+    use alloy::{
+        network::Ethereum,
+        providers::{Provider, ProviderBuilder, RootProvider},
+    };
+
+    // HTTP
+    let http_provider = ProviderBuilder::new().connect_http(endpoint.http_url.parse()?);
+    http_provider.get_chain_id().await?;
+
+    // WS
+    let ws_provider: RootProvider<Ethereum> = RootProvider::connect(&endpoint.ws_url)
+        .await
+        .map_err(|e| eyre::eyre!("WS connect failed for {}: {e}", endpoint.ws_url))?;
+    ws_provider.get_chain_id().await?;
+
+    // IPC
+    let ipc_provider: RootProvider<Ethereum> = RootProvider::connect(&endpoint.ipc_path)
+        .await
+        .map_err(|e| eyre::eyre!("IPC connect failed for {}: {e}", endpoint.ipc_path))?;
+    ipc_provider.get_chain_id().await?;
+
     Ok(())
+}
+
+/// Configure a command to write stdout to a per-node log file under `test_logs/`.
+///
+/// Logs are written to `crates/e2e-tests/test_logs/<test>/node<instance>-run<run>.log`.
+pub fn setup_log_dir(
+    command: &mut std::process::Command,
+    instance: impl std::fmt::Display,
+    test: &str,
+    run: u32,
+) -> std::path::PathBuf {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+    let log_dir = std::path::PathBuf::from(manifest_dir).join("test_logs");
+    let test_dir = log_dir.join(test);
+    std::fs::create_dir_all(&test_dir).expect("failed to create test log dir");
+    let out_file = std::fs::File::create(test_dir.join(format!("node{instance}-run{run}.log")))
+        .expect("valid log file");
+    let stdout: std::process::Stdio = out_file.into();
+    command.stdout(stdout);
+
+    // Capture stderr (panics, error-level output) to a separate log file
+    let err_file =
+        std::fs::File::create(test_dir.join(format!("node{instance}-run{run}.stderr.log")))
+            .expect("valid stderr log file");
+    let stderr: std::process::Stdio = err_file.into();
+    command.stderr(stderr);
+
+    test_dir
 }
 
 /// Helper to retrieve and build the main project binary.
@@ -199,6 +295,7 @@ pub fn get_telcoin_network_binary() -> &'static CargoRun {
 
         CargoBuild::new()
             .bin("telcoin-network")
+            .features("tn-storage/test-utils")
             .manifest_path(workspace_root.join("Cargo.toml"))
             .target_dir(workspace_root.join("target"))
             .current_target()
