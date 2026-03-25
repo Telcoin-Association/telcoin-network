@@ -78,6 +78,8 @@ sol!(
             /// The execution block height when the epoch started and the
             /// committee became active.
             uint64 blockHeight;
+            /// The epoch's id.
+            uint32 epochId;
             /// The duration for the epoch (in secs).
             ///
             /// NOTE: this is set at the start of each epoch based on the

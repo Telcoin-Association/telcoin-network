@@ -1064,7 +1064,8 @@ impl RethEnv {
         Self::new(&reth_config, task_manager, database, None, rewards.unwrap_or_default())
     }
 
-    /// Convenience method for compiling storage and bytecode to include genesis.
+    /// Convenience method for compiling storage and bytecode to include consensus registry
+    /// configuration in genesis.
     pub fn create_consensus_registry_genesis_accounts(
         validators: Vec<NodeInfo>,
         genesis: Genesis,
@@ -1672,6 +1673,7 @@ mod tests {
         let mut expected_epoch_info = ConsensusRegistry::EpochInfo {
             committee: expected_committee,
             blockHeight: 0,
+            epochId: 0,
             epochDuration: epoch_duration,
             epochIssuance: initial_stake_config.epochIssuance,
             stakeVersion: 0,
@@ -1730,6 +1732,7 @@ mod tests {
         debug!(target: "evm", ?epoch, ?epoch_info, ?committee, ?epoch, "new epoch state from canonical tip");
         // assert epoch info updated
         expected_epoch_info.blockHeight = 4;
+        expected_epoch_info.epochId = expected_epoch as u32;
         assert_eq!(expected_epoch, epoch);
         assert_eq!(epoch_start, canonical_header.timestamp);
         assert_eq!(epoch_info, expected_epoch_info);
@@ -1764,6 +1767,7 @@ mod tests {
         let expected = ConsensusRegistry::EpochInfo {
             committee: expected_new_committee,
             blockHeight: 0,
+            epochId: (expected_epoch + 1) as u32,
             // epoch duration set at the start
             epochDuration: Default::default(),
             // values should remain the same

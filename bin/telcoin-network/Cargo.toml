@@ -12,14 +12,9 @@ exclude.workspace = true
 
 [dependencies]
 rpassword = { workspace = true }
-tn-faucet = { workspace = true, optional = true }
 clap = { workspace = true }
 telcoin-network-cli = { workspace = true }
 tn-node = { workspace = true }
-
-[features]
-default = []
-faucet = ["tn-faucet"]
 
 [lints]
 workspace = true

@@ -51,22 +51,28 @@ mod network_tests;
 /// Custom network libp2p behaviour type for Telcoin Network.
 ///
 /// The behavior composes multiple sub-behaviors:
+/// - `peer_manager`: Connection management and peer scoring
 /// - `gossipsub`: Flood publishing for certificates and batches
 /// - `req_res`: Point-to-point request-response messages
-/// - `peer_manager`: Connection management and peer scoring
 /// - `kademlia`: Distributed hash table for peer discovery
 /// - `stream`: Stream-based bulk data transfer for state sync
+///
+/// **Field order matters**: `NetworkBehaviour` derive calls `handle_established_*_connection`
+/// on sub-behaviors in declaration order, short-circuiting on `Err(ConnectionDenied)`.
+/// `peer_manager` must be first so banned-peer denials fire before other behaviors
+/// (e.g. `req_res`) register the connection in their internal state.
 #[derive(NetworkBehaviour)]
 pub(crate) struct TNBehavior<C, DB>
 where
     C: Codec + Send + Clone + 'static,
 {
+    /// The peer manager — first so banned-peer denials short-circuit
+    /// before other behaviors register the connection.
+    pub(crate) peer_manager: peers::PeerManager,
     /// The gossipsub network behavior.
     pub(crate) gossipsub: gossipsub::Behaviour,
     /// The request-response network behavior.
     pub(crate) req_res: request_response::Behaviour<C>,
-    /// The peer manager.
-    pub(crate) peer_manager: peers::PeerManager,
     /// Used for peer discovery.
     pub(crate) kademlia: kad::Behaviour<KadStore<DB>>,
     /// Stream-based sync behavior for bulk data transfer.
@@ -87,7 +93,7 @@ where
     ) -> Self {
         let peer_manager = PeerManager::new(peer_config);
         let stream = StreamBehavior::new();
-        Self { gossipsub, req_res, peer_manager, kademlia, stream }
+        Self { peer_manager, gossipsub, req_res, kademlia, stream }
     }
 }
 
@@ -1027,8 +1033,12 @@ where
             }
             PeerEvent::DisconnectPeerX(peer_id, peer_exchange) => {
                 debug!(target: "peer-manager", this_node=?self.swarm.local_peer_id(), ?peer_id, "disconnecting from peer with exchange info");
-                // attempt to exchange peer information if limits allow
-                if self.pending_px_disconnects.len() < self.config.max_px_disconnects {
+
+                // guard: skip PX if peer already disconnected
+                if !self.swarm.is_connected(&peer_id) {
+                    debug!(target: "peer-manager", ?peer_id, "peer already disconnected, skipping PX");
+                } else if self.pending_px_disconnects.len() < self.config.max_px_disconnects {
+                    // attempt to exchange peer information if limits allow
                     let (reply, done) = oneshot::channel();
                     let request_id = self
                         .swarm

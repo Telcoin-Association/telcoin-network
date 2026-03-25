@@ -483,8 +483,8 @@ impl Committee {
     pub fn others_keys_except(&self, myself: &BlsPublicKey) -> Vec<BlsPublicKey> {
         self.inner
             .authorities
-            .iter()
-            .filter_map(|(_, authority)| {
+            .values()
+            .filter_map(|authority| {
                 if authority.protocol_key() == myself {
                     None
                 } else {

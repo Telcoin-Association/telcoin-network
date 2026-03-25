@@ -2,7 +2,6 @@
 
 use super::{inner::ExecutionNodeInner, TnBuilder};
 use tn_config::Config;
-use tn_faucet::FaucetArgs;
 use tn_reth::RethEnv;
 
 /// A builder that handles component initialization for the execution node.
@@ -14,17 +13,14 @@ pub(super) struct ExecutionNodeBuilder {
 
     /// Reth environment for executing transactions.
     reth_env: RethEnv,
-
-    /// Optional components (for testnet only).
-    opt_faucet_args: Option<FaucetArgs>,
 }
 
 impl ExecutionNodeBuilder {
     /// Start the builder with required components
     pub(super) fn new(tn_builder: &TnBuilder, reth_env: RethEnv) -> Self {
-        let TnBuilder { tn_config, opt_faucet_args, .. } = tn_builder;
+        let TnBuilder { tn_config, .. } = tn_builder;
 
-        Self { reth_env, tn_config: tn_config.clone(), opt_faucet_args: opt_faucet_args.clone() }
+        Self { reth_env, tn_config: tn_config.clone() }
     }
 
     /// Build the final ExecutionNodeInner
@@ -34,7 +30,6 @@ impl ExecutionNodeBuilder {
         Ok(ExecutionNodeInner {
             reth_env: self.reth_env,
             address: *self.tn_config.execution_address(),
-            opt_faucet_args: self.opt_faucet_args,
             tn_config: self.tn_config,
             workers: Vec::default(),
         })

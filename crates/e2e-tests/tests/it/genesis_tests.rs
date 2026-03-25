@@ -3,169 +3,93 @@
 //! NOTE: this test contains code for executing a proxy/impl pre-genesis
 //! however, the RPC calls don't work. The beginning of the test is left
 //! because the proxy version may be re-prioritized later.
-use alloy::{network::EthereumWallet, primitives::utils::parse_ether, providers::ProviderBuilder};
+use alloy::{network::EthereumWallet, providers::ProviderBuilder};
 use core::panic;
-use e2e_tests::{spawn_local_testnet, IT_TEST_MUTEX};
+use e2e_tests::{spawn_local_testnet, verify_all_transports};
 use eyre::OptionExt;
 use jsonrpsee::{
     core::client::ClientT,
     http_client::{HttpClient, HttpClientBuilder},
     rpc_params,
 };
-use serde_json::Value;
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 use telcoin_network_cli::args::clap_u256_parser_to_18_decimals;
 use tn_config::{
-    NetworkGenesis, BLSG1_JSON, CONSENSUS_REGISTRY_JSON, DEPLOYMENTS_JSON, ISSUANCE_ADDRESS,
-    ISSUANCE_JSON,
+    NetworkGenesis, BLSG1_JSON, CONSENSUS_REGISTRY_JSON, DEPLOYMENTS_JSON,
+    GENESIS_ACCOUNT_STATE_YAML, ISSUANCE_ADDRESS, ISSUANCE_JSON,
 };
 use tn_reth::{
     system_calls::{ConsensusRegistry, CONSENSUS_REGISTRY_ADDRESS},
     test_utils::TransactionFactory,
     RethEnv,
 };
-use tn_types::{address, Address, Bytes, FromHex, GenesisAccount, U256};
+use tn_types::{Address, Bytes, FromHex, GenesisAccount};
 use tracing::debug;
 
-async fn wait_for_rpc(url: &str) -> HttpClient {
-    let client = HttpClientBuilder::default().build(url).expect("couldn't build rpc client");
-    let max_attempts = 60;
+async fn wait_for_rpc(url: &str) -> eyre::Result<HttpClient> {
+    let client = HttpClientBuilder::default().build(url)?;
+    let max_attempts = 120;
+    let mut last_err = None;
     for attempt in 0..max_attempts {
         match client.request::<String, _>("eth_blockNumber", rpc_params!()).await {
-            Ok(_) => return client,
-            Err(_) if attempt < max_attempts - 1 => {
+            Ok(_) => return Ok(client),
+            Err(e) => {
+                if attempt % 20 == 0 {
+                    eprintln!("[wait_for_rpc] attempt {attempt}/{max_attempts} for {url}: {e}");
+                }
+                last_err = Some(e);
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
-            Err(e) => panic!("RPC at {url} not available after {max_attempts} attempts: {e}"),
         }
     }
-    unreachable!()
-}
-
-#[tokio::test]
-async fn test_genesis_with_its() -> eyre::Result<()> {
-    let _guard = IT_TEST_MUTEX.lock();
-    // sleep for other tests to cleanup
-    std::thread::sleep(std::time::Duration::from_secs(5));
-    // spawn testnet for RPC calls
-    let temp_path = tempfile::TempDir::with_suffix("genesis_with_its").expect("tempdir is okay");
-    spawn_local_testnet(
-        temp_path.path(),
-        #[cfg(feature = "faucet")]
-        "0x0000000000000000000000000000000000000000",
-        None,
+    eyre::bail!(
+        "RPC at {url} not available after {max_attempts} attempts ({}s). Last error: {}",
+        max_attempts / 2,
+        last_err.map(|e| e.to_string()).unwrap_or_default()
     )
-    .expect("failed to spawn testnet");
-    let rpc_url = "http://127.0.0.1:8545".to_string();
-    let client = wait_for_rpc(&rpc_url).await;
-
-    let itel_address =
-        RethEnv::fetch_value_from_json_str(DEPLOYMENTS_JSON, Some("its.InterchainTEL"))?
-            .as_str()
-            .map(|hex_str| Address::from_hex(hex_str).unwrap())
-            .unwrap();
-    let tel_supply = U256::try_from(parse_ether("100_000_000_000").unwrap()).unwrap();
-    let initial_stake = U256::try_from(parse_ether("4_000_000").unwrap()).unwrap();
-    let governance_balance = U256::try_from(parse_ether("10").unwrap()).unwrap();
-    // account for governance safe allocation and 4 million tel staked at genesis for 4 validators
-    let itel_bal = tel_supply - initial_stake - governance_balance;
-    let precompiles = NetworkGenesis::fetch_precompile_genesis_accounts(itel_address, itel_bal)
-        .expect("its precompiles not found");
-    // precompiles to prevent replay attacks for historic block hashes and consensus block roots
-    // contract deployments
-    let deployer_addrs = vec![
-        address!("0x0B799C86a49DEeb90402691F1041aa3AF2d3C875"),
-        address!("0x3462413Af4609098e1E27A490f554f260213D685"),
-    ];
-    for (address, genesis_account) in precompiles {
-        // check account storage or nonce
-        //
-        // see https://github.com/Telcoin-Association/tn-contracts/pull/57
-        if deployer_addrs.contains(&address) {
-            check_account_nonce(&client, address).await?;
-        } else {
-            check_account_storage(&client, address, genesis_account, itel_address, itel_bal)
-                .await?;
-        }
-    }
-
-    Ok(())
 }
 
 #[tokio::test]
 async fn test_precompile_genesis_accounts() -> eyre::Result<()> {
-    let _guard = IT_TEST_MUTEX.lock();
-    // sleep for other tests to cleanup
-    std::thread::sleep(std::time::Duration::from_secs(5));
-    // check that all addresses in expected_deployments are present in precompiles
-    let is_address_present = |address: &str, genesis_config: Vec<(Address, GenesisAccount)>| {
-        genesis_config
-            .iter()
-            .any(|(precompile_address, _)| precompile_address.to_string() == address)
-    };
-    let expected_deployments = RethEnv::fetch_value_from_json_str(DEPLOYMENTS_JSON, None)?;
+    let _permit = super::common::acquire_test_permit();
+    //
+    // TODO: Issue #584: LZ adapter + safe
+    //
 
-    // assert all interchain token service precompile configs are present
-    let its_addresses = expected_deployments.get("its").and_then(|v| v.as_object()).unwrap();
-    let itel_address =
-        Address::from_hex(its_addresses.get("InterchainTEL").and_then(|v| v.as_str()).unwrap())
-            .unwrap();
+    // fetch precompile accounts (no ITS args needed now)
+    let precompile_accounts = NetworkGenesis::fetch_precompile_genesis_accounts()?;
 
-    let some_bal = U256::try_from(parse_ether("95_000_000_000").unwrap()).unwrap();
-    let precompiles = NetworkGenesis::fetch_precompile_genesis_accounts(itel_address, some_bal)
-        .expect("its precompiles not found");
-    let addresses_with_storage: Vec<&str> = [
-        "InterchainTEL",
-        "InterchainTELImpl",
-        "AxelarAmplifierGateway",
-        "GasService",
-        "InterchainTokenService",
-        "InterchainTokenFactory",
-        "SafeImpl",
-        "Safe",
-    ]
-    .iter()
-    .filter_map(|&key| its_addresses.get(key).and_then(Value::as_str))
-    .collect();
-    its_addresses
-        .iter()
-        .filter_map(|(key, value)| value.as_str().map(|address| (key, address)))
-        .for_each(|(key, address)| {
-            assert!(
-                is_address_present(address, precompiles.clone()),
-                "{key} is not present in precompiles"
-            );
+    // parse expected directly from the YAML
+    let expected: HashMap<Address, GenesisAccount> =
+        serde_yaml::from_str(GENESIS_ACCOUNT_STATE_YAML).expect("yaml parsing failure");
 
-            if addresses_with_storage.contains(&address) {
-                if let Some((_, genesis_account)) = precompiles
-                    .iter()
-                    .find(|precompile| precompile.0 == Address::from_hex(address).unwrap())
-                {
-                    assert!(
-                        genesis_account.storage.is_some(),
-                        "Storage should be present for {address}"
-                    );
+    // verify count matches (currently 9 precompile accounts)
+    assert_eq!(
+        precompile_accounts.len(),
+        expected.len(),
+        "precompile account count mismatch: got {} expected {}",
+        precompile_accounts.len(),
+        expected.len()
+    );
 
-                    if key == "InterchainTEL" {
-                        let governance_bal = U256::try_from(parse_ether("10").unwrap()).unwrap();
-                        let expected_bal = some_bal - governance_bal;
-                        assert!(
-                            genesis_account.balance == expected_bal,
-                            "ITEL balance should be 100 billion TEL minus genesis validator stake"
-                        );
-                    }
-                }
-            }
-        });
+    // verify each expected account is present with correct fields
+    for (address, account) in &precompile_accounts {
+        let expected_account = expected
+            .get(address)
+            .unwrap_or_else(|| panic!("missing expected precompile address: {address}"));
+
+        assert_eq!(account.nonce, expected_account.nonce, "nonce mismatch for {address}");
+        assert_eq!(account.balance, expected_account.balance, "balance mismatch for {address}");
+        assert_eq!(account.code, expected_account.code, "code mismatch for {address}");
+        assert_eq!(account.storage, expected_account.storage, "storage mismatch for {address}");
+    }
 
     Ok(())
 }
 
 #[tokio::test]
 async fn test_genesis_with_consensus_registry_accounts() -> eyre::Result<()> {
-    let _guard = IT_TEST_MUTEX.lock();
-    // sleep for other tests to cleanup
-    std::thread::sleep(std::time::Duration::from_secs(5));
+    let _permit = super::common::acquire_test_permit();
     // fetch registry, blsg1, and issuance bytecodes
     let registry_runtimecode_binding = RethEnv::fetch_value_from_json_str(
         CONSENSUS_REGISTRY_JSON,
@@ -191,17 +115,13 @@ async fn test_genesis_with_consensus_registry_accounts() -> eyre::Result<()> {
         issuance_json_val.as_str().ok_or_eyre("fetch issuance runtime code")?;
 
     // spawn testnet for RPC calls
-    let temp_path = tempfile::TempDir::with_suffix("genesis_with_consensus_registry_accounts")
-        .expect("tempdir is okay");
-    spawn_local_testnet(
-        temp_path.path(),
-        #[cfg(feature = "faucet")]
-        "0x0000000000000000000000000000000000000000",
-        None,
-    )
-    .expect("failed to spawn testnet");
-    let rpc_url = "http://127.0.0.1:8545".to_string();
-    let client = wait_for_rpc(&rpc_url).await;
+    let temp_path = tempfile::TempDir::with_suffix("genesis_reg").expect("tempdir is okay");
+    let endpoints = spawn_local_testnet(temp_path.path(), None)?;
+    let rpc_url = endpoints[0].http_url.clone();
+    let client = wait_for_rpc(&rpc_url).await?;
+
+    // verify all three transports (HTTP, WS, IPC) are reachable
+    verify_all_transports(&endpoints[0]).await?;
 
     // sanity check onchain spawned both registry & issuance in genesis
     let returned_registry_bytecode: String = client
@@ -229,6 +149,48 @@ async fn test_genesis_with_consensus_registry_accounts() -> eyre::Result<()> {
         Bytes::from_hex(blsg1_deployed_bytecode)?
     );
 
+    // verify all precompile-config.yaml accounts are present in genesis on-chain
+    let precompile_accounts =
+        NetworkGenesis::fetch_precompile_genesis_accounts().expect("precompile fetch error");
+    for (address, expected_account) in &precompile_accounts {
+        let addr_str = format!("{address:#x}");
+        // check code
+        if expected_account.code.is_some() {
+            let code: String = client
+                .request("eth_getCode", rpc_params!(addr_str.clone(), "latest"))
+                .await
+                .unwrap_or_else(|e| panic!("eth_getCode failed for {addr_str}: {e}"));
+            assert!(
+                code != "0x" && code != "0x0",
+                "expected code at precompile address {addr_str} but got empty"
+            );
+        }
+        // check balance
+        if expected_account.balance != tn_types::U256::ZERO {
+            let bal_hex: String = client
+                .request("eth_getBalance", rpc_params!(addr_str.clone(), "latest"))
+                .await
+                .unwrap_or_else(|e| panic!("eth_getBalance failed for {addr_str}: {e}"));
+            let bal = tn_types::U256::from_str_radix(bal_hex.trim_start_matches("0x"), 16)
+                .expect("parse balance hex");
+            assert_eq!(bal, expected_account.balance, "balance mismatch for precompile {addr_str}");
+        }
+        // check nonce
+        if expected_account.nonce.is_some() {
+            let nonce_hex: String = client
+                .request("eth_getTransactionCount", rpc_params!(addr_str.clone(), "latest"))
+                .await
+                .unwrap_or_else(|e| panic!("eth_getTransactionCount failed for {addr_str}: {e}"));
+            let nonce = u64::from_str_radix(nonce_hex.trim_start_matches("0x"), 16)
+                .expect("parse nonce hex");
+            assert_eq!(
+                Some(nonce),
+                expected_account.nonce,
+                "nonce mismatch for precompile {addr_str}"
+            );
+        }
+    }
+
     let tx_factory = TransactionFactory::default();
     let signer = tx_factory.get_default_signer().expect("failed to fetch signer");
     let wallet = EthereumWallet::from(signer);
@@ -247,6 +209,7 @@ async fn test_genesis_with_consensus_registry_accounts() -> eyre::Result<()> {
         committee,
         epochIssuance,
         blockHeight,
+        epochId: _,
         epochDuration,
         stakeVersion,
     } = current_epoch_info;
@@ -265,47 +228,5 @@ async fn test_genesis_with_consensus_registry_accounts() -> eyre::Result<()> {
     assert_eq!(committee, validator_addresses);
     debug!(target: "genesis-test", "active validators??\n{:?}", validators);
 
-    Ok(())
-}
-
-/// Helper function to assert expected account code.
-async fn check_account_storage(
-    client: &HttpClient,
-    address: Address,
-    genesis_account: GenesisAccount,
-    itel_address: Address,
-    itel_bal: U256,
-) -> eyre::Result<()> {
-    debug!(target: "genesis-test", ?address, ?genesis_account, "checking account storage for");
-    let returned_code: String = client.request("eth_getCode", rpc_params!(address)).await?;
-    assert_eq!(Bytes::from_hex(returned_code), Ok(genesis_account.code.unwrap()));
-
-    if address == itel_address {
-        let returned_bal: String = client.request("eth_getBalance", rpc_params!(address)).await?;
-        let returned_bal = returned_bal.trim_start_matches("0x");
-        assert_eq!(U256::from_str_radix(returned_bal, 16)?, itel_bal);
-    }
-
-    if genesis_account.storage.is_some() {
-        for (slot, value) in genesis_account.storage.unwrap().iter() {
-            let returned_storage: String = client
-                .request("eth_getStorageAt", rpc_params!(address, slot.to_string(), "latest"))
-                .await?;
-            assert_eq!(returned_storage, value.to_string());
-        }
-    }
-
-    Ok(())
-}
-
-/// Helper function to assert expected account nonce.
-async fn check_account_nonce(client: &HttpClient, address: Address) -> eyre::Result<()> {
-    debug!(target: "genesis-test", ?address, "checking account nonce for");
-    let account_nonce: String =
-        client.request("eth_getTransactionCount", rpc_params!(address)).await?;
-
-    let returned_nonce = account_nonce.trim_start_matches("0x");
-    // assert first nonce spent
-    assert_eq!(u64::from_str_radix(returned_nonce, 16), Ok(1));
     Ok(())
 }

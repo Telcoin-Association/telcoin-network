@@ -14,7 +14,6 @@ use self::inner::ExecutionNodeInner;
 use builder::ExecutionNodeBuilder;
 use std::{net::SocketAddr, sync::Arc};
 use tn_config::Config;
-use tn_faucet::FaucetArgs;
 use tn_reth::{
     system_calls::EpochState, CanonStateNotificationStream, RethConfig, RethDb, RethEnv,
     WorkerTxPool,
@@ -41,9 +40,6 @@ pub struct TnBuilder {
     pub node_config: RethConfig,
     /// Telcoin Network config.
     pub tn_config: Config,
-    /// TODO: temporary solution until upstream reth
-    /// rpc hooks are publicly available.
-    pub opt_faucet_args: Option<FaucetArgs>,
     /// Enable Prometheus metrics.
     ///
     /// The metrics will be served at the given interface and port.
