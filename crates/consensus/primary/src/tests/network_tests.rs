@@ -13,8 +13,10 @@ use assert_matches::assert_matches;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
+    time::Duration,
 };
 use tempfile::TempDir;
+use tn_config::Parameters;
 use tn_network_libp2p::{GossipMessage, TopicHash};
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
 use tn_test_utils_committee::CommitteeFixture;
@@ -65,9 +67,16 @@ struct TestTypes<DB = MemDatabase> {
 }
 
 /// Helper function to create an instance of [RequestHandler] for the first authority in the
-/// committee.
-async fn create_test_types(path: &Path) -> TestTypes {
-    let committee = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+/// committee.  Allow params to be overridden.
+async fn create_test_types_with_params(path: &Path, params: Option<Parameters>) -> TestTypes {
+    let committee = if let Some(params) = params {
+        CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .with_consensus_parameters(params)
+            .build()
+    } else {
+        CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build()
+    };
     let authority = committee.first_authority();
     let config = authority.consensus_config();
     let cb = ConsensusBus::new();
@@ -91,6 +100,12 @@ async fn create_test_types(path: &Path) -> TestTypes {
     let handler =
         RequestHandler::new(config.clone(), cb.app().clone(), synchronizer, consensus_chain);
     TestTypes { committee, handler, parent, task_manager }
+}
+
+/// Helper function to create an instance of [RequestHandler] for the first authority in the
+/// committee.
+async fn create_test_types(path: &Path) -> TestTypes {
+    create_test_types_with_params(path, None).await
 }
 
 #[tokio::test]
@@ -478,6 +493,95 @@ async fn test_vote_older_round_rejected() -> eyre::Result<()> {
         Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVotedForLaterRound { .. })),
         "Vote for older round should be rejected"
     );
+
+    Ok(())
+}
+
+// ============================================================================
+// Locking and Timeout Tests
+// ============================================================================
+// These tests cover the per-authority locking and timeout behavior added to vote().
+
+/// Helper: same as `create_test_types` but overrides `max_header_delay`.
+async fn create_test_types_with_delay(path: &Path, max_header_delay: Duration) -> TestTypes {
+    let mut params = Parameters::default();
+    params.max_header_delay = max_header_delay;
+    create_test_types_with_params(path, Some(params)).await
+}
+
+/// Two concurrent vote requests for the same authority with the same header must both
+/// complete without deadlock.  The per-authority `TokioMutex` serialises the two calls;
+/// whichever wins the lock processes `vote_inner` normally and stores the cached result,
+/// while the other sees the cached response on its turn.
+#[tokio::test]
+async fn test_vote_per_authority_lock_concurrent_same_header() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .build();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    // Clone shares the same Arc<AuthEquivocationMap>, so both tasks contend on the
+    // same per-authority mutex.
+    let handler1 = handler.clone();
+    let handler2 = handler.clone();
+    let header1 = header.clone();
+    let header2 = header.clone();
+
+    let task1 = tokio::spawn(async move { handler1.vote(peer, header1, vec![]).await });
+    let task2 = tokio::spawn(async move { handler2.vote(peer, header2, vec![]).await });
+
+    let (res1, res2) = tokio::join!(task1, task2);
+
+    // Both must succeed: one runs vote_inner, the other returns the cached result.
+    assert!(res1.expect("task1 panicked").is_ok(), "first concurrent vote should succeed");
+    assert!(
+        res2.expect("task2 panicked").is_ok(),
+        "second concurrent vote should succeed (cached)"
+    );
+
+    Ok(())
+}
+
+/// When `vote_inner` blocks longer than `max_header_delay`, `vote()` must return
+/// `PrimaryNetworkError::Timeout`.
+///
+/// To force a reliable block we request a header whose `latest_execution_block` is at
+/// block number 1, while the test environment only has block 0.  This causes
+/// `wait_for_execution` to suspend on the watch channel.  We use
+/// `tokio::time::pause/advance` so the test completes instantly without real sleeping.
+#[tokio::test]
+async fn test_vote_inner_timeout() -> eyre::Result<()> {
+    tokio::time::pause();
+
+    let temp_dir = TempDir::new().unwrap();
+    // Use a 50 ms timeout — short enough to be clearly exceeded after a 100 ms advance.
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types_with_delay(temp_dir.path(), Duration::from_millis(50)).await;
+
+    // Block number 1 will never be executed in this test; vote_inner blocks in
+    // wait_for_execution until the outer timeout fires.
+    let future_block = BlockNumHash::new(1, BlockHash::random());
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(future_block)
+        .created_at(1)
+        .build();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    // Spawn on a separate task so we can advance the mock clock while it is suspended.
+    let vote_task = tokio::spawn(async move { handler.vote(peer, header, vec![]).await });
+
+    // Advance mock clock past the 50 ms deadline.
+    tokio::time::advance(Duration::from_millis(100)).await;
+
+    let res = vote_task.await.expect("vote task panicked");
+    assert_matches!(res, Err(PrimaryNetworkError::Timeout(_)), "expected Timeout error");
 
     Ok(())
 }

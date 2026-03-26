@@ -57,6 +57,8 @@ pub(crate) enum PrimaryNetworkError {
     /// Invalid topic- something was published to the wrong topic.
     #[error("Gossip was published to the wrong topic")]
     InvalidTopic,
+    #[error(transparent)]
+    Timeout(#[from] tokio::time::error::Elapsed),
 }
 
 impl From<&PrimaryNetworkError> for Option<Penalty> {
@@ -115,6 +117,7 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
             | PrimaryNetworkError::UnavailableEpochDigest(_)  // A node might not have this yet....
             | PrimaryNetworkError::PeerNotInCommittee(_)
             | PrimaryNetworkError::Storage(_)
+            | PrimaryNetworkError::Timeout(_)
             | PrimaryNetworkError::Internal(_) => None,
         }
     }
