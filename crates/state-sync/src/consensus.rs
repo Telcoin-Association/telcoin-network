@@ -20,12 +20,15 @@ async fn get_consensus_header<DB: TNDatabase>(
     config: &ConsensusConfig<DB>,
     consensus_bus: &ConsensusBusApp,
     network: &PrimaryNetworkHandle,
-    _consensus_chain: &ConsensusChain,
+    consensus_chain: &ConsensusChain,
 ) -> Option<(Epoch, u64, B256)> {
     let db = config.node_storage();
-    // If we have already processed consensus block number then stop.
-    if number <= consensus_bus.recent_blocks().borrow().latest_consensus_block_num_hash().number {
-        // This will be a quicker way to check if this consensus output has been finalized.
+    // Use the persisted ConsensusChain DB number as the cutoff, not the in-memory
+    // recent_blocks tracker. The in-memory tracker can advance during a brief CvvActive
+    // phase (local Bullshark commits) before the node transitions to CvvInactive, causing
+    // the backward traversal to incorrectly skip blocks that haven't been fetched from
+    // peers and stored in ConsensusHeaderCache yet.
+    if number <= consensus_chain.latest_consensus_number() {
         return None;
     }
     if let Ok(Some(block)) = config.node_storage().get::<ConsensusHeaderCache>(&number) {
@@ -135,16 +138,9 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
 
                 if let Some(next) = get_consensus_header(Some(epoch), number, hash, &config, &consensus_bus, &network, &consensus_chain).await {
                     let _ = tx.send(next).await;
-                } else {
-                    // Chain ended (either block already executed, or peer fetch failed).
-                    // If it stopped at an unprocessed block, log a warning; the next gossip
-                    // event will start a new traversal from the latest tip.
-                    let processed = consensus_bus.recent_blocks().borrow().latest_consensus_block_num_hash().number;
-                    if number > processed {
-                        warn!(target: "state-sync", ?number, ?epoch, ?processed,
-                            "backward chain fetch failed for unprocessed block - will retry on next gossip");
-                    }
                 }
+                // else: chain ended (block already in DB or peer fetch failed);
+                // next gossip event will start a new traversal from the latest tip.
             }
 
             _ = &rx_shutdown => {
