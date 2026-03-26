@@ -62,7 +62,14 @@ Output modes:
 
 #### 3. Stake on-chain
 
-**Prerequisite:** Governance must have minted a ConsensusNFT for your execution address before you can stake.
+**Prerequisite:** Governance must mint a ConsensusNFT for your execution address before you can stake.
+
+Governance mints the NFT:
+
+```bash
+# local testnet example
+cast send $CONSENSUS_REGISTRY "mint(address)" 0xVALIDATOR_EXECUTION_ADDRESS --trezor --rpc-url RPC_URL
+```
 
 The `ConsensusRegistry` is deployed at a fixed system address:
 
