@@ -410,7 +410,7 @@ impl<DB: Database> Certifier<DB> {
                         }
 
                         // notify ExEx subscribers about own certificate
-                        let _ = self.consensus_bus.exex_own_certificates().send(certificate.clone());
+                        let _ = self.consensus_bus.app().exex_own_certificates().send(certificate.clone());
 
                         // try to publish the certificate on gossip network
                         if let Err(e) = self.network.publish_certificate(certificate).await {

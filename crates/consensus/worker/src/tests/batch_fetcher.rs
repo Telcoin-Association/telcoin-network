@@ -24,7 +24,7 @@ async fn test_fetchertt() {
         (batch1.digest(), batch1.clone()),
         (batch2.digest(), batch2.clone()),
     ]);
-    let mut fetched_batches = fetcher.fetch(digests).await;
+    let mut fetched_batches = fetcher.fetch(digests).await.unwrap();
     // Reset metadata from the fetched and expected batches
     for batch in fetched_batches.values_mut() {
         // assert received_at was set to some value before resetting.
@@ -69,7 +69,7 @@ async fn test_fetcher_locally_with_remaining() {
         (batch2.digest(), batch2.clone()),
         (batch3.digest(), batch3.clone()),
     ]);
-    let fetched_batches = fetcher.fetch(digests).await;
+    let fetched_batches = fetcher.fetch(digests).await.unwrap();
     assert_eq!(fetched_batches, expected_batches);
 }
 
@@ -94,7 +94,7 @@ async fn test_fetcher_remote_with_remaining() {
         (batch2.digest(), batch2.clone()),
         (batch3.digest(), batch3.clone()),
     ]);
-    let mut fetched_batches = fetcher.fetch(digests).await;
+    let mut fetched_batches = fetcher.fetch(digests).await.unwrap();
 
     // Reset metadata from the fetched and expected batches
     for batch in fetched_batches.values_mut() {
@@ -129,7 +129,7 @@ async fn test_fetcher_local_and_remote() {
         (batch2.digest(), batch2.clone()),
         (batch3.digest(), batch3.clone()),
     ]);
-    let mut fetched_batches = fetcher.fetch(digests).await;
+    let mut fetched_batches = fetcher.fetch(digests).await.unwrap();
 
     // Reset metadata from the fetched and expected remote batches
     for batch in fetched_batches.values_mut() {
@@ -176,7 +176,7 @@ async fn test_fetcher_response_size_limit() {
         HashMap::from_iter(expected_batches.iter().map(|batch| (batch.digest(), batch.clone())));
     let digests = HashSet::from_iter(expected_batches.clone().into_keys());
     let fetcher = BatchFetcher { network: Arc::new(network.handle()), batch_store };
-    let mut fetched_batches = fetcher.fetch(digests).await;
+    let mut fetched_batches = fetcher.fetch(digests).await.unwrap();
 
     // Reset metadata from the fetched and expected remote batches
     for batch in fetched_batches.values_mut() {

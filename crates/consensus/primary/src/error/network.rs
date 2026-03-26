@@ -37,9 +37,6 @@ pub(crate) enum PrimaryNetworkError {
     Internal(String),
     /// Unknown consensus header.
     #[error("Unknown consensus header: {0}")]
-    UnknownConsensusHeaderNumber(u64),
-    /// Unknown consensus header.
-    #[error("Unknown consensus header: {0}")]
     UnknownConsensusHeaderDigest(BlockHash),
     /// Unknown consensus header certificate.
     #[error("Unknown consensus header certificate for: {0}")]
@@ -60,6 +57,8 @@ pub(crate) enum PrimaryNetworkError {
     /// Invalid topic- something was published to the wrong topic.
     #[error("Gossip was published to the wrong topic")]
     InvalidTopic,
+    #[error(transparent)]
+    Timeout(#[from] tokio::time::error::Elapsed),
 }
 
 impl From<&PrimaryNetworkError> for Option<Penalty> {
@@ -107,7 +106,6 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
                 | CertManagerError::ChannelClosed
                 | CertManagerError::TNSend(_) => None,
             },
-            PrimaryNetworkError::UnknownConsensusHeaderNumber(_)
             | PrimaryNetworkError::InvalidRequest(_)
             | PrimaryNetworkError::UnknownConsensusHeaderDigest(_)
             | PrimaryNetworkError::UnknownConsensusHeaderCert(_) => Some(Penalty::Mild),
@@ -119,6 +117,7 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
             | PrimaryNetworkError::UnavailableEpochDigest(_)  // A node might not have this yet....
             | PrimaryNetworkError::PeerNotInCommittee(_)
             | PrimaryNetworkError::Storage(_)
+            | PrimaryNetworkError::Timeout(_)
             | PrimaryNetworkError::Internal(_) => None,
         }
     }

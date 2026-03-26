@@ -3,11 +3,8 @@
 use std::sync::Arc;
 
 use tn_config::ConsensusConfig;
-use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus};
-use tn_storage::{
-    consensus::ConsensusChain,
-    tables::{ConsensusHeaderCache, EpochRecords},
-};
+use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
+use tn_storage::{consensus::ConsensusChain, tables::ConsensusHeaderCache};
 use tn_types::{Database as TNDatabase, Epoch, EpochRecord, TaskSpawner, B256};
 use tokio::sync::{mpsc::Receiver, Mutex, Semaphore, SemaphorePermit};
 use tracing::{debug, error, info, warn};
@@ -21,7 +18,7 @@ async fn get_consensus_header<DB: TNDatabase>(
     number: u64,
     hash: B256,
     config: &ConsensusConfig<DB>,
-    consensus_bus: &ConsensusBus,
+    consensus_bus: &ConsensusBusApp,
     network: &PrimaryNetworkHandle,
     _consensus_chain: &ConsensusChain,
 ) -> Option<(Epoch, u64, B256)> {
@@ -39,7 +36,7 @@ async fn get_consensus_header<DB: TNDatabase>(
         };
     }
     // request consensus from any peer
-    match network.request_consensus(None, Some(hash)).await {
+    match network.request_consensus(number, hash).await {
         Ok(header) => {
             if let Err(e) = db.insert::<ConsensusHeaderCache>(&header.number, &header) {
                 error!(target: "state-sync", ?e, "error saving a consensus header to cache storage!");
@@ -77,7 +74,7 @@ async fn get_consensus_header<DB: TNDatabase>(
 /// consensus_bus up to date. This should only be used when NOT participating in active consensus.
 pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
     config: ConsensusConfig<DB>,
-    consensus_bus: ConsensusBus,
+    consensus_bus: ConsensusBusApp,
     network: PrimaryNetworkHandle,
     task_spawner: TaskSpawner,
     consensus_chain: ConsensusChain,
@@ -85,15 +82,13 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
     let rx_shutdown = config.shutdown().subscribe();
     let mut rx_gossip_update = consensus_bus.last_published_consensus_num_hash().subscribe();
     let (tx, mut rx) = tokio::sync::mpsc::channel(10_000);
-    let db = config.node_storage().clone();
     // Get the epoch of our last executed consensus.
-    let mut current_fetch_epoch = if let Some(block) =
-        consensus_bus.last_executed_consensus_block(None, &consensus_chain).await
-    {
-        block.sub_dag.leader_epoch()
-    } else {
-        0
-    };
+    let mut current_fetch_epoch =
+        if let Some(block) = consensus_bus.last_executed_consensus_block(&consensus_chain).await {
+            block.sub_dag.leader_epoch()
+        } else {
+            0
+        };
     let (epochs_tx, epochs_rx) = tokio::sync::mpsc::channel(10_000);
     let epoch_queue = Arc::new(Mutex::new(epochs_rx));
     // spawn four critical workers that will fetch consensus outputs from an epoch work queue.
@@ -123,7 +118,7 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
                 if let Some(next) = get_consensus_header(None, number, hash, &config, &consensus_bus, &network, &consensus_chain).await {
                     if current_fetch_epoch < next.0 {
                         // If we still have epochs to fetch then add to the queue until we are out of epoch records.
-                        while let Ok(Some(epoch_record)) = db.get::<EpochRecords>(&current_fetch_epoch) {
+                        while let Some(epoch_record) = consensus_chain.epochs().record_by_epoch(current_fetch_epoch).await {
                             let _ = epochs_tx.send(epoch_record).await;
                             current_fetch_epoch += 1;
                         }
@@ -163,7 +158,7 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
 /// This should only be used when NOT participating in active consensus.
 async fn spawn_fetch_consensus<DB: TNDatabase>(
     config: ConsensusConfig<DB>,
-    consensus_bus: ConsensusBus,
+    consensus_bus: ConsensusBusApp,
     network: PrimaryNetworkHandle,
     epoch_queue: Arc<Mutex<Receiver<EpochRecord>>>,
     worker: u32, // Worker number for logging.

@@ -5,12 +5,10 @@ use tn_test_utils as _;
 
 use std::{collections::BTreeSet, time::Duration};
 
-use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus};
-use tn_storage::{tables::EpochRecords, EpochStore as _};
-use tn_types::{
-    BlsPublicKey, Database as TNDatabase, Epoch, EpochRecord, Noticer, TaskSpawner, B256,
-};
-use tracing::info;
+use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
+use tn_storage::consensus::ConsensusChain;
+use tn_types::{BlsPublicKey, Epoch, EpochRecord, Noticer, TaskSpawner, B256};
+use tracing::{error, info};
 
 /// How long to wait before retrying a failed epoch record collection.
 const EPOCH_COLLECT_RETRY_SECS: u64 = 5;
@@ -45,18 +43,23 @@ fn epoch_committee_valid(epoch_rec: &EpochRecord, committee: &BTreeSet<BlsPublic
 
 /// Asks peers for records from last_epoch to requested_epoch.
 /// Returns the Epoch that was last retrieved.
-async fn collect_epoch_records<DB>(
+async fn collect_epoch_records(
     last_epoch: Epoch,
-    db: &DB,
+    consensus_chain: &ConsensusChain,
     primary_handle: &PrimaryNetworkHandle,
-) -> Epoch
-where
-    DB: TNDatabase,
-{
+    consensus_bus: &ConsensusBusApp,
+) -> Epoch {
     let mut result_epoch = last_epoch;
+    // Track the highest final_consensus seen across all downloaded epoch records.
+    // We emit a single state-sync notification at the end rather than one per epoch,
+    // to avoid flooding peers with concurrent request_consensus calls during catch-up.
+    let mut best_final_consensus: Option<(u64, B256)> = None;
     for epoch in last_epoch.. {
         // If we already have epoch record AND it's certificate then continue.
-        if let Some((_, Some(_))) = db.get_epoch_by_number(epoch) {
+        if let Some((_, Some(_))) = consensus_chain.epochs().get_epoch_by_number(epoch).await {
+            // Advance result_epoch so we correctly track the last confirmed epoch,
+            // allowing last_epoch to advance past already-complete epochs on future calls.
+            result_epoch = epoch;
             continue;
         }
         // Try to recover by downloading the epoch record and cert from a peer.
@@ -64,10 +67,14 @@ where
             Ok((epoch_rec, cert)) => {
                 let (parent_hash, committee) = if epoch == 0 {
                     // If we can't find the genesis committee something is very wrong.
-                    let committee =
-                        db.get_committee_keys(0).expect("always can retrieve epoch 0 committee");
+                    let committee = consensus_chain
+                        .epochs()
+                        .get_committee_keys(0)
+                        .await
+                        .expect("always can retrieve epoch 0 committee");
                     (B256::default(), committee)
-                } else if let Ok(Some(prev)) = db.get::<EpochRecords>(&(epoch - 1)) {
+                } else if let Some(prev) = consensus_chain.epochs().record_by_epoch(epoch - 1).await
+                {
                     (prev.digest(), prev.next_committee.iter().copied().collect())
                 } else {
                     // We are missing epoch records.
@@ -78,17 +85,42 @@ where
                 };
                 // Verify the epoch has the expected parent and committee and is signed by
                 // that committee.
-                if parent_hash == epoch_rec.parent_hash
-                    && epoch_committee_valid(&epoch_rec, &committee)
-                    && epoch_rec.verify_with_cert(&cert)
-                {
+                let parents_match = parent_hash == epoch_rec.parent_hash;
+                let epoch_committee_valid = epoch_committee_valid(&epoch_rec, &committee);
+                let epoch_valid = epoch_rec.verify_with_cert(&cert);
+                if parents_match && epoch_committee_valid && epoch_valid {
                     let epoch_hash = epoch_rec.digest();
-                    db.save_epoch_record_with_cert(&epoch_rec, &cert);
+                    // Capture final_consensus before save consumes epoch_rec.
+                    let final_consensus = epoch_rec.final_consensus;
+                    if let Err(e) = consensus_chain.epochs().save(epoch_rec, cert).await {
+                        error!(
+                            target: "epoch-manager",
+                            ?e,
+                            "failed to save epoch record/cert for epoch {epoch}",
+                        );
+                        return epoch - 1;
+                    }
                     result_epoch = epoch;
                     info!(
                         target: "epoch-manager",
                         "retrieved cert for epoch {epoch}: {epoch_hash} from a peer",
                     );
+                    // Track the highest final_consensus across downloaded epochs.
+                    if final_consensus.hash != B256::default()
+                        && final_consensus.number
+                            > best_final_consensus.map(|(n, _)| n).unwrap_or(0)
+                    {
+                        best_final_consensus = Some((final_consensus.number, final_consensus.hash));
+                    }
+                } else {
+                    error!(
+                        target: "epoch-manager",
+                        ?parents_match,
+                        ?epoch_committee_valid,
+                        ?epoch_valid,
+                        "got an invalid epoch record, epoch {epoch}",
+                    );
+                    return epoch - 1;
                 }
             }
             Err(err) => {
@@ -103,33 +135,58 @@ where
             break;
         }
     }
+    if let Err(e) = consensus_chain.epochs().persist().await {
+        error!(
+            target: "epoch-manager",
+            ?e,
+            "failed to persist downloaded epoch record/certs",
+        );
+    }
+    // Emit a single state-sync notification with the highest epoch's final consensus.
+    // This unblocks nodes that missed a ConsensusResult gossip message due to a timing
+    // gap (e.g. gossip arrived before the epoch record was available). We do this once
+    // at the end rather than per-epoch to avoid flooding peers with concurrent requests.
+    if let Some((number, hash)) = best_final_consensus {
+        let (old_number, _) = consensus_bus.published_consensus_num_hash();
+        if number > old_number {
+            info!(
+                target: "epoch-manager",
+                "epoch sync downloaded up to epoch {result_epoch}, final consensus at block {number} ({hash}) - notifying state sync",
+            );
+            consensus_bus.last_published_consensus_num_hash().send_replace((number, hash));
+        }
+    }
     result_epoch
 }
 
 /// Spawn a long running task to collect missing epoch records.
 ///
 /// Most likely because a node is syncing.
-pub async fn spawn_epoch_record_collector<DB>(
-    db: DB,
+pub async fn spawn_epoch_record_collector(
+    consensus_chain: ConsensusChain,
     primary_handle: PrimaryNetworkHandle,
-    consensus_bus: ConsensusBus,
+    consensus_bus: ConsensusBusApp,
     node_task_spawner: TaskSpawner,
     node_shutdown: Noticer,
-) -> eyre::Result<()>
-where
-    DB: TNDatabase,
-{
+) -> eyre::Result<()> {
     let mut epoch_rx = consensus_bus.requested_missing_epoch().subscribe();
     node_task_spawner.spawn_critical_task("Epoch Record Collector", async move {
-        let mut last_epoch = if let Some((last_epoch, _)) = db.last_record::<EpochRecords>() {
-            last_epoch
-        } else {
-            0
-        };
+        // Always start from epoch 0 so any gaps (epochs whose certs were never
+        // saved, e.g. because the node was killed during a failed-quorum recovery)
+        // are back-filled on restart.  Epochs that already have both a record and
+        // a certificate are skipped immediately by get_epoch_by_number, so this
+        // is cheap for nodes that are fully caught up.
+        let mut last_epoch: Epoch = 0;
         loop {
-            let requested_epoch = *epoch_rx.borrow();
+            let requested_epoch = *epoch_rx.borrow_and_update();
             if requested_epoch > last_epoch {
-                last_epoch = collect_epoch_records(last_epoch, &db, &primary_handle).await;
+                last_epoch = collect_epoch_records(
+                    last_epoch,
+                    &consensus_chain,
+                    &primary_handle,
+                    &consensus_bus,
+                )
+                .await;
             }
             // Wait until the watch is updated or a retry timer fires.
             // The retry timer ensures that a failed collection attempt (e.g. peers not yet

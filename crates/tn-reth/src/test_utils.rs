@@ -23,7 +23,9 @@ use reth_evm::{execute::Executor as _, ConfigureEvm, EvmFactory as _};
 use reth_primitives::{sign_message, Account};
 use reth_primitives_traits::SignerRecoverable;
 use reth_provider::{AccountReader as _, StateProvider, StateProviderBox, StateProviderFactory};
-use reth_revm::{database::StateProviderDatabase, db::BundleState, State};
+use reth_revm::{
+    context::result::ResultAndState, database::StateProviderDatabase, db::BundleState, State,
+};
 use reth_transaction_pool::{EthPoolTransaction, EthPooledTransaction, PoolTransaction};
 use secp256k1::{
     rand::{rngs::StdRng, Rng, SeedableRng as _},
@@ -39,7 +41,8 @@ use tn_types::{
     B256, EMPTY_OMMER_ROOT_HASH, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS,
     ETHEREUM_BLOCK_GAS_LIMIT_30M, MIN_PROTOCOL_BASE_FEE, U256,
 };
-// re-exports for engine tests
+// re-exports for tests
+pub use crate::evm::precompile_test_utils;
 pub use alloy::eips::{
     eip2935::HISTORY_STORAGE_ADDRESS, eip4788::BEACON_ROOTS_ADDRESS, eip7685::EMPTY_REQUESTS_HASH,
 };
@@ -82,6 +85,21 @@ impl RethEnv {
             .evm_config
             .evm_factory()
             .create_evm(db, self.inner.evm_config.evm_env(&header)?))
+    }
+
+    /// Execute a read-only system call against a contract and return the result.
+    ///
+    /// Useful for integration tests that need to read precompile state after
+    /// block execution without importing the `Evm` trait.
+    pub fn read_contract_state(
+        &self,
+        block_hash: BlockHash,
+        contract: Address,
+        calldata: Bytes,
+    ) -> eyre::Result<ResultAndState> {
+        use reth_evm::Evm;
+        let mut evm = self.tn_evm(block_hash)?;
+        Ok(evm.transact_system_call(crate::system_calls::SYSTEM_ADDRESS, contract, calldata)?)
     }
 
     /// Test utility to execute batch and return execution outcome.

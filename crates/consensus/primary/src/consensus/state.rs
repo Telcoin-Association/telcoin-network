@@ -319,7 +319,10 @@ impl<DB: Database> Consensus<DB> {
             consensus_config.node_storage().clone(),
         );
 
-        consensus_bus.committed_round_updates().send_replace(state.last_round.committed_round);
+        consensus_bus
+            .app()
+            .committed_round_updates()
+            .send_replace(state.last_round.committed_round);
 
         let s = Self {
             committee: consensus_config.committee().clone(),
@@ -333,7 +336,7 @@ impl<DB: Database> Consensus<DB> {
 
         // Only run the consensus task if we are an active CVV.
         // Active means we are participating in consensus.
-        if consensus_bus.node_mode().borrow().is_active_cvv() {
+        if consensus_bus.is_active_cvv() {
             // Subscribe before spawning so the channel is active before any messages are sent.
             let rx_new_certificates = consensus_bus.subscribe_new_certificates();
             task_manager.spawn_critical_task("consensus task", s.run(rx_new_certificates));
@@ -344,7 +347,7 @@ impl<DB: Database> Consensus<DB> {
         mut self,
         mut rx_new_certificates: impl TnReceiver<Certificate>,
     ) -> Result<(), ConsensusError> {
-        self.active = self.consensus_bus.node_mode().borrow().is_active_cvv();
+        self.active = self.consensus_bus.is_active_cvv();
 
         // Listen to incoming certificates.
         loop {
@@ -391,11 +394,15 @@ impl<DB: Database> Consensus<DB> {
                 // fine. Also once we can follow gossiped consensus output this will not really be
                 // an issue (except during initial catch up).
                 let base_execution_block = committed_sub_dag.leader.header.latest_execution_block;
-                if self.consensus_bus.wait_for_execution(base_execution_block).await.is_err() {
+                if self.consensus_bus.app().wait_for_execution(base_execution_block).await.is_err()
+                {
                     // This seems to be a bogus sub dag, we are out of sync...
                     tracing::error!(target: "telcoin::consensus_state", "Got a bogus sub dag from bullshark, we are out of sync and probably can not recover!");
                     // Going inactive will probably not help us at this point....
-                    self.consensus_bus.node_mode().send_modify(|v| *v = NodeMode::CvvInactive);
+                    self.consensus_bus
+                        .app()
+                        .node_mode()
+                        .send_modify(|v| *v = NodeMode::CvvInactive);
                     self.consensus_config.shutdown().notify();
                     tracing::error!(target: "telcoin::consensus_state", ?base_execution_block, ?outcome, "commit {i} of {csd_len} subdags");
                     return Ok(());
@@ -408,7 +415,7 @@ impl<DB: Database> Consensus<DB> {
                 }
 
                 // notify ExEx subscribers about committed sub-DAG
-                let _ = self.consensus_bus.exex_committed_sub_dags().send(committed_sub_dag.clone());
+                let _ = self.consensus_bus.app().exex_committed_sub_dags().send(committed_sub_dag.clone());
 
                 // NOTE: The size of the sub-dag can be arbitrarily large (depending on the network
                 // condition and Byzantine leaders).
@@ -437,6 +444,7 @@ impl<DB: Database> Consensus<DB> {
                 assert_eq!(self.state.last_round.committed_round, leader_commit_round);
 
                 self.consensus_bus
+                    .app()
                     .committed_round_updates()
                     .send_replace(self.state.last_round.committed_round);
             }

@@ -44,7 +44,7 @@ async fn test_sync_save_consensus() {
     state_sync::save_consensus(&store, output, &None, &mut consensus_chain).await.unwrap();
 
     // Verify the consensus was saved
-    let saved = consensus_chain.consensus_header_by_number(None, 1).await.unwrap();
+    let saved = consensus_chain.consensus_header_by_number(1).await.unwrap();
     assert!(saved.is_some(), "Consensus should be saved to database");
 
     let saved_header = saved.unwrap();
@@ -94,7 +94,7 @@ async fn test_sync_parent_hash_chain() {
 
     // Verify we can read back the headers and parent hash chain is correct
     for i in 1..=3u64 {
-        let header = consensus_chain.consensus_header_by_number(None, i).await.unwrap();
+        let header = consensus_chain.consensus_header_by_number(i).await.unwrap();
         assert!(header.is_some(), "Header {} should exist", i);
 
         let header = header.unwrap();
@@ -138,7 +138,7 @@ async fn test_sync_lookup_by_hash() {
     let expected_digest = ConsensusHeader::digest_from_parts(B256::ZERO, &sub_dag, 1);
 
     // Verify we can look up by hash
-    let by_hash = consensus_chain.consensus_header_by_digest(None, expected_digest).await.unwrap();
+    let by_hash = consensus_chain.consensus_header_by_digest(0, expected_digest).await.unwrap();
     assert!(by_hash.is_some(), "Should be able to look up by hash");
     assert_eq!(by_hash.unwrap().number, 1, "Looked up header should have correct number");
 }
@@ -227,7 +227,7 @@ async fn test_digest_mismatch_detection() {
     state_sync::save_consensus(&store, output1, &None, &mut consensus_chain).await.unwrap();
 
     // Get block 1's digest
-    let block1 = consensus_chain.consensus_header_by_number(None, 1).await.unwrap().unwrap();
+    let block1 = consensus_chain.consensus_header_by_number(1).await.unwrap().unwrap();
     let block1_digest = block1.digest();
 
     // Now simulate verification: if we compute digest with wrong parent, it won't match

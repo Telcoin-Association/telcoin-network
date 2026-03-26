@@ -100,7 +100,7 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
     });
 
     // subscribe to output early
-    let mut consensus_output = consensus_bus.subscribe_consensus_output();
+    let mut consensus_output = consensus_bus.app().subscribe_consensus_output();
 
     // spawn consensus to send output to engine for full execution
     spawn_consensus(
@@ -230,7 +230,7 @@ async fn test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
         let _ = tx.send(res);
     });
 
-    let mut consensus_output = consensus_bus.subscribe_consensus_output();
+    let mut consensus_output = consensus_bus.app().subscribe_consensus_output();
 
     spawn_consensus(
         &fixture,
@@ -397,7 +397,7 @@ async fn test_catchup_accumulator_partial_execution() -> eyre::Result<()> {
         let _ = tx.send(res);
     });
 
-    let mut consensus_output = consensus_bus.subscribe_consensus_output();
+    let mut consensus_output = consensus_bus.app().subscribe_consensus_output();
 
     spawn_consensus(
         &fixture,
@@ -504,7 +504,7 @@ async fn spawn_consensus(
 
     // spawn consensus to await certificates
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    consensus_bus.recent_blocks().send_modify(|blocks| {
+    consensus_bus.app().recent_blocks().send_modify(|blocks| {
         blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
     });
     Consensus::spawn(config, consensus_bus, bullshark, task_manager, consensus_chain).await;

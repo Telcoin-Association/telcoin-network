@@ -15,7 +15,6 @@ use builder::ExecutionNodeBuilder;
 use std::{future::Future, net::SocketAddr, sync::Arc};
 use tn_config::Config;
 use tn_exex::ExExInstallFn;
-use tn_faucet::FaucetArgs;
 use tn_reth::{
     system_calls::EpochState, CanonStateNotificationStream, RethConfig, RethDb, RethEnv,
     WorkerTxPool,
@@ -41,9 +40,6 @@ pub struct TnBuilder {
     pub node_config: RethConfig,
     /// Telcoin Network config.
     pub tn_config: Config,
-    /// TODO: temporary solution until upstream reth
-    /// rpc hooks are publicly available.
-    pub opt_faucet_args: Option<FaucetArgs>,
     /// Enable Prometheus metrics.
     ///
     /// The metrics will be served at the given interface and port.
@@ -87,7 +83,6 @@ impl std::fmt::Debug for TnBuilder {
         f.debug_struct("TnBuilder")
             .field("node_config", &self.node_config)
             .field("tn_config", &self.tn_config)
-            .field("opt_faucet_args", &self.opt_faucet_args)
             .field("metrics", &self.metrics)
             .field("healthcheck", &self.healthcheck)
             .field("exex_count", &self.exex_fns.len())
@@ -143,6 +138,11 @@ impl ExecutionNode {
     pub async fn respawn_worker_network_tasks(&self, network_handle: WorkerNetworkHandle) {
         let guard = self.internal.write().await;
         guard.respawn_worker_network_tasks(network_handle).await
+    }
+
+    /// Returns true if worker components have already been initialized.
+    pub async fn are_workers_initialized(&self) -> bool {
+        !self.internal.read().await.workers.is_empty()
     }
 
     /// Batch maker

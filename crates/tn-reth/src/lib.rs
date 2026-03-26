@@ -19,7 +19,10 @@
 
 // Used in tests
 #[cfg(test)]
-use proptest as _;
+mod clippy {
+    use proptest as _;
+    use tn_reth as _;
+}
 
 use crate::{
     evm::TNEvm,
@@ -111,10 +114,10 @@ use tn_config::{
     ISSUANCE_JSON,
 };
 use tn_types::{
-    gas_accumulator::RewardsCounter, Address, BlockBody, BlockHashOrNumber, BlockNumHash,
-    BlockNumber, EngineUpdate, Epoch, ExecHeader, Genesis, GenesisAccount, RecoveredBlock, Round,
-    SealedBlock, SealedHeader, TaskManager, TaskSpawner, TransactionSigned, B256,
-    ETHEREUM_BLOCK_GAS_LIMIT_30M, U256,
+    deconstruct_nonce, gas_accumulator::RewardsCounter, Address, BlockBody, BlockHashOrNumber,
+    BlockNumHash, BlockNumber, EngineUpdate, Epoch, ExecHeader, Genesis, GenesisAccount,
+    RecoveredBlock, Round, SealedBlock, SealedHeader, TaskManager, TaskSpawner, TransactionSigned,
+    B256, ETHEREUM_BLOCK_GAS_LIMIT_30M, U256,
 };
 use tracing::{debug, error, info, warn};
 use traits::{TNPrimitives, TelcoinNode};
@@ -157,7 +160,14 @@ mod evm;
 pub mod rpc_server_args;
 pub mod system_calls;
 pub mod worker;
-pub use evm::calculate_gas_penalty;
+#[cfg(not(feature = "faucet"))]
+pub use evm::TIMELOCK_DURATION;
+pub use evm::{
+    add_telcoin_precompile, allowanceCall, approveCall, balanceOfCall, burnCall,
+    calculate_gas_penalty, claimCall, decimalsCall, grantMintRoleCall, hasMintRoleCall, mintCall,
+    nameCall, noncesCall, permitCall, revokeMintRoleCall, symbolCall, totalSupplyCall,
+    transferCall, transferFromCall, DOMAIN_SEPARATORCall, TELCOIN_PRECOMPILE_ADDRESS,
+};
 
 #[cfg(any(feature = "test-utils", test))]
 pub mod test_utils;
@@ -814,7 +824,7 @@ impl RethEnv {
         let chain_update = NewCanonicalChain::Commit { new: blocks };
         let canonical_head = chain_update.tip();
         let (epoch, round) =
-            Self::deconstruct_nonce(<FixedBytes<8> as Into<u64>>::into(canonical_head.nonce));
+            deconstruct_nonce(<FixedBytes<8> as Into<u64>>::into(canonical_head.nonce));
         info!(
             target: "engine",
             "canonical head for epoch {:?} round {:?}: {:?} - {:?}",
@@ -842,13 +852,6 @@ impl RethEnv {
         self.canonical_in_memory_state().notify_canon_state(notification);
 
         Ok(())
-    }
-
-    /// Helper to deconstruct block nonce into epoch and round.
-    pub fn deconstruct_nonce(nonce: u64) -> (u32, u32) {
-        let epoch = (nonce >> 32) as u32; // Extract the upper 32 bits
-        let round = nonce as u32; // Extract the lower 32 bits (truncates upper bits)
-        (epoch, round)
     }
 
     /// Look up and return the sealed header for hash.
@@ -1098,7 +1101,8 @@ impl RethEnv {
         Self::new(&reth_config, task_manager, database, None, rewards.unwrap_or_default())
     }
 
-    /// Convenience method for compiling storage and bytecode to include genesis.
+    /// Convenience method for compiling storage and bytecode to include consensus registry
+    /// configuration in genesis.
     pub fn create_consensus_registry_genesis_accounts(
         validators: Vec<NodeInfo>,
         genesis: Genesis,
@@ -1502,8 +1506,8 @@ mod tests {
     use rand::{rngs::StdRng, SeedableRng as _};
     use tempfile::TempDir;
     use tn_types::{
-        generate_proof_of_possession_bls, BlsKeypair, BlsSignature, Certificate, CommittedSubDag,
-        ConsensusHeader, ConsensusOutput, NodeP2pInfo, ReputationScores,
+        generate_proof_of_possession_bls_for_test, BlsKeypair, BlsSignature, Certificate,
+        CommittedSubDag, ConsensusHeader, ConsensusOutput, NodeP2pInfo, ReputationScores,
         SignatureVerificationState,
     };
 
@@ -1597,8 +1601,8 @@ mod tests {
                 let mut rng = StdRng::seed_from_u64(i as u64);
                 let bls = BlsKeypair::generate(&mut rng);
                 let bls_pubkey = bls.public();
-                let pop =
-                    generate_proof_of_possession_bls(&bls, addr).expect("pop generation failed");
+                let pop = generate_proof_of_possession_bls_for_test(&bls, addr)
+                    .expect("pop generation failed");
                 NodeInfo {
                     name: format!("validator-{i}"),
                     bls_public_key: *bls_pubkey,
@@ -1706,6 +1710,7 @@ mod tests {
         let mut expected_epoch_info = ConsensusRegistry::EpochInfo {
             committee: expected_committee,
             blockHeight: 0,
+            epochId: 0,
             epochDuration: epoch_duration,
             epochIssuance: initial_stake_config.epochIssuance,
             stakeVersion: 0,
@@ -1764,6 +1769,7 @@ mod tests {
         debug!(target: "evm", ?epoch, ?epoch_info, ?committee, ?epoch, "new epoch state from canonical tip");
         // assert epoch info updated
         expected_epoch_info.blockHeight = 4;
+        expected_epoch_info.epochId = expected_epoch as u32;
         assert_eq!(expected_epoch, epoch);
         assert_eq!(epoch_start, canonical_header.timestamp);
         assert_eq!(epoch_info, expected_epoch_info);
@@ -1798,6 +1804,7 @@ mod tests {
         let expected = ConsensusRegistry::EpochInfo {
             committee: expected_new_committee,
             blockHeight: 0,
+            epochId: (expected_epoch + 1) as u32,
             // epoch duration set at the start
             epochDuration: Default::default(),
             // values should remain the same

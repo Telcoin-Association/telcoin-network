@@ -11,14 +11,15 @@ pub use stores::*;
 pub use redb::database::ReDB;
 use tables::{
     CertificateDigestByOrigin, CertificateDigestByRound, Certificates, ConsensusHeaderCache,
-    EpochCerts, EpochRecords, EpochRecordsIndex, KadProviderRecords, KadRecords,
-    KadWorkerProviderRecords, KadWorkerRecords, LastProposed, NodeBatchesCache, Payload, Votes,
+    KadProviderRecords, KadRecords, KadWorkerProviderRecords, KadWorkerRecords, LastProposed,
+    NodeBatchesCache, Payload, Votes,
 };
 // Always build redb, we use it as the default for persistant consensus data.
 pub mod archive;
 pub mod composite_db;
 pub mod consensus;
 pub mod consensus_pack;
+pub mod epoch_records;
 pub mod layered_db;
 #[cfg(feature = "reth-libmdbx")]
 pub mod mdbx;
@@ -51,9 +52,7 @@ const CERTIFICATE_DIGEST_BY_ORIGIN_CF: &str = "certificate_digest_by_origin";
 const PAYLOAD_CF: &str = "payload";
 const NODE_BATCHES_CACHE_CF: &str = "node_batches_cache";
 const CONSENSUS_HEADER_CACHE_CF: &str = "consensus_header_cache";
-const EPOCH_RECORDS_CF: &str = "epoch_record_by_number";
-const EPOCH_CERTS_CF: &str = "epoch_cert_by_number";
-const EPOCH_RECORDS_INDEX_CF: &str = "epoch_records_index";
+
 const KAD_RECORD_CF: &str = "kad_record";
 const KAD_PROVIDER_RECORD_CF: &str = "kad_provider_record";
 const KAD_WORKER_RECORD_CF: &str = "kad_worker_record";
@@ -79,7 +78,7 @@ pub mod tables {
     use super::{PayloadToken, ProposerKey};
     use tn_types::{
         AuthorityIdentifier, Batch, BlockHash, Certificate, CertificateDigest, ConsensusHeader,
-        Epoch, EpochCertificate, EpochRecord, Header, Round, TableHint, VoteInfo, WorkerId, B256,
+        Header, Round, TableHint, VoteInfo, WorkerId,
     };
 
     tables!(
@@ -93,10 +92,6 @@ pub mod tables {
         NodeBatchesCache;crate::NODE_BATCHES_CACHE_CF;TableHint::Cache;<BlockHash, Batch>,
         // This is a cache to store ConsensusHeaders during some sync operations, remove once in confirmed consensus output.
         ConsensusHeaderCache;crate::CONSENSUS_HEADER_CACHE_CF;TableHint::Cache;<u64, ConsensusHeader>,
-        // These tables are for the epoch chain not the normal consensus.
-        EpochRecords;crate::EPOCH_RECORDS_CF;TableHint::EpochChain;<Epoch, EpochRecord>,
-        EpochCerts;crate::EPOCH_CERTS_CF;TableHint::EpochChain;<B256, EpochCertificate>,
-        EpochRecordsIndex;crate::EPOCH_RECORDS_INDEX_CF;TableHint::EpochChain;<B256, Epoch>,
         // These are used for network storage and separate from consensus
         KadRecords;crate::KAD_RECORD_CF;TableHint::Kad;<BlockHash, Vec<u8>>,
         KadProviderRecords;crate::KAD_PROVIDER_RECORD_CF;TableHint::Kad;<BlockHash, Vec<u8>>,
@@ -131,32 +126,35 @@ pub fn open_db<Path: AsRef<std::path::Path> + Send>(store_path: Path) -> Databas
 fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatabase<MdbxDatabase> {
     use tn_types::Database as _;
 
-    use crate::mdbx::database::{MEGABYTE, TERABYTE};
+    use crate::mdbx::database::MEGABYTE;
+
+    // Test builds use smaller database sizes to allow parallel test execution.
+    // These must still be large enough for long-running e2e tests (70s+ restart scenarios).
+    cfg_if::cfg_if! {
+        if #[cfg(any(test, feature = "test-utils"))] {
+            const EPOCH_MAX: usize = 16 * MEGABYTE;
+            const KAD_MAX: usize = 4 * MEGABYTE;
+            const CACHE_MAX: usize = 32 * MEGABYTE;
+            const GROWTH: usize = 4 * MEGABYTE;
+            const CACHE_GROWTH: usize = 8 * MEGABYTE;
+        } else {
+            const EPOCH_MAX: usize = 128 * MEGABYTE;
+            const KAD_MAX: usize = 64 * MEGABYTE;
+            const CACHE_MAX: usize = 512 * MEGABYTE;
+            const GROWTH: usize = 8 * MEGABYTE;
+            const CACHE_GROWTH: usize = 64 * MEGABYTE;
+        }
+    }
 
     let store_path = store_path.as_ref();
-    let epoch_db = MdbxDatabase::open(store_path.join("epoch"), 8, 128 * MEGABYTE, 8 * MEGABYTE)
+    let epoch_db = MdbxDatabase::open(store_path.join("epoch"), 8, EPOCH_MAX, GROWTH)
         .expect("Cannot open database (epoch)");
-    let batch_db = MdbxDatabase::open(store_path.join("batch"), 4, 2 * TERABYTE, 512 * MEGABYTE)
-        .expect("Cannot open database (batch)");
-    let consensus_chain_db =
-        MdbxDatabase::open(store_path.join("consensus_chain"), 4, TERABYTE, 512 * MEGABYTE)
-            .expect("Cannot open database (consensus_chain)");
-    let epoch_chain_db =
-        MdbxDatabase::open(store_path.join("epoch_chain"), 4, TERABYTE, 512 * MEGABYTE)
-            .expect("Cannot open database (epoch chain)");
-    let kad_db = MdbxDatabase::open(store_path.join("kad"), 8, 64 * MEGABYTE, 8 * MEGABYTE)
+    let kad_db = MdbxDatabase::open(store_path.join("kad"), 8, KAD_MAX, GROWTH)
         .expect("Cannot open database (kad)");
-    let cache_db = MdbxDatabase::open(store_path.join("cache"), 4, 512 * MEGABYTE, 64 * MEGABYTE)
+    let cache_db = MdbxDatabase::open(store_path.join("cache"), 4, CACHE_MAX, CACHE_GROWTH)
         .expect("Cannot open database (cache)");
 
-    let db = CompositeDatabase::open(
-        epoch_db,
-        batch_db,
-        consensus_chain_db,
-        epoch_chain_db,
-        kad_db,
-        cache_db,
-    );
+    let db = CompositeDatabase::open(epoch_db, kad_db, cache_db);
     // Epoch tables
     db.open_table::<LastProposed>().expect("failed to open table!");
     db.open_table::<Votes>().expect("failed to open table!");
@@ -164,10 +162,6 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatab
     db.open_table::<CertificateDigestByRound>().expect("failed to open table!");
     db.open_table::<CertificateDigestByOrigin>().expect("failed to open table!");
     db.open_table::<Payload>().expect("failed to open table!");
-    // Epoch chain tables
-    db.open_table::<EpochRecords>().expect("failed to open table!");
-    db.open_table::<EpochCerts>().expect("failed to open table!");
-    db.open_table::<EpochRecordsIndex>().expect("failed to open table!");
     // Kad tables
     db.open_table::<KadRecords>().expect("failed to open table!");
     db.open_table::<KadProviderRecords>().expect("failed to open table!");
@@ -186,21 +180,9 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatab
 
     let store_path = store_path.as_ref();
     let epoch_db = ReDB::open(store_path.join("epoch")).expect("Cannot open database (epoch)");
-    let batch_db = ReDB::open(store_path.join("batch")).expect("Cannot open database (batch)");
-    let consensus_chain_db = ReDB::open(store_path.join("consensus_chain"))
-        .expect("Cannot open database (consensus_chain)");
-    let epoch_chain_db =
-        ReDB::open(store_path.join("epoch_chain")).expect("Cannot open database (epoch chain)");
     let kad_db = ReDB::open(store_path.join("kad")).expect("Cannot open database (kad)");
     let cache_db = ReDB::open(store_path.join("cache")).expect("Cannot open database (cache)");
-    let db = CompositeDatabase::open(
-        epoch_db,
-        batch_db,
-        consensus_chain_db,
-        epoch_chain_db,
-        kad_db,
-        cache_db,
-    );
+    let db = CompositeDatabase::open(epoch_db, kad_db, cache_db);
     // Epoch tables
     db.open_table::<LastProposed>().expect("failed to open table!");
     db.open_table::<Votes>().expect("failed to open table!");
@@ -208,10 +190,6 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatab
     db.open_table::<CertificateDigestByRound>().expect("failed to open table!");
     db.open_table::<CertificateDigestByOrigin>().expect("failed to open table!");
     db.open_table::<Payload>().expect("failed to open table!");
-    // Epoch chain tables
-    db.open_table::<EpochRecords>().expect("failed to open table!");
-    db.open_table::<EpochCerts>().expect("failed to open table!");
-    db.open_table::<EpochRecordsIndex>().expect("failed to open table!");
     // Kad tables
     db.open_table::<KadRecords>().expect("failed to open table!");
     db.open_table::<KadProviderRecords>().expect("failed to open table!");

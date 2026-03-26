@@ -84,7 +84,7 @@ where
         // Clone the round updates channel so we can get update notifications specific to
         // this RPC handler.
         let mut rx_committed_round_updates =
-            self.consensus_bus.committed_round_updates().subscribe();
+            self.consensus_bus.app().committed_round_updates().subscribe();
         let mut committed_round = *rx_committed_round_updates.borrow();
         let max_round = committed_round.saturating_sub(max_age);
         if header.round() < max_round {

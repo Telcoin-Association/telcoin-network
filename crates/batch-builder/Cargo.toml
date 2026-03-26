@@ -28,7 +28,7 @@ tn-reth = { workspace = true, features = ["test-utils"] }
 # integration tests
 tn-worker = { workspace = true, features = ["test-utils"] }
 tn-network-types = { workspace = true }
-tn-storage = { workspace = true }
+tn-storage = { workspace = true, features = ["test-utils"] }
 tn-batch-validator = { workspace = true }
 tn-engine = { workspace = true }
 tn-batch-builder = { workspace = true, features = ["test-utils"] }

@@ -12,9 +12,6 @@ impl<V: Serialize + DeserializeOwned + Send + Sync + Clone + Debug + 'static> Va
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum TableHint {
     Epoch,
-    ConsensusChain,
-    EpochChain,
-    Batch,
     Kad,
     Cache,
 }

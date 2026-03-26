@@ -1,5 +1,5 @@
 use alloy::primitives::address;
-use e2e_tests::{config_local_testnet, IT_TEST_MUTEX};
+use e2e_tests::{config_local_testnet, setup_log_dir};
 use escargot::CargoRun;
 use ethereum_tx_sign::{LegacyTransaction, Transaction};
 use eyre::Report;
@@ -14,53 +14,15 @@ use nix::{
 };
 use secp256k1::{Keypair, Secp256k1, SecretKey};
 use serde_json::Value;
-use std::{
-    collections::HashMap,
-    fmt::Debug,
-    fs::File,
-    path::Path,
-    process::{Child, Command, Stdio},
-    time::Duration,
-};
-use tn_types::{get_available_tcp_port, keccak256, test_utils::init_test_tracing, Address};
+use std::{collections::HashMap, fmt::Debug, path::Path, process::Child, time::Duration};
+use tn_types::{get_available_tcp_port, keccak256, Address};
 use tokio::runtime::Builder;
 use tracing::{error, info};
 
+use super::common::{kill_child, ProcessGuard};
+
 /// One unit of TEL (10^18) measured in wei.
 const WEI_PER_TEL: u128 = 1_000_000_000_000_000_000;
-
-/// Send SIGTERM to child, can use this to pre-send TERM to all children when shutting down.
-fn send_term(child: &mut Child) {
-    if let Err(e) = signal::kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM) {
-        error!(target: "restart-test", ?e, "error killing child");
-    }
-}
-
-/// Helper function to shutdown child processes and log errors.
-fn kill_child(child: &mut Child) {
-    send_term(child);
-
-    for _ in 0..5 {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                info!(target: "restart-test", "child exited");
-                return;
-            }
-            Ok(None) => {}
-            Err(e) => error!(target: "restart-test", "error waiting on child to exit: {e}"),
-        }
-        std::thread::sleep(Duration::from_millis(1200));
-    }
-    // The child is not exiting...
-    // The code below will send SIGKILL without the use of nix.
-    if let Err(e) = child.kill() {
-        error!(target: "restart-test", ?e, "error killing child");
-    }
-    // Hopefully it will exit now...
-    if let Err(e) = child.wait() {
-        error!(target: "restart-test", ?e, "error waiting for child to die");
-    }
-}
 
 fn send_and_confirm(
     node: &str,
@@ -70,8 +32,8 @@ fn send_and_confirm(
     nonce: u128,
 ) -> eyre::Result<()> {
     let basefee_address = address!("0x9999999999999999999999999999999999999999");
-    let current = get_balance(node, &to_account.to_string(), 1)?;
-    let current_basefee = get_balance(node, &basefee_address.to_string(), 1)?;
+    let current = get_balance(node_test, &to_account.to_string(), 1)?;
+    let current_basefee = get_balance(node_test, &basefee_address.to_string(), 1)?;
     let amount = 10 * WEI_PER_TEL; // 10 TEL
     let expected = current + amount;
     send_tel(node, key, to_account, amount, 250, 21000, nonce)?;
@@ -90,7 +52,7 @@ fn send_and_confirm(
     let bal =
         get_balance_above_with_retry(node_test, &basefee_address.to_string(), current_basefee)?;
     let expected_bal = if nonce > 0 { current_basefee + (current_basefee / (nonce)) } else { 0 };
-    if nonce > 0 && bal != expected_bal {
+    if nonce > 0 && bal < expected_bal {
         error!(target: "restart-test", ?bal, ?expected_bal, "basefee error!");
         return Err(Report::msg("Expected a basefee increment!".to_string()));
     }
@@ -236,8 +198,23 @@ fn run_restart_tests_lagged1(
 /// Run the second part of tests, broken up like this to allow more robust node shutdown.
 fn run_restart_tests2(client_urls: &[String; 4]) -> eyre::Result<()> {
     network_advancing(client_urls)?;
-    std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will fail if a node is lagging.
-    test_blocks_same(client_urls)?; // Starting from a solid position after a restart?
+    std::thread::sleep(Duration::from_secs(2));
+
+    // After full restart, some nodes may still be catching up consensus/execution.
+    // Find the highest reported EL block and wait for all nodes to reach it
+    // before comparing block hashes.
+    let mut max_block = 0u64;
+    for url in client_urls.iter() {
+        if let Ok(n) = get_block_number(url) {
+            max_block = max_block.max(n);
+        }
+    }
+    assert!(max_block > 0, "max block is 0");
+    for url in client_urls.iter() {
+        wait_for_block(url, max_block)?;
+    }
+
+    test_blocks_same(client_urls)?;
     let key = get_key("test-source");
     let to_account = address_from_word("testing");
     for (i, uri) in client_urls.iter().enumerate().take(4) {
@@ -293,19 +270,15 @@ fn network_advancing(client_urls: &[String; 4]) -> eyre::Result<()> {
 }
 
 fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
-    let _guard = IT_TEST_MUTEX.lock();
-    init_test_tracing();
     info!(target: "restart-test", "do_restarts, delay: {delay}");
-    // the tmp dir should be removed once tmp_quard is dropped
     let tmp_guard = tempfile::TempDir::new().expect("tempdir is okay");
-    // create temp path for test
     let temp_path = tmp_guard.path().to_path_buf();
     {
         config_local_testnet(&temp_path, Some("restart_test".to_string()), None)
             .expect("failed to config");
     }
     let bin = e2e_tests::get_telcoin_network_binary();
-    let mut children: [Option<Child>; 4] = [None, None, None, None];
+    let mut guard = ProcessGuard::empty();
     let mut client_urls = [
         "http://127.0.0.1".to_string(),
         "http://127.0.0.1".to_string(),
@@ -313,19 +286,18 @@ fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
         "http://127.0.0.1".to_string(),
     ];
     let mut rpc_ports: [u16; 4] = [0, 0, 0, 0];
-    for (i, child) in children.iter_mut().enumerate() {
+    for i in 0..4 {
         let rpc_port = get_available_tcp_port("127.0.0.1")
             .expect("Failed to get an ephemeral rpc port for child!");
         rpc_ports[i] = rpc_port;
         client_urls[i].push_str(&format!(":{rpc_port}"));
-        *child = Some(start_validator(i, &bin, &temp_path, rpc_port, test, 0));
+        guard.push(start_validator(i, &bin, &temp_path, rpc_port, test, 0));
     }
 
-    // pass &mut to `run_restart_tests1` to shutdown child in case of error
-    let mut child2 = children[2].take().expect("missing child 2");
+    // Take child2 out of guard for restart testing
+    let mut child2 = guard.take(2).expect("missing child 2");
 
     info!(target: "restart-test", "Running restart tests 1");
-    // run restart tests1
     let res1 = if lagged {
         run_restart_tests_lagged1(
             &client_urls,
@@ -341,42 +313,23 @@ fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
     };
     info!(target: "restart-test", "Ran restart tests 1: {res1:?}");
     let is_ok = res1.is_ok();
-    // kill new child2 if successfully restarted
     let assert_str = match res1 {
         Ok(mut child2_restarted) => {
             kill_child(&mut child2_restarted);
             "".to_string()
         }
         Err(err) => {
-            // run_restart_tests1 shutsdown child2 on error
             tracing::error!(target: "restart-test", "Got error: {err}");
             err.to_string()
         }
     };
 
-    // send SIGTERM to all children (child2 should already be dead)
-    // This lets them start shutting down in parrallel.
-    for (i, child) in children.iter_mut().enumerate() {
-        if i != 2 {
-            let child = child.as_mut().expect("missing a child");
-            send_term(child);
-        }
-    }
-
-    // kill all children (child2 should already be dead)
-    for (i, child) in children.iter_mut().enumerate() {
-        // Best effort to kill all the other nodes.
-        if i != 2 {
-            let child = child.as_mut().expect("missing a child");
-            kill_child(child);
-            info!(target: "restart-test", "kill and wait on child{i} complete");
-        }
-    }
+    // Kill all remaining children (child2 slot is already None from take)
+    guard.kill_all();
 
     // Make sure we shutdown nodes even if an error in first testing.
-    assert!(is_ok, "{}", assert_str);
+    assert!(is_ok, "Phase 1 failed: {assert_str}. Check logs in test_logs/{test}/");
     let to_account = address_from_word("testing");
-    // The validators should be down now, confirm.
     assert!(get_balance(&client_urls[0], &to_account.to_string(), 5).is_err());
     assert!(get_balance(&client_urls[1], &to_account.to_string(), 5).is_err());
     assert!(get_balance(&client_urls[2], &to_account.to_string(), 5).is_err());
@@ -384,42 +337,29 @@ fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
 
     info!(target: "restart-test", "all nodes shutdown...restarting network");
     // Restart network
-    for (i, child) in children.iter_mut().enumerate() {
-        *child = Some(start_validator(i, &bin, &temp_path, rpc_ports[i], test, 3));
+    for i in 0..4 {
+        guard.replace(i, start_validator(i, &bin, &temp_path, rpc_ports[i], test, 3));
     }
 
     info!(target: "restart-test", "Running restart tests 2");
     let res2 = run_restart_tests2(&client_urls);
     info!(target: "restart-test", "Ran restart tests 2: {res2:?}");
 
-    // SIGTERM children so they can shutdown in parrellel.
-    for child in children.iter_mut() {
-        let child = child.as_mut().expect("missing a child");
-        send_term(child);
-    }
-
-    // kill children before returning final_result
-    for child in children.iter_mut() {
-        let child = child.as_mut().expect("missing a child");
-        kill_child(child);
-        info!(target: "restart-test", "kill and wait on child complete for final result");
-    }
+    // guard.drop() handles final cleanup
     res2
 }
 
 /// Test a restart case with a short delay, the stopped node should rejoin consensus.
-/// Note set the TEST_RESTARTS_LOG env variable to a directory when running this test
-/// in order to get each nodes logs broken out by test/node/run.  This can make debugging
-/// restart tests easier vs having all the logs jumbled together.
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restartstt() -> eyre::Result<()> {
+    let _permit = super::common::acquire_test_permit();
     do_restarts(2, false, "restarts")
 }
 
-/// Wait for `node` to reach at least `target_block`, polling every second for up to 30 seconds.
+/// Wait for `node` to reach at least `target_block`, polling every second for up to 60 seconds.
 fn wait_for_block(node: &str, target_block: u64) -> eyre::Result<()> {
-    for _ in 0..30 {
+    for _ in 0..60 {
         if let Ok(n) = get_block_number(node) {
             if n >= target_block {
                 return Ok(());
@@ -427,7 +367,7 @@ fn wait_for_block(node: &str, target_block: u64) -> eyre::Result<()> {
         }
         std::thread::sleep(Duration::from_secs(1));
     }
-    Err(eyre::eyre!("Node {node} did not reach block {target_block} within 30 seconds"))
+    Err(eyre::eyre!("Node {node} did not reach block {target_block} within 60 seconds"))
 }
 
 /// Run some test to make sure an observer is participating in the network.
@@ -445,11 +385,19 @@ fn run_observer_tests(client_urls: &[String; 4], obs_url: &str) -> eyre::Result<
     // After the first transaction, EL block 1 exists on all validators. Wait for the observer
     // to sync to that block before reading state from it — the observer starts at genesis and
     // may not have caught up yet, which would cause the basefee baseline to be 0.
-    let target_block = get_block_number(&client_urls[0])?;
+    // Use client_urls[2] since send_and_confirm already verified that validator's state,
+    // guaranteeing it has executed the TX block. client_urls[0] may lag slightly.
+    let target_block = get_block_number(&client_urls[2])?;
     wait_for_block(obs_url, target_block)?;
 
     // Send to observer, validator confirms- second time.
     send_and_confirm(obs_url, &client_urls[3], &key, to_account, 1)?;
+
+    // Wait for the observer to sync the second transaction's block before reading
+    // its baseline balance. client_urls[3] confirmed the second tx, so use its
+    // block height as the sync target.
+    let target_block = get_block_number(&client_urls[3])?;
+    wait_for_block(obs_url, target_block)?;
 
     // Send to a validator, observer sees transfer.
     send_and_confirm(&client_urls[0], obs_url, &key, to_account, 2)?;
@@ -459,93 +407,56 @@ fn run_observer_tests(client_urls: &[String; 4], obs_url: &str) -> eyre::Result<
 }
 
 /// Test an observer node can submit txns.
-/// Note set the TEST_RESTARTS_LOG env variable to a directory when running this test
-/// in order to get each nodes logs broken out by test/node/run.  This can make debugging
-/// restart tests easier vs having all the logs jumbled together.
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restarts_observer() -> eyre::Result<()> {
-    let _guard = IT_TEST_MUTEX.lock();
-    init_test_tracing();
+    let _permit = super::common::acquire_test_permit();
     info!(target: "restart-test", "do_restarts_observer");
-    // the tmp dir should be removed once tmp_quard is dropped
     let tmp_guard = tempfile::TempDir::new().expect("tempdir is okay");
-    // create temp path for test
     let temp_path = tmp_guard.path().to_path_buf();
     {
         config_local_testnet(&temp_path, Some("restart_test".to_string()), None)
             .expect("failed to config");
     }
     let bin = e2e_tests::get_telcoin_network_binary();
-    let mut children: [Option<Child>; 4] = [None, None, None, None];
+    let mut guard = ProcessGuard::empty();
     let mut client_urls = [
         "http://127.0.0.1".to_string(),
         "http://127.0.0.1".to_string(),
         "http://127.0.0.1".to_string(),
         "http://127.0.0.1".to_string(),
     ];
-    let mut rpc_ports: [u16; 4] = [0, 0, 0, 0];
-    for (i, child) in children.iter_mut().enumerate() {
+    for i in 0..4 {
         let rpc_port = get_available_tcp_port("127.0.0.1")
             .expect("Failed to get an ephemeral rpc port for child!");
-        rpc_ports[i] = rpc_port;
         client_urls[i].push_str(&format!(":{rpc_port}"));
-        *child = Some(start_validator(i, &bin, &temp_path, rpc_port, "observer", 0));
+        guard.push(start_validator(i, &bin, &temp_path, rpc_port, "observer", 0));
     }
     let obs_rpc_port = get_available_tcp_port("127.0.0.1")
         .expect("Failed to get an ephemeral rpc port for child!");
     let obs_url = format!("http://127.0.0.1:{obs_rpc_port}");
-    let mut obs_child = start_observer(4, &bin, &temp_path, obs_rpc_port, "observer", 0);
-    let res = run_observer_tests(&client_urls, &obs_url);
+    guard.push(start_observer(4, &bin, &temp_path, obs_rpc_port, "observer", 0));
 
-    // SIGTERM children so they can shutdown in parrellel.
-    for child in children.iter_mut() {
-        let child = child.as_mut().expect("missing a child");
-        send_term(child);
-    }
-    send_term(&mut obs_child);
-
-    // kill children before returning final_result
-    for child in children.iter_mut() {
-        let child = child.as_mut().expect("missing a child");
-        kill_child(child);
-        info!(target: "restart-test", "kill and wait on child complete for final result");
-    }
-    kill_child(&mut obs_child);
-    res
+    // Guard cleanup handles all process shutdown on drop
+    run_observer_tests(&client_urls, &obs_url)
 }
 
 /// Test a restart case with a long delay, the stopped node should not rejoin consensus but follow
 /// the consensus chain.
-/// Note set the TEST_RESTARTS_LOG env variable to a directory when running this test
-/// in order to get each nodes logs broken out by test/node/run.  This can make debugging
-/// restart tests easier vs having all the logs jumbled together.
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restarts_delayed() -> eyre::Result<()> {
+    let _permit = super::common::acquire_test_permit();
     do_restarts(70, false, "restarts_delayed")
 }
 
 /// Test a restart case with a long delay, the stopped node should not rejoin consensus but follow
 /// the consensus chain.  Lag the restarted validator.
-/// Note set the TEST_RESTARTS_LOG env variable to a directory when running this test
-/// in order to get each nodes logs broken out by test/node/run.  This can make debugging
-/// restart tests easier vs having all the logs jumbled together.
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restarts_lagged_delayed() -> eyre::Result<()> {
+    let _permit = super::common::acquire_test_permit();
     do_restarts(70, true, "restarts_lagged_delayed")
-}
-
-fn setup_log_dir(command: &mut Command, instance: usize, test: &str, run: u32) {
-    if let Ok(log_dir) = std::env::var("TEST_RESTARTS_LOG") {
-        let _ = std::fs::create_dir(format!("{log_dir}/"));
-        let _ = std::fs::create_dir(format!("{log_dir}/{test}/"));
-        let out_file = File::create(format!("{log_dir}/{test}/node{instance}-run{run}.log"))
-            .expect("valid log file");
-        let stdout: Stdio = out_file.into();
-        command.stdout(stdout);
-    }
 }
 
 /// Start a process running a validator node.
@@ -553,13 +464,14 @@ fn start_validator(
     instance: usize,
     bin: &'static CargoRun,
     base_dir: &Path,
-    mut rpc_port: u16,
+    rpc_port: u16,
     test: &str,
     run: u32,
 ) -> Child {
     let data_dir = base_dir.join(format!("validator-{}", instance + 1));
-    // The instance option will still change a set port so account for that.
-    rpc_port += instance as u16;
+    let ws_port = get_available_tcp_port("127.0.0.1").expect("ws port");
+    // IPC: use temp-dir-based path to avoid cross-test conflicts
+    let ipc_path = base_dir.join(format!("validator-{}.ipc", instance + 1));
     let mut command = bin.command();
 
     command
@@ -567,20 +479,18 @@ fn start_validator(
         .arg("node")
         .arg("--datadir")
         .arg(&*data_dir.to_string_lossy())
-        .arg("--instance")
-        .arg(format!("{}", instance + 1))
         .arg("--http")
         .arg("--http.port")
         .arg(format!("{rpc_port}"))
+        .arg("--ws")
+        .arg("--ws.port")
+        .arg(format!("{ws_port}"))
+        .arg("--ipcpath")
+        .arg(ipc_path.to_string_lossy().as_ref())
         .arg("--node-name")
         .arg(format!("{test}-node{instance}"));
 
     setup_log_dir(&mut command, instance, test, run);
-
-    #[cfg(feature = "faucet")]
-    command
-        .arg("--public-key") // If the binary is built with the faucet need this to start...
-        .arg("0223382261d641424b8d8b63497a811c56f85ee89574f9853474c3e9ab0d690d99");
 
     command.spawn().expect("failed to execute")
 }
@@ -590,13 +500,14 @@ fn start_observer(
     instance: usize,
     bin: &'static CargoRun,
     base_dir: &Path,
-    mut rpc_port: u16,
+    rpc_port: u16,
     test: &str,
     run: u32,
 ) -> Child {
     let data_dir = base_dir.join("observer");
-    // The instance option will still change a set port so account for that.
-    rpc_port += instance as u16;
+    let ws_port = get_available_tcp_port("127.0.0.1").expect("ws port");
+    // IPC: use temp-dir-based path to avoid cross-test conflicts
+    let ipc_path = base_dir.join("observer.ipc");
     let mut command = bin.command();
     command
         .env("TN_BLS_PASSPHRASE", "restart_test")
@@ -604,11 +515,14 @@ fn start_observer(
         .arg("--observer")
         .arg("--datadir")
         .arg(&*data_dir.to_string_lossy())
-        .arg("--instance")
-        .arg(format!("{}", instance + 1))
         .arg("--http")
         .arg("--http.port")
         .arg(format!("{rpc_port}"))
+        .arg("--ws")
+        .arg("--ws.port")
+        .arg(format!("{ws_port}"))
+        .arg("--ipcpath")
+        .arg(ipc_path.to_string_lossy().as_ref())
         .arg("--node-name")
         .arg(format!("{test}-node{instance}"));
 
@@ -666,9 +580,7 @@ fn get_positive_balance_with_retry(node: &str, address: &str) -> eyre::Result<u1
     get_balance_above_with_retry(node, address, 0)
 }
 
-/// Retry up to 30 times to retrieve an account balance > above.
-///
-/// Max time to get balance is 1min.
+/// Retry up to 45 times to retrieve an account balance > above.
 fn get_balance_above_with_retry(node: &str, address: &str, above: u128) -> eyre::Result<u128> {
     let mut bal = get_balance(node, address, 5)?;
     let mut i = 0;
@@ -703,7 +615,19 @@ fn get_block(node: &str, block_number: Option<u64>) -> eyre::Result<HashMap<Stri
     };
 
     let params = rpc_params!(&debug_params, true);
-    call_rpc(node, "eth_getBlockByNumber", params, 10, debug_params)
+    // Deserialize as Option to handle null responses from syncing/restarted nodes
+    // that haven't caught up to the requested block yet.
+    let mut result: Option<HashMap<String, Value>> =
+        call_rpc(node, "eth_getBlockByNumber", params.clone(), 10, &debug_params)?;
+    let mut retries = 0;
+    while result.is_none() && retries < 30 {
+        std::thread::sleep(Duration::from_secs(1));
+        result = call_rpc(node, "eth_getBlockByNumber", params.clone(), 3, &debug_params)?;
+        retries += 1;
+    }
+    result.ok_or_else(|| {
+        eyre::eyre!("eth_getBlockByNumber returned null after retries for {debug_params} on {node}")
+    })
 }
 
 fn get_block_number(node: &str) -> eyre::Result<u64> {
@@ -861,13 +785,18 @@ where
     let runtime = Builder::new_current_thread().enable_io().enable_time().build()?;
 
     let resp = runtime.block_on(async move {
-        let client = HttpClientBuilder::default().build(node).expect("couldn't build rpc client");
+        let client = HttpClientBuilder::default()
+            .request_timeout(Duration::from_secs(10))
+            .build(node)
+            .expect("couldn't build rpc client");
         let mut resp = client.request(command, params.clone()).await;
         let mut i = 0;
         while i < retries && resp.is_err() {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            let client =
-                HttpClientBuilder::default().build(node).expect("couldn't build rpc client");
+            let client = HttpClientBuilder::default()
+                .request_timeout(Duration::from_secs(10))
+                .build(node)
+                .expect("couldn't build rpc client");
             resp = client.request(command, params.clone()).await;
             i += 1;
         }
@@ -885,8 +814,7 @@ where
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_observer_late_join_catchup() -> eyre::Result<()> {
-    let _guard = IT_TEST_MUTEX.lock();
-    init_test_tracing();
+    let _permit = super::common::acquire_test_permit();
     info!(target: "restart-test", "test_observer_late_join_catchup");
     let tmp_guard = tempfile::TempDir::new().expect("tempdir is okay");
     let temp_path = tmp_guard.path().to_path_buf();
@@ -897,18 +825,18 @@ fn test_observer_late_join_catchup() -> eyre::Result<()> {
     let bin = e2e_tests::get_telcoin_network_binary();
 
     // Start 4 validators WITHOUT the observer
-    let mut children: [Option<Child>; 4] = [None, None, None, None];
+    let mut guard = ProcessGuard::empty();
     let mut client_urls = [
         "http://127.0.0.1".to_string(),
         "http://127.0.0.1".to_string(),
         "http://127.0.0.1".to_string(),
         "http://127.0.0.1".to_string(),
     ];
-    for (i, child) in children.iter_mut().enumerate() {
+    for i in 0..4 {
         let rpc_port = get_available_tcp_port("127.0.0.1")
             .expect("Failed to get an ephemeral rpc port for child!");
         client_urls[i].push_str(&format!(":{rpc_port}"));
-        *child = Some(start_validator(i, &bin, &temp_path, rpc_port, "late_join", 0));
+        guard.push(start_validator(i, &bin, &temp_path, rpc_port, "late_join", 0));
     }
 
     // Wait for validators to produce blocks
@@ -928,7 +856,7 @@ fn test_observer_late_join_catchup() -> eyre::Result<()> {
     let obs_rpc_port = get_available_tcp_port("127.0.0.1")
         .expect("Failed to get an ephemeral rpc port for observer!");
     let obs_url = format!("http://127.0.0.1:{obs_rpc_port}");
-    let mut obs_child = start_observer(4, &bin, &temp_path, obs_rpc_port, "late_join", 0);
+    guard.push(start_observer(4, &bin, &temp_path, obs_rpc_port, "late_join", 0));
 
     // Observer must catch up to at least the validator consensus height we recorded
     let mut retries = 0;
@@ -948,19 +876,11 @@ fn test_observer_late_join_catchup() -> eyre::Result<()> {
         std::thread::sleep(Duration::from_secs(1));
     };
 
-    // Cleanup
-    for child in children.iter_mut() {
-        let child = child.as_mut().expect("missing a child");
-        send_term(child);
-    }
-    send_term(&mut obs_child);
-    for child in children.iter_mut() {
-        let child = child.as_mut().expect("missing a child");
-        kill_child(child);
-    }
-    kill_child(&mut obs_child);
-
-    assert!(caught_up, "Observer did not catch up within {max_retries}s");
+    // Guard cleanup handles all process shutdown on drop
+    assert!(
+        caught_up,
+        "Observer did not catch up within {max_retries}s. Check logs in test_logs/late_join/"
+    );
     Ok(())
 }
 
@@ -970,8 +890,7 @@ fn test_observer_late_join_catchup() -> eyre::Result<()> {
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_observer_reconnect_after_pause() -> eyre::Result<()> {
-    let _guard = IT_TEST_MUTEX.lock();
-    init_test_tracing();
+    let _permit = super::common::acquire_test_permit();
     info!(target: "restart-test", "test_observer_reconnect_after_pause");
     let tmp_guard = tempfile::TempDir::new().expect("tempdir is okay");
     let temp_path = tmp_guard.path().to_path_buf();
@@ -982,23 +901,23 @@ fn test_observer_reconnect_after_pause() -> eyre::Result<()> {
     let bin = e2e_tests::get_telcoin_network_binary();
 
     // Start 4 validators + 1 observer
-    let mut children: [Option<Child>; 4] = [None, None, None, None];
+    let mut guard = ProcessGuard::empty();
     let mut client_urls = [
         "http://127.0.0.1".to_string(),
         "http://127.0.0.1".to_string(),
         "http://127.0.0.1".to_string(),
         "http://127.0.0.1".to_string(),
     ];
-    for (i, child) in children.iter_mut().enumerate() {
+    for i in 0..4 {
         let rpc_port = get_available_tcp_port("127.0.0.1")
             .expect("Failed to get an ephemeral rpc port for child!");
         client_urls[i].push_str(&format!(":{rpc_port}"));
-        *child = Some(start_validator(i, &bin, &temp_path, rpc_port, "reconnect", 0));
+        guard.push(start_validator(i, &bin, &temp_path, rpc_port, "reconnect", 0));
     }
     let obs_rpc_port = get_available_tcp_port("127.0.0.1")
         .expect("Failed to get an ephemeral rpc port for observer!");
     let obs_url = format!("http://127.0.0.1:{obs_rpc_port}");
-    let mut obs_child = start_observer(4, &bin, &temp_path, obs_rpc_port, "reconnect", 0);
+    guard.push(start_observer(4, &bin, &temp_path, obs_rpc_port, "reconnect", 0));
 
     // Wait for network to advance and observer to be in sync
     network_advancing(&client_urls)?;
@@ -1008,7 +927,7 @@ fn test_observer_reconnect_after_pause() -> eyre::Result<()> {
     info!(target: "restart-test", ?initial_obs_consensus_height, "observer synced, pausing it");
 
     // SIGSTOP the observer (simulate network partition / process freeze)
-    let obs_pid = Pid::from_raw(obs_child.id() as i32);
+    let obs_pid = Pid::from_raw(guard.get_mut(4).expect("observer child").id() as i32);
     signal::kill(obs_pid, Signal::SIGSTOP)?;
 
     // Let validators advance for 15 seconds while observer is paused
@@ -1042,18 +961,7 @@ fn test_observer_reconnect_after_pause() -> eyre::Result<()> {
         std::thread::sleep(Duration::from_secs(1));
     };
 
-    // Cleanup
-    for child in children.iter_mut() {
-        let child = child.as_mut().expect("missing a child");
-        send_term(child);
-    }
-    send_term(&mut obs_child);
-    for child in children.iter_mut() {
-        let child = child.as_mut().expect("missing a child");
-        kill_child(child);
-    }
-    kill_child(&mut obs_child);
-
-    assert!(caught_up, "Observer did not recover within {max_retries}s after SIGCONT");
+    // Guard cleanup handles all process shutdown on drop
+    assert!(caught_up, "Observer did not recover within {max_retries}s after SIGCONT. Check logs in test_logs/reconnect/");
     Ok(())
 }

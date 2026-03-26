@@ -65,7 +65,7 @@ async fn test_consensus_recovery_with_bullshark() {
 
     let cb = ConsensusBus::new();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    cb.recent_blocks().send_modify(|blocks| {
+    cb.app().recent_blocks().send_modify(|blocks| {
         blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
     });
     let mut rx_output = cb.subscribe_sequence();
@@ -157,7 +157,7 @@ async fn test_consensus_recovery_with_bullshark() {
 
     let cb = ConsensusBus::new();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    cb.recent_blocks().send_modify(|blocks| {
+    cb.app().recent_blocks().send_modify(|blocks| {
         blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
     });
     let mut rx_output = cb.subscribe_sequence();
@@ -218,7 +218,7 @@ async fn test_consensus_recovery_with_bullshark() {
 
     let cb = ConsensusBus::new();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
-    cb.recent_blocks().send_modify(|blocks| {
+    cb.app().recent_blocks().send_modify(|blocks| {
         blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
     });
     let mut rx_output = cb.subscribe_sequence();

@@ -8,7 +8,7 @@ use crate::{
     error::{CertManagerError, PrimaryNetworkError, PrimaryNetworkResult},
     network::message::PrimaryGossip,
     state_sync::{CertificateCollector, StateSynchronizer},
-    ConsensusBus, NodeMode,
+    ConsensusBusApp, NodeMode,
 };
 use parking_lot::Mutex;
 use std::{
@@ -18,7 +18,7 @@ use std::{
 };
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::GossipMessage;
-use tn_storage::{consensus::ConsensusChain, CertificateStore, EpochStore, VoteDigestStore};
+use tn_storage::{consensus::ConsensusChain, CertificateStore, VoteDigestStore};
 use tn_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
@@ -27,12 +27,15 @@ use tn_types::{
     Header, HeaderDigest, ProtocolSignature, Round, SignatureVerificationState, TnSender as _,
     Vote,
 };
+use tokio::sync::Mutex as TokioMutex;
 use tracing::{debug, error, info, warn};
 
 /// Map to hold vote info to detect invalid votes, equivocation and cache responses in case of
 /// rerequests.
-type AuthEquivocationMap =
-    BTreeMap<AuthorityIdentifier, (Epoch, Round, HeaderDigest, Option<PrimaryResponse>)>;
+type AuthEquivocationMap = HashMap<
+    AuthorityIdentifier,
+    TokioMutex<Option<(Epoch, Round, HeaderDigest, Option<PrimaryResponse>)>>,
+>;
 
 /// The type that handles requests from peers.
 #[derive(Clone, Debug)]
@@ -40,7 +43,7 @@ pub(crate) struct RequestHandler<DB> {
     /// Consensus config with access to database.
     consensus_config: ConsensusConfig<DB>,
     /// Inner-processs channel bus.
-    consensus_bus: ConsensusBus,
+    consensus_bus: ConsensusBusApp,
     /// Synchronize state between peers.
     state_sync: StateSynchronizer<DB>,
     /// The digests of parents that are currently being requested from peers.
@@ -52,7 +55,7 @@ pub(crate) struct RequestHandler<DB> {
     requested_parents: Arc<Mutex<BTreeMap<(Round, CertificateDigest), AuthorityIdentifier>>>,
     /// Map of the last epoch and round each authority requested a vote for.
     /// Used to stop validator equivocation early.
-    auth_last_vote: Arc<Mutex<AuthEquivocationMap>>,
+    auth_last_vote: Arc<AuthEquivocationMap>,
     /// Track consensus headers until we hit a simple quorum then send on.
     consensus_certs: Arc<Mutex<HashMap<BlockHash, u32>>>,
     /// Access to the consensus chain data.
@@ -66,16 +69,22 @@ where
     /// Create a new instance of Self.
     pub(crate) fn new(
         consensus_config: ConsensusConfig<DB>,
-        consensus_bus: ConsensusBus,
+        consensus_bus: ConsensusBusApp,
         state_sync: StateSynchronizer<DB>,
         consensus_chain: ConsensusChain,
     ) -> Self {
+        let mut auth_last_vote: AuthEquivocationMap = Default::default();
+        // Preload with each committee auth id.
+        // This is so we can lock each authority individually when processing votes.
+        for auth in consensus_config.committee().authorities() {
+            auth_last_vote.insert(auth.id(), TokioMutex::new(None));
+        }
         Self {
             consensus_config,
             consensus_bus,
             state_sync,
             requested_parents: Default::default(),
-            auth_last_vote: Default::default(),
+            auth_last_vote: Arc::new(auth_last_vote),
             consensus_certs: Default::default(),
             consensus_chain,
         }
@@ -93,7 +102,7 @@ where
         // too far behind.
         let (exec_number, exec_epoch, exec_round) = self
             .consensus_bus
-            .last_consensus_block(None, &self.consensus_chain)
+            .last_consensus_block(&self.consensus_chain)
             .await
             .map(|h| (h.number, h.sub_dag.leader_epoch(), h.sub_dag.leader_round()))
             .unwrap_or((0, 0, 0));
@@ -143,11 +152,11 @@ where
         }
     }
 
-    fn get_committee(&self, epoch: Epoch) -> Option<BTreeSet<BlsPublicKey>> {
+    async fn get_committee(&self, epoch: Epoch) -> Option<BTreeSet<BlsPublicKey>> {
         if epoch == self.consensus_config.committee().epoch() {
             Some(self.consensus_config.committee().bls_keys())
         } else {
-            self.consensus_config.node_storage().get_committee_keys(epoch)
+            self.consensus_chain.epochs().get_committee_keys(epoch).await
         }
     }
 
@@ -175,7 +184,7 @@ where
                 let epoch = cert.header().epoch;
                 // Early verify so we can detect we are behind.
                 // The verification is cached in the cert so this should not be too expensive.
-                if let Some(committee) = self.get_committee(epoch) {
+                if let Some(committee) = self.get_committee(epoch).await {
                     match cert.verify_cert(&committee) {
                         Ok(()) => {
                             if self.consensus_bus.is_cvv() {
@@ -212,7 +221,7 @@ where
                     // We have already dealt with this hash or we are past this output.
                     return Ok(());
                 }
-                if let Some(committee) = self.get_committee(epoch) {
+                if let Some(committee) = self.get_committee(epoch).await {
                     // If we do not have the committee to verify this message then just ignore for
                     // now. Another one will be along soon and we should be
                     // syncing epochs in the background.
@@ -273,7 +282,7 @@ where
                 );
                 // Verify committee membership if the epoch record is available
                 if let Some((epoch_rec, _)) =
-                    self.consensus_config.node_storage().get_epoch_by_hash(vote.epoch_hash)
+                    self.consensus_chain.epochs().get_epoch_by_hash(vote.epoch_hash).await
                 {
                     ensure!(
                         epoch_rec.committee.contains(&vote.public_key),
@@ -324,11 +333,14 @@ where
                 return Ok(PrimaryResponse::Vote(vote));
             }
         }
-        {
+        // We have already verified committee membership with the peer check but this will double
+        // check. Each committee member has it's own lock so different authorities can be
+        // voted on in parallel but only one vote for an authority can proceed at a time.
+        if let Some(auth_lock) = self.auth_last_vote.get(header.author()) {
             // Check for validator equivocation early and reject if so
-            let mut auth_last_vote = self.auth_last_vote.lock();
+            let mut auth_last_vote = auth_lock.lock().await;
             if let Some((last_epoch, last_round, last_digest, last_response)) =
-                auth_last_vote.remove(&header.author)
+                auth_last_vote.take()
             {
                 if last_digest == header.digest() {
                     match last_response {
@@ -339,29 +351,23 @@ where
                             if parents.len() == missing.len() {
                                 for parent in parents.iter().map(|p| p.digest()) {
                                     if !missing.contains(&parent) {
-                                        auth_last_vote.insert(
-                                            header.author().clone(),
-                                            (
-                                                last_epoch,
-                                                last_round,
-                                                last_digest,
-                                                Some(PrimaryResponse::MissingParents(missing)),
-                                            ),
-                                        );
+                                        *auth_last_vote = Some((
+                                            last_epoch,
+                                            last_round,
+                                            last_digest,
+                                            Some(PrimaryResponse::MissingParents(missing)),
+                                        ));
                                         return Err(HeaderError::InvalidParents.into());
                                     }
                                 }
                             } else {
                                 let missing_len = missing.len();
-                                auth_last_vote.insert(
-                                    header.author().clone(),
-                                    (
-                                        last_epoch,
-                                        last_round,
-                                        last_digest,
-                                        Some(PrimaryResponse::MissingParents(missing)),
-                                    ),
-                                );
+                                *auth_last_vote = Some((
+                                    last_epoch,
+                                    last_round,
+                                    last_digest,
+                                    Some(PrimaryResponse::MissingParents(missing)),
+                                ));
                                 return Err(HeaderError::WrongNumberOfParents(
                                     missing_len,
                                     parents.len(),
@@ -374,10 +380,7 @@ where
                 } else if header.epoch() < last_epoch
                     || (last_epoch == header.epoch() && last_round >= header.round())
                 {
-                    auth_last_vote.insert(
-                        header.author().clone(),
-                        (last_epoch, last_round, last_digest, None),
-                    );
+                    *auth_last_vote = Some((last_epoch, last_round, last_digest, None));
                     return Err(HeaderError::AlreadyVotedForLaterRound {
                         theirs: header.round(),
                         ours: last_round,
@@ -385,22 +388,29 @@ where
                     .into());
                 }
             }
+            let epoch = header.epoch();
+            let round = header.round();
+            let digest = header.digest();
+            // Use a timeout for a sanity check.  Should be able to process a vote request within
+            // header delay...
+            let res = tokio::time::timeout(
+                self.consensus_config.config().parameters.max_header_delay,
+                self.vote_inner(header, parents),
+            )
+            .await?;
+            // Do this to cache the "full" response.
+            // If pulling from the cache it is fine to already be converted
+            // but sometimes we want the full error (basically tests) so return
+            // res when we have a non-converted error.
+            let cached_res: PrimaryResponse = match &res {
+                Ok(msg) => msg.clone(),
+                Err(e) => PrimaryResponse::into_error_ref(e),
+            };
+            *auth_last_vote = Some((epoch, round, digest, Some(cached_res)));
+            res
+        } else {
+            Err(HeaderError::UnknownAuthority(header.author().to_string()).into())
         }
-        let author = header.author().clone();
-        let epoch = header.epoch();
-        let round = header.round();
-        let digest = header.digest();
-        let res = self.vote_inner(header, parents).await;
-        // Do this to cache the "full" response.
-        // If pulling from the cache it is fine to already be converted
-        // but sometimes we want the full error (basically tests) so return
-        // res when we have a non-converted error.
-        let cached_res: PrimaryResponse = match &res {
-            Ok(msg) => msg.clone(),
-            Err(e) => PrimaryResponse::into_error_ref(e),
-        };
-        self.auth_last_vote.lock().insert(author, (epoch, round, digest, Some(cached_res)));
-        res
     }
 
     /// Evaluate request to possibly issue a vote in support of peer's header.
@@ -784,15 +794,10 @@ where
     /// Retrieve a consensus header from local storage.
     pub(super) async fn retrieve_consensus_header(
         &self,
-        number: Option<u64>,
-        hash: Option<BlockHash>,
+        number: u64,
+        hash: BlockHash,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
-        let header = match (number, hash) {
-            (_, Some(hash)) => self.get_header_by_hash(hash).await?,
-            (Some(number), _) => self.get_header_by_number(number).await?,
-            (None, None) => self.get_latest_output().await?,
-        };
-
+        let header = self.get_header_by_hash(number, hash).await?;
         Ok(PrimaryResponse::ConsensusHeader(Arc::new(header)))
     }
 
@@ -811,28 +816,16 @@ where
         Ok(PrimaryResponse::EpochRecord { record, certificate })
     }
 
-    /// Retrieve the consensus header by number.
-    async fn get_header_by_number(&self, number: u64) -> PrimaryNetworkResult<ConsensusHeader> {
-        match self.consensus_chain.consensus_header_by_number(None, number).await {
-            Ok(Some(header)) => Ok(header),
-            _ => Err(PrimaryNetworkError::UnknownConsensusHeaderNumber(number)),
-        }
-    }
-
     /// Retrieve the consensus header by hash
-    async fn get_header_by_hash(&self, hash: BlockHash) -> PrimaryNetworkResult<ConsensusHeader> {
-        match self.consensus_chain.consensus_header_by_digest(None, hash).await {
+    async fn get_header_by_hash(
+        &self,
+        number: u64,
+        hash: BlockHash,
+    ) -> PrimaryNetworkResult<ConsensusHeader> {
+        let epoch = self.consensus_chain.epochs().number_to_epoch(number);
+        match self.consensus_chain.consensus_header_by_digest(epoch, hash).await {
             Ok(Some(header)) => Ok(header),
             _ => Err(PrimaryNetworkError::UnknownConsensusHeaderDigest(hash)),
-        }
-    }
-
-    /// Retrieve the last record in consensus blocks table.
-    async fn get_latest_output(&self) -> PrimaryNetworkResult<ConsensusHeader> {
-        if let Ok(Some(header)) = self.consensus_chain.consensus_header_latest().await {
-            Ok(header)
-        } else {
-            Err(PrimaryNetworkError::InvalidRequest("Consensus headers unavailable".to_string()))
         }
     }
 
@@ -841,14 +834,14 @@ where
         &self,
         epoch: Epoch,
     ) -> PrimaryNetworkResult<(EpochRecord, EpochCertificate)> {
-        match self.consensus_config.node_storage().get_epoch_by_number(epoch) {
+        match self.consensus_chain.epochs().get_epoch_by_number(epoch).await {
             Some((record, Some(cert))) => Ok((record, cert)),
             Some((_record, None)) => {
                 // If we have the record but not the cert then wait a beat for it to show up.
                 for _ in 0..5 {
                     tokio::time::sleep(Duration::from_millis(300)).await;
                     if let Some((record, Some(cert))) =
-                        self.consensus_config.node_storage().get_epoch_by_number(epoch)
+                        self.consensus_chain.epochs().get_epoch_by_number(epoch).await
                     {
                         return Ok((record, cert));
                     }
@@ -864,14 +857,14 @@ where
         &self,
         hash: BlockHash,
     ) -> PrimaryNetworkResult<(EpochRecord, EpochCertificate)> {
-        match self.consensus_config.node_storage().get_epoch_by_hash(hash) {
+        match self.consensus_chain.epochs().get_epoch_by_hash(hash).await {
             Some((record, Some(cert))) => Ok((record, cert)),
             Some((_record, None)) => {
                 // If we have the record but not the cert then wait a beat for it to show up.
                 for _ in 0..5 {
                     tokio::time::sleep(Duration::from_millis(300)).await;
                     if let Some((record, Some(cert))) =
-                        self.consensus_config.node_storage().get_epoch_by_hash(hash)
+                        self.consensus_chain.epochs().get_epoch_by_hash(hash).await
                     {
                         return Ok((record, cert));
                     }

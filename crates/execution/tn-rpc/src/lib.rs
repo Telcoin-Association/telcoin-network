@@ -16,5 +16,5 @@ pub trait EngineToPrimary {
         &self,
         epoch: Option<Epoch>,
         hash: Option<BlockHash>,
-    ) -> Option<(EpochRecord, EpochCertificate)>;
+    ) -> impl std::future::Future<Output = Option<(EpochRecord, EpochCertificate)>> + Send;
 }

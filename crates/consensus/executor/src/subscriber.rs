@@ -6,12 +6,13 @@ use state_sync::{last_executed_consensus_block, save_consensus, spawn_state_sync
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
+    time::Duration,
 };
 use tn_config::ConsensusConfig;
 use tn_network_types::{local::LocalNetwork, PrimaryToWorkerClient};
 use tn_primary::{
     network::{ConsensusResult, PrimaryNetworkHandle},
-    ConsensusBus, NodeMode,
+    ConsensusBus, ConsensusBusApp, NodeMode,
 };
 use tn_storage::{consensus::ConsensusChain, CertificateStore};
 use tn_types::{
@@ -28,7 +29,7 @@ use tracing::{debug, error, info, instrument, warn};
 #[derive(Clone, Debug)]
 pub struct Subscriber<DB> {
     /// Used to get the sequence receiver
-    consensus_bus: ConsensusBus,
+    consensus_bus: ConsensusBusApp,
     /// Consensus configuration (contains the consensus DB)
     config: ConsensusConfig<DB>,
     /// The handle to the network.
@@ -67,10 +68,10 @@ pub fn spawn_subscriber<DB: Database>(
     let authority_id = config.authority_id();
     let committee = config.committee().clone();
     let client = config.local_network().clone();
-    let mode = consensus_bus.current_node_mode();
+    let mode = consensus_bus.app().current_node_mode();
     info!(target: "tn::observer", node_mode = ?mode, "subscriber starting in mode");
     let subscriber = Subscriber {
-        consensus_bus,
+        consensus_bus: consensus_bus.app().clone(),
         config,
         network_handle,
         inner: Arc::new(Inner {
@@ -85,7 +86,7 @@ pub fn spawn_subscriber<DB: Database>(
         // If we are active then partcipate in consensus.
         NodeMode::CvvActive => {
             // Subscribe before spawning so the channel is active before any messages are sent.
-            let rx_sequence = subscriber.consensus_bus.subscribe_sequence();
+            let rx_sequence = consensus_bus.subscribe_sequence();
             task_manager.spawn_critical_task("subscriber consensus", async move {
                 info!(target: "subscriber", "Starting subscriber: CVV");
                 if let Err(e) = subscriber.run(rx_shutdown, rx_sequence, consensus_chain).await {
@@ -305,7 +306,12 @@ impl<DB: Database> Subscriber<DB> {
         // rx_sequence is now passed as parameter to avoid race condition
         // Listen to sequenced consensus message and process them.
         loop {
+            // Use biased select so shutdown is checked last. This ensures that if a
+            // completed output and shutdown are both ready, the output is saved first,
+            // preventing loss of committed consensus data during graceful shutdown.
             tokio::select! {
+                biased;
+
                 // Receive the ordered sequence of consensus messages from a consensus node.
                 Some(sub_dag) = rx_sequence.recv(), if !epoch_done && waiting.len() < Self::MAX_PENDING_PAYLOADS => {
                     // Once we cross epoch boundary then process this last output then we are done.
@@ -358,6 +364,31 @@ impl<DB: Database> Subscriber<DB> {
                 },
 
                 _ = &rx_shutdown => {
+                    // Drain any pending consensus outputs to prevent data loss.
+                    // Without this, committed subdags whose batch downloads are in-flight
+                    // would be lost on restart, causing consensus chain divergence.
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+                    while !waiting.is_empty() {
+                        tokio::select! {
+                            Some(output) = waiting.next() => {
+                                if let Ok(output) = output {
+                                    if let Err(e) = save_consensus(
+                                        self.config.node_storage(),
+                                        output,
+                                        &self.inner.authority_id,
+                                        &mut consensus_chain,
+                                    ).await {
+                                        warn!(target: "subscriber", "error saving consensus during shutdown: {e}");
+                                        break;
+                                    }
+                                }
+                            }
+                            _ = tokio::time::sleep_until(deadline) => {
+                                warn!(target: "subscriber", "timed out draining pending consensus during shutdown");
+                                break;
+                            }
+                        }
+                    }
                     return Ok(())
                 }
 

@@ -2,8 +2,6 @@
 
 use clap::Parser as _;
 use telcoin_network_cli::cli::{Commands, PassSource};
-#[cfg(feature = "faucet")]
-use tn_faucet::FaucetArgs;
 use tn_node::launch_node;
 
 const BLS_PASSPHRASE_ENVVAR: &str = "TN_BLS_PASSPHRASE";
@@ -56,10 +54,7 @@ fn read_passphrase() -> Option<String> {
 fn main() {
     // Access the environment befor we do anything else, even use CLAP.
     let mut passphrase = get_bls_passphrase_from_env();
-    #[cfg(not(feature = "faucet"))]
     let cli = telcoin_network_cli::cli::Cli::<telcoin_network_cli::NoArgs>::parse();
-    #[cfg(feature = "faucet")]
-    let cli = telcoin_network_cli::cli::Cli::<FaucetArgs>::parse();
 
     // Sort out the BLS key passphrase depending on the command run.
     match cli.bls_passphrase_source {
@@ -95,17 +90,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    #[cfg(not(feature = "faucet"))]
     if let Err(err) = cli.run(passphrase, |builder, _, tn_datadir, key_config| {
-        launch_node(builder, tn_datadir, key_config)
-    }) {
-        eprintln!("Error: {err:?}");
-        std::process::exit(1);
-    }
-
-    #[cfg(feature = "faucet")]
-    if let Err(err) = cli.run(passphrase, |mut builder, faucet, tn_datadir, key_config| {
-        builder.opt_faucet_args = Some(faucet);
         launch_node(builder, tn_datadir, key_config)
     }) {
         eprintln!("Error: {err:?}");

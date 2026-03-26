@@ -1,0 +1,417 @@
+   Compiling itoa v1.0.18
+   Compiling zerocopy v0.8.47
+   Compiling zeroize v1.8.2
+   Compiling sha3-asm v0.1.5
+   Compiling secp256k1-sys v0.10.1
+   Compiling serde_with v3.18.0
+   Compiling zstd-sys v2.0.16+zstd.1.5.7
+   Compiling ring v0.17.14
+   Compiling hashbrown v0.15.5
+   Compiling num_enum v0.7.6
+   Compiling secp256k1-sys v0.11.0
+   Compiling iri-string v0.7.11
+   Compiling tinyvec v1.11.0
+   Compiling tikv-jemalloc-sys v0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7
+   Compiling reth-mdbx-sys v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling interprocess v2.4.0
+   Compiling chrono v0.4.44
+   Compiling lz4_flex v0.12.1
+   Compiling lz4-sys v1.11.1+lz4-1.10.0
+   Compiling bzip2-sys v0.1.13+1.0.8
+   Compiling libz-sys v1.1.25
+   Compiling winnow v1.0.0
+   Compiling serde_spanned v1.1.0
+   Compiling toml_writer v1.1.0+spec-1.1.0
+   Compiling serde_json v1.0.149
+   Compiling http v1.4.0
+   Compiling zstd-safe v7.2.4
+   Compiling ppv-lite86 v0.2.21
+   Compiling ahash v0.8.12
+   Compiling time v0.3.47
+   Compiling serde_urlencoded v0.7.1
+   Compiling toml_parser v1.1.0+spec-1.1.0
+   Compiling moka v0.12.15
+   Compiling hashlink v0.11.0
+   Compiling hashlink v0.10.0
+   Compiling ethereum_hashing v0.7.0
+   Compiling socket2 v0.5.10
+   Compiling blake3 v1.8.3
+   Compiling derive_builder v0.12.0
+   Compiling rolling-file v0.2.0
+   Compiling generic-array v0.14.7
+   Compiling der v0.7.10
+   Compiling blst v0.3.16
+   Compiling rustls-pki-types v1.14.0
+   Compiling librocksdb-sys v0.17.3+10.4.2
+   Compiling tikv-jemallocator v0.6.1
+   Compiling compact_str v0.9.0
+   Compiling ouroboros v0.17.2
+   Compiling zstd v0.13.3
+   Compiling rand_chacha v0.3.1
+   Compiling rand_chacha v0.9.0
+   Compiling hashbrown v0.14.5
+   Compiling metrics v0.24.3
+   Compiling schnellru v0.2.4
+   Compiling toml v0.9.12+spec-1.1.0
+   Compiling tikv-jemalloc-ctl v0.6.1
+   Compiling spki v0.7.3
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling sec1 v0.7.3
+   Compiling crypto-bigint v0.5.5
+   Compiling rustls-webpki v0.103.10
+   Compiling webpki-roots v1.0.6
+   Compiling rustls-native-certs v0.8.3
+   Compiling tracing-subscriber v0.3.23
+   Compiling reth-fs-util v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling http-body v1.0.1
+   Compiling reth-zstd-compressors v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling rand v0.8.5
+   Compiling dashmap v6.1.0
+   Compiling reth-metrics v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling h2 v0.4.13
+   Compiling simple_asn1 v0.6.4
+   Compiling compression-codecs v0.4.37
+   Compiling block-padding v0.3.3
+   Compiling universal-hash v0.5.1
+   Compiling pkcs8 v0.10.2
+   Compiling c-kzg v2.1.7
+   Compiling digest v0.10.7
+   Compiling rustls v0.23.37
+   Compiling aead v0.5.2
+   Compiling jsonrpsee-types v0.26.0
+   Compiling rocksdb v0.24.0
+   Compiling webpki-roots v0.26.11
+   Compiling rand v0.9.2
+   Compiling asn1-rs v0.7.1
+   Compiling yasna v0.5.2
+   Compiling async-compression v0.4.41
+   Compiling hashlink v0.9.1
+   Compiling http-body-util v0.1.3
+   Compiling inout v0.1.4
+   Compiling ratatui-core v0.1.0
+   Compiling metrics-process v2.4.3
+   Compiling hmac v0.12.1
+   Compiling signature v2.2.0
+   Compiling sha2 v0.10.9
+   Compiling elliptic-curve v0.13.8
+   Compiling sha3 v0.10.8
+   Compiling keccak-asm v0.1.5
+   Compiling curve25519-dalek v4.1.3
+   Compiling ripemd v0.1.3
+   Compiling rustc-hash v2.1.1
+   Compiling secp256k1 v0.30.0
+   Compiling ark-std v0.5.0
+   Compiling jsonwebtoken v9.3.1
+   Compiling tokio-rustls v0.26.4
+   Compiling reth-tasks v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling sha1 v0.10.6
+   Compiling ruint v1.17.2
+   Compiling rapidhash v4.4.1
+   Compiling rfc6979 v0.4.0
+   Compiling secp256k1 v0.31.1
+   Compiling ed25519 v2.2.3
+   Compiling bs58 v0.5.1
+   Compiling hkdf v0.12.4
+   Compiling reth-libmdbx v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling cipher v0.4.4
+   Compiling opentelemetry_sdk v0.31.0
+   Compiling opentelemetry-appender-tracing v0.31.1
+   Compiling tracing-opentelemetry v0.32.1
+   Compiling tower-http v0.6.8
+   Compiling tracing-samply v0.1.5
+   Compiling hyper v1.8.1
+   Compiling ark-serialize v0.5.0
+   Compiling tracing-appender v0.2.4
+   Compiling tungstenite v0.26.2
+   Compiling primeorder v0.13.6
+   Compiling ecdsa v0.16.9
+   Compiling ed25519-dalek v2.2.0
+   Compiling tracing-logfmt v0.3.5
+   Compiling ctr v0.9.2
+   Compiling aes v0.8.4
+   Compiling tracing-journald v0.3.2
+   Compiling polyval v0.6.2
+   Compiling reth-nippy-jar v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling nybbles v0.4.8
+   Compiling jsonrpsee-core v0.26.0
+   Compiling boa_string v0.21.0
+   Compiling coins-core v0.12.0
+   Compiling hickory-proto v0.25.2
+   Compiling concat-kdf v0.1.0
+   Compiling pbkdf2 v0.12.2
+   Compiling soketto v0.8.1
+   Compiling ark-ff v0.5.0
+   Compiling rustls-platform-verifier v0.5.3
+   Compiling ghash v0.5.1
+   Compiling der-parser v10.0.0
+   Compiling oid-registry v0.8.1
+   Compiling quinn-proto v0.11.14
+   Compiling rcgen v0.13.2
+   Compiling futures-rustls v0.26.0
+   Compiling k256 v0.13.4
+   Compiling p256 v0.13.2
+   Compiling tungstenite v0.28.0
+   Compiling metrics-util v0.20.1
+   Compiling aes-gcm-siv v0.11.1
+   Compiling backoff v0.4.0
+   Compiling ratatui-widgets v0.3.0
+   Compiling tokio-tungstenite v0.26.2
+   Compiling reth-cli-runner v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling aes-gcm v0.10.3
+   Compiling ratatui-crossterm v0.1.0
+   Compiling tar v0.4.45
+   Compiling hyper-util v0.1.20
+   Compiling lz4 v1.28.1
+   Compiling secp256k1-sys v0.8.2
+   Compiling boa_gc v0.21.0
+   Compiling escargot v0.5.15
+   Compiling x509-parser v0.17.0
+   Compiling jsonrpsee-client-transport v0.26.0
+   Compiling metrics-exporter-prometheus v0.18.1
+   Compiling alloy-primitives v1.5.7
+   Compiling enr v0.13.0
+   Compiling libp2p-identity v0.2.13
+   Compiling coins-bip32 v0.12.0
+   Compiling tokio-tungstenite v0.28.0
+   Compiling secp256k1 v0.27.0
+   Compiling boa_interner v0.21.0
+   Compiling hickory-resolver v0.25.2
+   Compiling ratatui v0.30.0
+   Compiling hyper-rustls v0.27.7
+   Compiling hyper-timeout v0.5.2
+   Compiling jsonrpsee-server v0.26.0
+   Compiling ark-poly v0.5.0
+   Compiling ethereum-tx-sign v6.1.3
+   Compiling coins-bip39 v0.12.0
+   Compiling jsonrpsee-ws-client v0.26.0
+   Compiling quinn v0.11.9
+   Compiling multiaddr v0.18.2
+   Compiling boa_ast v0.21.0
+   Compiling alloy-eip7928 v0.3.3
+   Compiling alloy-eip2930 v0.2.3
+   Compiling alloy-eip7702 v0.6.3
+   Compiling alloy-eip2124 v0.2.0
+   Compiling ethereum_serde_utils v0.8.0
+   Compiling alloy-serde v1.7.3
+   Compiling alloy-trie v0.9.5
+   Compiling alloy-json-abi v1.5.7
+   Compiling revm-primitives v22.1.0
+   Compiling alloy-chains v0.2.32
+   Compiling reth-network-peers v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling alloy-rpc-types-debug v1.7.3
+   Compiling reth-net-banlist v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling tonic v0.14.5
+   Compiling alloy-signer v1.7.3
+   Compiling reqwest v0.12.28
+   Compiling jsonrpsee-http-client v0.26.0
+   Compiling ark-ec v0.5.0
+   Compiling discv5 v0.10.4
+   Compiling libp2p-core v0.43.2
+   Compiling alloy-sol-types v1.5.7
+   Compiling revm-bytecode v8.0.0
+   Compiling ethereum_ssz v0.9.1
+   Compiling ethereum_ssz v0.10.1
+   Compiling reth-network-types v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-ecies v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling alloy-hardforks v0.4.7
+   Compiling jsonrpsee v0.26.0
+   Compiling ark-bn254 v0.5.0
+   Compiling ark-bls12-381 v0.5.0
+   Compiling boa_parser v0.21.0
+   Compiling libp2p-swarm v0.47.1
+   Compiling libp2p-tls v0.6.2
+   Compiling alloy-eips v1.7.3
+   Compiling tree_hash v0.10.0
+   Compiling revm-state v9.0.0
+   Compiling reth-ethereum-forks v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling tonic-prost v0.14.5
+   Compiling reth-ipc v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling alloy-json-rpc v1.7.3
+   Compiling alloy-dyn-abi v1.5.7
+   Compiling opentelemetry-http v0.31.0
+   Compiling reth-net-nat v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-node-metrics v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling revm-precompile v32.1.0
+   Compiling reth-dns-discovery v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling libp2p-quic v0.13.0
+   Compiling revm-database-interface v9.0.0
+   Compiling boa_engine v0.21.0
+   Compiling opentelemetry-proto v0.31.0
+   Compiling libp2p-kad v0.48.0
+   Compiling libp2p-allow-block-list v0.6.0
+   Compiling libp2p-gossipsub v0.49.3
+   Compiling libp2p-request-response v0.29.0
+   Compiling libp2p-connection-limits v0.6.0
+   Compiling alloy-consensus v1.7.3
+   Compiling alloy-genesis v1.7.3
+   Compiling reth-cli-util v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-discv4 v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling alloy-transport v1.7.3
+   Compiling revm-database v10.0.0
+   Compiling revm-context-interface v14.0.0
+   Compiling alloy-core v1.5.7
+   Compiling opentelemetry-otlp v0.31.1
+   Compiling alloy-pubsub v1.7.3
+   Compiling alloy-transport-http v1.7.3
+   Compiling alloy-rpc-types-admin v1.7.3
+   Compiling revm-context v13.0.0
+   Compiling revm-interpreter v32.0.0
+   Compiling reth-tracing-otlp v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling alloy-network-primitives v1.7.3
+   Compiling alloy-consensus-any v1.7.3
+   Compiling reth-codecs v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling alloy-rpc-types-engine v1.7.3
+   Compiling reth-era v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling alloy-transport-ipc v1.7.3
+   Compiling alloy-transport-ws v1.7.3
+   Compiling libp2p v0.56.0
+   Compiling revm-handler v15.0.0
+   Compiling alloy-rpc-types-eth v1.7.3
+   Compiling reth-tracing v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-era-downloader v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-prune-types v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling alloy-rpc-client v1.7.3
+   Compiling revm-inspector v15.0.0
+   Compiling alloy-rpc-types-beacon v1.7.3
+   Compiling reth-rpc-layer v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling revm v34.0.0
+   Compiling reth-primitives-traits v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling alloy-evm v0.27.3
+   Compiling alloy-rpc-types-trace v1.7.3
+   Compiling alloy-rpc-types-anvil v1.7.3
+   Compiling alloy-rpc-types-txpool v1.7.3
+   Compiling alloy-rpc-types-any v1.7.3
+   Compiling alloy-rpc-types-mev v1.7.3
+   Compiling alloy-network v1.7.3
+   Compiling reth-trie-common v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-ethereum-primitives v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-db-models v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-payload-validator v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling alloy-signer-local v1.7.3
+   Compiling reth-chainspec v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling alloy-rpc-types v1.7.3
+   Compiling alloy-provider v1.7.3
+   Compiling reth-eth-wire-types v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-discv5 v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-stages-types v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-execution-types v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-static-file-types v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-consensus v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-eth-wire v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-storage-errors v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-config v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-primitives v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling alloy-contract v1.7.3
+   Compiling reth-consensus-common v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling revm-inspectors v0.34.3
+   Compiling reth-db-api v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-execution-errors v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-network-p2p v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-ethereum-consensus v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling alloy v1.7.3
+   Compiling reth-trie-sparse v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-errors v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-network-api v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling tn-types v0.1.0 (/Users/grant/coding/telcoin/tn-duplicate/crates/types)
+   Compiling reth-storage-api v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-db v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-etl v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-rpc-server-types v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling tn-network-types v0.1.0 (/Users/grant/coding/telcoin/tn-duplicate/crates/network-types)
+   Compiling tn-storage v0.1.0 (/Users/grant/coding/telcoin/tn-duplicate/crates/storage)
+   Compiling reth-evm v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-downloaders v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling tn-config v0.1.0 (/Users/grant/coding/telcoin/tn-duplicate/crates/config)
+   Compiling reth-trie v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-cli v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-evm-ethereum v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-rpc-convert v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling tn-network-libp2p v0.1.0 (/Users/grant/coding/telcoin/tn-duplicate/crates/network-libp2p)
+   Compiling reth-chain-state v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-trie-db v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-revm v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling tn-worker v0.1.0 (/Users/grant/coding/telcoin/tn-duplicate/crates/consensus/worker)
+   Compiling tn-primary v0.1.0 (/Users/grant/coding/telcoin/tn-duplicate/crates/consensus/primary)
+   Compiling reth-payload-primitives v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-transaction-pool v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-exex-types v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-payload-builder-primitives v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-engine-primitives v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling state-sync v0.1.0 (/Users/grant/coding/telcoin/tn-duplicate/crates/state-sync)
+   Compiling reth-node-types v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-ethereum-engine-primitives v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling tn-executor v0.1.0 (/Users/grant/coding/telcoin/tn-duplicate/crates/consensus/executor)
+   Compiling reth-network v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-rpc-eth-types v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-node-ethstats v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-provider v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-payload-builder v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-engine-local v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-basic-payload-builder v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-ethereum-payload-builder v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-node-core v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-prune v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-static-file v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-trie-parallel v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-era-utils v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-db-common v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-node-api v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-stages-api v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-rpc-eth-api v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-consensus-debug-client v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-engine-tree v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-exex v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-stages v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-rpc-api v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-node-events v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-engine-service v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-engine-util v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-rpc-engine-api v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-invalid-block-hooks v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-rpc v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-rpc-builder v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-node-builder v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-cli-commands v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-node-ethereum v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth-ethereum-cli v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling reth v1.11.3 (https://github.com/paradigmxyz/reth?tag=v1.11.3#d6324d63)
+   Compiling tn-reth v0.1.0 (/Users/grant/coding/telcoin/tn-duplicate/crates/tn-reth)
+   Compiling tn-exex v0.1.0 (/Users/grant/coding/telcoin/tn-duplicate/crates/exex)
+   Compiling tn-engine v0.1.0 (/Users/grant/coding/telcoin/tn-duplicate/crates/engine)
+   Compiling tn-batch-builder v0.1.0 (/Users/grant/coding/telcoin/tn-duplicate/crates/batch-builder)
+   Compiling tn-batch-validator v0.1.0 (/Users/grant/coding/telcoin/tn-duplicate/crates/batch-validator)
+   Compiling tn-rpc v0.1.0 (/Users/grant/coding/telcoin/tn-duplicate/crates/execution/tn-rpc)
+   Compiling tn-node v0.1.0 (/Users/grant/coding/telcoin/tn-duplicate/crates/node)
+   Compiling telcoin-network-cli v0.1.0 (/Users/grant/coding/telcoin/tn-duplicate/crates/telcoin-network-cli)
+   Compiling e2e-tests v0.1.0 (/Users/grant/coding/telcoin/tn-duplicate/crates/e2e-tests)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 08s
+────────────
+ Nextest run ID f2de0cc6-8987-492a-9af7-40a918d12fa7 with nextest profile: default
+    Starting 8 tests across 2 binaries (3 tests skipped)
+        SLOW [>120.000s] (─────) e2e-tests::it epochs::test_epoch_boundary
+        SLOW [>120.000s] (─────) e2e-tests::it epochs::test_epoch_sync
+        SLOW [>240.000s] (─────) e2e-tests::it epochs::test_epoch_sync
+        SLOW [>240.000s] (─────) e2e-tests::it epochs::test_epoch_boundary
+        PASS [ 331.765s] (1/8) e2e-tests::it epochs::test_epoch_boundary
+        PASS [  18.129s] (2/8) e2e-tests::it restarts::test_observer_late_join_catchup
+ TERMINATING [>360.000s] (─────) e2e-tests::it epochs::test_epoch_sync
+     TIMEOUT [ 360.012s] (3/8) e2e-tests::it epochs::test_epoch_sync
+  stdout ───
+
+    running 1 test
+    test epochs::test_epoch_sync has been running for over 60 seconds
+
+    (test timed out)
+
+        PASS [  29.619s] (4/8) e2e-tests::it restarts::test_observer_reconnect_after_pause
+        SLOW [>120.000s] (─────) e2e-tests::it restarts::test_restarts_delayed
+        SLOW [>120.000s] (─────) e2e-tests::it restarts::test_restarts_lagged_delayed
+        PASS [ 174.304s] (5/8) e2e-tests::it restarts::test_restarts_delayed
+        PASS [  21.246s] (6/8) e2e-tests::it restarts::test_restarts_observer
+        PASS [ 177.247s] (7/8) e2e-tests::it restarts::test_restarts_lagged_delayed
+        PASS [  53.124s] (8/8) e2e-tests::it restarts::test_restartstt
+────────────
+     Summary [ 608.707s] 8 tests run: 7 passed (3 slow), 1 timed out, 3 skipped
+     TIMEOUT [ 360.012s] (3/8) e2e-tests::it epochs::test_epoch_sync
+error: test run failed

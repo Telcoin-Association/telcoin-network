@@ -29,7 +29,6 @@ members = [
     # execution
     "crates/batch-builder",
     "crates/batch-validator",
-    "crates/execution/faucet",
     "crates/execution/tn-rpc",
 ]
 
@@ -44,7 +43,7 @@ edition = "2021"
 # - .clippy.toml
 # - README.md
 # - Dockerfile
-rust-version = "1.91" # see note
+rust-version = "1.94" # see note
 license = "MIT OR Apache-2.0"
 homepage = "https://telcoin.network"
 repository = "https://github.com/telcoin/telcoin-network"
@@ -158,9 +157,6 @@ tn-rpc = { path = "./crates/execution/tn-rpc" }
 state-sync = { path = "./crates/state-sync" }
 tn-utils = { path = "./crates/tn-utils" }
 telcoin-network-cli = { path = "./crates/telcoin-network-cli" }
-
-# optional
-tn-faucet = { path = "./crates/execution/faucet" }
 
 # consensus
 tn-executor = { path = "./crates/consensus/executor" }

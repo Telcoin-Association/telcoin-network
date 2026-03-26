@@ -91,8 +91,8 @@ impl WorkerNetworkHandle {
         peer_bls: BlsPublicKey,
         sealed_batch: SealedBatch,
     ) -> NetworkResult<()> {
-        // TODO- issue 237- should we sign these batches and check the sig before accepting any
-        // batches during consensus?
+        // We use libp2p auth to verify any batches come from CVVs (no need to add extra
+        // signatures).
         let request = WorkerRequest::ReportBatch { sealed_batch };
         let res = self.handle.send_request(request, peer_bls).await?;
         let res = res.await??;
@@ -202,7 +202,7 @@ impl WorkerNetworkHandle {
                     .push(*batch);
             }
             let mut futures = FuturesUnordered::new();
-            for (peer, batch_digests) in peers.iter().zip(batch_of_batches.into_iter()) {
+            for (peer, batch_digests) in peers.iter().zip(batch_of_batches) {
                 if !batch_digests.is_empty() {
                     futures.push(self.request_batches_from_peer(
                         *peer,
@@ -526,7 +526,7 @@ impl<DB: Database> PrimaryToWorkerClient for PrimaryReceiverHandler<DB> {
                 "fetch_batches() is unsupported via RPC interface, please call via local worker handler instead".to_string(),
             ));
         };
-        let batches = batch_fetcher.fetch(digests).await;
+        let batches = batch_fetcher.fetch(digests).await?;
         Ok(FetchBatchResponse { batches })
     }
 }

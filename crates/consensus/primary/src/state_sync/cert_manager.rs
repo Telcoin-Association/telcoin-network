@@ -61,7 +61,10 @@ where
     }
 
     fn gc_round(&self) -> Round {
-        gc_round(self.consensus_bus.committed_round(), self.config.config().parameters.gc_depth)
+        gc_round(
+            self.consensus_bus.app().committed_round(),
+            self.config.config().parameters.gc_depth,
+        )
     }
 
     /// Process verified certificate.
@@ -202,7 +205,7 @@ where
                 .map_err(|_| CertManagerError::FatalAppendParent)?;
 
             // notify ExEx subscribers about peer certificate
-            let _ = self.consensus_bus.exex_peer_certificates().send(cert.clone());
+            let _ = self.consensus_bus.app().exex_peer_certificates().send(cert.clone());
 
             // send to consensus for processing into the DAG
             self.consensus_bus.new_certificates().send(cert).await.inspect_err(|e| {
