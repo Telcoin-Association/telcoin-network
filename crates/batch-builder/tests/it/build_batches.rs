@@ -19,7 +19,7 @@ use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator},
     test_genesis, Address, Batch, BatchValidation, BlockHash, Bytes, Certificate, CertifiedBatch,
     CommittedSubDag, ConsensusOutput, Database, Encodable2718, GenesisAccount, ReputationScores,
-    SealedBatch, TaskManager, U160, U256,
+    SealedBatch, TaskManager, MIN_PROTOCOL_BASE_FEE, U160, U256,
 };
 use tn_worker::{test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle};
 use tokio::time::timeout;
@@ -78,7 +78,7 @@ async fn test_make_batch_el_to_cl() {
         Duration::from_secs(1),
         task_manager.get_spawner(),
         0,
-        BaseFeeContainer::default(),
+        MIN_PROTOCOL_BASE_FEE,
         0,
     );
 
@@ -237,7 +237,7 @@ async fn test_batch_builder_produces_valid_batches() {
         Duration::from_secs(1),
         task_manager.get_spawner(),
         0,
-        BaseFeeContainer::default(),
+        MIN_PROTOCOL_BASE_FEE,
         0,
     );
 
@@ -414,7 +414,7 @@ async fn test_canonical_notification_updates_pool() {
         Duration::from_secs(1),
         task_manager.get_spawner(),
         0,
-        BaseFeeContainer::default(),
+        MIN_PROTOCOL_BASE_FEE,
         0,
     );
 
