@@ -252,10 +252,7 @@ impl<DB: Database> Subscriber<DB> {
     /// This method is called on startup to retrieve the needed information to build the next
     /// `ConsensusHeader` off of this parent.
     async fn get_last_executed_consensus(&self) -> SubscriberResult<(BlockHash, u64)> {
-        let result = last_consensus_parent(
-            &self.consensus_bus,
-            &self.inner.consensus_chain,
-        ).await;
+        let result = last_consensus_parent(&self.consensus_bus, &self.inner.consensus_chain).await;
 
         info!(
             target: "subscriber",

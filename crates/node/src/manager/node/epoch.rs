@@ -36,9 +36,9 @@ use tn_storage::tables::{
 };
 use tn_types::{
     gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash, BlockNumHash, BlsPublicKey,
-    Committee, CommitteeBuilder, ConsensusOutput,
-    Database as TNDatabase, Epoch, EpochRecord, Multiaddr, NetworkPublicKey, Notifier,
-    TaskJoinError, TaskManager, TaskSpawner, TnReceiver, B256,
+    Committee, CommitteeBuilder, ConsensusOutput, Database as TNDatabase, Epoch, EpochRecord,
+    Multiaddr, NetworkPublicKey, Notifier, TaskJoinError, TaskManager, TaskSpawner, TnReceiver,
+    B256,
 };
 use tn_worker::{quorum_waiter::QuorumWaiterTrait, Worker, WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::mpsc;
@@ -378,10 +378,8 @@ where
                     consensus_header.sub_dag.leader_epoch()
                 ));
             }
-            let consensus_output = self
-                .consensus_chain
-                .get_consensus_output_current(consensus_header.number)
-                .await?;
+            let consensus_output =
+                self.consensus_chain.get_consensus_output_current(consensus_header.number).await?;
             let is_epoch_close = consensus_output.committed_at() >= self.epoch_boundary;
             let output_hash = consensus_output.consensus_header_hash();
             if let Err(e) = self.process_output(to_engine, consensus_output).await {
