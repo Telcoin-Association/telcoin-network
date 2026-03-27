@@ -66,6 +66,10 @@ pub(crate) struct EpochManager<P, DB> {
     /// The last consenses header for a closing epoch.
     last_consensus_header: Option<ConsensusHeader>,
 
+    /// Track the last consensus number that was actually forwarded to the execution engine.
+    /// This prevents waiting on consensus that was saved to the DB but never sent to the engine.
+    last_forwarded_consensus_number: u64,
+
     /// Access to the epoch pack files storing consensus data.
     consensus_chain: ConsensusChain,
 }
@@ -188,6 +192,7 @@ where
             consensus_bus,
             worker_event_stream,
             last_consensus_header: None,
+            last_forwarded_consensus_number: 0,
             consensus_chain,
         }
     }

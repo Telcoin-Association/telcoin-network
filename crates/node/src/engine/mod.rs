@@ -151,7 +151,7 @@ impl ExecutionNode {
         worker_id: WorkerId,
         block_provider_sender: BatchSender,
         task_spawner: &TaskSpawner,
-        base_fee: BaseFeeContainer,
+        base_fee: u64,
         epoch: Epoch,
     ) -> eyre::Result<()> {
         let mut guard = self.internal.write().await;

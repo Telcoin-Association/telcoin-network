@@ -93,7 +93,9 @@ use reth_revm::{
     db::{states::bundle_state::BundleRetention, BundleState},
     DatabaseCommit, State,
 };
-use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
+use reth_transaction_pool::{
+    blobstore::DiskFileBlobStore, EthTransactionPool, TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER,
+};
 use rpc_server_args::RpcServerArgs;
 use serde_json::Value;
 use std::{
@@ -139,7 +141,7 @@ pub use reth_node_core::{
     node_config::DEFAULT_PERSISTENCE_THRESHOLD,
 };
 pub use reth_primitives_traits::crypto::secp256k1::sign_message;
-pub use reth_provider::CanonStateNotificationStream;
+pub use reth_provider::{CanonStateNotificationStream, ChangedAccount};
 pub use reth_rpc_eth_types::EthApiError;
 pub use reth_tracing::{FileWorkerGuard, Layers};
 pub use reth_transaction_pool::{
@@ -288,8 +290,14 @@ impl RethConfig {
     ) -> Self {
         // create a reth DatadirArgs from tn datadir
         let datadir = path_to_datadir(datadir.as_ref());
+        let RethCommand { mut rpc, mut txpool, db } = reth_config;
 
-        let RethCommand { mut rpc, txpool, db } = reth_config;
+        // TN default: 256 slots per sender (Reth default is 16).
+        // Only apply if user hasn't explicitly set a custom value via --txpool.max-account-slots.
+        if txpool.max_account_slots == TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER {
+            txpool.max_account_slots = 256;
+        }
+
         Self::validate_rpc_modules(&mut rpc.http_api);
         Self::validate_rpc_modules(&mut rpc.ws_api);
         // We don't just use Default for these Reth args.
