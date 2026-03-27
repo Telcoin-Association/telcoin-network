@@ -2,7 +2,7 @@
 
 use crate::{errors::SubscriberResult, SubscriberError};
 use futures::{stream::FuturesOrdered, StreamExt};
-use state_sync::{last_executed_consensus_block, save_consensus, spawn_state_sync};
+use state_sync::{last_consensus_parent, save_consensus, spawn_state_sync};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
@@ -252,36 +252,19 @@ impl<DB: Database> Subscriber<DB> {
     /// This method is called on startup to retrieve the needed information to build the next
     /// `ConsensusHeader` off of this parent.
     async fn get_last_executed_consensus(&self) -> SubscriberResult<(BlockHash, u64)> {
-        // Load the consensus block associated with the latest executed EVM block.
-        // This can lag when outputs were processed but execution was skipped (empty rounds).
-        let last_executed_block =
-            last_executed_consensus_block(&self.consensus_bus, &self.inner.consensus_chain)
-                .await
-                .unwrap_or_default();
-
-        // Use the latest persisted consensus header as startup parent when it is newer.
-        // replay_missed_consensus + wait_for_consensus_execution ensures this header has already
-        // been processed by execution (including skipped rounds).
-        let last_db_block = self
-            .inner
-            .consensus_chain
-            .consensus_header_latest()
-            .await
-            .unwrap_or_default()
-            .unwrap_or(last_executed_block.clone());
-        let parent = if last_db_block.number > last_executed_block.number {
-            last_db_block
-        } else {
-            last_executed_block
-        };
+        let result = last_consensus_parent(
+            &self.consensus_bus,
+            &self.inner.consensus_chain,
+        ).await;
 
         info!(
             target: "subscriber",
-            ?parent,
-            "restoring last executed consensus for constucting the next ConsensusHeader:"
+            parent_hash = ?result.0,
+            parent_number = result.1,
+            "restoring last executed consensus for constructing the next ConsensusHeader:"
         );
 
-        Ok((parent.digest(), parent.number))
+        Ok(result)
     }
 
     /// Main loop connecting to the consensus to listen to sequence messages.
