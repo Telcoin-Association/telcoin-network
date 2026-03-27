@@ -76,7 +76,7 @@ async fn manage_epoch_votes(
     let mut reached_quorum = false;
     let mut timeout = Duration::from_millis(2500);
     let mut timeouts = 0;
-    let mut alt_recs: HashMap<B256, HashSet<BlsPublicKey>> = HashMap::default();
+    let mut alt_recs: HashMap<B256, usize> = HashMap::default();
     let mut committee_keys: HashSet<BlsPublicKey> = epoch_rec.committee.iter().copied().collect();
     let committee_size = committee_keys.len() as u64;
     let quorum = epoch_rec.super_quorum();
@@ -110,11 +110,12 @@ async fn manage_epoch_votes(
                                 }
                             }
                         } else if vote.epoch_hash != epoch_hash {
-                            // Track votes for alternative epoch records using unique voter sets
-                            if epoch_rec.committee.contains(&vote.public_key) {
-                                let voters = alt_recs.entry(vote.epoch_hash).or_default();
-                                voters.insert(vote.public_key);
-                                if voters.len() >= quorum {
+                            // Track votes for alternative epoch records — remove key so
+                            // a validator can only vote once (correct or alt), no equivocation.
+                            if committee_keys.remove(&vote.public_key) {
+                                let count = alt_recs.entry(vote.epoch_hash).or_default();
+                                *count += 1;
+                                if *count >= quorum {
                                     error!(
                                         target: "epoch-manager",
                                         "Reached quorum on epoch record {} instead of {}.",
