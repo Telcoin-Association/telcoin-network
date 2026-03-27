@@ -260,6 +260,18 @@ impl WorkerTxPool {
         self.0.add_transaction(TransactionOrigin::External, eth_tx).await
     }
 
+    /// Adds an already-recovered external transaction to the pool, avoiding redundant ECDSA
+    /// recovery. Used to submit gossipped transactions.
+    pub async fn add_recovered_transaction_external(
+        &self,
+        recovered: Recovered<TransactionSigned>,
+    ) -> Result<AddedTransactionOutcome, crate::PoolError> {
+        let hash = *recovered.hash();
+        let eth_tx = EthPooledTransaction::try_from_consensus(recovered)
+            .map_err(|_| PoolError::other(hash, "Failed to create pooled tx".to_string()))?;
+        self.0.add_transaction(TransactionOrigin::External, eth_tx).await
+    }
+
     /// Adds a local (NOT external) transaction to the pool and subscribes to transaction events.
     pub async fn add_transaction_and_subscribe_local(
         &self,
