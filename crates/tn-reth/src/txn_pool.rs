@@ -51,14 +51,6 @@ pub fn new_pool_txn(transaction: EthPooledTransaction, transaction_id: PoolTxnId
     }
 }
 
-/// Decode transaction bytes back to a ['TransactionSigned'].
-pub fn bytes_to_txn(tx_bytes: &[u8]) -> eyre::Result<TransactionSigned> {
-    let recovered = reth_recover_raw_transaction::<TransactionSigned>(tx_bytes)
-        .map_err(|_| eyre::eyre!("failed to recover transaction"))?;
-
-    Ok(recovered.into_inner())
-}
-
 /// Trait on a transaction pool to produce the best transaction.
 pub trait TxPool {
     /// Return an iterator over the best transactions in a pool.
