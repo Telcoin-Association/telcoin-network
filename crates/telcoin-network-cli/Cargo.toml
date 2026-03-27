@@ -43,6 +43,7 @@ tracing-subscriber = { workspace = true, default-features = false, features = [
 ] }
 tracing-opentelemetry = { workspace = true }
 
+alloy = { workspace = true }
 tn-types = { workspace = true }
 tn-node = { workspace = true }
 tn-reth = { workspace = true }
@@ -50,6 +51,7 @@ tn-config = { workspace = true }
 rayon = { workspace = true }
 dirs-next = { workspace = true }
 bs58 = { workspace = true }
+serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 
 [dev-dependencies]
