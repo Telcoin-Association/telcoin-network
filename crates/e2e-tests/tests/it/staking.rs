@@ -20,7 +20,7 @@ use tn_reth::{
     NewCanonicalChain, RethChainSpec, RethEnv,
 };
 use tn_types::{
-    generate_proof_of_possession_bls, test_utils::CommandParser, Address, BlsKeypair,
+    generate_proof_of_possession_bls_for_test, test_utils::CommandParser, Address, BlsKeypair,
     GenesisAccount, NodeP2pInfo, SealedHeader, TaskManager, B256, MIN_PROTOCOL_BASE_FEE, U256,
 };
 
@@ -68,6 +68,8 @@ fn execute_and_commit(
 /// E2E: generate keys via CLI keytool → stake on local ConsensusRegistry → verify committee.
 #[tokio::test]
 async fn test_cli_keygen_to_stake() -> eyre::Result<()> {
+    let _permit = super::common::acquire_test_permit();
+
     // ── 1. Create initial validators with deterministic BLS keys ──
     let initial_addresses = [
         Address::from_slice(&[0x11; 20]),
@@ -83,7 +85,8 @@ async fn test_cli_keygen_to_stake() -> eyre::Result<()> {
         .map(|(i, addr)| {
             let mut rng = StdRng::seed_from_u64(i as u64);
             let bls = BlsKeypair::generate(&mut rng);
-            let pop = generate_proof_of_possession_bls(&bls, addr).expect("pop generation failed");
+            let pop = generate_proof_of_possession_bls_for_test(&bls, addr)
+                .expect("pop generation failed");
             NodeInfo {
                 name: format!("validator-{i}"),
                 bls_public_key: *bls.public(),
