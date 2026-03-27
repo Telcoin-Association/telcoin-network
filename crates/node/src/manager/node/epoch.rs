@@ -514,6 +514,7 @@ where
         consensus_output: &mut impl TnReceiver<ConsensusOutput>,
         to_engine: &mpsc::Sender<ConsensusOutput>,
     ) -> Option<BlockHash> {
+        // Phase 1: Drain broadcast channel (existing behavior)
         while let Ok(output) = consensus_output.try_recv() {
             let result = if output.committed_at() >= self.epoch_boundary {
                 Some(output.consensus_header_hash())
@@ -526,6 +527,35 @@ where
                 return result;
             }
         }
+
+        // Phase 2: Check DB for outputs saved during subscriber shutdown drain.
+        // During shutdown, the subscriber saves outputs to the pack file DB but may not
+        // broadcast them through the channel. Scan for any gap between the last output
+        // we forwarded and the DB latest, loading missing entries from the pack file.
+        let latest_db = self.consensus_chain.latest_consensus_number();
+        let last_sent = self.last_forwarded_consensus_number;
+        if latest_db > last_sent {
+            for number in (last_sent + 1)..=latest_db {
+                match self.consensus_chain.get_consensus_output_current(number).await {
+                    Ok(output) => {
+                        let result = if output.committed_at() >= self.epoch_boundary {
+                            Some(output.consensus_header_hash())
+                        } else {
+                            None
+                        };
+                        let _ = self.process_output(to_engine, output).await;
+                        if result.is_some() {
+                            return result;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(target: "epoch-manager", number, ?e, "failed to load gap consensus from DB");
+                        break;
+                    }
+                }
+            }
+        }
+
         None
     }
 
