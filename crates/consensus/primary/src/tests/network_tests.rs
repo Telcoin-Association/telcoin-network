@@ -646,8 +646,7 @@ async fn test_vote_equivocation_per_authority() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_behind_consensus_not_active_cvv() {
     let temp_dir = TempDir::new().unwrap();
-    let TestTypes { handler, consensus_bus, .. } =
-        create_test_types(temp_dir.path()).await;
+    let TestTypes { handler, consensus_bus, .. } = create_test_types(temp_dir.path()).await;
 
     // Set node to inactive — behind_consensus should return false immediately
     consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
@@ -661,8 +660,7 @@ async fn test_behind_consensus_not_active_cvv() {
 #[tokio::test]
 async fn test_behind_consensus_committed_round_prevents_false_positive() {
     let temp_dir = TempDir::new().unwrap();
-    let TestTypes { handler, consensus_bus, .. } =
-        create_test_types(temp_dir.path()).await;
+    let TestTypes { handler, consensus_bus, .. } = create_test_types(temp_dir.path()).await;
 
     // Simulate: engine has only processed round 18 (stale), but consensus core
     // has committed through round 59 (current).
@@ -685,8 +683,7 @@ async fn test_behind_consensus_committed_round_prevents_false_positive() {
 #[tokio::test]
 async fn test_behind_consensus_genuinely_behind() {
     let temp_dir = TempDir::new().unwrap();
-    let TestTypes { handler, consensus_bus, .. } =
-        create_test_types(temp_dir.path()).await;
+    let TestTypes { handler, consensus_bus, .. } = create_test_types(temp_dir.path()).await;
 
     // Node was offline — both engine and consensus core are at round 5.
     // Incoming gossip is at round 60 in the same epoch.

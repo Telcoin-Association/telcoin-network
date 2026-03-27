@@ -115,9 +115,9 @@ where
         // In that case, rely on the most recent consensus round processed by the engine.
         let processed_consensus_round = self.consensus_bus.last_consensus_round();
         // The committed round is updated synchronously by the consensus core (Bullshark)
-        // when it commits certificates. This happens before the async engine pipeline processes them.
-        // Including it prevents false-positive "behind" detection when the engine lags
-        // behind a burst of empty consensus rounds.
+        // when it commits certificates. This happens before the async engine pipeline processes
+        // them. Including it prevents false-positive "behind" detection when the engine
+        // lags behind a burst of empty consensus rounds.
         let committed_round = self.consensus_bus.committed_round();
         let effective_exec_round = exec_round.max(processed_consensus_round).max(committed_round);
         let (last_consensus_number, _) = self.consensus_bus.published_consensus_num_hash();
