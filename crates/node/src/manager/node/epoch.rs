@@ -491,7 +491,11 @@ where
             // collector so it backfills any epoch certs that are missing (e.g. when
             // quorum failed AND the peer-fetch in manage_epoch_votes also failed because
             // the network channels had already closed after epoch shutdown).
-            self.consensus_bus.requested_missing_epoch().send_replace(previous_epoch);
+            // Never decrease requested_missing_epoch: if the gossip handler already set it
+            // to a higher epoch (e.g. 3 while we are opening epoch 3 with previous_epoch=2),
+            // keep the higher value so the collector retries that epoch too.
+            let current = *self.consensus_bus.requested_missing_epoch().borrow();
+            self.consensus_bus.requested_missing_epoch().send_replace(current.max(previous_epoch));
             rec
         } else if previous_epoch == 0 {
             EpochRecord {
@@ -507,7 +511,9 @@ where
             // catching up across multiple epoch boundaries - state sync feeds epoch-boundary
             // consensus to the engine faster than the epoch record collector fetches the records
             // from peers. Trigger the collector and wait up to 30 seconds for the record.
-            self.consensus_bus.requested_missing_epoch().send_replace(previous_epoch);
+            // Never decrease requested_missing_epoch (same reasoning as the found-record branch).
+            let current = *self.consensus_bus.requested_missing_epoch().borrow();
+            self.consensus_bus.requested_missing_epoch().send_replace(current.max(previous_epoch));
             warn!(target: "epoch-manager", previous_epoch, current_epoch, "missing previous epoch record, waiting for epoch record collector");
 
             // Pre-dial committee peers before blocking so the epoch record collector can connect.
