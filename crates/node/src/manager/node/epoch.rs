@@ -47,6 +47,14 @@ use tracing::{debug, error, info, info_span, warn, Instrument};
 /// The epoch-specific task manager name.
 const EPOCH_TASK_MANAGER: &str = "Epoch Task Manager";
 
+/// Result from replaying missed consensus outputs.
+struct ReplayResult {
+    /// If the epoch boundary was crossed during replay, this is the hash to close the epoch with.
+    epoch_close_hash: Option<BlockHash>,
+    /// The hash of the last consensus output that was actually forwarded to the engine.
+    last_replayed_hash: Option<BlockHash>,
+}
+
 /// Modes for an epoch.
 #[derive(Debug, Copy, Clone)]
 pub(crate) enum RunEpochMode {
@@ -92,6 +100,7 @@ where
         // channels.
         let consensus_bus = ConsensusBus::new_with_app(self.consensus_bus.clone());
         self.last_consensus_header = None;
+        self.last_forwarded_consensus_number = 0;
         // We have not created this epoch's primary yet (no committee) so get it from chain
         // ourselves... Note, any consensus output to replay should be in the same epoch...
         let (committee, epoch_info, epoch_start) =
@@ -109,25 +118,20 @@ where
             // If we are starting up then make sure that any consensus we previously validated goes
             // to the engine and is executed.  Otherwise we could miss consensus execution.
             gas_accumulator.rewards_counter().set_committee(committee.clone());
-            if let Some(target_hash) = self.replay_missed_consensus(committee, to_engine).await? {
+            let replay = self.replay_missed_consensus(committee, to_engine).await?;
+            if let Some(target_hash) = replay.epoch_close_hash {
                 // If things go down at exactly the wrong time we might have to replay the epoch end
                 // so account for that.
                 self.close_epoch(None, &gas_accumulator, target_hash).await?;
                 return Ok(RunEpochMode::NewEpoch);
             }
-        }
-        // If we are restarting the epoch not on a boundary
-        // and we sent some consensus output to the engine
-        // then we need to pause for the engine to execute.
-        // If we don't we can have races when the epoch restarts
-        // that will send consensus to the engine more than once.
-        if let Ok(Some(last_consensus_header)) =
-            self.consensus_chain.consensus_header_latest().await
-        {
-            let last_consensus_digest = last_consensus_header.digest();
-            info!(target: "epoch-manager", "Waiting for execution of consensus {last_consensus_digest}");
-            self.consensus_bus.wait_for_consensus_execution(last_consensus_digest).await?;
-            info!(target: "epoch-manager", "Confirmed execution of consensus {last_consensus_digest}");
+            // Only wait for consensus that was actually forwarded to the engine.
+            // Waiting on DB-latest consensus could hang if it was saved but never sent.
+            if let Some(last_hash) = replay.last_replayed_hash {
+                info!(target: "epoch-manager", "Waiting for execution of replayed consensus {last_hash}");
+                self.consensus_bus.wait_for_consensus_execution(last_hash).await?;
+                info!(target: "epoch-manager", "Confirmed execution of replayed consensus {last_hash}");
+            }
         }
 
         let node_ended = self.node_shutdown.subscribe();
@@ -360,9 +364,10 @@ where
         &mut self,
         committee: Committee,
         to_engine: &mpsc::Sender<ConsensusOutput>,
-    ) -> eyre::Result<Option<BlockHash>> {
+    ) -> eyre::Result<ReplayResult> {
         let missing =
             state_sync::get_missing_consensus(&self.consensus_bus, &self.consensus_chain).await?;
+        let mut last_replayed_hash = None;
         for consensus_header in missing.into_iter() {
             if consensus_header.sub_dag.leader_epoch() != committee.epoch() {
                 error!(target: "epoch-manager", "Crossed epoch boundary with missing execution! expected epoch {} got {}",
@@ -377,20 +382,21 @@ where
                 .consensus_chain
                 .get_consensus_output_current(consensus_header.number)
                 .await?;
-            let result = if consensus_output.committed_at() >= self.epoch_boundary {
-                Some(consensus_output.consensus_header_hash())
-            } else {
-                None
-            };
+            let is_epoch_close = consensus_output.committed_at() >= self.epoch_boundary;
+            let output_hash = consensus_output.consensus_header_hash();
             if let Err(e) = self.process_output(to_engine, consensus_output).await {
                 error!(target: "epoch-manager", "error sending consensus output to engine: {}", e);
                 return Err(e);
             }
-            if result.is_some() {
-                return Ok(result);
+            last_replayed_hash = Some(output_hash);
+            if is_epoch_close {
+                return Ok(ReplayResult {
+                    epoch_close_hash: Some(output_hash),
+                    last_replayed_hash,
+                });
             }
         }
-        Ok(None)
+        Ok(ReplayResult { epoch_close_hash: None, last_replayed_hash })
     }
 
     /// Create the current committee from the current execution state.  Also return the epoch info
@@ -488,6 +494,7 @@ where
         to_engine: &mpsc::Sender<ConsensusOutput>,
         mut output: ConsensusOutput,
     ) -> eyre::Result<()> {
+        self.last_forwarded_consensus_number = output.number();
         if output.committed_at() >= self.epoch_boundary {
             // update output so engine closes epoch
             output.close_epoch = true;
