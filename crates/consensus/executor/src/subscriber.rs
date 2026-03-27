@@ -357,13 +357,16 @@ impl<DB: Database> Subscriber<DB> {
                                 if let Ok(output) = output {
                                     if let Err(e) = save_consensus(
                                         self.config.node_storage(),
-                                        output,
+                                        output.clone(),
                                         &self.inner.authority_id,
                                         &mut consensus_chain,
                                     ).await {
                                         warn!(target: "subscriber", "error saving consensus during shutdown: {e}");
                                         break;
                                     }
+                                    // Best-effort broadcast: if epoch manager already exited, this is a no-op.
+                                    // The DB-aware drain (Phase 2) handles the gap regardless.
+                                    let _ = self.consensus_bus.consensus_output().send(output).await;
                                 }
                             }
                             _ = tokio::time::sleep_until(deadline) => {
