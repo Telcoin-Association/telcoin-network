@@ -324,18 +324,15 @@ where
                 exex_txs,
                 event_rxs,
             );
-            node_task_manager.get_spawner().spawn_critical_task(
-                "exex-manager",
-                async move {
-                    if let Err(e) = manager.await {
-                        tracing::error!(
-                            target: "exex",
-                            ?e,
-                            "ExEx manager failed"
-                        );
-                    }
-                },
-            );
+            node_task_manager.get_spawner().spawn_critical_task("exex-manager", async move {
+                if let Err(e) = manager.await {
+                    tracing::error!(
+                        target: "exex",
+                        ?e,
+                        "ExEx manager failed"
+                    );
+                }
+            });
             info!(target: "epoch-manager", "ExEx manager and tasks spawned");
         }
 

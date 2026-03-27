@@ -415,7 +415,11 @@ impl<DB: Database> Consensus<DB> {
                 }
 
                 // notify ExEx subscribers about committed sub-DAG
-                let _ = self.consensus_bus.app().exex_committed_sub_dags().send(committed_sub_dag.clone());
+                let _ = self
+                    .consensus_bus
+                    .app()
+                    .exex_committed_sub_dags()
+                    .send(committed_sub_dag.clone());
 
                 // NOTE: The size of the sub-dag can be arbitrarily large (depending on the network
                 // condition and Byzantine leaders).

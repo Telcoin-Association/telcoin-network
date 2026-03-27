@@ -138,10 +138,8 @@ impl futures::Future for TnExExManager {
         loop {
             match this.own_certs_stream.poll_next_unpin(cx) {
                 Poll::Ready(Some(Ok(cert))) => {
-                    let notification = TnExExNotification::CertificateAccepted {
-                        certificate: cert,
-                        is_own: true,
-                    };
+                    let notification =
+                        TnExExNotification::CertificateAccepted { certificate: cert, is_own: true };
                     this.fan_out(&notification);
                 }
                 Poll::Ready(Some(Err(e))) => {

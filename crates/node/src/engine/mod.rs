@@ -72,8 +72,7 @@ impl TnBuilder {
         F: FnOnce(tn_exex::TnExExContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = eyre::Result<()>> + Send + 'static,
     {
-        self.exex_fns
-            .push((name.into(), Box::new(|ctx| Box::pin(install_fn(ctx)))));
+        self.exex_fns.push((name.into(), Box::new(|ctx| Box::pin(install_fn(ctx)))));
         self
     }
 }
