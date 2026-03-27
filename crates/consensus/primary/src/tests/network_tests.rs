@@ -7,7 +7,7 @@ use crate::{
         MissingCertificatesRequest, RequestHandler,
     },
     state_sync::StateSynchronizer,
-    ConsensusBus, RecentBlocks,
+    ConsensusBus, ConsensusBusApp, NodeMode, RecentBlocks,
 };
 use assert_matches::assert_matches;
 use std::{
@@ -61,6 +61,8 @@ struct TestTypes<DB = MemDatabase> {
     /// num: 0
     /// hash: 0x78dec18c6d7da925bbe773c315653cdc70f6444ed6c1de9ac30bdb36cff74c3b
     parent: SealedHeader,
+    /// The consensus bus app for manipulating shared state in tests.
+    consensus_bus: ConsensusBusApp,
     /// Task manager the synchronizer (in RequestHandler) is spawned on.
     /// Save it so that task is not dropped early if needed.
     task_manager: TaskManager,
@@ -97,9 +99,10 @@ async fn create_test_types_with_params(path: &Path, params: Option<Parameters>) 
 
     let consensus_chain =
         ConsensusChain::new_for_test(path.to_owned(), committee.committee()).await.unwrap();
+    let consensus_bus = cb.app().clone();
     let handler =
         RequestHandler::new(config.clone(), cb.app().clone(), synchronizer, consensus_chain);
-    TestTypes { committee, handler, parent, task_manager }
+    TestTypes { committee, handler, parent, consensus_bus, task_manager }
 }
 
 /// Helper function to create an instance of [RequestHandler] for the first authority in the
@@ -631,4 +634,65 @@ async fn test_vote_equivocation_per_authority() -> eyre::Result<()> {
     );
 
     Ok(())
+}
+
+// ============================================================================
+// behind_consensus Tests
+// ============================================================================
+// These tests verify the behind_consensus detection logic, including the fix
+// for false-positive detection when the engine lags behind consensus commits.
+
+/// Non-active CVV should never be considered behind.
+#[tokio::test]
+async fn test_behind_consensus_not_active_cvv() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, consensus_bus, .. } = create_test_types(temp_dir.path()).await;
+
+    // Set node to inactive — behind_consensus should return false immediately
+    consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
+
+    let result = handler.behind_consensus(0, 999, None).await;
+    assert!(!result, "non-active CVV should never report as behind");
+}
+
+/// When the engine's processed_round lags but committed_round is current,
+/// behind_consensus should return false (the node IS participating in consensus).
+#[tokio::test]
+async fn test_behind_consensus_committed_round_prevents_false_positive() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, consensus_bus, .. } = create_test_types(temp_dir.path()).await;
+
+    // Simulate: engine has only processed round 18 (stale), but consensus core
+    // has committed through round 59 (current).
+    // Default gc_depth is 50, safety buffer subtracts 10 → effective gc_depth = 40.
+    // Without the fix: effective_exec_round = 18, 18 + 40 = 58 < 59 → false positive!
+    // With the fix: effective_exec_round = max(0, 18, 59) = 59, 59 + 40 = 99 > 59 → correct.
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(18, BlockNumHash::new(0, B256::default()), None);
+    consensus_bus.recent_blocks().send_replace(recent);
+
+    // Set committed round to 59 (as Bullshark would)
+    consensus_bus.committed_round_updates().send_replace(59);
+
+    // Incoming certificate at round 59 in the same epoch (0)
+    let result = handler.behind_consensus(0, 59, None).await;
+    assert!(!result, "committed_round should prevent false-positive behind detection");
+}
+
+/// When both engine and committed round are genuinely behind, detection should trigger.
+#[tokio::test]
+async fn test_behind_consensus_genuinely_behind() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, consensus_bus, .. } = create_test_types(temp_dir.path()).await;
+
+    // Node was offline — both engine and consensus core are at round 5.
+    // Incoming gossip is at round 60 in the same epoch.
+    // effective_exec_round = max(0, 5, 5) = 5, gc_depth = 40, 5 + 40 = 45 < 60 → behind.
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(5, BlockNumHash::new(0, B256::default()), None);
+    consensus_bus.recent_blocks().send_replace(recent);
+    consensus_bus.committed_round_updates().send_replace(5);
+
+    let result = handler.behind_consensus(0, 60, None).await;
+    assert!(result, "genuinely behind node should be detected");
 }

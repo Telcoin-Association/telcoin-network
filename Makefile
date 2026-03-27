@@ -108,6 +108,10 @@ test-faucet:
 test-restarts:
 	cargo nextest run --run-ignored all test_restarts ;
 
+# run e2e tests
+test-e2e:
+	cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features ;
+
 # run tests with coverage (using llvm-cov + nextest)
 coverage:
 	cargo llvm-cov nextest --workspace --exclude tn-faucet --no-fail-fast ;

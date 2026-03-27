@@ -171,7 +171,7 @@ sol!(
         /// Mint an NFT for validator to stake.
         function mint(address validatorAddress) external override onlyOwner;
         /// Stake to the consensus registry.
-        function stake(bytes calldata blsPubkey, ProofOfPossession calldata proofOfPossession) external override onlyOwner;
+        function stake(bytes calldata blsPubkey, ProofOfPossession calldata proofOfPossession) external override;
         /// Activate node for committee selection.
         /// Normally called by staker after node is synced.
         function activate() external override whenNotPaused;

@@ -18,7 +18,8 @@ use tn_storage::{
     tables::{ConsensusHeaderCache, NodeBatchesCache},
 };
 use tn_types::{
-    AuthorityIdentifier, ConsensusHeader, ConsensusOutput, Database, Epoch, TaskSpawner, TnSender,
+    AuthorityIdentifier, BlockHash, ConsensusHeader, ConsensusOutput, Database, Epoch, TaskSpawner,
+    TnSender,
 };
 use tracing::{debug, error, info, warn};
 
@@ -141,6 +142,24 @@ pub async fn last_executed_consensus_block(
     let last = consensus_bus.last_executed_consensus_block(consensus_chain).await;
     debug!(target: "state-sync", ?last, "last executed consensus block");
     last
+}
+
+/// Return the (hash, number) to use as parent for the next ConsensusHeader.
+/// Accounts for outputs committed to DB but not yet executed (which
+/// replay_missed_consensus handles before the subscriber starts).
+pub async fn last_consensus_parent(
+    consensus_bus: &ConsensusBusApp,
+    consensus_chain: &ConsensusChain,
+) -> (BlockHash, u64) {
+    let last_executed =
+        last_executed_consensus_block(consensus_bus, consensus_chain).await.unwrap_or_default();
+    let last_db = consensus_chain
+        .consensus_header_latest()
+        .await
+        .unwrap_or_default()
+        .unwrap_or_else(|| last_executed.clone());
+    let parent = if last_db.number > last_executed.number { last_db } else { last_executed };
+    (parent.digest(), parent.number)
 }
 
 /// Collect and return any consensus headers that were not executed before last shutdown.

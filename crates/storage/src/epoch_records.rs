@@ -22,6 +22,7 @@ use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     oneshot, watch,
 };
+use tracing::error;
 
 use crate::archive::{
     digest_index::index::HdxIndex,
@@ -85,21 +86,25 @@ fn run_db_loop(
         match msg {
             EpochDbMessage::SaveDummy0Record(record) => {
                 if let Err(e) = inner.save_dummy_epoch0(record) {
+                    error!(target: "epoch-db", %e, "failed to save dummy epoch 0 record");
                     tx_error.send_replace(Some(e));
                 }
             }
             EpochDbMessage::SaveRecord(record) => {
                 if let Err(e) = inner.save_record(record) {
+                    error!(target: "epoch-db", %e, "failed to save epoch record");
                     tx_error.send_replace(Some(e));
                 }
             }
             EpochDbMessage::Save(record, cert) => {
                 if let Err(e) = inner.save(record, cert) {
+                    error!(target: "epoch-db", %e, "failed to save epoch record and certificate");
                     tx_error.send_replace(Some(e));
                 }
             }
             EpochDbMessage::SaveCertificate(digest, cert) => {
                 if let Err(e) = inner.save_certificate(digest, cert) {
+                    error!(target: "epoch-db", %e, "failed to save epoch certificate");
                     tx_error.send_replace(Some(e));
                 }
             }
@@ -378,17 +383,14 @@ impl EpochRecordDb {
     }
 
     /// Find the epoch for a consensus header number.
-    /// None if the number is greater than expected.
+    ///
+    /// Uses binary search (`partition_point`) over `final_numbers` for O(log n)
+    /// lookup. The vector is guaranteed sorted because [`update_finals`] enforces
+    /// sequential epoch insertion. If `number` is beyond the last stored epoch,
+    /// returns `last_epoch + 1` (the current in-progress epoch).
     pub fn number_to_epoch(&self, number: u64) -> Epoch {
-        let mut final_epoch = None;
-        for (epoch, final_number) in self.final_numbers.lock().iter().enumerate() {
-            if number <= *final_number {
-                return epoch as u32;
-            }
-            final_epoch = Some(epoch);
-        }
-        // if we are above the last saved record then we should be at the last saved + 1.
-        final_epoch.map(|e| e + 1).unwrap_or_default() as u32
+        let finals = self.final_numbers.lock();
+        finals.partition_point(|final_num| number > *final_num) as u32
     }
 }
 
