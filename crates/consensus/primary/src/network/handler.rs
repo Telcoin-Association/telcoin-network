@@ -797,6 +797,12 @@ where
         number: u64,
         hash: BlockHash,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
+        let mut my_number = self.consensus_chain.latest_consensus_number();
+        // If we are one behind then wait to catch up.
+        while my_number + 1 == number {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            my_number = self.consensus_chain.latest_consensus_number();
+        }
         let header = self.get_header_by_hash(number, hash).await?;
         Ok(PrimaryResponse::ConsensusHeader(Arc::new(header)))
     }
