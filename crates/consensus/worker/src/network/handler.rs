@@ -6,7 +6,7 @@ use super::{
 };
 use crate::network::{stream_codec, PendingBatchStream};
 use futures::AsyncWriteExt as _;
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{GossipMessage, Stream};
 use tn_network_types::{WorkerOthersBatchMessage, WorkerToPrimaryClient};
@@ -15,6 +15,11 @@ use tn_types::{
     ensure, now, try_decode, BatchValidation, BlsPublicKey, Database, SealedBatch, WorkerId, B256,
 };
 use tracing::{debug, warn};
+
+/// Total timeout for sending all batches over a stream.
+/// Prevents slow-reader attacks where a peer accepts a stream but never reads.
+/// Set for 500MB through emerging market worse-case 20MB/s upload
+const SEND_STREAM_TIMEOUT: Duration = Duration::from_secs(200);
 
 /// The type that handles requests from peers.
 ///
@@ -170,15 +175,26 @@ where
         );
 
         let store = self.consensus_config.node_storage();
-        if let Err(e) = stream_codec::send_batches_over_stream(
-            &mut stream,
-            store,
-            &request.batch_digests,
-            request.epoch,
+
+        // set timeout to prevent slow-read attack
+        match tokio::time::timeout(
+            SEND_STREAM_TIMEOUT,
+            stream_codec::send_batches_over_stream(
+                &mut stream,
+                store,
+                &request.batch_digests,
+                request.epoch,
+            ),
         )
         .await
         {
-            warn!(target: "worker::network", %peer, ?e, "failed to send batches over stream");
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                warn!(target: "worker::network", %peer, ?e, "failed to send batches over stream");
+            }
+            Err(_elapsed) => {
+                warn!(target: "worker::network", %peer, ?request_digest, "sending batches stream timed out");
+            }
         }
 
         // attempt to close the stream gracefully

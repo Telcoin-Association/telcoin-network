@@ -19,7 +19,7 @@ use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
 use crate::{
-    network::{stream_codec, Req, Res},
+    network::{stream_codec, Req, Res, MAX_BATCH_DIGESTS_PER_REQUEST},
     WorkerGossip, WorkerRPCError, WorkerRequest, WorkerResponse,
 };
 
@@ -126,7 +126,7 @@ impl WorkerNetworkHandle {
         requested_digests: &mut HashSet<BlockHash>,
     ) -> NetworkResult<Vec<(BlockHash, Batch)>> {
         let peers = self.handle.connected_peers().await?;
-        if requested_digests.is_empty() || peers.is_empty() {
+        if peers.is_empty() {
             return Ok(vec![]);
         }
 
@@ -139,8 +139,25 @@ impl WorkerNetworkHandle {
                 break;
             }
 
+            // cap digests for this peer and send remainder to subsequent peers
+            // this should never happen
+            let peer_batch;
+            let digests_for_peer = if requested_digests.len() > MAX_BATCH_DIGESTS_PER_REQUEST {
+                warn!(
+                    target: "worker::network",
+                    total = requested_digests.len(),
+                    max = MAX_BATCH_DIGESTS_PER_REQUEST,
+                    "truncating oversized digest set for peer request"
+                );
+                peer_batch =
+                    requested_digests.iter().copied().take(MAX_BATCH_DIGESTS_PER_REQUEST).collect();
+                &peer_batch
+            } else {
+                &*requested_digests
+            };
+
             // loop: update remaining batches or log error
-            match self.request_batches_from_peer(peer, requested_digests).await {
+            match self.request_batches_from_peer(peer, digests_for_peer).await {
                 Ok(batches) => {
                     for (digest, batch) in batches {
                         if requested_digests.remove(&digest) {
@@ -268,22 +285,16 @@ impl WorkerNetworkHandle {
         stream: &mut S,
         requested_digests: &HashSet<BlockHash>,
     ) -> NetworkResult<Vec<(BlockHash, Batch)>> {
-        let max_size = max_batch_size(self.epoch);
         // allocate reusable buffers
         //
         // SAFETY: num of requests capped by `MAX_PENDING_BATCH_REQUESTS`
+        let max_size = max_batch_size(self.epoch);
         let mut decode_buffer = Vec::with_capacity(max_size);
         let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(max_size));
 
-        // SAFETY:
-        // TODO:
-        // - requested_digests capped by per msg max (1MB)
-        // - ~33k digest max per request (32 bytes)
-        // - !!!!! theoretical 33GB allocation
-        // - how does this allocation work with `Vec<u8>` in Batch?
-        //
-        //
-        //
+        // SAFETY: requested_digests is capped to MAX_BATCH_DIGESTS_PER_REQUEST (500) above.
+        // Worst-case allocation: 500 entries of (B256, Batch) where each batch is up to 1MB.
+        // This bounds memory to ~500MB rather than the theoretical ~33GB from 33k digests.
         let mut batches = Vec::with_capacity(requested_digests.len());
         let mut received_digests = HashSet::with_capacity(requested_digests.len());
 

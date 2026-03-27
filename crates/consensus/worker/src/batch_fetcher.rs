@@ -249,6 +249,60 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[tokio::test]
+    async fn test_validate_empty_stream_with_oversized_digest_set() {
+        // create 501 dummy digests (exceeds MAX_BATCH_DIGESTS_PER_REQUEST = 500)
+        let digests: HashSet<BlockHash> = (0..501u64)
+            .map(|i| {
+                let mut bytes = [0u8; 32];
+                bytes[..8].copy_from_slice(&i.to_le_bytes());
+                B256::from(bytes)
+            })
+            .collect();
+        assert_eq!(digests.len(), 501);
+
+        // empty stream (immediately closes) — no batches to read
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+
+        let task_manager = TaskManager::default();
+        let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
+
+        // should truncate and return Ok(vec![]) instead of Err(ProtocolError)
+        let result = handle.read_and_validate_batches_with_timeout(&mut cursor, &digests).await;
+        let validated = result.expect("should truncate gracefully, not error");
+        assert!(validated.is_empty());
+    }
+
+    /// Test that `read_and_validate_batches_with_timeout` returns Ok with only the
+    /// batches present in the stream when the stream closes before all requested
+    /// digests are fulfilled.
+    #[tokio::test]
+    async fn test_validate_partial_stream_fulfillment() {
+        let all_batches = create_test_batches(5);
+        let all_digests: HashSet<BlockHash> = all_batches.iter().map(|b| b.digest()).collect();
+        assert_eq!(all_digests.len(), 5);
+
+        // only encode 3 of the 5 batches into the stream
+        let partial_batches = &all_batches[..3];
+        let bytes = encode_batches_to_stream_bytes(partial_batches).await;
+        let mut cursor = Cursor::new(bytes);
+
+        let task_manager = TaskManager::default();
+        let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
+
+        // pass all 5 digests but stream only has 3
+        let result = handle.read_and_validate_batches_with_timeout(&mut cursor, &all_digests).await;
+        let validated = result.expect("should succeed with partial fulfillment");
+
+        assert_eq!(validated.len(), 3, "should return only the 3 batches from the stream");
+
+        // verify returned digests match the 3 encoded batches
+        let validated_digests: HashSet<BlockHash> = validated.iter().map(|(d, _)| *d).collect();
+        let expected_digests: HashSet<BlockHash> =
+            partial_batches.iter().map(|b| b.digest()).collect();
+        assert_eq!(validated_digests, expected_digests);
+    }
+
     // ============================================================================
     // BatchFetcher Local-Only Tests
     // ============================================================================

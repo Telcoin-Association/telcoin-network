@@ -12,7 +12,7 @@ use tn_test_utils::CommitteeFixture;
 use tn_types::{BlsPublicKey, SealedBatch, TaskManager, B256};
 use tn_worker::{
     PendingBatchStream, RequestHandler, WorkerGossip, WorkerNetworkError, WorkerNetworkHandle,
-    WorkerRequest, WorkerResponse,
+    WorkerRequest, WorkerResponse, MAX_BATCH_DIGESTS_PER_REQUEST,
 };
 use tokio::sync::mpsc;
 
@@ -374,4 +374,108 @@ async fn test_stream_error_penalties() {
     let stream_closed = WorkerNetworkError::StreamClosed;
     let penalty: Option<Penalty> = stream_closed.into();
     assert!(penalty.is_none(), "StreamClosed should have no penalty");
+}
+
+// ============================================================================
+// Truncation & Peer Fallback Tests
+// ============================================================================
+
+/// Test that request_batches truncates >500 digests to exactly MAX_BATCH_DIGESTS_PER_REQUEST.
+#[tokio::test]
+async fn test_request_batches_truncates_oversized_digests() {
+    let (tx, mut rx) = mpsc::channel(10);
+    let task_manager = TaskManager::default();
+    let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0);
+
+    let fixture = tn_test_utils::CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .build();
+    let peer1 = fixture.first_authority().primary_public_key();
+
+    tokio::spawn(async move {
+        while let Some(cmd) = rx.recv().await {
+            match cmd {
+                NetworkCommand::ConnectedPeers { reply } => {
+                    reply.send(vec![peer1]).expect("send peers");
+                }
+                NetworkCommand::SendRequest { request, reply, .. } => {
+                    if let WorkerRequest::RequestBatchesStream { batch_digests, .. } = request {
+                        // assert truncation happened
+                        assert_eq!(
+                            batch_digests.len(),
+                            MAX_BATCH_DIGESTS_PER_REQUEST,
+                            "digests should be truncated to MAX_BATCH_DIGESTS_PER_REQUEST (500)"
+                        );
+                        // reject to end the test
+                        reply
+                            .send(Ok(WorkerResponse::RequestBatchesStream { ack: false }))
+                            .expect("send reject");
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+
+    // create 600 digests (exceeds the 500 cap)
+    let mut digests: HashSet<B256> = (0..600u64)
+        .map(|i| {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&i.to_le_bytes());
+            B256::from(bytes)
+        })
+        .collect();
+    assert_eq!(digests.len(), 600);
+
+    let result = handle.pub_request_batches(&mut digests).await;
+    // peer rejected so we get an error (but truncation was verified above)
+    assert!(result.is_err());
+}
+
+/// Test that when peer 1 rejects, peer 2 receives the same (unchanged) digests.
+#[tokio::test]
+async fn test_request_batches_peer_fallback_preserves_digests() {
+    let (tx, mut rx) = mpsc::channel(10);
+    let task_manager = TaskManager::default();
+    let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0);
+
+    let fixture = tn_test_utils::CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .build();
+    let peer1 = fixture.first_authority().primary_public_key();
+    let peer2 = fixture.last_authority().primary_public_key();
+
+    let expected_count = 3;
+    tokio::spawn(async move {
+        let mut request_count = 0u32;
+        while let Some(cmd) = rx.recv().await {
+            match cmd {
+                NetworkCommand::ConnectedPeers { reply } => {
+                    reply.send(vec![peer1, peer2]).expect("send peers");
+                }
+                NetworkCommand::SendRequest { request, reply, .. } => {
+                    if let WorkerRequest::RequestBatchesStream { batch_digests, .. } = request {
+                        request_count += 1;
+                        // both peer1 and peer2 should receive exactly 3 digests
+                        assert_eq!(
+                            batch_digests.len(),
+                            expected_count,
+                            "peer {request_count} should receive all {expected_count} digests"
+                        );
+                        // reject to trigger fallback to next peer
+                        reply
+                            .send(Ok(WorkerResponse::RequestBatchesStream { ack: false }))
+                            .expect("send reject");
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let mut digests: HashSet<B256> = (0..expected_count).map(|_| B256::random()).collect();
+
+    let result = handle.pub_request_batches(&mut digests).await;
+    // all peers rejected → error
+    assert!(result.is_err());
 }
