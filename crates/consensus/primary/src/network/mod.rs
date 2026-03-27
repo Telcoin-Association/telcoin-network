@@ -419,8 +419,12 @@ where
                 header =
                     request_handler.retrieve_consensus_header(number, hash) => {
                         let response = header.into_response();
-                        // TODO: penalize peer's reputation for bad request
-                        // if response.is_err() { }
+                        // Penalize peer's reputation for bad request.
+                        // This could happen now and then and not be malicious so use a Mild only
+                        // to close any DOS attack.
+                        if response.is_err() {
+                            network_handle.handle.report_penalty(peer, Penalty::Mild).await;
+                        }
                         let _ = network_handle.handle.send_response(response, channel).await;
                     }
                 // cancel notification from network layer
