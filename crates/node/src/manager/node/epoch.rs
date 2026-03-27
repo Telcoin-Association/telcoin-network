@@ -13,7 +13,7 @@ use crate::{
 };
 use eyre::{eyre, OptionExt};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::Duration,
 };
@@ -36,7 +36,7 @@ use tn_storage::tables::{
 };
 use tn_types::{
     gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash, BlockNumHash, BlsPublicKey,
-    CertifiedBatch, CommittedSubDag, Committee, CommitteeBuilder, ConsensusOutput,
+    Committee, CommitteeBuilder, ConsensusOutput,
     Database as TNDatabase, Epoch, EpochRecord, Multiaddr, NetworkPublicKey, Notifier,
     TaskJoinError, TaskManager, TaskSpawner, TnReceiver, B256,
 };
@@ -353,65 +353,6 @@ where
         Ok(())
     }
 
-    /// Turn a CommittedSubDag with consensus header info into ConsensusOutput.
-    /// It will retrieve any missing Batches so the ConsensusOutput will be ready
-    /// to execute.
-    /// Note, an error here is BAD and will most likely cause node shutdown (clean).  Do
-    /// not provide a bogus sub dag...
-    async fn fetch_local_batches(
-        &self,
-        deliver: Arc<CommittedSubDag>,
-        parent_hash: B256,
-        number: u64,
-        committee: &Committee,
-    ) -> eyre::Result<ConsensusOutput> {
-        let num_blocks = deliver.num_primary_blocks();
-        let num_certs = deliver.len();
-
-        if num_blocks == 0 {
-            debug!(target: "epoch-manager", "No blocks to fetch, payload is empty");
-            return Ok(ConsensusOutput::new_with_subdag(deliver, parent_hash, number));
-        }
-
-        let sub_dag = deliver.clone();
-
-        let mut batch_set: HashSet<BlockHash> = HashSet::new();
-
-        let mut batch_digests = VecDeque::with_capacity(num_certs);
-        for cert in &sub_dag.certificates {
-            for (digest, _) in cert.header().payload().iter() {
-                batch_set.insert(*digest);
-                batch_digests.push_back(*digest);
-            }
-        }
-
-        // map all fetched batches to their respective certificates for applying block rewards
-        let mut batches = Vec::with_capacity(num_certs);
-        for cert in &sub_dag.certificates {
-            // create collection of batches to execute for this certificate
-            let mut cert_batches = Vec::with_capacity(cert.header().payload().len());
-
-            // retrieve fetched batch by digest
-            for digest in cert.header().payload().keys() {
-                if let Some(batch) = self.consensus_db.get::<NodeBatchesCache>(digest)? {
-                    cert_batches.push(batch);
-                } else {
-                    return Err(eyre::eyre!("Failed to find required batch {digest}"));
-                }
-            }
-
-            let address = committee.authority(cert.origin()).map(|a| a.execution_address());
-            if let Some(address) = address {
-                // main collection for execution
-                batches.push(CertifiedBatch { address, batches: cert_batches });
-            } else {
-                return Err(eyre::eyre!("Unknown authority address {}", cert.origin()));
-            }
-        }
-        debug!(target: "epoch-manager", "returning output to subscriber");
-        Ok(ConsensusOutput::new(deliver, parent_hash, number, false, batch_digests, batches))
-    }
-
     /// If we have any consensus that made it into the consensus chain but was not executed
     /// then make sure we submit it to the engine for execution now.
     /// Note, this has to be called correctly or it can lead to double execution.
@@ -433,12 +374,8 @@ where
                 ));
             }
             let consensus_output = self
-                .fetch_local_batches(
-                    consensus_header.sub_dag.clone(),
-                    consensus_header.parent_hash,
-                    consensus_header.number,
-                    &committee,
-                )
+                .consensus_chain
+                .get_consensus_output_current(consensus_header.number)
                 .await?;
             let result = if consensus_output.committed_at() >= self.epoch_boundary {
                 Some(consensus_output.consensus_header_hash())
