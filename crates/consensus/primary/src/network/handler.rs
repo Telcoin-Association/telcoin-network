@@ -93,7 +93,12 @@ where
     /// Detect if we are too far behind the given epoch, round and switch to CVV inactive if we are
     /// active. This will put us in a "catch up" mode until we have caught up enough to rejoin
     /// consensus.
-    async fn behind_consensus(&self, epoch: Epoch, round: Round, number: Option<u64>) -> bool {
+    pub(crate) async fn behind_consensus(
+        &self,
+        epoch: Epoch,
+        round: Round,
+        number: Option<u64>,
+    ) -> bool {
         // Need to be an active cvv to have fallen behind.
         if !self.consensus_bus.is_active_cvv() {
             return false;
@@ -109,7 +114,12 @@ where
         // When empty outputs are skipped by execution, no new EVM block is produced.
         // In that case, rely on the most recent consensus round processed by the engine.
         let processed_consensus_round = self.consensus_bus.last_consensus_round();
-        let effective_exec_round = exec_round.max(processed_consensus_round);
+        // The committed round is updated synchronously by the consensus core (Bullshark)
+        // when it commits certificates. This happens before the async engine pipeline processes
+        // them. Including it prevents false-positive "behind" detection when the engine
+        // lags behind a burst of empty consensus rounds.
+        let committed_round = self.consensus_bus.committed_round();
+        let effective_exec_round = exec_round.max(processed_consensus_round).max(committed_round);
         let (last_consensus_number, _) = self.consensus_bus.published_consensus_num_hash();
         // Use GC depth to estimate how many rounds we can be behind.
         // Subtract ten here so if we are right on the GC depth we will still go inactive (small
@@ -142,7 +152,15 @@ where
             // inactive to catch up.
             warn!(
                 target: "primary",
-                "we are behind, go to catchup mode!, epoch: {epoch}, exec_epoch: {exec_epoch}, number: {number:?}, exec_number: {exec_number}, exec_round: {exec_round}, processed_round: {processed_consensus_round}, effective_round: {effective_exec_round}"
+                epoch,
+                exec_epoch,
+                ?number,
+                exec_number,
+                exec_round,
+                processed_consensus_round,
+                committed_round,
+                effective_exec_round,
+                "we are behind, go to catchup mode!"
             );
             self.consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
             self.consensus_config.shutdown().notify();

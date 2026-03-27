@@ -492,13 +492,15 @@ where
         to_engine: &mpsc::Sender<ConsensusOutput>,
         mut output: ConsensusOutput,
     ) -> eyre::Result<()> {
-        self.last_forwarded_consensus_number = output.number();
+        let last_forwarded_consensus_number = output.number();
         if output.committed_at() >= self.epoch_boundary {
             // update output so engine closes epoch
             output.close_epoch = true;
         }
         // only forward the output to the engine
         to_engine.send(output).await?;
+        // store number after successful send
+        self.last_forwarded_consensus_number = last_forwarded_consensus_number;
         Ok(())
     }
 
