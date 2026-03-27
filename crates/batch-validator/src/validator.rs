@@ -1,7 +1,7 @@
 //! Block validator
 
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
-use tn_reth::{bytes_to_txn, recover_signed_transaction, RethEnv, WorkerTxPool};
+use tn_reth::{recover_raw_transaction, recover_signed_transaction, RethEnv, WorkerTxPool};
 use tn_types::{
     gas_accumulator::BaseFeeContainer, max_batch_gas, max_batch_size, BatchValidation,
     BatchValidationError, BlockHash, Epoch, SealedBatch, TransactionSigned, TransactionTrait as _,
@@ -81,18 +81,21 @@ impl BatchValidation for BatchValidator {
 
     /// Submit a transaction received from the gossip pool to the worker's transaction pool.
     /// This method is only active if the node is part of the committee.
+    ///
+    /// Routes by sender address so all transactions from the same account land on the same
+    /// validator, preserving nonce ordering.
     fn submit_txn_if_mine(&self, tx_bytes: &[u8], committee_size: u64, committee_slot: u64) {
-        if let Ok(tx) = bytes_to_txn(tx_bytes) {
+        if let Ok(recovered) = recover_raw_transaction(tx_bytes) {
             if let Some(tx_pool) = &self.tx_pool {
                 let tx_pool = tx_pool.clone();
+                let sender = recovered.signer();
                 let mut bytes = [0_u8; 8];
-                let hash = tx.hash();
-                bytes.copy_from_slice(&hash[0..8]);
-                // Make sure use fixed (not native) endian bytes here.
+                bytes.copy_from_slice(&sender.as_slice()[0..8]);
                 if (u64::from_le_bytes(bytes) % committee_size) == committee_slot {
+                    let hash = *recovered.hash();
                     let task_name = format!("submit-tx-{hash}");
                     self.reth_env.get_task_spawner().spawn_task(task_name, async move {
-                        let _ = tx_pool.add_raw_transaction_external(tx).await;
+                        let _ = tx_pool.add_recovered_transaction_external(recovered).await;
                     });
                 }
             }
