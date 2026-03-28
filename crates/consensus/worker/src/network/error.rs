@@ -90,10 +90,18 @@ impl From<WorkerNetworkError> for Option<Penalty> {
                 }
             }
             WorkerNetworkError::InvalidRequest(_) => Some(Penalty::Mild),
-            // may occur at epoch boundaries
-            WorkerNetworkError::NonCommitteeBatch | WorkerNetworkError::StdIo(_) => {
-                Some(Penalty::Medium)
+            WorkerNetworkError::StdIo(ref io_err) => {
+                // separate legitimate failures like connection resets from suspicious behavior
+                match io_err.kind() {
+                    std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::Interrupted => Some(Penalty::Mild),
+                    _ => Some(Penalty::Medium),
+                }
             }
+            // may occur at epoch boundaries
+            WorkerNetworkError::NonCommitteeBatch => Some(Penalty::Medium),
             // protocol violations - fatal penalty
             WorkerNetworkError::InvalidTopic
             | WorkerNetworkError::Bcs(_)

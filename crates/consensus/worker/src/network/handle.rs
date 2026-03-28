@@ -152,23 +152,22 @@ impl WorkerNetworkHandle {
                 // cap digests for this peer and send remainder to subsequent peers
                 // this should never happen
                 let peer_batch;
-                let digests_for_peer =
-                    if requested_digests.len() > MAX_BATCH_DIGESTS_PER_REQUEST {
-                        warn!(
-                            target: "worker::network",
-                            total = requested_digests.len(),
-                            max = MAX_BATCH_DIGESTS_PER_REQUEST,
-                            "truncating oversized digest set for peer request"
-                        );
-                        peer_batch = requested_digests
-                            .iter()
-                            .copied()
-                            .take(MAX_BATCH_DIGESTS_PER_REQUEST)
-                            .collect();
-                        &peer_batch
-                    } else {
-                        &*requested_digests
-                    };
+                let digests_for_peer = if requested_digests.len() > MAX_BATCH_DIGESTS_PER_REQUEST {
+                    warn!(
+                        target: "worker::network",
+                        total = requested_digests.len(),
+                        max = MAX_BATCH_DIGESTS_PER_REQUEST,
+                        "truncating oversized digest set for peer request"
+                    );
+                    peer_batch = requested_digests
+                        .iter()
+                        .copied()
+                        .take(MAX_BATCH_DIGESTS_PER_REQUEST)
+                        .collect();
+                    &peer_batch
+                } else {
+                    &*requested_digests
+                };
 
                 // loop: update remaining batches or log error
                 match self.request_batches_from_peer(peer, digests_for_peer).await {
@@ -255,7 +254,7 @@ impl WorkerNetworkHandle {
         // send request and await response from peer
         //
         // SAFETY: network layer handles request timeout
-        let res = self.handle.send_request(request.clone(), peer).await?.await??;
+        let res = self.handle.send_request(request, peer).await?.await??;
         match res {
             WorkerResponse::RequestBatchesStream { ack } => {
                 // return error if denied to try next peer
