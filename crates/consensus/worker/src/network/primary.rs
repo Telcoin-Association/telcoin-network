@@ -107,6 +107,6 @@ impl<DB: Database> PrimaryToWorkerClient for PrimaryReceiverHandler<DB> {
             ));
         };
 
-        batch_fetcher.fetch_for_primary(digests).await
+        Ok(batch_fetcher.fetch_for_primary(digests).await?)
     }
 }

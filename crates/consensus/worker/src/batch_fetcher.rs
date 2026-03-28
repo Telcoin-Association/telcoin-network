@@ -3,7 +3,10 @@
 //! This type handles requests from the primary. Requests sent to the `BatchFetcher` have already
 //! been certified.
 
-use crate::network::{error::WorkerNetworkResult, WorkerNetworkHandle};
+use crate::{
+    network::{error::WorkerNetworkResult, WorkerNetworkHandle},
+    WorkerNetworkError,
+};
 use std::collections::{HashMap, HashSet};
 use tn_storage::tables::NodeBatchesCache;
 use tn_types::{now, Batch, BlockHash, Database, DbTxMut};
@@ -37,7 +40,7 @@ impl<DB: Database> BatchFetcher<DB> {
     pub(crate) async fn fetch_for_primary(
         &self,
         mut missing_digests: HashSet<BlockHash>,
-    ) -> eyre::Result<HashMap<BlockHash, Batch>> {
+    ) -> WorkerNetworkResult<HashMap<BlockHash, Batch>> {
         debug!(target: "batch_fetcher", "Attempting to fetch {} digests from peers", missing_digests.len());
 
         // preallocate hashmap
@@ -68,7 +71,9 @@ impl<DB: Database> BatchFetcher<DB> {
             {
                 // set received_at timestamp for remote batches
                 let mut updated_new_batches = HashMap::new();
-                let mut txn = self.batch_store.write_txn()?;
+                let mut txn = self.batch_store.write_txn().map_err(|e| {
+                    WorkerNetworkError::DBCommit(format!("Failed to retrieve write txn: {e}"))
+                })?;
 
                 // update batch timestamps and insert to db
                 //
@@ -79,12 +84,12 @@ impl<DB: Database> BatchFetcher<DB> {
                     updated_new_batches.insert(*digest, batch.clone());
                     // also persist the batches, so they are available after restarts
                     txn.insert::<NodeBatchesCache>(digest, batch)
-                        .inspect_err(|e| error!(target: "batch_fetcher", ?e, "failed to insert batch! Node shutting down..."))?;
+                        .inspect_err(|e| error!(target: "batch_fetcher", ?e, "failed to insert batch! Node shutting down...")).map_err(|e| WorkerNetworkError::DBInsert(format!("Failed to insert: {e}")))?;
                 }
 
                 // commit db after all inserts
                 txn.commit()
-                    .inspect_err(|e| error!(target: "batch_fetcher", ?e, "failed to commit batch! Node shutting down..."))?;
+                    .inspect_err(|e| error!(target: "batch_fetcher", ?e, "failed to commit batch! Node shutting down...")).map_err(|e| WorkerNetworkError::DBCommit(format!("Failed to commit: {e}")))?;
 
                 // add recovered batches to final collection
                 fetched_batches.extend(updated_new_batches.iter().map(|(d, b)| (*d, (*b).clone())));
@@ -102,11 +107,13 @@ impl<DB: Database> BatchFetcher<DB> {
         &self,
         missing_digests: &mut HashSet<BlockHash>,
         fetched_batches: &mut HashMap<BlockHash, Batch>,
-    ) -> eyre::Result<()> {
+    ) -> WorkerNetworkResult<()> {
         // read from database
         debug!(target: "batch_fetcher", "Local attempt to fetch {} missing_digests", missing_digests.len());
-        let local_batches =
-            self.batch_store.multi_get::<NodeBatchesCache>(missing_digests.iter())?;
+        let local_batches = self
+            .batch_store
+            .multi_get::<NodeBatchesCache>(missing_digests.iter())
+            .map_err(|e| WorkerNetworkError::DBRead(format!("Multiget failed: {e}")))?;
         for (digest, batch) in missing_digests.iter().zip(local_batches) {
             if let Some(batch) = batch {
                 debug_assert_eq!(*digest, batch.digest());

@@ -59,6 +59,15 @@ pub enum WorkerNetworkError {
     /// Error conversion from [std::io::Error]
     #[error(transparent)]
     StdIo(#[from] std::io::Error),
+    /// Error while inserting into the DB.
+    #[error("DB Insert Error {0}")]
+    DBInsert(String),
+    /// Error committing to DB.
+    #[error("DB Commit Error {0}")]
+    DBCommit(String),
+    /// Error reading from DB.
+    #[error("DB read Error {0}")]
+    DBRead(String),
 }
 
 impl From<WorkerNetworkError> for Option<Penalty> {
@@ -112,6 +121,9 @@ impl From<WorkerNetworkError> for Option<Penalty> {
             | WorkerNetworkError::RequestHashMismatch => Some(Penalty::Fatal),
             // ignore
             WorkerNetworkError::Timeout(_)
+            | WorkerNetworkError::DBInsert(_)
+            | WorkerNetworkError::DBCommit(_)
+            | WorkerNetworkError::DBRead(_)
             | WorkerNetworkError::StreamClosed
             | WorkerNetworkError::Network(_)
             | WorkerNetworkError::Internal(_) => None,

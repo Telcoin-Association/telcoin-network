@@ -321,6 +321,11 @@ async fn catch_up_consensus_from_to<DB: Database>(
         } else if let Ok(Some(header)) = db.get::<ConsensusHeaderCache>(&number) {
             remove_cache = true;
             header
+        } else if let Ok(Some(header)) = consensus_chain.consensus_header_by_number(number).await {
+            // Block already in local ConsensusChain DB (e.g., processed before a restart).
+            // Use it to advance the parent-chain verification; execution will be skipped below
+            // since number <= consensus_chain.latest_consensus_number().
+            header
         } else {
             error!(
                 target: "tn::observer",
