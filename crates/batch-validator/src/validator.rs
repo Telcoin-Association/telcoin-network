@@ -315,7 +315,8 @@ mod tests {
     async fn test_valid_batch() {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
-        let TestTools { valid_batch, validator, .. } = test_tools(tmp_dir.path(), &task_manager).await;
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
         let result = validator.validate_batch(valid_batch.clone());
         assert!(result.is_ok());
 
@@ -335,7 +336,8 @@ mod tests {
     async fn _test_invalid_batch_wrong_parent_hash() {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
-        let TestTools { valid_batch, validator, .. } = test_tools(tmp_dir.path(), &task_manager).await;
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
         let (batch, _) = valid_batch.split();
         let Batch { transactions, beneficiary, base_fee_per_gas, received_at, .. } = batch;
         let wrong_parent_hash = B256::random();
@@ -357,7 +359,8 @@ mod tests {
     async fn test_invalid_batch_wrong_epoch() {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
-        let TestTools { valid_batch, validator, .. } = test_tools(tmp_dir.path(), &task_manager).await;
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
         let (mut batch, _) = valid_batch.split();
 
         batch.epoch += 1;
@@ -373,7 +376,8 @@ mod tests {
         // Set excessive gas limit.
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
-        let TestTools { valid_batch, validator, .. } = test_tools(tmp_dir.path(), &task_manager).await;
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
         let (batch, _) = valid_batch.split();
 
         // sign excessive transaction
@@ -420,7 +424,8 @@ mod tests {
         // Set excessive gas limit.
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
-        let TestTools { valid_batch, validator, .. } = test_tools(tmp_dir.path(), &task_manager).await;
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
         let (batch, _) = valid_batch.split();
 
         // sign excessive transaction
@@ -472,7 +477,8 @@ mod tests {
     async fn test_invalid_batch_wrong_size_in_bytes() {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
-        let TestTools { valid_batch, validator, .. } = test_tools(tmp_dir.path(), &task_manager).await;
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
         // create enough transactions to exceed 1MB
         // because validator uses provided with same genesis
         // and tx_factory needs funds
@@ -568,7 +574,8 @@ mod tests {
     async fn test_invalid_batch_empty_transactions() {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
-        let TestTools { valid_batch, validator, .. } = test_tools(tmp_dir.path(), &task_manager).await;
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
         let (mut batch, _) = valid_batch.split();
 
         // test batch with no transactions
@@ -584,7 +591,8 @@ mod tests {
     async fn test_invalid_batch_decode_transactions() {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
-        let TestTools { valid_batch, validator, .. } = test_tools(tmp_dir.path(), &task_manager).await;
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
         let (mut batch, _) = valid_batch.split();
 
         // test batch with bad decode
@@ -600,7 +608,8 @@ mod tests {
     async fn test_invalid_batch_base_fee_for_gas() {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
-        let TestTools { valid_batch, validator, .. } = test_tools(tmp_dir.path(), &task_manager).await;
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
         // Note validator will use MIN_PROROCOL_BASE_FEE.
         let (mut batch, _) = valid_batch.split();
 
@@ -624,7 +633,8 @@ mod tests {
     async fn test_invalid_tx_eip4844() {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
-        let TestTools { valid_batch, validator, .. } = test_tools(tmp_dir.path(), &task_manager).await;
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
         let (mut batch, _) = valid_batch.split();
 
         // eip4844 transaction
