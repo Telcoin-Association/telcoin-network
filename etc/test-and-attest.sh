@@ -88,7 +88,7 @@ cargo +nightly-2026-03-20 clippy --workspace -- -D warnings
 # all features
 cargo +nightly-2026-03-20 clippy --workspace --all-features -- -D warnings
 
-# echo "clippy for workspace: default and all features passed"
+echo "clippy for workspace: default and all features passed"
 
 #
 # run tests
