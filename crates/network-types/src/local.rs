@@ -1,11 +1,14 @@
 //! Client implementation for local network messages between primary and worker.
 use crate::{
-    FetchBatchResponse, PrimaryToWorkerClient, WorkerOthersBatchMessage, WorkerOwnBatchMessage,
+    PrimaryToWorkerClient, WorkerOthersBatchMessage, WorkerOwnBatchMessage,
     WorkerSynchronizeMessage, WorkerToPrimaryClient,
 };
 use parking_lot::RwLock;
-use std::{collections::HashSet, sync::Arc};
-use tn_types::{BlockHash, BlsPublicKey};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
+use tn_types::{Batch, BlockHash, BlsPublicKey};
 
 /// LocalNetwork provides the interface to send requests to other nodes, and call other components
 /// directly if they live in the same process. It is used by both primary and worker(s).
@@ -85,7 +88,10 @@ impl PrimaryToWorkerClient for LocalNetwork {
         }
     }
 
-    async fn fetch_batches(&self, digests: HashSet<BlockHash>) -> eyre::Result<FetchBatchResponse> {
+    async fn fetch_batches(
+        &self,
+        digests: HashSet<BlockHash>,
+    ) -> eyre::Result<HashMap<BlockHash, Batch>> {
         if let Some(c) = self.get_primary_to_worker_handler().await {
             c.fetch_batches(digests).await
         } else {
