@@ -377,3 +377,100 @@ pub fn recover_pooled_transaction(
     let pooled = EthPooledTransaction::try_from_consensus(recovered)?;
     Ok(pooled)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{test_utils::TransactionFactory, RethChainSpec, RethEnv};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tn_types::{test_genesis, Address, Bytes, Encodable2718 as _, TaskManager, U256};
+
+    #[test]
+    fn test_recover_raw_transaction_preserves_signer() {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let mut tx_factory = TransactionFactory::new();
+        let tx = tx_factory.create_eip1559(
+            chain,
+            None,
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        );
+        let original_hash = *tx.hash();
+        let encoded = tx.encoded_2718();
+
+        let recovered = recover_raw_transaction(&encoded).expect("recovery should succeed");
+        assert_eq!(recovered.signer(), tx_factory.address());
+        assert_eq!(*recovered.hash(), original_hash);
+    }
+
+    #[test]
+    fn test_recover_raw_transaction_invalid_bytes() {
+        assert!(recover_raw_transaction(b"not a real transaction").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_add_recovered_transaction_external() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
+                .unwrap();
+        let pool = reth_env.init_txn_pool().unwrap();
+
+        let mut tx_factory = TransactionFactory::new();
+        let tx = tx_factory.create_eip1559(
+            chain,
+            None,
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        );
+        let encoded = tx.encoded_2718();
+        let recovered = recover_raw_transaction(&encoded).unwrap();
+        let hash = *recovered.hash();
+
+        let result = pool.add_recovered_transaction_external(recovered).await;
+        assert!(result.is_ok());
+        assert_eq!(pool.pool_size().pending, 1);
+        assert!(pool.get(&hash).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_recover_and_submit_batch_transactions() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
+                .unwrap();
+        let pool = reth_env.init_txn_pool().unwrap();
+
+        let mut tx_factory = TransactionFactory::new();
+        let encoded_txs: Vec<Vec<u8>> = (0..3)
+            .map(|_| {
+                tx_factory
+                    .create_eip1559(
+                        chain.clone(),
+                        None,
+                        7,
+                        Some(Address::ZERO),
+                        U256::from(100),
+                        Bytes::new(),
+                    )
+                    .encoded_2718()
+            })
+            .collect();
+
+        for encoded in &encoded_txs {
+            let recovered = recover_raw_transaction(encoded).unwrap();
+            let result = pool.add_recovered_transaction_external(recovered).await;
+            assert!(result.is_ok());
+        }
+        assert_eq!(pool.pool_size().pending, 3);
+    }
+}
