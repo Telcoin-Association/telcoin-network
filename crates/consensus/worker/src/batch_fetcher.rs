@@ -59,6 +59,11 @@ impl<DB: Database> BatchFetcher<DB> {
             }
 
             // 2) fetch from peers over network
+            //
+            // NOTE: `request_batches` performs bounded retries (3 attempts with 500ms backoff)
+            // internally, so RPCError here means all retries were exhausted. The `if let Ok()`
+            // intentionally swallows that error to retry the outer infinite loop, which will
+            // re-check local storage and try peers again.
             if let Ok(mut new_batches) = self.request_batches_from_peers(&mut missing_digests).await
             {
                 // set received_at timestamp for remote batches

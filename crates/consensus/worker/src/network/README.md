@@ -109,7 +109,75 @@ The stream is flushed once per chunk (not per batch) because:
 
 3. **Logical unit**: A chunk represents a complete unit of work from the sender's database read.
 
+## Retry Logic
+
+### `request_batches()` — Bounded Retries with Backoff
+
+When a worker needs batches it doesn't have locally, `request_batches()` tries connected peers
+one at a time. If a peer rejects the request (e.g., its concurrency semaphore is full and it
+returns `ack: false`), the next peer is tried.
+
+If **all** peers reject a single pass, the method retries up to `MAX_BATCH_REQUEST_RETRIES` (3)
+times through the full peer list, with a `BATCH_REQUEST_RETRY_DELAY` (500ms) pause between
+attempts. This gives peer semaphores time to release permits.
+
+```
+Attempt 1: peer_a → rejected, peer_b → rejected, peer_c → rejected
+  ↓ sleep 500ms
+Attempt 2: peer_a → accepted → batches received → return Ok
+```
+
+Key behaviors:
+- **Re-fetches peers** each attempt to pick up newly connected nodes.
+- **Returns immediately** on any partial success (at least one batch received).
+- **Accumulates batches** across retries — digests fulfilled on earlier attempts are removed.
+- **Returns `RPCError`** only after all retries are exhausted with zero batches.
+
+The caller (`fetch_for_primary()` in `batch_fetcher.rs`) wraps this in an infinite loop that
+re-checks local storage between iterations. The inner retry with backoff prevents tight-spinning
+when all peers are temporarily at capacity.
+
 ## Security Measures
+
+### Concurrency Limiting
+
+#### Global Semaphore (`MAX_CONCURRENT_BATCH_STREAMS`)
+
+A tokio `Semaphore` with `MAX_CONCURRENT_BATCH_STREAMS` (5) permits bounds the total number of
+concurrent batch stream operations (pending + active). A permit is acquired when an inbound
+`RequestBatchesStream` RPC is accepted and held through the entire stream lifecycle via the
+`PendingBatchStream` struct's `_permit` field (RAII pattern — dropped when the struct is dropped).
+
+If no permits are available, the request gets `ack: false` and the requesting peer tries another node.
+
+#### Per-Peer Rate Limiting (`MAX_PENDING_REQUESTS_PER_PEER`)
+
+Each peer is limited to `MAX_PENDING_REQUESTS_PER_PEER` (2) concurrent pending requests.
+This prevents a single malicious peer from monopolizing all global semaphore slots:
+
+```rust
+let peer_count = pending_map.keys().filter(|(p, _)| *p == peer).count();
+if peer_count >= MAX_PENDING_REQUESTS_PER_PEER {
+    // reject — permit drops, freeing the global slot
+}
+```
+
+#### Stale Request Cleanup (`PENDING_REQUEST_TIMEOUT`)
+
+A periodic prune task runs every 15 seconds and removes pending requests older than
+`PENDING_REQUEST_TIMEOUT` (30s). This prevents slot leaks when a peer negotiates a stream
+via RPC but never opens the actual libp2p stream. Dropping stale `PendingBatchStream` entries
+releases their semaphore permits back to the pool.
+
+#### Oversized Request Truncation (`MAX_BATCH_DIGESTS_PER_REQUEST`)
+
+Requests exceeding `MAX_BATCH_DIGESTS_PER_REQUEST` (500) digests are truncated rather than
+rejected. This processes as many batches as possible while bounding memory:
+
+```
+Worst-case allocation: 500 entries × ~1MB per batch ≈ 500MB
+vs. uncapped: ~33k digests (1MB RPC limit) × 1MB ≈ 33GB
+```
 
 ### Size Validation Before Allocation
 
@@ -212,3 +280,11 @@ Protocol violations should trigger peer penalties via the peer manager.
 
 Stream codec functions are tested in isolation with mock streams.
 Integration tests in `tests/it/network_tests.rs` verify end-to-end batch synchronization between workers.
+
+Semaphore and concurrency tests cover:
+- Global semaphore exhaustion returns `ack: false`
+- RAII permit release when `PendingBatchStream` is dropped
+- Per-peer limit enforcement across distinct peers
+- Stale request cleanup and permit recovery
+- Capacity at exactly `MAX_CONCURRENT_BATCH_STREAMS` across multiple peers
+- Retry logic succeeding after initial peer rejection

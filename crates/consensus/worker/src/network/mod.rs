@@ -1,7 +1,7 @@
 //! Worker network implementation.
 
 use error::WorkerNetworkError;
-use futures::{AsyncReadExt as _, AsyncWriteExt as _};
+use futures::AsyncReadExt as _;
 pub use handle::WorkerNetworkHandle;
 use handler::RequestHandler;
 pub use message::{WorkerRequest, WorkerResponse};
@@ -17,7 +17,7 @@ use tn_types::{
     BatchValidation, BlockHash, BlsPublicKey, Database, Epoch, SealedBatch, TaskSpawner,
     TnReceiver, WorkerId, B256,
 };
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
 
 pub(crate) mod error;
@@ -33,11 +33,14 @@ pub(crate) type Req = WorkerRequest;
 /// Convenience type for Worker network.
 pub(crate) type Res = WorkerResponse;
 
-/// Maximum number of concurrent pending batch stream requests.
-const MAX_PENDING_BATCH_REQUESTS: usize = 5;
+/// Maximum number of concurrent batch stream operations (pending + active).
+///
+/// A semaphore permit is held from RPC acceptance through stream completion,
+/// so this bounds the true concurrent count—not just the pending map size.
+pub const MAX_CONCURRENT_BATCH_STREAMS: usize = 5;
 
 /// Timeout for pending batch requests before cleanup.
-const PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub const PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Interval for pruning pending batch requests (awaiting peer to open stream).
 const PENDING_REQUEST_PRUNE_INTERVAL: Duration = Duration::from_secs(15);
@@ -49,16 +52,10 @@ const PENDING_REQUEST_PRUNE_INTERVAL: Duration = Duration::from_secs(15);
 /// This is 66x smaller than the ~33k digests that fit in the 1MB RPC limit.
 pub const MAX_BATCH_DIGESTS_PER_REQUEST: usize = 500;
 
-/// Maximum number of concurrent inbound stream handler tasks.
-///
-/// Each stream task allocates ~2MB of buffers and holds a database reference.
-/// Matches MAX_PENDING_BATCH_REQUESTS since legitimate streams require a pending request.
-const MAX_CONCURRENT_INBOUND_STREAMS: usize = 5;
-
 /// Maximum number of concurrent pending batch requests from a single peer.
 ///
 /// Prevents a single malicious peer from filling all global slots.
-const MAX_PENDING_REQUESTS_PER_PEER: usize = 2;
+pub const MAX_PENDING_REQUESTS_PER_PEER: usize = 2;
 
 /// Tracks a pending batch stream request awaiting stream establishment.
 // pub for IT
@@ -70,15 +67,35 @@ pub struct PendingBatchStream {
     epoch: Epoch,
     /// When this request was created (for timeout cleanup).
     created_at: Instant,
+    /// Semaphore permit held for the lifetime of this request (pending + active).
+    /// Dropping the permit frees a global concurrency slot.
+    _permit: OwnedSemaphorePermit,
 }
 
 /// Key for pending requests: (peer_bls, request_digest)
 type PendingBatchRequestKey = (BlsPublicKey, B256);
 
 impl PendingBatchStream {
-    /// Create a new pending batch stream for testing.
-    pub fn new(batch_digests: HashSet<BlockHash>, epoch: Epoch) -> Self {
-        Self { batch_digests, epoch, created_at: Instant::now() }
+    /// Create a new pending batch stream.
+    pub fn new(
+        batch_digests: HashSet<BlockHash>,
+        epoch: Epoch,
+        permit: OwnedSemaphorePermit,
+    ) -> Self {
+        Self { batch_digests, epoch, created_at: Instant::now(), _permit: permit }
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl PendingBatchStream {
+    /// Create a pending batch stream with a custom `created_at` for testing stale cleanup.
+    pub fn new_with_created_at(
+        batch_digests: HashSet<BlockHash>,
+        epoch: Epoch,
+        permit: OwnedSemaphorePermit,
+        created_at: Instant,
+    ) -> Self {
+        Self { batch_digests, epoch, created_at, _permit: permit }
     }
 }
 
@@ -96,8 +113,8 @@ pub struct WorkerNetwork<DB, Events> {
     /// Wrapped in `Arc<Mutex>` so spawned stream tasks can look up the matching
     /// request after reading the correlation digest from the stream.
     pending_batch_requests: Arc<Mutex<HashMap<PendingBatchRequestKey, PendingBatchStream>>>,
-    /// Semaphore limiting concurrent inbound stream tasks.
-    inbound_stream_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Semaphore bounding total concurrent batch stream operations (pending + active).
+    batch_stream_semaphore: Arc<Semaphore>,
 }
 
 impl<DB, Events> WorkerNetwork<DB, Events>
@@ -120,9 +137,7 @@ where
             network_handle,
             request_handler,
             pending_batch_requests: Arc::new(Mutex::new(HashMap::new())),
-            inbound_stream_semaphore: Arc::new(tokio::sync::Semaphore::new(
-                MAX_CONCURRENT_INBOUND_STREAMS,
-            )),
+            batch_stream_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_BATCH_STREAMS)),
         }
     }
 
@@ -279,35 +294,37 @@ where
             debug!(target: "worker::network", "batch request empty");
             Err(WorkerNetworkError::InvalidRequest("Empty batch digests".into()))
         } else {
-            let mut pending_map = self.pending_batch_requests.lock();
+            // acquire semaphore permit (non-blocking) for global concurrency
+            let ack = match self.batch_stream_semaphore.clone().try_acquire_owned() {
+                Ok(permit) => {
+                    let mut pending_map = self.pending_batch_requests.lock();
 
-            // check global capacity
-            let ack = if pending_map.len() >= MAX_PENDING_BATCH_REQUESTS {
-                false
-            } else {
-                // check per-peer capacity
-                let peer_count = pending_map.keys().filter(|(p, _)| *p == peer).count();
-                if peer_count >= MAX_PENDING_REQUESTS_PER_PEER {
-                    debug!(
-                        target: "worker::network",
-                        %peer,
-                        peer_count,
-                        "rejecting batch stream request: per-peer limit reached"
-                    );
-                    false
-                } else {
-                    let request_digest =
-                        self.network_handle.generate_batch_request_id(&batch_digests);
-                    let pending = PendingBatchStream::new(batch_digests, epoch);
-                    pending_map.insert((peer, request_digest), pending);
-                    debug!(
-                        target: "worker::network",
-                        %peer,
-                        ?request_digest,
-                        "pending batch stream request accepted"
-                    );
-                    true
+                    // check per-peer capacity
+                    let peer_count = pending_map.keys().filter(|(p, _)| *p == peer).count();
+                    if peer_count >= MAX_PENDING_REQUESTS_PER_PEER {
+                        debug!(
+                            target: "worker::network",
+                            %peer,
+                            peer_count,
+                            "rejecting batch stream request: per-peer limit reached"
+                        );
+                        // permit drops here, freeing the slot
+                        false
+                    } else {
+                        let request_digest =
+                            self.network_handle.generate_batch_request_id(&batch_digests);
+                        let pending = PendingBatchStream::new(batch_digests, epoch, permit);
+                        pending_map.insert((peer, request_digest), pending);
+                        debug!(
+                            target: "worker::network",
+                            %peer,
+                            ?request_digest,
+                            "pending batch stream request accepted"
+                        );
+                        true
+                    }
                 }
+                Err(_) => false,
             };
 
             Ok(WorkerResponse::RequestBatchesStream { ack })
@@ -341,22 +358,11 @@ where
     ///
     /// Reads the request digest from the stream and validates against pending requests.
     fn process_inbound_stream(&self, peer: BlsPublicKey, mut stream: Stream) {
-        let semaphore = self.inbound_stream_semaphore.clone();
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
         let pending_map = self.pending_batch_requests.clone();
         let task_name = format!("stream-requested-batches-{peer}");
         self.network_handle.get_task_spawner().spawn_task(task_name, async move {
-            // acquire permit or reject if at capacity
-            let _permit = match semaphore.try_acquire() {
-                Ok(permit) => permit,
-                Err(_) => {
-                    warn!(target: "worker::network", %peer, "inbound stream rejected: at capacity");
-                    let _ = stream.close().await;
-                    return;
-                }
-            };
-
             // read the request digest (32-bytes) from the stream with timeout
             let mut digest_buf = [0u8; tn_types::DIGEST_LENGTH];
             match tokio::time::timeout(

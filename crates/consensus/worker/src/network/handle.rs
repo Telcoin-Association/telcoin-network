@@ -26,6 +26,12 @@ use crate::{
 /// Timeout for streaming a single batch from peer. Batches capped at 1MB.
 const BATCH_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Maximum number of retries through the full peer list in `request_batches()`.
+const MAX_BATCH_REQUEST_RETRIES: usize = 3;
+
+/// Delay between retry attempts in `request_batches()` to give semaphores time to release.
+const BATCH_REQUEST_RETRY_DELAY: Duration = Duration::from_millis(500);
+
 /// The wrapper around worker-specific network calls.
 #[derive(Clone, Debug)]
 pub struct WorkerNetworkHandle {
@@ -119,73 +125,103 @@ impl WorkerNetworkHandle {
 
     /// Request a group of batches by hashes using stream-based transfer.
     ///
-    /// Tries peers one at a time until all batches are received or all peers fail. Returns `Ok` if
-    /// any batches successfully fetched from peers.
+    /// Tries peers one at a time until all batches are received or all peers fail.
+    /// Retries up to [MAX_BATCH_REQUEST_RETRIES] times through the full peer list
+    /// with [BATCH_REQUEST_RETRY_DELAY] between attempts, giving semaphores time
+    /// to release. Returns `Ok` if any batches successfully fetched from peers.
     pub(crate) async fn request_batches(
         &self,
         requested_digests: &mut HashSet<BlockHash>,
     ) -> NetworkResult<Vec<(BlockHash, Batch)>> {
-        let peers = self.handle.connected_peers().await?;
-        if peers.is_empty() {
-            return Ok(vec![]);
-        }
-
         let mut all_batches = Vec::with_capacity(requested_digests.len());
 
-        // try peers one at a time with fallback
-        for peer in peers {
-            // check remaining digests before sending request
-            if requested_digests.is_empty() {
-                break;
+        for attempt in 0..MAX_BATCH_REQUEST_RETRIES {
+            // re-fetch peers each attempt to pick up newly connected peers
+            let peers = self.handle.connected_peers().await?;
+            if peers.is_empty() {
+                return Ok(all_batches);
             }
 
-            // cap digests for this peer and send remainder to subsequent peers
-            // this should never happen
-            let peer_batch;
-            let digests_for_peer = if requested_digests.len() > MAX_BATCH_DIGESTS_PER_REQUEST {
-                warn!(
-                    target: "worker::network",
-                    total = requested_digests.len(),
-                    max = MAX_BATCH_DIGESTS_PER_REQUEST,
-                    "truncating oversized digest set for peer request"
-                );
-                peer_batch =
-                    requested_digests.iter().copied().take(MAX_BATCH_DIGESTS_PER_REQUEST).collect();
-                &peer_batch
-            } else {
-                &*requested_digests
-            };
+            // try peers one at a time with fallback
+            for peer in peers {
+                // check remaining digests before sending request
+                if requested_digests.is_empty() {
+                    break;
+                }
 
-            // loop: update remaining batches or log error
-            match self.request_batches_from_peer(peer, digests_for_peer).await {
-                Ok(batches) => {
-                    for (digest, batch) in batches {
-                        if requested_digests.remove(&digest) {
-                            all_batches.push((digest, batch));
+                // cap digests for this peer and send remainder to subsequent peers
+                // this should never happen
+                let peer_batch;
+                let digests_for_peer =
+                    if requested_digests.len() > MAX_BATCH_DIGESTS_PER_REQUEST {
+                        warn!(
+                            target: "worker::network",
+                            total = requested_digests.len(),
+                            max = MAX_BATCH_DIGESTS_PER_REQUEST,
+                            "truncating oversized digest set for peer request"
+                        );
+                        peer_batch = requested_digests
+                            .iter()
+                            .copied()
+                            .take(MAX_BATCH_DIGESTS_PER_REQUEST)
+                            .collect();
+                        &peer_batch
+                    } else {
+                        &*requested_digests
+                    };
+
+                // loop: update remaining batches or log error
+                match self.request_batches_from_peer(peer, digests_for_peer).await {
+                    Ok(batches) => {
+                        for (digest, batch) in batches {
+                            if requested_digests.remove(&digest) {
+                                all_batches.push((digest, batch));
+                            }
                         }
+                        debug!(
+                            target: "worker::network",
+                            %peer,
+                            received = all_batches.len(),
+                            remaining = requested_digests.len(),
+                            "received batches from peer"
+                        );
                     }
-                    debug!(
-                        target: "worker::network",
-                        %peer,
-                        received = all_batches.len(),
-                        remaining = requested_digests.len(),
-                        "received batches from peer"
-                    );
+                    Err(e) => {
+                        warn!(
+                            target: "worker::network",
+                            %peer,
+                            ?e,
+                            "failed to fetch batches from peer, trying next"
+                        );
+                    }
                 }
-                Err(e) => {
-                    warn!(
-                        target: "worker::network",
-                        %peer,
-                        ?e,
-                        "failed to fetch batches from peer, trying next"
-                    );
-                }
+            }
+
+            // return immediately if any batches fetched (partial success) or all done
+            if !all_batches.is_empty() || requested_digests.is_empty() {
+                return Ok(all_batches);
+            }
+
+            // sleep before retrying (skip sleep on last attempt)
+            if attempt + 1 < MAX_BATCH_REQUEST_RETRIES {
+                debug!(
+                    target: "worker::network",
+                    attempt = attempt + 1,
+                    max = MAX_BATCH_REQUEST_RETRIES,
+                    "all peers rejected, retrying after delay"
+                );
+                tokio::time::sleep(BATCH_REQUEST_RETRY_DELAY).await;
             }
         }
 
-        // confirm all batches arrived after exiting loop
+        // all retries exhausted
         if all_batches.is_empty() && !requested_digests.is_empty() {
-            warn!(target: "worker::network", missing = requested_digests.len(), "request batches from all peers but still missing digests");
+            warn!(
+                target: "worker::network",
+                missing = requested_digests.len(),
+                retries = MAX_BATCH_REQUEST_RETRIES,
+                "request batches from all peers exhausted retries, still missing digests"
+            );
             Err(NetworkError::RPCError("Unable to get batches from any peers!".to_string()))
         } else {
             Ok(all_batches)
@@ -287,7 +323,7 @@ impl WorkerNetworkHandle {
     ) -> NetworkResult<Vec<(BlockHash, Batch)>> {
         // allocate reusable buffers
         //
-        // SAFETY: num of requests capped by `MAX_PENDING_BATCH_REQUESTS`
+        // SAFETY: num of requests capped by `MAX_CONCURRENT_BATCH_STREAMS`
         let max_size = max_batch_size(self.epoch);
         let mut decode_buffer = Vec::with_capacity(max_size);
         let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(max_size));

@@ -6,7 +6,8 @@ mod network;
 mod worker;
 pub use network::{
     PendingBatchStream, WorkerNetwork, WorkerNetworkHandle, WorkerRequest, WorkerResponse,
-    MAX_BATCH_DIGESTS_PER_REQUEST,
+    MAX_BATCH_DIGESTS_PER_REQUEST, MAX_CONCURRENT_BATCH_STREAMS, MAX_PENDING_REQUESTS_PER_PEER,
+    PENDING_REQUEST_TIMEOUT,
 };
 pub mod quorum_waiter;
 
