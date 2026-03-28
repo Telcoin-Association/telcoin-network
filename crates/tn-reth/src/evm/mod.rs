@@ -212,7 +212,9 @@ where
         // NOTE: revm currently marks the caller and block beneficiary accounts as "touched"
         // after the above transact calls, and includes them in the result.
         //
-        // System calls are used by TN protocol to update more than just the contract.
+        // Callers are responsible for removing SYSTEM_ADDRESS from the result state
+        // before committing. The reward_beneficiary handler skips system calls to
+        // prevent the beneficiary and basefee address from being spuriously touched.
         res
     }
 
