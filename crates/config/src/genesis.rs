@@ -160,36 +160,20 @@ impl NetworkGenesis {
         &self.validators
     }
 
-    /// Returns configurations for precompiles as genesis accounts
-    /// Precompiles configs yamls are generated using foundry in `tn-contracts` submodule.
-    ///
-    /// Overrides InterchainTEL genesis balance to reflect genesis validator stake.
-    /// Other accounts in genesis include:
-    /// - historic block hashes
-    /// - consensus block roots
-    pub fn fetch_precompile_genesis_accounts(
-        itel_address: Address,
-        itel_balance: tn_types::U256,
-    ) -> eyre::Result<Vec<(Address, GenesisAccount)>> {
+    /// Returns configurations for precompiles as genesis accounts.
+    /// Precompile configs are generated using foundry in `tn-contracts` submodule.
+    pub fn fetch_precompile_genesis_accounts() -> eyre::Result<Vec<(Address, GenesisAccount)>> {
         let config: HashMap<Address, GenesisAccount> =
             serde_yaml::from_str(GENESIS_ACCOUNT_STATE_YAML).expect("yaml parsing failure");
-        let governance_balance = config
-            .get(&GOVERNANCE_SAFE_ADDRESS)
-            .expect("base fee recipient governance safe missing")
-            .balance;
-        let final_itel_balance = itel_balance - governance_balance;
         let mut accounts = Vec::new();
         for (address, account) in config {
-            let bal = if address == itel_address { final_itel_balance } else { account.balance };
             let account = GenesisAccount::default()
                 .with_nonce(account.nonce)
-                .with_balance(bal)
+                .with_balance(account.balance)
                 .with_code(account.code)
                 .with_storage(account.storage);
-
             accounts.push((address, account));
         }
-
         Ok(accounts)
     }
 }
@@ -279,7 +263,7 @@ mod tests {
     use crate::NodeInfo;
     use rand::{rngs::StdRng, SeedableRng};
     use tn_types::{
-        generate_proof_of_possession_bls, Address, BlsKeypair, Multiaddr, NetworkKeypair,
+        generate_proof_of_possession_bls_for_test, Address, BlsKeypair, Multiaddr, NetworkKeypair,
         NodeP2pInfo,
     };
 
@@ -293,7 +277,7 @@ mod tests {
             let worker_network_keypair = NetworkKeypair::generate_ed25519();
             let address = Address::from_raw_public_key(&[0; 64]);
             let proof_of_possession =
-                generate_proof_of_possession_bls(&bls_keypair, &address).unwrap();
+                generate_proof_of_possession_bls_for_test(&bls_keypair, &address).unwrap();
             let primary_network_address = Multiaddr::empty();
             let worker_network_address = Multiaddr::empty();
             let primary_info = NodeP2pInfo::new(
@@ -330,7 +314,7 @@ mod tests {
 
             // generate proof with wrong chain spec
             let proof_of_possession =
-                generate_proof_of_possession_bls(&bls_keypair, &wrong_address).unwrap();
+                generate_proof_of_possession_bls_for_test(&bls_keypair, &wrong_address).unwrap();
             let primary_network_address = Multiaddr::empty();
             let worker_network_address = Multiaddr::empty();
             let primary_info = NodeP2pInfo::new(

@@ -122,13 +122,13 @@ impl Score {
     /// NOTE: this is a separate method for testing purposes.
     fn update_at(&mut self, now: Instant) {
         if let Some(prev_update) =
-            now.checked_duration_since(self.last_updated).map(|d| d.as_secs())
+            now.checked_duration_since(self.last_updated).map(|d| d.as_secs_f64())
         {
             let config = global_score_config();
 
             // e^(-ln(2)/HL*t)
             let halflife_decay = config.halflife_decay();
-            let decay_factor = (halflife_decay * prev_update as f64).exp();
+            let decay_factor = (halflife_decay * prev_update).exp();
             self.telcoin_score *= decay_factor;
             self.last_updated = now;
             self.update_score();

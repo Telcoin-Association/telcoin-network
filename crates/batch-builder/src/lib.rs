@@ -25,10 +25,10 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
-use tn_reth::{CanonStateNotificationStream, RethEnv, TxPool as _, WorkerTxPool};
+use tn_reth::{CanonStateNotificationStream, ChangedAccount, RethEnv, TxPool as _, WorkerTxPool};
 use tn_types::{
-    error::BlockSealError, gas_accumulator::BaseFeeContainer, Address, BatchBuilderArgs,
-    BatchSender, Epoch, SealedBlock, TaskSpawner, TxHash, WorkerId,
+    error::BlockSealError, Address, BatchBuilderArgs, BatchSender, Epoch, SealedBlock, TaskSpawner,
+    TxHash, WorkerId,
 };
 use tokio::{sync::oneshot, time::Interval};
 use tracing::{debug, error, field, info_span, Instrument};
@@ -38,8 +38,17 @@ mod error;
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
 
+/// The result of a successful batch build containing data needed to update the pool.
+#[derive(Debug)]
+struct MinedBatchResult {
+    /// Collection of transactions included in the accepted batch.
+    mined_transactions: Vec<TxHash>,
+    /// Account changes used to update the pool after mining a batch.
+    changed_accounts: Vec<ChangedAccount>,
+}
+
 /// Type alias for the blocking task that locks the tx pool and builds the next batch.
-type BuildResult = oneshot::Receiver<BatchBuilderResult<Vec<TxHash>>>;
+type BuildResult = oneshot::Receiver<BatchBuilderResult<MinedBatchResult>>;
 
 /// The type that builds blocks for workers to propose.
 ///
@@ -79,8 +88,8 @@ pub struct BatchBuilder {
     task_spawner: TaskSpawner,
     /// Worker id this batch builder belongs too.
     worker_id: WorkerId,
-    /// The current base fee for this worker.
-    base_fee: BaseFeeContainer,
+    /// The base fee for this epoch. Constant for the batch builder's lifetime.
+    base_fee: u64,
     /// The epoch we are building batches for.
     epoch: Epoch,
 }
@@ -96,7 +105,7 @@ impl BatchBuilder {
         max_delay: Duration,
         task_spawner: TaskSpawner,
         worker_id: WorkerId,
-        base_fee: BaseFeeContainer,
+        base_fee: u64,
         epoch: Epoch,
     ) -> Self {
         let max_delay_interval = tokio::time::interval(max_delay);
@@ -137,7 +146,7 @@ impl BatchBuilder {
         let build_args = BatchBuilderArgs::new(pool.clone(), self.address, self.epoch);
         let (result, done) = oneshot::channel();
         let worker_id = self.worker_id;
-        let base_fee = self.base_fee.base_fee();
+        let base_fee = self.base_fee;
 
         let span = info_span!(target: "telcoin", "propose-batch", batch = field::Empty, worker_id, base_fee, epoch = self.epoch);
         let span_clone = span.clone();
@@ -147,7 +156,7 @@ impl BatchBuilder {
             let (ack, rx) = oneshot::channel();
 
             // this is safe to call without a semaphore bc it's held as a single `Option`
-            let BatchBuilderOutput { batch, mined_transactions } = build_batch(build_args, worker_id, base_fee);
+            let BatchBuilderOutput { batch, mined_transactions, changed_accounts } = build_batch(build_args, worker_id, base_fee);
             let batch = batch.seal_slow();
             span.record("batch", batch.digest().to_string());
 
@@ -166,7 +175,7 @@ impl BatchBuilder {
                         Ok(_) => {
                             debug!(target: "worker::batch-builder", ?res, "received ack");
                             // signal to Self that this task is complete
-                            if let Err(e) = result.send(Ok(mined_transactions)) {
+                            if let Err(e) = result.send(Ok(MinedBatchResult { mined_transactions, changed_accounts })) {
                                 error!(target: "worker::batch_builder", ?e, "failed to send block builder result to block builder task");
                             }
                         }
@@ -186,7 +195,7 @@ impl BatchBuilder {
                                     //
                                     // return empty vec to indicate no transactions mined
                                     // NOTE: this will apply no changes to transaction pool
-                                    Ok(vec![])
+                                    Ok(MinedBatchResult { mined_transactions: vec![], changed_accounts: vec![] })
                                 }
                             };
 
@@ -239,6 +248,8 @@ impl Future for BatchBuilder {
         loop {
             // This is used as a "wake up" when canonical state updates.
             while let Poll::Ready(Some(latest)) = this.state_changed.poll_next_unpin(cx) {
+                // NOTE: separate background task applies these changes to the pool
+                // regardless of pending_task
                 this.last_canonical_update = latest.tip().sealed_block().clone()
             }
 
@@ -271,7 +282,7 @@ impl Future for BatchBuilder {
                     Poll::Ready(res) => {
                         debug!(target: "block-builder", ?res, "pending task complete");
                         // ensure no fatal errors
-                        let mined_transactions = res??;
+                        let MinedBatchResult { mined_transactions, changed_accounts } = res??;
 
                         // NOTE: empty vec returned for non-fatal error during block proposal
                         if mined_transactions.is_empty() {
@@ -296,7 +307,7 @@ impl Future for BatchBuilder {
                             base_fee_per_gas,
                             Some(u128::MAX), // set max fee for blobs
                             mined_transactions,
-                            vec![],
+                            changed_accounts,
                         );
 
                         // loop again to check for any other pending transactions
@@ -340,10 +351,11 @@ mod tests {
         test_utils::{create_committee_from_state, TransactionFactory},
         RethChainSpec,
     };
-    use tn_storage::{open_db, tables::Batches};
+    use tn_storage::{open_db, tables::NodeBatchesCache};
     use tn_types::{
-        gas_accumulator::GasAccumulator, test_genesis, Bytes, Certificate, CommittedSubDag,
-        ConsensusOutput, Database, GenesisAccount, TaskManager, U160, U256,
+        gas_accumulator::GasAccumulator, test_genesis, BlockHash, Bytes, Certificate,
+        CommittedSubDag, ConsensusOutput, Database, GenesisAccount, TaskManager,
+        MIN_PROTOCOL_BASE_FEE, U160, U256,
     };
     use tn_worker::{test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle};
     use tokio::time::timeout;
@@ -399,7 +411,7 @@ mod tests {
             Duration::from_secs(1),
             task_manager.get_spawner(),
             0,
-            BaseFeeContainer::default(),
+            MIN_PROTOCOL_BASE_FEE,
             0,
         );
 
@@ -455,7 +467,7 @@ mod tests {
         for _ in 0..5 {
             let _ = tokio::time::sleep(Duration::from_secs(1)).await;
             // Ensure the block is stored
-            if let Some((_, wb)) = store.iter::<Batches>().next() {
+            if let Some((_, wb)) = store.iter::<NodeBatchesCache>().next() {
                 new_batch = Some(wb);
                 break;
             }
@@ -553,7 +565,7 @@ mod tests {
             Duration::from_millis(1),
             task_manager.get_spawner(),
             0,
-            BaseFeeContainer::default(),
+            MIN_PROTOCOL_BASE_FEE,
             0,
         );
 
@@ -631,8 +643,7 @@ mod tests {
         leader_cert.header_mut_for_test().author = leader;
         let mut subdag = CommittedSubDag::default();
         subdag.leader = leader_cert;
-        let mut output = ConsensusOutput::default();
-        output.sub_dag = Arc::new(subdag);
+        let output = ConsensusOutput::new_with_subdag(Arc::new(subdag), BlockHash::default(), 0);
 
         // receive new blocks and return non-fatal errors
         // non-fatal errors cause the loop to break and wait for txpool updates
@@ -718,7 +729,7 @@ mod tests {
             Duration::from_secs(1),
             task_manager.get_spawner(),
             0,
-            BaseFeeContainer::default(),
+            MIN_PROTOCOL_BASE_FEE,
             0,
         );
 

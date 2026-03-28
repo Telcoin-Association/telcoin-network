@@ -10,9 +10,6 @@ use crate::layered_db::{LayeredDatabase, LayeredDbTxMut};
 #[derive(Clone, Debug)]
 struct Inner<DB: Database> {
     epoch_db: LayeredDatabase<DB>,
-    batch_db: LayeredDatabase<DB>,
-    consensus_chain_db: LayeredDatabase<DB>,
-    epoch_chain_db: LayeredDatabase<DB>,
     kad_db: LayeredDatabase<DB>,
     cache_db: LayeredDatabase<DB>,
 }
@@ -24,38 +21,16 @@ pub struct CompositeDatabase<DB: Database> {
 }
 
 impl<DB: Database> CompositeDatabase<DB> {
-    pub fn open(
-        epoch_db: DB,
-        batch_db: DB,
-        consensus_chain_db: DB,
-        epoch_chain_db: DB,
-        kad_db: DB,
-        cache_db: DB,
-    ) -> Self {
+    pub fn open(epoch_db: DB, kad_db: DB, cache_db: DB) -> Self {
         let epoch_db = LayeredDatabase::open(epoch_db, true);
-        let batch_db = LayeredDatabase::open(batch_db, false);
-        let consensus_chain_db = LayeredDatabase::open(consensus_chain_db, false);
-        let epoch_chain_db = LayeredDatabase::open(epoch_chain_db, false);
         let kad_db = LayeredDatabase::open(kad_db, true);
         let cache_db = LayeredDatabase::open(cache_db, true);
-        Self {
-            inner: Arc::new(Inner {
-                epoch_db,
-                batch_db,
-                consensus_chain_db,
-                epoch_chain_db,
-                kad_db,
-                cache_db,
-            }),
-        }
+        Self { inner: Arc::new(Inner { epoch_db, kad_db, cache_db }) }
     }
 
     fn get_db(&self, hint: TableHint) -> &LayeredDatabase<DB> {
         match hint {
             TableHint::Epoch => &self.inner.epoch_db,
-            TableHint::EpochChain => &self.inner.epoch_chain_db,
-            TableHint::Batch => &self.inner.batch_db,
-            TableHint::ConsensusChain => &self.inner.consensus_chain_db,
             TableHint::Kad => &self.inner.kad_db,
             TableHint::Cache => &self.inner.cache_db,
         }
@@ -85,9 +60,6 @@ impl<DB: Database> Database for CompositeDatabase<DB> {
         Ok(CompositeDbTxMut {
             inner: self.inner.clone(),
             epoch_tx: None,
-            batch_tx: None,
-            consensus_chain_tx: None,
-            epoch_chain_tx: None,
             kad_tx: None,
             cache_tx: None,
         })
@@ -143,9 +115,6 @@ impl<DB: Database> Database for CompositeDatabase<DB> {
 
     fn sync_persist(&self) {
         self.inner.epoch_db.sync_persist();
-        self.inner.batch_db.sync_persist();
-        self.inner.consensus_chain_db.sync_persist();
-        self.inner.epoch_chain_db.sync_persist();
         self.inner.kad_db.sync_persist();
         self.inner.cache_db.sync_persist();
     }
@@ -167,9 +136,6 @@ impl<DB: Database> DbTx for CompositeDbTx<DB> {
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
         match T::HINT {
             TableHint::Epoch => self.inner.epoch_db.get::<T>(key),
-            TableHint::EpochChain => self.inner.epoch_chain_db.get::<T>(key),
-            TableHint::Batch => self.inner.batch_db.get::<T>(key),
-            TableHint::ConsensusChain => self.inner.consensus_chain_db.get::<T>(key),
             TableHint::Kad => self.inner.kad_db.get::<T>(key),
             TableHint::Cache => self.inner.cache_db.get::<T>(key),
         }
@@ -184,9 +150,6 @@ impl<DB: Database> DbTx for CompositeDbTx<DB> {
 pub struct CompositeDbTxMut<DB: Database> {
     inner: Arc<Inner<DB>>,
     epoch_tx: Option<LayeredDbTxMut<DB>>,
-    batch_tx: Option<LayeredDbTxMut<DB>>,
-    consensus_chain_tx: Option<LayeredDbTxMut<DB>>,
-    epoch_chain_tx: Option<LayeredDbTxMut<DB>>,
     kad_tx: Option<LayeredDbTxMut<DB>>,
     cache_tx: Option<LayeredDbTxMut<DB>>,
 }
@@ -200,27 +163,6 @@ impl<DB: Database> CompositeDbTxMut<DB> {
                     self.epoch_tx = Some(epoch_tx);
                 }
                 Ok(self.epoch_tx.as_mut().expect("epoch transaction"))
-            }
-            TableHint::EpochChain => {
-                if self.epoch_chain_tx.is_none() {
-                    let tx = self.inner.epoch_chain_db.write_txn()?;
-                    self.epoch_chain_tx = Some(tx);
-                }
-                Ok(self.epoch_chain_tx.as_mut().expect("epoch chain transaction"))
-            }
-            TableHint::ConsensusChain => {
-                if self.consensus_chain_tx.is_none() {
-                    let tx = self.inner.consensus_chain_db.write_txn()?;
-                    self.consensus_chain_tx = Some(tx);
-                }
-                Ok(self.consensus_chain_tx.as_mut().expect("consensus transaction"))
-            }
-            TableHint::Batch => {
-                if self.batch_tx.is_none() {
-                    let tx = self.inner.batch_db.write_txn()?;
-                    self.batch_tx = Some(tx);
-                }
-                Ok(self.batch_tx.as_mut().expect("batch transaction"))
             }
             TableHint::Kad => {
                 if self.kad_tx.is_none() {
@@ -258,27 +200,6 @@ impl<DB: Database> DbTx for CompositeDbTxMut<DB> {
                     self.inner.epoch_db.get::<T>(key)
                 }
             }
-            TableHint::EpochChain => {
-                if let Some(tx) = self.epoch_chain_tx.as_ref() {
-                    tx.get::<T>(key)
-                } else {
-                    self.inner.epoch_chain_db.get::<T>(key)
-                }
-            }
-            TableHint::Batch => {
-                if let Some(tx) = self.batch_tx.as_ref() {
-                    tx.get::<T>(key)
-                } else {
-                    self.inner.batch_db.get::<T>(key)
-                }
-            }
-            TableHint::ConsensusChain => {
-                if let Some(tx) = self.consensus_chain_tx.as_ref() {
-                    tx.get::<T>(key)
-                } else {
-                    self.inner.consensus_chain_db.get::<T>(key)
-                }
-            }
             TableHint::Kad => {
                 if let Some(tx) = self.kad_tx.as_ref() {
                     tx.get::<T>(key)
@@ -311,15 +232,6 @@ impl<DB: Database> DbTxMut for CompositeDbTxMut<DB> {
 
     fn commit(self) -> eyre::Result<()> {
         if let Some(tx) = self.epoch_tx {
-            tx.commit()?;
-        }
-        if let Some(tx) = self.batch_tx {
-            tx.commit()?;
-        }
-        if let Some(tx) = self.consensus_chain_tx {
-            tx.commit()?;
-        }
-        if let Some(tx) = self.epoch_chain_tx {
             tx.commit()?;
         }
         if let Some(tx) = self.kad_tx {
@@ -359,8 +271,7 @@ mod test {
         let db =
             MdbxDatabase::open(path, 4, 16 * MEGABYTE, 8 * MEGABYTE).expect("Cannot open database");
 
-        let db =
-            CompositeDatabase::open(db.clone(), db.clone(), db.clone(), db.clone(), db.clone(), db);
+        let db = CompositeDatabase::open(db.clone(), db.clone(), db);
         db.open_table::<TestTable>().expect("failed to open table!");
         db
     }

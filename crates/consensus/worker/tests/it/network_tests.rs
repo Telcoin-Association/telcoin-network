@@ -503,10 +503,7 @@ async fn test_per_peer_limit_rejects_excess() {
 
     // peer_a should be rejected (per-peer limit)
     let peer_a_count = pending_map.keys().filter(|(p, _)| *p == peer_a).count();
-    assert!(
-        peer_a_count >= MAX_PENDING_REQUESTS_PER_PEER,
-        "peer_a should be at per-peer limit"
-    );
+    assert!(peer_a_count >= MAX_PENDING_REQUESTS_PER_PEER, "peer_a should be at per-peer limit");
 
     // peer_b should still succeed
     let peer_b_count = pending_map.keys().filter(|(p, _)| *p == peer_b).count();
@@ -602,10 +599,8 @@ async fn test_concurrent_capacity_exactly_max() {
             if first_key.is_none() {
                 first_key = Some(key);
             }
-            pending_map.insert(
-                key,
-                PendingBatchStream::new(HashSet::from([B256::random()]), 0, permit),
-            );
+            pending_map
+                .insert(key, PendingBatchStream::new(HashSet::from([B256::random()]), 0, permit));
         }
     }
 
@@ -613,20 +608,14 @@ async fn test_concurrent_capacity_exactly_max() {
     assert_eq!(semaphore.available_permits(), 0);
 
     // 6th request should fail
-    assert!(
-        semaphore.clone().try_acquire_owned().is_err(),
-        "should be at capacity"
-    );
+    assert!(semaphore.clone().try_acquire_owned().is_err(), "should be at capacity");
 
     // drop one entry → frees a permit
     let key = first_key.unwrap();
     pending_map.remove(&key);
 
     // now the 6th request should succeed
-    assert!(
-        semaphore.clone().try_acquire_owned().is_ok(),
-        "permit should be available after drop"
-    );
+    assert!(semaphore.clone().try_acquire_owned().is_ok(), "permit should be available after drop");
 }
 
 /// Test that request_batches retries after initial rejection and reaches

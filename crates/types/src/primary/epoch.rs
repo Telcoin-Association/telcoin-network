@@ -31,10 +31,10 @@ pub struct EpochRecord {
     /// The block number and hash of the last execution state of this epoch.
     /// Basically the execution genesis for the next epoch after this one.
     /// Also a signed checkpoint of execution state (with the certificate).
-    pub parent_state: BlockNumHash,
-    /// The hash of the last ['ConsensusHeader'] of this epoch.
+    pub final_state: BlockNumHash,
+    /// The hash and consensus block number of the last ['ConsensusHeader'] of this epoch.
     /// Can be used as a signed checkpoint for consensus (with the certificate).
-    pub parent_consensus: B256,
+    pub final_consensus: BlockNumHash,
 }
 
 impl EpochRecord {
@@ -52,7 +52,7 @@ impl EpochRecord {
             encode(&IntentMessage::new(Intent::consensus(IntentScope::EpochBoundary), epoch_hash));
         let signature = signer.request_signature_direct(&intent);
 
-        EpochVote { epoch_hash, public_key: signer.public_key(), signature }
+        EpochVote { epoch: self.epoch, epoch_hash, public_key: signer.public_key(), signature }
     }
 
     /// Return true if cert contains a quorum of committee signatures for this EpochRecord.
@@ -102,6 +102,8 @@ impl EpochRecord {
 /// Note this is gossipped by the outgoing (previous committee).
 #[derive(PartialEq, Serialize, Deserialize, Copy, Clone, Debug, Default)]
 pub struct EpochVote {
+    /// The epoch this is voting for.
+    pub epoch: Epoch,
     /// The hash of the ['EpochRecord'].
     /// Store the hash not the record to keep gossip size down.
     /// Other nodes can request the record once vs recieving it many times.
@@ -193,8 +195,8 @@ mod test {
             committee: vec![com1.public_key(), com2.public_key(), com3.public_key()],
             next_committee: vec![com1.public_key(), com2.public_key(), com3.public_key()],
             parent_hash: B256::default(),
-            parent_state: BlockNumHash::default(),
-            parent_consensus: B256::default(),
+            final_state: BlockNumHash::default(),
+            final_consensus: BlockNumHash::default(),
         };
         let vote1 = record.sign_vote(&com1);
         let vote2 = record.sign_vote(&com2);

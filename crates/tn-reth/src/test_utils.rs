@@ -23,7 +23,9 @@ use reth_evm::{execute::Executor as _, ConfigureEvm, EvmFactory as _};
 use reth_primitives::{sign_message, Account};
 use reth_primitives_traits::SignerRecoverable;
 use reth_provider::{AccountReader as _, StateProvider, StateProviderBox, StateProviderFactory};
-use reth_revm::{database::StateProviderDatabase, db::BundleState, State};
+use reth_revm::{
+    context::result::ResultAndState, database::StateProviderDatabase, db::BundleState, State,
+};
 use reth_transaction_pool::{EthPoolTransaction, EthPooledTransaction, PoolTransaction};
 use secp256k1::{
     rand::{rngs::StdRng, Rng, SeedableRng as _},
@@ -39,7 +41,8 @@ use tn_types::{
     B256, EMPTY_OMMER_ROOT_HASH, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS,
     ETHEREUM_BLOCK_GAS_LIMIT_30M, MIN_PROTOCOL_BASE_FEE, U256,
 };
-// re-exports for engine tests
+// re-exports for tests
+pub use crate::evm::precompile_test_utils;
 pub use alloy::eips::{
     eip2935::HISTORY_STORAGE_ADDRESS, eip4788::BEACON_ROOTS_ADDRESS, eip7685::EMPTY_REQUESTS_HASH,
 };
@@ -72,7 +75,7 @@ impl RethEnv {
     /// Create an EVM-environment from state provider.
     pub fn tn_evm(&self, hash: BlockHash) -> eyre::Result<TNEvmTestType> {
         let header = self.header(hash)?.expect("provided hash in header table");
-        let state = self.state_by_block_hash(hash)?;
+        let state: Box<dyn reth_provider::StateProvider> = self.state_by_block_hash(hash)?;
         let db = State::builder()
             .with_database(StateProviderDatabase::new(state))
             .with_bundle_update()
@@ -82,6 +85,21 @@ impl RethEnv {
             .evm_config
             .evm_factory()
             .create_evm(db, self.inner.evm_config.evm_env(&header)?))
+    }
+
+    /// Execute a read-only system call against a contract and return the result.
+    ///
+    /// Useful for integration tests that need to read precompile state after
+    /// block execution without importing the `Evm` trait.
+    pub fn read_contract_state(
+        &self,
+        block_hash: BlockHash,
+        contract: Address,
+        calldata: Bytes,
+    ) -> eyre::Result<ResultAndState> {
+        use reth_evm::Evm;
+        let mut evm = self.tn_evm(block_hash)?;
+        Ok(evm.transact_system_call(crate::system_calls::SYSTEM_ADDRESS, contract, calldata)?)
     }
 
     /// Test utility to execute batch and return execution outcome.
@@ -166,6 +184,22 @@ impl RethEnv {
             ConsensusRegistry::getRewardsCall { validatorAddress: address }.abi_encode().into();
         let rewards = self.call_consensus_registry::<_, U256>(&mut tn_evm, calldata)?;
         Ok(rewards)
+    }
+
+    /// Retrieve validator info from the ConsensusRegistry.
+    pub fn get_validator_info(
+        &self,
+        hash: BlockHash,
+        address: Address,
+    ) -> eyre::Result<ConsensusRegistry::ValidatorInfo> {
+        let mut tn_evm = self.tn_evm(hash)?;
+        let calldata =
+            ConsensusRegistry::getValidatorCall { validatorAddress: address }.abi_encode().into();
+        let info = self.call_consensus_registry::<_, ConsensusRegistry::ValidatorInfo>(
+            &mut tn_evm,
+            calldata,
+        )?;
+        Ok(info)
     }
 }
 
@@ -648,6 +682,5 @@ pub async fn create_committee_from_state(epoch_state: EpochState) -> eyre::Resul
         committee_builder.add_authority(bls_key, info.validatorAddress);
     }
     let committee = committee_builder.build();
-    committee.load();
     Ok(committee)
 }

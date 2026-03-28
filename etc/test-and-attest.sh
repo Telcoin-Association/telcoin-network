@@ -75,18 +75,18 @@ source .env
 #     exit 1
 # fi
 
-# # check cargo fmt first
-# cargo +nightly-2025-11-04 fmt -- --check
+# check cargo fmt first
+cargo +nightly-2026-03-20 fmt -- --check
 
 # echo "fmt passed"
 
-# #
-# # check clippy
-# #
-# # default features
-# cargo +nightly-2025-11-04 clippy --workspace -- -D warnings
-# # all features
-# cargo +nightly-2025-11-04 clippy --workspace --all-features -- -D warnings
+#
+# check clippy
+#
+# default features
+cargo +nightly-2026-03-20 clippy --workspace -- -D warnings
+# all features
+cargo +nightly-2026-03-20 clippy --workspace --all-features -- -D warnings
 
 # echo "clippy for workspace: default and all features passed"
 
@@ -95,12 +95,8 @@ source .env
 #
 # default features
 cargo nextest run --workspace --no-fail-fast
-# Run tests that require credentials.
-cargo nextest run test_with_creds --run-ignored ignored-only
 # run the e2e restart and epoch tests, they are seperate to avoid any port/node confusion
-cargo nextest run -p e2e-tests --run-ignored ignored-only
-# faucet it test
-cargo nextest run -p e2e-tests --test it --features faucet --no-fail-fast --run-ignored ignored-only faucet
+cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features
 
 echo "all checks passed - submitting attestation on-chain..."
 

@@ -98,14 +98,8 @@ impl Default for MemDatabase {
         let _ = db.open_table::<crate::tables::CertificateDigestByRound>();
         let _ = db.open_table::<crate::tables::CertificateDigestByOrigin>();
         let _ = db.open_table::<crate::tables::Payload>();
-        let _ = db.open_table::<crate::tables::Batches>();
-        let _ = db.open_table::<crate::tables::ConsensusBlocks>();
-        let _ = db.open_table::<crate::tables::ConsensusBlockNumbersByDigest>();
-        let _ = db.open_table::<crate::tables::ConsensusBlocksCache>();
         let _ = db.open_table::<crate::tables::NodeBatchesCache>();
-        let _ = db.open_table::<crate::tables::EpochRecords>();
-        let _ = db.open_table::<crate::tables::EpochCerts>();
-        let _ = db.open_table::<crate::tables::EpochRecordsIndex>();
+        let _ = db.open_table::<crate::tables::ConsensusHeaderCache>();
         let _ = db.open_table::<crate::tables::KadRecords>();
         let _ = db.open_table::<crate::tables::KadProviderRecords>();
         let _ = db.open_table::<crate::tables::KadWorkerRecords>();

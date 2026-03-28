@@ -16,7 +16,7 @@ fn test_empty_certificate_verification() {
     let votes =
         fixture.authorities().take(3).map(|a| (a.id(), *a.vote(&header).signature())).collect();
 
-    let certificate =
+    let mut certificate =
         Certificate::new_unsigned_for_test(&committee, header, votes).expect("new unsigned cert");
     assert!(certificate.validate_and_verify(&committee).is_err());
 }
@@ -35,12 +35,11 @@ fn test_valid_certificate_verification() {
         signatures.push((vote.author().clone(), *vote.signature()));
     }
 
-    let certificate = Certificate::new_unverified(&committee, header, signatures).unwrap();
-    let verified_certificate = certificate.validate_and_verify(&committee);
+    let mut certificate = Certificate::new_unverified(&committee, header, signatures).unwrap();
+    assert!(certificate.validate_and_verify(&committee).is_ok());
 
-    assert!(verified_certificate.is_ok());
     assert!(matches!(
-        verified_certificate.unwrap().signature_verification_state(),
+        certificate.signature_verification_state(),
         SignatureVerificationState::VerifiedDirectly(_)
     ));
 }
@@ -61,7 +60,8 @@ fn test_certificate_insufficient_signatures() {
 
     assert!(Certificate::new_unverified(&committee, header.clone(), signatures.clone()).is_err());
 
-    let certificate = Certificate::new_unsigned_for_test(&committee, header, signatures).unwrap();
+    let mut certificate =
+        Certificate::new_unsigned_for_test(&committee, header, signatures).unwrap();
 
     assert!(certificate.validate_and_verify(&committee).is_err());
 }
@@ -85,7 +85,7 @@ fn test_certificate_validly_repeated_public_keys() {
 
     let certificate_res = Certificate::new_unverified(&committee, header, signatures);
     assert!(certificate_res.is_ok());
-    let certificate = certificate_res.unwrap();
+    let mut certificate = certificate_res.unwrap();
 
     assert!(certificate.validate_and_verify(&committee).is_ok());
 }
@@ -133,7 +133,7 @@ proptest::proptest! {
             signatures.push((vote.author().clone(), *vote.signature()));
         }
 
-        let certificate = Certificate::new_unverified(&committee, header, signatures).unwrap();
+        let mut certificate = Certificate::new_unverified(&committee, header, signatures).unwrap();
 
         assert!(certificate
             .validate_and_verify(&committee)

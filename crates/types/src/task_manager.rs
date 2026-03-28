@@ -3,7 +3,6 @@
 use crate::Notifier;
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use std::{
-    collections::HashMap,
     fmt::{Debug, Display},
     future::Future,
     pin::pin,
@@ -67,7 +66,6 @@ impl Future for TaskHandle {
 /// there JoinHandles.
 pub struct TaskManager {
     tasks: FuturesUnordered<TaskHandle>,
-    submanagers: HashMap<String, TaskManager>,
     name: String,
     new_task_rx: mpsc::Receiver<TaskHandle>,
     new_task_tx: mpsc::Sender<TaskHandle>,
@@ -232,7 +230,6 @@ impl TaskManager {
         let (new_task_tx, new_task_rx) = mpsc::channel(1000);
         Self {
             tasks: FuturesUnordered::new(),
-            submanagers: HashMap::new(),
             name: name.to_string(),
             new_task_rx,
             new_task_tx,
@@ -296,16 +293,6 @@ impl TaskManager {
         }
     }
 
-    /// Return a mutable reference to a submanager.
-    pub fn get_submanager(&mut self, name: &str) -> Option<&mut TaskManager> {
-        self.submanagers.get_mut(name)
-    }
-
-    /// Adds a subtask manager by name to this TaskManager.  Allows building a heirarchy of tasks.
-    pub fn add_task_manager(&mut self, manager: TaskManager) {
-        self.submanagers.insert(manager.name.clone(), manager);
-    }
-
     /// Will resolve once one of the tasks for the manager resolves.
     ///
     /// The manager tracks critical and non-critical tasks. Critical tasks
@@ -323,6 +310,32 @@ impl TaskManager {
         self.join_internal(shutdown, true).await
     }
 
+    /// Will resolve once one of the tasks for the manager resolves, shutdown is notified or the
+    /// node recieves SIGTERM.
+    ///
+    /// Note the manager is based on the assumption that all tasks added via spawn_task
+    /// are critical and and one stopping is problem.
+    /// Also will end if the user hits ctrl-c or sends a SIGTERM to the app.
+    /// This will not join the tasks but resolves as soon as shutdown is indicated.
+    pub async fn until_exit(&mut self, shutdown: Notifier) -> Result<(), TaskJoinError> {
+        self.until_exit_internal(shutdown, true).await
+    }
+
+    /// Will resolve once one of the tasks for the manager resolves or shutdown is notified.
+    ///
+    /// Note the manager is based on the assumption that all tasks added via spawn_task
+    /// are critical and and one stopping is problem.
+    /// This will not join the tasks but resolves as soon as shutdown is indicated.
+    pub async fn until_task_ends(&mut self, shutdown: Notifier) -> Result<(), TaskJoinError> {
+        self.until_exit_internal(shutdown, false).await
+    }
+
+    /// Will resolve once all tasks have shutdown or timeout is reached.
+    /// Can be used after until_exit to split up the join.
+    pub async fn wait_for_task_shutdown(&mut self) {
+        self.wait_for_task_shutdown_internal().await
+    }
+
     /// Abort all of our direct tasks (not sub task managers though).
     pub fn abort(&self) {
         for task in self.tasks.iter() {
@@ -336,11 +349,6 @@ impl TaskManager {
     /// This is used to close epoch-related tasks.
     pub fn abort_all_tasks(&mut self) {
         self.abort();
-
-        // abort submanager tasks as well
-        for manager in self.submanagers.values_mut() {
-            manager.abort_all_tasks();
-        }
     }
 
     /// Take any tasks on the new task queue and put them in the task list.
@@ -354,22 +362,12 @@ impl TaskManager {
         }
     }
 
-    /// Implements the join logic for the manager.
-    async fn join_internal(
+    /// Resolves when the task manager should exit.
+    async fn until_exit_internal(
         &mut self,
         shutdown: Notifier,
         do_exit: bool,
     ) -> Result<(), TaskJoinError> {
-        let shutdown_ref = &shutdown;
-        let sub_wait_millis = (self.join_wait_millis / 4) * 3;
-        let mut future_managers: FuturesUnordered<_> = self
-            .submanagers
-            .drain()
-            .map(|(name, mut sub)| async move {
-                sub.set_join_wait(sub_wait_millis);
-                (sub.join(shutdown_ref.clone()).await, name)
-            })
-            .collect();
         let rx_shutdown = shutdown.subscribe();
         let mut result = Ok(());
         loop {
@@ -416,18 +414,16 @@ impl TaskManager {
                     }
                     break;
                 }
-                Some((res, name)) = future_managers.next() => {
-                    if !rx_shutdown.noticed() {
-                        tracing::error!(target: "tn::tasks", "{}: Sub-Task Manager {name} returned exited, exiting", self.name);
-                    }
-                    result = res;
-                    break;
-                }
             }
         }
         // No matter how we exit notify shutdown and allow a chance for other tasks to exit
         // cleanly.
         shutdown.notify();
+        result
+    }
+
+    /// Attempt to wait for all the tasks to complete or timeout waiting on them.
+    async fn wait_for_task_shutdown_internal(&mut self) {
         let task_name = self.name.clone();
         let join_wait = Duration::from_millis(self.join_wait_millis);
         // wait some time for shutdown...
@@ -465,28 +461,16 @@ impl TaskManager {
         {
             tracing::error!(target:"tn::tasks", "{}: All tasks NOT shutdown", task_name);
         }
+    }
 
-        // Another 2 seconds for any of our sub tasks to end...
-        let task_name_clone = task_name.clone();
-        if tokio::time::timeout(join_wait, async move {
-            while let Some((_, name)) = future_managers.next().await {
-                tracing::info!(
-                    target: "tn::tasks",
-                    "{}: TaskManager {name} shutdown successfully",
-                    task_name_clone
-                )
-            }
-            tracing::info!(
-                target: "tn::tasks",
-                "{}: All tasks managers shutdown",
-                task_name_clone
-            );
-        })
-        .await
-        .is_err()
-        {
-            tracing::error!(target: "tn::tasks", "{}: All tasks managers NOT shutdown", task_name);
-        }
+    /// Implements the join logic for the manager.
+    async fn join_internal(
+        &mut self,
+        shutdown: Notifier,
+        do_exit: bool,
+    ) -> Result<(), TaskJoinError> {
+        let result = self.until_exit_internal(shutdown, do_exit).await;
+        self.wait_for_task_shutdown_internal().await;
         result
     }
 
@@ -528,11 +512,6 @@ impl Display for TaskManager {
             let critical = if task.info.critical { "critical" } else { "not critical" };
             writeln!(f, "Task: {} ({critical})", task.info.name)?;
         }
-        for sub in self.submanagers.values() {
-            writeln!(f, "++++++++++++++++++++++++++++++++++++++++++++++++++++")?;
-            writeln!(f, "{sub}")?;
-            writeln!(f, "++++++++++++++++++++++++++++++++++++++++++++++++++++")?;
-        }
         Ok(())
     }
 }
@@ -544,19 +523,23 @@ impl Debug for TaskManager {
 }
 
 impl reth_tasks::TaskSpawner for TaskSpawner {
-    fn spawn(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
+    fn spawn_task(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
         self.spawn_reth_task("reth-task", fut, false, false)
     }
 
-    fn spawn_critical(&self, name: &'static str, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
+    fn spawn_critical_task(
+        &self,
+        name: &'static str,
+        fut: BoxFuture<'static, ()>,
+    ) -> JoinHandle<()> {
         self.spawn_reth_task(name, fut, true, false)
     }
 
-    fn spawn_blocking(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
+    fn spawn_blocking_task(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
         self.spawn_reth_task("reth-blocking-task", fut, false, true)
     }
 
-    fn spawn_critical_blocking(
+    fn spawn_critical_blocking_task(
         &self,
         name: &'static str,
         fut: BoxFuture<'static, ()>,
@@ -662,9 +645,9 @@ mod test {
         assert_eq!(spong_block.ping(2).await.unwrap(), 2);
 
         // Test the reth interface to the TaskSpawner.
-        use reth_tasks::TaskSpawner as _;
+        use reth_tasks::TaskSpawner as RethTaskSpawner;
         let (rsping_crit, mut rspong_crit) = new_ping_pong();
-        spawner.spawn_critical(
+        spawner.spawn_critical_task(
             "Crit",
             Box::pin(async move {
                 rsping_crit.run().await;
@@ -674,21 +657,27 @@ mod test {
         assert_eq!(rspong_crit.ping(2).await.unwrap(), 2);
 
         let (rsping_norm, mut rspong_norm) = new_ping_pong();
-        spawner.spawn(Box::pin(async move {
-            rsping_norm.run().await;
-        }));
+        RethTaskSpawner::spawn_task(
+            &spawner,
+            Box::pin(async move {
+                rsping_norm.run().await;
+            }),
+        );
         assert_eq!(rspong_norm.ping(1).await.unwrap(), 1);
         assert_eq!(rspong_norm.ping(2).await.unwrap(), 2);
 
         let (rsping_block, mut rspong_block) = new_ping_pong();
-        spawner.spawn_blocking(Box::pin(async move {
-            rsping_block.run().await;
-        }));
+        RethTaskSpawner::spawn_blocking_task(
+            &spawner,
+            Box::pin(async move {
+                rsping_block.run().await;
+            }),
+        );
         assert_eq!(rspong_block.ping(1).await.unwrap(), 1);
         assert_eq!(rspong_block.ping(2).await.unwrap(), 2);
 
         let (rsping_crit_block, mut rspong_crit_block) = new_ping_pong();
-        spawner.spawn_critical_blocking(
+        spawner.spawn_critical_blocking_task(
             "Crit block",
             Box::pin(async move {
                 rsping_crit_block.run().await;

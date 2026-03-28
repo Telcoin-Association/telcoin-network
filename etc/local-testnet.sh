@@ -12,6 +12,10 @@ DEV_FUNDS=""
 
 BASEFEE_ADDRESS=""
 
+# Owner of the ConsensusRegistry contract (can mint ConsensusNFTs).
+# Defaults to DEV_FUNDS if not provided.
+GOVERNANCE=""
+
 export TN_BLS_PASSPHRASE="local"
 
 while [ "$1" != "" ]; do
@@ -27,11 +31,20 @@ while [ "$1" != "" ]; do
                 shift
                 BASEFEE_ADDRESS=$1
                 ;;
+        --governance )
+                shift
+                GOVERNANCE=$1
+                ;;
         * )     echo "Invalid option: $1"
                 exit 1
     esac
     shift
 done
+
+# Default governance to dev-funds if not explicitly set
+if [ "$GOVERNANCE" == "" ] && [ "$DEV_FUNDS" != "" ]; then
+    GOVERNANCE="$DEV_FUNDS"
+fi
 
 VALIDATORS=("validator-1" "validator-2" "validator-3" "validator-4")
 ADDRESSES=(
@@ -105,7 +118,7 @@ else
             --dev-funded-account $DEV_FUNDS \
             --max-header-delay-ms 1000 \
             --min-header-delay-ms 1000 \
-            --consensus-registry-owner $DEV_FUNDS
+            --consensus-registry-owner $GOVERNANCE
     else
         target/${RELEASE}/telcoin-network genesis \
             --datadir "${ROOTDIR}" \
@@ -115,7 +128,7 @@ else
             --basefee-address $BASEFEE_ADDRESS \
             --max-header-delay-ms 1000 \
             --min-header-delay-ms 1000 \
-            --consensus-registry-owner $DEV_FUNDS
+            --consensus-registry-owner $GOVERNANCE
     fi
 
     # Copy the generated genesis, committee and parameters to each validator.

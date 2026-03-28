@@ -10,7 +10,7 @@ use reth::{
 };
 use reth_chainspec::ChainSpec;
 pub use reth_consensus::{Consensus, ConsensusError};
-use reth_consensus::{FullConsensus, HeaderValidator};
+use reth_consensus::{FullConsensus, HeaderValidator, ReceiptRootBloom};
 use reth_db::DatabaseEnv;
 use reth_engine_primitives::PayloadValidator;
 use reth_node_builder::{BuiltPayload, NewPayloadError, NodeTypes, NodeTypesWithDB, PayloadTypes};
@@ -62,17 +62,15 @@ impl<H> HeaderValidator<H> for TNExecution {
 }
 
 impl<B: Block> Consensus<B> for TNExecution {
-    type Error = ConsensusError;
-
     fn validate_body_against_header(
         &self,
         _body: &B::Body,
         _header: &SealedHeader<B::Header>,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), ConsensusError> {
         Ok(())
     }
 
-    fn validate_block_pre_execution(&self, _block: &SealedBlock<B>) -> Result<(), Self::Error> {
+    fn validate_block_pre_execution(&self, _block: &SealedBlock<B>) -> Result<(), ConsensusError> {
         Ok(())
     }
 }
@@ -82,6 +80,7 @@ impl<N: NodePrimitives> FullConsensus<N> for TNExecution {
         &self,
         _block: &RecoveredBlock<N::Block>,
         _result: &BlockExecutionResult<N::Receipt>,
+        _receipt_root_bloom: Option<ReceiptRootBloom>,
     ) -> Result<(), ConsensusError> {
         Ok(())
     }
@@ -95,6 +94,13 @@ where
     Types: PayloadTypes<ExecutionData = ExecutionData>,
 {
     type Block = tn_types::Block;
+
+    fn convert_payload_to_block(
+        &self,
+        _payload: ExecutionData,
+    ) -> Result<SealedBlock<Self::Block>, NewPayloadError> {
+        Ok(Default::default())
+    }
 
     fn ensure_well_formed_payload(
         &self,

@@ -3,7 +3,7 @@
 Consensus layer (CL) is an implementation of Narwhal and Bullshark.
 Execution layer (EL) produces EVM blocks compatible with Ethereum.
 
-Requires Rust 1.91
+Requires Rust 1.94
 
 ### Supported Platforms
 
@@ -22,36 +22,113 @@ Build a release version of the node software:
 Generate a config and keys for your observer node:
 `target/release/telcoin-network keytool generate observer --datadir DATADIR --address 0x4444444444444444444444444444444444444444 --bls-passphrase-source ask`
 
-This will use DATADIR for storage and set your "execution" address to 0x4444444444444444444444444444444444444444.  Note an observer does not recieve credit for execution but this option needs to be set anyway (at time of writing).  Use an address you control or a dummy like above.  This will also ask for the password for your nodes BLS key, this will need to be entered when started (or it can be put in an ENV var for injection).
+This will use DATADIR for storage and set your "execution" address to 0x4444444444444444444444444444444444444444. Note an observer does not recieve credit for execution but this option needs to be set anyway (at time of writing). Use an address you control or a dummy like above. This will also ask for the password for your nodes BLS key, this will need to be entered when started (or it can be put in an ENV var for injection).
 
 Start your observer node:
 `target/release/telcoin-network node -vvv --http --observer --chain adiri --bls-passphrase-source ask --datadir DATADIR`
 
 Make sure DATADIR matches the config command above and use the same password for reading the key.
 
+### Run a validator
+
+#### 1. Generate validator keys
+
+```bash
+telcoin-network --datadir DATADIR --bls-passphrase-source ask \
+  keytool generate validator \
+  --address 0xYOUR_EXECUTION_ADDRESS \
+  --external-primary-addr /ip4/YOUR_IP/udp/PORT/quic-v1
+```
+
+This generates a BLS keypair, network keys, proof-of-possession, and a `node-info.yaml` file in `DATADIR`.
+
+- `--address` is the execution layer address that receives fees
+- `--external-primary-addr` should be set to the node's public IP and port
+
+#### 2. Export staking arguments
+
+```bash
+telcoin-network keytool export-staking-args --node-info DATADIR/node-info.yaml
+```
+
+This reads the public `node-info.yaml` and outputs the BLS public key and proof-of-possession in the format required by `ConsensusRegistry.stake()`.
+No BLS private key or passphrase is needed.
+
+Output modes:
+
+- **Default**: human-readable display of each argument
+- `--json`: JSON object for programmatic use
+- `--calldata`: hex-encoded calldata for direct transaction submission
+
+#### 3. Stake on-chain
+
+**Prerequisite:** Governance must mint a ConsensusNFT for your execution address before you can stake.
+
+Governance mints the NFT:
+
+```bash
+# local testnet example
+cast send $CONSENSUS_REGISTRY "mint(address)" 0xVALIDATOR_EXECUTION_ADDRESS --trezor --rpc-url RPC_URL
+```
+
+The `ConsensusRegistry` is deployed at a fixed system address:
+
+```bash
+CONSENSUS_REGISTRY=0x07E17e17E17e17E17e17E17E17E17e17e17E17e1
+```
+
+The `stake()` function is payable.
+Users must send the exact required stake amount as the transaction value.
+Query the current required stake amount:
+
+```bash
+cast call $CONSENSUS_REGISTRY "getCurrentStakeConfig()(uint256,uint256,uint256,uint32)" --rpc-url RPC_URL
+```
+
+The first value returned is `stakeAmount` (in wei). Use it as the `--value` in the stake transaction:
+
+```bash
+CALLDATA=$(telcoin-network keytool export-staking-args --node-info DATADIR/node-info.yaml --calldata)
+cast send $CONSENSUS_REGISTRY $CALLDATA --value <STAKE_AMOUNT> --trezor --rpc-url RPC_URL
+```
+
+Other signing options: `--ledger` for Ledger hardware wallets, `--interactive` to enter a private key securely at a prompt.
+
+After staking, signal that your validator is ready for committee selection:
+
+```bash
+cast send $CONSENSUS_REGISTRY "activate()" --trezor --rpc-url RPC_URL
+```
+
+#### 4. Start the validator node
+
+```bash
+telcoin-network node -vvv --http --chain adiri --bls-passphrase-source ask --datadir DATADIR
+```
+
+Make sure `DATADIR` matches the directory used during key generation and use the same BLS passphrase.
+
 ### Start a local development network
 
 Run the test network script to start four local validators and begin advancing the chain:
 `etc/local-testnet.sh --start --dev-funds 0xADDRESS`
 Note: the script will compile a release build, which may take a few minutes.
-This configures and creates genesis for a new network and starts it. See the output for the RPC endpoints.
-0xADDRESS above should be a valid address prepended with 0x. Make sure you have the key for this address,
-it will be funded with 1billion TEL on your test network. After configuration you can run the script with
-just the --start option (--dev-funds is only used when configuring and CAN NOT be used later to fund
-an account). Nodes run in the backgound and should be killed with the `kill` or `killall` commands.
+This configures and creates genesis for a new network and starts it.
+See the output for the RPC endpoints.
+0xADDRESS above should be a valid address prepended with 0x.
+Make sure you have the key for this address, it will be funded with 1billion TEL on your test network.
+After configuration you can run the script with just the --start option (--dev-funds is only used when configuring and CAN NOT be used later to fund an account).
+Nodes run in the backgound and should be killed with the `kill telcoin-network` or `killall telcoin-network` commands.
 
-The best docs for running a test network will currently be this script. It is short and pretty basic,
-it configures each node, brings together the configs to create genesis and then shares this with each node.
-This is the same basic procedure used to create nodes on diffent machines (NOTE- do not use the instance
-option if not running on the same machine, it is to avoid port conflicts).
+The best docs for running a test network will currently be this script.
+It is short and pretty basic, it configures each node, brings together the configs to create genesis and then shares this with each node.
+This is the same basic procedure used to create nodes on diffent machines (NOTE- do not use the instance option if not running on the same machine, it is to avoid port conflicts).
 
 Once started you can use the RPC endpoint for any node with your favorate Ethereum tooling to test.
-You will have test funds in your dev funds account set during config. The network can be restarted
-by shutting down, `killall telcoin-network` is good for this, deleting ./local-validators/ and
-rerunning the script.
+You will have test funds in your dev funds account set during config.
+The network can be restarted by shutting down, `killall telcoin-network` is good for this, deleting ./local-validators/ and rerunning the script.
 
-The defaults should build a block roughly every 10 seconds, see comments on the script if you want to
-speed this up for testing.
+The defaults should build a block roughly every 10 seconds, see comments on the script if you want to speed this up for testing.
 
 ## CLI Usage
 

@@ -9,7 +9,7 @@
 use super::error::{WorkerNetworkError, WorkerNetworkResult};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use std::collections::HashSet;
-use tn_storage::tables::Batches;
+use tn_storage::tables::NodeBatchesCache;
 use tn_types::{max_batch_size, Batch, Database, Epoch, B256};
 
 /// Max number of batch digests per chunk.
@@ -102,7 +102,7 @@ where
     for chunk in digests.chunks(BATCH_DIGESTS_READ_CHUNK_SIZE) {
         // look up batches from db
         let batches: Vec<_> = store
-            .multi_get::<Batches>(chunk.iter())
+            .multi_get::<NodeBatchesCache>(chunk.iter())
             .map_err(|e| WorkerNetworkError::Internal(format!("DB error: {e}")))?
             .into_iter()
             .flatten() // removes `None`

@@ -7,12 +7,18 @@ use crate::{
         MissingCertificatesRequest, RequestHandler,
     },
     state_sync::StateSynchronizer,
-    ConsensusBus, RecentBlocks,
+    ConsensusBus, ConsensusBusApp, NodeMode, RecentBlocks,
 };
 use assert_matches::assert_matches;
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    time::Duration,
+};
+use tempfile::TempDir;
+use tn_config::Parameters;
 use tn_network_libp2p::{GossipMessage, TopicHash};
-use tn_storage::mem_db::MemDatabase;
+use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     error::HeaderError, now, AuthorityIdentifier, BlockHash, BlockHeader, BlockNumHash,
@@ -55,15 +61,24 @@ struct TestTypes<DB = MemDatabase> {
     /// num: 0
     /// hash: 0x78dec18c6d7da925bbe773c315653cdc70f6444ed6c1de9ac30bdb36cff74c3b
     parent: SealedHeader,
+    /// The consensus bus app for manipulating shared state in tests.
+    consensus_bus: ConsensusBusApp,
     /// Task manager the synchronizer (in RequestHandler) is spawned on.
     /// Save it so that task is not dropped early if needed.
     task_manager: TaskManager,
 }
 
 /// Helper function to create an instance of [RequestHandler] for the first authority in the
-/// committee.
-fn create_test_types() -> TestTypes {
-    let committee = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+/// committee.  Allow params to be overridden.
+async fn create_test_types_with_params(path: &Path, params: Option<Parameters>) -> TestTypes {
+    let committee = if let Some(params) = params {
+        CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .with_consensus_parameters(params)
+            .build()
+    } else {
+        CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build()
+    };
     let authority = committee.first_authority();
     let config = authority.consensus_config();
     let cb = ConsensusBus::new();
@@ -80,17 +95,28 @@ fn create_test_types() -> TestTypes {
     // set the latest execution result to genesis - test headers are proposed for round 1
     let mut recent = RecentBlocks::new(1);
     recent.push_latest(0, BlockNumHash::new(0, B256::default()), Some(parent.clone()));
-    cb.recent_blocks().send_replace(recent);
+    cb.app().recent_blocks().send_replace(recent);
 
-    let handler = RequestHandler::new(config.clone(), cb.clone(), synchronizer);
-    TestTypes { committee, handler, parent, task_manager }
+    let consensus_chain =
+        ConsensusChain::new_for_test(path.to_owned(), committee.committee()).await.unwrap();
+    let consensus_bus = cb.app().clone();
+    let handler =
+        RequestHandler::new(config.clone(), cb.app().clone(), synchronizer, consensus_chain);
+    TestTypes { committee, handler, parent, consensus_bus, task_manager }
+}
+
+/// Helper function to create an instance of [RequestHandler] for the first authority in the
+/// committee.
+async fn create_test_types(path: &Path) -> TestTypes {
+    create_test_types_with_params(path, None).await
 }
 
 #[tokio::test]
 async fn test_vote_succeeds() -> eyre::Result<()> {
     // common types
+    let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types();
+        create_test_types(temp_dir.path()).await;
 
     let parents = Vec::new();
 
@@ -112,8 +138,9 @@ async fn test_vote_succeeds() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_vote_fails_too_many_parents() -> eyre::Result<()> {
     // common types
+    let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types();
+        create_test_types(temp_dir.path()).await;
 
     // last authority produced 2 certs for round 1
     let mut too_many_parents: Vec<_> = Certificate::genesis(&committee.committee());
@@ -138,8 +165,9 @@ async fn test_vote_fails_too_many_parents() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_vote_fails_wrong_authority_network_key() -> eyre::Result<()> {
     // common types
+    let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types();
+        create_test_types(temp_dir.path()).await;
     let parents = Vec::new();
 
     // create valid header proposed by last peer in the committee for round 1
@@ -160,8 +188,9 @@ async fn test_vote_fails_wrong_authority_network_key() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_vote_fails_invalid_genesis_parent() -> eyre::Result<()> {
     // common types
+    let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types();
+        create_test_types(temp_dir.path()).await;
 
     let parents = Vec::new();
 
@@ -192,7 +221,9 @@ async fn test_vote_fails_invalid_genesis_parent() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_vote_fails_unknown_execution_result() -> eyre::Result<()> {
     // common types
-    let TestTypes { committee, handler, task_manager: _task_manager, .. } = create_test_types();
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
 
     // create header proposed by last peer in the committee for round 1
     let header = committee.header_from_last_authority();
@@ -209,7 +240,9 @@ async fn test_vote_fails_unknown_execution_result() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_vote_fails_invalid_header_digest() -> eyre::Result<()> {
     // common types
-    let TestTypes { committee, handler, task_manager: _task_manager, .. } = create_test_types();
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
 
     let parents = Vec::new();
 
@@ -228,8 +261,9 @@ async fn test_vote_fails_invalid_header_digest() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_vote_fails_invalid_timestamp() -> eyre::Result<()> {
     // common types
+    let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types();
+        create_test_types(temp_dir.path()).await;
 
     let parents = Vec::new();
 
@@ -252,8 +286,9 @@ async fn test_vote_fails_invalid_timestamp() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_vote_fails_wrong_epoch() -> eyre::Result<()> {
     // common types
+    let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types();
+        create_test_types(temp_dir.path()).await;
 
     let parents = Vec::new();
 
@@ -277,8 +312,9 @@ async fn test_vote_fails_wrong_epoch() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_vote_fails_unknown_authority() -> eyre::Result<()> {
     // common types
+    let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types();
+        create_test_types(temp_dir.path()).await;
 
     let parents = Vec::new();
 
@@ -302,7 +338,8 @@ async fn test_vote_fails_unknown_authority() -> eyre::Result<()> {
 /// Test that primary pub/sub is enforcing topics.
 #[tokio::test]
 async fn test_primary_batch_gossip_topics() {
-    let TestTypes { handler, .. } = create_test_types();
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, .. } = create_test_types(temp_dir.path()).await;
 
     let gossip = PrimaryGossip::Certificate(Box::new(Certificate::default()));
     let data = tn_types::encode(&gossip);
@@ -359,8 +396,9 @@ async fn test_primary_batch_gossip_topics() {
 /// Test that voting twice for the same header (same digest) returns cached response.
 #[tokio::test]
 async fn test_vote_same_digest_returns_cached() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types();
+        create_test_types(temp_dir.path()).await;
 
     let parents = Vec::new();
 
@@ -386,8 +424,9 @@ async fn test_vote_same_digest_returns_cached() -> eyre::Result<()> {
 /// Test that voting for different header in same round is rejected (equivocation).
 #[tokio::test]
 async fn test_vote_different_digest_same_round_rejected() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types();
+        create_test_types(temp_dir.path()).await;
 
     let parents = Vec::new();
 
@@ -424,8 +463,9 @@ async fn test_vote_different_digest_same_round_rejected() -> eyre::Result<()> {
 /// Test that voting for older round after voting for newer round is rejected.
 #[tokio::test]
 async fn test_vote_older_round_rejected() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types();
+        create_test_types(temp_dir.path()).await;
 
     let parents = Vec::new();
     let peer = *committee.last_authority().authority().protocol_key();
@@ -460,11 +500,101 @@ async fn test_vote_older_round_rejected() -> eyre::Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// Locking and Timeout Tests
+// ============================================================================
+// These tests cover the per-authority locking and timeout behavior added to vote().
+
+/// Helper: same as `create_test_types` but overrides `max_header_delay`.
+async fn create_test_types_with_delay(path: &Path, max_header_delay: Duration) -> TestTypes {
+    let mut params = Parameters::default();
+    params.max_header_delay = max_header_delay;
+    create_test_types_with_params(path, Some(params)).await
+}
+
+/// Two concurrent vote requests for the same authority with the same header must both
+/// complete without deadlock.  The per-authority `TokioMutex` serialises the two calls;
+/// whichever wins the lock processes `vote_inner` normally and stores the cached result,
+/// while the other sees the cached response on its turn.
+#[tokio::test]
+async fn test_vote_per_authority_lock_concurrent_same_header() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .build();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    // Clone shares the same Arc<AuthEquivocationMap>, so both tasks contend on the
+    // same per-authority mutex.
+    let handler1 = handler.clone();
+    let handler2 = handler.clone();
+    let header1 = header.clone();
+    let header2 = header.clone();
+
+    let task1 = tokio::spawn(async move { handler1.vote(peer, header1, vec![]).await });
+    let task2 = tokio::spawn(async move { handler2.vote(peer, header2, vec![]).await });
+
+    let (res1, res2) = tokio::join!(task1, task2);
+
+    // Both must succeed: one runs vote_inner, the other returns the cached result.
+    assert!(res1.expect("task1 panicked").is_ok(), "first concurrent vote should succeed");
+    assert!(
+        res2.expect("task2 panicked").is_ok(),
+        "second concurrent vote should succeed (cached)"
+    );
+
+    Ok(())
+}
+
+/// When `vote_inner` blocks longer than `max_header_delay`, `vote()` must return
+/// `PrimaryNetworkError::Timeout`.
+///
+/// To force a reliable block we request a header whose `latest_execution_block` is at
+/// block number 1, while the test environment only has block 0.  This causes
+/// `wait_for_execution` to suspend on the watch channel.  We use
+/// `tokio::time::pause/advance` so the test completes instantly without real sleeping.
+#[tokio::test]
+async fn test_vote_inner_timeout() -> eyre::Result<()> {
+    tokio::time::pause();
+
+    let temp_dir = TempDir::new().unwrap();
+    // Use a 50 ms timeout — short enough to be clearly exceeded after a 100 ms advance.
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types_with_delay(temp_dir.path(), Duration::from_millis(50)).await;
+
+    // Block number 1 will never be executed in this test; vote_inner blocks in
+    // wait_for_execution until the outer timeout fires.
+    let future_block = BlockNumHash::new(1, BlockHash::random());
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(future_block)
+        .created_at(1)
+        .build();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    // Spawn on a separate task so we can advance the mock clock while it is suspended.
+    let vote_task = tokio::spawn(async move { handler.vote(peer, header, vec![]).await });
+
+    // Advance mock clock past the 50 ms deadline.
+    tokio::time::advance(Duration::from_millis(100)).await;
+
+    let res = vote_task.await.expect("vote task panicked");
+    assert_matches!(res, Err(PrimaryNetworkError::Timeout(_)), "expected Timeout error");
+
+    Ok(())
+}
+
 /// Test that the equivocation cache is per-authority.
 #[tokio::test]
 async fn test_vote_equivocation_per_authority() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
-        create_test_types();
+        create_test_types(temp_dir.path()).await;
 
     let parents = Vec::new();
 
@@ -504,4 +634,65 @@ async fn test_vote_equivocation_per_authority() -> eyre::Result<()> {
     );
 
     Ok(())
+}
+
+// ============================================================================
+// behind_consensus Tests
+// ============================================================================
+// These tests verify the behind_consensus detection logic, including the fix
+// for false-positive detection when the engine lags behind consensus commits.
+
+/// Non-active CVV should never be considered behind.
+#[tokio::test]
+async fn test_behind_consensus_not_active_cvv() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, consensus_bus, .. } = create_test_types(temp_dir.path()).await;
+
+    // Set node to inactive — behind_consensus should return false immediately
+    consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
+
+    let result = handler.behind_consensus(0, 999, None).await;
+    assert!(!result, "non-active CVV should never report as behind");
+}
+
+/// When the engine's processed_round lags but committed_round is current,
+/// behind_consensus should return false (the node IS participating in consensus).
+#[tokio::test]
+async fn test_behind_consensus_committed_round_prevents_false_positive() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, consensus_bus, .. } = create_test_types(temp_dir.path()).await;
+
+    // Simulate: engine has only processed round 18 (stale), but consensus core
+    // has committed through round 59 (current).
+    // Default gc_depth is 50, safety buffer subtracts 10 → effective gc_depth = 40.
+    // Without the fix: effective_exec_round = 18, 18 + 40 = 58 < 59 → false positive!
+    // With the fix: effective_exec_round = max(0, 18, 59) = 59, 59 + 40 = 99 > 59 → correct.
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(18, BlockNumHash::new(0, B256::default()), None);
+    consensus_bus.recent_blocks().send_replace(recent);
+
+    // Set committed round to 59 (as Bullshark would)
+    consensus_bus.committed_round_updates().send_replace(59);
+
+    // Incoming certificate at round 59 in the same epoch (0)
+    let result = handler.behind_consensus(0, 59, None).await;
+    assert!(!result, "committed_round should prevent false-positive behind detection");
+}
+
+/// When both engine and committed round are genuinely behind, detection should trigger.
+#[tokio::test]
+async fn test_behind_consensus_genuinely_behind() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, consensus_bus, .. } = create_test_types(temp_dir.path()).await;
+
+    // Node was offline — both engine and consensus core are at round 5.
+    // Incoming gossip is at round 60 in the same epoch.
+    // effective_exec_round = max(0, 5, 5) = 5, gc_depth = 40, 5 + 40 = 45 < 60 → behind.
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(5, BlockNumHash::new(0, B256::default()), None);
+    consensus_bus.recent_blocks().send_replace(recent);
+    consensus_bus.committed_round_updates().send_replace(5);
+
+    let result = handler.behind_consensus(0, 60, None).await;
+    assert!(result, "genuinely behind node should be detected");
 }

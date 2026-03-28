@@ -154,7 +154,9 @@ impl std::fmt::Display for BlsAggregateSignature {
 /// `intent || message` (See more at [IntentMessage] and [Intent]).
 /// The message is constructed as: EIP2537([BlsPublicKey]) || [Address].
 /// Where the public key is uncompressed with G2 point coordinates padded to 64-byte EVM words
-pub fn generate_proof_of_possession_bls(
+/// This is only for testing because it takes a private key.  For prod code use
+/// KeyConfig.generate_proof_of_possesion().
+pub fn generate_proof_of_possession_bls_for_test(
     keypair: &BlsKeypair,
     address: &Address,
 ) -> eyre::Result<BlsSignature> {
@@ -254,7 +256,7 @@ impl ValidatorAggregateSignature for BlsAggregateSignature {
         T: Serialize,
     {
         if pks.is_empty() {
-            return true;
+            return false;
         }
         let message = encode(&value);
         let mut pk_s: Vec<&blst::min_sig::PublicKey> = Vec::with_capacity(pks.len());
@@ -325,5 +327,258 @@ impl<'de> Deserialize<'de> for BlsSignature {
         } else {
             deserializer.deserialize_bytes(BlsSignatureVisitor)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{to_intent_message, BlsKeypair};
+    use blst::min_sig::Signature as CoreBlsSignature;
+    use rand::{rngs::StdRng, SeedableRng};
+
+    fn make_keypair() -> BlsKeypair {
+        BlsKeypair::generate(&mut StdRng::from_os_rng())
+    }
+
+    fn make_intent_msg() -> IntentMessage<Vec<u8>> {
+        to_intent_message(b"test payload".to_vec())
+    }
+
+    // --- BlsSignature::from_bytes ---
+
+    #[test]
+    fn test_from_bytes_valid() {
+        let kp = make_keypair();
+        let sig = kp.sign(b"hello");
+        let bytes = sig.to_bytes();
+        let sig2 = BlsSignature::from_bytes(&bytes).expect("roundtrip should succeed");
+        assert_eq!(sig, sig2);
+    }
+
+    #[test]
+    fn test_from_bytes_invalid() {
+        assert!(BlsSignature::from_bytes(&[0u8; 10]).is_err());
+    }
+
+    // --- BlsSignature::default (infinity point) ---
+
+    #[test]
+    fn test_default_is_infinity_point() {
+        let sig = BlsSignature::default();
+        let bytes = sig.to_bytes();
+        // First byte 0xc0 = compressed (bit 7) + infinity (bit 6)
+        assert_eq!(bytes[0], 0xc0);
+    }
+
+    // --- Debug / Display ---
+
+    #[test]
+    fn test_debug_and_display_match() {
+        let kp = make_keypair();
+        let sig = kp.sign(b"hello");
+        let debug = format!("{:?}", sig);
+        let display = format!("{}", sig);
+        assert!(!debug.is_empty());
+        assert_eq!(debug, display);
+    }
+
+    // --- Serde roundtrips ---
+
+    #[test]
+    fn test_serde_json_roundtrip() {
+        let kp = make_keypair();
+        let sig = kp.sign(b"hello");
+        let json = serde_json::to_string(&sig).expect("serialize");
+        let sig2: BlsSignature = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(sig, sig2);
+    }
+
+    #[test]
+    fn test_bincode_roundtrip() {
+        let kp = make_keypair();
+        let sig = kp.sign(b"hello");
+        let bytes = bincode::serialize(&sig).expect("serialize");
+        let sig2: BlsSignature = bincode::deserialize(&bytes).expect("deserialize");
+        assert_eq!(sig, sig2);
+    }
+
+    // --- From / Into conversions ---
+
+    #[test]
+    fn test_from_core_bls_signature_roundtrip() {
+        let kp = make_keypair();
+        let bls_sig = kp.sign(b"hello");
+        let core: CoreBlsSignature = bls_sig.into();
+        let restored: BlsSignature = core.into();
+        assert_eq!(bls_sig, restored);
+    }
+
+    #[test]
+    fn test_from_ref_core_bls_signature() {
+        let kp = make_keypair();
+        let bls_sig = kp.sign(b"hello");
+        let core: CoreBlsSignature = (&bls_sig).into();
+        let restored: BlsSignature = (&core).into();
+        assert_eq!(bls_sig, restored);
+    }
+
+    // --- verify_raw ---
+
+    #[test]
+    fn test_verify_raw_success() {
+        let kp = make_keypair();
+        let msg = b"raw message";
+        let sig = kp.sign(msg);
+        assert!(sig.verify_raw(msg, kp.public()));
+    }
+
+    #[test]
+    fn test_verify_raw_wrong_key() {
+        let kp1 = make_keypair();
+        let kp2 = make_keypair();
+        let msg = b"raw message";
+        let sig = kp1.sign(msg);
+        assert!(!sig.verify_raw(msg, kp2.public()));
+    }
+
+    #[test]
+    fn test_verify_raw_wrong_message() {
+        let kp = make_keypair();
+        let sig = kp.sign(b"correct message");
+        assert!(!sig.verify_raw(b"wrong message", kp.public()));
+    }
+
+    // --- ProtocolSignature: new_secure / verify_secure ---
+
+    #[test]
+    fn test_new_secure_verify_secure_success() {
+        let kp = make_keypair();
+        let msg = make_intent_msg();
+        let sig = BlsSignature::new_secure(&msg, &kp);
+        assert!(sig.verify_secure(&msg, kp.public()));
+    }
+
+    #[test]
+    fn test_verify_secure_wrong_key() {
+        let kp1 = make_keypair();
+        let kp2 = make_keypair();
+        let msg = make_intent_msg();
+        let sig = BlsSignature::new_secure(&msg, &kp1);
+        assert!(!sig.verify_secure(&msg, kp2.public()));
+    }
+
+    #[test]
+    fn test_verify_secure_wrong_message() {
+        let kp = make_keypair();
+        let msg1 = to_intent_message(b"message one".to_vec());
+        let msg2 = to_intent_message(b"message two".to_vec());
+        let sig = BlsSignature::new_secure(&msg1, &kp);
+        assert!(!sig.verify_secure(&msg2, kp.public()));
+    }
+
+    // --- ProtocolSignature: new_secure_bytes / verify_secure_bytes ---
+
+    #[test]
+    fn test_new_secure_bytes_verify_secure_bytes_success() {
+        let kp = make_keypair();
+        let msg = b"raw secure bytes";
+        let dummy = BlsSignature::default();
+        let sig = dummy.new_secure_bytes(msg, &kp);
+        assert!(sig.verify_secure_bytes(msg, kp.public()));
+    }
+
+    #[test]
+    fn test_verify_secure_bytes_wrong_key() {
+        let kp1 = make_keypair();
+        let kp2 = make_keypair();
+        let msg = b"raw secure bytes";
+        let dummy = BlsSignature::default();
+        let sig = dummy.new_secure_bytes(msg, &kp1);
+        assert!(!sig.verify_secure_bytes(msg, kp2.public()));
+    }
+
+    #[test]
+    fn test_verify_secure_bytes_wrong_message() {
+        let kp = make_keypair();
+        let dummy = BlsSignature::default();
+        let sig = dummy.new_secure_bytes(b"correct", &kp);
+        assert!(!sig.verify_secure_bytes(b"wrong", kp.public()));
+    }
+
+    // --- BlsAggregateSignature ---
+
+    #[test]
+    fn test_aggregate_single_signature() {
+        let kp = make_keypair();
+        let sig = kp.sign(b"msg");
+        assert!(BlsAggregateSignature::aggregate(&[sig], true).is_ok());
+    }
+
+    #[test]
+    fn test_aggregate_multiple_signatures() {
+        let sigs: Vec<BlsSignature> = (0..3).map(|_| make_keypair().sign(b"msg")).collect();
+        assert!(BlsAggregateSignature::aggregate(&sigs, true).is_ok());
+    }
+
+    #[test]
+    fn test_from_signature_to_signature_roundtrip() {
+        let kp = make_keypair();
+        let sig = kp.sign(b"hello");
+        let agg = BlsAggregateSignature::from_signature(&sig);
+        let restored = agg.to_signature();
+        assert_eq!(sig, restored);
+    }
+
+    // --- ValidatorAggregateSignature::verify_secure ---
+
+    #[test]
+    fn test_aggregate_verify_secure_empty_pks_returns_false() {
+        let kp = make_keypair();
+        let msg = make_intent_msg();
+        let sig = BlsSignature::new_secure(&msg, &kp);
+        let agg = BlsAggregateSignature::aggregate(&[sig], true).unwrap();
+        // Must return false when no public keys are provided
+        assert!(!agg.verify_secure(&msg, &[]));
+    }
+
+    #[test]
+    fn test_aggregate_verify_secure_single_signer() {
+        let kp = make_keypair();
+        let msg = make_intent_msg();
+        let sig = BlsSignature::new_secure(&msg, &kp);
+        let agg = BlsAggregateSignature::aggregate(&[sig], true).unwrap();
+        assert!(agg.verify_secure(&msg, &[*kp.public()]));
+    }
+
+    #[test]
+    fn test_aggregate_verify_secure_multiple_signers() {
+        let kps: Vec<BlsKeypair> = (0..3).map(|_| make_keypair()).collect();
+        let msg = make_intent_msg();
+        let sigs: Vec<BlsSignature> =
+            kps.iter().map(|kp| BlsSignature::new_secure(&msg, kp)).collect();
+        let pks: Vec<BlsPublicKey> = kps.iter().map(|kp| *kp.public()).collect();
+        let agg = BlsAggregateSignature::aggregate(&sigs, true).unwrap();
+        assert!(agg.verify_secure(&msg, &pks));
+    }
+
+    #[test]
+    fn test_aggregate_verify_secure_wrong_pk_returns_false() {
+        let kp1 = make_keypair();
+        let kp2 = make_keypair();
+        let msg = make_intent_msg();
+        let sig = BlsSignature::new_secure(&msg, &kp1);
+        let agg = BlsAggregateSignature::aggregate(&[sig], true).unwrap();
+        assert!(!agg.verify_secure(&msg, &[*kp2.public()]));
+    }
+
+    #[test]
+    fn test_aggregate_verify_secure_wrong_message_returns_false() {
+        let kp = make_keypair();
+        let msg1 = to_intent_message(b"message one".to_vec());
+        let msg2 = to_intent_message(b"message two".to_vec());
+        let sig = BlsSignature::new_secure(&msg1, &kp);
+        let agg = BlsAggregateSignature::aggregate(&[sig], true).unwrap();
+        assert!(!agg.verify_secure(&msg2, &[*kp.public()]));
     }
 }

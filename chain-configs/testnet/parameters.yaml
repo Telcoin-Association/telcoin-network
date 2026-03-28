@@ -12,3 +12,6 @@ batch_vote_timeout:
   secs: 10
   nanos: 0
 basefee_address: "0x00000000000000000000000000000000000007a0"
+parallel_fetch_request_delay_interval:
+  secs: 5
+  nanos: 0

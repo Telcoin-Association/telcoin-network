@@ -8,9 +8,10 @@ use std::{
     cmp::{max, Ordering},
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Debug,
+    sync::Arc,
 };
 use tn_config::ConsensusConfig;
-use tn_storage::{CertificateStore, ConsensusStore};
+use tn_storage::{consensus::ConsensusChain, CertificateStore};
 use tn_types::{
     AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Committee, Database,
     Hash as _, Noticer, Round, TaskManager, Timestamp, TnReceiver, TnSender,
@@ -36,7 +37,7 @@ pub struct ConsensusState {
     pub last_committed: HashMap<AuthorityIdentifier, Round>,
     /// The last committed sub dag. If value is None, it means that we haven't committed any sub
     /// dag yet.
-    pub last_committed_sub_dag: Option<CommittedSubDag>,
+    pub last_committed_sub_dag: Option<Arc<CommittedSubDag>>,
     /// Keeps the latest committed certificate (and its parents) for every authority. Anything
     /// older must be regularly cleaned up through the function `update`.
     pub dag: Dag,
@@ -58,7 +59,7 @@ impl ConsensusState {
         last_committed_round: Round,
         gc_depth: Round,
         recovered_last_committed: HashMap<AuthorityIdentifier, Round>,
-        latest_sub_dag: Option<CommittedSubDag>,
+        latest_sub_dag: Option<Arc<CommittedSubDag>>,
         cert_store: DB,
     ) -> Self {
         let last_round = ConsensusRound::new_with_gc_depth(last_committed_round, gc_depth);
@@ -272,17 +273,17 @@ pub struct Consensus<DB> {
 }
 
 impl<DB: Database> Consensus<DB> {
-    pub fn spawn(
+    pub async fn spawn(
         consensus_config: ConsensusConfig<DB>,
         consensus_bus: &ConsensusBus,
         protocol: Bullshark,
         task_manager: &TaskManager,
+        consensus_chain: ConsensusChain,
     ) {
         let rx_shutdown = consensus_config.shutdown().subscribe();
         // The consensus state (everything else is immutable).
         let current_epoch = consensus_config.epoch();
-        let recovered_last_committed =
-            consensus_config.node_storage().read_last_committed(current_epoch);
+        let recovered_last_committed = consensus_chain.read_last_committed(current_epoch).await;
 
         debug!(target: "epoch-manager", ?recovered_last_committed, "recovered last committed for epoch {}", current_epoch);
         let last_committed_round = recovered_last_committed
@@ -292,10 +293,11 @@ impl<DB: Database> Consensus<DB> {
             .unwrap_or_else(|| 0);
 
         // ignore previous epochs
-        let latest_sub_dag = consensus_config
-            .node_storage()
-            .get_latest_sub_dag()
-            .filter(|subdag| subdag.leader_epoch() >= current_epoch);
+        let latest_sub_dag = consensus_chain
+            .latest_consensus_header_from_pack(current_epoch)
+            .await
+            .unwrap_or_default()
+            .map(|h| h.sub_dag);
 
         debug!(target: "epoch-manager", ?latest_sub_dag, "recovered latest subdag:");
         if let Some(sub_dag) = &latest_sub_dag {
@@ -317,7 +319,10 @@ impl<DB: Database> Consensus<DB> {
             consensus_config.node_storage().clone(),
         );
 
-        consensus_bus.committed_round_updates().send_replace(state.last_round.committed_round);
+        consensus_bus
+            .app()
+            .committed_round_updates()
+            .send_replace(state.last_round.committed_round);
 
         let s = Self {
             committee: consensus_config.committee().clone(),
@@ -331,7 +336,7 @@ impl<DB: Database> Consensus<DB> {
 
         // Only run the consensus task if we are an active CVV.
         // Active means we are participating in consensus.
-        if consensus_bus.node_mode().borrow().is_active_cvv() {
+        if consensus_bus.is_active_cvv() {
             // Subscribe before spawning so the channel is active before any messages are sent.
             let rx_new_certificates = consensus_bus.subscribe_new_certificates();
             task_manager.spawn_critical_task("consensus task", s.run(rx_new_certificates));
@@ -342,7 +347,7 @@ impl<DB: Database> Consensus<DB> {
         mut self,
         mut rx_new_certificates: impl TnReceiver<Certificate>,
     ) -> Result<(), ConsensusError> {
-        self.active = self.consensus_bus.node_mode().borrow().is_active_cvv();
+        self.active = self.consensus_bus.is_active_cvv();
 
         // Listen to incoming certificates.
         loop {
@@ -389,11 +394,15 @@ impl<DB: Database> Consensus<DB> {
                 // fine. Also once we can follow gossiped consensus output this will not really be
                 // an issue (except during initial catch up).
                 let base_execution_block = committed_sub_dag.leader.header.latest_execution_block;
-                if self.consensus_bus.wait_for_execution(base_execution_block).await.is_err() {
+                if self.consensus_bus.app().wait_for_execution(base_execution_block).await.is_err()
+                {
                     // This seems to be a bogus sub dag, we are out of sync...
                     tracing::error!(target: "telcoin::consensus_state", "Got a bogus sub dag from bullshark, we are out of sync and probably can not recover!");
                     // Going inactive will probably not help us at this point....
-                    self.consensus_bus.node_mode().send_modify(|v| *v = NodeMode::CvvInactive);
+                    self.consensus_bus
+                        .app()
+                        .node_mode()
+                        .send_modify(|v| *v = NodeMode::CvvInactive);
                     self.consensus_config.shutdown().notify();
                     tracing::error!(target: "telcoin::consensus_state", ?base_execution_block, ?outcome, "commit {i} of {csd_len} subdags");
                     return Ok(());
@@ -432,6 +441,7 @@ impl<DB: Database> Consensus<DB> {
                 assert_eq!(self.state.last_round.committed_round, leader_commit_round);
 
                 self.consensus_bus
+                    .app()
                     .committed_round_updates()
                     .send_replace(self.state.last_round.committed_round);
             }

@@ -8,6 +8,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+use tn_storage::tables::NodeBatchesCache;
 use tn_types::{max_batch_size, Batch, Database, SealedBatch, TaskSpawner};
 use tokio::sync::oneshot;
 
@@ -53,8 +54,7 @@ pub fn create_test_batches(count: usize) -> Vec<Batch> {
 pub fn setup_batch_db(batches: &[Batch]) -> tn_storage::mem_db::MemDatabase {
     let db = tn_storage::mem_db::MemDatabase::default();
     for batch in batches {
-        db.insert::<tn_storage::tables::Batches>(&batch.digest(), batch)
-            .expect("insert batch into test db");
+        db.insert::<NodeBatchesCache>(&batch.digest(), batch).expect("insert batch into test db");
     }
     db
 }

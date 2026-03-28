@@ -6,10 +6,10 @@
 use engine::TnBuilder;
 use manager::EpochManager;
 use tn_config::{KeyConfig, TelcoinDirs};
-use tn_primary::ConsensusBus;
+use tn_primary::ConsensusBusApp;
 use tn_rpc::EngineToPrimary;
-use tn_storage::{ConsensusStore, EpochStore};
-use tn_types::{BlockHash, ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord};
+use tn_storage::consensus::ConsensusChain;
+use tn_types::{BlockHash, ConsensusHeader, Epoch, EpochCertificate, EpochRecord};
 use tokio::task::JoinHandle;
 
 pub mod engine;
@@ -19,6 +19,9 @@ mod manager;
 pub mod primary;
 pub mod worker;
 pub use manager::catchup_accumulator;
+
+#[cfg(test)]
+use tempfile as _;
 
 /// Launch all components for the node.
 ///
@@ -36,30 +39,37 @@ where
 {
     let consensus_db = manager::open_consensus_db(&tn_datadir);
 
-    // create the epoch manager
-    let mut epoch_manager = EpochManager::new(builder, tn_datadir, consensus_db, key_config);
     // run the node
     // Note this is the "entry task" for the node and the caller needs to wait on the JoinHandle
     // then exit.
-    tokio::spawn(async move { epoch_manager.run().await })
+    tokio::spawn(async move {
+        // create the epoch manager
+        let mut epoch_manager =
+            EpochManager::new(builder, tn_datadir, consensus_db, key_config).await;
+        let result = epoch_manager.run().await;
+        if let Err(err) = &result {
+            tracing::error!("Error running node: {err}");
+        }
+        result
+    })
 }
 
 #[derive(Debug)]
-pub struct EngineToPrimaryRpc<DB> {
+pub struct EngineToPrimaryRpc {
     /// Container for consensus channels.
-    consensus_bus: ConsensusBus,
-    /// Consensus DB
-    db: DB,
+    consensus_bus: ConsensusBusApp,
+    /// Consensus Chain DB
+    consensus_chain: ConsensusChain,
 }
 
-impl<DB: Database> EngineToPrimaryRpc<DB> {
-    pub fn new(consensus_bus: ConsensusBus, db: DB) -> Self {
-        Self { consensus_bus, db }
+impl EngineToPrimaryRpc {
+    pub fn new(consensus_bus: ConsensusBusApp, consensus_chain: ConsensusChain) -> Self {
+        Self { consensus_bus, consensus_chain }
     }
 
     /// Retrieve the consensus header by number.
-    fn get_epoch_by_number(&self, epoch: Epoch) -> Option<(EpochRecord, EpochCertificate)> {
-        if let Some((r, Some(c))) = self.db.get_epoch_by_number(epoch) {
+    async fn get_epoch_by_number(&self, epoch: Epoch) -> Option<(EpochRecord, EpochCertificate)> {
+        if let Some((r, Some(c))) = self.consensus_chain.epochs().get_epoch_by_number(epoch).await {
             Some((r, c))
         } else {
             None
@@ -67,8 +77,8 @@ impl<DB: Database> EngineToPrimaryRpc<DB> {
     }
 
     /// Retrieve the consensus header by hash
-    fn get_epoch_by_hash(&self, hash: BlockHash) -> Option<(EpochRecord, EpochCertificate)> {
-        if let Some((r, Some(c))) = self.db.get_epoch_by_hash(hash) {
+    async fn get_epoch_by_hash(&self, hash: BlockHash) -> Option<(EpochRecord, EpochCertificate)> {
+        if let Some((r, Some(c))) = self.consensus_chain.epochs().get_epoch_by_hash(hash).await {
             Some((r, c))
         } else {
             None
@@ -76,27 +86,19 @@ impl<DB: Database> EngineToPrimaryRpc<DB> {
     }
 }
 
-impl<DB: Database> EngineToPrimary for EngineToPrimaryRpc<DB> {
+impl EngineToPrimary for EngineToPrimaryRpc {
     fn get_latest_consensus_block(&self) -> ConsensusHeader {
         self.consensus_bus.last_consensus_header().borrow().clone().unwrap_or_default()
     }
 
-    fn consensus_block_by_number(&self, number: u64) -> Option<ConsensusHeader> {
-        self.db.get_consensus_by_number(number)
-    }
-
-    fn consensus_block_by_hash(&self, hash: BlockHash) -> Option<ConsensusHeader> {
-        self.db.get_consensus_by_hash(hash)
-    }
-
-    fn epoch(
+    async fn epoch(
         &self,
         epoch: Option<Epoch>,
         hash: Option<BlockHash>,
     ) -> Option<(EpochRecord, EpochCertificate)> {
         match (epoch, hash) {
-            (_, Some(hash)) => self.get_epoch_by_hash(hash),
-            (Some(epoch), _) => self.get_epoch_by_number(epoch),
+            (_, Some(hash)) => self.get_epoch_by_hash(hash).await,
+            (Some(epoch), _) => self.get_epoch_by_number(epoch).await,
             (None, None) => None,
         }
     }

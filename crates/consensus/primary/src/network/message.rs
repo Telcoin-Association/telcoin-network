@@ -105,13 +105,12 @@ pub enum PrimaryRequest {
     },
     /// Request a consensus chain header with consensus output.
     ///
-    /// If both number and hash are set they should match (no need to set them both).
-    /// If neither number or hash are set then will return the latest consensus chain header.
+    /// Both number and hash should match (set them both).
     ConsensusHeader {
         /// Block number requesting if not None.
-        number: Option<u64>,
+        number: u64,
         /// Block hash requesting if not None.
-        hash: Option<BlockHash>,
+        hash: BlockHash,
     },
     /// Exchange peer information.
     ///
@@ -267,9 +266,9 @@ impl PrimaryResponse {
             | PrimaryNetworkError::UnavailableEpoch(_)
             | PrimaryNetworkError::UnavailableEpochDigest(_)
             | PrimaryNetworkError::InvalidTopic
-            | PrimaryNetworkError::UnknownConsensusHeaderNumber(_)
             | PrimaryNetworkError::UnknownConsensusHeaderDigest(_)
             | PrimaryNetworkError::UnknownConsensusHeaderCert(_)
+            | PrimaryNetworkError::Timeout(_)
             | PrimaryNetworkError::InvalidEpochRequest => {
                 Self::Error(PrimaryRPCError(error.to_string()))
             }

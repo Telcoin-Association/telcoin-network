@@ -33,9 +33,6 @@ tn-batch-validator = { workspace = true }
 jsonrpsee = { workspace = true }
 roaring = { workspace = true }
 
-# TODO: temporary solution until reth supports public rpc hooks
-tn-faucet = { workspace = true }
-
 [dev-dependencies]
 rand = { workspace = true }
 tn-primary = { workspace = true, features = ["test-utils"] }
@@ -43,6 +40,8 @@ tn-types = { workspace = true, features = ["test-utils"] }
 tn-engine = { workspace = true, features = ["test-utils"] }
 tn-test-utils = { workspace = true }
 tn-network-types = { workspace = true }
+tempfile = { workspace = true }
+tn-test-utils-committee = { workspace = true }
 
 [lints]
 workspace = true

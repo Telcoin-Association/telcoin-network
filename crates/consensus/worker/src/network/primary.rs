@@ -5,7 +5,7 @@ use std::{
 };
 
 use tn_network_types::{PrimaryToWorkerClient, WorkerSynchronizeMessage};
-use tn_storage::tables::Batches;
+use tn_storage::tables::NodeBatchesCache;
 use tn_types::{now, Batch, BatchValidation, BlockHash, Database, DbTxMut as _, SealedBatch};
 use tracing::{debug, trace};
 
@@ -35,7 +35,7 @@ impl<DB: Database> PrimaryToWorkerClient for PrimaryReceiverHandler<DB> {
         let mut missing = HashSet::new();
         for digest in message.digests.iter() {
             // Check if we already have the batch.
-            match self.store.get::<Batches>(digest) {
+            match self.store.get::<NodeBatchesCache>(digest) {
                 Ok(None) => {
                     missing.insert(*digest);
                     debug!("Requesting sync for batch {digest}");
@@ -75,7 +75,7 @@ impl<DB: Database> PrimaryToWorkerClient for PrimaryReceiverHandler<DB> {
                         "failed to create batch transaction to commit: {e:?}"
                     ))
                 })?;
-                tx.insert::<Batches>(&digest, &batch).map_err(|e| {
+                tx.insert::<NodeBatchesCache>(&digest, &batch).map_err(|e| {
                     WorkerNetworkError::Internal(format!(
                         "failed to batch transaction to commit: {e:?}"
                     ))

@@ -10,7 +10,7 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{GossipMessage, Stream};
 use tn_network_types::{WorkerOthersBatchMessage, WorkerToPrimaryClient};
-use tn_storage::tables::Batches;
+use tn_storage::tables::NodeBatchesCache;
 use tn_types::{
     ensure, now, try_decode, BatchValidation, BlsPublicKey, Database, SealedBatch, WorkerId, B256,
 };
@@ -69,7 +69,7 @@ where
                 );
                 // Retrieve the batch...
                 let store = self.consensus_config.node_storage();
-                if !matches!(store.get::<Batches>(&batch_hash), Ok(Some(_))) {
+                if !matches!(store.get::<NodeBatchesCache>(&batch_hash), Ok(Some(_))) {
                     // If batch is missing from db, then request from peer.
                     // If we are a CVV then we should already have it.
                     // This allows non-CVVs to pre fetch batches they will soon need.
@@ -77,7 +77,7 @@ where
                     match self.network_handle.request_batches(&mut missing).await {
                         Ok(batches) => {
                             if let Some((digest, batch)) = batches.first() {
-                                store.insert::<Batches>(digest, batch).map_err(|e| {
+                                store.insert::<NodeBatchesCache>(digest, batch).map_err(|e| {
                                     WorkerNetworkError::Internal(format!(
                                         "failed to write to batch store: {e}"
                                     ))
@@ -132,7 +132,7 @@ where
 
         // Set received_at timestamp for remote batch.
         batch.set_received_at(now());
-        store.insert::<Batches>(&digest, &batch).map_err(|e| {
+        store.insert::<NodeBatchesCache>(&digest, &batch).map_err(|e| {
             WorkerNetworkError::Internal(format!("failed to write to batch store: {e}"))
         })?;
 

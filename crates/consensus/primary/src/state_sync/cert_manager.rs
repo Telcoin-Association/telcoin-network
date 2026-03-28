@@ -61,7 +61,10 @@ where
     }
 
     fn gc_round(&self) -> Round {
-        gc_round(self.consensus_bus.committed_round(), self.config.config().parameters.gc_depth)
+        gc_round(
+            self.consensus_bus.app().committed_round(),
+            self.config.config().parameters.gc_depth,
+        )
     }
 
     /// Process verified certificate.
@@ -184,7 +187,7 @@ where
         debug!(target: "primary::cert_manager", ?certificates, "accepting {:?} certificates", certificates.len());
 
         // write certificates to storage
-        self.config.node_storage().write_all(certificates.clone())?;
+        self.config.node_storage().write_all(certificates.iter())?;
 
         for cert in certificates.into_iter() {
             // NOTE: these next two steps are considered critical

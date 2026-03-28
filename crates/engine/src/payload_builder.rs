@@ -5,7 +5,7 @@
 use crate::error::{EngineResult, TnEngineError};
 use tn_reth::{
     payload::{BuildArguments, TNPayload},
-    CanonicalInMemoryState, ExecutedBlockWithTrieUpdates, NewCanonicalChain, RethEnv,
+    CanonicalInMemoryState, DeferredTrieData, ExecutedBlock, NewCanonicalChain, RethEnv,
 };
 use tn_types::{
     gas_accumulator::GasAccumulator, max_batch_gas, EngineUpdate, Hash as _, SealedHeader, B256,
@@ -25,7 +25,8 @@ pub fn execute_consensus_output(
     engine_update_tx: mpsc::Sender<EngineUpdate>,
 ) -> EngineResult<SealedHeader> {
     // rename canonical header for clarity
-    let BuildArguments { reth_env, mut output, parent_header: mut canonical_header } = args;
+    let BuildArguments { reth_env, output, parent_header } = args;
+    let mut canonical_header = parent_header; // Last canonical header executed.
     gas_accumulator.rewards_counter().inc_leader_count(output.leader().origin());
     let epoch = output.leader().epoch();
     // output digest returns the `ConsensusHeader` digest
@@ -47,13 +48,15 @@ pub fn execute_consensus_output(
     // assert vecs match
     debug_assert_eq!(
         batches.len(),
-        output.batch_digests.len(),
+        output.batch_digests().len(),
         "uneven number of sealed blocks from batches and batch digests"
     );
 
     // ensure at least 1 block for empty output when close_epoch is true
     let mut executed_blocks = Vec::with_capacity(batches.len().max(1));
     let canonical_in_memory_state = reth_env.canonical_in_memory_state();
+    let anchor_hash = canonical_header.hash();
+    let mut ancestors: Vec<DeferredTrieData> = Vec::with_capacity(batches.len().max(1));
 
     if batches.is_empty() {
         if !output.close_epoch {
@@ -101,13 +104,19 @@ pub fn execute_consensus_output(
             &mut executed_blocks,
             &reth_env,
             &canonical_in_memory_state,
+            anchor_hash,
+            &ancestors,
         )?;
+        if let Some(last_block) = executed_blocks.last() {
+            ancestors.push(last_block.trie_data_handle());
+        }
     } else {
         // loop and construct blocks from batches with transactions
         for (batch_index, (cert_idx, batch_idx_in_cert)) in batches.into_iter().enumerate() {
-            let batch_digest =
-                output.next_batch_digest().ok_or(TnEngineError::NextBlockDigestMissing)?;
-            let cert_batch = &output.batches[cert_idx];
+            let batch_digest = output
+                .get_batch_digest(batch_index)
+                .ok_or(TnEngineError::NextBlockDigestMissing)?;
+            let cert_batch = &output.batches()[cert_idx];
             let batch = &cert_batch.batches[batch_idx_in_cert];
 
             // use batch's base fee, gas limit, and withdrawals
@@ -137,7 +146,12 @@ pub fn execute_consensus_output(
                 &mut executed_blocks,
                 &reth_env,
                 &canonical_in_memory_state,
+                anchor_hash,
+                &ancestors,
             )?;
+            if let Some(last_block) = executed_blocks.last() {
+                ancestors.push(last_block.trie_data_handle());
+            }
             gas_accumulator.inc_block(
                 batch.worker_id,
                 canonical_header.gas_used,
@@ -163,12 +177,15 @@ pub fn execute_consensus_output(
 fn execute_payload(
     payload: TNPayload,
     transactions: &Vec<Vec<u8>>,
-    executed_blocks: &mut Vec<ExecutedBlockWithTrieUpdates>,
+    executed_blocks: &mut Vec<ExecutedBlock>,
     reth_env: &RethEnv,
     canonical_in_memory_state: &CanonicalInMemoryState,
+    anchor_hash: B256,
+    ancestors: &[DeferredTrieData],
 ) -> EngineResult<SealedHeader> {
     // execute
-    let next_canonical_block = reth_env.build_block_from_batch_payload(payload, transactions)?;
+    let next_canonical_block =
+        reth_env.build_block_from_batch_payload(payload, transactions, anchor_hash, ancestors)?;
     debug!(target: "engine", ?next_canonical_block, "block executed");
 
     // update header for next block execution in loop

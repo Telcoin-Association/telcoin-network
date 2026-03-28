@@ -49,7 +49,7 @@ clap = { workspace = true, optional = true }
 serde_json = { workspace = true }
 proptest = { workspace = true }
 tn-test-utils-committee = { workspace = true }
-tn-storage = { workspace = true }
+tn-storage = { workspace = true, features = ["test-utils"] }
 
 [features]
 default = []

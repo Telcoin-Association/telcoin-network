@@ -5,7 +5,7 @@
 
 use crate::network::{error::WorkerNetworkResult, WorkerNetworkHandle};
 use std::collections::{HashMap, HashSet};
-use tn_storage::tables::Batches;
+use tn_storage::tables::NodeBatchesCache;
 use tn_types::{now, Batch, BlockHash, Database, DbTxMut};
 use tracing::{debug, error, instrument};
 
@@ -78,7 +78,7 @@ impl<DB: Database> BatchFetcher<DB> {
                     batch.set_received_at(now());
                     updated_new_batches.insert(*digest, batch.clone());
                     // also persist the batches, so they are available after restarts
-                    txn.insert::<Batches>(digest, batch)
+                    txn.insert::<NodeBatchesCache>(digest, batch)
                         .inspect_err(|e| error!(target: "batch_fetcher", ?e, "failed to insert batch! Node shutting down..."))?;
                 }
 
@@ -105,8 +105,9 @@ impl<DB: Database> BatchFetcher<DB> {
     ) -> eyre::Result<()> {
         // read from database
         debug!(target: "batch_fetcher", "Local attempt to fetch {} missing_digests", missing_digests.len());
-        let local_batches = self.batch_store.multi_get::<Batches>(missing_digests.iter())?;
-        for (digest, batch) in missing_digests.iter().zip(local_batches.into_iter()) {
+        let local_batches =
+            self.batch_store.multi_get::<NodeBatchesCache>(missing_digests.iter())?;
+        for (digest, batch) in missing_digests.iter().zip(local_batches) {
             if let Some(batch) = batch {
                 debug_assert_eq!(*digest, batch.digest());
                 fetched_batches.insert(*digest, batch);

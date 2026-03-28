@@ -48,10 +48,10 @@ help:
 	@echo "    :::> Generate HTML coverage report in target/llvm-cov/html/." ;
 	@echo ;
 	@echo "make fmt" ;
-	@echo "    :::> cargo +nightly-2025-11-04 fmt" ;
+	@echo "    :::> cargo +nightly-2026-03-20 fmt" ;
 	@echo ;
 	@echo "make clippy" ;
-	@echo "    :::> Cargo +nightly-2025-11-04 clippy for all features with fix enabled." ;
+	@echo "    :::> Cargo +nightly-2026-03-20 clippy for all features with fix enabled." ;
 	@echo ;
 	@echo "make docker-login" ;
 	@echo "    :::> Setup docker registry using gcloud artifacts." ;
@@ -87,7 +87,7 @@ attest:
 
 # check for unused dependencies
 udeps:
-	find . -type f -name Cargo.toml -exec sed -rne 's/^name = "(.*)"/\1/p' {} + | xargs -I {} sh -c "echo '\n\n{}:' && cargo +nightly-2025-11-04 udeps --package {}" ;
+	find . -type f -name Cargo.toml -exec sed -rne 's/^name = "(.*)"/\1/p' {} + | xargs -I {} sh -c "echo '\n\n{}:' && cargo +nightly-2026-03-20 udeps --package {}" ;
 
 check:
 	cargo check --workspace --all-features --all-targets ;
@@ -108,6 +108,10 @@ test-faucet:
 test-restarts:
 	cargo nextest run --run-ignored all test_restarts ;
 
+# run e2e tests
+test-e2e:
+	cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features ;
+
 # run tests with coverage (using llvm-cov + nextest)
 coverage:
 	cargo llvm-cov nextest --workspace --exclude tn-faucet --no-fail-fast ;
@@ -117,13 +121,13 @@ coverage-html:
 	cargo llvm-cov nextest --workspace --exclude tn-faucet --no-fail-fast --html ;
 	@echo "Coverage report: target/llvm-cov/html/index.html"
 
-# format using +nightly-2025-11-04 toolchain
+# format using +nightly-2026-03-20 toolchain
 fmt:
-	cargo +nightly-2025-11-04 fmt ;
+	cargo +nightly-2026-03-20 fmt ;
 
 # clippy formatter + try to fix problems
 clippy:
-	cargo +nightly-2025-11-04 clippy --workspace --all-features --fix ;
+	cargo +nightly-2026-03-20 clippy --workspace --all-features --fix ;
 
 # login to gcloud artifact registry for managing docker images
 docker-login:

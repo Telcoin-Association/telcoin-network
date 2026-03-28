@@ -10,7 +10,6 @@ use tn_batch_builder::BatchBuilder;
 use tn_batch_validator::BatchValidator;
 use tn_config::Config;
 use tn_engine::ExecutorEngine;
-use tn_faucet::{FaucetArgs, FaucetRpcExtApiServer as _};
 use tn_reth::{
     system_calls::EpochState,
     worker::{WorkerComponents, WorkerNetwork},
@@ -39,8 +38,6 @@ pub(super) struct ExecutionNodeInner {
     pub(super) tn_config: Config,
     /// Reth execution environment.
     pub(super) reth_env: RethEnv,
-    /// Optional args to turn on faucet (for testnet only).
-    pub(super) opt_faucet_args: Option<FaucetArgs>,
     /// Collection of execution components by worker.
     /// Index of vec is worker id.
     pub(super) workers: Vec<WorkerComponents>,
@@ -94,7 +91,7 @@ impl ExecutionNodeInner {
         worker_id: WorkerId,
         block_provider_sender: BatchSender,
         epoch_task_spawner: &TaskSpawner,
-        base_fee: BaseFeeContainer,
+        base_fee: u64,
         epoch: Epoch,
     ) -> eyre::Result<()> {
         // check for worker components and initialize if they're missing
@@ -151,32 +148,13 @@ impl ExecutionNodeInner {
 
         // extend TN namespace
         let tn_ext = TelcoinNetworkRpcExt::new(self.reth_env.chainspec(), engine_to_primary);
-        let mut server = self.reth_env.get_rpc_server(
+        let server = self.reth_env.get_rpc_server(
             transaction_pool.clone(),
             network.clone(),
             tn_ext.into_rpc(),
         );
 
         info!(target: "tn::execution", "tn rpc extension successfully merged");
-
-        // extend faucet namespace if included
-        if let Some(faucet_args) = self.opt_faucet_args.take() {
-            // create extension from CLI args
-            match faucet_args.create_rpc_extension(self.reth_env.clone(), transaction_pool.clone())
-            {
-                Ok(faucet_ext) => {
-                    // add faucet module
-                    if let Err(e) = server.merge_configured(faucet_ext.into_rpc()) {
-                        error!(target: "faucet", "Error merging faucet rpc module: {e:?}");
-                    }
-
-                    info!(target: "tn::execution", "faucet rpc extension successfully merged");
-                }
-                Err(e) => {
-                    error!(target: "faucet", "Error creating faucet rpc module: {e:?}");
-                }
-            }
-        }
 
         // start the RPC server
         let rpc_handle = self.reth_env.start_rpc(&server).await?;

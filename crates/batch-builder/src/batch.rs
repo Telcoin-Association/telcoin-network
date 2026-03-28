@@ -6,10 +6,11 @@
 //!
 //! The mined transactions are returned with the built block so the worker can update the pool.
 
-use tn_reth::{TxPool, TxnSize};
+use std::collections::HashMap;
+use tn_reth::{ChangedAccount, TxPool, TxnSize};
 use tn_types::{
-    max_batch_gas, max_batch_size, Batch, BatchBuilderArgs, Encodable2718 as _,
-    TransactionTrait as _, TxHash, WorkerId,
+    max_batch_gas, max_batch_size, Address, Batch, BatchBuilderArgs, Encodable2718 as _,
+    TransactionTrait as _, TxHash, WorkerId, U256,
 };
 use tracing::debug;
 
@@ -21,15 +22,12 @@ pub struct BatchBuilderOutput {
     /// The batch info for the worker to propose.
     pub(crate) batch: Batch,
     /// The transaction hashes mined in this worker's batch.
-    ///
-    /// NOTE: canonical changes update `ChangedAccount` and changed senders.
-    /// Only the mined transactions are removed from the pool. Account nonce and state
-    /// should only be updated on canonical changes so workers can validate
-    /// each other's blocks off the canonical tip.
-    ///
-    /// This is less efficient when accounts have lots of transactions in the pending
-    /// pool, but this approach is easier to implement in the short term.
     pub(crate) mined_transactions: Vec<TxHash>,
+    /// Per-sender nonce updates for the pool after mining.
+    ///
+    /// Keeps remaining transactions from the same sender in the pending sub-pool
+    /// rather than being demoted to queued due to a perceived nonce gap.
+    pub(crate) changed_accounts: Vec<ChangedAccount>,
 }
 
 /// Construct an TN batch using the best transactions from the pool.
@@ -66,6 +64,7 @@ pub fn build_batch<P: TxPool>(
     let mut transactions = Vec::new();
     let mut mined_transactions = Vec::new();
     let mut blob_transactions = Vec::new();
+    let mut sender_nonces: HashMap<Address, u64> = HashMap::new();
 
     // begin loop through sorted "best" transactions in pending pool
     // and execute them to build the block
@@ -112,6 +111,11 @@ pub fn build_batch<P: TxPool>(
         // append transaction to the list of executed transactions
         mined_transactions.push(*pool_tx.hash());
         transactions.push(tx.into_inner().encoded_2718());
+
+        // track max nonce per sender for pool state updates
+        let sender = pool_tx.sender();
+        let nonce = pool_tx.nonce();
+        sender_nonces.entry(sender).and_modify(|max| *max = (*max).max(nonce)).or_insert(nonce);
     }
 
     // batch
@@ -121,6 +125,19 @@ pub fn build_batch<P: TxPool>(
     // remove any blob transactions that were submitted
     pool.remove_eip4844_txs(blob_transactions);
 
+    // construct changed_accounts for pool nonce updates
+    //
+    // NOTE: new transactions entering the pool are sanitized using account balance checks
+    // `balance: U256::MAX` only affects whether the pool demotes accounts after mining the batch
+    let changed_accounts: Vec<ChangedAccount> = sender_nonces
+        .into_iter()
+        .map(|(address, max_nonce)| ChangedAccount {
+            address,
+            nonce: max_nonce + 1, // next expected nonce
+            balance: U256::MAX,   // corrected by engine's canonical update
+        })
+        .collect();
+
     // return output
-    BatchBuilderOutput { batch, mined_transactions }
+    BatchBuilderOutput { batch, mined_transactions, changed_accounts }
 }

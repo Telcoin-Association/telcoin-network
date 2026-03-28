@@ -19,7 +19,10 @@
 
 // Used in tests
 #[cfg(test)]
-use proptest as _;
+mod clippy {
+    use proptest as _;
+    use tn_reth as _;
+}
 
 use crate::{
     evm::TNEvm,
@@ -41,10 +44,13 @@ use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 use reth::{
     args::{
         DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, DiscoveryArgs, EngineArgs, EraArgs,
-        EraSourceArgs, NetworkArgs, PayloadBuilderArgs, PruningArgs, TxPoolArgs,
+        EraSourceArgs, MetricArgs, NetworkArgs, PayloadBuilderArgs, PruningArgs, StaticFilesArgs,
+        StorageArgs, TxPoolArgs,
     },
     builder::NodeConfig,
-    network::transactions::{config::TransactionPropagationKind, TransactionPropagationMode},
+    network::transactions::{
+        config::TransactionPropagationKind, TransactionIngressPolicy, TransactionPropagationMode,
+    },
     rpc::{
         builder::{
             config::RethRpcServerConfig, RethRpcModule, RpcModuleBuilder, RpcModuleSelection,
@@ -54,7 +60,6 @@ use reth::{
         server_types::eth::utils::recover_raw_transaction as reth_recover_raw_transaction,
     },
 };
-use reth_chain_state::ExecutedTrieUpdates;
 use reth_chainspec::{BaseFeeParams, EthChainSpec};
 use reth_db::{init_db, DatabaseEnv};
 use reth_db_common::init::init_genesis;
@@ -66,22 +71,20 @@ use reth_engine_tree::{
 use reth_errors::{BlockExecutionError, BlockValidationError};
 use reth_eth_wire::BlockHashNumber;
 use reth_evm::{
-    execute::{BlockBuilder, BlockBuilderOutcome},
+    execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionOutput},
     ConfigureEvm, EvmFactory,
 };
-use reth_evm_ethereum::EthEvmConfig;
 use reth_node_builder::{
-    DEFAULT_MAX_PROOF_TASK_CONCURRENCY, DEFAULT_MEMORY_BLOCK_BUFFER_TARGET,
-    DEFAULT_RESERVED_CPU_CORES,
+    DEFAULT_MEMORY_BLOCK_BUFFER_TARGET, DEFAULT_RESERVED_CPU_CORES,
+    DEFAULT_SPARSE_TRIE_MAX_STORAGE_TRIES, DEFAULT_SPARSE_TRIE_PRUNE_DEPTH,
 };
 use reth_node_core::node_config::DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB;
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
-    writer::UnifiedStorageWriter,
     BlockIdReader as _, BlockNumReader, BlockReader, CanonChainTracker,
-    CanonStateSubscriptions as _, ChainSpecProvider, ChainStateBlockReader, ChainStateBlockWriter,
+    CanonStateSubscriptions as _, ChainStateBlockReader, ChainStateBlockWriter, DBProvider,
     DatabaseProviderFactory, HeaderProvider as _, ProviderFactory, StateProviderBox,
-    StateProviderFactory, StaticFileProviderFactory, TransactionVariant,
+    StateProviderFactory, TransactionVariant,
 };
 use reth_revm::{
     cached::CachedReads,
@@ -90,7 +93,9 @@ use reth_revm::{
     db::{states::bundle_state::BundleRetention, BundleState},
     DatabaseCommit, State,
 };
-use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
+use reth_transaction_pool::{
+    blobstore::DiskFileBlobStore, EthTransactionPool, TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER,
+};
 use rpc_server_args::RpcServerArgs;
 use serde_json::Value;
 use std::{
@@ -111,7 +116,7 @@ use tn_config::{
     ISSUANCE_JSON,
 };
 use tn_types::{
-    gas_accumulator::RewardsCounter, Address, BlockBody, BlockHashOrNumber, BlockHeader as _,
+    deconstruct_nonce, gas_accumulator::RewardsCounter, Address, BlockBody, BlockHashOrNumber,
     BlockNumHash, BlockNumber, EngineUpdate, Epoch, ExecHeader, Genesis, GenesisAccount,
     RecoveredBlock, Round, SealedBlock, SealedHeader, TaskManager, TaskSpawner, TransactionSigned,
     B256, ETHEREUM_BLOCK_GAS_LIMIT_30M, U256,
@@ -126,7 +131,7 @@ pub use reth::{
     rpc::builder::RpcServerHandle,
 };
 pub use reth_chain_state::{
-    CanonicalInMemoryState, ExecutedBlockWithTrieUpdates, NewCanonicalChain,
+    CanonicalInMemoryState, DeferredTrieData, ExecutedBlock, NewCanonicalChain,
 };
 pub use reth_chainspec::ChainSpec as RethChainSpec;
 pub use reth_cli_util::{parse_duration_from_secs, parse_socket_address};
@@ -136,7 +141,7 @@ pub use reth_node_core::{
     node_config::DEFAULT_PERSISTENCE_THRESHOLD,
 };
 pub use reth_primitives_traits::crypto::secp256k1::sign_message;
-pub use reth_provider::{CanonStateNotificationStream, ExecutionOutcome};
+pub use reth_provider::{CanonStateNotificationStream, ChangedAccount};
 pub use reth_rpc_eth_types::EthApiError;
 pub use reth_tracing::{FileWorkerGuard, Layers};
 pub use reth_transaction_pool::{
@@ -157,7 +162,14 @@ mod evm;
 pub mod rpc_server_args;
 pub mod system_calls;
 pub mod worker;
-pub use evm::calculate_gas_penalty;
+#[cfg(not(feature = "faucet"))]
+pub use evm::TIMELOCK_DURATION;
+pub use evm::{
+    add_telcoin_precompile, allowanceCall, approveCall, balanceOfCall, burnCall,
+    calculate_gas_penalty, claimCall, decimalsCall, grantMintRoleCall, hasMintRoleCall, mintCall,
+    nameCall, noncesCall, permitCall, revokeMintRoleCall, symbolCall, totalSupplyCall,
+    transferCall, transferFromCall, DOMAIN_SEPARATORCall, TELCOIN_PRECOMPILE_ADDRESS,
+};
 
 #[cfg(any(feature = "test-utils", test))]
 pub mod test_utils;
@@ -278,8 +290,14 @@ impl RethConfig {
     ) -> Self {
         // create a reth DatadirArgs from tn datadir
         let datadir = path_to_datadir(datadir.as_ref());
+        let RethCommand { mut rpc, mut txpool, db } = reth_config;
 
-        let RethCommand { mut rpc, txpool, db } = reth_config;
+        // TN default: 256 slots per sender (Reth default is 16).
+        // Only apply if user hasn't explicitly set a custom value via --txpool.max-account-slots.
+        if txpool.max_account_slots == TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER {
+            txpool.max_account_slots = 256;
+        }
+
         Self::validate_rpc_modules(&mut rpc.http_api);
         Self::validate_rpc_modules(&mut rpc.ws_api);
         // We don't just use Default for these Reth args.
@@ -323,10 +341,16 @@ impl RethConfig {
             soft_limit_byte_size_pooled_transactions_response_on_pack_request: 0,
             max_capacity_cache_txns_pending_fetch: 0,
             net_if: None,
-            tx_propagation_policy: TransactionPropagationKind::Trusted,
+            tx_propagation_policy: TransactionPropagationKind::None,
+            tx_ingress_policy: TransactionIngressPolicy::None,
             disable_tx_gossip: true,
             propagation_mode: TransactionPropagationMode::Max(0),
             required_block_hashes: vec![],
+            network_id: None,
+            enforce_enr_fork_id: false,
+            max_peers: None,
+            netrestrict: None,
+            p2p_secret_key_hex: None,
         };
 
         // Not using the Reth payload builder.
@@ -336,6 +360,7 @@ impl RethConfig {
             interval: Duration::from_secs(1),
             deadline: Duration::from_secs(1),
             max_payload_tasks: 0,
+            max_blobs_per_block: None,
         };
         let debug = DebugArgs {
             terminate: false,
@@ -351,12 +376,19 @@ impl RethConfig {
             invalid_block_hook: None,
             healthy_node_rpc_url: None,
             ethstats: None,
+            startup_sync_state_idle: false,
         };
         // No Reth dev options.
-        let dev = DevArgs { dev: false, block_max_transactions: None, block_time: None };
+        let dev = DevArgs {
+            dev: false,
+            block_max_transactions: None,
+            block_time: None,
+            dev_mnemonic: Default::default(),
+        };
         // Ignore Reth pruning for now.
         let pruning = PruningArgs {
             full: false,
+            minimal: false,
             block_interval: None,
             sender_recovery_full: false,
             sender_recovery_distance: None,
@@ -381,27 +413,59 @@ impl RethConfig {
         };
 
         // Parameters for configuring the engine driver.
-        #[allow(deprecated)] // last 3 fields are depracated
+        #[allow(deprecated)] // deprecated fields
         let engine = EngineArgs {
             persistence_threshold: DEFAULT_PERSISTENCE_THRESHOLD,
             memory_block_buffer_target: DEFAULT_MEMORY_BLOCK_BUFFER_TARGET,
             legacy_state_root_task_enabled: false,
             state_root_task_compare_updates: false,
-            caching_and_prewarming_disabled: false,
+            state_cache_disabled: false,
+            prewarming_disabled: false,
             state_provider_metrics: false,
             cross_block_cache_size: DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB,
             accept_execution_requests_hash: false,
-            max_proof_task_concurrency: DEFAULT_MAX_PROOF_TASK_CONCURRENCY,
+            multiproof_chunking_enabled: false,
+            multiproof_chunk_size: 0,
             reserved_cpu_cores: DEFAULT_RESERVED_CPU_CORES,
             state_root_fallback: false,
-            parallel_sparse_trie_disabled: true,
             precompile_cache_disabled: false,
             always_process_payload_attributes_on_canonical_head: false,
             allow_unwind_canonical_header: false,
+            storage_worker_count: None,
+            account_worker_count: None,
+            disable_proof_v2: false,
+            cache_metrics_disabled: false,
+            disable_trie_cache: false,
+            sparse_trie_prune_depth: DEFAULT_SPARSE_TRIE_PRUNE_DEPTH,
+            sparse_trie_max_storage_tries: DEFAULT_SPARSE_TRIE_MAX_STORAGE_TRIES,
+            disable_sparse_trie_cache_pruning: false,
+            state_root_task_timeout: None,
+            // deprecated fields
             caching_and_prewarming_enabled: true,
             parallel_sparse_trie_enabled: false,
+            parallel_sparse_trie_disabled: true,
             precompile_cache_enabled: true,
         };
+
+        // metrics args
+        let metrics = MetricArgs {
+            prometheus: None,
+            push_gateway_url: None,
+            push_gateway_interval: Duration::from_mins(5), // reth default
+        };
+
+        // static files
+        let static_files = StaticFilesArgs {
+            blocks_per_file_headers: None,
+            blocks_per_file_transactions: None,
+            blocks_per_file_receipts: None,
+            blocks_per_file_transaction_senders: None,
+            blocks_per_file_account_change_sets: None,
+            blocks_per_file_storage_change_sets: None,
+        };
+
+        // storage
+        let storage = StorageArgs { v2: false };
 
         // Parameters to configure block history syncing.
         let era = EraArgs { enabled: false, source: EraSourceArgs { path: None, url: None } };
@@ -409,7 +473,7 @@ impl RethConfig {
         let mut this = NodeConfig {
             config: None,
             chain,
-            metrics: None,
+            metrics,
             instance,
             datadir,
             network,
@@ -422,6 +486,8 @@ impl RethConfig {
             pruning,
             engine,
             era,
+            static_files,
+            storage,
         };
         if with_unused_ports {
             this = this.with_unused_ports();
@@ -560,11 +626,15 @@ impl RethEnv {
     ) -> eyre::Result<ProviderFactory<TelcoinNode>> {
         // Initialize provider factory with static files
         let datadir = node_config.datadir();
+        let rocksdb_provider = reth_provider::providers::RocksDBProvider::new(datadir.data_dir())?;
+        let runtime = reth_tasks::Runtime::with_existing_handle(tokio::runtime::Handle::current())?;
         let provider_factory = ProviderFactory::new(
             database,
             Arc::clone(&node_config.chain),
             StaticFileProvider::read_write(datadir.static_files())?,
-        );
+            rocksdb_provider,
+            runtime,
+        )?;
 
         // Initialize genesis if needed
         let genesis_hash = init_genesis(&provider_factory)?;
@@ -579,6 +649,7 @@ impl RethEnv {
             &self.inner.node_config,
             &self.inner.task_spawner,
             &self.inner.blockchain_provider,
+            &self.inner.evm_config,
         )
     }
 
@@ -607,7 +678,9 @@ impl RethEnv {
         &self,
         payload: TNPayload,
         transactions: &Vec<Vec<u8>>,
-    ) -> TnRethResult<ExecutedBlockWithTrieUpdates> {
+        anchor_hash: B256,
+        ancestors: &[DeferredTrieData],
+    ) -> TnRethResult<ExecutedBlock> {
         let parent_header = payload.parent_header.clone();
         debug!(target: "engine", ?parent_header, "retrieving state for next block");
         let state_provider =
@@ -678,17 +751,18 @@ impl RethEnv {
             builder.finish(&state_provider)?;
 
         debug!(target: "engine", hash=?block.hash(), "block builder outcome");
-        let block_num = block.number();
-        let res: ExecutedBlockWithTrieUpdates<TNPrimitives> = ExecutedBlockWithTrieUpdates::new(
-            Arc::new(block),
-            Arc::new(ExecutionOutcome::new(
-                db.take_bundle(),
-                vec![execution_result.receipts],
-                block_num,
-                Vec::new(),
-            )),
+        let block_execution_output =
+            BlockExecutionOutput { result: execution_result, state: db.take_bundle() };
+        let computed_trie_data = DeferredTrieData::sort_and_build_trie_input(
             Arc::new(hashed_state),
-            ExecutedTrieUpdates::Present(Arc::new(trie_updates)),
+            Arc::new(trie_updates),
+            anchor_hash,
+            ancestors,
+        );
+        let res: ExecutedBlock<TNPrimitives> = ExecutedBlock::new(
+            Arc::new(block),
+            Arc::new(block_execution_output),
+            computed_trie_data,
         );
 
         Ok(res)
@@ -731,7 +805,7 @@ impl RethEnv {
     /// It also clears the canonical in-memory state.
     pub fn finish_executing_output(
         &self,
-        blocks: Vec<ExecutedBlockWithTrieUpdates>,
+        blocks: Vec<ExecutedBlock>,
         engine_update: Option<(Round, BlockNumHash, tokio::sync::mpsc::Sender<EngineUpdate>)>,
     ) -> TnRethResult<()> {
         // NOTE: this makes all blocks canonical, commits them to the database,
@@ -749,10 +823,8 @@ impl RethEnv {
 
         // insert blocks to db
         let provider_rw = self.inner.blockchain_provider.database_provider_rw()?;
-        let static_file_provider = self.inner.blockchain_provider.static_file_provider();
-        UnifiedStorageWriter::from(&provider_rw, &static_file_provider)
-            .save_blocks(blocks.clone())?;
-        UnifiedStorageWriter::commit(provider_rw)?;
+        provider_rw.save_blocks(blocks.clone(), reth_provider::SaveBlocksMode::Full)?;
+        provider_rw.commit()?;
 
         // process update
         //
@@ -760,7 +832,7 @@ impl RethEnv {
         let chain_update = NewCanonicalChain::Commit { new: blocks };
         let canonical_head = chain_update.tip();
         let (epoch, round) =
-            Self::deconstruct_nonce(<FixedBytes<8> as Into<u64>>::into(canonical_head.nonce));
+            deconstruct_nonce(<FixedBytes<8> as Into<u64>>::into(canonical_head.nonce));
         info!(
             target: "engine",
             "canonical head for epoch {:?} round {:?}: {:?} - {:?}",
@@ -788,13 +860,6 @@ impl RethEnv {
         self.canonical_in_memory_state().notify_canon_state(notification);
 
         Ok(())
-    }
-
-    /// Helper to deconstruct block nonce into epoch and round.
-    pub fn deconstruct_nonce(nonce: u64) -> (u32, u32) {
-        let epoch = (nonce >> 32) as u32; // Extract the upper 32 bits
-        let round = nonce as u32; // Extract the lower 32 bits (truncates upper bits)
-        (epoch, round)
     }
 
     /// Look up and return the sealed header for hash.
@@ -870,7 +935,7 @@ impl RethEnv {
 
     /// Return the execution header for hash if available.
     pub fn header(&self, hash: B256) -> TnRethResult<Option<ExecHeader>> {
-        Ok(self.inner.blockchain_provider.header(&hash)?)
+        Ok(self.inner.blockchain_provider.header(hash)?)
     }
 
     /// Return the execution header for block number if available.
@@ -883,7 +948,7 @@ impl RethEnv {
         let finalized_block_num_hash =
             self.inner.blockchain_provider.finalized_block_num_hash().unwrap_or_default();
         if let Some(finalized_block_num_hash) = finalized_block_num_hash {
-            Ok(self.inner.blockchain_provider.header(&finalized_block_num_hash.hash)?)
+            Ok(self.inner.blockchain_provider.header(finalized_block_num_hash.hash)?)
         } else {
             Ok(None)
         }
@@ -944,6 +1009,7 @@ impl RethEnv {
         let transaction_pool: EthTransactionPool<
             BlockchainProvider<TelcoinNode>,
             DiskFileBlobStore,
+            TnEvmConfig,
         > = transaction_pool.into();
         let tn_execution = Arc::new(TNExecution);
         let rpc_builder = RpcModuleBuilder::default()
@@ -952,22 +1018,19 @@ impl RethEnv {
             .with_network(network.clone())
             .with_executor(Box::new(self.inner.task_spawner.clone()))
             .with_evm_config(self.inner.evm_config.clone())
-            // .with_events(self.inner.blockchain_provider.clone())
-            // .with_block_executor(self.evm_executor.clone())
             .with_consensus(tn_execution.clone());
 
-        // //.node_configure namespaces
         let modules_config = self.inner.node_config.rpc.transport_rpc_module_config();
         let eth_api = EthApi::builder(
             self.inner.blockchain_provider.clone(),
             transaction_pool,
             network,
-            // TODO: there is a trait definition blocking TNEvmConfig
-            EthEvmConfig::new(self.inner.blockchain_provider.chain_spec()),
+            self.inner.evm_config.clone(),
         )
         .build();
 
-        let mut server = rpc_builder.build(modules_config, eth_api);
+        let engine_events = reth_tokio_util::EventSender::default();
+        let mut server = rpc_builder.build(modules_config, eth_api, engine_events);
         if let Err(e) = server.merge_configured(other) {
             tracing::error!(target: "tn::execution", "Error merging TN rpc module: {e:?}");
         }
@@ -998,6 +1061,8 @@ impl RethEnv {
                 datadir: MaybePlatformPath::from(db_path.as_ref().to_path_buf()),
                 // default static path should resolve to: `DEFAULT_ROOT_DIR/<CHAIN_ID>/static_files`
                 static_files_path: None,
+                rocksdb_path: None,
+                pprof_dumps_path: None,
             },
             chain,
             ..NodeConfig::default()
@@ -1007,7 +1072,8 @@ impl RethEnv {
         Self::new(&reth_config, task_manager, database, None, rewards.unwrap_or_default())
     }
 
-    /// Convenience method for compiling storage and bytecode to include genesis.
+    /// Convenience method for compiling storage and bytecode to include consensus registry
+    /// configuration in genesis.
     pub fn create_consensus_registry_genesis_accounts(
         validators: Vec<NodeInfo>,
         genesis: Genesis,
@@ -1403,19 +1469,26 @@ impl RethEnv {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::*;
     use crate::{system_calls::ConsensusRegistry::ValidatorStatus, test_utils::TransactionFactory};
     use alloy::primitives::utils::parse_ether;
     use rand::{rngs::StdRng, SeedableRng as _};
     use tempfile::TempDir;
     use tn_types::{
-        generate_proof_of_possession_bls, BlsKeypair, BlsSignature, Certificate, CommittedSubDag,
-        ConsensusHeader, ConsensusOutput, NodeP2pInfo, ReputationScores,
+        generate_proof_of_possession_bls_for_test, BlsKeypair, BlsSignature, Certificate,
+        CommittedSubDag, ConsensusHeader, ConsensusOutput, NodeP2pInfo, ReputationScores,
         SignatureVerificationState,
     };
 
     /// Helper function for creating a consensus output for tests.
-    fn consensus_output_for_tests(round: u32, epoch: u32, subdag_index: u64) -> ConsensusOutput {
+    fn consensus_output_for_tests(
+        round: u32,
+        epoch: u32,
+        subdag_index: u64,
+        close_epoch: bool,
+    ) -> ConsensusOutput {
         let mut leader = Certificate::default();
         // set signature for deterministic test results
         leader.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
@@ -1426,23 +1499,21 @@ mod tests {
         leader.header.epoch = epoch;
         let reputation_scores = ReputationScores::default();
         let previous_sub_dag = None;
-        ConsensusOutput {
-            sub_dag: CommittedSubDag::new(
-                vec![leader.clone(), Certificate::default()],
-                leader,
-                subdag_index,
-                reputation_scores,
-                previous_sub_dag,
-            )
-            .into(),
-            close_epoch: true,
-            batches: Default::default(),       // empty
-            batch_digests: Default::default(), // empty
-            parent_hash: ConsensusHeader::default().digest(),
-            number: subdag_index,
-            extra: Default::default(),
-            consensus_header_hash_cache: Default::default(),
-        }
+        let sub_dag = Arc::new(CommittedSubDag::new(
+            vec![leader.clone(), Certificate::default()],
+            leader,
+            subdag_index,
+            reputation_scores,
+            previous_sub_dag,
+        ));
+        ConsensusOutput::new(
+            sub_dag,
+            ConsensusHeader::default().digest(),
+            subdag_index,
+            close_epoch,
+            VecDeque::new(),
+            Vec::new(),
+        )
     }
 
     /// Build a block from TNPayload and transactions.
@@ -1450,8 +1521,10 @@ mod tests {
         reth_env: &RethEnv,
         payload: TNPayload,
         transactions: Vec<Vec<u8>>,
-    ) -> eyre::Result<ExecutedBlockWithTrieUpdates> {
-        let block = reth_env.build_block_from_batch_payload(payload, &transactions)?;
+    ) -> eyre::Result<ExecutedBlock> {
+        let anchor_hash = payload.parent_header.hash();
+        let block =
+            reth_env.build_block_from_batch_payload(payload, &transactions, anchor_hash, &[])?;
         // update chain state - normally handled by tn_engine::payload_builder
         let canonical_header = block.recovered_block.clone_sealed_header();
         let canonical_in_memory_state =
@@ -1499,8 +1572,8 @@ mod tests {
                 let mut rng = StdRng::seed_from_u64(i as u64);
                 let bls = BlsKeypair::generate(&mut rng);
                 let bls_pubkey = bls.public();
-                let pop =
-                    generate_proof_of_possession_bls(&bls, addr).expect("pop generation failed");
+                let pop = generate_proof_of_possession_bls_for_test(&bls, addr)
+                    .expect("pop generation failed");
                 NodeInfo {
                     name: format!("validator-{i}"),
                     bls_public_key: *bls_pubkey,
@@ -1608,6 +1681,7 @@ mod tests {
         let mut expected_epoch_info = ConsensusRegistry::EpochInfo {
             committee: expected_committee,
             blockHeight: 0,
+            epochId: 0,
             epochDuration: epoch_duration,
             epochIssuance: initial_stake_config.epochIssuance,
             stakeVersion: 0,
@@ -1637,8 +1711,7 @@ mod tests {
 
         // close epoch with deterministic signature as source of randomness
         // and execute the first block with txs for new validator to stake
-        let mut consensus_output = consensus_output_for_tests(2, expected_epoch, 1);
-        consensus_output.close_epoch = false;
+        let consensus_output = consensus_output_for_tests(2, expected_epoch, 1, false);
         let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
         let block1 = execute_payload_and_update_canonical_chain(
             &reth_env,
@@ -1649,14 +1722,14 @@ mod tests {
 
         // now close the first epoch
         expected_epoch += 1;
-        let consensus_output = consensus_output_for_tests(2, expected_epoch, 2);
+        let consensus_output = consensus_output_for_tests(2, expected_epoch, 2, true);
         let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
         let block2 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
         let canonical_header = block2.recovered_block.clone_sealed_header();
 
         // now close the second epoch so the new validator is active
         expected_epoch += 1;
-        let consensus_output = consensus_output_for_tests(2, expected_epoch, 3);
+        let consensus_output = consensus_output_for_tests(2, expected_epoch, 3, true);
         let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
         let block3 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
         let canonical_header = block3.recovered_block.clone_sealed_header();
@@ -1667,6 +1740,7 @@ mod tests {
         debug!(target: "evm", ?epoch, ?epoch_info, ?committee, ?epoch, "new epoch state from canonical tip");
         // assert epoch info updated
         expected_epoch_info.blockHeight = 4;
+        expected_epoch_info.epochId = expected_epoch as u32;
         assert_eq!(expected_epoch, epoch);
         assert_eq!(epoch_start, canonical_header.timestamp);
         assert_eq!(epoch_info, expected_epoch_info);
@@ -1701,6 +1775,7 @@ mod tests {
         let expected = ConsensusRegistry::EpochInfo {
             committee: expected_new_committee,
             blockHeight: 0,
+            epochId: (expected_epoch + 1) as u32,
             // epoch duration set at the start
             epochDuration: Default::default(),
             // values should remain the same
@@ -1737,8 +1812,7 @@ mod tests {
             calldata,
         );
         expected_epoch += 1;
-        let mut consensus_output = consensus_output_for_tests(2, expected_epoch, 4);
-        consensus_output.close_epoch = false;
+        let consensus_output = consensus_output_for_tests(2, expected_epoch, 4, false);
         let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
         let block4 =
             execute_payload_and_update_canonical_chain(&reth_env, payload, vec![begin_exit_tx])?;
@@ -1746,7 +1820,7 @@ mod tests {
 
         // close epoch
         expected_epoch += 1;
-        let consensus_output = consensus_output_for_tests(2, expected_epoch, 5);
+        let consensus_output = consensus_output_for_tests(2, expected_epoch, 5, true);
         let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
         let block5 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
         let canonical_header = block5.recovered_block.clone_sealed_header();
@@ -1804,13 +1878,13 @@ mod tests {
 
         // close epoch again to exit validator
         expected_epoch += 1;
-        let consensus_output = consensus_output_for_tests(2, expected_epoch, 6);
+        let consensus_output = consensus_output_for_tests(2, expected_epoch, 6, true);
         let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
         let block6 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
         let canonical_header = block6.recovered_block.clone_sealed_header();
         // close epoch again
         expected_epoch += 1;
-        let consensus_output = consensus_output_for_tests(2, expected_epoch, 7);
+        let consensus_output = consensus_output_for_tests(2, expected_epoch, 7, true);
         let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
         let block7 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
         let canonical_header = block7.recovered_block.clone_sealed_header();

@@ -7,7 +7,6 @@ use std::{
     io::{ErrorKind::NotFound, Read, Write},
     path::{Path, PathBuf},
 };
-use tn_types::Epoch;
 use tracing::info;
 
 /// The serialization format for the config.
@@ -145,9 +144,8 @@ pub trait TelcoinDirs: std::fmt::Debug + Send + Sync + 'static {
     fn network_config_path(&self) -> PathBuf;
 
     /// Return the path to consensus's epoch storage for a specific epoch.
-    fn epoch_db_path(&self, epoch: Epoch) -> PathBuf {
-        let extension = format!("epoch_{epoch}");
-        self.consensus_db_path().join(extension)
+    fn epochs_db_path(&self) -> PathBuf {
+        self.consensus_db_path().join("epochs")
     }
 }
 
