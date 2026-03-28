@@ -24,7 +24,7 @@ use tn_primary::{
     ConsensusBus, NodeMode, StateSynchronizer,
 };
 use tn_reth::{
-    bytes_to_txn,
+    recover_raw_transaction,
     system_calls::{
         ConsensusRegistry::{self, EpochInfo},
         EpochState,
@@ -338,10 +338,10 @@ where
                     // well.
                     if is_cvv {
                         for tx_bytes in batch.transactions() {
-                            // Put txn back into the mem pool.
-                            if let Ok(tx) = bytes_to_txn(tx_bytes) {
+                            // Put txn back into the mempool.
+                            if let Ok(recovered) = recover_raw_transaction(tx_bytes) {
                                 if let Some(pool) = pools.get(batch.worker_id as usize) {
-                                    let _ = pool.add_raw_transaction_external(tx).await;
+                                    let _ = pool.add_recovered_transaction_external(recovered).await;
                                 }
                             }
                         }

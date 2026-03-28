@@ -1,7 +1,7 @@
 //! Block validator
 
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
-use tn_reth::{bytes_to_txn, recover_signed_transaction, RethEnv, WorkerTxPool};
+use tn_reth::{recover_raw_transaction, recover_signed_transaction, RethEnv, WorkerTxPool};
 use tn_types::{
     gas_accumulator::BaseFeeContainer, max_batch_gas, max_batch_size, BatchValidation,
     BatchValidationError, BlockHash, Epoch, SealedBatch, TransactionSigned, TransactionTrait as _,
@@ -81,18 +81,21 @@ impl BatchValidation for BatchValidator {
 
     /// Submit a transaction received from the gossip pool to the worker's transaction pool.
     /// This method is only active if the node is part of the committee.
+    ///
+    /// Routes by sender address so all transactions from the same account land on the same
+    /// validator, preserving nonce ordering.
     fn submit_txn_if_mine(&self, tx_bytes: &[u8], committee_size: u64, committee_slot: u64) {
-        if let Ok(tx) = bytes_to_txn(tx_bytes) {
+        if let Ok(recovered) = recover_raw_transaction(tx_bytes) {
             if let Some(tx_pool) = &self.tx_pool {
                 let tx_pool = tx_pool.clone();
+                let sender = recovered.signer();
                 let mut bytes = [0_u8; 8];
-                let hash = tx.hash();
-                bytes.copy_from_slice(&hash[0..8]);
-                // Make sure use fixed (not native) endian bytes here.
+                bytes.copy_from_slice(&sender.as_slice()[0..8]);
                 if (u64::from_le_bytes(bytes) % committee_size) == committee_slot {
+                    let hash = *recovered.hash();
                     let task_name = format!("submit-tx-{hash}");
                     self.reth_env.get_task_spawner().spawn_task(task_name, async move {
-                        let _ = tx_pool.add_raw_transaction_external(tx).await;
+                        let _ = tx_pool.add_recovered_transaction_external(recovered).await;
                     });
                 }
             }
@@ -289,6 +292,8 @@ mod tests {
         valid_batch: SealedBatch,
         /// Validator
         validator: BatchValidator,
+        /// Transaction pool for verifying submissions.
+        tx_pool: WorkerTxPool,
     }
 
     /// Create an instance of block validator for tests.
@@ -299,18 +304,19 @@ mod tests {
             RethEnv::new_for_temp_chain(chain.clone(), path, task_manager, None).unwrap();
         let tx_pool = reth_env.init_txn_pool().unwrap();
         let validator =
-            BatchValidator::new(reth_env, Some(tx_pool), 0, BaseFeeContainer::default(), 0);
+            BatchValidator::new(reth_env, Some(tx_pool.clone()), 0, BaseFeeContainer::default(), 0);
         let valid_batch = next_valid_sealed_batch(chain);
 
         // block validator
-        TestTools { valid_batch, validator }
+        TestTools { valid_batch, validator, tx_pool }
     }
 
     #[tokio::test]
     async fn test_valid_batch() {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
-        let TestTools { valid_batch, validator } = test_tools(tmp_dir.path(), &task_manager).await;
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
         let result = validator.validate_batch(valid_batch.clone());
         assert!(result.is_ok());
 
@@ -330,7 +336,8 @@ mod tests {
     async fn _test_invalid_batch_wrong_parent_hash() {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
-        let TestTools { valid_batch, validator } = test_tools(tmp_dir.path(), &task_manager).await;
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
         let (batch, _) = valid_batch.split();
         let Batch { transactions, beneficiary, base_fee_per_gas, received_at, .. } = batch;
         let wrong_parent_hash = B256::random();
@@ -352,7 +359,8 @@ mod tests {
     async fn test_invalid_batch_wrong_epoch() {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
-        let TestTools { valid_batch, validator } = test_tools(tmp_dir.path(), &task_manager).await;
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
         let (mut batch, _) = valid_batch.split();
 
         batch.epoch += 1;
@@ -368,7 +376,8 @@ mod tests {
         // Set excessive gas limit.
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
-        let TestTools { valid_batch, validator } = test_tools(tmp_dir.path(), &task_manager).await;
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
         let (batch, _) = valid_batch.split();
 
         // sign excessive transaction
@@ -415,7 +424,8 @@ mod tests {
         // Set excessive gas limit.
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
-        let TestTools { valid_batch, validator } = test_tools(tmp_dir.path(), &task_manager).await;
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
         let (batch, _) = valid_batch.split();
 
         // sign excessive transaction
@@ -467,7 +477,8 @@ mod tests {
     async fn test_invalid_batch_wrong_size_in_bytes() {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
-        let TestTools { valid_batch, validator } = test_tools(tmp_dir.path(), &task_manager).await;
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
         // create enough transactions to exceed 1MB
         // because validator uses provided with same genesis
         // and tx_factory needs funds
@@ -563,7 +574,8 @@ mod tests {
     async fn test_invalid_batch_empty_transactions() {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
-        let TestTools { valid_batch, validator } = test_tools(tmp_dir.path(), &task_manager).await;
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
         let (mut batch, _) = valid_batch.split();
 
         // test batch with no transactions
@@ -579,7 +591,8 @@ mod tests {
     async fn test_invalid_batch_decode_transactions() {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
-        let TestTools { valid_batch, validator } = test_tools(tmp_dir.path(), &task_manager).await;
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
         let (mut batch, _) = valid_batch.split();
 
         // test batch with bad decode
@@ -595,7 +608,8 @@ mod tests {
     async fn test_invalid_batch_base_fee_for_gas() {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
-        let TestTools { valid_batch, validator } = test_tools(tmp_dir.path(), &task_manager).await;
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
         // Note validator will use MIN_PROROCOL_BASE_FEE.
         let (mut batch, _) = valid_batch.split();
 
@@ -619,7 +633,8 @@ mod tests {
     async fn test_invalid_tx_eip4844() {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
-        let TestTools { valid_batch, validator } = test_tools(tmp_dir.path(), &task_manager).await;
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
         let (mut batch, _) = valid_batch.split();
 
         // eip4844 transaction
@@ -645,5 +660,121 @@ mod tests {
             validator.validate_batch(batch.clone().seal_slow()),
             Err(BatchValidationError::InvalidTx4844(_))
         );
+    }
+
+    /// Compute the committee slot a sender address would be routed to.
+    fn compute_sender_slot(address: &Address, committee_size: u64) -> u64 {
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(&address.as_slice()[0..8]);
+        u64::from_le_bytes(bytes) % committee_size
+    }
+
+    #[tokio::test]
+    async fn test_submit_txn_if_mine_routes_to_correct_slot() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let TestTools { validator, tx_pool, .. } = test_tools(tmp_dir.path(), &task_manager).await;
+
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let mut tx_factory = TransactionFactory::new();
+        let encoded = tx_factory.create_eip1559_encoded(
+            chain,
+            None,
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        );
+
+        let committee_size = 4u64;
+        let expected_slot = compute_sender_slot(&tx_factory.address(), committee_size);
+
+        validator.submit_txn_if_mine(&encoded, committee_size, expected_slot);
+
+        // Poll for the spawned task to complete
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tx_pool.pool_size().pending == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert!(tokio::time::Instant::now() < deadline, "timeout waiting for tx in pool");
+        }
+        assert_eq!(tx_pool.pool_size().pending, 1);
+    }
+
+    #[tokio::test]
+    async fn test_submit_txn_if_mine_skips_wrong_slot() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let TestTools { validator, tx_pool, .. } = test_tools(tmp_dir.path(), &task_manager).await;
+
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let mut tx_factory = TransactionFactory::new();
+        let encoded = tx_factory.create_eip1559_encoded(
+            chain,
+            None,
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        );
+
+        let committee_size = 4u64;
+        let expected_slot = compute_sender_slot(&tx_factory.address(), committee_size);
+        let wrong_slot = (expected_slot + 1) % committee_size;
+
+        validator.submit_txn_if_mine(&encoded, committee_size, wrong_slot);
+
+        // Give time for any task to run (there shouldn't be one)
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(tx_pool.pool_size().pending, 0);
+    }
+
+    #[tokio::test]
+    async fn test_submit_txn_if_mine_same_sender_same_slot() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let TestTools { validator, tx_pool, .. } = test_tools(tmp_dir.path(), &task_manager).await;
+
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let mut tx_factory = TransactionFactory::new();
+        let committee_size = 4u64;
+        let expected_slot = compute_sender_slot(&tx_factory.address(), committee_size);
+
+        // Create 3 transactions from the same sender (auto-incrementing nonce)
+        for _ in 0..3 {
+            let encoded = tx_factory.create_eip1559_encoded(
+                chain.clone(),
+                None,
+                7,
+                Some(Address::ZERO),
+                U256::from(100),
+                Bytes::new(),
+            );
+            validator.submit_txn_if_mine(&encoded, committee_size, expected_slot);
+        }
+
+        // Poll for all 3 spawned tasks to complete
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tx_pool.pool_size().pending < 3 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert!(tokio::time::Instant::now() < deadline, "timeout waiting for txs in pool");
+        }
+        assert_eq!(tx_pool.pool_size().pending, 3);
+    }
+
+    #[test]
+    fn test_submit_txn_if_mine_routing_determinism() {
+        let committee_size = 4u64;
+
+        // Same seed -> same address -> same slot
+        let factory1 = TransactionFactory::new();
+        let factory2 = TransactionFactory::new();
+        let slot1 = compute_sender_slot(&factory1.address(), committee_size);
+        let slot2 = compute_sender_slot(&factory2.address(), committee_size);
+        assert_eq!(slot1, slot2);
+
+        // Different random addresses produce valid slots
+        let factory3 = TransactionFactory::new_random();
+        let slot3 = compute_sender_slot(&factory3.address(), committee_size);
+        assert!(slot3 < committee_size);
     }
 }
