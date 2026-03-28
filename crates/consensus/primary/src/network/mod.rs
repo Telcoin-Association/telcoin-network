@@ -262,6 +262,8 @@ pub struct PrimaryNetwork<DB, Events> {
     request_handler: RequestHandler<DB>,
     /// The type to spawn tasks.
     task_spawner: TaskSpawner,
+    /// Maintain reference to the consensus chain.
+    consensus_chain: ConsensusChain,
 }
 
 impl<DB, Events> PrimaryNetwork<DB, Events>
@@ -283,9 +285,9 @@ where
             consensus_config,
             consensus_bus,
             state_sync.clone(),
-            consensus_chain,
+            consensus_chain.clone(),
         );
-        Self { network_events, network_handle, request_handler, task_spawner }
+        Self { network_events, network_handle, request_handler, task_spawner, consensus_chain }
     }
 
     pub fn handle(&self) -> &PrimaryNetworkHandle {
@@ -414,13 +416,20 @@ where
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
         let task_name = format!("ConsensusOutputReq-{peer}");
+        let consensus_chain = self.consensus_chain.clone();
         self.task_spawner.spawn_task(task_name, async move {
             tokio::select! {
                 header =
                     request_handler.retrieve_consensus_header(number, hash) => {
+                        // Penalize peer's reputation for bad request.
+                        // This could happen now and then and not be malicious so use a Mild only
+                        // to close any DOS attack.
+                        if let Err(e) = &header {
+                            let my_number = consensus_chain.latest_consensus_number();
+                            tracing::warn!(target: "primary::network", ?e, ?my_number, ?number, ?hash, ?peer,  "applying penalty for failed consesus header retrieval");
+                            network_handle.handle.report_penalty(peer, Penalty::Mild).await;
+                        }
                         let response = header.into_response();
-                        // TODO: penalize peer's reputation for bad request
-                        // if response.is_err() { }
                         let _ = network_handle.handle.send_response(response, channel).await;
                     }
                 // cancel notification from network layer
