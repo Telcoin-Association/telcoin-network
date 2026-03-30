@@ -108,12 +108,12 @@ use std::{
 };
 use system_calls::{
     ConsensusRegistry::{self},
-    EpochState, CONSENSUS_REGISTRY_ADDRESS, SYSTEM_ADDRESS,
+    EpochGasTarget, EpochState, CONSENSUS_REGISTRY_ADDRESS, SYSTEM_ADDRESS,
 };
 use tempfile::TempDir;
 use tn_config::{
-    NodeInfo, BLSG1_JSON, CONSENSUS_REGISTRY_JSON, GOVERNANCE_SAFE_ADDRESS, ISSUANCE_ADDRESS,
-    ISSUANCE_JSON,
+    NodeInfo, BLSG1_JSON, CONSENSUS_REGISTRY_JSON, EPOCH_GAS_TARGET_ADDRESS, EPOCH_GAS_TARGET_JSON,
+    GOVERNANCE_SAFE_ADDRESS, ISSUANCE_ADDRESS, ISSUANCE_JSON,
 };
 use tn_types::{
     deconstruct_nonce, gas_accumulator::RewardsCounter, Address, BlockBody, BlockHashOrNumber,
@@ -1079,6 +1079,7 @@ impl RethEnv {
         genesis: Genesis,
         initial_stake_config: ConsensusRegistry::StakeConfig,
         owner_address: Address,
+        default_epoch_gas_target: u64,
     ) -> eyre::Result<Genesis> {
         // create temporary reth env for execution
         let tmp_chain: Arc<RethChainSpec> = Arc::new(genesis.clone().into());
@@ -1188,6 +1189,37 @@ impl RethEnv {
             owner_address.create(1)
         };
 
+        // deploy EpochGasTarget contract
+        let tmp_gas_target_address = {
+            let mut tn_evm = reth_env.inner.evm_config.evm_factory().create_evm(
+                &mut db,
+                reth_env.inner.evm_config.evm_env(&tmp_chain.sealed_genesis_header())?,
+            );
+
+            let gas_target_constructor_args = EpochGasTarget::constructorCall {
+                defaultTargetGas_: default_epoch_gas_target,
+                owner_: owner_address,
+            }
+            .abi_encode();
+
+            let gas_target_initcode_binding =
+                Self::fetch_value_from_json_str(EPOCH_GAS_TARGET_JSON, Some("bytecode.object"))?;
+            let gas_target_initcode = hex::decode(
+                gas_target_initcode_binding.as_str().ok_or_eyre("invalid epoch gas target json")?,
+            )?;
+            let mut create_gas_target = gas_target_initcode;
+            create_gas_target.extend(gas_target_constructor_args);
+
+            let ResultAndState { result, state } =
+                tn_evm.transact_pre_genesis_create(owner_address, create_gas_target.into())?;
+            debug!(target: "engine", "create epoch gas target result:\n{:#?}", result);
+
+            tn_evm.db_mut().commit(state);
+
+            // Third create tx on tmp chain (after blsg1 at nonce 0 and registry at nonce 1)
+            owner_address.create(2)
+        };
+
         // execute the transactions to get final bundle state
         db.merge_transitions(BundleRetention::PlainState);
         let BundleState { state, contracts, reverts, state_size, reverts_size } = db.take_bundle();
@@ -1210,6 +1242,17 @@ impl RethEnv {
         let registry_runtimecode =
             Self::link_solidity_library(registry_runtimecode_str, &blsg1_address.encode_hex())?;
 
+        let tmp_gas_target_storage = state.get(&tmp_gas_target_address).map(|account| {
+            account.storage.iter().map(|(k, v)| ((*k).into(), v.present_value.into())).collect()
+        });
+        let gas_target_runtimecode_binding = Self::fetch_value_from_json_str(
+            EPOCH_GAS_TARGET_JSON,
+            Some("deployedBytecode.object"),
+        )?;
+        let gas_target_runtimecode = hex::decode(
+            gas_target_runtimecode_binding.as_str().ok_or_eyre("invalid epoch gas target json")?,
+        )?;
+
         let blsg1_runtimecode_binding =
             Self::fetch_value_from_json_str(BLSG1_JSON, Some("deployedBytecode.object"))?;
         let blsg1_runtimecode =
@@ -1231,6 +1274,12 @@ impl RethEnv {
             (
                 ISSUANCE_ADDRESS,
                 GenesisAccount::default().with_code(Some(issuance_runtimecode.into())),
+            ),
+            (
+                EPOCH_GAS_TARGET_ADDRESS,
+                GenesisAccount::default()
+                    .with_code(Some(gas_target_runtimecode.into()))
+                    .with_storage(tmp_gas_target_storage),
             ),
         ]);
 
@@ -1410,6 +1459,47 @@ impl RethEnv {
     {
         let calldata = ConsensusRegistry::getCommitteeValidatorsCall { epoch }.abi_encode().into();
         self.call_consensus_registry::<_, Vec<ConsensusRegistry::ValidatorInfo>>(evm, calldata)
+    }
+
+    /// Read the gas target for a given worker from the [`EpochGasTarget`] contract on-chain.
+    ///
+    /// Creates an EVM against the canonical tip and calls `getTargetGas(workerId)`.
+    pub fn get_target_gas_for_worker(&self, worker_id: u16) -> eyre::Result<u64> {
+        let canonical_tip = self.canonical_tip();
+        let state_provider =
+            self.inner.blockchain_provider.state_by_block_hash(canonical_tip.hash())?;
+        let state = StateProviderDatabase::new(&state_provider);
+        let mut db = State::builder().with_database(state).with_bundle_update().build();
+        let mut tn_evm = self
+            .inner
+            .evm_config
+            .evm_factory()
+            .create_evm(&mut db, self.inner.evm_config.evm_env(&canonical_tip)?);
+
+        let calldata = EpochGasTarget::getTargetGasCall { workerId: worker_id }.abi_encode().into();
+        self.call_epoch_gas_target::<_, u64>(&mut tn_evm, calldata)
+    }
+
+    /// Helper function to call `EpochGasTarget` state on-chain.
+    fn call_epoch_gas_target<DB, T>(&self, evm: &mut TNEvm<DB>, calldata: Bytes) -> eyre::Result<T>
+    where
+        DB: alloy_evm::Database,
+        T: alloy::sol_types::SolValue,
+        T: From<
+            <<T as alloy::sol_types::SolValue>::SolType as alloy::sol_types::SolType>::RustType,
+        >,
+    {
+        let state =
+            self.read_state_on_chain(evm, SYSTEM_ADDRESS, EPOCH_GAS_TARGET_ADDRESS, calldata)?;
+
+        match state.result {
+            ExecutionResult::Success { output, .. } => {
+                let data = output.into_data();
+                let decoded = alloy::sol_types::SolValue::abi_decode(&data)?;
+                Ok(decoded)
+            }
+            e => Err(eyre::eyre!("failed to read epoch gas target from state: {e:?}")),
+        }
     }
 
     /// Helper function to call `ConsensusRegistry` state on-chain.
@@ -1626,6 +1716,7 @@ mod tests {
             tmp_genesis,
             initial_stake_config.clone(),
             governance,
+            30_000_000u64,
         )?;
 
         // update genesis again to include stake for new validator

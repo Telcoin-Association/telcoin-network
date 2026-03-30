@@ -90,10 +90,19 @@ pub struct GenesisArgs {
         long = "epoch-duration-in-secs",
         alias = "epoch_length",
         help_heading = "The length of each epoch in seconds.",
-        default_value_t = 60 * 60 * 24, // 24-hours
+        default_value_t = 60 * 60 * 8, // 8-hours
         verbatim_doc_comment
     )]
     pub epoch_duration: u32,
+
+    /// The target gas per epoch for basefee adjustments (EIP-1559).
+    #[arg(
+        long = "epoch-gas-target",
+        help_heading = "The target basefee for the epoch.",
+        default_value_t = 100_000_000,
+        verbatim_doc_comment
+    )]
+    pub epoch_gas_target: u64,
 
     /// Used to add a funded account (by simple text string).  Use this on a dev cluster
     /// to have an account with a deterministically derived key. This is ONLY for dev
@@ -173,6 +182,7 @@ impl GenesisArgs {
                 genesis,
                 initial_stake_config.clone(),
                 self.consensus_registry_owner,
+                self.epoch_gas_target,
             )?
         } else {
             // no runtime exists (normal CLI operation)
@@ -186,6 +196,7 @@ impl GenesisArgs {
                     genesis,
                     initial_stake_config,
                     self.consensus_registry_owner,
+                    self.epoch_gas_target,
                 )
             })?
         };

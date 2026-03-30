@@ -148,6 +148,7 @@ async fn test_cli_keygen_to_stake() -> eyre::Result<()> {
         genesis,
         initial_stake_config.clone(),
         governance,
+        30_000_000u64,
     )?;
 
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());

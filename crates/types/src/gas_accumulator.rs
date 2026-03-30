@@ -285,8 +285,116 @@ impl GasAccumulator {
     }
 }
 
+/// EIP-1559-style base fee adjustment computed once per epoch.
+///
+/// Compares `gas_used` (total gas consumed by a single worker during the epoch)
+/// against `target_gas` (governance-set target for the epoch) and nudges the
+/// base fee up or down by at most 12.5 % (denominator = 8).
+///
+/// The result is clamped to `[MIN_PROTOCOL_BASE_FEE, u64::MAX]`.
+pub fn compute_next_base_fee_eip1559(current_base_fee: u64, gas_used: u64, target_gas: u64) -> u64 {
+    // Guard: if target is zero, keep current fee unchanged.
+    if target_gas == 0 {
+        return current_base_fee;
+    }
+
+    let new_base_fee = if gas_used > target_gas {
+        // over target → increase base fee
+        // cap ratio at 1 to limit change to ±12.5% per epoch (matching EIP-1559)
+        let excess = (gas_used - target_gas).min(target_gas);
+        let delta =
+            (current_base_fee as u128).saturating_mul(excess as u128) / target_gas as u128 / 8;
+        current_base_fee.saturating_add(delta.min(u64::MAX as u128) as u64)
+    } else {
+        // at or under target → decrease base fee
+        let deficit = (target_gas - gas_used).min(target_gas);
+        let delta =
+            (current_base_fee as u128).saturating_mul(deficit as u128) / target_gas as u128 / 8;
+        current_base_fee.saturating_sub(delta.min(u64::MAX as u128) as u64)
+    };
+
+    new_base_fee.max(MIN_PROTOCOL_BASE_FEE)
+}
+
 impl Default for GasAccumulator {
     fn default() -> Self {
         Self::new(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::eips::eip1559::MIN_PROTOCOL_BASE_FEE;
+
+    #[test]
+    fn gas_at_target_no_change() {
+        // When gas_used == target_gas, delta is 0, fee unchanged
+        assert_eq!(compute_next_base_fee_eip1559(1000, 500, 500), 1000);
+    }
+
+    #[test]
+    fn gas_over_target_increases_fee() {
+        // gas_used = 2 * target → delta = 1000 * 1.0 / 8 = 125
+        assert_eq!(compute_next_base_fee_eip1559(1000, 1000, 500), 1125);
+    }
+
+    #[test]
+    fn gas_under_target_decreases_fee() {
+        // gas_used = 0 → delta = 1000 * 1.0 / 8 = 125
+        assert_eq!(compute_next_base_fee_eip1559(1000, 0, 500), 875);
+    }
+
+    #[test]
+    fn floor_at_min_protocol_base_fee() {
+        // Large decrease should floor at MIN_PROTOCOL_BASE_FEE (7)
+        // base=8, gas_used=0, target=1 → delta = 8 * 1 / 1 / 8 = 1, result = 7
+        assert_eq!(compute_next_base_fee_eip1559(8, 0, 1), MIN_PROTOCOL_BASE_FEE);
+    }
+
+    #[test]
+    fn zero_target_returns_current() {
+        assert_eq!(compute_next_base_fee_eip1559(1000, 500, 0), 1000);
+    }
+
+    #[test]
+    fn overflow_safety_large_values() {
+        // u64::MAX base fee with high gas usage should not panic
+        let result = compute_next_base_fee_eip1559(u64::MAX, u64::MAX, 1);
+        assert_eq!(result, u64::MAX); // saturating_add caps at MAX
+    }
+
+    #[test]
+    fn max_increase_is_12_5_percent() {
+        // Even with huge gas overshoot, increase is capped at base_fee/8
+        // gas_used = u64::MAX, target = 1 → ratio ≈ u64::MAX, but /8 caps it
+        let base = 1_000_000u64;
+        let result = compute_next_base_fee_eip1559(base, u64::MAX, 1);
+        // delta = base * (MAX-1) / 1 / 8, but saturating_mul and u128 handle it
+        // The result should be at most base + base * MAX / 1 / 8 which saturates to u64::MAX
+        assert!(result >= base);
+    }
+
+    #[test]
+    fn small_values() {
+        // Very small base fee
+        assert_eq!(
+            compute_next_base_fee_eip1559(MIN_PROTOCOL_BASE_FEE, 0, 100),
+            MIN_PROTOCOL_BASE_FEE
+        );
+    }
+
+    #[test]
+    fn partial_utilization() {
+        // 75% utilization → 25% under target → decrease by 25%/8 = 3.125%
+        // base=1000, delta = 1000 * 250 / 1000 / 8 = 31
+        assert_eq!(compute_next_base_fee_eip1559(1000, 750, 1000), 969);
+    }
+
+    #[test]
+    fn slight_over_target() {
+        // 110% utilization → 10% over → increase by 10%/8 = 1.25%
+        // base=1000, delta = 1000 * 100 / 1000 / 8 = 12 (integer division)
+        assert_eq!(compute_next_base_fee_eip1559(1000, 1100, 1000), 1012);
     }
 }

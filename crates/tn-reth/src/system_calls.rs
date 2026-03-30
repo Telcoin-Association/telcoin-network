@@ -181,8 +181,22 @@ sol!(
         function getRewards(address validatorAddress) public view virtual returns (uint256);
         /// Returns the next committee size
         function getNextCommitteeSize() external view returns (uint16);
-
     }
+
+    /// Epoch gas target for base fee adjustment.
+    #[sol(rpc)]
+    contract EpochGasTarget {
+        /// Initialize with a default target and owner.
+        constructor(uint64 defaultTargetGas_, address owner_);
+
+        function setDefaultTargetGas(uint64 targetGas) external;
+        function setWorkerTargetGas(uint16 workerId, uint64 targetGas) external;
+        function clearWorkerTargetGas(uint16 workerId) external;
+        /// Get the gas target for a specific worker (falls back to default).
+        function getTargetGas(uint16 workerId) external view returns (uint64 targetGas);
+        function defaultTargetGas() external view returns (uint64);
+    }
+
 );
 
 /// The state of consensus retrieved from chain.

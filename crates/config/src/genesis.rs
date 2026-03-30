@@ -36,6 +36,11 @@ pub const GENESIS_ACCOUNT_STATE_YAML: &str =
 pub const GOVERNANCE_SAFE_ADDRESS: Address = address!("00000000000000000000000000000000000007a0");
 /// The default issuance address.
 pub const ISSUANCE_ADDRESS: Address = address!("07a07a07a07a07a07a07a07a07a07a07a07a07a0");
+/// The address for the EpochGasTarget contract.
+pub const EPOCH_GAS_TARGET_ADDRESS: Address = address!("Fee0FEe0fee0fEE0FEe0fee0FEE0fEe0feE0FEe0");
+/// The path to EpochGasTarget json (tn-contracts submodule).
+pub const EPOCH_GAS_TARGET_JSON: &str =
+    include_str!("../../../tn-contracts/artifacts/EpochGasTarget.json");
 
 /// The struct for starting a network at genesis.
 #[derive(Debug)]
