@@ -1080,6 +1080,7 @@ impl RethEnv {
         initial_stake_config: ConsensusRegistry::StakeConfig,
         owner_address: Address,
         default_epoch_gas_target: u64,
+        worker_gas_targets: Vec<(u16, u64)>,
     ) -> eyre::Result<Genesis> {
         // create temporary reth env for execution
         let tmp_chain: Arc<RethChainSpec> = Arc::new(genesis.clone().into());
@@ -1219,6 +1220,35 @@ impl RethEnv {
             // Third create tx on tmp chain (after blsg1 at nonce 0 and registry at nonce 1)
             owner_address.create(2)
         };
+
+        // apply per-worker gas target overrides
+        if !worker_gas_targets.is_empty() {
+            let mut tn_evm = reth_env.inner.evm_config.evm_factory().create_evm(
+                &mut db,
+                reth_env.inner.evm_config.evm_env(&tmp_chain.sealed_genesis_header())?,
+            );
+
+            for (worker_id, target_gas) in &worker_gas_targets {
+                let calldata = EpochGasTarget::setWorkerTargetGasCall {
+                    workerId: *worker_id,
+                    targetGas: *target_gas,
+                }
+                .abi_encode();
+
+                let ResultAndState { result, state } = tn_evm.transact_pre_genesis_call(
+                    owner_address,
+                    tmp_gas_target_address,
+                    calldata.into(),
+                )?;
+                debug!(
+                    target: "engine",
+                    "setWorkerTargetGas(worker_id={}, target_gas={}) result:\n{:#?}",
+                    worker_id, target_gas, result
+                );
+
+                tn_evm.db_mut().commit(state);
+            }
+        }
 
         // execute the transactions to get final bundle state
         db.merge_transitions(BundleRetention::PlainState);
@@ -1480,6 +1510,33 @@ impl RethEnv {
         self.call_epoch_gas_target::<_, u64>(&mut tn_evm, calldata)
     }
 
+    /// Read the gas targets for all workers from the [`EpochGasTarget`] contract on-chain.
+    ///
+    /// Creates a single EVM against the canonical tip and reuses it for every worker,
+    /// avoiding the overhead of constructing a new state provider + EVM per call.
+    pub fn get_target_gas_for_workers(&self, num_workers: usize) -> eyre::Result<Vec<u64>> {
+        let canonical_tip = self.canonical_tip();
+        let state_provider =
+            self.inner.blockchain_provider.state_by_block_hash(canonical_tip.hash())?;
+        let state = StateProviderDatabase::new(&state_provider);
+        let mut db = State::builder().with_database(state).with_bundle_update().build();
+        let mut tn_evm = self
+            .inner
+            .evm_config
+            .evm_factory()
+            .create_evm(&mut db, self.inner.evm_config.evm_env(&canonical_tip)?);
+
+        let mut targets = Vec::with_capacity(num_workers);
+        for worker_id in 0..num_workers {
+            let calldata =
+                EpochGasTarget::getTargetGasCall { workerId: worker_id as u16 }.abi_encode().into();
+            let target = self.call_epoch_gas_target::<_, u64>(&mut tn_evm, calldata)?;
+            targets.push(target);
+        }
+
+        Ok(targets)
+    }
+
     /// Helper function to call `EpochGasTarget` state on-chain.
     fn call_epoch_gas_target<DB, T>(&self, evm: &mut TNEvm<DB>, calldata: Bytes) -> eyre::Result<T>
     where
@@ -1717,6 +1774,7 @@ mod tests {
             initial_stake_config.clone(),
             governance,
             30_000_000u64,
+            vec![],
         )?;
 
         // update genesis again to include stake for new validator

@@ -681,16 +681,19 @@ where
     /// and keeps the current base fees unchanged.
     async fn adjust_base_fees(&self, engine: &ExecutionNode, gas_accumulator: &GasAccumulator) {
         let reth_env = engine.get_reth_env().await;
+        let num_workers = gas_accumulator.num_workers();
 
-        for worker_id in 0..gas_accumulator.num_workers() {
+        // Fetch all target gas values in one shot, reusing a single EVM instance.
+        let targets = match reth_env.get_target_gas_for_workers(num_workers) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(target: "epoch-manager", ?e, "failed to read target gas for workers, keeping current base fees");
+                return;
+            }
+        };
+
+        for (worker_id, &target_gas) in targets.iter().enumerate() {
             let worker_id = worker_id as u16;
-            let target_gas = match reth_env.get_target_gas_for_worker(worker_id) {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!(target: "epoch-manager", ?e, worker_id, "failed to read target gas, keeping current base fee");
-                    continue;
-                }
-            };
             let (_blocks, gas_used, _gas_limit) = gas_accumulator.get_values(worker_id);
             let base_fee_container = gas_accumulator.base_fee(worker_id);
             let current = base_fee_container.base_fee();

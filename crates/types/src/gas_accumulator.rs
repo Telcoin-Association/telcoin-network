@@ -294,6 +294,7 @@ impl GasAccumulator {
 /// The result is clamped to `[MIN_PROTOCOL_BASE_FEE, u64::MAX]`.
 pub fn compute_next_base_fee_eip1559(current_base_fee: u64, gas_used: u64, target_gas: u64) -> u64 {
     // Guard: if target is zero, keep current fee unchanged.
+    // The contract reverts for target `0` and should never happen
     if target_gas == 0 {
         return current_base_fee;
     }
@@ -367,12 +368,19 @@ mod tests {
     #[test]
     fn max_increase_is_12_5_percent() {
         // Even with huge gas overshoot, increase is capped at base_fee/8
-        // gas_used = u64::MAX, target = 1 → ratio ≈ u64::MAX, but /8 caps it
+        // excess = min(u64::MAX - 1, 1) = 1, delta = 1_000_000 * 1 / 1 / 8 = 125_000
         let base = 1_000_000u64;
         let result = compute_next_base_fee_eip1559(base, u64::MAX, 1);
-        // delta = base * (MAX-1) / 1 / 8, but saturating_mul and u128 handle it
-        // The result should be at most base + base * MAX / 1 / 8 which saturates to u64::MAX
-        assert!(result >= base);
+        assert_eq!(result, base + base / 8);
+    }
+
+    #[test]
+    fn max_decrease_is_12_5_percent() {
+        // Even with zero gas usage, decrease is capped at base_fee/8
+        // deficit = min(1, 1) = 1, delta = 1_000_000 * 1 / 1 / 8 = 125_000
+        let base = 1_000_000u64;
+        let result = compute_next_base_fee_eip1559(base, 0, 1);
+        assert_eq!(result, base - base / 8);
     }
 
     #[test]

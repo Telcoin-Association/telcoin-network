@@ -119,6 +119,19 @@ pub struct GenesisArgs {
     /// Default is 0x7e1 (2017).
     #[arg(long, default_value_t = 2017, value_parser=maybe_hex)]
     pub chain_id: u64,
+    /// Per-worker gas target overrides at genesis.
+    ///
+    /// Format: WORKER_ID:TARGET_GAS (e.g., 0:30000000 for worker 0 with 30M gas target).
+    /// Can be specified multiple times for different workers.
+    #[arg(
+        long = "worker-gas-target",
+        alias = "worker_gas_target",
+        help_heading = "Per-worker gas target overrides",
+        value_name = "WORKER_ID:TARGET_GAS",
+        verbatim_doc_comment
+    )]
+    pub worker_gas_targets: Vec<String>,
+
     /// YAML file containing accounts to merge into genesis.
     /// This is intended for dev and test nets.
     #[arg(long, value_name = "YAML_FILE", verbatim_doc_comment)]
@@ -144,6 +157,28 @@ pub(crate) fn account_from_word(key_word: &str) -> Address {
 }
 
 impl GenesisArgs {
+    /// Parse `--worker-gas-target` values from `"WORKER_ID:TARGET_GAS"` strings
+    /// into `(worker_id, target_gas)` pairs.
+    fn parse_worker_gas_targets(&self) -> eyre::Result<Vec<(u16, u64)>> {
+        self.worker_gas_targets
+            .iter()
+            .map(|s| {
+                let (id_str, gas_str) = s.split_once(':').ok_or_else(|| {
+                    eyre::eyre!(
+                        "invalid --worker-gas-target format '{s}': expected WORKER_ID:TARGET_GAS"
+                    )
+                })?;
+                let worker_id: u16 = id_str.parse().map_err(|e| {
+                    eyre::eyre!("invalid worker id '{id_str}' in --worker-gas-target: {e}")
+                })?;
+                let target_gas: u64 = gas_str.parse().map_err(|e| {
+                    eyre::eyre!("invalid target gas '{gas_str}' in --worker-gas-target: {e}")
+                })?;
+                Ok((worker_id, target_gas))
+            })
+            .collect()
+    }
+
     /// Execute command
     pub fn execute(&self, data_dir: PathBuf) -> eyre::Result<()> {
         info!(target: "genesis::ceremony", "Creating a new chain genesis with initial validators");
@@ -172,6 +207,8 @@ impl GenesisArgs {
         set_genesis_defaults(&mut genesis);
         genesis.config.chain_id = self.chain_id;
 
+        let worker_gas_targets = self.parse_worker_gas_targets()?;
+
         // try to create a runtime if one doesn't already exist
         // this is a workaround for executing committees pre-genesis during tests and normal CLI
         // operations
@@ -183,6 +220,7 @@ impl GenesisArgs {
                 initial_stake_config.clone(),
                 self.consensus_registry_owner,
                 self.epoch_gas_target,
+                worker_gas_targets.clone(),
             )?
         } else {
             // no runtime exists (normal CLI operation)
@@ -197,6 +235,7 @@ impl GenesisArgs {
                     initial_stake_config,
                     self.consensus_registry_owner,
                     self.epoch_gas_target,
+                    worker_gas_targets,
                 )
             })?
         };
