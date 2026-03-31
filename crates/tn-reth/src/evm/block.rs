@@ -156,7 +156,7 @@ where
         trace!(target: "engine", ?calldata, "apply incentives calldata");
 
         // execute system call to consensus registry
-        let res = match self.evm.transact_system_call(
+        let mut res = match self.evm.transact_system_call(
             SYSTEM_ADDRESS,
             CONSENSUS_REGISTRY_ADDRESS,
             calldata,
@@ -181,6 +181,8 @@ where
         }
         trace!(target: "engine", ?res, "applying consensus block rewards");
 
+        // clean up SYSTEM_ADDRESS — only touched as the system caller, not a real state change
+        res.state.remove(&SYSTEM_ADDRESS);
         // commit the changes
         self.evm.db_mut().commit(res.state);
 
@@ -194,7 +196,7 @@ where
         trace!(target: "engine", ?calldata, "close epoch calldata");
 
         // execute system call to consensus registry
-        let res = match self.evm.transact_system_call(
+        let mut res = match self.evm.transact_system_call(
             SYSTEM_ADDRESS,
             CONSENSUS_REGISTRY_ADDRESS,
             calldata,
@@ -218,6 +220,8 @@ where
 
         trace!(target: "engine", "closing epoch logs:\n{:?}", res.result.logs());
 
+        // clean up SYSTEM_ADDRESS — only touched as the system caller, not a real state change
+        res.state.remove(&SYSTEM_ADDRESS);
         // commit the changes
         self.evm.db_mut().commit(res.state);
         Ok(())
