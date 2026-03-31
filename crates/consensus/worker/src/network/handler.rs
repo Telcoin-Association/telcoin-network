@@ -1,29 +1,29 @@
+//! The type that handles core logic for requests between workers.
 use super::{
     error::{WorkerNetworkError, WorkerNetworkResult},
+    handle::WorkerNetworkHandle,
     message::WorkerGossip,
-    WorkerNetworkHandle,
 };
-use crate::WorkerResponse;
-use std::sync::{Arc, LazyLock};
+use crate::network::{stream_codec, PendingBatchStream};
+use futures::AsyncWriteExt as _;
+use std::{collections::HashSet, sync::Arc, time::Duration};
 use tn_config::ConsensusConfig;
-use tn_network_libp2p::GossipMessage;
+use tn_network_libp2p::{GossipMessage, Stream};
 use tn_network_types::{WorkerOthersBatchMessage, WorkerToPrimaryClient};
 use tn_storage::tables::NodeBatchesCache;
 use tn_types::{
-    ensure, now, try_decode, Batch, BatchValidation, BlockHash, BlsPublicKey, Database,
-    SealedBatch, WorkerId,
+    ensure, now, try_decode, BatchValidation, BlsPublicKey, Database, SealedBatch, WorkerId, B256,
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
-/// The minimal length of a single, encoded, default [Batch] used to set a local min for
-/// message validation.
-static LOCAL_MIN_REQUEST_SIZE: LazyLock<usize> =
-    LazyLock::new(|| tn_types::encode(&Batch::default()).len());
-/// The minimal response wrapper using a default, empty message.
-static MESSAGE_OVERHEAD: LazyLock<usize> =
-    LazyLock::new(|| tn_types::encode(&WorkerResponse::RequestBatches(vec![])).len());
+/// Total timeout for sending all batches over a stream.
+/// Prevents slow-reader attacks where a peer accepts a stream but never reads.
+/// Set for 500MB through emerging market worse-case 20MB/s upload
+const SEND_STREAM_TIMEOUT: Duration = Duration::from_secs(200);
 
 /// The type that handles requests from peers.
+///
+/// An instance is cloned for each request and used in a spawned task.
 #[derive(Clone, Debug)]
 pub struct RequestHandler<DB> {
     /// This worker's id.
@@ -67,22 +67,21 @@ where
                     topic.to_string().eq(&tn_config::LibP2pConfig::worker_batch_topic()),
                     WorkerNetworkError::InvalidTopic
                 );
-                // Retrieve the block...
+                // Retrieve the batch...
                 let store = self.consensus_config.node_storage();
                 if !matches!(store.get::<NodeBatchesCache>(&batch_hash), Ok(Some(_))) {
-                    // If we don't have this batch already then try to get it.
+                    // If batch is missing from db, then request from peer.
                     // If we are a CVV then we should already have it.
                     // This allows non-CVVs to pre fetch batches they will soon need.
-                    match self.network_handle.request_batches(vec![batch_hash]).await {
+                    let mut missing = HashSet::from([batch_hash]);
+                    match self.network_handle.request_batches(&mut missing).await {
                         Ok(batches) => {
-                            if let Some(batch) = batches.first() {
-                                store.insert::<NodeBatchesCache>(&batch.digest(), batch).map_err(
-                                    |e| {
-                                        WorkerNetworkError::Internal(format!(
-                                            "failed to write to batch store: {e}"
-                                        ))
-                                    },
-                                )?;
+                            if let Some((digest, batch)) = batches.first() {
+                                store.insert::<NodeBatchesCache>(digest, batch).map_err(|e| {
+                                    WorkerNetworkError::Internal(format!(
+                                        "failed to write to batch store: {e}"
+                                    ))
+                                })?;
                             }
                         }
                         Err(e) => {
@@ -146,63 +145,62 @@ where
         Ok(())
     }
 
-    /// Attempt to return requested batches.
-    pub(super) async fn process_request_batches(
+    /// Process request to open stream for batches.
+    pub(super) async fn process_request_batches_stream(
         &self,
-        batch_digests: Vec<BlockHash>,
-        max_response_size: usize,
-    ) -> WorkerNetworkResult<Vec<Batch>> {
-        const BATCH_DIGESTS_READ_CHUNK_SIZE: usize = 200;
+        peer: BlsPublicKey,
+        pending_request: Option<PendingBatchStream>,
+        mut stream: Stream,
+        request_digest: B256,
+    ) -> WorkerNetworkResult<()> {
+        // `None` indicates unexpected request
+        let Some(request) = pending_request else {
+            // this is a protocol violation - return error for penalty
+            warn!(
+                target: "worker::network",
+                %peer,
+                ?request_digest,
+                "inbound stream has no matching pending request"
+            );
+            return Err(WorkerNetworkError::UnknownStreamRequest(request_digest));
+        };
 
-        // assume reasonable min is 1 encoded batch (no transactions)
-        // NOTE: caller needs to account for batches + msg overhead, and batches must have
-        // transactions
-        if max_response_size < *LOCAL_MIN_REQUEST_SIZE {
-            debug!(target: "cert-collector", "batch request max size too small: {}", max_response_size);
-            return Err(WorkerNetworkError::InvalidRequest("Request size too small".into()));
-        }
+        // process request to send batches through stream
+        debug!(
+            target: "worker::network",
+            %peer,
+            ?request_digest,
+            batch_count = request.batch_digests.len(),
+            "processing inbound batch stream"
+        );
 
-        // return error for empty batches
-        if batch_digests.is_empty() {
-            debug!(target: "cert-collector", "batch request empty");
-            return Err(WorkerNetworkError::InvalidRequest("Empty batch digests".into()));
-        }
+        let store = self.consensus_config.node_storage();
 
-        // use the min value between this node's max rpc message size and the requestor's reported
-        // max message size
-        //
-        // NOTE: assume safe overhead is accounted for because the codec will also compress messages
-        let local_max = self.consensus_config.network_config().libp2p_config().max_rpc_message_size
-            - *MESSAGE_OVERHEAD;
-        let max_message_size = max_response_size.min(local_max);
-
-        let store = self.consensus_config.node_storage().clone();
-
-        let digests_chunks = batch_digests
-            .chunks(BATCH_DIGESTS_READ_CHUNK_SIZE)
-            .map(|chunk| chunk.to_vec())
-            .collect::<Vec<_>>();
-        let mut batches = Vec::new();
-        let mut total_size = 0;
-
-        for digests_chunks in digests_chunks {
-            let stored_batches =
-                store.multi_get::<NodeBatchesCache>(digests_chunks.iter()).map_err(|e| {
-                    WorkerNetworkError::Internal(format!("failed to read from batch store: {e:?}"))
-                })?;
-
-            for stored_batch in stored_batches.into_iter().flatten() {
-                let batch_size = stored_batch.size();
-                if total_size + batch_size <= max_message_size {
-                    batches.push(stored_batch);
-                    total_size += batch_size;
-                } else {
-                    break;
-                }
+        // set timeout to prevent slow-read attack
+        match tokio::time::timeout(
+            SEND_STREAM_TIMEOUT,
+            stream_codec::send_batches_over_stream(
+                &mut stream,
+                store,
+                &request.batch_digests,
+                request.epoch,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                warn!(target: "worker::network", %peer, ?e, "failed to send batches over stream");
+            }
+            Err(_elapsed) => {
+                warn!(target: "worker::network", %peer, ?request_digest, "sending batches stream timed out");
             }
         }
 
-        Ok(batches)
+        // attempt to close the stream gracefully
+        let _ = stream.close().await;
+
+        Ok(())
     }
 }
 
@@ -232,12 +230,16 @@ where
     }
 
     /// Publicly available for tests.
-    /// See [Self::process_request_batches].
-    pub async fn pub_process_request_batches(
+    /// Sends requested batches over the provided stream.
+    ///
+    /// This is a simplified version for tests that bypasses the pending request mechanism.
+    pub async fn pub_process_request_batches_stream(
         &self,
-        batch_digests: Vec<BlockHash>,
-        max_response_size: usize,
-    ) -> WorkerNetworkResult<Vec<Batch>> {
-        self.process_request_batches(batch_digests, max_response_size).await
+        peer: BlsPublicKey,
+        stream: Stream,
+        pending_request: Option<PendingBatchStream>,
+        request_digest: B256,
+    ) -> WorkerNetworkResult<()> {
+        self.process_request_batches_stream(peer, pending_request, stream, request_digest).await
     }
 }

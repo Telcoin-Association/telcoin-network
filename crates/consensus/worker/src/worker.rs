@@ -5,7 +5,7 @@
 
 use crate::{
     batch_fetcher::BatchFetcher,
-    network::PrimaryReceiverHandler,
+    network::primary::PrimaryReceiverHandler,
     quorum_waiter::{QuorumWaiter, QuorumWaiterTrait},
     WorkerNetworkHandle,
 };
@@ -38,7 +38,6 @@ pub fn new_worker<DB: Database>(
     consensus_config.local_network().set_primary_to_worker_local_handler(Arc::new(
         PrimaryReceiverHandler {
             store: consensus_config.node_storage().clone(),
-            request_batches_timeout: consensus_config.parameters().sync_retry_delay,
             network: Some(network_handle.clone()),
             batch_fetcher: Some(batch_fetcher),
             validator,

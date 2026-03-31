@@ -18,17 +18,12 @@ async fn test_wait_for_quorum_happy_path() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let committee = fixture.committee();
     let my_primary = fixture.authorities().next().unwrap();
-    let max_rpc_msg_size =
-        my_primary.consensus_config().network_config().libp2p_config().max_rpc_message_size;
     let task_manager = TaskManager::default();
 
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
-    let network = WorkerNetworkHandle::new(
-        NetworkHandle::new(sender),
-        task_manager.get_spawner(),
-        max_rpc_msg_size,
-    );
+    let network =
+        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
     // Spawn a `QuorumWaiter` instance.
     let quorum_waiter =
         QuorumWaiter::new(my_primary.authority().clone(), committee.clone(), network);
@@ -68,17 +63,12 @@ async fn test_batch_rejected_timeout() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let committee = fixture.committee();
     let my_primary = fixture.authorities().next().unwrap();
-    let max_rpc_msg_size =
-        my_primary.consensus_config().network_config().libp2p_config().max_rpc_message_size;
     let task_manager = TaskManager::default();
 
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
-    let network = WorkerNetworkHandle::new(
-        NetworkHandle::new(sender),
-        task_manager.get_spawner(),
-        max_rpc_msg_size,
-    );
+    let network =
+        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
     // Spawn a `QuorumWaiter` instance.
     let quorum_waiter =
         QuorumWaiter::new(my_primary.authority().clone(), committee.clone(), network);
@@ -121,17 +111,12 @@ async fn test_batch_some_rejected_stake_still_passes() {
         .build();
     let committee = fixture.committee();
     let my_primary = fixture.authorities().next().unwrap();
-    let max_rpc_msg_size =
-        my_primary.consensus_config().network_config().libp2p_config().max_rpc_message_size;
     let task_manager = TaskManager::default();
 
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
-    let network = WorkerNetworkHandle::new(
-        NetworkHandle::new(sender),
-        task_manager.get_spawner(),
-        max_rpc_msg_size,
-    );
+    let network =
+        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
     // Spawn a `QuorumWaiter` instance.
     let quorum_waiter =
         QuorumWaiter::new(my_primary.authority().clone(), committee.clone(), network);
@@ -190,17 +175,12 @@ async fn test_batch_rejected_quorum() {
         .build();
     let committee = fixture.committee();
     let my_primary = fixture.authorities().next().unwrap();
-    let max_rpc_msg_size =
-        my_primary.consensus_config().network_config().libp2p_config().max_rpc_message_size;
     let task_manager = TaskManager::default();
 
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
-    let network = WorkerNetworkHandle::new(
-        NetworkHandle::new(sender),
-        task_manager.get_spawner(),
-        max_rpc_msg_size,
-    );
+    let network =
+        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
     // Spawn a `QuorumWaiter` instance.
     let quorum_waiter =
         QuorumWaiter::new(my_primary.authority().clone(), committee.clone(), network);
@@ -250,17 +230,12 @@ async fn test_batch_rejected_antiquorum() {
         .build();
     let committee = fixture.committee();
     let my_primary = fixture.authorities().next().unwrap();
-    let max_rpc_msg_size =
-        my_primary.consensus_config().network_config().libp2p_config().max_rpc_message_size;
     let task_manager = TaskManager::default();
 
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
-    let network = WorkerNetworkHandle::new(
-        NetworkHandle::new(sender),
-        task_manager.get_spawner(),
-        max_rpc_msg_size,
-    );
+    let network =
+        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
     // Spawn a `QuorumWaiter` instance.
     let quorum_waiter =
         QuorumWaiter::new(my_primary.authority().clone(), committee.clone(), network);
@@ -305,17 +280,12 @@ async fn test_batch_early_anti_quorum() {
         .build();
     let committee = fixture.committee();
     let my_primary = fixture.authorities().next().unwrap();
-    let max_rpc_msg_size =
-        my_primary.consensus_config().network_config().libp2p_config().max_rpc_message_size;
     let task_manager = TaskManager::default();
 
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
-    let network = WorkerNetworkHandle::new(
-        NetworkHandle::new(sender),
-        task_manager.get_spawner(),
-        max_rpc_msg_size,
-    );
+    let network =
+        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
     // Spawn a `QuorumWaiter` instance.
     let quorum_waiter =
         QuorumWaiter::new(my_primary.authority().clone(), committee.clone(), network);
