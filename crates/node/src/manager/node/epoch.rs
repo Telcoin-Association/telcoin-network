@@ -13,7 +13,7 @@ use crate::{
 };
 use eyre::{eyre, OptionExt};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
     time::Duration,
 };
@@ -37,8 +37,8 @@ use tn_storage::tables::{
 use tn_types::{
     gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash, BlockNumHash, BlsPublicKey,
     Committee, CommitteeBuilder, ConsensusOutput, Database as TNDatabase, Epoch, EpochRecord,
-    Multiaddr, NetworkPublicKey, Notifier, TaskJoinError, TaskManager, TaskSpawner, TnReceiver,
-    B256,
+    Multiaddr, NetworkPublicKey, Notifier, P2pNode, TaskJoinError, TaskManager, TaskSpawner,
+    TnReceiver, B256,
 };
 use tn_worker::{quorum_waiter::QuorumWaiterTrait, Worker, WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::mpsc;
@@ -960,27 +960,22 @@ where
             .map(|a| *a.protocol_key())
             .collect();
 
-        if initial_epoch {
-            // Make sure we at least hove bootstrap peers on first epoch.
-            network_handle
-                .inner_handle()
-                .add_bootstrap_peers(
-                    consensus_config
-                        .committee()
-                        .bootstrap_servers()
-                        .iter()
-                        .map(|(k, v)| (*k, v.primary.clone()))
-                        .collect(),
-                )
-                .await?;
-        }
-
-        network_handle.inner_handle().new_epoch(committee_keys.clone()).await?;
-        debug!(target: "epoch-manager", auth=?consensus_config.authority_id(), "event stream updated!");
+        let bootstrap_peers = consensus_config
+            .committee()
+            .bootstrap_servers()
+            .iter()
+            .map(|(k, v)| (*k, v.primary.clone()))
+            .collect();
+        Self::init_network_for_epoch(
+            network_handle.inner_handle(),
+            bootstrap_peers,
+            committee_keys.clone(),
+            initial_epoch,
+        )
+        .await?;
 
         // start listening if the network needs to be initialized
         if initial_epoch {
-            // start listening for p2p messages
             let primary_address = Self::parse_listener_address_for_swarm(
                 "PRIMARY_LISTENER_MULTIADDR",
                 consensus_config.primary_networkkey(),
@@ -999,8 +994,9 @@ where
             )
             .await?;
 
-        let mut peers = network_handle.connected_peers_count().await.unwrap_or(0);
-        if peers == 0 || self.consensus_bus.is_cvv() {
+        if network_handle.connected_peers_count().await.unwrap_or(0) == 0
+            || self.consensus_bus.is_cvv()
+        {
             // always dial peers for the new epoch
             // do this if a CVV (may need to connect to the other CVVs) or if we don't have any
             // peers if we are not a committee member and have peers then do not pester
@@ -1017,26 +1013,7 @@ where
             }
         }
 
-        // wait until the primary has connected with at least 1 peer
-        let mut retries = 0;
-        while peers == 0 {
-            retries += 1;
-            if retries > 240 {
-                // If we could not get on the network in about 2 minutes then trigger node exit.
-                // This indicates a fundemental problem (maybe no network access?) that should be
-                // addressed. Since this is a blockchain there is nothing useful for a
-                // node to do without being on the network.
-                return Err(eyre::eyre!(
-                    "Unable to join telcoin network, can not connect to any peers!"
-                ));
-            }
-            if retries % 10 == 0 {
-                // Log error about every 5 seconds.
-                error!(target: "epoch-manager", "failed to join the network!")
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            peers = network_handle.connected_peers_count().await.unwrap_or(0);
-        }
+        Self::wait_for_network_peers(network_handle.inner_handle(), "primary network").await?;
 
         // spawn primary network
         PrimaryNetwork::new(
@@ -1112,7 +1089,20 @@ where
             .into_iter()
             .map(|a| *a.protocol_key())
             .collect();
-        network_handle.inner_handle().new_epoch(committee_keys.clone()).await?;
+
+        let bootstrap_peers = consensus_config
+            .committee()
+            .bootstrap_servers()
+            .iter()
+            .map(|(k, v)| (*k, v.worker.clone()))
+            .collect();
+        Self::init_network_for_epoch(
+            network_handle.inner_handle(),
+            bootstrap_peers,
+            committee_keys.clone(),
+            initial_epoch,
+        )
+        .await?;
 
         // start listening if the network needs to be initialized
         if initial_epoch {
@@ -1122,18 +1112,6 @@ where
                 consensus_config.worker_address(),
             )?;
             network_handle.inner_handle().start_listening(worker_address).await?;
-            // Make sure we at least hove bootstrap peers on first epoch.
-            network_handle
-                .inner_handle()
-                .add_bootstrap_peers(
-                    consensus_config
-                        .committee()
-                        .bootstrap_servers()
-                        .iter()
-                        .map(|(k, v)| (*k, v.worker.clone()))
-                        .collect(),
-                )
-                .await?;
         }
 
         let worker_address = consensus_config.worker_address();
@@ -1152,6 +1130,8 @@ where
                 epoch_task_spawner.clone(),
             );
         }
+
+        Self::wait_for_network_peers(network_handle.inner_handle(), "worker network").await?;
 
         // update the authorized publishers for gossip every epoch
         network_handle
@@ -1263,5 +1243,46 @@ where
                     })
             })
             .unwrap_or(Ok(fallback))
+    }
+
+    /// Initialize a network handle for a new epoch: register bootstrap peers (on first epoch)
+    /// then update the epoch committee.
+    ///
+    /// Bootstrap peers must be added BEFORE `new_epoch()` so that `known_peers` is populated
+    /// when `new_epoch()` builds `current_committee` from it.
+    async fn init_network_for_epoch<Req: TNMessage, Res: TNMessage>(
+        handle: &NetworkHandle<Req, Res>,
+        bootstrap_peers: BTreeMap<BlsPublicKey, P2pNode>,
+        committee_keys: HashSet<BlsPublicKey>,
+        initial_epoch: bool,
+    ) -> eyre::Result<()> {
+        if initial_epoch {
+            handle.add_bootstrap_peers(bootstrap_peers).await?;
+        }
+        handle.new_epoch(committee_keys).await?;
+        Ok(())
+    }
+
+    /// Block until the network has connected to at least one peer, with retries.
+    async fn wait_for_network_peers<Req: TNMessage, Res: TNMessage>(
+        handle: &NetworkHandle<Req, Res>,
+        network_name: &str,
+    ) -> eyre::Result<()> {
+        let mut peers = handle.connected_peer_count().await.unwrap_or(0);
+        let mut retries = 0;
+        while peers == 0 {
+            retries += 1;
+            if retries > 240 {
+                return Err(eyre::eyre!(
+                    "{network_name} unable to join, cannot connect to any peers!"
+                ));
+            }
+            if retries % 10 == 0 {
+                error!(target: "epoch-manager", "failed to join the {network_name}!");
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            peers = handle.connected_peer_count().await.unwrap_or(0);
+        }
+        Ok(())
     }
 }
