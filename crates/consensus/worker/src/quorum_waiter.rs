@@ -12,6 +12,12 @@ use tn_types::{Authority, BlsPublicKey, Committee, SealedBatch, TaskSpawner, Vot
 use tokio::sync::oneshot;
 use tracing::debug;
 
+/// Maximum number of retry attempts for reporting a batch to a single peer.
+const MAX_BATCH_REPORT_ATTEMPTS: u32 = 3;
+
+/// Base backoff duration for retrying batch reports (doubles each attempt).
+const BATCH_REPORT_RETRY_BACKOFF: Duration = Duration::from_millis(200);
+
 /// Interface to QuorumWaiter, exists primarily for tests.
 pub trait QuorumWaiterTrait: Send + Sync + Clone + Unpin + 'static {
     /// Send a batch to committee peers in an attempt to get quorum on it's validity.
@@ -56,35 +62,41 @@ impl QuorumWaiter {
         Self { inner: Arc::new(QuorumWaiterInner { authority, committee, network }) }
     }
 
-    /// Helper function. It waits for a future to complete and then delivers a value.
+    /// Report a batch to a single peer with retry-and-backoff for transient network errors.
+    ///
+    /// - `Ok(deliver)` — peer accepted the batch
+    /// - `Err(Rejected)` — peer explicitly rejected (RPCError), no retry
+    /// - `Err(Network)` — all retry attempts exhausted
     async fn waiter(
         bls: BlsPublicKey,
-        wait_for: oneshot::Receiver<Result<(), NetworkError>>,
+        network: WorkerNetworkHandle,
+        sealed_batch: SealedBatch,
         deliver: VotingPower,
     ) -> Result<VotingPower, WaiterError> {
-        match wait_for.await {
-            Ok(r) => {
-                match r {
-                    Ok(_) => Ok(deliver),
-                    Err(NetworkError::RPCError(msg)) => {
-                        tracing::error!(
-                            target = "worker::quorum_waiter",
-                            "RPCError, peer {bls}: {msg}"
-                        );
-                        Err(WaiterError::Rejected(deliver))
-                    }
-                    // Non-exhaustive enum...
-                    Err(err) => {
-                        tracing::error!(
-                            target = "worker::quorum_waiter",
-                            "Network error, peer {bls}: {err:?}"
-                        );
-                        Err(WaiterError::Network(deliver))
+        for attempt in 0..MAX_BATCH_REPORT_ATTEMPTS {
+            match network.report_batch(bls, sealed_batch.clone()).await {
+                Ok(()) => return Ok(deliver),
+                Err(NetworkError::RPCError(msg)) => {
+                    tracing::error!(
+                        target = "worker::quorum_waiter",
+                        "RPCError, peer {bls}: {msg}"
+                    );
+                    return Err(WaiterError::Rejected(deliver));
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target = "worker::quorum_waiter",
+                        attempt = attempt + 1,
+                        max_attempts = MAX_BATCH_REPORT_ATTEMPTS,
+                        "Network error, peer {bls}: {err:?}, retrying..."
+                    );
+                    if attempt + 1 < MAX_BATCH_REPORT_ATTEMPTS {
+                        tokio::time::sleep(BATCH_REPORT_RETRY_BACKOFF * 2u32.pow(attempt)).await;
                     }
                 }
             }
-            Err(_) => Err(WaiterError::Network(deliver)),
         }
+        Err(WaiterError::Network(deliver))
     }
 }
 
@@ -105,9 +117,8 @@ impl QuorumWaiterTrait for QuorumWaiter {
                 // Broadcast the batch to the other workers.
                 let peers: Vec<_> =
                     inner.committee.others_keys_except(inner.authority.protocol_key());
-                let handlers = inner.network.report_batch_to_peers(&peers, sealed_batch);
 
-                // Collect all the handlers to receive acknowledgements.
+                // Spawn per-peer retry tasks that report the batch with backoff.
                 let mut wait_for_quorum: FuturesUnordered<
                     oneshot::Receiver<Result<VotingPower, WaiterError>>,
                 > = FuturesUnordered::new();
@@ -116,22 +127,18 @@ impl QuorumWaiterTrait for QuorumWaiter {
                 let mut available_stake = 0;
                 // Stake from a committee member that has rejected this batch.
                 let mut rejected_stake = 0;
-                peers
-                    .into_iter()
-                    .zip(handlers.into_iter().enumerate())
-                    .map(|(name, (i, handler))| {
-                        let stake = inner.committee.voting_power(&name);
-                        available_stake += stake;
-                        let (tx, rx) = oneshot::channel();
-                        let task_name = format!("qw-peer-{i}");
-                        spawner_clone.spawn_task(task_name, async move {
-                            // forward result through oneshot channel
-                            let res = Self::waiter(name, handler, stake).await;
-                            let _ = tx.send(res);
-                        });
-                        rx
-                    })
-                    .for_each(|f| wait_for_quorum.push(f));
+                for (i, name) in peers.into_iter().enumerate() {
+                    let stake = inner.committee.voting_power(&name);
+                    available_stake += stake;
+                    let (tx, rx) = oneshot::channel();
+                    let network = inner.network.clone();
+                    let batch = sealed_batch.clone();
+                    spawner_clone.spawn_task(format!("qw-peer-{i}"), async move {
+                        let res = Self::waiter(name, network, batch, stake).await;
+                        let _ = tx.send(res);
+                    });
+                    wait_for_quorum.push(rx);
+                }
 
                 // Wait for the first 2f nodes to send back an Ack. Then we consider the batch
                 // delivered and we send its digest to the primary (that will include it into
@@ -211,8 +218,6 @@ impl QuorumWaiterTrait for QuorumWaiter {
                         break Err(QuorumWaiterError::QuorumRejected);
                     }
                     if total_stake + available_stake < threshold {
-                        // It is no longer possible to reach quorum...
-                        // This is likely because of network/rpc errors and may not be permanent.
                         break Err(QuorumWaiterError::AntiQuorum);
                     }
                 }
