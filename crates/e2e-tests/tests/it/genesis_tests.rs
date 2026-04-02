@@ -214,7 +214,7 @@ async fn test_genesis_with_consensus_registry_accounts() -> eyre::Result<()> {
         stakeVersion,
     } = current_epoch_info;
     assert_eq!(blockHeight, 0);
-    assert_eq!(epochDuration, 86400);
+    assert_eq!(epochDuration, 28800); // 8-hrs
     assert_eq!(epochIssuance, expected_epoch_issuance);
     assert_eq!(stakeVersion, 0);
 
