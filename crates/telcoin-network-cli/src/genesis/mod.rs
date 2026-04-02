@@ -95,15 +95,6 @@ pub struct GenesisArgs {
     )]
     pub epoch_duration: u32,
 
-    /// The target gas per epoch for basefee adjustments (EIP-1559).
-    #[arg(
-        long = "epoch-gas-target",
-        help_heading = "The target basefee for the epoch.",
-        default_value_t = 100_000_000,
-        verbatim_doc_comment
-    )]
-    pub epoch_gas_target: u64,
-
     /// Used to add a funded account (by simple text string).  Use this on a dev cluster
     /// to have an account with a deterministically derived key. This is ONLY for dev
     /// testing, never use this for other chains.
@@ -119,18 +110,19 @@ pub struct GenesisArgs {
     /// Default is 0x7e1 (2017).
     #[arg(long, default_value_t = 2017, value_parser=maybe_hex)]
     pub chain_id: u64,
-    /// Per-worker gas target overrides at genesis.
+    /// Per-worker fee config overrides at genesis.
     ///
-    /// Format: WORKER_ID:TARGET_GAS (e.g., 0:30000000 for worker 0 with 30M gas target).
+    /// Format: WORKER_ID:STRATEGY:VALUE (e.g., 0:0:100000000 for worker 0 with EIP-1559 at 100M gas target,
+    /// or 1:1:200 for worker 1 with static fee of 200 wei).
     /// Can be specified multiple times for different workers.
     #[arg(
-        long = "worker-gas-target",
-        alias = "worker_gas_target",
-        help_heading = "Per-worker gas target overrides",
-        value_name = "WORKER_ID:TARGET_GAS",
+        long = "worker-fee-config",
+        alias = "worker_fee_config",
+        help_heading = "Per-worker fee config overrides",
+        value_name = "WORKER_ID:STRATEGY:VALUE",
         verbatim_doc_comment
     )]
-    pub worker_gas_targets: Vec<String>,
+    pub worker_fee_configs: Vec<String>,
 
     /// YAML file containing accounts to merge into genesis.
     /// This is intended for dev and test nets.
@@ -157,26 +149,51 @@ pub(crate) fn account_from_word(key_word: &str) -> Address {
 }
 
 impl GenesisArgs {
-    /// Parse `--worker-gas-target` values from `"WORKER_ID:TARGET_GAS"` strings
-    /// into `(worker_id, target_gas)` pairs.
-    fn parse_worker_gas_targets(&self) -> eyre::Result<Vec<(u16, u64)>> {
-        self.worker_gas_targets
+    /// Parse `--worker-fee-config` values from `"WORKER_ID:STRATEGY:VALUE"` strings
+    /// into `(strategy, value)` pairs ordered by worker id.
+    ///
+    /// The worker id is validated to match the index position (0, 1, 2, ...).
+    fn parse_worker_fee_configs(&self) -> eyre::Result<Vec<(u8, u64)>> {
+        if self.worker_fee_configs.is_empty() {
+            return Ok(vec![(0u8, 100_000_000_000u64)]);
+        }
+
+        let mut configs: Vec<(u16, u8, u64)> = self
+            .worker_fee_configs
             .iter()
             .map(|s| {
-                let (id_str, gas_str) = s.split_once(':').ok_or_else(|| {
-                    eyre::eyre!(
-                        "invalid --worker-gas-target format '{s}': expected WORKER_ID:TARGET_GAS"
-                    )
+                let parts: Vec<&str> = s.splitn(3, ':').collect();
+                if parts.len() != 3 {
+                    eyre::bail!(
+                        "invalid --worker-fee-config format '{s}': expected WORKER_ID:STRATEGY:VALUE"
+                    );
+                }
+                let worker_id: u16 = parts[0].parse().map_err(|e| {
+                    eyre::eyre!("invalid worker id '{}' in --worker-fee-config: {e}", parts[0])
                 })?;
-                let worker_id: u16 = id_str.parse().map_err(|e| {
-                    eyre::eyre!("invalid worker id '{id_str}' in --worker-gas-target: {e}")
+                let strategy: u8 = parts[1].parse().map_err(|e| {
+                    eyre::eyre!("invalid strategy '{}' in --worker-fee-config: {e}", parts[1])
                 })?;
-                let target_gas: u64 = gas_str.parse().map_err(|e| {
-                    eyre::eyre!("invalid target gas '{gas_str}' in --worker-gas-target: {e}")
+                let value: u64 = parts[2].parse().map_err(|e| {
+                    eyre::eyre!("invalid value '{}' in --worker-fee-config: {e}", parts[2])
                 })?;
-                Ok((worker_id, target_gas))
+                Ok((worker_id, strategy, value))
             })
-            .collect()
+            .collect::<eyre::Result<Vec<_>>>()?;
+
+        // Sort by worker_id so positional indexing is deterministic.
+        configs.sort_by_key(|(id, _, _)| *id);
+
+        // Validate contiguous worker ids starting from 0.
+        for (expected, (id, _, _)) in configs.iter().enumerate() {
+            if *id as usize != expected {
+                eyre::bail!(
+                    "worker fee configs must be contiguous starting from 0, but worker id {id} found at position {expected}"
+                );
+            }
+        }
+
+        Ok(configs.into_iter().map(|(_, strategy, value)| (strategy, value)).collect())
     }
 
     /// Execute command
@@ -207,7 +224,7 @@ impl GenesisArgs {
         set_genesis_defaults(&mut genesis);
         genesis.config.chain_id = self.chain_id;
 
-        let worker_gas_targets = self.parse_worker_gas_targets()?;
+        let worker_fee_configs = self.parse_worker_fee_configs()?;
 
         // try to create a runtime if one doesn't already exist
         // this is a workaround for executing committees pre-genesis during tests and normal CLI
@@ -219,8 +236,7 @@ impl GenesisArgs {
                 genesis,
                 initial_stake_config.clone(),
                 self.consensus_registry_owner,
-                self.epoch_gas_target,
-                worker_gas_targets.clone(),
+                worker_fee_configs.clone(),
             )?
         } else {
             // no runtime exists (normal CLI operation)
@@ -234,8 +250,7 @@ impl GenesisArgs {
                     genesis,
                     initial_stake_config,
                     self.consensus_registry_owner,
-                    self.epoch_gas_target,
-                    worker_gas_targets,
+                    worker_fee_configs,
                 )
             })?
         };
@@ -285,5 +300,70 @@ impl GenesisArgs {
         Config::write_to_path(data_dir.committee_path(), committee, ConfigFmt::YAML)?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tn_types::{Address, U256};
+
+    fn args_with_configs(configs: Vec<&str>) -> GenesisArgs {
+        GenesisArgs {
+            consensus_registry_owner: Address::ZERO,
+            basefee_address: Address::ZERO,
+            initial_stake: U256::ZERO,
+            min_withdrawal: U256::ZERO,
+            epoch_rewards: U256::ZERO,
+            epoch_duration: 0,
+            dev_funded_account: None,
+            max_header_delay_ms: None,
+            min_header_delay_ms: None,
+            chain_id: 2017,
+            worker_fee_configs: configs.into_iter().map(String::from).collect(),
+            accounts: None,
+        }
+    }
+
+    #[test]
+    fn test_parse_worker_fee_configs_empty_returns_default() {
+        let args = args_with_configs(vec![]);
+        let result = args.parse_worker_fee_configs().unwrap();
+        assert_eq!(result, vec![(0, 100_000_000_000)]);
+    }
+
+    #[test]
+    fn test_parse_worker_fee_configs_single() {
+        let args = args_with_configs(vec!["0:0:30000000"]);
+        let result = args.parse_worker_fee_configs().unwrap();
+        assert_eq!(result, vec![(0, 30_000_000)]);
+    }
+
+    #[test]
+    fn test_parse_worker_fee_configs_multiple() {
+        let args = args_with_configs(vec!["0:0:30000000", "1:1:500"]);
+        let result = args.parse_worker_fee_configs().unwrap();
+        assert_eq!(result, vec![(0, 30_000_000), (1, 500)]);
+    }
+
+    #[test]
+    fn test_parse_worker_fee_configs_sorts_by_worker_id() {
+        let args = args_with_configs(vec!["1:1:500", "0:0:30000000"]);
+        let result = args.parse_worker_fee_configs().unwrap();
+        assert_eq!(result, vec![(0, 30_000_000), (1, 500)]);
+    }
+
+    #[test]
+    fn test_parse_worker_fee_configs_non_contiguous_errors() {
+        let args = args_with_configs(vec!["0:0:30000000", "2:1:500"]);
+        let result = args.parse_worker_fee_configs();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_worker_fee_configs_bad_format_errors() {
+        let args = args_with_configs(vec!["bad"]);
+        let result = args.parse_worker_fee_configs();
+        assert!(result.is_err());
     }
 }

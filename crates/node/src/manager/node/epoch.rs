@@ -35,7 +35,7 @@ use tn_storage::tables::{
     NodeBatchesCache, Payload, Votes,
 };
 use tn_types::{
-    gas_accumulator::{compute_next_base_fee_eip1559, GasAccumulator},
+    gas_accumulator::{compute_next_base_fee_eip1559, GasAccumulator, WorkerFeeConfig},
     Batch, BatchValidation, BlockHash, BlockNumHash, BlsPublicKey, Committee, CommitteeBuilder,
     ConsensusOutput, Database as TNDatabase, Epoch, EpochRecord, Multiaddr, NetworkPublicKey,
     Notifier, TaskJoinError, TaskManager, TaskSpawner, TnReceiver, B256,
@@ -673,33 +673,41 @@ where
         Err(eyre::eyre!("invalid wait for epoch end"))
     }
 
-    /// Use accumulated gas information to set each workers base fee for the next epoch.
+    /// Use accumulated gas information to set each worker's base fee for the next epoch.
     ///
-    /// Reads the governance-set gas target from the [`EpochGasTarget`] contract and applies
-    /// an EIP-1559-style adjustment (up to ±12.5 %) to each worker's base fee.
-    /// If the contract read fails (e.g. contract not yet deployed), logs a warning
-    /// and keeps the current base fees unchanged.
+    /// Reads each worker's fee config from the [`WorkerConfigs`] contract and applies
+    /// the appropriate strategy:
+    /// - **EIP-1559**: adjusts up to ±12.5% based on gas utilization vs target.
+    /// - **Static**: sets the fee to the governance-configured value.
+    ///
+    /// If the contract read fails, logs a warning and keeps current base fees unchanged.
     async fn adjust_base_fees(&self, engine: &ExecutionNode, gas_accumulator: &GasAccumulator) {
         let reth_env = engine.get_reth_env().await;
         let num_workers = gas_accumulator.num_workers();
 
-        // Fetch all target gas values in one shot, reusing a single EVM instance.
-        let targets = match reth_env.get_target_gas_for_workers(num_workers) {
-            Ok(t) => t,
+        let configs = match reth_env.get_worker_fee_configs(num_workers) {
+            Ok(c) => c,
             Err(e) => {
-                warn!(target: "epoch-manager", ?e, "failed to read target gas for workers, keeping current base fees");
+                warn!(target: "epoch-manager", ?e, "failed to read worker fee configs, keeping current base fees");
                 return;
             }
         };
 
-        for (worker_id, &target_gas) in targets.iter().enumerate() {
+        for (worker_id, config) in configs.iter().enumerate() {
             let worker_id = worker_id as u16;
-            let (_blocks, gas_used, _gas_limit) = gas_accumulator.get_values(worker_id);
             let base_fee_container = gas_accumulator.base_fee(worker_id);
             let current = base_fee_container.base_fee();
-            let new_fee = compute_next_base_fee_eip1559(current, gas_used, target_gas);
+
+            let new_fee = match config {
+                WorkerFeeConfig::Eip1559 { target_gas } => {
+                    let (_blocks, gas_used, _gas_limit) = gas_accumulator.get_values(worker_id);
+                    compute_next_base_fee_eip1559(current, gas_used, *target_gas)
+                }
+                WorkerFeeConfig::Static { fee } => *fee,
+            };
+
             base_fee_container.set_base_fee(new_fee);
-            info!(target: "epoch-manager", worker_id, current, gas_used, target_gas, new_fee, "base fee adjusted");
+            info!(target: "epoch-manager", worker_id, current, new_fee, "base fee adjusted");
         }
     }
 

@@ -25,6 +25,17 @@
 //!    skipped or double-counted. State is updated through the normal path (payload_builder).
 
 use crate::{AuthorityIdentifier, Committee, WorkerId};
+
+/// Fee strategy for a worker, read from the WorkerConfigs contract each epoch.
+/// Adding a new strategy = new contract constant + new enum variant + match arm in adjust_base_fees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerFeeConfig {
+    /// Adjust fee +/-12.5% per epoch based on gas utilization vs target.
+    Eip1559 { target_gas: u64 },
+    /// Fixed fee set by governance, no utilization-based adjustment.
+    Static { fee: u64 },
+}
+
 use alloy::{
     eips::eip1559::MIN_PROTOCOL_BASE_FEE,
     primitives::Address,

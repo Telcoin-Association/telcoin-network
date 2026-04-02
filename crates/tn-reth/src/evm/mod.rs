@@ -266,60 +266,6 @@ where
     I: Inspector<TNEvmContext<DB>>,
     PRECOMPILE: PrecompileProvider<TNEvmContext<DB>, Output = InterpreterResult>,
 {
-    /// Transact a pre-genesis call to an already-deployed contract.
-    pub(crate) fn transact_pre_genesis_call(
-        &mut self,
-        caller: Address,
-        contract: Address,
-        data: Bytes,
-    ) -> Result<ResultAndState, EVMError<DB::Error>> {
-        let tx = TxEnv {
-            caller,
-            kind: TxKind::Call(contract),
-            // Explicitly set nonce to 0 so revm does not do any nonce checks
-            nonce: 0,
-            gas_limit: 30_000_000,
-            value: U256::ZERO,
-            data,
-            // Setting the gas price to zero enforces that no value is transferred as part of the
-            // call, and that the call will not count against the block's gas limit
-            gas_price: 0,
-            // The chain ID check is not relevant here and is disabled if set to None
-            chain_id: None,
-            // Setting the gas priority fee to None ensures the effective gas price is derived from
-            // the `gas_price` field, which we need to be zero
-            gas_priority_fee: None,
-            access_list: Default::default(),
-            // blob fields can be None for this tx
-            blob_hashes: Vec::new(),
-            max_fee_per_blob_gas: 0,
-            tx_type: 0,
-            authorization_list: Default::default(),
-        };
-
-        let mut gas_limit = tx.gas_limit;
-        let mut basefee = 0;
-        let mut disable_nonce_check = true;
-
-        // ensure the block gas limit is >= the tx
-        core::mem::swap(&mut self.block.gas_limit, &mut gas_limit);
-        // disable the base fee check for this call by setting the base fee to zero
-        core::mem::swap(&mut self.block.basefee, &mut basefee);
-        // disable the nonce check
-        core::mem::swap(&mut self.cfg.disable_nonce_check, &mut disable_nonce_check);
-
-        let res = self.transact(tx);
-
-        // swap back to the previous gas limit
-        core::mem::swap(&mut self.block.gas_limit, &mut gas_limit);
-        // swap back to the previous base fee
-        core::mem::swap(&mut self.block.basefee, &mut basefee);
-        // swap back to the previous nonce check flag
-        core::mem::swap(&mut self.cfg.disable_nonce_check, &mut disable_nonce_check);
-
-        res
-    }
-
     /// Transact pre-genesis calls.
     pub(crate) fn transact_pre_genesis_create(
         &mut self,

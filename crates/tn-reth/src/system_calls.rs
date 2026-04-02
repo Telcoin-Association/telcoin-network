@@ -183,18 +183,20 @@ sol!(
         function getNextCommitteeSize() external view returns (uint16);
     }
 
-    /// Epoch gas target for base fee adjustment.
+    /// Worker fee configs for base fee adjustment.
     #[sol(rpc)]
-    contract EpochGasTarget {
-        /// Initialize with a default target and owner.
-        constructor(uint64 defaultTargetGas_, address owner_);
-
-        function setDefaultTargetGas(uint64 targetGas) external;
-        function setWorkerTargetGas(uint16 workerId, uint64 targetGas) external;
-        function clearWorkerTargetGas(uint16 workerId) external;
-        /// Get the gas target for a specific worker (falls back to default).
-        function getTargetGas(uint16 workerId) external view returns (uint64 targetGas);
-        function defaultTargetGas() external view returns (uint64);
+    contract WorkerConfigs {
+        /// Initialize with per-worker configs and owner.
+        constructor(uint8[] memory strategies, uint64[] memory values, address owner_);
+        /// Get the stored fee config for a worker.
+        function getWorkerConfig(uint16 workerId) external view returns (uint8 strategy, uint64 value);
+        /// Set the number of workers for the next epoch.
+        function setNumWorkers(uint16 numWorkers_) external;
+        /// Set the config for a worker by worker id.
+        /// NOTE: this must be called before calling `setNumWorkers`.
+        function setWorkerConfig(uint16 workerId, uint8 strategy, uint64 value) external;
+        /// Retrieve the number of workers for the protocol.
+        function numWorkers() external view returns (uint16);
     }
 
 );

@@ -152,7 +152,7 @@ fn start_nodes(
     Ok((children, endpoints))
 }
 
-/// Configure the initial committee with `--target-basefee 21000` and fund accounts.
+/// Configure the initial committee with `--worker-fee-config 0:0:21000` and fund accounts.
 fn config_committee_with_basefee(
     temp_path: &Path,
     shared_genesis_dir: &Path,
@@ -173,7 +173,7 @@ fn config_committee_with_basefee(
     let min_withdrawal = "1_000";
     let epoch_rewards = "1000";
 
-    info!(target: "basefee-test", "creating committee with --target-basefee 21000");
+    info!(target: "basefee-test", "creating committee with --worker-fee-config 0:0:21000");
 
     let create_committee_command = CommandParser::<GenesisArgs>::parse_from([
         "tn",
@@ -189,8 +189,8 @@ fn config_committee_with_basefee(
         epoch_rewards,
         "--epoch-duration-in-secs",
         &EPOCH_DURATION.to_string(),
-        "--target-basefee",
-        "21000",
+        "--worker-fee-config",
+        "0:0:21000",
         "--dev-funded-account",
         "test-source",
         "--max-header-delay-ms",
@@ -224,7 +224,7 @@ fn config_committee_with_basefee(
 
 /// Create genesis for the basefee test.
 ///
-/// Funds a tx_sender account for sending value transfers and sets `--target-basefee 21000`.
+/// Funds a tx_sender account for sending value transfers and sets `--worker-fee-config 0:0:21000`.
 fn create_basefee_genesis(
     temp_path: &Path,
     tx_sender: Address,

@@ -108,15 +108,15 @@ use std::{
 };
 use system_calls::{
     ConsensusRegistry::{self},
-    EpochGasTarget, EpochState, CONSENSUS_REGISTRY_ADDRESS, SYSTEM_ADDRESS,
+    WorkerConfigs, EpochState, CONSENSUS_REGISTRY_ADDRESS, SYSTEM_ADDRESS,
 };
 use tempfile::TempDir;
 use tn_config::{
-    NodeInfo, BLSG1_JSON, CONSENSUS_REGISTRY_JSON, EPOCH_GAS_TARGET_ADDRESS, EPOCH_GAS_TARGET_JSON,
+    NodeInfo, BLSG1_JSON, CONSENSUS_REGISTRY_JSON, WORKER_CONFIGS_ADDRESS, WORKER_CONFIGS_JSON,
     GOVERNANCE_SAFE_ADDRESS, ISSUANCE_ADDRESS, ISSUANCE_JSON,
 };
 use tn_types::{
-    deconstruct_nonce, gas_accumulator::RewardsCounter, Address, BlockBody, BlockHashOrNumber,
+    deconstruct_nonce, gas_accumulator::{RewardsCounter, WorkerFeeConfig}, Address, BlockBody, BlockHashOrNumber,
     BlockNumHash, BlockNumber, EngineUpdate, Epoch, ExecHeader, Genesis, GenesisAccount,
     RecoveredBlock, Round, SealedBlock, SealedHeader, TaskManager, TaskSpawner, TransactionSigned,
     B256, ETHEREUM_BLOCK_GAS_LIMIT_30M, U256,
@@ -1079,8 +1079,7 @@ impl RethEnv {
         genesis: Genesis,
         initial_stake_config: ConsensusRegistry::StakeConfig,
         owner_address: Address,
-        default_epoch_gas_target: u64,
-        worker_gas_targets: Vec<(u16, u64)>,
+        worker_configs: Vec<(u8, u64)>,
     ) -> eyre::Result<Genesis> {
         // create temporary reth env for execution
         let tmp_chain: Arc<RethChainSpec> = Arc::new(genesis.clone().into());
@@ -1190,65 +1189,38 @@ impl RethEnv {
             owner_address.create(1)
         };
 
-        // deploy EpochGasTarget contract
-        let tmp_gas_target_address = {
+        // deploy WorkerConfigs contract
+        let tmp_worker_configs_address = {
             let mut tn_evm = reth_env.inner.evm_config.evm_factory().create_evm(
                 &mut db,
                 reth_env.inner.evm_config.evm_env(&tmp_chain.sealed_genesis_header())?,
             );
 
-            let gas_target_constructor_args = EpochGasTarget::constructorCall {
-                defaultTargetGas_: default_epoch_gas_target,
+            let (strategies, values): (Vec<u8>, Vec<u64>) = worker_configs.iter().copied().unzip();
+            let constructor_args = WorkerConfigs::constructorCall {
+                strategies,
+                values,
                 owner_: owner_address,
             }
             .abi_encode();
 
-            let gas_target_initcode_binding =
-                Self::fetch_value_from_json_str(EPOCH_GAS_TARGET_JSON, Some("bytecode.object"))?;
-            let gas_target_initcode = hex::decode(
-                gas_target_initcode_binding.as_str().ok_or_eyre("invalid epoch gas target json")?,
+            let initcode_binding =
+                Self::fetch_value_from_json_str(WORKER_CONFIGS_JSON, Some("bytecode.object"))?;
+            let initcode = hex::decode(
+                initcode_binding.as_str().ok_or_eyre("invalid worker configs json")?,
             )?;
-            let mut create_gas_target = gas_target_initcode;
-            create_gas_target.extend(gas_target_constructor_args);
+            let mut create_worker_configs = initcode;
+            create_worker_configs.extend(constructor_args);
 
             let ResultAndState { result, state } =
-                tn_evm.transact_pre_genesis_create(owner_address, create_gas_target.into())?;
-            debug!(target: "engine", "create epoch gas target result:\n{:#?}", result);
+                tn_evm.transact_pre_genesis_create(owner_address, create_worker_configs.into())?;
+            debug!(target: "engine", "create worker configs result:\n{:#?}", result);
 
             tn_evm.db_mut().commit(state);
 
             // Third create tx on tmp chain (after blsg1 at nonce 0 and registry at nonce 1)
             owner_address.create(2)
         };
-
-        // apply per-worker gas target overrides
-        if !worker_gas_targets.is_empty() {
-            let mut tn_evm = reth_env.inner.evm_config.evm_factory().create_evm(
-                &mut db,
-                reth_env.inner.evm_config.evm_env(&tmp_chain.sealed_genesis_header())?,
-            );
-
-            for (worker_id, target_gas) in &worker_gas_targets {
-                let calldata = EpochGasTarget::setWorkerTargetGasCall {
-                    workerId: *worker_id,
-                    targetGas: *target_gas,
-                }
-                .abi_encode();
-
-                let ResultAndState { result, state } = tn_evm.transact_pre_genesis_call(
-                    owner_address,
-                    tmp_gas_target_address,
-                    calldata.into(),
-                )?;
-                debug!(
-                    target: "engine",
-                    "setWorkerTargetGas(worker_id={}, target_gas={}) result:\n{:#?}",
-                    worker_id, target_gas, result
-                );
-
-                tn_evm.db_mut().commit(state);
-            }
-        }
 
         // execute the transactions to get final bundle state
         db.merge_transitions(BundleRetention::PlainState);
@@ -1272,15 +1244,15 @@ impl RethEnv {
         let registry_runtimecode =
             Self::link_solidity_library(registry_runtimecode_str, &blsg1_address.encode_hex())?;
 
-        let tmp_gas_target_storage = state.get(&tmp_gas_target_address).map(|account| {
+        let tmp_worker_configs_storage = state.get(&tmp_worker_configs_address).map(|account| {
             account.storage.iter().map(|(k, v)| ((*k).into(), v.present_value.into())).collect()
         });
-        let gas_target_runtimecode_binding = Self::fetch_value_from_json_str(
-            EPOCH_GAS_TARGET_JSON,
+        let worker_configs_runtimecode_binding = Self::fetch_value_from_json_str(
+            WORKER_CONFIGS_JSON,
             Some("deployedBytecode.object"),
         )?;
-        let gas_target_runtimecode = hex::decode(
-            gas_target_runtimecode_binding.as_str().ok_or_eyre("invalid epoch gas target json")?,
+        let worker_configs_runtimecode = hex::decode(
+            worker_configs_runtimecode_binding.as_str().ok_or_eyre("invalid worker configs json")?,
         )?;
 
         let blsg1_runtimecode_binding =
@@ -1306,10 +1278,10 @@ impl RethEnv {
                 GenesisAccount::default().with_code(Some(issuance_runtimecode.into())),
             ),
             (
-                EPOCH_GAS_TARGET_ADDRESS,
+                WORKER_CONFIGS_ADDRESS,
                 GenesisAccount::default()
-                    .with_code(Some(gas_target_runtimecode.into()))
-                    .with_storage(tmp_gas_target_storage),
+                    .with_code(Some(worker_configs_runtimecode.into()))
+                    .with_storage(tmp_worker_configs_storage),
             ),
         ]);
 
@@ -1491,10 +1463,11 @@ impl RethEnv {
         self.call_consensus_registry::<_, Vec<ConsensusRegistry::ValidatorInfo>>(evm, calldata)
     }
 
-    /// Read the gas target for a given worker from the [`EpochGasTarget`] contract on-chain.
+    /// Read fee configs for all workers from the [`WorkerConfigs`] contract on-chain.
     ///
-    /// Creates an EVM against the canonical tip and calls `getTargetGas(workerId)`.
-    pub fn get_target_gas_for_worker(&self, worker_id: u16) -> eyre::Result<u64> {
+    /// Creates a single EVM against the canonical tip and makes one `getWorkerConfig` call
+    /// per worker, returning a [`WorkerFeeConfig`] for each.
+    pub fn get_worker_fee_configs(&self, num_workers: usize) -> eyre::Result<Vec<WorkerFeeConfig>> {
         let canonical_tip = self.canonical_tip();
         let state_provider =
             self.inner.blockchain_provider.state_by_block_hash(canonical_tip.hash())?;
@@ -1506,58 +1479,33 @@ impl RethEnv {
             .evm_factory()
             .create_evm(&mut db, self.inner.evm_config.evm_env(&canonical_tip)?);
 
-        let calldata = EpochGasTarget::getTargetGasCall { workerId: worker_id }.abi_encode().into();
-        self.call_epoch_gas_target::<_, u64>(&mut tn_evm, calldata)
-    }
-
-    /// Read the gas targets for all workers from the [`EpochGasTarget`] contract on-chain.
-    ///
-    /// Creates a single EVM against the canonical tip and reuses it for every worker,
-    /// avoiding the overhead of constructing a new state provider + EVM per call.
-    pub fn get_target_gas_for_workers(&self, num_workers: usize) -> eyre::Result<Vec<u64>> {
-        let canonical_tip = self.canonical_tip();
-        let state_provider =
-            self.inner.blockchain_provider.state_by_block_hash(canonical_tip.hash())?;
-        let state = StateProviderDatabase::new(&state_provider);
-        let mut db = State::builder().with_database(state).with_bundle_update().build();
-        let mut tn_evm = self
-            .inner
-            .evm_config
-            .evm_factory()
-            .create_evm(&mut db, self.inner.evm_config.evm_env(&canonical_tip)?);
-
-        let mut targets = Vec::with_capacity(num_workers);
+        let mut configs = Vec::with_capacity(num_workers);
         for worker_id in 0..num_workers {
             let calldata =
-                EpochGasTarget::getTargetGasCall { workerId: worker_id as u16 }.abi_encode().into();
-            let target = self.call_epoch_gas_target::<_, u64>(&mut tn_evm, calldata)?;
-            targets.push(target);
+                WorkerConfigs::getWorkerConfigCall { workerId: worker_id as u16 }.abi_encode().into();
+            let state = self.read_state_on_chain(
+                &mut tn_evm,
+                SYSTEM_ADDRESS,
+                WORKER_CONFIGS_ADDRESS,
+                calldata,
+            )?;
+            let data = match state.result {
+                ExecutionResult::Success { output, .. } => output.into_data(),
+                e => eyre::bail!("failed to read worker config for worker {worker_id}: {e:?}"),
+            };
+            let ret = <WorkerConfigs::getWorkerConfigCall as alloy::sol_types::SolCall>::abi_decode_returns(&data)?;
+            let config = match ret.strategy {
+                0 => WorkerFeeConfig::Eip1559 { target_gas: ret.value },
+                1 => WorkerFeeConfig::Static { fee: ret.value },
+                s => eyre::bail!("unknown fee strategy {s} for worker {worker_id}"),
+            };
+            configs.push(config);
         }
 
-        Ok(targets)
+        Ok(configs)
     }
 
-    /// Helper function to call `EpochGasTarget` state on-chain.
-    fn call_epoch_gas_target<DB, T>(&self, evm: &mut TNEvm<DB>, calldata: Bytes) -> eyre::Result<T>
-    where
-        DB: alloy_evm::Database,
-        T: alloy::sol_types::SolValue,
-        T: From<
-            <<T as alloy::sol_types::SolValue>::SolType as alloy::sol_types::SolType>::RustType,
-        >,
-    {
-        let state =
-            self.read_state_on_chain(evm, SYSTEM_ADDRESS, EPOCH_GAS_TARGET_ADDRESS, calldata)?;
 
-        match state.result {
-            ExecutionResult::Success { output, .. } => {
-                let data = output.into_data();
-                let decoded = alloy::sol_types::SolValue::abi_decode(&data)?;
-                Ok(decoded)
-            }
-            e => Err(eyre::eyre!("failed to read epoch gas target from state: {e:?}")),
-        }
-    }
 
     /// Helper function to call `ConsensusRegistry` state on-chain.
     fn call_consensus_registry<DB, T>(
@@ -1773,8 +1721,7 @@ mod tests {
             tmp_genesis,
             initial_stake_config.clone(),
             governance,
-            30_000_000u64,
-            vec![],
+            vec![(0u8, 30_000_000u64)],
         )?;
 
         // update genesis again to include stake for new validator
@@ -2154,5 +2101,74 @@ mod tests {
                 assert!(mods.remove(&r));
             }
         };
+    }
+
+    #[tokio::test]
+    async fn test_get_worker_fee_configs() -> eyre::Result<()> {
+        // minimal validator set (5 validators)
+        let all_validators: Vec<Address> =
+            (1..=5).map(|i| Address::from_slice(&[i * 0x11; 20])).collect();
+
+        let validators: Vec<_> = all_validators
+            .iter()
+            .enumerate()
+            .map(|(i, addr)| {
+                let mut rng = StdRng::seed_from_u64(i as u64);
+                let bls = BlsKeypair::generate(&mut rng);
+                let bls_pubkey = bls.public();
+                let pop = generate_proof_of_possession_bls_for_test(&bls, addr)
+                    .expect("pop generation failed");
+                NodeInfo {
+                    name: format!("validator-{i}"),
+                    bls_public_key: *bls_pubkey,
+                    p2p_info: NodeP2pInfo::default(),
+                    execution_address: *addr,
+                    proof_of_possession: pop,
+                }
+            })
+            .collect();
+
+        let initial_stake_config = ConsensusRegistry::StakeConfig {
+            stakeAmount: U256::from(parse_ether("1_000_000").unwrap()),
+            minWithdrawAmount: U256::from(parse_ether("1_000").unwrap()),
+            epochIssuance: U256::from(parse_ether("20_000_000").unwrap())
+                .checked_div(U256::from(28))
+                .expect("u256 div checked"),
+            epochDuration: 86400,
+        };
+
+        let governance_multisig =
+            TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
+        let governance = governance_multisig.address();
+        let tmp_genesis = tn_types::test_genesis().extend_accounts([(
+            governance,
+            GenesisAccount::default().with_balance(U256::from((50_000_000 * 10) ^ 18)),
+        )]);
+
+        // deploy with 2 workers: worker 0 = EIP-1559 (strategy 0, target 30M),
+        // worker 1 = Static (strategy 1, fee 500)
+        let worker_configs = vec![(0u8, 30_000_000u64), (1u8, 500u64)];
+        let genesis = RethEnv::create_consensus_registry_genesis_accounts(
+            validators.clone(),
+            tmp_genesis,
+            initial_stake_config.clone(),
+            governance,
+            worker_configs,
+        )?;
+
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::new("Worker Fee Config Test");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
+                .unwrap();
+
+        // read back worker configs from chain state
+        let configs = reth_env.get_worker_fee_configs(2)?;
+        assert_eq!(configs.len(), 2);
+        assert_eq!(configs[0], WorkerFeeConfig::Eip1559 { target_gas: 30_000_000 });
+        assert_eq!(configs[1], WorkerFeeConfig::Static { fee: 500 });
+
+        Ok(())
     }
 }
