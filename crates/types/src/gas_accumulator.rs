@@ -306,24 +306,26 @@ impl GasAccumulator {
 /// The result is clamped to `[MIN_PROTOCOL_BASE_FEE, u64::MAX]`.
 pub fn compute_next_base_fee_eip1559(current_base_fee: u64, gas_used: u64, target_gas: u64) -> u64 {
     // Guard: if target is zero, keep current fee unchanged.
-    // The contract reverts for target `0` and should never happen
+    // The contract reverts for target `0` so this should never happen
     if target_gas == 0 {
         return current_base_fee;
     }
 
-    let new_base_fee = if gas_used > target_gas {
-        // over target → increase base fee
-        // cap ratio at 1 to limit change to ±12.5% per epoch (matching EIP-1559)
-        let excess = (gas_used - target_gas).min(target_gas);
-        let delta =
-            (current_base_fee as u128).saturating_mul(excess as u128) / target_gas as u128 / 8;
-        current_base_fee.saturating_add(delta.min(u64::MAX as u128) as u64)
-    } else {
-        // at or under target → decrease base fee
-        let deficit = (target_gas - gas_used).min(target_gas);
-        let delta =
-            (current_base_fee as u128).saturating_mul(deficit as u128) / target_gas as u128 / 8;
-        current_base_fee.saturating_sub(delta.min(u64::MAX as u128) as u64)
+    let new_base_fee = match gas_used.cmp(&target_gas) {
+        core::cmp::Ordering::Equal => current_base_fee,
+        core::cmp::Ordering::Greater => {
+            let excess = (gas_used - target_gas).min(target_gas);
+            let delta =
+                (current_base_fee as u128).saturating_mul(excess as u128) / target_gas as u128 / 8;
+            let delta = delta.max(1);
+            current_base_fee.saturating_add(delta.min(u64::MAX as u128) as u64)
+        }
+        core::cmp::Ordering::Less => {
+            let deficit = (target_gas - gas_used).min(target_gas);
+            let delta =
+                (current_base_fee as u128).saturating_mul(deficit as u128) / target_gas as u128 / 8;
+            current_base_fee.saturating_sub(delta.min(u64::MAX as u128) as u64)
+        }
     };
 
     new_base_fee.max(MIN_PROTOCOL_BASE_FEE)
@@ -416,5 +418,14 @@ mod tests {
         // 110% utilization → 10% over → increase by 10%/8 = 1.25%
         // base=1000, delta = 1000 * 100 / 1000 / 8 = 12 (integer division)
         assert_eq!(compute_next_base_fee_eip1559(1000, 1100, 1000), 1012);
+    }
+
+    #[test]
+    fn min_base_fee_still_increases_over_target() {
+        // At MIN_PROTOCOL_BASE_FEE (7), integer 7/8 = 0 but delta is floored at 1
+        assert_eq!(
+            compute_next_base_fee_eip1559(MIN_PROTOCOL_BASE_FEE, 200, 100),
+            MIN_PROTOCOL_BASE_FEE + 1
+        );
     }
 }
