@@ -112,8 +112,8 @@ pub struct GenesisArgs {
     pub chain_id: u64,
     /// Per-worker fee config overrides at genesis.
     ///
-    /// Format: WORKER_ID:STRATEGY:VALUE (e.g., 0:0:100000000 for worker 0 with EIP-1559 at 100M gas target,
-    /// or 1:1:200 for worker 1 with static fee of 200 wei).
+    /// Format: WORKER_ID:STRATEGY:VALUE (e.g., 0:0:100000000 for worker 0 with EIP-1559 at 100M
+    /// gas target, or 1:1:200 for worker 1 with static fee of 200 wei).
     /// Can be specified multiple times for different workers.
     #[arg(
         long = "worker-fee-config",

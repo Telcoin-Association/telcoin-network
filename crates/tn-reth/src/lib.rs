@@ -108,18 +108,19 @@ use std::{
 };
 use system_calls::{
     ConsensusRegistry::{self},
-    WorkerConfigs, EpochState, CONSENSUS_REGISTRY_ADDRESS, SYSTEM_ADDRESS,
+    EpochState, WorkerConfigs, CONSENSUS_REGISTRY_ADDRESS, SYSTEM_ADDRESS,
 };
 use tempfile::TempDir;
 use tn_config::{
-    NodeInfo, BLSG1_JSON, CONSENSUS_REGISTRY_JSON, WORKER_CONFIGS_ADDRESS, WORKER_CONFIGS_JSON,
-    GOVERNANCE_SAFE_ADDRESS, ISSUANCE_ADDRESS, ISSUANCE_JSON,
+    NodeInfo, BLSG1_JSON, CONSENSUS_REGISTRY_JSON, GOVERNANCE_SAFE_ADDRESS, ISSUANCE_ADDRESS,
+    ISSUANCE_JSON, WORKER_CONFIGS_ADDRESS, WORKER_CONFIGS_JSON,
 };
 use tn_types::{
-    deconstruct_nonce, gas_accumulator::{RewardsCounter, WorkerFeeConfig}, Address, BlockBody, BlockHashOrNumber,
-    BlockNumHash, BlockNumber, EngineUpdate, Epoch, ExecHeader, Genesis, GenesisAccount,
-    RecoveredBlock, Round, SealedBlock, SealedHeader, TaskManager, TaskSpawner, TransactionSigned,
-    B256, ETHEREUM_BLOCK_GAS_LIMIT_30M, U256,
+    deconstruct_nonce,
+    gas_accumulator::{RewardsCounter, WorkerFeeConfig},
+    Address, BlockBody, BlockHashOrNumber, BlockNumHash, BlockNumber, EngineUpdate, Epoch,
+    ExecHeader, Genesis, GenesisAccount, RecoveredBlock, Round, SealedBlock, SealedHeader,
+    TaskManager, TaskSpawner, TransactionSigned, B256, ETHEREUM_BLOCK_GAS_LIMIT_30M, U256,
 };
 use tracing::{debug, error, info, warn};
 use traits::{TNPrimitives, TelcoinNode};
@@ -1197,18 +1198,14 @@ impl RethEnv {
             );
 
             let (strategies, values): (Vec<u8>, Vec<u64>) = worker_configs.iter().copied().unzip();
-            let constructor_args = WorkerConfigs::constructorCall {
-                strategies,
-                values,
-                owner_: owner_address,
-            }
-            .abi_encode();
+            let constructor_args =
+                WorkerConfigs::constructorCall { strategies, values, owner_: owner_address }
+                    .abi_encode();
 
             let initcode_binding =
                 Self::fetch_value_from_json_str(WORKER_CONFIGS_JSON, Some("bytecode.object"))?;
-            let initcode = hex::decode(
-                initcode_binding.as_str().ok_or_eyre("invalid worker configs json")?,
-            )?;
+            let initcode =
+                hex::decode(initcode_binding.as_str().ok_or_eyre("invalid worker configs json")?)?;
             let mut create_worker_configs = initcode;
             create_worker_configs.extend(constructor_args);
 
@@ -1247,12 +1244,12 @@ impl RethEnv {
         let tmp_worker_configs_storage = state.get(&tmp_worker_configs_address).map(|account| {
             account.storage.iter().map(|(k, v)| ((*k).into(), v.present_value.into())).collect()
         });
-        let worker_configs_runtimecode_binding = Self::fetch_value_from_json_str(
-            WORKER_CONFIGS_JSON,
-            Some("deployedBytecode.object"),
-        )?;
+        let worker_configs_runtimecode_binding =
+            Self::fetch_value_from_json_str(WORKER_CONFIGS_JSON, Some("deployedBytecode.object"))?;
         let worker_configs_runtimecode = hex::decode(
-            worker_configs_runtimecode_binding.as_str().ok_or_eyre("invalid worker configs json")?,
+            worker_configs_runtimecode_binding
+                .as_str()
+                .ok_or_eyre("invalid worker configs json")?,
         )?;
 
         let blsg1_runtimecode_binding =
@@ -1481,8 +1478,9 @@ impl RethEnv {
 
         let mut configs = Vec::with_capacity(num_workers);
         for worker_id in 0..num_workers {
-            let calldata =
-                WorkerConfigs::getWorkerConfigCall { workerId: worker_id as u16 }.abi_encode().into();
+            let calldata = WorkerConfigs::getWorkerConfigCall { workerId: worker_id as u16 }
+                .abi_encode()
+                .into();
             let state = self.read_state_on_chain(
                 &mut tn_evm,
                 SYSTEM_ADDRESS,
@@ -1504,8 +1502,6 @@ impl RethEnv {
 
         Ok(configs)
     }
-
-
 
     /// Helper function to call `ConsensusRegistry` state on-chain.
     fn call_consensus_registry<DB, T>(

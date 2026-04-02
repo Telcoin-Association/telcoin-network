@@ -27,7 +27,8 @@
 use crate::{AuthorityIdentifier, Committee, WorkerId};
 
 /// Fee strategy for a worker, read from the WorkerConfigs contract each epoch.
-/// Adding a new strategy = new contract constant + new enum variant + match arm in adjust_base_fees.
+/// Adding a new strategy = new contract constant + new enum variant + match arm in
+/// adjust_base_fees.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerFeeConfig {
     /// Adjust fee +/-12.5% per epoch based on gas utilization vs target.

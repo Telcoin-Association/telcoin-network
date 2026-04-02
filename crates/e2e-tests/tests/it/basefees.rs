@@ -22,7 +22,7 @@ use tn_reth::{
     RethChainSpec,
 };
 use tn_types::{
-    get_available_tcp_port, test_utils::CommandParser, Address, GenesisAccount, Genesis,
+    get_available_tcp_port, test_utils::CommandParser, Address, Genesis, GenesisAccount,
     MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tokio::time::{timeout, Instant};
@@ -58,10 +58,10 @@ async fn send_value_transfers(
     for i in 0..count {
         let tx = tx_factory.create_eip1559_encoded(
             chain.clone(),
-            Some(21_000),   // exact gas for simple transfer
-            100_000,        // generous max_fee_per_gas
+            Some(21_000), // exact gas for simple transfer
+            100_000,      // generous max_fee_per_gas
             Some(recipient),
-            U256::from(1),  // 1 wei
+            U256::from(1), // 1 wei
             Default::default(),
         );
         let pending = provider.send_raw_transaction(&tx).await?;
@@ -238,10 +238,7 @@ fn create_basefee_genesis(
             governance_wallet,
             GenesisAccount::default().with_balance(U256::from(parse_ether("50_000_000")?)),
         ),
-        (
-            tx_sender,
-            GenesisAccount::default().with_balance(U256::from(parse_ether("1_000_000")?)),
-        ),
+        (tx_sender, GenesisAccount::default().with_balance(U256::from(parse_ether("1_000_000")?))),
     ];
 
     let shared_genesis_dir = temp_path.join("shared-genesis");
@@ -358,8 +355,7 @@ async fn test_basefee_adjustment_and_sync() -> eyre::Result<()> {
 
     // ── Phase 6: Restart validator-3 with new dynamic ports ──
 
-    let nodes_to_start: &[(&str, Address)] =
-        &[("validator-3", Address::from_slice(&[0x33; 20]))];
+    let nodes_to_start: &[(&str, Address)] = &[("validator-3", Address::from_slice(&[0x33; 20]))];
     let (mut new_children, mut new_endpoints) =
         start_nodes(temp_path, nodes_to_start, "basefee_test", 2)?;
     let new_child = new_children.pop().expect("child");
