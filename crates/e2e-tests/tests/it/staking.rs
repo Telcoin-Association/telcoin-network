@@ -129,7 +129,7 @@ async fn test_cli_keygen_to_stake() -> eyre::Result<()> {
         epochIssuance: U256::from(parse_ether("20_000_000").unwrap())
             .checked_div(U256::from(28))
             .expect("u256 div"),
-        epochDuration: 86400,
+        epochDuration: 28800,
     };
 
     let genesis = tn_types::test_genesis().extend_accounts([

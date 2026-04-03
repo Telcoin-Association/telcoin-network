@@ -1694,7 +1694,7 @@ mod tests {
         let tmp_genesis = tn_types::test_genesis().extend_accounts([
             (
                 governance,
-                GenesisAccount::default().with_balance(U256::from((50_000_000 * 10) ^ 18)), // 50mil TEL
+                GenesisAccount::default().with_balance(U256::from(parse_ether("50_000_000")?)), // 50mil TEL
             ),
             (
                 new_validator_eoa.address(),
@@ -2130,7 +2130,7 @@ mod tests {
             epochIssuance: U256::from(parse_ether("20_000_000").unwrap())
                 .checked_div(U256::from(28))
                 .expect("u256 div checked"),
-            epochDuration: 86400,
+            epochDuration: 28800,
         };
 
         let governance_multisig =

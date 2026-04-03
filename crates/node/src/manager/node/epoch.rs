@@ -688,8 +688,8 @@ where
         let configs = match reth_env.get_worker_fee_configs(num_workers) {
             Ok(c) => c,
             Err(e) => {
-                warn!(target: "epoch-manager", ?e, "failed to read worker fee configs, keeping current base fees");
-                return;
+                error!(target: "epoch-manager", ?e, "failed to read worker fee configs, keeping current base fees");
+                return; // noop
             }
         };
 
