@@ -1132,6 +1132,7 @@ impl RethEnv {
                     isRetired: false,
                     isDelegated: false,
                     stakeVersion: 0,
+                    region: 0,
                 };
                 let proof = ConsensusRegistry::ProofOfPossession {
                     uncompressedPubkey: v.bls_public_key.serialize().into(),
