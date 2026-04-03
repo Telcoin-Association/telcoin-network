@@ -57,8 +57,6 @@ sol!(
             ValidatorStatus currentStatus;
             /// The validator is permanently disqualified from consensus.
             bool isRetired;
-            /// The validator received stake through delegation.
-            bool isDelegated;
             /// The configuration for validators stake.
             ///
             /// This supports updating stake amount.

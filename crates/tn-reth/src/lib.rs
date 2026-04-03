@@ -1130,7 +1130,6 @@ impl RethEnv {
                     exitEpoch: 0,
                     currentStatus: ConsensusRegistry::ValidatorStatus::Active,
                     isRetired: false,
-                    isDelegated: false,
                     stakeVersion: 0,
                     region: 0,
                 };
@@ -1706,7 +1705,6 @@ mod tests {
             assert_eq!(on_chain.activationEpoch, epoch);
             assert_eq!(on_chain.exitEpoch, 0);
             assert!(!on_chain.isRetired);
-            assert!(!on_chain.isDelegated);
             assert_eq!(on_chain.stakeVersion, 0);
         }
 
@@ -1798,7 +1796,6 @@ mod tests {
             assert_eq!(on_chain.activationEpoch, 0);
             assert_eq!(on_chain.exitEpoch, 0);
             assert!(!on_chain.isRetired);
-            assert!(!on_chain.isDelegated);
             assert_eq!(on_chain.stakeVersion, 0);
         }
 
