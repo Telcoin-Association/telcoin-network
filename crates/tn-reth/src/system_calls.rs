@@ -181,8 +181,24 @@ sol!(
         function getRewards(address validatorAddress) public view virtual returns (uint256);
         /// Returns the next committee size
         function getNextCommitteeSize() external view returns (uint16);
-
     }
+
+    /// Worker fee configs for base fee adjustment.
+    #[sol(rpc)]
+    contract WorkerConfigs {
+        /// Initialize with per-worker configs and owner.
+        constructor(uint8[] memory strategies, uint64[] memory values, address owner_);
+        /// Get the stored fee config for a worker.
+        function getWorkerConfig(uint16 workerId) external view returns (uint8 strategy, uint64 value);
+        /// Set the number of workers for the next epoch.
+        function setNumWorkers(uint16 numWorkers_) external;
+        /// Set the config for a worker by worker id.
+        /// NOTE: this must be called before calling `setNumWorkers`.
+        function setWorkerConfig(uint16 workerId, uint8 strategy, uint64 value) external;
+        /// Retrieve the number of workers for the protocol.
+        function numWorkers() external view returns (uint16);
+    }
+
 );
 
 /// The state of consensus retrieved from chain.
