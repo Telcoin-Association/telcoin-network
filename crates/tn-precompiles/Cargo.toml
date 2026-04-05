@@ -1,0 +1,17 @@
+[package]
+name = "tn-precompiles"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+alloy = { workspace = true, features = ["sol-types", "k256"] }
+alloy-evm = ">=0.27"
+revm = { version = ">=34", default-features = false }
+serde = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+default = []
+faucet = []

@@ -1,0 +1,15 @@
+[package]
+name = "tn-evm"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+tn-precompiles = { workspace = true }
+alloy = { workspace = true }
+alloy-evm = ">=0.27"
+reth-evm = { workspace = true }
+reth-revm = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }

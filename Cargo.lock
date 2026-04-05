@@ -11633,6 +11633,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tn-evm"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "alloy-evm",
+ "reth-evm",
+ "reth-revm",
+ "serde",
+ "tn-precompiles",
+ "tracing",
+]
+
+[[package]]
 name = "tn-executor"
 version = "0.1.0"
 dependencies = [
@@ -11719,6 +11732,17 @@ dependencies = [
  "tn-types",
  "tn-worker",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "tn-precompiles"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "alloy-evm",
+ "revm",
+ "serde",
  "tracing",
 ]
 
