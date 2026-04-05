@@ -2,6 +2,7 @@
 
 use super::{inner::ExecutionNodeInner, TnBuilder};
 use tn_config::Config;
+use tn_exex::TnExExManagerHandle;
 use tn_reth::RethEnv;
 
 /// A builder that handles component initialization for the execution node.
@@ -13,14 +14,21 @@ pub(super) struct ExecutionNodeBuilder {
 
     /// Reth environment for executing transactions.
     reth_env: RethEnv,
+
+    /// ExEx manager handle for notifying Execution Extensions.
+    exex_handle: TnExExManagerHandle,
 }
 
 impl ExecutionNodeBuilder {
     /// Start the builder with required components
-    pub(super) fn new(tn_builder: &TnBuilder, reth_env: RethEnv) -> Self {
+    pub(super) fn new(
+        tn_builder: &TnBuilder,
+        reth_env: RethEnv,
+        exex_handle: TnExExManagerHandle,
+    ) -> Self {
         let TnBuilder { tn_config, .. } = tn_builder;
 
-        Self { reth_env, tn_config: tn_config.clone() }
+        Self { reth_env, tn_config: tn_config.clone(), exex_handle }
     }
 
     /// Build the final ExecutionNodeInner
@@ -32,6 +40,7 @@ impl ExecutionNodeBuilder {
             address: *self.tn_config.execution_address(),
             tn_config: self.tn_config,
             workers: Vec::default(),
+            exex_handle: self.exex_handle,
         })
     }
 }

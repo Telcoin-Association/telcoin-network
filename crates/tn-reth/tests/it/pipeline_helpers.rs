@@ -271,7 +271,7 @@ impl PipelineTestEnv {
         cims.set_canonical_head(canonical_header.clone());
 
         // 5. Persist state
-        self.reth_env.finish_executing_output(vec![block.clone()], None)?;
+        self.reth_env.finish_executing_output(vec![block.clone()], None, tn_reth::exex_handle::EmptyExExHandle)?;
         self.reth_env.finalize_block(canonical_header.clone())?;
 
         // Update env state

@@ -17,6 +17,7 @@ futures-util = { workspace = true }
 thiserror = { workspace = true }
 tn-types = { workspace = true }
 tn-reth = { workspace = true }
+tn-exex = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
 tokio-stream = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }

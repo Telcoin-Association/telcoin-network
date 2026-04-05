@@ -10,6 +10,7 @@ use tn_batch_builder::BatchBuilder;
 use tn_batch_validator::BatchValidator;
 use tn_config::Config;
 use tn_engine::ExecutorEngine;
+use tn_exex::TnExExManagerHandle;
 use tn_reth::{
     system_calls::EpochState,
     worker::{WorkerComponents, WorkerNetwork},
@@ -41,6 +42,8 @@ pub(super) struct ExecutionNodeInner {
     /// Collection of execution components by worker.
     /// Index of vec is worker id.
     pub(super) workers: Vec<WorkerComponents>,
+    /// ExEx manager handle for notifying Execution Extensions.
+    pub(super) exex_handle: TnExExManagerHandle,
 }
 
 impl ExecutionNodeInner {
@@ -70,6 +73,7 @@ impl ExecutionNodeInner {
             self.reth_env.get_task_spawner().clone(),
             gas_accumulator,
             engine_update_tx,
+            self.exex_handle.clone(),
         );
 
         // spawn tn engine
