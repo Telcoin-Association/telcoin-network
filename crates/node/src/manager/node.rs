@@ -214,6 +214,26 @@ where
 
         info!(target: "epoch-manager", "starting node and launching first epoch");
 
+        // Initialize ExEx system before creating engine
+        // Query current chain head for ExEx initialization
+        let node_head = self.get_chain_head(&node_task_manager)?;
+        
+        // Create launcher and spawn ExEx manager
+        let launcher = tn_exex::TnExExLauncher::new();
+        let (exex_manager, exex_handle) = launcher
+            .launch(node_head, (), node_task_spawner.clone())
+            .await
+            .map_err(|e| eyre!("Failed to launch ExEx manager: {}", e))?;
+        
+        // Replace empty handle with real manager handle
+        self.exex_handle = exex_handle;
+        
+        // Spawn ExEx manager as critical background task
+        node_task_spawner.spawn_critical_task("exex-manager", async move {
+            exex_manager.await;
+            info!(target: "exex", "ExEx manager shut down");
+        });
+
         // create channels for engine that survive the lifetime of the node
         let (to_engine, for_engine) = mpsc::channel(1000);
 
@@ -445,6 +465,25 @@ where
         let engine = ExecutionNode::new(&self.builder, reth_env, self.exex_handle.clone())?;
 
         Ok(engine)
+    }
+
+    /// Helper method to query the current chain head for ExEx initialization.
+    /// 
+    /// Creates a temporary RethEnv to look up the head block without fully
+    /// initializing the execution engine.
+    fn get_chain_head(&self, task_manager: &TaskManager) -> eyre::Result<BlockNumHash> {
+        let basefee_address = self.builder.tn_config.parameters.basefee_address;
+        let temp_env = RethEnv::new(
+            &self.builder.node_config,
+            task_manager,
+            self.reth_db.clone(),
+            basefee_address,
+            // Use a dummy rewards counter since we're just querying
+            tn_types::gas_accumulator::GasAccumulator::new(1).rewards_counter(),
+        )?;
+        
+        let head = temp_env.lookup_head()?;
+        Ok(BlockNumHash::new(head.number, head.hash()))
     }
 
     /// Helper method to restore execution state for the consensus components.
