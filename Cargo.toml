@@ -14,6 +14,7 @@ members = [
     "crates/network-libp2p",
     "crates/state-sync",
     "crates/tn-reth",
+    "crates/tn-exex",
     "crates/e2e-tests",
     "crates/telcoin-network-cli",
 
@@ -144,6 +145,7 @@ assert_matches = { version = "1.5.0" }
 # common
 tn-types = { path = "./crates/types" }
 tn-reth = { path = "./crates/tn-reth" }
+tn-exex = { path = "./crates/tn-exex" }
 tn-node = { path = "./crates/node" }
 tn-config = { path = "./crates/config" }
 tn-network-libp2p = { path = "./crates/network-libp2p" }

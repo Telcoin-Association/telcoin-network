@@ -1,0 +1,30 @@
+[package]
+name = "tn-exex"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors = [
+    "Arie Jones <arie.jones@indydatapartners.com>",
+]
+
+[dependencies]
+# Workspace dependencies
+tn-types = { workspace = true }
+tn-reth = { workspace = true }
+tn-config = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true, features = ["sync", "time", "macros"] }
+
+# Reth dependencies
+reth-chain-state = { workspace = true }
+reth-provider = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "time", "macros", "rt", "rt-multi-thread"] }
+
+[lints]
+workspace = true
