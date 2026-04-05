@@ -18,10 +18,17 @@ tn-config = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true, features = ["sync", "time", "macros"] }
+tokio-util = { workspace = true }
 
 # Reth dependencies
 reth-chain-state = { workspace = true }
 reth-provider = { workspace = true }
+
+# Metrics
+metrics = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "time", "macros", "rt", "rt-multi-thread"] }
