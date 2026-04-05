@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 /// of the ExEx task. The notification receiver will be closed when the node shuts down
 /// or when the ExEx manager is dropped.
 #[derive(Debug)]
-pub struct TnExExContext {
+pub struct TnExExContext<Provider = BlockchainProvider<TelcoinNode>> {
     /// The current head of the chain when this ExEx was started.
     ///
     /// ExExes should begin processing from this point forward. Historical backfill
@@ -57,7 +57,7 @@ pub struct TnExExContext {
     /// - Chain metadata
     ///
     /// The provider is backed by the node's database and is safe to use concurrently.
-    pub provider: BlockchainProvider<TelcoinNode>,
+    pub provider: Provider,
 
     /// Task executor for spawning background tasks.
     ///
