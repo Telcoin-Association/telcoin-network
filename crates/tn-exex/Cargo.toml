@@ -24,6 +24,9 @@ tokio-util = { workspace = true }
 reth-chain-state = { workspace = true }
 reth-provider = { workspace = true }
 
+# Error handling
+eyre = { workspace = true }
+
 # Metrics
 metrics = { workspace = true }
 

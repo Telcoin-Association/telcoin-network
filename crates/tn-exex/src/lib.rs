@@ -38,10 +38,12 @@
 
 mod context;
 mod event;
+mod launcher;
 mod manager;
 mod notification;
 
 pub use context::TnExExContext;
 pub use event::TnExExEvent;
+pub use launcher::{TnExExInstallFn, TnExExLauncher};
 pub use manager::{TnExExHandle, TnExExManager, TnExExManagerHandle};
 pub use notification::TnExExNotification;
