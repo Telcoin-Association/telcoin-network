@@ -11654,6 +11654,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tn-exex"
+version = "0.1.0"
+dependencies = [
+ "reth-chain-state",
+ "reth-provider",
+ "tn-config",
+ "tn-reth",
+ "tn-types",
+ "tokio",
+]
+
+[[package]]
 name = "tn-network-libp2p"
 version = "0.1.0"
 dependencies = [
