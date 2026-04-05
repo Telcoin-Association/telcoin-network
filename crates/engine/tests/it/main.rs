@@ -170,6 +170,7 @@ async fn test_empty_output_skips_execution() -> eyre::Result<()> {
         task_manager.get_spawner(),
         gas_accumulator,
         engine_update_tx,
+        tn_exex::TnExExManagerHandle::empty(),
     );
 
     // send output
@@ -277,6 +278,7 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
         task_manager.get_spawner(),
         gas_accumulator,
         engine_update_tx,
+        tn_exex::TnExExManagerHandle::empty(),
     );
 
     // send output
@@ -455,6 +457,7 @@ async fn test_empty_output_increments_leader_count() -> eyre::Result<()> {
         task_manager.get_spawner(),
         gas_accumulator.clone(),
         engine_update_tx,
+        tn_exex::TnExExManagerHandle::empty(),
     );
 
     // send output
@@ -779,6 +782,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         task_manager.get_spawner(),
         gas_accumulator.clone(),
         engine_update_tx,
+        tn_exex::TnExExManagerHandle::empty(),
     );
 
     // assert the canonical chain in-memory is empty
@@ -1293,6 +1297,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         task_manager.get_spawner(),
         gas_accumulator.clone(),
         engine_update_tx,
+        tn_exex::TnExExManagerHandle::empty(),
     );
 
     // queue the first output - simulate already received from channel
@@ -1662,6 +1667,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         task_manager.get_spawner(),
         GasAccumulator::default(),
         engine_update_tx,
+        tn_exex::TnExExManagerHandle::empty(),
     );
 
     // queue both output - simulate already received from channel
@@ -1874,6 +1880,7 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
         task_manager.get_spawner(),
         gas_accumulator.clone(),
         engine_update_tx,
+        tn_exex::TnExExManagerHandle::empty(),
     );
 
     // assert the canonical chain in-memory is empty
@@ -2177,6 +2184,7 @@ async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
         task_manager.get_spawner(),
         gas_accumulator.clone(),
         engine_update_tx,
+        tn_exex::TnExExManagerHandle::empty(),
     );
 
     let broadcast_result = to_engine.send(consensus_output.clone()).await;
