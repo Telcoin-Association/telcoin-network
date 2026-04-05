@@ -11670,6 +11670,7 @@ dependencies = [
 name = "tn-exex"
 version = "0.1.0"
 dependencies = [
+ "eyre",
  "metrics 0.23.1",
  "reth-chain-state",
  "reth-provider",
