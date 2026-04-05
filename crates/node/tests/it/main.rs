@@ -91,6 +91,7 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
         task_manager.get_spawner(),
         gas_accumulator.clone(),
         engine_update_tx,
+        tn_exex::TnExExManagerHandle::empty(),
     );
     let (tx, mut rx) = oneshot::channel();
     task_manager.spawn_task("test task eng", async move {
@@ -223,6 +224,7 @@ async fn test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
         task_manager.get_spawner(),
         gas_accumulator.clone(),
         engine_update_tx,
+        tn_exex::TnExExManagerHandle::empty(),
     );
     let (tx, mut rx) = oneshot::channel();
     task_manager.spawn_task("test task eng", async move {
@@ -391,6 +393,7 @@ async fn test_catchup_accumulator_partial_execution() -> eyre::Result<()> {
         task_manager.get_spawner(),
         gas_accumulator.clone(),
         engine_update_tx,
+        tn_exex::TnExExManagerHandle::empty(),
     );
     let (tx, mut rx) = oneshot::channel();
     task_manager.spawn_task("test task eng", async move {
