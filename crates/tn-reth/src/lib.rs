@@ -154,6 +154,7 @@ pub mod dirs;
 pub mod payload;
 use payload::TNPayload;
 pub mod traits;
+pub mod exex_handle;
 pub mod txn_pool;
 pub use txn_pool::*;
 use worker::WorkerNetwork;
@@ -803,11 +804,15 @@ impl RethEnv {
     /// and set last executed header as the tracked header.
     ///
     /// It also clears the canonical in-memory state.
-    pub fn finish_executing_output(
+    pub fn finish_executing_output<H>(
         &self,
         blocks: Vec<ExecutedBlock>,
         engine_update: Option<(Round, BlockNumHash, tokio::sync::mpsc::Sender<EngineUpdate>)>,
-    ) -> TnRethResult<()> {
+        exex_handle: H,
+    ) -> TnRethResult<()>
+    where
+        H: crate::exex_handle::ExExNotificationHandle,
+    {
         // NOTE: this makes all blocks canonical, commits them to the database,
         // and broadcasts new chain on `canon_state_notification_sender`
         //
@@ -857,7 +862,12 @@ impl RethEnv {
 
         // broadcast canonical update
         let notification = chain_update.to_chain_notification();
-        self.canonical_in_memory_state().notify_canon_state(notification);
+        self.canonical_in_memory_state().notify_canon_state(notification.clone());
+
+        // Send notification to ExEx tasks if any are installed
+        if exex_handle.has_exexs() {
+            exex_handle.send_canon_notification(notification);
+        }
 
         Ok(())
     }
@@ -1532,7 +1542,7 @@ mod tests {
         canonical_in_memory_state
             .update_chain(NewCanonicalChain::Commit { new: vec![block.clone()] });
         canonical_in_memory_state.set_canonical_head(canonical_header.clone());
-        reth_env.finish_executing_output(vec![block.clone()], None)?;
+        reth_env.finish_executing_output(vec![block.clone()], None, crate::exex_handle::EmptyExExHandle)?;
         reth_env.finalize_block(canonical_header.clone())?;
         Ok(block)
     }

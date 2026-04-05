@@ -21,6 +21,7 @@ use tn_types::{
     ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, Notifier, TaskError, TaskManager,
     TaskSpawner, TimestampSec, MIN_PROTOCOL_BASE_FEE,
 };
+use tn_exex::TnExExManagerHandle;
 use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -73,6 +74,10 @@ pub(crate) struct EpochManager<P, DB> {
 
     /// Access to the epoch pack files storing consensus data.
     consensus_chain: ConsensusChain,
+
+    /// Handle for sending notifications to ExEx tasks.
+    /// Persists across epoch transitions.
+    exex_handle: TnExExManagerHandle,
 }
 
 /// Restore the [`GasAccumulator`] state after a mid-epoch restart.
@@ -195,6 +200,7 @@ where
             last_consensus_header: None,
             last_forwarded_consensus_number: 0,
             consensus_chain,
+            exex_handle: tn_exex::TnExExManagerHandle::empty(),
         }
     }
 
@@ -458,7 +464,7 @@ where
             basefee_address,
             gas_accumulator.rewards_counter(),
         )?;
-        let engine = ExecutionNode::new(&self.builder, reth_env)?;
+        let engine = ExecutionNode::new(&self.builder, reth_env, self.exex_handle.clone())?;
 
         Ok(engine)
     }
