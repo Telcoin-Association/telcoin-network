@@ -41,7 +41,7 @@ impl TnExExEvent {
     ///
     /// ```no_run
     /// use tn_exex::TnExExEvent;
-    /// use alloy::eips::BlockNumHash;
+    /// use tn_types::BlockNumHash;
     ///
     /// let block = BlockNumHash::new(100, Default::default());
     /// let event = TnExExEvent::finished_height(block);

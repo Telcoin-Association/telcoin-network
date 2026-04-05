@@ -24,6 +24,7 @@ use tn_types::{
     Database as TNDatabase, EngineUpdate, Epoch, Notifier, TaskError, TaskManager, TaskSpawner,
     TimestampSec, DEFAULT_WORKER_ID, MIN_PROTOCOL_BASE_FEE,
 };
+use tn_exex::TnExExManagerHandle;
 use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -95,6 +96,10 @@ pub(crate) struct EpochManager<P, DB> {
 
     /// The version string for the running node.
     version_str: &'static str,
+
+    /// Handle for sending notifications to ExEx tasks.
+    /// Persists across epoch transitions.
+    exex_handle: TnExExManagerHandle,
 }
 
 /// Restore the [`GasAccumulator`] state after a mid-epoch restart.
@@ -231,6 +236,7 @@ where
             consensus_chain,
             bootstrap_servers,
             version_str,
+            exex_handle: tn_exex::TnExExManagerHandle::empty(),
         }
     }
 
@@ -536,7 +542,7 @@ where
             basefee_address,
             gas_accumulator.rewards_counter(),
         )?;
-        let engine = ExecutionNode::new(&self.builder, reth_env)?;
+        let engine = ExecutionNode::new(&self.builder, reth_env, self.exex_handle.clone())?;
 
         Ok(engine)
     }

@@ -433,6 +433,15 @@ impl TnExExManagerHandle {
         }
     }
 
+    /// Sends a canonical state notification from Reth to all ExExes.
+    ///
+    /// Converts the Reth notification to TnExExNotification before sending.
+    /// This method avoids circular dependencies by accepting the Reth type directly.
+    pub fn send_canon_notification(&self, notification: reth_chain_state::CanonStateNotification) {
+        let exex_notification: TnExExNotification = notification.into();
+        self.send(exex_notification);
+    }
+
     /// Sends a notification to all registered ExExes (async with backpressure).
     ///
     /// This will wait until the manager has capacity before returning.
@@ -464,6 +473,20 @@ impl fmt::Debug for TnExExManagerHandle {
             .field("has_channel", &self.handle_tx.is_some())
             .field("current_capacity", &self.current_capacity.load(Ordering::Relaxed))
             .finish()
+    }
+}
+
+/// Implement the minimal ExEx handle interface from tn-reth.
+///
+/// This allows tn-reth to use the handle without depending on the full tn-exex crate,
+/// avoiding circular dependencies.
+impl tn_reth::exex_handle::ExExNotificationHandle for TnExExManagerHandle {
+    fn has_exexs(&self) -> bool {
+        self.has_exexs()
+    }
+
+    fn send_canon_notification(&self, notification: reth_chain_state::CanonStateNotification) {
+        self.send_canon_notification(notification)
     }
 }
 
