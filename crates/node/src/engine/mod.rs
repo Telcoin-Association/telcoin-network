@@ -64,8 +64,12 @@ pub struct ExecutionNode {
 
 impl ExecutionNode {
     /// Create a new instance of `Self`.
-    pub fn new(tn_builder: &TnBuilder, reth_env: RethEnv) -> eyre::Result<Self> {
-        let inner = ExecutionNodeBuilder::new(tn_builder, reth_env).build()?;
+    pub fn new(
+        tn_builder: &TnBuilder,
+        reth_env: RethEnv,
+        exex_handle: tn_exex::TnExExManagerHandle,
+    ) -> eyre::Result<Self> {
+        let inner = ExecutionNodeBuilder::new(tn_builder, reth_env, exex_handle).build()?;
 
         Ok(ExecutionNode { internal: Arc::new(RwLock::new(inner)) })
     }

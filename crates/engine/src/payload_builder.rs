@@ -23,6 +23,7 @@ pub fn execute_consensus_output(
     args: BuildArguments,
     gas_accumulator: GasAccumulator,
     engine_update_tx: mpsc::Sender<EngineUpdate>,
+    exex_handle: tn_exex::TnExExManagerHandle,
 ) -> EngineResult<SealedHeader> {
     // rename canonical header for clarity
     let BuildArguments { reth_env, output, parent_header } = args;
@@ -167,6 +168,7 @@ pub fn execute_consensus_output(
     reth_env.finish_executing_output(
         executed_blocks,
         Some((leader_round, consensus_num_hash, engine_update_tx)),
+        exex_handle,
     )?;
     // remove blocks from memory and stores them in the database
     reth_env.finalize_block(canonical_header.clone())?;
