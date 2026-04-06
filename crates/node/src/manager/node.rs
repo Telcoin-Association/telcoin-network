@@ -205,7 +205,12 @@ where
     }
 
     /// Run the node, handling epoch transitions.
-    pub(crate) async fn run(&mut self) -> eyre::Result<()> {
+    ///
+    /// ## ExEx Support
+    ///
+    /// If `exex_launcher` is provided with installed ExExs, they will be launched at node startup.
+    /// The ExEx manager persists across epoch transitions.
+    pub(crate) async fn run(&mut self, exex_launcher: Option<tn_exex::TnExExLauncher>) -> eyre::Result<()> {
         // Surface any errors that may have been triggered on create.
         self.consensus_chain.persist_current().await?;
         // Main task manager that manages tasks across epochs.
@@ -215,14 +220,51 @@ where
 
         info!(target: "epoch-manager", "starting node and launching first epoch");
 
+        // Create the gas accumulator early since we need it for RethEnv
+        let gas_accumulator = GasAccumulator::new(1);
+
+        // Create RethEnv early so we can get the provider for ExEx initialization
+        let basefee_address = self.builder.tn_config.parameters.basefee_address;
+        let reth_env = RethEnv::new(
+            &self.builder.node_config,
+            &node_task_manager,
+            self.reth_db.clone(),
+            basefee_address,
+            gas_accumulator.rewards_counter(),
+        )?;
+
         // Initialize ExEx system before creating engine
         // Query current chain head for ExEx initialization
-        let node_head = self.get_chain_head(&node_task_manager)?;
+        let node_head = {
+            let head = reth_env.lookup_head()?;
+            BlockNumHash::new(head.number, head.hash())
+        };
         
-        // Create launcher and spawn ExEx manager
-        let launcher = tn_exex::TnExExLauncher::new();
+        // Use provided launcher or create empty one
+        let launcher = exex_launcher.unwrap_or_else(tn_exex::TnExExLauncher::new);
+        
+        // If there are ExExs configured, log how many are installed vs enabled
+        let installed_count = launcher.len();
+        let enabled_ids: Vec<_> = self.builder.tn_config.exex.iter()
+            .filter(|e| e.enabled)
+            .map(|e| e.id.as_str())
+            .collect();
+        
+        if !enabled_ids.is_empty() {
+            info!(
+                target: "exex",
+                installed = installed_count,
+                enabled = enabled_ids.len(),
+                enabled_ids = ?enabled_ids,
+                "ExEx configuration loaded"
+            );
+        }
+        
+        // Create blockchain provider for ExEx context
+        let blockchain_provider = reth_env.blockchain_provider();
+        
         let (exex_manager, exex_handle) = launcher
-            .launch(node_head, (), node_task_spawner.clone())
+            .launch(node_head, blockchain_provider, node_task_spawner.clone())
             .await
             .map_err(|e| eyre!("Failed to launch ExEx manager: {}", e))?;
         
@@ -238,14 +280,11 @@ where
         // create channels for engine that survive the lifetime of the node
         let (to_engine, for_engine) = mpsc::channel(1000);
 
-        // Create our epoch gas accumulator, we currently have one worker.
-        // All nodes have to agree on the worker count, do not change this for an existing chain.
-        let gas_accumulator = GasAccumulator::new(1);
         // create channel for engine updates to consensus
         let (engine_update_tx, engine_update_rx) = mpsc::channel(64);
 
-        // create the engine
-        let engine = self.create_engine(&node_task_manager, &gas_accumulator)?;
+        // create the engine with the RethEnv we already created
+        let engine = ExecutionNode::new(&self.builder, reth_env.clone(), self.exex_handle.clone())?;
         engine
             .start_engine(
                 for_engine,
@@ -467,45 +506,6 @@ where
             }
             info!(target: "epoch-manager", "looping run epoch");
         }
-    }
-
-    /// Helper method to create all engine components.
-    fn create_engine(
-        &self,
-        engine_task_manager: &TaskManager,
-        gas_accumulator: &GasAccumulator,
-    ) -> eyre::Result<ExecutionNode> {
-        // create execution components (ie - reth env)
-        let basefee_address = self.builder.tn_config.parameters.basefee_address;
-        let reth_env = RethEnv::new(
-            &self.builder.node_config,
-            engine_task_manager,
-            self.reth_db.clone(),
-            basefee_address,
-            gas_accumulator.rewards_counter(),
-        )?;
-        let engine = ExecutionNode::new(&self.builder, reth_env, self.exex_handle.clone())?;
-
-        Ok(engine)
-    }
-
-    /// Helper method to query the current chain head for ExEx initialization.
-    /// 
-    /// Creates a temporary RethEnv to look up the head block without fully
-    /// initializing the execution engine.
-    fn get_chain_head(&self, task_manager: &TaskManager) -> eyre::Result<BlockNumHash> {
-        let basefee_address = self.builder.tn_config.parameters.basefee_address;
-        let temp_env = RethEnv::new(
-            &self.builder.node_config,
-            task_manager,
-            self.reth_db.clone(),
-            basefee_address,
-            // Use a dummy rewards counter since we're just querying
-            tn_types::gas_accumulator::GasAccumulator::new(1).rewards_counter(),
-        )?;
-        
-        let head = temp_env.lookup_head()?;
-        Ok(BlockNumHash::new(head.number, head.hash()))
     }
 
     /// Helper method to restore execution state for the consensus components.
