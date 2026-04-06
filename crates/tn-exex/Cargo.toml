@@ -35,6 +35,10 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "time", "macros", "rt", "rt-multi-thread"] }
+tempfile = { workspace = true }
+tn-test-utils = { workspace = true }
+tracing = { workspace = true }
+eyre = { workspace = true }
 
 [lints]
 workspace = true
