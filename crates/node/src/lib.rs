@@ -29,10 +29,35 @@ use tempfile as _;
 /// This will possibly "loop" to launch multiple times in response to
 /// a node's mode changes.  This ensures a clean state and fresh tasks
 /// when switching modes.
+///
+/// ## ExEx Support
+///
+/// To run ExExes with the node, provide a custom `exex_launcher` that has ExExs installed.
+/// The launcher can be created and populated like this:
+///
+/// ```no_run
+/// use tn_exex::TnExExLauncher;
+///
+/// async fn my_indexer_exex<P>(ctx: tn_exex::TnExExContext<P>) -> eyre::Result<()>
+/// where
+///     P: tn_reth::BlockReader + Clone + Unpin + 'static,
+/// {
+///     // ExEx implementation here
+///     Ok(())
+/// }
+///
+/// let mut launcher = TnExExLauncher::new();
+/// launcher.install("my-indexer", my_indexer_exex);
+/// // Pass launcher to launch_node()
+/// ```
+///
+/// The config's `exex` field or `--exex` CLI flag filters which installed ExExs actually run.
+/// If no ExExs are installed in the launcher, the node runs with zero ExEx overhead.
 pub fn launch_node<P>(
     builder: TnBuilder,
     tn_datadir: P,
     key_config: KeyConfig,
+    exex_launcher: Option<tn_exex::TnExExLauncher>,
     version: &'static str,
 ) -> JoinHandle<eyre::Result<()>>
 where
@@ -47,7 +72,7 @@ where
         // create the epoch manager
         let mut epoch_manager =
             EpochManager::new(builder, tn_datadir, consensus_db, key_config, version).await;
-        let result = epoch_manager.run().await;
+        let result = epoch_manager.run(exex_launcher).await;
         if let Err(err) = &result {
             tracing::error!("Error running node: {err}");
         }

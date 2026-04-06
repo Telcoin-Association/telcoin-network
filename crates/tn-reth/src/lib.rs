@@ -669,6 +669,13 @@ impl RethEnv {
         ChainSpec(self.inner.node_config.chain.clone())
     }
 
+    /// Return a clone of the blockchain provider.
+    ///
+    /// This is used primarily for ExEx initialization to provide state access.
+    pub fn blockchain_provider(&self) -> BlockchainProvider<TelcoinNode> {
+        self.inner.blockchain_provider.clone()
+    }
+
     /// Return the canonical in-memory state.
     pub fn canonical_in_memory_state(&self) -> CanonicalInMemoryState {
         self.inner.blockchain_provider.canonical_in_memory_state()
