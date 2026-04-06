@@ -13,6 +13,36 @@
 //! - **No Reorg Notifications**: Only `ChainCommitted` events are needed
 //! - **Simplified Manager**: No pipeline vs blockchain-tree distinction
 //!
+//! ## Observer Nodes - Primary Use Case
+//!
+//! **Observer nodes are the recommended deployment target for ExExes.** Observers:
+//!
+//! - Follow consensus without participating in committee voting
+//! - Execute all blocks identically to validators (same `ExecutorEngine` → `finish_executing_output()` path)
+//! - Receive ExEx notifications for every committed chain state transition
+//! - Do not affect consensus performance (ExEx backpressure only impacts the observer)
+//! - Can run custom indexing, bridges, or analytics without validator hardware requirements
+//!
+//! **Deployment pattern:**
+//! ```text
+//! ┌──────────────────────────────────────────────────────┐
+//! │ Validator Committee (consensus + execution)          │
+//! │ - No ExExes installed (minimal overhead)             │
+//! └──────────────────────────────────────────────────────┘
+//!                       │
+//!                       │ Consensus output
+//!                       ▼
+//! ┌──────────────────────────────────────────────────────┐
+//! │ Observer Node (execution + ExEx)                     │
+//! │ - Follows consensus via state-sync                   │
+//! │ - Runs custom ExExes (indexer, bridge, analytics)    │
+//! │ - Exposes custom RPC endpoints for dapp queries      │
+//! └──────────────────────────────────────────────────────┘
+//! ```
+//!
+//! **Configuration:** Launch observer with `--observer` flag. ExExes receive identical
+//! chain state transitions as validators without affecting network consensus.
+//!
 //! ## Architecture
 //!
 //! ```text
