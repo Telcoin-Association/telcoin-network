@@ -3092,6 +3092,7 @@ dependencies = [
  "telcoin-network-cli",
  "tempfile",
  "tn-config",
+ "tn-exex",
  "tn-node",
  "tn-reth",
  "tn-types",
