@@ -8,6 +8,7 @@ use std::{
     cmp::{max, Ordering},
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Debug,
+    sync::Arc,
 };
 use tn_config::ConsensusConfig;
 use tn_storage::{
@@ -450,6 +451,13 @@ impl<DB: Database> Consensus<DB> {
                 metrics.subdags_committed_total.increment(1);
                 let leader_created = *committed_sub_dag.leader().created_at();
                 metrics.commit_latency_seconds.record(now().saturating_sub(leader_created) as f64);
+
+                // notify ExEx subscribers about committed sub-DAG
+                let _ = self
+                    .consensus_bus
+                    .app()
+                    .exex_committed_sub_dags()
+                    .send(Arc::new(committed_sub_dag.clone()));
 
                 // NOTE: The size of the sub-dag can be arbitrarily large (depending on the network
                 // condition and Byzantine leaders).

@@ -54,6 +54,8 @@ pub(crate) struct Certifier<DB> {
     proposal_lock: Arc<Mutex<()>>,
     /// Prometheus metrics for vote collection and certificate formation.
     metrics: crate::PrimaryMetrics,
+    /// Consensus bus for ExEx notifications.
+    consensus_bus: ConsensusBus,
 }
 
 impl<DB: Database> Certifier<DB> {
@@ -110,6 +112,7 @@ impl<DB: Database> Certifier<DB> {
                 new_proposal: Notifier::new(),
                 proposal_lock: Arc::new(Mutex::new(())),
                 metrics,
+                consensus_bus,
             }
             .run(rx_headers)
             .await;
@@ -449,6 +452,9 @@ impl<DB: Database> Certifier<DB> {
                             error!(target: "primary::certifier", "error accepting own certificate: {e}");
                             return Err(e.into());
                         }
+
+                        // notify ExEx subscribers about own certificate
+                        let _ = self.consensus_bus.app().exex_own_certificates().send(certificate.clone());
 
                         // try to publish the certificate on gossip network
                         if let Err(e) = self.network.publish_certificate(certificate).await {

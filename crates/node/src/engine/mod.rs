@@ -12,8 +12,9 @@
 
 use self::inner::ExecutionNodeInner;
 use builder::ExecutionNodeBuilder;
-use std::{net::SocketAddr, sync::Arc};
+use std::{future::Future, net::SocketAddr, sync::Arc};
 use tn_config::Config;
+use tn_exex::ExExInstallFn;
 use tn_reth::{
     system_calls::EpochState, CanonStateNotificationStream, RethConfig, RethDb, RethEnv,
     WorkerTxPool,
@@ -34,7 +35,6 @@ pub use tn_reth::worker::*;
 ///
 /// Used to build the node until upstream reth supports
 /// broader node customization.
-#[derive(Clone, Debug)]
 pub struct TnBuilder {
     /// The node configuration.
     pub node_config: RethConfig,
@@ -54,6 +54,39 @@ pub struct TnBuilder {
     pub healthcheck: Option<u16>,
     /// A reference to the long lived reth DB for the node.
     pub reth_db: RethDb,
+    /// Registered ExEx install functions.
+    ///
+    /// Each entry is a `(name, install_fn)` pair. These are consumed during node
+    /// startup to spawn ExEx tasks on the node-level task manager.
+    pub exex_fns: Vec<(String, ExExInstallFn)>,
+}
+
+impl TnBuilder {
+    /// Register an Execution Extension (ExEx) plugin.
+    ///
+    /// ExExes are long-running tasks that receive notifications about the full
+    /// transaction lifecycle: certificate accepted, consensus committed, and
+    /// chain executed.
+    pub fn install_exex<F, Fut>(&mut self, name: impl Into<String>, install_fn: F) -> &mut Self
+    where
+        F: FnOnce(tn_exex::TnExExContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = eyre::Result<()>> + Send + 'static,
+    {
+        self.exex_fns.push((name.into(), Box::new(|ctx| Box::pin(install_fn(ctx)))));
+        self
+    }
+}
+
+impl std::fmt::Debug for TnBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TnBuilder")
+            .field("node_config", &self.node_config)
+            .field("tn_config", &self.tn_config)
+            .field("metrics", &self.metrics)
+            .field("healthcheck", &self.healthcheck)
+            .field("exex_count", &self.exex_fns.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Wrapper for the inner execution node components.
