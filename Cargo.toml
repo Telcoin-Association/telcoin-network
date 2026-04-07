@@ -4,6 +4,7 @@ members = [
     "bin/telcoin-network",
     "crates/config",
     "crates/engine",
+    "crates/exex",
     "crates/node",
     "crates/storage",
     "crates/test-utils",
@@ -21,6 +22,9 @@ members = [
     "crates/consensus/executor",
     "crates/consensus/primary",
     "crates/consensus/worker",
+
+    # examples
+    "examples/exex-lifecycle",
 
     # execution
     "crates/batch-builder",
@@ -133,6 +137,7 @@ alloy-evm = { version = "0.27.2" }
 
 tn-batch-validator = { path = "crates/batch-validator" }
 tn-engine = { path = "crates/engine" }
+tn-exex = { path = "crates/exex" }
 
 # batch maker
 tn-batch-builder = { path = "crates/batch-builder" }

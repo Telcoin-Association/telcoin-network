@@ -169,7 +169,8 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
 
         // create dbs to survive between sync state transitions
         let reth_db = tn_reth::RethEnv::new_database(&node_config, tn_datadir.reth_db_path())?;
-        let builder = TnBuilder { node_config, tn_config, metrics, healthcheck, reth_db };
+        let builder =
+            TnBuilder { node_config, tn_config, metrics, healthcheck, reth_db, exex_fns: vec![] };
 
         Ok(launcher(builder, ext, tn_datadir, key_config))
     }

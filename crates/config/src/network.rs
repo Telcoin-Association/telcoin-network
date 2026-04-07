@@ -85,11 +85,17 @@ pub struct LibP2pConfig {
     pub supported_req_res_protocols: Vec<(StreamProtocol, ProtocolSupport)>,
     /// Maximum message size between request/response network messages in bytes.
     pub max_rpc_message_size: usize,
-    /// Maximum message size for gossipped network messages in bytes.
+    /// Maximum message size for gossipped messages request/response network messages in bytes.
     ///
-    /// The largest gossip message is likely a `Certificate`.
-    /// The default of 12,000 bytes should be enough for legit gossip.
-    /// Large messages should not be gossipped
+    /// The largest gossip message is the `ConsensusHeader`, which influenced the default max.
+    ///
+    /// Consensus headers are created based on subdag commits which can be several rounds deep.
+    /// More benchmarking is needed, but this should be a safe number for a 4-member committee.
+    /// - 6 round max between commits
+    /// - 4 certificate max per round
+    /// - ~300 bytes size per empty certificate
+    /// - 5 batch digests max per certificate (32 bytes each)
+    /// - (6 * 4)(300 + (5 * 32)) = 11,040
     pub max_gossip_message_size: usize,
     /// The maximum duration to keep an idle connection alive between peers.
     ///

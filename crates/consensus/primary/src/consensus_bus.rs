@@ -223,6 +223,17 @@ pub struct ConsensusBusAppInner {
     /// Broadcast the latest output from consensus after committing to the subdag.
     /// Engine consumes and executes to extend canonical chain.
     consensus_output: broadcast::Sender<ConsensusOutput>,
+
+    /// Broadcast channel for own certificates (ExEx).
+    /// Sent after our header is certified.
+    exex_own_certificates: broadcast::Sender<Certificate>,
+    /// Broadcast channel for peer certificates (ExEx).
+    /// Sent when a peer certificate is accepted and forwarded to consensus.
+    exex_peer_certificates: broadcast::Sender<Certificate>,
+    /// Broadcast channel for committed sub-DAGs (ExEx).
+    /// Sent when Bullshark commits a sub-DAG.
+    exex_committed_sub_dags: broadcast::Sender<Arc<CommittedSubDag>>,
+
     /// Status of sync?
     tx_sync_status: watch::Sender<NodeMode>,
 
@@ -269,6 +280,10 @@ impl ConsensusBusApp {
         let (consensus_header, _rx_consensus_header) = broadcast::channel(CHANNEL_CAPACITY);
         let (consensus_output, _rx_consensus_output) = broadcast::channel(100);
 
+        let (exex_own_certificates, _) = broadcast::channel(CHANNEL_CAPACITY);
+        let (exex_peer_certificates, _) = broadcast::channel(CHANNEL_CAPACITY);
+        let (exex_committed_sub_dags, _) = broadcast::channel(CHANNEL_CAPACITY);
+
         let (tx_epoch_record, _) = watch::channel(None);
 
         Self {
@@ -282,6 +297,9 @@ impl ConsensusBusApp {
                 tx_last_published_consensus_num_hash,
                 consensus_header,
                 consensus_output,
+                exex_own_certificates,
+                exex_peer_certificates,
+                exex_committed_sub_dags,
                 tx_sync_status,
                 new_epoch_votes: QueChannel::new(),
                 tx_epoch_record,
@@ -451,6 +469,36 @@ impl ConsensusBusApp {
     /// Provide a subscription(Receiver) to consensus_headers.
     pub fn subscribe_consensus_header(&self) -> impl TnReceiver<ConsensusHeader> {
         self.inner.consensus_header.subscribe()
+    }
+
+    /// Broadcast sender for own certificates (ExEx).
+    pub fn exex_own_certificates(&self) -> &broadcast::Sender<Certificate> {
+        &self.inner.exex_own_certificates
+    }
+
+    /// Broadcast sender for peer certificates (ExEx).
+    pub fn exex_peer_certificates(&self) -> &broadcast::Sender<Certificate> {
+        &self.inner.exex_peer_certificates
+    }
+
+    /// Broadcast sender for committed sub-DAGs (ExEx).
+    pub fn exex_committed_sub_dags(&self) -> &broadcast::Sender<Arc<CommittedSubDag>> {
+        &self.inner.exex_committed_sub_dags
+    }
+
+    /// Subscribe to own certificate notifications (ExEx).
+    pub fn subscribe_exex_own_certificates(&self) -> broadcast::Receiver<Certificate> {
+        self.inner.exex_own_certificates.subscribe()
+    }
+
+    /// Subscribe to peer certificate notifications (ExEx).
+    pub fn subscribe_exex_peer_certificates(&self) -> broadcast::Receiver<Certificate> {
+        self.inner.exex_peer_certificates.subscribe()
+    }
+
+    /// Subscribe to committed sub-DAG notifications (ExEx).
+    pub fn subscribe_exex_committed_sub_dags(&self) -> broadcast::Receiver<Arc<CommittedSubDag>> {
+        self.inner.exex_committed_sub_dags.subscribe()
     }
 
     /// Will resolve once we have executed block.

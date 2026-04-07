@@ -82,9 +82,9 @@ use reth_node_core::node_config::DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB;
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
     BlockIdReader as _, BlockNumReader, BlockReader, CanonChainTracker,
-    CanonStateSubscriptions as _, ChainStateBlockReader, ChainStateBlockWriter, DBProvider,
-    DatabaseProviderFactory, HeaderProvider as _, ProviderFactory, StateProviderBox,
-    StateProviderFactory, TransactionVariant,
+    CanonStateSubscriptions as _, Chain, ChainStateBlockReader, ChainStateBlockWriter, DBProvider,
+    DatabaseProviderFactory, ExecutionOutcome, HeaderProvider as _, ProviderFactory,
+    ReceiptProvider as _, StateProviderBox, StateProviderFactory, TransactionVariant,
 };
 use reth_revm::{
     cached::CachedReads,
@@ -909,6 +909,43 @@ impl RethEnv {
         range: RangeInclusive<BlockNumber>,
     ) -> TnRethResult<Vec<SealedHeader>> {
         Ok(self.inner.blockchain_provider.sealed_headers_range(range)?)
+    }
+
+    /// Build a [`Chain`] from a historical block in the database.
+    ///
+    /// Reads the block with recovered senders and its receipts, then constructs
+    /// a `Chain` suitable for ExEx replay notifications.
+    ///
+    /// Returns `None` if the block does not exist in the database.
+    pub fn replay_block_as_chain(
+        &self,
+        block_number: BlockNumber,
+    ) -> TnRethResult<Option<Arc<reth_provider::Chain>>> {
+        // Read block with senders
+        let Some(block) = self.inner.blockchain_provider.sealed_block_with_senders(
+            BlockHashOrNumber::Number(block_number),
+            TransactionVariant::NoHash,
+        )?
+        else {
+            return Ok(None);
+        };
+
+        // Read receipts for this block
+        let receipts = self
+            .inner
+            .blockchain_provider
+            .receipts_by_block(BlockHashOrNumber::Number(block_number))?
+            .unwrap_or_default();
+
+        // Construct a minimal ExecutionOutcome with receipts only (no bundle state)
+        let execution_outcome = ExecutionOutcome::new(
+            Default::default(), // empty BundleState — state already committed to DB
+            vec![receipts],
+            block_number,
+            Vec::new(), // no requests
+        );
+
+        Ok(Some(Arc::new(Chain::new(vec![block], execution_outcome, Default::default()))))
     }
 
     /// Return the head header from the reth db.

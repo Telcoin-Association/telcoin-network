@@ -47,6 +47,8 @@ pub(crate) struct Certifier<DB> {
     task_spawner: TaskSpawner,
     /// Notifier to cancel pending proposals and vote requests if new header is received.
     new_proposal: Notifier,
+    /// Consensus bus for ExEx notifications.
+    consensus_bus: ConsensusBus,
 }
 
 impl<DB: Database> Certifier<DB> {
@@ -100,6 +102,7 @@ impl<DB: Database> Certifier<DB> {
                 network: primary_network,
                 task_spawner,
                 new_proposal: Notifier::new(),
+                consensus_bus,
             }
             .run(rx_headers)
             .await;
@@ -405,6 +408,9 @@ impl<DB: Database> Certifier<DB> {
                             error!(target: "primary::certifier", "error accepting own certificate: {e}");
                             return;
                         }
+
+                        // notify ExEx subscribers about own certificate
+                        let _ = self.consensus_bus.app().exex_own_certificates().send(certificate.clone());
 
                         // try to publish the certificate on gossip network
                         if let Err(e) = self.network.publish_certificate(certificate).await {
