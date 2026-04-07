@@ -5,6 +5,7 @@
 
 mod common;
 mod epochs;
+mod exex;
 #[cfg(feature = "faucet")]
 mod faucet;
 mod genesis_tests;
