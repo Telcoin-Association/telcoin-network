@@ -82,9 +82,9 @@ use reth_node_core::node_config::DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB;
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
     BlockIdReader as _, BlockNumReader, BlockReader, CanonChainTracker,
-    CanonStateSubscriptions as _, ChainStateBlockReader, ChainStateBlockWriter, DBProvider,
-    DatabaseProviderFactory, HeaderProvider as _, ProviderFactory, StateProviderBox,
-    StateProviderFactory, TransactionVariant,
+    CanonStateSubscriptions as _, Chain, ChainStateBlockReader, ChainStateBlockWriter, DBProvider,
+    DatabaseProviderFactory, ExecutionOutcome, HeaderProvider as _, ProviderFactory,
+    ReceiptProvider, StateProviderBox, StateProviderFactory, TransactionVariant,
 };
 use reth_revm::{
     cached::CachedReads,
@@ -99,7 +99,7 @@ use reth_transaction_pool::{
 use rpc_server_args::RpcServerArgs;
 use serde_json::Value;
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     net::{IpAddr, Ipv4Addr},
     ops::RangeInclusive,
     path::Path,
@@ -918,6 +918,44 @@ impl RethEnv {
         range: RangeInclusive<BlockNumber>,
     ) -> TnRethResult<Vec<BlockWithSenders>> {
         Ok(self.inner.blockchain_provider.block_with_senders_range(range)?)
+    }
+
+    /// Reconstruct a [`Chain`] from a historical block stored in the database.
+    ///
+    /// This retrieves the block and its receipts, constructing a minimal `Chain`
+    /// suitable for replaying to ExEx tasks. The returned chain contains no state
+    /// diffs (bundle state) or trie data since those are not needed for replay.
+    ///
+    /// Returns `Ok(None)` if the block does not exist.
+    pub fn replay_block_as_chain(
+        &self,
+        block_number: u64,
+    ) -> TnRethResult<Option<Arc<Chain>>> {
+        let Some(block) = self.inner.blockchain_provider.sealed_block_with_senders(
+            BlockHashOrNumber::Number(block_number),
+            TransactionVariant::NoHash,
+        )? else {
+            return Ok(None);
+        };
+
+        let receipts = self
+            .inner
+            .blockchain_provider
+            .receipts_by_block(BlockHashOrNumber::Number(block_number))?
+            .unwrap_or_default();
+
+        let execution_outcome = ExecutionOutcome::new(
+            BundleState::default(),
+            vec![receipts],
+            block_number,
+            Default::default(),
+        );
+
+        Ok(Some(Arc::new(Chain::new(
+            [block],
+            execution_outcome,
+            BTreeMap::new(),
+        ))))
     }
 
     /// Return the blocks for a range of block numbers.
