@@ -13,6 +13,7 @@ use std::{
 };
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{types::NetworkEvent, GossipMessage, ResponseChannel, Stream};
+use tn_storage::consensus::ConsensusChain;
 use tn_types::{
     BatchValidation, BlockHash, BlsPublicKey, Database, Epoch, SealedBatch, TaskSpawner,
     TnReceiver, WorkerId, B256,
@@ -115,6 +116,8 @@ pub struct WorkerNetwork<DB, Events> {
     pending_batch_requests: Arc<Mutex<HashMap<PendingBatchRequestKey, PendingBatchStream>>>,
     /// Semaphore bounding total concurrent batch stream operations (pending + active).
     batch_stream_semaphore: Arc<Semaphore>,
+    /// Access to the consensus chain.
+    consensus_chain: ConsensusChain,
 }
 
 impl<DB, Events> WorkerNetwork<DB, Events>
@@ -129,6 +132,7 @@ where
         consensus_config: ConsensusConfig<DB>,
         id: WorkerId,
         validator: Arc<dyn BatchValidation>,
+        consensus_chain: ConsensusChain,
     ) -> Self {
         let request_handler =
             RequestHandler::new(id, validator, consensus_config, network_handle.clone());
@@ -138,6 +142,7 @@ where
             request_handler,
             pending_batch_requests: Arc::new(Mutex::new(HashMap::new())),
             batch_stream_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_BATCH_STREAMS)),
+            consensus_chain,
         }
     }
 
@@ -362,6 +367,7 @@ where
         let network_handle = self.network_handle.clone();
         let pending_map = self.pending_batch_requests.clone();
         let task_name = format!("stream-requested-batches-{peer}");
+        let consensus_chain = self.consensus_chain.clone();
         self.network_handle.get_task_spawner().spawn_task(task_name, async move {
             // read the request digest (32-bytes) from the stream with timeout
             let mut digest_buf = [0u8; tn_types::DIGEST_LENGTH];
@@ -388,7 +394,7 @@ where
 
             // process stream
             if let Err(err) = request_handler
-                .process_request_batches_stream(peer, opt_pending_req, stream, request_digest)
+                .process_request_batches_stream(peer, opt_pending_req, stream, request_digest, &consensus_chain)
                 .await {
                     // apply applicable penalty for error
                     warn!(target: "worker::network", ?err, "error processing request batches stream");
