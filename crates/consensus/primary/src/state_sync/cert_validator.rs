@@ -88,25 +88,6 @@ where
         certificate: &mut Certificate,
         external: bool,
     ) -> CertManagerResult<()> {
-        // validate certificate standalone and forward to CertificateManager
-        // - try_accept_certificate
-        // - accept_own_certificate
-        //
-        // synchronizer::process_certificate_internal
-        // - check node storage for certificate already exists
-        //      - make this a separate method so vote can call it too
-        //          - synchronizer::get_unknown_parent_digests
-        //      - return missing
-        // + ignore pending state -> let next step do this
-        // - sanitize certificate
-        // - ignore sync batches request (L1140) - duplicate from PrimaryNetwork
-        //      - confirm this is duplicate and remove from PrimaryNetwork handler
-        //      - NOTE: this is never subscribed????
-        // - sync ancestors if too new? Or let pending do this?
-        //      - confirm certificate fetcher command is redundant here
-        // - forward to certificate manager to check for pending
-        //      - return/await oneshot reply
-
         // see if certificate already processed
         let digest = certificate.digest();
         if self.config.node_storage().contains(&digest)? {
