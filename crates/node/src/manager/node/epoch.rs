@@ -1175,6 +1175,7 @@ where
             consensus_config.clone(),
             *worker_id,
             validator,
+            self.consensus_chain.clone(),
         )
         .spawn(&epoch_task_spawner);
 

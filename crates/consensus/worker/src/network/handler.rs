@@ -10,7 +10,7 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{GossipMessage, Stream};
 use tn_network_types::{WorkerOthersBatchMessage, WorkerToPrimaryClient};
-use tn_storage::tables::NodeBatchesCache;
+use tn_storage::{consensus::ConsensusChain, tables::NodeBatchesCache};
 use tn_types::{
     ensure, now, try_decode, BatchValidation, BlsPublicKey, Database, SealedBatch, WorkerId, B256,
 };
@@ -152,6 +152,7 @@ where
         pending_request: Option<PendingBatchStream>,
         mut stream: Stream,
         request_digest: B256,
+        consensus_chain: &ConsensusChain,
     ) -> WorkerNetworkResult<()> {
         // `None` indicates unexpected request
         let Some(request) = pending_request else {
@@ -182,6 +183,7 @@ where
             stream_codec::send_batches_over_stream(
                 &mut stream,
                 store,
+                consensus_chain,
                 &request.batch_digests,
                 request.epoch,
             ),
@@ -239,7 +241,15 @@ where
         stream: Stream,
         pending_request: Option<PendingBatchStream>,
         request_digest: B256,
+        consensus_chain: &ConsensusChain,
     ) -> WorkerNetworkResult<()> {
-        self.process_request_batches_stream(peer, pending_request, stream, request_digest).await
+        self.process_request_batches_stream(
+            peer,
+            pending_request,
+            stream,
+            request_digest,
+            consensus_chain,
+        )
+        .await
     }
 }
