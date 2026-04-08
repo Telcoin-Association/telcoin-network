@@ -63,7 +63,7 @@ async fn test_multiple_exexs_receive_notifications() -> Result<()> {
     // Launch ExEx manager
     let node_head = BlockNumHash::new(0, BlockHash::default());
     let (exex_manager, exex_handle) =
-        launcher.launch(node_head, provider, task_manager.get_spawner()).await?;
+        launcher.launch(node_head, tn_config::Config::default_for_test(), provider, task_manager.get_spawner(), None, None).await?;
 
     tokio::spawn(async move {
         exex_manager.await;
@@ -149,7 +149,7 @@ async fn test_backpressure_handling() -> Result<()> {
 
     let node_head = BlockNumHash::new(0, BlockHash::default());
     let (exex_manager, exex_handle) =
-        launcher.launch(node_head, provider, task_manager.get_spawner()).await?;
+        launcher.launch(node_head, tn_config::Config::default_for_test(), provider, task_manager.get_spawner(), None, None).await?;
 
     tokio::spawn(async move {
         exex_manager.await;
@@ -224,7 +224,7 @@ async fn test_notification_processing() -> Result<()> {
 
     let node_head = BlockNumHash::new(0, BlockHash::default());
     let (exex_manager, exex_handle) =
-        launcher.launch(node_head, provider, task_manager.get_spawner()).await?;
+        launcher.launch(node_head, tn_config::Config::default_for_test(), provider, task_manager.get_spawner(), None, None).await?;
 
     tokio::spawn(async move {
         exex_manager.await;
@@ -291,7 +291,7 @@ async fn test_notification_ordering() -> Result<()> {
 
     let node_head = BlockNumHash::new(0, BlockHash::default());
     let (exex_manager, exex_handle) =
-        launcher.launch(node_head, provider, task_manager.get_spawner()).await?;
+        launcher.launch(node_head, tn_config::Config::default_for_test(), provider, task_manager.get_spawner(), None, None).await?;
 
     tokio::spawn(async move {
         exex_manager.await;

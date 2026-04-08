@@ -13,9 +13,9 @@ use std::{
     },
     task::{Context, Poll},
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::PollSender;
-use tn_types::BlockNumHash;
+use tn_types::{BlockNumHash, Certificate, CommittedSubDag};
 
 /// The lowest finished height among all ExEx tasks.
 ///
@@ -141,6 +141,13 @@ pub struct TnExExManager {
 
     /// Monotonically increasing notification ID.
     next_notification_id: usize,
+
+    /// Optional broadcast receiver for ExEx certificate notifications from consensus.
+    /// `None` when no ConsensusBus is connected (e.g., in tests or when no ExExes installed).
+    exex_certificates_rx: Option<broadcast::Receiver<Arc<Certificate>>>,
+
+    /// Optional broadcast receiver for ExEx committed sub-DAG notifications from consensus.
+    exex_committed_sub_dags_rx: Option<broadcast::Receiver<Arc<CommittedSubDag>>>,
 }
 
 impl TnExExManager {
@@ -150,6 +157,8 @@ impl TnExExManager {
     ///
     /// * `handles` - Vec of ExEx handles to manage
     /// * `max_capacity` - Maximum buffer size before backpressure (default: 64)
+    /// * `exex_certificates_rx` - Optional broadcast receiver for certificate notifications
+    /// * `exex_committed_sub_dags_rx` - Optional broadcast receiver for committed sub-DAG notifications
     ///
     /// # Returns
     ///
@@ -157,6 +166,8 @@ impl TnExExManager {
     pub fn new(
         handles: Vec<TnExExHandle>,
         max_capacity: Option<usize>,
+        exex_certificates_rx: Option<broadcast::Receiver<Arc<Certificate>>>,
+        exex_committed_sub_dags_rx: Option<broadcast::Receiver<Arc<CommittedSubDag>>>,
     ) -> (Self, TnExExManagerHandle) {
         let (handle_tx, handle_rx) = mpsc::unbounded_channel();
         let max_capacity = max_capacity.unwrap_or(64);
@@ -178,6 +189,8 @@ impl TnExExManager {
             is_ready: is_ready_tx,
             finished_height: finished_height_tx,
             next_notification_id: 0,
+            exex_certificates_rx,
+            exex_committed_sub_dags_rx,
         };
 
         let handle = TnExExManagerHandle {
@@ -254,6 +267,67 @@ impl TnExExManager {
         // Signal readiness
         let is_ready = remaining > 0;
         let _ = self.is_ready.send(is_ready);
+    }
+
+    /// Receives consensus-layer notifications from ConsensusBus broadcast channels.
+    ///
+    /// Polls the optional certificate and committed sub-DAG broadcast receivers,
+    /// wraps received data in `TnExExNotification` variants, and pushes to the buffer.
+    /// Handles `Lagged` errors by logging a warning (indicates ExEx is too slow to keep up).
+    fn receive_consensus_notifications(&mut self) {
+        // Drain certificate notifications
+        if let Some(rx) = &mut self.exex_certificates_rx {
+            loop {
+                if self.buffer.len() >= self.max_capacity {
+                    break;
+                }
+                match rx.try_recv() {
+                    Ok(certificate) => {
+                        let id = self.next_notification_id;
+                        self.next_notification_id += 1;
+                        self.buffer.push_back((
+                            id,
+                            TnExExNotification::CertificateCreated { certificate },
+                        ));
+                    }
+                    Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                        tracing::warn!(
+                            lagged = n,
+                            "ExEx manager lagged behind on certificate notifications"
+                        );
+                    }
+                    Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Drain committed sub-DAG notifications
+        if let Some(rx) = &mut self.exex_committed_sub_dags_rx {
+            loop {
+                if self.buffer.len() >= self.max_capacity {
+                    break;
+                }
+                match rx.try_recv() {
+                    Ok(sub_dag) => {
+                        let id = self.next_notification_id;
+                        self.next_notification_id += 1;
+                        self.buffer
+                            .push_back((id, TnExExNotification::ConsensusCommitted { sub_dag }));
+                    }
+                    Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                        tracing::warn!(
+                            lagged = n,
+                            "ExEx manager lagged behind on committed sub-DAG notifications"
+                        );
+                    }
+                    Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     /// Sends buffered notifications to ExExes that are ready.
@@ -353,7 +427,10 @@ impl Future for TnExExManager {
         // 2. Receive new notifications from engine
         this.receive_new_notifications(cx);
 
-        // 3. Send buffered notifications to ExExes
+        // 3. Receive consensus-layer notifications from ConsensusBus
+        this.receive_consensus_notifications();
+
+        // 4. Send buffered notifications to ExExes
         this.send_notifications_to_exexes(cx);
 
         // Manager runs indefinitely
@@ -537,7 +614,7 @@ mod tests {
         let (handle1, _event_tx1, _notif_rx1) = TnExExHandle::new("exex1".to_string(), node_head);
         let (handle2, _event_tx2, _notif_rx2) = TnExExHandle::new("exex2".to_string(), node_head);
 
-        let (_manager, mgr_handle) = TnExExManager::new(vec![handle1, handle2], Some(10));
+        let (_manager, mgr_handle) = TnExExManager::new(vec![handle1, handle2], Some(10), None, None);
 
         assert!(mgr_handle.has_exexs());
         assert!(mgr_handle.has_capacity());
@@ -548,7 +625,7 @@ mod tests {
         let node_head = BlockNumHash::new(0, Default::default());
         let (handle, _event_tx, mut notif_rx) = TnExExHandle::new("test_exex".to_string(), node_head);
 
-        let (manager, mgr_handle) = TnExExManager::new(vec![handle], Some(10));
+        let (manager, mgr_handle) = TnExExManager::new(vec![handle], Some(10), None, None);
 
         // Pin the manager for polling
         let mut manager = Box::pin(manager);
@@ -577,5 +654,113 @@ mod tests {
         let received = tokio::time::timeout(Duration::from_secs(1), notif_rx.recv()).await;
         assert!(received.is_ok());
         assert!(received.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_manager_receives_certificate_broadcast() {
+        let node_head = BlockNumHash::new(0, Default::default());
+        let (handle, _event_tx, mut notif_rx) =
+            TnExExHandle::new("cert_exex".to_string(), node_head);
+
+        // Create a broadcast channel for certificates
+        let (cert_tx, cert_rx) = broadcast::channel::<Arc<Certificate>>(16);
+
+        let (manager, _mgr_handle) =
+            TnExExManager::new(vec![handle], Some(10), Some(cert_rx), None);
+
+        let mut manager = Box::pin(manager);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                std::future::poll_fn(|cx| {
+                    let _ = Pin::new(&mut manager).poll(cx);
+                    Poll::Ready(())
+                })
+                .await;
+            }
+        });
+
+        // Send a certificate through the broadcast channel
+        let cert = Arc::new(Certificate::default());
+        cert_tx.send(cert.clone()).unwrap();
+
+        // ExEx should receive the certificate as a notification
+        let received = tokio::time::timeout(Duration::from_secs(2), notif_rx.recv()).await;
+        assert!(received.is_ok(), "Should receive notification");
+        let notification = received.unwrap().unwrap();
+        assert!(
+            notification.certificate().is_some(),
+            "Should be a CertificateCreated notification"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_manager_receives_committed_sub_dag_broadcast() {
+        let node_head = BlockNumHash::new(0, Default::default());
+        let (handle, _event_tx, mut notif_rx) =
+            TnExExHandle::new("dag_exex".to_string(), node_head);
+
+        // Create a broadcast channel for committed sub-DAGs
+        let (dag_tx, dag_rx) = broadcast::channel::<Arc<CommittedSubDag>>(16);
+
+        let (manager, _mgr_handle) =
+            TnExExManager::new(vec![handle], Some(10), None, Some(dag_rx));
+
+        let mut manager = Box::pin(manager);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                std::future::poll_fn(|cx| {
+                    let _ = Pin::new(&mut manager).poll(cx);
+                    Poll::Ready(())
+                })
+                .await;
+            }
+        });
+
+        // Send a committed sub-DAG through the broadcast channel
+        let sub_dag = Arc::new(CommittedSubDag::default());
+        dag_tx.send(sub_dag.clone()).unwrap();
+
+        // ExEx should receive the sub-DAG as a notification
+        let received = tokio::time::timeout(Duration::from_secs(2), notif_rx.recv()).await;
+        assert!(received.is_ok(), "Should receive notification");
+        let notification = received.unwrap().unwrap();
+        assert!(
+            notification.committed_sub_dag().is_some(),
+            "Should be a ConsensusCommitted notification"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_manager_no_consensus_receivers() {
+        // When no consensus receivers are provided, manager should still work for chain notifications
+        let node_head = BlockNumHash::new(0, Default::default());
+        let (handle, _event_tx, mut notif_rx) =
+            TnExExHandle::new("chain_only".to_string(), node_head);
+
+        let (manager, mgr_handle) = TnExExManager::new(vec![handle], Some(10), None, None);
+
+        let mut manager = Box::pin(manager);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                std::future::poll_fn(|cx| {
+                    let _ = Pin::new(&mut manager).poll(cx);
+                    Poll::Ready(())
+                })
+                .await;
+            }
+        });
+
+        // Send a chain notification
+        mgr_handle.send(TnExExNotification::ChainCommitted {
+            new: Arc::new(reth_provider::Chain::default()),
+        });
+
+        let received = tokio::time::timeout(Duration::from_secs(1), notif_rx.recv()).await;
+        assert!(received.is_ok());
+        let notification = received.unwrap().unwrap();
+        assert!(notification.committed_chain().is_some());
     }
 }

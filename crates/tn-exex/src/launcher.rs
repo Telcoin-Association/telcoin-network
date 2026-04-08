@@ -3,8 +3,9 @@
 
 use crate::{TnExExContext, TnExExHandle, TnExExManager, TnExExManagerHandle};
 use eyre::Result;
-use std::{future::Future, pin::Pin};
-use tn_types::{BlockNumHash, TaskSpawner};
+use std::{future::Future, pin::Pin, sync::Arc};
+use tokio::sync::broadcast;
+use tn_types::{BlockNumHash, Certificate, CommittedSubDag, TaskSpawner};
 
 /// Type alias for an ExEx installation function.
 ///
@@ -132,8 +133,11 @@ where
     /// # Arguments
     ///
     /// * `node_head` - Current chain head (ExExes start from here)
+    /// * `config` - Node configuration to provide to each ExEx
     /// * `provider` - Blockchain provider for state access
     /// * `task_spawner` - Task spawner for launching ExEx tasks
+    /// * `exex_certificates_rx` - Optional broadcast receiver for certificate notifications from ConsensusBus
+    /// * `exex_committed_sub_dags_rx` - Optional broadcast receiver for committed sub-DAG notifications from ConsensusBus
     ///
     /// # Returns
     ///
@@ -147,13 +151,16 @@ where
     pub async fn launch(
         mut self,
         node_head: BlockNumHash,
+        config: tn_config::Config,
         provider: Provider,
         task_spawner: TaskSpawner,
+        exex_certificates_rx: Option<broadcast::Receiver<Arc<Certificate>>>,
+        exex_committed_sub_dags_rx: Option<broadcast::Receiver<Arc<CommittedSubDag>>>,
     ) -> Result<(TnExExManager, TnExExManagerHandle)> {
         if self.exexs.is_empty() {
             tracing::info!("No ExExes registered, using empty handle");
             return Ok((
-                TnExExManager::new(vec![], None).0,
+                TnExExManager::new(vec![], None, None, None).0,
                 TnExExManagerHandle::empty(),
             ));
         }
@@ -171,7 +178,7 @@ where
             // Create context for this ExEx
             let context = TnExExContext {
                 head: node_head,
-                config: tn_config::Config::default_for_test(), // TODO: Pass actual config in Phase 6
+                config: config.clone(),
                 events: event_tx,
                 notifications: notification_rx,
                 provider: provider.clone(),
@@ -196,8 +203,9 @@ where
             handles.push(handle);
         }
 
-        // Create the manager with all handles
-        let (manager, manager_handle) = TnExExManager::new(handles, None);
+        // Create the manager with all handles and optional consensus receivers
+        let (manager, manager_handle) =
+            TnExExManager::new(handles, None, exex_certificates_rx, exex_committed_sub_dags_rx);
 
         tracing::info!(
             num_exexs = manager_handle.has_exexs() as usize,
@@ -257,7 +265,7 @@ mod tests {
         let node_head = BlockNumHash::new(0, Default::default());
 
         let (_manager, handle) = launcher
-            .launch(node_head, (), task_manager.get_spawner())
+            .launch(node_head, tn_config::Config::default_for_test(), (), task_manager.get_spawner(), None, None)
             .await
             .unwrap();
 
@@ -288,7 +296,7 @@ mod tests {
         let node_head = BlockNumHash::new(0, Default::default());
 
         let (manager, handle) = launcher
-            .launch(node_head, (), task_manager.get_spawner())
+            .launch(node_head, tn_config::Config::default_for_test(), (), task_manager.get_spawner(), None, None)
             .await
             .unwrap();
 
@@ -362,11 +370,9 @@ mod tests {
         let node_head = BlockNumHash::new(0, Default::default());
 
         let (manager, handle) = launcher
-            .launch(node_head, (), task_manager.get_spawner())
+            .launch(node_head, tn_config::Config::default_for_test(), (), task_manager.get_spawner(), None, None)
             .await
             .unwrap();
-
-        // Spawn manager
         let mut manager = Box::pin(manager);
         tokio::spawn(async move {
             loop {

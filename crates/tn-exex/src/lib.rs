@@ -2,7 +2,7 @@
 //! # Telcoin Network Execution Extensions (TN ExEx)
 //!
 //! A simplified execution extension system for Telcoin Network that feeds real-time chain state
-//! transitions to extension tasks on observer and validator nodes.
+//! transitions and consensus events to extension tasks on observer and validator nodes.
 //!
 //! Unlike traditional blockchain indexers that require re-processing historical data, TN ExEx
 //! enables dapp developers to consume every executed block directly as it's committed.
@@ -12,6 +12,23 @@
 //! - **No Write-Ahead Log (WAL)**: Bullshark consensus provides finality, eliminating reorgs
 //! - **No Reorg Notifications**: Only `ChainCommitted` events are needed
 //! - **Simplified Manager**: No pipeline vs blockchain-tree distinction
+//!
+//! ## Notification Types
+//!
+//! TN ExEx provides three notification types covering the full block lifecycle:
+//!
+//! 1. **[`TnExExNotification::CertificateCreated`]** — A certificate was created (own) or
+//!    received (peer). Fires during the consensus layer's certificate exchange.
+//! 2. **[`TnExExNotification::ConsensusCommitted`]** — A committed sub-DAG was produced by
+//!    Bullshark consensus. Contains the ordered set of certificates for execution.
+//! 3. **[`TnExExNotification::ChainCommitted`]** — A new chain segment was executed and
+//!    committed. Contains blocks, receipts, and state changes.
+//!
+//! ## Historical Replay
+//!
+//! [`ReplayStream`] allows ExEx tasks to replay historical blocks from the database before
+//! switching to live notifications. This is useful for backfilling indexes or catching up
+//! after downtime.
 //!
 //! ## Observer Nodes - Primary Use Case
 //!
@@ -46,21 +63,21 @@
 //! ## Architecture
 //!
 //! ```text
-//! ┌─────────────────┐
-//! │ ExecutorEngine  │
-//! └────────┬────────┘
-//!          │ CanonStateNotification
-//!          ▼
-//! ┌─────────────────┐
-//! │  TnExExManager  │ ◄──── Backpressure signals
-//! └────────┬────────┘
-//!          │ TnExExNotification
-//!          ▼
-//! ┌─────────────────┐
-//! │   ExEx Tasks    │ ──┐
-//! │  (indexers,     │   │ TnExExEvent
-//! │   bridges, etc) │ ◄─┘
-//! └─────────────────┘
+//! ┌─────────────────┐     ┌─────────────────┐
+//! │ ExecutorEngine  │     │  ConsensusBus    │
+//! └────────┬────────┘     └────────┬────────┘
+//!          │ CanonStateNotification│ broadcast channels
+//!          ▼                       ▼
+//!        ┌───────────────────────────┐
+//!        │      TnExExManager        │ ◄──── Backpressure signals
+//!        └─────────────┬─────────────┘
+//!                      │ TnExExNotification
+//!                      ▼
+//!              ┌─────────────────┐
+//!              │   ExEx Tasks    │ ──┐
+//!              │  (indexers,     │   │ TnExExEvent
+//!              │   bridges, etc) │ ◄─┘
+//!              └─────────────────┘
 //! ```
 
 #![warn(missing_docs, unreachable_pub)]
@@ -75,9 +92,11 @@ mod event;
 mod launcher;
 mod manager;
 mod notification;
+mod replay;
 
 pub use context::TnExExContext;
 pub use event::TnExExEvent;
 pub use launcher::{TnExExInstallFn, TnExExLauncher};
 pub use manager::{TnExExHandle, TnExExManager, TnExExManagerHandle};
 pub use notification::TnExExNotification;
+pub use replay::ReplayStream;

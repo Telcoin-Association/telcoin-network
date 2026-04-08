@@ -418,9 +418,16 @@ impl<DB: Database> Consensus<DB> {
                 // condition and Byzantine leaders).
                 self.consensus_bus
                     .sequence()
-                    .send(committed_sub_dag)
+                    .send(Arc::clone(&committed_sub_dag))
                     .await
                     .map_err(|_| ConsensusError::ShuttingDown)?;
+
+                // Notify ExEx consumers about the committed sub-DAG
+                let _ = self
+                    .consensus_bus
+                    .app()
+                    .exex_committed_sub_dags()
+                    .send(committed_sub_dag);
             }
 
             if !committed_certificates.is_empty() {
