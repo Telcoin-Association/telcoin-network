@@ -66,6 +66,10 @@
 #![warn(missing_docs, unreachable_pub)]
 #![deny(unused_must_use, rust_2018_idioms)]
 
+// Suppress warnings for dev-dependencies only used in integration tests
+#[cfg(test)]
+use {tempfile as _, tn_test_utils as _};
+
 mod context;
 mod event;
 mod launcher;
