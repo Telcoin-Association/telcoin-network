@@ -263,8 +263,25 @@ where
         // Create blockchain provider for ExEx context
         let blockchain_provider = reth_env.blockchain_provider();
         
+        // Subscribe to ConsensusBus ExEx channels if ExExes are installed
+        let (exex_certs_rx, exex_sub_dags_rx) = if !launcher.is_empty() {
+            (
+                Some(self.consensus_bus.subscribe_exex_certificates()),
+                Some(self.consensus_bus.subscribe_exex_committed_sub_dags()),
+            )
+        } else {
+            (None, None)
+        };
+
         let (exex_manager, exex_handle) = launcher
-            .launch(node_head, blockchain_provider, node_task_spawner.clone())
+            .launch(
+                node_head,
+                self.builder.tn_config.clone(),
+                blockchain_provider,
+                node_task_spawner.clone(),
+                exex_certs_rx,
+                exex_sub_dags_rx,
+            )
             .await
             .map_err(|e| eyre!("Failed to launch ExEx manager: {}", e))?;
         

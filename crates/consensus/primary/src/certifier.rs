@@ -4,7 +4,7 @@ use crate::{
     aggregators::VotesAggregator,
     network::{PrimaryNetworkHandle, RequestVoteResult},
     state_sync::StateSynchronizer,
-    ConsensusBus,
+    ConsensusBus, ConsensusBusApp,
 };
 use std::time::Duration;
 use tn_config::{ConsensusConfig, KeyConfig};
@@ -16,6 +16,7 @@ use tn_types::{
     AuthorityIdentifier, BlsPublicKey, Certificate, CertificateDigest, Committee, Database, Header,
     Noticer, Notifier, TaskManager, TaskResult, TaskSpawner, TnReceiver, Vote,
 };
+use std::sync::Arc;
 use tracing::{debug, enabled, error, info, instrument};
 
 #[cfg(test)]
@@ -47,6 +48,8 @@ pub(crate) struct Certifier<DB> {
     task_spawner: TaskSpawner,
     /// Notifier to cancel pending proposals and vote requests if new header is received.
     new_proposal: Notifier,
+    /// App-lifetime consensus bus for ExEx notifications.
+    consensus_bus_app: ConsensusBusApp,
 }
 
 impl<DB: Database> Certifier<DB> {
@@ -100,6 +103,7 @@ impl<DB: Database> Certifier<DB> {
                 network: primary_network,
                 task_spawner,
                 new_proposal: Notifier::new(),
+                consensus_bus_app: consensus_bus.app().clone(),
             }
             .run(rx_headers)
             .await;
@@ -408,6 +412,9 @@ impl<DB: Database> Certifier<DB> {
                             error!(target: "primary::certifier", "error accepting own certificate: {e}");
                             return Err(e.into());
                         }
+
+                        // Notify ExEx consumers about the new own certificate
+                        let _ = self.consensus_bus_app.exex_certificates().send(Arc::new(certificate.clone()));
 
                         // try to publish the certificate on gossip network
                         if let Err(e) = self.network.publish_certificate(certificate).await {
