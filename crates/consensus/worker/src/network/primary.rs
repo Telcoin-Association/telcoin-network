@@ -58,6 +58,14 @@ impl<DB: Database> PrimaryToWorkerClient for PrimaryReceiverHandler<DB> {
         let sealed_batches_from_response: Vec<SealedBatch> =
             response.into_iter().map(|(digest, batch)| batch.seal(digest)).collect();
 
+        // open db write tx
+        let mut tx = self.store.write_txn().map_err(|e| {
+            WorkerNetworkError::Internal(format!(
+                "failed to create batch transaction to commit: {e:?}"
+            ))
+        })?;
+
+        // loop through responses
         for sealed_batch in sealed_batches_from_response.into_iter() {
             if !message.is_certified {
                 // This batch is not part of a certificate, so we need to validate it.
@@ -70,18 +78,12 @@ impl<DB: Database> PrimaryToWorkerClient for PrimaryReceiverHandler<DB> {
             if missing.remove(&digest) {
                 // Set received_at timestamp for remote batch.
                 batch.set_received_at(now());
-                let mut tx = self.store.write_txn().map_err(|e| {
-                    WorkerNetworkError::Internal(format!(
-                        "failed to create batch transaction to commit: {e:?}"
-                    ))
-                })?;
+
+                // insert batch
                 tx.insert::<NodeBatchesCache>(&digest, &batch).map_err(|e| {
                     WorkerNetworkError::Internal(format!(
                         "failed to batch transaction to commit: {e:?}"
                     ))
-                })?;
-                tx.commit().map_err(|e| {
-                    WorkerNetworkError::Internal(format!("failed to commit batch: {e:?}"))
                 })?;
             } else {
                 return Err(eyre::eyre!(format!(
@@ -90,9 +92,14 @@ impl<DB: Database> PrimaryToWorkerClient for PrimaryReceiverHandler<DB> {
             }
         }
 
+        // commit all batch db writes
+        tx.commit()
+            .map_err(|e| WorkerNetworkError::Internal(format!("failed to commit batch: {e:?}")))?;
+
         if missing.is_empty() {
             return Ok(());
         }
+
         Err(eyre::eyre!("failed to synchronize batches!".to_string()))
     }
 
