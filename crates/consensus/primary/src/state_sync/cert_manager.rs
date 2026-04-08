@@ -204,9 +204,12 @@ where
                 .map_err(|_| CertManagerError::FatalAppendParent)?;
 
             // send to consensus for processing into the DAG
-            self.consensus_bus.new_certificates().send(cert).await.inspect_err(|e| {
+            self.consensus_bus.new_certificates().send(cert.clone()).await.inspect_err(|e| {
                 error!(target: "primary::cert_manager", ?e, "failed to forward accepted certificate to consensus");
             }).map_err(|_| CertManagerError::FatalForwardAcceptedCertificate)?;
+
+            // Notify ExEx consumers about the verified peer certificate
+            let _ = self.consensus_bus.app().exex_certificates().send(Arc::new(cert));
         }
 
         Ok(())
