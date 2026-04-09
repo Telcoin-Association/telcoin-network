@@ -15,7 +15,6 @@ use tn_network_libp2p::{
 use tn_types::{
     encode, max_batch_size, Batch, BlockHash, BlsPublicKey, Epoch, SealedBatch, TaskSpawner, B256,
 };
-use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
 use crate::{
@@ -75,7 +74,7 @@ impl WorkerNetworkHandle {
     }
 
     /// Report a new batch to a peer.
-    async fn report_batch(
+    pub(crate) async fn report_batch(
         &self,
         peer_bls: BlsPublicKey,
         sealed_batch: SealedBatch,
@@ -93,34 +92,6 @@ impl WorkerNetworkHandle {
             )),
             WorkerResponse::Error(WorkerRPCError(s)) => Err(NetworkError::RPCError(s)),
         }
-    }
-
-    /// Report a new batch to peers.
-    ///
-    /// QuorumWaiter uses this to reach quorum for new batches.
-    pub(crate) fn report_batch_to_peers(
-        &self,
-        peers: &[BlsPublicKey],
-        sealed_batch: SealedBatch,
-    ) -> Vec<oneshot::Receiver<NetworkResult<()>>> {
-        let mut result = vec![];
-        // loop through committee peers
-        for peer in peers {
-            let handle = self.clone();
-            let batch = sealed_batch.clone();
-            let task_name = format!("ReportBatchToPeer-{peer}");
-            let (tx, rx) = oneshot::channel();
-            let peer = *peer;
-            self.task_spawner.spawn_task(task_name, async move {
-                let res = handle.report_batch(peer, batch).await;
-                // ignore error bc quorum waiter will move on once quorum is reached
-                let _ = tx.send(res);
-            });
-
-            result.push(rx);
-        }
-
-        result
     }
 
     /// Request a group of batches by hashes using stream-based transfer.
