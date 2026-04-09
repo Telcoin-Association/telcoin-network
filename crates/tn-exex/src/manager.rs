@@ -297,6 +297,7 @@ impl TnExExManager {
                         ));
                     }
                     Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                        metrics::counter!("tn_exex_consensus_notifications_lagged_total", "kind" => "certificate").increment(n);
                         tracing::warn!(
                             lagged = n,
                             "ExEx manager lagged behind on certificate notifications"
@@ -323,6 +324,7 @@ impl TnExExManager {
                             .push_back((id, TnExExNotification::ConsensusCommitted { sub_dag }));
                     }
                     Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                        metrics::counter!("tn_exex_consensus_notifications_lagged_total", "kind" => "committed_sub_dag").increment(n);
                         tracing::warn!(
                             lagged = n,
                             "ExEx manager lagged behind on committed sub-DAG notifications"
