@@ -1,0 +1,52 @@
+flowchart TD
+    %% ─── User / RPC ─────────────────────────────
+    subgraph UserRPC["User / RPC"]
+        Wallet([User Wallet])
+        RPC["eth_sendRawTransaction"]
+    end
+
+    %% ─── Worker A (Our Validator) ────────────────
+    subgraph WorkerA["Worker A (Our Validator)"]
+        TxPool[("Transaction Pool\n(pending sub-pool)")]
+        BB["BatchBuilder\npolls best_transactions()"]
+        Sealed["SealedBatch created"]
+        QW["QuorumWaiter\nbroadcasts to peers"]
+        Collect["Collect acks\n(need 2f+1 stake)"]
+        Quorum{Quorum\nReached?}
+        Store["Store batch locally"]
+        Gossip["Gossip digest\nto peer primaries"]
+    end
+
+    %% ─── Worker B (Peer Validator) ───────────────
+    subgraph WorkerB["Worker B (Peer Validator)"]
+        Receive["Receive ReportBatch"]
+        Validate["Validate batch"]
+        PeerStore["Store batch"]
+        Ack["Send ack"]
+    end
+
+    %% ─── Primary ─────────────────────────────────
+    subgraph PrimaryNode["Primary"]
+        Report["report_own_batch\n(WorkerOwnBatchMessage)"]
+    end
+
+    %% ─── Flow ────────────────────────────────────
+    Wallet --> RPC
+    RPC --> TxPool
+    TxPool --> BB
+    BB --> Sealed
+    Sealed --> QW
+
+    QW -->|"ReportBatch(SealedBatch)"| Receive
+    Receive --> Validate
+    Validate --> PeerStore
+    PeerStore --> Ack
+    Ack -->|"Ack (stake weight)"| Collect
+
+    Collect --> Quorum
+
+    Quorum -->|Yes| Store
+    Store --> Gossip
+    Gossip -->|"WorkerOwnBatchMessage\n(worker_id, digest)"| Report
+
+    Quorum -->|No| TxPool
