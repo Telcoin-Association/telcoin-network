@@ -142,7 +142,7 @@ fn start_validator_nodes(
             .arg("--ws")
             .arg("--ws.port")
             .arg(ws_port.to_string())
-            .arg("--ipc-path")
+            .arg("--ipcpath")
             .arg(ipc_path.to_string_lossy().as_ref());
 
         e2e_tests::setup_log_dir(&mut command, name, test_name, run);
