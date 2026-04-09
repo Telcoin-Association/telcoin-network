@@ -1,0 +1,114 @@
+sequenceDiagram
+    autonumber
+
+    actor User
+    participant RPC as RPC<br/>(JSON-RPC / Reth)
+    participant TxPool as TxPool<br/>(Mempool)
+    participant BB as BatchBuilder
+    participant W0 as Worker 0
+    participant W1 as Worker 1
+    participant PW as Peer Workers<br/>(2f+1 committee)
+    participant Primary as Primary<br/>(Proposer + Certifier)
+    participant PP as Peer Primaries<br/>(2f+1 committee)
+    participant Sub as Subscriber
+    participant EVM as ExecutorEngine<br/>(EVM)
+
+    %% ───────────────────────────────────────────
+    %% Section 1 — Transaction Ingestion
+    %% ───────────────────────────────────────────
+    rect rgb(66, 133, 244, 0.15)
+        Note over User,W0: Transaction Ingestion
+        User->>RPC: eth_sendRawTransaction(signed tx)
+        RPC->>TxPool: validate & insert PooledTransaction
+        TxPool-->>BB: pending tx available
+        Note over BB: Timer fires or state update<br/>triggers build_batch()
+        BB->>BB: select best txs from pending pool
+        BB->>W0: SealedBatch { batch, digest }<br/>via ack_channel
+    end
+
+    %% ───────────────────────────────────────────
+    %% Section 2 — Worker Batch Quorum
+    %% ───────────────────────────────────────────
+    rect rgb(52, 168, 83, 0.15)
+        Note over W0,PW: Worker Batch Quorum (2f+1 acks)
+
+        Note over W0: Worker 0 broadcasts batch
+        par Worker 0 quorum
+            W0->>PW: WorkerRequest::ReportBatch { sealed_batch }
+            PW-->>W0: WorkerResponse::ReportBatch (ack)
+            Note over W0: accumulate voting power<br/>until weight >= quorum_threshold
+        end
+
+        W0->>Primary: OurDigestMessage { digest, worker_id: 0 }
+
+        Note over W1: Worker 1 independently builds batch
+        par Worker 1 quorum
+            W1->>PW: WorkerRequest::ReportBatch { sealed_batch }
+            PW-->>W1: WorkerResponse::ReportBatch (ack)
+            Note over W1: accumulate voting power<br/>until weight >= quorum_threshold
+        end
+
+        W1->>Primary: OurDigestMessage { digest, worker_id: 1 }
+    end
+
+    %% ───────────────────────────────────────────
+    %% Section 3 — Header & Voting
+    %% ───────────────────────────────────────────
+    rect rgb(251, 188, 4, 0.15)
+        Note over Primary,PP: Header & Voting (Certificate Formation)
+
+        Note over Primary: Proposer aggregates digests<br/>from Worker 0 + Worker 1
+        Primary->>Primary: propose_header()<br/>Header { round, epoch, payload: Map<BatchDigest, WorkerId>, parents }
+
+        Primary->>PP: PrimaryRequest::Vote { header, parent_certs }
+        PP-->>Primary: PrimaryResponse::Vote { signature over header_digest }
+
+        Note over Primary: Certifier accumulates votes<br/>weight >= 2f+1 quorum_threshold
+        Primary->>Primary: Certificate::new()<br/>{ header, aggregated_bls_sig, signed_authorities }
+
+        Primary->>PP: PrimaryGossip::Certificate(cert)<br/>(libp2p gossip)
+        PP->>Primary: PrimaryGossip::Certificate(peer_cert)
+    end
+
+    %% ───────────────────────────────────────────
+    %% Section 4 — DAG Consensus (Bullshark)
+    %% ───────────────────────────────────────────
+    rect rgb(156, 39, 176, 0.15)
+        Note over Primary,PP: DAG Consensus (Bullshark)
+
+        Note over Primary: Insert certificates into DAG<br/>CertificatesAggregator tracks per-round weight
+        Primary->>Primary: DAG.insert(cert) for each round
+
+        Note over Primary: Leader election at even rounds
+        Primary->>Primary: Bullshark::process_certificates()<br/>check if leader has 2f+1 support in next round
+
+        Note over Primary: Leader committed!
+        Primary->>Primary: walk_ancestors() -> CommittedSubDag<br/>{ leader, certificates, reputation_scores }
+
+        Primary->>Sub: CommittedSubDag via consensus_bus
+    end
+
+    %% ───────────────────────────────────────────
+    %% Section 5 — Execution
+    %% ───────────────────────────────────────────
+    rect rgb(234, 67, 53, 0.15)
+        Note over Sub,EVM: Execution
+
+        Sub->>W0: WorkerRequest::RequestBatchesStream { digests }
+        W0-->>Sub: Batch data (streamed)
+        Sub->>W1: WorkerRequest::RequestBatchesStream { digests }
+        W1-->>Sub: Batch data (streamed)
+
+        Sub->>Sub: build ConsensusOutput<br/>{ sub_dag, batches: Vec<CertifiedBatch> }
+
+        Sub->>EVM: ConsensusOutput via consensus_bus
+
+        loop For each CertifiedBatch
+            EVM->>EVM: TNPayload.execute()<br/>EVM execution via Reth
+            Note over EVM: ExecutedBlock { header, body, receipts }
+        end
+
+        EVM->>EVM: extend canonical_in_memory_state
+        EVM-->>Primary: EngineUpdate { round, block_num_hash, sealed_header }
+        EVM-->>TxPool: CanonStateNotification<br/>(update pending pool)
+    end
