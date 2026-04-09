@@ -25,25 +25,12 @@ pub const WORKER_NETWORK_SEED_FILE: &str = "worker.seed";
 pub struct ExExConfig {
     /// Unique identifier for this ExEx.
     pub id: String,
-    
-    /// Whether this ExEx is enabled.
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
-}
-
-fn default_enabled() -> bool {
-    true
 }
 
 impl ExExConfig {
     /// Create a new ExEx configuration.
     pub fn new(id: impl Into<String>) -> Self {
-        Self { id: id.into(), enabled: true }
-    }
-    
-    /// Create a new disabled ExEx configuration.
-    pub fn new_disabled(id: impl Into<String>) -> Self {
-        Self { id: id.into(), enabled: false }
+        Self { id: id.into() }
     }
 }
 
