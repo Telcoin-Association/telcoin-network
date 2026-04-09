@@ -242,19 +242,17 @@ where
         // Use provided launcher or create empty one
         let launcher = exex_launcher.unwrap_or_else(tn_exex::TnExExLauncher::new);
         
-        // If there are ExExs configured, log how many are installed vs enabled
+        // If there are ExExs configured, log how many are installed
         let installed_count = launcher.len();
-        let enabled_ids: Vec<_> = self.builder.tn_config.exex.iter()
-            .filter(|e| e.enabled)
+        let config_ids: Vec<_> = self.builder.tn_config.exex.iter()
             .map(|e| e.id.as_str())
             .collect();
         
-        if !enabled_ids.is_empty() {
+        if !config_ids.is_empty() || installed_count > 0 {
             info!(
                 target: "exex",
                 installed = installed_count,
-                enabled = enabled_ids.len(),
-                enabled_ids = ?enabled_ids,
+                config_ids = ?config_ids,
                 "ExEx configuration loaded"
             );
         }
