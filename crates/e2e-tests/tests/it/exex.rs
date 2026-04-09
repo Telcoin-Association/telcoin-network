@@ -2,13 +2,18 @@
 //!
 //! Tests the full pipeline: consensus → execution → ExEx notifications.
 //!
-//! Note: These tests demonstrate ExEx integration patterns. Full programmatic
-//! observer testing requires additional infrastructure (planned for future work).
+//! ## Test strategy
+//!
+//! - `test_exex_infrastructure_ready`: Binary-based — spawns validators as child processes,
+//!   verifies the network produces blocks with ExEx-enabled builds.
+//! - `test_exex_observer_notifications`: Programmatic — uses `spawn_local_testnet()` for
+//!   validators (in-process), then launches an observer with a probe ExEx injected via
+//!   `TnExExLauncher`. Verifies the ExEx receives `ChainCommitted` notifications.
 
 use super::common::ProcessGuard;
 use alloy::providers::{Provider, ProviderBuilder};
 use eyre::Result;
-use std::{process::Child, time::Duration};
+use std::{process::Child, sync::Arc, time::Duration};
 use tempfile::TempDir;
 use tn_types::get_available_tcp_port;
 use tokio::time::{sleep, timeout};
@@ -82,29 +87,195 @@ async fn test_exex_infrastructure_ready() -> Result<()> {
     Ok(())
 }
 
-/// Demonstrates how an ExEx-enabled observer would be tested.
+/// Test that an observer node with an ExEx plugin receives block notifications.
 ///
-/// This test is currently a placeholder showing the testing approach.
-/// Full implementation requires:
-/// - Simplified programmatic node launch API (tracked in issue TBD)  
-/// - Or CLI-based test runner for observer + ExEx (like bin/telcoin-network with config)
+/// This is the full end-to-end test for the ExEx pipeline:
+/// 1. Start a 4-validator network (in-process via `spawn_local_testnet`)
+/// 2. Launch an observer node with a "probe" ExEx immediately after (not waiting for blocks)
+/// 3. Wait for the network to produce blocks and the ExEx to receive them
+/// 4. Verify the probe ExEx receives `ChainCommitted` notifications with valid block numbers
 ///
-/// For manual testing, use:
-/// ```ignore
-/// // In your custom node binary:
-/// let mut launcher = TnExExLauncher::new();
-/// launcher.install("my-exex", my_exex_factory);
-/// // Pass launcher to launch_node()
-/// ```
-#[ignore = "placeholder for future observer ExEx testing"]
+/// Note: The observer is started immediately after the validators — both start from genesis
+/// together. This avoids the late-join epoch mismatch that occurs when starting an observer
+/// after validators have already advanced multiple epochs.
+#[ignore = "only run independently from all other it tests"]
 #[tokio::test]
 async fn test_exex_observer_notifications() -> Result<()> {
-    // TODO: Implement once programmatic observer launch is available
-    // Expected behavior:
-    // 1. Start validator network
-    // 2. Launch observer node with ExEx
-    // 3. Verify ExEx receives block notifications
-    // 4. Optionally test across epoch boundaries
+    use clap::Parser;
+    use telcoin_network_cli::{node::NodeCommand, NoArgs};
+    use tn_config::KeyConfig;
+    use tn_exex::{TnExExEvent, TnExExLauncher};
+    use tn_node::launch_node;
+
+    let _permit = super::common::acquire_test_permit();
+
+    let temp_dir = TempDir::with_prefix("exex_observer")?;
+    let temp_path = temp_dir.path();
+
+    // Step 1: Start the validator network in-process
+    // This calls config_local_testnet internally, creating configs for 4 validators + 1 observer
+    let _endpoints = e2e_tests::spawn_local_testnet(temp_path, None)?;
+
+    // Step 2: Create an ExEx launcher with a probe that sends block numbers back to us
+    let (probe_tx, probe_rx) = std::sync::mpsc::channel::<u64>();
+
+    let mut exex_launcher = TnExExLauncher::new();
+    exex_launcher.install(
+        "test-probe",
+        Box::new(move |ctx| {
+            Box::pin(async move {
+                let mut ctx = ctx;
+                info!(target: "exex-probe", head = ?ctx.head, "Probe ExEx started");
+
+                while let Some(notification) = ctx.notifications.recv().await {
+                    if let Some(chain) = notification.committed_chain() {
+                        let tip = chain.tip();
+                        let block_num = tip.number;
+                        info!(
+                            target: "exex-probe",
+                            block_num,
+                            "Probe received ChainCommitted"
+                        );
+
+                        // Send block number to the test
+                        if probe_tx.send(block_num).is_err() {
+                            break;
+                        }
+
+                        // Report progress back to manager
+                        let _ = ctx.events.send(TnExExEvent::finished_height(
+                            tn_types::BlockNumHash::new(tip.number, tip.hash()),
+                        ));
+                    }
+                }
+                Ok(())
+            })
+        }),
+    );
+
+    // Step 3: Launch the observer node immediately after validators
+    // Both start from genesis so the observer won't be behind on epochs
+    let observer_dir = temp_path.join("observer");
+
+    let observer_rpc_port = get_available_tcp_port("127.0.0.1")
+        .ok_or_else(|| eyre::eyre!("Failed to get observer RPC port"))?;
+    let observer_ws_port = get_available_tcp_port("127.0.0.1")
+        .ok_or_else(|| eyre::eyre!("Failed to get observer WS port"))?;
+    let observer_ipc_path = temp_path.join("observer.ipc");
+
+    let command = NodeCommand::<NoArgs>::parse_from([
+        "tn",
+        "--observer",
+        "--exex",
+        "test-probe",
+        "--http",
+        "--http.port",
+        &observer_rpc_port.to_string(),
+        "--ws",
+        "--ws.port",
+        &observer_ws_port.to_string(),
+        "--ipcpath",
+        &observer_ipc_path.to_string_lossy(),
+    ]);
+
+    let observer_dir_clone = observer_dir.clone();
+    // Observer keys were created with passphrase=None by config_local_testnet
+    let key_config = KeyConfig::read_config(&observer_dir, None)?;
+
+    let (startup_tx, startup_rx) = std::sync::mpsc::channel::<String>();
+
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .thread_name("observer-node")
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("can build tokio runtime");
+
+        runtime.block_on(async move {
+            match command.execute(
+                observer_dir_clone,
+                key_config,
+                |builder, _: NoArgs, tn_datadir, passphrase| {
+                    launch_node(builder, tn_datadir, passphrase, Some(exex_launcher))
+                },
+            ) {
+                Ok(handle) => {
+                    let err = handle.await;
+                    tracing::error!(target: "exex-test", "Observer exited: {err:?}");
+                }
+                Err(e) => {
+                    let msg = format!("Observer failed to start: {e:?}");
+                    tracing::error!(target: "exex-test", "{msg}");
+                    let _ = startup_tx.send(msg);
+                }
+            }
+        });
+    });
+
+    // Give the observer a moment to fail fast
+    std::thread::sleep(Duration::from_millis(500));
+    if let Ok(err) = startup_rx.try_recv() {
+        eyre::bail!("Observer startup failed: {err}");
+    }
+
+    // Step 4: Wait for the probe ExEx to receive block notifications
+    let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let received_clone = Arc::clone(&received);
+
+    let collect_handle = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        while std::time::Instant::now() < deadline {
+            match probe_rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(block_num) => {
+                    let mut guard = received_clone.lock().unwrap();
+                    guard.push(block_num);
+                    if guard.len() >= 3 {
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    });
+
+    collect_handle.join().expect("collector thread panicked");
+
+    let blocks: Vec<u64> = received.lock().unwrap().clone();
+
+    info!(
+        target: "exex-test",
+        count = blocks.len(),
+        blocks = ?blocks,
+        "Probe ExEx received notifications"
+    );
+
+    // Assertions
+    assert!(
+        blocks.len() >= 3,
+        "ExEx should receive at least 3 block notifications, got {}",
+        blocks.len()
+    );
+
+    assert!(blocks.iter().all(|&b| b > 0), "All block numbers should be > 0");
+
+    for window in blocks.windows(2) {
+        assert!(
+            window[1] > window[0],
+            "Block numbers should increase: {} -> {}",
+            window[0],
+            window[1]
+        );
+    }
+
+    info!(
+        target: "exex-test",
+        first_block = blocks.first().copied().unwrap_or(0),
+        last_block = blocks.last().copied().unwrap_or(0),
+        "ExEx observer notification test passed"
+    );
+
     Ok(())
 }
 
