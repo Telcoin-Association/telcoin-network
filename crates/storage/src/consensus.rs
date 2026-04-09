@@ -13,8 +13,8 @@ use std::{
 
 use parking_lot::Mutex;
 use tn_types::{
-    gas_accumulator::RewardsCounter, AuthorityIdentifier, BlockHash, BlockNumHash, CommittedSubDag,
-    Committee, ConsensusHeader, ConsensusOutput, Epoch, EpochRecord, Round, B256,
+    gas_accumulator::RewardsCounter, AuthorityIdentifier, Batch, BlockHash, BlockNumHash,
+    CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput, Epoch, EpochRecord, Round, B256,
 };
 use tokio::{
     fs::File as AsyncFile,
@@ -544,6 +544,23 @@ impl ConsensusChain {
         } else {
             false
         }
+    }
+
+    /// Return a vector of batches matching the provided digests (if found).
+    pub async fn get_batches(
+        &self,
+        epoch: Epoch,
+        digests: impl Iterator<Item = &BlockHash>,
+    ) -> Vec<Batch> {
+        let mut result = Vec::new();
+        if let Ok(pack) = self.get_static(epoch).await {
+            for digest in digests {
+                if let Some(batch) = pack.batch(*digest).await {
+                    result.push(batch);
+                }
+            }
+        }
+        result
     }
 
     /// Count leaders in this pack (in rewards_counter) lower than last_executed_round.

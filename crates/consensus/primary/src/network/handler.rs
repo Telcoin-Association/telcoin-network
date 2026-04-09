@@ -898,4 +898,9 @@ where
             None => Err(PrimaryNetworkError::UnavailableEpochDigest(hash)),
         }
     }
+
+    /// Return a reference to the `ConsensusChain`.
+    pub(super) fn consensus_chain(&self) -> &ConsensusChain {
+        &self.consensus_chain
+    }
 }
