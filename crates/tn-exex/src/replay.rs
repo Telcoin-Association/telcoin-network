@@ -6,18 +6,28 @@
 //! they may have missed (e.g. when starting from genesis or after downtime).
 
 use crate::TnExExNotification;
+use reth_provider::Chain;
 use std::{
+    future::Future,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
+use tokio::task::JoinHandle;
 use tokio_stream::Stream;
 use tn_reth::RethEnv;
+
+/// Result of a single block replay on the blocking thread.
+type ReplayResult = tn_reth::error::TnRethResult<Option<Arc<Chain>>>;
 
 /// A stream that yields [`TnExExNotification::ChainCommitted`] for historical blocks.
 ///
 /// `ReplayStream` iterates over a range of block numbers, reconstructing each block
 /// as a [`Chain`](reth_provider::Chain) from the database and wrapping it in a notification.
 /// This allows ExEx tasks to process historical blocks identically to live ones.
+///
+/// Database reads are offloaded to [`tokio::task::spawn_blocking`] so the async
+/// runtime is never blocked by disk I/O.
 ///
 /// # Usage
 ///
@@ -48,6 +58,8 @@ pub struct ReplayStream {
     target_block: u64,
     /// Set to `true` when an error occurs or replay is complete.
     finished: bool,
+    /// In-flight blocking task for the current block read.
+    pending: Option<JoinHandle<ReplayResult>>,
 }
 
 impl ReplayStream {
@@ -64,6 +76,7 @@ impl ReplayStream {
             current_block: from_block,
             target_block: to_block,
             finished: from_block > to_block,
+            pending: None,
         }
     }
 
@@ -86,39 +99,57 @@ impl ReplayStream {
 impl Stream for ReplayStream {
     type Item = eyre::Result<TnExExNotification>;
 
-    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
         if this.finished {
             return Poll::Ready(None);
         }
 
-        // Try to reconstruct the next block as a chain
-        match this.reth_env.replay_block_as_chain(this.current_block) {
-            Ok(Some(chain)) => {
-                let notification = TnExExNotification::ChainCommitted { new: chain };
-                this.current_block += 1;
-                if this.current_block > this.target_block {
-                    this.finished = true;
+        loop {
+            // If there's an in-flight blocking task, poll it.
+            if let Some(handle) = &mut this.pending {
+                match Pin::new(handle).poll(cx) {
+                    Poll::Ready(join_result) => {
+                        this.pending = None;
+                        let result = join_result
+                            .map_err(|e| eyre::eyre!("spawn_blocking panicked: {e}"))
+                            .and_then(|inner| inner.map_err(Into::into));
+
+                        match result {
+                            Ok(Some(chain)) => {
+                                let notification =
+                                    TnExExNotification::ChainCommitted { new: chain };
+                                this.current_block += 1;
+                                if this.current_block > this.target_block {
+                                    this.finished = true;
+                                }
+                                return Poll::Ready(Some(Ok(notification)));
+                            }
+                            Ok(None) => {
+                                // Block doesn't exist — skip it and try the next one.
+                                this.current_block += 1;
+                                if this.current_block > this.target_block {
+                                    this.finished = true;
+                                    return Poll::Ready(None);
+                                }
+                                // Fall through to spawn the next block read.
+                            }
+                            Err(e) => {
+                                this.finished = true;
+                                return Poll::Ready(Some(Err(e)));
+                            }
+                        }
+                    }
+                    Poll::Pending => return Poll::Pending,
                 }
-                Poll::Ready(Some(Ok(notification)))
             }
-            Ok(None) => {
-                // Block doesn't exist — skip it and try the next one
-                this.current_block += 1;
-                if this.current_block > this.target_block {
-                    this.finished = true;
-                    Poll::Ready(None)
-                } else {
-                    // Signal that we're ready to be polled again immediately
-                    _cx.waker().wake_by_ref();
-                    Poll::Pending
-                }
-            }
-            Err(e) => {
-                this.finished = true;
-                Poll::Ready(Some(Err(e.into())))
-            }
+
+            // Spawn a blocking task for the next block.
+            let env = this.reth_env.clone();
+            let block_num = this.current_block;
+            this.pending =
+                Some(tokio::task::spawn_blocking(move || env.replay_block_as_chain(block_num)));
         }
     }
 
