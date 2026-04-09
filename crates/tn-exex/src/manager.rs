@@ -17,6 +17,13 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::PollSender;
 use tn_types::{BlockNumHash, Certificate, CommittedSubDag};
 
+/// Default capacity for the bounded channel between the execution engine and the ExEx manager.
+///
+/// This bounds memory usage: at most this many notifications can be queued before
+/// the engine's synchronous `send()` starts dropping them (with a logged warning).
+/// Dropped notifications are recoverable via `ReplayStream`.
+const EXEX_HANDLE_CHANNEL_CAPACITY: usize = 1024;
+
 /// The lowest finished height among all ExEx tasks.
 ///
 /// This is used to track the minimum block height that all ExExes have processed,
@@ -121,7 +128,7 @@ pub struct TnExExManager {
     exex_handles: Vec<TnExExHandle>,
 
     /// Channel for receiving notifications from the execution engine.
-    handle_rx: mpsc::UnboundedReceiver<TnExExNotification>,
+    handle_rx: mpsc::Receiver<TnExExNotification>,
 
     /// Internal buffer of notifications pending delivery.
     /// Tuple of (notification_id, notification).
@@ -169,10 +176,10 @@ impl TnExExManager {
         exex_certificates_rx: Option<broadcast::Receiver<Arc<Certificate>>>,
         exex_committed_sub_dags_rx: Option<broadcast::Receiver<Arc<CommittedSubDag>>>,
     ) -> (Self, TnExExManagerHandle) {
-        let (handle_tx, handle_rx) = mpsc::unbounded_channel();
+        let (handle_tx, handle_rx) = mpsc::channel(EXEX_HANDLE_CHANNEL_CAPACITY);
         let max_capacity = max_capacity.unwrap_or(64);
         let current_capacity = Arc::new(AtomicUsize::new(max_capacity));
-        let (is_ready_tx, is_ready_rx) = watch::channel(true);
+        let (is_ready_tx, _is_ready_rx) = watch::channel(true);
         let (finished_height_tx, finished_height_rx) = watch::channel(FinishedTnExExHeight::default());
 
         let num_exexs = handles.len();
@@ -197,7 +204,6 @@ impl TnExExManager {
             num_exexs,
             handle_tx: Some(handle_tx),
             current_capacity,
-            is_ready: is_ready_rx,
             finished_height: finished_height_rx,
         };
 
@@ -460,13 +466,10 @@ pub struct TnExExManagerHandle {
 
     /// Channel for sending notifications to the manager.
     /// None if this is an empty handle.
-    handle_tx: Option<mpsc::UnboundedSender<TnExExNotification>>,
+    handle_tx: Option<mpsc::Sender<TnExExNotification>>,
 
     /// Shared capacity counter.
     current_capacity: Arc<AtomicUsize>,
-
-    /// Watch receiver for readiness signal.
-    is_ready: watch::Receiver<bool>,
 
     /// Watch receiver for the finished height across all ExExes.
     finished_height: watch::Receiver<FinishedTnExExHeight>,
@@ -478,14 +481,12 @@ impl TnExExManagerHandle {
     /// This allows the engine to use the same code path regardless of whether
     /// ExExes are configured. All operations on an empty handle are no-ops.
     pub fn empty() -> Self {
-        let (_, is_ready_rx) = watch::channel(true);
         let (_, finished_height_rx) = watch::channel(FinishedTnExExHeight::default());
         
         Self {
             num_exexs: 0,
             handle_tx: None,
             current_capacity: Arc::new(AtomicUsize::new(0)),
-            is_ready: is_ready_rx,
             finished_height: finished_height_rx,
         }
     }
@@ -502,11 +503,19 @@ impl TnExExManagerHandle {
 
     /// Sends a notification to all registered ExExes (synchronous, non-blocking).
     ///
-    /// This will queue the notification for delivery but may fail if the internal
-    /// channel is full or closed.
+    /// Uses `try_send` on the bounded channel. If the channel is full the notification
+    /// is dropped and a warning is logged — the ExEx can recover missed data via
+    /// `ReplayStream`. This ensures the execution engine is never blocked.
     pub fn send(&self, notification: TnExExNotification) {
         if let Some(tx) = &self.handle_tx {
-            let _ = tx.send(notification);
+            if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(notification) {
+                metrics::counter!("tn_exex_notifications_dropped_total").increment(1);
+                tracing::warn!(
+                    target: "exex",
+                    "ExEx manager channel full — notification dropped. \
+                     ExExes can recover via ReplayStream."
+                );
+            }
         }
     }
 
@@ -530,16 +539,10 @@ impl TnExExManagerHandle {
 
     /// Sends a notification to all registered ExExes (async with backpressure).
     ///
-    /// This will wait until the manager has capacity before returning.
+    /// This will wait until the bounded channel has capacity before returning.
     pub async fn send_async(&self, notification: TnExExNotification) -> Result<(), ()> {
         if let Some(tx) = &self.handle_tx {
-            // Wait for capacity if needed
-            let mut is_ready = self.is_ready.clone();
-            while !*is_ready.borrow_and_update() {
-                is_ready.changed().await.map_err(|_| ())?;
-            }
-
-            tx.send(notification).map_err(|_| ())?;
+            tx.send(notification).await.map_err(|_| ())?;
             Ok(())
         } else {
             Ok(())
