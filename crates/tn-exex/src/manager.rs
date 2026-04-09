@@ -513,10 +513,19 @@ impl TnExExManagerHandle {
     /// Sends a canonical state notification from Reth to all ExExes.
     ///
     /// Converts the Reth notification to TnExExNotification before sending.
-    /// This method avoids circular dependencies by accepting the Reth type directly.
+    /// Reorg notifications are logged as errors and skipped — Bullshark consensus
+    /// should never produce reorgs, but a bug elsewhere must not crash the node.
     pub fn send_canon_notification(&self, notification: reth_chain_state::CanonStateNotification) {
-        let exex_notification: TnExExNotification = notification.into();
-        self.send(exex_notification);
+        match TnExExNotification::try_from_canon_state(notification) {
+            Some(exex_notification) => self.send(exex_notification),
+            None => {
+                tracing::error!(
+                    target: "exex",
+                    "Received unexpected reorg notification — Bullshark consensus should never reorg. \
+                     ExEx notification skipped. This may indicate a bug in the execution layer."
+                );
+            }
+        }
     }
 
     /// Sends a notification to all registered ExExes (async with backpressure).

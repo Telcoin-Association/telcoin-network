@@ -74,24 +74,16 @@ impl TnExExNotification {
             _ => None,
         }
     }
-}
 
-impl From<CanonStateNotification> for TnExExNotification {
-    /// Convert a Reth `CanonStateNotification` to `TnExExNotification`.
+    /// Try to convert a Reth `CanonStateNotification` into a `TnExExNotification`.
     ///
-    /// This conversion only handles the `Commit` variant since TN consensus guarantees
-    /// finality and does not produce reorgs.
-    ///
-    /// # Panics
-    ///
-    /// This conversion will panic if given a non-Commit notification, as reorgs should
-    /// never occur in TN's Bullshark consensus.
-    fn from(notification: CanonStateNotification) -> Self {
+    /// Returns `Some(ChainCommitted)` for `Commit` notifications.
+    /// Returns `None` for `Reorg` notifications — Bullshark consensus provides finality
+    /// so reorgs should never occur.  Callers are expected to log the anomaly and skip.
+    pub fn try_from_canon_state(notification: CanonStateNotification) -> Option<Self> {
         match notification {
-            CanonStateNotification::Commit { new } => Self::ChainCommitted { new },
-            CanonStateNotification::Reorg { .. } => {
-                panic!("TN ExEx received unexpected reorg notification - Bullshark consensus should never reorg")
-            }
+            CanonStateNotification::Commit { new } => Some(Self::ChainCommitted { new }),
+            CanonStateNotification::Reorg { .. } => None,
         }
     }
 }
@@ -148,13 +140,14 @@ mod tests {
     }
 
     #[test]
-    fn test_from_canon_state_commit() {
+    fn test_try_from_canon_state_commit() {
         let chain = Arc::new(Chain::default());
         let canon_notification = CanonStateNotification::Commit { new: Arc::clone(&chain) };
 
-        let tn_notification: TnExExNotification = canon_notification.into();
+        let tn_notification = TnExExNotification::try_from_canon_state(canon_notification);
+        assert!(tn_notification.is_some());
 
-        match tn_notification {
+        match tn_notification.unwrap() {
             TnExExNotification::ChainCommitted { new } => {
                 assert_eq!(Arc::as_ptr(&new), Arc::as_ptr(&chain));
             }
@@ -163,15 +156,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(
-        expected = "TN ExEx received unexpected reorg notification - Bullshark consensus should never reorg"
-    )]
-    fn test_from_canon_state_reorg_panics() {
+    fn test_try_from_canon_state_reorg_returns_none() {
         let old = Arc::new(Chain::default());
         let new = Arc::new(Chain::default());
         let canon_notification = CanonStateNotification::Reorg { old, new };
 
-        // This should panic
-        let _: TnExExNotification = canon_notification.into();
+        // Reorg should return None, not panic
+        let result = TnExExNotification::try_from_canon_state(canon_notification);
+        assert!(result.is_none(), "Reorg notification should be safely skipped");
     }
 }
