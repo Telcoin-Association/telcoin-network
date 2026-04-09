@@ -25,6 +25,18 @@
 //!    skipped or double-counted. State is updated through the normal path (payload_builder).
 
 use crate::{AuthorityIdentifier, Committee, WorkerId};
+
+/// Fee strategy for a worker, read from the WorkerConfigs contract each epoch.
+/// Adding a new strategy = new contract constant + new enum variant + match arm in
+/// adjust_base_fees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerFeeConfig {
+    /// Adjust fee +/-12.5% per epoch based on gas utilization vs target.
+    Eip1559 { target_gas: u64 },
+    /// Fixed fee set by governance, no utilization-based adjustment.
+    Static { fee: u64 },
+}
+
 use alloy::{
     eips::eip1559::MIN_PROTOCOL_BASE_FEE,
     primitives::Address,
@@ -285,8 +297,135 @@ impl GasAccumulator {
     }
 }
 
+/// EIP-1559-style base fee adjustment computed once per epoch.
+///
+/// Compares `gas_used` (total gas consumed by a single worker during the epoch)
+/// against `target_gas` (governance-set target for the epoch) and nudges the
+/// base fee up or down by at most 12.5 % (denominator = 8).
+///
+/// The result is clamped to `[MIN_PROTOCOL_BASE_FEE, u64::MAX]`.
+pub fn compute_next_base_fee_eip1559(current_base_fee: u64, gas_used: u64, target_gas: u64) -> u64 {
+    // Guard: if target is zero, keep current fee unchanged.
+    // The contract reverts for target `0` so this should never happen
+    if target_gas == 0 {
+        return current_base_fee;
+    }
+
+    let new_base_fee = match gas_used.cmp(&target_gas) {
+        core::cmp::Ordering::Equal => current_base_fee,
+        core::cmp::Ordering::Greater => {
+            let excess = (gas_used - target_gas).min(target_gas);
+            let delta =
+                (current_base_fee as u128).saturating_mul(excess as u128) / target_gas as u128 / 8;
+            let delta = delta.max(1);
+            current_base_fee.saturating_add(delta.min(u64::MAX as u128) as u64)
+        }
+        core::cmp::Ordering::Less => {
+            let deficit = (target_gas - gas_used).min(target_gas);
+            let delta =
+                (current_base_fee as u128).saturating_mul(deficit as u128) / target_gas as u128 / 8;
+            current_base_fee.saturating_sub(delta.min(u64::MAX as u128) as u64)
+        }
+    };
+
+    new_base_fee.max(MIN_PROTOCOL_BASE_FEE)
+}
+
 impl Default for GasAccumulator {
     fn default() -> Self {
         Self::new(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::eips::eip1559::MIN_PROTOCOL_BASE_FEE;
+
+    #[test]
+    fn gas_at_target_no_change() {
+        // When gas_used == target_gas, delta is 0, fee unchanged
+        assert_eq!(compute_next_base_fee_eip1559(1000, 500, 500), 1000);
+    }
+
+    #[test]
+    fn gas_over_target_increases_fee() {
+        // gas_used = 2 * target → delta = 1000 * 1.0 / 8 = 125
+        assert_eq!(compute_next_base_fee_eip1559(1000, 1000, 500), 1125);
+    }
+
+    #[test]
+    fn gas_under_target_decreases_fee() {
+        // gas_used = 0 → delta = 1000 * 1.0 / 8 = 125
+        assert_eq!(compute_next_base_fee_eip1559(1000, 0, 500), 875);
+    }
+
+    #[test]
+    fn floor_at_min_protocol_base_fee() {
+        // Large decrease should floor at MIN_PROTOCOL_BASE_FEE (7)
+        // base=8, gas_used=0, target=1 → delta = 8 * 1 / 1 / 8 = 1, result = 7
+        assert_eq!(compute_next_base_fee_eip1559(8, 0, 1), MIN_PROTOCOL_BASE_FEE);
+    }
+
+    #[test]
+    fn zero_target_returns_current() {
+        assert_eq!(compute_next_base_fee_eip1559(1000, 500, 0), 1000);
+    }
+
+    #[test]
+    fn overflow_safety_large_values() {
+        // u64::MAX base fee with high gas usage should not panic
+        let result = compute_next_base_fee_eip1559(u64::MAX, u64::MAX, 1);
+        assert_eq!(result, u64::MAX); // saturating_add caps at MAX
+    }
+
+    #[test]
+    fn max_increase_is_12_5_percent() {
+        // Even with huge gas overshoot, increase is capped at base_fee/8
+        // excess = min(u64::MAX - 1, 1) = 1, delta = 1_000_000 * 1 / 1 / 8 = 125_000
+        let base = 1_000_000u64;
+        let result = compute_next_base_fee_eip1559(base, u64::MAX, 1);
+        assert_eq!(result, base + base / 8);
+    }
+
+    #[test]
+    fn max_decrease_is_12_5_percent() {
+        // Even with zero gas usage, decrease is capped at base_fee/8
+        // deficit = min(1, 1) = 1, delta = 1_000_000 * 1 / 1 / 8 = 125_000
+        let base = 1_000_000u64;
+        let result = compute_next_base_fee_eip1559(base, 0, 1);
+        assert_eq!(result, base - base / 8);
+    }
+
+    #[test]
+    fn small_values() {
+        // Very small base fee
+        assert_eq!(
+            compute_next_base_fee_eip1559(MIN_PROTOCOL_BASE_FEE, 0, 100),
+            MIN_PROTOCOL_BASE_FEE
+        );
+    }
+
+    #[test]
+    fn partial_utilization() {
+        // 75% utilization → 25% under target → decrease by 25%/8 = 3.125%
+        // base=1000, delta = 1000 * 250 / 1000 / 8 = 31
+        assert_eq!(compute_next_base_fee_eip1559(1000, 750, 1000), 969);
+    }
+
+    #[test]
+    fn slight_over_target() {
+        // 110% utilization → 10% over → increase by 10%/8 = 1.25%
+        // base=1000, delta = 1000 * 100 / 1000 / 8 = 12 (integer division)
+        assert_eq!(compute_next_base_fee_eip1559(1000, 1100, 1000), 1012);
+    }
+
+    #[test]
+    fn min_base_fee_still_increases_over_target() {
+        // At MIN_PROTOCOL_BASE_FEE (7), integer 7/8 = 0 but delta is floored at 1
+        assert_eq!(
+            compute_next_base_fee_eip1559(MIN_PROTOCOL_BASE_FEE, 200, 100),
+            MIN_PROTOCOL_BASE_FEE + 1
+        );
     }
 }

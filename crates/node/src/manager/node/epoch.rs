@@ -35,10 +35,10 @@ use tn_storage::tables::{
     NodeBatchesCache, Payload, Votes,
 };
 use tn_types::{
-    gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash, BlockNumHash, BlsPublicKey,
-    Committee, CommitteeBuilder, ConsensusOutput, Database as TNDatabase, Epoch, EpochRecord,
-    Multiaddr, NetworkPublicKey, Notifier, TaskJoinError, TaskManager, TaskSpawner, TnReceiver,
-    B256,
+    gas_accumulator::{compute_next_base_fee_eip1559, GasAccumulator, WorkerFeeConfig},
+    Batch, BatchValidation, BlockHash, BlockNumHash, BlsPublicKey, Committee, CommitteeBuilder,
+    ConsensusOutput, Database as TNDatabase, Epoch, EpochRecord, Multiaddr, NetworkPublicKey,
+    Notifier, TaskJoinError, TaskManager, TaskSpawner, TnReceiver, B256,
 };
 use tn_worker::{quorum_waiter::QuorumWaiterTrait, Worker, WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::mpsc;
@@ -122,7 +122,7 @@ where
             if let Some(target_hash) = replay.epoch_close_hash {
                 // If things go down at exactly the wrong time we might have to replay the epoch end
                 // so account for that.
-                self.close_epoch(None, &gas_accumulator, target_hash).await?;
+                self.close_epoch(None, engine, &gas_accumulator, target_hash).await?;
                 return Ok(RunEpochMode::NewEpoch);
             }
             // Only wait for consensus that was actually forwarded to the engine.
@@ -225,7 +225,7 @@ where
                 let target_hash = res.inspect_err(|e| {
                     error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
                 })?;
-                self.close_epoch(Some(consensus_shutdown.clone()), &gas_accumulator, target_hash)
+                self.close_epoch(Some(consensus_shutdown.clone()), engine, &gas_accumulator, target_hash)
                     .await?;
 
                 // Write the epoch record to DB and save in manager for next epoch.
@@ -283,7 +283,7 @@ where
         {
             // If things go down at exactly the wrong time we might have reached the epoch end
             // so account for that.
-            self.close_epoch(None, &gas_accumulator, target_hash).await?;
+            self.close_epoch(None, engine, &gas_accumulator, target_hash).await?;
             res = RunEpochMode::NewEpoch;
             clear_tables_for_next_epoch = true;
         } else {
@@ -679,14 +679,41 @@ where
         Err(eyre::eyre!("invalid wait for epoch end"))
     }
 
-    /// Use accumulated gas information to set each workers base fee for the epoch.
-    /// Currently a no-op.
-    fn adjust_base_fees(&self, gas_accumulator: &GasAccumulator) {
-        for worker_id in 0..gas_accumulator.num_workers() {
+    /// Use accumulated gas information to set each worker's base fee for the next epoch.
+    ///
+    /// Reads each worker's fee config from the [`WorkerConfigs`] contract and applies
+    /// the appropriate strategy:
+    /// - **EIP-1559**: adjusts up to ±12.5% based on gas utilization vs target.
+    /// - **Static**: sets the fee to the governance-configured value.
+    ///
+    /// If the contract read fails, logs a warning and keeps current base fees unchanged.
+    async fn adjust_base_fees(&self, engine: &ExecutionNode, gas_accumulator: &GasAccumulator) {
+        let reth_env = engine.get_reth_env().await;
+        let num_workers = gas_accumulator.num_workers();
+
+        let configs = match reth_env.get_worker_fee_configs(num_workers) {
+            Ok(c) => c,
+            Err(e) => {
+                error!(target: "epoch-manager", ?e, "failed to read worker fee configs, keeping current base fees");
+                return; // noop
+            }
+        };
+
+        for (worker_id, config) in configs.iter().enumerate() {
             let worker_id = worker_id as u16;
-            let (_blocks, _gas_used, _gas_limit) = gas_accumulator.get_values(worker_id);
-            // Change this base fee to update base fee in batches workers create.
-            let _base_fee = gas_accumulator.base_fee(worker_id);
+            let base_fee_container = gas_accumulator.base_fee(worker_id);
+            let current = base_fee_container.base_fee();
+
+            let new_fee = match config {
+                WorkerFeeConfig::Eip1559 { target_gas } => {
+                    let (_blocks, gas_used, _gas_limit) = gas_accumulator.get_values(worker_id);
+                    compute_next_base_fee_eip1559(current, gas_used, *target_gas)
+                }
+                WorkerFeeConfig::Static { fee } => *fee,
+            };
+
+            base_fee_container.set_base_fee(new_fee);
+            info!(target: "epoch-manager", worker_id, current, new_fee, "base fee adjusted");
         }
     }
 
@@ -694,6 +721,7 @@ where
     async fn close_epoch(
         &self,
         shutdown_consensus: Option<Notifier>,
+        engine: &ExecutionNode,
         gas_accumulator: &GasAccumulator,
         target_hash: B256,
     ) -> eyre::Result<()> {
@@ -702,7 +730,7 @@ where
             s.notify()
         }
         self.consensus_bus.wait_for_consensus_execution(target_hash).await?;
-        self.adjust_base_fees(gas_accumulator);
+        self.adjust_base_fees(engine, gas_accumulator).await;
         gas_accumulator.clear(); // Clear the accumlated values for next epoch.
         Ok(())
     }
