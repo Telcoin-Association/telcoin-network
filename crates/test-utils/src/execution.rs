@@ -37,11 +37,13 @@ pub fn default_test_execution_node(
         ExecutionNode::new(
             &builder,
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir, &TaskManager::default(), rewards)?,
+            tn_exex::TnExExManagerHandle::empty(),
         )?
     } else {
         ExecutionNode::new(
             &builder,
             RethEnv::new_for_test(tmp_dir, &TaskManager::default(), rewards)?,
+            tn_exex::TnExExManagerHandle::empty(),
         )?
     };
 

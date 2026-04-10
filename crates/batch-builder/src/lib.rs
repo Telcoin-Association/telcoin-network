@@ -675,9 +675,13 @@ mod tests {
             // execute output to trigger canonical update
             let args = BuildArguments::new(reth_env.clone(), output.clone(), parent);
             let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
-            let final_header =
-                execute_consensus_output(args, gas_accumulator.clone(), engine_update_tx)
-                    .expect("output executed");
+            let final_header = execute_consensus_output(
+                args,
+                gas_accumulator.clone(),
+                engine_update_tx,
+                tn_exex::TnExExManagerHandle::empty(),
+            )
+            .expect("output executed");
 
             // update values for next loop
             parent = final_header;

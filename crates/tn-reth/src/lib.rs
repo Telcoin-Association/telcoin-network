@@ -82,9 +82,9 @@ use reth_node_core::node_config::DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB;
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
     BlockIdReader as _, BlockNumReader, BlockReader, CanonChainTracker,
-    CanonStateSubscriptions as _, ChainStateBlockReader, ChainStateBlockWriter, DBProvider,
-    DatabaseProviderFactory, HeaderProvider as _, ProviderFactory, StateProviderBox,
-    StateProviderFactory, TransactionVariant,
+    CanonStateSubscriptions as _, Chain, ChainStateBlockReader, ChainStateBlockWriter, DBProvider,
+    DatabaseProviderFactory, ExecutionOutcome, HeaderProvider as _, ProviderFactory,
+    ReceiptProvider, StateProviderBox, StateProviderFactory, TransactionVariant,
 };
 use reth_revm::{
     cached::CachedReads,
@@ -99,7 +99,7 @@ use reth_transaction_pool::{
 use rpc_server_args::RpcServerArgs;
 use serde_json::Value;
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     net::{IpAddr, Ipv4Addr},
     ops::RangeInclusive,
     path::Path,
@@ -154,6 +154,7 @@ pub mod dirs;
 pub mod payload;
 use payload::TNPayload;
 pub mod traits;
+pub mod exex_handle;
 pub mod txn_pool;
 pub use txn_pool::*;
 use worker::WorkerNetwork;
@@ -668,6 +669,13 @@ impl RethEnv {
         ChainSpec(self.inner.node_config.chain.clone())
     }
 
+    /// Return a clone of the blockchain provider.
+    ///
+    /// This is used primarily for ExEx initialization to provide state access.
+    pub fn blockchain_provider(&self) -> BlockchainProvider<TelcoinNode> {
+        self.inner.blockchain_provider.clone()
+    }
+
     /// Return the canonical in-memory state.
     pub fn canonical_in_memory_state(&self) -> CanonicalInMemoryState {
         self.inner.blockchain_provider.canonical_in_memory_state()
@@ -803,11 +811,15 @@ impl RethEnv {
     /// and set last executed header as the tracked header.
     ///
     /// It also clears the canonical in-memory state.
-    pub fn finish_executing_output(
+    pub fn finish_executing_output<H>(
         &self,
         blocks: Vec<ExecutedBlock>,
         engine_update: Option<(Round, BlockNumHash, tokio::sync::mpsc::Sender<EngineUpdate>)>,
-    ) -> TnRethResult<()> {
+        exex_handle: H,
+    ) -> TnRethResult<()>
+    where
+        H: crate::exex_handle::ExExNotificationHandle,
+    {
         // NOTE: this makes all blocks canonical, commits them to the database,
         // and broadcasts new chain on `canon_state_notification_sender`
         //
@@ -857,7 +869,12 @@ impl RethEnv {
 
         // broadcast canonical update
         let notification = chain_update.to_chain_notification();
-        self.canonical_in_memory_state().notify_canon_state(notification);
+        self.canonical_in_memory_state().notify_canon_state(notification.clone());
+
+        // Send notification to ExEx tasks if any are installed
+        if exex_handle.has_exexs() {
+            exex_handle.send_canon_notification(notification);
+        }
 
         Ok(())
     }
@@ -901,6 +918,44 @@ impl RethEnv {
         range: RangeInclusive<BlockNumber>,
     ) -> TnRethResult<Vec<BlockWithSenders>> {
         Ok(self.inner.blockchain_provider.block_with_senders_range(range)?)
+    }
+
+    /// Reconstruct a [`Chain`] from a historical block stored in the database.
+    ///
+    /// This retrieves the block and its receipts, constructing a minimal `Chain`
+    /// suitable for replaying to ExEx tasks. The returned chain contains no state
+    /// diffs (bundle state) or trie data since those are not needed for replay.
+    ///
+    /// Returns `Ok(None)` if the block does not exist.
+    pub fn replay_block_as_chain(
+        &self,
+        block_number: u64,
+    ) -> TnRethResult<Option<Arc<Chain>>> {
+        let Some(block) = self.inner.blockchain_provider.sealed_block_with_senders(
+            BlockHashOrNumber::Number(block_number),
+            TransactionVariant::NoHash,
+        )? else {
+            return Ok(None);
+        };
+
+        let receipts = self
+            .inner
+            .blockchain_provider
+            .receipts_by_block(BlockHashOrNumber::Number(block_number))?
+            .unwrap_or_default();
+
+        let execution_outcome = ExecutionOutcome::new(
+            BundleState::default(),
+            vec![receipts],
+            block_number,
+            Default::default(),
+        );
+
+        Ok(Some(Arc::new(Chain::new(
+            [block],
+            execution_outcome,
+            BTreeMap::new(),
+        ))))
     }
 
     /// Return the blocks for a range of block numbers.
@@ -1532,7 +1587,7 @@ mod tests {
         canonical_in_memory_state
             .update_chain(NewCanonicalChain::Commit { new: vec![block.clone()] });
         canonical_in_memory_state.set_canonical_head(canonical_header.clone());
-        reth_env.finish_executing_output(vec![block.clone()], None)?;
+        reth_env.finish_executing_output(vec![block.clone()], None, crate::exex_handle::EmptyExExHandle)?;
         reth_env.finalize_block(canonical_header.clone())?;
         Ok(block)
     }

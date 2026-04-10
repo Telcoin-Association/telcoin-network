@@ -510,8 +510,13 @@ async fn test_canonical_notification_updates_pool() {
     // execute output to trigger canonical update
     let args = BuildArguments::new(reth_env.clone(), output, chain.sealed_genesis_header());
     let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
-    let _final_header = execute_consensus_output(args, GasAccumulator::default(), engine_update_tx)
-        .expect("output executed");
+    let _final_header = execute_consensus_output(
+        args,
+        GasAccumulator::default(),
+        engine_update_tx,
+        tn_exex::TnExExManagerHandle::empty(),
+    )
+    .expect("output executed");
 
     // sleep to ensure canonical update received before ack
     let _ = tokio::time::sleep(Duration::from_secs(1)).await;
