@@ -361,26 +361,6 @@ impl TnExExManager {
                 continue;
             }
 
-            // Skip if this ExEx has already processed past the first buffered notification
-            if let Some((_, first_notif)) = self.buffer.front() {
-                if let Some(chain) = first_notif.committed_chain() {
-                    // Only check the tip if the chain has blocks
-                    if !chain.blocks().is_empty() {
-                        let tip = chain.tip();
-                        let tip_number = tip.number;
-                        if let Some(finished) = handle.finished_height {
-                            if finished.number >= tip_number {
-                                // ExEx is already ahead, skip all buffered notifications
-                                if let Some((last_id, _)) = self.buffer.back() {
-                                    min_delivered_id = min_delivered_id.min(*last_id);
-                                }
-                                continue;
-                            }
-                        }
-                    }
-                }
-            }
-
             // Try to send all buffered notifications to this ExEx
             let mut last_sent_id = None;
             for (id, notification) in &self.buffer {
