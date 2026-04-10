@@ -540,18 +540,6 @@ impl TnExExManagerHandle {
         }
     }
 
-    /// Sends a notification to all registered ExExes (async with backpressure).
-    ///
-    /// This will wait until the bounded channel has capacity before returning.
-    pub async fn send_async(&self, notification: TnExExNotification) -> Result<(), ()> {
-        if let Some(tx) = &self.handle_tx {
-            tx.send(notification).await.map_err(|_| ())?;
-            Ok(())
-        } else {
-            Ok(())
-        }
-    }
-
     /// Returns a watch receiver for the lowest finished height across all ExExes.
     pub fn finished_height(&self) -> watch::Receiver<FinishedTnExExHeight> {
         self.finished_height.clone()
@@ -616,11 +604,6 @@ mod tests {
         handle.send(TnExExNotification::ChainCommitted {
             new: Arc::new(reth_provider::Chain::default()),
         });
-
-        let result = handle.send_async(TnExExNotification::ChainCommitted {
-            new: Arc::new(reth_provider::Chain::default()),
-        }).await;
-        assert!(result.is_ok());
     }
 
     #[tokio::test]
