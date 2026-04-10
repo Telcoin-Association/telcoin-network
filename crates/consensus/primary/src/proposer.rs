@@ -295,21 +295,15 @@ impl<DB: Database> Proposer<DB> {
     /// The min delay is reduced when this authority expects to become the leader of the next round.
     /// Reducing the min delay increases the chances of successfully committing a leader.
     ///
-    /// NOTE: If the next round is even, the leader schedule is used to identify the next leader. If
-    /// the next round is odd, the whole committee is used in order to keep the proposal rate as
-    /// high as possible (which leads to a higher round rates). Using the entire committee here also
-    /// helps boost scores for weaker nodes that may be trying to resync.
+    /// Leaders are only elected on even rounds. For even rounds, zero delay when this node is the
+    /// anticipated leader increases commit chance. For odd rounds, use min_header_delay so the
+    /// certifier has time to certify the previous (possibly batch-bearing) even round header
+    /// before it gets canceled by the next proposal.
     fn calc_min_delay(&self) -> Duration {
-        // check next round
         let next_round = self.round + 1;
 
-        // compare:
-        // - leader schedule for even rounds
-        // - entire committee for odd rounds
-        //
-        // NOTE: committee size is asserted >1 during Committee::load()
-        if !(next_round.is_multiple_of(2)
-            && self.leader_schedule.leader(next_round).id() != self.authority_id)
+        if next_round.is_multiple_of(2)
+            && self.leader_schedule.leader(next_round).id() == self.authority_id
         {
             Duration::ZERO
         } else {
