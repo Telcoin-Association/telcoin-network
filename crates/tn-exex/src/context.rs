@@ -26,8 +26,8 @@ use tokio::sync::mpsc;
 pub struct TnExExContext<Provider = BlockchainProvider<TelcoinNode>> {
     /// The current head of the chain when this ExEx was started.
     ///
-    /// ExExes should begin processing from this point forward. Historical backfill
-    /// is not currently supported but could be added in a future version.
+    /// ExExes should begin processing from this point forward. For historical
+    /// replay of earlier blocks, see [`ReplayStream`](crate::replay::ReplayStream).
     pub head: BlockNumHash,
 
     /// The node's configuration.
