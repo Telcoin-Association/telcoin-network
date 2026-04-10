@@ -70,12 +70,17 @@ pub type TnExExInstallFn<Provider> =
 /// // Use handle to send notifications from engine
 /// handle.send(notification);
 /// ```
-#[derive(Default)]
 pub struct TnExExLauncher<Provider = reth_provider::providers::BlockchainProvider<tn_reth::traits::TelcoinNode>> {
     /// Registered ExExes to be launched.
     /// Tuple of (id, install_function).
     exexs: Vec<(String, TnExExInstallFn<Provider>)>,
     _phantom: std::marker::PhantomData<Provider>,
+}
+
+impl<Provider> Default for TnExExLauncher<Provider> {
+    fn default() -> Self {
+        Self { exexs: Vec::new(), _phantom: std::marker::PhantomData }
+    }
 }
 
 impl<Provider> TnExExLauncher<Provider>
@@ -217,7 +222,7 @@ where
     }
 }
 
-impl std::fmt::Debug for TnExExLauncher {
+impl<Provider> std::fmt::Debug for TnExExLauncher<Provider> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TnExExLauncher")
             .field("num_exexs", &self.exexs.len())
