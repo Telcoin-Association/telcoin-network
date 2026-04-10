@@ -204,11 +204,12 @@ where
         }
 
         // Create the manager with all handles and optional consensus receivers
+        let num_exexs = handles.len();
         let (manager, manager_handle) =
             TnExExManager::new(handles, None, exex_certificates_rx, exex_committed_sub_dags_rx);
 
         tracing::info!(
-            num_exexs = manager_handle.has_exexs() as usize,
+            num_exexs,
             "ExEx manager created"
         );
 
