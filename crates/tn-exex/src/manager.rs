@@ -63,21 +63,21 @@ impl FinishedTnExExHeight {
 #[derive(Debug)]
 pub struct TnExExHandle {
     /// Unique identifier for this ExEx.
-    pub id: String,
+    pub(crate) id: String,
 
     /// Channel for sending notifications to the ExEx.
     /// Uses PollSender for backpressure-aware sending.
-    pub sender: PollSender<TnExExNotification>,
+    pub(crate) sender: PollSender<TnExExNotification>,
 
     /// Channel for receiving events from the ExEx.
-    pub receiver: mpsc::UnboundedReceiver<TnExExEvent>,
+    pub(crate) receiver: mpsc::UnboundedReceiver<TnExExEvent>,
 
     /// Monotonically increasing ID for notifications sent to this ExEx.
-    pub next_notification_id: usize,
+    pub(crate) next_notification_id: usize,
 
     /// The last block height this ExEx reported as finished.
     /// Used to skip sending notifications for blocks already processed.
-    pub finished_height: Option<BlockNumHash>,
+    pub(crate) finished_height: Option<BlockNumHash>,
 
     /// `true` when the ExEx task has died (notification channel closed).
     /// Dead handles are skipped during sends and periodically removed.
