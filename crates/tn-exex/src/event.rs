@@ -50,10 +50,10 @@ impl TnExExEvent {
         Self::FinishedHeight(block)
     }
 
-    /// Returns the block height if this is a `FinishedHeight` event.
-    pub fn block(&self) -> Option<BlockNumHash> {
+    /// Returns the block height from this event.
+    pub fn block(&self) -> BlockNumHash {
         match self {
-            Self::FinishedHeight(block) => Some(*block),
+            Self::FinishedHeight(block) => *block,
         }
     }
 }
@@ -76,6 +76,6 @@ mod tests {
         let block = BlockNumHash::new(100, B256::from([2u8; 32]));
         let event = TnExExEvent::FinishedHeight(block);
 
-        assert_eq!(event.block(), Some(block));
+        assert_eq!(event.block(), block);
     }
 }
