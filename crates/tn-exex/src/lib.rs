@@ -97,6 +97,6 @@ mod replay;
 pub use context::TnExExContext;
 pub use event::TnExExEvent;
 pub use launcher::{TnExExInstallFn, TnExExLauncher};
-pub use manager::{TnExExHandle, TnExExManager, TnExExManagerHandle};
+pub use manager::{FinishedTnExExHeight, TnExExHandle, TnExExManager, TnExExManagerHandle};
 pub use notification::TnExExNotification;
 pub use replay::ReplayStream;
