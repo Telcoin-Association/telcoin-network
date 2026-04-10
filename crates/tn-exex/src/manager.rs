@@ -78,6 +78,10 @@ pub struct TnExExHandle {
     /// The last block height this ExEx reported as finished.
     /// Used to skip sending notifications for blocks already processed.
     pub finished_height: Option<BlockNumHash>,
+
+    /// `true` when the ExEx task has died (notification channel closed).
+    /// Dead handles are skipped during sends and periodically removed.
+    dead: bool,
 }
 
 impl TnExExHandle {
@@ -109,6 +113,7 @@ impl TnExExHandle {
             next_notification_id: 0,
             // Initialize to node head - ExEx will start from here
             finished_height: Some(node_head),
+            dead: false,
         };
 
         (handle, event_tx, notification_rx)
@@ -348,6 +353,14 @@ impl TnExExManager {
         let mut min_delivered_id = usize::MAX;
 
         for handle in &mut self.exex_handles {
+            // Skip dead ExExes — they don't block buffer pruning.
+            if handle.dead {
+                if let Some((last_id, _)) = self.buffer.back() {
+                    min_delivered_id = min_delivered_id.min(*last_id);
+                }
+                continue;
+            }
+
             // Skip if this ExEx has already processed past the first buffered notification
             if let Some((_, first_notif)) = self.buffer.front() {
                 if let Some(chain) = first_notif.committed_chain() {
@@ -387,14 +400,19 @@ impl TnExExManager {
                                 metrics::counter!("tn_exex_notifications_sent_total").increment(1);
                             }
                             Err(_) => {
-                                // Channel closed - ExEx died
-                                tracing::error!(exex_id = %handle.id, "ExEx notification channel closed");
+                                // Channel closed - mark ExEx as dead
+                                handle.dead = true;
+                                tracing::error!(exex_id = %handle.id, "ExEx notification channel closed — marking as dead");
+                                metrics::gauge!("tn_exex_num_exexs").decrement(1.0);
                                 break;
                             }
                         }
                     }
                     Poll::Ready(Err(_)) => {
-                        // Channel closed
+                        // Channel closed - mark ExEx as dead
+                        handle.dead = true;
+                        tracing::error!(exex_id = %handle.id, "ExEx notification channel closed — marking as dead");
+                        metrics::gauge!("tn_exex_num_exexs").decrement(1.0);
                         break;
                     }
                     Poll::Pending => {
@@ -420,6 +438,9 @@ impl TnExExManager {
             let is_ready = remaining > 0;
             let _ = self.is_ready.send(is_ready);
         }
+
+        // Drain dead handles so they stop consuming memory.
+        self.exex_handles.retain(|h| !h.dead);
     }
 }
 
