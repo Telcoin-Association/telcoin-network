@@ -33,13 +33,18 @@ const EXEX_HANDLE_CHANNEL_CAPACITY: usize = 1024;
 pub struct FinishedTnExExHeight {
     /// The lowest block that all ExExes have finished processing.
     /// `None` if no ExExes have reported any progress yet.
-    pub height: Option<BlockNumHash>,
+    height: Option<BlockNumHash>,
 }
 
 impl FinishedTnExExHeight {
     /// Creates a new `FinishedTnExExHeight` with the given block.
     pub fn new(height: BlockNumHash) -> Self {
         Self { height: Some(height) }
+    }
+
+    /// Returns the lowest finished block, or `None` if no ExEx has reported progress.
+    pub fn height(&self) -> Option<BlockNumHash> {
+        self.height
     }
 
     /// Updates the finished height to the minimum of the current and new heights.
