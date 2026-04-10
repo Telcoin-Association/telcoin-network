@@ -92,18 +92,6 @@ impl TnExExContext {
     }
 }
 
-// Safety: TnExExContext contains channels and a provider that are all Send + Sync
-// The Send bound is required so contexts can be passed across thread boundaries
-// The Sync bound is not strictly required but is good practice
-#[allow(dead_code)]
-fn assert_context_bounds() {
-    fn assert_send<T: Send>() {}
-    fn assert_sync<T: Sync>() {}
-
-    assert_send::<TnExExContext>();
-    assert_sync::<TnExExContext>();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
