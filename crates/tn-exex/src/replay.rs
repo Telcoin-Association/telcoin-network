@@ -165,7 +165,6 @@ impl Stream for ReplayStream {
 
 #[cfg(test)]
 mod tests {
-    // Note: ReplayStream requires a real RethEnv backed by a database,
-    // so meaningful tests live in crates/tn-exex/tests/it/ as integration tests.
-    // The stream's correctness is exercised there.
+    // ReplayStream requires a real RethEnv backed by a database.
+    // Tests live in crates/tn-exex/tests/it/main.rs (test_replay_stream_*).
 }
