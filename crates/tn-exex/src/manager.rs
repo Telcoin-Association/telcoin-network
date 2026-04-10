@@ -14,6 +14,7 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::sync::{broadcast, mpsc, watch};
+use tokio_stream::{wrappers::BroadcastStream, Stream};
 use tokio_util::sync::PollSender;
 use tn_types::{BlockNumHash, Certificate, CommittedSubDag};
 
@@ -154,12 +155,12 @@ pub struct TnExExManager {
     /// Monotonically increasing notification ID.
     next_notification_id: usize,
 
-    /// Optional broadcast receiver for ExEx certificate notifications from consensus.
+    /// Optional stream for ExEx certificate notifications from consensus.
     /// `None` when no ConsensusBus is connected (e.g., in tests or when no ExExes installed).
-    exex_certificates_rx: Option<broadcast::Receiver<Arc<Certificate>>>,
+    exex_certificates_rx: Option<BroadcastStream<Arc<Certificate>>>,
 
-    /// Optional broadcast receiver for ExEx committed sub-DAG notifications from consensus.
-    exex_committed_sub_dags_rx: Option<broadcast::Receiver<Arc<CommittedSubDag>>>,
+    /// Optional stream for ExEx committed sub-DAG notifications from consensus.
+    exex_committed_sub_dags_rx: Option<BroadcastStream<Arc<CommittedSubDag>>>,
 }
 
 impl TnExExManager {
@@ -201,8 +202,8 @@ impl TnExExManager {
             is_ready: is_ready_tx,
             finished_height: finished_height_tx,
             next_notification_id: 0,
-            exex_certificates_rx,
-            exex_committed_sub_dags_rx,
+            exex_certificates_rx: exex_certificates_rx.map(BroadcastStream::new),
+            exex_committed_sub_dags_rx: exex_committed_sub_dags_rx.map(BroadcastStream::new),
         };
 
         let handle = TnExExManagerHandle {
@@ -280,20 +281,20 @@ impl TnExExManager {
         let _ = self.is_ready.send(is_ready);
     }
 
-    /// Receives consensus-layer notifications from ConsensusBus broadcast channels.
+    /// Receives consensus-layer notifications from ConsensusBus broadcast streams.
     ///
-    /// Polls the optional certificate and committed sub-DAG broadcast receivers,
-    /// wraps received data in `TnExExNotification` variants, and pushes to the buffer.
+    /// Polls the optional certificate and committed sub-DAG streams with the task
+    /// waker, so the manager is re-polled when new consensus data arrives.
     /// Handles `Lagged` errors by logging a warning (indicates ExEx is too slow to keep up).
-    fn receive_consensus_notifications(&mut self) {
+    fn receive_consensus_notifications(&mut self, cx: &mut Context<'_>) {
         // Drain certificate notifications
         if let Some(rx) = &mut self.exex_certificates_rx {
             loop {
                 if self.buffer.len() >= self.max_capacity {
                     break;
                 }
-                match rx.try_recv() {
-                    Ok(certificate) => {
+                match Pin::new(&mut *rx).poll_next(cx) {
+                    Poll::Ready(Some(Ok(certificate))) => {
                         let id = self.next_notification_id;
                         self.next_notification_id += 1;
                         self.buffer.push_back((
@@ -301,14 +302,14 @@ impl TnExExManager {
                             TnExExNotification::CertificateCreated { certificate },
                         ));
                     }
-                    Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                    Poll::Ready(Some(Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)))) => {
                         metrics::counter!("tn_exex_consensus_notifications_lagged_total", "kind" => "certificate").increment(n);
                         tracing::warn!(
                             lagged = n,
                             "ExEx manager lagged behind on certificate notifications"
                         );
                     }
-                    Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
+                    Poll::Ready(None) | Poll::Pending => {
                         break;
                     }
                 }
@@ -321,21 +322,21 @@ impl TnExExManager {
                 if self.buffer.len() >= self.max_capacity {
                     break;
                 }
-                match rx.try_recv() {
-                    Ok(sub_dag) => {
+                match Pin::new(&mut *rx).poll_next(cx) {
+                    Poll::Ready(Some(Ok(sub_dag))) => {
                         let id = self.next_notification_id;
                         self.next_notification_id += 1;
                         self.buffer
                             .push_back((id, TnExExNotification::ConsensusCommitted { sub_dag }));
                     }
-                    Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                    Poll::Ready(Some(Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)))) => {
                         metrics::counter!("tn_exex_consensus_notifications_lagged_total", "kind" => "committed_sub_dag").increment(n);
                         tracing::warn!(
                             lagged = n,
                             "ExEx manager lagged behind on committed sub-DAG notifications"
                         );
                     }
-                    Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
+                    Poll::Ready(None) | Poll::Pending => {
                         break;
                     }
                 }
@@ -437,7 +438,7 @@ impl Future for TnExExManager {
         this.receive_new_notifications(cx);
 
         // 3. Receive consensus-layer notifications from ConsensusBus
-        this.receive_consensus_notifications();
+        this.receive_consensus_notifications(cx);
 
         // 4. Send buffered notifications to ExExes
         this.send_notifications_to_exexes(cx);
