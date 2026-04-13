@@ -20,6 +20,7 @@ use tn_types::{
     ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, Notifier, TaskManager,
     TaskSpawner, TimestampSec, MIN_PROTOCOL_BASE_FEE,
 };
+use tn_exex::TnExExManagerHandle;
 use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -72,6 +73,10 @@ pub(crate) struct EpochManager<P, DB> {
 
     /// Access to the epoch pack files storing consensus data.
     consensus_chain: ConsensusChain,
+
+    /// Handle for sending notifications to ExEx tasks.
+    /// Persists across epoch transitions.
+    exex_handle: TnExExManagerHandle,
 }
 
 /// Restore the [`GasAccumulator`] state after a mid-epoch restart.
@@ -194,11 +199,17 @@ where
             last_consensus_header: None,
             last_forwarded_consensus_number: 0,
             consensus_chain,
+            exex_handle: tn_exex::TnExExManagerHandle::empty(),
         }
     }
 
     /// Run the node, handling epoch transitions.
-    pub(crate) async fn run(&mut self) -> eyre::Result<()> {
+    ///
+    /// ## ExEx Support
+    ///
+    /// If `exex_launcher` is provided with installed ExExs, they will be launched at node startup.
+    /// The ExEx manager persists across epoch transitions.
+    pub(crate) async fn run(&mut self, exex_launcher: Option<tn_exex::TnExExLauncher>) -> eyre::Result<()> {
         // Surface any errors that may have been triggered on create.
         self.consensus_chain.persist_current().await?;
         // Main task manager that manages tasks across epochs.
@@ -208,17 +219,86 @@ where
 
         info!(target: "epoch-manager", "starting node and launching first epoch");
 
+        // Create the gas accumulator early since we need it for RethEnv
+        let gas_accumulator = GasAccumulator::new(1);
+
+        // Create RethEnv early so we can get the provider for ExEx initialization
+        let basefee_address = self.builder.tn_config.parameters.basefee_address;
+        let reth_env = RethEnv::new(
+            &self.builder.node_config,
+            &node_task_manager,
+            self.reth_db.clone(),
+            basefee_address,
+            gas_accumulator.rewards_counter(),
+        )?;
+
+        // Initialize ExEx system before creating engine
+        // Query current chain head for ExEx initialization
+        let node_head = {
+            let head = reth_env.lookup_head()?;
+            BlockNumHash::new(head.number, head.hash())
+        };
+        
+        // Use provided launcher or create empty one
+        let launcher = exex_launcher.unwrap_or_else(tn_exex::TnExExLauncher::new);
+        
+        // If there are ExExs configured, log how many are installed
+        let installed_count = launcher.len();
+        let config_ids: Vec<_> = self.builder.tn_config.exex.iter()
+            .map(|e| e.id.as_str())
+            .collect();
+        
+        if !config_ids.is_empty() || installed_count > 0 {
+            info!(
+                target: "exex",
+                installed = installed_count,
+                config_ids = ?config_ids,
+                "ExEx configuration loaded"
+            );
+        }
+        
+        // Create blockchain provider for ExEx context
+        let blockchain_provider = reth_env.blockchain_provider();
+        
+        // Subscribe to ConsensusBus ExEx channels if ExExes are installed
+        let (exex_certs_rx, exex_sub_dags_rx) = if !launcher.is_empty() {
+            (
+                Some(self.consensus_bus.subscribe_exex_certificates()),
+                Some(self.consensus_bus.subscribe_exex_committed_sub_dags()),
+            )
+        } else {
+            (None, None)
+        };
+
+        let (exex_manager, exex_handle) = launcher
+            .launch(
+                node_head,
+                self.builder.tn_config.clone(),
+                blockchain_provider,
+                node_task_spawner.clone(),
+                exex_certs_rx,
+                exex_sub_dags_rx,
+            )
+            .await
+            .map_err(|e| eyre!("Failed to launch ExEx manager: {}", e))?;
+        
+        // Replace empty handle with real manager handle
+        self.exex_handle = exex_handle;
+        
+        // Spawn ExEx manager as critical background task
+        node_task_spawner.spawn_critical_task("exex-manager", async move {
+            exex_manager.await;
+            info!(target: "exex", "ExEx manager shut down");
+        });
+
         // create channels for engine that survive the lifetime of the node
         let (to_engine, for_engine) = mpsc::channel(1000);
 
-        // Create our epoch gas accumulator, we currently have one worker.
-        // All nodes have to agree on the worker count, do not change this for an existing chain.
-        let gas_accumulator = GasAccumulator::new(1);
         // create channel for engine updates to consensus
         let (engine_update_tx, engine_update_rx) = mpsc::channel(64);
 
-        // create the engine
-        let engine = self.create_engine(&node_task_manager, &gas_accumulator)?;
+        // create the engine with the RethEnv we already created
+        let engine = ExecutionNode::new(&self.builder, reth_env.clone(), self.exex_handle.clone())?;
         engine
             .start_engine(
                 for_engine,
@@ -417,26 +497,6 @@ where
             }
             info!(target: "epoch-manager", "looping run epoch");
         }
-    }
-
-    /// Helper method to create all engine components.
-    fn create_engine(
-        &self,
-        engine_task_manager: &TaskManager,
-        gas_accumulator: &GasAccumulator,
-    ) -> eyre::Result<ExecutionNode> {
-        // create execution components (ie - reth env)
-        let basefee_address = self.builder.tn_config.parameters.basefee_address;
-        let reth_env = RethEnv::new(
-            &self.builder.node_config,
-            engine_task_manager,
-            self.reth_db.clone(),
-            basefee_address,
-            gas_accumulator.rewards_counter(),
-        )?;
-        let engine = ExecutionNode::new(&self.builder, reth_env)?;
-
-        Ok(engine)
     }
 
     /// Helper method to restore execution state for the consensus components.

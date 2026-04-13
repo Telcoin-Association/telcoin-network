@@ -31,6 +31,7 @@ tn-network-types = { workspace = true }
 tn-storage = { workspace = true, features = ["test-utils"] }
 tn-batch-validator = { workspace = true }
 tn-engine = { workspace = true }
+tn-exex = { workspace = true }
 tn-batch-builder = { workspace = true, features = ["test-utils"] }
 
 [features]

@@ -14,6 +14,7 @@ members = [
     "crates/network-libp2p",
     "crates/state-sync",
     "crates/tn-reth",
+    "crates/tn-exex",
     "crates/e2e-tests",
     "crates/telcoin-network-cli",
 
@@ -69,6 +70,7 @@ clap = "4"
 eyre = "0.6"
 futures = "0.3"
 tokio = { version = "1.44", default-features = false }
+tokio-util = "0.7"
 tracing = "0.1.0"
 tracing-subscriber = { version = "0.3.20", default-features = false }
 metrics = "0.23.0"                                     # Needed for `metrics-macro` to resolve the crate using `::metrics` notation
@@ -144,6 +146,7 @@ assert_matches = { version = "1.5.0" }
 # common
 tn-types = { path = "./crates/types" }
 tn-reth = { path = "./crates/tn-reth" }
+tn-exex = { path = "./crates/tn-exex" }
 tn-node = { path = "./crates/node" }
 tn-config = { path = "./crates/config" }
 tn-network-libp2p = { path = "./crates/network-libp2p" }
