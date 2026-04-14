@@ -10,13 +10,13 @@ The `telcoin-network` binary has three subcommands:
 
 ## Prerequisites
 
-Hardware (recommended minimums):
+Hardware (recommended minimums for Adiri testnet):
 
 | Resource | Minimum    | Recommended   |
 | -------- | ---------- | ------------- |
-| CPU      | 4 cores    | 8+ cores      |
-| RAM      | 16 GB      | 32 GB         |
-| Disk     | 500 GB SSD | 1 TB NVMe SSD |
+| CPU      | 8 cores    | 16+ cores     |
+| RAM      | 16 GB      | 64 GB        |
+| Disk     | 500 TB TLC NVMe SSD | 1 TB TLC NVMe SSD |
 | Network  | 100 Mbps   | 1 Gbps        |
 
 Software:
@@ -490,7 +490,7 @@ RUST_LOG=info,consensus=debug,evm=trace telcoin-network node ...
 
 ## Multi-instance setup
 
-The `--instance` flag adjusts port numbers so multiple nodes can run on the same machine without conflicts. Instance numbers range from 0 to 200.
+The `--instance` flag adjusts port numbers so multiple nodes can run on the same machine without conflicts. Instance numbers range from 0 to 200. This configuration is only recommended for spawning local networks and should not be used in production environments.
 
 ### Port offset formula
 
