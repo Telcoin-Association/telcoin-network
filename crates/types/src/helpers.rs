@@ -1,9 +1,13 @@
 //! Helpers for starting a node
 
+use parking_lot::Mutex;
 use secp256k1::PublicKey;
 use std::net::{TcpListener, UdpSocket};
 
 const MAX_RETRIES: u32 = 1000;
+
+/// Track any ports we have given out already to avoid TOCTOU issues with port generation.
+static USED_PORTS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
 
 /// Represents the type of socket to create
 #[derive(Debug, Clone, Copy)]
@@ -31,7 +35,11 @@ pub enum PortError {
 pub fn get_available_port(config: &PortConfig) -> Result<u16, PortError> {
     for _ in 0..config.max_retries {
         if let Ok(port) = get_ephemeral_port(&config.host, config.socket_type) {
-            return Ok(port);
+            let mut used_ports = USED_PORTS.lock();
+            if !used_ports.contains(&port) {
+                used_ports.push(port);
+                return Ok(port);
+            }
         }
     }
     Err(PortError::NoPortsAvailable)

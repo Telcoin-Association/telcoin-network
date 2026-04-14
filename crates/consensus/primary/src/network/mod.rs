@@ -418,9 +418,15 @@ where
             tokio::select! {
                 header =
                     request_handler.retrieve_consensus_header(number, hash) => {
+                        // Penalize peer's reputation for bad request.
+                        // This could happen now and then and not be malicious so use a Mild only
+                        // to close any DOS attack.
+                        if let Err(e) = &header {
+                            let my_number = request_handler.consensus_chain().latest_consensus_number();
+                            tracing::warn!(target: "primary::network", ?e, ?my_number, ?number, ?hash, ?peer,  "applying penalty for failed consesus header request");
+                            network_handle.handle.report_penalty(peer, Penalty::Mild).await;
+                        }
                         let response = header.into_response();
-                        // TODO: penalize peer's reputation for bad request
-                        // if response.is_err() { }
                         let _ = network_handle.handle.send_response(response, channel).await;
                     }
                 // cancel notification from network layer

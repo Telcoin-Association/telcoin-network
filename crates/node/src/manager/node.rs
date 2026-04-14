@@ -17,8 +17,8 @@ use tn_reth::{system_calls::EpochState, RethDb, RethEnv};
 use tn_storage::{consensus::ConsensusChain, open_db, DatabaseType};
 use tn_types::{
     deconstruct_nonce, gas_accumulator::GasAccumulator, BlockNumHash, ConsensusHeader,
-    ConsensusOutput, Database as TNDatabase, EngineUpdate, Notifier, TaskManager, TaskSpawner,
-    TimestampSec, MIN_PROTOCOL_BASE_FEE,
+    ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, Notifier, TaskManager,
+    TaskSpawner, TimestampSec, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::mpsc;
@@ -240,7 +240,7 @@ where
 
         // read the network config or use the default
         let network_config = NetworkConfig::read_config(&self.tn_datadir)?;
-        self.spawn_node_networks(node_task_spawner, &network_config).await?;
+        self.spawn_node_networks(node_task_spawner, &network_config, epoch).await?;
         let primary_network_handle =
             self.primary_network_handle.as_ref().expect("primary network").clone();
         primary_network_handle
@@ -309,6 +309,7 @@ where
         &mut self,
         node_task_spawner: TaskSpawner,
         network_config: &NetworkConfig,
+        epoch: Epoch,
     ) -> eyre::Result<()> {
         //
         //=== PRIMARY
@@ -368,11 +369,8 @@ where
         });
 
         // set temporary task spawner - this is updated with each epoch
-        self.worker_network_handle = Some(WorkerNetworkHandle::new(
-            worker_network_handle,
-            node_task_spawner.clone(),
-            network_config.libp2p_config().max_rpc_message_size,
-        ));
+        self.worker_network_handle =
+            Some(WorkerNetworkHandle::new(worker_network_handle, node_task_spawner.clone(), epoch));
 
         Ok(())
     }
