@@ -179,7 +179,7 @@ pub async fn spawn_epoch_record_collector(
         let mut last_epoch: Epoch = 0;
         loop {
             let requested_epoch = *epoch_rx.borrow_and_update();
-            if requested_epoch > last_epoch {
+            if requested_epoch >= last_epoch {
                 last_epoch = collect_epoch_records(
                     last_epoch,
                     &consensus_chain,
