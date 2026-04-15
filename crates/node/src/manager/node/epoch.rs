@@ -329,7 +329,7 @@ where
                 info_span!(target: "telcoin", "orphan-batches", epoch = tracing::field::Empty);
             span.record("epoch", epoch.to_string());
             epoch_task_manager.spawn_task("Orphaned Batches", async move {
-                info!(target: "epoch-manager", "Re-introducing orphaned batchs {} transactions", orphan_batches.len());
+                info!(target: "epoch-manager", "Re-introducing orphaned batches {} transactions", orphan_batches.len());
                 let pools = engine.get_all_worker_transaction_pools().await;
                 let is_cvv = consensus_bus.is_active_cvv();
                 for (digest, batch) in orphan_batches.drain(..) {
