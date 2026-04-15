@@ -238,10 +238,12 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
                         let _ = self.network_handle.publish_batch(digest).await;
                     }
                     Err(e) => {
+                        // On error the batch builder should leave the transactions in the pool for
+                        // a future batch. So go ahead and remove so we
+                        // don't try to re-inject them later.
+                        let _ = self.store.remove::<OurNodeBatchesCache>(&digest);
                         return Err(match e {
                             crate::quorum_waiter::QuorumWaiterError::QuorumRejected => {
-                                // Explicitly rejected — don't re-inject at epoch boundary
-                                let _ = self.store.remove::<OurNodeBatchesCache>(&digest);
                                 BlockSealError::QuorumRejected
                             }
                             crate::quorum_waiter::QuorumWaiterError::AntiQuorum => {
