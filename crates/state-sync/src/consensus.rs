@@ -14,7 +14,6 @@ use tracing::{debug, error, info, warn};
 /// have already been "validated" so the only check we
 /// make is that the returned header matches the hash.
 async fn get_consensus_header<DB: TNDatabase>(
-    _epoch: Option<Epoch>,
     number: u64,
     hash: B256,
     config: &ConsensusConfig<DB>,
@@ -33,7 +32,11 @@ async fn get_consensus_header<DB: TNDatabase>(
     }
     if let Ok(Some(block)) = config.node_storage().get::<ConsensusHeaderCache>(&number) {
         return if block.number > 0 {
-            Some((block.sub_dag.leader_epoch(), block.number - 1, block.parent_hash))
+            Some((
+                consensus_chain.epochs().number_to_epoch(block.number - 1),
+                block.number - 1,
+                block.parent_hash,
+            ))
         } else {
             None
         };
@@ -47,7 +50,6 @@ async fn get_consensus_header<DB: TNDatabase>(
             // The header we got will match hash (request_consensus() contract).
             let parent = header.parent_hash;
             let parent_number = header.number - 1;
-            let epoch = header.sub_dag.leader_epoch();
             let last_seen_header_number = consensus_bus
                 .last_consensus_header()
                 .borrow()
@@ -58,6 +60,7 @@ async fn get_consensus_header<DB: TNDatabase>(
                 // Update our last seen valid consensus header if it is newer.
                 consensus_bus.last_consensus_header().send_replace(Some(header));
             }
+            let epoch = consensus_chain.epochs().number_to_epoch(parent_number);
             Some((epoch, parent_number, parent))
         }
         Err(e) => {
@@ -112,18 +115,26 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
     // This loop will track current consensus as well as try to backfill from current.
     // The spawned workers above will try to fetch consensus for previous epochs in
     // parrallel starting with earliest so we can start executing sooner.
+    let mut last_gossipped_epoch = None;
     loop {
         tokio::select! {
             _ = rx_gossip_update.changed() => {
                 let (number, hash) = *rx_gossip_update.borrow_and_update();
                 debug!(target: "state-sync", ?number, ?hash, "tracking recent consensus and detected change through gossip - requesting consensus from peer");
+                if last_gossipped_epoch.is_none() {
+                    last_gossipped_epoch = Some(consensus_chain.epochs().number_to_epoch(number))
+                }
 
-                if let Some(next) = get_consensus_header(None, number, hash, &config, &consensus_bus, &network, &consensus_chain).await {
+                if let Some(next) = get_consensus_header(number, hash, &config, &consensus_bus, &network, &consensus_chain).await {
                     if current_fetch_epoch < next.0 {
                         // If we still have epochs to fetch then add to the queue until we are out of epoch records.
                         while let Some(epoch_record) = consensus_chain.epochs().record_by_epoch(current_fetch_epoch).await {
-                            let _ = epochs_tx.send(epoch_record).await;
-                            current_fetch_epoch += 1;
+                            if epoch_record.epoch < last_gossipped_epoch.unwrap_or_default() {
+                                let _ = epochs_tx.send(epoch_record).await;
+                                current_fetch_epoch += 1;
+                            } else {
+                                break;
+                            }
                         }
                     }
                     // Each gossip event starts a backward traversal from the new tip.
@@ -134,9 +145,14 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
             }
 
             Some((epoch, number, hash)) = rx.recv() => {
+                if let Some(last_gossipped_epoch) = last_gossipped_epoch {
+                    if epoch < last_gossipped_epoch {
+                        continue;
+                    }
+                }
                 debug!(target: "state-sync", ?number, ?hash, "tracking recent consensus and detected change through gossip - requesting consensus from peer");
 
-                if let Some(next) = get_consensus_header(Some(epoch), number, hash, &config, &consensus_bus, &network, &consensus_chain).await {
+                if let Some(next) = get_consensus_header(number, hash, &config, &consensus_bus, &network, &consensus_chain).await {
                     let _ = tx.send(next).await;
                 }
                 // else: chain ended (block already in DB or peer fetch failed);
@@ -152,9 +168,10 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
 
 /// Spawn a long running task on task_manager that will fetch consensus for an epoch.
 /// This should only be used when NOT participating in active consensus.
+/// This works by stream an entire epochs pack file from a peer.
 async fn spawn_fetch_consensus<DB: TNDatabase>(
     config: ConsensusConfig<DB>,
-    consensus_bus: ConsensusBusApp,
+    _consensus_bus: ConsensusBusApp,
     network: PrimaryNetworkHandle,
     epoch_queue: Arc<Mutex<Receiver<EpochRecord>>>,
     worker: u32, // Worker number for logging.
@@ -168,47 +185,31 @@ async fn spawn_fetch_consensus<DB: TNDatabase>(
         epoch_queue.lock().await.recv().await.map(|e| (permit, e))
     }
     let rx_shutdown = config.shutdown().subscribe();
-    let mut epoch = 0;
-    let mut log_counter = 0;
-    let (tx, mut rx) = tokio::sync::mpsc::channel(10_000);
     // When can we accept more work (a new epoch).
     let next_sem = Arc::new(Semaphore::new(1));
-    let mut next_permit = None;
     // Get the epoch of our last executed consensus.
     loop {
         tokio::select! {
-            Some((permit, epoch_record)) = next_epoch(&epoch_queue, &next_sem) => {
-                epoch = epoch_record.epoch;
-                info!(target: "state-sync", "epoch consensus fetcher {worker} retreiving epoch {epoch}");
-                let _ = tx.send((epoch, epoch_record.final_consensus.number, epoch_record.final_consensus.hash)).await;
-                next_permit = Some(permit);
-            }
-            Some((rx_epoch, number, hash)) = rx.recv() => {
-                debug!(target: "state-sync", ?epoch, ?hash, "tracking recent consensus for an epoch - requesting consensus from peer");
-                if log_counter > 98 {
-                    // Log an info every 100 consensus blocks to show progress but not fill the logs.
-                    info!(target: "state-sync", ?number, ?epoch, ?hash, "tracking recent consensus for an epoch - requesting consensus from peer");
-                    log_counter = 0;
-                } else {
-                    log_counter += 1;
-                }
-
-                if let Some((new_epoch, num, hash)) = get_consensus_header(Some(rx_epoch), number, hash, &config, &consensus_bus, &network, &consensus_chain).await {
-                    if new_epoch == epoch {
-                        // Stop once we reach another epoch.
-                        let _ = tx.send((epoch, num, hash)).await;
-                    } else {
-                        info!(target: "state-sync", ?new_epoch, ?epoch, "tracking recent consensus for an epoch - changed epochs, finished");
-                        // We are done so can accept a new epoch.
-                        next_permit.take();
+            Some((_permit, epoch_record)) = next_epoch(&epoch_queue, &next_sem) => {
+                let epoch = epoch_record.epoch;
+                if let Some((previous_epoch, _)) = consensus_chain.epochs().get_epoch_by_number(epoch).await {
+                    info!(target: "state-sync", "epoch consensus fetcher {worker} retreiving epoch {epoch}");
+                    loop {
+                        match network.request_epoch_pack(
+                            epoch_record.clone(),
+                            previous_epoch.clone(),
+                            &consensus_chain,
+                        ).await {
+                            Ok(_) => break,
+                            Err(e) => {
+                                error!(target: "state-sync", "failed to request epoch pack for epoch {epoch}: {e}");
+                            }
+                        }
                     }
                 } else {
-                    info!(target: "state-sync", ?epoch, "tracking recent consensus for an epoch - out of consensus, finished");
-                    // We are done so can accept a new epoch.
-                    next_permit.take();
+                    error!(target: "state-sync", "unable to find previous epoch for epoch {epoch}");
                 }
             }
-
             _ = &rx_shutdown => {
                 return Ok(())
             }

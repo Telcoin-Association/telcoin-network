@@ -31,7 +31,7 @@ use crate::{
     epoch_records::{EpochDbError, EpochRecordDb},
 };
 
-pub trait ReadStream: AsyncRead + AsyncSeek + Unpin {}
+pub trait ReadStream: AsyncRead + AsyncSeek + Send + Unpin {}
 impl ReadStream for AsyncFile {}
 
 /// Simple enum for which of two saved consensus states we are using.
@@ -353,15 +353,48 @@ impl ConsensusChain {
 
     /// Populate an epoch pack from a stream.
     /// This will resolve once the stream has been written.
-    pub async fn stream_import<R: AsyncRead + AsyncSeek + Unpin>(
+    pub async fn stream_import<R: AsyncRead + Unpin>(
         &self,
         stream: R,
-        epoch: Epoch,
+        epoch_record: &EpochRecord,
         previous_epoch: EpochRecord,
     ) -> Result<(), ConsensusChainError> {
-        let pack =
-            ConsensusPack::stream_import(&self.base_path, stream, epoch, previous_epoch).await?;
-        Ok(pack.persist().await?)
+        let epoch = epoch_record.epoch;
+        // Store our files out of the way while we import so we don't use them until ready.
+        let path = self.base_path.join("import-{epoch}");
+        let res_pack = ConsensusPack::stream_import(&path, stream, epoch, previous_epoch).await;
+        match res_pack {
+            Ok(pack) => {
+                let base_dir = self.base_path.join(format!("epoch-{epoch}"));
+                let path_base_dir = path.join(format!("epoch-{epoch}"));
+                pack.persist().await?;
+                match pack.latest_consensus_header().await {
+                    Some(last_header) => {
+                        if epoch_record.final_consensus.number != last_header.number
+                            || epoch_record.final_consensus.hash != last_header.digest()
+                        {
+                            // Invalid final consensus header...
+                            let _ = std::fs::remove_dir(&path);
+                            return Err(ConsensusChainError::EmptyImport);
+                        }
+                    }
+                    None => {
+                        // Missing a final consensus header...
+                        let _ = std::fs::remove_dir(&path);
+                        return Err(ConsensusChainError::EmptyImport);
+                    }
+                }
+                drop(pack);
+                std::fs::rename(&path_base_dir, &base_dir)?;
+                let _ = std::fs::remove_dir(&path);
+                Ok(())
+            }
+            Err(e) => {
+                // We don't recover right now so just blow away the directory and remains of files.
+                let _ = std::fs::remove_dir_all(&path);
+                Err(e.into())
+            }
+        }
     }
 
     /// Return a stream reader for the log file of epoch.
@@ -616,6 +649,8 @@ pub enum ConsensusChainError {
     PrevCommitteeEpochMismatch,
     CrcError,
     EpochDbError(EpochDbError),
+    EmptyImport,
+    InvalidImport,
 }
 
 impl Error for ConsensusChainError {}
@@ -633,6 +668,10 @@ impl Display for ConsensusChainError {
             }
             ConsensusChainError::CrcError => write!(f, "Crc error"),
             ConsensusChainError::EpochDbError(e) => write!(f, "Epoch DB Error: {e}"),
+            ConsensusChainError::EmptyImport => write!(f, "No consensus in imported pack file"),
+            ConsensusChainError::InvalidImport => {
+                write!(f, "Bad final consensus in imported pack file")
+            }
         }
     }
 }
@@ -702,8 +741,6 @@ mod test {
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         let committee = fixture.committee();
         let previous_epoch = EpochRecord {
-            // If we can't find the recort then this we should be starting at epoch 0- use this
-            // filler.
             epoch: 0,
             committee: committee.bls_keys().iter().copied().collect(),
             next_committee: committee.bls_keys().iter().copied().collect(),
@@ -723,6 +760,9 @@ mod test {
             outputs.push(consensus_output.clone());
             consensus_chain.save_consensus_output(consensus_output).await.unwrap();
         }
+        let last = outputs.last().unwrap();
+        let mut epoch_record = previous_epoch.clone();
+        epoch_record.final_consensus = BlockNumHash::new(last.number(), last.digest().into());
         for i in 0..num_outputs {
             let output_db =
                 consensus_chain.get_consensus_output_current(i as u64 + 1).await.unwrap();
@@ -736,7 +776,10 @@ mod test {
         let temp_dir2 = TempDir::with_prefix("test_consensus_pack2").expect("temp dir");
         let consensus_chain2 = ConsensusChain::new(temp_dir2.path().to_owned()).unwrap();
         let stream = consensus_chain.get_epoch_stream(0).await.unwrap();
-        consensus_chain2.stream_import(stream, 0, previous_epoch.clone()).await.unwrap();
+        consensus_chain2
+            .stream_import(stream, &epoch_record, previous_epoch.clone())
+            .await
+            .unwrap();
         consensus_chain2.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
         for i in 0..num_outputs {
             let output_db =

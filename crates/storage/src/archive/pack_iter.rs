@@ -9,7 +9,7 @@ use std::{
 
 use serde::{de::DeserializeOwned, Serialize};
 use tn_types::decode;
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncSeek, AsyncSeekExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _};
 
 use crate::archive::{
     error::{fetch::FetchError, load_header::LoadHeaderError},
@@ -120,7 +120,7 @@ where
 impl<V, R> AsyncPackIter<V, R>
 where
     V: Debug + Serialize + DeserializeOwned,
-    R: AsyncRead + AsyncSeek + Unpin,
+    R: AsyncRead + Unpin,
 {
     /// Open the iterator using reader as a data source.
     /// Produces an iterator over all the (key, values).  All and records
@@ -128,17 +128,6 @@ where
     pub async fn open(mut reader: R, uid_idx: u64) -> Result<Self, LoadHeaderError> {
         let _header = DataHeader::load_header_async(&mut reader, uid_idx).await?;
         Ok(AsyncPackIter { _val: PhantomData, reader, buffer: Vec::new() })
-    }
-
-    /// Return the current position of the data file.
-    pub async fn position(&mut self) -> io::Result<u64> {
-        self.reader.stream_position().await
-    }
-
-    /// Sets the current position of the data file.
-    pub async fn set_position(&mut self, position: u64) -> io::Result<()> {
-        self.reader.seek(io::SeekFrom::Start(position)).await?;
-        Ok(())
     }
 
     /// Read the next record or return an error if an overflow bucket.

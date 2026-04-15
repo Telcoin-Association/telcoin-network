@@ -6,10 +6,11 @@ use super::{
 };
 use crate::{
     error::{CertManagerError, PrimaryNetworkError, PrimaryNetworkResult},
-    network::message::PrimaryGossip,
+    network::{message::PrimaryGossip, PendingEpochStream},
     state_sync::{CertificateCollector, StateSynchronizer},
     ConsensusBusApp, NodeMode,
 };
+use futures::{AsyncWrite, AsyncWriteExt as _};
 use parking_lot::Mutex;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -17,7 +18,7 @@ use std::{
     time::Duration,
 };
 use tn_config::ConsensusConfig;
-use tn_network_libp2p::GossipMessage;
+use tn_network_libp2p::{GossipMessage, Stream};
 use tn_storage::{consensus::ConsensusChain, CertificateStore, VoteDigestStore};
 use tn_types::{
     ensure,
@@ -25,10 +26,15 @@ use tn_types::{
     now, to_intent_message, try_decode, AuthorityIdentifier, BlockHash, BlsPublicKey, Certificate,
     CertificateDigest, ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord, Hash as _,
     Header, HeaderDigest, ProtocolSignature, Round, SignatureVerificationState, TnSender as _,
-    Vote,
+    Vote, B256,
 };
-use tokio::sync::Mutex as TokioMutex;
+use tokio::{io::AsyncReadExt, sync::Mutex as TokioMutex};
 use tracing::{debug, error, info, warn};
+
+/// Total timeout for sending all batches over a stream.
+/// Prevents slow-reader attacks where a peer accepts a stream but never reads.
+/// Set to 5 minutes as a an arbitrary upper bound on downloading a pack file.
+const SEND_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Map to hold vote info to detect invalid votes, equivocation and cache responses in case of
 /// rerequests.
@@ -902,5 +908,81 @@ where
     /// Return a reference to the `ConsensusChain`.
     pub(super) fn consensus_chain(&self) -> &ConsensusChain {
         &self.consensus_chain
+    }
+
+    /// Send batches over stream, looking up from database.
+    async fn send_epoch_over_stream<S>(
+        stream: &mut S,
+        consensus_chain: &ConsensusChain,
+        epoch: Epoch,
+    ) -> PrimaryNetworkResult<()>
+    where
+        S: AsyncWrite + Unpin + Send,
+    {
+        let mut bytes = vec![0_u8; 16 * 1024];
+        if let Ok(mut epoch_stream) = consensus_chain.get_epoch_stream(epoch).await {
+            loop {
+                let n = epoch_stream.read_buf(&mut bytes).await?;
+                if n == 0 {
+                    break;
+                }
+                stream.write_all(&bytes).await?;
+                bytes.resize(16 * 1024, 0_u8); // resize in case we did not get a full read for some
+                                               // reason.
+            }
+        }
+        Ok(())
+    }
+
+    /// Process request to open stream for an epoch pack.
+    pub(super) async fn process_request_epoch_stream(
+        &self,
+        peer: BlsPublicKey,
+        pending_request: Option<PendingEpochStream>,
+        mut stream: Stream,
+        request_digest: B256,
+        consensus_chain: &ConsensusChain,
+    ) -> PrimaryNetworkResult<()> {
+        // `None` indicates unexpected request
+        let Some(request) = pending_request else {
+            // this is a protocol violation - return error for penalty
+            warn!(
+                target: "primary::network",
+                %peer,
+                ?request_digest,
+                "inbound stream has no matching pending request"
+            );
+            return Err(PrimaryNetworkError::UnknownStreamRequest(request_digest));
+        };
+
+        // process request to send batches through stream
+        debug!(
+            target: "primary::network",
+            %peer,
+            ?request_digest,
+            epoch = request.epoch,
+            "processing inbound epoch stream"
+        );
+
+        // set timeout to prevent slow-read attack
+        match tokio::time::timeout(
+            SEND_STREAM_TIMEOUT,
+            Self::send_epoch_over_stream(&mut stream, consensus_chain, request.epoch),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                warn!(target: "primary::network", %peer, ?e, "failed to send epoch over stream");
+            }
+            Err(_elapsed) => {
+                warn!(target: "primary::network", %peer, ?request_digest, "sending epoch stream timed out");
+            }
+        }
+
+        // attempt to close the stream gracefully
+        let _ = stream.close().await;
+
+        Ok(())
     }
 }

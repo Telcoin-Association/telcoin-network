@@ -21,7 +21,7 @@ use tn_types::{
     EpochRecord, Round, B256,
 };
 use tokio::{
-    io::{AsyncRead, AsyncSeek},
+    io::AsyncRead,
     sync::{
         mpsc::{self, Receiver, Sender},
         oneshot, watch,
@@ -250,7 +250,7 @@ impl ConsensusPack {
     }
 
     /// Create a new set of epoch static files to write consensus output into.
-    pub async fn stream_import<P: Into<PathBuf>, R: AsyncRead + AsyncSeek + Unpin>(
+    pub async fn stream_import<P: Into<PathBuf>, R: AsyncRead + Unpin>(
         path: P,
         stream: R,
         epoch: Epoch,
@@ -668,7 +668,7 @@ impl Inner {
     }
 
     /// Create a new set of epoch static files to write consensus output into.
-    async fn stream_import<P: AsRef<Path>, R: AsyncRead + AsyncSeek + Unpin>(
+    async fn stream_import<P: AsRef<Path>, R: AsyncRead + Unpin>(
         path: P,
         stream: R,
         epoch: Epoch,

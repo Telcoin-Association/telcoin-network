@@ -59,6 +59,9 @@ pub(crate) enum PrimaryNetworkError {
     InvalidTopic,
     #[error(transparent)]
     Timeout(#[from] tokio::time::error::Elapsed),
+    /// No matching pending request for inbound stream.
+    #[error("No pending request matches stream hash")]
+    UnknownStreamRequest(BlockHash),
 }
 
 impl From<&PrimaryNetworkError> for Option<Penalty> {
@@ -108,6 +111,7 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
             },
             | PrimaryNetworkError::InvalidRequest(_)
             | PrimaryNetworkError::UnknownConsensusHeaderDigest(_)
+            | PrimaryNetworkError::UnknownStreamRequest(_)
             | PrimaryNetworkError::UnknownConsensusHeaderCert(_) => Some(Penalty::Mild),
             PrimaryNetworkError::InvalidEpochRequest
             | PrimaryNetworkError::StdIo(_) => Some(Penalty::Medium),
