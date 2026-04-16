@@ -266,7 +266,11 @@ async fn test_epoch_sync_inner(
     for ep in endpoints {
         let provider = ProviderBuilder::new().connect_http(ep.http_url.parse()?);
         for epoch in 0..=latest_epoch {
-            let deadline = Instant::now() + Duration::from_secs(EPOCH_DURATION * 3);
+            // Use 6× epoch duration: when a new validator joins the committee mid-test,
+            // its epoch vote quorum collection can time out (25 × 2.5s = ~62s) before the
+            // failed-quorum P2P fallback runs. The spawn_epoch_record_collector retries
+            // every 5s independently, so 60s gives enough time for it to succeed.
+            let deadline = Instant::now() + Duration::from_secs(EPOCH_DURATION * 6);
             let (epoch_rec, cert) = loop {
                 match provider
                     .raw_request::<_, (EpochRecord, EpochCertificate)>(
