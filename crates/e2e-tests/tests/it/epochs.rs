@@ -1,5 +1,7 @@
 //! Test the epoch boundary and validator shuffles.
 
+use crate::common::get_block;
+
 use super::common::ProcessGuard;
 use alloy::{
     primitives::utils::parse_ether,
@@ -212,6 +214,7 @@ async fn test_epoch_sync_inner(
     guard: &mut ProcessGuard,
     kill_idx: usize,
     nodes_to_start: &[(&str, Address)],
+    committee: &[(&str, Address)],
     temp_path: &Path,
     endpoints: &mut Vec<NodeEndpoints>,
 ) -> eyre::Result<()> {
@@ -263,9 +266,18 @@ async fn test_epoch_sync_inner(
     // after epoch boundaries via quorum voting.
     // TODO issue 375, should use tn_latestConsensusHeader RPC for this when fixed.
     let latest_epoch = current_epoch - 1;
-    for ep in endpoints {
+    for (i, ep) in endpoints.iter().enumerate() {
         let provider = ProviderBuilder::new().connect_http(ep.http_url.parse()?);
         for epoch in 0..=latest_epoch {
+            let val_name = committee[i].0;
+            let file_test = temp_path
+                .join(val_name)
+                .join("consensus-db")
+                .join("epochs")
+                .join(format!("epoch-{epoch}"))
+                .join("data");
+            let pack_file_exists = std::fs::exists(file_test).unwrap_or_default();
+            assert!(pack_file_exists, "Missing an epoch pack file for {val_name} on epoch {epoch}");
             // Use 6× epoch duration: when a new validator joins the committee mid-test,
             // its epoch vote quorum collection can time out (25 × 2.5s = ~62s) before the
             // failed-quorum P2P fallback runs. The spawn_epoch_record_collector retries
@@ -285,7 +297,7 @@ async fn test_epoch_sync_inner(
                     }
                     Err(e) => {
                         return Err(eyre::eyre!(
-                            "epoch record not available for epoch {epoch} on {}: {e}",
+                            "epoch record not available for validator {val_name} epoch {epoch} on {}: {e}",
                             ep.http_url
                         ));
                     }
@@ -299,6 +311,12 @@ async fn test_epoch_sync_inner(
                 epoch_rec.digest(),
                 cert.epoch_hash
             );
+            // Make sure we have executed the final block from the epoch record.
+            // This should prove we have the consensus output as well (i.e. verify the pack data).
+            get_block(&ep.http_url, Some(epoch_rec.final_state.number)).expect(&format!(
+                "final block for {epoch} for {val_name} missing {}",
+                epoch_rec.final_state.number
+            ));
         }
     }
 
@@ -344,7 +362,7 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
 }
 
 #[ignore = "only run independently from all other it tests"]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 /// Test that sync works to fill in missing epochs.
 async fn test_epoch_sync() -> eyre::Result<()> {
     let _permit = super::common::acquire_test_permit();
@@ -381,6 +399,7 @@ async fn test_epoch_sync() -> eyre::Result<()> {
         &mut guard,
         2,
         &[("validator-3", Address::from_slice(&[0x33; 20]))],
+        &committee[..],
         temp_path,
         &mut endpoints,
     )

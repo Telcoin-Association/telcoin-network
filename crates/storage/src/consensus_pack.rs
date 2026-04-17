@@ -254,12 +254,12 @@ impl ConsensusPack {
         path: P,
         stream: R,
         epoch: Epoch,
-        previous_epoch: EpochRecord,
+        previous_epoch: &EpochRecord,
     ) -> Result<ConsensusPack, PackError> {
         let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
         let (tx_error, error) = watch::channel(None);
-        let inner = Inner::stream_import(path, stream, epoch, &previous_epoch).await?;
+        let inner = Inner::stream_import(path, stream, epoch, previous_epoch).await?;
         let handle = std::thread::spawn(move || {
             run_pack_loop(inner, rx, tx_error);
         });
@@ -1321,10 +1321,9 @@ pub(crate) mod test {
                 tokio::fs::File::open(temp_dir.path().join("epoch-0").join(Inner::DATA_NAME))
                     .await
                     .expect("log file");
-            let pack =
-                ConsensusPack::stream_import(temp_dir2.path(), stream, 0, previous_epoch.clone())
-                    .await
-                    .expect("open pack");
+            let pack = ConsensusPack::stream_import(temp_dir2.path(), stream, 0, &previous_epoch)
+                .await
+                .expect("open pack");
             tokio::time::sleep(Duration::from_secs(2)).await;
             for i in 0..num_outputs {
                 let output_db = pack.get_consensus_output(i as u64 + 1).await.unwrap();

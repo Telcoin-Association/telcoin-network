@@ -5,8 +5,8 @@ use std::sync::Arc;
 use tn_config::ConsensusConfig;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
 use tn_storage::{consensus::ConsensusChain, tables::ConsensusHeaderCache};
-use tn_types::{Database as TNDatabase, Epoch, EpochRecord, TaskSpawner, B256};
-use tokio::sync::{mpsc::Receiver, Mutex, Semaphore, SemaphorePermit};
+use tn_types::{Database as TNDatabase, Epoch, EpochRecord, Noticer, B256};
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::{debug, error, info, warn};
 
 /// Retrieve a consensus header from a peer.
@@ -82,61 +82,41 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
     config: ConsensusConfig<DB>,
     consensus_bus: ConsensusBusApp,
     network: PrimaryNetworkHandle,
-    task_spawner: TaskSpawner,
     consensus_chain: ConsensusChain,
 ) -> eyre::Result<()> {
     let rx_shutdown = config.shutdown().subscribe();
     let mut rx_gossip_update = consensus_bus.last_published_consensus_num_hash().subscribe();
     let (tx, mut rx) = tokio::sync::mpsc::channel(10_000);
     // Get the epoch of our last executed consensus.
-    let mut current_fetch_epoch =
-        if let Some(block) = consensus_bus.last_executed_consensus_block(&consensus_chain).await {
-            block.sub_dag.leader_epoch()
-        } else {
-            0
-        };
-    let (epochs_tx, epochs_rx) = tokio::sync::mpsc::channel(10_000);
-    let epoch_queue = Arc::new(Mutex::new(epochs_rx));
-    // spawn four critical workers that will fetch consensus outputs from an epoch work queue.
-    // Note, these workers will just go dormant once we have caught up- that's ok.
-    for i in 0..4 {
-        task_spawner.spawn_critical_task(
-            format!("epoch-consensus-worker-{i}"),
-            spawn_fetch_consensus(
-                config.clone(),
-                consensus_bus.clone(),
-                network.clone(),
-                epoch_queue.clone(),
-                i,
-                consensus_chain.clone(),
-            ),
-        );
-    }
-    // This loop will track current consensus as well as try to backfill from current.
-    // The spawned workers above will try to fetch consensus for previous epochs in
-    // parrallel starting with earliest so we can start executing sooner.
+    let mut current_fetch_epoch = consensus_chain.latest_consensus_epoch();
     let mut last_gossipped_epoch = None;
+    // This loop will track current consensus as well as try to backfill from current.
+    // This task backfills the current epoch records as well as requesting entire pack files
+    // be downloaded for missing historic epochs.
     loop {
         tokio::select! {
             _ = rx_gossip_update.changed() => {
-                let (number, hash) = *rx_gossip_update.borrow_and_update();
+                let (epoch, number, hash) = *rx_gossip_update.borrow_and_update();
                 debug!(target: "state-sync", ?number, ?hash, "tracking recent consensus and detected change through gossip - requesting consensus from peer");
                 if last_gossipped_epoch.is_none() {
-                    last_gossipped_epoch = Some(consensus_chain.epochs().number_to_epoch(number))
+                    last_gossipped_epoch = Some(epoch);
                 }
 
-                if let Some(next) = get_consensus_header(number, hash, &config, &consensus_bus, &network, &consensus_chain).await {
-                    if current_fetch_epoch < next.0 {
-                        // If we still have epochs to fetch then add to the queue until we are out of epoch records.
-                        while let Some(epoch_record) = consensus_chain.epochs().record_by_epoch(current_fetch_epoch).await {
-                            if epoch_record.epoch < last_gossipped_epoch.unwrap_or_default() {
-                                let _ = epochs_tx.send(epoch_record).await;
-                                current_fetch_epoch += 1;
-                            } else {
-                                break;
+                if current_fetch_epoch < epoch {
+                    // If we still have epochs to fetch then add to the queue until we are out of epoch records.
+                    while let Some(epoch_record) = consensus_chain.epochs().record_by_epoch(current_fetch_epoch).await {
+                        current_fetch_epoch += 1;
+                        if epoch_record.epoch < last_gossipped_epoch.unwrap_or_default() {
+                            let contains_final_header = consensus_chain.consensus_header_by_number(epoch_record.final_consensus.number).await.unwrap_or_default().is_some();
+                            if !contains_final_header {
+                                consensus_bus.request_epoch_pack_file(epoch_record).await;
                             }
+                        } else {
+                            break;
                         }
                     }
+                }
+                if let Some(next) = get_consensus_header(number, hash, &config, &consensus_bus, &network, &consensus_chain).await {
                     // Each gossip event starts a backward traversal from the new tip.
                     // The traversal terminates naturally when it reaches an already-executed
                     // or already-cached block, ensuring new consensus blocks are always cached.
@@ -146,6 +126,7 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
 
             Some((epoch, number, hash)) = rx.recv() => {
                 if let Some(last_gossipped_epoch) = last_gossipped_epoch {
+                    // epochs before last_gossipped_epoch are retrieved as pack files
                     if epoch < last_gossipped_epoch {
                         continue;
                     }
@@ -166,38 +147,39 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
     }
 }
 
-/// Spawn a long running task on task_manager that will fetch consensus for an epoch.
+/// Spawn a long running task (application scoped)
+/// that will fetch download entire pack files for epochs.
 /// This should only be used when NOT participating in active consensus.
+/// Several of these will run but will do nothing unless requested.
 /// This works by stream an entire epochs pack file from a peer.
-async fn spawn_fetch_consensus<DB: TNDatabase>(
-    config: ConsensusConfig<DB>,
-    _consensus_bus: ConsensusBusApp,
+pub async fn spawn_fetch_consensus(
+    rx_shutdown: Noticer,
+    consensus_bus: ConsensusBusApp,
     network: PrimaryNetworkHandle,
-    epoch_queue: Arc<Mutex<Receiver<EpochRecord>>>,
-    worker: u32, // Worker number for logging.
+    task_index: u32, // Task index for logging.
     consensus_chain: ConsensusChain,
 ) -> eyre::Result<()> {
     async fn next_epoch<'s>(
-        epoch_queue: &Arc<Mutex<Receiver<EpochRecord>>>,
+        consensus_bus: &ConsensusBusApp,
         next_sem: &'s Arc<Semaphore>,
     ) -> Option<(SemaphorePermit<'s>, EpochRecord)> {
         let permit = next_sem.acquire().await.ok()?;
-        epoch_queue.lock().await.recv().await.map(|e| (permit, e))
+        consensus_bus.get_next_epoch_pack_file_request().await.map(|e| (permit, e))
     }
-    let rx_shutdown = config.shutdown().subscribe();
     // When can we accept more work (a new epoch).
     let next_sem = Arc::new(Semaphore::new(1));
     // Get the epoch of our last executed consensus.
     loop {
         tokio::select! {
-            Some((_permit, epoch_record)) = next_epoch(&epoch_queue, &next_sem) => {
+            Some((_permit, epoch_record)) = next_epoch(&consensus_bus, &next_sem) => {
                 let epoch = epoch_record.epoch;
-                if let Some((previous_epoch, _)) = consensus_chain.epochs().get_epoch_by_number(epoch).await {
-                    info!(target: "state-sync", "epoch consensus fetcher {worker} retreiving epoch {epoch}");
+                let prev_epoch_num = epoch.saturating_sub(1);
+                if let Some((previous_epoch, _)) = consensus_chain.epochs().get_epoch_by_number(prev_epoch_num).await {
+                    info!(target: "state-sync", "epoch consensus fetcher {task_index} retreiving epoch {epoch}");
                     loop {
                         match network.request_epoch_pack(
-                            epoch_record.clone(),
-                            previous_epoch.clone(),
+                            &epoch_record,
+                            &previous_epoch,
                             &consensus_chain,
                         ).await {
                             Ok(_) => break,

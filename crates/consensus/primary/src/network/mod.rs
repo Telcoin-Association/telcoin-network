@@ -33,7 +33,7 @@ use tn_types::{
 };
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 pub mod handler;
 mod message;
 pub use message::ConsensusResult;
@@ -321,8 +321,8 @@ impl PrimaryNetworkHandle {
     /// 3. Reads and validates batches from the stream in real-time
     pub async fn request_epoch_pack(
         &self,
-        epoch_record: EpochRecord,
-        previous_epoch: EpochRecord,
+        epoch_record: &EpochRecord,
+        previous_epoch: &EpochRecord,
         consensus_chain: &ConsensusChain,
     ) -> NetworkResult<()> {
         let epoch = epoch_record.epoch;
@@ -341,7 +341,7 @@ impl PrimaryNetworkHandle {
             if let PrimaryResponse::RequestEpochStream { ack, peer } =
                 self.handle.send_request_any(request.clone()).await?.await??
             {
-                // return error if denied to try next peer
+                // continue if denied to try next peer
                 if !ack {
                     continue;
                 }
@@ -362,18 +362,25 @@ impl PrimaryNetworkHandle {
                     NetworkError::RPCError(format!("failed to flush request digest: {e}"))
                 })?;
 
-                debug!(
+                info!(
                     target: "primary::network",
                     %peer,
-                    "stream opened - reading and validating batches..."
+                    epoch,
+                    "stream opened - reading and validating epoch pack file..."
                 );
 
                 consensus_chain
-                    .stream_import(stream.compat(), &epoch_record, previous_epoch)
+                    .stream_import(stream.compat(), epoch_record, previous_epoch)
                     .await
                     .map_err(|e| {
                         NetworkError::RPCError(format!("failed to stream pack file: {e}"))
                     })?;
+                info!(
+                    target: "primary::network",
+                    %peer,
+                    epoch,
+                    "streamed epoch pack file"
+                );
 
                 return Ok(());
             }
@@ -402,6 +409,8 @@ pub struct PrimaryNetwork<DB, Events> {
     /// Wrapped in `Arc<Mutex>` so spawned stream tasks can look up the matching
     /// request after reading the correlation digest from the stream.
     pending_epoch_requests: Arc<Mutex<HashMap<PendingEpochRequestKey, PendingEpochStream>>>,
+    /// My node's BLS public key.
+    bls_public_key: BlsPublicKey,
 }
 
 impl<DB, Events> PrimaryNetwork<DB, Events>
@@ -419,6 +428,7 @@ where
         task_spawner: TaskSpawner,
         consensus_chain: ConsensusChain,
     ) -> Self {
+        let bls_public_key = consensus_config.key_config().primary_public_key();
         let request_handler = RequestHandler::new(
             consensus_config,
             consensus_bus,
@@ -435,6 +445,7 @@ where
             consensus_chain,
             epoch_stream_semaphore,
             pending_epoch_requests: pending_batch_requests,
+            bls_public_key,
         }
     }
 
@@ -661,7 +672,7 @@ where
                 // check per-peer capacity
                 let peer_count = pending_map.keys().filter(|(p, _)| *p == peer).count();
                 if peer_count >= MAX_PENDING_REQUESTS_PER_PEER {
-                    debug!(
+                    info!(
                         target: "primary::network",
                         %peer,
                         peer_count,
@@ -674,11 +685,23 @@ where
                     hasher.update(&epoch.to_le_bytes());
                     let request_digest = B256::from_slice(hasher.finalize().as_bytes());
                     let pending = PendingEpochStream::new(epoch, permit);
-                    pending_map.insert((peer, request_digest), pending);
+                    // If the same peer requests the same epoch then replace request.
+                    // If the peer tries to stream twice the second attempt will be
+                    // punished as a protocol violation.
+                    if pending_map.insert((peer, request_digest), pending).is_some() {
+                        debug!(
+                            target: "primary::network",
+                            %peer,
+                            ?request_digest,
+                            epoch,
+                            "pending epoch stream request replaced with identical epoch request"
+                        );
+                    }
                     debug!(
                         target: "primary::network",
                         %peer,
                         ?request_digest,
+                        epoch,
                         "pending epoch stream request accepted"
                     );
                     true
@@ -688,7 +711,7 @@ where
         };
 
         let response: PrimaryNetworkResult<PrimaryResponse> =
-            Ok(PrimaryResponse::RequestEpochStream { ack, peer });
+            Ok(PrimaryResponse::RequestEpochStream { ack, peer: self.bls_public_key });
         // send response
         let network_handle = self.network_handle.clone();
         let task_name = format!("process-request-epoch-{peer}");

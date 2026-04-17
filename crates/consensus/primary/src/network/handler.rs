@@ -126,7 +126,8 @@ where
         // lags behind a burst of empty consensus rounds.
         let committed_round = self.consensus_bus.committed_round();
         let effective_exec_round = exec_round.max(processed_consensus_round).max(committed_round);
-        let (last_consensus_number, _) = self.consensus_bus.published_consensus_num_hash();
+        let (_last_consensus_epoch, last_consensus_number, _) =
+            self.consensus_bus.published_consensus_num_hash();
         // Use GC depth to estimate how many rounds we can be behind.
         // Subtract ten here so if we are right on the GC depth we will still go inactive (small
         // safety buffer).  Ten is arbitrary but should make sure we are comfortably within
@@ -240,7 +241,8 @@ where
                 let consensus_result_hash = result.digest();
                 let ConsensusResult { epoch, round, number, hash, validator: key, signature } =
                     *result;
-                let (old_number, old_hash) = self.consensus_bus.published_consensus_num_hash();
+                let (_old_epoch, old_number, old_hash) =
+                    self.consensus_bus.published_consensus_num_hash();
                 if hash == old_hash || old_number >= number {
                     // We have already dealt with this hash or we are past this output.
                     return Ok(());
@@ -277,7 +279,7 @@ where
                             info!(target: "primary", "got new consensus {number}/{hash}");
                             self.consensus_bus
                                 .last_published_consensus_num_hash()
-                                .send_replace((number, hash));
+                                .send_replace((epoch, number, hash));
                             self.consensus_certs.lock().clear();
                         } else {
                             self.consensus_certs.lock().insert(consensus_result_hash, sigs + 1);
@@ -910,7 +912,7 @@ where
         &self.consensus_chain
     }
 
-    /// Send batches over stream, looking up from database.
+    /// Send epoch pack file over stream.
     async fn send_epoch_over_stream<S>(
         stream: &mut S,
         consensus_chain: &ConsensusChain,
@@ -919,16 +921,14 @@ where
     where
         S: AsyncWrite + Unpin + Send,
     {
-        let mut bytes = vec![0_u8; 16 * 1024];
+        let mut bytes = vec![0_u8; 16 * 1024]; // Use a 16kb read buffer.
         if let Ok(mut epoch_stream) = consensus_chain.get_epoch_stream(epoch).await {
             loop {
-                let n = epoch_stream.read_buf(&mut bytes).await?;
+                let n = epoch_stream.read(&mut bytes[..]).await?;
                 if n == 0 {
                     break;
                 }
-                stream.write_all(&bytes).await?;
-                bytes.resize(16 * 1024, 0_u8); // resize in case we did not get a full read for some
-                                               // reason.
+                stream.write_all(&bytes[..n]).await?;
             }
         }
         Ok(())

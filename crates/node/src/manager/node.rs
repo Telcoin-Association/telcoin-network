@@ -10,6 +10,7 @@ use crate::{
     manager::spawn_epoch_vote_collector,
 };
 use eyre::eyre;
+use state_sync::spawn_fetch_consensus;
 use tn_config::{KeyConfig, NetworkConfig, TelcoinDirs};
 use tn_network_libp2p::{types::NetworkEvent, ConsensusNetwork};
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode, QueChannel};
@@ -264,7 +265,7 @@ where
             self.consensus_chain.clone(),
             self.consensus_bus.clone(),
             self.key_config.clone(),
-            primary_network_handle,
+            primary_network_handle.clone(),
             node_task_manager.get_spawner(),
             self.node_shutdown.subscribe(),
         );
@@ -280,6 +281,21 @@ where
         // spawn node healthcheck service if enabled
         if let Some(port) = self.builder.healthcheck {
             let _ = HealthcheckServer::spawn(node_task_manager.get_spawner(), port).await;
+        }
+
+        // spawn three critical workers that will fetch epoch pack files from an epoch work queue.
+        // Note, these workers will just go dormant once we have caught up- that's ok.
+        for i in 0..3 {
+            node_task_manager.spawn_critical_task(
+                format!("epoch-consensus-worker-{i}"),
+                spawn_fetch_consensus(
+                    self.node_shutdown.subscribe(),
+                    self.consensus_bus.clone(),
+                    primary_network_handle.clone(),
+                    i,
+                    self.consensus_chain.clone(),
+                ),
+            );
         }
 
         // await all tasks on epoch-task-manager or node shutdown

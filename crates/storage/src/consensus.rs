@@ -357,11 +357,13 @@ impl ConsensusChain {
         &self,
         stream: R,
         epoch_record: &EpochRecord,
-        previous_epoch: EpochRecord,
+        previous_epoch: &EpochRecord,
     ) -> Result<(), ConsensusChainError> {
         let epoch = epoch_record.epoch;
         // Store our files out of the way while we import so we don't use them until ready.
-        let path = self.base_path.join("import-{epoch}");
+        let path = self.base_path.join(format!("import-{epoch}"));
+        // We need to start with a clean import dir since we do not restart.
+        let _ = std::fs::remove_dir_all(&path);
         let res_pack = ConsensusPack::stream_import(&path, stream, epoch, previous_epoch).await;
         match res_pack {
             Ok(pack) => {
@@ -374,17 +376,32 @@ impl ConsensusChain {
                             || epoch_record.final_consensus.hash != last_header.digest()
                         {
                             // Invalid final consensus header...
-                            let _ = std::fs::remove_dir(&path);
+                            let _ = std::fs::remove_dir_all(&path);
                             return Err(ConsensusChainError::EmptyImport);
                         }
                     }
                     None => {
                         // Missing a final consensus header...
-                        let _ = std::fs::remove_dir(&path);
+                        let _ = std::fs::remove_dir_all(&path);
                         return Err(ConsensusChainError::EmptyImport);
                     }
                 }
+                let mut current_pack = self.current_pack.lock();
+                let replace_current = if let Some(current_pack) = &*current_pack {
+                    current_pack.epoch() == epoch
+                } else {
+                    false
+                };
+                if replace_current {
+                    *current_pack = None;
+                }
                 drop(pack);
+                drop(current_pack);
+                // Make sure we don't have any cruft in the final dir.
+                if std::fs::exists(&base_dir).unwrap_or_default() {
+                    self.recent_packs.lock().retain(|p| p.epoch() != epoch);
+                    let _ = std::fs::remove_dir_all(&base_dir);
+                }
                 std::fs::rename(&path_base_dir, &base_dir)?;
                 let _ = std::fs::remove_dir(&path);
                 Ok(())
@@ -422,7 +439,7 @@ impl ConsensusChain {
             }
             Ok(())
         } else {
-            Err(ConsensusChainError::NoCurrentEpoch)
+            Ok(()) // If no current then this is a no-op.
         }
     }
 
@@ -776,10 +793,7 @@ mod test {
         let temp_dir2 = TempDir::with_prefix("test_consensus_pack2").expect("temp dir");
         let consensus_chain2 = ConsensusChain::new(temp_dir2.path().to_owned()).unwrap();
         let stream = consensus_chain.get_epoch_stream(0).await.unwrap();
-        consensus_chain2
-            .stream_import(stream, &epoch_record, previous_epoch.clone())
-            .await
-            .unwrap();
+        consensus_chain2.stream_import(stream, &epoch_record, &previous_epoch).await.unwrap();
         consensus_chain2.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
         for i in 0..num_outputs {
             let output_db =

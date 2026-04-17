@@ -215,7 +215,7 @@ pub struct ConsensusBusAppInner {
     /// Watch tracking most recently seen consensus header.
     tx_last_consensus_header: watch::Sender<Option<ConsensusHeader>>,
     /// Watch tracking the last gossipped consensus block number and hash.
-    tx_last_published_consensus_num_hash: watch::Sender<(u64, BlockHash)>,
+    tx_last_published_consensus_num_hash: watch::Sender<(Epoch, u64, BlockHash)>,
 
     /// Consensus header.  Note this can be used to create consensus output to execute for non
     /// validators.
@@ -232,6 +232,10 @@ pub struct ConsensusBusAppInner {
     tx_epoch_record: watch::Sender<Option<EpochRecord>>,
     /// The que channel for primary network events.
     primary_network_events: QueChannel<NetworkEvent<crate::network::Req, crate::network::Res>>,
+    /// Sender for epoch records that need to have a pack file downloaded.
+    epoch_request_queue_tx: tokio::sync::mpsc::Sender<EpochRecord>,
+    /// Reciever for epoch records to download pack files for.
+    epoch_request_queue_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<EpochRecord>>>,
 }
 
 /// The thread-safe inner type that holds all the channels for inner-consensus
@@ -261,7 +265,8 @@ impl ConsensusBusApp {
 
         let (tx_primary_round_updates, _) = watch::channel(0u32);
         let (tx_last_consensus_header, _) = watch::channel(None);
-        let (tx_last_published_consensus_num_hash, _) = watch::channel((0, BlockHash::default()));
+        let (tx_last_published_consensus_num_hash, _) =
+            watch::channel((0, 0, BlockHash::default()));
 
         let (tx_recent_blocks, _) = watch::channel(RecentBlocks::new(recent_blocks as usize));
         let (tx_sync_status, _) = watch::channel(NodeMode::default());
@@ -271,6 +276,8 @@ impl ConsensusBusApp {
 
         let (tx_epoch_record, _) = watch::channel(None);
 
+        let (epoch_request_queue_tx, epochs_rx) = tokio::sync::mpsc::channel(10_000);
+        let epoch_request_queue_rx = Arc::new(tokio::sync::Mutex::new(epochs_rx));
         Self {
             inner: Arc::new(ConsensusBusAppInner {
                 tx_committed_round_updates,
@@ -286,6 +293,8 @@ impl ConsensusBusApp {
                 new_epoch_votes: QueChannel::new(),
                 tx_epoch_record,
                 primary_network_events: QueChannel::new_always_subscribed(),
+                epoch_request_queue_tx,
+                epoch_request_queue_rx,
             }),
         }
     }
@@ -351,12 +360,12 @@ impl ConsensusBusApp {
     /// Track the latest published consensus header block number and hash seen on the gossip
     /// network. This value will have been verified and can be trusted to be the correct hash
     /// for block number.  DO NOT send unverified values to this watch.
-    pub fn last_published_consensus_num_hash(&self) -> &watch::Sender<(u64, BlockHash)> {
+    pub fn last_published_consensus_num_hash(&self) -> &watch::Sender<(Epoch, u64, BlockHash)> {
         &self.inner.tx_last_published_consensus_num_hash
     }
 
     /// Returns the latest verified consensus block number and hash from gossip.
-    pub fn published_consensus_num_hash(&self) -> (u64, BlockHash) {
+    pub fn published_consensus_num_hash(&self) -> (Epoch, u64, BlockHash) {
         *self.inner.tx_last_published_consensus_num_hash.borrow()
     }
 
@@ -536,6 +545,18 @@ impl ConsensusBusApp {
             .consensus_header_by_digest(epoch, latest_consensus.hash)
             .await
             .unwrap_or_default()
+    }
+
+    /// Send a request to down load the epoch pack file for the provided EpochRecord.
+    pub async fn request_epoch_pack_file(&self, epoch_record: EpochRecord) {
+        let _ = self.inner.epoch_request_queue_tx.send(epoch_record).await;
+    }
+
+    /// Retreive the next request to down load an epoch pack file.
+    /// Will not resolve until a request is ready and will only ever
+    /// provide each request once.  Returns None when the underlying channel closes.
+    pub async fn get_next_epoch_pack_file_request(&self) -> Option<EpochRecord> {
+        self.inner.epoch_request_queue_rx.lock().await.recv().await
     }
 }
 

@@ -3,21 +3,18 @@ use e2e_tests::{config_local_testnet, setup_log_dir};
 use escargot::CargoRun;
 use ethereum_tx_sign::{LegacyTransaction, Transaction};
 use eyre::Report;
-use jsonrpsee::{
-    core::{client::ClientT, DeserializeOwned},
-    http_client::HttpClientBuilder,
-    rpc_params,
-};
+use jsonrpsee::rpc_params;
 use nix::{
     sys::signal::{self, Signal},
     unistd::Pid,
 };
 use secp256k1::{Keypair, Secp256k1, SecretKey};
 use serde_json::Value;
-use std::{collections::HashMap, fmt::Debug, path::Path, process::Child, time::Duration};
+use std::{collections::HashMap, path::Path, process::Child, time::Duration};
 use tn_types::{get_available_tcp_port, keccak256, Address};
-use tokio::runtime::Builder;
 use tracing::{error, info};
+
+use crate::common::{call_rpc, get_block};
 
 use super::common::{kill_child, ProcessGuard};
 
@@ -607,29 +604,6 @@ fn get_key(key: &str) -> String {
     }
 }
 
-fn get_block(node: &str, block_number: Option<u64>) -> eyre::Result<HashMap<String, Value>> {
-    let debug_params = if let Some(block_number) = block_number {
-        format!("0x{block_number:x}")
-    } else {
-        "latest".to_string()
-    };
-
-    let params = rpc_params!(&debug_params, true);
-    // Deserialize as Option to handle null responses from syncing/restarted nodes
-    // that haven't caught up to the requested block yet.
-    let mut result: Option<HashMap<String, Value>> =
-        call_rpc(node, "eth_getBlockByNumber", params.clone(), 10, &debug_params)?;
-    let mut retries = 0;
-    while result.is_none() && retries < 30 {
-        std::thread::sleep(Duration::from_secs(1));
-        result = call_rpc(node, "eth_getBlockByNumber", params.clone(), 3, &debug_params)?;
-        retries += 1;
-    }
-    result.ok_or_else(|| {
-        eyre::eyre!("eth_getBlockByNumber returned null after retries for {debug_params} on {node}")
-    })
-}
-
 fn get_block_number(node: &str) -> eyre::Result<u64> {
     let block = get_block(node, None)?;
     Ok(u64::from_str_radix(&block["number"].as_str().unwrap_or("0x100_000")[2..], 16)?)
@@ -762,50 +736,6 @@ fn decode_key(key: &str) -> eyre::Result<(String, String, String)> {
         }
         Err(err) => Err(Report::msg(err.to_string())),
     }
-}
-
-/// Make an RPC call to node with command and params.
-/// Wraps any Eyre otherwise returns the result as a String.
-/// This is for testing and will try up to retries times at one second intervals to send the
-/// request.
-fn call_rpc<R, Params, DebugParams>(
-    node: &str,
-    command: &str,
-    params: Params,
-    retries: usize,
-    debug_params: DebugParams,
-) -> eyre::Result<R>
-where
-    R: DeserializeOwned + Debug,
-    Params: jsonrpsee::core::traits::ToRpcParams + Send + Clone + Debug,
-    DebugParams: Debug,
-{
-    // jsonrpsee is async AND tokio specific so give it a runtime (and can't use a crate like
-    // pollster)...
-    let runtime = Builder::new_current_thread().enable_io().enable_time().build()?;
-
-    let resp = runtime.block_on(async move {
-        let client = HttpClientBuilder::default()
-            .request_timeout(Duration::from_secs(10))
-            .build(node)
-            .expect("couldn't build rpc client");
-        let mut resp = client.request(command, params.clone()).await;
-        let mut i = 0;
-        while i < retries && resp.is_err() {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let client = HttpClientBuilder::default()
-                .request_timeout(Duration::from_secs(10))
-                .build(node)
-                .expect("couldn't build rpc client");
-            resp = client.request(command, params.clone()).await;
-            i += 1;
-        }
-        resp.inspect_err(|error| {
-            error!(target: "restart-tests", ?error, ?command, ?node, ?debug_params, "rpc call failed");
-        })
-    });
-
-    Ok(resp?)
 }
 
 /// Test that an observer started AFTER validators have already produced blocks
