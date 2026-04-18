@@ -177,14 +177,20 @@ pub async fn spawn_fetch_consensus(
                 if let Some((previous_epoch, _)) = consensus_chain.epochs().get_epoch_by_number(prev_epoch_num).await {
                     info!(target: "state-sync", "epoch consensus fetcher {task_index} retreiving epoch {epoch}");
                     loop {
-                        match network.request_epoch_pack(
-                            &epoch_record,
-                            &previous_epoch,
-                            &consensus_chain,
-                        ).await {
-                            Ok(_) => break,
-                            Err(e) => {
-                                error!(target: "state-sync", "failed to request epoch pack for epoch {epoch}: {e}");
+                        tokio::select! {
+                            result = network.request_epoch_pack(&epoch_record, &previous_epoch, &consensus_chain) => {
+                                match result {
+                                    Ok(_) => break,
+                                    Err(e) => {
+                                        error!(target: "state-sync",
+                                            "failed to request epoch pack for epoch {epoch}: {e}");
+                                    }
+                                }
+                            }
+                            _ = &rx_shutdown => {
+                                info!(target: "state-sync",
+                                    "epoch consensus fetcher {task_index} shutting down during pack fetch");
+                                return Ok(());
                             }
                         }
                     }

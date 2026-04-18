@@ -360,6 +360,17 @@ impl ConsensusChain {
         previous_epoch: &EpochRecord,
     ) -> Result<(), ConsensusChainError> {
         let epoch = epoch_record.epoch;
+        if let Ok(pack) = self.get_static(epoch).await {
+            if let Some(last_header) = pack.latest_consensus_header().await {
+                if epoch_record.final_consensus.number == last_header.number
+                    && epoch_record.final_consensus.hash == last_header.digest()
+                {
+                    // If we already have a complete pack file then we are done, no need to
+                    // stream...
+                    return Ok(());
+                }
+            }
+        }
         // Store our files out of the way while we import so we don't use them until ready.
         let path = self.base_path.join(format!("import-{epoch}"));
         // We need to start with a clean import dir since we do not restart.
@@ -377,7 +388,7 @@ impl ConsensusChain {
                         {
                             // Invalid final consensus header...
                             let _ = std::fs::remove_dir_all(&path);
-                            return Err(ConsensusChainError::EmptyImport);
+                            return Err(ConsensusChainError::InvalidImport);
                         }
                     }
                     None => {
@@ -399,6 +410,10 @@ impl ConsensusChain {
                 drop(current_pack);
                 // Make sure we don't have any cruft in the final dir.
                 if std::fs::exists(&base_dir).unwrap_or_default() {
+                    // If this exists it is incomplete (see check at start of function).
+                    // This remove will leave a tiny window before the rename where it is
+                    // not available.  This may produce errors that should be handled correctly if
+                    // so.
                     self.recent_packs.lock().retain(|p| p.epoch() != epoch);
                     let _ = std::fs::remove_dir_all(&base_dir);
                 }
@@ -415,13 +430,37 @@ impl ConsensusChain {
     }
 
     /// Return a stream reader for the log file of epoch.
+    /// Verifies the epoch pack is complete or will return an error.
     pub async fn get_epoch_stream(
         &self,
         epoch: Epoch,
     ) -> Result<Box<dyn ReadStream>, ConsensusChainError> {
-        let base_dir = self.base_path.join(format!("epoch-{epoch}"));
-        let stream = AsyncFile::open(base_dir.join(DATA_NAME)).await?;
-        Ok(Box::new(stream))
+        if let Ok(pack) = self.get_static(epoch).await {
+            if let Some((epoch_record, _)) = self.epochs().get_epoch_by_number(epoch).await {
+                match pack.latest_consensus_header().await {
+                    Some(last_header) => {
+                        if epoch_record.final_consensus.number == last_header.number
+                            && epoch_record.final_consensus.hash == last_header.digest()
+                        {
+                            drop(pack);
+                            // Remove the other open file.
+                            // Should not matter a "complete" pack file should not be changed or
+                            // moved again.
+                            let base_dir = self.base_path.join(format!("epoch-{epoch}"));
+                            let stream = AsyncFile::open(base_dir.join(DATA_NAME)).await?;
+                            Ok(Box::new(stream))
+                        } else {
+                            Err(ConsensusChainError::StreamUnavailable)
+                        }
+                    }
+                    None => Err(ConsensusChainError::StreamUnavailable),
+                }
+            } else {
+                Err(ConsensusChainError::StreamUnavailable)
+            }
+        } else {
+            Err(ConsensusChainError::StreamUnavailable)
+        }
     }
 
     /// Save all the batches and consensus header from the ConsensusOutput the pack file for the
@@ -668,6 +707,7 @@ pub enum ConsensusChainError {
     EpochDbError(EpochDbError),
     EmptyImport,
     InvalidImport,
+    StreamUnavailable,
 }
 
 impl Error for ConsensusChainError {}
@@ -688,6 +728,9 @@ impl Display for ConsensusChainError {
             ConsensusChainError::EmptyImport => write!(f, "No consensus in imported pack file"),
             ConsensusChainError::InvalidImport => {
                 write!(f, "Bad final consensus in imported pack file")
+            }
+            ConsensusChainError::StreamUnavailable => {
+                write!(f, "Incomplete data to stream a pack file")
             }
         }
     }
