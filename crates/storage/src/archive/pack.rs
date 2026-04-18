@@ -3,7 +3,7 @@
 
 use serde::{de::DeserializeOwned, Serialize};
 use tn_types::{encode_into_buffer, try_decode};
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncSeek, AsyncSeekExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _};
 
 use crate::archive::{
     error::{
@@ -415,11 +415,11 @@ impl DataHeader {
     }
 
     /// Load a DataHeader from source.
-    pub(crate) async fn load_header_async<R: AsyncRead + AsyncSeek + Unpin>(
+    /// Note the read position must be at the header (this does not seek first).
+    pub(crate) async fn load_header_async<R: AsyncRead + Unpin>(
         source: &mut R,
         uid_idx: u64,
     ) -> Result<Self, LoadHeaderError> {
-        source.rewind().await?;
         let mut buffer = [0_u8; DATA_HEADER_BYTES];
         source.read_exact(&mut buffer[..]).await?;
         Self::load_header_from_buffer(buffer, uid_idx)

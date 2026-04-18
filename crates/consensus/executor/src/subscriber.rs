@@ -228,7 +228,7 @@ impl<DB: Database> Subscriber<DB> {
                     .borrow()
                     .latest_consensus_block_num_hash()
                     .number;
-                let (latest_network_consensus, _) =
+                let (_latest_network_epoch, latest_network_consensus, _) =
                     self.consensus_bus.published_consensus_num_hash();
                 let consensus_sync_distance =
                     latest_network_consensus.saturating_sub(latest_processed_consensus);

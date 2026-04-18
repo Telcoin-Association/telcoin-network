@@ -26,6 +26,7 @@ use tracing::{debug, error, info, warn};
 mod epoch;
 pub use epoch::spawn_epoch_record_collector;
 mod consensus;
+pub use consensus::spawn_fetch_consensus;
 use consensus::spawn_track_recent_consensus;
 
 /// Sets some bus defaults.
@@ -72,7 +73,6 @@ pub fn spawn_state_sync<DB: Database>(
         NodeMode::CvvInactive | NodeMode::Observer => {
             // If we are not an active CVV then follow latest consensus from peers.
             let (config_clone, consensus_bus_clone) = (config.clone(), consensus_bus.clone());
-            let task_spawner_clone = task_spawner.clone();
             let consensus_chain_clone = consensus_chain.clone();
             task_spawner.spawn_task(
                 "state sync: track latest consensus header from peers",
@@ -82,7 +82,6 @@ pub fn spawn_state_sync<DB: Database>(
                         config_clone,
                         consensus_bus_clone,
                         network,
-                        task_spawner_clone,
                         consensus_chain_clone,
                     )
                     .await

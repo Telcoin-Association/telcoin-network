@@ -3,29 +3,37 @@
 //! This module includes implementations for when the primary receives network
 //! requests from it's own workers and other primaries.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crate::{
-    proposer::OurDigestMessage, state_sync::StateSynchronizer, ConsensusBus, ConsensusBusApp,
+    error::PrimaryNetworkResult, proposer::OurDigestMessage, state_sync::StateSynchronizer,
+    ConsensusBus, ConsensusBusApp,
 };
+use futures::{AsyncReadExt as _, AsyncWriteExt as _};
 use handler::RequestHandler;
 pub use message::{MissingCertificatesRequest, PrimaryRequest, PrimaryResponse};
 use message::{PrimaryGossip, PrimaryRPCError};
+use parking_lot::Mutex;
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     error::NetworkError,
     types::{IntoResponse as _, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResult},
-    GossipMessage, Penalty, ResponseChannel,
+    GossipMessage, Penalty, ResponseChannel, Stream,
 };
 use tn_network_types::{WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerToPrimaryClient};
 use tn_storage::{consensus::ConsensusChain, PayloadStore};
 use tn_types::{
     encode, BlockHash, BlsPublicKey, BlsSignature, Certificate, CertificateDigest, ConsensusHeader,
     Database, Epoch, EpochCertificate, EpochRecord, EpochVote, Header, Round, TaskSpawner,
-    TnReceiver, TnSender, Vote,
+    TnReceiver, TnSender, Vote, B256,
 };
-use tokio::sync::{mpsc, oneshot};
-use tracing::warn;
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio_util::compat::FuturesAsyncReadCompatExt;
+use tracing::{debug, info, warn};
 pub mod handler;
 mod message;
 pub use message::ConsensusResult;
@@ -38,6 +46,58 @@ mod network_tests;
 pub(crate) type Req = PrimaryRequest;
 /// Convenience type for Primary network.
 pub(crate) type Res = PrimaryResponse;
+
+/// Interval for pruning pending epoch pack requests (awaiting peer to open stream).
+const PENDING_REQUEST_PRUNE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Timeout for pending epoch pack requests before cleanup.
+pub const PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum number of concurrent epoch stream operations (pending + active).
+///
+/// A semaphore permit is held from RPC acceptance through stream completion,
+/// so this bounds the true concurrent count—not just the pending map size.
+pub const MAX_CONCURRENT_EPOCH_STREAMS: usize = 5;
+
+/// Maximum number of concurrent pending batch requests from a single peer.
+///
+/// Prevents a single malicious peer from filling all global slots.
+pub const MAX_PENDING_REQUESTS_PER_PEER: usize = 2;
+
+/// Tracks a pending epoch pack stream request awaiting stream establishment.
+// pub for IT
+#[derive(Debug)]
+pub struct PendingEpochStream {
+    /// The epoch which produced these batches.
+    epoch: Epoch,
+    /// When this request was created (for timeout cleanup).
+    created_at: Instant,
+    /// Semaphore permit held for the lifetime of this request (pending + active).
+    /// Dropping the permit frees a global concurrency slot.
+    _permit: OwnedSemaphorePermit,
+}
+
+/// Key for pending requests: (peer_bls, request_digest)
+type PendingEpochRequestKey = (BlsPublicKey, B256);
+
+impl PendingEpochStream {
+    /// Create a new pending batch stream.
+    pub fn new(epoch: Epoch, permit: OwnedSemaphorePermit) -> Self {
+        Self { epoch, created_at: Instant::now(), _permit: permit }
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl PendingEpochStream {
+    /// Create a pending batch stream with a custom `created_at` for testing stale cleanup.
+    pub fn new_with_created_at(
+        epoch: Epoch,
+        permit: OwnedSemaphorePermit,
+        created_at: Instant,
+    ) -> Self {
+        Self { epoch, created_at, _permit: permit }
+    }
+}
 
 /// Primary network specific handle.
 #[derive(Clone, Debug)]
@@ -146,6 +206,9 @@ impl PrimaryNetworkHandle {
             PrimaryResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
                 "Got wrong response, not a vote is peer exchange!".to_string(),
             )),
+            PrimaryResponse::RequestEpochStream { .. } => Err(NetworkError::RPCError(
+                "Got wrong response, not a vote is epoch stream!".to_string(),
+            )),
         }
     }
 
@@ -249,6 +312,81 @@ impl PrimaryNetworkHandle {
     pub async fn connected_peers_count(&self) -> NetworkResult<usize> {
         self.handle.connected_peer_count().await
     }
+
+    /// Attempt to get an epoch pack file from any peer via stream.
+    ///
+    /// This method:
+    /// 1. Sends a `RequestEpochStream` request to negotiate
+    /// 2. If accepted, opens a stream with the request digest for correlation
+    /// 3. Reads and validates batches from the stream in real-time
+    pub async fn request_epoch_pack(
+        &self,
+        epoch_record: &EpochRecord,
+        previous_epoch: &EpochRecord,
+        consensus_chain: &ConsensusChain,
+    ) -> NetworkResult<()> {
+        let epoch = epoch_record.epoch;
+        // Try up to three times (from three peers) to get consensus.
+        // This could be a lot more complicated but this KISS method should work fine.
+        // send request to negotiate stream
+        let request = PrimaryRequest::StreamEpoch { epoch };
+        let mut hasher = tn_types::DefaultHashFunction::new();
+        hasher.update(&epoch.to_le_bytes());
+        let request_digest = B256::from_slice(hasher.finalize().as_bytes());
+
+        for _ in 0..3 {
+            // send request and await response from peer
+            //
+            // SAFETY: network layer handles request timeout
+            if let PrimaryResponse::RequestEpochStream { ack, peer } =
+                self.handle.send_request_any(request.clone()).await?.await??
+            {
+                // continue if denied to try next peer
+                if !ack {
+                    continue;
+                }
+
+                debug!(
+                    target: "primary::network",
+                    %peer,
+                    ?ack,
+                    "peer ack for stream request"
+                );
+
+                // open raw stream then write request_digest for correlation
+                let mut stream = self.handle.open_stream(peer).await??;
+                stream.write_all(request_digest.as_slice()).await.map_err(|e| {
+                    NetworkError::RPCError(format!("failed to write request digest: {e}"))
+                })?;
+                stream.flush().await.map_err(|e| {
+                    NetworkError::RPCError(format!("failed to flush request digest: {e}"))
+                })?;
+
+                info!(
+                    target: "primary::network",
+                    %peer,
+                    epoch,
+                    "stream opened - reading and validating epoch pack file..."
+                );
+
+                consensus_chain
+                    .stream_import(stream.compat(), epoch_record, previous_epoch)
+                    .await
+                    .map_err(|e| {
+                        NetworkError::RPCError(format!("failed to stream pack file: {e}"))
+                    })?;
+                info!(
+                    target: "primary::network",
+                    %peer,
+                    epoch,
+                    "streamed epoch pack file"
+                );
+
+                return Ok(());
+            }
+        }
+        Err(NetworkError::RPCError("Could not get the epoch pack file!".to_string()))
+    }
 }
 
 /// Handle inter-node communication between primaries.
@@ -262,6 +400,17 @@ pub struct PrimaryNetwork<DB, Events> {
     request_handler: RequestHandler<DB>,
     /// The type to spawn tasks.
     task_spawner: TaskSpawner,
+    /// Hold a reference to the consensus chain.
+    consensus_chain: ConsensusChain,
+    /// Semaphore bounding total concurrent epoch pack stream operations (pending + active).
+    epoch_stream_semaphore: Arc<Semaphore>,
+    /// Pending epoch pack requests awaiting stream from requestor.
+    ///
+    /// Wrapped in `Arc<Mutex>` so spawned stream tasks can look up the matching
+    /// request after reading the correlation digest from the stream.
+    pending_epoch_requests: Arc<Mutex<HashMap<PendingEpochRequestKey, PendingEpochStream>>>,
+    /// My node's BLS public key.
+    bls_public_key: BlsPublicKey,
 }
 
 impl<DB, Events> PrimaryNetwork<DB, Events>
@@ -279,13 +428,25 @@ where
         task_spawner: TaskSpawner,
         consensus_chain: ConsensusChain,
     ) -> Self {
+        let bls_public_key = consensus_config.key_config().primary_public_key();
         let request_handler = RequestHandler::new(
             consensus_config,
             consensus_bus,
             state_sync.clone(),
-            consensus_chain,
+            consensus_chain.clone(),
         );
-        Self { network_events, network_handle, request_handler, task_spawner }
+        let epoch_stream_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_EPOCH_STREAMS));
+        let pending_batch_requests = Arc::new(Mutex::new(HashMap::default()));
+        Self {
+            network_events,
+            network_handle,
+            request_handler,
+            task_spawner,
+            consensus_chain,
+            epoch_stream_semaphore,
+            pending_epoch_requests: pending_batch_requests,
+            bls_public_key,
+        }
     }
 
     pub fn handle(&self) -> &PrimaryNetworkHandle {
@@ -295,10 +456,37 @@ where
     /// Run the network for the epoch.
     pub fn spawn(mut self, epoch_task_spawner: &TaskSpawner) {
         epoch_task_spawner.spawn_critical_task("primary network events", async move {
-            while let Some(event) = self.network_events.recv().await {
-                self.process_network_event(event)
+            // start interval for pruning stale stream requests
+            let mut prune_requests = tokio::time::interval(PENDING_REQUEST_PRUNE_INTERVAL);
+            loop {
+                tokio::select! {
+                    // process network events
+                    next = self.network_events.recv() => {
+                        match next {
+                            Some(event) => {
+                                self.process_network_event(event);
+                            }
+                            None => {
+                                warn!(target: "worker::network", "critical worker network events channel dropped");
+                                break;
+                            }
+                        }
+                    }
+                    // periodically prune stale stream requests
+                    _ = prune_requests.tick() => {
+                        self.cleanup_stale_pending_requests();
+                    }
+                }
             }
         });
+    }
+
+    /// Clean up stale pending requests that have timed out.
+    fn cleanup_stale_pending_requests(&mut self) {
+        let now = Instant::now();
+        self.pending_epoch_requests
+            .lock()
+            .retain(|_, pending| now.duration_since(pending.created_at) < PENDING_REQUEST_TIMEOUT);
     }
 
     /// Handle events concurrently.
@@ -327,6 +515,9 @@ where
                 PrimaryRequest::EpochRecord { epoch, hash } => {
                     self.process_epoch_record_request(peer, epoch, hash, channel, cancel)
                 }
+                PrimaryRequest::StreamEpoch { epoch } => {
+                    self.process_epoch_stream(peer, epoch, channel, cancel)
+                }
             },
             NetworkEvent::Gossip(msg, propagation_source) => {
                 self.process_gossip(msg, propagation_source);
@@ -338,7 +529,9 @@ where
                     let _ = network_handle.handle.send_response(err, channel).await;
                 });
             }
-            _ => unimplemented!("inbound stream unimplemented"),
+            NetworkEvent::InboundStream { peer, stream } => {
+                self.process_inbound_stream(peer, stream);
+            }
         }
     }
 
@@ -463,6 +656,86 @@ where
         });
     }
 
+    /// Process a request to stream an epoch pack file.
+    fn process_epoch_stream(
+        &self,
+        peer: BlsPublicKey,
+        epoch: Epoch,
+        channel: ResponseChannel<PrimaryResponse>,
+        cancel: oneshot::Receiver<()>,
+    ) {
+        // acquire semaphore permit (non-blocking) for global concurrency
+        let ack = match self.epoch_stream_semaphore.clone().try_acquire_owned() {
+            Ok(permit) => {
+                let mut pending_map = self.pending_epoch_requests.lock();
+
+                // check per-peer capacity
+                let peer_count = pending_map.keys().filter(|(p, _)| *p == peer).count();
+                if peer_count >= MAX_PENDING_REQUESTS_PER_PEER {
+                    info!(
+                        target: "primary::network",
+                        %peer,
+                        peer_count,
+                        "rejecting batch stream request: per-peer limit reached"
+                    );
+                    // permit drops here, freeing the slot
+                    false
+                } else {
+                    let mut hasher = tn_types::DefaultHashFunction::new();
+                    hasher.update(&epoch.to_le_bytes());
+                    let request_digest = B256::from_slice(hasher.finalize().as_bytes());
+                    let pending = PendingEpochStream::new(epoch, permit);
+                    // If the same peer requests the same epoch then replace request.
+                    // If the peer tries to stream twice the second attempt will be
+                    // punished as a protocol violation.
+                    if pending_map.insert((peer, request_digest), pending).is_some() {
+                        debug!(
+                            target: "primary::network",
+                            %peer,
+                            ?request_digest,
+                            epoch,
+                            "pending epoch stream request replaced with identical epoch request"
+                        );
+                    }
+                    debug!(
+                        target: "primary::network",
+                        %peer,
+                        ?request_digest,
+                        epoch,
+                        "pending epoch stream request accepted"
+                    );
+                    true
+                }
+            }
+            Err(_) => false,
+        };
+
+        let response: PrimaryNetworkResult<PrimaryResponse> =
+            Ok(PrimaryResponse::RequestEpochStream { ack, peer: self.bls_public_key });
+        // send response
+        let network_handle = self.network_handle.clone();
+        let task_name = format!("process-request-epoch-{peer}");
+        self.task_spawner.spawn_task(task_name, async move {
+            let msg = match response {
+                Ok(msg) => msg,
+                Err(err) => {
+                    let error = err.to_string();
+                    if let Some(penalty) = (&err).into() {
+                        network_handle.report_penalty(peer, penalty).await;
+                    }
+
+                    PrimaryResponse::Error(message::PrimaryRPCError(error))
+                }
+            };
+
+            // send response or cancel
+            tokio::select! {
+                _ = network_handle.inner_handle().send_response(msg, channel) => (),
+                _ = cancel => (),
+            }
+        });
+    }
+
     /// Process gossip from committee.
     fn process_gossip(&self, msg: GossipMessage, propagation_source: BlsPublicKey) {
         // clone for spawned tasks
@@ -478,6 +751,52 @@ where
                     network_handle.report_penalty(propagation_source, penalty).await;
                 }
             }
+        });
+    }
+
+    /// Process an inbound stream for epoch pack transfer.
+    ///
+    /// Reads the request digest from the stream and validates against pending requests.
+    fn process_inbound_stream(&self, peer: BlsPublicKey, mut stream: Stream) {
+        let request_handler = self.request_handler.clone();
+        let network_handle = self.network_handle.clone();
+        let pending_map = self.pending_epoch_requests.clone();
+        let task_name = format!("stream-requested-batches-{peer}");
+        let consensus_chain = self.consensus_chain.clone();
+        self.task_spawner.spawn_task(task_name, async move {
+            // read the request digest (32-bytes) from the stream with timeout
+            let mut digest_buf = [0u8; tn_types::DIGEST_LENGTH];
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                stream.read_exact(&mut digest_buf),
+            ).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!(target: "worker::network", %peer, ?e, "failed to read request digest from stream");
+                    return;
+                }
+                Err(_) => {
+                    warn!(target: "worker::network", %peer, "timeout reading request digest from stream");
+                    return;
+                }
+            }
+            let request_digest = B256::from(digest_buf);
+
+            // look up and remove the matching pending request
+            let opt_pending_req = pending_map
+                .lock()
+                .remove(&(peer, request_digest));
+
+            // process stream
+            if let Err(err) = request_handler
+                .process_request_epoch_stream(peer, opt_pending_req, stream, request_digest, &consensus_chain)
+                .await {
+                    // apply applicable penalty for error
+                    warn!(target: "worker::network", ?err, "error processing request batches stream");
+                    if let Some(penalty) = (&err).into() {
+                        network_handle.report_penalty(peer, penalty).await;
+                    }
+                }
         });
     }
 }
