@@ -835,6 +835,7 @@ mod test {
 
         let temp_dir2 = TempDir::with_prefix("test_consensus_pack2").expect("temp dir");
         let consensus_chain2 = ConsensusChain::new(temp_dir2.path().to_owned()).unwrap();
+        consensus_chain.epochs().save_record(epoch_record.clone()).await.expect("save epoch");
         let stream = consensus_chain.get_epoch_stream(0).await.unwrap();
         consensus_chain2.stream_import(stream, &epoch_record, &previous_epoch).await.unwrap();
         consensus_chain2.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
