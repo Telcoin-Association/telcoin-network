@@ -190,6 +190,7 @@ impl BatchBuilder {
                                 | BlockSealError::AntiQuorum
                                 | BlockSealError::Timeout
                                 | BlockSealError::NotValidator
+                                | BlockSealError::FailedToReport
                                 | BlockSealError::FailedQuorum => {
                                     // potentially non-fatal error
                                     //

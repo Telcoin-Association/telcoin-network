@@ -12,10 +12,10 @@ use crate::{
 use std::{sync::Arc, time::Duration};
 use tn_config::ConsensusConfig;
 use tn_network_types::{local::LocalNetwork, WorkerOwnBatchMessage, WorkerToPrimaryClient};
-use tn_storage::tables::NodeBatchesCache;
+use tn_storage::tables::{NodeBatchesCache, OurNodeBatchesCache};
 use tn_types::{
-    error::BlockSealError, BatchReceiver, BatchSender, BatchValidation, Database, SealedBatch,
-    TaskManager, WorkerId,
+    error::BlockSealError, BatchReceiver, BatchSender, BatchValidation, Database, DbTxMut as _,
+    SealedBatch, TaskManager, WorkerId,
 };
 use tracing::{error, info, instrument};
 
@@ -107,7 +107,7 @@ pub struct Worker<DB, QW> {
     network_handle: WorkerNetworkHandle,
 }
 
-// Need to imlement clone directly because of the rx_batches field.
+// Need to implement clone directly because of the rx_batches field.
 // This field is a use once field when spawning the batch manager so this is fine.
 // Code will panic quickly if this is messed up.
 impl<DB: Clone, QW: Clone> Clone for Worker<DB, QW> {
@@ -210,7 +210,7 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         );
 
         let (batch, digest) = sealed_batch.split();
-        if let Err(e) = self.store.insert::<NodeBatchesCache>(&digest, &batch) {
+        if let Err(e) = self.store.insert::<OurNodeBatchesCache>(&digest, &batch) {
             // Cache the batch early, avoid race conditions.
             // Note the cache should be cleared every epoch after processing.
             error!(target: "worker::batch_provider", "Store failed (batch cache) with error: {:?}", e);
@@ -238,6 +238,10 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
                         let _ = self.network_handle.publish_batch(digest).await;
                     }
                     Err(e) => {
+                        // On error the batch builder should leave the transactions in the pool for
+                        // a future batch. So go ahead and remove so we
+                        // don't try to re-inject them later.
+                        let _ = self.store.remove::<OurNodeBatchesCache>(&digest);
                         return Err(match e {
                             crate::quorum_waiter::QuorumWaiterError::QuorumRejected => {
                                 BlockSealError::QuorumRejected
@@ -263,23 +267,39 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
             }
         }
 
-        // Now save it to permenant storage
-        if let Err(e) = self.store.insert::<NodeBatchesCache>(&digest, &batch) {
-            error!(target: "worker::batch_provider", "Store failed with error: {:?}", e);
-            return Err(BlockSealError::FatalDBFailure);
+        match self.store.write_txn() {
+            Ok(mut txn) => {
+                // Now save it to live batch storage (still a cache until included in consensus
+                // output)
+                if let Err(e) = txn.insert::<NodeBatchesCache>(&digest, &batch) {
+                    error!(target: "worker::batch_provider", "Store failed with error: {:?}", e);
+                    return Err(BlockSealError::FatalDBFailure);
+                }
+                // Remove from our cache since we are about to push out as a valid batch.
+                if let Err(e) = txn.remove::<OurNodeBatchesCache>(&digest) {
+                    error!(target: "worker::batch_provider", "Remove failed with error: {:?}", e);
+                    return Err(BlockSealError::FatalDBFailure);
+                }
+                // Make sure we have persisted the batch before we report it to other nodes.
+                if let Err(e) = txn.commit() {
+                    error!(target: "worker::batch_provider", "Commit failed with error: {:?}", e);
+                    return Err(BlockSealError::FatalDBFailure);
+                }
+            }
+            Err(e) => {
+                error!(target: "worker::batch_provider", "Store failed with error: {:?}", e);
+                return Err(BlockSealError::FatalDBFailure);
+            }
         }
-        // Make sure we have persisted the batch before we report it to other nodes.
-        self.store.persist::<NodeBatchesCache>().await;
 
         // Send the batch to the primary.
         let message = WorkerOwnBatchMessage { worker_id: self.id, digest };
         if let Err(err) = self.client.report_own_batch(message).await {
             error!(target: "worker::batch_provider", "Failed to report our batch: {err:?}");
-            // Should we return an error here?  Doing so complicates some tests but also the batch
-            // is sealed, etc. If we can not report our own batch is this a
-            // showstopper?
+            let _ = self.store.remove::<NodeBatchesCache>(&digest);
+            Err(BlockSealError::FailedToReport)
+        } else {
+            Ok(())
         }
-
-        Ok(())
     }
 }
