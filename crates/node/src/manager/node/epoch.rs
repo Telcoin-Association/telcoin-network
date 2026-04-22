@@ -32,7 +32,7 @@ use tn_reth::{
 };
 use tn_storage::tables::{
     CertificateDigestByOrigin, CertificateDigestByRound, Certificates, LastProposed,
-    NodeBatchesCache, Payload, Votes,
+    NodeBatchesCache, OurNodeBatchesCache, Payload, Votes,
 };
 use tn_types::{
     gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash, BlockNumHash, BlsPublicKey,
@@ -298,8 +298,8 @@ where
         Ok(res)
     }
 
-    /// Collect any batches that never got into consensus (at epoch change or node restart) and
-    /// Re-introduce them into the mempool for inclusion in future batches.
+    /// Collect any of our batches that never got into consensus (at epoch change or node restart)
+    /// and Re-introduce them into the mempool for inclusion in future batches.
     async fn orphan_batches<QuorumWaiter: QuorumWaiterTrait>(
         &mut self,
         epoch_task_manager: &TaskManager,
@@ -308,28 +308,19 @@ where
         epoch: Epoch,
     ) -> eyre::Result<()> {
         // Collect any batches from this epoch that never made it to the consensus chain.
-        let mut orphan_batches: Vec<(BlockHash, Batch)> = Vec::new();
-        // We can not await while using the db iter so capture the digest and filter out the ones
-        // that were processed.
-        let digests: Vec<BlockHash> =
-            self.consensus_db.iter::<NodeBatchesCache>().map(|(digest, _)| digest).collect();
-        for digest in digests.into_iter() {
-            if !self.consensus_chain.contains_current_batch(digest).await {
-                if let Ok(Some(batch)) = self.consensus_db.get::<NodeBatchesCache>(&digest) {
-                    orphan_batches.push((digest, batch));
-                }
-            }
-        }
-        // We have what we need so clear the Batch cache now.
-        // Do this now vs at end of epoch so we keep the batches until we need them.
-        self.consensus_db.clear_table::<NodeBatchesCache>()?;
+        let mut orphan_batches: Vec<(BlockHash, Batch)> =
+            // Any batches in this table were created by us but never made it to consensus.
+            self.consensus_db.iter::<OurNodeBatchesCache>().collect();
+        // We have what we need so clear our Batch cache now.
+        // We are reintroducing the transactions so these batches are now defunct.
+        self.consensus_db.clear_table::<OurNodeBatchesCache>()?;
         if !orphan_batches.is_empty() {
             let consensus_bus = self.consensus_bus.clone();
             let span =
                 info_span!(target: "telcoin", "orphan-batches", epoch = tracing::field::Empty);
             span.record("epoch", epoch.to_string());
             epoch_task_manager.spawn_task("Orphaned Batches", async move {
-                info!(target: "epoch-manager", "Re-introducing orphaned batchs {} transactions", orphan_batches.len());
+                info!(target: "epoch-manager", "Re-introducing orphaned batches {} transactions", orphan_batches.len());
                 let pools = engine.get_all_worker_transaction_pools().await;
                 let is_cvv = consensus_bus.is_active_cvv();
                 for (digest, batch) in orphan_batches.drain(..) {
@@ -1205,7 +1196,7 @@ where
     /// Clear the epoch-related tables for consensus.
     ///
     /// These tables are epoch-specific. Complete historic data is stored
-    /// in the `ConsensusBlocks` table.
+    /// in the `ConsensusChain` data store.
     fn clear_consensus_db_for_next_epoch(&self) -> eyre::Result<()> {
         self.consensus_db.clear_table::<LastProposed>()?;
         self.consensus_db.clear_table::<Votes>()?;
@@ -1213,6 +1204,9 @@ where
         self.consensus_db.clear_table::<CertificateDigestByRound>()?;
         self.consensus_db.clear_table::<CertificateDigestByOrigin>()?;
         self.consensus_db.clear_table::<Payload>()?;
+        self.consensus_db.clear_table::<NodeBatchesCache>()?;
+        // Note do not clear OurNodeBatchesCache here- we need to keep those until we process the
+        // orphans and clear then.
         Ok(())
     }
 

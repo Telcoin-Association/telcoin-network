@@ -77,11 +77,28 @@ where
                     match self.network_handle.request_batches(&mut missing).await {
                         Ok(batches) => {
                             if let Some((digest, batch)) = batches.first() {
-                                store.insert::<NodeBatchesCache>(digest, batch).map_err(|e| {
-                                    WorkerNetworkError::Internal(format!(
-                                        "failed to write to batch store: {e}"
-                                    ))
-                                })?;
+                                // Storing batches for future epochs can cause problems.  This might
+                                // open an attack for rogue
+                                // validator to fill disk space, the cache is cleared on
+                                // epoch boundaries anyway, etc.
+                                // Note: retrieving this batch for no reason is wasteful, it should
+                                // only effect nodes catching up old epochs though...
+                                if batch.epoch == self.consensus_config.epoch() {
+                                    store.insert::<NodeBatchesCache>(digest, batch).map_err(
+                                        |e| {
+                                            WorkerNetworkError::Internal(format!(
+                                                "failed to write to batch store: {e}"
+                                            ))
+                                        },
+                                    )?;
+                                } else {
+                                    debug!(
+                                        target: "worker:network",
+                                        batch_epoch = batch.epoch,
+                                        current_epoch = self.consensus_config.epoch(),
+                                        "gossipped batch epoch mismatch - discarding"
+                                    );
+                                }
                             }
                         }
                         Err(e) => {
