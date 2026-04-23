@@ -12,7 +12,10 @@ use crate::{
 use std::{sync::Arc, time::Duration};
 use tn_config::ConsensusConfig;
 use tn_network_types::{local::LocalNetwork, WorkerOwnBatchMessage, WorkerToPrimaryClient};
-use tn_storage::tables::{NodeBatchesCache, OurNodeBatchesCache};
+use tn_storage::{
+    consensus::ConsensusChain,
+    tables::{NodeBatchesCache, OurNodeBatchesCache},
+};
 use tn_types::{
     error::BlockSealError, BatchReceiver, BatchSender, BatchValidation, Database, DbTxMut as _,
     SealedBatch, TaskManager, WorkerId,
@@ -30,16 +33,20 @@ pub fn new_worker<DB: Database>(
     validator: Arc<dyn BatchValidation>,
     consensus_config: ConsensusConfig<DB>,
     network_handle: WorkerNetworkHandle,
+    consensus_chain: ConsensusChain,
 ) -> Worker<DB, QuorumWaiter> {
     info!(target: "worker::worker", "Boot worker node with id {} key {:?}", id, consensus_config.key_config().primary_public_key());
 
-    let batch_fetcher =
-        BatchFetcher::new(network_handle.clone(), consensus_config.node_storage().clone());
+    let batch_fetcher = BatchFetcher::new(
+        network_handle.clone(),
+        consensus_config.node_storage().clone(),
+        consensus_chain,
+    );
     consensus_config.local_network().set_primary_to_worker_local_handler(Arc::new(
         PrimaryReceiverHandler {
             store: consensus_config.node_storage().clone(),
             network: Some(network_handle.clone()),
-            batch_fetcher: Some(batch_fetcher),
+            batch_fetcher,
             validator,
         },
     ));
@@ -263,6 +270,8 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
             }
             Err(e) => {
                 error!(target: "worker::batch_provider", "Join error attempting batch quorum! {e}");
+                // See remove comment above.
+                let _ = self.store.remove::<OurNodeBatchesCache>(&digest);
                 return Err(BlockSealError::FailedQuorum);
             }
         }
@@ -296,7 +305,6 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         let message = WorkerOwnBatchMessage { worker_id: self.id, digest };
         if let Err(err) = self.client.report_own_batch(message).await {
             error!(target: "worker::batch_provider", "Failed to report our batch: {err:?}");
-            let _ = self.store.remove::<NodeBatchesCache>(&digest);
             Err(BlockSealError::FailedToReport)
         } else {
             Ok(())

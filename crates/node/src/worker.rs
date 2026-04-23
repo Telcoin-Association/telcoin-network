@@ -2,6 +2,7 @@
 use crate::manager::WORKER_TASK_BASE;
 use std::sync::Arc;
 use tn_config::ConsensusConfig;
+use tn_storage::consensus::ConsensusChain;
 use tn_types::{BatchValidation, Database as ConsensusDatabase, WorkerId};
 use tn_worker::{new_worker, quorum_waiter::QuorumWaiter, Worker, WorkerNetworkHandle};
 use tokio::sync::RwLock;
@@ -17,6 +18,8 @@ pub struct WorkerNodeInner<CDB> {
     network_handle: WorkerNetworkHandle,
     /// The batch validator.
     validator: Arc<dyn BatchValidation>,
+    /// The consensus chain.
+    consensus_chain: ConsensusChain,
 }
 
 impl<CDB: ConsensusDatabase> WorkerNodeInner<CDB> {
@@ -31,6 +34,7 @@ impl<CDB: ConsensusDatabase> WorkerNodeInner<CDB> {
             self.validator.clone(),
             self.consensus_config.clone(),
             self.network_handle.clone(),
+            self.consensus_chain.clone(),
         );
 
         Ok(batch_provider)
@@ -48,8 +52,10 @@ impl<CDB: ConsensusDatabase> WorkerNode<CDB> {
         consensus_config: ConsensusConfig<CDB>,
         network_handle: WorkerNetworkHandle,
         validator: Arc<dyn BatchValidation>,
+        consensus_chain: ConsensusChain,
     ) -> WorkerNode<CDB> {
-        let inner = WorkerNodeInner { id, consensus_config, network_handle, validator };
+        let inner =
+            WorkerNodeInner { id, consensus_config, network_handle, validator, consensus_chain };
 
         Self { internal: Arc::new(RwLock::new(inner)) }
     }

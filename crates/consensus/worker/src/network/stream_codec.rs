@@ -6,10 +6,12 @@
 //! To start stream, peers exchange `B256` (32-byte) digest at the
 //! beginning of the stream.
 
+use crate::batch_fetcher::get_batches_local;
+
 use super::error::{WorkerNetworkError, WorkerNetworkResult};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use std::collections::HashSet;
-use tn_storage::{consensus::ConsensusChain, tables::NodeBatchesCache};
+use tn_storage::consensus::ConsensusChain;
 use tn_types::{max_batch_size, Batch, Database, Epoch, B256};
 
 /// Max number of batch digests per chunk.
@@ -80,42 +82,6 @@ where
     Ok(count)
 }
 
-/// Retrieve batches from the list of batch_digests.
-async fn get_batches<DB>(
-    epoch: Epoch,
-    batch_digests: &[B256],
-    store: &DB,
-    consensus_chain: &ConsensusChain,
-) -> WorkerNetworkResult<Vec<Batch>>
-where
-    DB: Database,
-{
-    // look up batches from db
-    let mut batches: Vec<_> = store
-        .multi_get::<NodeBatchesCache>(batch_digests.iter())
-        .map_err(|e| WorkerNetworkError::Internal(format!("DB error: {e}")))?
-        .into_iter()
-        .flatten() // removes `None`
-        .collect();
-
-    let batches = if batches.is_empty() {
-        consensus_chain.get_batches(epoch, batch_digests.iter()).await
-    } else if batches.len() < batch_digests.len() {
-        let mut missing = Vec::new();
-        for digest in batches.iter().map(|b| b.digest()) {
-            if !batch_digests.contains(&digest) {
-                missing.push(digest);
-            }
-        }
-        batches.extend(consensus_chain.get_batches(epoch, missing.iter()).await);
-        batches
-    } else {
-        batches
-    };
-
-    Ok(batches)
-}
-
 /// Send batches over stream, looking up from database.
 pub(crate) async fn send_batches_over_stream<DB, S>(
     stream: &mut S,
@@ -138,7 +104,7 @@ where
     let digests: Vec<_> = batch_digests.iter().copied().collect();
     for chunk in digests.chunks(BATCH_DIGESTS_READ_CHUNK_SIZE) {
         // look up batches from db
-        let batches: Vec<_> = get_batches(epoch, chunk, store, consensus_chain).await?;
+        let batches: Vec<_> = get_batches_local(epoch, chunk, store, consensus_chain).await?;
 
         // write batch count for this chunk
         let chunk_size = batches.len() as u32;

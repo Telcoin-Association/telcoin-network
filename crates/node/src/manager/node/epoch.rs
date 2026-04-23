@@ -921,8 +921,13 @@ where
         )
         .await?;
 
-        let worker =
-            WorkerNode::new(worker_id, consensus_config.clone(), network_handle.clone(), validator);
+        let worker = WorkerNode::new(
+            worker_id,
+            consensus_config.clone(),
+            network_handle.clone(),
+            validator,
+            self.consensus_chain.clone(),
+        );
 
         Ok(worker)
     }
