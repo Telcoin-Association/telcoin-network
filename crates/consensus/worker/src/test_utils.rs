@@ -34,7 +34,8 @@ impl QuorumWaiterTrait for TestMakeBlockQuorumWaiter {
         let task_name = format!("qw-test-{}", batch.digest());
         task_spawner.spawn_task(task_name, async move {
             *data.lock().unwrap() = Some(batch);
-            tx.send(Ok(()))
+            let _ = tx.send(Ok(()));
+            Ok(())
         });
         rx
     }

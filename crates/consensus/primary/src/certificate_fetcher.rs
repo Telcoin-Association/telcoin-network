@@ -112,6 +112,7 @@ impl<DB: Database> CertificateFetcher<DB> {
             .await
             .map_err(|e| {
                 error!(target: "primary::cert_fetcher", ?e, "cert fetcher shutting down");
+                eyre::eyre!("{e}")
             })
         });
     }
@@ -287,6 +288,7 @@ impl<DB: Database> CertificateFetcher<DB> {
                 .await;
 
                 let _ = tx.send(result);
+                Ok(())
             },
         );
 
@@ -531,6 +533,7 @@ fn spawn_peer_fetch(
                 // cancelled - another peer succeeded
             }
         }
+        Ok(())
     });
 }
 

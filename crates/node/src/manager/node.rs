@@ -351,7 +351,7 @@ where
                 },
                 res = primary_network.run() => {
                     warn!(target: "epoch-manager", ?res, "primary network stopped");
-                    res
+                    Ok(res?)
                 },
             )
         });
@@ -379,7 +379,7 @@ where
                 }
                 res = worker_network.run() => {
                     warn!(target: "epoch-manager", ?res, "worker network stopped");
-                    res
+                    Ok(res?)
                 }
             )
         });
@@ -498,6 +498,7 @@ where
                 });
             }
             error!(target: "engine", "engine updates ended, node will exit");
+            Err(eyre::eyre!("engine updates ended, node will exit"))
         });
     }
 }

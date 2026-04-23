@@ -1056,6 +1056,7 @@ where
                         // ignore errors and disconnect after px attempt
                         let _res = tokio::time::timeout(timeout, done).await;
                         let _ = handle.disconnect_peer(peer_id).await;
+                        Ok(())
                     });
 
                     // insert to pending px disconnects

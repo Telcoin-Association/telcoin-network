@@ -96,6 +96,7 @@ impl BatchValidation for BatchValidator {
                     let task_name = format!("submit-tx-{hash}");
                     self.reth_env.get_task_spawner().spawn_task(task_name, async move {
                         let _ = tx_pool.add_recovered_transaction_external(recovered).await;
+                        Ok(())
                     });
                 }
             }

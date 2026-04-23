@@ -15,18 +15,23 @@ use tokio::{
     task::{JoinError, JoinHandle},
 };
 
+/// The error type for tasks.
+pub type TaskError = eyre::Report;
+/// Result type for all tasks.
+pub type TaskResult = Result<(), TaskError>;
+
 /// Used for the futures that will resolve when tasks do.
 /// Allows us to hold a FuturesUnordered directly in the TaskManager struct.
 struct TaskHandle {
     /// The  owned permission to join on a task (await its termination).
-    handle: JoinHandle<()>,
+    handle: JoinHandle<TaskResult>,
     /// The name for the task.
     info: TaskInfo,
 }
 
 impl TaskHandle {
     /// Create a new instance of `Self`.
-    fn new(name: String, handle: JoinHandle<()>, critical: bool) -> Self {
+    fn new(name: String, handle: JoinHandle<TaskResult>, critical: bool) -> Self {
         Self { handle, info: TaskInfo { name, critical } }
     }
 }
@@ -43,7 +48,7 @@ struct TaskInfo {
 
 impl Future for TaskHandle {
     // Return the `name` and `critical` status for task.
-    type Output = Result<TaskInfo, (TaskInfo, JoinError)>;
+    type Output = Result<TaskInfo, (TaskInfo, TaskJoinError)>;
 
     fn poll(
         self: std::pin::Pin<&mut Self>,
@@ -52,8 +57,17 @@ impl Future for TaskHandle {
         let this = self.get_mut();
         match this.handle.poll_unpin(cx) {
             Poll::Ready(res) => match res {
-                Ok(_) => Poll::Ready(Ok(this.info.clone())),
-                Err(err) => Poll::Ready(Err((this.info.clone(), err))),
+                Ok(r) => match r {
+                    Ok(_) => Poll::Ready(Ok(this.info.clone())),
+                    Err(e) => Poll::Ready(Err((
+                        this.info.clone(),
+                        TaskJoinError::CriticalExitError(this.info.name.clone(), e),
+                    ))),
+                },
+                Err(err) => Poll::Ready(Err((
+                    this.info.clone(),
+                    TaskJoinError::CriticalJoinError(this.info.name.clone(), err),
+                ))),
             },
             Poll::Pending => Poll::Pending,
         }
@@ -98,8 +112,7 @@ impl TaskSpawner {
     /// unaffected when this task resolves.
     pub fn spawn_task<F, S: ToString>(&self, name: S, future: F)
     where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
+        F: Future<Output = Result<(), TaskError>> + Send + 'static,
     {
         self.create_task(name, future, false);
     }
@@ -110,8 +123,7 @@ impl TaskSpawner {
     /// will shutdown.
     pub fn spawn_critical_task<F, S: ToString>(&self, name: S, future: F)
     where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
+        F: Future<Output = Result<(), TaskError>> + Send + 'static,
     {
         self.create_task(name, future, true);
     }
@@ -120,15 +132,18 @@ impl TaskSpawner {
     /// manager.
     fn create_task<F, S: ToString>(&self, name: S, future: F, critical: bool)
     where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
+        F: Future<Output = Result<(), TaskError>> + Send + 'static,
     {
         let name = name.to_string();
         let rx_shutdown = self.local_shutdown.subscribe();
         let handle = tokio::spawn(async move {
             tokio::select! {
-                _ = rx_shutdown => {}
-                _ = future => {}
+                _ = rx_shutdown => {
+                    Ok(())
+                }
+                res = future => {
+                    res
+                }
             }
         });
         if let Err(err) = self.new_task_tx.try_send(TaskHandle::new(name.clone(), handle, critical))
@@ -144,7 +159,7 @@ impl TaskSpawner {
     /// It WILL NOT be ended early when it's task manager is dropped so use wisely.
     pub fn spawn_blocking_task<F, S: ToString>(&self, name: S, task: F)
     where
-        F: FnOnce() + Send + 'static,
+        F: FnOnce() -> TaskResult + Send + 'static,
     {
         let name = name.to_string();
         let handle = tokio::task::spawn_blocking(task);
@@ -162,23 +177,26 @@ impl TaskSpawner {
         critical: bool,
         blocking: bool,
     ) -> JoinHandle<()> {
-        let (tx, mut rx) = tokio::sync::broadcast::channel(1);
+        let (tx, rx) = tokio::sync::oneshot::channel();
         // Need two join handles so do this channel dance to get them.
         // Required because the task manager needs one and this foreign Reth interface return one.
         let rx_shutdown = self.local_shutdown.subscribe();
         let f = async move {
             tokio::select! {
-                _ = rx_shutdown => {}
-                value = fut => {
-                    let _ = tx.send(value);
+                _ = rx_shutdown => {
+                    let _ = tx.send(Ok::<(), TaskError>(()));
+                }
+                _ = fut => {
+                    let _ = tx.send(Ok::<(), TaskError>(()));
                 }
             }
+            Ok::<(), TaskError>(())
         };
         let rx_shutdown = self.local_shutdown.subscribe();
         let join = tokio::spawn(async move {
             tokio::select! {
-                _ = rx_shutdown => {}
-                _ = rx.recv() => {}
+                _ = rx_shutdown => { }
+                _ = rx => { }
             }
         });
 
@@ -249,8 +267,7 @@ impl TaskManager {
     /// unaffected when this task resolves.
     pub fn spawn_task<F, S: ToString>(&self, name: S, future: F)
     where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
+        F: Future<Output = Result<(), TaskError>> + Send + 'static,
     {
         self.create_task(name, future, false);
     }
@@ -261,8 +278,7 @@ impl TaskManager {
     /// will shutdown.
     pub fn spawn_critical_task<F, S: ToString>(&self, name: S, future: F)
     where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
+        F: Future<Output = Result<(), TaskError>> + Send + 'static,
     {
         self.create_task(name, future, true);
     }
@@ -271,15 +287,14 @@ impl TaskManager {
     /// manager.
     fn create_task<F, S: ToString>(&self, name: S, future: F, critical: bool)
     where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
+        F: Future<Output = Result<(), TaskError>> + Send + 'static,
     {
         let name = name.to_string();
         let rx_shutdown = self.local_shutdown.subscribe();
         let handle = tokio::spawn(async move {
             tokio::select! {
-                _ = rx_shutdown => {}
-                _ = future => {}
+                _ = rx_shutdown => { Ok(()) }
+                res = future => { res }
             }
         });
         self.tasks.push(TaskHandle::new(name, handle, critical));
@@ -408,7 +423,7 @@ impl TaskManager {
                             // Ok exit is fine if we are shutting down.
                             if !rx_shutdown.noticed() {
                                 tracing::error!(target: "tn::tasks", "{}: {} returned error {join_err}, exiting", self.name, info.name);
-                                result = Err(TaskJoinError::CriticalExitError(info.name, join_err));
+                                result = Err(join_err);
                             }
                         }
                     }
@@ -440,18 +455,25 @@ impl TaskManager {
                             info.name,
                         )
                     }
-                    Err((info, err)) if err.is_cancelled() => tracing::info!(
-                        target: "tn::tasks",
-                        "{}: {} was cancelled",
-                        self.name,
-                        info.name,
-                    ),
-                    Err((info, err)) => tracing::error!(
-                        target: "tn::tasks",
-                        "{}: {} shutdown with error {err}",
-                        self.name,
-                        info.name,
-                    ),
+                    Err((info, TaskJoinError::CriticalJoinError(_, err))) if err.is_cancelled() => {
+                        tracing::info!(
+                            target: "tn::tasks",
+                            "{}: {} was cancelled",
+                            self.name,
+                            info.name,
+                        )
+                    }
+                    Err((info, err)) => {
+                        if !info.critical {
+                            continue;
+                        }
+                        tracing::error!(
+                            target: "tn::tasks",
+                            "{}: {} shutdown with error {err}",
+                            self.name,
+                            info.name,
+                        )
+                    }
                 }
             }
             tracing::info!(target: "tn::tasks", "{}: All tasks shutdown", self.name);
@@ -553,8 +575,10 @@ impl reth_tasks::TaskSpawner for TaskSpawner {
 pub enum TaskJoinError {
     #[error("Critical task {0} has exited unexpectedly: OK")]
     CriticalExitOk(String),
+    #[error("Critical task {0} has exited unexpectedly (join error): {1}")]
+    CriticalJoinError(String, JoinError),
     #[error("Critical task {0} has exited unexpectedly: {1}")]
-    CriticalExitError(String, JoinError),
+    CriticalExitError(String, TaskError),
 }
 
 #[cfg(test)]
@@ -563,7 +587,7 @@ mod test {
 
     use tokio::sync::mpsc::{self, Receiver, Sender};
 
-    use crate::TaskManager;
+    use crate::{Notifier, TaskJoinError, TaskManager};
 
     struct Ping {
         ping_rx: Receiver<u32>,
@@ -611,6 +635,7 @@ mod test {
         let (ping_crit, mut pong_crit) = new_ping_pong();
         task_manager.spawn_critical_task("Crit", async move {
             ping_crit.run().await;
+            Ok(())
         });
         assert_eq!(pong_crit.ping(1).await.unwrap(), 1);
         assert_eq!(pong_crit.ping(2).await.unwrap(), 2);
@@ -618,6 +643,7 @@ mod test {
         let (ping_norm, mut pong_norm) = new_ping_pong();
         task_manager.spawn_task("task", async move {
             ping_norm.run().await;
+            Ok(())
         });
         assert_eq!(pong_norm.ping(1).await.unwrap(), 1);
         assert_eq!(pong_norm.ping(2).await.unwrap(), 2);
@@ -626,6 +652,7 @@ mod test {
         let (sping_crit, mut spong_crit) = new_ping_pong();
         spawner.spawn_critical_task("Crit", async move {
             sping_crit.run().await;
+            Ok(())
         });
         assert_eq!(spong_crit.ping(1).await.unwrap(), 1);
         assert_eq!(spong_crit.ping(2).await.unwrap(), 2);
@@ -633,6 +660,7 @@ mod test {
         let (sping_norm, mut spong_norm) = new_ping_pong();
         spawner.spawn_task("task", async move {
             sping_norm.run().await;
+            Ok(())
         });
         assert_eq!(spong_norm.ping(1).await.unwrap(), 1);
         assert_eq!(spong_norm.ping(2).await.unwrap(), 2);
@@ -640,6 +668,7 @@ mod test {
         let (sping_block, mut spong_block) = new_ping_pong();
         spawner.spawn_blocking_task("SBlock", move || {
             sping_block.run_blocking();
+            Ok(())
         });
         assert_eq!(spong_block.ping(1).await.unwrap(), 1);
         assert_eq!(spong_block.ping(2).await.unwrap(), 2);
@@ -651,6 +680,7 @@ mod test {
             "Crit",
             Box::pin(async move {
                 rsping_crit.run().await;
+                Ok(())
             }),
         );
         assert_eq!(rspong_crit.ping(1).await.unwrap(), 1);
@@ -701,5 +731,30 @@ mod test {
         assert!(rspong_norm.ping(2).await.is_err());
         assert!(rspong_block.ping(2).await.is_err());
         assert!(rspong_crit_block.ping(2).await.is_err());
+    }
+
+    /// Test that an error produced in a task makes it up to join.
+    #[tokio::test]
+    async fn test_task_manager_join() {
+        let mut task_manager = TaskManager::default();
+        task_manager.spawn_critical_task("Crit 1", async move { Ok(()) });
+        match task_manager.join(Notifier::default()).await {
+            Ok(_) => {}
+            Err(TaskJoinError::CriticalExitOk(name)) => assert!(name.eq("Crit 1")),
+            Err(TaskJoinError::CriticalJoinError(_name, _err)) => panic!("wrong error"),
+            Err(TaskJoinError::CriticalExitError(_name, _err)) => panic!("wrong error"),
+        }
+        let mut task_manager = TaskManager::default();
+        task_manager.spawn_critical_task("Crit 1", async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok(())
+        });
+        task_manager.spawn_critical_task("Crit 2", async move { Err(eyre::eyre!("BOOM!")) });
+        match task_manager.join(Notifier::default()).await {
+            Ok(_) => {}
+            Err(TaskJoinError::CriticalExitOk(_name)) => panic!("should not be OK"),
+            Err(TaskJoinError::CriticalJoinError(_name, _err)) => panic!("wrong error"),
+            Err(TaskJoinError::CriticalExitError(name, _err)) => assert!(name.eq("Crit 2")),
+        }
     }
 }

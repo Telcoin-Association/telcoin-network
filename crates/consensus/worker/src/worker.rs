@@ -166,13 +166,14 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
     pub fn spawn_batch_builder(&mut self, prefix: &str, task_manager: &TaskManager) {
         let this_clone = self.clone();
         let mut rx_batches = self.rx_batches.take().expect("have batch receive");
-        task_manager.spawn_critical_task(&format!("{prefix} batch-builder"), async move {
+        task_manager.spawn_critical_task(format!("{prefix} batch-builder"), async move {
             while let Some((batch, tx)) = rx_batches.recv().await {
                 let res = this_clone.seal(batch).await;
                 if tx.send(res).is_err() {
                     error!(target: "worker::batch_provider", "Error sending result to channel caller!  Channel closed.");
                 }
             }
+            Ok(())
         });
     }
 

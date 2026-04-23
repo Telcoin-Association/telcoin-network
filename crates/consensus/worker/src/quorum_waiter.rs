@@ -136,6 +136,7 @@ impl QuorumWaiterTrait for QuorumWaiter {
                     spawner_clone.spawn_task(format!("qw-peer-{i}"), async move {
                         let res = Self::waiter(name, network, batch, stake).await;
                         let _ = tx.send(res);
+                        Ok(())
                     });
                     wait_for_quorum.push(rx);
                 }
@@ -183,6 +184,7 @@ impl QuorumWaiterTrait for QuorumWaiter {
                                                     }
                                                 })
                                                 .await;
+                                            Ok(())
                                         });
                                     }
                                     break Ok(());
@@ -233,7 +235,8 @@ impl QuorumWaiterTrait for QuorumWaiter {
             };
 
             // forward result
-            tx.send(res)
+            let _ = tx.send(res.clone());
+            res.map_err(|e| eyre::eyre!({ e }))
         });
         rx
     }

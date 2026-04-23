@@ -83,6 +83,9 @@ pub fn spawn_state_sync<DB: Database>(
                     .await
                     {
                         error!(target: "state-sync", "Error tracking latest consensus headers: {e}");
+                        Err(eyre::eyre!("{e}"))
+                    } else {
+                        Ok(())
                     }
                 },
             );
@@ -92,6 +95,9 @@ pub fn spawn_state_sync<DB: Database>(
                     info!(target: "state-sync", "Starting state sync: stream consensus header from peers");
                     if let Err(e) = spawn_stream_consensus_headers(config, consensus_bus, consensus_chain).await {
                         error!(target: "state-sync", "Error streaming consensus headers: {e}");
+                        Err(eyre::eyre!("{e}"))
+                    } else {
+                        Ok(())
                     }
                 },
             );

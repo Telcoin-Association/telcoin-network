@@ -186,6 +186,9 @@ where
                 let res = sync_header.sync_header_batches(&header, true, max_age).await;
                 if let Err(e) = res {
                     error!(target: "primary::cert_validator", ?e, ?header, ?max_age, "error syncing batches for certified header");
+                    Err(eyre::eyre!("{e}"))
+                } else {
+                    Ok(())
                 }
             });
 

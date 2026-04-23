@@ -135,6 +135,7 @@ impl WorkerTxPool {
                     _ => unreachable!("TN reorgs are impossible"),
                 }
             }
+            Err(eyre::eyre!("canonical txn pool task ended because state_stream closed"))
         });
         Ok(this)
     }

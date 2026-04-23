@@ -135,6 +135,7 @@ impl ExecutorEngine {
                 if let Err(e) = tx.send(result) {
                     warn!(target: "engine", ?e, "error sending result from execute_consensus_output")
                 }
+                Ok(())
             });
         } else {
             let _ = tx.send(Err(TnEngineError::EmptyQueue));

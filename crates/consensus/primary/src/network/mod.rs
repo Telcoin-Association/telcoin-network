@@ -468,7 +468,7 @@ where
                             }
                             None => {
                                 warn!(target: "worker::network", "critical worker network events channel dropped");
-                                break;
+                                break Err(eyre::eyre!("critical worker network events channel dropped"));
                             }
                         }
                     }
@@ -527,6 +527,7 @@ where
                 let network_handle = self.network_handle.clone();
                 self.task_spawner.spawn_task("report request error", async move {
                     let _ = network_handle.handle.send_response(err, channel).await;
+                    Ok(())
                 });
             }
             NetworkEvent::InboundStream { peer, stream } => {
@@ -560,6 +561,7 @@ where
                 // cancel notification from network layer
                 _ = cancel => (),
             }
+            Ok(())
         });
     }
 
@@ -591,6 +593,7 @@ where
                 // cancel notification from network layer
                 _ = cancel => (),
             }
+            Ok(())
         });
     }
 
@@ -625,6 +628,7 @@ where
                 // cancel notification from network layer
                 _ = cancel => (),
             }
+            Ok(())
         });
     }
 
@@ -653,6 +657,7 @@ where
                 // cancel notification from network layer
                 _ = cancel => (),
             }
+            Ok(())
         });
     }
 
@@ -733,6 +738,7 @@ where
                 _ = network_handle.inner_handle().send_response(msg, channel) => (),
                 _ = cancel => (),
             }
+            Ok(())
         });
     }
 
@@ -746,10 +752,14 @@ where
         self.task_spawner.spawn_task(task_name, async move {
             if let Err(e) = request_handler.process_gossip(&msg).await {
                 warn!(target: "primary::network", ?e, "process_gossip");
+                let res_err = Err(eyre::eyre!("{e}"));
                 // convert error into penalty to lower peer score
                 if let Some(penalty) = (&e).into() {
                     network_handle.report_penalty(propagation_source, penalty).await;
                 }
+                res_err
+            } else {
+                Ok(())
             }
         });
     }
@@ -773,11 +783,11 @@ where
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     warn!(target: "worker::network", %peer, ?e, "failed to read request digest from stream");
-                    return;
+                    return Err(eyre::eyre!("{e}"));
                 }
-                Err(_) => {
+                Err(e) => {
                     warn!(target: "worker::network", %peer, "timeout reading request digest from stream");
-                    return;
+                    return Err(eyre::eyre!("{e}"));
                 }
             }
             let request_digest = B256::from(digest_buf);
@@ -793,9 +803,13 @@ where
                 .await {
                     // apply applicable penalty for error
                     warn!(target: "worker::network", ?err, "error processing request batches stream");
+                    let res_err = Err(eyre::eyre!("{err}"));
                     if let Some(penalty) = (&err).into() {
                         network_handle.report_penalty(peer, penalty).await;
                     }
+                    res_err
+                } else {
+                    Ok(())
                 }
         });
     }

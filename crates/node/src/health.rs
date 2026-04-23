@@ -64,6 +64,7 @@ impl HealthcheckServer {
                 // then drop connection
                 let _ = socket.write_all(response).await;
             }
+            Ok(())
         });
 
         Ok(listen_on)
