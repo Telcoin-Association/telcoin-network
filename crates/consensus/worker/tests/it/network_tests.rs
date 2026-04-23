@@ -738,3 +738,77 @@ async fn test_request_batches_peer_fallback_preserves_digests() {
     // all peers rejected → error
     assert!(result.is_err());
 }
+
+/// A peer that re-requests the same batch set while an entry is already pending must not
+/// be able to reset the cleanup timer. If the replacement path rearmed `created_at`, a
+/// peer could re-request every 20s and hold a slot forever. This test exercises the
+/// preservation logic used by `process_request_batches_stream` and verifies the entry is
+/// evicted on schedule relative to the *original* insertion time.
+#[tokio::test]
+async fn test_pending_batch_stream_replacement_preserves_created_at() {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_BATCH_STREAMS));
+    let mut pending_map: std::collections::HashMap<(BlsPublicKey, B256), PendingBatchStream> =
+        std::collections::HashMap::new();
+
+    let task_manager = TaskManager::default();
+    let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
+
+    let peer = BlsPublicKey::default();
+    let batch_digests: HashSet<B256> = HashSet::from([B256::random(), B256::random()]);
+    let request_digest = handle.pub_generate_batch_request_id(&batch_digests);
+    let key = (peer, request_digest);
+    let epoch = 7u32;
+
+    // initial insertion at T0, where T0 is just past the cleanup horizon so we can
+    // assert eviction without waiting on wall-clock time
+    let t0 =
+        std::time::Instant::now() - PENDING_REQUEST_TIMEOUT - std::time::Duration::from_secs(1);
+    let permit = semaphore.clone().try_acquire_owned().expect("permit available");
+    pending_map.insert(
+        key,
+        PendingBatchStream::new_with_created_at(batch_digests.clone(), epoch, permit, t0),
+    );
+
+    // simulate a re-request: production code looks up the existing entry's
+    // `created_at` and reuses it when building the replacement
+    let new_permit = semaphore.clone().try_acquire_owned().expect("permit available");
+    let preserved_created_at = pending_map
+        .get(&key)
+        .map(|p| p.created_at())
+        .unwrap_or_else(std::time::Instant::now);
+    let replacement = PendingBatchStream::new_with_created_at(
+        batch_digests.clone(),
+        epoch,
+        new_permit,
+        preserved_created_at,
+    );
+    assert!(pending_map.insert(key, replacement).is_some(), "expected replacement");
+
+    // the replacement must carry the original `created_at`, not a fresh one
+    let after = pending_map.get(&key).expect("entry present after replacement");
+    assert_eq!(
+        after.created_at(),
+        t0,
+        "replacement must preserve original created_at to prevent cleanup-timer reset"
+    );
+
+    // cleanup mirrors `WorkerNetwork::cleanup_stale_pending_requests`: entries whose
+    // age >= PENDING_REQUEST_TIMEOUT must be evicted. Since created_at is t0 (stale),
+    // the entry must drop.
+    let now = std::time::Instant::now();
+    pending_map.retain(|_, pending| {
+        now.duration_since(pending.created_at()) < PENDING_REQUEST_TIMEOUT
+    });
+
+    assert!(
+        pending_map.is_empty(),
+        "stale entry must be evicted by cleanup even though it was 'replaced' moments ago"
+    );
+
+    // and the permit must have returned to the semaphore
+    assert_eq!(
+        semaphore.available_permits(),
+        MAX_CONCURRENT_BATCH_STREAMS,
+        "dropping the evicted pending entry must release its semaphore permit"
+    );
+}

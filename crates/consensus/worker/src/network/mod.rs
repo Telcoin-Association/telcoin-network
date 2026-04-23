@@ -98,6 +98,11 @@ impl PendingBatchStream {
     ) -> Self {
         Self { batch_digests, epoch, created_at, _permit: permit }
     }
+
+    /// Read the `created_at` timestamp for testing the cleanup / replacement behavior.
+    pub fn created_at(&self) -> Instant {
+        self.created_at
+    }
 }
 
 /// Handle inter-node communication between primaries.
@@ -318,8 +323,30 @@ where
                     } else {
                         let request_digest =
                             self.network_handle.generate_batch_request_id(&batch_digests);
-                        let pending = PendingBatchStream::new(batch_digests, epoch, permit);
-                        pending_map.insert((peer, request_digest), pending);
+                        // If the same peer re-requests the same batch set while a prior
+                        // entry is still pending, preserve the original `created_at` so
+                        // the cleanup timer is not rearmed. Without this, a peer could
+                        // hold a slot indefinitely by re-requesting before the 30s
+                        // timeout. A second stream open is still punished as a protocol
+                        // violation.
+                        let created_at = pending_map
+                            .get(&(peer, request_digest))
+                            .map(|p| p.created_at)
+                            .unwrap_or_else(Instant::now);
+                        let pending = PendingBatchStream {
+                            batch_digests,
+                            epoch,
+                            created_at,
+                            _permit: permit,
+                        };
+                        if pending_map.insert((peer, request_digest), pending).is_some() {
+                            debug!(
+                                target: "worker::network",
+                                %peer,
+                                ?request_digest,
+                                "pending batch stream request replaced with identical batch request"
+                            );
+                        }
                         debug!(
                             target: "worker::network",
                             %peer,

@@ -98,7 +98,9 @@ impl From<WorkerNetworkError> for Option<Penalty> {
                     }
                 }
             }
-            WorkerNetworkError::InvalidRequest(_) => Some(Penalty::Mild),
+            WorkerNetworkError::InvalidRequest(_) | WorkerNetworkError::UnknownStreamRequest(_) => {
+                Some(Penalty::Mild)
+            }
             WorkerNetworkError::StdIo(ref io_err) => {
                 // separate legitimate failures like connection resets from suspicious behavior
                 match io_err.kind() {
@@ -117,7 +119,6 @@ impl From<WorkerNetworkError> for Option<Penalty> {
             | WorkerNetworkError::TooManyBatches { .. }
             | WorkerNetworkError::UnexpectedBatch(_)
             | WorkerNetworkError::DuplicateBatch(_)
-            | WorkerNetworkError::UnknownStreamRequest(_)
             | WorkerNetworkError::RequestHashMismatch => Some(Penalty::Fatal),
             // ignore
             WorkerNetworkError::Timeout(_)

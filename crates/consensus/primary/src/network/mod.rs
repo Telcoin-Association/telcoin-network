@@ -684,10 +684,16 @@ where
                     let mut hasher = tn_types::DefaultHashFunction::new();
                     hasher.update(&epoch.to_le_bytes());
                     let request_digest = B256::from_slice(hasher.finalize().as_bytes());
-                    let pending = PendingEpochStream::new(epoch, permit);
-                    // If the same peer requests the same epoch then replace request.
-                    // If the peer tries to stream twice the second attempt will be
-                    // punished as a protocol violation.
+                    // If the same peer re-requests the same epoch while a prior entry
+                    // is still pending, preserve the original `created_at` so the
+                    // cleanup timer is not rearmed. Without this, a peer could hold a
+                    // slot indefinitely by re-requesting before the 30s timeout.
+                    // A second stream open is still punished as a protocol violation.
+                    let created_at = pending_map
+                        .get(&(peer, request_digest))
+                        .map(|p| p.created_at)
+                        .unwrap_or_else(Instant::now);
+                    let pending = PendingEpochStream { epoch, created_at, _permit: permit };
                     if pending_map.insert((peer, request_digest), pending).is_some() {
                         debug!(
                             target: "primary::network",
