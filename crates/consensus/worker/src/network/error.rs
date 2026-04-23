@@ -1,6 +1,6 @@
 //! Worker's network-related errors.
 use tn_network_libp2p::{error::NetworkError, Penalty};
-use tn_types::{BatchValidationError, BcsError, BlockHash};
+use tn_types::{BatchValidationError, BcsError, BlockHash, Epoch};
 use tokio::time::error::Elapsed;
 
 /// Result alias for results that possibly return [`WorkerNetworkError`].
@@ -68,6 +68,9 @@ pub enum WorkerNetworkError {
     /// Error reading from DB.
     #[error("DB read Error {0}")]
     DBRead(String),
+    /// Invalid batch epoch.
+    #[error("Got batch from epoch {0} expected {1}")]
+    BatchEpochMismatch(Epoch, Epoch),
 }
 
 impl From<WorkerNetworkError> for Option<Penalty> {
@@ -126,6 +129,7 @@ impl From<WorkerNetworkError> for Option<Penalty> {
             | WorkerNetworkError::DBRead(_)
             | WorkerNetworkError::StreamClosed
             | WorkerNetworkError::Network(_)
+            | WorkerNetworkError::BatchEpochMismatch(_, _)
             | WorkerNetworkError::Internal(_) => None,
         }
     }

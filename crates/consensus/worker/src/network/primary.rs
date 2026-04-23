@@ -19,7 +19,7 @@ pub(crate) struct PrimaryReceiverHandler<DB> {
     /// Synchronize header payloads from other workers.
     pub network: Option<WorkerNetworkHandle>,
     /// Fetch certificate payloads from other workers.
-    pub batch_fetcher: Option<BatchFetcher<DB>>,
+    pub batch_fetcher: BatchFetcher<DB>,
     /// Validate incoming batches
     pub validator: Arc<dyn BatchValidation>,
 }
@@ -35,7 +35,7 @@ impl<DB: Database> PrimaryToWorkerClient for PrimaryReceiverHandler<DB> {
         let mut missing = HashSet::new();
         for digest in message.digests.iter() {
             // Check if we already have the batch.
-            match self.store.get::<NodeBatchesCache>(digest) {
+            match self.batch_fetcher.fetch_local_batch(*digest).await {
                 Ok(None) => {
                     missing.insert(*digest);
                     debug!("Requesting sync for batch {digest}");
@@ -107,13 +107,6 @@ impl<DB: Database> PrimaryToWorkerClient for PrimaryReceiverHandler<DB> {
         &self,
         digests: HashSet<BlockHash>,
     ) -> eyre::Result<HashMap<BlockHash, Batch>> {
-        // option approach required for startup - this should never happen
-        let Some(batch_fetcher) = self.batch_fetcher.as_ref() else {
-            return Err(eyre::eyre!(
-                "fetch_batches() is unsupported via RPC interface, please call via local worker handler instead".to_string(),
-            ));
-        };
-
-        Ok(batch_fetcher.fetch_for_primary(digests).await?)
+        Ok(self.batch_fetcher.fetch_for_primary(digests).await?)
     }
 }

@@ -82,7 +82,7 @@ async fn test_batch_gossip_topics() {
     let TestTypes { network_commands_rx: _, handler, task_manager: _, committee: _ } =
         create_test_types();
     let batch_digest = B256::random();
-    let gossip = WorkerGossip::Batch(batch_digest);
+    let gossip = WorkerGossip::Batch(0, batch_digest);
     let data = tn_types::encode(&gossip);
     let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic());
     let good_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
@@ -115,7 +115,7 @@ async fn test_batch_gossip_triggers_stream_request() {
     let TestTypes { mut network_commands_rx, handler, task_manager, committee } =
         create_test_types();
     let batch_digest = B256::random();
-    let gossip = WorkerGossip::Batch(batch_digest);
+    let gossip = WorkerGossip::Batch(0, batch_digest);
     let data = tn_types::encode(&gossip);
     let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic());
     let msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
@@ -162,7 +162,7 @@ async fn test_batch_gossip_stream_accepted_opens_stream() {
     let TestTypes { mut network_commands_rx, handler, task_manager, committee } =
         create_test_types();
     let batch_digest = B256::random();
-    let gossip = WorkerGossip::Batch(batch_digest);
+    let gossip = WorkerGossip::Batch(0, batch_digest);
     let data = tn_types::encode(&gossip);
     let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic());
     let msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };

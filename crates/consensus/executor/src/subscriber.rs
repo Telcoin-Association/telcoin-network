@@ -152,13 +152,7 @@ impl<DB: Database> Subscriber<DB> {
         // This save will essentially mark this consensus output as written in stone (added to the
         // consensus chain). This does NOT imply execution although it will be sent off for
         // execution.
-        save_consensus(
-            self.config.node_storage(),
-            consensus_output.clone(),
-            &self.inner.authority_id,
-            &mut consensus_chain,
-        )
-        .await?;
+        save_consensus(consensus_output.clone(), &mut consensus_chain).await?;
 
         let last_round = consensus_output.leader_round();
 
@@ -327,7 +321,7 @@ impl<DB: Database> Subscriber<DB> {
                     match output {
                         Ok(output) => {
                             debug!(target: "subscriber", output=?output.digest(), "saving next output");
-                            save_consensus(self.config.node_storage(), output.clone(), &self.inner.authority_id, &mut consensus_chain).await?;
+                            save_consensus(output.clone(), &mut consensus_chain).await?;
                             debug!(target: "subscriber", "broadcasting output...");
                             if let Err(e) = self.consensus_bus.consensus_output().send(output).await {
                                 error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self.inner.authority_id, e);
@@ -353,9 +347,7 @@ impl<DB: Database> Subscriber<DB> {
                             Some(output) = waiting.next() => {
                                 if let Ok(output) = output {
                                     if let Err(e) = save_consensus(
-                                        self.config.node_storage(),
                                         output.clone(),
-                                        &self.inner.authority_id,
                                         &mut consensus_chain,
                                     ).await {
                                         warn!(target: "subscriber", "error saving consensus during shutdown: {e}");
