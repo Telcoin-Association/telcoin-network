@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 use tn_storage::tables::NodeBatchesCache;
-use tn_types::{max_batch_size, Batch, Database, SealedBatch, TaskSpawner};
+use tn_types::{max_batch_size, Batch, Database, SealedBatch, TaskError, TaskSpawner};
 use tokio::sync::oneshot;
 
 #[derive(Clone, Debug)]
@@ -35,7 +35,7 @@ impl QuorumWaiterTrait for TestMakeBlockQuorumWaiter {
         task_spawner.spawn_task(task_name, async move {
             *data.lock().unwrap() = Some(batch);
             let _ = tx.send(Ok(()));
-            Ok(())
+            Ok::<_, TaskError>(())
         });
         rx
     }

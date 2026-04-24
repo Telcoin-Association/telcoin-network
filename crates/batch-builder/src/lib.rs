@@ -163,58 +163,49 @@ impl BatchBuilder {
             // forward to worker and wait for ack that quorum was reached
             if let Err(e) = to_worker.send((batch, ack)).await {
                 error!(target: "worker::batch_builder", ?e, "failed to send next batch to worker");
-                let res_err = Err(eyre::eyre!("{e}"));
-                // try to return error if worker channel closed
-                let _ = result.send(Err(e.into()));
-                return res_err;
+                // signal to Self that this task failed, and escalate to shutdown via the
+                // task's return.
+                let _ = result.send(Err(BatchBuilderError::WorkerChannelClosed));
+                return Err(BatchBuilderError::WorkerChannelClosed);
             }
 
             // wait for worker to ack quorum reached then update pool with mined transactions
             match rx.await {
-                Ok(res) => {
-                    match res {
-                        Ok(_) => {
-                            debug!(target: "worker::batch-builder", ?res, "received ack");
-                            // signal to Self that this task is complete
-                            if let Err(e) = result.send(Ok(MinedBatchResult { mined_transactions, changed_accounts })) {
-                                error!(target: "worker::batch_builder", ?e, "failed to send block builder result to block builder task");
-                            }
-                        }
-                        Err(error) => {
-                            error!(target: "worker::batch_builder", ?error, "error while sealing batch");
-                            let converted = match error {
-                                BlockSealError::FatalDBFailure => {
-                                    // fatal - return error
-                                    Err(BatchBuilderError::FatalDBFailure)
-                                }
-                                BlockSealError::QuorumRejected
-                                | BlockSealError::AntiQuorum
-                                | BlockSealError::Timeout
-                                | BlockSealError::NotValidator
-                                | BlockSealError::FailedToReport
-                                | BlockSealError::FailedQuorum => {
-                                    // potentially non-fatal error
-                                    //
-                                    // return empty vec to indicate no transactions mined
-                                    // NOTE: this will apply no changes to transaction pool
-                                    Ok(MinedBatchResult { mined_transactions: vec![], changed_accounts: vec![] })
-                                }
-                            };
-
-                            if let Err(e) = result.send(converted) {
-                                error!(target: "worker::batch_builder", ?e, "failed to send block builder result to block builder task");
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!(target: "worker::batch_builder", ?e, "quorum waiter failed ack failed");
-                    if let Err(e) = result.send(Err(e.into())) {
+                Ok(Ok(_)) => {
+                    debug!(target: "worker::batch-builder", "received ack");
+                    // signal to Self that this task is complete
+                    if let Err(e) = result.send(Ok(MinedBatchResult { mined_transactions, changed_accounts })) {
                         error!(target: "worker::batch_builder", ?e, "failed to send block builder result to block builder task");
                     }
+                    Ok(())
+                }
+                Ok(Err(BlockSealError::FatalDBFailure)) => {
+                    error!(target: "worker::batch_builder", "fatal db failure while sealing batch");
+                    let _ = result.send(Err(BatchBuilderError::FatalDBFailure));
+                    Err(BatchBuilderError::FatalDBFailure)
+                }
+                Ok(Err(error @ (BlockSealError::QuorumRejected
+                    | BlockSealError::AntiQuorum
+                    | BlockSealError::Timeout
+                    | BlockSealError::NotValidator
+                    | BlockSealError::FailedToReport
+                    | BlockSealError::FailedQuorum))) => {
+                    // potentially non-fatal error
+                    //
+                    // return empty vec to indicate no transactions mined
+                    // NOTE: this will apply no changes to transaction pool
+                    error!(target: "worker::batch_builder", ?error, "non-fatal error while sealing batch");
+                    if let Err(e) = result.send(Ok(MinedBatchResult { mined_transactions: vec![], changed_accounts: vec![] })) {
+                        error!(target: "worker::batch_builder", ?e, "failed to send block builder result to block builder task");
+                    }
+                    Ok(())
+                }
+                Err(_e) => {
+                    error!(target: "worker::batch_builder", "quorum waiter ack failed");
+                    let _ = result.send(Err(BatchBuilderError::AckChannelClosed));
+                    Err(BatchBuilderError::AckChannelClosed)
                 }
             }
-            Ok(())
         }.instrument(span_clone));
 
         // return oneshot channel for receiving completion status

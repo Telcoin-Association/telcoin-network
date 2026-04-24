@@ -89,12 +89,10 @@ pub fn spawn_subscriber<DB: Database>(
             let rx_sequence = consensus_bus.subscribe_sequence();
             task_manager.spawn_critical_task("subscriber consensus", async move {
                 info!(target: "subscriber", "Starting subscriber: CVV");
-                if let Err(e) = subscriber.run(rx_shutdown, rx_sequence, consensus_chain).await {
-                    error!(target: "subscriber", "Error subscriber consensus: {e}");
-                    Err(eyre::eyre!("{e}"))
-                } else {
-                    Ok(())
-                }
+                subscriber
+                    .run(rx_shutdown, rx_sequence, consensus_chain)
+                    .await
+                    .inspect_err(|e| error!(target: "subscriber", "Error subscriber consensus: {e}"))
             });
         }
         NodeMode::CvvInactive => {
@@ -104,12 +102,10 @@ pub fn spawn_subscriber<DB: Database>(
                 "subscriber catch up and rejoin consensus",
                 async move {
                     info!(target: "subscriber", "Starting subscriber: Catch up and rejoin");
-                    if let Err(e) = subscriber.catch_up_rejoin_consensus(clone).await {
-                        error!(target: "subscriber", "Error catching up consensus: {e}");
-                        Err(eyre::eyre!("{e}"))
-                    } else {
-                        Ok(())
-                    }
+                    subscriber
+                        .catch_up_rejoin_consensus(clone)
+                        .await
+                        .inspect_err(|e| error!(target: "subscriber", "Error catching up consensus: {e}"))
                 },
             );
         }
@@ -118,12 +114,10 @@ pub fn spawn_subscriber<DB: Database>(
             // If we are not active then just follow consensus.
             task_manager.spawn_critical_task("subscriber follow consensus", async move {
                 info!(target: "subscriber", "Starting subscriber: Follower");
-                if let Err(e) = subscriber.follow_consensus(clone).await {
-                    error!(target: "subscriber", "Error following consensus: {e}");
-                    Err(eyre::eyre!("{e}"))
-                } else {
-                    Ok(())
-                }
+                subscriber
+                    .follow_consensus(clone)
+                    .await
+                    .inspect_err(|e| error!(target: "subscriber", "Error following consensus: {e}"))
             });
         }
     }

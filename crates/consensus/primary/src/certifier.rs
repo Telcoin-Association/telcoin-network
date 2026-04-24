@@ -14,7 +14,7 @@ use tn_types::{
     ensure,
     error::{DagError, DagResult},
     AuthorityIdentifier, BlsPublicKey, Certificate, CertificateDigest, Committee, Database, Header,
-    Noticer, Notifier, TaskManager, TaskResult, TaskSpawner, TnReceiver, Vote,
+    Noticer, Notifier, TaskError, TaskManager, TaskResult, TaskSpawner, TnReceiver, Vote,
 };
 use tracing::{debug, enabled, error, info, instrument};
 
@@ -296,7 +296,7 @@ impl<DB: Database> Certifier<DB> {
                     )
                     .await,
                 );
-                Ok(())
+                Ok::<_, TaskError>(())
             });
         }
 
@@ -406,7 +406,7 @@ impl<DB: Database> Certifier<DB> {
                         // pass to state_sync for internal processing
                         if let Err(e) = self.state_sync.process_own_certificate(&mut certificate).await {
                             error!(target: "primary::certifier", "error accepting own certificate: {e}");
-                            return Err(eyre::eyre!("{e}"));
+                            return Err(e.into());
                         }
 
                         // try to publish the certificate on gossip network
@@ -434,7 +434,7 @@ impl<DB: Database> Certifier<DB> {
                                     auth=?self.authority_id,
                                     "Certifier error on proposed header task: {e}"
                                 );
-                                Err(eyre::eyre!("{e}"))
+                                Err(e.into())
                             }
                         }
                     }

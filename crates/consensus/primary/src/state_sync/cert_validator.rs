@@ -183,13 +183,10 @@ where
             // NOTE: this should be okay bc header is already certified by quorum of signatures
             self.task_spawner.spawn_task("sync header batches", async move {
                 let sync_header = HeaderValidator::new(config, bus);
-                let res = sync_header.sync_header_batches(&header, true, max_age).await;
-                if let Err(e) = res {
-                    error!(target: "primary::cert_validator", ?e, ?header, ?max_age, "error syncing batches for certified header");
-                    Err(eyre::eyre!("{e}"))
-                } else {
-                    Ok(())
-                }
+                sync_header
+                    .sync_header_batches(&header, true, max_age)
+                    .await
+                    .inspect_err(|e| error!(target: "primary::cert_validator", ?e, ?header, ?max_age, "error syncing batches for certified header"))
             });
 
             // trigger certificate fetching if cert is too far ahead of this node

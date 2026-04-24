@@ -20,7 +20,7 @@ use tn_config::ConsensusConfig;
 use tn_storage::CertificateStore;
 use tn_types::{
     validate_fetched_certificate, AuthorityIdentifier, BlsPublicKey, Certificate, Committee,
-    Database, Header, Noticer, Notifier, Round, TaskManager, TaskSpawner, TnReceiver,
+    Database, Header, Noticer, Notifier, Round, TaskError, TaskManager, TaskSpawner, TnReceiver,
 };
 use tokio::{
     sync::oneshot,
@@ -110,10 +110,7 @@ impl<DB: Database> CertificateFetcher<DB> {
             }
             .run(rx_certificate_fetcher)
             .await
-            .map_err(|e| {
-                error!(target: "primary::cert_fetcher", ?e, "cert fetcher shutting down");
-                eyre::eyre!("{e}")
-            })
+            .inspect_err(|e| error!(target: "primary::cert_fetcher", ?e, "cert fetcher shutting down"))
         });
     }
 
@@ -288,7 +285,7 @@ impl<DB: Database> CertificateFetcher<DB> {
                 .await;
 
                 let _ = tx.send(result);
-                Ok(())
+                Ok::<_, TaskError>(())
             },
         );
 
@@ -533,7 +530,7 @@ fn spawn_peer_fetch(
                 // cancelled - another peer succeeded
             }
         }
-        Ok(())
+        Ok::<_, TaskError>(())
     });
 }
 

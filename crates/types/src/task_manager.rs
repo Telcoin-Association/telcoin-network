@@ -110,9 +110,14 @@ pub struct TaskSpawner {
 impl TaskSpawner {
     /// Spawns a non-critical task on tokio and records it's JoinHandle and name. Other tasks are
     /// unaffected when this task resolves.
-    pub fn spawn_task<F, S: ToString>(&self, name: S, future: F)
+    ///
+    /// The future may return any error type that converts into [`eyre::Report`]; the conversion
+    /// happens once inside the manager so callers can `?` out arbitrary errors without a manual
+    /// `eyre::eyre!` wrap.
+    pub fn spawn_task<F, E, S: ToString>(&self, name: S, future: F)
     where
-        F: Future<Output = Result<(), TaskError>> + Send + 'static,
+        F: Future<Output = Result<(), E>> + Send + 'static,
+        E: Into<eyre::Report> + Send + 'static,
     {
         self.create_task(name, future, false);
     }
@@ -121,18 +126,20 @@ impl TaskSpawner {
     ///
     /// The task is tracked as "critical". When the task resolves, other tasks
     /// will shutdown.
-    pub fn spawn_critical_task<F, S: ToString>(&self, name: S, future: F)
+    pub fn spawn_critical_task<F, E, S: ToString>(&self, name: S, future: F)
     where
-        F: Future<Output = Result<(), TaskError>> + Send + 'static,
+        F: Future<Output = Result<(), E>> + Send + 'static,
+        E: Into<eyre::Report> + Send + 'static,
     {
         self.create_task(name, future, true);
     }
 
     /// The main function to spawn tasks on the `tokio` runtime. These tasks are tracked by the
     /// manager.
-    fn create_task<F, S: ToString>(&self, name: S, future: F, critical: bool)
+    fn create_task<F, E, S: ToString>(&self, name: S, future: F, critical: bool)
     where
-        F: Future<Output = Result<(), TaskError>> + Send + 'static,
+        F: Future<Output = Result<(), E>> + Send + 'static,
+        E: Into<eyre::Report> + Send + 'static,
     {
         let name = name.to_string();
         let rx_shutdown = self.local_shutdown.subscribe();
@@ -142,7 +149,7 @@ impl TaskSpawner {
                     Ok(())
                 }
                 res = future => {
-                    res
+                    res.map_err(Into::into)
                 }
             }
         });
@@ -157,12 +164,13 @@ impl TaskSpawner {
     /// Other tasks are unaffected when this task resolves.
     /// Note: this essencially spawns a thread on the tokio blocking thread pool.
     /// It WILL NOT be ended early when it's task manager is dropped so use wisely.
-    pub fn spawn_blocking_task<F, S: ToString>(&self, name: S, task: F)
+    pub fn spawn_blocking_task<F, E, S: ToString>(&self, name: S, task: F)
     where
-        F: FnOnce() -> TaskResult + Send + 'static,
+        F: FnOnce() -> Result<(), E> + Send + 'static,
+        E: Into<eyre::Report> + Send + 'static,
     {
         let name = name.to_string();
-        let handle = tokio::task::spawn_blocking(task);
+        let handle = tokio::task::spawn_blocking(move || task().map_err(Into::into));
         if let Err(err) = self.new_task_tx.try_send(TaskHandle::new(name.clone(), handle, false)) {
             tracing::error!(target: "tn::tasks", "Task error sending joiner for {name}: {err}");
         }
@@ -265,9 +273,14 @@ impl TaskManager {
 
     /// Spawns a non-critical task on tokio and records it's JoinHandle and name. Other tasks are
     /// unaffected when this task resolves.
-    pub fn spawn_task<F, S: ToString>(&self, name: S, future: F)
+    ///
+    /// The future may return any error type that converts into [`eyre::Report`]; the conversion
+    /// happens once inside the manager so callers can `?` out arbitrary errors without a manual
+    /// `eyre::eyre!` wrap.
+    pub fn spawn_task<F, E, S: ToString>(&self, name: S, future: F)
     where
-        F: Future<Output = Result<(), TaskError>> + Send + 'static,
+        F: Future<Output = Result<(), E>> + Send + 'static,
+        E: Into<eyre::Report> + Send + 'static,
     {
         self.create_task(name, future, false);
     }
@@ -276,25 +289,27 @@ impl TaskManager {
     ///
     /// The task is tracked as "critical". When the task resolves, other tasks
     /// will shutdown.
-    pub fn spawn_critical_task<F, S: ToString>(&self, name: S, future: F)
+    pub fn spawn_critical_task<F, E, S: ToString>(&self, name: S, future: F)
     where
-        F: Future<Output = Result<(), TaskError>> + Send + 'static,
+        F: Future<Output = Result<(), E>> + Send + 'static,
+        E: Into<eyre::Report> + Send + 'static,
     {
         self.create_task(name, future, true);
     }
 
     /// The main function to spawn tasks on the `tokio` runtime. These tasks are tracked by the
     /// manager.
-    fn create_task<F, S: ToString>(&self, name: S, future: F, critical: bool)
+    fn create_task<F, E, S: ToString>(&self, name: S, future: F, critical: bool)
     where
-        F: Future<Output = Result<(), TaskError>> + Send + 'static,
+        F: Future<Output = Result<(), E>> + Send + 'static,
+        E: Into<eyre::Report> + Send + 'static,
     {
         let name = name.to_string();
         let rx_shutdown = self.local_shutdown.subscribe();
         let handle = tokio::spawn(async move {
             tokio::select! {
                 _ = rx_shutdown => { Ok(()) }
-                res = future => { res }
+                res = future => { res.map_err(Into::into) }
             }
         });
         self.tasks.push(TaskHandle::new(name, handle, critical));
@@ -587,7 +602,7 @@ mod test {
 
     use tokio::sync::mpsc::{self, Receiver, Sender};
 
-    use crate::{Notifier, TaskJoinError, TaskManager};
+    use crate::{Notifier, TaskError, TaskJoinError, TaskManager};
 
     struct Ping {
         ping_rx: Receiver<u32>,
@@ -635,7 +650,7 @@ mod test {
         let (ping_crit, mut pong_crit) = new_ping_pong();
         task_manager.spawn_critical_task("Crit", async move {
             ping_crit.run().await;
-            Ok(())
+            Ok::<_, TaskError>(())
         });
         assert_eq!(pong_crit.ping(1).await.unwrap(), 1);
         assert_eq!(pong_crit.ping(2).await.unwrap(), 2);
@@ -643,7 +658,7 @@ mod test {
         let (ping_norm, mut pong_norm) = new_ping_pong();
         task_manager.spawn_task("task", async move {
             ping_norm.run().await;
-            Ok(())
+            Ok::<_, TaskError>(())
         });
         assert_eq!(pong_norm.ping(1).await.unwrap(), 1);
         assert_eq!(pong_norm.ping(2).await.unwrap(), 2);
@@ -652,7 +667,7 @@ mod test {
         let (sping_crit, mut spong_crit) = new_ping_pong();
         spawner.spawn_critical_task("Crit", async move {
             sping_crit.run().await;
-            Ok(())
+            Ok::<_, TaskError>(())
         });
         assert_eq!(spong_crit.ping(1).await.unwrap(), 1);
         assert_eq!(spong_crit.ping(2).await.unwrap(), 2);
@@ -660,7 +675,7 @@ mod test {
         let (sping_norm, mut spong_norm) = new_ping_pong();
         spawner.spawn_task("task", async move {
             sping_norm.run().await;
-            Ok(())
+            Ok::<_, TaskError>(())
         });
         assert_eq!(spong_norm.ping(1).await.unwrap(), 1);
         assert_eq!(spong_norm.ping(2).await.unwrap(), 2);
@@ -668,7 +683,7 @@ mod test {
         let (sping_block, mut spong_block) = new_ping_pong();
         spawner.spawn_blocking_task("SBlock", move || {
             sping_block.run_blocking();
-            Ok(())
+            Ok::<_, TaskError>(())
         });
         assert_eq!(spong_block.ping(1).await.unwrap(), 1);
         assert_eq!(spong_block.ping(2).await.unwrap(), 2);
@@ -680,7 +695,7 @@ mod test {
             "Crit",
             Box::pin(async move {
                 rsping_crit.run().await;
-                Ok(())
+                Ok::<_, TaskError>(())
             }),
         );
         assert_eq!(rspong_crit.ping(1).await.unwrap(), 1);
@@ -737,7 +752,7 @@ mod test {
     #[tokio::test]
     async fn test_task_manager_join() {
         let mut task_manager = TaskManager::default();
-        task_manager.spawn_critical_task("Crit 1", async move { Ok(()) });
+        task_manager.spawn_critical_task("Crit 1", async move { Ok::<_, TaskError>(()) });
         match task_manager.join(Notifier::default()).await {
             Ok(_) => {}
             Err(TaskJoinError::CriticalExitOk(name)) => assert!(name.eq("Crit 1")),
@@ -747,7 +762,7 @@ mod test {
         let mut task_manager = TaskManager::default();
         task_manager.spawn_critical_task("Crit 1", async move {
             tokio::time::sleep(Duration::from_secs(10)).await;
-            Ok(())
+            Ok::<_, TaskError>(())
         });
         task_manager.spawn_critical_task("Crit 2", async move { Err(eyre::eyre!("BOOM!")) });
         match task_manager.join(Notifier::default()).await {
@@ -755,6 +770,41 @@ mod test {
             Err(TaskJoinError::CriticalExitOk(_name)) => panic!("should not be OK"),
             Err(TaskJoinError::CriticalJoinError(_name, _err)) => panic!("wrong error"),
             Err(TaskJoinError::CriticalExitError(name, _err)) => assert!(name.eq("Crit 2")),
+        }
+    }
+
+    /// Test that a critical task returning a typed domain error surfaces through
+    /// `TaskJoinError::CriticalExitError` — the testnet scenario where the node used to keep
+    /// running while a critical protocol task had already failed.
+    #[tokio::test]
+    async fn test_critical_typed_error_surfaces_at_join() {
+        #[derive(Debug, thiserror::Error)]
+        enum DomainError {
+            #[error("protocol violation: {0}")]
+            Protocol(&'static str),
+        }
+
+        let mut task_manager = TaskManager::default();
+        task_manager.spawn_critical_task("long-lived", async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok::<_, TaskError>(())
+        });
+        task_manager.spawn_critical_task("domain-error", async move {
+            Err::<(), _>(DomainError::Protocol("invariant broken"))
+        });
+
+        // join must resolve within a short time — this is the testnet scenario.
+        match tokio::time::timeout(Duration::from_secs(2), task_manager.join(Notifier::default()))
+            .await
+            .expect("join resolved before timeout")
+        {
+            Ok(_) => panic!("expected a critical exit error"),
+            Err(TaskJoinError::CriticalExitOk(_)) => panic!("should not be OK"),
+            Err(TaskJoinError::CriticalJoinError(_, _)) => panic!("should not be a join error"),
+            Err(TaskJoinError::CriticalExitError(name, err)) => {
+                assert_eq!(name, "domain-error");
+                assert!(err.to_string().contains("protocol violation"));
+            }
         }
     }
 }

@@ -36,7 +36,7 @@ use std::{
 use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig};
 use tn_types::{
     decode, encode, now, try_decode, BlsPublicKey, BlsSigner, Database, NetworkKeypair,
-    NetworkPublicKey, TaskSpawner, TnSender,
+    NetworkPublicKey, TaskError, TaskSpawner, TnSender,
 };
 use tokio::sync::{
     mpsc::{Receiver, Sender},
@@ -1056,7 +1056,7 @@ where
                         // ignore errors and disconnect after px attempt
                         let _res = tokio::time::timeout(timeout, done).await;
                         let _ = handle.disconnect_peer(peer_id).await;
-                        Ok(())
+                        Ok::<_, TaskError>(())
                     });
 
                     // insert to pending px disconnects

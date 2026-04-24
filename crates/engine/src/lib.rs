@@ -21,7 +21,7 @@ use std::{
 use tn_reth::{payload::BuildArguments, RethEnv};
 use tn_types::{
     gas_accumulator::GasAccumulator, ConsensusOutput, EngineUpdate, Noticer, SealedHeader,
-    TaskSpawner,
+    TaskError, TaskSpawner,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
@@ -135,7 +135,7 @@ impl ExecutorEngine {
                 if let Err(e) = tx.send(result) {
                     warn!(target: "engine", ?e, "error sending result from execute_consensus_output")
                 }
-                Ok(())
+                Ok::<_, TaskError>(())
             });
         } else {
             let _ = tx.send(Err(TnEngineError::EmptyQueue));

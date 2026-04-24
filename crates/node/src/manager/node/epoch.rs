@@ -37,8 +37,8 @@ use tn_storage::tables::{
 use tn_types::{
     gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash, BlockNumHash, BlsPublicKey,
     Committee, CommitteeBuilder, ConsensusOutput, Database as TNDatabase, Epoch, EpochRecord,
-    Multiaddr, NetworkPublicKey, Notifier, P2pNode, TaskJoinError, TaskManager, TaskSpawner,
-    TnReceiver, B256,
+    Multiaddr, NetworkPublicKey, Notifier, P2pNode, TaskError, TaskJoinError, TaskManager,
+    TaskSpawner, TnReceiver, B256,
 };
 use tn_worker::{quorum_waiter::QuorumWaiterTrait, Worker, WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::mpsc;
@@ -341,7 +341,7 @@ where
                         let _ = worker.disburse_txns(batch.seal(digest)).await;
                     }
                 }
-                Ok(())
+                Ok::<_, TaskError>(())
             }.instrument(span));
         } else {
             info!(target: "epoch-manager", "No batches leftover");
@@ -1046,7 +1046,7 @@ where
                 if matches!(e, NetworkError::AlreadyConnected(_))
                     || matches!(e, NetworkError::AlreadyDialing(_))
                 {
-                    return Ok(());
+                    return Ok::<_, TaskError>(());
                 }
                 retries += 1;
 

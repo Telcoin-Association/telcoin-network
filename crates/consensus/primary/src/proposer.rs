@@ -28,7 +28,7 @@ use tn_config::ConsensusConfig;
 use tn_storage::ProposerStore;
 use tn_types::{
     now, AuthorityIdentifier, BlockHash, Certificate, Committee, Database, Epoch, Hash as _,
-    Header, Noticer, Round, TaskManager, TaskSpawner, TnReceiver, TnSender, WorkerId,
+    Header, Noticer, Round, TaskError, TaskManager, TaskSpawner, TnReceiver, TnSender, WorkerId,
 };
 use tokio::{
     sync::oneshot,
@@ -580,7 +580,7 @@ impl<DB: Database> Proposer<DB> {
                     let res =
                         Proposer::repropose_header(header, proposer_store, &consensus_bus).await;
                     let _ = tx.send(res);
-                    Ok(())
+                    Ok::<_, TaskError>(())
                 });
             }
             // create new header
@@ -606,7 +606,7 @@ impl<DB: Database> Proposer<DB> {
                     .await;
 
                     let _ = tx.send(proposal);
-                    Ok(())
+                    Ok::<_, TaskError>(())
                 });
             }
         }
@@ -646,9 +646,7 @@ impl<DB: Database> Proposer<DB> {
             let rx_committed_own_headers = self.consensus_bus.subscribe_committed_own_headers();
             task_manager.spawn_critical_task("proposer task", async move {
                 info!(target: "primary::proposer", "Starting proposer");
-                self.run(rx_our_digests, rx_parents, rx_committed_own_headers)
-                    .await
-                    .map_err(|e| eyre::eyre!("{e}"))
+                self.run(rx_our_digests, rx_parents, rx_committed_own_headers).await
             });
         }
         // If not an active CVV then don't propose anything.
@@ -808,7 +806,7 @@ impl<DB: Database> Proposer<DB> {
                         )
                         .await;
                         let _ = tx.send(res);
-                        Ok(())
+                        Ok::<_, TaskError>(())
                     });
                     max_delay_timed_out = false;
                     min_delay_timed_out = false;

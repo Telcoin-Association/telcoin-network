@@ -4,8 +4,8 @@ use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 use tn_reth::{recover_raw_transaction, recover_signed_transaction, RethEnv, WorkerTxPool};
 use tn_types::{
     gas_accumulator::BaseFeeContainer, max_batch_gas, max_batch_size, BatchValidation,
-    BatchValidationError, BlockHash, Epoch, SealedBatch, TransactionSigned, TransactionTrait as _,
-    WorkerId,
+    BatchValidationError, BlockHash, Epoch, SealedBatch, TaskError, TransactionSigned,
+    TransactionTrait as _, WorkerId,
 };
 
 /// Type convenience for implementing block validation errors.
@@ -96,7 +96,7 @@ impl BatchValidation for BatchValidator {
                     let task_name = format!("submit-tx-{hash}");
                     self.reth_env.get_task_spawner().spawn_task(task_name, async move {
                         let _ = tx_pool.add_recovered_transaction_external(recovered).await;
-                        Ok(())
+                        Ok::<_, TaskError>(())
                     });
                 }
             }

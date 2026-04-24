@@ -29,7 +29,7 @@ use tn_types::{
     gas_accumulator::GasAccumulator, max_batch_gas, now, test_chain_spec_arc, test_genesis,
     Address, Batch, BlockHash, Bloom, Bytes, Certificate, CertifiedBatch, CommittedSubDag,
     ConsensusOutput, Encodable2718, GenesisAccount, Hash as _, Notifier, ReputationScores,
-    SealedBlock, TaskManager, TransactionTrait as _, B256, EMPTY_WITHDRAWALS,
+    SealedBlock, TaskError, TaskManager, TransactionTrait as _, B256, EMPTY_WITHDRAWALS,
     MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tokio::{sync::oneshot, time::timeout};
@@ -188,7 +188,7 @@ async fn test_empty_output_skips_execution() -> eyre::Result<()> {
     task_manager.spawn_task("Test task eng", async move {
         let res = engine.await;
         let _ = tx.send(res);
-        Ok(())
+        Ok::<_, TaskError>(())
     });
 
     let engine_task = timeout(Duration::from_secs(10), rx).await??;
@@ -295,7 +295,7 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
     task_manager.spawn_task("Test task eng", async move {
         let res = engine.await;
         let _ = tx.send(res);
-        Ok(())
+        Ok::<_, TaskError>(())
     });
 
     let engine_task = timeout(Duration::from_secs(10), rx).await??;
@@ -470,7 +470,7 @@ async fn test_empty_output_increments_leader_count() -> eyre::Result<()> {
     task_manager.spawn_task("Test task eng", async move {
         let res = engine.await;
         let _ = tx.send(res);
-        Ok(())
+        Ok::<_, TaskError>(())
     });
 
     let engine_task = timeout(Duration::from_secs(10), rx).await??;
@@ -809,7 +809,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     task_manager.spawn_task("test task eng", async move {
         let res = engine.await;
         let _ = tx.send(res);
-        Ok(())
+        Ok::<_, TaskError>(())
     });
 
     let engine_task = timeout(Duration::from_secs(10), rx).await??;
@@ -1320,7 +1320,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     task_manager.spawn_task("test task eng", async move {
         let res = engine.await;
         let _ = tx.send(res);
-        Ok(())
+        Ok::<_, TaskError>(())
     });
 
     let engine_task = timeout(Duration::from_secs(10), rx).await??;
@@ -1689,7 +1689,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     task_manager.spawn_task("test task eng", async move {
         let res = engine.await;
         let _ = tx.send(res);
-        Ok(())
+        Ok::<_, TaskError>(())
     });
 
     let engine_task = timeout(Duration::from_secs(10), rx).await??;
@@ -1909,7 +1909,7 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
     task_manager.spawn_task("test task eng", async move {
         let res = engine.await;
         let _ = tx.send(res);
-        Ok(())
+        Ok::<_, TaskError>(())
     });
 
     let engine_task = timeout(Duration::from_secs(5), rx).await??;
@@ -2200,7 +2200,7 @@ async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
     task_manager.spawn_task("test task eng", async move {
         let res = engine.await;
         let _ = tx.send(res);
-        Ok(())
+        Ok::<_, TaskError>(())
     });
 
     let engine_task = timeout(Duration::from_secs(5), rx).await??;

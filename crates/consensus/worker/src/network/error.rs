@@ -73,8 +73,8 @@ pub enum WorkerNetworkError {
     BatchEpochMismatch(Epoch, Epoch),
 }
 
-impl From<WorkerNetworkError> for Option<Penalty> {
-    fn from(val: WorkerNetworkError) -> Self {
+impl From<&WorkerNetworkError> for Option<Penalty> {
+    fn from(val: &WorkerNetworkError) -> Self {
         //
         // explicitly match every error type to ensure penalties are updated with changes
         //
@@ -102,7 +102,7 @@ impl From<WorkerNetworkError> for Option<Penalty> {
                 }
             }
             WorkerNetworkError::InvalidRequest(_) => Some(Penalty::Mild),
-            WorkerNetworkError::StdIo(ref io_err) => {
+            WorkerNetworkError::StdIo(io_err) => {
                 // separate legitimate failures like connection resets from suspicious behavior
                 match io_err.kind() {
                     std::io::ErrorKind::ConnectionReset

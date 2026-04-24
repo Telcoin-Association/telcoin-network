@@ -7,7 +7,7 @@ use std::{collections::BTreeSet, time::Duration};
 
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
 use tn_storage::consensus::ConsensusChain;
-use tn_types::{BlsPublicKey, Epoch, EpochRecord, Noticer, TaskSpawner, B256};
+use tn_types::{BlsPublicKey, Epoch, EpochRecord, Noticer, TaskError, TaskSpawner, B256};
 use tracing::{error, info};
 
 /// How long to wait before retrying a failed epoch record collection.
@@ -195,7 +195,7 @@ pub async fn spawn_epoch_record_collector(
             // watch notification.
             tokio::select!(
                 _ = &node_shutdown => {
-                    break Ok(());  // Break the outer loop.
+                    break Ok::<_, TaskError>(());  // Break the outer loop.
                 },
                 _ = epoch_rx.changed() => { }
                 _ = tokio::time::sleep(Duration::from_secs(EPOCH_COLLECT_RETRY_SECS)) => { }

@@ -23,6 +23,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tn_types::TaskError;
 use tn_worker::WorkerNetworkHandle;
 
 /// Execution components on a per-worker basis.
@@ -91,6 +92,8 @@ impl WorkerNetwork {
                 }
                 tokio::time::sleep(Duration::from_secs(15)).await;
             }
+            #[allow(unreachable_code)]
+            Ok::<_, TaskError>(())
         });
         Self { chain_spec: chain_spec.reth_chain_spec(), peer_count, version }
     }
@@ -108,6 +111,8 @@ impl WorkerNetwork {
                 }
                 tokio::time::sleep(Duration::from_secs(15)).await;
             }
+            #[allow(unreachable_code)]
+            Ok::<_, TaskError>(())
         });
     }
 }

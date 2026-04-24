@@ -8,7 +8,9 @@ use std::{
 };
 use thiserror::Error;
 use tn_network_libp2p::error::NetworkError;
-use tn_types::{Authority, BlsPublicKey, Committee, SealedBatch, TaskSpawner, VotingPower};
+use tn_types::{
+    Authority, BlsPublicKey, Committee, SealedBatch, TaskError, TaskSpawner, VotingPower,
+};
 use tokio::sync::oneshot;
 use tracing::debug;
 
@@ -136,7 +138,7 @@ impl QuorumWaiterTrait for QuorumWaiter {
                     spawner_clone.spawn_task(format!("qw-peer-{i}"), async move {
                         let res = Self::waiter(name, network, batch, stake).await;
                         let _ = tx.send(res);
-                        Ok(())
+                        Ok::<_, TaskError>(())
                     });
                     wait_for_quorum.push(rx);
                 }
@@ -184,7 +186,7 @@ impl QuorumWaiterTrait for QuorumWaiter {
                                                     }
                                                 })
                                                 .await;
-                                            Ok(())
+                                            Ok::<_, TaskError>(())
                                         });
                                     }
                                     break Ok(());
@@ -234,9 +236,9 @@ impl QuorumWaiterTrait for QuorumWaiter {
                 Err(_elapsed) => Err(QuorumWaiterError::Timeout),
             };
 
-            // forward result
+            // forward result to oneshot, then surface any error as the task result
             let _ = tx.send(res.clone());
-            res.map_err(|e| eyre::eyre!({ e }))
+            res
         });
         rx
     }

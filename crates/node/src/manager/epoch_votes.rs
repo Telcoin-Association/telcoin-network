@@ -10,7 +10,7 @@ use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
 use tn_storage::{consensus::ConsensusChain, epoch_records::EpochRecordDb};
 use tn_types::{
     BlsAggregateSignature, BlsPublicKey, BlsSignature, Epoch, EpochCertificate, EpochRecord,
-    EpochVote, Noticer, TaskSpawner, TnReceiver as _, B256,
+    EpochVote, Noticer, TaskError, TaskSpawner, TnReceiver as _, B256,
 };
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::{error, info, warn};
@@ -304,7 +304,7 @@ pub(crate) fn spawn_epoch_vote_collector(
             // Wait for an EpochRecord to arrive
             let epoch_rec = loop {
                 tokio::select! {
-                    _ = &node_shutdown => return Ok(()),
+                    _ = &node_shutdown => return Ok::<_, TaskError>(()),
                     _ = epoch_rx.changed() => {
                         if let Some(rec) = epoch_rx.borrow_and_update().clone() {
                             break rec;
@@ -336,7 +336,7 @@ pub(crate) fn spawn_epoch_vote_collector(
                             consensus_chain,
                         )
                         .await;
-                        Ok(())
+                        Ok::<_, TaskError>(())
                     },
                 );
             }

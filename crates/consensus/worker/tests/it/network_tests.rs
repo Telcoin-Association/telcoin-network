@@ -9,7 +9,7 @@ use tn_network_libp2p::{
 };
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
-use tn_types::{BlsPublicKey, SealedBatch, TaskManager, B256};
+use tn_types::{BlsPublicKey, SealedBatch, TaskError, TaskManager, B256};
 use tn_worker::{
     PendingBatchStream, RequestHandler, WorkerGossip, WorkerNetworkError, WorkerNetworkHandle,
     WorkerRequest, WorkerResponse, MAX_BATCH_DIGESTS_PER_REQUEST, MAX_CONCURRENT_BATCH_STREAMS,
@@ -122,7 +122,7 @@ async fn test_batch_gossip_triggers_stream_request() {
 
     task_manager.spawn_task("process-gossip-test", async move {
         handler.pub_process_gossip_for_test(&msg).await.expect("success process gossip");
-        Ok(())
+        Ok::<_, TaskError>(())
     });
 
     // recv commands
@@ -171,7 +171,7 @@ async fn test_batch_gossip_stream_accepted_opens_stream() {
     task_manager.spawn_task("process-gossip-test", async move {
         // This will timeout eventually since we don't complete the stream
         let _ = handler.pub_process_gossip_for_test(&msg).await;
-        Ok(())
+        Ok::<_, TaskError>(())
     });
 
     let expected_peer = committee.last_authority().primary_public_key();
@@ -361,7 +361,7 @@ async fn test_stream_error_penalties() {
         WorkerNetworkError::RequestHashMismatch,
     ];
     for error in cases_fatal {
-        let penalty: Option<Penalty> = error.into();
+        let penalty: Option<Penalty> = (&error).into();
         assert!(matches!(penalty, Some(Penalty::Fatal)), "expected Fatal penalty");
     }
 
@@ -373,11 +373,11 @@ async fn test_stream_error_penalties() {
         .await
         .unwrap_err(),
     );
-    let penalty: Option<Penalty> = timeout_err.into();
+    let penalty: Option<Penalty> = (&timeout_err).into();
     assert!(penalty.is_none(), "Timeout should have no penalty");
 
     let stream_closed = WorkerNetworkError::StreamClosed;
-    let penalty: Option<Penalty> = stream_closed.into();
+    let penalty: Option<Penalty> = (&stream_closed).into();
     assert!(penalty.is_none(), "StreamClosed should have no penalty");
 }
 

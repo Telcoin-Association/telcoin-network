@@ -18,7 +18,7 @@ use tn_reth::{system_calls::EpochState, RethDb, RethEnv};
 use tn_storage::{consensus::ConsensusChain, open_db, DatabaseType};
 use tn_types::{
     deconstruct_nonce, gas_accumulator::GasAccumulator, BlockNumHash, ConsensusHeader,
-    ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, Notifier, TaskManager,
+    ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, Notifier, TaskError, TaskManager,
     TaskSpawner, TimestampSec, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
@@ -347,7 +347,7 @@ where
         node_task_spawner.spawn_critical_task("Primary Network", async move {
             tokio::select!(
                 _ = &node_shutdown => {
-                    Ok(())
+                    Ok::<_, TaskError>(())
                 },
                 res = primary_network.run() => {
                     warn!(target: "epoch-manager", ?res, "primary network stopped");
@@ -375,7 +375,7 @@ where
         node_task_spawner.spawn_critical_task("Worker Network", async move {
             tokio::select!(
                 _ = &node_shutdown => {
-                    Ok(())
+                    Ok::<_, TaskError>(())
                 }
                 res = worker_network.run() => {
                     warn!(target: "epoch-manager", ?res, "worker network stopped");

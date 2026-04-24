@@ -28,7 +28,7 @@ use tn_test_utils::{
 };
 use tn_types::{
     adiri_genesis, gas_accumulator::GasAccumulator, Batch, BlockNumHash, ExecHeader, Notifier,
-    SealedHeader, TaskManager, TnReceiver as _, TnSender as _, B256,
+    SealedHeader, TaskError, TaskManager, TnReceiver as _, TnSender as _, B256,
     DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::{
@@ -97,7 +97,7 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
         let res = engine.await;
         debug!(target: "gas-test", ?res, "res:");
         let _ = tx.send(res);
-        Ok(())
+        Ok::<_, TaskError>(())
     });
 
     // subscribe to output early
@@ -229,7 +229,7 @@ async fn test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
         let res = engine.await;
         debug!(target: "gas-test", ?res, "res:");
         let _ = tx.send(res);
-        Ok(())
+        Ok::<_, TaskError>(())
     });
 
     let mut consensus_output = consensus_bus.app().subscribe_consensus_output();
@@ -397,7 +397,7 @@ async fn test_catchup_accumulator_partial_execution() -> eyre::Result<()> {
         let res = engine.await;
         debug!(target: "gas-test", ?res, "partial res:");
         let _ = tx.send(res);
-        Ok(())
+        Ok::<_, TaskError>(())
     });
 
     let mut consensus_output = consensus_bus.app().subscribe_consensus_output();

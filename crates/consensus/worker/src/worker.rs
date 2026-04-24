@@ -18,7 +18,7 @@ use tn_storage::{
 };
 use tn_types::{
     error::BlockSealError, BatchReceiver, BatchSender, BatchValidation, Database, DbTxMut as _,
-    SealedBatch, TaskManager, WorkerId,
+    SealedBatch, TaskError, TaskManager, WorkerId,
 };
 use tracing::{error, info, instrument};
 
@@ -173,7 +173,7 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
                     error!(target: "worker::batch_provider", "Error sending result to channel caller!  Channel closed.");
                 }
             }
-            Ok(())
+            Ok::<_, TaskError>(())
         });
     }
 

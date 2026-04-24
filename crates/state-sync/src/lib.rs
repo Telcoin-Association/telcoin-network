@@ -74,31 +74,23 @@ pub fn spawn_state_sync<DB: Database>(
                 "state sync: track latest consensus header from peers",
                 async move {
                     info!(target: "state-sync", "Starting state sync: track latest consensus header from peers");
-                    if let Err(e) = spawn_track_recent_consensus(
+                    spawn_track_recent_consensus(
                         config_clone,
                         consensus_bus_clone,
                         network,
                         consensus_chain_clone,
                     )
                     .await
-                    {
-                        error!(target: "state-sync", "Error tracking latest consensus headers: {e}");
-                        Err(eyre::eyre!("{e}"))
-                    } else {
-                        Ok(())
-                    }
+                    .inspect_err(|e| error!(target: "state-sync", "Error tracking latest consensus headers: {e}"))
                 },
             );
             task_spawner.spawn_task(
                 "state sync: stream consensus headers",
                 async move {
                     info!(target: "state-sync", "Starting state sync: stream consensus header from peers");
-                    if let Err(e) = spawn_stream_consensus_headers(config, consensus_bus, consensus_chain).await {
-                        error!(target: "state-sync", "Error streaming consensus headers: {e}");
-                        Err(eyre::eyre!("{e}"))
-                    } else {
-                        Ok(())
-                    }
+                    spawn_stream_consensus_headers(config, consensus_bus, consensus_chain)
+                        .await
+                        .inspect_err(|e| error!(target: "state-sync", "Error streaming consensus headers: {e}"))
                 },
             );
         }

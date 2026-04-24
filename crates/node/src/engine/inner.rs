@@ -19,7 +19,7 @@ use tn_rpc::{EngineToPrimary, TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServe
 use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator},
     Address, BatchSender, BatchValidation, BlockHeader, BlsPublicKey, ConsensusOutput,
-    EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId, B256,
+    EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskError, TaskSpawner, WorkerId, B256,
     MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::WorkerNetworkHandle;
@@ -75,17 +75,10 @@ impl ExecutionNodeInner {
         // spawn tn engine
         self.reth_env.get_task_spawner().spawn_critical_task("consensus engine", async move {
             info!("Engine stated from block {block_num}/{block_hash}, consensus output {consensus_header:?}");
-            let res = tn_engine.await;
-            match res {
-                Ok(_) => {
-                    info!(target: "engine", "TN Engine exited gracefully");
-                    Ok(())
-                }
-                Err(e) => {
-                    error!(target: "engine", ?e, "TN Engine error");
-                    Err(eyre::eyre!("{e}"))
-                }
-            }
+            tn_engine
+                .await
+                .inspect(|_| info!(target: "engine", "TN Engine exited gracefully"))
+                .inspect_err(|e| error!(target: "engine", ?e, "TN Engine error"))
         });
 
         Ok(())
@@ -124,7 +117,7 @@ impl ExecutionNodeInner {
         epoch_task_spawner.spawn_critical_task("batch builder", async move {
             let res = batch_builder.await;
             info!(target: "tn::execution", ?res, "batch builder task exited");
-            Ok(res?)
+            Ok::<_, TaskError>(res?)
         });
 
         Ok(())

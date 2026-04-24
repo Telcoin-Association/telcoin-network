@@ -5,7 +5,7 @@
 
 use std::net::SocketAddr;
 
-use tn_types::TaskSpawner;
+use tn_types::{TaskError, TaskSpawner};
 use tokio::{io::AsyncWriteExt, net::TcpListener};
 use tracing::info;
 
@@ -64,7 +64,7 @@ impl HealthcheckServer {
                 // then drop connection
                 let _ = socket.write_all(response).await;
             }
-            Ok(())
+            Ok::<_, TaskError>(())
         });
 
         Ok(listen_on)

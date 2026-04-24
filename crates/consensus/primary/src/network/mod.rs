@@ -28,8 +28,8 @@ use tn_network_types::{WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerTo
 use tn_storage::{consensus::ConsensusChain, PayloadStore};
 use tn_types::{
     encode, BlockHash, BlsPublicKey, BlsSignature, Certificate, CertificateDigest, ConsensusHeader,
-    Database, Epoch, EpochCertificate, EpochRecord, EpochVote, Header, Round, TaskSpawner,
-    TnReceiver, TnSender, Vote, B256,
+    Database, Epoch, EpochCertificate, EpochRecord, EpochVote, Header, Round, TaskError,
+    TaskSpawner, TnReceiver, TnSender, Vote, B256,
 };
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
@@ -527,7 +527,7 @@ where
                 let network_handle = self.network_handle.clone();
                 self.task_spawner.spawn_task("report request error", async move {
                     let _ = network_handle.handle.send_response(err, channel).await;
-                    Ok(())
+                    Ok::<_, TaskError>(())
                 });
             }
             NetworkEvent::InboundStream { peer, stream } => {
@@ -561,7 +561,7 @@ where
                 // cancel notification from network layer
                 _ = cancel => (),
             }
-            Ok(())
+            Ok::<_, TaskError>(())
         });
     }
 
@@ -593,7 +593,7 @@ where
                 // cancel notification from network layer
                 _ = cancel => (),
             }
-            Ok(())
+            Ok::<_, TaskError>(())
         });
     }
 
@@ -628,7 +628,7 @@ where
                 // cancel notification from network layer
                 _ = cancel => (),
             }
-            Ok(())
+            Ok::<_, TaskError>(())
         });
     }
 
@@ -657,7 +657,7 @@ where
                 // cancel notification from network layer
                 _ = cancel => (),
             }
-            Ok(())
+            Ok::<_, TaskError>(())
         });
     }
 
@@ -738,7 +738,7 @@ where
                 _ = network_handle.inner_handle().send_response(msg, channel) => (),
                 _ = cancel => (),
             }
-            Ok(())
+            Ok::<_, TaskError>(())
         });
     }
 
@@ -752,15 +752,13 @@ where
         self.task_spawner.spawn_task(task_name, async move {
             if let Err(e) = request_handler.process_gossip(&msg).await {
                 warn!(target: "primary::network", ?e, "process_gossip");
-                let res_err = Err(eyre::eyre!("{e}"));
                 // convert error into penalty to lower peer score
                 if let Some(penalty) = (&e).into() {
                     network_handle.report_penalty(propagation_source, penalty).await;
                 }
-                res_err
-            } else {
-                Ok(())
+                return Err(e.into());
             }
+            Ok::<_, TaskError>(())
         });
     }
 
@@ -783,11 +781,11 @@ where
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     warn!(target: "worker::network", %peer, ?e, "failed to read request digest from stream");
-                    return Err(eyre::eyre!("{e}"));
+                    return Err(e.into());
                 }
                 Err(e) => {
                     warn!(target: "worker::network", %peer, "timeout reading request digest from stream");
-                    return Err(eyre::eyre!("{e}"));
+                    return Err(e.into());
                 }
             }
             let request_digest = B256::from(digest_buf);
@@ -803,14 +801,12 @@ where
                 .await {
                     // apply applicable penalty for error
                     warn!(target: "worker::network", ?err, "error processing request batches stream");
-                    let res_err = Err(eyre::eyre!("{err}"));
                     if let Some(penalty) = (&err).into() {
                         network_handle.report_penalty(peer, penalty).await;
                     }
-                    res_err
-                } else {
-                    Ok(())
+                    return Err(err.into());
                 }
+            Ok::<_, TaskError>(())
         });
     }
 }
