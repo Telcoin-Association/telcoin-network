@@ -352,7 +352,8 @@ async fn test_pending_request_stream_correlation() {
 async fn test_stream_error_penalties() {
     // Fatal penalties
     let cases_fatal = vec![
-        WorkerNetworkError::UnknownStreamRequest(B256::random()),
+        WorkerNetworkError::InvalidTopic,
+        WorkerNetworkError::Bcs(bcs::Error::Eof),
         WorkerNetworkError::TooManyBatches { expected: 1, received: 5 },
         WorkerNetworkError::UnexpectedBatch(B256::random()),
         WorkerNetworkError::DuplicateBatch(B256::random()),
