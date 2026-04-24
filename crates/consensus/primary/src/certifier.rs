@@ -406,7 +406,7 @@ impl<DB: Database> Certifier<DB> {
                         // pass to state_sync for internal processing
                         if let Err(e) = self.state_sync.process_own_certificate(&mut certificate).await {
                             error!(target: "primary::certifier", "error accepting own certificate: {e}");
-                            return Err(eyre::eyre!("{e}"));
+                            return Err(e.into());
                         }
 
                         // try to publish the certificate on gossip network
@@ -434,7 +434,7 @@ impl<DB: Database> Certifier<DB> {
                                     auth=?self.authority_id,
                                     "Certifier error on proposed header task: {e}"
                                 );
-                                Err(eyre::eyre!("{e}"))
+                                Err(e.into())
                             }
                         }
                     }

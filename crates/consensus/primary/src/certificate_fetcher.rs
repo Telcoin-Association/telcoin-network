@@ -112,7 +112,7 @@ impl<DB: Database> CertificateFetcher<DB> {
             .await
             .map_err(|e| {
                 error!(target: "primary::cert_fetcher", ?e, "cert fetcher shutting down");
-                eyre::eyre!("{e}")
+                e.into()
             })
         });
     }

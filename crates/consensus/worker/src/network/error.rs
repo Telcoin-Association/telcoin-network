@@ -73,12 +73,13 @@ pub enum WorkerNetworkError {
     BatchEpochMismatch(Epoch, Epoch),
 }
 
-impl From<WorkerNetworkError> for Option<Penalty> {
-    fn from(val: WorkerNetworkError) -> Self {
+impl WorkerNetworkError {
+    /// Return the penalty for this error if it causes one (None if no penalty).
+    pub fn penalty(&self) -> Option<Penalty> {
         //
         // explicitly match every error type to ensure penalties are updated with changes
         //
-        match val {
+        match self {
             WorkerNetworkError::BatchValidation(batch_validation_error) => {
                 match batch_validation_error {
                     // mild
@@ -132,5 +133,11 @@ impl From<WorkerNetworkError> for Option<Penalty> {
             | WorkerNetworkError::BatchEpochMismatch(_, _)
             | WorkerNetworkError::Internal(_) => None,
         }
+    }
+}
+
+impl From<WorkerNetworkError> for Option<Penalty> {
+    fn from(val: WorkerNetworkError) -> Self {
+        val.penalty()
     }
 }

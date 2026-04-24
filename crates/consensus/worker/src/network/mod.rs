@@ -15,7 +15,7 @@ use tn_config::ConsensusConfig;
 use tn_network_libp2p::{types::NetworkEvent, GossipMessage, ResponseChannel, Stream};
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{
-    BatchValidation, BlockHash, BlsPublicKey, Database, Epoch, SealedBatch, TaskSpawner,
+    BatchValidation, BlockHash, BlsPublicKey, Database, Epoch, SealedBatch, TaskError, TaskSpawner,
     TnReceiver, WorkerId, B256,
 };
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
@@ -161,7 +161,7 @@ where
                             }
                             None => {
                                 warn!(target: "worker::network", "critical worker network events channel dropped");
-                                break Err(eyre::eyre!("critical worker network events channel dropped"));
+                                break Err(TaskError::from_message("critical worker network events channel dropped"));
                             }
                         }
                     }
@@ -261,12 +261,11 @@ where
         self.network_handle.get_task_spawner().spawn_task(task_name, async move {
             if let Err(e) = request_handler.process_gossip(&msg).await {
                 warn!(target: "worker::network", ?e, "process_gossip");
-                let res_err = Err(eyre::eyre!("{e}"));
                 // convert error into penalty to lower peer score
-                if let Some(penalty) = e.into() {
+                if let Some(penalty) = e.penalty() {
                     network_handle.report_penalty(propagation_source, penalty).await;
                 }
-                res_err
+                Err(e.into())
             } else {
                 Ok(())
             }
@@ -385,11 +384,11 @@ where
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     warn!(target: "worker::network", %peer, ?e, "failed to read request digest from stream");
-                    return Err(eyre::eyre!("{e}"));
+                    return Err(e.into());
                 }
                 Err(e) => {
                     warn!(target: "worker::network", %peer, "timeout reading request digest from stream");
-                    return Err(eyre::eyre!("{e}"));
+                    return Err(e.into());
                 }
             }
             let request_digest = B256::from(digest_buf);
@@ -405,11 +404,10 @@ where
                 .await {
                     // apply applicable penalty for error
                     warn!(target: "worker::network", ?err, "error processing request batches stream");
-                    let res_err = Err(eyre::eyre!("{err}"));
-                    if let Some(penalty) = err.into() {
+                    if let Some(penalty) = err.penalty() {
                         network_handle.report_penalty(peer, penalty).await;
                     }
-                    res_err
+                    Err(err.into())
                 } else {
                     Ok(())
                 }

@@ -646,9 +646,7 @@ impl<DB: Database> Proposer<DB> {
             let rx_committed_own_headers = self.consensus_bus.subscribe_committed_own_headers();
             task_manager.spawn_critical_task("proposer task", async move {
                 info!(target: "primary::proposer", "Starting proposer");
-                self.run(rx_our_digests, rx_parents, rx_committed_own_headers)
-                    .await
-                    .map_err(|e| eyre::eyre!("{e}"))
+                Ok(self.run(rx_our_digests, rx_parents, rx_committed_own_headers).await?)
             });
         }
         // If not an active CVV then don't propose anything.

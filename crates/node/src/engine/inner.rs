@@ -76,16 +76,15 @@ impl ExecutionNodeInner {
         self.reth_env.get_task_spawner().spawn_critical_task("consensus engine", async move {
             info!("Engine stated from block {block_num}/{block_hash}, consensus output {consensus_header:?}");
             let res = tn_engine.await;
-            match res {
+            match &res {
                 Ok(_) => {
                     info!(target: "engine", "TN Engine exited gracefully");
-                    Ok(())
                 }
                 Err(e) => {
                     error!(target: "engine", ?e, "TN Engine error");
-                    Err(eyre::eyre!("{e}"))
                 }
             }
+            Ok(res?)
         });
 
         Ok(())

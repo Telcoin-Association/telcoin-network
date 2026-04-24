@@ -6,6 +6,7 @@ use std::{
     fmt::{Debug, Display},
     future::Future,
     pin::pin,
+    sync::Arc,
     task::Poll,
     time::Duration,
 };
@@ -15,8 +16,57 @@ use tokio::{
     task::{JoinError, JoinHandle},
 };
 
-/// The error type for tasks.
-pub type TaskError = eyre::Report;
+/// Trait that encompasses the required traits for a TaskError.
+pub trait TaskErrorTrait: std::error::Error + Send + Sync + 'static {}
+
+impl<E: std::error::Error + Send + Sync + 'static> TaskErrorTrait for E {}
+
+/// Used internally to wrap a simple message error when there is nothing better to wrap.
+#[derive(Clone, Debug)]
+struct TaskStrErr(String);
+
+impl std::error::Error for TaskStrErr {}
+impl Display for TaskStrErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Error type for tasks.
+/// Reports an error happened and gets it's string.
+/// Wraps the original error.
+#[derive(Clone, Debug)]
+pub struct TaskError {
+    error: Arc<dyn TaskErrorTrait>,
+}
+
+impl TaskError {
+    /// Retrun a reference to the contained error.
+    pub fn error(&self) -> &dyn TaskErrorTrait {
+        &*self.error
+    }
+
+    /// Produce a TaskError from a String.
+    /// We can not just implement From because of the
+    /// generic implementation (even though it does not work for a String...).
+    pub fn from_message(message: impl ToString) -> Self {
+        let err = TaskStrErr(message.to_string());
+        err.into()
+    }
+}
+
+impl<E: std::error::Error + Send + Sync + 'static> From<E> for TaskError {
+    fn from(error: E) -> Self {
+        Self { error: Arc::new(error) }
+    }
+}
+
+impl Display for TaskError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+
 /// Result type for all tasks.
 pub type TaskResult = Result<(), TaskError>;
 
@@ -587,7 +637,7 @@ mod test {
 
     use tokio::sync::mpsc::{self, Receiver, Sender};
 
-    use crate::{Notifier, TaskJoinError, TaskManager};
+    use crate::{Notifier, TaskError, TaskJoinError, TaskManager};
 
     struct Ping {
         ping_rx: Receiver<u32>,
@@ -749,7 +799,8 @@ mod test {
             tokio::time::sleep(Duration::from_secs(10)).await;
             Ok(())
         });
-        task_manager.spawn_critical_task("Crit 2", async move { Err(eyre::eyre!("BOOM!")) });
+        task_manager
+            .spawn_critical_task("Crit 2", async move { Err(TaskError::from_message("BOOM!")) });
         match task_manager.join(Notifier::default()).await {
             Ok(_) => {}
             Err(TaskJoinError::CriticalExitOk(_name)) => panic!("should not be OK"),
