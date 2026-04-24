@@ -90,12 +90,20 @@ impl ExecutionNode {
         worker_id: WorkerId,
         network_handle: WorkerNetworkHandle,
         engine_to_primary: EP,
+        initial_base_fee: u64,
     ) -> eyre::Result<()>
     where
         EP: EngineToPrimary + Send + Sync + 'static,
     {
         let mut guard = self.internal.write().await;
-        guard.initialize_worker_components(worker_id, network_handle, engine_to_primary).await
+        guard
+            .initialize_worker_components(
+                worker_id,
+                network_handle,
+                engine_to_primary,
+                initial_base_fee,
+            )
+            .await
     }
 
     /// Respawn any tasks on the worker network when we get a new epoch task manager.

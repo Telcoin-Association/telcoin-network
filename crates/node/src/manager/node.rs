@@ -16,9 +16,10 @@ use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode, QueCh
 use tn_reth::{system_calls::EpochState, RethDb, RethEnv};
 use tn_storage::{consensus::ConsensusChain, open_db, DatabaseType};
 use tn_types::{
-    deconstruct_nonce, gas_accumulator::GasAccumulator, BlockNumHash, ConsensusHeader,
-    ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, Notifier, TaskManager,
-    TaskSpawner, TimestampSec, MIN_PROTOCOL_BASE_FEE,
+    deconstruct_nonce,
+    gas_accumulator::{GasAccumulator, RewardsCounter, WorkerFeeConfig},
+    BlockNumHash, ConsensusHeader, ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch,
+    Notifier, TaskManager, TaskSpawner, TimestampSec, WorkerId, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::mpsc;
@@ -80,8 +81,11 @@ pub(crate) struct EpochManager<P, DB> {
 /// [`tn_types::gas_accumulator`] for the full picture). It runs once at startup, before
 /// execution resumes, and performs the following:
 ///
-/// 1. **Base fee** — sets worker 0's base fee from the finalized reth header. In a multi-worker
-///    configuration this will need per-worker restoration.
+/// 1. **Base fee** — primes each worker's [`tn_types::gas_accumulator::BaseFeeContainer`] according
+///    to its [`WorkerFeeConfig`]. `Static` workers are primed to the configured fee; `Eip1559`
+///    workers are restored to the `base_fee_per_gas` of the most recent replayed block produced by
+///    that worker this epoch, falling back to `MIN_PROTOCOL_BASE_FEE` only when no block for the
+///    worker exists yet (early multi-worker case).
 /// 2. **Gas stats** — iterates every reth block from the epoch's start height through the finalized
 ///    tip, extracting the worker id from each block's `difficulty` field and calling
 ///    [`GasAccumulator::inc_block`] to rebuild per-worker gas totals.
@@ -91,47 +95,74 @@ pub(crate) struct EpochManager<P, DB> {
 ///    because [`EpochManager::replay_missed_consensus`] will re-execute them, which increments
 ///    leader counts through the normal payload-builder path.
 ///
-/// If there is no finalized header (fresh genesis), this is a no-op.
+/// During replay of executed blocks, basefees come from the block headers themselves (see
+/// `replay_missed_consensus`). `catchup_accumulator` restores the NEXT batch's basefee —
+/// identical to the most recent block of each worker.
+///
+/// If there is no finalized header (fresh genesis), only the static-worker base-fee priming runs.
 pub async fn catchup_accumulator(
-    reth_env: RethEnv,
+    reth_env: &RethEnv,
     gas_accumulator: &GasAccumulator,
+    configs: &[WorkerFeeConfig],
+    epoch_state: &EpochState,
     consensus_chain: &mut ConsensusChain,
 ) -> eyre::Result<()> {
-    if let Some(block) = reth_env.finalized_header()? {
-        let epoch_state = reth_env.epoch_state_from_canonical_tip()?;
-
-        // Note WORKER: In a single worker world this should be suffecient to set the base fee.
-        // In a multi-worker world (future) this will NOT work and needs updating.
-        gas_accumulator
-            .base_fee(0)
-            .set_base_fee(block.base_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE));
-
-        let nonce: u64 = block.nonce.into();
-        let (last_executed_epoch, last_executed_round) = deconstruct_nonce(nonce);
-
-        let blocks =
-            reth_env.blocks_for_range(epoch_state.epoch_info.blockHeight..=block.number)?;
-
-        // loop through blocks to accumulate gas stats
-        for current in blocks {
-            let gas = current.gas_used;
-            let limit = current.gas_limit;
-
-            // difficulty contains the worker id and batch index:
-            // `U256::from(payload.batch_index << 16 | payload.worker_id as usize)`
-            let lower64 = current.difficulty.into_limbs()[0];
-            let worker_id = (lower64 & 0xffff) as u16;
-            gas_accumulator.inc_block(worker_id, gas, limit);
+    let Some(block) = reth_env.finalized_header()? else {
+        // fresh genesis: no blocks to replay. prime static workers from configs so new
+        // batches use the governance-configured fee; eip1559 workers remain at the
+        // container default (MIN_PROTOCOL_BASE_FEE).
+        for (worker_id, cfg) in configs.iter().enumerate() {
+            if let WorkerFeeConfig::Static { fee } = cfg {
+                gas_accumulator.base_fee(worker_id as WorkerId).set_base_fee(*fee);
+            }
         }
-
-        // count leaders from consensus db for the current epoch
-        // NOTE: replay_missed_consensus catches up rounds above last_executed_round.
-        if last_executed_round > 0 && last_executed_epoch == epoch_state.epoch {
-            consensus_chain
-                .count_leaders(last_executed_round, gas_accumulator.rewards_counter().clone())
-                .await?;
-        }
+        return Ok(());
     };
+
+    let nonce: u64 = block.nonce.into();
+    let (last_executed_epoch, last_executed_round) = deconstruct_nonce(nonce);
+
+    let blocks = reth_env.blocks_for_range(epoch_state.epoch_info.blockHeight..=block.number)?;
+
+    // loop through blocks to accumulate gas stats
+    for current in blocks.iter() {
+        let gas = current.gas_used;
+        let limit = current.gas_limit;
+
+        // difficulty contains the worker id and batch index:
+        // `U256::from(payload.batch_index << 16 | payload.worker_id as usize)`
+        let lower64 = current.difficulty.into_limbs()[0];
+        let worker_id = (lower64 & 0xffff) as WorkerId;
+        gas_accumulator.inc_block(worker_id, gas, limit);
+    }
+
+    // per-worker basefee restoration. static workers always take the configured fee; eip1559
+    // workers take the basefee from their most recent block this epoch.
+    for (worker_idx, cfg) in configs.iter().enumerate() {
+        let worker_id = worker_idx as WorkerId;
+        match cfg {
+            WorkerFeeConfig::Static { fee } => {
+                gas_accumulator.base_fee(worker_id).set_base_fee(*fee);
+            }
+            WorkerFeeConfig::Eip1559 { .. } => {
+                // find most recent replayed block produced by this worker
+                let recent = blocks.iter().rev().find(|h| {
+                    let lower64 = h.difficulty.into_limbs()[0];
+                    (lower64 & 0xffff) as WorkerId == worker_id
+                });
+                let fee = recent.and_then(|h| h.base_fee_per_gas).unwrap_or(MIN_PROTOCOL_BASE_FEE);
+                gas_accumulator.base_fee(worker_id).set_base_fee(fee);
+            }
+        }
+    }
+
+    // count leaders from consensus db for the current epoch
+    // NOTE: replay_missed_consensus catches up rounds above last_executed_round.
+    if last_executed_round > 0 && last_executed_epoch == epoch_state.epoch {
+        consensus_chain
+            .count_leaders(last_executed_round, gas_accumulator.rewards_counter().clone())
+            .await?;
+    }
 
     Ok(())
 }
@@ -211,14 +242,49 @@ where
         // create channels for engine that survive the lifetime of the node
         let (to_engine, for_engine) = mpsc::channel(1000);
 
-        // Create our epoch gas accumulator, we currently have one worker.
-        // All nodes have to agree on the worker count, do not change this for an existing chain.
-        let gas_accumulator = GasAccumulator::new(1);
         // create channel for engine updates to consensus
         let (engine_update_tx, engine_update_rx) = mpsc::channel(64);
 
-        // create the engine
-        let engine = self.create_engine(&node_task_manager, &gas_accumulator)?;
+        // build the rewards counter first so the engine's evm config can share it. the full
+        // gas accumulator is constructed below once we know the on-chain worker count.
+        let rewards_counter = RewardsCounter::default();
+
+        // create the engine with just the rewards counter. the engine cannot know its worker
+        // count until we read WorkerConfigs.sol at the boundary block below.
+        let engine = self.create_engine(&node_task_manager, rewards_counter.clone())?;
+
+        // resolve the epoch boundary block so we can read worker configs from a pinned state
+        // root rather than canonical tip. governance may have rewritten WorkerConfigs storage
+        // mid-epoch; values that ACTUALLY applied during the current epoch are pinned in the
+        // state at blockHeight - 1 (the closing block of the previous epoch).
+        let reth_env = engine.get_reth_env().await;
+        let epoch_state = reth_env.epoch_state_from_canonical_tip()?;
+        let epoch = epoch_state.epoch;
+        debug!(target: "epoch-manager", ?epoch, "retrieved epoch state from canonical tip");
+
+        let close_height = epoch_state.epoch_info.blockHeight.saturating_sub(1);
+        let close_hash = reth_env.sealed_header_by_number(close_height)?.map(|h| h.hash());
+
+        // read the per-worker fee strategy plus the on-chain worker count from the pinned
+        // boundary block. on fresh genesis (blockHeight == 0) no boundary exists yet; the
+        // canonical tip IS the genesis block, so we read configs there.
+        let (num_workers, worker_configs) = match close_hash {
+            Some(hash) => reth_env.get_worker_fee_configs_at_block(hash)?,
+            None => {
+                // fresh genesis: read configs at canonical tip
+                let tip_hash = reth_env.canonical_tip().hash();
+                reth_env.get_worker_fee_configs_at_block(tip_hash)?
+            }
+        };
+        info!(
+            target: "epoch-manager",
+            ?num_workers,
+            ?epoch,
+            "resolved worker count from WorkerConfigs.sol at epoch boundary"
+        );
+
+        let gas_accumulator = GasAccumulator::new_with_rewards(num_workers, rewards_counter);
+
         engine
             .start_engine(
                 for_engine,
@@ -228,12 +294,11 @@ where
             )
             .await?;
 
-        // retrieve epoch information from canonical tip on startup
-        let EpochState { epoch, .. } = engine.epoch_state_from_canonical_tip().await?;
-        debug!(target: "epoch-manager", ?epoch, "retrieved epoch state from canonical tip");
         catchup_accumulator(
-            engine.get_reth_env().await,
+            &reth_env,
             &gas_accumulator,
+            &worker_configs,
+            &epoch_state,
             &mut self.consensus_chain,
         )
         .await?;
@@ -420,10 +485,14 @@ where
     }
 
     /// Helper method to create all engine components.
+    ///
+    /// The engine only needs the [`RewardsCounter`] at construction time; the full
+    /// [`GasAccumulator`] is wired in later via [`ExecutionNode::start_engine`] once the
+    /// on-chain worker count is known.
     fn create_engine(
         &self,
         engine_task_manager: &TaskManager,
-        gas_accumulator: &GasAccumulator,
+        rewards_counter: RewardsCounter,
     ) -> eyre::Result<ExecutionNode> {
         // create execution components (ie - reth env)
         let basefee_address = self.builder.tn_config.parameters.basefee_address;
@@ -432,7 +501,7 @@ where
             engine_task_manager,
             self.reth_db.clone(),
             basefee_address,
-            gas_accumulator.rewards_counter(),
+            rewards_counter,
         )?;
         let engine = ExecutionNode::new(&self.builder, reth_env)?;
 

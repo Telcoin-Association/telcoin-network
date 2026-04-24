@@ -228,11 +228,16 @@ pub struct GasAccumulator {
 impl GasAccumulator {
     /// Create a new [`GasAccumulator`] with `workers` slots, all zeroed.
     pub fn new(workers: usize) -> Self {
+        Self::new_with_rewards(workers, RewardsCounter::default())
+    }
+
+    /// Create a new [`GasAccumulator`] with `workers` slots and a pre-built [`RewardsCounter`].
+    pub fn new_with_rewards(workers: usize, rewards: RewardsCounter) -> Self {
         let mut inner = Vec::with_capacity(workers);
         for _ in 0..workers {
             inner.push(Accumulated::default());
         }
-        Self { inner: Arc::new(inner), rewards_counter: RewardsCounter::default() }
+        Self { inner: Arc::new(inner), rewards_counter: rewards }
     }
 
     /// Increment the block count, gas used, and gas limit for `worker_id`.

@@ -54,7 +54,7 @@ where
     })
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct EngineToPrimaryRpc {
     /// Container for consensus channels.
     consensus_bus: ConsensusBusApp,

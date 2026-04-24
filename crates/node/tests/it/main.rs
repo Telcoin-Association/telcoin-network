@@ -27,9 +27,10 @@ use tn_test_utils::{
     create_signed_certificates_for_rounds, default_test_execution_node, CommitteeFixture,
 };
 use tn_types::{
-    adiri_genesis, gas_accumulator::GasAccumulator, Batch, BlockNumHash, ExecHeader, Notifier,
-    SealedHeader, TaskManager, TnReceiver as _, TnSender as _, B256,
-    DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    adiri_genesis,
+    gas_accumulator::{GasAccumulator, WorkerFeeConfig},
+    Batch, BlockNumHash, ExecHeader, Notifier, SealedHeader, TaskManager, TnReceiver as _,
+    TnSender as _, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -146,7 +147,9 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
     // initialize a new gas accumulator to simulate node recovery
     let recovered = GasAccumulator::new(1);
     recovered.rewards_counter().set_committee(fixture.committee());
-    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain).await?;
+    let configs = [WorkerFeeConfig::Eip1559 { target_gas: 15_000_000 }];
+    let epoch_state = reth_env.epoch_state_from_canonical_tip()?;
+    catchup_accumulator(&reth_env, &recovered, &configs, &epoch_state, &mut consensus_chain).await?;
     // assert recovered and active track the same expected values
     //      G48pDy85GhyGMp9afPBvWgaNzgPAnvBtMxjReQTe1NiN: 3,
     //      Agv7rsffEbxoa7ybTJj57TiAHchf27ia7ziB5CVrHNTk: 3,
@@ -324,7 +327,9 @@ async fn test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
     let worker_id = 0;
     let recovered = GasAccumulator::new(1);
     recovered.rewards_counter().set_committee(fixture.committee());
-    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain).await?;
+    let configs = [WorkerFeeConfig::Eip1559 { target_gas: 15_000_000 }];
+    let epoch_state = reth_env.epoch_state_from_canonical_tip()?;
+    catchup_accumulator(&reth_env, &recovered, &configs, &epoch_state, &mut consensus_chain).await?;
     assert_eq!(gas_accumulator.get_values(worker_id), recovered.get_values(worker_id));
 
     let expected: BTreeMap<_, _> = rewards
@@ -434,7 +439,9 @@ async fn test_catchup_accumulator_partial_execution() -> eyre::Result<()> {
 
     let recovered = GasAccumulator::new(1);
     recovered.rewards_counter().set_committee(fixture.committee());
-    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain).await?;
+    let configs = [WorkerFeeConfig::Eip1559 { target_gas: 15_000_000 }];
+    let epoch_state = reth_env.epoch_state_from_canonical_tip()?;
+    catchup_accumulator(&reth_env, &recovered, &configs, &epoch_state, &mut consensus_chain).await?;
 
     let worker_id = 0;
     assert_eq!(gas_accumulator.get_values(worker_id), recovered.get_values(worker_id));

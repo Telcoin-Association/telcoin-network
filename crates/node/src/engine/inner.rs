@@ -20,7 +20,6 @@ use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator},
     Address, BatchSender, BatchValidation, BlockHeader, BlsPublicKey, ConsensusOutput,
     EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId, B256,
-    MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::mpsc;
@@ -131,6 +130,7 @@ impl ExecutionNodeInner {
         worker_id: WorkerId,
         network_handle: WorkerNetworkHandle,
         engine_to_primary: EP,
+        initial_base_fee: u64,
     ) -> eyre::Result<()>
     where
         EP: EngineToPrimary + Send + Sync + 'static,
@@ -140,7 +140,7 @@ impl ExecutionNodeInner {
         let network =
             WorkerNetwork::new(self.reth_env.chainspec(), network_handle, self.tn_config.version);
         let mut tx_pool_latest = transaction_pool.block_info();
-        tx_pool_latest.pending_basefee = MIN_PROTOCOL_BASE_FEE;
+        tx_pool_latest.pending_basefee = initial_base_fee;
         let last_seen = self.reth_env.finalized_block_hash_number_for_startup()?;
         tx_pool_latest.last_seen_block_hash = last_seen.hash;
         tx_pool_latest.last_seen_block_number = last_seen.number;

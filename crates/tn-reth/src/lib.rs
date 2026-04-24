@@ -1460,21 +1460,39 @@ impl RethEnv {
         self.call_consensus_registry::<_, Vec<ConsensusRegistry::ValidatorInfo>>(evm, calldata)
     }
 
-    /// Read fee configs for all workers from the [`WorkerConfigs`] contract on-chain.
+    /// Read fee configs for all workers from the [`WorkerConfigs`] contract at the given header.
     ///
-    /// Creates a single EVM against the canonical tip and makes one `getWorkerConfig` call
-    /// per worker, returning a [`WorkerFeeConfig`] for each.
-    pub fn get_worker_fee_configs(&self, num_workers: usize) -> eyre::Result<Vec<WorkerFeeConfig>> {
-        let canonical_tip = self.canonical_tip();
-        let state_provider =
-            self.inner.blockchain_provider.state_by_block_hash(canonical_tip.hash())?;
+    /// Builds an EVM against `header`'s state, calls `numWorkers()`, then makes one
+    /// `getWorkerConfig` call per worker. Returns the on-chain worker count alongside the
+    /// decoded [`WorkerFeeConfig`]s.
+    fn worker_fee_configs_inner(
+        &self,
+        header: &SealedHeader,
+    ) -> eyre::Result<(usize, Vec<WorkerFeeConfig>)> {
+        let state_provider = self.inner.blockchain_provider.state_by_block_hash(header.hash())?;
         let state = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder().with_database(state).with_bundle_update().build();
         let mut tn_evm = self
             .inner
             .evm_config
             .evm_factory()
-            .create_evm(&mut db, self.inner.evm_config.evm_env(&canonical_tip)?);
+            .create_evm(&mut db, self.inner.evm_config.evm_env(header)?);
+
+        let num_workers_calldata = WorkerConfigs::numWorkersCall {}.abi_encode().into();
+        let num_workers_state = self.read_state_on_chain(
+            &mut tn_evm,
+            SYSTEM_ADDRESS,
+            WORKER_CONFIGS_ADDRESS,
+            num_workers_calldata,
+        )?;
+        let num_workers_data = match num_workers_state.result {
+            ExecutionResult::Success { output, .. } => output.into_data(),
+            e => eyre::bail!("failed to read num workers: {e:?}"),
+        };
+        let num_workers =
+            <WorkerConfigs::numWorkersCall as alloy::sol_types::SolCall>::abi_decode_returns(
+                &num_workers_data,
+            )? as usize;
 
         let mut configs = Vec::with_capacity(num_workers);
         for worker_id in 0..num_workers {
@@ -1500,6 +1518,39 @@ impl RethEnv {
             configs.push(config);
         }
 
+        Ok((num_workers, configs))
+    }
+
+    /// Read worker fee configs from the [`WorkerConfigs`] contract at the block identified by
+    /// `block_hash`.
+    ///
+    /// Returns the on-chain worker count and one [`WorkerFeeConfig`] per worker. Fails with a
+    /// descriptive error if `block_hash` does not resolve to a sealed header.
+    pub fn get_worker_fee_configs_at_block(
+        &self,
+        block_hash: B256,
+    ) -> eyre::Result<(usize, Vec<WorkerFeeConfig>)> {
+        let header = self
+            .sealed_header_by_hash(block_hash)?
+            .ok_or_else(|| eyre::eyre!("sealed header not found for block hash {block_hash:?}"))?;
+        self.worker_fee_configs_inner(&header)
+    }
+
+    /// Read worker fee configs from the [`WorkerConfigs`] contract at the canonical tip.
+    ///
+    /// `num_workers` is the caller's view of the on-chain worker count. It is compared against
+    /// the value returned by `numWorkers()` at canonical tip; a mismatch indicates governance
+    /// grew/shrank the worker set mid-node-lifetime and the in-memory `GasAccumulator` no longer
+    /// matches the contract. Caller must restart or re-resolve the worker count.
+    pub fn get_worker_fee_configs(&self, num_workers: usize) -> eyre::Result<Vec<WorkerFeeConfig>> {
+        let canonical_tip = self.canonical_tip();
+        let (num_workers_on_chain, configs) = self.worker_fee_configs_inner(&canonical_tip)?;
+        if num_workers != num_workers_on_chain {
+            return Err(eyre::eyre!(
+                "worker count drift: caller={num_workers}, on-chain numWorkers()={num_workers_on_chain}; \
+                 GasAccumulator sized at startup no longer matches WorkerConfigs; node restart required"
+            ));
+        }
         Ok(configs)
     }
 
