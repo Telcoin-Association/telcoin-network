@@ -83,7 +83,7 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
     consensus_bus: ConsensusBusApp,
     network: PrimaryNetworkHandle,
     consensus_chain: ConsensusChain,
-) -> eyre::Result<()> {
+) {
     let rx_shutdown = config.shutdown().subscribe();
     let mut rx_gossip_update = consensus_bus.last_published_consensus_num_hash().subscribe();
     let (tx, mut rx) = tokio::sync::mpsc::channel(10_000);
@@ -141,7 +141,7 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
             }
 
             _ = &rx_shutdown => {
-                return Ok(())
+                return;
             }
         }
     }
@@ -158,7 +158,7 @@ pub async fn spawn_fetch_consensus(
     network: PrimaryNetworkHandle,
     task_index: u32, // Task index for logging.
     consensus_chain: ConsensusChain,
-) -> eyre::Result<()> {
+) {
     async fn next_epoch<'s>(
         consensus_bus: &ConsensusBusApp,
         next_sem: &'s Arc<Semaphore>,
@@ -190,7 +190,7 @@ pub async fn spawn_fetch_consensus(
                             _ = &rx_shutdown => {
                                 info!(target: "state-sync",
                                     "epoch consensus fetcher {task_index} shutting down during pack fetch");
-                                return Ok(());
+                                return;
                             }
                         }
                     }
@@ -199,7 +199,7 @@ pub async fn spawn_fetch_consensus(
                 }
             }
             _ = &rx_shutdown => {
-                return Ok(())
+                break;
             }
         }
     }

@@ -91,7 +91,7 @@ pub fn spawn_subscriber<DB: Database>(
                 info!(target: "subscriber", "Starting subscriber: CVV");
                 if let Err(e) = subscriber.run(rx_shutdown, rx_sequence, consensus_chain).await {
                     error!(target: "subscriber", "Error subscriber consensus: {e}");
-                    Err(eyre::eyre!("{e}"))
+                    Err(e.into())
                 } else {
                     Ok(())
                 }
@@ -106,7 +106,7 @@ pub fn spawn_subscriber<DB: Database>(
                     info!(target: "subscriber", "Starting subscriber: Catch up and rejoin");
                     if let Err(e) = subscriber.catch_up_rejoin_consensus(clone).await {
                         error!(target: "subscriber", "Error catching up consensus: {e}");
-                        Err(eyre::eyre!("{e}"))
+                        Err(e.into())
                     } else {
                         Ok(())
                     }
@@ -120,7 +120,7 @@ pub fn spawn_subscriber<DB: Database>(
                 info!(target: "subscriber", "Starting subscriber: Follower");
                 if let Err(e) = subscriber.follow_consensus(clone).await {
                     error!(target: "subscriber", "Error following consensus: {e}");
-                    Err(eyre::eyre!("{e}"))
+                    Err(e.into())
                 } else {
                     Ok(())
                 }

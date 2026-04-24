@@ -18,7 +18,7 @@ use tn_reth::{system_calls::EpochState, RethDb, RethEnv};
 use tn_storage::{consensus::ConsensusChain, open_db, DatabaseType};
 use tn_types::{
     deconstruct_nonce, gas_accumulator::GasAccumulator, BlockNumHash, ConsensusHeader,
-    ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, Notifier, TaskManager,
+    ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, Notifier, TaskError, TaskManager,
     TaskSpawner, TimestampSec, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
@@ -286,15 +286,23 @@ where
         // spawn three critical workers that will fetch epoch pack files from an epoch work queue.
         // Note, these workers will just go dormant once we have caught up- that's ok.
         for i in 0..3 {
+            let shutdown = self.node_shutdown.subscribe();
+            let consensus_bus = self.consensus_bus.clone();
+            let primary_network_handle = primary_network_handle.clone();
+            let consensus_chain = self.consensus_chain.clone();
             node_task_manager.spawn_critical_task(
                 format!("epoch-consensus-worker-{i}"),
-                spawn_fetch_consensus(
-                    self.node_shutdown.subscribe(),
-                    self.consensus_bus.clone(),
-                    primary_network_handle.clone(),
-                    i,
-                    self.consensus_chain.clone(),
-                ),
+                async move {
+                    spawn_fetch_consensus(
+                        shutdown,
+                        consensus_bus,
+                        primary_network_handle,
+                        i,
+                        consensus_chain,
+                    )
+                    .await;
+                    Ok(())
+                },
             );
         }
 
@@ -498,7 +506,7 @@ where
                 });
             }
             error!(target: "engine", "engine updates ended, node will exit");
-            Err(eyre::eyre!("engine updates ended, node will exit"))
+            Err(TaskError::from_message("engine updates ended, node will exit"))
         });
     }
 }

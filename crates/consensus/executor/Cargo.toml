@@ -21,7 +21,6 @@ state-sync = { workspace = true }
 tn-types = { workspace = true }
 tn-config = { workspace = true }
 tn-primary = { workspace = true }
-eyre = { workspace = true }
 
 [dev-dependencies]
 eyre = { workspace = true }

@@ -236,7 +236,7 @@ impl QuorumWaiterTrait for QuorumWaiter {
 
             // forward result
             let _ = tx.send(res.clone());
-            res.map_err(|e| eyre::eyre!({ e }))
+            Ok(res?)
         });
         rx
     }
