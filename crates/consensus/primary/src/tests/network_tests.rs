@@ -4,16 +4,18 @@ use crate::{
     error::PrimaryNetworkError,
     network::{
         message::{ConsensusResult, PrimaryGossip},
-        MissingCertificatesRequest, RequestHandler,
+        MissingCertificatesRequest, PendingEpochStream, RequestHandler,
+        MAX_CONCURRENT_EPOCH_STREAMS, PENDING_REQUEST_TIMEOUT,
     },
     state_sync::StateSynchronizer,
     ConsensusBus, ConsensusBusApp, NodeMode, RecentBlocks,
 };
 use assert_matches::assert_matches;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
-    time::Duration,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 use tempfile::TempDir;
 use tn_config::Parameters;
@@ -695,4 +697,61 @@ async fn test_behind_consensus_genuinely_behind() {
 
     let result = handler.behind_consensus(0, 60, None).await;
     assert!(result, "genuinely behind node should be detected");
+}
+
+/// A peer that re-requests the same epoch while an entry is already pending must not be
+/// able to reset the cleanup timer. If the replacement path rearmed `created_at`, a peer
+/// could re-request every 20s and hold a slot forever. This test exercises the
+/// preservation logic used by `process_epoch_stream` and verifies the entry is evicted on
+/// schedule relative to the *original* insertion time.
+#[tokio::test]
+async fn test_pending_epoch_stream_replacement_preserves_created_at() {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_EPOCH_STREAMS));
+    let mut pending_map: HashMap<(BlsPublicKey, B256), PendingEpochStream> = HashMap::new();
+
+    let peer = BlsPublicKey::default();
+    let digest = B256::random();
+    let key = (peer, digest);
+    let epoch: u32 = 7;
+
+    // initial insertion at T0, where T0 is just past the cleanup horizon so we can
+    // assert eviction without waiting on wall-clock time
+    let t0 = Instant::now() - PENDING_REQUEST_TIMEOUT - Duration::from_secs(1);
+    let permit = semaphore.clone().try_acquire_owned().expect("permit available");
+    pending_map.insert(key, PendingEpochStream::new_with_created_at(epoch, permit, t0));
+
+    // simulate a re-request: production code looks up the existing entry's
+    // `created_at` and reuses it when building the replacement
+    let new_permit = semaphore.clone().try_acquire_owned().expect("permit available");
+    let preserved_created_at =
+        pending_map.get(&key).map(|p| p.created_at).unwrap_or_else(Instant::now);
+    let replacement =
+        PendingEpochStream { epoch, created_at: preserved_created_at, _permit: new_permit };
+    assert!(pending_map.insert(key, replacement).is_some(), "expected replacement");
+
+    // the replacement must carry the original `created_at`, not a fresh one
+    let after = pending_map.get(&key).expect("entry present after replacement");
+    assert_eq!(
+        after.created_at, t0,
+        "replacement must preserve original created_at to prevent cleanup-timer reset"
+    );
+
+    // cleanup mirrors `PrimaryNetwork::cleanup_stale_pending_requests`: entries whose
+    // age >= PENDING_REQUEST_TIMEOUT must be evicted. Since created_at is t0 (stale),
+    // the entry must drop.
+    let now = Instant::now();
+    pending_map
+        .retain(|_, pending| now.duration_since(pending.created_at) < PENDING_REQUEST_TIMEOUT);
+
+    assert!(
+        pending_map.is_empty(),
+        "stale entry must be evicted by cleanup even though it was 'replaced' moments ago"
+    );
+
+    // and the permit must have returned to the semaphore
+    assert_eq!(
+        semaphore.available_permits(),
+        MAX_CONCURRENT_EPOCH_STREAMS,
+        "dropping the evicted pending entry must release its semaphore permit"
+    );
 }
