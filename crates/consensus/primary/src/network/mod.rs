@@ -324,6 +324,7 @@ impl PrimaryNetworkHandle {
         epoch_record: &EpochRecord,
         previous_epoch: &EpochRecord,
         consensus_chain: &ConsensusChain,
+        record_timeout: Duration,
     ) -> NetworkResult<()> {
         let epoch = epoch_record.epoch;
         // Try up to three times (from three peers) to get consensus.
@@ -369,12 +370,17 @@ impl PrimaryNetworkHandle {
                     "stream opened - reading and validating epoch pack file..."
                 );
 
-                consensus_chain
-                    .stream_import(stream.compat(), epoch_record, previous_epoch)
+                let res = consensus_chain
+                    .stream_import(stream.compat(), epoch_record, previous_epoch, record_timeout)
                     .await
                     .map_err(|e| {
                         NetworkError::RPCError(format!("failed to stream pack file: {e}"))
-                    })?;
+                    });
+                if res.is_err() {
+                    // This peer failed to stream so apply a mild penalty.
+                    self.report_penalty(peer, Penalty::Mild).await;
+                }
+                res?;
                 info!(
                     target: "primary::network",
                     %peer,
@@ -467,7 +473,7 @@ where
                                 self.process_network_event(event);
                             }
                             None => {
-                                warn!(target: "worker::network", "critical worker network events channel dropped");
+                                warn!(target: "primary::network", "critical worker network events channel dropped");
                                 break;
                             }
                         }
@@ -778,11 +784,11 @@ where
             ).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
-                    warn!(target: "worker::network", %peer, ?e, "failed to read request digest from stream");
+                    warn!(target: "primary::network", %peer, ?e, "failed to read request digest from stream");
                     return;
                 }
                 Err(_) => {
-                    warn!(target: "worker::network", %peer, "timeout reading request digest from stream");
+                    warn!(target: "primary::network", %peer, "timeout reading request digest from stream");
                     return;
                 }
             }
@@ -798,7 +804,7 @@ where
                 .process_request_epoch_stream(peer, opt_pending_req, stream, request_digest, &consensus_chain)
                 .await {
                     // apply applicable penalty for error
-                    warn!(target: "worker::network", ?err, "error processing request batches stream");
+                    warn!(target: "primary::network", ?err, "error processing request batches stream");
                     if let Some(penalty) = (&err).into() {
                         network_handle.report_penalty(peer, penalty).await;
                     }

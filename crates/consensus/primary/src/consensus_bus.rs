@@ -547,12 +547,12 @@ impl ConsensusBusApp {
             .unwrap_or_default()
     }
 
-    /// Send a request to down load the epoch pack file for the provided EpochRecord.
+    /// Send a request to download the epoch pack file for the provided EpochRecord.
     pub async fn request_epoch_pack_file(&self, epoch_record: EpochRecord) {
         let _ = self.inner.epoch_request_queue_tx.send(epoch_record).await;
     }
 
-    /// Retreive the next request to down load an epoch pack file.
+    /// Retrieve the next request to down load an epoch pack file.
     /// Will not resolve until a request is ready and will only ever
     /// provide each request once.  Returns None when the underlying channel closes.
     pub async fn get_next_epoch_pack_file_request(&self) -> Option<EpochRecord> {

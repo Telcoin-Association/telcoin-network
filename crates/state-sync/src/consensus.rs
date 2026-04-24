@@ -1,6 +1,6 @@
 //! Tasks and helpers for collecting consensus headers trustlessly.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use tn_config::ConsensusConfig;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
@@ -8,6 +8,10 @@ use tn_storage::{consensus::ConsensusChain, tables::ConsensusHeaderCache};
 use tn_types::{Database as TNDatabase, Epoch, EpochRecord, Noticer, B256};
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::{debug, error, info, warn};
+
+/// How long to wait before retrying a failed pack file download.
+const PACK_DOWNLOAD_RETRY_SECS: u64 = 5;
+const PACK_RECORD_TIMEOUT_SECS: u64 = 10;
 
 /// Retrieve a consensus header from a peer.
 /// If we are requesting a hash then that hash should
@@ -175,15 +179,24 @@ pub async fn spawn_fetch_consensus(
                 let epoch = epoch_record.epoch;
                 let prev_epoch_num = epoch.saturating_sub(1);
                 if let Some((previous_epoch, _)) = consensus_chain.epochs().get_epoch_by_number(prev_epoch_num).await {
-                    info!(target: "state-sync", "epoch consensus fetcher {task_index} retreiving epoch {epoch}");
+                    info!(target: "state-sync", "epoch consensus fetcher {task_index} retrieving epoch {epoch}");
                     loop {
                         tokio::select! {
-                            result = network.request_epoch_pack(&epoch_record, &previous_epoch, &consensus_chain) => {
+                            result = network.request_epoch_pack(&epoch_record, &previous_epoch, &consensus_chain, Duration::from_secs(PACK_RECORD_TIMEOUT_SECS)) => {
                                 match result {
                                     Ok(_) => break,
                                     Err(e) => {
                                         error!(target: "state-sync",
                                             "failed to request epoch pack for epoch {epoch}: {e}");
+                                        // Wait a beat before we try again, may have a network issue.
+                                        tokio::select!(
+                                            _ = &rx_shutdown => {
+                                                info!(target: "state-sync",
+                                                    "epoch consensus fetcher {task_index} shutting down during pack fetch");
+                                                return Ok(());
+                                            },
+                                            _ = tokio::time::sleep(Duration::from_secs(PACK_DOWNLOAD_RETRY_SECS)) => { }
+                                        );
                                     }
                                 }
                             }

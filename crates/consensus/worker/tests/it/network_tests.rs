@@ -772,10 +772,8 @@ async fn test_pending_batch_stream_replacement_preserves_created_at() {
     // simulate a re-request: production code looks up the existing entry's
     // `created_at` and reuses it when building the replacement
     let new_permit = semaphore.clone().try_acquire_owned().expect("permit available");
-    let preserved_created_at = pending_map
-        .get(&key)
-        .map(|p| p.created_at())
-        .unwrap_or_else(std::time::Instant::now);
+    let preserved_created_at =
+        pending_map.get(&key).map(|p| p.created_at()).unwrap_or_else(std::time::Instant::now);
     let replacement = PendingBatchStream::new_with_created_at(
         batch_digests.clone(),
         epoch,
@@ -796,9 +794,8 @@ async fn test_pending_batch_stream_replacement_preserves_created_at() {
     // age >= PENDING_REQUEST_TIMEOUT must be evicted. Since created_at is t0 (stale),
     // the entry must drop.
     let now = std::time::Instant::now();
-    pending_map.retain(|_, pending| {
-        now.duration_since(pending.created_at()) < PENDING_REQUEST_TIMEOUT
-    });
+    pending_map
+        .retain(|_, pending| now.duration_since(pending.created_at()) < PENDING_REQUEST_TIMEOUT);
 
     assert!(
         pending_map.is_empty(),

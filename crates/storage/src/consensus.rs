@@ -9,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
     thread::JoinHandle,
+    time::Duration,
 };
 
 use parking_lot::Mutex;
@@ -358,6 +359,7 @@ impl ConsensusChain {
         stream: R,
         epoch_record: &EpochRecord,
         previous_epoch: &EpochRecord,
+        timeout: Duration,
     ) -> Result<(), ConsensusChainError> {
         let epoch = epoch_record.epoch;
         if let Ok(pack) = self.get_static(epoch).await {
@@ -375,7 +377,8 @@ impl ConsensusChain {
         let path = self.base_path.join(format!("import-{epoch}"));
         // We need to start with a clean import dir since we do not restart.
         let _ = std::fs::remove_dir_all(&path);
-        let res_pack = ConsensusPack::stream_import(&path, stream, epoch, previous_epoch).await;
+        let res_pack =
+            ConsensusPack::stream_import(&path, stream, epoch, previous_epoch, timeout).await;
         match res_pack {
             Ok(pack) => {
                 let base_dir = self.base_path.join(format!("epoch-{epoch}"));
@@ -414,10 +417,15 @@ impl ConsensusChain {
                     // This remove will leave a tiny window before the rename where it is
                     // not available.  This may produce errors that should be handled correctly if
                     // so.
-                    self.recent_packs.lock().retain(|p| p.epoch() != epoch);
                     let _ = std::fs::remove_dir_all(&base_dir);
                 }
                 std::fs::rename(&path_base_dir, &base_dir)?;
+                // Invalidate the cache AFTER the rename so a concurrent get_static that
+                // missed the cache and opened FDs on the old (now-unlinked) inode cannot
+                // leave a stale entry behind for other callers — any entry cached during
+                // the race is purged here. Readers after this point fall through and
+                // see the new on-disk pack.
+                self.recent_packs.lock().retain(|p| p.epoch() != epoch);
                 let _ = std::fs::remove_dir(&path);
                 Ok(())
             }
@@ -759,7 +767,7 @@ mod test {
     use tempfile::TempDir;
 
     use crate::consensus::{ConsensusSlot, LatestConsensus};
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use tn_types::{test_genesis, BlockHash, BlockNumHash, Epoch, EpochRecord, Hash as _, B256};
 
@@ -837,7 +845,10 @@ mod test {
         let consensus_chain2 = ConsensusChain::new(temp_dir2.path().to_owned()).unwrap();
         consensus_chain.epochs().save_record(epoch_record.clone()).await.expect("save epoch");
         let stream = consensus_chain.get_epoch_stream(0).await.unwrap();
-        consensus_chain2.stream_import(stream, &epoch_record, &previous_epoch).await.unwrap();
+        consensus_chain2
+            .stream_import(stream, &epoch_record, &previous_epoch, Duration::from_secs(5))
+            .await
+            .unwrap();
         consensus_chain2.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
         for i in 0..num_outputs {
             let output_db =
