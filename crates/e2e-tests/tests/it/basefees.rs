@@ -7,17 +7,18 @@
 
 use super::common::ProcessGuard;
 use alloy::{
-    primitives::utils::parse_ether,
+    primitives::{utils::parse_ether, Bytes},
     providers::{Provider, ProviderBuilder},
+    sol_types::SolCall,
 };
 use clap::Parser as _;
 use e2e_tests::{create_validator_info, setup_log_dir, NodeEndpoints};
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::{path::Path, process::Child, sync::Arc, time::Duration};
 use telcoin_network_cli::genesis::GenesisArgs;
-use tn_config::{Config, ConfigFmt, ConfigTrait as _};
+use tn_config::{Config, ConfigFmt, ConfigTrait as _, WORKER_CONFIGS_ADDRESS};
 use tn_reth::{
-    system_calls::{ConsensusRegistry, CONSENSUS_REGISTRY_ADDRESS},
+    system_calls::{ConsensusRegistry, WorkerConfigs, CONSENSUS_REGISTRY_ADDRESS},
     test_utils::TransactionFactory,
     RethChainSpec,
 };
@@ -32,9 +33,6 @@ const NODE_PASSWORD: &str = "sup3rsecuur";
 const INITIAL_STAKE_AMOUNT: &str = "1_000_000";
 const EPOCH_DURATION: u64 = 10;
 
-/// Number of value transfers to send per epoch.
-const TRANSFERS_PER_EPOCH: usize = 5;
-
 /// Get the base fee from the latest block via RPC.
 async fn get_base_fee(rpc_url: &str) -> eyre::Result<u64> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
@@ -45,31 +43,38 @@ async fn get_base_fee(rpc_url: &str) -> eyre::Result<u64> {
     Ok(block.header.base_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE))
 }
 
-/// Send `count` simple value transfers (21,000 gas each) and wait for confirmation.
-async fn send_value_transfers(
-    rpc_url: &str,
-    tx_factory: &mut TransactionFactory,
-    chain: &Arc<RethChainSpec>,
-    count: usize,
-) -> eyre::Result<()> {
-    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    let recipient = Address::from_slice(&[0xAA; 20]);
+/// Spawn a background task that sends one value transfer to each node endpoint every second.
+/// Fire-and-forget: errors from down nodes are silently ignored.
+/// Returns a JoinHandle — call `.abort()` to stop.
+fn spawn_tx_sender(
+    rpc_urls: Vec<String>,
+    mut tx_factory: TransactionFactory,
+    chain: Arc<RethChainSpec>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let recipient = Address::from_slice(&[0xAA; 20]);
+        let providers: Vec<_> = rpc_urls
+            .iter()
+            .filter_map(|url| url.parse().ok().map(|u| ProviderBuilder::new().connect_http(u)))
+            .collect();
 
-    for i in 0..count {
-        let tx = tx_factory.create_eip1559_encoded(
-            chain.clone(),
-            Some(21_000), // exact gas for simple transfer
-            100_000,      // generous max_fee_per_gas
-            Some(recipient),
-            U256::from(1), // 1 wei
-            Default::default(),
-        );
-        let pending = provider.send_raw_transaction(&tx).await?;
-        debug!(target: "basefee-test", i, "sent transfer, waiting for confirmation");
-        // Allow two full epoch durations + startup buffer for confirmation
-        timeout(Duration::from_secs(EPOCH_DURATION * 2 + 11), pending.watch()).await??;
-    }
-    Ok(())
+        loop {
+            for provider in &providers {
+                let tx = tx_factory.create_eip1559_encoded(
+                    chain.clone(),
+                    Some(21_000),
+                    100_000,
+                    Some(recipient),
+                    U256::from(1),
+                    Default::default(),
+                );
+                let _ = provider.send_raw_transaction(&tx).await.inspect_err(
+                    |e| tracing::error!(target: "basefee-test", ?e, "failed to send raw transaction"),
+                );
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
 }
 
 /// Poll `getCurrentEpochInfo()` until `iterations` epoch transitions are observed.
@@ -171,7 +176,7 @@ fn config_committee_with_basefee(
     }
 
     let min_withdrawal = "1_000";
-    let epoch_rewards = "1000";
+    let epoch_rewards = "1_000";
 
     info!(target: "basefee-test", "creating committee with --worker-fee-config 0:0:21000");
 
@@ -261,7 +266,7 @@ async fn test_basefee_adjustment_and_sync() -> eyre::Result<()> {
 
     // ── Phase 1: Setup genesis & start 5 validators ──
 
-    let mut tx_sender = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(99));
+    let tx_sender = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(99));
     let governance_wallet =
         TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
 
@@ -310,15 +315,14 @@ async fn test_basefee_adjustment_and_sync() -> eyre::Result<()> {
         "genesis should start at MIN_PROTOCOL_BASE_FEE (7)"
     );
 
-    // ── Phase 3: Run 3 epochs sending transfers each → verify fee > 7 ──
+    // ── Phase 3: Start background tx sender, run 3 epochs → verify fee > 7 ──
 
     tokio::time::sleep(Duration::from_secs(EPOCH_DURATION + 1)).await;
 
-    for epoch in 0..3 {
-        send_value_transfers(&rpc_url, &mut tx_sender, &chain, TRANSFERS_PER_EPOCH).await?;
-        info!(target: "basefee-test", epoch, "sent transfers, waiting for epoch transition");
-        loop_epochs(epoch, 1, &rpc_url).await?;
-    }
+    let all_rpc_urls: Vec<String> = endpoints.iter().map(|ep| ep.http_url.clone()).collect();
+    let sender = spawn_tx_sender(all_rpc_urls, tx_sender, chain.clone());
+
+    loop_epochs(0, 3, &rpc_url).await?;
 
     let pre_kill_base_fee = get_base_fee(&rpc_url).await?;
     info!(target: "basefee-test", pre_kill_base_fee, "base fee after 3 epochs of activity");
@@ -338,13 +342,10 @@ async fn test_basefee_adjustment_and_sync() -> eyre::Result<()> {
     let killed_provider = ProviderBuilder::new().connect_http(killed_url.parse()?);
     assert!(killed_provider.get_chain_id().await.is_err(), "Killed node should be down");
 
-    // ── Phase 5: Run 3 more epochs with transfers → verify fee increased further ──
+    // ── Phase 5: Run 3 more epochs → verify fee increased further ──
+    // Background sender keeps going; errors to the dead node are silently ignored.
 
-    for epoch in 3..6 {
-        send_value_transfers(&rpc_url, &mut tx_sender, &chain, TRANSFERS_PER_EPOCH).await?;
-        info!(target: "basefee-test", epoch, "sent transfers (node down), waiting for epoch");
-        loop_epochs(epoch, 1, &rpc_url).await?;
-    }
+    loop_epochs(3, 3, &rpc_url).await?;
 
     let network_base_fee = get_base_fee(&rpc_url).await?;
     info!(target: "basefee-test", network_base_fee, pre_kill_base_fee, "base fee after 6 epochs");
@@ -364,11 +365,7 @@ async fn test_basefee_adjustment_and_sync() -> eyre::Result<()> {
 
     // ── Phase 7: Run 3 more epochs for sync to complete ──
 
-    for epoch in 6..9 {
-        send_value_transfers(&rpc_url, &mut tx_sender, &chain, TRANSFERS_PER_EPOCH).await?;
-        info!(target: "basefee-test", epoch, "sent transfers (after restart), waiting for epoch");
-        loop_epochs(epoch, 1, &rpc_url).await?;
-    }
+    loop_epochs(6, 3, &rpc_url).await?;
 
     // ── Phase 8: Verify restarted node's base fee matches the network ──
 
@@ -395,17 +392,184 @@ async fn test_basefee_adjustment_and_sync() -> eyre::Result<()> {
         "restarted node base fee ({synced_node_fee}) should match network ({final_network_fee})"
     );
 
-    // ── Phase 9: Verify all nodes have base fees > 7 ──
+    // ── Phase 9: Verify all nodes have base fee 10 then stop sender ──
 
     for (i, ep) in endpoints.iter().enumerate() {
         let fee = get_base_fee(&ep.http_url).await?;
         info!(target: "basefee-test", i, fee, "node base fee");
-        assert!(
-            fee > MIN_PROTOCOL_BASE_FEE,
-            "node {i} base fee should be > {MIN_PROTOCOL_BASE_FEE}, got {fee}"
-        );
+        assert_eq!(fee, 10, "node {i} base fee should be > {MIN_PROTOCOL_BASE_FEE}, got {fee}");
     }
 
+    sender.abort();
     info!(target: "basefee-test", "all assertions passed");
+    Ok(())
+}
+
+#[ignore = "only run independently from all other it tests"]
+#[tokio::test]
+/// Test that governance can update the WorkerConfigs contract and all nodes (including a synced
+/// node) pick up the new fee strategy.
+async fn test_worker_config_governance_update() -> eyre::Result<()> {
+    let _permit = super::common::acquire_test_permit();
+
+    // ── Phase 1: Setup genesis & start 5 validators ──
+
+    let tx_sender = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(99));
+    let mut governance_wallet =
+        TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
+
+    let committee = vec![
+        ("validator-1", Address::from_slice(&[0x11; 20])),
+        ("validator-2", Address::from_slice(&[0x22; 20])),
+        ("validator-3", Address::from_slice(&[0x33; 20])),
+        ("validator-4", Address::from_slice(&[0x44; 20])),
+        ("validator-5", Address::from_slice(&[0x55; 20])),
+    ];
+
+    let temp_dir = tempfile::TempDir::with_prefix("worker_config_test")?;
+    let temp_path = temp_dir.path();
+
+    let genesis = create_basefee_genesis(
+        temp_path,
+        tx_sender.address(),
+        governance_wallet.address(),
+        &committee,
+    )?;
+
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    let (procs, mut endpoints) = start_nodes(temp_path, &committee, "worker_config_test", 1)?;
+    let mut guard = ProcessGuard::new(procs);
+
+    let rpc_url = endpoints[0].http_url.clone();
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+
+    timeout(Duration::from_secs(20), async {
+        let mut result = provider.get_chain_id().await;
+        while let Err(e) = result {
+            debug!(target: "basefee-test", "provider error getting chain id: {e:?}");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            result = provider.get_chain_id().await;
+        }
+    })
+    .await?;
+
+    // ── Phase 2: Drive base fee above MIN via background sender ──
+
+    tokio::time::sleep(Duration::from_secs(EPOCH_DURATION + 1)).await;
+
+    let all_rpc_urls: Vec<String> = endpoints.iter().map(|ep| ep.http_url.clone()).collect();
+    let sender = spawn_tx_sender(all_rpc_urls, tx_sender, chain.clone());
+
+    loop_epochs(0, 3, &rpc_url).await?;
+
+    let base_fee = get_base_fee(&rpc_url).await?;
+    info!(target: "basefee-test", base_fee, "base fee after 3 epochs");
+    assert!(
+        base_fee > MIN_PROTOCOL_BASE_FEE,
+        "base fee should have increased from {MIN_PROTOCOL_BASE_FEE}, got {base_fee}"
+    );
+
+    // ── Phase 3: Governance updates WorkerConfigs to Static(42) ──
+
+    let calldata: Bytes =
+        WorkerConfigs::setWorkerConfigCall { workerId: 0, strategy: 1, value: 42 }
+            .abi_encode()
+            .into();
+
+    let tx = governance_wallet.create_eip1559_encoded(
+        chain.clone(),
+        None,
+        100_000,
+        Some(WORKER_CONFIGS_ADDRESS),
+        U256::ZERO,
+        calldata,
+    );
+    let pending = provider.send_raw_transaction(&tx).await?;
+    info!(target: "basefee-test", "sent setWorkerConfig(0, 1, 42), waiting for confirmation");
+    timeout(Duration::from_secs(EPOCH_DURATION * 2 + 11), pending.watch()).await??;
+
+    // ── Phase 4: Verify fee = 42 after epoch transition ──
+
+    loop_epochs(3, 1, &rpc_url).await?;
+
+    // The epoch-closing block carries the parent's base fee; the Static(42)
+    // fee only appears once the new epoch's batch builder creates its first batch.
+    let deadline = Instant::now() + Duration::from_secs(EPOCH_DURATION * 2);
+    loop {
+        let fee = get_base_fee(&rpc_url).await?;
+        if fee == 42 {
+            info!(target: "basefee-test", "node 0 base fee reached 42");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "node 0 base fee did not reach 42 within {}s, still {fee}",
+            EPOCH_DURATION * 2
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    // Static fee ignores gas usage — stop the background sender
+    sender.abort();
+
+    for (i, ep) in endpoints.iter().enumerate() {
+        let fee = get_base_fee(&ep.http_url).await?;
+        info!(target: "basefee-test", i, fee, "node base fee after governance update");
+        assert_eq!(fee, 42, "node {i} base fee should be 42 (Static), got {fee}");
+    }
+
+    // ── Phase 5: Kill one node, run more epochs, verify fee still 42 ──
+
+    let kill_idx = 2;
+    if let Some(mut taken) = guard.take(kill_idx) {
+        super::common::kill_child(&mut taken);
+    }
+
+    loop_epochs(4, 2, &rpc_url).await?;
+
+    for (i, ep) in endpoints.iter().enumerate() {
+        if i == kill_idx {
+            continue;
+        }
+        let fee = get_base_fee(&ep.http_url).await?;
+        info!(target: "basefee-test", i, fee, "node base fee after kill (should still be 42)");
+        assert_eq!(fee, 42, "node {i} base fee should still be 42, got {fee}");
+    }
+
+    // ── Phase 6: Restart and verify synced node picks up Static(42) ──
+
+    let nodes_to_start: &[(&str, Address)] = &[("validator-3", Address::from_slice(&[0x33; 20]))];
+    let (mut new_children, mut new_endpoints) =
+        start_nodes(temp_path, nodes_to_start, "worker_config_test", 2)?;
+    let new_child = new_children.pop().expect("child");
+    guard.replace(kill_idx, new_child);
+    endpoints[kill_idx] = new_endpoints.pop().expect("endpoint");
+
+    let restarted_url = endpoints[kill_idx].http_url.clone();
+    let restarted_provider = ProviderBuilder::new().connect_http(restarted_url.parse()?);
+    timeout(Duration::from_secs(EPOCH_DURATION * 4), async {
+        let mut result = restarted_provider.get_chain_id().await;
+        while let Err(e) = result {
+            debug!(target: "basefee-test", "restarted node not ready: {e:?}");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            result = restarted_provider.get_chain_id().await;
+        }
+    })
+    .await?;
+
+    loop_epochs(6, 2, &rpc_url).await?;
+
+    let synced_fee = get_base_fee(&restarted_url).await?;
+    info!(target: "basefee-test", synced_fee, "restarted node base fee");
+    assert_eq!(synced_fee, 42, "restarted node base fee should be 42, got {synced_fee}");
+
+    for (i, ep) in endpoints.iter().enumerate() {
+        let fee = get_base_fee(&ep.http_url).await?;
+        info!(target: "basefee-test", i, fee, "final node base fee");
+        assert_eq!(fee, 42, "node {i} base fee should be 42, got {fee}");
+    }
+
+    info!(target: "basefee-test", "worker config governance update test passed");
     Ok(())
 }
