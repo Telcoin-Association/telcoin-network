@@ -31,9 +31,9 @@ use tn_types::{
 use tokio::{io::AsyncReadExt, sync::Mutex as TokioMutex, time::timeout};
 use tracing::{debug, error, info, warn};
 
-/// Total timeout for sending all batches over a stream.
+/// Total timeout for sending a buffer of pack file data.
 /// Prevents slow-reader attacks where a peer accepts a stream but never reads.
-/// Set to 5 minutes as a an arbitrary upper bound on downloading a pack file.
+/// Set to an arbitrary 10 seconds to read 16kb buffer.
 const SEND_STREAM_BUFFER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Map to hold vote info to detect invalid votes, equivocation and cache responses in case of
@@ -914,7 +914,7 @@ where
 
     /// Send epoch pack file over stream.
     async fn send_epoch_over_stream<S>(
-        stream: &mut S,
+        mut stream: S,
         consensus_chain: &ConsensusChain,
         epoch: Epoch,
         buffer_timeout: Duration,
@@ -934,6 +934,10 @@ where
             }
             timeout(buffer_timeout, stream.write_all(&bytes[..n])).await??;
         }
+
+        // attempt to close the stream gracefully
+        let _ = stream.close().await;
+
         Ok(())
     }
 
@@ -942,7 +946,7 @@ where
         &self,
         peer: BlsPublicKey,
         pending_request: Option<PendingEpochStream>,
-        mut stream: Stream,
+        stream: Stream,
         request_digest: B256,
         consensus_chain: &ConsensusChain,
     ) -> PrimaryNetworkResult<()> {
@@ -968,24 +972,15 @@ where
         );
 
         // set timeout to prevent slow-read attack
-        let result = match Self::send_epoch_over_stream(
-            &mut stream,
+        Self::send_epoch_over_stream(
+            stream,
             consensus_chain,
             request.epoch,
             SEND_STREAM_BUFFER_TIMEOUT,
         )
         .await
-        {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                warn!(target: "primary::network", %peer, ?e, "failed to send epoch over stream");
-                Err(e)
-            }
-        };
-
-        // attempt to close the stream gracefully
-        let _ = stream.close().await;
-
-        result
+        .inspect_err(
+            |e| warn!(target: "primary::network", %peer, ?e, "failed to send epoch over stream"),
+        )
     }
 }

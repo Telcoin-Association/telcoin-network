@@ -677,6 +677,8 @@ impl Inner {
         previous_epoch: &EpochRecord,
         timeout: Duration,
     ) -> Result<Self, PackError> {
+        /// Private helper to read the next record from a pack iterator or timeout if it takes
+        /// longer than timeout.
         async fn next<R: AsyncRead + Unpin>(
             iter: &mut AsyncPackIter<PackRecord, R>,
             timeout: Duration,
@@ -729,7 +731,6 @@ impl Inner {
         let mut parent_digest = previous_epoch.final_consensus.hash;
         let mut batches = HashSet::new();
         while let Some(record) = next(&mut stream_iter, timeout).await? {
-            //XXXXlet record = record.map_err(|e| PackError::ReadError(e.to_string()))?;
             match record {
                 PackRecord::EpochMeta(_epoch_meta) => {
                     return Err(PackError::EpochLoad("epoch meta data found twice".to_string()))

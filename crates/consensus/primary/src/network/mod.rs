@@ -379,8 +379,14 @@ impl PrimaryNetworkHandle {
                 if res.is_err() {
                     // This peer failed to stream so apply a mild penalty.
                     self.report_penalty(peer, Penalty::Mild).await;
+                    warn!(
+                        target: "primary::network",
+                        %peer,
+                        epoch,
+                        "FAILED to streamed epoch pack file from peer"
+                    );
+                    continue;
                 }
-                res?;
                 info!(
                     target: "primary::network",
                     %peer,
@@ -651,9 +657,13 @@ where
             tokio::select! {
                 header =
                     request_handler.retrieve_epoch_record(epoch, hash) => {
+                        // penalize peer's reputation for bad request
+                        if let Err(err) = &header {
+                            if let Some(penalty) = err.into() {
+                                network_handle.report_penalty(peer, penalty).await;
+                            }
+                        }
                         let response = header.into_response();
-                        // TODO: penalize peer's reputation for bad request
-                        // if response.is_err() { }
                         let _ = network_handle.handle.send_response(response, channel).await;
                     }
                 // cancel notification from network layer

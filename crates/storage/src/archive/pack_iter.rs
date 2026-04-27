@@ -8,13 +8,18 @@ use std::{
 };
 
 use serde::{de::DeserializeOwned, Serialize};
-use tn_types::decode;
+use tn_types::try_decode;
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 
 use crate::archive::{
     error::{fetch::FetchError, load_header::LoadHeaderError},
     pack::DataHeader,
 };
+
+/// Provide an upper bound on a record size.
+/// This should be large enough for any record but provide
+/// an upper bound on memory allocations for a record.
+const MAX_RECORD_SIZE: u32 = 16 * 1024 * 1024;
 
 /// Iterate over a Db's key, value pairs in insert order.
 /// This iterator is "raw", it does not use any indexes just the data file.
@@ -73,6 +78,9 @@ where
         }
         crc32_hasher.update(&val_size_buf);
         let val_size = u32::from_le_bytes(val_size_buf);
+        if val_size > MAX_RECORD_SIZE {
+            return Err(FetchError::RequestedSizeTooLarge(val_size, MAX_RECORD_SIZE));
+        }
         buffer.resize(val_size as usize, 0);
         file.read_exact(buffer)?;
         crc32_hasher.update(buffer);
@@ -83,7 +91,7 @@ where
         if calc_crc32 != read_crc32 {
             return Err(FetchError::CrcFailed);
         }
-        Ok(decode::<V>(&buffer[..]))
+        try_decode::<V>(&buffer[..]).map_err(|e| FetchError::DeserializeValue(e.to_string()))
     }
 }
 
@@ -146,6 +154,9 @@ where
         }
         crc32_hasher.update(&val_size_buf);
         let val_size = u32::from_le_bytes(val_size_buf);
+        if val_size > MAX_RECORD_SIZE {
+            return Err(FetchError::RequestedSizeTooLarge(val_size, MAX_RECORD_SIZE));
+        }
         buffer.resize(val_size as usize, 0);
         file.read_exact(buffer).await?;
         crc32_hasher.update(buffer);
@@ -156,7 +167,7 @@ where
         if calc_crc32 != read_crc32 {
             return Err(FetchError::CrcFailed);
         }
-        Ok(decode::<V>(&buffer[..]))
+        try_decode::<V>(&buffer[..]).map_err(|e| FetchError::DeserializeValue(e.to_string()))
     }
 
     /// Return the next V when available.
