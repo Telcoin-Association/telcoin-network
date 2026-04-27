@@ -31,7 +31,7 @@ use tn_types::{
 use tokio::{io::AsyncReadExt, sync::Mutex as TokioMutex, time::timeout};
 use tracing::{debug, error, info, warn};
 
-/// Total timeout for sending a buffer of pack file data.
+/// Total timeout for sending a 16kb buffer of pack file data.
 /// Prevents slow-reader attacks where a peer accepts a stream but never reads.
 /// Set to an arbitrary 10 seconds to read 16kb buffer.
 const SEND_STREAM_BUFFER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -918,6 +918,7 @@ where
         consensus_chain: &ConsensusChain,
         epoch: Epoch,
         buffer_timeout: Duration,
+        peer: BlsPublicKey,
     ) -> PrimaryNetworkResult<()>
     where
         S: AsyncWrite + Unpin + Send,
@@ -936,7 +937,9 @@ where
         }
 
         // attempt to close the stream gracefully
-        let _ = stream.close().await;
+        if let Err(e) = stream.close().await {
+            tracing::warn!(target: "primary::network", %peer, %epoch, ?e, "stream close failed");
+        }
 
         Ok(())
     }
@@ -977,6 +980,7 @@ where
             consensus_chain,
             request.epoch,
             SEND_STREAM_BUFFER_TIMEOUT,
+            peer,
         )
         .await
         .inspect_err(

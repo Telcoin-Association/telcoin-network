@@ -276,7 +276,7 @@ impl ConsensusBusApp {
 
         let (tx_epoch_record, _) = watch::channel(None);
 
-        let (epoch_request_queue_tx, epochs_rx) = tokio::sync::mpsc::channel(10_000);
+        let (epoch_request_queue_tx, epochs_rx) = tokio::sync::mpsc::channel(1024);
         let epoch_request_queue_rx = Arc::new(tokio::sync::Mutex::new(epochs_rx));
         Self {
             inner: Arc::new(ConsensusBusAppInner {

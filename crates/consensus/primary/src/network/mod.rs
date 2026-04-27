@@ -25,7 +25,11 @@ use tn_network_libp2p::{
     GossipMessage, Penalty, ResponseChannel, Stream,
 };
 use tn_network_types::{WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerToPrimaryClient};
-use tn_storage::{consensus::ConsensusChain, PayloadStore};
+use tn_storage::{
+    consensus::{ConsensusChain, ConsensusChainError},
+    consensus_pack::PackError,
+    PayloadStore,
+};
 use tn_types::{
     encode, BlockHash, BlsPublicKey, BlsSignature, Certificate, CertificateDigest, ConsensusHeader,
     Database, Epoch, EpochCertificate, EpochRecord, EpochVote, Header, Round, TaskSpawner,
@@ -339,9 +343,25 @@ impl PrimaryNetworkHandle {
             // send request and await response from peer
             //
             // SAFETY: network layer handles request timeout
-            if let PrimaryResponse::RequestEpochStream { ack, peer } =
-                self.handle.send_request_any(request.clone()).await?.await??
-            {
+            let dispatch = match self.handle.send_request_any(request.clone()).await {
+                Ok(rx) => rx,
+                Err(e) => {
+                    warn!(target: "primary::network", ?e, "send_request_any failed; retrying");
+                    continue;
+                }
+            };
+            let resp = match dispatch.await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    warn!(target: "primary::network", ?e, "peer responded with error; retrying");
+                    continue;
+                }
+                Err(e) => {
+                    warn!(target: "primary::network", ?e, "peer dropped response channel; retrying");
+                    continue;
+                }
+            };
+            if let PrimaryResponse::RequestEpochStream { ack, peer } = resp {
                 // continue if denied to try next peer
                 if !ack {
                     continue;
@@ -370,15 +390,13 @@ impl PrimaryNetworkHandle {
                     "stream opened - reading and validating epoch pack file..."
                 );
 
-                let res = consensus_chain
+                if let Err(err) = consensus_chain
                     .stream_import(stream.compat(), epoch_record, previous_epoch, record_timeout)
                     .await
-                    .map_err(|e| {
-                        NetworkError::RPCError(format!("failed to stream pack file: {e}"))
-                    });
-                if res.is_err() {
-                    // This peer failed to stream so apply a mild penalty.
-                    self.report_penalty(peer, Penalty::Mild).await;
+                {
+                    if let Some(penalty) = Self::consensus_chain_error_to_penalty(&err) {
+                        self.report_penalty(peer, penalty).await;
+                    }
                     warn!(
                         target: "primary::network",
                         %peer,
@@ -398,6 +416,52 @@ impl PrimaryNetworkHandle {
             }
         }
         Err(NetworkError::RPCError("Could not get the epoch pack file!".to_string()))
+    }
+
+    /// Helper to convert a consensus chain error to penalty.
+    /// This error does not have network knowledge so do it here for the
+    /// streaming case vs with the error.
+    fn consensus_chain_error_to_penalty(error: &ConsensusChainError) -> Option<Penalty> {
+        match error {
+            ConsensusChainError::PackError(pack_error) => match pack_error {
+                PackError::MissingBatch
+                | PackError::NotConsensus
+                | PackError::NotBatch
+                | PackError::NotEpoch => Some(Penalty::Medium),
+                PackError::InvalidConsensusChain
+                | PackError::ExtraBatches
+                | PackError::MissingBatches
+                | PackError::CorruptPack
+                | PackError::InvalidEpoch => Some(Penalty::Severe),
+                PackError::IO(_)
+                | PackError::BatchLoad(_)
+                | PackError::EpochLoad(_)
+                | PackError::Append(_)
+                | PackError::IndexAppend(_)
+                | PackError::Fetch(_)
+                | PackError::Open(_)
+                | PackError::ReadOnly
+                | PackError::ReadError(_)
+                | PackError::MissingAuthority
+                | PackError::SendFailed
+                | PackError::ReceiveFailed
+                | PackError::PersistError(_)
+                | PackError::InvalidConsensusNumber(_, _)
+                | PackError::ConsensusNumberAlreadyAdded
+                | PackError::ConsensusNumberTooLow
+                | PackError::ConsensusNumberTooHigh => None,
+            },
+            ConsensusChainError::EpochMismatch
+            | ConsensusChainError::PrevCommitteeEpochMismatch
+            | ConsensusChainError::CrcError => Some(Penalty::Mild),
+            ConsensusChainError::EmptyImport | ConsensusChainError::InvalidImport => {
+                Some(Penalty::Severe)
+            }
+            ConsensusChainError::StreamUnavailable
+            | ConsensusChainError::NoCurrentEpoch
+            | ConsensusChainError::EpochDbError(_)
+            | ConsensusChainError::IO(_) => None,
+        }
     }
 }
 
@@ -783,7 +847,7 @@ where
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
         let pending_map = self.pending_epoch_requests.clone();
-        let task_name = format!("stream-requested-batches-{peer}");
+        let task_name = format!("stream-requested-epoch-{peer}");
         let consensus_chain = self.consensus_chain.clone();
         self.task_spawner.spawn_task(task_name, async move {
             // read the request digest (32-bytes) from the stream with timeout

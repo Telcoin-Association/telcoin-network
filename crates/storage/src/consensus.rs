@@ -373,12 +373,12 @@ impl ConsensusChain {
                 }
             }
         }
+        // Import path will use RAII to remove the import dir when we are done.
+        let import_path = ImportPath::new(&self.base_path, epoch);
         // Store our files out of the way while we import so we don't use them until ready.
-        let path = self.base_path.join(format!("import-{epoch}"));
-        // We need to start with a clean import dir since we do not restart.
-        let _ = std::fs::remove_dir_all(&path);
+        let path = import_path.path();
         let res_pack =
-            ConsensusPack::stream_import(&path, stream, epoch, previous_epoch, timeout).await;
+            ConsensusPack::stream_import(path, stream, epoch, previous_epoch, timeout).await;
         match res_pack {
             Ok(pack) => {
                 let base_dir = self.base_path.join(format!("epoch-{epoch}"));
@@ -390,13 +390,11 @@ impl ConsensusChain {
                             || epoch_record.final_consensus.hash != last_header.digest()
                         {
                             // Invalid final consensus header...
-                            let _ = std::fs::remove_dir_all(&path);
                             return Err(ConsensusChainError::InvalidImport);
                         }
                     }
                     None => {
                         // Missing a final consensus header...
-                        let _ = std::fs::remove_dir_all(&path);
                         return Err(ConsensusChainError::EmptyImport);
                     }
                 }
@@ -419,21 +417,17 @@ impl ConsensusChain {
                     // so.
                     let _ = std::fs::remove_dir_all(&base_dir);
                 }
-                std::fs::rename(&path_base_dir, &base_dir)?;
+                let rename_err = std::fs::rename(&path_base_dir, &base_dir);
                 // Invalidate the cache AFTER the rename so a concurrent get_static that
                 // missed the cache and opened FDs on the old (now-unlinked) inode cannot
                 // leave a stale entry behind for other callers — any entry cached during
                 // the race is purged here. Readers after this point fall through and
                 // see the new on-disk pack.
                 self.recent_packs.lock().retain(|p| p.epoch() != epoch);
-                let _ = std::fs::remove_dir(&path);
+                rename_err?;
                 Ok(())
             }
-            Err(e) => {
-                // We don't recover right now so just blow away the directory and remains of files.
-                let _ = std::fs::remove_dir_all(&path);
-                Err(e.into())
-            }
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -759,6 +753,34 @@ impl From<std::io::Error> for ConsensusChainError {
 impl From<EpochDbError> for ConsensusChainError {
     fn from(value: EpochDbError) -> Self {
         Self::EpochDbError(value)
+    }
+}
+
+/// Helper to create the stream import dir and remove on Drop.
+struct ImportPath {
+    path: PathBuf,
+}
+
+impl ImportPath {
+    /// New ImportPath rooted at base_path.
+    fn new(base_path: &Path, epoch: Epoch) -> Self {
+        // Store our files out of the way while we import so we don't use them until ready.
+        let path = base_path.join(format!("import-{epoch}"));
+        // We need to start with a clean import dir since we do not restart.
+        // Note, this should not exist but just in case...
+        let _ = std::fs::remove_dir_all(&path);
+        Self { path }
+    }
+
+    /// Return the contained path.
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ImportPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
     }
 }
 

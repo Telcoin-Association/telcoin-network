@@ -155,7 +155,7 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
 /// that will fetch download entire pack files for epochs.
 /// This should only be used when NOT participating in active consensus.
 /// Several of these will run but will do nothing unless requested.
-/// This works by stream an entire epochs pack file from a peer.
+/// This works by streaming an entire epochs pack file from a peer.
 pub async fn spawn_fetch_consensus(
     rx_shutdown: Noticer,
     consensus_bus: ConsensusBusApp,
