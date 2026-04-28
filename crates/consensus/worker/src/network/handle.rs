@@ -9,7 +9,7 @@ use std::{collections::HashSet, time::Duration};
 use futures::{AsyncRead, AsyncWriteExt as _};
 use tn_network_libp2p::{
     error::NetworkError,
-    types::{NetworkHandle, NetworkResult},
+    types::{NetworkHandle, NetworkResponseMessage, NetworkResult},
     Penalty,
 };
 use tn_types::{
@@ -81,7 +81,7 @@ impl WorkerNetworkHandle {
     ) -> NetworkResult<()> {
         let request = WorkerRequest::ReportBatch { sealed_batch };
         let res = self.handle.send_request(request, peer_bls).await?;
-        let res = res.await??;
+        let res = res.await??.result;
         match res {
             WorkerResponse::ReportBatch => Ok(()),
             WorkerResponse::RequestBatchesStream { .. } => Err(NetworkError::RPCError(
@@ -225,7 +225,8 @@ impl WorkerNetworkHandle {
         // send request and await response from peer
         //
         // SAFETY: network layer handles request timeout
-        let res = self.handle.send_request(request, peer).await?.await??;
+        let NetworkResponseMessage { peer: _, result: res } =
+            self.handle.send_request(request, peer).await?.await??;
         match res {
             WorkerResponse::RequestBatchesStream { ack } => {
                 // return error if denied to try next peer

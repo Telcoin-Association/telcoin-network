@@ -4,7 +4,7 @@ use assert_matches::assert_matches;
 use std::{collections::HashSet, sync::Arc};
 use tn_batch_validator::NoopBatchValidator;
 use tn_network_libp2p::{
-    types::{NetworkCommand, NetworkHandle},
+    types::{NetworkCommand, NetworkHandle, NetworkResponseMessage},
     GossipMessage, Penalty, TopicHash,
 };
 use tn_storage::mem_db::MemDatabase;
@@ -140,7 +140,10 @@ async fn test_batch_gossip_triggers_stream_request() {
                         assert_eq!(batch_digests, HashSet::from([batch_digest]));
                         // Reject to end the test (no actual stream setup in unit test)
                         reply
-                            .send(Ok(WorkerResponse::RequestBatchesStream { ack: false }))
+                            .send(Ok(NetworkResponseMessage {
+                                peer,
+                                result: WorkerResponse::RequestBatchesStream { ack: false },
+                            }))
                             .expect("reply sent");
                         // Test passes - we verified the stream request was sent
                         break;
@@ -187,7 +190,10 @@ async fn test_batch_gossip_stream_accepted_opens_stream() {
                         assert_eq!(batch_digests, HashSet::from([batch_digest]));
                         // Accept the stream request
                         reply
-                            .send(Ok(WorkerResponse::RequestBatchesStream { ack: true }))
+                            .send(Ok(NetworkResponseMessage {
+                                peer,
+                                result: WorkerResponse::RequestBatchesStream { ack: true },
+                            }))
                             .expect("reply sent");
                         stream_request_acked = true;
                     }
@@ -283,7 +289,10 @@ async fn test_request_batches_peer_rejects_tries_next() {
                     if let WorkerRequest::RequestBatchesStream { .. } = request {
                         // both peers reject
                         reply
-                            .send(Ok(WorkerResponse::RequestBatchesStream { ack: false }))
+                            .send(Ok(NetworkResponseMessage {
+                                peer: peer1,
+                                result: WorkerResponse::RequestBatchesStream { ack: false },
+                            }))
                             .expect("send reject");
                     }
                 }
@@ -412,7 +421,10 @@ async fn test_request_batches_truncates_oversized_digests() {
                         );
                         // reject to end the test
                         reply
-                            .send(Ok(WorkerResponse::RequestBatchesStream { ack: false }))
+                            .send(Ok(NetworkResponseMessage {
+                                peer: peer1,
+                                result: WorkerResponse::RequestBatchesStream { ack: false },
+                            }))
                             .expect("send reject");
                     }
                 }
@@ -649,12 +661,18 @@ async fn test_retry_succeeds_after_initial_rejection() {
                         if connected_peers_count <= 1 {
                             // first attempt: reject
                             reply
-                                .send(Ok(WorkerResponse::RequestBatchesStream { ack: false }))
+                                .send(Ok(NetworkResponseMessage {
+                                    peer: peer1,
+                                    result: WorkerResponse::RequestBatchesStream { ack: false },
+                                }))
                                 .expect("send reject");
                         } else {
                             // second attempt: accept
                             reply
-                                .send(Ok(WorkerResponse::RequestBatchesStream { ack: true }))
+                                .send(Ok(NetworkResponseMessage {
+                                    peer: peer1,
+                                    result: WorkerResponse::RequestBatchesStream { ack: true },
+                                }))
                                 .expect("send accept");
                             stream_accepted = true;
                         }
@@ -724,8 +742,11 @@ async fn test_request_batches_peer_fallback_preserves_digests() {
                         );
                         // reject to trigger fallback to next peer
                         reply
-                            .send(Ok(WorkerResponse::RequestBatchesStream { ack: false }))
-                            .expect("send reject");
+                            .send(Ok(NetworkResponseMessage {
+                                peer: peer2,
+                                result: WorkerResponse::RequestBatchesStream { ack: false },
+                            }))
+                            .unwrap();
                     }
                 }
                 _ => {}

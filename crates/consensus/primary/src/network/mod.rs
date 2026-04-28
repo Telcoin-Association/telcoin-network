@@ -21,7 +21,10 @@ use parking_lot::Mutex;
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     error::NetworkError,
-    types::{IntoResponse as _, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResult},
+    types::{
+        IntoResponse as _, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResponseMessage,
+        NetworkResult,
+    },
     GossipMessage, Penalty, ResponseChannel, Stream,
 };
 use tn_network_types::{WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerToPrimaryClient};
@@ -178,14 +181,14 @@ impl PrimaryNetworkHandle {
         let header = Arc::new(header);
         let request = PrimaryRequest::Vote { header: header.clone(), parents: parents.clone() };
         let res = self.handle.send_request(request, peer).await?;
-        let mut res = res.await??;
+        let mut res = res.await??.result;
         let mut tries = 0;
         while let PrimaryResponse::RecoverableError(PrimaryRPCError(s)) = res {
             warn!(target: "primary::network", "Got recoverable error {s}, retrying");
             tokio::time::sleep(Duration::from_millis(250)).await;
             let request = PrimaryRequest::Vote { header: header.clone(), parents: parents.clone() };
             let res_raw = self.handle.send_request(request, peer).await?;
-            res = res_raw.await??;
+            res = res_raw.await??.result;
             tries += 1;
             if tries > 5 {
                 break;
@@ -223,7 +226,7 @@ impl PrimaryNetworkHandle {
     ) -> NetworkResult<Vec<Certificate>> {
         let request = PrimaryRequest::MissingCertificates { inner: request };
         let res = self.handle.send_request(request, peer).await?;
-        let res = res.await??;
+        let res = res.await??.result;
         match res {
             PrimaryResponse::RequestedCertificates(certs) => Ok(certs),
             PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
@@ -241,7 +244,7 @@ impl PrimaryNetworkHandle {
     ) -> NetworkResult<ConsensusHeader> {
         let request = PrimaryRequest::ConsensusHeader { number, hash };
         let res = self.handle.send_request(request, peer).await?;
-        let res = res.await??;
+        let res = res.await??.result;
         match res {
             PrimaryResponse::ConsensusHeader(header) => {
                 if header.digest() == hash && header.number == number {
@@ -274,7 +277,11 @@ impl PrimaryNetworkHandle {
         for _ in 0..3 {
             let res = self.handle.send_request_any(request.clone()).await?;
             let res = res.await?;
-            if let Ok(PrimaryResponse::ConsensusHeader(header)) = res {
+            if let Ok(NetworkResponseMessage {
+                peer: _,
+                result: PrimaryResponse::ConsensusHeader(header),
+            }) = res
+            {
                 if header.digest() == hash && header.number == number {
                     return Ok(Arc::unwrap_or_clone(header));
                 } else {
@@ -300,7 +307,11 @@ impl PrimaryNetworkHandle {
         // This could be a lot more complicated but this KISS method should work fine.
         for _ in 0..3 {
             let res = self.handle.send_request_any(request.clone()).await?;
-            if let Ok(Ok(PrimaryResponse::EpochRecord { record, certificate })) = res.await {
+            if let Ok(Ok(NetworkResponseMessage {
+                peer: _,
+                result: PrimaryResponse::EpochRecord { record, certificate },
+            })) = res.await
+            {
                 return Ok((record, certificate));
             }
         }
@@ -361,7 +372,11 @@ impl PrimaryNetworkHandle {
                     continue;
                 }
             };
-            if let PrimaryResponse::RequestEpochStream { ack, peer } = resp {
+            if let NetworkResponseMessage {
+                peer,
+                result: PrimaryResponse::RequestEpochStream { ack },
+            } = resp
+            {
                 // continue if denied to try next peer
                 if !ack {
                     continue;
@@ -485,8 +500,6 @@ pub struct PrimaryNetwork<DB, Events> {
     /// Wrapped in `Arc<Mutex>` so spawned stream tasks can look up the matching
     /// request after reading the correlation digest from the stream.
     pending_epoch_requests: Arc<Mutex<HashMap<PendingEpochRequestKey, PendingEpochStream>>>,
-    /// My node's BLS public key.
-    bls_public_key: BlsPublicKey,
 }
 
 impl<DB, Events> PrimaryNetwork<DB, Events>
@@ -504,7 +517,6 @@ where
         task_spawner: TaskSpawner,
         consensus_chain: ConsensusChain,
     ) -> Self {
-        let bls_public_key = consensus_config.key_config().primary_public_key();
         let request_handler = RequestHandler::new(
             consensus_config,
             consensus_bus,
@@ -521,7 +533,6 @@ where
             consensus_chain,
             epoch_stream_semaphore,
             pending_epoch_requests: pending_batch_requests,
-            bls_public_key,
         }
     }
 
@@ -797,7 +808,7 @@ where
         };
 
         let response: PrimaryNetworkResult<PrimaryResponse> =
-            Ok(PrimaryResponse::RequestEpochStream { ack, peer: self.bls_public_key });
+            Ok(PrimaryResponse::RequestEpochStream { ack });
         // send response
         let network_handle = self.network_handle.clone();
         let task_name = format!("process-request-epoch-{peer}");

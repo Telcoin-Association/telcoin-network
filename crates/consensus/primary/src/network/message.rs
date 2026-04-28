@@ -252,9 +252,6 @@ pub enum PrimaryResponse {
     RequestEpochStream {
         /// Whether the request is accepted.
         ack: bool,
-        // The peer to stream from.
-        // Used when requesting a stream from any peer.
-        peer: BlsPublicKey,
     },
 }
 
