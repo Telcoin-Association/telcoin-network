@@ -3,7 +3,7 @@
 
 use std::{
     cmp::max,
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     error::Error,
     fmt::Display,
     hash::BuildHasherDefault,
@@ -11,14 +11,15 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
     thread::JoinHandle,
+    time::Duration,
 };
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tn_types::{
     gas_accumulator::RewardsCounter, AuthorityIdentifier, Batch, BlockHash, BlockNumHash,
-    CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput, Epoch,
-    EpochRecord, Round, B256,
+    BlsPublicKey, CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput,
+    Epoch, EpochRecord, Round, B256,
 };
 use tokio::{
     io::AsyncRead,
@@ -255,11 +256,21 @@ impl ConsensusPack {
         stream: R,
         epoch: Epoch,
         previous_epoch: &EpochRecord,
+        final_consensus_number: u64,
+        timeout: Duration,
     ) -> Result<ConsensusPack, PackError> {
         let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
         let (tx_error, error) = watch::channel(None);
-        let inner = Inner::stream_import(path, stream, epoch, previous_epoch).await?;
+        let inner = Inner::stream_import(
+            path,
+            stream,
+            epoch,
+            previous_epoch,
+            final_consensus_number,
+            timeout,
+        )
+        .await?;
         let handle = std::thread::spawn(move || {
             run_pack_loop(inner, rx, tx_error);
         });
@@ -667,27 +678,68 @@ impl Inner {
         Ok(Self { data, consensus_idx, consensus_digests, batch_digests, epoch_meta })
     }
 
+    /// Verify a streamed EpochMeta record is valid.
+    fn verify_epoch_meta(
+        epoch: Epoch,
+        previous_epoch: &EpochRecord,
+        epoch_meta: &EpochMeta,
+    ) -> Result<(), PackError> {
+        if epoch != epoch_meta.epoch {
+            return Err(PackError::InvalidEpoch);
+        }
+        let start_consensus_number =
+            if epoch == 0 { 1 } else { previous_epoch.final_consensus.number + 1 };
+        if start_consensus_number != epoch_meta.start_consensus_number {
+            return Err(PackError::InvalidEpoch);
+        }
+        if previous_epoch.final_state != epoch_meta.genesis_exec_state {
+            return Err(PackError::InvalidEpoch);
+        }
+        if previous_epoch.final_consensus != epoch_meta.genesis_consensus {
+            return Err(PackError::InvalidEpoch);
+        }
+        let committee: BTreeSet<BlsPublicKey> =
+            previous_epoch.next_committee.iter().copied().collect();
+        if epoch_meta.committee.bls_keys() != committee {
+            return Err(PackError::InvalidEpoch);
+        }
+        Ok(())
+    }
+
     /// Create a new set of epoch static files to write consensus output into.
     async fn stream_import<P: AsRef<Path>, R: AsyncRead + Unpin>(
         path: P,
         stream: R,
         epoch: Epoch,
         previous_epoch: &EpochRecord,
+        final_consensus_number: u64,
+        timeout: Duration,
     ) -> Result<Self, PackError> {
+        /// Private helper to read the next record from a pack iterator or timeout if it takes
+        /// longer than timeout.
+        async fn next<R: AsyncRead + Unpin>(
+            iter: &mut AsyncPackIter<PackRecord, R>,
+            timeout: Duration,
+        ) -> Result<Option<PackRecord>, PackError> {
+            match tokio::time::timeout(timeout, iter.next()).await {
+                Ok(Some(Ok(rec))) => Ok(Some(rec)),
+                Ok(Some(Err(e))) => Err(PackError::ReadError(e.to_string())),
+                Ok(None) => Ok(None),
+                Err(_) => Err(PackError::ReadError("timeout".to_string())),
+            }
+        }
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
         let _ = std::fs::create_dir_all(&base_dir);
         let mut stream_iter = AsyncPackIter::<PackRecord, R>::open(stream, epoch as u64)
             .await
             .map_err(|e| PackError::ReadError(e.to_string()))?;
         let mut data = Pack::open(base_dir.join(Self::DATA_NAME), epoch as u64, false)?;
-        let epoch_meta = if let Some(Ok(meta)) = stream_iter.next().await {
+        let epoch_meta = if let Some(meta) = next(&mut stream_iter, timeout).await? {
             meta.into_epoch()?
         } else {
             return Err(PackError::NotEpoch);
         };
-        if epoch != epoch_meta.epoch {
-            return Err(PackError::InvalidEpoch);
-        }
+        Self::verify_epoch_meta(epoch, previous_epoch, &epoch_meta)?;
         data.append(&PackRecord::EpochMeta(epoch_meta.clone()))
             .map_err(|e| PackError::Append(e.to_string()))?;
         let mut consensus_idx = PositionIndex::open_pdx_file(
@@ -714,8 +766,7 @@ impl Inner {
         .map_err(OpenError::IndexFileOpen)?;
         let mut parent_digest = previous_epoch.final_consensus.hash;
         let mut batches = HashSet::new();
-        while let Some(record) = stream_iter.next().await {
-            let record = record.map_err(|e| PackError::ReadError(e.to_string()))?;
+        while let Some(record) = next(&mut stream_iter, timeout).await? {
             match record {
                 PackRecord::EpochMeta(_epoch_meta) => {
                     return Err(PackError::EpochLoad("epoch meta data found twice".to_string()))
@@ -750,6 +801,12 @@ impl Inner {
                     let consensus_digest = consensus_header.digest();
                     parent_digest = consensus_digest;
                     let consensus_number = consensus_header.number;
+                    if consensus_number > final_consensus_number {
+                        return Err(PackError::InvalidConsensusNumber(
+                            consensus_number,
+                            final_consensus_number,
+                        ));
+                    }
                     let position = data
                         .append(&PackRecord::Consensus(consensus_header))
                         .map_err(|e| PackError::Append(e.to_string()))?;
@@ -915,8 +972,21 @@ impl Inner {
     /// Retrieve a consensus header by digest.
     fn consensus_header_by_digest(&mut self, digest: B256) -> Option<ConsensusHeader> {
         let pos = self.consensus_digests.load(digest).ok()?;
-        let rec = self.data.fetch(pos).ok()?;
-        rec.into_consensus().ok()
+        // This is not strickly needed, the fetch below will fail if
+        // we try to read past the end of the file but this potentially
+        // short circuits a lot of checks for a small cost.
+        // Note, this could happen if a file is damaged and repaired.
+        if pos >= self.data.file_len() {
+            return None;
+        }
+        let header = self.data.fetch(pos).ok()?.into_consensus().ok()?;
+        // Verify the digest.  There is an extremely unlikely edge case where
+        // a repaired DB could write a new header to the same location as an
+        // old header.  This makes sure the contract is always intact.
+        if header.digest() != digest {
+            return None;
+        }
+        Some(header)
     }
 
     /// Retrieve a consensus header by number.
@@ -1002,19 +1072,34 @@ impl Inner {
 
     /// True if the pack contains the batch for digest.
     fn contains_batch(&mut self, digest: BlockHash) -> bool {
-        self.batch_digests.load(digest).is_ok()
+        // This is a bit more complicated (the pos file_len check) because in a very rare
+        // case of repairing a damaged pack we might have something in the index not in the
+        // pack file (yet).
+        if let Ok(pos) = self.batch_digests.load(digest) {
+            pos < self.data.file_len()
+        } else {
+            false
+        }
     }
 
     /// Return the Batch for digest if found.
     fn batch(&mut self, digest: BlockHash) -> Option<Batch> {
-        if let Ok(pos) = self.batch_digests.load(digest) {
-            if let Ok(batch) = self.data.fetch(pos) {
-                if let Ok(batch) = batch.into_batch() {
-                    return Some(batch);
-                }
-            }
+        let pos = self.batch_digests.load(digest).ok()?;
+        // This is not strickly needed, the fetch below will fail if
+        // we try to read past the end of the file but this potentially
+        // short circuits a lot of checks for a small cost.
+        // Note, this could happen if a file is damaged and repaired.
+        if pos >= self.data.file_len() {
+            return None;
         }
-        None
+        let batch = self.data.fetch(pos).ok()?.into_batch().ok()?;
+        // Verify the digest.  There is an extremely unlikely edge case where
+        // a repaired DB could write a new batch to the same location as an
+        // old batch.  This makes sure the contract is always intact.
+        if batch.digest() != digest {
+            return None;
+        }
+        Some(batch)
     }
 
     /// Count leaders in this pack (in rewards_counter) lower than last_executed_round.
@@ -1321,9 +1406,16 @@ pub(crate) mod test {
                 tokio::fs::File::open(temp_dir.path().join("epoch-0").join(Inner::DATA_NAME))
                     .await
                     .expect("log file");
-            let pack = ConsensusPack::stream_import(temp_dir2.path(), stream, 0, &previous_epoch)
-                .await
-                .expect("open pack");
+            let pack = ConsensusPack::stream_import(
+                temp_dir2.path(),
+                stream,
+                0,
+                &previous_epoch,
+                num_outputs as u64 * 2,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("open pack");
             tokio::time::sleep(Duration::from_secs(2)).await;
             for i in 0..num_outputs {
                 let output_db = pack.get_consensus_output(i as u64 + 1).await.unwrap();

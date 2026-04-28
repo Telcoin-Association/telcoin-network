@@ -9,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
     thread::JoinHandle,
+    time::Duration,
 };
 
 use parking_lot::Mutex;
@@ -358,6 +359,7 @@ impl ConsensusChain {
         stream: R,
         epoch_record: &EpochRecord,
         previous_epoch: &EpochRecord,
+        timeout: Duration,
     ) -> Result<(), ConsensusChainError> {
         let epoch = epoch_record.epoch;
         if let Ok(pack) = self.get_static(epoch).await {
@@ -371,11 +373,19 @@ impl ConsensusChain {
                 }
             }
         }
+        // Import path will use RAII to remove the import dir when we are done.
+        let import_path = ImportPath::new(&self.base_path, epoch);
         // Store our files out of the way while we import so we don't use them until ready.
-        let path = self.base_path.join(format!("import-{epoch}"));
-        // We need to start with a clean import dir since we do not restart.
-        let _ = std::fs::remove_dir_all(&path);
-        let res_pack = ConsensusPack::stream_import(&path, stream, epoch, previous_epoch).await;
+        let path = import_path.path();
+        let res_pack = ConsensusPack::stream_import(
+            path,
+            stream,
+            epoch,
+            previous_epoch,
+            epoch_record.final_consensus.number,
+            timeout,
+        )
+        .await;
         match res_pack {
             Ok(pack) => {
                 let base_dir = self.base_path.join(format!("epoch-{epoch}"));
@@ -383,17 +393,18 @@ impl ConsensusChain {
                 pack.persist().await?;
                 match pack.latest_consensus_header().await {
                     Some(last_header) => {
+                        // The chain was verified as it was streamed.  So if the final block matches
+                        // the expected final_consensus then the entire pack
+                        // file should be valid.
                         if epoch_record.final_consensus.number != last_header.number
                             || epoch_record.final_consensus.hash != last_header.digest()
                         {
                             // Invalid final consensus header...
-                            let _ = std::fs::remove_dir_all(&path);
                             return Err(ConsensusChainError::InvalidImport);
                         }
                     }
                     None => {
                         // Missing a final consensus header...
-                        let _ = std::fs::remove_dir_all(&path);
                         return Err(ConsensusChainError::EmptyImport);
                     }
                 }
@@ -414,18 +425,19 @@ impl ConsensusChain {
                     // This remove will leave a tiny window before the rename where it is
                     // not available.  This may produce errors that should be handled correctly if
                     // so.
-                    self.recent_packs.lock().retain(|p| p.epoch() != epoch);
                     let _ = std::fs::remove_dir_all(&base_dir);
                 }
-                std::fs::rename(&path_base_dir, &base_dir)?;
-                let _ = std::fs::remove_dir(&path);
+                let rename_err = std::fs::rename(&path_base_dir, &base_dir);
+                // Invalidate the cache AFTER the rename so a concurrent get_static that
+                // missed the cache and opened FDs on the old (now-unlinked) inode cannot
+                // leave a stale entry behind for other callers — any entry cached during
+                // the race is purged here. Readers after this point fall through and
+                // see the new on-disk pack.
+                self.recent_packs.lock().retain(|p| p.epoch() != epoch);
+                rename_err?;
                 Ok(())
             }
-            Err(e) => {
-                // We don't recover right now so just blow away the directory and remains of files.
-                let _ = std::fs::remove_dir_all(&path);
-                Err(e.into())
-            }
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -754,12 +766,40 @@ impl From<EpochDbError> for ConsensusChainError {
     }
 }
 
+/// Helper to create the stream import dir and remove on Drop.
+struct ImportPath {
+    path: PathBuf,
+}
+
+impl ImportPath {
+    /// New ImportPath rooted at base_path.
+    fn new(base_path: &Path, epoch: Epoch) -> Self {
+        // Store our files out of the way while we import so we don't use them until ready.
+        let path = base_path.join(format!("import-{epoch}"));
+        // We need to start with a clean import dir since we do not restart.
+        // Note, this should not exist but just in case...
+        let _ = std::fs::remove_dir_all(&path);
+        Self { path }
+    }
+
+    /// Return the contained path.
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ImportPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 #[cfg(test)]
 mod test {
     use tempfile::TempDir;
 
     use crate::consensus::{ConsensusSlot, LatestConsensus};
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use tn_types::{test_genesis, BlockHash, BlockNumHash, Epoch, EpochRecord, Hash as _, B256};
 
@@ -837,7 +877,10 @@ mod test {
         let consensus_chain2 = ConsensusChain::new(temp_dir2.path().to_owned()).unwrap();
         consensus_chain.epochs().save_record(epoch_record.clone()).await.expect("save epoch");
         let stream = consensus_chain.get_epoch_stream(0).await.unwrap();
-        consensus_chain2.stream_import(stream, &epoch_record, &previous_epoch).await.unwrap();
+        consensus_chain2
+            .stream_import(stream, &epoch_record, &previous_epoch, Duration::from_secs(5))
+            .await
+            .unwrap();
         consensus_chain2.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
         for i in 0..num_outputs {
             let output_db =

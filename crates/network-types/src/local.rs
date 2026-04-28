@@ -5,7 +5,7 @@ use crate::{
 };
 use parking_lot::RwLock;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap},
     sync::Arc,
 };
 use tn_types::{Batch, BlockHash, BlsPublicKey};
@@ -90,7 +90,7 @@ impl PrimaryToWorkerClient for LocalNetwork {
 
     async fn fetch_batches(
         &self,
-        digests: HashSet<BlockHash>,
+        digests: BTreeSet<BlockHash>,
     ) -> eyre::Result<HashMap<BlockHash, Batch>> {
         if let Some(c) = self.get_primary_to_worker_handler().await {
             c.fetch_batches(digests).await

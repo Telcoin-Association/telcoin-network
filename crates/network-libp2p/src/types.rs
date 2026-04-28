@@ -182,7 +182,7 @@ where
         /// The request to send.
         request: Req,
         /// Channel for forwarding any responses.
-        reply: oneshot::Sender<NetworkResult<Res>>,
+        reply: NetworkResponseSender<Res>,
     },
     /// Send a request to a peer by PeerId.
     ///
@@ -195,7 +195,7 @@ where
         /// The request to send.
         request: Req,
         /// Channel for forwarding any responses.
-        reply: oneshot::Sender<NetworkResult<Res>>,
+        reply: NetworkResponseSender<Res>,
     },
     /// Send a request to any connected peer.
     ///
@@ -206,7 +206,7 @@ where
         /// The request to send.
         request: Req,
         /// Channel for forwarding any responses.
-        reply: oneshot::Sender<NetworkResult<Res>>,
+        reply: NetworkResponseSender<Res>,
     },
     /// Send response to a peer's request.
     SendResponse {
@@ -310,6 +310,19 @@ where
         reply: oneshot::Sender<NetworkResult<Stream>>,
     },
 }
+
+/// Wrap a network response.
+/// Adds the Bls key of the peer that sent the response.
+#[derive(Clone, Debug)]
+pub struct NetworkResponseMessage<Res: TNMessage> {
+    /// The BLS public key of the node that sent this response.
+    pub peer: BlsPublicKey,
+    /// The actual response.
+    pub result: Res,
+}
+
+/// Type for the result channel for a network request.
+pub type NetworkResponseSender<Res> = oneshot::Sender<NetworkResult<NetworkResponseMessage<Res>>>;
 
 /// Network handle.
 ///
@@ -472,7 +485,7 @@ where
         &self,
         request: Req,
         peer: BlsPublicKey,
-    ) -> NetworkResult<oneshot::Receiver<NetworkResult<Res>>> {
+    ) -> NetworkResult<oneshot::Receiver<NetworkResult<NetworkResponseMessage<Res>>>> {
         let (reply, to_caller) = oneshot::channel();
         self.sender.send(NetworkCommand::SendRequest { peer, request, reply }).await?;
         Ok(to_caller)
@@ -484,7 +497,7 @@ where
     pub async fn send_request_any(
         &self,
         request: Req,
-    ) -> NetworkResult<oneshot::Receiver<NetworkResult<Res>>> {
+    ) -> NetworkResult<oneshot::Receiver<NetworkResult<NetworkResponseMessage<Res>>>> {
         let (reply, to_caller) = oneshot::channel();
         self.sender.send(NetworkCommand::SendRequestAny { request, reply }).await?;
         Ok(to_caller)
@@ -708,7 +721,7 @@ where
         &self,
         request: Req,
         peer: PeerId,
-    ) -> NetworkResult<oneshot::Receiver<NetworkResult<Res>>> {
+    ) -> NetworkResult<oneshot::Receiver<NetworkResult<NetworkResponseMessage<Res>>>> {
         let (reply, to_caller) = oneshot::channel();
         self.sender.send(NetworkCommand::SendRequestDirect { peer, request, reply }).await?;
         Ok(to_caller)

@@ -21,11 +21,18 @@ use parking_lot::Mutex;
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     error::NetworkError,
-    types::{IntoResponse as _, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResult},
+    types::{
+        IntoResponse as _, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResponseMessage,
+        NetworkResult,
+    },
     GossipMessage, Penalty, ResponseChannel, Stream,
 };
 use tn_network_types::{WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerToPrimaryClient};
-use tn_storage::{consensus::ConsensusChain, PayloadStore};
+use tn_storage::{
+    consensus::{ConsensusChain, ConsensusChainError},
+    consensus_pack::PackError,
+    PayloadStore,
+};
 use tn_types::{
     encode, BlockHash, BlsPublicKey, BlsSignature, Certificate, CertificateDigest, ConsensusHeader,
     Database, Epoch, EpochCertificate, EpochRecord, EpochVote, Header, Round, TaskSpawner,
@@ -174,14 +181,14 @@ impl PrimaryNetworkHandle {
         let header = Arc::new(header);
         let request = PrimaryRequest::Vote { header: header.clone(), parents: parents.clone() };
         let res = self.handle.send_request(request, peer).await?;
-        let mut res = res.await??;
+        let mut res = res.await??.result;
         let mut tries = 0;
         while let PrimaryResponse::RecoverableError(PrimaryRPCError(s)) = res {
             warn!(target: "primary::network", "Got recoverable error {s}, retrying");
             tokio::time::sleep(Duration::from_millis(250)).await;
             let request = PrimaryRequest::Vote { header: header.clone(), parents: parents.clone() };
             let res_raw = self.handle.send_request(request, peer).await?;
-            res = res_raw.await??;
+            res = res_raw.await??.result;
             tries += 1;
             if tries > 5 {
                 break;
@@ -219,7 +226,7 @@ impl PrimaryNetworkHandle {
     ) -> NetworkResult<Vec<Certificate>> {
         let request = PrimaryRequest::MissingCertificates { inner: request };
         let res = self.handle.send_request(request, peer).await?;
-        let res = res.await??;
+        let res = res.await??.result;
         match res {
             PrimaryResponse::RequestedCertificates(certs) => Ok(certs),
             PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
@@ -237,7 +244,7 @@ impl PrimaryNetworkHandle {
     ) -> NetworkResult<ConsensusHeader> {
         let request = PrimaryRequest::ConsensusHeader { number, hash };
         let res = self.handle.send_request(request, peer).await?;
-        let res = res.await??;
+        let res = res.await??.result;
         match res {
             PrimaryResponse::ConsensusHeader(header) => {
                 if header.digest() == hash && header.number == number {
@@ -270,7 +277,11 @@ impl PrimaryNetworkHandle {
         for _ in 0..3 {
             let res = self.handle.send_request_any(request.clone()).await?;
             let res = res.await?;
-            if let Ok(PrimaryResponse::ConsensusHeader(header)) = res {
+            if let Ok(NetworkResponseMessage {
+                peer: _,
+                result: PrimaryResponse::ConsensusHeader(header),
+            }) = res
+            {
                 if header.digest() == hash && header.number == number {
                     return Ok(Arc::unwrap_or_clone(header));
                 } else {
@@ -296,7 +307,11 @@ impl PrimaryNetworkHandle {
         // This could be a lot more complicated but this KISS method should work fine.
         for _ in 0..3 {
             let res = self.handle.send_request_any(request.clone()).await?;
-            if let Ok(Ok(PrimaryResponse::EpochRecord { record, certificate })) = res.await {
+            if let Ok(Ok(NetworkResponseMessage {
+                peer: _,
+                result: PrimaryResponse::EpochRecord { record, certificate },
+            })) = res.await
+            {
                 return Ok((record, certificate));
             }
         }
@@ -324,6 +339,7 @@ impl PrimaryNetworkHandle {
         epoch_record: &EpochRecord,
         previous_epoch: &EpochRecord,
         consensus_chain: &ConsensusChain,
+        record_timeout: Duration,
     ) -> NetworkResult<()> {
         let epoch = epoch_record.epoch;
         // Try up to three times (from three peers) to get consensus.
@@ -338,8 +354,28 @@ impl PrimaryNetworkHandle {
             // send request and await response from peer
             //
             // SAFETY: network layer handles request timeout
-            if let PrimaryResponse::RequestEpochStream { ack, peer } =
-                self.handle.send_request_any(request.clone()).await?.await??
+            let dispatch = match self.handle.send_request_any(request.clone()).await {
+                Ok(rx) => rx,
+                Err(e) => {
+                    warn!(target: "primary::network", ?e, "send_request_any failed; retrying");
+                    continue;
+                }
+            };
+            let resp = match dispatch.await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    warn!(target: "primary::network", ?e, "peer responded with error; retrying");
+                    continue;
+                }
+                Err(e) => {
+                    warn!(target: "primary::network", ?e, "peer dropped response channel; retrying");
+                    continue;
+                }
+            };
+            if let NetworkResponseMessage {
+                peer,
+                result: PrimaryResponse::RequestEpochStream { ack },
+            } = resp
             {
                 // continue if denied to try next peer
                 if !ack {
@@ -369,12 +405,21 @@ impl PrimaryNetworkHandle {
                     "stream opened - reading and validating epoch pack file..."
                 );
 
-                consensus_chain
-                    .stream_import(stream.compat(), epoch_record, previous_epoch)
+                if let Err(err) = consensus_chain
+                    .stream_import(stream.compat(), epoch_record, previous_epoch, record_timeout)
                     .await
-                    .map_err(|e| {
-                        NetworkError::RPCError(format!("failed to stream pack file: {e}"))
-                    })?;
+                {
+                    if let Some(penalty) = Self::consensus_chain_error_to_penalty(&err) {
+                        self.report_penalty(peer, penalty).await;
+                    }
+                    warn!(
+                        target: "primary::network",
+                        %peer,
+                        epoch,
+                        "FAILED to streamed epoch pack file from peer"
+                    );
+                    continue;
+                }
                 info!(
                     target: "primary::network",
                     %peer,
@@ -386,6 +431,52 @@ impl PrimaryNetworkHandle {
             }
         }
         Err(NetworkError::RPCError("Could not get the epoch pack file!".to_string()))
+    }
+
+    /// Helper to convert a consensus chain error to penalty.
+    /// This error does not have network knowledge so do it here for the
+    /// streaming case vs with the error.
+    fn consensus_chain_error_to_penalty(error: &ConsensusChainError) -> Option<Penalty> {
+        match error {
+            ConsensusChainError::PackError(pack_error) => match pack_error {
+                PackError::MissingBatch
+                | PackError::NotConsensus
+                | PackError::NotBatch
+                | PackError::NotEpoch => Some(Penalty::Medium),
+                PackError::InvalidConsensusChain
+                | PackError::ExtraBatches
+                | PackError::MissingBatches
+                | PackError::CorruptPack
+                | PackError::InvalidEpoch => Some(Penalty::Severe),
+                PackError::IO(_)
+                | PackError::BatchLoad(_)
+                | PackError::EpochLoad(_)
+                | PackError::Append(_)
+                | PackError::IndexAppend(_)
+                | PackError::Fetch(_)
+                | PackError::Open(_)
+                | PackError::ReadOnly
+                | PackError::ReadError(_)
+                | PackError::MissingAuthority
+                | PackError::SendFailed
+                | PackError::ReceiveFailed
+                | PackError::PersistError(_)
+                | PackError::InvalidConsensusNumber(_, _)
+                | PackError::ConsensusNumberAlreadyAdded
+                | PackError::ConsensusNumberTooLow
+                | PackError::ConsensusNumberTooHigh => None,
+            },
+            ConsensusChainError::EpochMismatch
+            | ConsensusChainError::PrevCommitteeEpochMismatch
+            | ConsensusChainError::CrcError => Some(Penalty::Mild),
+            ConsensusChainError::EmptyImport | ConsensusChainError::InvalidImport => {
+                Some(Penalty::Severe)
+            }
+            ConsensusChainError::StreamUnavailable
+            | ConsensusChainError::NoCurrentEpoch
+            | ConsensusChainError::EpochDbError(_)
+            | ConsensusChainError::IO(_) => None,
+        }
     }
 }
 
@@ -409,8 +500,6 @@ pub struct PrimaryNetwork<DB, Events> {
     /// Wrapped in `Arc<Mutex>` so spawned stream tasks can look up the matching
     /// request after reading the correlation digest from the stream.
     pending_epoch_requests: Arc<Mutex<HashMap<PendingEpochRequestKey, PendingEpochStream>>>,
-    /// My node's BLS public key.
-    bls_public_key: BlsPublicKey,
 }
 
 impl<DB, Events> PrimaryNetwork<DB, Events>
@@ -428,7 +517,6 @@ where
         task_spawner: TaskSpawner,
         consensus_chain: ConsensusChain,
     ) -> Self {
-        let bls_public_key = consensus_config.key_config().primary_public_key();
         let request_handler = RequestHandler::new(
             consensus_config,
             consensus_bus,
@@ -445,7 +533,6 @@ where
             consensus_chain,
             epoch_stream_semaphore,
             pending_epoch_requests: pending_batch_requests,
-            bls_public_key,
         }
     }
 
@@ -467,7 +554,7 @@ where
                                 self.process_network_event(event);
                             }
                             None => {
-                                warn!(target: "worker::network", "critical worker network events channel dropped");
+                                warn!(target: "primary::network", "critical worker network events channel dropped");
                                 break;
                             }
                         }
@@ -645,9 +732,13 @@ where
             tokio::select! {
                 header =
                     request_handler.retrieve_epoch_record(epoch, hash) => {
+                        // penalize peer's reputation for bad request
+                        if let Err(err) = &header {
+                            if let Some(penalty) = err.into() {
+                                network_handle.report_penalty(peer, penalty).await;
+                            }
+                        }
                         let response = header.into_response();
-                        // TODO: penalize peer's reputation for bad request
-                        // if response.is_err() { }
                         let _ = network_handle.handle.send_response(response, channel).await;
                     }
                 // cancel notification from network layer
@@ -684,10 +775,16 @@ where
                     let mut hasher = tn_types::DefaultHashFunction::new();
                     hasher.update(&epoch.to_le_bytes());
                     let request_digest = B256::from_slice(hasher.finalize().as_bytes());
-                    let pending = PendingEpochStream::new(epoch, permit);
-                    // If the same peer requests the same epoch then replace request.
-                    // If the peer tries to stream twice the second attempt will be
-                    // punished as a protocol violation.
+                    // If the same peer re-requests the same epoch while a prior entry
+                    // is still pending, preserve the original `created_at` so the
+                    // cleanup timer is not rearmed. Without this, a peer could hold a
+                    // slot indefinitely by re-requesting before the 30s timeout.
+                    // A second stream open is still punished as a protocol violation.
+                    let created_at = pending_map
+                        .get(&(peer, request_digest))
+                        .map(|p| p.created_at)
+                        .unwrap_or_else(Instant::now);
+                    let pending = PendingEpochStream { epoch, created_at, _permit: permit };
                     if pending_map.insert((peer, request_digest), pending).is_some() {
                         debug!(
                             target: "primary::network",
@@ -711,7 +808,7 @@ where
         };
 
         let response: PrimaryNetworkResult<PrimaryResponse> =
-            Ok(PrimaryResponse::RequestEpochStream { ack, peer: self.bls_public_key });
+            Ok(PrimaryResponse::RequestEpochStream { ack });
         // send response
         let network_handle = self.network_handle.clone();
         let task_name = format!("process-request-epoch-{peer}");
@@ -761,7 +858,7 @@ where
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
         let pending_map = self.pending_epoch_requests.clone();
-        let task_name = format!("stream-requested-batches-{peer}");
+        let task_name = format!("stream-requested-epoch-{peer}");
         let consensus_chain = self.consensus_chain.clone();
         self.task_spawner.spawn_task(task_name, async move {
             // read the request digest (32-bytes) from the stream with timeout
@@ -772,11 +869,11 @@ where
             ).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
-                    warn!(target: "worker::network", %peer, ?e, "failed to read request digest from stream");
+                    warn!(target: "primary::network", %peer, ?e, "failed to read request digest from stream");
                     return;
                 }
                 Err(_) => {
-                    warn!(target: "worker::network", %peer, "timeout reading request digest from stream");
+                    warn!(target: "primary::network", %peer, "timeout reading request digest from stream");
                     return;
                 }
             }
@@ -792,7 +889,7 @@ where
                 .process_request_epoch_stream(peer, opt_pending_req, stream, request_digest, &consensus_chain)
                 .await {
                     // apply applicable penalty for error
-                    warn!(target: "worker::network", ?err, "error processing request batches stream");
+                    warn!(target: "primary::network", ?err, "error processing request batches stream");
                     if let Some(penalty) = (&err).into() {
                         network_handle.report_penalty(peer, penalty).await;
                     }
