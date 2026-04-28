@@ -233,9 +233,10 @@ pub struct ConsensusBusAppInner {
     /// The que channel for primary network events.
     primary_network_events: QueChannel<NetworkEvent<crate::network::Req, crate::network::Res>>,
     /// Sender for epoch records that need to have a pack file downloaded.
-    epoch_request_queue_tx: tokio::sync::mpsc::Sender<EpochRecord>,
+    epoch_request_queue_tx: tokio::sync::mpsc::Sender<(EpochRecord, EpochRecord)>,
     /// Reciever for epoch records to download pack files for.
-    epoch_request_queue_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<EpochRecord>>>,
+    epoch_request_queue_rx:
+        Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(EpochRecord, EpochRecord)>>>,
 }
 
 /// The thread-safe inner type that holds all the channels for inner-consensus
@@ -276,7 +277,7 @@ impl ConsensusBusApp {
 
         let (tx_epoch_record, _) = watch::channel(None);
 
-        let (epoch_request_queue_tx, epochs_rx) = tokio::sync::mpsc::channel(10_000);
+        let (epoch_request_queue_tx, epochs_rx) = tokio::sync::mpsc::channel(1024);
         let epoch_request_queue_rx = Arc::new(tokio::sync::Mutex::new(epochs_rx));
         Self {
             inner: Arc::new(ConsensusBusAppInner {
@@ -547,15 +548,19 @@ impl ConsensusBusApp {
             .unwrap_or_default()
     }
 
-    /// Send a request to down load the epoch pack file for the provided EpochRecord.
-    pub async fn request_epoch_pack_file(&self, epoch_record: EpochRecord) {
-        let _ = self.inner.epoch_request_queue_tx.send(epoch_record).await;
+    /// Send a request to download the epoch pack file for the provided EpochRecord.
+    pub async fn request_epoch_pack_file(
+        &self,
+        previous_epoch_record: EpochRecord,
+        epoch_record: EpochRecord,
+    ) {
+        let _ = self.inner.epoch_request_queue_tx.send((previous_epoch_record, epoch_record)).await;
     }
 
-    /// Retreive the next request to down load an epoch pack file.
+    /// Retrieve the next request to down load an epoch pack file.
     /// Will not resolve until a request is ready and will only ever
     /// provide each request once.  Returns None when the underlying channel closes.
-    pub async fn get_next_epoch_pack_file_request(&self) -> Option<EpochRecord> {
+    pub async fn get_next_epoch_pack_file_request(&self) -> Option<(EpochRecord, EpochRecord)> {
         self.inner.epoch_request_queue_rx.lock().await.recv().await
     }
 }

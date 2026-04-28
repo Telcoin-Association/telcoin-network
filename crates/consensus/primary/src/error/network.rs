@@ -62,6 +62,9 @@ pub(crate) enum PrimaryNetworkError {
     /// No matching pending request for inbound stream.
     #[error("No pending request matches stream hash")]
     UnknownStreamRequest(BlockHash),
+    /// A requested pack file stream is not available.
+    #[error("Pack file is not available to stream for epoch {0}")]
+    StreamUnavailable(Epoch),
 }
 
 impl From<&PrimaryNetworkError> for Option<Penalty> {
@@ -122,6 +125,7 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
             | PrimaryNetworkError::PeerNotInCommittee(_)
             | PrimaryNetworkError::Storage(_)
             | PrimaryNetworkError::Timeout(_)
+            | PrimaryNetworkError::StreamUnavailable(_)
             | PrimaryNetworkError::Internal(_) => None,
         }
     }

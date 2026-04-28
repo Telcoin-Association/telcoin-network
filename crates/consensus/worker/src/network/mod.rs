@@ -7,7 +7,7 @@ use handler::RequestHandler;
 pub use message::{WorkerRequest, WorkerResponse};
 use parking_lot::Mutex;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -63,7 +63,7 @@ pub const MAX_PENDING_REQUESTS_PER_PEER: usize = 2;
 #[derive(Debug)]
 pub struct PendingBatchStream {
     /// The batch digests requested (looked up from DB when stream arrives).
-    batch_digests: HashSet<BlockHash>,
+    batch_digests: BTreeSet<BlockHash>,
     /// The epoch which produced these batches.
     epoch: Epoch,
     /// When this request was created (for timeout cleanup).
@@ -79,7 +79,7 @@ type PendingBatchRequestKey = (BlsPublicKey, B256);
 impl PendingBatchStream {
     /// Create a new pending batch stream.
     pub fn new(
-        batch_digests: HashSet<BlockHash>,
+        batch_digests: BTreeSet<BlockHash>,
         epoch: Epoch,
         permit: OwnedSemaphorePermit,
     ) -> Self {
@@ -91,12 +91,17 @@ impl PendingBatchStream {
 impl PendingBatchStream {
     /// Create a pending batch stream with a custom `created_at` for testing stale cleanup.
     pub fn new_with_created_at(
-        batch_digests: HashSet<BlockHash>,
+        batch_digests: BTreeSet<BlockHash>,
         epoch: Epoch,
         permit: OwnedSemaphorePermit,
         created_at: Instant,
     ) -> Self {
         Self { batch_digests, epoch, created_at, _permit: permit }
+    }
+
+    /// Read the `created_at` timestamp for testing the cleanup / replacement behavior.
+    pub fn created_at(&self) -> Instant {
+        self.created_at
     }
 }
 
@@ -280,13 +285,13 @@ where
     fn process_request_batches_stream(
         &self,
         peer: BlsPublicKey,
-        batch_digests: HashSet<B256>,
+        batch_digests: BTreeSet<B256>,
         epoch: Epoch,
         channel: ResponseChannel<WorkerResponse>,
         cancel: oneshot::Receiver<()>,
     ) {
         // cap batch digests to node's max — process as many as possible
-        let batch_digests: HashSet<B256> = if batch_digests.len() > MAX_BATCH_DIGESTS_PER_REQUEST {
+        let batch_digests: BTreeSet<B256> = if batch_digests.len() > MAX_BATCH_DIGESTS_PER_REQUEST {
             warn!(
                 target: "worker::network",
                 %peer,
@@ -323,8 +328,30 @@ where
                     } else {
                         let request_digest =
                             self.network_handle.generate_batch_request_id(&batch_digests);
-                        let pending = PendingBatchStream::new(batch_digests, epoch, permit);
-                        pending_map.insert((peer, request_digest), pending);
+                        // If the same peer re-requests the same batch set while a prior
+                        // entry is still pending, preserve the original `created_at` so
+                        // the cleanup timer is not rearmed. Without this, a peer could
+                        // hold a slot indefinitely by re-requesting before the 30s
+                        // timeout. A second stream open is still punished as a protocol
+                        // violation.
+                        let created_at = pending_map
+                            .get(&(peer, request_digest))
+                            .map(|p| p.created_at)
+                            .unwrap_or_else(Instant::now);
+                        let pending = PendingBatchStream {
+                            batch_digests,
+                            epoch,
+                            created_at,
+                            _permit: permit,
+                        };
+                        if pending_map.insert((peer, request_digest), pending).is_some() {
+                            debug!(
+                                target: "worker::network",
+                                %peer,
+                                ?request_digest,
+                                "pending batch stream request replaced with identical batch request"
+                            );
+                        }
                         debug!(
                             target: "worker::network",
                             %peer,

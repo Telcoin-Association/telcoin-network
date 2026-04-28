@@ -11,7 +11,7 @@ use crate::archive::{
         load_header::LoadHeaderError, open::OpenError, rename::RenameError,
     },
     fxhasher::FxHasher,
-    pack_iter::PackIter,
+    pack_iter::{PackIter, MAX_RECORD_SIZE},
 };
 
 use super::{crc::add_crc32, data_file::DataFile};
@@ -317,6 +317,9 @@ where
         self.data_file.read_exact(&mut val_size_buf)?;
         crc32_hasher.update(&val_size_buf);
         let val_size = u32::from_le_bytes(val_size_buf);
+        if val_size > MAX_RECORD_SIZE {
+            return Err(FetchError::RequestedSizeTooLarge(val_size, MAX_RECORD_SIZE));
+        }
         self.value_buffer.resize(val_size as usize, 0);
         self.data_file.read_exact(&mut self.value_buffer[..])?;
         crc32_hasher.update(&self.value_buffer);
@@ -341,6 +344,9 @@ where
         self.data_file.read_exact(&mut val_size_buf)?;
         crc32_hasher.update(&val_size_buf);
         let val_size = u32::from_le_bytes(val_size_buf);
+        if val_size > MAX_RECORD_SIZE {
+            return Err(FetchError::RequestedSizeTooLarge(val_size, MAX_RECORD_SIZE));
+        }
         self.value_buffer.resize(val_size as usize, 0);
         self.data_file.read_exact(&mut self.value_buffer[..])?;
         crc32_hasher.update(&self.value_buffer);

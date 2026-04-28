@@ -28,13 +28,13 @@ use tn_types::{
     Header, HeaderDigest, ProtocolSignature, Round, SignatureVerificationState, TnSender as _,
     Vote, B256,
 };
-use tokio::{io::AsyncReadExt, sync::Mutex as TokioMutex};
+use tokio::{io::AsyncReadExt, sync::Mutex as TokioMutex, time::timeout};
 use tracing::{debug, error, info, warn};
 
-/// Total timeout for sending all batches over a stream.
+/// Total timeout for sending a 16kb buffer of pack file data.
 /// Prevents slow-reader attacks where a peer accepts a stream but never reads.
-/// Set to 5 minutes as a an arbitrary upper bound on downloading a pack file.
-const SEND_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+/// Set to an arbitrary 10 seconds to read 16kb buffer.
+const SEND_STREAM_BUFFER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Map to hold vote info to detect invalid votes, equivocation and cache responses in case of
 /// rerequests.
@@ -914,23 +914,33 @@ where
 
     /// Send epoch pack file over stream.
     async fn send_epoch_over_stream<S>(
-        stream: &mut S,
+        mut stream: S,
         consensus_chain: &ConsensusChain,
         epoch: Epoch,
+        buffer_timeout: Duration,
+        peer: BlsPublicKey,
     ) -> PrimaryNetworkResult<()>
     where
         S: AsyncWrite + Unpin + Send,
     {
         let mut bytes = vec![0_u8; 16 * 1024]; // Use a 16kb read buffer.
-        if let Ok(mut epoch_stream) = consensus_chain.get_epoch_stream(epoch).await {
-            loop {
-                let n = epoch_stream.read(&mut bytes[..]).await?;
-                if n == 0 {
-                    break;
-                }
-                stream.write_all(&bytes[..n]).await?;
+        let mut epoch_stream = consensus_chain
+            .get_epoch_stream(epoch)
+            .await
+            .map_err(|_| PrimaryNetworkError::StreamUnavailable(epoch))?;
+        loop {
+            let n = epoch_stream.read(&mut bytes[..]).await?;
+            if n == 0 {
+                break;
             }
+            timeout(buffer_timeout, stream.write_all(&bytes[..n])).await??;
         }
+
+        // attempt to close the stream gracefully
+        if let Err(e) = stream.close().await {
+            tracing::warn!(target: "primary::network", %peer, %epoch, ?e, "stream close failed");
+        }
+
         Ok(())
     }
 
@@ -939,7 +949,7 @@ where
         &self,
         peer: BlsPublicKey,
         pending_request: Option<PendingEpochStream>,
-        mut stream: Stream,
+        stream: Stream,
         request_digest: B256,
         consensus_chain: &ConsensusChain,
     ) -> PrimaryNetworkResult<()> {
@@ -965,24 +975,16 @@ where
         );
 
         // set timeout to prevent slow-read attack
-        match tokio::time::timeout(
-            SEND_STREAM_TIMEOUT,
-            Self::send_epoch_over_stream(&mut stream, consensus_chain, request.epoch),
+        Self::send_epoch_over_stream(
+            stream,
+            consensus_chain,
+            request.epoch,
+            SEND_STREAM_BUFFER_TIMEOUT,
+            peer,
         )
         .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                warn!(target: "primary::network", %peer, ?e, "failed to send epoch over stream");
-            }
-            Err(_elapsed) => {
-                warn!(target: "primary::network", %peer, ?request_digest, "sending epoch stream timed out");
-            }
-        }
-
-        // attempt to close the stream gracefully
-        let _ = stream.close().await;
-
-        Ok(())
+        .inspect_err(
+            |e| warn!(target: "primary::network", %peer, ?e, "failed to send epoch over stream"),
+        )
     }
 }

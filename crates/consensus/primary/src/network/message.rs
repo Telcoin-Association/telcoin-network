@@ -252,9 +252,6 @@ pub enum PrimaryResponse {
     RequestEpochStream {
         /// Whether the request is accepted.
         ack: bool,
-        // The peer to stream from.
-        // Used when requesting a stream from any peer.
-        peer: BlsPublicKey,
     },
 }
 
@@ -287,6 +284,7 @@ impl PrimaryResponse {
             | PrimaryNetworkError::UnknownConsensusHeaderCert(_)
             | PrimaryNetworkError::Timeout(_)
             | PrimaryNetworkError::UnknownStreamRequest(_)
+            | PrimaryNetworkError::StreamUnavailable(_)
             | PrimaryNetworkError::InvalidEpochRequest => {
                 Self::Error(PrimaryRPCError(error.to_string()))
             }

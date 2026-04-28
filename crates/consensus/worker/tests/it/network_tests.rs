@@ -1,10 +1,10 @@
 //! Test network handler tests.
 
 use assert_matches::assert_matches;
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::BTreeSet, sync::Arc};
 use tn_batch_validator::NoopBatchValidator;
 use tn_network_libp2p::{
-    types::{NetworkCommand, NetworkHandle},
+    types::{NetworkCommand, NetworkHandle, NetworkResponseMessage},
     GossipMessage, Penalty, TopicHash,
 };
 use tn_storage::mem_db::MemDatabase;
@@ -138,10 +138,13 @@ async fn test_batch_gossip_triggers_stream_request() {
                 match request {
                     WorkerRequest::RequestBatchesStream { batch_digests, epoch: _ } => {
                         // Verify the stream request contains the correct digest
-                        assert_eq!(batch_digests, HashSet::from([batch_digest]));
+                        assert_eq!(batch_digests, BTreeSet::from([batch_digest]));
                         // Reject to end the test (no actual stream setup in unit test)
                         reply
-                            .send(Ok(WorkerResponse::RequestBatchesStream { ack: false }))
+                            .send(Ok(NetworkResponseMessage {
+                                peer,
+                                result: WorkerResponse::RequestBatchesStream { ack: false },
+                            }))
                             .expect("reply sent");
                         // Test passes - we verified the stream request was sent
                         break;
@@ -186,10 +189,13 @@ async fn test_batch_gossip_stream_accepted_opens_stream() {
                 assert_eq!(peer, expected_peer);
                 match request {
                     WorkerRequest::RequestBatchesStream { batch_digests, epoch: _ } => {
-                        assert_eq!(batch_digests, HashSet::from([batch_digest]));
+                        assert_eq!(batch_digests, BTreeSet::from([batch_digest]));
                         // Accept the stream request
                         reply
-                            .send(Ok(WorkerResponse::RequestBatchesStream { ack: true }))
+                            .send(Ok(NetworkResponseMessage {
+                                peer,
+                                result: WorkerResponse::RequestBatchesStream { ack: true },
+                            }))
                             .expect("reply sent");
                         stream_request_acked = true;
                     }
@@ -255,7 +261,7 @@ async fn test_request_batches_no_peers() {
         }
     });
 
-    let mut digests = HashSet::from([B256::random()]);
+    let mut digests = BTreeSet::from([B256::random()]);
     let result = handle.pub_request_batches(&mut digests).await;
     // no peers → returns Ok(empty)
     assert!(result.unwrap().is_empty());
@@ -285,7 +291,10 @@ async fn test_request_batches_peer_rejects_tries_next() {
                     if let WorkerRequest::RequestBatchesStream { .. } = request {
                         // both peers reject
                         reply
-                            .send(Ok(WorkerResponse::RequestBatchesStream { ack: false }))
+                            .send(Ok(NetworkResponseMessage {
+                                peer: peer1,
+                                result: WorkerResponse::RequestBatchesStream { ack: false },
+                            }))
                             .expect("send reject");
                     }
                 }
@@ -294,7 +303,7 @@ async fn test_request_batches_peer_rejects_tries_next() {
         }
     });
 
-    let mut digests = HashSet::from([B256::random()]);
+    let mut digests = BTreeSet::from([B256::random()]);
     let result = handle.pub_request_batches(&mut digests).await;
     // all peers rejected → error
     assert!(result.is_err());
@@ -308,14 +317,14 @@ async fn test_request_digest_is_deterministic() {
 
     let d1 = B256::random();
     let d2 = B256::random();
-    let digests = HashSet::from([d1, d2]);
+    let digests = BTreeSet::from([d1, d2]);
 
     let id1 = handle.pub_generate_batch_request_id(&digests);
     let id2 = handle.pub_generate_batch_request_id(&digests);
     assert_eq!(id1, id2, "same digests should produce same request id");
 
     // different digests produce different id
-    let other_digests = HashSet::from([B256::random()]);
+    let other_digests = BTreeSet::from([B256::random()]);
     let id3 = handle.pub_generate_batch_request_id(&other_digests);
     assert_ne!(id1, id3, "different digests should produce different request id");
 }
@@ -325,7 +334,7 @@ async fn test_request_digest_is_deterministic() {
 async fn test_pending_request_stream_correlation() {
     let d1 = B256::random();
     let d2 = B256::random();
-    let batch_digests: HashSet<B256> = HashSet::from([d1, d2]);
+    let batch_digests: BTreeSet<B256> = BTreeSet::from([d1, d2]);
 
     let task_manager = TaskManager::default();
     let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
@@ -354,7 +363,8 @@ async fn test_pending_request_stream_correlation() {
 async fn test_stream_error_penalties() {
     // Fatal penalties
     let cases_fatal = vec![
-        WorkerNetworkError::UnknownStreamRequest(B256::random()),
+        WorkerNetworkError::InvalidTopic,
+        WorkerNetworkError::Bcs(bcs::Error::Eof),
         WorkerNetworkError::TooManyBatches { expected: 1, received: 5 },
         WorkerNetworkError::UnexpectedBatch(B256::random()),
         WorkerNetworkError::DuplicateBatch(B256::random()),
@@ -413,7 +423,10 @@ async fn test_request_batches_truncates_oversized_digests() {
                         );
                         // reject to end the test
                         reply
-                            .send(Ok(WorkerResponse::RequestBatchesStream { ack: false }))
+                            .send(Ok(NetworkResponseMessage {
+                                peer: peer1,
+                                result: WorkerResponse::RequestBatchesStream { ack: false },
+                            }))
                             .expect("send reject");
                     }
                 }
@@ -423,7 +436,7 @@ async fn test_request_batches_truncates_oversized_digests() {
     });
 
     // create 600 digests (exceeds the 500 cap)
-    let mut digests: HashSet<B256> = (0..600u64)
+    let mut digests: BTreeSet<B256> = (0..600u64)
         .map(|i| {
             let mut bytes = [0u8; 32];
             bytes[..8].copy_from_slice(&i.to_le_bytes());
@@ -469,7 +482,7 @@ async fn test_semaphore_release_on_pending_drop() {
 
     // acquire the only permit via PendingBatchStream
     let permit = semaphore.clone().try_acquire_owned().expect("permit available");
-    let pending = PendingBatchStream::new(HashSet::from([B256::random()]), 0, permit);
+    let pending = PendingBatchStream::new(BTreeSet::from([B256::random()]), 0, permit);
 
     // semaphore exhausted
     assert!(semaphore.clone().try_acquire_owned().is_err(), "should be exhausted");
@@ -499,7 +512,7 @@ async fn test_per_peer_limit_rejects_excess() {
         let digest = B256::random();
         pending_map.insert(
             (peer_a, digest),
-            PendingBatchStream::new(HashSet::from([B256::random()]), 0, permit),
+            PendingBatchStream::new(BTreeSet::from([B256::random()]), 0, permit),
         );
     }
 
@@ -514,7 +527,7 @@ async fn test_per_peer_limit_rejects_excess() {
     let permit = semaphore.clone().try_acquire_owned().expect("global permits remain");
     pending_map.insert(
         (peer_b, B256::random()),
-        PendingBatchStream::new(HashSet::from([B256::random()]), 0, permit),
+        PendingBatchStream::new(BTreeSet::from([B256::random()]), 0, permit),
     );
     assert_eq!(pending_map.keys().filter(|(p, _)| *p == peer_b).count(), 1);
 }
@@ -535,7 +548,7 @@ async fn test_stale_cleanup_releases_permits() {
     // create 2 stale entries (created_at past PENDING_REQUEST_TIMEOUT)
     let stale_time =
         std::time::Instant::now() - PENDING_REQUEST_TIMEOUT - std::time::Duration::from_secs(1);
-    let mut stale_keys = HashSet::new();
+    let mut stale_keys = BTreeSet::new();
     for _ in 0..2 {
         let permit = semaphore.clone().try_acquire_owned().expect("permit available");
         let digest = B256::random();
@@ -543,7 +556,7 @@ async fn test_stale_cleanup_releases_permits() {
         pending_map.insert(
             (peer, digest),
             PendingBatchStream::new_with_created_at(
-                HashSet::from([B256::random()]),
+                BTreeSet::from([B256::random()]),
                 0,
                 permit,
                 stale_time,
@@ -556,7 +569,7 @@ async fn test_stale_cleanup_releases_permits() {
     let fresh_digest = B256::random();
     pending_map.insert(
         (peer, fresh_digest),
-        PendingBatchStream::new(HashSet::from([B256::random()]), 0, permit),
+        PendingBatchStream::new(BTreeSet::from([B256::random()]), 0, permit),
     );
 
     // 3 permits consumed
@@ -602,7 +615,7 @@ async fn test_concurrent_capacity_exactly_max() {
                 first_key = Some(key);
             }
             pending_map
-                .insert(key, PendingBatchStream::new(HashSet::from([B256::random()]), 0, permit));
+                .insert(key, PendingBatchStream::new(BTreeSet::from([B256::random()]), 0, permit));
         }
     }
 
@@ -650,12 +663,18 @@ async fn test_retry_succeeds_after_initial_rejection() {
                         if connected_peers_count <= 1 {
                             // first attempt: reject
                             reply
-                                .send(Ok(WorkerResponse::RequestBatchesStream { ack: false }))
+                                .send(Ok(NetworkResponseMessage {
+                                    peer: peer1,
+                                    result: WorkerResponse::RequestBatchesStream { ack: false },
+                                }))
                                 .expect("send reject");
                         } else {
                             // second attempt: accept
                             reply
-                                .send(Ok(WorkerResponse::RequestBatchesStream { ack: true }))
+                                .send(Ok(NetworkResponseMessage {
+                                    peer: peer1,
+                                    result: WorkerResponse::RequestBatchesStream { ack: true },
+                                }))
                                 .expect("send accept");
                             stream_accepted = true;
                         }
@@ -674,7 +693,7 @@ async fn test_retry_succeeds_after_initial_rejection() {
         }
     });
 
-    let mut digests = HashSet::from([B256::random()]);
+    let mut digests = BTreeSet::from([B256::random()]);
     // request_batches will retry — we don't care about the final result,
     // we care that the retry mechanism reached the acceptance path
     let handle_task = tokio::spawn(async move {
@@ -725,8 +744,11 @@ async fn test_request_batches_peer_fallback_preserves_digests() {
                         );
                         // reject to trigger fallback to next peer
                         reply
-                            .send(Ok(WorkerResponse::RequestBatchesStream { ack: false }))
-                            .expect("send reject");
+                            .send(Ok(NetworkResponseMessage {
+                                peer: peer2,
+                                result: WorkerResponse::RequestBatchesStream { ack: false },
+                            }))
+                            .unwrap();
                     }
                 }
                 _ => {}
@@ -734,9 +756,80 @@ async fn test_request_batches_peer_fallback_preserves_digests() {
         }
     });
 
-    let mut digests: HashSet<B256> = (0..expected_count).map(|_| B256::random()).collect();
+    let mut digests: BTreeSet<B256> = (0..expected_count).map(|_| B256::random()).collect();
 
     let result = handle.pub_request_batches(&mut digests).await;
     // all peers rejected → error
     assert!(result.is_err());
+}
+
+/// A peer that re-requests the same batch set while an entry is already pending must not
+/// be able to reset the cleanup timer. If the replacement path rearmed `created_at`, a
+/// peer could re-request every 20s and hold a slot forever. This test exercises the
+/// preservation logic used by `process_request_batches_stream` and verifies the entry is
+/// evicted on schedule relative to the *original* insertion time.
+#[tokio::test]
+async fn test_pending_batch_stream_replacement_preserves_created_at() {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_BATCH_STREAMS));
+    let mut pending_map: std::collections::HashMap<(BlsPublicKey, B256), PendingBatchStream> =
+        std::collections::HashMap::new();
+
+    let task_manager = TaskManager::default();
+    let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
+
+    let peer = BlsPublicKey::default();
+    let batch_digests: BTreeSet<B256> = BTreeSet::from([B256::random(), B256::random()]);
+    let request_digest = handle.pub_generate_batch_request_id(&batch_digests);
+    let key = (peer, request_digest);
+    let epoch = 7u32;
+
+    // initial insertion at T0, where T0 is just past the cleanup horizon so we can
+    // assert eviction without waiting on wall-clock time
+    let t0 =
+        std::time::Instant::now() - PENDING_REQUEST_TIMEOUT - std::time::Duration::from_secs(1);
+    let permit = semaphore.clone().try_acquire_owned().expect("permit available");
+    pending_map.insert(
+        key,
+        PendingBatchStream::new_with_created_at(batch_digests.clone(), epoch, permit, t0),
+    );
+
+    // simulate a re-request: production code looks up the existing entry's
+    // `created_at` and reuses it when building the replacement
+    let new_permit = semaphore.clone().try_acquire_owned().expect("permit available");
+    let preserved_created_at =
+        pending_map.get(&key).map(|p| p.created_at()).unwrap_or_else(std::time::Instant::now);
+    let replacement = PendingBatchStream::new_with_created_at(
+        batch_digests.clone(),
+        epoch,
+        new_permit,
+        preserved_created_at,
+    );
+    assert!(pending_map.insert(key, replacement).is_some(), "expected replacement");
+
+    // the replacement must carry the original `created_at`, not a fresh one
+    let after = pending_map.get(&key).expect("entry present after replacement");
+    assert_eq!(
+        after.created_at(),
+        t0,
+        "replacement must preserve original created_at to prevent cleanup-timer reset"
+    );
+
+    // cleanup mirrors `WorkerNetwork::cleanup_stale_pending_requests`: entries whose
+    // age >= PENDING_REQUEST_TIMEOUT must be evicted. Since created_at is t0 (stale),
+    // the entry must drop.
+    let now = std::time::Instant::now();
+    pending_map
+        .retain(|_, pending| now.duration_since(pending.created_at()) < PENDING_REQUEST_TIMEOUT);
+
+    assert!(
+        pending_map.is_empty(),
+        "stale entry must be evicted by cleanup even though it was 'replaced' moments ago"
+    );
+
+    // and the permit must have returned to the semaphore
+    assert_eq!(
+        semaphore.available_permits(),
+        MAX_CONCURRENT_BATCH_STREAMS,
+        "dropping the evicted pending entry must release its semaphore permit"
+    );
 }

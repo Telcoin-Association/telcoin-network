@@ -1,6 +1,6 @@
 //! Messages sent between workers.
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 use tn_network_libp2p::{PeerExchangeMap, TNMessage};
@@ -47,7 +47,7 @@ pub enum WorkerRequest {
     /// in the header for correlation.
     RequestBatchesStream {
         /// The batch digests being requested.
-        batch_digests: HashSet<BlockHash>,
+        batch_digests: BTreeSet<BlockHash>,
         /// The epoch these batches were produced.
         epoch: Epoch,
     },

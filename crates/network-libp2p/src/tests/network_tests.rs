@@ -270,7 +270,8 @@ async fn test_valid_req_restt() -> eyre::Result<()> {
     }
 
     // expect response
-    let response = timeout(max_time, response_from_peer).await?.expect("outbound id recv")?;
+    let NetworkResponseMessage { peer: _, result: response } =
+        timeout(max_time, response_from_peer).await?.expect("outbound id recv")?;
     assert_eq!(response, batch_res);
 
     Ok(())

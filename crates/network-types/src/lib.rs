@@ -5,7 +5,7 @@
 pub mod local;
 mod notify;
 pub use notify::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use tn_types::{Batch, BlockHash};
 
 // async_trait for object safety, get rid of when possible.
@@ -59,7 +59,7 @@ pub trait PrimaryToWorkerClient: Send + Sync + 'static {
     /// Fetch batches from local database or from peers.
     async fn fetch_batches(
         &self,
-        digests: HashSet<BlockHash>,
+        digests: BTreeSet<BlockHash>,
     ) -> eyre::Result<HashMap<BlockHash, Batch>>;
 }
 
@@ -78,7 +78,7 @@ impl PrimaryToWorkerClient for MockPrimaryToWorkerClient {
 
     async fn fetch_batches(
         &self,
-        _digests: HashSet<BlockHash>,
+        _digests: BTreeSet<BlockHash>,
     ) -> eyre::Result<HashMap<BlockHash, Batch>> {
         Ok(self.batches.clone())
     }
