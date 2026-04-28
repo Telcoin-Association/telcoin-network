@@ -4,7 +4,10 @@
 //! worker to interact with `ConsensusNetwork` within the worker's
 //! context.
 
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::{BTreeSet, HashSet},
+    time::Duration,
+};
 
 use futures::{AsyncRead, AsyncWriteExt as _};
 use tn_network_libp2p::{
@@ -102,7 +105,7 @@ impl WorkerNetworkHandle {
     /// to release. Returns `Ok` if any batches successfully fetched from peers.
     pub(crate) async fn request_batches(
         &self,
-        requested_digests: &mut HashSet<BlockHash>,
+        requested_digests: &mut BTreeSet<BlockHash>,
     ) -> NetworkResult<Vec<(BlockHash, Batch)>> {
         let mut all_batches = Vec::with_capacity(requested_digests.len());
 
@@ -207,7 +210,7 @@ impl WorkerNetworkHandle {
     async fn request_batches_from_peer(
         &self,
         peer: BlsPublicKey,
-        batch_digests: &HashSet<BlockHash>,
+        batch_digests: &BTreeSet<BlockHash>,
     ) -> NetworkResult<Vec<(BlockHash, Batch)>> {
         // sanity check - should never happen
         if batch_digests.is_empty() {
@@ -290,7 +293,7 @@ impl WorkerNetworkHandle {
     pub(crate) async fn read_and_validate_batches_with_timeout<S: AsyncRead + Unpin + Send>(
         &self,
         stream: &mut S,
-        requested_digests: &HashSet<BlockHash>,
+        requested_digests: &BTreeSet<BlockHash>,
     ) -> NetworkResult<Vec<(BlockHash, Batch)>> {
         // allocate reusable buffers
         //
@@ -399,7 +402,7 @@ impl WorkerNetworkHandle {
     /// Helper method to digest missing batch request before initiating stream.
     ///
     /// The digest is used to detect duplicate requests from peers.
-    pub(crate) fn generate_batch_request_id(&self, batch_digests: &HashSet<BlockHash>) -> B256 {
+    pub(crate) fn generate_batch_request_id(&self, batch_digests: &BTreeSet<BlockHash>) -> B256 {
         let mut hasher = tn_types::DefaultHashFunction::new();
         let bytes = encode(batch_digests);
         hasher.update(&bytes);
@@ -421,14 +424,14 @@ impl WorkerNetworkHandle {
     /// See [Self::request_batches].
     pub async fn pub_request_batches(
         &self,
-        requested_digests: &mut HashSet<BlockHash>,
+        requested_digests: &mut BTreeSet<BlockHash>,
     ) -> NetworkResult<Vec<(BlockHash, Batch)>> {
         self.request_batches(requested_digests).await
     }
 
     /// Publicly available for tests.
     /// See [Self::generate_batch_request_id].
-    pub fn pub_generate_batch_request_id(&self, batch_digests: &HashSet<BlockHash>) -> B256 {
+    pub fn pub_generate_batch_request_id(&self, batch_digests: &BTreeSet<BlockHash>) -> B256 {
         self.generate_batch_request_id(batch_digests)
     }
 }

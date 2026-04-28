@@ -7,7 +7,7 @@ use handler::RequestHandler;
 pub use message::{WorkerRequest, WorkerResponse};
 use parking_lot::Mutex;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -63,7 +63,7 @@ pub const MAX_PENDING_REQUESTS_PER_PEER: usize = 2;
 #[derive(Debug)]
 pub struct PendingBatchStream {
     /// The batch digests requested (looked up from DB when stream arrives).
-    batch_digests: HashSet<BlockHash>,
+    batch_digests: BTreeSet<BlockHash>,
     /// The epoch which produced these batches.
     epoch: Epoch,
     /// When this request was created (for timeout cleanup).
@@ -79,7 +79,7 @@ type PendingBatchRequestKey = (BlsPublicKey, B256);
 impl PendingBatchStream {
     /// Create a new pending batch stream.
     pub fn new(
-        batch_digests: HashSet<BlockHash>,
+        batch_digests: BTreeSet<BlockHash>,
         epoch: Epoch,
         permit: OwnedSemaphorePermit,
     ) -> Self {
@@ -91,7 +91,7 @@ impl PendingBatchStream {
 impl PendingBatchStream {
     /// Create a pending batch stream with a custom `created_at` for testing stale cleanup.
     pub fn new_with_created_at(
-        batch_digests: HashSet<BlockHash>,
+        batch_digests: BTreeSet<BlockHash>,
         epoch: Epoch,
         permit: OwnedSemaphorePermit,
         created_at: Instant,
@@ -280,13 +280,13 @@ where
     fn process_request_batches_stream(
         &self,
         peer: BlsPublicKey,
-        batch_digests: HashSet<B256>,
+        batch_digests: BTreeSet<B256>,
         epoch: Epoch,
         channel: ResponseChannel<WorkerResponse>,
         cancel: oneshot::Receiver<()>,
     ) {
         // cap batch digests to node's max — process as many as possible
-        let batch_digests: HashSet<B256> = if batch_digests.len() > MAX_BATCH_DIGESTS_PER_REQUEST {
+        let batch_digests: BTreeSet<B256> = if batch_digests.len() > MAX_BATCH_DIGESTS_PER_REQUEST {
             warn!(
                 target: "worker::network",
                 %peer,

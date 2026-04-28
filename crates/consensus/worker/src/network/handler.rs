@@ -6,7 +6,7 @@ use super::{
 };
 use crate::network::{stream_codec, PendingBatchStream};
 use futures::AsyncWriteExt as _;
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{GossipMessage, Stream};
 use tn_network_types::{WorkerOthersBatchMessage, WorkerToPrimaryClient};
@@ -73,7 +73,7 @@ where
                     // If batch is missing from db, then request from peer.
                     // If we are a CVV then we should already have it.
                     // This allows non-CVVs to pre fetch batches they will soon need.
-                    let mut missing = HashSet::from([batch_hash]);
+                    let mut missing = BTreeSet::from([batch_hash]);
                     match self.network_handle.request_batches(&mut missing).await {
                         Ok(batches) => {
                             if let Some((digest, batch)) = batches.first() {

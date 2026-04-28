@@ -1,7 +1,7 @@
 //! Test network handler tests.
 
 use assert_matches::assert_matches;
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::BTreeSet, sync::Arc};
 use tn_batch_validator::NoopBatchValidator;
 use tn_network_libp2p::{
     types::{NetworkCommand, NetworkHandle, NetworkResponseMessage},
@@ -137,7 +137,7 @@ async fn test_batch_gossip_triggers_stream_request() {
                 match request {
                     WorkerRequest::RequestBatchesStream { batch_digests, epoch: _ } => {
                         // Verify the stream request contains the correct digest
-                        assert_eq!(batch_digests, HashSet::from([batch_digest]));
+                        assert_eq!(batch_digests, BTreeSet::from([batch_digest]));
                         // Reject to end the test (no actual stream setup in unit test)
                         reply
                             .send(Ok(NetworkResponseMessage {
@@ -187,7 +187,7 @@ async fn test_batch_gossip_stream_accepted_opens_stream() {
                 assert_eq!(peer, expected_peer);
                 match request {
                     WorkerRequest::RequestBatchesStream { batch_digests, epoch: _ } => {
-                        assert_eq!(batch_digests, HashSet::from([batch_digest]));
+                        assert_eq!(batch_digests, BTreeSet::from([batch_digest]));
                         // Accept the stream request
                         reply
                             .send(Ok(NetworkResponseMessage {
@@ -259,7 +259,7 @@ async fn test_request_batches_no_peers() {
         }
     });
 
-    let mut digests = HashSet::from([B256::random()]);
+    let mut digests = BTreeSet::from([B256::random()]);
     let result = handle.pub_request_batches(&mut digests).await;
     // no peers → returns Ok(empty)
     assert!(result.unwrap().is_empty());
@@ -301,7 +301,7 @@ async fn test_request_batches_peer_rejects_tries_next() {
         }
     });
 
-    let mut digests = HashSet::from([B256::random()]);
+    let mut digests = BTreeSet::from([B256::random()]);
     let result = handle.pub_request_batches(&mut digests).await;
     // all peers rejected → error
     assert!(result.is_err());
@@ -315,14 +315,14 @@ async fn test_request_digest_is_deterministic() {
 
     let d1 = B256::random();
     let d2 = B256::random();
-    let digests = HashSet::from([d1, d2]);
+    let digests = BTreeSet::from([d1, d2]);
 
     let id1 = handle.pub_generate_batch_request_id(&digests);
     let id2 = handle.pub_generate_batch_request_id(&digests);
     assert_eq!(id1, id2, "same digests should produce same request id");
 
     // different digests produce different id
-    let other_digests = HashSet::from([B256::random()]);
+    let other_digests = BTreeSet::from([B256::random()]);
     let id3 = handle.pub_generate_batch_request_id(&other_digests);
     assert_ne!(id1, id3, "different digests should produce different request id");
 }
@@ -332,7 +332,7 @@ async fn test_request_digest_is_deterministic() {
 async fn test_pending_request_stream_correlation() {
     let d1 = B256::random();
     let d2 = B256::random();
-    let batch_digests: HashSet<B256> = HashSet::from([d1, d2]);
+    let batch_digests: BTreeSet<B256> = BTreeSet::from([d1, d2]);
 
     let task_manager = TaskManager::default();
     let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
@@ -434,7 +434,7 @@ async fn test_request_batches_truncates_oversized_digests() {
     });
 
     // create 600 digests (exceeds the 500 cap)
-    let mut digests: HashSet<B256> = (0..600u64)
+    let mut digests: BTreeSet<B256> = (0..600u64)
         .map(|i| {
             let mut bytes = [0u8; 32];
             bytes[..8].copy_from_slice(&i.to_le_bytes());
@@ -480,7 +480,7 @@ async fn test_semaphore_release_on_pending_drop() {
 
     // acquire the only permit via PendingBatchStream
     let permit = semaphore.clone().try_acquire_owned().expect("permit available");
-    let pending = PendingBatchStream::new(HashSet::from([B256::random()]), 0, permit);
+    let pending = PendingBatchStream::new(BTreeSet::from([B256::random()]), 0, permit);
 
     // semaphore exhausted
     assert!(semaphore.clone().try_acquire_owned().is_err(), "should be exhausted");
@@ -510,7 +510,7 @@ async fn test_per_peer_limit_rejects_excess() {
         let digest = B256::random();
         pending_map.insert(
             (peer_a, digest),
-            PendingBatchStream::new(HashSet::from([B256::random()]), 0, permit),
+            PendingBatchStream::new(BTreeSet::from([B256::random()]), 0, permit),
         );
     }
 
@@ -525,7 +525,7 @@ async fn test_per_peer_limit_rejects_excess() {
     let permit = semaphore.clone().try_acquire_owned().expect("global permits remain");
     pending_map.insert(
         (peer_b, B256::random()),
-        PendingBatchStream::new(HashSet::from([B256::random()]), 0, permit),
+        PendingBatchStream::new(BTreeSet::from([B256::random()]), 0, permit),
     );
     assert_eq!(pending_map.keys().filter(|(p, _)| *p == peer_b).count(), 1);
 }
@@ -546,7 +546,7 @@ async fn test_stale_cleanup_releases_permits() {
     // create 2 stale entries (created_at past PENDING_REQUEST_TIMEOUT)
     let stale_time =
         std::time::Instant::now() - PENDING_REQUEST_TIMEOUT - std::time::Duration::from_secs(1);
-    let mut stale_keys = HashSet::new();
+    let mut stale_keys = BTreeSet::new();
     for _ in 0..2 {
         let permit = semaphore.clone().try_acquire_owned().expect("permit available");
         let digest = B256::random();
@@ -554,7 +554,7 @@ async fn test_stale_cleanup_releases_permits() {
         pending_map.insert(
             (peer, digest),
             PendingBatchStream::new_with_created_at(
-                HashSet::from([B256::random()]),
+                BTreeSet::from([B256::random()]),
                 0,
                 permit,
                 stale_time,
@@ -567,7 +567,7 @@ async fn test_stale_cleanup_releases_permits() {
     let fresh_digest = B256::random();
     pending_map.insert(
         (peer, fresh_digest),
-        PendingBatchStream::new(HashSet::from([B256::random()]), 0, permit),
+        PendingBatchStream::new(BTreeSet::from([B256::random()]), 0, permit),
     );
 
     // 3 permits consumed
@@ -613,7 +613,7 @@ async fn test_concurrent_capacity_exactly_max() {
                 first_key = Some(key);
             }
             pending_map
-                .insert(key, PendingBatchStream::new(HashSet::from([B256::random()]), 0, permit));
+                .insert(key, PendingBatchStream::new(BTreeSet::from([B256::random()]), 0, permit));
         }
     }
 
@@ -691,7 +691,7 @@ async fn test_retry_succeeds_after_initial_rejection() {
         }
     });
 
-    let mut digests = HashSet::from([B256::random()]);
+    let mut digests = BTreeSet::from([B256::random()]);
     // request_batches will retry — we don't care about the final result,
     // we care that the retry mechanism reached the acceptance path
     let handle_task = tokio::spawn(async move {
@@ -754,7 +754,7 @@ async fn test_request_batches_peer_fallback_preserves_digests() {
         }
     });
 
-    let mut digests: HashSet<B256> = (0..expected_count).map(|_| B256::random()).collect();
+    let mut digests: BTreeSet<B256> = (0..expected_count).map(|_| B256::random()).collect();
 
     let result = handle.pub_request_batches(&mut digests).await;
     // all peers rejected → error
@@ -776,7 +776,7 @@ async fn test_pending_batch_stream_replacement_preserves_created_at() {
     let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
 
     let peer = BlsPublicKey::default();
-    let batch_digests: HashSet<B256> = HashSet::from([B256::random(), B256::random()]);
+    let batch_digests: BTreeSet<B256> = BTreeSet::from([B256::random(), B256::random()]);
     let request_digest = handle.pub_generate_batch_request_id(&batch_digests);
     let key = (peer, request_digest);
     let epoch = 7u32;
