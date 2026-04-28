@@ -19,7 +19,7 @@ use crate::archive::{
 /// Provide an upper bound on a record size.
 /// This should be large enough for any record but provide
 /// an upper bound on memory allocations for a record.
-const MAX_RECORD_SIZE: u32 = 16 * 1024 * 1024;
+pub(crate) const MAX_RECORD_SIZE: u32 = 16 * 1024 * 1024;
 
 /// Iterate over a Db's key, value pairs in insert order.
 /// This iterator is "raw", it does not use any indexes just the data file.

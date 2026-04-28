@@ -393,6 +393,9 @@ impl ConsensusChain {
                 pack.persist().await?;
                 match pack.latest_consensus_header().await {
                     Some(last_header) => {
+                        // The chain was verified as it was streamed.  So if the final block matches
+                        // the expected final_consensus then the entire pack
+                        // file should be valid.
                         if epoch_record.final_consensus.number != last_header.number
                             || epoch_record.final_consensus.hash != last_header.digest()
                         {
