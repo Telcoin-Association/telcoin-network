@@ -10,7 +10,7 @@ use tn_types::{BlockHash, Epoch, SealedBatch};
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum WorkerGossip {
     /// A new is available.
-    Batch(BlockHash),
+    Batch(Epoch, BlockHash),
     /// Transaction- published so a committee member can include in a batch.
     Txn(Vec<u8>),
 }

@@ -4,7 +4,10 @@ use super::{
     handle::WorkerNetworkHandle,
     message::WorkerGossip,
 };
-use crate::network::{stream_codec, PendingBatchStream};
+use crate::{
+    batch_fetcher::get_batch_local_cache,
+    network::{stream_codec, PendingBatchStream},
+};
 use futures::AsyncWriteExt as _;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use tn_config::ConsensusConfig;
@@ -62,14 +65,25 @@ where
         let gossip = try_decode(data)?;
 
         match gossip {
-            WorkerGossip::Batch(batch_hash) => {
+            WorkerGossip::Batch(epoch, batch_hash) => {
                 ensure!(
                     topic.to_string().eq(&tn_config::LibP2pConfig::worker_batch_topic()),
                     WorkerNetworkError::InvalidTopic
                 );
+                let my_epoch = self.consensus_config.epoch();
+                // We are probably behind.  Do not bother to fetch and store this Batch now, it will
+                // most likely be removed before we can use it and will be fetched
+                // later when needed.
+                ensure!(my_epoch == epoch, WorkerNetworkError::BatchEpochMismatch(epoch, my_epoch));
                 // Retrieve the batch...
                 let store = self.consensus_config.node_storage();
-                if !matches!(store.get::<NodeBatchesCache>(&batch_hash), Ok(Some(_))) {
+                // Since we are precaching Batches for the current epoch we only need to check if it
+                // is in the local cache. There should not have been an opertunity
+                // for it to be in the consensus chain yet.
+                if !matches!(
+                    get_batch_local_cache(batch_hash, self.consensus_config.node_storage(),),
+                    Ok(Some(_))
+                ) {
                     // If batch is missing from db, then request from peer.
                     // If we are a CVV then we should already have it.
                     // This allows non-CVVs to pre fetch batches they will soon need.

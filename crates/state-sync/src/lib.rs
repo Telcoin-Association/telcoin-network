@@ -13,13 +13,9 @@ use tn_test_utils_committee as _;
 use std::time::Duration;
 use tn_config::ConsensusConfig;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode};
-use tn_storage::{
-    consensus::ConsensusChain,
-    tables::{ConsensusHeaderCache, NodeBatchesCache},
-};
+use tn_storage::{consensus::ConsensusChain, tables::ConsensusHeaderCache};
 use tn_types::{
-    AuthorityIdentifier, BlockHash, ConsensusHeader, ConsensusOutput, Database, Epoch, TaskSpawner,
-    TnSender,
+    BlockHash, ConsensusHeader, ConsensusOutput, Database, Epoch, TaskSpawner, TnSender,
 };
 use tracing::{debug, error, info, warn};
 
@@ -103,30 +99,17 @@ pub fn spawn_state_sync<DB: Database>(
     }
 }
 
-/// Write the consensus header and it's component transaction batches to the consensus DB.
+/// Write the consensus header and it's component transaction batches to the consensus chain.
 ///
 /// An error here indicates a critical node failure.
 /// Note, if this returns an error then the DB could not be written to- this is probably fatal.
-pub async fn save_consensus<DB: Database>(
-    db: &DB,
+pub async fn save_consensus(
     consensus_output: ConsensusOutput,
-    authority_id: &Option<AuthorityIdentifier>,
     consensus_chain: &mut ConsensusChain,
 ) -> eyre::Result<()> {
-    let sub_dag = consensus_output.sub_dag().clone();
     consensus_chain.save_consensus_output(consensus_output).await?;
-    if let Some(authority_id) = authority_id {
-        // If we are a validator we need to clear any of our batches from our cache that are
-        // now part of consensus.
-        for cert in &sub_dag.certificates {
-            if cert.header().author() == authority_id {
-                for batch_hash in cert.header().payload().keys() {
-                    let _ = db.remove::<NodeBatchesCache>(batch_hash);
-                }
-            }
-        }
-    }
-    // Make sure we have persisted the consensus output before we execute.
+    // Note it is ok to leave batches in NodeBatchesCache until the epoch ends (when the table is
+    // cleared). Make sure we have persisted the consensus output before we execute.
     consensus_chain.persist_current().await?;
     Ok(())
 }
