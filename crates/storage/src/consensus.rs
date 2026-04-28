@@ -377,8 +377,15 @@ impl ConsensusChain {
         let import_path = ImportPath::new(&self.base_path, epoch);
         // Store our files out of the way while we import so we don't use them until ready.
         let path = import_path.path();
-        let res_pack =
-            ConsensusPack::stream_import(path, stream, epoch, previous_epoch, timeout).await;
+        let res_pack = ConsensusPack::stream_import(
+            path,
+            stream,
+            epoch,
+            previous_epoch,
+            epoch_record.final_consensus.number,
+            timeout,
+        )
+        .await;
         match res_pack {
             Ok(pack) => {
                 let base_dir = self.base_path.join(format!("epoch-{epoch}"));

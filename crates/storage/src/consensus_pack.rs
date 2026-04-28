@@ -3,7 +3,7 @@
 
 use std::{
     cmp::max,
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     error::Error,
     fmt::Display,
     hash::BuildHasherDefault,
@@ -18,8 +18,8 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tn_types::{
     gas_accumulator::RewardsCounter, AuthorityIdentifier, Batch, BlockHash, BlockNumHash,
-    CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput, Epoch,
-    EpochRecord, Round, B256,
+    BlsPublicKey, CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput,
+    Epoch, EpochRecord, Round, B256,
 };
 use tokio::{
     io::AsyncRead,
@@ -256,12 +256,21 @@ impl ConsensusPack {
         stream: R,
         epoch: Epoch,
         previous_epoch: &EpochRecord,
+        final_consensus_number: u64,
         timeout: Duration,
     ) -> Result<ConsensusPack, PackError> {
         let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
         let (tx_error, error) = watch::channel(None);
-        let inner = Inner::stream_import(path, stream, epoch, previous_epoch, timeout).await?;
+        let inner = Inner::stream_import(
+            path,
+            stream,
+            epoch,
+            previous_epoch,
+            final_consensus_number,
+            timeout,
+        )
+        .await?;
         let handle = std::thread::spawn(move || {
             run_pack_loop(inner, rx, tx_error);
         });
@@ -669,12 +678,41 @@ impl Inner {
         Ok(Self { data, consensus_idx, consensus_digests, batch_digests, epoch_meta })
     }
 
+    /// Verify a streamed EpochMeta record is valid.
+    fn verify_epoch_meta(
+        epoch: Epoch,
+        previous_epoch: &EpochRecord,
+        epoch_meta: &EpochMeta,
+    ) -> Result<(), PackError> {
+        if epoch != epoch_meta.epoch {
+            return Err(PackError::InvalidEpoch);
+        }
+        let start_consensus_number =
+            if epoch == 0 { 1 } else { previous_epoch.final_consensus.number + 1 };
+        if start_consensus_number != epoch_meta.start_consensus_number {
+            return Err(PackError::InvalidEpoch);
+        }
+        if previous_epoch.final_state != epoch_meta.genesis_exec_state {
+            return Err(PackError::InvalidEpoch);
+        }
+        if previous_epoch.final_consensus != epoch_meta.genesis_consensus {
+            return Err(PackError::InvalidEpoch);
+        }
+        let committee: BTreeSet<BlsPublicKey> =
+            previous_epoch.next_committee.iter().copied().collect();
+        if epoch_meta.committee.bls_keys() != committee {
+            return Err(PackError::InvalidEpoch);
+        }
+        Ok(())
+    }
+
     /// Create a new set of epoch static files to write consensus output into.
     async fn stream_import<P: AsRef<Path>, R: AsyncRead + Unpin>(
         path: P,
         stream: R,
         epoch: Epoch,
         previous_epoch: &EpochRecord,
+        final_consensus_number: u64,
         timeout: Duration,
     ) -> Result<Self, PackError> {
         /// Private helper to read the next record from a pack iterator or timeout if it takes
@@ -701,9 +739,7 @@ impl Inner {
         } else {
             return Err(PackError::NotEpoch);
         };
-        if epoch != epoch_meta.epoch {
-            return Err(PackError::InvalidEpoch);
-        }
+        Self::verify_epoch_meta(epoch, previous_epoch, &epoch_meta)?;
         data.append(&PackRecord::EpochMeta(epoch_meta.clone()))
             .map_err(|e| PackError::Append(e.to_string()))?;
         let mut consensus_idx = PositionIndex::open_pdx_file(
@@ -765,6 +801,12 @@ impl Inner {
                     let consensus_digest = consensus_header.digest();
                     parent_digest = consensus_digest;
                     let consensus_number = consensus_header.number;
+                    if consensus_number > final_consensus_number {
+                        return Err(PackError::InvalidConsensusNumber(
+                            consensus_number,
+                            final_consensus_number,
+                        ));
+                    }
                     let position = data
                         .append(&PackRecord::Consensus(consensus_header))
                         .map_err(|e| PackError::Append(e.to_string()))?;
@@ -1341,6 +1383,7 @@ pub(crate) mod test {
                 stream,
                 0,
                 &previous_epoch,
+                num_outputs as u64 * 2,
                 Duration::from_secs(5),
             )
             .await

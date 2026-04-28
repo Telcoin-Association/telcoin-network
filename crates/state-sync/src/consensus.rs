@@ -88,6 +88,42 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
     network: PrimaryNetworkHandle,
     consensus_chain: ConsensusChain,
 ) -> eyre::Result<()> {
+    /// Attempt to request epoch packs for every epoch from current_fetch_epoch to latest epoch
+    /// record.
+    async fn request_epochs(
+        current_fetch_epoch: &mut Epoch,
+        consensus_chain: &ConsensusChain,
+        consensus_bus: &ConsensusBusApp,
+        last_gossipped_epoch: Option<Epoch>,
+    ) {
+        // If we still have epochs to fetch then add to the queue until we are out of epoch records.
+        let previous_epoch = current_fetch_epoch.saturating_sub(1);
+        if let Some(mut previous_epoch_record) =
+            consensus_chain.epochs().record_by_epoch(previous_epoch).await
+        {
+            while let Some(epoch_record) =
+                consensus_chain.epochs().record_by_epoch(*current_fetch_epoch).await
+            {
+                *current_fetch_epoch += 1;
+                if epoch_record.epoch < last_gossipped_epoch.unwrap_or_default() {
+                    let contains_final_header = consensus_chain
+                        .consensus_header_by_number(epoch_record.final_consensus.number)
+                        .await
+                        .unwrap_or_default()
+                        .is_some();
+                    if !contains_final_header {
+                        consensus_bus
+                            .request_epoch_pack_file(previous_epoch_record, epoch_record.clone())
+                            .await;
+                    }
+                    previous_epoch_record = epoch_record;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
     let rx_shutdown = config.shutdown().subscribe();
     let mut rx_gossip_update = consensus_bus.last_published_consensus_num_hash().subscribe();
     let (tx, mut rx) = tokio::sync::mpsc::channel(10_000);
@@ -107,18 +143,7 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
                 }
 
                 if current_fetch_epoch < epoch {
-                    // If we still have epochs to fetch then add to the queue until we are out of epoch records.
-                    while let Some(epoch_record) = consensus_chain.epochs().record_by_epoch(current_fetch_epoch).await {
-                        current_fetch_epoch += 1;
-                        if epoch_record.epoch < last_gossipped_epoch.unwrap_or_default() {
-                            let contains_final_header = consensus_chain.consensus_header_by_number(epoch_record.final_consensus.number).await.unwrap_or_default().is_some();
-                            if !contains_final_header {
-                                consensus_bus.request_epoch_pack_file(epoch_record).await;
-                            }
-                        } else {
-                            break;
-                        }
-                    }
+                    request_epochs(&mut current_fetch_epoch, &consensus_chain, &consensus_bus, last_gossipped_epoch).await
                 }
                 if let Some(next) = get_consensus_header(number, hash, &config, &consensus_bus, &network, &consensus_chain).await {
                     // Each gossip event starts a backward traversal from the new tip.
@@ -166,49 +191,56 @@ pub async fn spawn_fetch_consensus(
     async fn next_epoch<'s>(
         consensus_bus: &ConsensusBusApp,
         next_sem: &'s Arc<Semaphore>,
-    ) -> Option<(SemaphorePermit<'s>, EpochRecord)> {
+    ) -> Option<(SemaphorePermit<'s>, EpochRecord, EpochRecord)> {
         let permit = next_sem.acquire().await.ok()?;
-        consensus_bus.get_next_epoch_pack_file_request().await.map(|e| (permit, e))
+        consensus_bus.get_next_epoch_pack_file_request().await.map(|(pe, e)| (permit, pe, e))
     }
     // When can we accept more work (a new epoch).
     let next_sem = Arc::new(Semaphore::new(1));
     // Get the epoch of our last executed consensus.
     loop {
         tokio::select! {
-            Some((_permit, epoch_record)) = next_epoch(&consensus_bus, &next_sem) => {
+            Some((_permit, previous_epoch_record, epoch_record)) = next_epoch(&consensus_bus, &next_sem) => {
                 let epoch = epoch_record.epoch;
-                let prev_epoch_num = epoch.saturating_sub(1);
-                if let Some((previous_epoch, _)) = consensus_chain.epochs().get_epoch_by_number(prev_epoch_num).await {
-                    info!(target: "state-sync", "epoch consensus fetcher {task_index} retrieving epoch {epoch}");
-                    loop {
-                        tokio::select! {
-                            result = network.request_epoch_pack(&epoch_record, &previous_epoch, &consensus_chain, Duration::from_secs(PACK_RECORD_TIMEOUT_SECS)) => {
-                                match result {
-                                    Ok(_) => break,
-                                    Err(e) => {
-                                        error!(target: "state-sync",
-                                            "failed to request epoch pack for epoch {epoch}: {e}");
-                                        // Wait a beat before we try again, may have a network issue.
-                                        tokio::select!(
-                                            _ = &rx_shutdown => {
-                                                info!(target: "state-sync",
-                                                    "epoch consensus fetcher {task_index} shutting down during pack fetch");
-                                                return Ok(());
-                                            },
-                                            _ = tokio::time::sleep(Duration::from_secs(PACK_DOWNLOAD_RETRY_SECS)) => { }
-                                        );
-                                    }
+                info!(target: "state-sync", "epoch consensus fetcher {task_index} retrieving epoch {epoch}");
+                let mut attempts = 1;
+                loop {
+                    tokio::select! {
+                        result = network.request_epoch_pack(&epoch_record, &previous_epoch_record, &consensus_chain, Duration::from_secs(PACK_RECORD_TIMEOUT_SECS)) => {
+                            match result {
+                                Ok(_) => break,
+                                Err(e) => {
+                                    error!(target: "state-sync",
+                                        "failed to request epoch pack for epoch {epoch}, attempt {attempts}: {e}");
+                                    // Wait a beat before we try again, may have a network issue.
+                                    // Wait time will increase as attempts grow.
+                                    tokio::select!(
+                                        _ = &rx_shutdown => {
+                                            info!(target: "state-sync",
+                                                "epoch consensus fetcher {task_index} shutting down during pack fetch");
+                                            return Ok(());
+                                        },
+                                        _ = tokio::time::sleep(Duration::from_secs(((attempts / 10) + 1) * PACK_DOWNLOAD_RETRY_SECS)) => { }
+                                    );
                                 }
                             }
-                            _ = &rx_shutdown => {
-                                info!(target: "state-sync",
-                                    "epoch consensus fetcher {task_index} shutting down during pack fetch");
-                                return Ok(());
-                            }
+                        }
+                        _ = &rx_shutdown => {
+                            info!(target: "state-sync",
+                                "epoch consensus fetcher {task_index} shutting down during pack fetch");
+                            return Ok(());
                         }
                     }
-                } else {
-                    error!(target: "state-sync", "unable to find previous epoch for epoch {epoch}");
+                    if attempts > 100 {
+                        // We are giving up on this epoch for now.
+                        // This is not a real solution, without getting this pack file execution will be stuck.
+                        // But put it back on the queue and try another one since this one is not getting anywhere.
+                        error!(target: "state-sync",
+                            "failed to request epoch pack for epoch {epoch}, after {attempts}, will try to again later (WE ARE STUCK)");
+                        consensus_bus.request_epoch_pack_file(previous_epoch_record, epoch_record).await;
+                        break;
+                    }
+                    attempts += 1;
                 }
             }
             _ = &rx_shutdown => {
