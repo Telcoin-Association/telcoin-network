@@ -4,7 +4,7 @@ use crate::{errors::SubscriberResult, SubscriberError};
 use futures::{stream::FuturesOrdered, StreamExt};
 use state_sync::{last_consensus_parent, save_consensus, spawn_state_sync};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -228,7 +228,7 @@ impl<DB: Database> Subscriber<DB> {
                     .borrow()
                     .latest_consensus_block_num_hash()
                     .number;
-                let (latest_network_consensus, _) =
+                let (_latest_network_epoch, latest_network_consensus, _) =
                     self.consensus_bus.published_consensus_num_hash();
                 let consensus_sync_distance =
                     latest_network_consensus.saturating_sub(latest_processed_consensus);
@@ -416,7 +416,7 @@ impl<DB: Database> Subscriber<DB> {
             return Ok(ConsensusOutput::new_with_subdag(sub_dag, parent_hash, number));
         }
 
-        let mut batch_set: HashSet<BlockHash> = HashSet::new();
+        let mut batch_set: BTreeSet<BlockHash> = BTreeSet::new();
 
         let mut batch_digests = VecDeque::with_capacity(num_certs);
         for cert in sub_dag.certificates() {
@@ -488,7 +488,7 @@ impl<DB: Database> Subscriber<DB> {
     /// peers.
     async fn fetch_batches_from_peers(
         &self,
-        batch_digests: HashSet<BlockHash>,
+        batch_digests: BTreeSet<BlockHash>,
     ) -> SubscriberResult<HashMap<BlockHash, Batch>> {
         let mut fetched_blocks = HashMap::new();
 

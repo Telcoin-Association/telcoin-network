@@ -1,6 +1,6 @@
 //! Worker <-> Primary networking logic.
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap},
     sync::Arc,
 };
 
@@ -32,7 +32,7 @@ impl<DB: Database> PrimaryToWorkerClient for PrimaryReceiverHandler<DB> {
                 "synchronize() is unsupported via RPC interface, please call via local worker handler instead".to_string(),
             ));
         };
-        let mut missing = HashSet::new();
+        let mut missing = BTreeSet::new();
         for digest in message.digests.iter() {
             // Check if we already have the batch.
             match self.store.get::<NodeBatchesCache>(digest) {
@@ -105,7 +105,7 @@ impl<DB: Database> PrimaryToWorkerClient for PrimaryReceiverHandler<DB> {
 
     async fn fetch_batches(
         &self,
-        digests: HashSet<BlockHash>,
+        digests: BTreeSet<BlockHash>,
     ) -> eyre::Result<HashMap<BlockHash, Batch>> {
         // option approach required for startup - this should never happen
         let Some(batch_fetcher) = self.batch_fetcher.as_ref() else {

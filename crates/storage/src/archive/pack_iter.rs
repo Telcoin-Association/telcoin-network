@@ -8,13 +8,18 @@ use std::{
 };
 
 use serde::{de::DeserializeOwned, Serialize};
-use tn_types::decode;
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncSeek, AsyncSeekExt as _};
+use tn_types::try_decode;
+use tokio::io::{AsyncRead, AsyncReadExt as _};
 
 use crate::archive::{
     error::{fetch::FetchError, load_header::LoadHeaderError},
     pack::DataHeader,
 };
+
+/// Provide an upper bound on a record size.
+/// This should be large enough for any record but provide
+/// an upper bound on memory allocations for a record.
+pub(crate) const MAX_RECORD_SIZE: u32 = 16 * 1024 * 1024;
 
 /// Iterate over a Db's key, value pairs in insert order.
 /// This iterator is "raw", it does not use any indexes just the data file.
@@ -73,6 +78,9 @@ where
         }
         crc32_hasher.update(&val_size_buf);
         let val_size = u32::from_le_bytes(val_size_buf);
+        if val_size > MAX_RECORD_SIZE {
+            return Err(FetchError::RequestedSizeTooLarge(val_size, MAX_RECORD_SIZE));
+        }
         buffer.resize(val_size as usize, 0);
         file.read_exact(buffer)?;
         crc32_hasher.update(buffer);
@@ -83,7 +91,7 @@ where
         if calc_crc32 != read_crc32 {
             return Err(FetchError::CrcFailed);
         }
-        Ok(decode::<V>(&buffer[..]))
+        try_decode::<V>(&buffer[..]).map_err(|e| FetchError::DeserializeValue(e.to_string()))
     }
 }
 
@@ -120,7 +128,7 @@ where
 impl<V, R> AsyncPackIter<V, R>
 where
     V: Debug + Serialize + DeserializeOwned,
-    R: AsyncRead + AsyncSeek + Unpin,
+    R: AsyncRead + Unpin,
 {
     /// Open the iterator using reader as a data source.
     /// Produces an iterator over all the (key, values).  All and records
@@ -128,17 +136,6 @@ where
     pub async fn open(mut reader: R, uid_idx: u64) -> Result<Self, LoadHeaderError> {
         let _header = DataHeader::load_header_async(&mut reader, uid_idx).await?;
         Ok(AsyncPackIter { _val: PhantomData, reader, buffer: Vec::new() })
-    }
-
-    /// Return the current position of the data file.
-    pub async fn position(&mut self) -> io::Result<u64> {
-        self.reader.stream_position().await
-    }
-
-    /// Sets the current position of the data file.
-    pub async fn set_position(&mut self, position: u64) -> io::Result<()> {
-        self.reader.seek(io::SeekFrom::Start(position)).await?;
-        Ok(())
     }
 
     /// Read the next record or return an error if an overflow bucket.
@@ -157,6 +154,9 @@ where
         }
         crc32_hasher.update(&val_size_buf);
         let val_size = u32::from_le_bytes(val_size_buf);
+        if val_size > MAX_RECORD_SIZE {
+            return Err(FetchError::RequestedSizeTooLarge(val_size, MAX_RECORD_SIZE));
+        }
         buffer.resize(val_size as usize, 0);
         file.read_exact(buffer).await?;
         crc32_hasher.update(buffer);
@@ -167,7 +167,7 @@ where
         if calc_crc32 != read_crc32 {
             return Err(FetchError::CrcFailed);
         }
-        Ok(decode::<V>(&buffer[..]))
+        try_decode::<V>(&buffer[..]).map_err(|e| FetchError::DeserializeValue(e.to_string()))
     }
 
     /// Return the next V when available.

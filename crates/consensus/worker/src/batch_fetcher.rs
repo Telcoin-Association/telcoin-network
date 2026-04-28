@@ -7,7 +7,7 @@ use crate::{
     network::{error::WorkerNetworkResult, WorkerNetworkHandle},
     WorkerNetworkError,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use tn_storage::tables::NodeBatchesCache;
 use tn_types::{now, Batch, BlockHash, Database, DbTxMut};
 use tracing::{debug, error, instrument};
@@ -39,7 +39,7 @@ impl<DB: Database> BatchFetcher<DB> {
     #[instrument(level = "debug", skip_all, fields(num_digests = missing_digests.len()))]
     pub(crate) async fn fetch_for_primary(
         &self,
-        mut missing_digests: HashSet<BlockHash>,
+        mut missing_digests: BTreeSet<BlockHash>,
     ) -> WorkerNetworkResult<HashMap<BlockHash, Batch>> {
         debug!(target: "batch_fetcher", "Attempting to fetch {} digests from peers", missing_digests.len());
 
@@ -105,7 +105,7 @@ impl<DB: Database> BatchFetcher<DB> {
     /// Retrieve batches from the local database.
     fn fetch_local(
         &self,
-        missing_digests: &mut HashSet<BlockHash>,
+        missing_digests: &mut BTreeSet<BlockHash>,
         fetched_batches: &mut HashMap<BlockHash, Batch>,
     ) -> WorkerNetworkResult<()> {
         // read from database
@@ -131,7 +131,7 @@ impl<DB: Database> BatchFetcher<DB> {
     #[instrument(level = "debug", skip_all, fields(num_digests = missing_digests.len()))]
     async fn request_batches_from_peers(
         &self,
-        missing_digests: &mut HashSet<BlockHash>,
+        missing_digests: &mut BTreeSet<BlockHash>,
     ) -> WorkerNetworkResult<HashMap<BlockHash, Batch>> {
         // request batches and return to caller
         let recovered_batches =
@@ -149,14 +149,14 @@ mod tests {
         test_utils::{create_test_batches, encode_batches_to_stream_bytes, setup_batch_db},
     };
     use futures::io::Cursor;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeSet, HashMap};
     use tn_network_libp2p::error::NetworkError;
     use tn_types::{max_batch_size, Batch, BlockHash, TaskManager, B256};
 
     #[tokio::test]
     async fn test_validate_batches_from_stream() {
         let batches = create_test_batches(3);
-        let digests: HashSet<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+        let digests: BTreeSet<BlockHash> = batches.iter().map(|b| b.digest()).collect();
 
         // encode batches to wire format
         let bytes = encode_batches_to_stream_bytes(&batches).await;
@@ -171,7 +171,7 @@ mod tests {
         let validated = result.expect("should validate successfully");
 
         assert_eq!(validated.len(), batches.len());
-        let validated_digests: HashSet<BlockHash> = validated.iter().map(|(d, _)| *d).collect();
+        let validated_digests: BTreeSet<BlockHash> = validated.iter().map(|(d, _)| *d).collect();
         assert_eq!(validated_digests, digests);
     }
 
@@ -183,7 +183,7 @@ mod tests {
         let mut cursor = Cursor::new(bytes);
 
         // only request 3
-        let digests: HashSet<BlockHash> = batches.iter().take(3).map(|b| b.digest()).collect();
+        let digests: BTreeSet<BlockHash> = batches.iter().take(3).map(|b| b.digest()).collect();
 
         let task_manager = TaskManager::default();
         let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
@@ -201,7 +201,7 @@ mod tests {
 
         // request a different digest
         let fake_digest = B256::random();
-        let digests: HashSet<BlockHash> = HashSet::from([fake_digest]);
+        let digests: BTreeSet<BlockHash> = BTreeSet::from([fake_digest]);
 
         let task_manager = TaskManager::default();
         let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
@@ -234,7 +234,7 @@ mod tests {
         // request set includes the batch digest (and count=2 passes the count check)
         let digest = batch.digest();
         let another_digest = B256::random();
-        let digests: HashSet<BlockHash> = HashSet::from([digest, another_digest]);
+        let digests: BTreeSet<BlockHash> = BTreeSet::from([digest, another_digest]);
 
         let task_manager = TaskManager::default();
         let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
@@ -252,7 +252,7 @@ mod tests {
 
         let mut cursor = Cursor::new(output);
 
-        let digests: HashSet<BlockHash> = HashSet::from([B256::random(), B256::random()]);
+        let digests: BTreeSet<BlockHash> = BTreeSet::from([B256::random(), B256::random()]);
 
         let task_manager = TaskManager::default();
         let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
@@ -265,7 +265,7 @@ mod tests {
     #[tokio::test]
     async fn test_validate_empty_stream_with_oversized_digest_set() {
         // create 501 dummy digests (exceeds MAX_BATCH_DIGESTS_PER_REQUEST = 500)
-        let digests: HashSet<BlockHash> = (0..501u64)
+        let digests: BTreeSet<BlockHash> = (0..501u64)
             .map(|i| {
                 let mut bytes = [0u8; 32];
                 bytes[..8].copy_from_slice(&i.to_le_bytes());
@@ -292,7 +292,7 @@ mod tests {
     #[tokio::test]
     async fn test_validate_partial_stream_fulfillment() {
         let all_batches = create_test_batches(5);
-        let all_digests: HashSet<BlockHash> = all_batches.iter().map(|b| b.digest()).collect();
+        let all_digests: BTreeSet<BlockHash> = all_batches.iter().map(|b| b.digest()).collect();
         assert_eq!(all_digests.len(), 5);
 
         // only encode 3 of the 5 batches into the stream
@@ -310,8 +310,8 @@ mod tests {
         assert_eq!(validated.len(), 3, "should return only the 3 batches from the stream");
 
         // verify returned digests match the 3 encoded batches
-        let validated_digests: HashSet<BlockHash> = validated.iter().map(|(d, _)| *d).collect();
-        let expected_digests: HashSet<BlockHash> =
+        let validated_digests: BTreeSet<BlockHash> = validated.iter().map(|(d, _)| *d).collect();
+        let expected_digests: BTreeSet<BlockHash> =
             partial_batches.iter().map(|b| b.digest()).collect();
         assert_eq!(validated_digests, expected_digests);
     }
@@ -324,7 +324,7 @@ mod tests {
     async fn test_fetch_for_primary_all_local() {
         let batches = create_test_batches(3);
         let db = setup_batch_db(&batches);
-        let digests: HashSet<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+        let digests: BTreeSet<BlockHash> = batches.iter().map(|b| b.digest()).collect();
 
         let task_manager = TaskManager::default();
         let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
@@ -341,7 +341,7 @@ mod tests {
     async fn test_fetch_for_primary_all_local_many() {
         let batches = create_test_batches(20);
         let db = setup_batch_db(&batches);
-        let digests: HashSet<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+        let digests: BTreeSet<BlockHash> = batches.iter().map(|b| b.digest()).collect();
 
         let task_manager = TaskManager::default();
         let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
@@ -371,7 +371,7 @@ mod tests {
         let all_batches = create_test_batches(5);
         // only store the first batch locally
         let db = setup_batch_db(&all_batches[..1]);
-        let all_digests: HashSet<BlockHash> = all_batches.iter().map(|b| b.digest()).collect();
+        let all_digests: BTreeSet<BlockHash> = all_batches.iter().map(|b| b.digest()).collect();
 
         let task_manager = TaskManager::default();
         let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());

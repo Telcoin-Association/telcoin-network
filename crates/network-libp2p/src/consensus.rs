@@ -10,8 +10,8 @@ use crate::{
     send_or_log_error,
     stream::{StreamBehavior, StreamEvent},
     types::{
-        KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo, NetworkResult,
-        NodeRecord,
+        KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo, NetworkResponseMessage,
+        NetworkResponseSender, NetworkResult, NodeRecord,
     },
     PeerExchangeMap,
 };
@@ -136,7 +136,7 @@ where
     /// Callers include a oneshot channel for the network to return response. The caller is
     /// responsible for decoding message bytes and reporting peers who return bad data. Peers that
     /// send messages that fail to decode must receive an application score penalty.
-    outbound_requests: HashMap<(PeerId, OutboundRequestId), oneshot::Sender<NetworkResult<Res>>>,
+    outbound_requests: HashMap<(PeerId, OutboundRequestId), NetworkResponseSender<Res>>,
     /// The collection of pending inbound requests.
     ///
     /// Callers include a oneshot channel for the network to return a cancellation notice. The
@@ -881,10 +881,18 @@ where
                         }
 
                         // try to forward response to original caller
-                        let _ = self
-                            .outbound_requests
-                            .remove(&(peer, request_id))
-                            .map(|ack| ack.send(Ok(response)));
+                        let _ = self.outbound_requests.remove(&(peer, request_id)).map(|ack| {
+                            if let Some(key) =
+                                self.swarm.behaviour().peer_manager.peer_to_bls(&peer)
+                            {
+                                let _ = ack.send(Ok(NetworkResponseMessage {
+                                    peer: key,
+                                    result: response,
+                                }));
+                            } else {
+                                let _ = ack.send(Err(NetworkError::PeerMissing));
+                            }
+                        });
                     }
                 }
             }
@@ -903,10 +911,9 @@ where
                 self.swarm.behaviour_mut().peer_manager.process_penalty(peer, Penalty::Medium);
 
                 // try to forward error to original caller
-                let _ = self
-                    .outbound_requests
-                    .remove(&(peer, request_id))
-                    .map(|ack| ack.send(Err(error.into())));
+                let _ = self.outbound_requests.remove(&(peer, request_id)).map(|ack| {
+                    let _ = ack.send(Err(error.into()));
+                });
             }
             ReqResEvent::InboundFailure { peer, request_id, error, connection_id: _ } => {
                 debug!(target: "network", ?peer, ?error, pending=?self.inbound_requests, "Inbound failure for req/res");
@@ -1025,10 +1032,9 @@ where
 
                 // remove from outbound_requests and send error
                 for k in keys {
-                    let _ = self
-                        .outbound_requests
-                        .remove(&k)
-                        .map(|ack| ack.send(Err(NetworkError::Disconnected)));
+                    let _ = self.outbound_requests.remove(&k).map(|ack| {
+                        let _ = ack.send(Err(NetworkError::Disconnected));
+                    });
                 }
             }
             PeerEvent::DisconnectPeerX(peer_id, peer_exchange) => {

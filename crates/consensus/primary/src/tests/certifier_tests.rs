@@ -10,7 +10,7 @@ use std::{
     collections::HashMap,
     num::{NonZero, NonZeroUsize},
 };
-use tn_network_libp2p::types::{NetworkCommand, NetworkHandle};
+use tn_network_libp2p::types::{NetworkCommand, NetworkHandle, NetworkResponseMessage};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{BlsKeypair, BlsSigner, SignatureVerificationState, TnSender};
@@ -68,7 +68,9 @@ async fn propose_header_to_form_certificate() {
         } = req
         {
             if let Some(vote) = peer_votes.remove(&peer) {
-                reply.send(Ok(PrimaryResponse::Vote(vote))).unwrap();
+                reply
+                    .send(Ok(NetworkResponseMessage { peer, result: PrimaryResponse::Vote(vote) }))
+                    .unwrap();
             }
         }
         if peer_votes.is_empty() {
@@ -218,7 +220,9 @@ async fn run_vote_aggregator_with_param(
         } = req
         {
             if let Some(vote) = peer_votes.remove(&peer) {
-                reply.send(Ok(PrimaryResponse::Vote(vote))).unwrap();
+                reply
+                    .send(Ok(NetworkResponseMessage { peer, result: PrimaryResponse::Vote(vote) }))
+                    .unwrap();
             }
         }
         if peer_votes.is_empty() {
@@ -337,7 +341,9 @@ async fn propose_headers_one_bad() {
         } = req
         {
             if let Some(vote) = peer_votes.remove(&peer) {
-                reply.send(Ok(PrimaryResponse::Vote(vote))).unwrap();
+                reply
+                    .send(Ok(NetworkResponseMessage { peer, result: PrimaryResponse::Vote(vote) }))
+                    .unwrap();
             }
         }
         if peer_votes.is_empty() {
