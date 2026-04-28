@@ -972,8 +972,21 @@ impl Inner {
     /// Retrieve a consensus header by digest.
     fn consensus_header_by_digest(&mut self, digest: B256) -> Option<ConsensusHeader> {
         let pos = self.consensus_digests.load(digest).ok()?;
-        let rec = self.data.fetch(pos).ok()?;
-        rec.into_consensus().ok()
+        // This is not strickly needed, the fetch below will fail if
+        // we try to read past the end of the file but this potentially
+        // short circuits a lot of checks for a small cost.
+        // Note, this could happen if a file is damaged and repaired.
+        if pos >= self.data.file_len() {
+            return None;
+        }
+        let header = self.data.fetch(pos).ok()?.into_consensus().ok()?;
+        // Verify the digest.  There is an extremely unlikely edge case where
+        // a repaired DB could write a new header to the same location as an
+        // old header.  This makes sure the contract is always intact.
+        if header.digest() != digest {
+            return None;
+        }
+        Some(header)
     }
 
     /// Retrieve a consensus header by number.
@@ -1059,19 +1072,34 @@ impl Inner {
 
     /// True if the pack contains the batch for digest.
     fn contains_batch(&mut self, digest: BlockHash) -> bool {
-        self.batch_digests.load(digest).is_ok()
+        // This is a bit more complicated (the pos file_len check) because in a very rare
+        // case of repairing a damaged pack we might have something in the index not in the
+        // pack file (yet).
+        if let Ok(pos) = self.batch_digests.load(digest) {
+            pos < self.data.file_len()
+        } else {
+            false
+        }
     }
 
     /// Return the Batch for digest if found.
     fn batch(&mut self, digest: BlockHash) -> Option<Batch> {
-        if let Ok(pos) = self.batch_digests.load(digest) {
-            if let Ok(batch) = self.data.fetch(pos) {
-                if let Ok(batch) = batch.into_batch() {
-                    return Some(batch);
-                }
-            }
+        let pos = self.batch_digests.load(digest).ok()?;
+        // This is not strickly needed, the fetch below will fail if
+        // we try to read past the end of the file but this potentially
+        // short circuits a lot of checks for a small cost.
+        // Note, this could happen if a file is damaged and repaired.
+        if pos >= self.data.file_len() {
+            return None;
         }
-        None
+        let batch = self.data.fetch(pos).ok()?.into_batch().ok()?;
+        // Verify the digest.  There is an extremely unlikely edge case where
+        // a repaired DB could write a new batch to the same location as an
+        // old batch.  This makes sure the contract is always intact.
+        if batch.digest() != digest {
+            return None;
+        }
+        Some(batch)
     }
 
     /// Count leaders in this pack (in rewards_counter) lower than last_executed_round.
