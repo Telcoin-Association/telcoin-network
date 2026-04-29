@@ -4,7 +4,7 @@ use crate::{errors::SubscriberResult, SubscriberError};
 use futures::{stream::FuturesOrdered, StreamExt};
 use state_sync::{last_consensus_parent, save_consensus, spawn_state_sync};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -91,6 +91,9 @@ pub fn spawn_subscriber<DB: Database>(
                 info!(target: "subscriber", "Starting subscriber: CVV");
                 if let Err(e) = subscriber.run(rx_shutdown, rx_sequence, consensus_chain).await {
                     error!(target: "subscriber", "Error subscriber consensus: {e}");
+                    Err(e.into())
+                } else {
+                    Ok(())
                 }
             });
         }
@@ -103,6 +106,9 @@ pub fn spawn_subscriber<DB: Database>(
                     info!(target: "subscriber", "Starting subscriber: Catch up and rejoin");
                     if let Err(e) = subscriber.catch_up_rejoin_consensus(clone).await {
                         error!(target: "subscriber", "Error catching up consensus: {e}");
+                        Err(e.into())
+                    } else {
+                        Ok(())
                     }
                 },
             );
@@ -114,6 +120,9 @@ pub fn spawn_subscriber<DB: Database>(
                 info!(target: "subscriber", "Starting subscriber: Follower");
                 if let Err(e) = subscriber.follow_consensus(clone).await {
                     error!(target: "subscriber", "Error following consensus: {e}");
+                    Err(e.into())
+                } else {
+                    Ok(())
                 }
             });
         }
@@ -152,13 +161,7 @@ impl<DB: Database> Subscriber<DB> {
         // This save will essentially mark this consensus output as written in stone (added to the
         // consensus chain). This does NOT imply execution although it will be sent off for
         // execution.
-        save_consensus(
-            self.config.node_storage(),
-            consensus_output.clone(),
-            &self.inner.authority_id,
-            &mut consensus_chain,
-        )
-        .await?;
+        save_consensus(consensus_output.clone(), &mut consensus_chain).await?;
 
         let last_round = consensus_output.leader_round();
 
@@ -228,7 +231,7 @@ impl<DB: Database> Subscriber<DB> {
                     .borrow()
                     .latest_consensus_block_num_hash()
                     .number;
-                let (latest_network_consensus, _) =
+                let (_latest_network_epoch, latest_network_consensus, _) =
                     self.consensus_bus.published_consensus_num_hash();
                 let consensus_sync_distance =
                     latest_network_consensus.saturating_sub(latest_processed_consensus);
@@ -327,7 +330,7 @@ impl<DB: Database> Subscriber<DB> {
                     match output {
                         Ok(output) => {
                             debug!(target: "subscriber", output=?output.digest(), "saving next output");
-                            save_consensus(self.config.node_storage(), output.clone(), &self.inner.authority_id, &mut consensus_chain).await?;
+                            save_consensus(output.clone(), &mut consensus_chain).await?;
                             debug!(target: "subscriber", "broadcasting output...");
                             if let Err(e) = self.consensus_bus.consensus_output().send(output).await {
                                 error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self.inner.authority_id, e);
@@ -353,9 +356,7 @@ impl<DB: Database> Subscriber<DB> {
                             Some(output) = waiting.next() => {
                                 if let Ok(output) = output {
                                     if let Err(e) = save_consensus(
-                                        self.config.node_storage(),
                                         output.clone(),
-                                        &self.inner.authority_id,
                                         &mut consensus_chain,
                                     ).await {
                                         warn!(target: "subscriber", "error saving consensus during shutdown: {e}");
@@ -416,7 +417,7 @@ impl<DB: Database> Subscriber<DB> {
             return Ok(ConsensusOutput::new_with_subdag(sub_dag, parent_hash, number));
         }
 
-        let mut batch_set: HashSet<BlockHash> = HashSet::new();
+        let mut batch_set: BTreeSet<BlockHash> = BTreeSet::new();
 
         let mut batch_digests = VecDeque::with_capacity(num_certs);
         for cert in sub_dag.certificates() {
@@ -488,7 +489,7 @@ impl<DB: Database> Subscriber<DB> {
     /// peers.
     async fn fetch_batches_from_peers(
         &self,
-        batch_digests: HashSet<BlockHash>,
+        batch_digests: BTreeSet<BlockHash>,
     ) -> SubscriberResult<HashMap<BlockHash, Batch>> {
         let mut fetched_blocks = HashMap::new();
 

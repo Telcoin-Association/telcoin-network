@@ -6,10 +6,11 @@ use super::{
 };
 use crate::{
     error::{CertManagerError, PrimaryNetworkError, PrimaryNetworkResult},
-    network::message::PrimaryGossip,
+    network::{message::PrimaryGossip, PendingEpochStream},
     state_sync::{CertificateCollector, StateSynchronizer},
     ConsensusBusApp, NodeMode,
 };
+use futures::{AsyncWrite, AsyncWriteExt as _};
 use parking_lot::Mutex;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -17,7 +18,7 @@ use std::{
     time::Duration,
 };
 use tn_config::ConsensusConfig;
-use tn_network_libp2p::GossipMessage;
+use tn_network_libp2p::{GossipMessage, Stream};
 use tn_storage::{consensus::ConsensusChain, CertificateStore, VoteDigestStore};
 use tn_types::{
     ensure,
@@ -25,10 +26,15 @@ use tn_types::{
     now, to_intent_message, try_decode, AuthorityIdentifier, BlockHash, BlsPublicKey, Certificate,
     CertificateDigest, ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord, Hash as _,
     Header, HeaderDigest, ProtocolSignature, Round, SignatureVerificationState, TnSender as _,
-    Vote,
+    Vote, B256,
 };
-use tokio::sync::Mutex as TokioMutex;
+use tokio::{io::AsyncReadExt, sync::Mutex as TokioMutex, time::timeout};
 use tracing::{debug, error, info, warn};
+
+/// Total timeout for sending a 16kb buffer of pack file data.
+/// Prevents slow-reader attacks where a peer accepts a stream but never reads.
+/// Set to an arbitrary 10 seconds to read 16kb buffer.
+const SEND_STREAM_BUFFER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Map to hold vote info to detect invalid votes, equivocation and cache responses in case of
 /// rerequests.
@@ -120,7 +126,8 @@ where
         // lags behind a burst of empty consensus rounds.
         let committed_round = self.consensus_bus.committed_round();
         let effective_exec_round = exec_round.max(processed_consensus_round).max(committed_round);
-        let (last_consensus_number, _) = self.consensus_bus.published_consensus_num_hash();
+        let (_last_consensus_epoch, last_consensus_number, _) =
+            self.consensus_bus.published_consensus_num_hash();
         // Use GC depth to estimate how many rounds we can be behind.
         // Subtract ten here so if we are right on the GC depth we will still go inactive (small
         // safety buffer).  Ten is arbitrary but should make sure we are comfortably within
@@ -234,7 +241,8 @@ where
                 let consensus_result_hash = result.digest();
                 let ConsensusResult { epoch, round, number, hash, validator: key, signature } =
                     *result;
-                let (old_number, old_hash) = self.consensus_bus.published_consensus_num_hash();
+                let (_old_epoch, old_number, old_hash) =
+                    self.consensus_bus.published_consensus_num_hash();
                 if hash == old_hash || old_number >= number {
                     // We have already dealt with this hash or we are past this output.
                     return Ok(());
@@ -271,7 +279,7 @@ where
                             info!(target: "primary", "got new consensus {number}/{hash}");
                             self.consensus_bus
                                 .last_published_consensus_num_hash()
-                                .send_replace((number, hash));
+                                .send_replace((epoch, number, hash));
                             self.consensus_certs.lock().clear();
                         } else {
                             self.consensus_certs.lock().insert(consensus_result_hash, sigs + 1);
@@ -902,5 +910,81 @@ where
     /// Return a reference to the `ConsensusChain`.
     pub(super) fn consensus_chain(&self) -> &ConsensusChain {
         &self.consensus_chain
+    }
+
+    /// Send epoch pack file over stream.
+    async fn send_epoch_over_stream<S>(
+        mut stream: S,
+        consensus_chain: &ConsensusChain,
+        epoch: Epoch,
+        buffer_timeout: Duration,
+        peer: BlsPublicKey,
+    ) -> PrimaryNetworkResult<()>
+    where
+        S: AsyncWrite + Unpin + Send,
+    {
+        let mut bytes = vec![0_u8; 16 * 1024]; // Use a 16kb read buffer.
+        let mut epoch_stream = consensus_chain
+            .get_epoch_stream(epoch)
+            .await
+            .map_err(|_| PrimaryNetworkError::StreamUnavailable(epoch))?;
+        loop {
+            let n = epoch_stream.read(&mut bytes[..]).await?;
+            if n == 0 {
+                break;
+            }
+            timeout(buffer_timeout, stream.write_all(&bytes[..n])).await??;
+        }
+
+        // attempt to close the stream gracefully
+        if let Err(e) = stream.close().await {
+            tracing::warn!(target: "primary::network", %peer, %epoch, ?e, "stream close failed");
+        }
+
+        Ok(())
+    }
+
+    /// Process request to open stream for an epoch pack.
+    pub(super) async fn process_request_epoch_stream(
+        &self,
+        peer: BlsPublicKey,
+        pending_request: Option<PendingEpochStream>,
+        stream: Stream,
+        request_digest: B256,
+        consensus_chain: &ConsensusChain,
+    ) -> PrimaryNetworkResult<()> {
+        // `None` indicates unexpected request
+        let Some(request) = pending_request else {
+            // this is a protocol violation - return error for penalty
+            warn!(
+                target: "primary::network",
+                %peer,
+                ?request_digest,
+                "inbound stream has no matching pending request"
+            );
+            return Err(PrimaryNetworkError::UnknownStreamRequest(request_digest));
+        };
+
+        // process request to send batches through stream
+        debug!(
+            target: "primary::network",
+            %peer,
+            ?request_digest,
+            epoch = request.epoch,
+            "processing inbound epoch stream"
+        );
+
+        // set timeout to prevent slow-read attack
+        Self::send_epoch_over_stream(
+            stream,
+            consensus_chain,
+            request.epoch,
+            SEND_STREAM_BUFFER_TIMEOUT,
+            peer,
+        )
+        .await
+        .inspect_err(
+            |e| warn!(target: "primary::network", %peer, ?e, "failed to send epoch over stream"),
+        )
     }
 }

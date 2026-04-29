@@ -11562,6 +11562,7 @@ name = "tn-batch-builder"
 version = "0.1.0"
 dependencies = [
  "assert_matches",
+ "eyre",
  "futures-util",
  "tempfile",
  "thiserror 1.0.69",
@@ -11750,6 +11751,7 @@ dependencies = [
  "tn-test-utils-committee",
  "tn-types",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 

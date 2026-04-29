@@ -304,7 +304,7 @@ pub(crate) fn spawn_epoch_vote_collector(
             // Wait for an EpochRecord to arrive
             let epoch_rec = loop {
                 tokio::select! {
-                    _ = &node_shutdown => return,
+                    _ = &node_shutdown => return Ok(()),
                     _ = epoch_rx.changed() => {
                         if let Some(rec) = epoch_rx.borrow_and_update().clone() {
                             break rec;
@@ -312,7 +312,7 @@ pub(crate) fn spawn_epoch_vote_collector(
                     }
                     result = vote_rx.recv() => {
                         match result {
-                            None => return,  // Channel closed- we are done.
+                            None => return Ok(()),  // Channel closed- we are done.
                             Some(vote) => {
                                 handle_new_vote(vote, &mut vote_queues).await;
                             }
@@ -322,15 +322,22 @@ pub(crate) fn spawn_epoch_vote_collector(
             };
 
             if let Some(epoch_vote_rx) = get_new_vote_channel(epoch_rec.epoch, &mut vote_queues) {
+                let consensus_chain = consensus_chain.clone();
+                let primary_network = primary_network.clone();
+                let key_config = key_config.clone();
                 task_spawner.spawn_task(
                     format!("epoch votes for epoch {}", epoch_rec.epoch),
-                    manage_epoch_votes(
-                        epoch_rec,
-                        key_config.clone(),
-                        primary_network.clone(),
-                        epoch_vote_rx,
-                        consensus_chain.clone(),
-                    ),
+                    async move {
+                        manage_epoch_votes(
+                            epoch_rec,
+                            key_config,
+                            primary_network,
+                            epoch_vote_rx,
+                            consensus_chain,
+                        )
+                        .await;
+                        Ok(())
+                    },
                 );
             }
         }

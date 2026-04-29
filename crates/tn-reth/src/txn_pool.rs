@@ -23,8 +23,8 @@ use reth_transaction_pool::{
 };
 use std::{sync::Arc, time::Instant};
 use tn_types::{
-    Address, EnvKzgSettings, Recovered, SealedBlock, TaskSpawner, TransactionSigned, TxHash,
-    MIN_PROTOCOL_BASE_FEE,
+    Address, EnvKzgSettings, Recovered, SealedBlock, TaskError, TaskSpawner, TransactionSigned,
+    TxHash, MIN_PROTOCOL_BASE_FEE,
 };
 use tracing::{debug, info, trace};
 
@@ -135,6 +135,9 @@ impl WorkerTxPool {
                     _ => unreachable!("TN reorgs are impossible"),
                 }
             }
+            Err(TaskError::from_message(
+                "canonical txn pool task ended because state_stream closed",
+            ))
         });
         Ok(this)
     }

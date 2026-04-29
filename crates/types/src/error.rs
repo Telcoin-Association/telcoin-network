@@ -165,6 +165,8 @@ pub enum BlockSealError {
     FatalDBFailure,
     #[error("Not a validator, can not validate/seal batches")]
     NotValidator,
+    #[error("Failed to report our validated batch")]
+    FailedToReport,
 }
 
 #[derive(Error, Debug)]

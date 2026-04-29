@@ -2,7 +2,7 @@
 
 use crate::ConsensusBus;
 use tn_types::{
-    AuthorityIdentifier, Certificate, Noticer, Round, TaskManager, TnReceiver, TnSender,
+    AuthorityIdentifier, Certificate, Noticer, Round, TaskManager, TaskResult, TnReceiver, TnSender,
 };
 use tracing::{debug, error, info, instrument};
 
@@ -28,7 +28,7 @@ impl StateHandler {
         let state_handler =
             Self { authority_id, consensus_bus: consensus_bus.clone(), rx_shutdown };
         task_manager.spawn_critical_task("state handler task", async move {
-            state_handler.run(rx_committed_certificates).await;
+            state_handler.run(rx_committed_certificates).await
         });
     }
 
@@ -62,7 +62,7 @@ impl StateHandler {
     async fn run(
         mut self,
         mut rx_committed_certificates: impl TnReceiver<(Round, Vec<Certificate>)>,
-    ) {
+    ) -> TaskResult {
         info!(target: "primary::state_handler", "StateHandler on node {} has started successfully.", self.authority_id);
         loop {
             tokio::select! {
@@ -71,7 +71,7 @@ impl StateHandler {
                 },
 
                 _ = &self.rx_shutdown => {
-                    return;
+                    return Ok(());
                 }
             }
         }

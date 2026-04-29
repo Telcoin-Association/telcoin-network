@@ -13,6 +13,8 @@ pub enum FetchError {
     NotFound,
     /// The calculated and recorded crc32 codes do not match for the record.
     CrcFailed,
+    /// Requested record size is too large.
+    RequestedSizeTooLarge(u32, u32),
 }
 
 impl Error for FetchError {}
@@ -24,6 +26,9 @@ impl fmt::Display for FetchError {
             Self::IO(e) => write!(f, "io: {e}"),
             Self::NotFound => write!(f, "not found"),
             Self::CrcFailed => write!(f, "crc32 mismatch"),
+            Self::RequestedSizeTooLarge(requested, max) => {
+                write!(f, "requested record size is too large: requested {requested}, max {max}")
+            }
         }
     }
 }

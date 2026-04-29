@@ -808,8 +808,7 @@ async fn test_basefee_static_genesis_propagates_to_first_block() -> eyre::Result
     )?;
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
 
-    let (procs, endpoints) =
-        start_nodes(temp_path, &committee, "basefee_static_genesis", 1)?;
+    let (procs, endpoints) = start_nodes(temp_path, &committee, "basefee_static_genesis", 1)?;
     let _guard = ProcessGuard::new(procs);
 
     let rpc_url = endpoints[0].http_url.clone();
@@ -913,12 +912,8 @@ async fn test_basefee_rollover_pool_sync() -> eyre::Result<()> {
     let temp_dir = tempfile::TempDir::with_prefix("basefee_rollover_pool")?;
     let temp_path = temp_dir.path();
 
-    let genesis = create_basefee_genesis(
-        temp_path,
-        &sender_addrs,
-        governance_wallet.address(),
-        &committee,
-    )?;
+    let genesis =
+        create_basefee_genesis(temp_path, &sender_addrs, governance_wallet.address(), &committee)?;
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
 
     let (procs, endpoints) = start_nodes(temp_path, &committee, "basefee_rollover_pool", 1)?;
@@ -1052,12 +1047,8 @@ async fn test_basefee_restart_restores_per_worker_fee() -> eyre::Result<()> {
     let temp_dir = tempfile::TempDir::with_prefix("basefee_restart_per_worker")?;
     let temp_path = temp_dir.path();
 
-    let genesis = create_basefee_genesis(
-        temp_path,
-        &sender_addrs,
-        governance_wallet.address(),
-        &committee,
-    )?;
+    let genesis =
+        create_basefee_genesis(temp_path, &sender_addrs, governance_wallet.address(), &committee)?;
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
 
     let (procs, mut endpoints) =
@@ -1102,8 +1093,7 @@ async fn test_basefee_restart_restores_per_worker_fee() -> eyre::Result<()> {
     // on restart rather than a trivial no-sync path.
     loop_epochs(3, 2, &rpc_url).await?;
 
-    let nodes_to_start: &[(&str, Address)] =
-        &[("validator-3", Address::from_slice(&[0x33; 20]))];
+    let nodes_to_start: &[(&str, Address)] = &[("validator-3", Address::from_slice(&[0x33; 20]))];
     let (mut new_children, mut new_endpoints) =
         start_nodes(temp_path, nodes_to_start, "basefee_restart_per_worker", 2)?;
     let new_child = new_children.pop().expect("child");
@@ -1172,7 +1162,10 @@ async fn test_basefee_restart_restores_per_worker_fee() -> eyre::Result<()> {
         }
         let fee = get_base_fee_at_block(&ep.http_url, pinned).await?;
         if let Some(r) = reference_fee {
-            assert_eq!(fee, r, "alive node {i} fee {fee} differs from reference {r} at block {pinned}");
+            assert_eq!(
+                fee, r,
+                "alive node {i} fee {fee} differs from reference {r} at block {pinned}"
+            );
         } else {
             reference_fee = Some(fee);
         }

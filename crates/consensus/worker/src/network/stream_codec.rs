@@ -6,10 +6,12 @@
 //! To start stream, peers exchange `B256` (32-byte) digest at the
 //! beginning of the stream.
 
+use crate::batch_fetcher::get_batches_local;
+
 use super::error::{WorkerNetworkError, WorkerNetworkResult};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use std::collections::HashSet;
-use tn_storage::{consensus::ConsensusChain, tables::NodeBatchesCache};
+use std::collections::BTreeSet;
+use tn_storage::consensus::ConsensusChain;
 use tn_types::{max_batch_size, Batch, Database, Epoch, B256};
 
 /// Max number of batch digests per chunk.
@@ -80,48 +82,12 @@ where
     Ok(count)
 }
 
-/// Retrieve batches from the list of batch_digests.
-async fn get_batches<DB>(
-    epoch: Epoch,
-    batch_digests: &[B256],
-    store: &DB,
-    consensus_chain: &ConsensusChain,
-) -> WorkerNetworkResult<Vec<Batch>>
-where
-    DB: Database,
-{
-    // look up batches from db
-    let mut batches: Vec<_> = store
-        .multi_get::<NodeBatchesCache>(batch_digests.iter())
-        .map_err(|e| WorkerNetworkError::Internal(format!("DB error: {e}")))?
-        .into_iter()
-        .flatten() // removes `None`
-        .collect();
-
-    let batches = if batches.is_empty() {
-        consensus_chain.get_batches(epoch, batch_digests.iter()).await
-    } else if batches.len() < batch_digests.len() {
-        let mut missing = Vec::new();
-        for digest in batches.iter().map(|b| b.digest()) {
-            if !batch_digests.contains(&digest) {
-                missing.push(digest);
-            }
-        }
-        batches.extend(consensus_chain.get_batches(epoch, missing.iter()).await);
-        batches
-    } else {
-        batches
-    };
-
-    Ok(batches)
-}
-
 /// Send batches over stream, looking up from database.
 pub(crate) async fn send_batches_over_stream<DB, S>(
     stream: &mut S,
     store: &DB,
     consensus_chain: &ConsensusChain,
-    batch_digests: &HashSet<B256>,
+    batch_digests: &BTreeSet<B256>,
     epoch: Epoch,
 ) -> WorkerNetworkResult<()>
 where
@@ -138,7 +104,7 @@ where
     let digests: Vec<_> = batch_digests.iter().copied().collect();
     for chunk in digests.chunks(BATCH_DIGESTS_READ_CHUNK_SIZE) {
         // look up batches from db
-        let batches: Vec<_> = get_batches(epoch, chunk, store, consensus_chain).await?;
+        let batches: Vec<_> = get_batches_local(epoch, chunk, store, consensus_chain).await?;
 
         // write batch count for this chunk
         let chunk_size = batches.len() as u32;
@@ -340,7 +306,7 @@ mod tests {
             ConsensusChain::new(temp_dir.path().to_path_buf()).expect("consensus chain");
 
         // collect digests
-        let digests: HashSet<B256> = batches.iter().map(|b| b.digest()).collect();
+        let digests: BTreeSet<B256> = batches.iter().map(|b| b.digest()).collect();
 
         // send batches over a Vec<u8> buffer
         let mut output = Vec::new();
@@ -365,8 +331,8 @@ mod tests {
             received.push(batch);
         }
 
-        // verify all batches present (order may differ due to HashSet iteration)
-        let received_digests: HashSet<B256> = received.iter().map(|b| b.digest()).collect();
+        // verify all batches present
+        let received_digests: BTreeSet<B256> = received.iter().map(|b| b.digest()).collect();
         assert_eq!(received_digests, digests);
     }
 
@@ -381,7 +347,7 @@ mod tests {
         consensus_chain.persist_current().await.expect("clean open");
 
         // request all 3 digests
-        let digests: HashSet<B256> = batches.iter().map(|b| b.digest()).collect();
+        let digests: BTreeSet<B256> = batches.iter().map(|b| b.digest()).collect();
 
         let mut output = Vec::new();
         send_batches_over_stream(&mut output, &db, &consensus_chain, &digests, 0)
@@ -397,7 +363,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_batches_over_stream_empty_digests() {
         let db = setup_batch_db(&[]);
-        let digests: HashSet<B256> = HashSet::new();
+        let digests: BTreeSet<B256> = BTreeSet::new();
         let temp_dir = TempDir::new().expect("tempdir");
         let consensus_chain =
             ConsensusChain::new(temp_dir.path().to_path_buf()).expect("consensus chain");
@@ -423,7 +389,7 @@ mod tests {
         let consensus_chain =
             ConsensusChain::new(temp_dir.path().to_path_buf()).expect("consensus chain");
 
-        let digests: HashSet<B256> = batches.iter().map(|b| b.digest()).collect();
+        let digests: BTreeSet<B256> = batches.iter().map(|b| b.digest()).collect();
         assert_eq!(digests.len(), batch_count);
 
         // send batches (will chunk into 200 + 50)
@@ -443,7 +409,7 @@ mod tests {
             .expect("should read all chunks");
 
         assert_eq!(result.len(), batch_count);
-        let received_digests: HashSet<B256> = result.iter().map(|(d, _)| *d).collect();
+        let received_digests: BTreeSet<B256> = result.iter().map(|(d, _)| *d).collect();
         assert_eq!(received_digests, digests);
     }
 }

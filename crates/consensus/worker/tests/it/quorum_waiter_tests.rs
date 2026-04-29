@@ -2,7 +2,7 @@
 
 use assert_matches::assert_matches;
 use std::{collections::HashMap, num::NonZeroUsize, time::Duration};
-use tn_network_libp2p::types::{NetworkCommand, NetworkHandle};
+use tn_network_libp2p::types::{NetworkCommand, NetworkHandle, NetworkResponseMessage};
 use tn_reth::test_utils::batch;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
@@ -43,12 +43,14 @@ async fn test_wait_for_quorum_happy_path() {
     for _i in 0..threshold {
         match network_rx.recv().await {
             Some(NetworkCommand::SendRequest {
-                peer: _,
+                peer,
                 request: WorkerRequest::ReportBatch { sealed_batch: in_batch },
                 reply,
             }) => {
                 assert_eq!(in_batch, sealed_batch);
-                reply.send(Ok(WorkerResponse::ReportBatch)).unwrap();
+                reply
+                    .send(Ok(NetworkResponseMessage { peer, result: WorkerResponse::ReportBatch }))
+                    .unwrap();
             }
             Some(_) => panic!("unexpected network command!"),
             None => panic!("failed to get a batch!"),
@@ -85,12 +87,14 @@ async fn test_batch_rejected_timeout() {
     // send one vote for batch
     match network_rx.recv().await {
         Some(NetworkCommand::SendRequest {
-            peer: _,
+            peer,
             request: WorkerRequest::ReportBatch { sealed_batch: in_batch },
             reply,
         }) => {
             assert_eq!(in_batch, sealed_batch);
-            reply.send(Ok(WorkerResponse::ReportBatch)).unwrap();
+            reply
+                .send(Ok(NetworkResponseMessage { peer, result: WorkerResponse::ReportBatch }))
+                .unwrap();
         }
         Some(_) => panic!("unexpected network command!"),
         None => panic!("failed to get a batch!"),
@@ -134,13 +138,16 @@ async fn test_batch_some_rejected_stake_still_passes() {
     // send one rejection for batch
     match network_rx.recv().await {
         Some(NetworkCommand::SendRequest {
-            peer: _,
+            peer,
             request: WorkerRequest::ReportBatch { sealed_batch: in_batch },
             reply,
         }) => {
             assert_eq!(in_batch, sealed_batch);
             reply
-                .send(Ok(WorkerResponse::Error(WorkerRPCError("REJECTED!!!".to_string()))))
+                .send(Ok(NetworkResponseMessage {
+                    peer,
+                    result: WorkerResponse::Error(WorkerRPCError("REJECTED!!!".to_string())),
+                }))
                 .unwrap();
         }
         Some(_) => panic!("unexpected network command!"),
@@ -151,12 +158,14 @@ async fn test_batch_some_rejected_stake_still_passes() {
     for _i in 0..(threshold - 1) {
         match network_rx.recv().await {
             Some(NetworkCommand::SendRequest {
-                peer: _,
+                peer,
                 request: WorkerRequest::ReportBatch { sealed_batch: in_batch },
                 reply,
             }) => {
                 assert_eq!(in_batch, sealed_batch);
-                reply.send(Ok(WorkerResponse::ReportBatch)).unwrap();
+                reply
+                    .send(Ok(NetworkResponseMessage { peer, result: WorkerResponse::ReportBatch }))
+                    .unwrap();
             }
             Some(_) => panic!("unexpected network command!"),
             None => panic!("failed to get a batch!"),
@@ -199,13 +208,16 @@ async fn test_batch_rejected_quorum() {
     for _i in 0..threshold {
         match network_rx.recv().await {
             Some(NetworkCommand::SendRequest {
-                peer: _,
+                peer,
                 request: WorkerRequest::ReportBatch { sealed_batch: in_batch },
                 reply,
             }) => {
                 assert_eq!(in_batch, sealed_batch);
                 reply
-                    .send(Ok(WorkerResponse::Error(WorkerRPCError("REJECTED!!!".to_string()))))
+                    .send(Ok(NetworkResponseMessage {
+                        peer,
+                        result: WorkerResponse::Error(WorkerRPCError("REJECTED!!!".to_string())),
+                    }))
                     .unwrap();
             }
             Some(_) => panic!("unexpected network command!"),
@@ -313,12 +325,18 @@ async fn test_batch_early_anti_quorum() {
                     });
                     match behavior {
                         0..=2 => {
-                            let _ = reply.send(Ok(WorkerResponse::ReportBatch));
+                            let _ = reply.send(Ok(NetworkResponseMessage {
+                                peer,
+                                result: WorkerResponse::ReportBatch,
+                            }));
                         }
                         3..=5 => {
-                            let _ = reply.send(Ok(WorkerResponse::Error(WorkerRPCError(
-                                "REJECTED!!!".to_string(),
-                            ))));
+                            let _ = reply.send(Ok(NetworkResponseMessage {
+                                peer,
+                                result: WorkerResponse::Error(WorkerRPCError(
+                                    "REJECTED!!!".to_string(),
+                                )),
+                            }));
                         }
                         _ => drop(reply),
                     }
@@ -374,7 +392,10 @@ async fn test_network_error_retry_then_quorum() {
                     if *count == 1 {
                         drop(reply);
                     } else {
-                        let _ = reply.send(Ok(WorkerResponse::ReportBatch));
+                        let _ = reply.send(Ok(NetworkResponseMessage {
+                            peer,
+                            result: WorkerResponse::ReportBatch,
+                        }));
                     }
                 }
                 _ => panic!("unexpected network command!"),
@@ -432,13 +453,19 @@ async fn test_network_error_partial_retry_success() {
                     *count += 1;
                     match order {
                         0..=2 => {
-                            let _ = reply.send(Ok(WorkerResponse::ReportBatch));
+                            let _ = reply.send(Ok(NetworkResponseMessage {
+                                peer,
+                                result: WorkerResponse::ReportBatch,
+                            }));
                         }
                         3..=5 => {
                             if *count == 1 {
                                 drop(reply);
                             } else {
-                                let _ = reply.send(Ok(WorkerResponse::ReportBatch));
+                                let _ = reply.send(Ok(NetworkResponseMessage {
+                                    peer,
+                                    result: WorkerResponse::ReportBatch,
+                                }));
                             }
                         }
                         _ => drop(reply),

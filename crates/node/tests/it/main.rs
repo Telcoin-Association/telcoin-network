@@ -98,6 +98,7 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
         let res = engine.await;
         debug!(target: "gas-test", ?res, "res:");
         let _ = tx.send(res);
+        Ok(())
     });
 
     // subscribe to output early
@@ -149,7 +150,8 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
     recovered.rewards_counter().set_committee(fixture.committee());
     let configs = [WorkerFeeConfig::Eip1559 { target_gas: 15_000_000 }];
     let epoch_state = reth_env.epoch_state_from_canonical_tip()?;
-    catchup_accumulator(&reth_env, &recovered, &configs, &epoch_state, &mut consensus_chain).await?;
+    catchup_accumulator(&reth_env, &recovered, &configs, &epoch_state, &mut consensus_chain)
+        .await?;
     // assert recovered and active track the same expected values
     //      G48pDy85GhyGMp9afPBvWgaNzgPAnvBtMxjReQTe1NiN: 3,
     //      Agv7rsffEbxoa7ybTJj57TiAHchf27ia7ziB5CVrHNTk: 3,
@@ -231,6 +233,7 @@ async fn test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
         let res = engine.await;
         debug!(target: "gas-test", ?res, "res:");
         let _ = tx.send(res);
+        Ok(())
     });
 
     let mut consensus_output = consensus_bus.app().subscribe_consensus_output();
@@ -329,7 +332,8 @@ async fn test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
     recovered.rewards_counter().set_committee(fixture.committee());
     let configs = [WorkerFeeConfig::Eip1559 { target_gas: 15_000_000 }];
     let epoch_state = reth_env.epoch_state_from_canonical_tip()?;
-    catchup_accumulator(&reth_env, &recovered, &configs, &epoch_state, &mut consensus_chain).await?;
+    catchup_accumulator(&reth_env, &recovered, &configs, &epoch_state, &mut consensus_chain)
+        .await?;
     assert_eq!(gas_accumulator.get_values(worker_id), recovered.get_values(worker_id));
 
     let expected: BTreeMap<_, _> = rewards
@@ -400,6 +404,7 @@ async fn test_catchup_accumulator_partial_execution() -> eyre::Result<()> {
         let res = engine.await;
         debug!(target: "gas-test", ?res, "partial res:");
         let _ = tx.send(res);
+        Ok(())
     });
 
     let mut consensus_output = consensus_bus.app().subscribe_consensus_output();
@@ -441,7 +446,8 @@ async fn test_catchup_accumulator_partial_execution() -> eyre::Result<()> {
     recovered.rewards_counter().set_committee(fixture.committee());
     let configs = [WorkerFeeConfig::Eip1559 { target_gas: 15_000_000 }];
     let epoch_state = reth_env.epoch_state_from_canonical_tip()?;
-    catchup_accumulator(&reth_env, &recovered, &configs, &epoch_state, &mut consensus_chain).await?;
+    catchup_accumulator(&reth_env, &recovered, &configs, &epoch_state, &mut consensus_chain)
+        .await?;
 
     let worker_id = 0;
     assert_eq!(gas_accumulator.get_values(worker_id), recovered.get_values(worker_id));

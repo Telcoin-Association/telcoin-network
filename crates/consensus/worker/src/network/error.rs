@@ -1,6 +1,6 @@
 //! Worker's network-related errors.
 use tn_network_libp2p::{error::NetworkError, Penalty};
-use tn_types::{BatchValidationError, BcsError, BlockHash};
+use tn_types::{BatchValidationError, BcsError, BlockHash, Epoch};
 use tokio::time::error::Elapsed;
 
 /// Result alias for results that possibly return [`WorkerNetworkError`].
@@ -68,14 +68,18 @@ pub enum WorkerNetworkError {
     /// Error reading from DB.
     #[error("DB read Error {0}")]
     DBRead(String),
+    /// Invalid batch epoch.
+    #[error("Got batch from epoch {0} expected {1}")]
+    BatchEpochMismatch(Epoch, Epoch),
 }
 
-impl From<WorkerNetworkError> for Option<Penalty> {
-    fn from(val: WorkerNetworkError) -> Self {
+impl WorkerNetworkError {
+    /// Return the penalty for this error if it causes one (None if no penalty).
+    pub fn penalty(&self) -> Option<Penalty> {
         //
         // explicitly match every error type to ensure penalties are updated with changes
         //
-        match val {
+        match self {
             WorkerNetworkError::BatchValidation(batch_validation_error) => {
                 match batch_validation_error {
                     // mild
@@ -98,7 +102,9 @@ impl From<WorkerNetworkError> for Option<Penalty> {
                     }
                 }
             }
-            WorkerNetworkError::InvalidRequest(_) => Some(Penalty::Mild),
+            WorkerNetworkError::InvalidRequest(_) | WorkerNetworkError::UnknownStreamRequest(_) => {
+                Some(Penalty::Mild)
+            }
             WorkerNetworkError::StdIo(ref io_err) => {
                 // separate legitimate failures like connection resets from suspicious behavior
                 match io_err.kind() {
@@ -117,7 +123,6 @@ impl From<WorkerNetworkError> for Option<Penalty> {
             | WorkerNetworkError::TooManyBatches { .. }
             | WorkerNetworkError::UnexpectedBatch(_)
             | WorkerNetworkError::DuplicateBatch(_)
-            | WorkerNetworkError::UnknownStreamRequest(_)
             | WorkerNetworkError::RequestHashMismatch => Some(Penalty::Fatal),
             // ignore
             WorkerNetworkError::Timeout(_)
@@ -126,7 +131,14 @@ impl From<WorkerNetworkError> for Option<Penalty> {
             | WorkerNetworkError::DBRead(_)
             | WorkerNetworkError::StreamClosed
             | WorkerNetworkError::Network(_)
+            | WorkerNetworkError::BatchEpochMismatch(_, _)
             | WorkerNetworkError::Internal(_) => None,
         }
+    }
+}
+
+impl From<WorkerNetworkError> for Option<Penalty> {
+    fn from(val: WorkerNetworkError) -> Self {
+        val.penalty()
     }
 }

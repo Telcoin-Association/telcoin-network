@@ -7,9 +7,9 @@ use crate::{
     network::{error::WorkerNetworkResult, WorkerNetworkHandle},
     WorkerNetworkError,
 };
-use std::collections::{HashMap, HashSet};
-use tn_storage::tables::NodeBatchesCache;
-use tn_types::{now, Batch, BlockHash, Database, DbTxMut};
+use std::collections::{BTreeSet, HashMap};
+use tn_storage::{consensus::ConsensusChain, tables::NodeBatchesCache};
+use tn_types::{now, Batch, BlockHash, Database, DbTxMut, Epoch, B256};
 use tracing::{debug, error, instrument};
 
 #[derive(Debug)]
@@ -19,12 +19,99 @@ pub(crate) struct BatchFetcher<DB> {
     network: WorkerNetworkHandle,
     /// The local database instance.
     batch_store: DB,
+    /// The consensus chain.
+    consensus_chain: ConsensusChain,
+}
+
+/// Retrieve a batch from local storage for batch_digest.
+/// Use this as a helper to fetch a batch from the local cache or the
+/// consensus chain.
+pub(crate) async fn get_batch_local<DB>(
+    epoch: Epoch,
+    batch_digest: B256,
+    store: &DB,
+    consensus_chain: &ConsensusChain,
+) -> WorkerNetworkResult<Option<Batch>>
+where
+    DB: Database,
+{
+    // read from database
+    // look up batches from db
+    if let Some(batch) = store
+        .get::<NodeBatchesCache>(&batch_digest)
+        .map_err(|e| WorkerNetworkError::Internal(format!("DB error: {e}")))?
+    {
+        Ok(Some(batch))
+    } else {
+        Ok(consensus_chain.get_batches(epoch, [batch_digest].iter()).await.into_iter().next())
+    }
+}
+
+/// Retrieve a batch from the local cache for batch_digest.
+/// Use this as a helper to fetch a batch from ONLY the local cache.
+pub(crate) fn get_batch_local_cache<DB>(
+    batch_digest: B256,
+    store: &DB,
+) -> WorkerNetworkResult<Option<Batch>>
+where
+    DB: Database,
+{
+    store
+        .get::<NodeBatchesCache>(&batch_digest)
+        .map_err(|e| WorkerNetworkError::Internal(format!("DB error: {e}")))
+}
+
+/// Retrieve batches from local storage for the list of batch_digests.
+/// Use this as a helper to fetch batches from the local cache or the
+/// consensus chain.
+pub(crate) async fn get_batches_local<DB>(
+    epoch: Epoch,
+    batch_digests: &[B256],
+    store: &DB,
+    consensus_chain: &ConsensusChain,
+) -> WorkerNetworkResult<Vec<Batch>>
+where
+    DB: Database,
+{
+    // read from database
+    // look up batches from db
+    let mut batches: Vec<_> = store
+        .multi_get::<NodeBatchesCache>(batch_digests.iter())
+        .map_err(|e| WorkerNetworkError::Internal(format!("DB error: {e}")))?
+        .into_iter()
+        .flatten() // removes `None`
+        .collect();
+
+    let batches = if batches.is_empty() {
+        // Nothing in cache so get what we can from the consensus chain.
+        consensus_chain.get_batches(epoch, batch_digests.iter()).await
+    } else if batches.len() < batch_digests.len() {
+        // Some not in cache so try to get the rest from the consensus chain.
+        let found_digests: Vec<B256> = batches.iter().map(|b| b.digest()).collect();
+        let mut missing = Vec::new();
+        for digest in batch_digests.iter() {
+            if !found_digests.contains(digest) {
+                missing.push(*digest);
+            }
+        }
+        batches.extend(consensus_chain.get_batches(epoch, missing.iter()).await);
+        batches
+    } else {
+        // All the batches were in the cache.
+        batches
+    };
+
+    Ok(batches)
 }
 
 impl<DB: Database> BatchFetcher<DB> {
     /// Create a new instance of `Self`.
-    pub(crate) fn new(network: WorkerNetworkHandle, batch_store: DB) -> Self {
-        Self { network, batch_store }
+    pub(crate) fn new(
+        network: WorkerNetworkHandle,
+        batch_store: DB,
+        consensus_chain: ConsensusChain,
+    ) -> Self {
+        Self { network, batch_store, consensus_chain }
     }
 
     /// Bulk fetches payload from local storage and remote workers.
@@ -39,7 +126,7 @@ impl<DB: Database> BatchFetcher<DB> {
     #[instrument(level = "debug", skip_all, fields(num_digests = missing_digests.len()))]
     pub(crate) async fn fetch_for_primary(
         &self,
-        mut missing_digests: HashSet<BlockHash>,
+        mut missing_digests: BTreeSet<BlockHash>,
     ) -> WorkerNetworkResult<HashMap<BlockHash, Batch>> {
         debug!(target: "batch_fetcher", "Attempting to fetch {} digests from peers", missing_digests.len());
 
@@ -54,7 +141,7 @@ impl<DB: Database> BatchFetcher<DB> {
             }
 
             // 1) fetch from local storage
-            self.fetch_local(&mut missing_digests, &mut fetched_batches)?;
+            self.fetch_local(&mut missing_digests, &mut fetched_batches).await?;
 
             // return if all batches recovered
             if missing_digests.is_empty() {
@@ -103,23 +190,22 @@ impl<DB: Database> BatchFetcher<DB> {
     }
 
     /// Retrieve batches from the local database.
-    fn fetch_local(
+    async fn fetch_local(
         &self,
-        missing_digests: &mut HashSet<BlockHash>,
+        missing_digests: &mut BTreeSet<BlockHash>,
         fetched_batches: &mut HashMap<BlockHash, Batch>,
     ) -> WorkerNetworkResult<()> {
         // read from database
         debug!(target: "batch_fetcher", "Local attempt to fetch {} missing_digests", missing_digests.len());
-        let local_batches = self
-            .batch_store
-            .multi_get::<NodeBatchesCache>(missing_digests.iter())
-            .map_err(|e| WorkerNetworkError::DBRead(format!("Multiget failed: {e}")))?;
-        for (digest, batch) in missing_digests.iter().zip(local_batches) {
-            if let Some(batch) = batch {
-                debug_assert_eq!(*digest, batch.digest());
-                fetched_batches.insert(*digest, batch);
-            }
-        }
+        let missing_vec: Vec<B256> = missing_digests.iter().copied().collect();
+        let local_batches = get_batches_local(
+            self.network.epoch(),
+            &missing_vec,
+            &self.batch_store,
+            &self.consensus_chain,
+        )
+        .await?;
+        fetched_batches.extend(local_batches.into_iter().map(|b| (b.digest(), b)));
 
         // remove fetched batches from missing
         missing_digests.retain(|d| !fetched_batches.contains_key(d));
@@ -127,11 +213,20 @@ impl<DB: Database> BatchFetcher<DB> {
         Ok(())
     }
 
+    /// Retrieve a batch from the local database.
+    pub(crate) async fn fetch_local_batch(
+        &self,
+        digest: BlockHash,
+    ) -> WorkerNetworkResult<Option<Batch>> {
+        get_batch_local(self.network.epoch(), digest, &self.batch_store, &self.consensus_chain)
+            .await
+    }
+
     /// Issue request_batches RPC and verifies response integrity
     #[instrument(level = "debug", skip_all, fields(num_digests = missing_digests.len()))]
     async fn request_batches_from_peers(
         &self,
-        missing_digests: &mut HashSet<BlockHash>,
+        missing_digests: &mut BTreeSet<BlockHash>,
     ) -> WorkerNetworkResult<HashMap<BlockHash, Batch>> {
         // request batches and return to caller
         let recovered_batches =
@@ -149,14 +244,16 @@ mod tests {
         test_utils::{create_test_batches, encode_batches_to_stream_bytes, setup_batch_db},
     };
     use futures::io::Cursor;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeSet, HashMap};
+    use tempfile::TempDir;
     use tn_network_libp2p::error::NetworkError;
+    use tn_storage::consensus::ConsensusChain;
     use tn_types::{max_batch_size, Batch, BlockHash, TaskManager, B256};
 
     #[tokio::test]
     async fn test_validate_batches_from_stream() {
         let batches = create_test_batches(3);
-        let digests: HashSet<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+        let digests: BTreeSet<BlockHash> = batches.iter().map(|b| b.digest()).collect();
 
         // encode batches to wire format
         let bytes = encode_batches_to_stream_bytes(&batches).await;
@@ -171,7 +268,7 @@ mod tests {
         let validated = result.expect("should validate successfully");
 
         assert_eq!(validated.len(), batches.len());
-        let validated_digests: HashSet<BlockHash> = validated.iter().map(|(d, _)| *d).collect();
+        let validated_digests: BTreeSet<BlockHash> = validated.iter().map(|(d, _)| *d).collect();
         assert_eq!(validated_digests, digests);
     }
 
@@ -183,7 +280,7 @@ mod tests {
         let mut cursor = Cursor::new(bytes);
 
         // only request 3
-        let digests: HashSet<BlockHash> = batches.iter().take(3).map(|b| b.digest()).collect();
+        let digests: BTreeSet<BlockHash> = batches.iter().take(3).map(|b| b.digest()).collect();
 
         let task_manager = TaskManager::default();
         let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
@@ -201,7 +298,7 @@ mod tests {
 
         // request a different digest
         let fake_digest = B256::random();
-        let digests: HashSet<BlockHash> = HashSet::from([fake_digest]);
+        let digests: BTreeSet<BlockHash> = BTreeSet::from([fake_digest]);
 
         let task_manager = TaskManager::default();
         let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
@@ -234,7 +331,7 @@ mod tests {
         // request set includes the batch digest (and count=2 passes the count check)
         let digest = batch.digest();
         let another_digest = B256::random();
-        let digests: HashSet<BlockHash> = HashSet::from([digest, another_digest]);
+        let digests: BTreeSet<BlockHash> = BTreeSet::from([digest, another_digest]);
 
         let task_manager = TaskManager::default();
         let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
@@ -252,7 +349,7 @@ mod tests {
 
         let mut cursor = Cursor::new(output);
 
-        let digests: HashSet<BlockHash> = HashSet::from([B256::random(), B256::random()]);
+        let digests: BTreeSet<BlockHash> = BTreeSet::from([B256::random(), B256::random()]);
 
         let task_manager = TaskManager::default();
         let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
@@ -265,7 +362,7 @@ mod tests {
     #[tokio::test]
     async fn test_validate_empty_stream_with_oversized_digest_set() {
         // create 501 dummy digests (exceeds MAX_BATCH_DIGESTS_PER_REQUEST = 500)
-        let digests: HashSet<BlockHash> = (0..501u64)
+        let digests: BTreeSet<BlockHash> = (0..501u64)
             .map(|i| {
                 let mut bytes = [0u8; 32];
                 bytes[..8].copy_from_slice(&i.to_le_bytes());
@@ -292,7 +389,7 @@ mod tests {
     #[tokio::test]
     async fn test_validate_partial_stream_fulfillment() {
         let all_batches = create_test_batches(5);
-        let all_digests: HashSet<BlockHash> = all_batches.iter().map(|b| b.digest()).collect();
+        let all_digests: BTreeSet<BlockHash> = all_batches.iter().map(|b| b.digest()).collect();
         assert_eq!(all_digests.len(), 5);
 
         // only encode 3 of the 5 batches into the stream
@@ -310,8 +407,8 @@ mod tests {
         assert_eq!(validated.len(), 3, "should return only the 3 batches from the stream");
 
         // verify returned digests match the 3 encoded batches
-        let validated_digests: HashSet<BlockHash> = validated.iter().map(|(d, _)| *d).collect();
-        let expected_digests: HashSet<BlockHash> =
+        let validated_digests: BTreeSet<BlockHash> = validated.iter().map(|(d, _)| *d).collect();
+        let expected_digests: BTreeSet<BlockHash> =
             partial_batches.iter().map(|b| b.digest()).collect();
         assert_eq!(validated_digests, expected_digests);
     }
@@ -324,11 +421,16 @@ mod tests {
     async fn test_fetch_for_primary_all_local() {
         let batches = create_test_batches(3);
         let db = setup_batch_db(&batches);
-        let digests: HashSet<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+        let digests: BTreeSet<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+        let temp_dir = TempDir::new().expect("temp dir");
 
         let task_manager = TaskManager::default();
         let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
-        let fetcher = BatchFetcher::new(handle, db);
+        let fetcher = BatchFetcher::new(
+            handle,
+            db,
+            ConsensusChain::new(temp_dir.path().to_path_buf()).expect("consensus chain"),
+        );
 
         let result = fetcher.fetch_for_primary(digests.clone()).await.expect("fetch local batches");
         assert_eq!(result.len(), batches.len());
@@ -341,11 +443,16 @@ mod tests {
     async fn test_fetch_for_primary_all_local_many() {
         let batches = create_test_batches(20);
         let db = setup_batch_db(&batches);
-        let digests: HashSet<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+        let digests: BTreeSet<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+        let temp_dir = TempDir::new().expect("temp dir");
 
         let task_manager = TaskManager::default();
         let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
-        let fetcher = BatchFetcher::new(handle, db);
+        let fetcher = BatchFetcher::new(
+            handle,
+            db,
+            ConsensusChain::new(temp_dir.path().to_path_buf()).expect("consensus chain"),
+        );
 
         let result = fetcher.fetch_for_primary(digests.clone()).await.expect("fetch local batches");
         assert_eq!(result.len(), 20);
@@ -371,16 +478,21 @@ mod tests {
         let all_batches = create_test_batches(5);
         // only store the first batch locally
         let db = setup_batch_db(&all_batches[..1]);
-        let all_digests: HashSet<BlockHash> = all_batches.iter().map(|b| b.digest()).collect();
+        let all_digests: BTreeSet<BlockHash> = all_batches.iter().map(|b| b.digest()).collect();
+        let temp_dir = TempDir::new().expect("temp dir");
 
         let task_manager = TaskManager::default();
         let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
-        let fetcher = BatchFetcher::new(handle.clone(), db);
+        let fetcher = BatchFetcher::new(
+            handle.clone(),
+            db,
+            ConsensusChain::new(temp_dir.path().to_path_buf()).expect("consensus chain"),
+        );
 
         // step 1: fetch_local finds 1 batch, leaves 4 missing
         let mut missing_digests = all_digests.clone();
         let mut fetched_batches = HashMap::new();
-        fetcher.fetch_local(&mut missing_digests, &mut fetched_batches).unwrap();
+        fetcher.fetch_local(&mut missing_digests, &mut fetched_batches).await.unwrap();
 
         assert_eq!(fetched_batches.len(), 1);
         assert_eq!(missing_digests.len(), 4);

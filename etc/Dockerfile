@@ -25,7 +25,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=./target,sharing=locked \
     rm -rf /usr/local/cargo/registry/src \
-    && cargo build --bin telcoin-network --release --features faucet \
+    && cargo build --bin telcoin-network --release \
     && mv ./target/release/telcoin-network /tmp/
 
 # production image

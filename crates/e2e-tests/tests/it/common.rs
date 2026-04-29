@@ -2,16 +2,25 @@
 //!
 //! Process management, cleanup guards, and helpers used across all test modules.
 
+use jsonrpsee::{
+    core::{client::ClientT as _, DeserializeOwned},
+    http_client::HttpClientBuilder,
+    rpc_params,
+};
 use nix::{
     sys::signal::{self, Signal},
     unistd::Pid,
 };
+use serde_json::Value;
 use std::{
+    collections::HashMap,
+    fmt::Debug,
     process::Child,
     sync::{Condvar, Mutex},
     time::Duration,
 };
 use tn_types::test_utils::init_test_tracing;
+use tokio::runtime::Builder;
 use tracing::{error, info};
 
 /// Max number of e2e tests that can run concurrently.
@@ -174,4 +183,96 @@ fn wait_or_kill(child: &mut Child) {
     if let Err(e) = child.wait() {
         error!(target: "e2e-test", ?e, "error waiting for child after SIGKILL");
     }
+}
+
+/// Get the block for block_number or latest block if None for node.
+pub(crate) fn get_block(
+    node: &str,
+    block_number: Option<u64>,
+) -> eyre::Result<HashMap<String, Value>> {
+    let debug_params = if let Some(block_number) = block_number {
+        format!("0x{block_number:x}")
+    } else {
+        "latest".to_string()
+    };
+
+    let params = rpc_params!(&debug_params, true);
+    // Deserialize as Option to handle null responses from syncing/restarted nodes
+    // that haven't caught up to the requested block yet.
+    let mut result: Option<HashMap<String, Value>> =
+        call_rpc(node, "eth_getBlockByNumber", params.clone(), 10, &debug_params)?;
+    let mut retries = 0;
+    while result.is_none() && retries < 30 {
+        std::thread::sleep(Duration::from_secs(1));
+        result = call_rpc(node, "eth_getBlockByNumber", params.clone(), 3, &debug_params)?;
+        retries += 1;
+    }
+    result.ok_or_else(|| {
+        eyre::eyre!("eth_getBlockByNumber returned null after retries for {debug_params} on {node}")
+    })
+}
+
+/// Inner async core for call_rpc.
+/// It can be called with or without tokio already running.
+async fn call_rpc_inner<R, Params, DebugParams>(
+    node: &str,
+    command: &str,
+    params: Params,
+    retries: usize,
+    debug_params: DebugParams,
+) -> eyre::Result<R>
+where
+    R: DeserializeOwned + Debug,
+    Params: jsonrpsee::core::traits::ToRpcParams + Send + Clone + Debug,
+    DebugParams: Debug,
+{
+    let client = HttpClientBuilder::default()
+        .request_timeout(Duration::from_secs(10))
+        .build(node)
+        .expect("couldn't build rpc client");
+    let mut resp = client.request(command, params.clone()).await;
+    let mut i = 0;
+    while i < retries && resp.is_err() {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let client = HttpClientBuilder::default()
+            .request_timeout(Duration::from_secs(10))
+            .build(node)
+            .expect("couldn't build rpc client");
+        resp = client.request(command, params.clone()).await;
+        i += 1;
+    }
+    Ok(resp.inspect_err(|error| {
+        error!(target: "restart-tests", ?error, ?command, ?node, ?debug_params, "rpc call failed");
+    })?)
+}
+
+/// Make an RPC call to node with command and params.
+/// Wraps any Eyre otherwise returns the result as a String.
+/// This is for testing and will try up to retries times at one second intervals to send the
+/// request.
+pub(crate) fn call_rpc<R, Params, DebugParams>(
+    node: &str,
+    command: &str,
+    params: Params,
+    retries: usize,
+    debug_params: DebugParams,
+) -> eyre::Result<R>
+where
+    R: DeserializeOwned + Debug,
+    Params: jsonrpsee::core::traits::ToRpcParams + Send + Clone + Debug,
+    DebugParams: Debug,
+{
+    // jsonrpsee is async AND tokio specific so give it a runtime if needed (and can't use a crate
+    // like pollster)...
+    let resp = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(move || {
+            handle.block_on(call_rpc_inner(node, command, params, retries, debug_params))
+        }),
+        Err(_) => Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()?
+            .block_on(call_rpc_inner(node, command, params, retries, debug_params)),
+    };
+    Ok(resp?)
 }

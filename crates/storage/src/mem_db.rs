@@ -99,6 +99,7 @@ impl Default for MemDatabase {
         let _ = db.open_table::<crate::tables::CertificateDigestByOrigin>();
         let _ = db.open_table::<crate::tables::Payload>();
         let _ = db.open_table::<crate::tables::NodeBatchesCache>();
+        let _ = db.open_table::<crate::tables::OurNodeBatchesCache>();
         let _ = db.open_table::<crate::tables::ConsensusHeaderCache>();
         let _ = db.open_table::<crate::tables::KadRecords>();
         let _ = db.open_table::<crate::tables::KadProviderRecords>();

@@ -4,9 +4,12 @@ use super::{
     handle::WorkerNetworkHandle,
     message::WorkerGossip,
 };
-use crate::network::{stream_codec, PendingBatchStream};
+use crate::{
+    batch_fetcher::get_batch_local_cache,
+    network::{stream_codec, PendingBatchStream},
+};
 use futures::AsyncWriteExt as _;
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{GossipMessage, Stream};
 use tn_network_types::{WorkerOthersBatchMessage, WorkerToPrimaryClient};
@@ -62,26 +65,54 @@ where
         let gossip = try_decode(data)?;
 
         match gossip {
-            WorkerGossip::Batch(batch_hash) => {
+            WorkerGossip::Batch(epoch, batch_hash) => {
                 ensure!(
                     topic.to_string().eq(&tn_config::LibP2pConfig::worker_batch_topic()),
                     WorkerNetworkError::InvalidTopic
                 );
+                let my_epoch = self.consensus_config.epoch();
+                // We are probably behind.  Do not bother to fetch and store this Batch now, it will
+                // most likely be removed before we can use it and will be fetched
+                // later when needed.
+                ensure!(my_epoch == epoch, WorkerNetworkError::BatchEpochMismatch(epoch, my_epoch));
                 // Retrieve the batch...
                 let store = self.consensus_config.node_storage();
-                if !matches!(store.get::<NodeBatchesCache>(&batch_hash), Ok(Some(_))) {
+                // Since we are precaching Batches for the current epoch we only need to check if it
+                // is in the local cache. There should not have been an opertunity
+                // for it to be in the consensus chain yet.
+                if !matches!(
+                    get_batch_local_cache(batch_hash, self.consensus_config.node_storage(),),
+                    Ok(Some(_))
+                ) {
                     // If batch is missing from db, then request from peer.
                     // If we are a CVV then we should already have it.
                     // This allows non-CVVs to pre fetch batches they will soon need.
-                    let mut missing = HashSet::from([batch_hash]);
+                    let mut missing = BTreeSet::from([batch_hash]);
                     match self.network_handle.request_batches(&mut missing).await {
                         Ok(batches) => {
                             if let Some((digest, batch)) = batches.first() {
-                                store.insert::<NodeBatchesCache>(digest, batch).map_err(|e| {
-                                    WorkerNetworkError::Internal(format!(
-                                        "failed to write to batch store: {e}"
-                                    ))
-                                })?;
+                                // Storing batches for future epochs can cause problems.  This might
+                                // open an attack for rogue
+                                // validator to fill disk space, the cache is cleared on
+                                // epoch boundaries anyway, etc.
+                                // Note: retrieving this batch for no reason is wasteful, it should
+                                // only effect nodes catching up old epochs though...
+                                if batch.epoch == self.consensus_config.epoch() {
+                                    store.insert::<NodeBatchesCache>(digest, batch).map_err(
+                                        |e| {
+                                            WorkerNetworkError::Internal(format!(
+                                                "failed to write to batch store: {e}"
+                                            ))
+                                        },
+                                    )?;
+                                } else {
+                                    debug!(
+                                        target: "worker:network",
+                                        batch_epoch = batch.epoch,
+                                        current_epoch = self.consensus_config.epoch(),
+                                        "gossipped batch epoch mismatch - discarding"
+                                    );
+                                }
                             }
                         }
                         Err(e) => {
