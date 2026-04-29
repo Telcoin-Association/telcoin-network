@@ -14,7 +14,7 @@ use tn_config::ConsensusConfig;
 use tn_storage::{consensus::ConsensusChain, CertificateStore};
 use tn_types::{
     AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Committee, Database,
-    Hash as _, Noticer, Round, TaskManager, Timestamp, TnReceiver, TnSender,
+    Hash as _, Noticer, Round, TaskManager, TnReceiver, TnSender,
 };
 use tracing::{debug, error, info, instrument};
 
@@ -166,12 +166,9 @@ impl ConsensusState {
             .or_insert_with(|| certificate.round());
         self.last_round = self.last_round.update(certificate.round(), self.gc_depth);
 
-        let commit_latency_ms = certificate.created_at().elapsed().as_millis() as u64;
-
         // Metric: certificate_commit_latency_ms - time from certificate creation to commit
         info!(
             target: "consensus::metrics",
-            certificate_commit_latency_ms = commit_latency_ms,
             round = certificate.round(),
             origin = ?certificate.origin(),
             digest = ?certificate.digest(),

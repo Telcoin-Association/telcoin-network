@@ -248,7 +248,7 @@ impl LeaderSchedule {
     }
 
     /// Restores the LeaderSchedule by using the storage. It will attempt to retrieve the last
-    /// committed "final" ReputationScores and use them to create build a LeaderSwapTable to use
+    /// committed "final" ReputationScores and use them to build a LeaderSwapTable to use
     /// for the LeaderSchedule.
     pub async fn from_store(
         committee: Committee,

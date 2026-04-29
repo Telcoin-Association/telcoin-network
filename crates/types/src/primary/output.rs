@@ -355,7 +355,7 @@ impl Hash<{ crypto::DIGEST_LENGTH }> for CommittedSubDag {
             hasher.update(cert.digest().as_ref());
         }
         hasher.update(self.leader.digest().as_ref());
-        // skip reputation for stable hashes
+        hasher.update(encode(&self.reputation_score).as_ref());
         hasher.update(encode(&self.commit_timestamp).as_ref());
         ConsensusDigest(Digest { digest: hasher.finalize().into() })
     }
