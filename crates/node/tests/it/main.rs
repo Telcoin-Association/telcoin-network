@@ -97,6 +97,7 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
         let res = engine.await;
         debug!(target: "gas-test", ?res, "res:");
         let _ = tx.send(res);
+        Ok(())
     });
 
     // subscribe to output early
@@ -228,6 +229,7 @@ async fn test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
         let res = engine.await;
         debug!(target: "gas-test", ?res, "res:");
         let _ = tx.send(res);
+        Ok(())
     });
 
     let mut consensus_output = consensus_bus.app().subscribe_consensus_output();
@@ -395,6 +397,7 @@ async fn test_catchup_accumulator_partial_execution() -> eyre::Result<()> {
         let res = engine.await;
         debug!(target: "gas-test", ?res, "partial res:");
         let _ = tx.send(res);
+        Ok(())
     });
 
     let mut consensus_output = consensus_bus.app().subscribe_consensus_output();

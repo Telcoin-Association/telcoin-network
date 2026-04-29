@@ -195,7 +195,7 @@ pub async fn spawn_epoch_record_collector(
             // watch notification.
             tokio::select!(
                 _ = &node_shutdown => {
-                    break;  // Break the outer loop.
+                    break Ok(());  // Break the outer loop.
                 },
                 _ = epoch_rx.changed() => { }
                 _ = tokio::time::sleep(Duration::from_secs(EPOCH_COLLECT_RETRY_SECS)) => { }

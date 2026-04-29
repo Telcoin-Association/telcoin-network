@@ -87,7 +87,7 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
     consensus_bus: ConsensusBusApp,
     network: PrimaryNetworkHandle,
     consensus_chain: ConsensusChain,
-) -> eyre::Result<()> {
+) {
     /// Attempt to request epoch packs for every epoch from current_fetch_epoch to latest epoch
     /// record.
     async fn request_epochs(
@@ -170,7 +170,7 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
             }
 
             _ = &rx_shutdown => {
-                return Ok(())
+                return;
             }
         }
     }
@@ -187,7 +187,7 @@ pub async fn spawn_fetch_consensus(
     network: PrimaryNetworkHandle,
     task_index: u32, // Task index for logging.
     consensus_chain: ConsensusChain,
-) -> eyre::Result<()> {
+) {
     async fn next_epoch<'s>(
         consensus_bus: &ConsensusBusApp,
         next_sem: &'s Arc<Semaphore>,
@@ -214,21 +214,21 @@ pub async fn spawn_fetch_consensus(
                                         "failed to request epoch pack for epoch {epoch}, attempt {attempts}: {e}");
                                     // Wait a beat before we try again, may have a network issue.
                                     // Wait time will increase as attempts grow.
-                                    tokio::select!(
+                                    tokio::select! {
                                         _ = &rx_shutdown => {
                                             info!(target: "state-sync",
                                                 "epoch consensus fetcher {task_index} shutting down during pack fetch");
-                                            return Ok(());
+                                            return;
                                         },
                                         _ = tokio::time::sleep(Duration::from_secs(((attempts / 10) + 1) * PACK_DOWNLOAD_RETRY_SECS)) => { }
-                                    );
+                                    }
                                 }
                             }
                         }
                         _ = &rx_shutdown => {
                             info!(target: "state-sync",
                                 "epoch consensus fetcher {task_index} shutting down during pack fetch");
-                            return Ok(());
+                            break;
                         }
                     }
                     if attempts > 100 {
@@ -244,7 +244,7 @@ pub async fn spawn_fetch_consensus(
                 }
             }
             _ = &rx_shutdown => {
-                return Ok(())
+                break;
             }
         }
     }

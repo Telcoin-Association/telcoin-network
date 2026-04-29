@@ -15,7 +15,7 @@ use tn_config::ConsensusConfig;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode};
 use tn_storage::{consensus::ConsensusChain, tables::ConsensusHeaderCache};
 use tn_types::{
-    BlockHash, ConsensusHeader, ConsensusOutput, Database, Epoch, TaskSpawner, TnSender,
+    BlockHash, ConsensusHeader, ConsensusOutput, Database, Epoch, TaskError, TaskSpawner, TnSender,
 };
 use tracing::{debug, error, info, warn};
 
@@ -74,16 +74,13 @@ pub fn spawn_state_sync<DB: Database>(
                 "state sync: track latest consensus header from peers",
                 async move {
                     info!(target: "state-sync", "Starting state sync: track latest consensus header from peers");
-                    if let Err(e) = spawn_track_recent_consensus(
+                    spawn_track_recent_consensus(
                         config_clone,
                         consensus_bus_clone,
                         network,
                         consensus_chain_clone,
-                    )
-                    .await
-                    {
-                        error!(target: "state-sync", "Error tracking latest consensus headers: {e}");
-                    }
+                    ).await;
+                    Ok(())
                 },
             );
             task_spawner.spawn_task(
@@ -92,6 +89,9 @@ pub fn spawn_state_sync<DB: Database>(
                     info!(target: "state-sync", "Starting state sync: stream consensus header from peers");
                     if let Err(e) = spawn_stream_consensus_headers(config, consensus_bus, consensus_chain).await {
                         error!(target: "state-sync", "Error streaming consensus headers: {e}");
+                        Err(TaskError::from_message(e))
+                    } else {
+                        Ok(())
                     }
                 },
             );

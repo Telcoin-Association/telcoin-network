@@ -14,7 +14,7 @@ use tn_types::{
     ensure,
     error::{DagError, DagResult},
     AuthorityIdentifier, BlsPublicKey, Certificate, CertificateDigest, Committee, Database, Header,
-    Noticer, Notifier, TaskManager, TaskSpawner, TnReceiver, Vote,
+    Noticer, Notifier, TaskManager, TaskResult, TaskSpawner, TnReceiver, Vote,
 };
 use tracing::{debug, enabled, error, info, instrument};
 
@@ -90,7 +90,7 @@ impl<DB: Database> Certifier<DB> {
 
             info!(target: "primary::certifier", "Certifier on node {:?} has started successfully.", authority_id);
 
-            Self {
+            let res = Self {
                 authority_id: authority_id.clone(),
                 committee: config.committee().clone(),
                 certificate_store: config.node_storage().clone(),
@@ -104,6 +104,7 @@ impl<DB: Database> Certifier<DB> {
             .run(rx_headers)
             .await;
             info!(target: "primary::certifier", "Certifier on node {} has shutdown.", authority_id);
+            res
         });
     }
 
@@ -282,7 +283,7 @@ impl<DB: Database> Certifier<DB> {
             let task_name = format!("vote-{header:?}-{name}");
             self.task_spawner.spawn_task(task_name, async move {
                 // process request for vote
-                tx_votes.send(
+                let _ = tx_votes.send(
                     // this will exit early on cancel_proposal
                     Self::request_vote(
                         name,
@@ -294,7 +295,8 @@ impl<DB: Database> Certifier<DB> {
                         cancel_proposal,
                     )
                     .await,
-                )
+                );
+                Ok(())
             });
         }
 
@@ -388,12 +390,13 @@ impl<DB: Database> Certifier<DB> {
     /// This listens for new proposal notifications to exit early.
     /// The method returns once enough votes are processed to certify the proposal,
     /// or if a new proposal arrives.
-    async fn spawn_header_proposal(self, header: Header) {
+    async fn spawn_header_proposal(self, header: Header) -> TaskResult {
         tokio::select! {
             // listen for new_proposal notification to exit
             // NOTE: sub here is okay bc no loop
             _ = self.new_proposal.subscribe() => {
                 debug!(target: "primary::certifier", "new proposal notification received");
+                Ok(())
             },
 
             // receive enough votes for certification (or exit early)
@@ -403,24 +406,26 @@ impl<DB: Database> Certifier<DB> {
                         // pass to state_sync for internal processing
                         if let Err(e) = self.state_sync.process_own_certificate(&mut certificate).await {
                             error!(target: "primary::certifier", "error accepting own certificate: {e}");
-                            return;
+                            return Err(e.into());
                         }
 
                         // try to publish the certificate on gossip network
                         if let Err(e) = self.network.publish_certificate(certificate).await {
                             error!(target: "primary::certifier", ?e, "failed to gossip certificate");
                         }
+                        Ok(())
                     }
 
                     Err(e) => {
                         match e {
-                            // ignore cancelled proposal errors
+                            // ignore cancelled proposal errors - expected when new proposal arrives
                             DagError::Canceled => {
                                 debug!(
                                     target: "primary::certifier",
                                     auth=?self.authority_id,
                                     "certifier cancelled proposed header task"
                                 );
+                                Ok(())
                             }
                             // log other errors loudly
                             e =>  {
@@ -429,6 +434,7 @@ impl<DB: Database> Certifier<DB> {
                                     auth=?self.authority_id,
                                     "Certifier error on proposed header task: {e}"
                                 );
+                                Err(e.into())
                             }
                         }
                     }
@@ -440,7 +446,7 @@ impl<DB: Database> Certifier<DB> {
     /// Execute the main certification task.  Will run until shutdown is signalled.
     /// If this exits outside of shutdown it will log an error and this will trigger a node
     /// shutdown.
-    async fn run(self, mut rx_headers: impl TnReceiver<Header>) {
+    async fn run(self, mut rx_headers: impl TnReceiver<Header>) -> TaskResult {
         info!(target: "primary::certifier", "Certifier on node {} has started successfully.", &self.authority_id);
         let shutdown = &self.config.shutdown().subscribe();
         loop {
@@ -466,7 +472,7 @@ impl<DB: Database> Certifier<DB> {
                     // cancel any outstanding proposals and vote requests
                     // NOTE: this isn't strictly necessary but may help shutdown
                     self.new_proposal.notify();
-                    break;
+                    break Ok(());
                 }
             }
         }

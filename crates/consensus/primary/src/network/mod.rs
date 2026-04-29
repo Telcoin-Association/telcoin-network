@@ -35,8 +35,8 @@ use tn_storage::{
 };
 use tn_types::{
     encode, BlockHash, BlsPublicKey, BlsSignature, Certificate, CertificateDigest, ConsensusHeader,
-    Database, Epoch, EpochCertificate, EpochRecord, EpochVote, Header, Round, TaskSpawner,
-    TnReceiver, TnSender, Vote, B256,
+    Database, Epoch, EpochCertificate, EpochRecord, EpochVote, Header, Round, TaskError,
+    TaskSpawner, TnReceiver, TnSender, Vote, B256,
 };
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
@@ -555,7 +555,7 @@ where
                             }
                             None => {
                                 warn!(target: "primary::network", "critical worker network events channel dropped");
-                                break;
+                                break Err(TaskError::from_message("critical worker network events channel dropped"));
                             }
                         }
                     }
@@ -614,6 +614,7 @@ where
                 let network_handle = self.network_handle.clone();
                 self.task_spawner.spawn_task("report request error", async move {
                     let _ = network_handle.handle.send_response(err, channel).await;
+                    Ok(())
                 });
             }
             NetworkEvent::InboundStream { peer, stream } => {
@@ -647,6 +648,7 @@ where
                 // cancel notification from network layer
                 _ = cancel => (),
             }
+            Ok(())
         });
     }
 
@@ -678,6 +680,7 @@ where
                 // cancel notification from network layer
                 _ = cancel => (),
             }
+            Ok(())
         });
     }
 
@@ -712,6 +715,7 @@ where
                 // cancel notification from network layer
                 _ = cancel => (),
             }
+            Ok(())
         });
     }
 
@@ -744,6 +748,7 @@ where
                 // cancel notification from network layer
                 _ = cancel => (),
             }
+            Ok(())
         });
     }
 
@@ -830,6 +835,7 @@ where
                 _ = network_handle.inner_handle().send_response(msg, channel) => (),
                 _ = cancel => (),
             }
+            Ok(())
         });
     }
 
@@ -847,6 +853,9 @@ where
                 if let Some(penalty) = (&e).into() {
                     network_handle.report_penalty(propagation_source, penalty).await;
                 }
+                Err(e.into())
+            } else {
+                Ok(())
             }
         });
     }
@@ -870,11 +879,11 @@ where
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     warn!(target: "primary::network", %peer, ?e, "failed to read request digest from stream");
-                    return;
+                    return Err(e.into());
                 }
-                Err(_) => {
+                Err(e) => {
                     warn!(target: "primary::network", %peer, "timeout reading request digest from stream");
-                    return;
+                    return Err(e.into());
                 }
             }
             let request_digest = B256::from(digest_buf);
@@ -893,6 +902,9 @@ where
                     if let Some(penalty) = (&err).into() {
                         network_handle.report_penalty(peer, penalty).await;
                     }
+                    Err(err.into())
+                } else {
+                    Ok(())
                 }
         });
     }

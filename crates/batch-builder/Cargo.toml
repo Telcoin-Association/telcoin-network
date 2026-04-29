@@ -18,6 +18,7 @@ futures-util = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+eyre = { workspace = true }
 
 [dev-dependencies]
 # unit tests

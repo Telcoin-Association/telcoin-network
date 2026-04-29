@@ -341,6 +341,7 @@ where
                         let _ = worker.disburse_txns(batch.seal(digest)).await;
                     }
                 }
+                Ok(())
             }.instrument(span));
         } else {
             info!(target: "epoch-manager", "No batches leftover");
@@ -1045,7 +1046,7 @@ where
                 if matches!(e, NetworkError::AlreadyConnected(_))
                     || matches!(e, NetworkError::AlreadyDialing(_))
                 {
-                    return;
+                    return Ok(());
                 }
                 retries += 1;
 
@@ -1058,10 +1059,11 @@ where
                 // We have been trying for a while (at least two max backoffs at 120 secs), if we
                 // have any other peers give up.
                 if retries > 10 && peers > 0 {
-                    error!(target = "dial_peer", "failed to reach peer {bls_pubkey}, giving up");
-                    return;
+                    warn!(target = "dial_peer", "failed to reach peer {bls_pubkey}, giving up");
+                    return Ok(()); // failing to reach a peer is expected now and then
                 }
             }
+            Ok(())
         });
     }
 

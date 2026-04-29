@@ -164,8 +164,8 @@ impl BatchBuilder {
             if let Err(e) = to_worker.send((batch, ack)).await {
                 error!(target: "worker::batch_builder", ?e, "failed to send next batch to worker");
                 // try to return error if worker channel closed
-                let _ = result.send(Err(e.into()));
-                return;
+                let _ = result.send(Err(BatchBuilderError::WorkerChannelClosed));
+                return Err(e.into());
             }
 
             // wait for worker to ack quorum reached then update pool with mined transactions
@@ -213,6 +213,7 @@ impl BatchBuilder {
                     }
                 }
             }
+            Ok(())
         }.instrument(span_clone));
 
         // return oneshot channel for receiving completion status

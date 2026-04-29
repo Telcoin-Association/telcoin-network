@@ -53,7 +53,9 @@ where
         let certificate_manager = self.certificate_validator.new_cert_manager();
         // Subscribe before spawning so the channel is active before any messages are sent.
         let rx = self.certificate_validator.consensus_bus().subscribe_certificate_manager();
-        task_manager.spawn_critical_task("certificate-manager", certificate_manager.run(rx));
+        task_manager.spawn_critical_task("certificate-manager", async move {
+            Ok(certificate_manager.run(rx).await?)
+        });
     }
 
     //

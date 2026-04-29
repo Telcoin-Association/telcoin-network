@@ -122,6 +122,7 @@ async fn test_batch_gossip_triggers_stream_request() {
 
     task_manager.spawn_task("process-gossip-test", async move {
         handler.pub_process_gossip_for_test(&msg).await.expect("success process gossip");
+        Ok(())
     });
 
     // recv commands
@@ -173,6 +174,7 @@ async fn test_batch_gossip_stream_accepted_opens_stream() {
     task_manager.spawn_task("process-gossip-test", async move {
         // This will timeout eventually since we don't complete the stream
         let _ = handler.pub_process_gossip_for_test(&msg).await;
+        Ok(())
     });
 
     let expected_peer = committee.last_authority().primary_public_key();

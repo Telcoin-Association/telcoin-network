@@ -339,7 +339,9 @@ impl<DB: Database> Consensus<DB> {
         if consensus_bus.is_active_cvv() {
             // Subscribe before spawning so the channel is active before any messages are sent.
             let rx_new_certificates = consensus_bus.subscribe_new_certificates();
-            task_manager.spawn_critical_task("consensus task", s.run(rx_new_certificates));
+            task_manager.spawn_critical_task("consensus task", async move {
+                Ok(s.run(rx_new_certificates).await?)
+            });
         }
     }
 
