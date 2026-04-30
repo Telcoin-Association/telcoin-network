@@ -1008,8 +1008,9 @@ async fn test_basefee_rollover_pool_sync() -> eyre::Result<()> {
 /// strategies (e.g., worker 0 EIP-1559, worker 1 Static), run several epochs, kill and restart
 /// a node, assert per-worker base fees restored independently from on-chain state.
 ///
-/// Blocked by the keytool harness limitation documented above — see `test_basefee_restart_restores_per_worker_fee`
-/// for the single-worker variant that IS runnable today.
+/// Blocked by the keytool harness limitation documented above — see
+/// `test_basefee_restart_restores_per_worker_fee` for the single-worker variant that IS runnable
+/// today.
 async fn test_basefee_multiworker_restart_placeholder() -> eyre::Result<()> {
     // intentionally empty — this test exists to document the follow-up work for multi-worker
     Ok(())
