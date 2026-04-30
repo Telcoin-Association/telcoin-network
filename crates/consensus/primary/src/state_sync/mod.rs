@@ -5,7 +5,7 @@ use cert_validator::CertificateValidator;
 use header_validator::HeaderValidator;
 use tn_config::ConsensusConfig;
 use tn_types::{
-    error::HeaderResult, Certificate, CertificateDigest, Database, Header, Round, TaskManager,
+    error::HeaderResult, Certificate, Database, Header, HeaderDigest, Round, TaskManager,
     TaskSpawner,
 };
 mod cert_collector;
@@ -116,7 +116,7 @@ where
     pub(crate) async fn identify_unkown_parents(
         &self,
         header: &Header,
-    ) -> HeaderResult<Vec<CertificateDigest>> {
+    ) -> HeaderResult<Vec<HeaderDigest>> {
         self.header_validator.identify_unkown_parents(header).await
     }
 }

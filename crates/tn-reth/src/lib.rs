@@ -1500,7 +1500,7 @@ mod tests {
         let reputation_scores = ReputationScores::default();
         let previous_sub_dag = None;
         let sub_dag = Arc::new(CommittedSubDag::new(
-            vec![leader.clone(), Certificate::default()],
+            vec![Certificate::default(), leader.clone()],
             leader,
             subdag_index,
             reputation_scores,

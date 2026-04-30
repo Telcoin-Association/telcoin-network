@@ -12,7 +12,7 @@ pub use crate::consensus::{
 };
 use thiserror::Error;
 use tn_storage::StoreError;
-use tn_types::{Certificate, CertificateDigest};
+use tn_types::{Certificate, HeaderDigest};
 
 /// The default channel size used in the consensus and subscriber logic.
 pub const DEFAULT_CHANNEL_SIZE: usize = 1_000;
@@ -32,7 +32,7 @@ pub enum ConsensusError {
     ShuttingDown,
 
     #[error("Parent digest {0:?} not found in DAG for {1:?}!")]
-    MissingParent(CertificateDigest, Box<Certificate>),
+    MissingParent(HeaderDigest, Box<Certificate>),
 
     #[error("Parent round not found in DAG for {0:?}!")]
     MissingParentRound(Box<Certificate>),

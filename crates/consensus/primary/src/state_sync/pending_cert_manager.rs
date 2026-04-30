@@ -5,7 +5,7 @@
 
 use crate::error::{CertManagerError, CertManagerResult};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use tn_types::{Certificate, CertificateDigest, Hash as _, Round};
+use tn_types::{Certificate, Hash as _, HeaderDigest, Round};
 use tracing::debug;
 
 /// A certificate that is missing parents and pending approval.
@@ -17,12 +17,12 @@ struct PendingCertificate {
     certificate: Certificate,
     /// The certificate's missing parents that must be retrieved before the pending certificate is
     /// accepted.
-    missing_parent_digests: HashSet<CertificateDigest>,
+    missing_parent_digests: HashSet<HeaderDigest>,
 }
 
 impl PendingCertificate {
     /// Create a new instance of Self.
-    fn new(certificate: Certificate, missing_parents: HashSet<CertificateDigest>) -> Self {
+    fn new(certificate: Certificate, missing_parents: HashSet<HeaderDigest>) -> Self {
         Self { certificate, missing_parent_digests: missing_parents }
     }
 }
@@ -38,12 +38,12 @@ pub(super) struct PendingCertificateManager {
     /// Each certificate entry tracks both the certificate itself and its dependency state
     ///
     /// Pending certificates that cannot be accepted yet.
-    pending: HashMap<CertificateDigest, PendingCertificate>,
+    pending: HashMap<HeaderDigest, PendingCertificate>,
     /// Map of a the missing certificate digests and the pending certificates that are blocked by
     /// them.
     ///
     /// The keys are (round, digest) to enable garbage collection by round.
-    missing_for_pending: BTreeMap<(Round, CertificateDigest), HashSet<CertificateDigest>>,
+    missing_for_pending: BTreeMap<(Round, HeaderDigest), HashSet<HeaderDigest>>,
 }
 
 impl PendingCertificateManager {
@@ -58,7 +58,7 @@ impl PendingCertificateManager {
     pub(super) fn insert_pending(
         &mut self,
         certificate: Certificate,
-        missing_parents: HashSet<CertificateDigest>,
+        missing_parents: HashSet<HeaderDigest>,
     ) -> CertManagerResult<()> {
         let digest = certificate.digest();
         let parent_round = certificate.round() - 1;
@@ -85,7 +85,7 @@ impl PendingCertificateManager {
     pub(super) fn update_pending(
         &mut self,
         round: Round,
-        digest: CertificateDigest,
+        digest: HeaderDigest,
     ) -> CertManagerResult<VecDeque<Certificate>> {
         let mut ready_certificates = VecDeque::new();
         let mut certificates_to_process = VecDeque::new();
@@ -134,10 +134,7 @@ impl PendingCertificateManager {
     ///
     /// This is useful for iterating through all missing certificates that are blocking pending
     /// certificates from being accepted.
-    pub(super) fn next_for_gc_round(
-        &mut self,
-        gc_round: Round,
-    ) -> Option<(Round, CertificateDigest)> {
+    pub(super) fn next_for_gc_round(&mut self, gc_round: Round) -> Option<(Round, HeaderDigest)> {
         let (round, digest) = self
             .missing_for_pending
             .first_key_value()
@@ -159,7 +156,7 @@ impl PendingCertificateManager {
     }
 
     /// Returns whether a certificate is being tracked
-    pub(super) fn is_pending(&self, digest: &CertificateDigest) -> bool {
+    pub(super) fn is_pending(&self, digest: &HeaderDigest) -> bool {
         self.pending.contains_key(digest)
     }
 
@@ -172,7 +169,7 @@ impl PendingCertificateManager {
     /// Filter parents that are pending in place.
     ///
     /// This is used when voting for headers.
-    pub(super) fn filter_unknown_digests(&self, unknown: &mut Vec<CertificateDigest>) {
+    pub(super) fn filter_unknown_digests(&self, unknown: &mut Vec<HeaderDigest>) {
         unknown.retain(|digest| !self.pending.contains_key(digest));
     }
 }

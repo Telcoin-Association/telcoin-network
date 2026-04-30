@@ -27,7 +27,7 @@ pub fn execute_consensus_output(
     // rename canonical header for clarity
     let BuildArguments { reth_env, output, parent_header } = args;
     let mut canonical_header = parent_header; // Last canonical header executed.
-    gas_accumulator.rewards_counter().inc_leader_count(output.leader().origin());
+    gas_accumulator.rewards_counter().inc_leader_count(output.leader().author());
     let epoch = output.leader().epoch();
     // output digest returns the `ConsensusHeader` digest
     let output_digest: B256 = output.digest().into();
@@ -76,7 +76,7 @@ pub fn execute_consensus_output(
         // Use parent values for next block (these values would come from the worker's block).
         let base_fee_per_gas = canonical_header.base_fee_per_gas.unwrap_or_default();
         let gas_limit = canonical_header.gas_limit;
-        let leader = output.leader().origin();
+        let leader = output.leader().author();
         let beneficiary = gas_accumulator
             .get_authority_address(leader)
             .ok_or(TnEngineError::UnknownAuthority(leader.clone()))

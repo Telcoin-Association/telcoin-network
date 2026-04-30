@@ -29,7 +29,7 @@ async fn test_sync_save_consensus() {
     let genesis: BTreeSet<_> = fixture.genesis().collect();
     let (_, headers) = fixture.headers_round(0, &genesis);
     let certificates: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
-    let leader = certificates.first().cloned().unwrap();
+    let leader = certificates.last().cloned().unwrap();
 
     // Create a CommittedSubDag
     let reputation = ReputationScores::new(&committee);
@@ -49,7 +49,7 @@ async fn test_sync_save_consensus() {
     let saved_header = saved.unwrap();
     assert_eq!(saved_header.number, 1, "Consensus number should be 1");
     assert_eq!(
-        saved_header.sub_dag.certificates.len(),
+        saved_header.sub_dag.headers.len(),
         certificates.len(),
         "Should have same number of certificates"
     );
@@ -74,7 +74,7 @@ async fn test_sync_parent_hash_chain() {
     let mut saved_digests: Vec<B256> = vec![B256::ZERO]; // Genesis parent
 
     for i in 1..=3u64 {
-        let leader = certificates.first().cloned().unwrap();
+        let leader = certificates.last().cloned().unwrap();
         let reputation = ReputationScores::new(&committee);
         let sub_dag =
             Arc::new(CommittedSubDag::new(certificates.clone(), leader, i - 1, reputation, None));
@@ -121,7 +121,7 @@ async fn test_sync_lookup_by_hash() {
     let genesis: BTreeSet<_> = fixture.genesis().collect();
     let (_, headers) = fixture.headers_round(0, &genesis);
     let certificates: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
-    let leader = certificates.first().cloned().unwrap();
+    let leader = certificates.last().cloned().unwrap();
 
     let reputation = ReputationScores::new(&committee);
     let sub_dag = Arc::new(CommittedSubDag::new(certificates, leader, 0, reputation, None));
@@ -149,7 +149,7 @@ async fn test_digest_determinism() {
     let genesis: BTreeSet<_> = fixture.genesis().collect();
     let (_, headers) = fixture.headers_round(0, &genesis);
     let certificates: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
-    let leader = certificates.first().cloned().unwrap();
+    let leader = certificates.last().cloned().unwrap();
 
     let reputation = ReputationScores::new(&committee);
     let sub_dag = CommittedSubDag::new(certificates, leader, 0, reputation, None);
@@ -175,7 +175,7 @@ async fn test_digest_collision_resistance() {
     let genesis: BTreeSet<_> = fixture.genesis().collect();
     let (_, headers) = fixture.headers_round(0, &genesis);
     let certificates: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
-    let leader = certificates.first().cloned().unwrap();
+    let leader = certificates.last().cloned().unwrap();
 
     let reputation = ReputationScores::new(&committee);
     let sub_dag = CommittedSubDag::new(certificates, leader, 0, reputation, None);
@@ -213,7 +213,7 @@ async fn test_digest_mismatch_detection() {
     let genesis: BTreeSet<_> = fixture.genesis().collect();
     let (_, headers) = fixture.headers_round(0, &genesis);
     let certificates: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
-    let leader = certificates.first().cloned().unwrap();
+    let leader = certificates.last().cloned().unwrap();
 
     let reputation = ReputationScores::new(&committee);
     let sub_dag = Arc::new(CommittedSubDag::new(certificates, leader, 0, reputation, None));

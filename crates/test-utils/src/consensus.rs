@@ -7,8 +7,8 @@ use std::{
     ops::RangeInclusive,
 };
 use tn_types::{
-    now, test_chain_spec_arc, AuthorityIdentifier, Batch, BlockHash, Certificate,
-    CertificateDigest, Database, Hash as _, HeaderBuilder, Round, WorkerId,
+    now, test_chain_spec_arc, AuthorityIdentifier, Batch, BlockHash, Certificate, Database,
+    Hash as _, HeaderBuilder, HeaderDigest, Round, WorkerId,
 };
 
 /// Create a random number of batches with signed transactions.
@@ -36,9 +36,9 @@ fn random_batches(
 fn signed_cert<DB>(
     origin: AuthorityIdentifier,
     round: Round,
-    parents: BTreeSet<CertificateDigest>,
+    parents: BTreeSet<HeaderDigest>,
     committee: &CommitteeFixture<DB>,
-) -> (CertificateDigest, Certificate, HashMap<BlockHash, Batch>)
+) -> (HeaderDigest, Certificate, HashMap<BlockHash, Batch>)
 where
     DB: Database,
 {
@@ -60,9 +60,9 @@ where
 fn signed_cert_empty<DB>(
     origin: AuthorityIdentifier,
     round: Round,
-    parents: BTreeSet<CertificateDigest>,
+    parents: BTreeSet<HeaderDigest>,
     committee: &CommitteeFixture<DB>,
-) -> (CertificateDigest, Certificate)
+) -> (HeaderDigest, Certificate)
 where
     DB: Database,
 {
@@ -86,7 +86,7 @@ pub fn create_signed_certificates_for_rounds<DB>(
     range: RangeInclusive<Round>,
     fixture: &CommitteeFixture<DB>,
     empty_rounds: &[Round],
-) -> (VecDeque<Certificate>, BTreeSet<CertificateDigest>, HashMap<BlockHash, Batch>)
+) -> (VecDeque<Certificate>, BTreeSet<HeaderDigest>, HashMap<BlockHash, Batch>)
 where
     DB: Database,
 {
@@ -129,7 +129,7 @@ pub fn create_signed_certificates_with_empty_rounds<DB>(
     range: RangeInclusive<Round>,
     fixture: &CommitteeFixture<DB>,
     empty_rounds: &[Round],
-) -> (VecDeque<Certificate>, BTreeSet<CertificateDigest>, HashMap<BlockHash, Batch>)
+) -> (VecDeque<Certificate>, BTreeSet<HeaderDigest>, HashMap<BlockHash, Batch>)
 where
     DB: Database,
 {

@@ -13,7 +13,7 @@ use tn_storage::CertificateStore;
 use tn_types::{
     ensure,
     error::{DagError, DagResult},
-    AuthorityIdentifier, BlsPublicKey, Certificate, CertificateDigest, Committee, Database, Header,
+    AuthorityIdentifier, BlsPublicKey, Certificate, Committee, Database, Header, HeaderDigest,
     Noticer, Notifier, TaskManager, TaskResult, TaskSpawner, TnReceiver, Vote,
 };
 use tracing::{debug, enabled, error, info, instrument};
@@ -120,7 +120,7 @@ impl<DB: Database> Certifier<DB> {
         committee: Committee,
         cancel_proposal: Noticer,
     ) -> DagResult<Vote> {
-        let mut missing_parents: Option<Vec<CertificateDigest>> = None;
+        let mut missing_parents: Option<Vec<HeaderDigest>> = None;
         let mut attempt: u32 = 0;
         debug!(target: "primary::certifier", ?authority, ?header, "requesting vote for header...");
 

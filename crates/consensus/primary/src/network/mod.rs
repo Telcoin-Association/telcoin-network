@@ -34,9 +34,9 @@ use tn_storage::{
     PayloadStore,
 };
 use tn_types::{
-    encode, BlockHash, BlsPublicKey, BlsSignature, Certificate, CertificateDigest, ConsensusHeader,
-    Database, Epoch, EpochCertificate, EpochRecord, EpochVote, Header, Round, TaskError,
-    TaskSpawner, TnReceiver, TnSender, Vote, B256,
+    encode, BlockHash, BlsPublicKey, BlsSignature, Certificate, ConsensusHeader, Database, Epoch,
+    EpochCertificate, EpochRecord, EpochVote, Header, HeaderDigest, Round, TaskError, TaskSpawner,
+    TnReceiver, TnSender, Vote, B256,
 };
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
@@ -959,5 +959,5 @@ pub enum RequestVoteResult {
     ///
     /// If the peer was unable to verify parents for a proposed header, they respond requesting
     /// the missing certificate by digest.
-    MissingParents(Vec<CertificateDigest>),
+    MissingParents(Vec<HeaderDigest>),
 }

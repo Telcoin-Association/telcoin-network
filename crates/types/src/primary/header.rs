@@ -1,8 +1,8 @@
 use crate::{
     crypto, encode,
     error::{HeaderError, HeaderResult},
-    now, AuthorityIdentifier, Batch, BlockHash, BlockNumHash, CertificateDigest, Committee, Digest,
-    Epoch, Hash, Round, TimestampSec, VoteDigest, WorkerId,
+    now, AuthorityIdentifier, Batch, BlockHash, BlockNumHash, Committee, Digest, Epoch, Hash,
+    Round, TimestampSec, VoteDigest, WorkerId,
 };
 use derive_builder::Builder;
 use indexmap::IndexMap;
@@ -26,7 +26,7 @@ pub struct Header {
     #[serde(with = "indexmap::map::serde_seq")]
     pub payload: IndexMap<BlockHash, WorkerId>,
     /// Parent certificates for this Header.
-    pub parents: BTreeSet<CertificateDigest>,
+    pub parents: BTreeSet<HeaderDigest>,
     /// Hash and number of the latest known execution block when this Header was build.
     /// This may be our parent block or may not but it does include our latest
     /// execution result in a signed and validated structure which validates
@@ -44,7 +44,7 @@ impl Header {
         round: Round,
         epoch: Epoch,
         payload: IndexMap<BlockHash, WorkerId>,
-        parents: BTreeSet<CertificateDigest>,
+        parents: BTreeSet<HeaderDigest>,
         latest_execution_block: BlockNumHash,
     ) -> Self {
         let header = Self {
@@ -122,7 +122,7 @@ impl Header {
         &self.payload
     }
     /// The parents for the header.
-    pub fn parents(&self) -> &BTreeSet<CertificateDigest> {
+    pub fn parents(&self) -> &BTreeSet<HeaderDigest> {
         &self.parents
     }
 
@@ -150,12 +150,6 @@ impl Header {
     /// The nonce of this header used during execution.
     pub fn nonce(&self) -> u64 {
         ((self.epoch as u64) << 32) | self.round as u64
-    }
-}
-
-impl From<Header> for CertificateDigest {
-    fn from(value: Header) -> Self {
-        Self::new(value.digest().into())
     }
 }
 

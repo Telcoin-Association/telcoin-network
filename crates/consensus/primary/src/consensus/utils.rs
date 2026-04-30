@@ -48,8 +48,10 @@ pub(crate) fn order_dag(leader: &Certificate, state: &ConsensusState) -> Vec<Cer
         }
     }
 
-    // Ordering the output by round is not really necessary but it makes the commit sequence
-    // prettier.
+    // Ordering the output by round is necessary to make sure batches from early rounds go in before
+    // later rounds and to put the leader at the end plus it makes the commit sequence prettier.
+    // Note, the leader should be a single certificate with the highest round, it will sort last-
+    // this marks it as the leader.
     ordered.sort_by_key(|x| x.round());
     ordered
 }

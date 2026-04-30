@@ -12,11 +12,11 @@ use crate::{
     StoreResult, ROUNDS_TO_KEEP,
 };
 use tn_types::{
-    AuthorityIdentifier, Certificate, CertificateDigest, Database, DbTx, DbTxMut, Hash, Round,
+    AuthorityIdentifier, Certificate, Database, DbTx, DbTxMut, Hash, HeaderDigest, Round,
 };
 use tn_utils::NotifyRead;
 
-static NOTIFY_SUBSCRIBERS: LazyLock<NotifyRead<CertificateDigest, Certificate>> =
+static NOTIFY_SUBSCRIBERS: LazyLock<NotifyRead<HeaderDigest, Certificate>> =
     LazyLock::new(NotifyRead::new);
 
 /// The main storage trait when we have to deal with certificates.
@@ -51,7 +51,7 @@ pub trait CertificateStore {
 
     /// Retrieves a certificate from the store. If not found
     /// then None is returned as result.
-    fn read(&self, id: CertificateDigest) -> StoreResult<Option<Certificate>>;
+    fn read(&self, id: HeaderDigest) -> StoreResult<Option<Certificate>>;
 
     /// Retrieves a certificate from the store by round and authority.
     /// If not found, None is returned as result.
@@ -62,27 +62,27 @@ pub trait CertificateStore {
     ) -> StoreResult<Option<Certificate>>;
 
     /// Check database for certificate.
-    fn contains(&self, digest: &CertificateDigest) -> StoreResult<bool>;
+    fn contains(&self, digest: &HeaderDigest) -> StoreResult<bool>;
 
     /// Check database for multiple certificates.
     fn multi_contains<'a>(
         &self,
-        digests: impl Iterator<Item = &'a CertificateDigest>,
+        digests: impl Iterator<Item = &'a HeaderDigest>,
     ) -> StoreResult<Vec<bool>>;
 
     /// Retrieves multiple certificates by their provided ids. The results
     /// are returned in the same sequence as the provided keys.
     fn read_all(
         &self,
-        ids: impl IntoIterator<Item = CertificateDigest>,
+        ids: impl IntoIterator<Item = HeaderDigest>,
     ) -> StoreResult<Vec<Option<Certificate>>>;
 
     /// Waits to get notified until the requested certificate becomes available
     // Use de-sugared async fn to specify trait bounds and avoid clippy warnings.
-    fn notify_read(&self, id: CertificateDigest) -> impl Future<Output = StoreResult<Certificate>>;
+    fn notify_read(&self, id: HeaderDigest) -> impl Future<Output = StoreResult<Certificate>>;
 
     /// Deletes a single certificate by its digest.
-    fn delete(&self, id: CertificateDigest) -> StoreResult<()>;
+    fn delete(&self, id: HeaderDigest) -> StoreResult<()>;
 
     /// Retrieves all the certificates with round >= the provided round.
     /// The result is returned with certificates sorted in round asc order
@@ -128,7 +128,7 @@ pub trait CertificateStore {
 /// Save a cert using an open txn.
 fn save_cert<TX: DbTxMut>(
     txn: &mut TX,
-    digest: CertificateDigest,
+    digest: HeaderDigest,
     certificate: &Certificate,
 ) -> StoreResult<()> {
     txn.insert::<Certificates>(&digest, certificate)?;
@@ -210,7 +210,7 @@ impl<DB: Database> CertificateStore for DB {
 
     /// Retrieves a certificate from the store. If not found
     /// then None is returned as result.
-    fn read(&self, id: CertificateDigest) -> StoreResult<Option<Certificate>> {
+    fn read(&self, id: HeaderDigest) -> StoreResult<Option<Certificate>> {
         self.get::<Certificates>(&id)
     }
 
@@ -227,13 +227,13 @@ impl<DB: Database> CertificateStore for DB {
         }
     }
 
-    fn contains(&self, digest: &CertificateDigest) -> StoreResult<bool> {
+    fn contains(&self, digest: &HeaderDigest) -> StoreResult<bool> {
         self.contains_key::<Certificates>(digest)
     }
 
     fn multi_contains<'a>(
         &self,
-        digests: impl Iterator<Item = &'a CertificateDigest>,
+        digests: impl Iterator<Item = &'a HeaderDigest>,
     ) -> StoreResult<Vec<bool>> {
         digests.map(|digest| self.contains_key::<Certificates>(digest)).collect()
     }
@@ -242,13 +242,13 @@ impl<DB: Database> CertificateStore for DB {
     /// are returned in the same sequence as the provided keys.
     fn read_all(
         &self,
-        ids: impl IntoIterator<Item = CertificateDigest>,
+        ids: impl IntoIterator<Item = HeaderDigest>,
     ) -> StoreResult<Vec<Option<Certificate>>> {
         ids.into_iter().map(|digest| self.get::<Certificates>(&digest)).collect()
     }
 
     /// Waits to get notified until the requested certificate becomes available
-    async fn notify_read(&self, id: CertificateDigest) -> StoreResult<Certificate> {
+    async fn notify_read(&self, id: HeaderDigest) -> StoreResult<Certificate> {
         // we register our interest to be notified with the value
         let receiver = NOTIFY_SUBSCRIBERS.register_one(&id);
 
@@ -269,7 +269,7 @@ impl<DB: Database> CertificateStore for DB {
     }
 
     /// Deletes a single certificate by its digest.
-    fn delete(&self, id: CertificateDigest) -> StoreResult<()> {
+    fn delete(&self, id: HeaderDigest) -> StoreResult<()> {
         let mut txn = self.write_txn()?;
         // first read the certificate to get the round - we'll need in order
         // to delete the secondary index

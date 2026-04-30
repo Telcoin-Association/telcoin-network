@@ -78,16 +78,16 @@ macro_rules! tables {
 pub mod tables {
     use super::{PayloadToken, ProposerKey};
     use tn_types::{
-        AuthorityIdentifier, Batch, BlockHash, Certificate, CertificateDigest, ConsensusHeader,
-        Header, Round, TableHint, VoteInfo, WorkerId,
+        AuthorityIdentifier, Batch, BlockHash, Certificate, ConsensusHeader, Header, HeaderDigest,
+        Round, TableHint, VoteInfo, WorkerId,
     };
 
     tables!(
         LastProposed;crate::LAST_PROPOSED_CF;TableHint::Epoch;<ProposerKey, Header>,  // Cleared every epoch
         Votes;crate::VOTES_CF;TableHint::Epoch;<AuthorityIdentifier, VoteInfo>,  // Cleared every epoch
-        Certificates;crate::CERTIFICATES_CF;TableHint::Epoch;<CertificateDigest, Certificate>,  // Cleared every epoch
-        CertificateDigestByRound;crate::CERTIFICATE_DIGEST_BY_ROUND_CF;TableHint::Epoch;<(Round, AuthorityIdentifier), CertificateDigest>,  // Cleared every epoch
-        CertificateDigestByOrigin;crate::CERTIFICATE_DIGEST_BY_ORIGIN_CF;TableHint::Epoch;<(AuthorityIdentifier, Round), CertificateDigest>,  // Cleared every epoch
+        Certificates;crate::CERTIFICATES_CF;TableHint::Epoch;<HeaderDigest, Certificate>,  // Cleared every epoch
+        CertificateDigestByRound;crate::CERTIFICATE_DIGEST_BY_ROUND_CF;TableHint::Epoch;<(Round, AuthorityIdentifier), HeaderDigest>,  // Cleared every epoch
+        CertificateDigestByOrigin;crate::CERTIFICATE_DIGEST_BY_ORIGIN_CF;TableHint::Epoch;<(AuthorityIdentifier, Round), HeaderDigest>,  // Cleared every epoch
         Payload;crate::PAYLOAD_CF;TableHint::Epoch;<(BlockHash, WorkerId), PayloadToken>,  // Cleared every epoch
         // This is a cache to store this nodes batches before consensus, remove once in a ConsensusHeader.
         NodeBatchesCache;crate::NODE_BATCHES_CACHE_CF;TableHint::Cache;<BlockHash, Batch>,

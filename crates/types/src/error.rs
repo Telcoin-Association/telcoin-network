@@ -1,8 +1,8 @@
 //! Error types whenn validating types during consensus.
 
 use crate::{
-    crypto, BlockNumHash, BlsPublicKey, CertificateDigest, Digest, Epoch, HeaderDigest, Round,
-    SendError, TimestampSec, VoteDigest, WorkerId,
+    crypto, BlockNumHash, BlsPublicKey, Digest, Epoch, HeaderDigest, Round, SendError,
+    TimestampSec, VoteDigest, WorkerId,
 };
 use thiserror::Error;
 
@@ -117,7 +117,7 @@ pub enum DagError {
     InvalidTimestamp { created_time: TimestampSec, local_time: TimestampSec },
 
     #[error("Invalid parent {0} (not found in genesis)")]
-    InvalidGenesisParent(CertificateDigest),
+    InvalidGenesisParent(HeaderDigest),
 
     #[error("No peer can be reached for fetching certificates! Check if network is healthy.")]
     NoCertificateFetched,
@@ -237,7 +237,7 @@ pub enum HeaderError {
     UnknownExecutionResult(BlockNumHash),
     /// Invalid parent for genesis.
     #[error("Invalid parent for genesis: {0}")]
-    InvalidGenesisParent(CertificateDigest),
+    InvalidGenesisParent(HeaderDigest),
     /// Error retrieving value from storage.
     #[error("Storage failure: {0}")]
     Storage(#[from] StoreError),
@@ -302,10 +302,10 @@ pub enum CertificateError {
     InvalidSignature,
     /// The certificates's round is too far behind.
     #[error("Certificate {0} for round {1} is too old for GC round {2}")]
-    TooOld(CertificateDigest, Round, Round),
+    TooOld(HeaderDigest, Round, Round),
     /// The certificate is too far in the future for this node.
     #[error("Certificate {0} for round {1} is too new for this primary at round {2}")]
-    TooNew(CertificateDigest, Round, Round),
+    TooNew(HeaderDigest, Round, Round),
     /// Oneshot channel dropped while processing the certificate.
     #[error("Failed to process certificate - oneshot sender error")]
     ResChannelClosed(String),

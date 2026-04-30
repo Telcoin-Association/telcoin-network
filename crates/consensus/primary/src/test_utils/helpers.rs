@@ -18,8 +18,8 @@ use tn_reth::{
 };
 use tn_types::{
     test_chain_spec_arc, test_genesis, to_intent_message, Address, AuthorityIdentifier, Batch,
-    BlockHash, BlsKeypair, BlsSignature, Bytes, Certificate, CertificateDigest, Committee, Epoch,
-    ExecHeader, Hash as _, HeaderBuilder, ProtocolSignature, Round, VotingPower, WorkerId, U256,
+    BlockHash, BlsKeypair, BlsSignature, Bytes, Certificate, Committee, Epoch, ExecHeader,
+    Hash as _, HeaderBuilder, HeaderDigest, ProtocolSignature, Round, VotingPower, WorkerId, U256,
 };
 
 pub fn temp_dir() -> TempDir {
@@ -107,27 +107,27 @@ pub fn batch_with_rand<R: Rng + ?Sized>(rand: &mut R, worker_id: WorkerId) -> Ba
 pub fn make_optimal_certificates(
     committee: &Committee,
     range: RangeInclusive<Round>,
-    initial_parents: &BTreeSet<CertificateDigest>,
+    initial_parents: &BTreeSet<HeaderDigest>,
     ids: &[AuthorityIdentifier],
-) -> (VecDeque<Certificate>, BTreeSet<CertificateDigest>) {
+) -> (VecDeque<Certificate>, BTreeSet<HeaderDigest>) {
     make_certificates(committee, range, initial_parents, ids, 0.0)
 }
 
 /// Outputs rounds worth of certificates with optimal parents that are signed.
 pub fn make_optimal_signed_certificates(
     range: RangeInclusive<Round>,
-    initial_parents: &BTreeSet<CertificateDigest>,
+    initial_parents: &BTreeSet<HeaderDigest>,
     committee: &Committee,
     keys: &[(AuthorityIdentifier, BlsKeypair)],
-) -> (VecDeque<Certificate>, BTreeSet<CertificateDigest>) {
+) -> (VecDeque<Certificate>, BTreeSet<HeaderDigest>) {
     make_signed_certificates(range, initial_parents, committee, keys, 0.0)
 }
 
 /// Bernoulli-samples from a set of ancestors passed as a argument,
 fn this_cert_parents(
-    ancestors: &BTreeSet<CertificateDigest>,
+    ancestors: &BTreeSet<HeaderDigest>,
     failure_prob: f64,
-) -> BTreeSet<CertificateDigest> {
+) -> BTreeSet<HeaderDigest> {
     std::iter::from_fn(|| {
         let f: f64 = rand::rng().random();
         Some(f > failure_prob)
@@ -143,15 +143,15 @@ fn this_cert_parents(
 /// `make_one_certificate` argument
 fn rounds_of_certificates(
     range: RangeInclusive<Round>,
-    initial_parents: &BTreeSet<CertificateDigest>,
+    initial_parents: &BTreeSet<HeaderDigest>,
     ids: &[AuthorityIdentifier],
     failure_probability: f64,
     make_one_certificate: impl Fn(
         AuthorityIdentifier,
         Round,
-        BTreeSet<CertificateDigest>,
-    ) -> (CertificateDigest, Certificate),
-) -> (VecDeque<Certificate>, BTreeSet<CertificateDigest>) {
+        BTreeSet<HeaderDigest>,
+    ) -> (HeaderDigest, Certificate),
+) -> (VecDeque<Certificate>, BTreeSet<HeaderDigest>) {
     let mut certificates = VecDeque::new();
     let mut parents = initial_parents.iter().cloned().collect::<BTreeSet<_>>();
     let mut next_parents = BTreeSet::new();
@@ -174,10 +174,10 @@ fn rounds_of_certificates(
 pub fn make_certificates(
     committee: &Committee,
     range: RangeInclusive<Round>,
-    initial_parents: &BTreeSet<CertificateDigest>,
+    initial_parents: &BTreeSet<HeaderDigest>,
     ids: &[AuthorityIdentifier],
     failure_probability: f64,
-) -> (VecDeque<Certificate>, BTreeSet<CertificateDigest>) {
+) -> (VecDeque<Certificate>, BTreeSet<HeaderDigest>) {
     let generator = |pk, round, parents| mock_certificate(committee, pk, round, parents);
 
     rounds_of_certificates(range, initial_parents, ids, failure_probability, generator)
@@ -265,10 +265,10 @@ pub struct TestLeaderConfiguration {
 pub fn make_certificates_with_leader_configuration(
     committee: &Committee,
     range: RangeInclusive<Round>,
-    initial_parents: &BTreeSet<CertificateDigest>,
+    initial_parents: &BTreeSet<HeaderDigest>,
     names: &[AuthorityIdentifier],
     leader_configurations: HashMap<Round, TestLeaderConfiguration>,
-) -> (VecDeque<Certificate>, BTreeSet<CertificateDigest>) {
+) -> (VecDeque<Certificate>, BTreeSet<HeaderDigest>) {
     for round in leader_configurations.keys() {
         assert_eq!(round % 2, 0, "Leaders are elected only on even rounds");
     }
@@ -365,7 +365,7 @@ pub fn this_cert_parents_with_slow_nodes(
     slow_nodes: &[(AuthorityIdentifier, f64)],
     rand: &mut StdRng,
     committee: &Committee,
-) -> BTreeSet<CertificateDigest> {
+) -> BTreeSet<HeaderDigest> {
     let mut parents = BTreeSet::new();
     let mut not_included = Vec::new();
     let mut total_stake = 0;
@@ -420,9 +420,9 @@ pub fn make_certificates_with_epoch(
     committee: &Committee,
     range: RangeInclusive<Round>,
     epoch: Epoch,
-    initial_parents: &BTreeSet<CertificateDigest>,
+    initial_parents: &BTreeSet<HeaderDigest>,
     keys: &[AuthorityIdentifier],
-) -> (VecDeque<Certificate>, BTreeSet<CertificateDigest>) {
+) -> (VecDeque<Certificate>, BTreeSet<HeaderDigest>) {
     let mut certificates = VecDeque::new();
     let mut parents = initial_parents.iter().cloned().collect::<BTreeSet<_>>();
     let mut next_parents = BTreeSet::new();
@@ -443,11 +443,11 @@ pub fn make_certificates_with_epoch(
 /// make rounds worth of signed certificates with the sampled number of parents
 pub fn make_signed_certificates(
     range: RangeInclusive<Round>,
-    initial_parents: &BTreeSet<CertificateDigest>,
+    initial_parents: &BTreeSet<HeaderDigest>,
     committee: &Committee,
     keys: &[(AuthorityIdentifier, BlsKeypair)],
     failure_probability: f64,
-) -> (VecDeque<Certificate>, BTreeSet<CertificateDigest>) {
+) -> (VecDeque<Certificate>, BTreeSet<HeaderDigest>) {
     let ids = keys.iter().map(|(authority, _)| authority.clone()).collect::<Vec<_>>();
     let generator = |pk, round, parents| signed_cert_for_test(keys, pk, round, parents, committee);
 
@@ -458,9 +458,9 @@ pub fn mock_certificate_with_rand<R: RngCore + ?Sized>(
     committee: &Committee,
     origin: AuthorityIdentifier,
     round: Round,
-    parents: BTreeSet<CertificateDigest>,
+    parents: BTreeSet<HeaderDigest>,
     rand: &mut R,
-) -> (CertificateDigest, Certificate) {
+) -> (HeaderDigest, Certificate) {
     let header_builder = HeaderBuilder::default();
     let header = header_builder
         .author(origin)
@@ -479,8 +479,8 @@ pub fn mock_certificate(
     committee: &Committee,
     origin: AuthorityIdentifier,
     round: Round,
-    parents: BTreeSet<CertificateDigest>,
-) -> (CertificateDigest, Certificate) {
+    parents: BTreeSet<HeaderDigest>,
+) -> (HeaderDigest, Certificate) {
     mock_certificate_with_epoch(committee, origin, round, 0, parents)
 }
 
@@ -491,8 +491,8 @@ pub fn mock_certificate_with_epoch(
     origin: AuthorityIdentifier,
     round: Round,
     epoch: Epoch,
-    parents: BTreeSet<CertificateDigest>,
-) -> (CertificateDigest, Certificate) {
+    parents: BTreeSet<HeaderDigest>,
+) -> (HeaderDigest, Certificate) {
     let header_builder = HeaderBuilder::default();
     let header = header_builder
         .author(origin)
@@ -510,9 +510,9 @@ pub fn signed_cert_for_test(
     signers: &[(AuthorityIdentifier, BlsKeypair)],
     origin: AuthorityIdentifier,
     round: Round,
-    parents: BTreeSet<CertificateDigest>,
+    parents: BTreeSet<HeaderDigest>,
     committee: &Committee,
-) -> (CertificateDigest, Certificate) {
+) -> (HeaderDigest, Certificate) {
     let header = HeaderBuilder::default()
         .author(origin)
         .payload(fixture_payload(1))
