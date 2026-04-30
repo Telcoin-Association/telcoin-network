@@ -49,6 +49,9 @@ impl ConsensusHeader {
         hasher.update(parent_hash.as_slice());
         hasher.update(sub_dag.digest().as_ref());
         hasher.update(number.to_le_bytes().as_ref());
+        // Include the extra field.
+        // Not using this yet but include the default in the hash in prep when we do.
+        hasher.update(B256::default().as_slice());
         BlockHash::from_slice(hasher.finalize().as_bytes())
     }
 }

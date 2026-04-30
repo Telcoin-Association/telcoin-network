@@ -700,10 +700,8 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     // are randomly generated
     //
     // for each tx, seed address with funds in genesis
-    let timestamp = now();
     let mut leader_1 = Certificate::default();
     // update cert
-    leader_1.update_created_at_for_test(timestamp);
     leader_1.header_mut_for_test().author = authority_1;
     let sub_dag_index_1 = 1;
     leader_1.header.round = sub_dag_index_1 as u32;
@@ -730,7 +728,6 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     let mut leader_2 = Certificate::default();
     let leader_2_epoch = leader_2.epoch();
     // update cert
-    leader_2.update_created_at_for_test(timestamp + 2);
     leader_2.header_mut_for_test().author = authority_2;
     let sub_dag_index_2 = 2;
     leader_2.header.round = sub_dag_index_2 as u32;
@@ -1212,10 +1209,8 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     // are randomly generated
     //
     // for each tx, seed address with funds in genesis
-    let timestamp = now();
     let mut leader_1 = Certificate::default();
     // update timestamp
-    leader_1.update_created_at_for_test(timestamp);
     leader_1.header_mut_for_test().author = authority_1;
     let sub_dag_index_1: u64 = 1;
     leader_1.header.round = sub_dag_index_1 as u32;
@@ -1244,7 +1239,6 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     let mut leader_2 = Certificate::default();
     let leader_2_epoch = leader_2.epoch();
     // update timestamp
-    leader_2.update_created_at_for_test(timestamp + 2);
     leader_2.header_mut_for_test().author = authority_2;
     let sub_dag_index_2 = 2;
     leader_2.header.round = sub_dag_index_2 as u32;
@@ -1599,10 +1593,8 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     // are randomly generated
     //
     // for each tx, seed address with funds in genesis
-    let timestamp = now();
     let mut leader_1 = Certificate::default();
     // update timestamp
-    leader_1.update_created_at_for_test(timestamp);
     let sub_dag_index_1 = 1;
     leader_1.header.round = sub_dag_index_1 as u32;
     let reputation_scores = ReputationScores::default();
@@ -1628,7 +1620,6 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     // create second output
     let mut leader_2 = Certificate::default();
     // update timestamp
-    leader_2.update_created_at_for_test(timestamp + 2);
     let sub_dag_index_2 = 2;
     leader_2.header.round = sub_dag_index_2 as u32;
     let reputation_scores = ReputationScores::default();
@@ -1836,10 +1827,8 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
     // are randomly generated
     //
     // for each tx, seed address with funds in genesis
-    let timestamp = now();
     let mut leader = Certificate::default();
     // update cert
-    leader.update_created_at_for_test(timestamp);
     leader.header_mut_for_test().author = authority_1;
     let sub_dag_index = 1;
     leader.header.round = sub_dag_index as u32;
@@ -2144,9 +2133,7 @@ async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
     execute_test_batch(&mut batch);
 
     // consensus output
-    let timestamp = now();
     let mut leader = Certificate::default();
-    leader.update_created_at_for_test(timestamp);
     leader.header_mut_for_test().author = authority_1;
     let sub_dag_index = 1;
     leader.header.round = sub_dag_index as u32;
