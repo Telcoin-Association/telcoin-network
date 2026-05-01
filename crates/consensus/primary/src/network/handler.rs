@@ -218,7 +218,7 @@ where
                                 }
                                 self.state_sync.process_peer_certificate(&mut cert).await?;
                             }
-                            if !self.consensus_bus.is_cvv_inactive()
+                            if self.consensus_bus.is_cvv_inactive()
                                 && self.consensus_config.committee().epoch() == cert.epoch()
                             {
                                 // If we are catching up and this is for our current epoch save in

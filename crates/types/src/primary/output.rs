@@ -308,7 +308,6 @@ impl CommittedSubDag {
             });
         let randomness = keccak256(randomness.to_bytes());
         let headers = certificates.into_iter().map(|c| c.header).collect();
-
         Self { headers, reputation_score, commit_timestamp, randomness }
     }
 

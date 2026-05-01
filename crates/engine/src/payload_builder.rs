@@ -36,9 +36,11 @@ pub fn execute_consensus_output(
     let batches = output.flatten_batches();
 
     let span = info_span!(target: "telcoin", "execute-consensus", epoch,
+        consensus_number = output.number(),
         consensus_hash = output_digest.to_string(),
-        parent_number = canonical_header.number,
-        parent_hash = canonical_header.hash().to_string(),
+        parent_consensus_hash = output.parent_hash().to_string(),
+        parent_exec_number = canonical_header.number,
+        parent_exec_hash = canonical_header.hash().to_string(),
         executed_blocks = field::Empty,
         batches = batches.len(),
     );
