@@ -644,7 +644,7 @@ mod tests {
         let mut leader_cert = Certificate::default();
         leader_cert.header_mut_for_test().author = leader;
         let mut subdag = CommittedSubDag::default();
-        subdag.leader = leader_cert;
+        subdag.headers.push(leader_cert.header.clone());
         let output = ConsensusOutput::new_with_subdag(Arc::new(subdag), BlockHash::default(), 0);
 
         // receive new blocks and return non-fatal errors

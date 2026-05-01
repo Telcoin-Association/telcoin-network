@@ -24,9 +24,8 @@ use tn_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
     now, to_intent_message, try_decode, AuthorityIdentifier, BlockHash, BlsPublicKey, Certificate,
-    CertificateDigest, ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord, Hash as _,
-    Header, HeaderDigest, ProtocolSignature, Round, SignatureVerificationState, TnSender as _,
-    Vote, B256,
+    ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord, Hash as _, Header,
+    HeaderDigest, ProtocolSignature, Round, SignatureVerificationState, TnSender as _, Vote, B256,
 };
 use tokio::{io::AsyncReadExt, sync::Mutex as TokioMutex, time::timeout};
 use tracing::{debug, error, info, warn};
@@ -58,7 +57,7 @@ pub(crate) struct RequestHandler<DB> {
     /// for missing parents. The values are associated with the first authority that proposed a
     /// header with these parents. The node keeps track of requested Certificates to prevent
     /// unsolicited certificate attacks.
-    requested_parents: Arc<Mutex<BTreeMap<(Round, CertificateDigest), AuthorityIdentifier>>>,
+    requested_parents: Arc<Mutex<BTreeMap<(Round, HeaderDigest), AuthorityIdentifier>>>,
     /// Map of the last epoch and round each authority requested a vote for.
     /// Used to stop validator equivocation early.
     auth_last_vote: Arc<AuthEquivocationMap>,
@@ -187,7 +186,7 @@ where
 
     /// Process gossip from the committee.
     ///
-    /// Peers gossip the CertificateDigest so peers can request the Certificate. This waits until
+    /// Peers gossip the HeaderDigest so peers can request the Certificate. This waits until
     /// the certificate can be retrieved and timesout after some time. It's important to give up
     /// after enough time to limit the DoS attack surface. Peers who timeout must lose reputation.
     pub(super) async fn process_gossip(&self, msg: &GossipMessage) -> PrimaryNetworkResult<()> {
@@ -218,6 +217,14 @@ where
                                     return Ok(());
                                 }
                                 self.state_sync.process_peer_certificate(&mut cert).await?;
+                            }
+                            if self.consensus_bus.is_cvv_inactive()
+                                && self.consensus_config.committee().epoch() == cert.epoch()
+                            {
+                                // If we are catching up and this is for our current epoch save in
+                                // cache so we will be able
+                                // to rejoin consensus later when caught up.
+                                let _ = self.consensus_config.node_storage().write((*cert).clone());
                             }
                         }
                         Err(e) => warn!(target: "primary", "Recieved invalid cert {e}"),
@@ -702,10 +709,7 @@ where
     ///
     /// Certificates are considered "known" if they are in local storage, pending, or already
     /// requested from a peer.
-    async fn check_for_missing_parents(
-        &self,
-        header: &Header,
-    ) -> HeaderResult<Vec<CertificateDigest>> {
+    async fn check_for_missing_parents(&self, header: &Header) -> HeaderResult<Vec<HeaderDigest>> {
         // identify parents that are neither in storage nor pending
         let mut unknown_certs = self.state_sync.identify_unkown_parents(header).await?;
 

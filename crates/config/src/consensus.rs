@@ -8,8 +8,8 @@ use std::{
 };
 use tn_network_types::local::LocalNetwork;
 use tn_types::{
-    Authority, AuthorityIdentifier, BlsPublicKey, Certificate, CertificateDigest, Committee,
-    Database, Epoch, Hash as _, Multiaddr, NetworkPublicKey, Notifier,
+    Authority, AuthorityIdentifier, BlsPublicKey, Certificate, Committee, Database, Epoch,
+    Hash as _, HeaderDigest, Multiaddr, NetworkPublicKey, Notifier,
 };
 use tracing::info;
 
@@ -22,7 +22,7 @@ struct ConsensusConfigInner<DB> {
     authority: Option<Authority>,
     local_network: LocalNetwork,
     network_config: NetworkConfig,
-    genesis: HashMap<CertificateDigest, Certificate>,
+    genesis: HashMap<HeaderDigest, Certificate>,
 }
 
 /// The configuration for consensus.
@@ -147,7 +147,7 @@ where
     ///
     /// Genesis certificates establish the initial state and authority set
     /// for the consensus protocol to produce the first primary `Header`.
-    pub fn genesis(&self) -> &HashMap<CertificateDigest, Certificate> {
+    pub fn genesis(&self) -> &HashMap<HeaderDigest, Certificate> {
         &self.inner.genesis
     }
 

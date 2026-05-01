@@ -709,7 +709,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     let previous_sub_dag = None;
     let mut batch_digests_1: VecDeque<BlockHash> = batches_1.iter().map(|b| b.digest()).collect();
     let subdag_1 = Arc::new(CommittedSubDag::new(
-        vec![leader_1.clone(), Certificate::default()],
+        vec![Certificate::default(), leader_1.clone()],
         leader_1,
         sub_dag_index_1,
         reputation_scores,
@@ -735,7 +735,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     let previous_sub_dag = Some(subdag_1.clone());
     let batch_digests_2: VecDeque<BlockHash> = batches_2.iter().map(|b| b.digest()).collect();
     let subdag_2 = CommittedSubDag::new(
-        vec![leader_2.clone(), Certificate::default()],
+        vec![Certificate::default(), leader_2.clone()],
         leader_2,
         sub_dag_index_2,
         reputation_scores,
@@ -1220,7 +1220,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     let mut cert_1 = Certificate::default();
     cert_1.header.round = 1;
     let subdag_1 = Arc::new(CommittedSubDag::new(
-        vec![cert_1],
+        vec![leader_1.clone()],
         leader_1,
         sub_dag_index_1,
         reputation_scores,
@@ -1248,7 +1248,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     let mut cert_2 = Certificate::default();
     cert_2.header.round = 2;
     let subdag_2: Arc<CommittedSubDag> = CommittedSubDag::new(
-        vec![cert_2],
+        vec![leader_2.clone()],
         leader_2,
         sub_dag_index_2,
         reputation_scores,
@@ -1601,7 +1601,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     let previous_sub_dag = None;
     let batch_digests_1: VecDeque<BlockHash> = batches_1.iter().map(|b| b.digest()).collect();
     let subdag_1 = Arc::new(CommittedSubDag::new(
-        vec![Certificate::default()],
+        vec![leader_1.clone()],
         leader_1,
         sub_dag_index_1,
         reputation_scores,
@@ -1626,7 +1626,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     let previous_sub_dag = Some(subdag_1.clone());
     let batch_digests_2: VecDeque<BlockHash> = batches_2.iter().map(|b| b.digest()).collect();
     let subdag_2: Arc<CommittedSubDag> = CommittedSubDag::new(
-        vec![Certificate::default()],
+        vec![Certificate::default(), leader_2.clone()],
         leader_2,
         sub_dag_index_2,
         reputation_scores,
@@ -1837,7 +1837,7 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
     let batch_digest = batch.digest();
     let batch_digests = VecDeque::from([batch_digest]);
     let subdag = Arc::new(CommittedSubDag::new(
-        vec![leader.clone(), Certificate::default()],
+        vec![Certificate::default(), leader.clone()],
         leader,
         sub_dag_index,
         reputation_scores,
@@ -2142,7 +2142,7 @@ async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
     let batch_digest = batch.digest();
     let batch_digests = VecDeque::from([batch_digest]);
     let subdag = Arc::new(CommittedSubDag::new(
-        vec![leader.clone(), Certificate::default()],
+        vec![Certificate::default(), leader.clone()],
         leader,
         sub_dag_index,
         reputation_scores,

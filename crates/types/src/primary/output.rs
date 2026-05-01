@@ -4,7 +4,7 @@
 use super::ConsensusHeader;
 use crate::{
     crypto, encode, Address, Batch, BlockHash, BlockNumHash, BlsSignature, Certificate, Digest,
-    Epoch, Hash, ReputationScores, Round, SealedHeader, TimestampSec, B256,
+    Epoch, Hash, Header, ReputationScores, Round, SealedHeader, TimestampSec, B256,
 };
 use alloy::primitives::keccak256;
 use once_cell::sync::OnceCell;
@@ -135,8 +135,8 @@ impl ConsensusOutput {
     }
 
     /// The leader for the round
-    pub fn leader(&self) -> &Certificate {
-        &self.inner.sub_dag.leader
+    pub fn leader(&self) -> &Header {
+        self.inner.sub_dag.leader()
     }
 
     /// The round for the [CommittedSubDag].
@@ -151,7 +151,7 @@ impl ConsensusOutput {
 
     /// The leader's `nonce`.
     pub fn nonce(&self) -> SequenceNumber {
-        self.inner.sub_dag.leader.nonce()
+        self.inner.sub_dag.leader().nonce()
     }
 
     /// Return the batch digest for index idx or None if not available.
@@ -229,11 +229,7 @@ impl ConsensusOutput {
     /// NOTE: this cannot fail - uses [BlsSignature::default] and is considered acceptable with
     /// permissioned validator set, but should never happen.
     pub fn keccak_leader_sigs(&self) -> B256 {
-        let randomness = self.leader().aggregated_signature().unwrap_or_else(|| {
-            error!(target: "engine", ?self, "BLS signature missing for leader - using default for closing epoch");
-            BlsSignature::default()
-        });
-        keccak256(randomness.to_bytes())
+        self.inner.sub_dag.randomness
     }
 
     /// The parent hash for this output.
@@ -256,20 +252,23 @@ impl Display for ConsensusOutput {
         write!(
             f,
             "ConsensusOutput(epoch={:?}, round={:?}, timestamp={:?}, digest={:?})",
-            self.inner.sub_dag.leader.epoch(),
-            self.inner.sub_dag.leader.round(),
+            self.inner.sub_dag.leader().epoch(),
+            self.inner.sub_dag.leader().round(),
             self.inner.sub_dag.commit_timestamp(),
             self.digest()
         )
     }
 }
 
-#[derive(PartialEq, Serialize, Deserialize, Clone, Debug, Default)]
+/// Contains the committed output from Bullshark consensus.
+/// Note it stores Headers without certificates, all validation
+/// should be complete.  Future validation can be done by verifying
+/// the consensus chain against signed checkpoints (like epoch records).
+#[derive(PartialEq, Serialize, Deserialize, Clone, Debug)]
 pub struct CommittedSubDag {
     /// The sequence of committed certificates.
-    pub certificates: Vec<Certificate>,
-    /// The leader certificate responsible for committing this sub-dag.
-    pub leader: Certificate,
+    /// Note the last element MUST be the leader.
+    pub headers: Vec<Header>,
     /// The so far calculated reputation score for nodes
     pub reputation_score: ReputationScores,
     /// The timestamp that should identify this commit. This is guaranteed to be monotonically
@@ -278,9 +277,26 @@ pub struct CommittedSubDag {
     /// Property is explicitly private so the method commit_timestamp() should be used instead
     /// which bears additional resolution logic.
     commit_timestamp: TimestampSec,
+    /// Randomness derived from the leaders BLS aggregate signature.
+    randomness: B256,
+}
+
+impl Default for CommittedSubDag {
+    fn default() -> Self {
+        // Override default so we have one default header (the leader)
+        // so a default value won't panic when used.
+        Self {
+            headers: vec![Header::default()],
+            reputation_score: Default::default(),
+            commit_timestamp: Default::default(),
+            randomness: Default::default(),
+        }
+    }
 }
 
 impl CommittedSubDag {
+    /// Create a new CommittedSubDag.
+    /// Note that leader MUST be the first element or certificates or this will panic.
     pub fn new(
         certificates: Vec<Certificate>,
         leader: Certificate,
@@ -295,36 +311,48 @@ impl CommittedSubDag {
 
         if previous_sub_dag_ts > *leader.header().created_at() {
             warn!(sub_dag_index = ?sub_dag_index, "Leader timestamp {} is older than previously committed sub dag timestamp {}. Auto-correcting to max {}.",
-            leader.header().created_at(), previous_sub_dag_ts, commit_timestamp);
+                leader.header().created_at(), previous_sub_dag_ts, commit_timestamp);
         }
-
-        Self { certificates, leader, reputation_score, commit_timestamp }
+        // Make sure the leader is the LAST certificate.
+        //
+        assert_eq!(leader.digest(), certificates.last().map(|c| c.digest()).unwrap_or_default());
+        let randomness = leader.aggregated_signature().unwrap_or_else(|| {
+                error!(target: "engine", "BLS signature missing for leader - using default for closing epoch");
+                BlsSignature::default()
+            });
+        let randomness = keccak256(randomness.to_bytes());
+        let headers = certificates.into_iter().map(|c| c.header).collect();
+        Self { headers, reputation_score, commit_timestamp, randomness }
     }
 
+    /// How many consensus headers are in this sub dag (including the leader).
     pub fn len(&self) -> usize {
-        self.certificates.len()
+        self.headers.len()
     }
 
+    /// Is this empty (i.e. contains no headers).
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    pub fn num_primary_blocks(&self) -> usize {
-        self.certificates.iter().map(|x| x.header().payload().len()).sum()
+    /// Number of batches contained in the sub dag.
+    pub fn num_primary_batches(&self) -> usize {
+        self.headers.iter().map(|x| x.payload().len()).sum()
     }
 
-    pub fn is_last(&self, output: &Certificate) -> bool {
-        self.certificates.iter().last().map_or_else(|| false, |x| x == output)
+    /// The leader header responsible for committing this sub-dag.
+    pub fn leader(&self) -> &Header {
+        self.headers.last().expect("sub dag MUST have a leader")
     }
 
     /// The Certificate's round.
     pub fn leader_round(&self) -> Round {
-        self.leader.round()
+        self.leader().round()
     }
 
     /// The Certificate's epoch.
     pub fn leader_epoch(&self) -> Epoch {
-        self.leader.epoch()
+        self.leader().epoch()
     }
 
     /// Return the leaders commit timestamp.
@@ -333,14 +361,14 @@ impl CommittedSubDag {
         // replaying this commit and field is never initialised. It's safe to fallback on leader's
         // timestamp.
         if self.commit_timestamp == 0 {
-            return *self.leader.header().created_at();
+            return *self.leader().created_at();
         }
         self.commit_timestamp
     }
 
     /// Return the Certificates for this SubDag.
-    pub fn certificates(&self) -> &[Certificate] {
-        &self.certificates
+    pub fn headers(&self) -> &[Header] {
+        &self.headers
     }
 }
 
@@ -351,12 +379,12 @@ impl Hash<{ crypto::DIGEST_LENGTH }> for CommittedSubDag {
         let mut hasher = crypto::DefaultHashFunction::new();
         // Instead of hashing serialized CommittedSubDag, hash the certificate digests instead.
         // Signatures in the certificates are not part of the commitment.
-        for cert in &self.certificates {
+        for cert in &self.headers {
             hasher.update(cert.digest().as_ref());
         }
-        hasher.update(self.leader.digest().as_ref());
         hasher.update(encode(&self.reputation_score).as_ref());
         hasher.update(encode(&self.commit_timestamp).as_ref());
+        hasher.update(self.randomness.as_ref());
         ConsensusDigest(Digest { digest: hasher.finalize().into() })
     }
 }

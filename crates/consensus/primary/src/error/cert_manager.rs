@@ -2,7 +2,7 @@
 
 use tn_network_libp2p::error::NetworkError;
 use tn_storage::StoreError;
-use tn_types::{error::CertificateError, CertificateDigest, SendError};
+use tn_types::{error::CertificateError, HeaderDigest, SendError};
 
 use super::GarbageCollectorError;
 
@@ -20,13 +20,13 @@ pub(crate) enum CertManagerError {
     GC(#[from] GarbageCollectorError),
     /// The certificate's signature verification state is unverified.
     #[error("Unverified signature verification state {0}")]
-    UnverifiedSignature(CertificateDigest),
+    UnverifiedSignature(HeaderDigest),
     /// Oneshot channel dropped for certificate manager.
     #[error("Failed to return certificate manager's result.")]
     CertificateManagerOneshot,
     /// The pending certificate is unexpectedly missing. This should not happen.
     #[error("Pending certificate not found by digest: {0}")]
-    PendingCertificateNotFound(CertificateDigest),
+    PendingCertificateNotFound(HeaderDigest),
     /// The certificate was verified, accepted, and stored in storage.
     /// However, an error occurred adding it to the collection of parents.
     /// This is the only way to advance the round and is fatal.
@@ -42,13 +42,13 @@ pub(crate) enum CertManagerError {
     JoinError,
     /// The certificate is pending acceptance due to missing parents.
     #[error("The certificate {0} is pending acceptance due to missing parents.")]
-    Pending(CertificateDigest),
+    Pending(HeaderDigest),
     /// Error retrieving value from storage.
     #[error("Storage failure: {0}")]
     Storage(#[from] StoreError),
     /// A duplicate certificate was received but it has different missing parents.
     #[error("The certificate {0} was already pending, but now it has different missing parents.")]
-    PendingParentsMismatch(CertificateDigest),
+    PendingParentsMismatch(HeaderDigest),
 
     /// mpsc sender dropped while processig the certificate
     #[error("Failed to process certificate - TN sender error: {0}")]

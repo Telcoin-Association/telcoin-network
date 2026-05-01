@@ -788,8 +788,8 @@ impl Inner {
                     if consensus_header.parent_hash != parent_digest {
                         return Err(PackError::InvalidConsensusChain);
                     }
-                    for cert in &consensus_header.sub_dag.certificates {
-                        for (digest, _) in cert.header().payload().iter() {
+                    for header in &consensus_header.sub_dag.headers {
+                        for (digest, _) in header.payload().iter() {
                             if !batches.remove(digest) {
                                 return Err(PackError::MissingBatches);
                             }
@@ -901,7 +901,7 @@ impl Inner {
             .into_consensus()?;
         let parent_hash = header.parent_hash;
         let deliver = header.sub_dag;
-        let num_blocks = deliver.num_primary_blocks();
+        let num_blocks = deliver.num_primary_batches();
         let num_certs = deliver.len();
 
         let sub_dag = deliver;
@@ -912,8 +912,8 @@ impl Inner {
         let mut batch_set: HashSet<BlockHash> = HashSet::new();
 
         let mut batch_digests = VecDeque::with_capacity(num_certs);
-        for cert in sub_dag.certificates() {
-            for (digest, _) in cert.header().payload().iter() {
+        for header in sub_dag.headers() {
+            for (digest, _) in header.payload().iter() {
                 batch_set.insert(*digest);
                 batch_digests.push_back(*digest);
             }
@@ -921,12 +921,12 @@ impl Inner {
 
         // map all fetched batches to their respective certificates for applying block rewards
         let mut batches = Vec::with_capacity(num_certs);
-        for cert in &sub_dag.certificates {
+        for header in &sub_dag.headers {
             // create collection of batches to execute for this certificate
-            let mut cert_batches = Vec::with_capacity(cert.header().payload().len());
+            let mut cert_batches = Vec::with_capacity(header.payload().len());
 
             // retrieve fetched batch by digest
-            for digest in cert.header().payload().keys() {
+            for digest in header.payload().keys() {
                 let position = self
                     .batch_digests
                     .load(*digest)
@@ -940,7 +940,7 @@ impl Inner {
             }
 
             let address =
-                self.epoch_meta.committee.authority(cert.origin()).map(|a| a.execution_address());
+                self.epoch_meta.committee.authority(header.author()).map(|a| a.execution_address());
             if let Some(address) = address {
                 // main collection for execution
                 batches.push(CertifiedBatch { address, batches: cert_batches });
@@ -1032,14 +1032,14 @@ impl Inner {
                 let block = self.data.fetch(pos);
                 block.ok().map(|b| b.into_consensus().ok()).unwrap_or_default()
             }) {
-                let id = block.sub_dag.leader.origin().clone();
+                let id = block.sub_dag.leader().author().clone();
                 let round = block.sub_dag.leader_round();
-                let certs = block.sub_dag.certificates();
+                let headers = block.sub_dag.headers();
                 res.entry(id).and_modify(|r| *r = max(*r, round)).or_insert_with(|| round);
-                for c in certs {
-                    res.entry(c.origin().clone())
-                        .and_modify(|r| *r = max(*r, c.round()))
-                        .or_insert_with(|| c.round());
+                for h in headers {
+                    res.entry(h.author().clone())
+                        .and_modify(|r| *r = max(*r, h.round()))
+                        .or_insert_with(|| h.round());
                 }
             }
         }
@@ -1125,7 +1125,7 @@ impl Inner {
                 continue;
             }
 
-            rewards_counter.inc_leader_count(header.sub_dag.leader.origin());
+            rewards_counter.inc_leader_count(header.sub_dag.leader().author());
         }
         Ok(())
     }

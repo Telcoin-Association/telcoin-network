@@ -7,7 +7,7 @@
 use std::fmt::Debug;
 use thiserror::Error;
 use tn_storage::StoreError;
-use tn_types::{AuthorityIdentifier, BlockHash, CertificateDigest, WorkerId};
+use tn_types::{AuthorityIdentifier, BlockHash, HeaderDigest, WorkerId};
 
 /// Returns an error if the given condition is false.
 ///
@@ -64,7 +64,7 @@ pub enum SubscriberError {
     /// a certificate, which prevents the certificate from being executed. The certificate
     /// digest and error details are included for debugging.
     #[error("Error occurred while retrieving certificate {0} payload: {1}")]
-    PayloadRetrieveError(CertificateDigest, String),
+    PayloadRetrieveError(HeaderDigest, String),
 
     /// Consensus output referenced a worker ID that doesn't exist in the committee.
     ///

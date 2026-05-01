@@ -19,7 +19,7 @@ use tn_config::ConsensusConfig;
 use tn_storage::CertificateStore;
 use tn_types::{
     error::{CertificateError, HeaderError},
-    Certificate, CertificateDigest, Database, Hash as _, Round, TnReceiver, TnSender as _,
+    Certificate, Database, Hash as _, HeaderDigest, Round, TnReceiver, TnSender as _,
 };
 use tokio::sync::oneshot;
 use tracing::{debug, error};
@@ -132,7 +132,7 @@ where
     async fn get_missing_parents(
         &self,
         certificate: &Certificate,
-    ) -> CertManagerResult<HashSet<CertificateDigest>> {
+    ) -> CertManagerResult<HashSet<HeaderDigest>> {
         // handle genesis cert
         if certificate.round() == 1 {
             debug!(target: "primary::cert_manager", ?certificate, "cert round 1");
@@ -179,7 +179,6 @@ where
     ///
     /// NOTE: `self::process_verified_certificates` checks the verification status, so all
     /// certificates managed here are verified.
-    // synchronizer::accept_certificate_internal
     async fn accept_verified_certificates(
         &mut self,
         certificates: VecDeque<Certificate>,
@@ -332,8 +331,8 @@ pub(crate) enum CertificateManagerCommand {
     /// This is used to vote on headers.
     FilterUnkownDigests {
         /// The collection of digests not found in local storage.
-        unknown: Vec<CertificateDigest>,
+        unknown: Vec<HeaderDigest>,
         /// Return the result to the header validator.
-        reply: oneshot::Sender<Vec<CertificateDigest>>,
+        reply: oneshot::Sender<Vec<HeaderDigest>>,
     },
 }

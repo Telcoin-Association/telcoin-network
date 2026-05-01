@@ -79,8 +79,8 @@ impl Bullshark {
         // update the score for the previous leader. If no previous leader exists,
         // then this is the first time we commit a leader, so no score update takes place
         if let Some(last_committed_sub_dag) = state.last_committed_sub_dag.as_ref() {
-            let leader_digest = last_committed_sub_dag.leader.digest();
-            let leader_round = last_committed_sub_dag.leader.round();
+            let leader_digest = last_committed_sub_dag.leader().digest();
+            let leader_round = last_committed_sub_dag.leader().round();
             for certificate in committed_sequence.iter().filter(|c| c.round() == leader_round + 1) {
                 if certificate.header().parents().contains(&leader_digest) {
                     reputation_score.add_score(certificate.origin(), 1);
@@ -221,18 +221,15 @@ impl Bullshark {
             debug!("Leader {:?} has enough support", leader);
 
             let mut min_round = leader.round();
-            let mut sequence = Vec::new();
+            let sequence = utils::order_dag(&leader, state);
 
             // Starting from the oldest leader, flatten the sub-dag referenced by the leader.
-            for x in utils::order_dag(&leader, state) {
+            for x in &sequence {
                 // Update and clean up internal state.
-                state.update(&x);
+                state.update(x);
 
                 // For logging.
                 min_round = min_round.min(x.round());
-
-                // Add the certificate to the sequence.
-                sequence.push(x);
             }
             let num_certificates = sequence.len();
             debug!(min_round, "Subdag has {} certificates", num_certificates);

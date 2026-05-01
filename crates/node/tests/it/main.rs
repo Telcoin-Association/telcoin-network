@@ -127,7 +127,7 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
             // forward output from consensus to engine
             Some(output) = consensus_output.recv() => {
                 debug!(target: "gas-test", output=?output.leader(), round=output.leader().round(), "received output");
-                let leader = output.leader().origin().clone();
+                let leader = output.leader().author().clone();
                 // manually track values as well
                 rewards.entry(leader).and_modify(|count| *count += 1).or_insert(1);
                 to_engine.send(output).await?;
@@ -278,7 +278,7 @@ async fn test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
     let mut rewards = HashMap::new();
     let mut empty_outputs_seen = 0u32;
     for (i, output) in real_outputs.into_iter().enumerate() {
-        let leader = output.leader().origin().clone();
+        let leader = output.leader().author().clone();
         rewards.entry(leader.clone()).and_modify(|count| *count += 1).or_insert(1);
         to_engine.send(output.clone()).await?;
 
@@ -420,7 +420,7 @@ async fn test_catchup_accumulator_partial_execution() -> eyre::Result<()> {
     loop {
         tokio::select! {
             Some(output) = consensus_output.recv() => {
-                let leader = output.leader().origin().clone();
+                let leader = output.leader().author().clone();
                 let round = output.leader().round();
                 if round <= engine_stop_round as u32 {
                     executed_rewards.entry(leader).and_modify(|c| *c += 1).or_insert(1u32);

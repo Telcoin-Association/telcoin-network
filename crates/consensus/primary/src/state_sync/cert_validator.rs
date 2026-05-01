@@ -12,7 +12,7 @@ use std::{collections::HashSet, sync::Arc};
 use tn_config::ConsensusConfig;
 use tn_storage::CertificateStore;
 use tn_types::{
-    error::CertificateError, Certificate, CertificateDigest, Database, Hash as _, Round,
+    error::CertificateError, Certificate, Database, Hash as _, HeaderDigest, Round,
     SignatureVerificationState, TaskSpawner, TnSender as _,
 };
 use tokio::sync::oneshot;
@@ -301,7 +301,7 @@ where
     fn requires_direct_verification(
         &self,
         cert: &Certificate,
-        all_parents: &HashSet<CertificateDigest>,
+        all_parents: &HashSet<HeaderDigest>,
     ) -> bool {
         !all_parents.contains(&cert.digest())
             || cert.header().round().is_multiple_of(

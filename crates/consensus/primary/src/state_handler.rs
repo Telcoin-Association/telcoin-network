@@ -2,7 +2,7 @@
 
 use crate::ConsensusBus;
 use tn_types::{
-    AuthorityIdentifier, Certificate, Noticer, Round, TaskManager, TaskResult, TnReceiver, TnSender,
+    AuthorityIdentifier, Header, Noticer, Round, TaskManager, TaskResult, TnReceiver, TnSender,
 };
 use tracing::{debug, error, info, instrument};
 
@@ -33,13 +33,13 @@ impl StateHandler {
     }
 
     #[instrument(level = "debug", skip_all, fields(commit_round, num_certs = certificates.len()))]
-    async fn handle_sequenced(&mut self, commit_round: Round, certificates: Vec<Certificate>) {
+    async fn handle_sequenced(&mut self, commit_round: Round, certificates: Vec<Header>) {
         // Now we are going to signal which of our own batches have been committed.
         let own_rounds_committed: Vec<_> = certificates
             .iter()
-            .filter_map(|cert| {
-                if cert.header().author() == &self.authority_id {
-                    Some(cert.header().round())
+            .filter_map(|header| {
+                if header.author() == &self.authority_id {
+                    Some(header.round())
                 } else {
                     None
                 }
@@ -61,13 +61,13 @@ impl StateHandler {
 
     async fn run(
         mut self,
-        mut rx_committed_certificates: impl TnReceiver<(Round, Vec<Certificate>)>,
+        mut rx_committed_certificates: impl TnReceiver<(Round, Vec<Header>)>,
     ) -> TaskResult {
         info!(target: "primary::state_handler", "StateHandler on node {} has started successfully.", self.authority_id);
         loop {
             tokio::select! {
-                Some((commit_round, certificates)) = rx_committed_certificates.recv() => {
-                    self.handle_sequenced(commit_round, certificates).await;
+                Some((commit_round, headers)) = rx_committed_certificates.recv() => {
+                    self.handle_sequenced(commit_round, headers).await;
                 },
 
                 _ = &self.rx_shutdown => {

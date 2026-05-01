@@ -13,8 +13,8 @@ use std::{
 use tn_config::ConsensusConfig;
 use tn_storage::{consensus::ConsensusChain, CertificateStore};
 use tn_types::{
-    AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Committee, Database,
-    Hash as _, Noticer, Round, TaskManager, TnReceiver, TnSender,
+    AuthorityIdentifier, Certificate, CommittedSubDag, Committee, Database, Hash as _,
+    HeaderDigest, Noticer, Round, TaskManager, TnReceiver, TnSender,
 };
 use tracing::{debug, error, info, instrument};
 
@@ -23,7 +23,7 @@ use tracing::{debug, error, info, instrument};
 mod consensus_tests;
 
 /// The representation of the DAG in memory.
-pub type Dag = BTreeMap<Round, HashMap<AuthorityIdentifier, (CertificateDigest, Certificate)>>;
+pub type Dag = BTreeMap<Round, HashMap<AuthorityIdentifier, (HeaderDigest, Certificate)>>;
 
 /// The state that needs to be persisted for crash-recovery.
 #[derive(Debug)]
@@ -194,7 +194,7 @@ impl ConsensusState {
             return Ok(());
         }
         if let Some(round_table) = dag.get(&(round - 1)) {
-            let store_parents: BTreeSet<&CertificateDigest> =
+            let store_parents: BTreeSet<&HeaderDigest> =
                 round_table.iter().map(|(_, (digest, _))| digest).collect();
             for parent_digest in certificate.header().parents() {
                 if !store_parents.contains(parent_digest) {
@@ -392,7 +392,7 @@ impl<DB: Database> Consensus<DB> {
                 // This will force the follow function to not outrun execution...  this is probably
                 // fine. Also once we can follow gossiped consensus output this will not really be
                 // an issue (except during initial catch up).
-                let base_execution_block = committed_sub_dag.leader.header.latest_execution_block;
+                let base_execution_block = committed_sub_dag.leader().latest_execution_block;
                 if self.consensus_bus.app().wait_for_execution(base_execution_block).await.is_err()
                 {
                     // This seems to be a bogus sub dag, we are out of sync...
@@ -407,9 +407,9 @@ impl<DB: Database> Consensus<DB> {
                     return Ok(());
                 }
 
-                tracing::debug!(target: "telcoin::consensus_state", "Commit in Sequence {:?}", committed_sub_dag.leader.nonce());
+                tracing::debug!(target: "telcoin::consensus_state", "Commit in Sequence {:?}", committed_sub_dag.leader().nonce());
 
-                for certificate in &committed_sub_dag.certificates {
+                for certificate in &committed_sub_dag.headers {
                     committed_certificates.push(certificate.clone());
                 }
 
