@@ -397,6 +397,8 @@ impl<DB: Database> Certifier<DB> {
     /// The method returns once enough votes are processed to certify the proposal,
     /// or if a new proposal arrives.
     async fn spawn_header_proposal(self, header: Header) -> TaskResult {
+        // Grab this before the lock so quick exit after the lock if need to.
+        let new_proposal_noticer = self.new_proposal.subscribe();
         // Make sure other proposal's are shutdown and done before we check if
         // this header is already certified.  Any existing proposals should have been cancelled
         // before this call.
@@ -416,7 +418,7 @@ impl<DB: Database> Certifier<DB> {
         tokio::select! {
             // listen for new_proposal notification to exit
             // NOTE: sub here is okay bc no loop
-            _ = self.new_proposal.subscribe() => {
+            _ = new_proposal_noticer => {
                 debug!(target: "primary::certifier", "new proposal notification received");
                 Ok(())
             },

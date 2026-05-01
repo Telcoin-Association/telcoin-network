@@ -264,7 +264,7 @@ impl Display for ConsensusOutput {
 /// Note it stores Headers without certificates, all validation
 /// should be complete.  Future validation can be done by verifying
 /// the consensus chain against signed checkpoints (like epoch records).
-#[derive(PartialEq, Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(PartialEq, Serialize, Deserialize, Clone, Debug)]
 pub struct CommittedSubDag {
     /// The sequence of committed certificates.
     /// Note the last element MUST be the leader.
@@ -279,6 +279,19 @@ pub struct CommittedSubDag {
     commit_timestamp: TimestampSec,
     /// Randomness derived from the leaders BLS aggregate signature.
     randomness: B256,
+}
+
+impl Default for CommittedSubDag {
+    fn default() -> Self {
+        // Override default so we have one default header (the leader)
+        // so a default value won't panic when used.
+        Self {
+            headers: vec![Header::default()],
+            reputation_score: Default::default(),
+            commit_timestamp: Default::default(),
+            randomness: Default::default(),
+        }
+    }
 }
 
 impl CommittedSubDag {
@@ -300,7 +313,8 @@ impl CommittedSubDag {
             warn!(sub_dag_index = ?sub_dag_index, "Leader timestamp {} is older than previously committed sub dag timestamp {}. Auto-correcting to max {}.",
                 leader.header().created_at(), previous_sub_dag_ts, commit_timestamp);
         }
-        // Make sure the leader is at index 0.
+        // Make sure the leader is the LAST certificate.
+        //
         assert_eq!(leader.digest(), certificates.last().map(|c| c.digest()).unwrap_or_default());
         let randomness = leader.aggregated_signature().unwrap_or_else(|| {
                 error!(target: "engine", "BLS signature missing for leader - using default for closing epoch");
