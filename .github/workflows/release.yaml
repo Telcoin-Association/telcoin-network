@@ -1,0 +1,208 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'        # mainnet channel
+      - 'v*.*.*-adiri'  # testnet channel
+
+permissions:
+  contents: write       # create draft release, upload assets
+  packages: write       # push to ghcr.io
+  id-token: write       # OIDC for keyless provenance
+  attestations: write   # actions/attest-build-provenance
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: telcoin-association/telcoin-network
+  RUST_TOOLCHAIN: '1.94'
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.c.outputs.channel }}
+      version: ${{ steps.c.outputs.version }}
+      tag: ${{ github.ref_name }}
+      docker_tags: ${{ steps.c.outputs.docker_tags }}
+    steps:
+      - id: c
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$TAG" == *-adiri ]]; then
+            CHANNEL=adiri
+            VERSION="${TAG%-adiri}"
+            VERSION="${VERSION#v}"
+            DOCKER_TAGS="${REGISTRY}/${IMAGE_NAME}:${TAG}"$'\n'"${REGISTRY}/${IMAGE_NAME}:adiri"
+          else
+            CHANNEL=mainnet
+            VERSION="${TAG#v}"
+            DOCKER_TAGS="${REGISTRY}/${IMAGE_NAME}:${TAG}"$'\n'"${REGISTRY}/${IMAGE_NAME}:latest"
+          fi
+          {
+            echo "channel=$CHANNEL"
+            echo "version=$VERSION"
+            echo "docker_tags<<EOF"
+            echo "$DOCKER_TAGS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  build-binary:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake libclang-dev pkg-config libssl-dev libapr1-dev
+
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      - name: cargo build
+        run: cargo build --bin telcoin-network --release --target ${{ matrix.target }}
+
+      - name: package tarball + sha256
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/telcoin-network"
+          strip "$BIN"
+          NAME="telcoin-network-${{ needs.meta.outputs.tag }}-${{ matrix.target }}"
+          mkdir -p dist
+          tar -C "$(dirname "$BIN")" -czf "dist/${NAME}.tar.gz" "$(basename "$BIN")"
+          ( cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
+
+      - name: attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'dist/*.tar.gz'
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: dist/
+
+  build-image:
+    needs: meta
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: setup qemu
+        uses: docker/setup-qemu-action@v3
+
+      - name: setup buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: registry login
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: build & push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: etc/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ needs.meta.outputs.docker_tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/telcoin-association/telcoin-network
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.meta.outputs.tag }}
+          provenance: mode=max
+          sbom: true
+
+      - name: attest image provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  draft-release:
+    needs: [meta, build-binary, build-image]
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: bin-*
+          merge-multiple: true
+
+      - name: aggregate checksums
+        run: |
+          set -euo pipefail
+          ( cd dist && sha256sum *.tar.gz > SHA256SUMS )
+          ls -la dist/
+
+      - name: build release notes
+        env:
+          DIGEST: ${{ needs.build-image.outputs.digest }}
+          TAG: ${{ needs.meta.outputs.tag }}
+          CHANNEL: ${{ needs.meta.outputs.channel }}
+        run: |
+          cat > release-notes.md <<EOF
+          ## Channel
+          ${CHANNEL}
+
+          ## Image
+          \`${REGISTRY}/${IMAGE_NAME}@${DIGEST}\`
+
+          Pull tags:
+          ${{ needs.meta.outputs.docker_tags }}
+
+          ## Verification
+          See [docs/INSTALL.md](https://github.com/telcoin-association/telcoin-network/blob/${TAG}/docs/INSTALL.md).
+
+          This release is **DRAFT** until two maintainer countersignatures land.
+          The CI build provenance below is bound to the workflow + commit; the
+          maintainer signatures attest that two independent humans approved the
+          tagged commit before it ships.
+          EOF
+
+      - name: create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --draft \
+            --generate-notes \
+            --title "$TAG" \
+            --notes-file release-notes.md \
+            dist/*.tar.gz dist/*.sha256 dist/SHA256SUMS

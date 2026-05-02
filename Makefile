@@ -1,4 +1,4 @@
-.PHONY: help attest udeps check test test-cargo test-faucet coverage coverage-html fmt clippy docker-login docker-adiri docker-push docker-builder docker-builder-init up down validators pr init-submodules update-tn-contracts revert-submodule clean-logs
+.PHONY: help attest udeps check test test-cargo test-faucet coverage coverage-html fmt clippy docker-login docker-adiri docker-push docker-builder docker-builder-init up down validators pr init-submodules update-tn-contracts revert-submodule clean-logs release-binaries release-image release-sign release-verify release-publish release-yubikey-init release-changelog
 
 # full path for the Makefile
 ROOT_DIR:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
@@ -79,6 +79,27 @@ help:
 	@echo ;
 	@echo "make clean-logs LOG_FILE=path/to/file.log" ;
 	@echo "    :::> Strip ANSI color codes and timestamps from a log file." ;
+	@echo ;
+	@echo "make release-binaries TAG=vX.Y.Z" ;
+	@echo "    :::> Local parity build of the linux release tarball into ./dist (linux host only)." ;
+	@echo ;
+	@echo "make release-image TAG=vX.Y.Z" ;
+	@echo "    :::> Manual fallback for the multi-arch ghcr.io push (CI does this on tag push)." ;
+	@echo ;
+	@echo "make release-sign TAG=vX.Y.Z SIGNER=<handle>" ;
+	@echo "    :::> Countersign a draft release with this maintainer's YubiKey (cosign + libykcs11)." ;
+	@echo ;
+	@echo "make release-verify TAG=vX.Y.Z" ;
+	@echo "    :::> Verify provenance + both maintainer signatures on a release." ;
+	@echo ;
+	@echo "make release-publish TAG=vX.Y.Z" ;
+	@echo "    :::> Run release-verify, then flip the draft release to published." ;
+	@echo ;
+	@echo "make release-yubikey-init" ;
+	@echo "    :::> Print one-time ykman provisioning commands for slot 9c." ;
+	@echo ;
+	@echo "make release-changelog" ;
+	@echo "    :::> Regenerate CHANGELOG.md from conventional commits between tags (git-cliff)." ;
 	@echo ;
 
 # run CI locally and submit attestation githash to on-chain program
@@ -197,3 +218,43 @@ clean-logs:
 		exit 1; \
 	fi
 	sed -i '' -E "s/[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]+Z //g; s/\x1B\[([0-9]{1,3}(;[0-9]{1,3})*)?[mGK]//g" $(LOG_FILE)
+
+# --- public release pipeline -------------------------------------------------
+# CI does the heavy lifting on tag push (.github/workflows/release.yaml).
+# These targets are the local entrypoints maintainers use to countersign and
+# publish. Documented in docs/RELEASING.md.
+
+# Local parity build of the linux release tarball.
+release-binaries:
+	@case "$(TAG)" in v*.*.*) ;; *) echo "TAG must look like vX.Y.Z (got: $(TAG))"; exit 1;; esac
+	./etc/scripts/release-binaries.sh $(TAG)
+
+# Manual fallback for the multi-arch ghcr.io push.
+release-image:
+	@case "$(TAG)" in v*.*.*) ;; *) echo "TAG must look like vX.Y.Z (got: $(TAG))"; exit 1;; esac
+	./etc/scripts/release-image.sh $(TAG)
+
+# Countersign a draft release with this maintainer's YubiKey.
+release-sign:
+	@case "$(TAG)" in v*.*.*) ;; *) echo "Usage: make release-sign TAG=vX.Y.Z SIGNER=<handle> (got TAG=$(TAG))"; exit 1;; esac
+	@if [ -z "$(SIGNER)" ]; then echo "Usage: make release-sign TAG=vX.Y.Z SIGNER=<handle>"; exit 1; fi
+	./etc/scripts/release-sign.sh $(TAG) $(SIGNER)
+
+# Verify provenance + both maintainer signatures.
+release-verify:
+	@case "$(TAG)" in v*.*.*) ;; *) echo "TAG must look like vX.Y.Z (got: $(TAG))"; exit 1;; esac
+	./etc/scripts/release-verify.sh $(TAG)
+
+# Pre-flight verify, then flip the draft release to published.
+release-publish:
+	@case "$(TAG)" in v*.*.*) ;; *) echo "TAG must look like vX.Y.Z (got: $(TAG))"; exit 1;; esac
+	./etc/scripts/release-verify.sh $(TAG)
+	gh release edit $(TAG) --repo telcoin-association/telcoin-network --draft=false
+
+# Print one-time ykman provisioning commands.
+release-yubikey-init:
+	@./etc/scripts/release-yubikey-init.sh
+
+# Regenerate CHANGELOG.md from conventional commits.
+release-changelog:
+	git cliff -o CHANGELOG.md

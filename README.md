@@ -9,6 +9,23 @@ Requires Rust 1.94
 
 The Telcoin Network protocol client supports Linux and MacOS operating systems. For Windows users, use WSL to run a Linux environment in which the client compiles and runs properly.
 
+## Install
+
+Two paths to a verified node binary:
+
+- **Download a signed release** (recommended). Verified multi-arch tarballs
+  and Docker images live at:
+  - <https://github.com/telcoin-association/telcoin-network/releases>
+  - `ghcr.io/telcoin-association/telcoin-network`
+
+  Each release carries CI build provenance plus two maintainer
+  countersignatures. Verification commands and a one-shot
+  `make release-verify TAG=...` are documented in [docs/INSTALL.md](docs/INSTALL.md).
+
+- **Build from source.** Required only if you need a target the release
+  pipeline doesn't ship (e.g. macOS, Windows-via-WSL, musl). Maintainers cut
+  releases via the runbook at [docs/RELEASING.md](docs/RELEASING.md).
+
 ## Quick Start
 
 Check out the repo and update the submodules:
@@ -16,7 +33,9 @@ Check out the repo and update the submodules:
 
 ### Run an observer against testnet
 
-Build a release version of the node software:
+The fastest path is the signed tarball or `ghcr.io` image documented in
+[docs/INSTALL.md](docs/INSTALL.md). To build from source instead:
+
 `cargo build --bin telcoin-network --release`
 
 Generate a config and keys for your observer node:
