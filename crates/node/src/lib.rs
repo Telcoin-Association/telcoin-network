@@ -51,7 +51,8 @@ use tempfile as _;
 /// // Pass launcher to launch_node()
 /// ```
 ///
-/// The config's `exex` field or `--exex` CLI flag filters which installed ExExs actually run.
+/// The config's `exex` field and `--exex` CLI flag are available to custom node binaries,
+/// but the launcher does not automatically filter installed ExExs.
 /// If no ExExs are installed in the launcher, the node runs with zero ExEx overhead.
 pub fn launch_node<P>(
     builder: TnBuilder,

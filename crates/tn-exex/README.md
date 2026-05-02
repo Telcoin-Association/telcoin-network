@@ -80,7 +80,7 @@ The `--observer` flag ensures the node:
 ### Registering an ExEx
 
 ```rust
-use tn_exex::{TnExExContext, TnExExLauncher, TnExExNotification};
+use tn_exex::{TnExExContext, TnExExEvent, TnExExLauncher, TnExExNotification};
 use reth_provider::BlockchainProvider;
 
 // Create launcher before node start
@@ -116,8 +116,11 @@ launcher.install("my-indexer", |mut ctx: TnExExContext<BlockchainProvider>| {
 // Launch creates the manager (called by node startup code)
 let (manager, handle) = launcher.launch(
     node_head,
+    config,
     provider,
     task_spawner,
+    None,
+    None,
 );
 ```
 
@@ -222,7 +225,8 @@ launcher.install("bridge-relayer", |mut ctx| {
 
 ## Testing
 
-ExExes can be tested with mock providers:
+ExExes can be tested with mock providers or with the integration tests in
+`crates/tn-exex/tests/it/main.rs`:
 
 ```rust
 #[cfg(test)]
@@ -237,10 +241,10 @@ mod tests {
         
         let ctx = TnExExContext {
             head: BlockNumHash::default(),
-            config: Config::default(),
+            config: Config::default_for_test(),
             events: event_tx,
             notifications: rx,
-            provider: Arc::new(MockEthProvider::default()),
+            provider: MockEthProvider::default(),
             task_executor: TaskSpawner::default(),
         };
         
