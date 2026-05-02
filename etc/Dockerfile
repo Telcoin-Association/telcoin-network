@@ -44,6 +44,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # production image
 FROM debian:bookworm-slim
 
+# OCI image annotations — these link the ghcr.io package page back to the
+# repo and let `docker inspect` self-report version + revision. Build-time
+# overrides land via --label in CI; the defaults make manual builds inspectable.
+LABEL org.opencontainers.image.source="https://github.com/telcoin-association/telcoin-network" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0" \
+      org.opencontainers.image.title="telcoin-network" \
+      org.opencontainers.image.description="Telcoin Network node — DAG-based BFT consensus + EVM execution"
+
 # ca-certificates for outbound rustls TLS (faucet / OTLP exporters). No libssl3 / libapr1:
 # unused by the binary. bash + coreutils ship in the base and are required by
 # etc/setup_validator.sh and etc/genesis.sh.
