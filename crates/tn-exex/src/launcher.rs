@@ -202,7 +202,6 @@ where
                     } else {
                         tracing::info!(exex_id = %id, "ExEx task completed successfully");
                     }
-                    Ok(())
                 }),
             );
 
