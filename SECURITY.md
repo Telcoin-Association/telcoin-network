@@ -58,6 +58,37 @@ Telcoin Network is still under heavy development and considered unstable.
 Coming soon.
 If you have something to share and want to inquire about the status of our bug bounty program, please email security{{[@]}}telcoin<.>org
 
+## Verifying releases
+
+Every published release carries two independent attestations:
+
+1. CI build provenance via `actions/attest-build-provenance` — bound by OIDC
+   to `.github/workflows/release.yaml` and the tagged commit. Verified with
+   `gh attestation verify`.
+2. Two maintainer countersignatures produced locally with `cosign` and a
+   YubiKey (PIV slot 9c, ECCP256, touch-required). Two-of-two: one
+   compromised key cannot ship a release.
+
+Operators verify a downloaded tarball or pulled image with the commands in
+[`docs/INSTALL.md`](docs/INSTALL.md), or in one shot with
+`make release-verify TAG=<tag>` from a clone at the tag.
+
+### Maintainer signing certificates
+
+Public certs live at `.github/release-keys/<handle>.pem` in this repo. Their
+SHA-256 fingerprints — record them out-of-band so a tampered repo cannot
+silently swap the cert it ships:
+
+| Handle | Fingerprint (SHA-256) | First release signed |
+|--------|-----------------------|----------------------|
+| @grantkee   | _to be recorded on first release_ | _pending_ |
+| @sstanfield | _to be recorded on first release_ | _pending_ |
+
+When a key is rotated the new fingerprint is appended here with the date the
+previous key is retired. Past releases remain verifiable using the cert that
+signed them at the time — committed certs are version-controlled and never
+overwritten in place.
+
 ## Credits & Acknowledgments
 
 We thank all security researchers who responsibly disclose vulnerabilities.
