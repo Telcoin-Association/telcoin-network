@@ -495,6 +495,13 @@ where
             // update output so engine closes epoch
             output.close_epoch = true;
         }
+        // Now that this output has made it to execution (or almost) clear any of
+        // batches from our batches cache.
+        for digest in output.batch_digests().iter() {
+            if let Err(e) = self.consensus_db.remove::<OurNodeBatchesCache>(digest) {
+                error!(target: "epoch-manager", "Remove from our batches cache failed with error: {:?}", e);
+            }
+        }
         // only forward the output to the engine
         to_engine.send(output).await?;
         // store number after successful send
