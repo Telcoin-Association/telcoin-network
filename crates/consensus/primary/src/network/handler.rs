@@ -372,6 +372,21 @@ where
                     match last_response {
                         None | Some(PrimaryResponse::RecoverableError(_)) => {}
                         Some(PrimaryResponse::MissingParents(missing)) => {
+                            if parents.is_empty() {
+                                // Proposer retried with a fresh request (no parents provided).
+                                // Re-issue the missing parents request so the proposer knows
+                                // what to provide on the next attempt. This avoids a deadlock
+                                // where the proposer's certifier restarts (losing the missing
+                                // parent hint) and the cached state here causes a fatal
+                                // WrongNumberOfParents error on every subsequent attempt.
+                                *auth_last_vote = Some((
+                                    last_epoch,
+                                    last_round,
+                                    last_digest,
+                                    Some(PrimaryResponse::MissingParents(missing.clone())),
+                                ));
+                                return Ok(PrimaryResponse::MissingParents(missing));
+                            }
                             // A proper response to missing parents will include exactly the missing
                             // parents.
                             if parents.len() == missing.len() {
