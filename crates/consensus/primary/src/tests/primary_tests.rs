@@ -342,28 +342,34 @@ async fn test_request_vote_has_missing_parents() {
     let received_missing: HashSet<_> = missing.into_iter().collect();
     assert_eq!(expected_missing, received_missing);
 
-    // TEST PHASE 2: Handler should not return additional unknown digests.
-    // No additional missing parents will be requested.
+    // TEST PHASE 2: Handler should re-issue the same MissingParents when proposer retries with
+    // empty parents (fresh request). This avoids a deadlock where the proposer's certifier
+    // restarts and the cached state causes a fatal WrongNumberOfParents error.
     let result =
         timeout(Duration::from_secs(5), handler.vote(author_peer, test_header.clone(), Vec::new()))
             .await;
-    assert!(
-        matches!(
-            result,
-            Ok(Err(PrimaryNetworkError::InvalidHeader(HeaderError::WrongNumberOfParents(5, 0))))
-        ),
-        "{result:?}"
-    );
+    let missing2 = if let Ok(Ok(PrimaryResponse::MissingParents(missing))) = result {
+        missing
+    } else {
+        panic!("Expected MissingParents response on retry, got: {result:?}");
+    };
+    // Should re-issue the same missing parents as before.
+    let received_missing2: HashSet<_> = missing2.into_iter().collect();
+    assert_eq!(expected_missing, received_missing2);
 
-    // TEST PHASE 3: Handler should return error if header is too old.
-    // Increase round threshold.
+    // TEST PHASE 3: With the MissingParents state still cached, a fresh empty-parents request
+    // continues to re-issue MissingParents (proposer is expected to provide them).
+    // Increase round threshold to simulate header becoming old, but the cached MissingParents
+    // state means the handler still re-issues the same request before TooOld is checked.
     cb.app().primary_round_updates().send_replace(100);
-    // Because round 1 certificates are not in store, the missing parents will not be accepted yet.
     let result =
         timeout(Duration::from_secs(5), handler.vote(author_peer, test_header, Vec::new()))
             .await
             .unwrap();
-    assert!(result.is_err(), "{result:?}");
+    assert!(
+        matches!(result, Ok(PrimaryResponse::MissingParents(_))),
+        "Expected MissingParents on retry, got: {result:?}"
+    );
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
