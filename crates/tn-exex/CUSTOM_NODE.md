@@ -4,7 +4,7 @@ This guide explains how to create custom Telcoin Network node binaries that incl
 
 ## Overview
 
-The default `telcoin-network` binary has no ExExs built-in. To run ExExs, you need to:
+The default `telcoin-network` binary does not ship general-purpose ExExs. To run your own ExExs, you need to:
 
 1. Create a custom node binary that depends on your ExEx crates
 2. Register your ExExs with a `TnExExLauncher`
@@ -141,10 +141,8 @@ node_info:
 
 # Enable specific ExExs
 exex:
-  - id: "indexer"
-    enabled: true
-  - id: "metrics"
-    enabled: false
+    - id: "indexer"
+    - id: "metrics"
 ```
 
 ### Conditional Installation
@@ -169,8 +167,8 @@ fn main() {
             Box::pin(my_metrics_exex::metrics_exex(ctx))
         }));
         
-        // The launcher will only run ExExs listed in builder.tn_config.exex
-        // with enabled=true
+        // Your binary decides how to interpret builder.tn_config.exex.
+        // The launcher itself does not automatically filter by config.
         launch_node(builder, tn_datadir, key_config, Some(launcher))
     }) {
         eprintln!("Error: {err:?}");
@@ -179,7 +177,7 @@ fn main() {
 }
 ```
 
-**Note**: The launcher runs **all** installed ExExs by default. The config's `exex` field is available for your custom logic, but you'll need to implement filtering yourself if desired. Future versions may add automatic filtering.
+**Note**: The launcher runs all installed ExExs by default. The config's `exex` field and `--exex` CLI flag are available for your custom node logic, but filtering is not automatic today.
 
 ## CLI Flag Support
 
@@ -189,7 +187,7 @@ The `--exex` flag is available but requires custom handling:
 my-custom-node node --observer --exex indexer --exex metrics
 ```
 
-The CLI flag populates `builder.tn_config.exex` which you can use to filter which ExExs to install.
+The CLI flag populates `builder.tn_config.exex`, which your custom node can use to decide which installed ExExs to register or launch.
 
 ## Why Observer Nodes for ExExs?
 
