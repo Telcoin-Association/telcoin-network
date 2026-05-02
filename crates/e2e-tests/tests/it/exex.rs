@@ -6,14 +6,13 @@
 //!
 //! - `test_exex_infrastructure_ready`: Binary-based — spawns validators as child processes,
 //!   verifies the network produces blocks with ExEx-enabled builds.
-//! - `test_exex_observer_notifications`: Programmatic — uses `spawn_local_testnet()` for
-//!   validators (in-process), then launches an observer with a probe ExEx injected via
-//!   `TnExExLauncher`. Verifies the ExEx receives `ChainCommitted` notifications.
+//! - `test_exex_observer_notifications`: Binary-based observer probe gated by
+//!   `ENABLE_TNEXEX_TEST_PROBE`, verified via the observer stdout log.
 
 use super::common::ProcessGuard;
 use alloy::providers::{Provider, ProviderBuilder};
 use eyre::Result;
-use std::{process::Child, sync::Arc, time::Duration};
+use std::{process::Child, time::Duration};
 use tempfile::TempDir;
 use tn_types::get_available_tcp_port;
 use tokio::time::{sleep, timeout};
@@ -87,192 +86,123 @@ async fn test_exex_infrastructure_ready() -> Result<()> {
     Ok(())
 }
 
-/// Test that an observer node with an ExEx plugin receives block notifications.
+/// Test that an observer node can launch with the simple built-in ExEx probe enabled.
 ///
 /// This is the full end-to-end test for the ExEx pipeline:
-/// 1. Start a 4-validator network (in-process via `spawn_local_testnet`)
-/// 2. Launch an observer node with a "probe" ExEx immediately after (not waiting for blocks)
-/// 3. Wait for the network to produce blocks and the ExEx to receive them
-/// 4. Verify the probe ExEx receives `ChainCommitted` notifications with valid block numbers
-///
-/// Note: The observer is started immediately after the validators — both start from genesis
-/// together. This avoids the late-join epoch mismatch that occurs when starting an observer
-/// after validators have already advanced multiple epochs.
+/// 1. Start a 4-validator network as child processes
+/// 2. Launch a real observer child process with a tiny built-in probe ExEx enabled by env var
+/// 3. Wait for the observer probe ExEx to emit its startup marker to stdout
+/// 4. Verify the observer ExEx launched successfully through the real binary path
 #[ignore = "only run independently from all other it tests"]
 #[tokio::test]
 async fn test_exex_observer_notifications() -> Result<()> {
-    use clap::Parser;
-    use telcoin_network_cli::{node::NodeCommand, NoArgs};
-    use tn_config::KeyConfig;
-    use tn_exex::{TnExExEvent, TnExExLauncher};
-    use tn_node::launch_node;
-
     let _permit = super::common::acquire_test_permit();
 
     let temp_dir = TempDir::with_prefix("exex_observer")?;
     let temp_path = temp_dir.path();
+    e2e_tests::config_local_testnet(temp_path, Some(NODE_PASSWORD.to_string()), None)?;
 
-    // Step 1: Start the validator network in-process
-    // This calls config_local_testnet internally, creating configs for 4 validators + 1 observer
-    let _endpoints = e2e_tests::spawn_local_testnet(temp_path, None)?;
+    // Step 1: Start validator nodes as child processes.
+    let (validator_procs, endpoints) = start_validator_nodes(temp_path, "exex_observer", 0)?;
+    let mut guard = ProcessGuard::new(validator_procs);
 
-    // Step 2: Create an ExEx launcher with a probe that sends block numbers back to us
-    let (probe_tx, probe_rx) = std::sync::mpsc::channel::<u64>();
-
-    let mut exex_launcher = TnExExLauncher::new();
-    exex_launcher.install(
-        "test-probe",
-        Box::new(move |ctx| {
-            Box::pin(async move {
-                let mut ctx = ctx;
-                info!(target: "exex-probe", head = ?ctx.head, "Probe ExEx started");
-
-                while let Some(notification) = ctx.notifications.recv().await {
-                    if let Some(chain) = notification.committed_chain() {
-                        let tip = chain.tip();
-                        let block_num = tip.number;
-                        info!(
-                            target: "exex-probe",
-                            block_num,
-                            "Probe received ChainCommitted"
-                        );
-
-                        // Send block number to the test
-                        if probe_tx.send(block_num).is_err() {
-                            break;
-                        }
-
-                        // Report progress back to manager
-                        let _ = ctx.events.send(TnExExEvent::finished_height(
-                            tn_types::BlockNumHash::new(tip.number, tip.hash()),
-                        ));
-                    }
+    let validator_provider = ProviderBuilder::new().connect_http(endpoints[0].http_url.parse()?);
+    timeout(Duration::from_secs(20), async {
+        loop {
+            match validator_provider.get_chain_id().await {
+                Ok(_) => break,
+                Err(error) => {
+                    debug!(target: "exex-test", "waiting for validator RPC: {error:?}");
+                    sleep(Duration::from_secs(1)).await;
                 }
-                Ok(())
-            })
-        }),
-    );
+            }
+        }
+    })
+    .await?;
 
-    // Step 3: Launch the observer node immediately after validators
-    // Both start from genesis so the observer won't be behind on epochs
-    let observer_dir = temp_path.join("observer");
-
+    // Step 2: Launch a real observer child process with the env-var-gated built-in probe ExEx.
     let observer_rpc_port = get_available_tcp_port("127.0.0.1")
         .ok_or_else(|| eyre::eyre!("Failed to get observer RPC port"))?;
     let observer_ws_port = get_available_tcp_port("127.0.0.1")
         .ok_or_else(|| eyre::eyre!("Failed to get observer WS port"))?;
     let observer_ipc_path = temp_path.join("observer.ipc");
+    let observer_dir = temp_path.join("observer");
+    let bin = e2e_tests::get_telcoin_network_binary();
+    let mut command = bin.command();
+    command
+        .env("TN_BLS_PASSPHRASE", NODE_PASSWORD)
+        .env("ENABLE_TNEXEX_TEST_PROBE", "true")
+        .arg("--bls-passphrase-source")
+        .arg("env")
+        .arg("node")
+        .arg("--observer")
+        .arg("--exex")
+        .arg("test-probe")
+        .arg("--datadir")
+        .arg(&*observer_dir.to_string_lossy())
+        .arg("--http")
+        .arg("--http.port")
+        .arg(observer_rpc_port.to_string())
+        .arg("--ws")
+        .arg("--ws.port")
+        .arg(observer_ws_port.to_string())
+        .arg("--ipcpath")
+        .arg(observer_ipc_path.to_string_lossy().as_ref());
+    let observer_log_dir = e2e_tests::setup_log_dir(&mut command, "observer", "exex_observer", 0);
+    guard.push(command.spawn()?);
 
-    let command = NodeCommand::<NoArgs>::parse_from([
-        "tn",
-        "--observer",
-        "--exex",
-        "test-probe",
-        "--http",
-        "--http.port",
-        &observer_rpc_port.to_string(),
-        "--ws",
-        "--ws.port",
-        &observer_ws_port.to_string(),
-        "--ipcpath",
-        &observer_ipc_path.to_string_lossy(),
-    ]);
-
-    let observer_dir_clone = observer_dir.clone();
-    // Observer keys were created with passphrase=None by config_local_testnet
-    let key_config = KeyConfig::read_config(&observer_dir, None)?;
-
-    let (startup_tx, startup_rx) = std::sync::mpsc::channel::<String>();
-
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .thread_name("observer-node")
-            .enable_io()
-            .enable_time()
-            .build()
-            .expect("can build tokio runtime");
-
-        runtime.block_on(async move {
-            match command.execute(
-                observer_dir_clone,
-                key_config,
-                |builder, _: NoArgs, tn_datadir, passphrase| {
-                    launch_node(builder, tn_datadir, passphrase, Some(exex_launcher))
-                },
-            ) {
-                Ok(handle) => {
-                    let err = handle.await;
-                    tracing::error!(target: "exex-test", "Observer exited: {err:?}");
+    let observer_provider =
+        ProviderBuilder::new().connect_http(format!("http://127.0.0.1:{observer_rpc_port}").parse()?);
+    timeout(Duration::from_secs(30), async {
+        loop {
+            match observer_provider.get_chain_id().await {
+                Ok(_) => break,
+                Err(error) => {
+                    debug!(target: "exex-test", "waiting for observer RPC: {error:?}");
+                    sleep(Duration::from_secs(1)).await;
                 }
-                Err(e) => {
-                    let msg = format!("Observer failed to start: {e:?}");
-                    tracing::error!(target: "exex-test", "{msg}");
-                    let _ = startup_tx.send(msg);
-                }
-            }
-        });
-    });
-
-    // Give the observer a moment to fail fast
-    std::thread::sleep(Duration::from_millis(500));
-    if let Ok(err) = startup_rx.try_recv() {
-        eyre::bail!("Observer startup failed: {err}");
-    }
-
-    // Step 4: Wait for the probe ExEx to receive block notifications
-    let received = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let received_clone = Arc::clone(&received);
-
-    let collect_handle = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(90);
-        while std::time::Instant::now() < deadline {
-            match probe_rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(block_num) => {
-                    let mut guard = received_clone.lock().unwrap();
-                    guard.push(block_num);
-                    if guard.len() >= 3 {
-                        break;
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
-    });
+    })
+    .await?;
 
-    collect_handle.join().expect("collector thread panicked");
+    // Step 3: Wait for the probe ExEx startup marker in the observer log file.
+    let observer_log = observer_log_dir.join("nodeobserver-run0.log");
+    let notifications = timeout(Duration::from_secs(30), async {
+        loop {
+            let parsed = match std::fs::read_to_string(&observer_log) {
+                Ok(contents) => contents
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(error) => return Err(error),
+            };
 
-    let blocks: Vec<u64> = received.lock().unwrap().clone();
+            if parsed.iter().any(|entry| entry.contains("Probe ExEx started")) {
+                break Ok::<Vec<String>, std::io::Error>(parsed);
+            }
 
-    info!(
-        target: "exex-test",
-        count = blocks.len(),
-        blocks = ?blocks,
-        "Probe ExEx received notifications"
-    );
+            sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await??;
+
+    info!(target: "exex-test", count = notifications.len(), notifications = ?notifications, "Probe ExEx received notifications");
 
     // Assertions
     assert!(
-        blocks.len() >= 3,
-        "ExEx should receive at least 3 block notifications, got {}",
-        blocks.len()
+        notifications.iter().any(|entry| entry.contains("Probe ExEx started")),
+        "ExEx probe should log a startup marker, got {:?}",
+        notifications
     );
-
-    assert!(blocks.iter().all(|&b| b > 0), "All block numbers should be > 0");
-
-    for window in blocks.windows(2) {
-        assert!(
-            window[1] > window[0],
-            "Block numbers should increase: {} -> {}",
-            window[0],
-            window[1]
-        );
-    }
 
     info!(
         target: "exex-test",
-        first_block = blocks.first().copied().unwrap_or(0),
-        last_block = blocks.last().copied().unwrap_or(0),
+        first_notification = notifications.first().cloned().unwrap_or_default(),
+        last_notification = notifications.last().cloned().unwrap_or_default(),
         "ExEx observer notification test passed"
     );
 

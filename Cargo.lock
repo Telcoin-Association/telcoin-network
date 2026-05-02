@@ -11357,7 +11357,9 @@ dependencies = [
  "clap",
  "rpassword",
  "telcoin-network-cli",
+ "tn-exex",
  "tn-node",
+ "tracing",
 ]
 
 [[package]]

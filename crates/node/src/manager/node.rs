@@ -290,6 +290,7 @@ where
         node_task_spawner.spawn_critical_task("exex-manager", async move {
             exex_manager.await;
             info!(target: "exex", "ExEx manager shut down");
+            Ok(())
         });
 
         // create channels for engine that survive the lifetime of the node
