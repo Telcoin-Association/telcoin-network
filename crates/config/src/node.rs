@@ -20,6 +20,20 @@ pub const PRIMARY_NETWORK_SEED_FILE: &str = "primary.seed";
 /// The filename to use when reading/writing the network key seed used by all workers.
 pub const WORKER_NETWORK_SEED_FILE: &str = "worker.seed";
 
+/// Configuration for a single Execution Extension (ExEx).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExExConfig {
+    /// Unique identifier for this ExEx.
+    pub id: String,
+}
+
+impl ExExConfig {
+    /// Create a new ExEx configuration.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self { id: id.into() }
+    }
+}
+
 /// Configuration for the Telcoin Network node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -34,6 +48,13 @@ pub struct Config {
 
     /// Is this an observer node?
     pub observer: bool,
+
+    /// Execution Extensions configuration.
+    ///
+    /// ExExes receive real-time notifications of committed chain state transitions.
+    /// Observer nodes are the recommended deployment target for ExExes.
+    #[serde(default)]
+    pub exex: Vec<ExExConfig>,
 
     /// Reference to the apps version string.
     #[serde(skip)]
@@ -56,6 +77,7 @@ impl Config {
             parameters: Default::default(),
             genesis,
             observer: false,
+            exex: Vec::new(),
             version: "UNKNOWN",
         }
     }
@@ -76,7 +98,7 @@ impl Config {
         let genesis: Genesis =
             Config::load_from_path_or_default(tn_datadir.genesis_file_path(), ConfigFmt::YAML)?;
 
-        Ok(Config { node_info, parameters, genesis, observer, version })
+        Ok(Config { node_info, parameters, genesis, observer, exex: Vec::new(), version })
     }
 
     /// Load a config from it's component parts.
@@ -92,7 +114,14 @@ impl Config {
         let genesis: Genesis =
             Config::load_from_path(tn_datadir.genesis_file_path(), ConfigFmt::YAML)?;
 
-        Ok(Config { node_info: validator_info, parameters, genesis, observer, version })
+        Ok(Config {
+            node_info: validator_info,
+            parameters,
+            genesis,
+            observer,
+            exex: Vec::new(),
+            version,
+        })
     }
 
     /// Load a config from it's component parts.
@@ -114,7 +143,14 @@ impl Config {
             File::create_new(committee_path)?.write_all(TESTNET_COMMITTEE.as_bytes())?
         }
 
-        Ok(Config { node_info: validator_info, parameters, genesis, observer, version })
+        Ok(Config {
+            node_info: validator_info,
+            parameters,
+            genesis,
+            observer,
+            exex: Vec::new(),
+            version,
+        })
     }
 
     /// Load a config from it's component parts.
@@ -136,7 +172,14 @@ impl Config {
             File::create_new(committee_path)?.write_all(MAINNET_COMMITTEE.as_bytes())?
         }
 
-        Ok(Config { node_info: validator_info, parameters, genesis, observer, version })
+        Ok(Config {
+            node_info: validator_info,
+            parameters,
+            genesis,
+            observer,
+            exex: Vec::new(),
+            version,
+        })
     }
 
     /// Update the authority protocol key.

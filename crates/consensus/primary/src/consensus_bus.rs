@@ -237,6 +237,13 @@ pub struct ConsensusBusAppInner {
     /// Reciever for epoch records to download pack files for.
     epoch_request_queue_rx:
         Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(EpochRecord, EpochRecord)>>>,
+
+    /// Broadcast channel for ExEx consumers: certificates (own + peer).
+    /// Uses broadcast so multiple ExExes can subscribe independently.
+    /// App-lifetime so it persists across epoch boundaries.
+    exex_certificates: broadcast::Sender<Arc<Certificate>>,
+    /// Broadcast channel for ExEx consumers: committed sub-DAGs.
+    exex_committed_sub_dags: broadcast::Sender<Arc<CommittedSubDag>>,
 }
 
 /// The thread-safe inner type that holds all the channels for inner-consensus
@@ -279,6 +286,10 @@ impl ConsensusBusApp {
 
         let (epoch_request_queue_tx, epochs_rx) = tokio::sync::mpsc::channel(1024);
         let epoch_request_queue_rx = Arc::new(tokio::sync::Mutex::new(epochs_rx));
+
+        let (exex_certificates, _) = broadcast::channel(CHANNEL_CAPACITY);
+        let (exex_committed_sub_dags, _) = broadcast::channel(CHANNEL_CAPACITY);
+
         Self {
             inner: Arc::new(ConsensusBusAppInner {
                 tx_committed_round_updates,
@@ -296,6 +307,8 @@ impl ConsensusBusApp {
                 primary_network_events: QueChannel::new_always_subscribed(),
                 epoch_request_queue_tx,
                 epoch_request_queue_rx,
+                exex_certificates,
+                exex_committed_sub_dags,
             }),
         }
     }
@@ -461,6 +474,32 @@ impl ConsensusBusApp {
     /// Provide a subscription(Receiver) to consensus_headers.
     pub fn subscribe_consensus_header(&self) -> impl TnReceiver<ConsensusHeader> {
         self.inner.consensus_header.subscribe()
+    }
+
+    /// Broadcast sender for ExEx certificate notifications (own + peer).
+    ///
+    /// Consensus components send certificates here after creation/verification.
+    /// Returns `Err` if no receivers are subscribed (normal when no ExExes installed).
+    pub fn exex_certificates(&self) -> &broadcast::Sender<Arc<Certificate>> {
+        &self.inner.exex_certificates
+    }
+
+    /// Subscribe to ExEx certificate notifications.
+    pub fn subscribe_exex_certificates(&self) -> broadcast::Receiver<Arc<Certificate>> {
+        self.inner.exex_certificates.subscribe()
+    }
+
+    /// Broadcast sender for ExEx committed sub-DAG notifications.
+    ///
+    /// Consensus state sends committed sub-DAGs here after Bullshark commits.
+    /// Returns `Err` if no receivers are subscribed (normal when no ExExes installed).
+    pub fn exex_committed_sub_dags(&self) -> &broadcast::Sender<Arc<CommittedSubDag>> {
+        &self.inner.exex_committed_sub_dags
+    }
+
+    /// Subscribe to ExEx committed sub-DAG notifications.
+    pub fn subscribe_exex_committed_sub_dags(&self) -> broadcast::Receiver<Arc<CommittedSubDag>> {
+        self.inner.exex_committed_sub_dags.subscribe()
     }
 
     /// Will resolve once we have executed block.

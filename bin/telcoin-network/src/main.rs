@@ -2,9 +2,20 @@
 
 use clap::Parser as _;
 use telcoin_network_cli::cli::{Commands, PassSource};
+use tn_exex::TnExExLauncher;
 use tn_node::launch_node;
 
 const BLS_PASSPHRASE_ENVVAR: &str = "TN_BLS_PASSPHRASE";
+const ENABLE_TNEXEX_TEST_PROBE_ENVVAR: &str = "ENABLE_TNEXEX_TEST_PROBE";
+
+fn env_var_enabled(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(value) => {
+            matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(_) => false,
+    }
+}
 
 /// Read the bls key passphrase from then incoming environment if set.
 /// This also will remove the key once read to avoid leaks in future.
@@ -90,8 +101,37 @@ fn main() {
         std::process::exit(1);
     }
 
-    if let Err(err) = cli.run(passphrase, |builder, _, tn_datadir, key_config| {
-        launch_node(builder, tn_datadir, key_config)
+    let enable_test_probe = env_var_enabled(ENABLE_TNEXEX_TEST_PROBE_ENVVAR);
+
+    if let Err(err) = cli.run(passphrase, move |builder, _, tn_datadir, key_config| {
+        let exex_launcher = enable_test_probe.then(|| {
+            let mut launcher = TnExExLauncher::new();
+            launcher.install(
+                "test-probe",
+                Box::new(move |ctx| {
+                    Box::pin(async move {
+                        let mut ctx = ctx;
+                        tracing::info!(target: "exex-probe", head = ?ctx.head, "Probe ExEx started");
+
+                        while let Some(notification) = ctx.notifications.recv().await {
+                            if let Some(chain) = notification.committed_chain() {
+                                let tip = chain.tip();
+                                tracing::info!(target: "exex-probe", block = tip.number, "Probe ExEx observed chain commit");
+                            } else if notification.committed_sub_dag().is_some() {
+                                tracing::info!(target: "exex-probe", "Probe ExEx observed consensus commit");
+                            } else if notification.certificate().is_some() {
+                                tracing::info!(target: "exex-probe", "Probe ExEx observed certificate");
+                            }
+                        }
+
+                        Ok(())
+                    })
+                }),
+            );
+            launcher
+        });
+
+        launch_node(builder, tn_datadir, key_config, exex_launcher)
     }) {
         eprintln!("Error: {err:?}");
         std::process::exit(1);
