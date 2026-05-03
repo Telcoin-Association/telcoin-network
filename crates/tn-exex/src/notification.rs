@@ -119,8 +119,7 @@ mod tests {
     #[test]
     fn test_committed_sub_dag_accessor() {
         let sub_dag = Arc::new(CommittedSubDag::default());
-        let notification =
-            TnExExNotification::ConsensusCommitted { sub_dag: Arc::clone(&sub_dag) };
+        let notification = TnExExNotification::ConsensusCommitted { sub_dag: Arc::clone(&sub_dag) };
 
         assert!(notification.committed_chain().is_none());
         assert!(notification.certificate().is_none());

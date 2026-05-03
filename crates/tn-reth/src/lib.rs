@@ -153,8 +153,8 @@ pub use reth_transaction_pool::{
 pub mod dirs;
 pub mod payload;
 use payload::TNPayload;
-pub mod traits;
 pub mod exex_handle;
+pub mod traits;
 pub mod txn_pool;
 pub use txn_pool::*;
 use worker::WorkerNetwork;
@@ -927,14 +927,12 @@ impl RethEnv {
     /// diffs (bundle state) or trie data since those are not needed for replay.
     ///
     /// Returns `Ok(None)` if the block does not exist.
-    pub fn replay_block_as_chain(
-        &self,
-        block_number: u64,
-    ) -> TnRethResult<Option<Arc<Chain>>> {
+    pub fn replay_block_as_chain(&self, block_number: u64) -> TnRethResult<Option<Arc<Chain>>> {
         let Some(block) = self.inner.blockchain_provider.sealed_block_with_senders(
             BlockHashOrNumber::Number(block_number),
             TransactionVariant::NoHash,
-        )? else {
+        )?
+        else {
             return Ok(None);
         };
 
@@ -951,11 +949,7 @@ impl RethEnv {
             Default::default(),
         );
 
-        Ok(Some(Arc::new(Chain::new(
-            [block],
-            execution_outcome,
-            BTreeMap::new(),
-        ))))
+        Ok(Some(Arc::new(Chain::new([block], execution_outcome, BTreeMap::new()))))
     }
 
     /// Return the blocks for a range of block numbers.
@@ -1587,7 +1581,11 @@ mod tests {
         canonical_in_memory_state
             .update_chain(NewCanonicalChain::Commit { new: vec![block.clone()] });
         canonical_in_memory_state.set_canonical_head(canonical_header.clone());
-        reth_env.finish_executing_output(vec![block.clone()], None, crate::exex_handle::EmptyExExHandle)?;
+        reth_env.finish_executing_output(
+            vec![block.clone()],
+            None,
+            crate::exex_handle::EmptyExExHandle,
+        )?;
         reth_env.finalize_block(canonical_header.clone())?;
         Ok(block)
     }

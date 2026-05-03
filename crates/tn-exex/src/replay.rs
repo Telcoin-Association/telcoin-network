@@ -13,9 +13,9 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
+use tn_reth::RethEnv;
 use tokio::task::JoinHandle;
 use tokio_stream::Stream;
-use tn_reth::RethEnv;
 
 /// Result of a single block replay on the blocking thread.
 type ReplayResult = tn_reth::error::TnRethResult<Option<Arc<Chain>>>;

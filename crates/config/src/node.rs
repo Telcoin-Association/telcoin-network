@@ -50,7 +50,7 @@ pub struct Config {
     pub observer: bool,
 
     /// Execution Extensions configuration.
-    /// 
+    ///
     /// ExExes receive real-time notifications of committed chain state transitions.
     /// Observer nodes are the recommended deployment target for ExExes.
     #[serde(default)]
@@ -114,7 +114,14 @@ impl Config {
         let genesis: Genesis =
             Config::load_from_path(tn_datadir.genesis_file_path(), ConfigFmt::YAML)?;
 
-        Ok(Config { node_info: validator_info, parameters, genesis, observer, exex: Vec::new(), version })
+        Ok(Config {
+            node_info: validator_info,
+            parameters,
+            genesis,
+            observer,
+            exex: Vec::new(),
+            version,
+        })
     }
 
     /// Load a config from it's component parts.
@@ -136,7 +143,14 @@ impl Config {
             File::create_new(committee_path)?.write_all(TESTNET_COMMITTEE.as_bytes())?
         }
 
-        Ok(Config { node_info: validator_info, parameters, genesis, observer, exex: Vec::new(), version })
+        Ok(Config {
+            node_info: validator_info,
+            parameters,
+            genesis,
+            observer,
+            exex: Vec::new(),
+            version,
+        })
     }
 
     /// Load a config from it's component parts.
@@ -158,7 +172,14 @@ impl Config {
             File::create_new(committee_path)?.write_all(MAINNET_COMMITTEE.as_bytes())?
         }
 
-        Ok(Config { node_info: validator_info, parameters, genesis, observer, exex: Vec::new(), version })
+        Ok(Config {
+            node_info: validator_info,
+            parameters,
+            genesis,
+            observer,
+            exex: Vec::new(),
+            version,
+        })
     }
 
     /// Update the authority protocol key.

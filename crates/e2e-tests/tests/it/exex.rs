@@ -151,8 +151,8 @@ async fn test_exex_observer_notifications() -> Result<()> {
     let observer_log_dir = e2e_tests::setup_log_dir(&mut command, "observer", "exex_observer", 0);
     guard.push(command.spawn()?);
 
-    let observer_provider =
-        ProviderBuilder::new().connect_http(format!("http://127.0.0.1:{observer_rpc_port}").parse()?);
+    let observer_provider = ProviderBuilder::new()
+        .connect_http(format!("http://127.0.0.1:{observer_rpc_port}").parse()?);
     timeout(Duration::from_secs(30), async {
         loop {
             match observer_provider.get_chain_id().await {

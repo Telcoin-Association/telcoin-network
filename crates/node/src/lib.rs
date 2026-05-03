@@ -70,13 +70,8 @@ where
     // then exit.
     tokio::spawn(async move {
         // create the epoch manager
-        let mut epoch_manager = EpochManager::new(
-            builder,
-            tn_datadir,
-            consensus_db,
-            key_config,
-        )
-        .await;
+        let mut epoch_manager =
+            EpochManager::new(builder, tn_datadir, consensus_db, key_config).await;
         let result = epoch_manager.run(exex_launcher).await;
         if let Err(err) = &result {
             tracing::error!("Error running node: {err}");

@@ -498,9 +498,7 @@ impl ConsensusBusApp {
     }
 
     /// Subscribe to ExEx committed sub-DAG notifications.
-    pub fn subscribe_exex_committed_sub_dags(
-        &self,
-    ) -> broadcast::Receiver<Arc<CommittedSubDag>> {
+    pub fn subscribe_exex_committed_sub_dags(&self) -> broadcast::Receiver<Arc<CommittedSubDag>> {
         self.inner.exex_committed_sub_dags.subscribe()
     }
 

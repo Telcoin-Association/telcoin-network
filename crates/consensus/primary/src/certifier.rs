@@ -6,6 +6,7 @@ use crate::{
     state_sync::StateSynchronizer,
     ConsensusBus, ConsensusBusApp,
 };
+use std::sync::Arc;
 use std::time::Duration;
 use tn_config::{ConsensusConfig, KeyConfig};
 use tn_network_libp2p::error::NetworkError;
@@ -16,7 +17,6 @@ use tn_types::{
     AuthorityIdentifier, BlsPublicKey, Certificate, CertificateDigest, Committee, Database, Header,
     Noticer, Notifier, TaskManager, TaskResult, TaskSpawner, TnReceiver, Vote,
 };
-use std::sync::Arc;
 use tracing::{debug, enabled, error, info, instrument};
 
 #[cfg(test)]
