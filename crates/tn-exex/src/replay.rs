@@ -45,8 +45,8 @@ type ReplayResult = tn_reth::error::TnRethResult<Option<Arc<Chain>>>;
 /// # Notes
 ///
 /// - Blocks that do not exist in the database are silently skipped.
-/// - The reconstructed chains contain receipts but no state diffs (bundle state)
-///   or trie data, since those are not needed for indexing/analytics replay.
+/// - The reconstructed chains contain receipts but no state diffs (bundle state) or trie data,
+///   since those are not needed for indexing/analytics replay.
 /// - Errors during block retrieval terminate the stream.
 #[derive(Debug)]
 pub struct ReplayStream {

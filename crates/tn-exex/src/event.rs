@@ -13,13 +13,13 @@ pub enum TnExExEvent {
     ///
     /// This event serves two purposes:
     ///
-    /// 1. **Backpressure**: The manager uses this to track how far behind each ExEx is.
-    ///    If an ExEx falls too far behind, the manager can apply backpressure to the
-    ///    execution engine to prevent unbounded memory growth.
+    /// 1. **Backpressure**: The manager uses this to track how far behind each ExEx is. If an ExEx
+    ///    falls too far behind, the manager can apply backpressure to the execution engine to
+    ///    prevent unbounded memory growth.
     ///
-    /// 2. **Pruning Hints** (future): In a future version, this could inform the storage
-    ///    layer that data before this height is no longer needed by this ExEx, enabling
-    ///    safe pruning of historical state.
+    /// 2. **Pruning Hints** (future): In a future version, this could inform the storage layer
+    ///    that data before this height is no longer needed by this ExEx, enabling safe pruning of
+    ///    historical state.
     ///
     /// # Note
     ///

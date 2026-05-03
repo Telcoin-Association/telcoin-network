@@ -6,8 +6,7 @@ use crate::{
     state_sync::StateSynchronizer,
     ConsensusBus, ConsensusBusApp,
 };
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tn_config::{ConsensusConfig, KeyConfig};
 use tn_network_libp2p::error::NetworkError;
 use tn_storage::CertificateStore;

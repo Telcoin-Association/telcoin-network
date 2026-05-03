@@ -17,12 +17,12 @@
 //!
 //! TN ExEx provides three notification types covering the full block lifecycle:
 //!
-//! 1. **[`TnExExNotification::CertificateCreated`]** — A certificate was created (own) or
-//!    received (peer). Fires during the consensus layer's certificate exchange.
+//! 1. **[`TnExExNotification::CertificateCreated`]** — A certificate was created (own) or received
+//!    (peer). Fires during the consensus layer's certificate exchange.
 //! 2. **[`TnExExNotification::ConsensusCommitted`]** — A committed sub-DAG was produced by
 //!    Bullshark consensus. Contains the ordered set of certificates for execution.
-//! 3. **[`TnExExNotification::ChainCommitted`]** — A new chain segment was executed and
-//!    committed. Contains blocks, receipts, and state changes.
+//! 3. **[`TnExExNotification::ChainCommitted`]** — A new chain segment was executed and committed.
+//!    Contains blocks, receipts, and state changes.
 //!
 //! ## Historical Replay
 //!
@@ -35,7 +35,8 @@
 //! **Observer nodes are the recommended deployment target for ExExes.** Observers:
 //!
 //! - Follow consensus without participating in committee voting
-//! - Execute all blocks identically to validators (same `ExecutorEngine` → `finish_executing_output()` path)
+//! - Execute all blocks identically to validators (same `ExecutorEngine` →
+//!   `finish_executing_output()` path)
 //! - Receive ExEx notifications for every committed chain state transition
 //! - Do not affect consensus performance (ExEx backpressure only impacts the observer)
 //! - Can run custom indexing, bridges, or analytics without validator hardware requirements
