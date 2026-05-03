@@ -141,8 +141,10 @@ where
     /// * `config` - Node configuration to provide to each ExEx
     /// * `provider` - Blockchain provider for state access
     /// * `task_spawner` - Task spawner for launching ExEx tasks
-    /// * `exex_certificates_rx` - Optional broadcast receiver for certificate notifications from ConsensusBus
-    /// * `exex_committed_sub_dags_rx` - Optional broadcast receiver for committed sub-DAG notifications from ConsensusBus
+    /// * `exex_certificates_rx` - Optional broadcast receiver for certificate notifications from
+    ///   ConsensusBus
+    /// * `exex_committed_sub_dags_rx` - Optional broadcast receiver for committed sub-DAG
+    ///   notifications from ConsensusBus
     ///
     /// # Returns
     ///
