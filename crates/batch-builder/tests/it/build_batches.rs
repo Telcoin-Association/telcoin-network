@@ -16,7 +16,7 @@ use tn_reth::{
 };
 use tn_storage::{open_db, tables::NodeBatchesCache};
 use tn_types::{
-    gas_accumulator::{BaseFeeContainer, GasAccumulator},
+    gas_accumulator::GasAccumulator,
     test_genesis, Address, Batch, BatchValidation, BlockHash, Bytes, Certificate, CertifiedBatch,
     CommittedSubDag, ConsensusOutput, Database, Encodable2718, GenesisAccount, ReputationScores,
     SealedBatch, TaskManager, MIN_PROTOCOL_BASE_FEE, U160, U256,
@@ -155,7 +155,7 @@ async fn test_make_batch_el_to_cl() {
         reth_env.clone(),
         Some(txpool.clone()),
         0,
-        BaseFeeContainer::default(),
+        MIN_PROTOCOL_BASE_FEE,
         0,
     );
 
@@ -333,7 +333,7 @@ async fn test_batch_builder_produces_valid_batches() {
         reth_env.clone(),
         Some(txpool.clone()),
         0,
-        BaseFeeContainer::default(),
+        MIN_PROTOCOL_BASE_FEE,
         0,
     );
 
@@ -538,7 +538,7 @@ async fn test_canonical_notification_updates_pool() {
         reth_env.clone(),
         Some(txpool.clone()),
         0,
-        BaseFeeContainer::default(),
+        MIN_PROTOCOL_BASE_FEE,
         0,
     );
 

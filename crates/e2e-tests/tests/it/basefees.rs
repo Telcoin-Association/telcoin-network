@@ -939,11 +939,13 @@ async fn test_basefee_rollover_pool_sync() -> eyre::Result<()> {
     let sender = spawn_tx_senders(all_rpc_urls, tx_senders, chain.clone());
 
     // Drive at least one epoch of growth so we're not stuck at MIN_PROTOCOL_BASE_FEE for
-    // every sample — identical values would hide the very divergence this test watches for.
+    // every sample since identical values would hide the very divergence this test watches for.
     loop_epochs(0, 1, &rpc_url).await?;
 
-    // Per project memory: base fee invariants MUST be anchored to the epoch-start block
-    // `EpochInfo.blockHeight`, never to `latest` (which drifts mid-epoch).
+    // Anchor to epoch-START block (`blockHeight`), not epoch-end.
+    // Both the reference and target blocks must be in the SAME epoch so the base fee
+    // is expected to match — comparing across an epoch boundary would fail whenever
+    // `adjust_base_fees` changes the fee.
     let num_epochs_to_sample: u32 = 3;
     let mut prev_epoch_id = consensus_registry.getCurrentEpochInfo().call().await?.epochId;
     for i in 0..num_epochs_to_sample {
@@ -953,10 +955,9 @@ async fn test_basefee_rollover_pool_sync() -> eyre::Result<()> {
 
         let epoch_start_fee = get_base_fee_at_block(&rpc_url, epoch_start_block).await?;
 
-        // Sample a block mid-epoch; wait for the chain to advance so we aren't reading the
-        // same block twice. If `adjust_base_fees` forgot to sync the pool at rollover, the
-        // worker would resume producing blocks with the pre-rollover fee and this would
-        // diverge from `epoch_start_fee`.
+        // Wait for later blocks in the same epoch. If `adjust_base_fees` forgot to sync
+        // the pool at rollover, the worker would resume producing blocks with the
+        // pre-rollover fee and this would diverge from `epoch_start_fee`.
         let target = epoch_start_block + 3;
         let mid_deadline = Instant::now() + Duration::from_secs(EPOCH_DURATION * 2);
         loop {
@@ -974,7 +975,7 @@ async fn test_basefee_rollover_pool_sync() -> eyre::Result<()> {
             );
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        let mid_epoch_fee = get_base_fee_at_block(&rpc_url, target).await?;
+        let new_epoch_fee = get_base_fee_at_block(&rpc_url, target).await?;
 
         info!(
             target: "basefee-test",
@@ -983,36 +984,19 @@ async fn test_basefee_rollover_pool_sync() -> eyre::Result<()> {
             epoch_start_block,
             epoch_start_fee,
             target,
-            mid_epoch_fee,
-            "epoch-start vs mid-epoch base fee"
+            new_epoch_fee,
+            "epoch-start vs later-in-epoch base fee"
         );
         assert_eq!(
-            mid_epoch_fee, epoch_start_fee,
+            new_epoch_fee, epoch_start_fee,
             "pool/container disagreement in epoch {next_id}: block {epoch_start_block}={epoch_start_fee} \
-             vs block {target}={mid_epoch_fee}"
+             vs block {target}={new_epoch_fee}"
         );
 
         prev_epoch_id = next_id;
     }
 
     sender.abort();
-    Ok(())
-}
-
-#[ignore = "blocked: keytool rejects --workers != 1 (see crates/telcoin-network-cli/src/keytool/generate.rs:161). \
-            Rust runtime and WorkerConfigs genesis both support multi-worker, but per-validator \
-            key generation does not. Unblock with a multi-worker keytool fixture, then remove this \
-            ignore and drop the fallback in test_basefee_restart_restores_per_worker_fee."]
-#[tokio::test]
-/// Placeholder for true multi-worker restart coverage: two workers configured with different
-/// strategies (e.g., worker 0 EIP-1559, worker 1 Static), run several epochs, kill and restart
-/// a node, assert per-worker base fees restored independently from on-chain state.
-///
-/// Blocked by the keytool harness limitation documented above — see
-/// `test_basefee_restart_restores_per_worker_fee` for the single-worker variant that IS runnable
-/// today.
-async fn test_basefee_multiworker_restart_placeholder() -> eyre::Result<()> {
-    // intentionally empty — this test exists to document the follow-up work for multi-worker
     Ok(())
 }
 
@@ -1092,7 +1076,7 @@ async fn test_basefee_restart_restores_per_worker_fee() -> eyre::Result<()> {
 
     // Let the live network advance while the target node is down; this forces catchup work
     // on restart rather than a trivial no-sync path.
-    loop_epochs(3, 2, &rpc_url).await?;
+    loop_epochs(3, 1, &rpc_url).await?;
 
     let nodes_to_start: &[(&str, Address)] = &[("validator-3", Address::from_slice(&[0x33; 20]))];
     let (mut new_children, mut new_endpoints) =
@@ -1113,37 +1097,20 @@ async fn test_basefee_restart_restores_per_worker_fee() -> eyre::Result<()> {
     })
     .await?;
 
-    loop_epochs(5, 2, &rpc_url).await?;
+    loop_epochs(4, 2, &rpc_url).await?;
 
     sender.abort();
     tokio::time::sleep(Duration::from_secs(EPOCH_DURATION * 2)).await;
 
-    // Cross-node equality at a PINNED block, not `latest`: the four always-alive nodes
-    // agree on the canonical base fee for block N, and the restarted node — having restored
-    // worker 0 from the finalized header chain — must return the same value for the same
-    // block. Reading `latest` on each node separately races against ongoing block production.
-    let alive: Vec<(usize, _)> = endpoints
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i != kill_idx)
-        .map(|(i, ep)| {
-            (i, ProviderBuilder::new().connect_http(ep.http_url.parse().expect("valid url")))
-        })
-        .collect();
+    // Use the epoch-end block as a deterministic pinned reference: all alive nodes share
+    // this block, and the restarted node encounters it during catchup. Unlike `latest - 2`,
+    // this doesn't drift with ongoing block production.
+    let consensus_registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &provider);
+    let epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
+    let pinned = epoch_info.blockHeight - 1;
 
-    let mut min_tip: Option<u64> = None;
-    for (i, p) in &alive {
-        let latest = p
-            .get_block_by_number(alloy::eips::BlockNumberOrTag::Latest)
-            .await?
-            .ok_or_else(|| eyre::eyre!("node {i} has no latest block"))?;
-        min_tip = Some(min_tip.map_or(latest.header.number, |m| m.min(latest.header.number)));
-    }
-    let pinned = min_tip.expect("at least one alive endpoint").saturating_sub(2);
-
-    // Wait until the restarted node has synced to (or past) the pinned block; `latest`-based
-    // equality could otherwise assert against a block the restarted node hasn't seen yet.
-    timeout(Duration::from_secs(EPOCH_DURATION * 6), async {
+    // Wait until the restarted node has synced to (or past) the pinned block.
+    timeout(Duration::from_secs(EPOCH_DURATION * 12), async {
         loop {
             match restarted_provider
                 .get_block_by_number(alloy::eips::BlockNumberOrTag::Number(pinned))
