@@ -18,8 +18,8 @@ use std::{
 };
 use tempfile::TempDir;
 use tn_exex::{
-    ReplayStream, TnExExContext, TnExExEvent, TnExExLauncher, TnExExNotification,
-    TnExExHandle, TnExExManager,
+    ReplayStream, TnExExContext, TnExExEvent, TnExExHandle, TnExExLauncher, TnExExManager,
+    TnExExNotification,
 };
 use tn_reth::RethEnv;
 use tn_types::{test_chain_spec_arc, BlockHash, BlockNumHash, TaskManager};
@@ -67,8 +67,16 @@ async fn test_multiple_exexs_receive_notifications() -> Result<()> {
 
     // Launch ExEx manager
     let node_head = BlockNumHash::new(0, BlockHash::default());
-    let (exex_manager, exex_handle) =
-        launcher.launch(node_head, tn_config::Config::default_for_test(), provider, task_manager.get_spawner(), None, None).await?;
+    let (exex_manager, exex_handle) = launcher
+        .launch(
+            node_head,
+            tn_config::Config::default_for_test(),
+            provider,
+            task_manager.get_spawner(),
+            None,
+            None,
+        )
+        .await?;
 
     tokio::spawn(async move {
         exex_manager.await;
@@ -153,8 +161,16 @@ async fn test_backpressure_handling() -> Result<()> {
     let provider = reth_env.blockchain_provider();
 
     let node_head = BlockNumHash::new(0, BlockHash::default());
-    let (exex_manager, exex_handle) =
-        launcher.launch(node_head, tn_config::Config::default_for_test(), provider, task_manager.get_spawner(), None, None).await?;
+    let (exex_manager, exex_handle) = launcher
+        .launch(
+            node_head,
+            tn_config::Config::default_for_test(),
+            provider,
+            task_manager.get_spawner(),
+            None,
+            None,
+        )
+        .await?;
 
     tokio::spawn(async move {
         exex_manager.await;
@@ -178,20 +194,16 @@ async fn test_backpressure_handling() -> Result<()> {
     })
     .await;
 
-    assert!(result.is_ok(), "Fast ExEx should process all notifications even with slow ExEx present");
-
-    assert_eq!(
-        fast_count.load(Ordering::SeqCst),
-        5,
-        "Fast ExEx processed all notifications"
+    assert!(
+        result.is_ok(),
+        "Fast ExEx should process all notifications even with slow ExEx present"
     );
+
+    assert_eq!(fast_count.load(Ordering::SeqCst), 5, "Fast ExEx processed all notifications");
 
     // Slow ExEx may not have processed all yet due to delays
     let slow_processed = slow_count.load(Ordering::SeqCst);
-    assert!(
-        slow_processed <= 5,
-        "Slow ExEx should not have processed more than sent"
-    );
+    assert!(slow_processed <= 5, "Slow ExEx should not have processed more than sent");
 
     Ok(())
 }
@@ -228,8 +240,16 @@ async fn test_notification_processing() -> Result<()> {
     let provider = reth_env.blockchain_provider();
 
     let node_head = BlockNumHash::new(0, BlockHash::default());
-    let (exex_manager, exex_handle) =
-        launcher.launch(node_head, tn_config::Config::default_for_test(), provider, task_manager.get_spawner(), None, None).await?;
+    let (exex_manager, exex_handle) = launcher
+        .launch(
+            node_head,
+            tn_config::Config::default_for_test(),
+            provider,
+            task_manager.get_spawner(),
+            None,
+            None,
+        )
+        .await?;
 
     tokio::spawn(async move {
         exex_manager.await;
@@ -254,11 +274,7 @@ async fn test_notification_processing() -> Result<()> {
     .await;
 
     assert!(result.is_ok(), "ExEx should process all notifications");
-    assert_eq!(
-        processed_count.load(Ordering::SeqCst),
-        3,
-        "Should have processed 3 notifications"
-    );
+    assert_eq!(processed_count.load(Ordering::SeqCst), 3, "Should have processed 3 notifications");
 
     Ok(())
 }
@@ -295,8 +311,16 @@ async fn test_notification_ordering() -> Result<()> {
     let provider = reth_env.blockchain_provider();
 
     let node_head = BlockNumHash::new(0, BlockHash::default());
-    let (exex_manager, exex_handle) =
-        launcher.launch(node_head, tn_config::Config::default_for_test(), provider, task_manager.get_spawner(), None, None).await?;
+    let (exex_manager, exex_handle) = launcher
+        .launch(
+            node_head,
+            tn_config::Config::default_for_test(),
+            provider,
+            task_manager.get_spawner(),
+            None,
+            None,
+        )
+        .await?;
 
     tokio::spawn(async move {
         exex_manager.await;
@@ -321,11 +345,7 @@ async fn test_notification_ordering() -> Result<()> {
     .await;
 
     assert!(result.is_ok(), "ExEx should receive all notifications in order");
-    assert_eq!(
-        received_count.load(Ordering::SeqCst),
-        5,
-        "Should have received 5 notifications"
-    );
+    assert_eq!(received_count.load(Ordering::SeqCst), 5, "Should have received 5 notifications");
 
     Ok(())
 }
@@ -526,4 +546,3 @@ async fn test_finished_height_converges_to_minimum() -> Result<()> {
 
     Ok(())
 }
-

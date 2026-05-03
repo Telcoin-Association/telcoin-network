@@ -4,8 +4,8 @@
 use crate::{TnExExContext, TnExExHandle, TnExExManager, TnExExManagerHandle};
 use eyre::Result;
 use std::{future::Future, pin::Pin, sync::Arc};
-use tokio::sync::broadcast;
 use tn_types::{BlockNumHash, Certificate, CommittedSubDag, TaskSpawner};
+use tokio::sync::broadcast;
 
 /// Type alias for an ExEx installation function.
 ///
@@ -36,8 +36,9 @@ use tn_types::{BlockNumHash, Certificate, CommittedSubDag, TaskSpawner};
 ///     })
 /// }
 /// ```
-pub type TnExExInstallFn<Provider> =
-    Box<dyn FnOnce(TnExExContext<Provider>) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send>;
+pub type TnExExInstallFn<Provider> = Box<
+    dyn FnOnce(TnExExContext<Provider>) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send,
+>;
 
 /// Builder for registering and launching execution extensions.
 ///
@@ -70,7 +71,9 @@ pub type TnExExInstallFn<Provider> =
 /// // Use handle to send notifications from engine
 /// handle.send(notification);
 /// ```
-pub struct TnExExLauncher<Provider = reth_provider::providers::BlockchainProvider<tn_reth::traits::TelcoinNode>> {
+pub struct TnExExLauncher<
+    Provider = reth_provider::providers::BlockchainProvider<tn_reth::traits::TelcoinNode>,
+> {
     /// Registered ExExes to be launched.
     /// Tuple of (id, install_function).
     exexs: Vec<(String, TnExExInstallFn<Provider>)>,
@@ -89,10 +92,7 @@ where
 {
     /// Creates a new empty launcher.
     pub fn new() -> Self {
-        Self {
-            exexs: Vec::new(),
-            _phantom: std::marker::PhantomData,
-        }
+        Self { exexs: Vec::new(), _phantom: std::marker::PhantomData }
     }
 
     /// Registers an ExEx to be launched.
@@ -107,7 +107,7 @@ where
     /// Panics if an ExEx with the same `id` is already registered.
     pub fn install(&mut self, id: impl Into<String>, install_fn: TnExExInstallFn<Provider>) {
         let id = id.into();
-        
+
         // Ensure ID is unique
         if self.exexs.iter().any(|(existing_id, _)| existing_id == &id) {
             panic!("ExEx with id '{}' is already registered", id);
@@ -214,10 +214,7 @@ where
         let (manager, manager_handle) =
             TnExExManager::new(handles, None, exex_certificates_rx, exex_committed_sub_dags_rx);
 
-        tracing::info!(
-            num_exexs,
-            "ExEx manager created"
-        );
+        tracing::info!(num_exexs, "ExEx manager created");
 
         Ok((manager, manager_handle))
     }
@@ -225,9 +222,7 @@ where
 
 impl<Provider> std::fmt::Debug for TnExExLauncher<Provider> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TnExExLauncher")
-            .field("num_exexs", &self.exexs.len())
-            .finish()
+        f.debug_struct("TnExExLauncher").field("num_exexs", &self.exexs.len()).finish()
     }
 }
 
@@ -240,8 +235,8 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
-    use tokio::time::{sleep, Duration};
     use tn_types::TaskManager;
+    use tokio::time::{sleep, Duration};
 
     #[test]
     fn test_launcher_registration() {
@@ -272,7 +267,14 @@ mod tests {
         let node_head = BlockNumHash::new(0, Default::default());
 
         let (_manager, handle) = launcher
-            .launch(node_head, tn_config::Config::default_for_test(), (), task_manager.get_spawner(), None, None)
+            .launch(
+                node_head,
+                tn_config::Config::default_for_test(),
+                (),
+                task_manager.get_spawner(),
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -303,7 +305,14 @@ mod tests {
         let node_head = BlockNumHash::new(0, Default::default());
 
         let (manager, handle) = launcher
-            .launch(node_head, tn_config::Config::default_for_test(), (), task_manager.get_spawner(), None, None)
+            .launch(
+                node_head,
+                tn_config::Config::default_for_test(),
+                (),
+                task_manager.get_spawner(),
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -324,9 +333,7 @@ mod tests {
 
         // Send a few notifications
         for _ in 0..3 {
-            handle.send(TnExExNotification::ChainCommitted {
-                new: Arc::new(Chain::default()),
-            });
+            handle.send(TnExExNotification::ChainCommitted { new: Arc::new(Chain::default()) });
         }
 
         // Give it time to process
@@ -339,10 +346,10 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_exexs() {
         let mut launcher = TnExExLauncher::<()>::new();
-        
+
         let count1 = Arc::new(AtomicUsize::new(0));
         let count2 = Arc::new(AtomicUsize::new(0));
-        
+
         let count1_clone = Arc::clone(&count1);
         let count2_clone = Arc::clone(&count2);
 
@@ -377,7 +384,14 @@ mod tests {
         let node_head = BlockNumHash::new(0, Default::default());
 
         let (manager, handle) = launcher
-            .launch(node_head, tn_config::Config::default_for_test(), (), task_manager.get_spawner(), None, None)
+            .launch(
+                node_head,
+                tn_config::Config::default_for_test(),
+                (),
+                task_manager.get_spawner(),
+                None,
+                None,
+            )
             .await
             .unwrap();
         let mut manager = Box::pin(manager);
@@ -394,9 +408,7 @@ mod tests {
 
         // Send notifications
         for _ in 0..2 {
-            handle.send(TnExExNotification::ChainCommitted {
-                new: Arc::new(Chain::default()),
-            });
+            handle.send(TnExExNotification::ChainCommitted { new: Arc::new(Chain::default()) });
         }
 
         sleep(Duration::from_millis(150)).await;

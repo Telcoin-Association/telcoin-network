@@ -59,11 +59,11 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     pub observer: bool,
 
     /// Enable Execution Extensions by ID.
-    /// 
+    ///
     /// Can be specified multiple times to enable multiple ExExes.
     /// ExExes receive real-time notifications of committed chain state transitions.
     /// Observer nodes are the recommended deployment target for ExExes.
-    /// 
+    ///
     /// Example: --exex my-indexer --exex bridge-relayer
     #[arg(long = "exex", value_name = "EXEX_ID", global = true)]
     pub exex: Vec<String>,
