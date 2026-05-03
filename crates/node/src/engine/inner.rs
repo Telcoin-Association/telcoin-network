@@ -17,9 +17,9 @@ use tn_reth::{
 };
 use tn_rpc::{EngineToPrimary, TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{
-    gas_accumulator::GasAccumulator,
-    Address, BatchSender, BatchValidation, BlockHeader, BlsPublicKey, ConsensusOutput,
-    EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId, B256,
+    gas_accumulator::GasAccumulator, Address, BatchSender, BatchValidation, BlockHeader,
+    BlsPublicKey, ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader,
+    TaskSpawner, WorkerId, B256,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::mpsc;

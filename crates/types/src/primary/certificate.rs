@@ -11,10 +11,9 @@ use crate::{
     },
     ensure,
     error::{CertificateError, CertificateResult, DagError, DagResult, HeaderError},
-    now,
     serde::RoaringBitmapSerde,
     Authority, AuthorityIdentifier, BlockHash, Committee, Digest, Epoch, Hash, Header, Round,
-    TimestampSec, VotingPower,
+    VotingPower,
 };
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
@@ -35,10 +34,6 @@ pub struct Certificate {
     /// Bitmap that indicates which authorities from committee signed this certificate.
     #[serde_as(as = "RoaringBitmapSerde")]
     signed_authorities: roaring::RoaringBitmap,
-    /// Timestamp for certificate creation.
-    ///
-    /// This is only used for performance metrics. Consensus relies on the header's timestamp.
-    created_at: TimestampSec,
 }
 
 impl Certificate {
@@ -160,12 +155,7 @@ impl Certificate {
             SignatureVerificationState::Unverified(bls_signature)
         };
 
-        Ok(Certificate {
-            header,
-            signature_verification_state,
-            signed_authorities,
-            created_at: now(),
-        })
+        Ok(Certificate { header, signature_verification_state, signed_authorities })
     }
 
     /// Return the group of authorities that signed this certificate.
@@ -346,13 +336,6 @@ impl Certificate {
         &self.signature_verification_state
     }
 
-    /// The time (sec) when the certificate was created.
-    ///
-    /// This is only used for performance metrics. Consensus relies on the header's timestamp.
-    pub fn created_at(&self) -> &TimestampSec {
-        &self.created_at
-    }
-
     /// Set the state of the Signature verification.
     pub fn set_signature_verification_state(&mut self, state: SignatureVerificationState) {
         self.signature_verification_state = state;
@@ -389,13 +372,6 @@ impl Certificate {
     /// Only Used for testing.
     pub fn header_mut_for_test(&mut self) -> &mut Header {
         &mut self.header
-    }
-
-    /// Change the certificate's created_at timestamp.
-    ///
-    /// Only Used for testing.
-    pub fn update_created_at_for_test(&mut self, timestamp: TimestampSec) {
-        self.created_at = timestamp;
     }
 }
 

@@ -20,9 +20,8 @@ use tn_reth::{
 };
 use tn_rpc::EngineToPrimary;
 use tn_types::{
-    gas_accumulator::GasAccumulator,
-    BatchSender, BatchValidation, BlsPublicKey, ConsensusOutput, EngineUpdate, Epoch, ExecHeader,
-    Noticer, SealedHeader, TaskSpawner, WorkerId, B256,
+    gas_accumulator::GasAccumulator, BatchSender, BatchValidation, BlsPublicKey, ConsensusOutput,
+    EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId, B256,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::{mpsc, RwLock};

@@ -234,7 +234,7 @@ mod tests {
     use tn_reth::{test_utils::TransactionFactory, RethChainSpec};
     use tn_types::{
         max_batch_gas, test_genesis, Address, Batch, Bytes, Encodable2718 as _, FromHex,
-        GenesisAccount, TaskManager, B256, U256, MIN_PROTOCOL_BASE_FEE,
+        GenesisAccount, TaskManager, B256, MIN_PROTOCOL_BASE_FEE, U256,
     };
 
     /// Return the next valid sealed batch

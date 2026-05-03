@@ -1236,7 +1236,7 @@ pub(crate) mod test {
     use tn_reth::RethChainSpec;
     use tn_test_utils::CommitteeFixture;
     use tn_types::{
-        now, test_genesis, BlockHash, Certificate, CertifiedBatch, CommittedSubDag, Committee,
+        test_genesis, BlockHash, Certificate, CertifiedBatch, CommittedSubDag, Committee,
         ConsensusOutput, EpochRecord, Hash, ReputationScores,
     };
 
@@ -1264,10 +1264,8 @@ pub(crate) mod test {
             .expect("authority in committee")
             .execution_address();
 
-        let timestamp = now();
         let mut leader_1 = Certificate::default();
         // update cert
-        leader_1.update_created_at_for_test(timestamp);
         leader_1.header_mut_for_test().author = authority_1;
         for batch in &batches_1 {
             leader_1.header.payload.insert(batch.digest(), 0_u16);

@@ -2,14 +2,14 @@
 
 use crate::{AuthorityIdentifier, Committee};
 use serde::{Deserialize, Serialize};
-use std::{cmp::Ordering, collections::HashMap};
+use std::{cmp::Ordering, collections::BTreeMap};
 
 /// The reputation scores for authorities participating in consensus.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, Eq, PartialEq)]
 pub struct ReputationScores {
     /// Holds the score for every authority. If an authority is not amongst
     /// the records of the map then we assume that its score is zero.
-    pub scores_per_authority: HashMap<AuthorityIdentifier, u64>,
+    pub scores_per_authority: BTreeMap<AuthorityIdentifier, u64>,
     /// When true it notifies us that those scores will be the last updated scores of the
     /// current schedule before they get reset for the next schedule and start
     /// scoring from the beginning. In practice we can leverage this information to

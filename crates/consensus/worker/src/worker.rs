@@ -17,8 +17,8 @@ use tn_storage::{
     tables::{NodeBatchesCache, OurNodeBatchesCache},
 };
 use tn_types::{
-    error::BlockSealError, BatchReceiver, BatchSender, BatchValidation, Database, DbTxMut as _,
-    SealedBatch, TaskManager, WorkerId,
+    error::BlockSealError, BatchReceiver, BatchSender, BatchValidation, Database, SealedBatch,
+    TaskManager, WorkerId,
 };
 use tracing::{error, info, instrument};
 
@@ -277,29 +277,14 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
             }
         }
 
-        match self.store.write_txn() {
-            Ok(mut txn) => {
-                // Now save it to live batch storage (still a cache until included in consensus
-                // output)
-                if let Err(e) = txn.insert::<NodeBatchesCache>(&digest, &batch) {
-                    error!(target: "worker::batch_provider", "Store failed with error: {:?}", e);
-                    return Err(BlockSealError::FatalDBFailure);
-                }
-                // Remove from our cache since we are about to push out as a valid batch.
-                if let Err(e) = txn.remove::<OurNodeBatchesCache>(&digest) {
-                    error!(target: "worker::batch_provider", "Remove failed with error: {:?}", e);
-                    return Err(BlockSealError::FatalDBFailure);
-                }
-                // Make sure we have persisted the batch before we report it to other nodes.
-                if let Err(e) = txn.commit() {
-                    error!(target: "worker::batch_provider", "Commit failed with error: {:?}", e);
-                    return Err(BlockSealError::FatalDBFailure);
-                }
-            }
-            Err(e) => {
-                error!(target: "worker::batch_provider", "Store failed with error: {:?}", e);
-                return Err(BlockSealError::FatalDBFailure);
-            }
+        // Save to live batch storage so other nodes can fetch it.
+        // Keep OurNodeBatchesCache entry intact: if the epoch ends before this batch's cert is
+        // committed, orphan_batches() will re-inject the transactions at the next epoch start.
+        // Already-executed transactions are rejected by the pool (nonce too low), so re-injection
+        // is always safe.
+        if let Err(e) = self.store.insert::<NodeBatchesCache>(&digest, &batch) {
+            error!(target: "worker::batch_provider", "Store failed with error: {:?}", e);
+            return Err(BlockSealError::FatalDBFailure);
         }
 
         // Send the batch to the primary.
