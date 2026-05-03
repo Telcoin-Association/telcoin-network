@@ -176,7 +176,8 @@ impl TnExExManager {
     /// * `handles` - Vec of ExEx handles to manage
     /// * `max_capacity` - Maximum buffer size before backpressure (default: 64)
     /// * `exex_certificates_rx` - Optional broadcast receiver for certificate notifications
-    /// * `exex_committed_sub_dags_rx` - Optional broadcast receiver for committed sub-DAG notifications
+    /// * `exex_committed_sub_dags_rx` - Optional broadcast receiver for committed sub-DAG
+    ///   notifications
     ///
     /// # Returns
     ///
@@ -744,7 +745,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_manager_no_consensus_receivers() {
-        // When no consensus receivers are provided, manager should still work for chain notifications
+        // When no consensus receivers are provided, manager should still work for chain
+        // notifications
         let node_head = BlockNumHash::new(0, Default::default());
         let (handle, _event_tx, mut notif_rx) =
             TnExExHandle::new("chain_only".to_string(), node_head);
