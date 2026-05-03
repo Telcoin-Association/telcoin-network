@@ -13,10 +13,10 @@ use std::{
     },
     task::{Context, Poll},
 };
+use tn_types::{BlockNumHash, Certificate, CommittedSubDag};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_stream::{wrappers::BroadcastStream, Stream};
 use tokio_util::sync::PollSender;
-use tn_types::{BlockNumHash, Certificate, CommittedSubDag};
 
 /// Default capacity for the bounded channel between the execution engine and the ExEx manager.
 ///
@@ -191,10 +191,11 @@ impl TnExExManager {
         let max_capacity = max_capacity.unwrap_or(64);
         let current_capacity = Arc::new(AtomicUsize::new(max_capacity));
         let (is_ready_tx, _is_ready_rx) = watch::channel(true);
-        let (finished_height_tx, finished_height_rx) = watch::channel(FinishedTnExExHeight::default());
+        let (finished_height_tx, finished_height_rx) =
+            watch::channel(FinishedTnExExHeight::default());
 
         let num_exexs = handles.len();
-        
+
         // Update metrics
         metrics::gauge!("tn_exex_num_exexs").set(num_exexs as f64);
 
@@ -246,7 +247,7 @@ impl TnExExManager {
     /// Updates the global finished height to the minimum across all ExExes.
     fn update_finished_height(&mut self) {
         let mut finished = FinishedTnExExHeight::default();
-        
+
         for handle in &self.exex_handles {
             finished.update(handle.finished_height);
         }
@@ -266,7 +267,7 @@ impl TnExExManager {
                     let id = self.next_notification_id;
                     self.next_notification_id += 1;
                     self.buffer.push_back((id, notification));
-                    
+
                     metrics::gauge!("tn_exex_buffer_size").set(self.buffer.len() as f64);
                 }
                 Poll::Ready(None) => {
@@ -307,7 +308,9 @@ impl TnExExManager {
                             TnExExNotification::CertificateCreated { certificate },
                         ));
                     }
-                    Poll::Ready(Some(Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)))) => {
+                    Poll::Ready(Some(Err(
+                        tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n),
+                    ))) => {
                         metrics::counter!("tn_exex_consensus_notifications_lagged_total", "kind" => "certificate").increment(n);
                         tracing::warn!(
                             lagged = n,
@@ -334,7 +337,9 @@ impl TnExExManager {
                         self.buffer
                             .push_back((id, TnExExNotification::ConsensusCommitted { sub_dag }));
                     }
-                    Poll::Ready(Some(Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)))) => {
+                    Poll::Ready(Some(Err(
+                        tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n),
+                    ))) => {
                         metrics::counter!("tn_exex_consensus_notifications_lagged_total", "kind" => "committed_sub_dag").increment(n);
                         tracing::warn!(
                             lagged = n,
@@ -382,7 +387,7 @@ impl TnExExManager {
                             Ok(()) => {
                                 handle.next_notification_id = *id + 1;
                                 last_sent_id = Some(*id);
-                                
+
                                 metrics::counter!("tn_exex_notifications_sent_total").increment(1);
                             }
                             Err(_) => {
@@ -491,7 +496,7 @@ impl TnExExManagerHandle {
     /// ExExes are configured. All operations on an empty handle are no-ops.
     pub fn empty() -> Self {
         let (_, finished_height_rx) = watch::channel(FinishedTnExExHeight::default());
-        
+
         Self {
             num_exexs: 0,
             handle_tx: None,
@@ -602,7 +607,7 @@ mod tests {
     #[tokio::test]
     async fn test_empty_handle() {
         let handle = TnExExManagerHandle::empty();
-        
+
         assert!(!handle.has_exexs());
         assert!(!handle.has_capacity());
 
@@ -618,7 +623,8 @@ mod tests {
         let (handle1, _event_tx1, _notif_rx1) = TnExExHandle::new("exex1".to_string(), node_head);
         let (handle2, _event_tx2, _notif_rx2) = TnExExHandle::new("exex2".to_string(), node_head);
 
-        let (_manager, mgr_handle) = TnExExManager::new(vec![handle1, handle2], Some(10), None, None);
+        let (_manager, mgr_handle) =
+            TnExExManager::new(vec![handle1, handle2], Some(10), None, None);
 
         assert!(mgr_handle.has_exexs());
         assert!(mgr_handle.has_capacity());
@@ -627,7 +633,8 @@ mod tests {
     #[tokio::test]
     async fn test_notification_delivery() {
         let node_head = BlockNumHash::new(0, Default::default());
-        let (handle, _event_tx, mut notif_rx) = TnExExHandle::new("test_exex".to_string(), node_head);
+        let (handle, _event_tx, mut notif_rx) =
+            TnExExHandle::new("test_exex".to_string(), node_head);
 
         let (manager, mgr_handle) = TnExExManager::new(vec![handle], Some(10), None, None);
 
@@ -641,14 +648,14 @@ mod tests {
                 std::future::poll_fn(|cx| {
                     let _ = Pin::new(&mut manager).poll(cx);
                     Poll::Ready(())
-                }).await;
+                })
+                .await;
             }
         });
 
         // Send notification
-        let notification = TnExExNotification::ChainCommitted {
-            new: Arc::new(reth_provider::Chain::default()),
-        };
+        let notification =
+            TnExExNotification::ChainCommitted { new: Arc::new(reth_provider::Chain::default()) };
         mgr_handle.send(notification.clone());
 
         // Give it time to process
@@ -707,8 +714,7 @@ mod tests {
         // Create a broadcast channel for committed sub-DAGs
         let (dag_tx, dag_rx) = broadcast::channel::<Arc<CommittedSubDag>>(16);
 
-        let (manager, _mgr_handle) =
-            TnExExManager::new(vec![handle], Some(10), None, Some(dag_rx));
+        let (manager, _mgr_handle) = TnExExManager::new(vec![handle], Some(10), None, Some(dag_rx));
 
         let mut manager = Box::pin(manager);
         tokio::spawn(async move {

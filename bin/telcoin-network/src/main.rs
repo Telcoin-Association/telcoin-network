@@ -10,7 +10,9 @@ const ENABLE_TNEXEX_TEST_PROBE_ENVVAR: &str = "ENABLE_TNEXEX_TEST_PROBE";
 
 fn env_var_enabled(name: &str) -> bool {
     match std::env::var(name) {
-        Ok(value) => matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Ok(value) => {
+            matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+        }
         Err(_) => false,
     }
 }

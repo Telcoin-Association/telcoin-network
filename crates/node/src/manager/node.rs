@@ -14,6 +14,7 @@ use crate::{
 use eyre::{eyre, WrapErr as _};
 use state_sync::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_recent_consensus};
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, TelcoinDirs};
+use tn_exex::TnExExManagerHandle;
 use tn_network_libp2p::{types::NetworkEvent, ConsensusNetwork};
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode, QueChannel};
 use tn_reth::{system_calls::EpochState, RethDb, RethEnv};
@@ -24,7 +25,6 @@ use tn_types::{
     Database as TNDatabase, EngineUpdate, Epoch, Notifier, TaskError, TaskManager, TaskSpawner,
     TimestampSec, DEFAULT_WORKER_ID, MIN_PROTOCOL_BASE_FEE,
 };
-use tn_exex::TnExExManagerHandle;
 use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -246,7 +246,10 @@ where
     ///
     /// If `exex_launcher` is provided with installed ExExs, they will be launched at node startup.
     /// The ExEx manager persists across epoch transitions.
-    pub(crate) async fn run(&mut self, exex_launcher: Option<tn_exex::TnExExLauncher>) -> eyre::Result<()> {
+    pub(crate) async fn run(
+        &mut self,
+        exex_launcher: Option<tn_exex::TnExExLauncher>,
+    ) -> eyre::Result<()> {
         // Surface any errors that may have been triggered on create.
         self.consensus_chain.persist_current().await?;
         // Main task manager that manages tasks across epochs.
@@ -279,16 +282,15 @@ where
             let head = reth_env.lookup_head()?;
             BlockNumHash::new(head.number, head.hash())
         };
-        
+
         // Use provided launcher or create empty one
         let launcher = exex_launcher.unwrap_or_else(tn_exex::TnExExLauncher::new);
-        
+
         // If there are ExExs configured, log how many are installed
         let installed_count = launcher.len();
-        let config_ids: Vec<_> = self.builder.tn_config.exex.iter()
-            .map(|e| e.id.as_str())
-            .collect();
-        
+        let config_ids: Vec<_> =
+            self.builder.tn_config.exex.iter().map(|e| e.id.as_str()).collect();
+
         if !config_ids.is_empty() || installed_count > 0 {
             info!(
                 target: "exex",
@@ -297,10 +299,10 @@ where
                 "ExEx configuration loaded"
             );
         }
-        
+
         // Create blockchain provider for ExEx context
         let blockchain_provider = reth_env.blockchain_provider();
-        
+
         // Subscribe to ConsensusBus ExEx channels if ExExes are installed
         let (exex_certs_rx, exex_sub_dags_rx) = if !launcher.is_empty() {
             (
@@ -322,10 +324,10 @@ where
             )
             .await
             .map_err(|e| eyre!("Failed to launch ExEx manager: {}", e))?;
-        
+
         // Replace empty handle with real manager handle
         self.exex_handle = exex_handle;
-        
+
         // Spawn ExEx manager as critical background task
         node_task_spawner.spawn_critical_task("exex-manager", async move {
             exex_manager.await;
