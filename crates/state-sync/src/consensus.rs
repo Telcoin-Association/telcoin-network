@@ -208,7 +208,30 @@ pub async fn spawn_fetch_consensus(
                     tokio::select! {
                         result = network.request_epoch_pack(&epoch_record, &previous_epoch_record, &consensus_chain, Duration::from_secs(PACK_RECORD_TIMEOUT_SECS)) => {
                             match result {
-                                Ok(_) => break,
+                                Ok(_) => {
+                                    // After a successful pack download, signal spawn_stream_consensus_headers
+                                    // that locally-available blocks are ready. This unblocks streaming even
+                                    // when the gossip/network path (request_consensus) is slow or unresponsive.
+                                    if let Ok(Some(final_header)) = consensus_chain
+                                        .consensus_header_by_number(epoch_record.final_consensus.number)
+                                        .await
+                                    {
+                                        let current_last = consensus_bus
+                                            .last_consensus_header()
+                                            .borrow()
+                                            .as_ref()
+                                            .map(|h| h.number)
+                                            .unwrap_or_default();
+                                        if final_header.number > current_last {
+                                            info!(target: "state-sync",
+                                                epoch = epoch_record.epoch,
+                                                final_header_number = final_header.number,
+                                                "epoch pack downloaded, signaling stream to process locally available blocks");
+                                            consensus_bus.last_consensus_header().send_replace(Some(final_header));
+                                        }
+                                    }
+                                    break;
+                                }
                                 Err(e) => {
                                     error!(target: "state-sync",
                                         "failed to request epoch pack for epoch {epoch}, attempt {attempts}: {e}");

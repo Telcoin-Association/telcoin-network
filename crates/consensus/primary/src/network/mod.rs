@@ -271,12 +271,20 @@ impl PrimaryNetworkHandle {
         number: u64,
         hash: BlockHash,
     ) -> NetworkResult<ConsensusHeader> {
+        const TIMEOUT: Duration = Duration::from_secs(10);
         let request = PrimaryRequest::ConsensusHeader { number, hash };
         // Try up to three times (from three peers) to get consensus.
         // This could be a lot more complicated but this KISS method should work fine.
         for _ in 0..3 {
             let res = self.handle.send_request_any(request.clone()).await?;
-            let res = res.await?;
+            let res = match tokio::time::timeout(TIMEOUT, res).await {
+                Ok(r) => r,
+                Err(_) => {
+                    tracing::warn!(target: "state-sync", ?number, "request_consensus timed out waiting for peer response");
+                    continue;
+                }
+            };
+            let res = res?;
             if let Ok(NetworkResponseMessage {
                 peer: _,
                 result: PrimaryResponse::ConsensusHeader(header),

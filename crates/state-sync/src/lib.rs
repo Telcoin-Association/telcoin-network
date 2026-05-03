@@ -198,63 +198,69 @@ async fn spawn_stream_consensus_headers<DB: Database>(
     let mut last_consensus_height = last_consensus_header.number;
     let epoch = config.committee().epoch();
 
+    // Read and consume the current watch value immediately. This handles a race where a pack
+    // file was downloaded and last_consensus_header() was updated before this task subscribed
+    // (e.g., epoch N's pack arrives before epoch N's spawn_stream_consensus_headers starts).
+    // borrow_and_update() marks the value as seen so that changed() fires correctly for
+    // subsequent sends — without it, changed() could fire spuriously for the stale value.
+    let mut pending_header = rx_last_consensus_header.borrow_and_update().clone().unwrap_or_default();
+
     // infinite loop over consensus output
     loop {
+        if pending_header.number > last_consensus_height {
+            debug!(target: "state-sync", rx_last_consensus_header=?pending_header.number, ?last_consensus_height, "streaming consensus headers detected change");
+            // Retry loop: the concurrent backward traversal in
+            // spawn_track_recent_consensus fills ConsensusHeaderCache asynchronously.
+            // catch_up_consensus_from_to may return early on a cache miss before the
+            // backward traversal has fetched an intermediate block. Retry with a short
+            // delay to let the traversal finish rather than waiting for the next gossip
+            // update (which may never come for an older epoch's blocks).
+            let mut no_progress_count = 0u32;
+            const MAX_NO_PROGRESS: u32 = 600; // 600 * 100ms = 60 seconds max wait
+            loop {
+                let prev_height = last_consensus_height;
+                last_consensus_header = catch_up_consensus_from_to(
+                    &consensus_bus,
+                    last_consensus_header,
+                    pending_header.clone(),
+                    config.node_storage(),
+                    &consensus_chain,
+                    epoch,
+                )
+                .await?;
+                if last_consensus_header.sub_dag.leader_epoch() > epoch { return Ok(()); }
+                last_consensus_height = last_consensus_header.number;
+
+                if last_consensus_height >= pending_header.number {
+                    break; // Fully caught up to the target.
+                }
+                if last_consensus_height == prev_height {
+                    // No progress: the backward traversal hasn't yet cached this block.
+                    no_progress_count += 1;
+                    if no_progress_count >= MAX_NO_PROGRESS {
+                        warn!(target: "state-sync", ?epoch, last_consensus_height, target=pending_header.number,
+                            "could not catch up to consensus target after retries, waiting for next gossip update");
+                        break;
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                        _ = &rx_shutdown => return Ok(()),
+                    }
+                } else {
+                    if no_progress_count > 0 {
+                        info!(target: "state-sync", ?epoch, last_consensus_height, no_progress_count,
+                            "catch-up made progress after retries");
+                    }
+                    no_progress_count = 0; // Progress was made, reset counter.
+                }
+            }
+        }
+
         tokio::select! {
             _ = rx_last_consensus_header.changed() => {
-                // If this changes it should not be None...
                 // Use borrow_and_update so the change is marked consumed; any subsequent
-                // updates during the retry loop below will re-arm changed() correctly.
-                let header = rx_last_consensus_header.borrow_and_update().clone().unwrap_or_default();
-                debug!(target: "state-sync", rx_last_consensus_header=?header.number, ?last_consensus_height, "streaming consensus headers detected change");
-
-                if header.number > last_consensus_height {
-                    // Retry loop: the concurrent backward traversal in
-                    // spawn_track_recent_consensus fills ConsensusHeaderCache asynchronously.
-                    // catch_up_consensus_from_to may return early on a cache miss before the
-                    // backward traversal has fetched an intermediate block. Retry with a short
-                    // delay to let the traversal finish rather than waiting for the next gossip
-                    // update (which may never come for an older epoch's blocks).
-                    let mut no_progress_count = 0u32;
-                    const MAX_NO_PROGRESS: u32 = 600; // 600 * 100ms = 60 seconds max wait
-                    loop {
-                        let prev_height = last_consensus_height;
-                        last_consensus_header = catch_up_consensus_from_to(
-                            &consensus_bus,
-                            last_consensus_header,
-                            header.clone(),
-                            config.node_storage(),
-                            &consensus_chain,
-                            epoch,
-                        )
-                        .await?;
-                        if last_consensus_header.sub_dag.leader_epoch() > epoch { return Ok(()); }
-                        last_consensus_height = last_consensus_header.number;
-
-                        if last_consensus_height >= header.number {
-                            break; // Fully caught up to the target.
-                        }
-                        if last_consensus_height == prev_height {
-                            // No progress: the backward traversal hasn't yet cached this block.
-                            no_progress_count += 1;
-                            if no_progress_count >= MAX_NO_PROGRESS {
-                                warn!(target: "state-sync", ?epoch, last_consensus_height, target=header.number,
-                                    "could not catch up to consensus target after retries, waiting for next gossip update");
-                                break;
-                            }
-                            tokio::select! {
-                                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
-                                _ = &rx_shutdown => return Ok(()),
-                            }
-                        } else {
-                            if no_progress_count > 0 {
-                                info!(target: "state-sync", ?epoch, last_consensus_height, no_progress_count,
-                                    "catch-up made progress after retries");
-                            }
-                            no_progress_count = 0; // Progress was made, reset counter.
-                        }
-                    }
-                }
+                // updates during the retry loop above will re-arm changed() correctly.
+                pending_header = rx_last_consensus_header.borrow_and_update().clone().unwrap_or_default();
             }
             _ = &rx_shutdown => {
                 return Ok(())
