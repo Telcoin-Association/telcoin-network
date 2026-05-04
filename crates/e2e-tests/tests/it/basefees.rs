@@ -769,6 +769,34 @@ async fn get_base_fee_at_block(rpc_url: &str, block_number: u64) -> eyre::Result
     Ok(block.header.base_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE))
 }
 
+/// Poll `eth_getBlockByNumber(block_number)` until the block is canonical or the
+/// deadline elapses. Use this whenever the queried height comes from a contract
+/// that promises a future block (e.g. `EpochInfo.blockHeight = block.number + 1`
+/// from `concludeEpoch`) — telcoin does not produce empty blocks, so the
+/// "promised" height only materializes once new traffic flows through a worker.
+async fn wait_for_block(
+    rpc_url: &str,
+    block_number: u64,
+    timeout: Duration,
+) -> eyre::Result<alloy::rpc::types::Block> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(block) = provider
+            .get_block_by_number(alloy::eips::BlockNumberOrTag::Number(block_number))
+            .await?
+        {
+            return Ok(block);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "chain stalled: block {block_number} not produced within {}s",
+            timeout.as_secs()
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 #[ignore = "only run independently from all other it tests"]
 #[tokio::test]
 /// Genesis configured with a Static{fee: 1000} worker must propagate that fee end-to-end:
@@ -953,29 +981,23 @@ async fn test_basefee_rollover_pool_sync() -> eyre::Result<()> {
         let info = consensus_registry.getCurrentEpochInfo().call().await?;
         let epoch_start_block = info.blockHeight;
 
-        let epoch_start_fee = get_base_fee_at_block(&rpc_url, epoch_start_block).await?;
+        // `epoch_start_block` is `EpochInfo.blockHeight = block.number + 1` written by
+        // `concludeEpoch` — i.e. the first block of the new epoch, which has not yet
+        // been produced when the registry transitions. Wait for it to actually exist
+        // before reading state at that height.
+        let epoch_start =
+            wait_for_block(&rpc_url, epoch_start_block, Duration::from_secs(EPOCH_DURATION * 2))
+                .await?;
+        let epoch_start_fee =
+            epoch_start.header.base_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE);
 
-        // Wait for later blocks in the same epoch. If `adjust_base_fees` forgot to sync
+        // Wait for a later block in the same epoch. If `adjust_base_fees` forgot to sync
         // the pool at rollover, the worker would resume producing blocks with the
         // pre-rollover fee and this would diverge from `epoch_start_fee`.
         let target = epoch_start_block + 3;
-        let mid_deadline = Instant::now() + Duration::from_secs(EPOCH_DURATION * 2);
-        loop {
-            let tip = provider
-                .get_block_by_number(alloy::eips::BlockNumberOrTag::Latest)
-                .await?
-                .ok_or_else(|| eyre::eyre!("no latest block"))?;
-            if tip.header.number >= target {
-                break;
-            }
-            assert!(
-                Instant::now() < mid_deadline,
-                "chain stalled after epoch {next_id}: tip {} < target {target}",
-                tip.header.number
-            );
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-        let new_epoch_fee = get_base_fee_at_block(&rpc_url, target).await?;
+        let target_block =
+            wait_for_block(&rpc_url, target, Duration::from_secs(EPOCH_DURATION * 2)).await?;
+        let new_epoch_fee = target_block.header.base_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE);
 
         info!(
             target: "basefee-test",
