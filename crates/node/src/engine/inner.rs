@@ -17,9 +17,9 @@ use tn_reth::{
 };
 use tn_rpc::{EngineToPrimary, TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{
-    gas_accumulator::GasAccumulator, Address, BatchSender, BatchValidation, BlockHeader,
-    BlsPublicKey, ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader,
-    TaskSpawner, WorkerId, B256,
+    gas_accumulator::{BaseFeeContainer, GasAccumulator},
+    Address, BatchSender, BatchValidation, BlockHeader, BlsPublicKey, ConsensusOutput,
+    EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId, B256,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::mpsc;
@@ -189,7 +189,7 @@ impl ExecutionNodeInner {
     pub(super) fn new_batch_validator(
         &self,
         worker_id: &WorkerId,
-        base_fee: u64,
+        base_fee: BaseFeeContainer,
         epoch: Epoch,
     ) -> Arc<dyn BatchValidation> {
         // retrieve handle to transaction pool to submit gossip transactions to validators

@@ -989,8 +989,8 @@ where
         let mut workers = Vec::with_capacity(num_workers);
         for worker_idx in 0..num_workers {
             let worker_id = worker_idx as WorkerId;
-            let base_fee = gas_accumulator.base_fee(worker_id).base_fee();
-            let validator = engine.new_batch_validator(&worker_id, base_fee, epoch).await;
+            let base_fee_container = gas_accumulator.base_fee(worker_id);
+            let validator = engine.new_batch_validator(&worker_id, base_fee_container, epoch).await;
             // worker network is node-scoped; only the first worker runs network-wide setup
             let run_network_wide_setup = worker_idx == 0;
             self.spawn_worker_network_for_epoch(

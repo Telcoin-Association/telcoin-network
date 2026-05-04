@@ -3,8 +3,9 @@
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 use tn_reth::{recover_raw_transaction, recover_signed_transaction, RethEnv, WorkerTxPool};
 use tn_types::{
-    max_batch_gas, max_batch_size, BatchValidation, BatchValidationError, BlockHash, Epoch,
-    SealedBatch, TransactionSigned, TransactionTrait as _, WorkerId,
+    gas_accumulator::BaseFeeContainer, max_batch_gas, max_batch_size, BatchValidation,
+    BatchValidationError, BlockHash, Epoch, SealedBatch, TransactionSigned, TransactionTrait as _,
+    WorkerId,
 };
 
 /// Type convenience for implementing block validation errors.
@@ -23,8 +24,8 @@ pub struct BatchValidator {
     tx_pool: Option<WorkerTxPool>,
     /// Worker id for this validator.
     worker_id: WorkerId,
-    /// Current base fee for this validators worker (captured at epoch start).
-    base_fee: u64,
+    /// Current base fee for this validators worker.
+    base_fee: BaseFeeContainer,
     /// Epoch we are validating for.
     epoch: Epoch,
 }
@@ -109,7 +110,7 @@ impl BatchValidator {
         reth_env: RethEnv,
         tx_pool: Option<WorkerTxPool>,
         worker_id: WorkerId,
-        base_fee: u64,
+        base_fee: BaseFeeContainer,
         epoch: Epoch,
     ) -> Self {
         Self { reth_env, tx_pool, worker_id, base_fee, epoch }
@@ -181,8 +182,9 @@ impl BatchValidator {
         Ok(())
     }
 
+    /// Validate the block's basefee
     fn validate_basefee(&self, base_fee: u64) -> BatchValidationResult<()> {
-        let expected_base_fee = self.base_fee;
+        let expected_base_fee = self.base_fee.base_fee();
         if base_fee != expected_base_fee {
             Err(BatchValidationError::InvalidBaseFee { expected_base_fee, base_fee })
         } else {
@@ -233,8 +235,8 @@ mod tests {
     use tempfile::TempDir;
     use tn_reth::{test_utils::TransactionFactory, RethChainSpec};
     use tn_types::{
-        max_batch_gas, test_genesis, Address, Batch, Bytes, Encodable2718 as _, FromHex,
-        GenesisAccount, TaskManager, B256, MIN_PROTOCOL_BASE_FEE, U256,
+        gas_accumulator::BaseFeeContainer, max_batch_gas, test_genesis, Address, Batch, Bytes,
+        Encodable2718 as _, FromHex, GenesisAccount, TaskManager, B256, MIN_PROTOCOL_BASE_FEE, U256,
     };
 
     /// Return the next valid sealed batch
@@ -303,7 +305,7 @@ mod tests {
             RethEnv::new_for_temp_chain(chain.clone(), path, task_manager, None).unwrap();
         let tx_pool = reth_env.init_txn_pool().unwrap();
         let validator =
-            BatchValidator::new(reth_env, Some(tx_pool.clone()), 0, MIN_PROTOCOL_BASE_FEE, 0);
+            BatchValidator::new(reth_env, Some(tx_pool.clone()), 0, BaseFeeContainer::default(), 0);
         let valid_batch = next_valid_sealed_batch(chain);
 
         // block validator
