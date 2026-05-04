@@ -341,7 +341,7 @@ async fn catch_up_consensus_from_to<DB: Database>(
             continue;
         }
 
-        let base_execution_block = consensus_header.sub_dag.leader.header().latest_execution_block;
+        let base_execution_block = consensus_header.sub_dag.leader().latest_execution_block;
         // We need to make sure execution has caught up so we can verify we have not
         // forked. This will force the follow function to not outrun
         // execution...  this is probably fine. Also once we can

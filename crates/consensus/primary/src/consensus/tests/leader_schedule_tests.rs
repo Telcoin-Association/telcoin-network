@@ -431,7 +431,8 @@ async fn test_leader_schedule_from_store() {
         scores.add_score(&id, score as u64);
     }
 
-    let sub_dag = Arc::new(CommittedSubDag::new(vec![], Certificate::default(), 0, scores, None));
+    let cert = Certificate::default();
+    let sub_dag = Arc::new(CommittedSubDag::new(vec![cert.clone()], cert, 0, scores, None));
 
     consensus_chain.write_subdag_for_test(1, sub_dag).await;
 

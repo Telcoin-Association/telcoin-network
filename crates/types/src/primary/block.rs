@@ -58,9 +58,10 @@ impl ConsensusHeader {
 
 impl Default for ConsensusHeader {
     fn default() -> Self {
+        let cert = Certificate::default();
         let sub_dag = Arc::new(CommittedSubDag::new(
-            vec![],
-            Certificate::default(),
+            vec![cert.clone()],
+            cert,
             0,
             crate::ReputationScores::default(),
             None,

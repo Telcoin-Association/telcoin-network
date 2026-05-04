@@ -14,7 +14,7 @@ use tn_primary::{
     network::{ConsensusResult, PrimaryNetworkHandle},
     ConsensusBus, ConsensusBusApp, NodeMode,
 };
-use tn_storage::{consensus::ConsensusChain, CertificateStore};
+use tn_storage::consensus::ConsensusChain;
 use tn_types::{
     encode, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash, BlsSigner as _,
     CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput, Database,
@@ -152,10 +152,6 @@ impl<DB: Database> Subscriber<DB> {
                 consensus_header.number,
             )
             .await?;
-
-        // If we want to rejoin consensus eventually then save certs.
-        let _ = self.config.node_storage().write(consensus_output.sub_dag().leader.clone());
-        let _ = self.config.node_storage().write_all(consensus_output.sub_dag().certificates());
 
         let mut consensus_chain = self.inner.consensus_chain.clone();
         // This save will essentially mark this consensus output as written in stone (added to the
@@ -409,7 +405,7 @@ impl<DB: Database> Subscriber<DB> {
         parent_hash: B256,
         number: u64,
     ) -> SubscriberResult<ConsensusOutput> {
-        let num_blocks = sub_dag.num_primary_blocks();
+        let num_blocks = sub_dag.num_primary_batches();
         let num_certs = sub_dag.len();
 
         if num_blocks == 0 {
@@ -420,8 +416,8 @@ impl<DB: Database> Subscriber<DB> {
         let mut batch_set: BTreeSet<BlockHash> = BTreeSet::new();
 
         let mut batch_digests = VecDeque::with_capacity(num_certs);
-        for cert in sub_dag.certificates() {
-            for (digest, _) in cert.header().payload().iter() {
+        for header in sub_dag.headers() {
+            for (digest, _) in header.payload().iter() {
                 batch_set.insert(*digest);
                 batch_digests.push_back(*digest);
             }
@@ -433,12 +429,12 @@ impl<DB: Database> Subscriber<DB> {
 
         let mut batches = Vec::with_capacity(num_certs);
         // map all fetched batches to their respective certificates for applying block rewards
-        for cert in sub_dag.certificates() {
+        for header in sub_dag.headers() {
             // create collection of batches to execute for this certificate
-            let mut cert_batches = Vec::with_capacity(cert.header().payload().len());
+            let mut cert_batches = Vec::with_capacity(header.payload().len());
 
             // retrieve fetched batch by digest
-            for digest in cert.header().payload().keys() {
+            for digest in header.payload().keys() {
                 let batch = fetched_batches.remove(digest).ok_or(SubscriberError::MissingFetchedBatch(*digest)).inspect_err(|_| {
                     error!(target: "subscriber", "[Protocol violation] Batch not found in fetched batches from workers of certificate signers");
                 })?;
@@ -446,14 +442,14 @@ impl<DB: Database> Subscriber<DB> {
                 debug!(
                     target: "subscriber",
                     "Adding fetched batch {digest} from certificate {} to consensus output",
-                    cert.digest()
+                    header.digest()
                 );
                 cert_batches.push(batch);
             }
 
             // main collection for execution
             batches.push(CertifiedBatch {
-                address: self.authority_execution_address(cert.origin())?,
+                address: self.authority_execution_address(header.author())?,
                 batches: cert_batches,
             });
         }

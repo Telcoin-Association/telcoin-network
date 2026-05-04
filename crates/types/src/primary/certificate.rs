@@ -12,7 +12,7 @@ use crate::{
     ensure,
     error::{CertificateError, CertificateResult, DagError, DagResult, HeaderError},
     serde::RoaringBitmapSerde,
-    Authority, AuthorityIdentifier, BlockHash, Committee, Digest, Epoch, Hash, Header, Round,
+    Authority, AuthorityIdentifier, Committee, Epoch, Hash, Header, HeaderDigest, Round,
     VotingPower,
 };
 use serde::{Deserialize, Serialize};
@@ -448,54 +448,11 @@ pub fn validate_fetched_certificate(
     Ok(certificate)
 }
 
-/// Certificate digest.
-#[derive(
-    Clone, Copy, Default, PartialEq, Eq, std::hash::Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
-pub struct CertificateDigest(Digest<{ crypto::DIGEST_LENGTH }>);
-
-impl CertificateDigest {
-    /// Create a new instance of CertificateDigest.
-    pub fn new(digest: [u8; crypto::DIGEST_LENGTH]) -> Self {
-        CertificateDigest(Digest { digest })
-    }
-}
-
-impl AsRef<[u8]> for CertificateDigest {
-    fn as_ref(&self) -> &[u8] {
-        &self.0.digest
-    }
-}
-
-impl From<CertificateDigest> for Digest<{ crypto::DIGEST_LENGTH }> {
-    fn from(hd: CertificateDigest) -> Self {
-        hd.0
-    }
-}
-
-impl fmt::Debug for CertificateDigest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl fmt::Display for CertificateDigest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(f, "{}", self.0.to_string().get(0..16).ok_or(fmt::Error)?)
-    }
-}
-
 impl Hash<{ crypto::DIGEST_LENGTH }> for Certificate {
-    type TypedDigest = CertificateDigest;
+    type TypedDigest = HeaderDigest;
 
-    fn digest(&self) -> CertificateDigest {
-        CertificateDigest(Digest { digest: self.header.digest().into() })
-    }
-}
-
-impl From<CertificateDigest> for BlockHash {
-    fn from(value: CertificateDigest) -> Self {
-        Self::from(value.0.digest)
+    fn digest(&self) -> HeaderDigest {
+        self.header.digest()
     }
 }
 

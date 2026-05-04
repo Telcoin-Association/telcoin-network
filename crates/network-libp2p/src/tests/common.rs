@@ -9,7 +9,7 @@ use std::{
     sync::{Arc, Once},
 };
 use tn_config::ScoreConfig;
-use tn_types::{BlockHash, Certificate, CertificateDigest, Header, SealedBatch, Vote};
+use tn_types::{BlockHash, Certificate, Header, HeaderDigest, SealedBatch, Vote};
 
 /// Default heartbeat for tests.
 #[allow(dead_code)] // used in network_tests.rs
@@ -93,7 +93,7 @@ pub(super) enum TestPrimaryRequest {
 pub(super) enum TestPrimaryResponse {
     Vote(Vote),
     MissingCertificates(Vec<Certificate>),
-    MissingParents(Vec<CertificateDigest>),
+    MissingParents(Vec<HeaderDigest>),
 }
 
 impl From<PeerExchangeMap> for TestWorkerRequest {

@@ -6,16 +6,17 @@ use crate::{
     state_sync::StateSynchronizer,
     ConsensusBus,
 };
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tn_config::{ConsensusConfig, KeyConfig};
 use tn_network_libp2p::error::NetworkError;
 use tn_storage::CertificateStore;
 use tn_types::{
     ensure,
     error::{DagError, DagResult},
-    AuthorityIdentifier, BlsPublicKey, Certificate, CertificateDigest, Committee, Database, Header,
+    AuthorityIdentifier, BlsPublicKey, Certificate, Committee, Database, Header, HeaderDigest,
     Noticer, Notifier, TaskManager, TaskResult, TaskSpawner, TnReceiver, Vote,
 };
+use tokio::sync::Mutex;
 use tracing::{debug, enabled, error, info, instrument};
 
 #[cfg(test)]
@@ -47,6 +48,10 @@ pub(crate) struct Certifier<DB> {
     task_spawner: TaskSpawner,
     /// Notifier to cancel pending proposals and vote requests if new header is received.
     new_proposal: Notifier,
+    /// Lock to make sure we are only in one header proposal at a time.
+    /// Should not generally happen but can lead to leader cert equivocation
+    /// if it does so be really sure.
+    proposal_lock: Arc<Mutex<()>>,
 }
 
 impl<DB: Database> Certifier<DB> {
@@ -100,6 +105,7 @@ impl<DB: Database> Certifier<DB> {
                 network: primary_network,
                 task_spawner,
                 new_proposal: Notifier::new(),
+                proposal_lock: Arc::new(Mutex::new(())),
             }
             .run(rx_headers)
             .await;
@@ -120,7 +126,7 @@ impl<DB: Database> Certifier<DB> {
         committee: Committee,
         cancel_proposal: Noticer,
     ) -> DagResult<Vote> {
-        let mut missing_parents: Option<Vec<CertificateDigest>> = None;
+        let mut missing_parents: Option<Vec<HeaderDigest>> = None;
         let mut attempt: u32 = 0;
         debug!(target: "primary::certifier", ?authority, ?header, "requesting vote for header...");
 
@@ -391,10 +397,28 @@ impl<DB: Database> Certifier<DB> {
     /// The method returns once enough votes are processed to certify the proposal,
     /// or if a new proposal arrives.
     async fn spawn_header_proposal(self, header: Header) -> TaskResult {
+        // Grab this before the lock so quick exit after the lock if need to.
+        let new_proposal_noticer = self.new_proposal.subscribe();
+        // Make sure other proposal's are shutdown and done before we check if
+        // this header is already certified.  Any existing proposals should have been cancelled
+        // before this call.
+        let _guard = self.proposal_lock.lock().await;
+        let header_digest = header.digest();
+        if let Ok(Some(cert)) = self.config.node_storage().read(header_digest) {
+            info!(target: "primary::certifier", "asked to propose a header that is already certified {header_digest}, skipping proposal and re-publishing");
+            // We have already processed this certificate, doing so again could produce signature
+            // equivocation and destroy deterministic randomness (based on the leader
+            // signature). Since we got here try to re-publish the certificate on gossip
+            // network
+            if let Err(e) = self.network.publish_certificate(cert).await {
+                error!(target: "primary::certifier", ?e, "failed to re-gossip certificate");
+            }
+            return Ok(());
+        }
         tokio::select! {
             // listen for new_proposal notification to exit
             // NOTE: sub here is okay bc no loop
-            _ = self.new_proposal.subscribe() => {
+            _ = new_proposal_noticer => {
                 debug!(target: "primary::certifier", "new proposal notification received");
                 Ok(())
             },

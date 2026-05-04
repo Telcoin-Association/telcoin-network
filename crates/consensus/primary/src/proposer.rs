@@ -210,7 +210,7 @@ impl<DB: Database> Proposer<DB> {
             current_round,
             current_epoch,
             digests.iter().map(|m| (m.digest, m.worker_id)).collect(),
-            parents.iter().map(|x| x.digest()).collect(),
+            parents.iter().map(|x| x.header().digest()).collect(),
             consensus_bus.app().latest_execution_block_num_hash(),
         );
 

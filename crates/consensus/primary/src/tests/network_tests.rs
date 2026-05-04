@@ -24,7 +24,7 @@ use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     error::HeaderError, now, AuthorityIdentifier, BlockHash, BlockHeader, BlockNumHash,
-    BlsPublicKey, Certificate, CertificateDigest, EpochVote, ExecHeader, Hash as _, SealedHeader,
+    BlsPublicKey, Certificate, EpochVote, ExecHeader, Hash as _, HeaderDigest, SealedHeader,
     TaskManager, B256,
 };
 use tracing::debug;
@@ -199,7 +199,7 @@ async fn test_vote_fails_invalid_genesis_parent() -> eyre::Result<()> {
     // start with the expected parents in genesis
     let mut expected_parents: Vec<_> =
         Certificate::genesis(&committee.committee()).iter().map(|x| x.digest()).collect();
-    let extra_parent = CertificateDigest::new(BlockHash::random().0);
+    let extra_parent = HeaderDigest::new(BlockHash::random().0);
     expected_parents.pop();
     expected_parents.push(extra_parent);
     let wrong_genesis: BTreeSet<_> = expected_parents.into_iter().collect();

@@ -4,8 +4,8 @@ use super::{AuthorityFixture, Builder};
 use std::collections::{BTreeMap, BTreeSet};
 use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_types::{
-    AuthorityIdentifier, Certificate, CertificateDigest, Committee, Database, Hash as _, Header,
-    HeaderBuilder, Round, Vote,
+    AuthorityIdentifier, Certificate, Committee, Database, Hash as _, Header, HeaderBuilder,
+    HeaderDigest, Round, Vote,
 };
 
 /// Fixture representing a committee to reach consensus.
@@ -109,7 +109,7 @@ impl<DB: Database> CommitteeFixture<DB> {
     pub fn headers_round(
         &self,
         prior_round: Round,
-        parents: &BTreeSet<CertificateDigest>,
+        parents: &BTreeSet<HeaderDigest>,
     ) -> (Round, Vec<Header>) {
         let round = prior_round + 1;
         let next_headers = self
@@ -176,7 +176,7 @@ impl<DB: Database> CommitteeFixture<DB> {
     }
 
     /// Create the genesis certificates for the committe.
-    pub fn genesis(&self) -> impl Iterator<Item = CertificateDigest> {
+    pub fn genesis(&self) -> impl Iterator<Item = HeaderDigest> {
         Certificate::genesis(&self.committee()).into_iter().map(|x| x.digest())
     }
 }

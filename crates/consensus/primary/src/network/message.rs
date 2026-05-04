@@ -10,8 +10,8 @@ use std::{
 use tn_network_libp2p::{types::IntoRpcError, PeerExchangeMap, TNMessage};
 use tn_types::{
     error::HeaderError, AuthorityIdentifier, BlockHash, BlsPublicKey, BlsSignature, Certificate,
-    CertificateDigest, ConsensusHeader, Epoch, EpochCertificate, EpochRecord, EpochVote, Header,
-    Round, Vote, B256,
+    ConsensusHeader, Epoch, EpochCertificate, EpochRecord, EpochVote, Header, HeaderDigest, Round,
+    Vote, B256,
 };
 
 /// Info that is published (via gossip) by validators once they reach consensus.
@@ -28,7 +28,7 @@ pub struct ConsensusResult {
     /// the validator that produced this result
     pub validator: BlsPublicKey,
     /// the signature of the validator publishing this record
-    /// see digest() below, this is a signature over the has of the epoch, round, number and hash
+    /// see digest() below, this is a signature over the hash of the epoch, round, number and hash
     /// fields
     pub signature: BlsSignature,
 }
@@ -228,7 +228,7 @@ pub enum PrimaryResponse {
     ///
     /// If the peer was unable to verify parents for a proposed header, they respond requesting
     /// the missing certificate by digest.
-    MissingParents(Vec<CertificateDigest>),
+    MissingParents(Vec<HeaderDigest>),
     /// The requested consensus header.
     ConsensusHeader(Arc<ConsensusHeader>),
     /// The requested epoch record and certificate.

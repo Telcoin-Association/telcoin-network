@@ -256,7 +256,7 @@ async fn test_commit_order_oldest_first() {
     // Verify leaders are committed in ascending round order
     let mut last_leader_round = 0;
     for subdag in &all_committed {
-        let leader_round = subdag.leader.round();
+        let leader_round = subdag.leader().round();
         assert!(
             leader_round > last_leader_round,
             "Leaders should be committed in ascending round order: {} > {}",

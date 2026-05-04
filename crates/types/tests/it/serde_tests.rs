@@ -69,7 +69,7 @@ fn test_committed_subdag_serde_roundtrip() {
     let certificates: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
 
     // Create a CommittedSubDag
-    let leader = certificates.first().cloned().unwrap();
+    let leader = certificates.last().cloned().unwrap();
     let reputation = ReputationScores::new(&committee);
 
     let original_subdag =
@@ -82,12 +82,10 @@ fn test_committed_subdag_serde_roundtrip() {
     let recovered_subdag: CommittedSubDag = decode(&bytes);
 
     // Compare leader and certificates
-    assert_eq!(original_subdag.leader.digest(), recovered_subdag.leader.digest());
-    assert_eq!(original_subdag.certificates.len(), recovered_subdag.certificates.len());
+    assert_eq!(original_subdag.leader().digest(), recovered_subdag.leader().digest());
+    assert_eq!(original_subdag.headers.len(), recovered_subdag.headers.len());
 
-    for (orig, recov) in
-        original_subdag.certificates.iter().zip(recovered_subdag.certificates.iter())
-    {
+    for (orig, recov) in original_subdag.headers.iter().zip(recovered_subdag.headers.iter()) {
         assert_eq!(orig.digest(), recov.digest());
     }
 }
