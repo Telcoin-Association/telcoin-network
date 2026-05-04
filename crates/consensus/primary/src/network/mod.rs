@@ -280,7 +280,7 @@ impl PrimaryNetworkHandle {
             let res = match tokio::time::timeout(TIMEOUT, res).await {
                 Ok(r) => r,
                 Err(_) => {
-                    tracing::warn!(target: "state-sync", ?number, "request_consensus timed out waiting for peer response");
+                    tracing::warn!(target: "primary::network", ?number, "request_consensus timed out waiting for peer response");
                     continue;
                 }
             };

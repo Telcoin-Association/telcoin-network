@@ -212,23 +212,31 @@ pub async fn spawn_fetch_consensus(
                                     // After a successful pack download, signal spawn_stream_consensus_headers
                                     // that locally-available blocks are ready. This unblocks streaming even
                                     // when the gossip/network path (request_consensus) is slow or unresponsive.
-                                    if let Ok(Some(final_header)) = consensus_chain
+                                    match consensus_chain
                                         .consensus_header_by_number(epoch_record.final_consensus.number)
-                                        .await
-                                    {
-                                        let current_last = consensus_bus
-                                            .last_consensus_header()
-                                            .borrow()
-                                            .as_ref()
-                                            .map(|h| h.number)
-                                            .unwrap_or_default();
-                                        if final_header.number > current_last {
-                                            info!(target: "state-sync",
-                                                epoch = epoch_record.epoch,
-                                                final_header_number = final_header.number,
-                                                "epoch pack downloaded, signaling stream to process locally available blocks");
-                                            consensus_bus.last_consensus_header().send_replace(Some(final_header));
+                                        .await {
+                                        Ok(Some(final_header)) => {
+                                            let current_last = consensus_bus
+                                                .last_consensus_header()
+                                                .borrow()
+                                                .as_ref()
+                                                .map(|h| h.number)
+                                                .unwrap_or_default();
+                                            if final_header.number > current_last {
+                                                info!(target: "state-sync",
+                                                    epoch = epoch_record.epoch,
+                                                    final_header_number = final_header.number,
+                                                    "epoch pack downloaded, signaling stream to process locally available blocks");
+                                                consensus_bus.last_consensus_header().send_replace(Some(final_header));
+                                            }
                                         }
+                                        Ok(None) => error!(target: "state-sync",
+                                            epoch = epoch_record.epoch,
+                                            "Unable to find header by number for new pack file"),
+                                        Err(e) => error!(target: "state-sync",
+                                            epoch = epoch_record.epoch,
+                                            ?e,
+                                            "Unable to find header by number for new pack file"),
                                     }
                                     break;
                                 }

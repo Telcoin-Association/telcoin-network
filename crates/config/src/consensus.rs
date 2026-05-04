@@ -17,6 +17,8 @@ use tracing::info;
 struct ConsensusConfigInner<DB> {
     config: Config,
     committee: Committee,
+    /// Contains the keys for the next epoch.
+    next_committee_keys: Vec<BlsPublicKey>,
     node_storage: DB,
     key_config: KeyConfig,
     authority: Option<Authority>,
@@ -53,12 +55,20 @@ where
         node_storage: DB,
         key_config: KeyConfig,
         network_config: NetworkConfig,
+        next_committee_keys: Vec<BlsPublicKey>,
     ) -> eyre::Result<Self> {
         // load committee from file
         let committee: Committee =
             Config::load_from_path_or_default(tn_datadir.committee_path(), ConfigFmt::YAML)?;
         info!(target: "telcoin", "committee loaded");
-        Self::new_with_committee(config, node_storage, key_config, committee, network_config)
+        Self::new_with_committee(
+            config,
+            node_storage,
+            key_config,
+            committee,
+            network_config,
+            next_committee_keys,
+        )
     }
 
     /// Creates a new configuration with a pre-loaded committee for testing purposes.
@@ -73,7 +83,14 @@ where
         committee: Committee,
         network_config: NetworkConfig,
     ) -> eyre::Result<Self> {
-        Self::new_with_committee(config, node_storage, key_config, committee, network_config)
+        Self::new_with_committee(
+            config,
+            node_storage,
+            key_config,
+            committee,
+            network_config,
+            vec![],
+        )
     }
 
     /// Creates configuration for the next consensus epoch.
@@ -86,8 +103,16 @@ where
         key_config: KeyConfig,
         committee: Committee,
         network_config: NetworkConfig,
+        next_committee_keys: Vec<BlsPublicKey>,
     ) -> eyre::Result<Self> {
-        Self::new_with_committee(config, node_storage, key_config, committee, network_config)
+        Self::new_with_committee(
+            config,
+            node_storage,
+            key_config,
+            committee,
+            network_config,
+            next_committee_keys,
+        )
     }
 
     /// Internal constructor that initializes consensus configuration with provided committee.
@@ -103,6 +128,7 @@ where
         key_config: KeyConfig,
         committee: Committee,
         network_config: NetworkConfig,
+        next_committee_keys: Vec<BlsPublicKey>,
     ) -> eyre::Result<Self> {
         let local_network = LocalNetwork::new(key_config.primary_public_key());
 
@@ -119,6 +145,7 @@ where
             inner: Arc::new(ConsensusConfigInner {
                 config,
                 committee,
+                next_committee_keys,
                 node_storage,
                 key_config,
                 authority,
@@ -157,6 +184,11 @@ where
     /// for the current epoch.
     pub fn committee(&self) -> &Committee {
         &self.inner.committee
+    }
+
+    /// Returns the keys for the next committee.
+    pub fn next_committee_keys(&self) -> &[BlsPublicKey] {
+        &self.inner.next_committee_keys
     }
 
     /// Returns a reference to the node's persistent storage database for the current epoch.

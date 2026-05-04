@@ -203,7 +203,8 @@ async fn spawn_stream_consensus_headers<DB: Database>(
     // (e.g., epoch N's pack arrives before epoch N's spawn_stream_consensus_headers starts).
     // borrow_and_update() marks the value as seen so that changed() fires correctly for
     // subsequent sends — without it, changed() could fire spuriously for the stale value.
-    let mut pending_header = rx_last_consensus_header.borrow_and_update().clone().unwrap_or_default();
+    let mut pending_header =
+        rx_last_consensus_header.borrow_and_update().clone().unwrap_or_default();
 
     // infinite loop over consensus output
     loop {
@@ -228,7 +229,9 @@ async fn spawn_stream_consensus_headers<DB: Database>(
                     epoch,
                 )
                 .await?;
-                if last_consensus_header.sub_dag.leader_epoch() > epoch { return Ok(()); }
+                if last_consensus_header.sub_dag.leader_epoch() > epoch {
+                    return Ok(());
+                }
                 last_consensus_height = last_consensus_header.number;
 
                 if last_consensus_height >= pending_header.number {

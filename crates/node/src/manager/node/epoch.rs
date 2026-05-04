@@ -780,7 +780,8 @@ where
         let mut next_vals: HashSet<BlsPublicKey> = HashSet::new();
         next_vals.extend(validators.iter());
 
-        next_vals.extend(engine.validators_for_epoch(committee.epoch() + 1).await?);
+        let next_committee_keys = engine.validators_for_epoch(committee.epoch() + 1).await?;
+        next_vals.extend(next_committee_keys.iter());
         next_vals.extend(engine.validators_for_epoch(committee.epoch() + 2).await?);
 
         // create config for consensus
@@ -790,6 +791,7 @@ where
             self.key_config.clone(),
             committee,
             network_config.clone(),
+            next_committee_keys,
         )?;
 
         Ok((consensus_config, next_vals.into_iter().collect()))

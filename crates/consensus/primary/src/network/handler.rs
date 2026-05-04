@@ -179,6 +179,8 @@ where
     async fn get_committee(&self, epoch: Epoch) -> Option<BTreeSet<BlsPublicKey>> {
         if epoch == self.consensus_config.committee().epoch() {
             Some(self.consensus_config.committee().bls_keys())
+        } else if epoch == self.consensus_config.committee().epoch() + 1 {
+            Some(self.consensus_config.next_committee_keys().iter().copied().collect())
         } else {
             self.consensus_chain.epochs().get_committee_keys(epoch).await
         }
