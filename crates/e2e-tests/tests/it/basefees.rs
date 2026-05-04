@@ -88,8 +88,11 @@ fn spawn_tx_senders(
 }
 
 /// Poll `getCurrentEpochInfo()` until `iterations` epoch transitions are observed.
-/// Returns the epoch id after the last transition.
-async fn loop_epochs(start: u32, iterations: u32, rpc_url: &str) -> eyre::Result<u32> {
+/// Returns `(epochId, blockHeight)` after the last transition. `blockHeight` is the
+/// new epoch's first block (`concludeEpoch` writes `block.number + 1`); the caller
+/// must `wait_for_block` before reading state at that height because telcoin does
+/// not produce empty blocks.
+async fn loop_epochs(start: u32, iterations: u32, rpc_url: &str) -> eyre::Result<(u32, u64)> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let consensus_registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &provider);
     let mut current_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
@@ -116,7 +119,7 @@ async fn loop_epochs(start: u32, iterations: u32, rpc_url: &str) -> eyre::Result
         last_epoch_block_height = new_epoch_info.blockHeight;
         current_epoch_info = new_epoch_info;
     }
-    Ok(current_epoch_info.epochId)
+    Ok((current_epoch_info.epochId, current_epoch_info.blockHeight))
 }
 
 /// Start node processes for the given validators.
@@ -340,9 +343,13 @@ async fn test_basefee_adjustment_and_sync() -> eyre::Result<()> {
     let all_rpc_urls: Vec<String> = endpoints.iter().map(|ep| ep.http_url.clone()).collect();
     let sender = spawn_tx_senders(all_rpc_urls, tx_senders, chain.clone());
 
-    loop_epochs(0, 3, &rpc_url).await?;
-
-    let pre_kill_base_fee = get_base_fee(&rpc_url).await?;
+    // Sample at the new epoch's first block (`EpochInfo.blockHeight = block.number + 1`
+    // from `concludeEpoch`) so the read is post-`adjust_base_fees`. Reading `latest`
+    // could land on the boundary block, which still carries the pre-adjust fee.
+    let (_, pre_kill_block_height) = loop_epochs(0, 3, &rpc_url).await?;
+    wait_for_block(&rpc_url, pre_kill_block_height, Duration::from_secs(EPOCH_DURATION * 2))
+        .await?;
+    let pre_kill_base_fee = get_base_fee_at_block(&rpc_url, pre_kill_block_height).await?;
     info!(target: "basefee-test", pre_kill_base_fee, "base fee after 3 epochs of activity");
     assert!(
         pre_kill_base_fee >= 9,
@@ -367,9 +374,13 @@ async fn test_basefee_adjustment_and_sync() -> eyre::Result<()> {
     // stream keeps advancing and the surviving 4 workers continue to receive enough gas to
     // exceed the per-epoch target. Three epochs at +1 each → strict +3 growth.
 
-    loop_epochs(3, 3, &rpc_url).await?;
-
-    let network_base_fee = get_base_fee(&rpc_url).await?;
+    // Same epoch-start sampling discipline as Phase 3: read at the new epoch's first
+    // block so the assertion compares two post-adjust fees on the same epoch boundary,
+    // not one boundary block (pre-adjust) against one new-epoch block (post-adjust).
+    let (_, network_block_height) = loop_epochs(3, 3, &rpc_url).await?;
+    wait_for_block(&rpc_url, network_block_height, Duration::from_secs(EPOCH_DURATION * 2))
+        .await?;
+    let network_base_fee = get_base_fee_at_block(&rpc_url, network_block_height).await?;
     info!(target: "basefee-test", network_base_fee, pre_kill_base_fee, "base fee after 6 epochs");
     assert!(
         network_base_fee >= pre_kill_base_fee + 3,
@@ -977,7 +988,7 @@ async fn test_basefee_rollover_pool_sync() -> eyre::Result<()> {
     let num_epochs_to_sample: u32 = 3;
     let mut prev_epoch_id = consensus_registry.getCurrentEpochInfo().call().await?.epochId;
     for i in 0..num_epochs_to_sample {
-        let next_id = loop_epochs(prev_epoch_id, 1, &rpc_url).await?;
+        let (next_id, _) = loop_epochs(prev_epoch_id, 1, &rpc_url).await?;
         let info = consensus_registry.getCurrentEpochInfo().call().await?;
         let epoch_start_block = info.blockHeight;
 
@@ -1092,6 +1103,8 @@ async fn test_basefee_restart_restores_per_worker_fee() -> eyre::Result<()> {
     if let Some(mut taken) = guard.take(kill_idx) {
         super::common::kill_child(&mut taken);
     }
+    // Brief pause to let MDBX/REDB lock files release before the eventual restart.
+    tokio::time::sleep(Duration::from_secs(2)).await;
     let killed_url = endpoints[kill_idx].http_url.clone();
     let killed_provider = ProviderBuilder::new().connect_http(killed_url.parse()?);
     assert!(killed_provider.get_chain_id().await.is_err(), "killed node must be down");
@@ -1122,17 +1135,24 @@ async fn test_basefee_restart_restores_per_worker_fee() -> eyre::Result<()> {
     loop_epochs(4, 2, &rpc_url).await?;
 
     sender.abort();
-    tokio::time::sleep(Duration::from_secs(EPOCH_DURATION * 2)).await;
 
-    // Use the epoch-end block as a deterministic pinned reference: all alive nodes share
-    // this block, and the restarted node encounters it during catchup. Unlike `latest - 2`,
-    // this doesn't drift with ongoing block production.
+    // Pin the epoch-end block BEFORE waiting for finality. Reading after the sleep would let
+    // the live network roll into a later epoch, pushing `blockHeight` (and therefore the
+    // catchup target) further out and giving the restarted node less time to converge.
     let consensus_registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &provider);
     let epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
     let pinned = epoch_info.blockHeight - 1;
 
-    // Wait until the restarted node has synced to (or past) the pinned block.
-    timeout(Duration::from_secs(EPOCH_DURATION * 12), async {
+    tokio::time::sleep(Duration::from_secs(EPOCH_DURATION * 2)).await;
+
+    // The pinned block is a deterministic shared reference: all alive nodes have it, and the
+    // restarted node encounters it during catchup. Unlike `latest - 2`, it doesn't drift with
+    // ongoing block production.
+
+    // Wait until the restarted node has synced to (or past) the pinned block. Restoration
+    // tests intrinsically run long; a generous deadline removes flake without masking a
+    // real stall (state-sync resilience fixes prevent the 60s no-progress windows).
+    timeout(Duration::from_secs(EPOCH_DURATION * 20), async {
         loop {
             match restarted_provider
                 .get_block_by_number(alloy::eips::BlockNumberOrTag::Number(pinned))
