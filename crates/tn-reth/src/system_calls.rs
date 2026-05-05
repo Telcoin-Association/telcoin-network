@@ -57,12 +57,13 @@ sol!(
             ValidatorStatus currentStatus;
             /// The validator is permanently disqualified from consensus.
             bool isRetired;
-            /// The validator received stake through delegation.
-            bool isDelegated;
             /// The configuration for validators stake.
             ///
             /// This supports updating stake amount.
             uint8 stakeVersion;
+            /// GSMA region identifier for geographic diversity.
+            /// 0 = unspecified, 1-8 = assigned regions.
+            uint8 region;
         }
 
         /// The epoch info stored on-chain.
@@ -181,6 +182,9 @@ sol!(
         function getRewards(address validatorAddress) public view virtual returns (uint256);
         /// Returns the next committee size
         function getNextCommitteeSize() external view returns (uint16);
+        /// Sets the GSMA region identifier for a validator (0=unspecified, 1-255=assigned regions).
+        /// Only callable by governance (owner).
+        function setValidatorRegion(address validatorAddress, uint8 region) external;
     }
 
     /// Worker fee configs for base fee adjustment.

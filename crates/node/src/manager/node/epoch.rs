@@ -32,7 +32,7 @@ use tn_reth::{
 };
 use tn_storage::tables::{
     CertificateDigestByOrigin, CertificateDigestByRound, Certificates, LastProposed,
-    NodeBatchesCache, OurNodeBatchesCache, Payload, Votes,
+    NodeBatchesCache, OurNodeBatchesCache, Payload, ProposedCertificates, Votes,
 };
 use tn_types::{
     gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash, BlockNumHash, BlsPublicKey,
@@ -1220,6 +1220,7 @@ where
         self.consensus_db.clear_table::<Certificates>()?;
         self.consensus_db.clear_table::<CertificateDigestByRound>()?;
         self.consensus_db.clear_table::<CertificateDigestByOrigin>()?;
+        self.consensus_db.clear_table::<ProposedCertificates>()?;
         self.consensus_db.clear_table::<Payload>()?;
         self.consensus_db.clear_table::<NodeBatchesCache>()?;
         // Note do not clear OurNodeBatchesCache here- we need to keep those until we process the

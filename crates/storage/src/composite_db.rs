@@ -24,7 +24,7 @@ impl<DB: Database> CompositeDatabase<DB> {
     pub fn open(epoch_db: DB, kad_db: DB, cache_db: DB) -> Self {
         let epoch_db = LayeredDatabase::open(epoch_db, true);
         let kad_db = LayeredDatabase::open(kad_db, true);
-        let cache_db = LayeredDatabase::open(cache_db, true);
+        let cache_db = LayeredDatabase::open(cache_db, false);
         Self { inner: Arc::new(Inner { epoch_db, kad_db, cache_db }) }
     }
 

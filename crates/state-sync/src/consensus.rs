@@ -97,10 +97,24 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
         last_gossipped_epoch: Option<Epoch>,
     ) {
         // If we still have epochs to fetch then add to the queue until we are out of epoch records.
-        let previous_epoch = current_fetch_epoch.saturating_sub(1);
-        if let Some(mut previous_epoch_record) =
-            consensus_chain.epochs().record_by_epoch(previous_epoch).await
-        {
+        // For epoch 0: `saturating_sub(1)` yields 0, so record_by_epoch(0) would return the
+        // *real* epoch-0 record whose final_state is the end-of-epoch execution state.
+        // But epoch 0's pack was written with genesis defaults as its genesis_exec_state
+        // (BlockNumHash::default()), so passing the real epoch-0 record as `previous_epoch`
+        // to stream_import would cause verify_epoch_meta to reject the pack.
+        // Fix: synthesise a sentinel record that has the genesis defaults for final_state /
+        // final_consensus but copies the real epoch-0 committee into next_committee so the
+        // committee check in verify_epoch_meta still passes.
+        let maybe_previous = if *current_fetch_epoch == 0 {
+            consensus_chain.epochs().record_by_epoch(0).await.map(|r| EpochRecord {
+                committee: r.committee.clone(),
+                next_committee: r.committee.clone(),
+                ..EpochRecord::default()
+            })
+        } else {
+            consensus_chain.epochs().record_by_epoch(current_fetch_epoch.saturating_sub(1)).await
+        };
+        if let Some(mut previous_epoch_record) = maybe_previous {
             while let Some(epoch_record) =
                 consensus_chain.epochs().record_by_epoch(*current_fetch_epoch).await
             {

@@ -424,7 +424,8 @@ impl PrimaryNetworkHandle {
                         target: "primary::network",
                         %peer,
                         epoch,
-                        "FAILED to streamed epoch pack file from peer"
+                        ?err,
+                        "FAILED to stream epoch pack file from peer"
                     );
                     continue;
                 }
