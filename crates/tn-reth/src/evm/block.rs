@@ -302,7 +302,7 @@ where
             .partition(|v| v.currentStatus == ValidatorStatus::PendingExit);
 
         let active_validator_count = active_validators.len();
-        let validators_for_shuffle = if active_validator_count >= new_committee_size {
+        let mut validators_for_shuffle = if active_validator_count >= new_committee_size {
             // enough active validators for next committee
             active_validators
         } else {
@@ -315,133 +315,23 @@ where
             active_validators
         };
 
-        // region-aware round-robin shuffle for geographic diversity
-        let new_committee =
-            Self::region_aware_shuffle(&mut rng, validators_for_shuffle, new_committee_size);
+        // simple Fisher-Yates shuffle
+        for i in (1..validators_for_shuffle.len()).rev() {
+            let j = rng.random_range(0..=i);
+            validators_for_shuffle.swap(i, j);
+        }
 
-        trace!(target: "engine",  ?new_committee_size, ?new_committee, "region-aware shuffle for new committee");
+        debug!(target: "engine",  "validators post-shuffle {:?}", validators_for_shuffle);
+
+        let mut new_committee =
+            validators_for_shuffle.into_iter().map(|v| v.validatorAddress).collect::<Vec<_>>();
+
+        // trim the shuffled committee to maintain correct size
+        new_committee.truncate(new_committee_size);
+
+        trace!(target: "engine",  ?new_committee_size, ?new_committee, "truncated shuffle for new committee");
 
         Ok(new_committee)
-    }
-
-    /// Perform region-aware round-robin selection with Fisher-Yates intra-region shuffling.
-    ///
-    /// Validators with region 0 (unspecified) bypass diversity constraints and fill remaining
-    /// slots after region-aware selection. For assigned regions (1-8), round-robin ensures no
-    /// single region dominates the committee.
-    fn region_aware_shuffle(
-        rng: &mut StdRng,
-        validators: Vec<ConsensusRegistry::ValidatorInfo>,
-        committee_size: usize,
-    ) -> Vec<Address> {
-        // separate into assigned (region 1-8) and unassigned (region 0)
-        let mut unassigned: Vec<ConsensusRegistry::ValidatorInfo> = Vec::new();
-        let mut region_groups: BTreeMap<u8, Vec<ConsensusRegistry::ValidatorInfo>> =
-            BTreeMap::new();
-
-        for v in validators {
-            if v.region == 0 {
-                unassigned.push(v);
-            } else {
-                region_groups.entry(v.region).or_default().push(v);
-            }
-        }
-
-        // if no assigned regions, fall back to plain Fisher-Yates
-        if region_groups.is_empty() {
-            Self::fisher_yates_shuffle(rng, &mut unassigned);
-            let mut committee: Vec<Address> =
-                unassigned.into_iter().map(|v| v.validatorAddress).collect();
-            committee.truncate(committee_size);
-            return committee;
-        }
-
-        // Fisher-Yates shuffle within each region group for intra-region fairness
-        for group in region_groups.values_mut() {
-            Self::fisher_yates_shuffle(rng, group);
-        }
-
-        // Fisher-Yates shuffle the unassigned pool
-        Self::fisher_yates_shuffle(rng, &mut unassigned);
-
-        // collect and shuffle region keys to randomize visit order
-        let mut region_keys: Vec<u8> = region_groups.keys().copied().collect();
-        for i in (1..region_keys.len()).rev() {
-            let j = rng.random_range(0..=i);
-            region_keys.swap(i, j);
-        }
-
-        // round-robin: cycle through shuffled regions, taking one per region per round
-        let mut committee: Vec<Address> = Vec::with_capacity(committee_size);
-        let mut region_indices: BTreeMap<u8, usize> = BTreeMap::new();
-
-        // first pass: fill diversity slots via round-robin from assigned regions
-        'outer: loop {
-            let mut any_remaining = false;
-            for &region in &region_keys {
-                if committee.len() >= committee_size {
-                    break 'outer;
-                }
-
-                let group = region_groups.get(&region).expect("region key exists");
-                let idx = region_indices.entry(region).or_insert(0);
-                if *idx < group.len() {
-                    committee.push(group[*idx].validatorAddress);
-                    *idx += 1;
-                    any_remaining = true;
-                }
-            }
-
-            if !any_remaining {
-                break;
-            }
-        }
-
-        // second pass: fill remaining from unassigned (region 0) pool
-        let mut unassigned_idx = 0;
-        while committee.len() < committee_size && unassigned_idx < unassigned.len() {
-            committee.push(unassigned[unassigned_idx].validatorAddress);
-            unassigned_idx += 1;
-        }
-
-        // third pass: if still not full, continue from assigned regions
-        // (handles case where unassigned pool is empty or too small)
-        if committee.len() < committee_size {
-            'fill: loop {
-                let mut any_remaining = false;
-                for &region in &region_keys {
-                    if committee.len() >= committee_size {
-                        break 'fill;
-                    }
-
-                    let group = region_groups.get(&region).expect("region key exists");
-                    let idx = region_indices.entry(region).or_insert(0);
-                    if *idx < group.len() {
-                        committee.push(group[*idx].validatorAddress);
-                        *idx += 1;
-                        any_remaining = true;
-                    }
-                }
-
-                if !any_remaining {
-                    break;
-                }
-            }
-        }
-
-        committee.truncate(committee_size);
-        committee
-    }
-
-    /// Standard Fisher-Yates shuffle for a slice of validators.
-    fn fisher_yates_shuffle(
-        rng: &mut StdRng,
-        validators: &mut [ConsensusRegistry::ValidatorInfo],
-    ) {
-        for i in (1..validators.len()).rev() {
-            let j = rng.random_range(0..=i);
-            validators.swap(i, j);
-        }
     }
 
     /// Read state on-chain.
