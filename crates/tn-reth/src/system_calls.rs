@@ -182,7 +182,7 @@ sol!(
         function getRewards(address validatorAddress) public view virtual returns (uint256);
         /// Returns the next committee size
         function getNextCommitteeSize() external view returns (uint16);
-        /// Sets the GSMA region identifier for a validator (0=unspecified, 1-8=assigned regions).
+        /// Sets the GSMA region identifier for a validator (0=unspecified, 1-255=assigned regions).
         /// Only callable by governance (owner).
         function setValidatorRegion(address validatorAddress, uint8 region) external;
     }
