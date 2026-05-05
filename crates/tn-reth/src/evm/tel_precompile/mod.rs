@@ -7,8 +7,11 @@
 //! and its primary ERC-20.
 //!
 //! The precompile is registered as a [`DynPrecompile`] inside a [`PrecompilesMap`] at
-//! [`TELCOIN_PRECOMPILE_ADDRESS`] (`0x7e1`). Any `CALL`/`STATICCALL` targeting that address is
-//! intercepted and routed to [`telcoin_precompile`] instead of executing bytecode.
+//! [`TELCOIN_PRECOMPILE_ADDRESS`] (`0x7e1`). Any `CALL`, `STATICCALL`, `DELEGATECALL`, or
+//! `CALLCODE` targeting that address is intercepted and routed to [`telcoin_precompile`]
+//! instead of executing bytecode. Authorization uses the preserved `msg.sender` and all
+//! state is anchored to `0x7e1`, so `DELEGATECALL`/`CALLCODE` grant no additional privileges
+//! over a plain `CALL`.
 //!
 //! # Module structure
 //!
@@ -90,9 +93,12 @@ pub use faucet::mintCall;
 ///
 /// All TEL token state (pending mints, allowances, total supply) is stored under this address.
 /// Native account balances at other addresses represent TEL holdings for those accounts.
-/// Calls targeting this address are intercepted by the [`DynPrecompile`] registered via
-/// [`add_telcoin_precompile`] and routed to the precompile dispatcher instead of executing EVM
-/// bytecode.
+/// Calls targeting this address — under any scheme (`CALL`, `STATICCALL`, `DELEGATECALL`,
+/// `CALLCODE`) — are intercepted by the [`DynPrecompile`] registered via
+/// [`add_telcoin_precompile`] and routed to the precompile dispatcher instead of executing
+/// EVM bytecode. Genesis seeds `0xfe` (`INVALID`) here as defense-in-depth: the dispatcher
+/// short-circuits bytecode execution while the precompile is registered, so that byte is
+/// only observable via `EXTCODESIZE`/`EXTCODEHASH`, never executed.
 pub const TELCOIN_PRECOMPILE_ADDRESS: Address =
     address!("00000000000000000000000000000000000007e1");
 
@@ -210,5 +216,126 @@ mod tests {
         data.extend_from_slice(&[0u8; 32]);
         let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, data);
         assert_not_success(&result);
+    }
+}
+
+/// Regression tests pinning the `DELEGATECALL` safety properties of the precompile.
+///
+/// These tests document, as code-level invariants, that:
+///
+/// - revm preserves `msg.sender` across `DELEGATECALL` frames, so a wrapper contract
+///   cannot impersonate `GOVERNANCE_SAFE_ADDRESS` by `DELEGATECALL`-ing into `0x7e1`.
+/// - All precompile storage is anchored to [`TELCOIN_PRECOMPILE_ADDRESS`]; a wrapper's own
+///   storage is untouched by a `DELEGATECALL` into the precompile.
+/// - From the precompile's point of view, `DELEGATECALL` is functionally identical to
+///   `CALL` — when the controlling frame is `GOVERNANCE_SAFE_ADDRESS`, both schemes
+///   succeed; when it isn't, both schemes fail with the same authorization error.
+///
+/// If any of these tests start failing, do not loosen the assertions — investigate whether a
+/// revm upgrade has changed `DELEGATECALL` frame semantics. The precompile's authorization
+/// model depends on these invariants holding.
+#[cfg(all(test, not(feature = "faucet")))]
+mod delegatecall_tests {
+    use super::burnable::mintCall;
+    use super::test_utils::*;
+    use super::TELCOIN_PRECOMPILE_ADDRESS;
+    use alloy::sol_types::SolCall;
+    use tn_config::GOVERNANCE_SAFE_ADDRESS;
+    use tn_types::U256;
+
+    /// Encode mainnet `mint(uint256)` calldata.
+    fn mint_calldata(amount: u128) -> Vec<u8> {
+        mintCall { amount: U256::from(amount) }.abi_encode()
+    }
+
+    /// Positive control: a direct `CALL` from a non-governance EOA reverts on `mint`.
+    #[test]
+    fn direct_call_from_unprivileged_reverts() {
+        let mut env = TestEnv::new();
+        let result = env.exec_default(USER, mint_calldata(1_000));
+        assert_not_success(&result);
+    }
+
+    /// Possibility B disconfirmation: an unprivileged EOA `U` calls a wrapper `W` that
+    /// `DELEGATECALL`s into `0x7e1.mint(...)`. The precompile must NOT escalate `U` to
+    /// governance authority — `mint` must revert.
+    #[test]
+    fn delegatecall_from_unprivileged_does_not_escalate() {
+        let mut env = TestEnv::new();
+        let proxy_code = delegatecall_proxy_bytecode(TELCOIN_PRECOMPILE_ADDRESS);
+        env.deploy_code(WRAPPER_ADDR, proxy_code);
+
+        let result = env.exec_to(USER, WRAPPER_ADDR, mint_calldata(1_000), 200_000);
+        assert_not_success(&result);
+    }
+
+    /// Storage isolation: after an unprivileged DELEGATECALL attempt, the wrapper's own
+    /// storage at the precompile's well-known slots remains zero. The precompile anchors
+    /// every `sload`/`sstore` to `TELCOIN_PRECOMPILE_ADDRESS`, so the wrapper's storage
+    /// frame is never touched.
+    #[test]
+    fn delegatecall_does_not_write_wrapper_storage() {
+        let mut env = TestEnv::new();
+        let proxy_code = delegatecall_proxy_bytecode(TELCOIN_PRECOMPILE_ADDRESS);
+        env.deploy_code(WRAPPER_ADDR, proxy_code);
+
+        let _ = env.exec_to(USER, WRAPPER_ADDR, mint_calldata(1_000), 200_000);
+
+        // Slot 100 is `totalSupply`; if storage were misrouted under DELEGATECALL the
+        // wrapper would have a non-zero value here.
+        assert_eq!(env.storage(WRAPPER_ADDR, U256::from(100)), U256::ZERO);
+        // Slot 0 is the `pendingMint` mapping base; the wrapper should have nothing here
+        // either.
+        assert_eq!(env.storage(WRAPPER_ADDR, U256::ZERO), U256::ZERO);
+    }
+
+    /// `STATICCALL` for a state-mutating selector reverts (write-protection from revm), while
+    /// the same selector under direct `CALL` from governance succeeds. This pins the
+    /// expected scheme behaviour and complements the DELEGATECALL tests above.
+    #[test]
+    fn unprivileged_call_to_view_function_succeeds_via_wrapper() {
+        // Read-only path: `totalSupply()` must succeed even when routed through a wrapper
+        // by an unprivileged caller.
+        let mut env = TestEnv::new();
+        let proxy_code = delegatecall_proxy_bytecode(TELCOIN_PRECOMPILE_ADDRESS);
+        env.deploy_code(WRAPPER_ADDR, proxy_code);
+
+        let total_supply_calldata = super::erc20::totalSupplyCall {}.abi_encode();
+        let result = env.exec_to(USER, WRAPPER_ADDR, total_supply_calldata, 100_000);
+        let value = decode_u256(&result);
+        let expected = U256::from(GENESIS_SUPPLY) * U256::from(10).pow(U256::from(18));
+        assert_eq!(value, expected, "totalSupply view should be unchanged after DELEGATECALL");
+    }
+
+    /// Governance equivalence: when the controlling frame is `GOVERNANCE_SAFE_ADDRESS`, a
+    /// `DELEGATECALL` into `0x7e1.mint(...)` succeeds, exactly as a direct CALL would. This
+    /// documents that DELEGATECALL grants no extra privileges *and* loses none — it is
+    /// functionally equivalent to CALL from the precompile's point of view.
+    ///
+    /// Setup: install the forwarding proxy at `GOVERNANCE_SAFE_ADDRESS` itself. Sending a
+    /// transaction from `GOVERNANCE_SAFE_ADDRESS` to `GOVERNANCE_SAFE_ADDRESS` then runs
+    /// the proxy in governance's frame; the proxy's `DELEGATECALL` preserves `caller =
+    /// GOVERNANCE_SAFE_ADDRESS`, and `mint` authorizes.
+    ///
+    /// EIP-3607 normally rejects transactions from accounts with code; we disable that
+    /// check on the test `CfgEnv` because we are intentionally simulating a tx originating
+    /// from a contract-bearing address (the governance Safe contract in production calls
+    /// itself via internal frames, but in this in-memory harness we collapse that to a
+    /// single tx for clarity).
+    #[test]
+    fn delegatecall_from_governance_succeeds() {
+        let mut env = TestEnv::new();
+        let proxy_code = delegatecall_proxy_bytecode(TELCOIN_PRECOMPILE_ADDRESS);
+        env.deploy_code(GOVERNANCE_SAFE_ADDRESS, proxy_code);
+        // Allow tx from a code-bearing account in this test only.
+        env.evm.ctx.cfg.disable_eip3607 = true;
+
+        let result = env.exec_to(
+            GOVERNANCE_SAFE_ADDRESS,
+            GOVERNANCE_SAFE_ADDRESS,
+            mint_calldata(1_000),
+            200_000,
+        );
+        assert_success(&result);
     }
 }

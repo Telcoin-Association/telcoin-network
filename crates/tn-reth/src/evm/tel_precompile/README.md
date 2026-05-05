@@ -2,7 +2,7 @@
 
 This directory implements a **native ERC-20 precompile** for the Telcoin (TEL) token. Unlike a standard Solidity contract, the precompile operates directly on native account balances — `balanceOf(addr)` returns the same value as `addr.balance`. This makes TEL simultaneously the chain's gas token and its primary ERC-20.
 
-The precompile is registered as a `DynPrecompile` inside reth's `PrecompilesMap` at address `0x00000000000000000000000000000000000007e1`. Any `CALL` or `STATICCALL` targeting this address is intercepted by the dispatcher in `mod.rs` and routed to the appropriate handler based on the 4-byte function selector.
+The precompile is registered as a `DynPrecompile` inside reth's `PrecompilesMap` at address `0x00000000000000000000000000000000000007e1`. Any `CALL`, `STATICCALL`, `DELEGATECALL`, or `CALLCODE` targeting this address is intercepted by the dispatcher in `mod.rs` and routed to the appropriate handler based on the 4-byte function selector. Authorization is based on the preserved `msg.sender` and all state is anchored to `0x7e1`, so `DELEGATECALL`/`CALLCODE` grant no additional privileges over a plain `CALL` (see [Call scheme safety](#call-scheme-safety) below).
 
 ## Module map
 
@@ -69,7 +69,7 @@ No pending state, no timelock. Mint roles can be granted/revoked by governance.
 | ----------------------------------------------- | -------------------------------------------------- |
 | `mint` (mainnet)                                | Governance only                                    |
 | `mint` (faucet)                                 | Governance + dynamically granted mint-role holders |
-| `claim`                                         | Anyone (after timelock)                            |
+| `claim`                                         | Governance only (after 7-day timelock)             |
 | `burn`                                          | Governance only                                    |
 | `grantMintRole` / `revokeMintRole`              | Governance only (faucet feature)                   |
 | `transfer`, `approve`, `transferFrom`, `permit` | Any account                                        |
@@ -78,6 +78,30 @@ No pending state, no timelock. Mint roles can be granted/revoked by governance.
 Governance is identified by `GOVERNANCE_SAFE_ADDRESS` from `tn-config`.
 
 ## Security considerations
+
+### Call scheme safety
+
+The precompile is intercepted on every call scheme — `CALL`, `STATICCALL`, `DELEGATECALL`, and `CALLCODE` — because reth's `PrecompilesMap` lookup is keyed only on the call's `bytecode_address` (which equals `0x7e1` regardless of scheme). The `0xfe` (`INVALID`) byte that genesis seeds at `0x7e1` is therefore unreachable: precompile dispatch short-circuits bytecode execution. It exists only so that `EXTCODESIZE`/`EXTCODEHASH` against `0x7e1` look like a contract; a `CALL` to that byte would never run because the dispatcher intercepts first.
+
+`DELEGATECALL` does **not** create a privilege-escalation path:
+
+- `input.caller` is the *preserved* `msg.sender` of the parent frame (per revm's standard `DELEGATECALL` semantics), not the address of the wrapper that issued the `DELEGATECALL`. A wrapper contract `W` cannot trick the precompile into believing the call came from `GOVERNANCE_SAFE_ADDRESS` by `DELEGATECALL`-ing into `0x7e1`.
+- All `sload`/`sstore` calls in the handlers pass `TELCOIN_PRECOMPILE_ADDRESS` as the explicit storage account. There is no path where caller-derived storage is read or written. So `DELEGATECALL` cannot redirect writes into a wrapper's own storage either.
+
+Authorization for privileged operations therefore reduces to a single trust anchor: whichever contract or EOA controls the most-recent non-delegated frame. **`GOVERNANCE_SAFE_ADDRESS` is a hard trust boundary.** If a Safe transaction is signed with `Operation=DelegateCall` to a library that performs a plain `CALL` to `0x7e1`, the precompile sees `caller == GOVERNANCE_SAFE_ADDRESS` and authorizes — this is inherent to Safe's call semantics and identical to the exposure of any other ERC-20 whose owner is a Safe. Operators are responsible for vetting the libraries that Safe signers approve, and for monitoring `enableModule` activity on the governance Safe.
+
+Regression tests in `mod.rs` (`#[cfg(test)] mod delegatecall_tests`) pin this property as a code-level invariant against future revm upgrades.
+
+### Timelock asymmetry
+
+Only mint creation is timelocked. `claim` (post-timelock), `burn`, and (faucet only) `grantMintRole`/`revokeMintRole` are instant. The asymmetry is deliberate:
+
+- **`mint` has the cancel window** because it is the only operation that expands supply. A second `mint` overwrites the pending entry, so a malicious mint can be cancelled by minting `0` before the timelock expires.
+- **`claim` is intentionally instant once the timelock has passed** — the cancel window has already elapsed, and requiring a second authorization step would not add security against a quorum that has already approved the mint.
+- **`burn` is intentionally instant** because its blast radius is bounded by the precompile account's own balance. Users hold TEL in their own accounts; the precompile does not accumulate user balances. `burn` retires tokens that were deliberately routed to `0x7e1`, so a compromised quorum cannot drain user holdings via `burn`.
+- **`grantMintRole` / `revokeMintRole`** are gated behind the `faucet` feature and are therefore not present in mainnet binaries (see "Timelock bypass" below).
+
+If future flows accumulate user-deposited TEL at `0x7e1`, the `burn` exposure changes and a symmetric timelock should be added.
 
 ### Timelock bypass (`faucet` feature)
 

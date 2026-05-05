@@ -8,6 +8,7 @@ use crate::evm::context::{TNEvmContext, TelcoinEvm};
 use alloy::sol_types::SolCall;
 use alloy_evm::precompiles::PrecompilesMap;
 use reth_revm::{
+    bytecode::Bytecode,
     context::{
         result::{EVMError, ExecutionResult, InvalidTransaction},
         BlockEnv, Context, ContextSetters, Evm, FrameStack, TxEnv,
@@ -17,7 +18,7 @@ use reth_revm::{
     inspector::NoOpInspector,
     primitives::{address, Address, KECCAK_EMPTY},
     state::AccountInfo,
-    MainContext,
+    Database, MainContext,
 };
 use std::collections::HashMap;
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
@@ -51,6 +52,14 @@ pub const USER: Address = address!("1111100000000000000000000000000000000001");
 
 /// Test address used as a transfer/mint recipient in unit and integration tests.
 pub const RECIPIENT: Address = address!("2222222000000000000000000000000000000002");
+
+/// Test address used as a deployable wrapper contract for DELEGATECALL regression tests.
+///
+/// The wrapper at this address is constructed via [`delegatecall_proxy_bytecode`] and forwards
+/// any incoming calldata to [`TELCOIN_PRECOMPILE_ADDRESS`] via `DELEGATECALL`. Because the
+/// wrapper has no balance and no governance role, calls routed through it must never escalate
+/// authority — see `mod.rs` `delegatecall_tests`.
+pub const WRAPPER_ADDR: Address = address!("3333333000000000000000000000000000000003");
 
 /// Genesis total supply in whole TEL units (100 billion).
 ///
@@ -223,6 +232,68 @@ impl TestEnv {
         );
     }
 
+    /// Deploy `bytecode` at `addr`, preserving any existing balance and lifting the nonce to at
+    /// least 1 (contract accounts always have nonce ≥ 1).
+    ///
+    /// Used by DELEGATECALL regression tests to install a forwarding proxy at a wrapper
+    /// address. If the account already exists (e.g. funded via [`Self::new`]), its balance is
+    /// kept; otherwise a fresh contract account with zero balance is inserted. The test
+    /// harness's nonce tracker for `addr` is updated to match the post-deployment account
+    /// nonce so subsequent [`Self::exec_to`] calls from `addr` use a consistent nonce.
+    pub fn deploy_code(&mut self, addr: Address, bytecode: Vec<u8>) {
+        let code = Bytecode::new_raw(Bytes::from(bytecode));
+        let code_hash = code.hash_slow();
+
+        let existing = self.evm.ctx.journaled_state.database.basic(addr).ok().flatten();
+        let (balance, nonce) = match existing {
+            Some(info) => (info.balance, info.nonce.max(1)),
+            None => (U256::ZERO, 1),
+        };
+
+        self.evm.ctx.journaled_state.database.insert_account_info(
+            addr,
+            AccountInfo { balance, nonce, code_hash, code: Some(code), ..Default::default() },
+        );
+        // Keep the harness's nonce tracker in sync with the on-chain account nonce.
+        self.nonces.insert(addr, nonce);
+    }
+
+    /// Read raw storage at `addr[slot]` from the underlying [`InMemoryDB`].
+    ///
+    /// Returns `U256::ZERO` if the slot has never been written. Used by DELEGATECALL tests to
+    /// confirm storage isolation — i.e. that a wrapper's storage is untouched after the
+    /// wrapper `DELEGATECALL`s into the precompile.
+    pub fn storage(&mut self, addr: Address, slot: U256) -> U256 {
+        self.evm.ctx.journaled_state.database.storage(addr, slot).unwrap_or(U256::ZERO)
+    }
+
+    /// Execute a transaction from `caller` to an arbitrary `target`.
+    ///
+    /// Unlike [`Self::exec`], which always targets [`TELCOIN_PRECOMPILE_ADDRESS`], this routes
+    /// the call through `target`. Used to invoke a deployed wrapper contract that itself
+    /// forwards into the precompile.
+    pub fn exec_to(
+        &mut self,
+        caller: Address,
+        target: Address,
+        calldata: Vec<u8>,
+        gas_limit: u64,
+    ) -> TestResult {
+        let nonce = self.nonces.entry(caller).or_insert(0);
+        self.evm.ctx.set_tx(
+            TxEnv::builder()
+                .caller(caller)
+                .kind(TxKind::Call(target))
+                .data(calldata.into())
+                .gas_limit(gas_limit)
+                .nonce(*nonce)
+                .build()
+                .unwrap(),
+        );
+        *nonce += 1;
+        MainnetHandler::default().run(&mut self.evm)
+    }
+
     /// Execute a precompile call with the given gas limit.
     ///
     /// Automatically increments the caller's nonce. The call targets
@@ -345,4 +416,66 @@ pub fn decode_u256(result: &TestResult) -> U256 {
 /// Decode a successful execution's output as a `bool` (`U256 != 0`).
 pub fn decode_bool(result: &TestResult) -> bool {
     !decode_u256(result).is_zero()
+}
+
+// --- DELEGATECALL proxy bytecode ---
+
+/// Build a minimal forwarding proxy that `DELEGATECALL`s `target` and propagates the result.
+///
+/// The returned 49-byte program performs:
+///
+/// ```text
+/// CALLDATACOPY 0..calldatasize        // mirror inbound calldata into memory
+/// DELEGATECALL gas, target, mem 0..cs // invoke target with the same calldata
+/// RETURNDATACOPY 0..returndatasize    // mirror returndata back into memory
+/// JUMPI to RETURN if success           // success → RETURN(0, returndatasize)
+/// REVERT(0, returndatasize)            // failure → propagate revert reason
+/// ```
+///
+/// Used by the `delegatecall_tests` module in `mod.rs` to assemble wrapper contracts that
+/// route calls into the TEL precompile via `DELEGATECALL`.
+pub fn delegatecall_proxy_bytecode(target: Address) -> Vec<u8> {
+    let mut code = Vec::with_capacity(49);
+    // Phase 1: CALLDATACOPY(0, 0, calldatasize)
+    code.extend_from_slice(&[
+        0x36, // CALLDATASIZE                  -> [cs]
+        0x3d, // RETURNDATASIZE (push 0)       -> [cs, 0]
+        0x3d, // RETURNDATASIZE (push 0)       -> [cs, 0, 0]
+        0x37, // CALLDATACOPY(dst=0, src=0, sz=cs)
+    ]);
+    // Phase 2: prepare DELEGATECALL args (gas, target, in_off=0, in_size=cs, out_off=0, out_size=0)
+    code.extend_from_slice(&[
+        0x3d, // RETURNDATASIZE (out_size=0)
+        0x3d, // RETURNDATASIZE (out_off=0)
+        0x36, // CALLDATASIZE   (in_size=cs)
+        0x3d, // RETURNDATASIZE (in_off=0)
+        0x73, // PUSH20 target
+    ]);
+    code.extend_from_slice(target.as_slice()); // 20 bytes
+    code.extend_from_slice(&[
+        0x5a, // GAS
+        0xf4, // DELEGATECALL                 -> [success]
+    ]);
+    // Phase 3: RETURNDATACOPY(0, 0, returndatasize)
+    code.extend_from_slice(&[
+        0x3d, // RETURNDATASIZE (size)
+        0x60, 0x00, // PUSH1 0 (src)
+        0x60, 0x00, // PUSH1 0 (dst)
+        0x3e, // RETURNDATACOPY                -> [success]
+    ]);
+    // Phase 4: branch on success → RETURN(0, returndatasize) else REVERT(0, returndatasize)
+    code.extend_from_slice(&[
+        0x60, 0x2c, // PUSH1 0x2c (jumpdest at byte 44)
+        0x57, // JUMPI                          (if success != 0, jump)
+        0x3d, // RETURNDATASIZE
+        0x60, 0x00, // PUSH1 0
+        0xfd, // REVERT(0, returndatasize)
+        0x5b, // JUMPDEST                        (offset 44 = 0x2c)
+        0x3d, // RETURNDATASIZE
+        0x60, 0x00, // PUSH1 0
+        0xf3, // RETURN(0, returndatasize)
+    ]);
+    debug_assert_eq!(code.len(), 49, "delegatecall proxy bytecode length");
+    debug_assert_eq!(code[44], 0x5b, "JUMPDEST must be at byte 44");
+    code
 }
