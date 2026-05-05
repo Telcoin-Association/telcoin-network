@@ -9,12 +9,12 @@ use crate::{
 use std::{sync::Arc, time::Duration};
 use tn_config::{ConsensusConfig, KeyConfig};
 use tn_network_libp2p::error::NetworkError;
-use tn_storage::CertificateStore;
+use tn_storage::{tables::ProposedCertificates, CertificateStore};
 use tn_types::{
     ensure,
     error::{DagError, DagResult},
     AuthorityIdentifier, BlsPublicKey, Certificate, Committee, Database, Header, HeaderDigest,
-    Noticer, Notifier, TaskManager, TaskResult, TaskSpawner, TnReceiver, Vote,
+    Noticer, Notifier, TaskError, TaskManager, TaskResult, TaskSpawner, TnReceiver, Vote,
 };
 use tokio::sync::Mutex;
 use tracing::{debug, enabled, error, info, instrument};
@@ -404,7 +404,9 @@ impl<DB: Database> Certifier<DB> {
         // before this call.
         let _guard = self.proposal_lock.lock().await;
         let header_digest = header.digest();
-        if let Ok(Some(cert)) = self.config.node_storage().read(header_digest) {
+        if let Ok(Some(cert)) =
+            self.config.node_storage().get::<ProposedCertificates>(&header_digest)
+        {
             info!(target: "primary::certifier", "asked to propose a header that is already certified {header_digest}, skipping proposal and re-publishing");
             // We have already processed this certificate, doing so again could produce signature
             // equivocation and destroy deterministic randomness (based on the leader
@@ -427,6 +429,10 @@ impl<DB: Database> Certifier<DB> {
             proposal_result = self.propose_header(header) => {
                 match proposal_result {
                     Ok(mut certificate) => {
+                        if let Err(e) = self.config.node_storage().insert::<ProposedCertificates>(&header_digest, &certificate) {
+                            error!(target: "primary::certifier", "error accepting own certificate, unable to save the certificate: {e}");
+                            return Err(TaskError::from_message(e.to_string()));
+                        }
                         // pass to state_sync for internal processing
                         if let Err(e) = self.state_sync.process_own_certificate(&mut certificate).await {
                             error!(target: "primary::certifier", "error accepting own certificate: {e}");

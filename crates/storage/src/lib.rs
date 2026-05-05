@@ -12,7 +12,7 @@ pub use redb::database::ReDB;
 use tables::{
     CertificateDigestByOrigin, CertificateDigestByRound, Certificates, ConsensusHeaderCache,
     KadProviderRecords, KadRecords, KadWorkerProviderRecords, KadWorkerRecords, LastProposed,
-    NodeBatchesCache, OurNodeBatchesCache, Payload, Votes,
+    NodeBatchesCache, OurNodeBatchesCache, Payload, ProposedCertificates, Votes,
 };
 // Always build redb, we use it as the default for persistant consensus data.
 pub mod archive;
@@ -49,6 +49,7 @@ const VOTES_CF: &str = "votes";
 const CERTIFICATES_CF: &str = "certificates";
 const CERTIFICATE_DIGEST_BY_ROUND_CF: &str = "certificate_digest_by_round";
 const CERTIFICATE_DIGEST_BY_ORIGIN_CF: &str = "certificate_digest_by_origin";
+const PROPOSED_CERTIFICATES_CF: &str = "proposed_certificates";
 const PAYLOAD_CF: &str = "payload";
 const NODE_BATCHES_CACHE_CF: &str = "node_batches_cache";
 const OUR_NODE_BATCHES_CACHE_CF: &str = "our_node_batches_cache";
@@ -88,6 +89,7 @@ pub mod tables {
         Certificates;crate::CERTIFICATES_CF;TableHint::Epoch;<HeaderDigest, Certificate>,  // Cleared every epoch
         CertificateDigestByRound;crate::CERTIFICATE_DIGEST_BY_ROUND_CF;TableHint::Epoch;<(Round, AuthorityIdentifier), HeaderDigest>,  // Cleared every epoch
         CertificateDigestByOrigin;crate::CERTIFICATE_DIGEST_BY_ORIGIN_CF;TableHint::Epoch;<(AuthorityIdentifier, Round), HeaderDigest>,  // Cleared every epoch
+        ProposedCertificates;crate::PROPOSED_CERTIFICATES_CF;TableHint::Epoch;<HeaderDigest, Certificate>,  // Cleared every epoch
         Payload;crate::PAYLOAD_CF;TableHint::Epoch;<(BlockHash, WorkerId), PayloadToken>,  // Cleared every epoch
         // This is a cache to store this nodes batches before consensus, remove once in a ConsensusHeader.
         NodeBatchesCache;crate::NODE_BATCHES_CACHE_CF;TableHint::Cache;<BlockHash, Batch>,
@@ -164,6 +166,7 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatab
     db.open_table::<Certificates>().expect("failed to open table!");
     db.open_table::<CertificateDigestByRound>().expect("failed to open table!");
     db.open_table::<CertificateDigestByOrigin>().expect("failed to open table!");
+    db.open_table::<ProposedCertificates>().expect("failed to open table!");
     db.open_table::<Payload>().expect("failed to open table!");
     // Kad tables
     db.open_table::<KadRecords>().expect("failed to open table!");
@@ -193,6 +196,7 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatab
     db.open_table::<Certificates>().expect("failed to open table!");
     db.open_table::<CertificateDigestByRound>().expect("failed to open table!");
     db.open_table::<CertificateDigestByOrigin>().expect("failed to open table!");
+    db.open_table::<ProposedCertificates>().expect("failed to open table!");
     db.open_table::<Payload>().expect("failed to open table!");
     // Kad tables
     db.open_table::<KadRecords>().expect("failed to open table!");
