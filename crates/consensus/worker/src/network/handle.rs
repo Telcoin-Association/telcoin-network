@@ -234,6 +234,13 @@ impl WorkerNetworkHandle {
             WorkerResponse::RequestBatchesStream { ack } => {
                 // return error if denied to try next peer
                 if !ack {
+                    warn!(
+                        target: "worker::network",
+                        %peer,
+                        epoch = self.epoch(),
+                        digest_count = batch_digests.len(),
+                        "peer denied request to sync (ack: false)"
+                    );
                     return Err(NetworkError::RPCError(
                         "Peer {peer:%} denied request to sync".to_string(),
                     ));

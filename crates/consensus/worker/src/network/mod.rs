@@ -317,10 +317,13 @@ where
                     // check per-peer capacity
                     let peer_count = pending_map.keys().filter(|(p, _)| *p == peer).count();
                     if peer_count >= MAX_PENDING_REQUESTS_PER_PEER {
-                        debug!(
+                        warn!(
                             target: "worker::network",
                             %peer,
                             peer_count,
+                            max = MAX_PENDING_REQUESTS_PER_PEER,
+                            current_epoch = self.network_handle.epoch(),
+                            requested_epoch = epoch,
                             "rejecting batch stream request: per-peer limit reached"
                         );
                         // permit drops here, freeing the slot
@@ -361,7 +364,18 @@ where
                         true
                     }
                 }
-                Err(_) => false,
+                Err(_) => {
+                    warn!(
+                        target: "worker::network",
+                        %peer,
+                        available_permits = self.batch_stream_semaphore.available_permits(),
+                        max = MAX_CONCURRENT_BATCH_STREAMS,
+                        current_epoch = self.network_handle.epoch(),
+                        requested_epoch = epoch,
+                        "rejecting batch stream request: global batch-stream semaphore exhausted"
+                    );
+                    false
+                }
             };
 
             Ok(WorkerResponse::RequestBatchesStream { ack })
