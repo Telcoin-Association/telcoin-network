@@ -108,18 +108,19 @@ use std::{
 };
 use system_calls::{
     ConsensusRegistry::{self},
-    EpochState, CONSENSUS_REGISTRY_ADDRESS, SYSTEM_ADDRESS,
+    EpochState, WorkerConfigs, CONSENSUS_REGISTRY_ADDRESS, SYSTEM_ADDRESS,
 };
 use tempfile::TempDir;
 use tn_config::{
     NodeInfo, BLSG1_JSON, CONSENSUS_REGISTRY_JSON, GOVERNANCE_SAFE_ADDRESS, ISSUANCE_ADDRESS,
-    ISSUANCE_JSON,
+    ISSUANCE_JSON, WORKER_CONFIGS_ADDRESS, WORKER_CONFIGS_JSON,
 };
 use tn_types::{
-    deconstruct_nonce, gas_accumulator::RewardsCounter, Address, BlockBody, BlockHashOrNumber,
-    BlockNumHash, BlockNumber, EngineUpdate, Epoch, ExecHeader, Genesis, GenesisAccount,
-    RecoveredBlock, Round, SealedBlock, SealedHeader, TaskManager, TaskSpawner, TransactionSigned,
-    B256, ETHEREUM_BLOCK_GAS_LIMIT_30M, U256,
+    deconstruct_nonce,
+    gas_accumulator::{RewardsCounter, WorkerFeeConfig},
+    Address, BlockBody, BlockHashOrNumber, BlockNumHash, BlockNumber, EngineUpdate, Epoch,
+    ExecHeader, Genesis, GenesisAccount, RecoveredBlock, Round, SealedBlock, SealedHeader,
+    TaskManager, TaskSpawner, TransactionSigned, B256, ETHEREUM_BLOCK_GAS_LIMIT_30M, U256,
 };
 use tracing::{debug, error, info, warn};
 use traits::{TNPrimitives, TelcoinNode};
@@ -1079,6 +1080,7 @@ impl RethEnv {
         genesis: Genesis,
         initial_stake_config: ConsensusRegistry::StakeConfig,
         owner_address: Address,
+        worker_configs: Vec<(u8, u64)>,
     ) -> eyre::Result<Genesis> {
         // create temporary reth env for execution
         let tmp_chain: Arc<RethChainSpec> = Arc::new(genesis.clone().into());
@@ -1188,6 +1190,35 @@ impl RethEnv {
             owner_address.create(1)
         };
 
+        // deploy WorkerConfigs contract
+        let tmp_worker_configs_address = {
+            let mut tn_evm = reth_env.inner.evm_config.evm_factory().create_evm(
+                &mut db,
+                reth_env.inner.evm_config.evm_env(&tmp_chain.sealed_genesis_header())?,
+            );
+
+            let (strategies, values): (Vec<u8>, Vec<u64>) = worker_configs.iter().copied().unzip();
+            let constructor_args =
+                WorkerConfigs::constructorCall { strategies, values, owner_: owner_address }
+                    .abi_encode();
+
+            let initcode_binding =
+                Self::fetch_value_from_json_str(WORKER_CONFIGS_JSON, Some("bytecode.object"))?;
+            let initcode =
+                hex::decode(initcode_binding.as_str().ok_or_eyre("invalid worker configs json")?)?;
+            let mut create_worker_configs = initcode;
+            create_worker_configs.extend(constructor_args);
+
+            let ResultAndState { result, state } =
+                tn_evm.transact_pre_genesis_create(owner_address, create_worker_configs.into())?;
+            debug!(target: "engine", "create worker configs result:\n{:#?}", result);
+
+            tn_evm.db_mut().commit(state);
+
+            // Third create tx on tmp chain (after blsg1 at nonce 0 and registry at nonce 1)
+            owner_address.create(2)
+        };
+
         // execute the transactions to get final bundle state
         db.merge_transitions(BundleRetention::PlainState);
         let BundleState { state, contracts, reverts, state_size, reverts_size } = db.take_bundle();
@@ -1210,6 +1241,17 @@ impl RethEnv {
         let registry_runtimecode =
             Self::link_solidity_library(registry_runtimecode_str, &blsg1_address.encode_hex())?;
 
+        let tmp_worker_configs_storage = state.get(&tmp_worker_configs_address).map(|account| {
+            account.storage.iter().map(|(k, v)| ((*k).into(), v.present_value.into())).collect()
+        });
+        let worker_configs_runtimecode_binding =
+            Self::fetch_value_from_json_str(WORKER_CONFIGS_JSON, Some("deployedBytecode.object"))?;
+        let worker_configs_runtimecode = hex::decode(
+            worker_configs_runtimecode_binding
+                .as_str()
+                .ok_or_eyre("invalid worker configs json")?,
+        )?;
+
         let blsg1_runtimecode_binding =
             Self::fetch_value_from_json_str(BLSG1_JSON, Some("deployedBytecode.object"))?;
         let blsg1_runtimecode =
@@ -1231,6 +1273,12 @@ impl RethEnv {
             (
                 ISSUANCE_ADDRESS,
                 GenesisAccount::default().with_code(Some(issuance_runtimecode.into())),
+            ),
+            (
+                WORKER_CONFIGS_ADDRESS,
+                GenesisAccount::default()
+                    .with_code(Some(worker_configs_runtimecode.into()))
+                    .with_storage(tmp_worker_configs_storage),
             ),
         ]);
 
@@ -1410,6 +1458,100 @@ impl RethEnv {
     {
         let calldata = ConsensusRegistry::getCommitteeValidatorsCall { epoch }.abi_encode().into();
         self.call_consensus_registry::<_, Vec<ConsensusRegistry::ValidatorInfo>>(evm, calldata)
+    }
+
+    /// Read fee configs for all workers from the [`WorkerConfigs`] contract at the given header.
+    ///
+    /// Builds an EVM against `header`'s state, calls `numWorkers()`, then makes one
+    /// `getWorkerConfig` call per worker. Returns the on-chain worker count alongside the
+    /// decoded [`WorkerFeeConfig`]s.
+    fn worker_fee_configs_inner(
+        &self,
+        header: &SealedHeader,
+    ) -> eyre::Result<(usize, Vec<WorkerFeeConfig>)> {
+        let state_provider = self.inner.blockchain_provider.state_by_block_hash(header.hash())?;
+        let state = StateProviderDatabase::new(&state_provider);
+        let mut db = State::builder().with_database(state).with_bundle_update().build();
+        let mut tn_evm = self
+            .inner
+            .evm_config
+            .evm_factory()
+            .create_evm(&mut db, self.inner.evm_config.evm_env(header)?);
+
+        let num_workers_calldata = WorkerConfigs::numWorkersCall {}.abi_encode().into();
+        let num_workers_state = self.read_state_on_chain(
+            &mut tn_evm,
+            SYSTEM_ADDRESS,
+            WORKER_CONFIGS_ADDRESS,
+            num_workers_calldata,
+        )?;
+        let num_workers_data = match num_workers_state.result {
+            ExecutionResult::Success { output, .. } => output.into_data(),
+            e => eyre::bail!("failed to read num workers: {e:?}"),
+        };
+        let num_workers =
+            <WorkerConfigs::numWorkersCall as alloy::sol_types::SolCall>::abi_decode_returns(
+                &num_workers_data,
+            )? as usize;
+
+        let mut configs = Vec::with_capacity(num_workers);
+        for worker_id in 0..num_workers {
+            let calldata = WorkerConfigs::getWorkerConfigCall { workerId: worker_id as u16 }
+                .abi_encode()
+                .into();
+            let state = self.read_state_on_chain(
+                &mut tn_evm,
+                SYSTEM_ADDRESS,
+                WORKER_CONFIGS_ADDRESS,
+                calldata,
+            )?;
+            let data = match state.result {
+                ExecutionResult::Success { output, .. } => output.into_data(),
+                e => eyre::bail!("failed to read worker config for worker {worker_id}: {e:?}"),
+            };
+            let ret = <WorkerConfigs::getWorkerConfigCall as alloy::sol_types::SolCall>::abi_decode_returns(&data)?;
+            let config = match ret.strategy {
+                0 => WorkerFeeConfig::Eip1559 { target_gas: ret.value },
+                1 => WorkerFeeConfig::Static { fee: ret.value },
+                s => eyre::bail!("unknown fee strategy {s} for worker {worker_id}"),
+            };
+            configs.push(config);
+        }
+
+        Ok((num_workers, configs))
+    }
+
+    /// Read worker fee configs from the [`WorkerConfigs`] contract at the block identified by
+    /// `block_hash`.
+    ///
+    /// Returns the on-chain worker count and one [`WorkerFeeConfig`] per worker. Fails with a
+    /// descriptive error if `block_hash` does not resolve to a sealed header.
+    pub fn get_worker_fee_configs_at_block(
+        &self,
+        block_hash: B256,
+    ) -> eyre::Result<(usize, Vec<WorkerFeeConfig>)> {
+        let header = self
+            .sealed_header_by_hash(block_hash)?
+            .ok_or_else(|| eyre::eyre!("sealed header not found for block hash {block_hash:?}"))?;
+        self.worker_fee_configs_inner(&header)
+    }
+
+    /// Read worker fee configs from the [`WorkerConfigs`] contract at the canonical tip.
+    ///
+    /// `num_workers` is the caller's view of the on-chain worker count. It is compared against
+    /// the value returned by `numWorkers()` at canonical tip; a mismatch indicates governance
+    /// grew/shrank the worker set mid-node-lifetime and the in-memory `GasAccumulator` no longer
+    /// matches the contract. Caller must restart or re-resolve the worker count.
+    pub fn get_worker_fee_configs(&self, num_workers: usize) -> eyre::Result<Vec<WorkerFeeConfig>> {
+        let canonical_tip = self.canonical_tip();
+        let (num_workers_on_chain, configs) = self.worker_fee_configs_inner(&canonical_tip)?;
+        if num_workers != num_workers_on_chain {
+            return Err(eyre::eyre!(
+                "worker count drift: caller={num_workers}, on-chain numWorkers()={num_workers_on_chain}; \
+                 GasAccumulator sized at startup no longer matches WorkerConfigs; node restart required"
+            ));
+        }
+        Ok(configs)
     }
 
     /// Helper function to call `ConsensusRegistry` state on-chain.
@@ -1603,7 +1745,7 @@ mod tests {
         let tmp_genesis = tn_types::test_genesis().extend_accounts([
             (
                 governance,
-                GenesisAccount::default().with_balance(U256::from((50_000_000 * 10) ^ 18)), // 50mil TEL
+                GenesisAccount::default().with_balance(U256::from(parse_ether("50_000_000")?)), // 50mil TEL
             ),
             (
                 new_validator_eoa.address(),
@@ -1626,6 +1768,7 @@ mod tests {
             tmp_genesis,
             initial_stake_config.clone(),
             governance,
+            vec![(0u8, 30_000_000u64)],
         )?;
 
         // update genesis again to include stake for new validator
@@ -2005,5 +2148,74 @@ mod tests {
                 assert!(mods.remove(&r));
             }
         };
+    }
+
+    #[tokio::test]
+    async fn test_get_worker_fee_configs() -> eyre::Result<()> {
+        // minimal validator set (5 validators)
+        let all_validators: Vec<Address> =
+            (1..=5).map(|i| Address::from_slice(&[i * 0x11; 20])).collect();
+
+        let validators: Vec<_> = all_validators
+            .iter()
+            .enumerate()
+            .map(|(i, addr)| {
+                let mut rng = StdRng::seed_from_u64(i as u64);
+                let bls = BlsKeypair::generate(&mut rng);
+                let bls_pubkey = bls.public();
+                let pop = generate_proof_of_possession_bls_for_test(&bls, addr)
+                    .expect("pop generation failed");
+                NodeInfo {
+                    name: format!("validator-{i}"),
+                    bls_public_key: *bls_pubkey,
+                    p2p_info: NodeP2pInfo::default(),
+                    execution_address: *addr,
+                    proof_of_possession: pop,
+                }
+            })
+            .collect();
+
+        let initial_stake_config = ConsensusRegistry::StakeConfig {
+            stakeAmount: U256::from(parse_ether("1_000_000").unwrap()),
+            minWithdrawAmount: U256::from(parse_ether("1_000").unwrap()),
+            epochIssuance: U256::from(parse_ether("20_000_000").unwrap())
+                .checked_div(U256::from(28))
+                .expect("u256 div checked"),
+            epochDuration: 28800,
+        };
+
+        let governance_multisig =
+            TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
+        let governance = governance_multisig.address();
+        let tmp_genesis = tn_types::test_genesis().extend_accounts([(
+            governance,
+            GenesisAccount::default().with_balance(U256::from((50_000_000 * 10) ^ 18)),
+        )]);
+
+        // deploy with 2 workers: worker 0 = EIP-1559 (strategy 0, target 30M),
+        // worker 1 = Static (strategy 1, fee 500)
+        let worker_configs = vec![(0u8, 30_000_000u64), (1u8, 500u64)];
+        let genesis = RethEnv::create_consensus_registry_genesis_accounts(
+            validators.clone(),
+            tmp_genesis,
+            initial_stake_config.clone(),
+            governance,
+            worker_configs,
+        )?;
+
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::new("Worker Fee Config Test");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
+                .unwrap();
+
+        // read back worker configs from chain state
+        let configs = reth_env.get_worker_fee_configs(2)?;
+        assert_eq!(configs.len(), 2);
+        assert_eq!(configs[0], WorkerFeeConfig::Eip1559 { target_gas: 30_000_000 });
+        assert_eq!(configs[1], WorkerFeeConfig::Static { fee: 500 });
+
+        Ok(())
     }
 }
