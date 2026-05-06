@@ -1,7 +1,7 @@
 //! Committe fixture for all authorities and their workers within a committee for a specific epoch.
 
 use super::{AuthorityFixture, Builder};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{collections::{BTreeMap, BTreeSet}, num::NonZeroUsize};
 use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_types::{
     AuthorityIdentifier, Certificate, Committee, Database, Hash as _, Header, HeaderBuilder,
@@ -179,4 +179,23 @@ impl<DB: Database> CommitteeFixture<DB> {
     pub fn genesis(&self) -> impl Iterator<Item = HeaderDigest> {
         Certificate::genesis(&self.committee()).into_iter().map(|x| x.digest())
     }
+}
+
+/// One-liner to create a [`CommitteeFixture`] with `n` authorities.
+///
+/// Randomizes ports so tests don't collide. Panics if `n == 0`.
+/// Useful when a test needs a non-default committee size without repeating the full builder chain.
+///
+/// # Example
+/// ```ignore
+/// let fixture = make_committee_fixture_with_n(7, MemDatabase::default);
+/// ```
+pub fn make_committee_fixture_with_n<DB: Database, F: Fn() -> DB>(
+    n: usize,
+    new_db: F,
+) -> CommitteeFixture<DB> {
+    CommitteeFixture::builder(new_db)
+        .committee_size(NonZeroUsize::new(n).expect("committee size must be non-zero"))
+        .randomize_ports(true)
+        .build()
 }
