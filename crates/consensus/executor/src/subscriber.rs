@@ -190,7 +190,13 @@ impl<DB: Database> Subscriber<DB> {
             if let Some(last_consensus_header) =
                 self.consensus_bus.last_consensus_header().borrow().as_ref()
             {
-                if consensus_header_number == last_consensus_header.number {
+                // If we seem to be on the same number also make sure this is not a stale record.
+                // If that happens during a catch up it will lead to premature cvv active when not
+                // caught up.
+                if consensus_header_number == last_consensus_header.number
+                    && last_consensus_header.sub_dag.commit_timestamp().elapsed()
+                        < Duration::from_secs(5)
+                {
                     // We are caught up enough so try to jump back into consensus
                     info!(target: "subscriber", "attempting to rejoin consensus, consensus block height {consensus_header_number}");
                     self.consensus_bus.node_mode().send_replace(NodeMode::CvvActive);

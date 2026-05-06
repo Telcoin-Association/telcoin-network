@@ -100,7 +100,6 @@ where
         // channels.
         let consensus_bus = ConsensusBus::new_with_app(self.consensus_bus.clone());
         self.last_consensus_header = None;
-        self.last_forwarded_consensus_number = 0;
         // We have not created this epoch's primary yet (no committee) so get it from chain
         // ourselves... Note, any consensus output to replay should be in the same epoch...
         let (committee, epoch_info, epoch_start) =
