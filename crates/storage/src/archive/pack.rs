@@ -154,7 +154,8 @@ where
     header: DataHeader,
     data_file: DataFile,
     value_buffer: Vec<u8>,
-    compressed_buffer: Vec<u8>,
+    /// Used as a second buffer for compress and decompress operations on records.
+    compression_buffer: Vec<u8>,
     failed: bool,
     read_only: bool,
     uid_idx: u64, // Store for opening an iterator.
@@ -189,7 +190,7 @@ where
             header,
             data_file,
             value_buffer: Vec::new(),
-            compressed_buffer: Vec::new(),
+            compression_buffer: Vec::new(),
             failed: false,
             read_only,
             uid_idx,
@@ -216,12 +217,12 @@ where
         let buffer = match self.header.compression {
             PackCompression::None => &self.value_buffer,
             PackCompression::ZStd => {
-                self.compressed_buffer.clear();
+                self.compression_buffer.clear();
                 let mut compressor =
-                    zstd::stream::write::Encoder::new(&mut self.compressed_buffer, 0)?;
+                    zstd::stream::write::Encoder::new(&mut self.compression_buffer, 0)?;
                 compressor.write_all(&self.value_buffer)?;
                 compressor.finish()?;
-                &self.compressed_buffer
+                &self.compression_buffer
             }
         };
 
@@ -357,11 +358,15 @@ where
         let buffer = match self.header.compression {
             PackCompression::None => &self.value_buffer,
             PackCompression::ZStd => {
-                let mut compressor = zstd::stream::read::Decoder::new(&self.value_buffer[..])?;
-                self.compressed_buffer.clear();
-                compressor.read_to_end(&mut self.compressed_buffer)?;
-                compressor.finish();
-                &self.compressed_buffer
+                let decoder = zstd::stream::read::Decoder::new(&self.value_buffer[..])?;
+                self.compression_buffer.clear();
+                // +1 lets us detect overflow vs. natural EOF
+                let mut limited = decoder.take(MAX_RECORD_SIZE as u64 + 1);
+                limited.read_to_end(&mut self.compression_buffer)?;
+                if self.compression_buffer.len() as u64 > MAX_RECORD_SIZE as u64 {
+                    return Err(FetchError::RequestedSizeTooLarge(u32::MAX, MAX_RECORD_SIZE));
+                }
+                &self.compression_buffer
             }
         };
         let val =
