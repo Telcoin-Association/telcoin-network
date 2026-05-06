@@ -347,9 +347,9 @@ impl ExecutionNodeInner {
     pub(super) fn validators_for_epoch(&self, epoch: u32) -> eyre::Result<Vec<BlsPublicKey>> {
         Ok(self
             .reth_env
-            .validators_for_epoch(epoch)?
+            .bls_pubkeys_for_epoch(epoch)?
             .iter()
-            .filter_map(|v| BlsPublicKey::from_literal_bytes(v.blsPubkey.as_ref()).ok())
+            .filter_map(|bls| BlsPublicKey::from_literal_bytes(bls.as_ref()).ok())
             .collect())
     }
 }
