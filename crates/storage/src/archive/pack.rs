@@ -39,8 +39,13 @@ where
     V: Debug + Serialize + DeserializeOwned,
 {
     /// Open a new or reopen an existing database.
-    pub fn open<P: AsRef<Path>>(path: P, uid_idx: u64, read_only: bool) -> Result<Self, OpenError> {
-        Ok(Self { inner: PackInner::open(path, uid_idx, read_only)? })
+    pub fn open<P: AsRef<Path>>(
+        path: P,
+        uid_idx: u64,
+        read_only: bool,
+        compression: PackCompression,
+    ) -> Result<Self, OpenError> {
+        Ok(Self { inner: PackInner::open(path, uid_idx, read_only, compression)? })
     }
 
     /// Length of the Pack file.
@@ -85,7 +90,7 @@ where
     }
 
     /// Return the DB application number (set at creation).
-    pub fn appnum(&self) -> u64 {
+    pub fn appnum(&self) -> u32 {
         self.inner.appnum()
     }
 
@@ -149,6 +154,7 @@ where
     header: DataHeader,
     data_file: DataFile,
     value_buffer: Vec<u8>,
+    compressed_buffer: Vec<u8>,
     failed: bool,
     read_only: bool,
     uid_idx: u64, // Store for opening an iterator.
@@ -171,13 +177,19 @@ where
     V: Debug + Serialize + DeserializeOwned,
 {
     /// Open a new or reopen an existing database.
-    fn open<P: AsRef<Path>>(path: P, uid_idx: u64, read_only: bool) -> Result<Self, OpenError> {
-        let (data_file, header) =
-            Self::open_data_file(path, uid_idx, read_only).map_err(OpenError::DataFileOpen)?;
+    fn open<P: AsRef<Path>>(
+        path: P,
+        uid_idx: u64,
+        read_only: bool,
+        compression: PackCompression,
+    ) -> Result<Self, OpenError> {
+        let (data_file, header) = Self::open_data_file(path, uid_idx, read_only, compression)
+            .map_err(OpenError::DataFileOpen)?;
         Ok(Self {
             header,
             data_file,
             value_buffer: Vec::new(),
+            compressed_buffer: Vec::new(),
             failed: false,
             read_only,
             uid_idx,
@@ -201,16 +213,27 @@ where
         self.value_buffer.clear();
         encode_into_buffer(&mut self.value_buffer, value)
             .map_err(|e| AppendError::SerializeValue(e.to_string()))?;
+        let buffer = match self.header.compression {
+            PackCompression::None => &self.value_buffer,
+            PackCompression::ZStd => {
+                self.compressed_buffer.clear();
+                let mut compressor =
+                    zstd::stream::write::Encoder::new(&mut self.compressed_buffer, 0)?;
+                compressor.write_all(&self.value_buffer)?;
+                compressor.finish()?;
+                &self.compressed_buffer
+            }
+        };
 
         let mut crc32_hasher = crc32fast::Hasher::new();
         // Once we have written to write_buffer, it needs to be rolled back before returning an
         // error. Space for the value length.
-        let value_size = (self.value_buffer.len() as u32).to_le_bytes();
+        let value_size = (buffer.len() as u32).to_le_bytes();
         self.data_file.write_all(&value_size)?;
         crc32_hasher.update(&value_size);
 
-        self.data_file.write_all(&self.value_buffer)?;
-        crc32_hasher.update(&self.value_buffer);
+        self.data_file.write_all(buffer)?;
+        crc32_hasher.update(buffer);
         let crc32 = crc32_hasher.finalize();
         self.data_file.write_all(&crc32.to_le_bytes())?;
 
@@ -253,7 +276,7 @@ where
     }
 
     /// Return the DB application number (set at creation).
-    fn appnum(&self) -> u64 {
+    fn appnum(&self) -> u32 {
         self.header.appnum()
     }
 
@@ -285,12 +308,13 @@ where
         path: P,
         uid_idx: u64,
         ro: bool,
+        compression: PackCompression,
     ) -> Result<(DataFile, DataHeader), LoadHeaderError> {
         let mut data_file = DataFile::open(path, ro)?;
         let file_end = data_file.data_file_end();
 
         let header = if file_end == 0 {
-            let header = DataHeader::new(uid_idx);
+            let header = DataHeader::new(uid_idx, compression);
             header.write_header(&mut data_file)?;
             header
         } else {
@@ -330,8 +354,18 @@ where
         if calc_crc32 != read_crc32 {
             return Err(FetchError::CrcFailed);
         }
-        let val = try_decode::<V>(&self.value_buffer[..])
-            .map_err(|e| FetchError::DeserializeValue(e.to_string()))?;
+        let buffer = match self.header.compression {
+            PackCompression::None => &self.value_buffer,
+            PackCompression::ZStd => {
+                let mut compressor = zstd::stream::read::Decoder::new(&self.value_buffer[..])?;
+                self.compressed_buffer.clear();
+                compressor.read_to_end(&mut self.compressed_buffer)?;
+                compressor.finish();
+                &self.compressed_buffer
+            }
+        };
+        let val =
+            try_decode::<V>(buffer).map_err(|e| FetchError::DeserializeValue(e.to_string()))?;
         Ok(val)
     }
 
@@ -395,18 +429,23 @@ pub const DATA_HEADER_BYTES: usize = 28;
 /// truncated to maintain consistency.
 /// This data in the file will be followed by a CRC32 checksum value to verify it.
 #[derive(Debug, Copy, Clone)]
-#[repr(C)]
 pub struct DataHeader {
-    type_id: [u8; 6], // The characters "telnet"
-    version: u16,     // Holds the version number
-    uid: u64,         // Unique ID generated on creation
-    appnum: u64,      // Application defined constant
+    /// The characters "telnet"
+    type_id: [u8; 6],
+    /// Holds the version number
+    version: u16,
+    /// Unique ID generated on creation
+    uid: u64,
+    /// Application defined constant
+    appnum: u32,
+    /// Define compression used.
+    compression: PackCompression,
 }
 
 impl DataHeader {
-    pub(crate) fn new(uid_idx: u64) -> Self {
+    pub(crate) fn new(uid_idx: u64, compression: PackCompression) -> Self {
         let uid = Self::gen_uid(uid_idx);
-        Self { type_id: *b"telnet", version: 0, uid, appnum: 1 }
+        Self { type_id: *b"telnet", version: 0, uid, appnum: 1, compression }
     }
 
     /// Load a DataHeader from source.
@@ -463,9 +502,13 @@ impl DataHeader {
             return Err(LoadHeaderError::InvalidDataUID);
         }
         pos += 8;
-        buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
-        let appnum = u64::from_le_bytes(buf64);
-        let header = Self { type_id, version, uid, appnum };
+        buf32.copy_from_slice(&buffer[pos..(pos + 4)]);
+        let appconst = u32::from_le_bytes(buf32);
+        pos += 4;
+        buf32.copy_from_slice(&buffer[pos..(pos + 4)]);
+        let compression = u32::from_le_bytes(buf32);
+        let compression = PackCompression::from_u32(compression)?;
+        let header = Self { type_id, version, uid, appnum: appconst, compression };
         Ok(header)
     }
 
@@ -490,8 +533,10 @@ impl DataHeader {
         pos += 2;
         buffer[pos..(pos + 8)].copy_from_slice(&self.uid.to_le_bytes());
         pos += 8;
-        buffer[pos..(pos + 8)].copy_from_slice(&self.appnum.to_le_bytes());
-        pos += 8;
+        buffer[pos..(pos + 4)].copy_from_slice(&self.appnum.to_le_bytes());
+        pos += 4;
+        buffer[pos..(pos + 4)].copy_from_slice(&self.compression.to_u32().to_le_bytes());
+        pos += 4;
         add_crc32(&mut buffer);
         pos += 4;
         assert_eq!(pos, DATA_HEADER_BYTES);
@@ -510,8 +555,41 @@ impl DataHeader {
     }
 
     /// User defined appnum.
-    pub(crate) fn appnum(&self) -> u64 {
+    pub(crate) fn appnum(&self) -> u32 {
         self.appnum
+    }
+
+    /// Compression for records.
+    pub(crate) fn compression(&self) -> PackCompression {
+        self.compression
+    }
+}
+
+/// Set the pack file record level compression.
+#[derive(Debug, Copy, Clone)]
+pub enum PackCompression {
+    /// No compression
+    None,
+    /// ZStd compression
+    ZStd,
+}
+
+impl PackCompression {
+    /// Create a PackCompression enum from a u32.
+    pub fn from_u32(v: u32) -> Result<Self, LoadHeaderError> {
+        match v {
+            0 => Ok(Self::None),
+            1 => Ok(Self::ZStd),
+            _ => Err(LoadHeaderError::InvalidCompression),
+        }
+    }
+
+    /// Convert a PackCompression enum into a u32.
+    pub fn to_u32(&self) -> u32 {
+        match self {
+            PackCompression::None => 0,
+            PackCompression::ZStd => 1,
+        }
     }
 }
 
@@ -535,7 +613,8 @@ mod tests {
     fn test_archive_pack_one() {
         let tmp_path = TempDir::with_prefix("test_archive_pack_one").expect("temp dir");
         let mut db: TestPack =
-            Pack::open(tmp_path.path().join("pack_test_one"), 0, false).expect("open pack");
+            Pack::open(tmp_path.path().join("pack_test_one"), 0, false, PackCompression::ZStd)
+                .expect("open pack");
         let pos_1 = db.append(&TestRec { idx: 1, name: "Value One".to_string() }).expect("append");
         let pos_2 = db.append(&TestRec { idx: 2, name: "Value Two".to_string() }).expect("append");
         let pos_3 =
@@ -582,7 +661,8 @@ mod tests {
         drop(db);
 
         let mut db: TestPack =
-            Pack::open(tmp_path.path().join("pack_test_one"), 0, false).expect("open pack");
+            Pack::open(tmp_path.path().join("pack_test_one"), 0, false, PackCompression::ZStd)
+                .expect("open pack");
         let pos_1_2 =
             db.append(&TestRec { idx: 6, name: "Value One2".to_string() }).expect("append");
         let pos_2_2 =
@@ -602,7 +682,8 @@ mod tests {
         drop(db);
 
         let mut db: TestPack =
-            Pack::open(tmp_path.path().join("pack_test_one"), 0, true).expect("open pack");
+            Pack::open(tmp_path.path().join("pack_test_one"), 0, true, PackCompression::ZStd)
+                .expect("open pack");
         let v = db.fetch(pos_1_2).unwrap();
         assert_eq!(v.idx, 6);
         assert_eq!(v.name, "Value One2");
@@ -648,7 +729,8 @@ mod tests {
         assert!(iter.next().is_none());
 
         let db: TestPack =
-            Pack::open(tmp_path.path().join("pack_test_one"), 0, true).expect("open pack");
+            Pack::open(tmp_path.path().join("pack_test_one"), 0, true, PackCompression::ZStd)
+                .expect("open pack");
         let mut iter = db.raw_iter().unwrap().map(|r| r.unwrap());
         let v: TestRec = iter.next().unwrap();
         assert_eq!(v.idx, 1);

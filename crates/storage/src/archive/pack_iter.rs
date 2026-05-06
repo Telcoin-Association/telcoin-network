@@ -13,7 +13,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _};
 
 use crate::archive::{
     error::{fetch::FetchError, load_header::LoadHeaderError},
-    pack::DataHeader,
+    pack::{DataHeader, PackCompression},
 };
 
 /// Provide an upper bound on a record size.
@@ -32,6 +32,8 @@ where
     _val: PhantomData<V>,
     reader: BufReader<R>,
     buffer: Vec<u8>,
+    compress_buffer: Vec<u8>,
+    compression: PackCompression,
 }
 
 impl<V, R> PackIter<V, R>
@@ -43,9 +45,15 @@ where
     /// Produces an iterator over all the (key, values).  All and records
     /// are returned in insert order.
     pub fn open(mut reader: R, uid_idx: u64) -> Result<Self, LoadHeaderError> {
-        let _header = DataHeader::load_header(&mut reader, uid_idx)?;
+        let header = DataHeader::load_header(&mut reader, uid_idx)?;
         let reader = BufReader::new(reader);
-        Ok(PackIter { _val: PhantomData, reader, buffer: Vec::new() })
+        Ok(PackIter {
+            _val: PhantomData,
+            reader,
+            buffer: Vec::new(),
+            compress_buffer: Vec::new(),
+            compression: header.compression(),
+        })
     }
 
     /// Return the current position of the data file.
@@ -64,6 +72,8 @@ where
     fn read_record_file<R2: Read + Seek>(
         file: &mut R2,
         buffer: &mut Vec<u8>,
+        compress_buffer: &mut Vec<u8>,
+        compression: PackCompression,
     ) -> Result<V, FetchError> {
         let mut crc32_hasher = crc32fast::Hasher::new();
         let mut val_size_buf = [0_u8; 4];
@@ -91,6 +101,16 @@ where
         if calc_crc32 != read_crc32 {
             return Err(FetchError::CrcFailed);
         }
+        let buffer = match compression {
+            PackCompression::None => buffer,
+            PackCompression::ZStd => {
+                let mut compressor = zstd::stream::read::Decoder::new(&buffer[..])?;
+                compress_buffer.clear();
+                compressor.read_to_end(compress_buffer)?;
+                compressor.finish();
+                compress_buffer
+            }
+        };
         try_decode::<V>(&buffer[..]).map_err(|e| FetchError::DeserializeValue(e.to_string()))
     }
 }
@@ -102,7 +122,12 @@ where
     type Item = Result<V, FetchError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match Self::read_record_file(&mut self.reader, &mut self.buffer) {
+        match Self::read_record_file(
+            &mut self.reader,
+            &mut self.buffer,
+            &mut self.compress_buffer,
+            self.compression,
+        ) {
             Ok(val) => Some(Ok(val)),
             Err(err) => match err {
                 FetchError::NotFound => None,
@@ -123,6 +148,8 @@ where
     _val: PhantomData<V>,
     reader: R,
     buffer: Vec<u8>,
+    compress_buffer: Vec<u8>,
+    compression: PackCompression,
 }
 
 impl<V, R> AsyncPackIter<V, R>
@@ -134,13 +161,24 @@ where
     /// Produces an iterator over all the (key, values).  All and records
     /// are returned in insert order.
     pub async fn open(mut reader: R, uid_idx: u64) -> Result<Self, LoadHeaderError> {
-        let _header = DataHeader::load_header_async(&mut reader, uid_idx).await?;
-        Ok(AsyncPackIter { _val: PhantomData, reader, buffer: Vec::new() })
+        let header = DataHeader::load_header_async(&mut reader, uid_idx).await?;
+        Ok(AsyncPackIter {
+            _val: PhantomData,
+            reader,
+            buffer: Vec::new(),
+            compress_buffer: Vec::new(),
+            compression: header.compression(),
+        })
     }
 
     /// Read the next record or return an error if an overflow bucket.
     /// This expects the file cursor to be positioned at the records first byte.
-    async fn read_record_file(file: &mut R, buffer: &mut Vec<u8>) -> Result<V, FetchError> {
+    async fn read_record_file(
+        file: &mut R,
+        buffer: &mut Vec<u8>,
+        compress_buffer: &mut Vec<u8>,
+        compression: PackCompression,
+    ) -> Result<V, FetchError> {
         let mut crc32_hasher = crc32fast::Hasher::new();
         let mut val_size_buf = [0_u8; 4];
         if let Err(err) = file.read_exact(&mut val_size_buf).await {
@@ -167,12 +205,29 @@ where
         if calc_crc32 != read_crc32 {
             return Err(FetchError::CrcFailed);
         }
+        let buffer = match compression {
+            PackCompression::None => buffer,
+            PackCompression::ZStd => {
+                let mut compressor = zstd::stream::read::Decoder::new(&buffer[..])?;
+                compress_buffer.clear();
+                compressor.read_to_end(compress_buffer)?;
+                compressor.finish();
+                compress_buffer
+            }
+        };
         try_decode::<V>(&buffer[..]).map_err(|e| FetchError::DeserializeValue(e.to_string()))
     }
 
     /// Return the next V when available.
     pub async fn next(&mut self) -> Option<Result<V, FetchError>> {
-        match Self::read_record_file(&mut self.reader, &mut self.buffer).await {
+        match Self::read_record_file(
+            &mut self.reader,
+            &mut self.buffer,
+            &mut self.compress_buffer,
+            self.compression,
+        )
+        .await
+        {
             Ok(val) => Some(Ok(val)),
             Err(err) => match err {
                 FetchError::NotFound => None,

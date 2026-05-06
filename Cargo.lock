@@ -11848,6 +11848,7 @@ dependencies = [
  "tn-utils",
  "tokio",
  "tracing",
+ "zstd",
 ]
 
 [[package]]

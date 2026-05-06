@@ -35,7 +35,7 @@ use crate::archive::{
     error::{fetch::FetchError, open::OpenError},
     fxhasher::FxHasher,
     index::Index as _,
-    pack::{Pack, DATA_HEADER_BYTES},
+    pack::{Pack, PackCompression, DATA_HEADER_BYTES},
     pack_iter::AsyncPackIter,
     position_index::index::PositionIndex,
 };
@@ -547,7 +547,8 @@ impl Inner {
         let _ = std::fs::create_dir_all(&base_dir);
         let pack_file = base_dir.join(Self::DATA_NAME);
         let have_pack = std::fs::exists(&pack_file).unwrap_or_default();
-        let mut data: Pack<PackRecord> = Pack::open(&pack_file, epoch as u64, false)?;
+        let mut data: Pack<PackRecord> =
+            Pack::open(&pack_file, epoch as u64, false, PackCompression::ZStd)?;
         let start_consensus_number =
             if epoch == 0 { 1 } else { previous_epoch.final_consensus.number + 1 };
         let epoch_meta = EpochMeta {
@@ -604,8 +605,12 @@ impl Inner {
     fn open_append_exists<P: AsRef<Path>>(path: P, epoch: Epoch) -> Result<Self, PackError> {
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
 
-        let mut data =
-            Pack::<PackRecord>::open(base_dir.join(Self::DATA_NAME), epoch as u64, false)?;
+        let mut data = Pack::<PackRecord>::open(
+            base_dir.join(Self::DATA_NAME),
+            epoch as u64,
+            false,
+            PackCompression::ZStd,
+        )?;
         let epoch_meta = data
             .fetch(DATA_HEADER_BYTES as u64)
             .map_err(|e| PackError::EpochLoad(e.to_string()))?
@@ -642,8 +647,12 @@ impl Inner {
     fn open_static<P: AsRef<Path>>(path: P, epoch: Epoch) -> Result<Self, PackError> {
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
 
-        let mut data =
-            Pack::<PackRecord>::open(base_dir.join(Self::DATA_NAME), epoch as u64, true)?;
+        let mut data = Pack::<PackRecord>::open(
+            base_dir.join(Self::DATA_NAME),
+            epoch as u64,
+            true,
+            PackCompression::ZStd,
+        )?;
         let epoch_meta = data
             .fetch(DATA_HEADER_BYTES as u64)
             .map_err(|e| PackError::EpochLoad(e.to_string()))?
@@ -733,7 +742,8 @@ impl Inner {
         let mut stream_iter = AsyncPackIter::<PackRecord, R>::open(stream, epoch as u64)
             .await
             .map_err(|e| PackError::ReadError(e.to_string()))?;
-        let mut data = Pack::open(base_dir.join(Self::DATA_NAME), epoch as u64, false)?;
+        let mut data =
+            Pack::open(base_dir.join(Self::DATA_NAME), epoch as u64, false, PackCompression::ZStd)?;
         let epoch_meta = if let Some(meta) = next(&mut stream_iter, timeout).await? {
             meta.into_epoch()?
         } else {
