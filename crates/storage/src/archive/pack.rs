@@ -609,11 +609,10 @@ mod tests {
     }
     type TestPack = Pack<TestRec>;
 
-    #[test]
-    fn test_archive_pack_one() {
+    fn archive_pack_(compression: PackCompression) {
         let tmp_path = TempDir::with_prefix("test_archive_pack_one").expect("temp dir");
         let mut db: TestPack =
-            Pack::open(tmp_path.path().join("pack_test_one"), 0, false, PackCompression::ZStd)
+            Pack::open(tmp_path.path().join("pack_test_one"), 0, false, compression)
                 .expect("open pack");
         let pos_1 = db.append(&TestRec { idx: 1, name: "Value One".to_string() }).expect("append");
         let pos_2 = db.append(&TestRec { idx: 2, name: "Value Two".to_string() }).expect("append");
@@ -661,7 +660,7 @@ mod tests {
         drop(db);
 
         let mut db: TestPack =
-            Pack::open(tmp_path.path().join("pack_test_one"), 0, false, PackCompression::ZStd)
+            Pack::open(tmp_path.path().join("pack_test_one"), 0, false, compression)
                 .expect("open pack");
         let pos_1_2 =
             db.append(&TestRec { idx: 6, name: "Value One2".to_string() }).expect("append");
@@ -682,7 +681,7 @@ mod tests {
         drop(db);
 
         let mut db: TestPack =
-            Pack::open(tmp_path.path().join("pack_test_one"), 0, true, PackCompression::ZStd)
+            Pack::open(tmp_path.path().join("pack_test_one"), 0, true, compression)
                 .expect("open pack");
         let v = db.fetch(pos_1_2).unwrap();
         assert_eq!(v.idx, 6);
@@ -728,9 +727,8 @@ mod tests {
         assert_eq!(v.name, "Value Three2");
         assert!(iter.next().is_none());
 
-        let db: TestPack =
-            Pack::open(tmp_path.path().join("pack_test_one"), 0, true, PackCompression::ZStd)
-                .expect("open pack");
+        let db: TestPack = Pack::open(tmp_path.path().join("pack_test_one"), 0, true, compression)
+            .expect("open pack");
         let mut iter = db.raw_iter().unwrap().map(|r| r.unwrap());
         let v: TestRec = iter.next().unwrap();
         assert_eq!(v.idx, 1);
@@ -757,5 +755,15 @@ mod tests {
         assert_eq!(v.idx, 8);
         assert_eq!(v.name, "Value Three2");
         assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_archive_pack_zstd() {
+        archive_pack_(PackCompression::ZStd);
+    }
+
+    #[test]
+    fn test_archive_pack_none() {
+        archive_pack_(PackCompression::None);
     }
 }
