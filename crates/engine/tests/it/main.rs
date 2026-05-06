@@ -137,12 +137,12 @@ async fn test_empty_output_skips_execution() -> eyre::Result<()> {
     let timestamp = now();
     let mut leader = Certificate::default();
     let sub_dag_index = 0;
-    leader.header.round = sub_dag_index as u32;
+    leader.update_header_round_for_test(sub_dag_index as u32);
     // update timestamp so it's not default 0
-    leader.header.created_at = timestamp;
+    leader.update_header_created_at_for_test(timestamp);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
-    leader.header_mut_for_test().author = leader_id;
+    leader.update_header_author_for_test(leader_id);
 
     let sub_dag: Arc<CommittedSubDag> = CommittedSubDag::new(
         vec![leader.clone()],
@@ -243,12 +243,12 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
     let timestamp = now();
     let mut leader = Certificate::default();
     let sub_dag_index = 0;
-    leader.header.round = sub_dag_index as u32;
+    leader.update_header_round_for_test(sub_dag_index as u32);
     // update timestamp so it's not default 0
-    leader.header.created_at = timestamp;
+    leader.update_header_created_at_for_test(timestamp);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
-    leader.header_mut_for_test().author = leader_id;
+    leader.update_header_author_for_test(leader_id);
 
     let subdag = Arc::new(CommittedSubDag::new(
         vec![leader.clone()],
@@ -419,11 +419,11 @@ async fn test_empty_output_increments_leader_count() -> eyre::Result<()> {
     let timestamp = now();
     let mut leader = Certificate::default();
     let sub_dag_index = 0;
-    leader.header.round = sub_dag_index as u32;
-    leader.header.created_at = timestamp;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    leader.update_header_created_at_for_test(timestamp);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
-    leader.header_mut_for_test().author = leader_id;
+    leader.update_header_author_for_test(leader_id);
 
     let subdag = Arc::new(CommittedSubDag::new(
         vec![leader.clone()],
@@ -702,9 +702,9 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     // for each tx, seed address with funds in genesis
     let mut leader_1 = Certificate::default();
     // update cert
-    leader_1.header_mut_for_test().author = authority_1;
+    leader_1.update_header_author_for_test(authority_1);
     let sub_dag_index_1 = 1;
-    leader_1.header.round = sub_dag_index_1 as u32;
+    leader_1.update_header_round_for_test(sub_dag_index_1 as u32);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
     let mut batch_digests_1: VecDeque<BlockHash> = batches_1.iter().map(|b| b.digest()).collect();
@@ -728,9 +728,9 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     let mut leader_2 = Certificate::default();
     let leader_2_epoch = leader_2.epoch();
     // update cert
-    leader_2.header_mut_for_test().author = authority_2;
+    leader_2.update_header_author_for_test(authority_2);
     let sub_dag_index_2 = 2;
-    leader_2.header.round = sub_dag_index_2 as u32;
+    leader_2.update_header_round_for_test(sub_dag_index_2 as u32);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = Some(subdag_1.clone());
     let batch_digests_2: VecDeque<BlockHash> = batches_2.iter().map(|b| b.digest()).collect();
@@ -1211,14 +1211,14 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     // for each tx, seed address with funds in genesis
     let mut leader_1 = Certificate::default();
     // update timestamp
-    leader_1.header_mut_for_test().author = authority_1;
+    leader_1.update_header_author_for_test(authority_1);
     let sub_dag_index_1: u64 = 1;
-    leader_1.header.round = sub_dag_index_1 as u32;
+    leader_1.update_header_round_for_test(sub_dag_index_1 as u32);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
     let mut batch_digests_1: VecDeque<BlockHash> = batches_1.iter().map(|b| b.digest()).collect();
     let mut cert_1 = Certificate::default();
-    cert_1.header.round = 1;
+    cert_1.update_header_round_for_test(1);
     let subdag_1 = Arc::new(CommittedSubDag::new(
         vec![leader_1.clone()],
         leader_1,
@@ -1239,14 +1239,14 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     let mut leader_2 = Certificate::default();
     let leader_2_epoch = leader_2.epoch();
     // update timestamp
-    leader_2.header_mut_for_test().author = authority_2;
+    leader_2.update_header_author_for_test(authority_2);
     let sub_dag_index_2 = 2;
-    leader_2.header.round = sub_dag_index_2 as u32;
+    leader_2.update_header_round_for_test(sub_dag_index_2 as u32);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = Some(subdag_1.clone());
     let batch_digests_2: VecDeque<BlockHash> = batches_2.iter().map(|b| b.digest()).collect();
     let mut cert_2 = Certificate::default();
-    cert_2.header.round = 2;
+    cert_2.update_header_round_for_test(2);
     let subdag_2: Arc<CommittedSubDag> = CommittedSubDag::new(
         vec![leader_2.clone()],
         leader_2,
@@ -1596,7 +1596,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     let mut leader_1 = Certificate::default();
     // update timestamp
     let sub_dag_index_1 = 1;
-    leader_1.header.round = sub_dag_index_1 as u32;
+    leader_1.update_header_round_for_test(sub_dag_index_1 as u32);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
     let batch_digests_1: VecDeque<BlockHash> = batches_1.iter().map(|b| b.digest()).collect();
@@ -1621,7 +1621,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     let mut leader_2 = Certificate::default();
     // update timestamp
     let sub_dag_index_2 = 2;
-    leader_2.header.round = sub_dag_index_2 as u32;
+    leader_2.update_header_round_for_test(sub_dag_index_2 as u32);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = Some(subdag_1.clone());
     let batch_digests_2: VecDeque<BlockHash> = batches_2.iter().map(|b| b.digest()).collect();
@@ -1829,9 +1829,9 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
     // for each tx, seed address with funds in genesis
     let mut leader = Certificate::default();
     // update cert
-    leader.header_mut_for_test().author = authority_1;
+    leader.update_header_author_for_test(authority_1);
     let sub_dag_index = 1;
-    leader.header.round = sub_dag_index as u32;
+    leader.update_header_round_for_test(sub_dag_index as u32);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
     let batch_digest = batch.digest();
@@ -2134,9 +2134,9 @@ async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
 
     // consensus output
     let mut leader = Certificate::default();
-    leader.header_mut_for_test().author = authority_1;
+    leader.update_header_author_for_test(authority_1);
     let sub_dag_index = 1;
-    leader.header.round = sub_dag_index as u32;
+    leader.update_header_round_for_test(sub_dag_index as u32);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
     let batch_digest = batch.digest();

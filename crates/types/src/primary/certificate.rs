@@ -13,13 +13,14 @@ use crate::{
     error::{CertificateError, CertificateResult, DagError, DagResult, HeaderError},
     serde::RoaringBitmapSerde,
     Authority, AuthorityIdentifier, Committee, Epoch, Hash, Header, HeaderDigest, Round,
-    VotingPower,
+    TimestampSec, VotingPower,
 };
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    sync::Arc,
 };
 
 /// Certificates are the output of consensus.
@@ -28,7 +29,9 @@ use std::{
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct Certificate {
     /// Certificate's header.
-    pub header: Header,
+    /// Wrapped in an Arc to make cloning cheaper and to discourage changing the header and
+    /// invalidating the cert.
+    pub header: Arc<Header>,
     /// Container for [BlsAggregateSignatureBytes].
     pub signature_verification_state: SignatureVerificationState,
     /// Bitmap that indicates which authorities from committee signed this certificate.
@@ -43,11 +46,11 @@ impl Certificate {
             .authorities()
             .iter()
             .map(|authority| Self {
-                header: Header {
+                header: Arc::new(Header {
                     author: authority.id(),
                     epoch: committee.epoch(),
                     ..Default::default()
-                },
+                }),
                 ..Self::default()
             })
             .collect()
@@ -155,7 +158,11 @@ impl Certificate {
             SignatureVerificationState::Unverified(bls_signature)
         };
 
-        Ok(Certificate { header, signature_verification_state, signed_authorities })
+        Ok(Certificate {
+            header: Arc::new(header),
+            signature_verification_state,
+            signed_authorities,
+        })
     }
 
     /// Return the group of authorities that signed this certificate.
@@ -364,14 +371,35 @@ impl Certificate {
     ///
     /// Only Used for testing.
     pub fn update_header_for_test(&mut self, header: Header) {
-        self.header = header;
+        self.header = Arc::new(header);
     }
 
-    /// Return a mutable reference to the header.
-    ///
-    /// Only Used for testing.
-    pub fn header_mut_for_test(&mut self) -> &mut Header {
-        &mut self.header
+    /// Update the headers author for a test- not for production code.
+    pub fn update_header_author_for_test(&mut self, author: AuthorityIdentifier) {
+        let mut header = (*self.header).clone();
+        header.author = author;
+        self.header = Arc::new(header);
+    }
+
+    /// Update the headers round for a test- not for production code.
+    pub fn update_header_round_for_test(&mut self, round: Round) {
+        let mut header = (*self.header).clone();
+        header.round = round;
+        self.header = Arc::new(header);
+    }
+
+    /// Update the headers epoch for a test- not for production code.
+    pub fn update_header_epoch_for_test(&mut self, epoch: Epoch) {
+        let mut header = (*self.header).clone();
+        header.epoch = epoch;
+        self.header = Arc::new(header);
+    }
+
+    /// Update the headers created_at for a test- not for production code.
+    pub fn update_header_created_at_for_test(&mut self, created_at: TimestampSec) {
+        let mut header = (*self.header).clone();
+        header.created_at = created_at;
+        self.header = Arc::new(header);
     }
 }
 

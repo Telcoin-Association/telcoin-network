@@ -264,7 +264,7 @@ impl Display for ConsensusOutput {
 /// Note it stores Headers without certificates, all validation
 /// should be complete.  Future validation can be done by verifying
 /// the consensus chain against signed checkpoints (like epoch records).
-#[derive(PartialEq, Serialize, Deserialize, Clone, Debug)]
+#[derive(PartialEq, Serialize, Deserialize, Debug)]
 pub struct CommittedSubDag {
     /// The sequence of committed certificates.
     /// Note the last element MUST be the leader.
@@ -321,7 +321,7 @@ impl CommittedSubDag {
                 BlsSignature::default()
             });
         let randomness = keccak256(randomness.to_bytes());
-        let headers = certificates.into_iter().map(|c| c.header).collect();
+        let headers = certificates.into_iter().map(|c| Arc::unwrap_or_clone(c.header)).collect();
         Self { headers, reputation_score, commit_timestamp, randomness }
     }
 

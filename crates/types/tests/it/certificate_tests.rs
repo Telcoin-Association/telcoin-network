@@ -98,7 +98,7 @@ async fn test_certificate_bls_signature_verification() {
     // Create a certificate with tampered header (different round)
     // The signature will not match the tampered header
     let mut tampered_cert = fixture.certificate(&header);
-    tampered_cert.header_mut_for_test().update_round_for_test(999);
+    tampered_cert.update_header_round_for_test(999);
 
     // Verification should fail due to signature mismatch
     let tampered_result = tampered_cert.validate_and_verify(&committee);

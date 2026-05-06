@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
 };
 use tn_config::ConsensusConfig;
-use tn_storage::{consensus::ConsensusChain, CertificateStore};
+use tn_storage::{certificate_pack::CertificatePack, consensus::ConsensusChain, CertificateStore};
 use tn_types::{
     AuthorityIdentifier, Certificate, CommittedSubDag, Committee, Database, Hash as _,
     HeaderDigest, Noticer, Round, TaskManager, TnReceiver, TnSender,
@@ -267,6 +267,10 @@ pub struct Consensus<DB> {
     /// Are we an active CVV?
     /// An active CVV is participating in consensus (not catching up or following as an NVV).
     active: bool,
+
+    /// Optional pack that is available we want to save all our certificates into
+    /// before sending to bullshark.
+    certificate_pack: Option<CertificatePack>,
 }
 
 impl<DB: Database> Consensus<DB> {
@@ -276,6 +280,7 @@ impl<DB: Database> Consensus<DB> {
         protocol: Bullshark,
         task_manager: &TaskManager,
         consensus_chain: ConsensusChain,
+        certificate_pack: Option<CertificatePack>,
     ) {
         let rx_shutdown = consensus_config.shutdown().subscribe();
         // The consensus state (everything else is immutable).
@@ -329,6 +334,7 @@ impl<DB: Database> Consensus<DB> {
             protocol,
             state,
             active: false,
+            certificate_pack,
         };
 
         // Only run the consensus task if we are an active CVV.
@@ -376,6 +382,11 @@ impl<DB: Database> Consensus<DB> {
                 return Ok(());
             }
         }
+        if let Some(certificate_pack) = &self.certificate_pack {
+            if let Err(e) = certificate_pack.save(certificate.clone()).await {
+                tracing::error!(target: "telcoin::consensus_state", ?e, "Failed to save certificate to cert pack file");
+            }
+        }
         // Process the certificate using the selected consensus protocol.
         let (outcome, committed_sub_dags) =
             self.protocol.process_certificate(&mut self.state, certificate)?;
@@ -383,7 +394,7 @@ impl<DB: Database> Consensus<DB> {
             // We extract a list of headers from this specific validator that
             // have been agreed upon, and signal this back to the narwhal sub-system
             // to be used to re-send batches that have not made it to a commit.
-            let mut committed_certificates = Vec::new();
+            let mut committed_headers = Vec::new();
 
             // Output the sequence in the right order.
             let csd_len = committed_sub_dags.len();
@@ -409,8 +420,8 @@ impl<DB: Database> Consensus<DB> {
 
                 tracing::debug!(target: "telcoin::consensus_state", "Commit in Sequence {:?}", committed_sub_dag.leader().nonce());
 
-                for certificate in &committed_sub_dag.headers {
-                    committed_certificates.push(certificate.clone());
+                for header in &committed_sub_dag.headers {
+                    committed_headers.push(header.clone());
                 }
 
                 // NOTE: The size of the sub-dag can be arbitrarily large (depending on the network
@@ -422,10 +433,10 @@ impl<DB: Database> Consensus<DB> {
                     .map_err(|_| ConsensusError::ShuttingDown)?;
             }
 
-            if !committed_certificates.is_empty() {
+            if !committed_headers.is_empty() {
                 // Highest committed certificate round is the leader round / commit round
                 // expected by primary.
-                let leader_commit_round = committed_certificates
+                let leader_commit_round = committed_headers
                     .iter()
                     .map(|c| c.round())
                     .max()
@@ -433,7 +444,7 @@ impl<DB: Database> Consensus<DB> {
 
                 self.consensus_bus
                     .committed_certificates()
-                    .send((leader_commit_round, committed_certificates))
+                    .send((leader_commit_round, committed_headers))
                     .await
                     .map_err(|_| ConsensusError::ShuttingDown)?;
 

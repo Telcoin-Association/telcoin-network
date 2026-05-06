@@ -440,9 +440,9 @@ fn consensus_output_for_test(
         BlsSignature::default(),
     ));
     // Set the timestamp on the leader's header (used by CommittedSubDag for block timestamp)
-    leader.header_mut_for_test().created_at = timestamp;
-    leader.header.round = round;
-    leader.header.epoch = epoch;
+    leader.update_header_created_at_for_test(timestamp);
+    leader.update_header_round_for_test(round);
+    leader.update_header_epoch_for_test(epoch);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
     let sub_dag = Arc::new(CommittedSubDag::new(
