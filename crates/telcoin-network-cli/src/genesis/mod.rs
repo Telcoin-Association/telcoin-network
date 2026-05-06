@@ -122,6 +122,7 @@ pub struct GenesisArgs {
         alias = "worker_fee_config",
         help_heading = "Per-worker fee config overrides",
         value_name = "WORKER_ID:STRATEGY:VALUE",
+        default_value = "0:0:18446744073709551615", // u64::MAX
         verbatim_doc_comment
     )]
     pub worker_fee_configs: Vec<String>,
