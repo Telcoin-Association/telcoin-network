@@ -1,12 +1,7 @@
 //! Pack file for storing Certificates, indexed by certificate digest (header hash).
 
 use std::{
-    error::Error,
-    fmt::Display,
-    hash::BuildHasherDefault,
-    io,
-    path::{Path, PathBuf},
-    sync::Arc,
+    error::Error, fmt::Display, hash::BuildHasherDefault, io, path::Path, sync::Arc,
     thread::JoinHandle,
 };
 
@@ -109,9 +104,9 @@ impl CertificatePack {
     }
 
     /// Open an existing certificate pack at `path` in read-only mode.
-    pub fn open_static<P: Into<PathBuf>>(path: P) -> Self {
+    pub fn open_static<P: AsRef<Path>>(path: P, epoch: Epoch) -> Self {
         let (tx, rx) = mpsc::channel(1000);
-        let path: PathBuf = path.into();
+        let path = path.as_ref().join(format!("epoch-{epoch}"));
         let (tx_error, error) = watch::channel(None);
         let handle = std::thread::spawn(move || match Inner::open(path, true) {
             Ok(inner) => run_pack_loop(inner, rx, tx_error),
@@ -370,7 +365,7 @@ mod test {
         drop(pack);
 
         // Open read-only.
-        let pack = CertificatePack::open_static(temp_dir.path());
+        let pack = CertificatePack::open_static(temp_dir.path(), 0);
         for cert in &certs {
             let digest = cert.digest();
             let loaded = pack.get(digest).await.expect("should load cert read-only");
