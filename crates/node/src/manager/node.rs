@@ -206,6 +206,10 @@ where
         // Long-running tasks for the lifetime of the node.
         let mut node_task_manager = TaskManager::new(NODE_TASK_MANAGER);
         let node_task_spawner = node_task_manager.get_spawner();
+        // Prime the last forwarded consensus number at startup.
+        // Normally this is not needed but is a layer of safety in case
+        // run_epoch() does not process any output for some reason.
+        self.last_forwarded_consensus_number = self.consensus_chain.latest_consensus_number();
 
         info!(target: "epoch-manager", "starting node and launching first epoch");
 
