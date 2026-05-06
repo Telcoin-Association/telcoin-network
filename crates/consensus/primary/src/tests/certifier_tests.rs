@@ -6,10 +6,7 @@ use crate::{
     ConsensusBus,
 };
 use rand::{rngs::StdRng, SeedableRng};
-use std::{
-    collections::HashMap,
-    num::NonZeroUsize,
-};
+use std::{collections::HashMap, num::NonZeroUsize};
 use tn_network_libp2p::types::{NetworkCommand, NetworkHandle, NetworkResponseMessage};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils_committee::{AuthorityFixture, CommitteeFixture};
@@ -47,8 +44,7 @@ struct CertifierContext {
 impl CertifierContext {
     /// 4-authority context; `Certifier` spawned on the last authority.
     fn new() -> Self {
-        let fixture =
-            CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+        let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
         Self::from_fixture(fixture)
     }
 
@@ -69,8 +65,11 @@ impl CertifierContext {
         let task_manager = TaskManager::default();
 
         let primary = fixture.authorities().last().expect("committee has authorities");
-        let synchronizer =
-            StateSynchronizer::new(primary.consensus_config(), cb.clone(), task_manager.get_spawner());
+        let synchronizer = StateSynchronizer::new(
+            primary.consensus_config(),
+            cb.clone(),
+            task_manager.get_spawner(),
+        );
         synchronizer.spawn(&task_manager);
 
         Certifier::spawn(
@@ -188,11 +187,7 @@ async fn drive_vote_requests(
     let num_peers = fixture.num_authorities() - 1;
     let mut handled = 0;
     while let Some(req) = network_rx.recv().await {
-        let NetworkCommand::SendRequest {
-            peer,
-            request: PrimaryRequest::Vote { .. },
-            reply,
-        } = req
+        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
         else {
             continue;
         };
@@ -236,7 +231,11 @@ async fn missing_parents_happy_path() {
     // retry can be satisfied (the certifier reads them on the next loop iteration).
     let genesis_certs = Certificate::genesis(&committee);
     for cert in &genesis_certs {
-        cx.proposer().consensus_config().node_storage().write(cert.clone()).expect("write genesis cert to store");
+        cx.proposer()
+            .consensus_config()
+            .node_storage()
+            .write(cert.clone())
+            .expect("write genesis cert to store");
     }
 
     let header = cx.proposer_header(); // round 1; parents == genesis cert digests
@@ -266,8 +265,7 @@ async fn missing_parents_happy_path() {
     let mut handled = 0;
     let mut slow_peer_first_done = false;
     while let Some(req) = cx.network_rx.recv().await {
-        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } =
-            req
+        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
         else {
             continue;
         };
@@ -335,8 +333,7 @@ async fn missing_parents_fake_digests() {
     let num_peers = cx.fixture.num_authorities() - 1;
     let mut handled = 0;
     while let Some(req) = cx.network_rx.recv().await {
-        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } =
-            req
+        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
         else {
             continue;
         };
@@ -390,8 +387,7 @@ async fn missing_parents_store_miss() {
     let num_peers = cx.fixture.num_authorities() - 1;
     let mut handled = 0;
     while let Some(req) = cx.network_rx.recv().await {
-        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } =
-            req
+        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
         else {
             continue;
         };
@@ -435,12 +431,8 @@ async fn transient_network_error_retries() {
     let proposer_id = cx.proposer().id();
     let mut cert_rx = cx.subscribe_new_certificates();
 
-    let flaky_peer = cx
-        .fixture
-        .authorities()
-        .find(|a| a.id() != proposer_id)
-        .expect("non-proposer peer")
-        .id();
+    let flaky_peer =
+        cx.fixture.authorities().find(|a| a.id() != proposer_id).expect("non-proposer peer").id();
 
     cx.consensus_bus.headers().send(header.clone()).await.unwrap();
 
@@ -448,8 +440,7 @@ async fn transient_network_error_retries() {
     let mut handled = 0;
     let mut flaky_first_done = false;
     while let Some(req) = cx.network_rx.recv().await {
-        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } =
-            req
+        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
         else {
             continue;
         };
@@ -516,8 +507,10 @@ async fn new_header_cancels_inflight() {
             .await
             .expect("h1 vote request within 5s")
             .expect("channel open");
-        if let NetworkCommand::SendRequest { request: PrimaryRequest::Vote { ref header, .. }, .. } =
-            req
+        if let NetworkCommand::SendRequest {
+            request: PrimaryRequest::Vote { ref header, .. },
+            ..
+        } = req
         {
             if header.digest() == h1_digest {
                 break req;
@@ -539,8 +532,11 @@ async fn new_header_cancels_inflight() {
     while let Ok(Some(req)) =
         tokio::time::timeout(Duration::from_secs(10), cx.network_rx.recv()).await
     {
-        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { ref header, .. }, reply } =
-            req
+        let NetworkCommand::SendRequest {
+            peer,
+            request: PrimaryRequest::Vote { ref header, .. },
+            reply,
+        } = req
         else {
             continue;
         };
@@ -655,7 +651,8 @@ async fn non_cvv_node_skips_certifier() {
     let network: NetworkHandle<PrimaryRequest, PrimaryResponse> = NetworkHandle::new(sender);
     let cb = ConsensusBus::new();
     let task_manager = TaskManager::default();
-    let sync = StateSynchronizer::new(non_cvv_config.clone(), cb.clone(), task_manager.get_spawner());
+    let sync =
+        StateSynchronizer::new(non_cvv_config.clone(), cb.clone(), task_manager.get_spawner());
     sync.spawn(&task_manager);
 
     // Spawn returns immediately without starting the certifier task.
@@ -694,8 +691,7 @@ async fn vote_wrong_author() {
     // Collect all non-proposer ids so we can pick a "wrong" one for each peer.
     let all_ids: Vec<_> = cx.fixture.authorities().map(|a| a.id()).collect();
     while let Some(req) = cx.network_rx.recv().await {
-        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } =
-            req
+        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
         else {
             continue;
         };
@@ -709,7 +705,8 @@ async fn vote_wrong_author() {
         }
         // Manufacture a vote signed by `authority` but claiming authorship of a different peer.
         let wrong_author = all_ids.iter().find(|id| **id != authority.id()).unwrap().clone();
-        let mut vote = Vote::new(&header, authority.id(), authority.consensus_config().key_config());
+        let mut vote =
+            Vote::new(&header, authority.id(), authority.consensus_config().key_config());
         vote.author = wrong_author;
         reply
             .send(Ok(NetworkResponseMessage { peer, result: PrimaryResponse::Vote(vote) }))
@@ -743,8 +740,7 @@ async fn vote_wrong_header_digest() {
     let num_peers = cx.fixture.num_authorities() - 1;
     let mut handled = 0;
     while let Some(req) = cx.network_rx.recv().await {
-        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } =
-            req
+        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
         else {
             continue;
         };
@@ -756,7 +752,8 @@ async fn vote_wrong_header_digest() {
         if authority.id() == proposer_id {
             continue;
         }
-        let mut vote = Vote::new(&header, authority.id(), authority.consensus_config().key_config());
+        let mut vote =
+            Vote::new(&header, authority.id(), authority.consensus_config().key_config());
         vote.header_digest = HeaderDigest::default(); // wrong digest
         reply
             .send(Ok(NetworkResponseMessage { peer, result: PrimaryResponse::Vote(vote) }))
@@ -791,8 +788,7 @@ async fn vote_wrong_origin() {
     let mut handled = 0;
     let all_ids: Vec<_> = cx.fixture.authorities().map(|a| a.id()).collect();
     while let Some(req) = cx.network_rx.recv().await {
-        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } =
-            req
+        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
         else {
             continue;
         };
@@ -805,7 +801,8 @@ async fn vote_wrong_origin() {
             continue;
         }
         let wrong_origin = all_ids.iter().find(|id| **id != authority.id()).unwrap().clone();
-        let mut vote = Vote::new(&header, authority.id(), authority.consensus_config().key_config());
+        let mut vote =
+            Vote::new(&header, authority.id(), authority.consensus_config().key_config());
         vote.origin = wrong_origin;
         reply
             .send(Ok(NetworkResponseMessage { peer, result: PrimaryResponse::Vote(vote) }))
@@ -839,8 +836,7 @@ async fn vote_epoch_mismatch() {
     let num_peers = cx.fixture.num_authorities() - 1;
     let mut handled = 0;
     while let Some(req) = cx.network_rx.recv().await {
-        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } =
-            req
+        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
         else {
             continue;
         };
@@ -852,7 +848,8 @@ async fn vote_epoch_mismatch() {
         if authority.id() == proposer_id {
             continue;
         }
-        let mut vote = Vote::new(&header, authority.id(), authority.consensus_config().key_config());
+        let mut vote =
+            Vote::new(&header, authority.id(), authority.consensus_config().key_config());
         vote.epoch = header.epoch().wrapping_add(1); // wrong epoch
         reply
             .send(Ok(NetworkResponseMessage { peer, result: PrimaryResponse::Vote(vote) }))
@@ -886,8 +883,7 @@ async fn vote_round_mismatch() {
     let num_peers = cx.fixture.num_authorities() - 1;
     let mut handled = 0;
     while let Some(req) = cx.network_rx.recv().await {
-        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } =
-            req
+        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
         else {
             continue;
         };
@@ -899,7 +895,8 @@ async fn vote_round_mismatch() {
         if authority.id() == proposer_id {
             continue;
         }
-        let mut vote = Vote::new(&header, authority.id(), authority.consensus_config().key_config());
+        let mut vote =
+            Vote::new(&header, authority.id(), authority.consensus_config().key_config());
         vote.round = header.round().wrapping_add(1); // wrong round
         reply
             .send(Ok(NetworkResponseMessage { peer, result: PrimaryResponse::Vote(vote) }))
@@ -936,8 +933,7 @@ async fn vote_unknown_authority() {
     let num_peers = cx.fixture.num_authorities() - 1;
     let mut handled = 0;
     while let Some(req) = cx.network_rx.recv().await {
-        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } =
-            req
+        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
         else {
             continue;
         };
@@ -949,7 +945,8 @@ async fn vote_unknown_authority() {
         if authority.id() == proposer_id {
             continue;
         }
-        let mut vote = Vote::new(&header, authority.id(), authority.consensus_config().key_config());
+        let mut vote =
+            Vote::new(&header, authority.id(), authority.consensus_config().key_config());
         vote.author = ghost_id.clone(); // not in committee
         reply
             .send(Ok(NetworkResponseMessage { peer, result: PrimaryResponse::Vote(vote) }))
@@ -986,8 +983,7 @@ async fn duplicate_vote_same_peer() {
     let mut handled = 0;
     let mut duplicate_peer_id: Option<AuthorityIdentifier> = None;
     while let Some(req) = cx.network_rx.recv().await {
-        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } =
-            req
+        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
         else {
             continue;
         };
@@ -1094,8 +1090,7 @@ async fn minimum_quorum_exactly_threshold() {
             break;
         }
 
-        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } =
-            req
+        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
         else {
             continue;
         };
@@ -1151,10 +1146,8 @@ async fn propose_header_to_form_certificate() {
     drive_vote_requests(&mut cx.network_rx, &cx.fixture, &proposer_id, &header, &HashMap::new())
         .await;
 
-    let cert = tokio::time::timeout(Duration::from_secs(10), cert_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let cert =
+        tokio::time::timeout(Duration::from_secs(10), cert_rx.recv()).await.unwrap().unwrap();
     assert_eq!(cert.header().digest(), proposed_digest);
     assert!(matches!(
         cert.signature_verification_state(),
@@ -1242,10 +1235,8 @@ async fn run_vote_aggregator_with_param(
 
     if expect_cert {
         // A cert is expected; check that the header digest matches.
-        let cert = tokio::time::timeout(Duration::from_secs(5), cert_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let cert =
+            tokio::time::timeout(Duration::from_secs(5), cert_rx.recv()).await.unwrap().unwrap();
         assert_eq!(cert.header().digest(), proposed_digest);
     } else {
         // A cert is not expected; verify it times out without forming.
@@ -1265,9 +1256,10 @@ async fn test_shutdown_core() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     config.shutdown().notify();
     let mut task_manager = cx.task_manager;
-    let _ = tokio::time::timeout(Duration::from_secs(3), task_manager.join(config.shutdown().clone()))
-        .await
-        .expect("timeout");
+    let _ =
+        tokio::time::timeout(Duration::from_secs(3), task_manager.join(config.shutdown().clone()))
+            .await
+            .expect("timeout");
 }
 
 /// One vote request will produce an error, make sure the certificate is still formed with the good
@@ -1312,10 +1304,8 @@ async fn propose_headers_one_bad() {
         }
     }
 
-    let cert = tokio::time::timeout(Duration::from_secs(10), cert_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let cert =
+        tokio::time::timeout(Duration::from_secs(10), cert_rx.recv()).await.unwrap().unwrap();
     assert_eq!(cert.header().digest(), proposed_digest);
     assert!(matches!(
         cert.signature_verification_state(),
