@@ -43,8 +43,6 @@ sol!(
         /// The validator's information.
         #[derive(Debug)]
         struct ValidatorInfo {
-            /// The BLS12-381 public key.
-            bytes blsPubkey;
             /// The address based on ECDSA public key.
             address validatorAddress;
             /// The epoch which the validator's status
@@ -140,6 +138,8 @@ sol!(
             StakeConfig memory genesisConfig_,
             /// The initial validators with stake.
             ValidatorInfo[] memory initialValidators_,
+            /// The initial validators' BLS12-381 public keys.
+            bytes[] memory blsPubkeys_,
             /// The initial validators' uncompressed proofs of possession
             ProofOfPossession[] memory proofsOfPossession,
             /// The address of the owner.
@@ -162,6 +162,10 @@ sol!(
         function getValidators(uint8 status) public view returns (ValidatorInfo[] memory);
         /// Fetch the committee for a given epoch.
         function getCommitteeValidators(uint32 epoch) external view returns (ValidatorInfo[] memory);
+        /// Fetch the BLS pubkey for a given validator address.
+        function getBlsPubkey(address validatorAddress) external view returns (bytes memory);
+        /// Fetch the BLS pubkeys for the committee of a given epoch.
+        function getCommitteeBlsPubkeys(uint32 epoch) external view returns (bytes[] memory);
         /// Fetch the `ValidatorInfo` for a give address.
         function getValidator(address validatorAddress) external view returns (ValidatorInfo memory);
         /// Returns the BLS12-381 proof of possession message: `blsPubkey || validatorAddress`
@@ -213,6 +217,8 @@ pub struct EpochState {
     pub epoch_info: ConsensusRegistry::EpochInfo,
     /// The collection of validator info.
     pub validators: Vec<ConsensusRegistry::ValidatorInfo>,
+    /// The BLS12-381 public keys for the committee validators.
+    pub bls_pubkeys: Vec<tn_types::Bytes>,
     /// The timestamp for when the previous epoch closed.
     ///
     /// This time plus the `EpochInfo::epochDuration` creates the timestamp for the next epoch

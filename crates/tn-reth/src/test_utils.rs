@@ -186,6 +186,20 @@ impl RethEnv {
         Ok(rewards)
     }
 
+    /// Retrieve BLS pubkey from the ConsensusRegistry.
+    pub fn get_bls_pubkey(
+        &self,
+        hash: BlockHash,
+        address: Address,
+    ) -> eyre::Result<alloy::primitives::Bytes> {
+        let mut tn_evm = self.tn_evm(hash)?;
+        let calldata =
+            ConsensusRegistry::getBlsPubkeyCall { validatorAddress: address }.abi_encode().into();
+        let pubkey =
+            self.call_consensus_registry::<_, alloy::primitives::Bytes>(&mut tn_evm, calldata)?;
+        Ok(pubkey)
+    }
+
     /// Retrieve validator info from the ConsensusRegistry.
     pub fn get_validator_info(
         &self,
@@ -668,11 +682,12 @@ pub fn seeded_genesis_from_random_batches<'a>(
 /// Helper function to create a committee for tests from on-chain data.
 pub async fn create_committee_from_state(epoch_state: EpochState) -> eyre::Result<Committee> {
     // deconstruct epoch information
-    let EpochState { epoch, validators, .. } = epoch_state;
+    let EpochState { epoch, validators, bls_pubkeys, .. } = epoch_state;
     let validators = validators
         .iter()
-        .map(|v| {
-            let decoded_bls = BlsPublicKey::from_literal_bytes(v.blsPubkey.as_ref());
+        .zip(bls_pubkeys.iter())
+        .map(|(v, bls)| {
+            let decoded_bls = BlsPublicKey::from_literal_bytes(bls.as_ref());
             decoded_bls.map(|decoded| (decoded, v))
         })
         .collect::<Result<HashMap<_, _>, _>>()

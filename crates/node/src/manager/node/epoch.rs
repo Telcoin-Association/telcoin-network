@@ -402,12 +402,13 @@ where
         &self,
         engine: &ExecutionNode,
     ) -> eyre::Result<(Committee, EpochInfo, u64)> {
-        let EpochState { epoch, epoch_info, validators, epoch_start } =
+        let EpochState { epoch, epoch_info, validators, bls_pubkeys, epoch_start } =
             engine.epoch_state_from_canonical_tip().await?;
         let validators = validators
             .iter()
-            .map(|v| {
-                let decoded_bls = BlsPublicKey::from_literal_bytes(v.blsPubkey.as_ref());
+            .zip(bls_pubkeys.iter())
+            .map(|(v, bls)| {
+                let decoded_bls = BlsPublicKey::from_literal_bytes(bls.as_ref());
                 decoded_bls.map(|decoded| (decoded, v))
             })
             .collect::<Result<HashMap<_, _>, _>>()
