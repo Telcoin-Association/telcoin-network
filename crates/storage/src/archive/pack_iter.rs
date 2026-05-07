@@ -46,6 +46,12 @@ where
     /// are returned in insert order.
     pub fn open(mut reader: R, uid_idx: u64) -> Result<Self, LoadHeaderError> {
         let header = DataHeader::load_header(&mut reader, uid_idx)?;
+        if header.version() != 0 {
+            return Err(LoadHeaderError::InvalidVersion);
+        }
+        if header.appnum() != 1 {
+            return Err(LoadHeaderError::InvalidAppNum);
+        }
         let reader = BufReader::new(reader);
         Ok(PackIter {
             _val: PhantomData,
