@@ -358,13 +358,14 @@ where
         let buffer = match self.header.compression {
             PackCompression::None => &self.value_buffer,
             PackCompression::ZStd => {
-                let decoder = zstd::stream::read::Decoder::new(&self.value_buffer[..])?;
+                let mut decoder = zstd::stream::read::Decoder::new(&self.value_buffer[..])?;
+                decoder.window_log_max(24)?;
                 self.compression_buffer.clear();
                 // +1 lets us detect overflow vs. natural EOF
                 let mut limited = decoder.take(MAX_RECORD_SIZE as u64 + 1);
                 limited.read_to_end(&mut self.compression_buffer)?;
                 if self.compression_buffer.len() as u64 > MAX_RECORD_SIZE as u64 {
-                    return Err(FetchError::RequestedSizeTooLarge(u32::MAX, MAX_RECORD_SIZE));
+                    return Err(FetchError::RequestedDecompressSizeTooLarge(MAX_RECORD_SIZE));
                 }
                 &self.compression_buffer
             }

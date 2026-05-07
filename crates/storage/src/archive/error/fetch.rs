@@ -15,6 +15,8 @@ pub enum FetchError {
     CrcFailed,
     /// Requested record size is too large.
     RequestedSizeTooLarge(u32, u32),
+    /// Requested record size is too large after decompression.
+    RequestedDecompressSizeTooLarge(u32),
 }
 
 impl Error for FetchError {}
@@ -28,6 +30,9 @@ impl fmt::Display for FetchError {
             Self::CrcFailed => write!(f, "crc32 mismatch"),
             Self::RequestedSizeTooLarge(requested, max) => {
                 write!(f, "requested record size is too large: requested {requested}, max {max}")
+            }
+            Self::RequestedDecompressSizeTooLarge(max) => {
+                write!(f, "requested record size decompression is too large: max {max}")
             }
         }
     }

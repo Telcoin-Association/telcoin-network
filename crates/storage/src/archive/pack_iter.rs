@@ -104,13 +104,14 @@ where
         let buffer = match compression {
             PackCompression::None => buffer,
             PackCompression::ZStd => {
-                let decoder = zstd::stream::read::Decoder::new(&buffer[..])?;
+                let mut decoder = zstd::stream::read::Decoder::new(&buffer[..])?;
+                decoder.window_log_max(24)?;
                 decompress_buffer.clear();
                 // +1 lets us detect overflow vs. natural EOF
                 let mut limited = decoder.take(MAX_RECORD_SIZE as u64 + 1);
                 limited.read_to_end(decompress_buffer)?;
                 if decompress_buffer.len() as u64 > MAX_RECORD_SIZE as u64 {
-                    return Err(FetchError::RequestedSizeTooLarge(u32::MAX, MAX_RECORD_SIZE));
+                    return Err(FetchError::RequestedDecompressSizeTooLarge(MAX_RECORD_SIZE));
                 }
                 decompress_buffer
             }
@@ -212,13 +213,14 @@ where
         let buffer = match compression {
             PackCompression::None => buffer,
             PackCompression::ZStd => {
-                let decoder = zstd::stream::read::Decoder::new(&buffer[..])?;
+                let mut decoder = zstd::stream::read::Decoder::new(&buffer[..])?;
+                decoder.window_log_max(24)?;
                 decompress_buffer.clear();
                 // +1 lets us detect overflow vs. natural EOF
                 let mut limited = decoder.take(MAX_RECORD_SIZE as u64 + 1);
                 limited.read_to_end(decompress_buffer)?;
                 if decompress_buffer.len() as u64 > MAX_RECORD_SIZE as u64 {
-                    return Err(FetchError::RequestedSizeTooLarge(u32::MAX, MAX_RECORD_SIZE));
+                    return Err(FetchError::RequestedDecompressSizeTooLarge(MAX_RECORD_SIZE));
                 }
                 decompress_buffer
             }
