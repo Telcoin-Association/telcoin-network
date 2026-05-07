@@ -40,7 +40,7 @@ pub enum WorkerFeeConfig {
 }
 
 use alloy::{
-    eips::eip1559::MIN_PROTOCOL_BASE_FEE,
+    eips::eip1559::{calc_next_block_base_fee, BaseFeeParams, MIN_PROTOCOL_BASE_FEE},
     primitives::Address,
     rpc::types::{Withdrawal, Withdrawals},
 };
@@ -310,31 +310,24 @@ impl GasAccumulator {
 /// against `target_gas` (governance-set target for the epoch) and nudges the
 /// base fee up or down by at most 12.5 % (denominator = 8).
 ///
+/// Delegates the formula to alloy's [`calc_next_block_base_fee`] using
+/// [`BaseFeeParams::ethereum`] (`elasticity_multiplier = 2`,
+/// `max_change_denominator = 8`). The synthetic `gas_limit` passed to alloy is
+/// `target_gas * 2` so alloy recovers the same `gas_target`. `gas_used` is
+/// clamped to `gas_limit` to enforce the EIP-1559 elasticity bound and avoid
+/// the unbounded delta arithmetic alloy would otherwise produce when callers
+/// pass `gas_used > gas_limit`.
+///
 /// The result is clamped to `[MIN_PROTOCOL_BASE_FEE, u64::MAX]`.
 pub fn compute_next_base_fee_eip1559(current_base_fee: u64, gas_used: u64, target_gas: u64) -> u64 {
-    // Guard: if target is zero, keep current fee unchanged.
-    // The contract reverts for target `0` so this should never happen
     if target_gas == 0 {
-        return current_base_fee;
+        return current_base_fee.max(MIN_PROTOCOL_BASE_FEE);
     }
 
-    let new_base_fee = match gas_used.cmp(&target_gas) {
-        core::cmp::Ordering::Equal => current_base_fee,
-        core::cmp::Ordering::Greater => {
-            let excess = (gas_used - target_gas).min(target_gas);
-            let delta =
-                (current_base_fee as u128).saturating_mul(excess as u128) / target_gas as u128 / 8;
-            let delta = delta.max(1);
-            current_base_fee.saturating_add(delta.min(u64::MAX as u128) as u64)
-        }
-        core::cmp::Ordering::Less => {
-            let deficit = (target_gas - gas_used).min(target_gas);
-            let delta =
-                (current_base_fee as u128).saturating_mul(deficit as u128) / target_gas as u128 / 8;
-            current_base_fee.saturating_sub(delta.min(u64::MAX as u128) as u64)
-        }
-    };
-
+    let params = BaseFeeParams::ethereum();
+    let gas_limit = target_gas.saturating_mul(params.elasticity_multiplier as u64);
+    let gas_used = gas_used.min(gas_limit);
+    let new_base_fee = calc_next_block_base_fee(gas_used, gas_limit, current_base_fee, params);
     new_base_fee.max(MIN_PROTOCOL_BASE_FEE)
 }
 
@@ -347,7 +340,6 @@ impl Default for GasAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::eips::eip1559::MIN_PROTOCOL_BASE_FEE;
 
     #[test]
     fn gas_at_target_no_change() {
@@ -381,9 +373,12 @@ mod tests {
 
     #[test]
     fn overflow_safety_large_values() {
-        // u64::MAX base fee with high gas usage should not panic
-        let result = compute_next_base_fee_eip1559(u64::MAX, u64::MAX, 1);
-        assert_eq!(result, u64::MAX); // saturating_add caps at MAX
+        // Even when the caller passes `gas_used = u64::MAX`, the wrapper clamps it to
+        // `gas_limit = 2 * target_gas`, so the increase is bounded by the 12.5 % EIP-1559
+        // cap and the arithmetic stays within `u64`.
+        let base = 1_000_000_000_000_000u64;
+        let result = compute_next_base_fee_eip1559(base, u64::MAX, 1);
+        assert_eq!(result, base + base / 8);
     }
 
     #[test]
