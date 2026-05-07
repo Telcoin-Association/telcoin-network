@@ -29,7 +29,7 @@ proptest! {
     ) {
         let mut env = PipelineTestEnv::new();
         let supply_before = env.get_total_supply();
-        let mint_tx = env.governance_mint_tx(GOVERNANCE_SAFE_ADDRESS, U256::from(amount));
+        let mint_tx = env.governance_mint_tx(U256::from(amount));
         let block1 = env.execute_block_at_timestamp(vec![mint_tx], mint_ts)
             .expect("execute mint block");
         assert!(env.tx_succeeded(&block1, 0), "mint tx should succeed");
@@ -138,7 +138,7 @@ proptest! {
         let mut env = PipelineTestEnv::new();
 
         // Block 1: mint
-        let tx1 = env.governance_mint_tx(GOVERNANCE_SAFE_ADDRESS, U256::from(amount));
+        let tx1 = env.governance_mint_tx(U256::from(amount));
         let block1 = env.execute_block_at_timestamp(vec![tx1], mint_ts).expect("mint block");
         assert!(env.tx_succeeded(&block1, 0));
 
@@ -169,12 +169,12 @@ proptest! {
         let supply_before = env.get_total_supply();
 
         // Block 1: mint first
-        let tx1 = env.governance_mint_tx(GOVERNANCE_SAFE_ADDRESS, U256::from(first));
+        let tx1 = env.governance_mint_tx(U256::from(first));
         let block1 = env.execute_block_at_timestamp(vec![tx1], mint_ts).expect("mint 1");
         assert!(env.tx_succeeded(&block1, 0));
 
         // Block 2: mint second (overwrites first, resets timelock)
-        let tx2 = env.governance_mint_tx(GOVERNANCE_SAFE_ADDRESS, U256::from(second));
+        let tx2 = env.governance_mint_tx(U256::from(second));
         let block2 = env.execute_block_at_timestamp(vec![tx2], mint_ts + 1).expect("mint 2");
         assert!(env.tx_succeeded(&block2, 0));
 
@@ -203,7 +203,7 @@ proptest! {
     ) {
         let mut env = PipelineTestEnv::new();
 
-        let tx1 = env.governance_mint_tx(GOVERNANCE_SAFE_ADDRESS, U256::from(amount));
+        let tx1 = env.governance_mint_tx(U256::from(amount));
         let block1 = env.execute_block_at_timestamp(vec![tx1], mint_ts).expect("mint block");
         assert!(env.tx_succeeded(&block1, 0));
 
@@ -229,7 +229,7 @@ proptest! {
         let gov_balance_before = env.get_balance(GOVERNANCE_SAFE_ADDRESS);
 
         // Block 1: governance mints
-        let tx1 = env.governance_mint_tx(GOVERNANCE_SAFE_ADDRESS, U256::from(amount));
+        let tx1 = env.governance_mint_tx(U256::from(amount));
         let block1 = env.execute_block_at_timestamp(vec![tx1], mint_ts).expect("mint block");
         assert!(env.tx_succeeded(&block1, 0));
 
@@ -279,7 +279,7 @@ proptest! {
         let supply_initial = env.get_total_supply();
 
         // Block 1: mint
-        let tx1 = env.governance_mint_tx(GOVERNANCE_SAFE_ADDRESS, U256::from(mint_amount));
+        let tx1 = env.governance_mint_tx(U256::from(mint_amount));
         let block1 = env.execute_block_at_timestamp(vec![tx1], mint_ts).expect("mint");
         assert!(env.tx_succeeded(&block1, 0));
 
@@ -339,7 +339,7 @@ proptest! {
         let supply_before = env.get_total_supply();
 
         // Block 1: mint
-        let mint_tx = env.governance_mint_tx(GOVERNANCE_SAFE_ADDRESS, U256::from(amount));
+        let mint_tx = env.governance_mint_tx(U256::from(amount));
         let block1 = env.execute_block_at_timestamp(vec![mint_tx], mint_ts)
             .expect("execute mint block");
         assert!(env.tx_succeeded(&block1, 0), "mint tx should succeed");
@@ -407,7 +407,7 @@ proptest! {
         let supply_before = env.get_total_supply();
 
         // Block 1: mint
-        let mint_tx = env.governance_mint_tx(GOVERNANCE_SAFE_ADDRESS, U256::from(amount));
+        let mint_tx = env.governance_mint_tx(U256::from(amount));
         let block1 = env.execute_block_at_timestamp(vec![mint_tx], mint_ts)
             .expect("execute mint block");
         assert!(env.tx_succeeded(&block1, 0), "mint tx should succeed");
