@@ -70,7 +70,8 @@ async fn test_consensus_recovery_with_bullshark() {
     });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
-    Consensus::spawn(config.clone(), &cb, bullshark, &task_manager, consensus_chain.clone()).await;
+    Consensus::spawn(config.clone(), &cb, bullshark, &task_manager, consensus_chain.clone(), None)
+        .await;
 
     // WHEN we feed all certificates to the consensus.
     for certificate in certificates.iter() {
@@ -162,7 +163,8 @@ async fn test_consensus_recovery_with_bullshark() {
     });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
-    Consensus::spawn(config.clone(), &cb, bullshark, &task_manager, consensus_chain.clone()).await;
+    Consensus::spawn(config.clone(), &cb, bullshark, &task_manager, consensus_chain.clone(), None)
+        .await;
 
     // WHEN we send same certificates but up to round 3 (inclusive)
     // Then we store all the certificates up to round 6 so we can let the recovery algorithm
@@ -223,7 +225,7 @@ async fn test_consensus_recovery_with_bullshark() {
     });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
-    Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain.clone()).await;
+    Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain.clone(), None).await;
 
     // WHEN send the certificates of round >= 5 to trigger a leader election for round 4
     // and start committing.

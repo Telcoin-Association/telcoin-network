@@ -30,9 +30,12 @@ use tn_reth::{
         EpochState,
     },
 };
-use tn_storage::tables::{
-    CertificateDigestByOrigin, CertificateDigestByRound, Certificates, LastProposed,
-    NodeBatchesCache, OurNodeBatchesCache, Payload, ProposedCertificates, Votes,
+use tn_storage::{
+    certificate_pack::CertificatePack,
+    tables::{
+        CertificateDigestByOrigin, CertificateDigestByRound, Certificates, LastProposed,
+        NodeBatchesCache, OurNodeBatchesCache, Payload, ProposedCertificates, Votes,
+    },
 };
 use tn_types::{
     gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash, BlockNumHash, BlsPublicKey,
@@ -178,8 +181,13 @@ where
         }
 
         gas_accumulator.rewards_counter().set_committee(primary.current_committee().await);
+        let certificate_pack = if consensus_bus.is_active_cvv() {
+            Some(CertificatePack::open(self.tn_datadir.epochs_db_path(), current_epoch))
+        } else {
+            None
+        };
         // start primary
-        primary.start(&epoch_task_manager, self.consensus_chain.clone()).await?;
+        primary.start(&epoch_task_manager, self.consensus_chain.clone(), certificate_pack).await?;
 
         let worker_task_manager_name = worker_task_manager_name(worker_node.id().await);
         // start batch builder

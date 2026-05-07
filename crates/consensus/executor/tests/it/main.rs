@@ -90,8 +90,15 @@ async fn test_output_to_header() -> eyre::Result<()> {
         blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
     });
     let task_manager = TaskManager::default();
-    Consensus::spawn(config.clone(), &consensus_bus, bullshark, &task_manager, consensus_chain)
-        .await;
+    Consensus::spawn(
+        config.clone(),
+        &consensus_bus,
+        bullshark,
+        &task_manager,
+        consensus_chain,
+        None,
+    )
+    .await;
 
     // forward certificates to trigger subdag commit
     for certificate in certificates.iter() {
@@ -198,6 +205,7 @@ async fn test_executor_output_ordering() -> eyre::Result<()> {
         bullshark,
         &task_manager2,
         consensus_chain.clone(),
+        None,
     )
     .await;
 
@@ -291,8 +299,15 @@ async fn test_executor_batch_fetching() -> eyre::Result<()> {
         blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
     });
     let task_manager2 = TaskManager::default();
-    Consensus::spawn(config.clone(), &consensus_bus, bullshark, &task_manager2, consensus_chain)
-        .await;
+    Consensus::spawn(
+        config.clone(),
+        &consensus_bus,
+        bullshark,
+        &task_manager2,
+        consensus_chain,
+        None,
+    )
+    .await;
 
     for certificate in certificates.iter() {
         consensus_bus.new_certificates().send(certificate.clone()).await.unwrap();

@@ -1674,9 +1674,9 @@ mod tests {
         leader.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
             BlsSignature::default(),
         ));
-        leader.header_mut_for_test().created_at = tn_types::now();
-        leader.header.round = round;
-        leader.header.epoch = epoch;
+        leader.update_header_created_at_for_test(tn_types::now());
+        leader.update_header_round_for_test(round);
+        leader.update_header_epoch_for_test(epoch);
         let reputation_scores = ReputationScores::default();
         let previous_sub_dag = None;
         let sub_dag = Arc::new(CommittedSubDag::new(

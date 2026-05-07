@@ -184,7 +184,7 @@ fn run_pack_loop(
 impl Drop for ConsensusPack {
     fn drop(&mut self) {
         if Arc::strong_count(&self.handle) == 1 {
-            // If we are the last ConsensusPack then shutdown thread and wait for it persist and
+            // If we are the last ConsensusPack then shutdown thread and wait for it to persist and
             // exit.
             if let Some(handle) = self.handle.lock().take() {
                 if self.tx.try_send(PackMessage::Shutdown).is_ok() {
@@ -1276,13 +1276,15 @@ pub(crate) mod test {
 
         let mut leader_1 = Certificate::default();
         // update cert
-        leader_1.header_mut_for_test().author = authority_1;
+        leader_1.update_header_author_for_test(authority_1);
         for batch in &batches_1 {
-            leader_1.header.payload.insert(batch.digest(), 0_u16);
+            let mut ch = leader_1.header().clone();
+            ch.payload.insert(batch.digest(), 0_u16);
+            leader_1.update_header_for_test(ch);
         }
         let sub_dag_index_1 = 1;
-        leader_1.header.round = sub_dag_index_1 as u32;
-        leader_1.header.epoch = committee.epoch();
+        leader_1.update_header_round_for_test(sub_dag_index_1 as u32);
+        leader_1.update_header_epoch_for_test(committee.epoch());
         let reputation_scores = ReputationScores::default();
         let previous_sub_dag = None;
         let batch_digests_1: VecDeque<BlockHash> = batches_1.iter().map(|b| b.digest()).collect();
