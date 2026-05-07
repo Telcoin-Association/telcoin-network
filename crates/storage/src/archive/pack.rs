@@ -877,7 +877,7 @@ mod tests {
         let mut pack: TestPack =
             Pack::open(&path, 0, true, PackCompression::ZStd).expect("open pack");
         match pack.fetch(pos) {
-            Err(FetchError::RequestedSizeTooLarge(_, max)) => {
+            Err(FetchError::RequestedDecompressSizeTooLarge(max)) => {
                 assert_eq!(max, MAX_RECORD_SIZE);
             }
             other => panic!("expected RequestedSizeTooLarge, got {other:?}"),
@@ -891,7 +891,7 @@ mod tests {
         let file = File::open(&path).expect("open file");
         let mut iter = PackIter::<TestRec, _>::open(file, 0).expect("iter open");
         match iter.next() {
-            Some(Err(FetchError::RequestedSizeTooLarge(_, max))) => {
+            Some(Err(FetchError::RequestedDecompressSizeTooLarge(max))) => {
                 assert_eq!(max, MAX_RECORD_SIZE);
             }
             other => panic!("expected RequestedSizeTooLarge, got {other:?}"),
@@ -907,7 +907,7 @@ mod tests {
         let file = tokio::fs::File::open(&path).await.expect("open file");
         let mut iter = AsyncPackIter::<TestRec, _>::open(file, 0).await.expect("iter open");
         match iter.next().await {
-            Some(Err(FetchError::RequestedSizeTooLarge(_, max))) => {
+            Some(Err(FetchError::RequestedDecompressSizeTooLarge(max))) => {
                 assert_eq!(max, MAX_RECORD_SIZE);
             }
             other => panic!("expected RequestedSizeTooLarge, got {other:?}"),
