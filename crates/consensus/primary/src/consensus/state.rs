@@ -11,7 +11,11 @@ use std::{
     sync::Arc,
 };
 use tn_config::ConsensusConfig;
-use tn_storage::{certificate_pack::CertificatePack, consensus::ConsensusChain, CertificateStore};
+use tn_storage::{
+    certificate_pack::{CertificatePack, PackError},
+    consensus::ConsensusChain,
+    CertificateStore,
+};
 use tn_types::{
     AuthorityIdentifier, Certificate, CommittedSubDag, Committee, Database, Hash as _,
     HeaderDigest, Noticer, Round, TaskManager, TnReceiver, TnSender,
@@ -388,12 +392,15 @@ impl<DB: Database> Consensus<DB> {
             }
         }
         if let Some(certificate_pack) = &self.certificate_pack {
-            if let Err(e) = certificate_pack.save(certificate.clone()).await {
+            if let Err(e) = certificate_pack.try_save(certificate.clone()) {
                 tracing::error!(target: "telcoin::consensus_state", ?e, "Failed to save certificate to cert pack file");
                 // The certificate pack is in a failed state so stop using it.
                 // This is not a critical path so not stopping but if the DB gets in a failed
                 // state the node is probably not long for world...
-                self.certificate_pack = None;
+                // If the sender is overflowed then can try again later.
+                if let PackError::SendFailed = e {
+                    self.certificate_pack = None;
+                }
             }
         }
         // Process the certificate using the selected consensus protocol.

@@ -11,7 +11,7 @@ use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     oneshot, watch,
 };
-use tracing::error;
+use tracing::{error, info};
 
 use crate::archive::{
     digest_index::index::HdxIndex,
@@ -31,11 +31,13 @@ enum PackMessage {
 }
 
 /// Manages a pack file of [`Certificate`] data, indexed by certificate digest.
-#[derive(Debug, Clone)]
+/// Note, lack of Clone to make shutdown easier to manage.
+#[derive(Debug)]
 pub struct CertificatePack {
     tx: Sender<PackMessage>,
     handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     error: watch::Receiver<Option<PackError>>,
+    epoch: Epoch,
 }
 
 fn clear_pack_loop(mut rx: Receiver<PackMessage>) {
@@ -49,6 +51,7 @@ fn run_pack_loop(
     mut inner: Inner,
     mut rx: Receiver<PackMessage>,
     tx_error: watch::Sender<Option<PackError>>,
+    epoch: Epoch,
 ) {
     while let Some(msg) = rx.blocking_recv() {
         match msg {
@@ -68,6 +71,7 @@ fn run_pack_loop(
             }
             PackMessage::Shutdown => {
                 let _ = inner.persist();
+                info!(target: "certificate_pack", "certificate pack for epoch {} persisted", epoch);
                 break;
             }
             PackMessage::ShutdownAsync(tx) => {
@@ -81,18 +85,12 @@ fn run_pack_loop(
 impl Drop for CertificatePack {
     fn drop(&mut self) {
         if Arc::strong_count(&self.handle) == 1 {
-            if let Some(handle) = self.handle.lock().take() {
-                if self.tx.try_send(PackMessage::Shutdown).is_ok() {
-                    let join_result = if tokio::runtime::Handle::try_current().is_ok() {
-                        // Don't block tokio if in a runtime.
-                        tokio::task::block_in_place(|| handle.join())
-                    } else {
-                        handle.join()
-                    };
-                    if let Err(e) = join_result {
-                        error!(target: "certificate_pack", ?e, "Failed to join certificate pack thread");
-                    }
-                }
+            if let Some(_handle) = self.handle.lock().take() {
+                error!(target: "certificate_pack", "DID NOT CALL SHUTDOWN on certificate pack for epoch {}", self.epoch);
+                // Make an effort to shutdown anyway but this may not have time to run.
+                // Ideally would wait on the handle to join but don't block the Drop or mess around
+                // with an async runtime- not calling shutdown is the root problem.
+                let _ = self.tx.try_send(PackMessage::Shutdown);
             }
         }
     }
@@ -105,13 +103,13 @@ impl CertificatePack {
         let path = path.as_ref().join(format!("epoch-{epoch}"));
         let (tx_error, error) = watch::channel(None);
         let handle = std::thread::spawn(move || match Inner::open(path, false) {
-            Ok(inner) => run_pack_loop(inner, rx, tx_error),
+            Ok(inner) => run_pack_loop(inner, rx, tx_error, epoch),
             Err(e) => {
                 tx_error.send_replace(Some(e));
                 clear_pack_loop(rx);
             }
         });
-        Self { tx, handle: Arc::new(Mutex::new(Some(handle))), error }
+        Self { tx, handle: Arc::new(Mutex::new(Some(handle))), error, epoch }
     }
 
     /// Open an existing certificate pack at `path` in read-only mode.
@@ -120,13 +118,13 @@ impl CertificatePack {
         let path = path.as_ref().join(format!("epoch-{epoch}"));
         let (tx_error, error) = watch::channel(None);
         let handle = std::thread::spawn(move || match Inner::open(path, true) {
-            Ok(inner) => run_pack_loop(inner, rx, tx_error),
+            Ok(inner) => run_pack_loop(inner, rx, tx_error, epoch),
             Err(e) => {
                 tx_error.send_replace(Some(e));
                 clear_pack_loop(rx);
             }
         });
-        Self { tx, handle: Arc::new(Mutex::new(Some(handle))), error }
+        Self { tx, handle: Arc::new(Mutex::new(Some(handle))), error, epoch }
     }
 
     /// Return any delayed error from a previous background operation.
@@ -143,6 +141,21 @@ impl CertificatePack {
         self.get_error()?;
         if self.tx.send(PackMessage::Save(cert)).await.is_err() {
             Err(PackError::SendFailed)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Save a certificate into the pack file. The write is backgrounded; any error
+    /// from this call (or a prior one) is surfaced via [`get_error`](Self::get_error).
+    /// If the channel to send to the background thread is full will return an error.
+    pub fn try_save(&self, cert: Certificate) -> Result<(), PackError> {
+        self.get_error()?;
+        if let Err(e) = self.tx.try_send(PackMessage::Save(cert)) {
+            match e {
+                mpsc::error::TrySendError::Full(_) => Err(PackError::SendFull),
+                mpsc::error::TrySendError::Closed(_) => Err(PackError::SendFailed),
+            }
         } else {
             Ok(())
         }
@@ -307,6 +320,7 @@ pub enum PackError {
     Open(Arc<OpenError>),
     ReadError(String),
     SendFailed,
+    SendFull,
     ReceiveFailed,
     PersistError(String),
     CorruptPack,
@@ -324,6 +338,7 @@ impl Display for PackError {
             PackError::Open(e) => write!(f, "Open Error {e}"),
             PackError::ReadError(e) => write!(f, "Read Error {e}"),
             PackError::SendFailed => write!(f, "Internal channel send failed"),
+            PackError::SendFull => write!(f, "Internal channel send is full"),
             PackError::ReceiveFailed => write!(f, "Internal channel receive failed"),
             PackError::PersistError(e) => write!(f, "Failed to persist: {e}"),
             PackError::CorruptPack => write!(f, "Pack file is corrupt"),
