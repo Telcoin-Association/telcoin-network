@@ -29,7 +29,7 @@ use crate::archive::{
     error::{fetch::FetchError, open::OpenError},
     fxhasher::FxHasher,
     index::Index as _,
-    pack::{Pack, DATA_HEADER_BYTES},
+    pack::{Pack, PackCompression, DATA_HEADER_BYTES},
     position_index::index::PositionIndex,
 };
 
@@ -482,12 +482,17 @@ impl Inner {
         let _ = std::fs::create_dir_all(base_dir);
         let have_records = std::fs::exists(base_dir.join(Self::RECORDS_NAME)).unwrap_or_default();
 
-        let mut records =
-            Pack::<EpochRecord>::open(base_dir.join(Self::RECORDS_NAME), Self::PACK_EPOCH, false)?;
+        let mut records = Pack::<EpochRecord>::open(
+            base_dir.join(Self::RECORDS_NAME),
+            Self::PACK_EPOCH,
+            false,
+            PackCompression::ZStd,
+        )?;
         let mut certs = Pack::<EpochCertificate>::open(
             base_dir.join(Self::CERTS_NAME),
             Self::CERT_PACK_EPOCH,
             false,
+            PackCompression::ZStd,
         )?;
 
         let mut epoch_idx = PositionIndex::open_pdx_file(
