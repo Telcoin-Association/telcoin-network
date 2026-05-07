@@ -1120,11 +1120,10 @@ impl RethEnv {
         db.merge_transitions(BundleRetention::PlainState);
 
         // prepare registry deployment
-        let (validators, proofs): (Vec<_>, Vec<_>) = validators
+        let (validators, (bls_pubkeys, proofs)): (Vec<_>, (Vec<_>, Vec<_>)) = validators
             .iter()
             .map(|v| {
                 let validator = ConsensusRegistry::ValidatorInfo {
-                    blsPubkey: v.bls_public_key.to_bytes().into(),
                     validatorAddress: v.execution_address,
                     activationEpoch: 0,
                     exitEpoch: 0,
@@ -1133,12 +1132,13 @@ impl RethEnv {
                     stakeVersion: 0,
                     region: 0,
                 };
+                let bls_pubkey: tn_types::Bytes = v.bls_public_key.to_bytes().into();
                 let proof = ConsensusRegistry::ProofOfPossession {
                     uncompressedPubkey: v.bls_public_key.serialize().into(),
                     uncompressedSignature: v.proof_of_possession.serialize().into(),
                 };
 
-                (validator, proof)
+                (validator, (bls_pubkey, proof))
             })
             .unzip();
 
@@ -1151,6 +1151,7 @@ impl RethEnv {
         let constructor_args = ConsensusRegistry::constructorCall {
             genesisConfig_: initial_stake_config,
             initialValidators_: validators,
+            blsPubkeys_: bls_pubkeys,
             proofsOfPossession: proofs,
             owner_: owner_address,
         }
@@ -1390,7 +1391,8 @@ impl RethEnv {
 
         // retrieve the committee
         let validators = self.get_committee_validators_by_epoch(epoch, &mut tn_evm)?;
-        let epoch_state = EpochState { epoch, epoch_info, validators, epoch_start };
+        let bls_pubkeys = self.get_committee_bls_pubkeys_by_epoch(epoch, &mut tn_evm)?;
+        let epoch_state = EpochState { epoch, epoch_info, validators, bls_pubkeys, epoch_start };
         debug!(target: "engine", ?epoch_state, "returning epoch state from canonical tip");
 
         Ok(epoch_state)
@@ -1416,6 +1418,23 @@ impl RethEnv {
             .create_evm(&mut db, self.inner.evm_config.evm_env(&canonical_tip)?);
 
         self.get_committee_validators_by_epoch(epoch, &mut tn_evm)
+    }
+
+    /// Read the BLS pubkeys for the committee of the provided epoch from the [ConsensusRegistry]
+    /// on-chain.
+    pub fn bls_pubkeys_for_epoch(&self, epoch: u32) -> eyre::Result<Vec<alloy::primitives::Bytes>> {
+        let canonical_tip = self.canonical_tip();
+        let state_provider =
+            self.inner.blockchain_provider.state_by_block_hash(canonical_tip.hash())?;
+        let state = StateProviderDatabase::new(&state_provider);
+        let mut db = State::builder().with_database(state).with_bundle_update().build();
+        let mut tn_evm = self
+            .inner
+            .evm_config
+            .evm_factory()
+            .create_evm(&mut db, self.inner.evm_config.evm_env(&canonical_tip)?);
+
+        self.get_committee_bls_pubkeys_by_epoch(epoch, &mut tn_evm)
     }
 
     /// Extract the epoch number from a header's nonce.
@@ -1456,6 +1475,19 @@ impl RethEnv {
     {
         let calldata = ConsensusRegistry::getCommitteeValidatorsCall { epoch }.abi_encode().into();
         self.call_consensus_registry::<_, Vec<ConsensusRegistry::ValidatorInfo>>(evm, calldata)
+    }
+
+    /// Retrieve BLS pubkeys for the committee of the provided epoch.
+    fn get_committee_bls_pubkeys_by_epoch<DB>(
+        &self,
+        epoch: Epoch,
+        evm: &mut TNEvm<DB>,
+    ) -> eyre::Result<Vec<alloy::primitives::Bytes>>
+    where
+        DB: alloy_evm::Database,
+    {
+        let calldata = ConsensusRegistry::getCommitteeBlsPubkeysCall { epoch }.abi_encode().into();
+        self.call_consensus_registry::<_, Vec<alloy::primitives::Bytes>>(evm, calldata)
     }
 
     /// Read fee configs for all workers from the [`WorkerConfigs`] contract at the given header.
@@ -1829,7 +1861,7 @@ mod tests {
         };
 
         // assert epoch state is correct
-        let EpochState { epoch, epoch_info, validators: committee, epoch_start } =
+        let EpochState { epoch, epoch_info, validators: committee, bls_pubkeys, epoch_start } =
             reth_env.epoch_state_from_canonical_tip()?;
         debug!(target:"evm", ?epoch, ?epoch_info, ?committee, ?epoch, "original epoch state from canonical tip in genesis");
         assert_eq!(epoch, expected_epoch);
@@ -1838,11 +1870,12 @@ mod tests {
 
         // assert committee matches validator args for constructor
         for v in &validators {
-            let on_chain = committee
+            let idx = committee
                 .iter()
-                .find(|info| info.validatorAddress == v.execution_address)
+                .position(|info| info.validatorAddress == v.execution_address)
                 .expect("validator on-chain");
-            assert_eq!(on_chain.blsPubkey.as_ref(), v.bls_public_key.to_bytes());
+            assert_eq!(bls_pubkeys[idx].as_ref(), v.bls_public_key.to_bytes());
+            let on_chain = &committee[idx];
             assert_eq!(on_chain.activationEpoch, epoch);
             assert_eq!(on_chain.exitEpoch, 0);
             assert!(!on_chain.isRetired);
@@ -1875,7 +1908,7 @@ mod tests {
         let canonical_header = block3.recovered_block.clone_sealed_header();
 
         // read new epoch state
-        let EpochState { epoch, epoch_info, validators: committee, epoch_start } =
+        let EpochState { epoch, epoch_info, validators: committee, bls_pubkeys, epoch_start } =
             reth_env.epoch_state_from_canonical_tip()?;
         debug!(target: "evm", ?epoch, ?epoch_info, ?committee, ?epoch, "new epoch state from canonical tip");
         // assert epoch info updated
@@ -1929,11 +1962,12 @@ mod tests {
         // assert new committee matches validator args for constructor
         // this should be the case for the first 3 epochs
         for v in &validators {
-            let on_chain = committee
+            let idx = committee
                 .iter()
-                .find(|info| info.validatorAddress == v.execution_address)
+                .position(|info| info.validatorAddress == v.execution_address)
                 .expect("validator on-chain");
-            assert_eq!(on_chain.blsPubkey.as_ref(), v.bls_public_key.to_bytes());
+            assert_eq!(bls_pubkeys[idx].as_ref(), v.bls_public_key.to_bytes());
+            let on_chain = &committee[idx];
             assert_eq!(on_chain.activationEpoch, 0);
             assert_eq!(on_chain.exitEpoch, 0);
             assert!(!on_chain.isRetired);
