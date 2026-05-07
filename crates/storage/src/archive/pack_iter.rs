@@ -32,7 +32,7 @@ where
     _val: PhantomData<V>,
     reader: BufReader<R>,
     buffer: Vec<u8>,
-    compress_buffer: Vec<u8>,
+    decompress_buffer: Vec<u8>,
     compression: PackCompression,
 }
 
@@ -51,7 +51,7 @@ where
             _val: PhantomData,
             reader,
             buffer: Vec::new(),
-            compress_buffer: Vec::new(),
+            decompress_buffer: Vec::new(),
             compression: header.compression(),
         })
     }
@@ -72,7 +72,7 @@ where
     fn read_record_file<R2: Read + Seek>(
         file: &mut R2,
         buffer: &mut Vec<u8>,
-        compress_buffer: &mut Vec<u8>,
+        decompress_buffer: &mut Vec<u8>,
         compression: PackCompression,
     ) -> Result<V, FetchError> {
         let mut crc32_hasher = crc32fast::Hasher::new();
@@ -104,11 +104,16 @@ where
         let buffer = match compression {
             PackCompression::None => buffer,
             PackCompression::ZStd => {
-                let mut compressor = zstd::stream::read::Decoder::new(&buffer[..])?;
-                compress_buffer.clear();
-                compressor.read_to_end(compress_buffer)?;
-                compressor.finish();
-                compress_buffer
+                let mut decoder = zstd::stream::read::Decoder::new(&buffer[..])?;
+                decoder.window_log_max(24)?;
+                decompress_buffer.clear();
+                // +1 lets us detect overflow vs. natural EOF
+                let mut limited = decoder.take(MAX_RECORD_SIZE as u64 + 1);
+                limited.read_to_end(decompress_buffer)?;
+                if decompress_buffer.len() as u64 > MAX_RECORD_SIZE as u64 {
+                    return Err(FetchError::RequestedDecompressSizeTooLarge(MAX_RECORD_SIZE));
+                }
+                decompress_buffer
             }
         };
         try_decode::<V>(&buffer[..]).map_err(|e| FetchError::DeserializeValue(e.to_string()))
@@ -125,7 +130,7 @@ where
         match Self::read_record_file(
             &mut self.reader,
             &mut self.buffer,
-            &mut self.compress_buffer,
+            &mut self.decompress_buffer,
             self.compression,
         ) {
             Ok(val) => Some(Ok(val)),
@@ -148,7 +153,7 @@ where
     _val: PhantomData<V>,
     reader: R,
     buffer: Vec<u8>,
-    compress_buffer: Vec<u8>,
+    decompress_buffer: Vec<u8>,
     compression: PackCompression,
 }
 
@@ -166,7 +171,7 @@ where
             _val: PhantomData,
             reader,
             buffer: Vec::new(),
-            compress_buffer: Vec::new(),
+            decompress_buffer: Vec::new(),
             compression: header.compression(),
         })
     }
@@ -176,7 +181,7 @@ where
     async fn read_record_file(
         file: &mut R,
         buffer: &mut Vec<u8>,
-        compress_buffer: &mut Vec<u8>,
+        decompress_buffer: &mut Vec<u8>,
         compression: PackCompression,
     ) -> Result<V, FetchError> {
         let mut crc32_hasher = crc32fast::Hasher::new();
@@ -208,11 +213,16 @@ where
         let buffer = match compression {
             PackCompression::None => buffer,
             PackCompression::ZStd => {
-                let mut compressor = zstd::stream::read::Decoder::new(&buffer[..])?;
-                compress_buffer.clear();
-                compressor.read_to_end(compress_buffer)?;
-                compressor.finish();
-                compress_buffer
+                let mut decoder = zstd::stream::read::Decoder::new(&buffer[..])?;
+                decoder.window_log_max(24)?;
+                decompress_buffer.clear();
+                // +1 lets us detect overflow vs. natural EOF
+                let mut limited = decoder.take(MAX_RECORD_SIZE as u64 + 1);
+                limited.read_to_end(decompress_buffer)?;
+                if decompress_buffer.len() as u64 > MAX_RECORD_SIZE as u64 {
+                    return Err(FetchError::RequestedDecompressSizeTooLarge(MAX_RECORD_SIZE));
+                }
+                decompress_buffer
             }
         };
         try_decode::<V>(&buffer[..]).map_err(|e| FetchError::DeserializeValue(e.to_string()))
@@ -223,7 +233,7 @@ where
         match Self::read_record_file(
             &mut self.reader,
             &mut self.buffer,
-            &mut self.compress_buffer,
+            &mut self.decompress_buffer,
             self.compression,
         )
         .await
