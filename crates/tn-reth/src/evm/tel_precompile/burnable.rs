@@ -13,7 +13,10 @@
 //! With `feature = "faucet"`, the `mint` function signature changes to `mint(address, uint256)`
 //! and bypasses the timelock entirely (see [`faucet`](super::faucet) module).
 
-use alloy::{sol, sol_types::SolEvent};
+use alloy::{
+    sol,
+    sol_types::{SolEvent, SolValue},
+};
 use alloy_evm::EvmInternals;
 use reth_revm::precompile::{PrecompileError, PrecompileOutput, PrecompileResult};
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
@@ -23,7 +26,6 @@ use tn_types::{Address, Bytes, U256};
 use crate::evm::tel_precompile::faucet::mint_role_slot;
 use crate::{
     evm::tel_precompile::{
-        erc20::Transfer,
         helpers::{amount_slot, balance_decr, balance_incr, timestamp_slot},
         TOTAL_SUPPLY_SLOT,
     },
@@ -35,6 +37,8 @@ use crate::{
 // Generates selector constants and Rust encoding/decoding types for the token lifecycle
 // and role management interface.
 sol! {
+    /// Returns the total circulating supply of TEL (from storage slot 100).
+    function totalSupply() external view returns (uint256);
     /// Finalize a pending mint after the timelock expires.
     function claim(address recipient) external;
     /// Destroy `amount` tokens held by the precompile account. Governance-only.
@@ -51,6 +55,8 @@ sol! {
     event Claim(address indexed recipient, uint256 amount);
     /// Emitted when tokens are burned.
     event Burn(uint256 amount);
+    /// Emitted when tokens are minted (from address(0)) or burned (to address(0)).
+    event Transfer(address indexed from, address indexed to, uint256 value);
 }
 
 // mainnet `mint` ABI: takes only an amount, always mints to governance with a timelock.
@@ -71,6 +77,23 @@ sol! {
 /// `feature = "faucet"` enabled, or the timelock protection is silently disabled.
 #[cfg(not(feature = "faucet"))]
 pub const TIMELOCK_DURATION: u64 = 7 * 24 * 60 * 60; // 604800s = 7 days
+
+/// `totalSupply()` → reads [`TOTAL_SUPPLY_SLOT`] (slot 100) and returns the current circulating
+/// supply.
+pub(super) fn handle_total_supply(
+    internals: &mut EvmInternals<'_>,
+    gas_limit: u64,
+) -> PrecompileResult {
+    const GAS_COST: u64 = 2_100;
+    if gas_limit < GAS_COST {
+        return Err(PrecompileError::OutOfGas);
+    }
+    let supply = internals
+        .sload(TELCOIN_PRECOMPILE_ADDRESS, TOTAL_SUPPLY_SLOT)
+        .map_err(|e| PrecompileError::Other(format!("sload failed: {e:?}").into()))?
+        .data;
+    Ok(PrecompileOutput::new(GAS_COST, Bytes::from(supply.abi_encode())))
+}
 
 /// Check whether `caller` is authorized to invoke `mint`.
 ///
@@ -356,8 +379,6 @@ pub(super) fn handle_burn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(not(feature = "faucet"))]
-    use crate::evm::tel_precompile::erc20::{balanceOfCall, totalSupplyCall};
     use crate::evm::tel_precompile::test_utils::*;
     use alloy::sol_types::SolCall;
     use tn_config::GOVERNANCE_SAFE_ADDRESS;
@@ -422,8 +443,7 @@ mod tests {
             burnCall { amount: U256::from(200) }.abi_encode(),
         )
         .unwrap();
-        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, totalSupplyCall {}.abi_encode());
-        assert_eq!(decode_u256(&result), genesis + U256::from(500) - U256::from(200));
+        assert_eq!(env.get_total_supply(), genesis + U256::from(500) - U256::from(200));
     }
 
     #[test]
@@ -547,11 +567,7 @@ mod tests {
             claimCall { recipient: GOVERNANCE_SAFE_ADDRESS }.abi_encode(),
         )
         .unwrap();
-        let result = env.exec_default(
-            GOVERNANCE_SAFE_ADDRESS,
-            balanceOfCall { account: GOVERNANCE_SAFE_ADDRESS }.abi_encode(),
-        );
-        assert_eq!(decode_u256(&result), initial_balance + U256::from(300));
+        assert_eq!(env.get_balance(GOVERNANCE_SAFE_ADDRESS), initial_balance + U256::from(300));
     }
 
     #[test]

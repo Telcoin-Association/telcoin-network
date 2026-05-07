@@ -198,6 +198,8 @@ sol!(
         constructor(uint8[] memory strategies, uint64[] memory values, address owner_);
         /// Get the stored fee config for a worker.
         function getWorkerConfig(uint16 workerId) external view returns (uint8 strategy, uint64 value);
+        /// Get every worker's config in a single call.
+        function getAllWorkerConfigs() external view returns (uint16 count, uint8[] memory strategies, uint64[] memory values);
         /// Set the number of workers for the next epoch.
         function setNumWorkers(uint16 numWorkers_) external;
         /// Set the config for a worker by worker id.
