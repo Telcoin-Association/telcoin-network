@@ -46,6 +46,9 @@ cd "$(dirname "$0")/.."
 
 echo "executing bash script from $(pwd)"
 
+# nightly toolchain used for fmt/clippy (rustfmt and clippy use nightly-only options)
+NIGHTLY=$(cat rust-nightly)
+
 # Check if cargo-nextest is installed
 if ! cargo nextest --version &> /dev/null; then
     echo "cargo-nextest is not installed."
@@ -76,7 +79,7 @@ if [ -n "$MODIFIED_TRACKED_FILES" ]; then
 fi
 
 # check cargo fmt first
-cargo +nightly-2026-03-20 fmt -- --check
+cargo +$NIGHTLY fmt -- --check
 
 echo "fmt passed"
 
@@ -84,9 +87,9 @@ echo "fmt passed"
 # check clippy
 #
 # default features
-cargo +nightly-2026-03-20 clippy --workspace -- -D warnings
+cargo +$NIGHTLY clippy --workspace -- -D warnings
 # all features
-cargo +nightly-2026-03-20 clippy --workspace --all-features -- -D warnings
+cargo +$NIGHTLY clippy --workspace --all-features -- -D warnings
 
 echo "clippy for workspace: default and all features passed"
 
