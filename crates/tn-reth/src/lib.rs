@@ -1197,8 +1197,9 @@ impl RethEnv {
             );
 
             let (strategies, values): (Vec<u8>, Vec<u64>) = worker_configs.iter().copied().unzip();
+            let datas = vec![0u128; strategies.len()];
             let constructor_args =
-                WorkerConfigs::constructorCall { strategies, values, owner_: owner_address }
+                WorkerConfigs::constructorCall { strategies, values, datas, owner_: owner_address }
                     .abi_encode();
 
             let initcode_binding =
@@ -1524,11 +1525,15 @@ impl RethEnv {
             )?;
 
         let num_workers = ret.count as usize;
-        if ret.strategies.len() != num_workers || ret.values.len() != num_workers {
+        if ret.strategies.len() != num_workers
+            || ret.values.len() != num_workers
+            || ret.datas.len() != num_workers
+        {
             eyre::bail!(
-                "worker config arity mismatch: count={num_workers}, strategies={}, values={}",
+                "worker config arity mismatch: count={num_workers}, strategies={}, values={}, datas={}",
                 ret.strategies.len(),
-                ret.values.len()
+                ret.values.len(),
+                ret.datas.len(),
             );
         }
 
