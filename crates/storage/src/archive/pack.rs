@@ -772,4 +772,188 @@ mod tests {
     fn test_archive_pack_none() {
         archive_pack_(PackCompression::None);
     }
+
+    /// Builds a zstd pack file containing a single hand-crafted record whose compressed
+    /// payload is small (so val_size <= MAX_RECORD_SIZE) but decompresses to
+    /// MAX_RECORD_SIZE + 1 bytes. The outer CRC32 is computed over the same bytes the
+    /// production read path hashes, so the record reaches the zstd decoder with the
+    /// integrity check passing — exercising the in-memory cap added at pack.rs:362-368.
+    ///
+    /// Returns the temp dir handle (drop = cleanup) and the byte position at which the
+    /// crafted record starts, suitable for `Pack::fetch` or as the iterator's first
+    /// post-header read.
+    fn build_pack_with_decompression_bomb() -> (TempDir, u64) {
+        let tmp_path = TempDir::with_prefix("test_zstd_bomb").expect("temp dir");
+        let path = tmp_path.path().join("pack_bomb");
+        {
+            let _pack: TestPack =
+                Pack::open(&path, 0, false, PackCompression::ZStd).expect("open pack");
+        }
+        let pos = fs::metadata(&path).expect("metadata").len();
+
+        let payload = vec![0u8; (MAX_RECORD_SIZE as usize) + 1];
+        let mut compressed = Vec::new();
+        {
+            let mut encoder =
+                zstd::stream::write::Encoder::new(&mut compressed, 0).expect("zstd encoder");
+            encoder.write_all(&payload).expect("zstd write");
+            encoder.finish().expect("zstd finish");
+        }
+
+        let val_size = compressed.len() as u32;
+        let val_size_bytes = val_size.to_le_bytes();
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&val_size_bytes);
+        hasher.update(&compressed);
+        let crc = hasher.finalize();
+
+        let mut file = OpenOptions::new().append(true).open(&path).expect("open for append");
+        file.write_all(&val_size_bytes).expect("write val_size");
+        file.write_all(&compressed).expect("write compressed");
+        file.write_all(&crc.to_le_bytes()).expect("write crc");
+        file.flush().expect("flush");
+
+        (tmp_path, pos)
+    }
+
+    /// Builds a zstd pack file containing one valid record and then mutates a byte deep
+    /// in the zstd frame body, recomputing the outer CRC32 so the corruption survives
+    /// the integrity check. The decoder must surface an io-error or a deserialization
+    /// failure rather than silently returning bad bytes.
+    ///
+    /// Returns the temp dir and the byte position of the corrupted record.
+    fn build_pack_with_corrupt_zstd_frame() -> (TempDir, u64) {
+        let tmp_path = TempDir::with_prefix("test_zstd_corrupt").expect("temp dir");
+        let path = tmp_path.path().join("pack_corrupt");
+        let pos = {
+            let mut pack: TestPack =
+                Pack::open(&path, 0, false, PackCompression::ZStd).expect("open pack");
+            pack.append(&TestRec { idx: 1, name: "f4 fixture".to_string() }).expect("append")
+        };
+
+        let mut file = OpenOptions::new().read(true).write(true).open(&path).expect("open for rw");
+
+        file.seek(SeekFrom::Start(pos)).expect("seek val_size");
+        let mut val_size_bytes = [0_u8; 4];
+        file.read_exact(&mut val_size_bytes).expect("read val_size");
+        let val_size = u32::from_le_bytes(val_size_bytes);
+
+        let mut compressed = vec![0u8; val_size as usize];
+        file.read_exact(&mut compressed).expect("read compressed");
+
+        // Flip every byte past the 4-byte zstd magic. A single-byte corruption is too narrow:
+        // for small payloads zstd may emit a Raw_Block where a one-byte flip is silently
+        // absorbed into the output, and bincode is permissive enough to decode the resulting
+        // bytes as a valid-but-wrong record. Corrupting the entire post-magic span makes the
+        // decoder either reject the frame structurally (frame header / block header parse
+        // failure) or produce enough garbage that bincode fails to deserialize.
+        let corruption_start = 4_usize.min(compressed.len());
+        for byte in compressed[corruption_start..].iter_mut() {
+            *byte ^= 0xFF;
+        }
+
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&val_size_bytes);
+        hasher.update(&compressed);
+        let new_crc = hasher.finalize();
+
+        file.seek(SeekFrom::Start(pos + 4)).expect("seek body");
+        file.write_all(&compressed).expect("write corrupted");
+        file.seek(SeekFrom::Start(pos + 4 + val_size as u64)).expect("seek crc");
+        file.write_all(&new_crc.to_le_bytes()).expect("write crc");
+        file.flush().expect("flush");
+
+        (tmp_path, pos)
+    }
+
+    // F3: the in-memory MAX_RECORD_SIZE cap on decompressed output must fire at every
+    // decompression site (sync fetch, sync iterator, async iterator). Parity tests across
+    // the three sites guard against drift if one site is refactored without the others.
+
+    #[test]
+    fn test_zstd_decompression_bomb_fetch() {
+        let (tmp_dir, pos) = build_pack_with_decompression_bomb();
+        let path = tmp_dir.path().join("pack_bomb");
+        let mut pack: TestPack =
+            Pack::open(&path, 0, true, PackCompression::ZStd).expect("open pack");
+        match pack.fetch(pos) {
+            Err(FetchError::RequestedSizeTooLarge(_, max)) => {
+                assert_eq!(max, MAX_RECORD_SIZE);
+            }
+            other => panic!("expected RequestedSizeTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_zstd_decompression_bomb_pack_iter() {
+        let (tmp_dir, _pos) = build_pack_with_decompression_bomb();
+        let path = tmp_dir.path().join("pack_bomb");
+        let file = File::open(&path).expect("open file");
+        let mut iter = PackIter::<TestRec, _>::open(file, 0).expect("iter open");
+        match iter.next() {
+            Some(Err(FetchError::RequestedSizeTooLarge(_, max))) => {
+                assert_eq!(max, MAX_RECORD_SIZE);
+            }
+            other => panic!("expected RequestedSizeTooLarge, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_zstd_decompression_bomb_async_pack_iter() {
+        use crate::archive::pack_iter::AsyncPackIter;
+
+        let (tmp_dir, _pos) = build_pack_with_decompression_bomb();
+        let path = tmp_dir.path().join("pack_bomb");
+        let file = tokio::fs::File::open(&path).await.expect("open file");
+        let mut iter = AsyncPackIter::<TestRec, _>::open(file, 0).await.expect("iter open");
+        match iter.next().await {
+            Some(Err(FetchError::RequestedSizeTooLarge(_, max))) => {
+                assert_eq!(max, MAX_RECORD_SIZE);
+            }
+            other => panic!("expected RequestedSizeTooLarge, got {other:?}"),
+        }
+    }
+
+    // F4: a CRC-valid but internally corrupt zstd frame must surface as an error rather
+    // than silently passing through. Either FetchError::IO (zstd decode error) or
+    // FetchError::DeserializeValue (zstd produced different bytes that bincode rejects)
+    // is acceptable — both signal that the frame did not round-trip cleanly.
+
+    #[test]
+    fn test_zstd_corrupt_frame_fetch() {
+        let (tmp_dir, pos) = build_pack_with_corrupt_zstd_frame();
+        let path = tmp_dir.path().join("pack_corrupt");
+        let mut pack: TestPack =
+            Pack::open(&path, 0, true, PackCompression::ZStd).expect("open pack");
+        match pack.fetch(pos) {
+            Err(FetchError::IO(_)) | Err(FetchError::DeserializeValue(_)) => {}
+            other => panic!("expected IO or DeserializeValue error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_zstd_corrupt_frame_pack_iter() {
+        let (tmp_dir, _pos) = build_pack_with_corrupt_zstd_frame();
+        let path = tmp_dir.path().join("pack_corrupt");
+        let file = File::open(&path).expect("open file");
+        let mut iter = PackIter::<TestRec, _>::open(file, 0).expect("iter open");
+        match iter.next() {
+            Some(Err(FetchError::IO(_))) | Some(Err(FetchError::DeserializeValue(_))) => {}
+            other => panic!("expected IO or DeserializeValue error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_zstd_corrupt_frame_async_pack_iter() {
+        use crate::archive::pack_iter::AsyncPackIter;
+
+        let (tmp_dir, _pos) = build_pack_with_corrupt_zstd_frame();
+        let path = tmp_dir.path().join("pack_corrupt");
+        let file = tokio::fs::File::open(&path).await.expect("open file");
+        let mut iter = AsyncPackIter::<TestRec, _>::open(file, 0).await.expect("iter open");
+        match iter.next().await {
+            Some(Err(FetchError::IO(_))) | Some(Err(FetchError::DeserializeValue(_))) => {}
+            other => panic!("expected IO or DeserializeValue error, got {other:?}"),
+        }
+    }
 }
