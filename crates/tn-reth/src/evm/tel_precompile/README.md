@@ -78,9 +78,17 @@ Governance is identified by `GOVERNANCE_SAFE_ADDRESS` from `tn-config`.
 
 The precompile previously exposed `transfer`, `approve`, `transferFrom`, `permit`, `nonces`, `allowance`, `name`, `symbol`, `decimals`, `balanceOf`, and `DOMAIN_SEPARATOR`. That surface has been removed.
 
-The reason is that `DELEGATECALL` reads storage from the precompile's own account but executes against the calling contract's storage layout. If a malicious contract `DELEGATECALL`s into `0x7e1`, every `SSTORE` the precompile performs writes into the **caller's** storage at the same slot index. With the old ERC-20/permit surface, slots 2 (allowances) and 4 (nonces) became attacker-controlled write primitives in any contract that delegated to the precompile, putting downstream contract state at risk.
+The rationale is that none of those selectors needed to live at the protocol level:
 
-Removing the mutating selectors closes that attack class entirely. `totalSupply()` is intentionally retained because it only performs an `SLOAD`: under `DELEGATECALL` it reads slot 100 from the caller's own storage (typically zero) and cannot be used to mutate caller state. ERC-20-style transfers remain available natively — `CALL <addr> <value>` moves TEL between accounts because TEL **is** the native gas token, so user-space contracts can implement allowance-and-permit semantics on top of native value transfers without exposing them at the protocol level.
+- TEL **is** the native gas token. Moving TEL between accounts is `CALL <addr> <value>` — a native value transfer that updates `account.balance` directly. A precompile-level `transfer` / `transferFrom` was redundant with this primitive.
+- Allowances and nonces are user-space concerns. Any contract that wants ERC-20-style approvals or EIP-2612 permits can layer them on top of native value transfers without the protocol managing the underlying maps.
+- The remaining selectors (`mint` / `claim` / `burn` / `totalSupply`, plus `grantMintRole` / `revokeMintRole` / `hasMintRole` under the `faucet` feature) are the only ones that genuinely require protocol-level state — issuance authority and the supply counter cannot live in user space.
+
+Shrinking the surface to issuance-only is the actual reason for the deletion; the resulting protocol is simpler and exposes less authority than a full ERC-20 implementation would.
+
+#### `DELEGATECALL` semantics under revm
+
+For completeness: a contract that `DELEGATECALL`s into `0x7e1` runs the precompile's logic, but every `SSTORE` the precompile performs targets the literal address argument it passes — `TELCOIN_PRECOMPILE_ADDRESS` — not the calling contract's storage. The precompile dispatcher routes through `EvmInternals::sstore(TELCOIN_PRECOMPILE_ADDRESS, …)`, and revm's journaled state writes to the address argument verbatim with no `DELEGATECALL`-aware rewrite. A regression test in `crates/tn-reth/tests/it/tel_precompile_props.rs` (`test_delegatecall_writes_target_precompile_storage`) pins this behaviour against future revm upgrades.
 
 ### Timelock bypass (`faucet` feature)
 

@@ -13,14 +13,14 @@ use std::{
 };
 use tempfile::TempDir;
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
+#[cfg(not(feature = "faucet"))]
+use tn_reth::mintCall;
 use tn_reth::{
     payload::TNPayload,
     test_utils::{precompile_test_utils::GENESIS_SUPPLY, TransactionFactory},
     totalSupplyCall, ExecutedBlock, NewCanonicalChain, RethChainSpec, RethEnv,
     TELCOIN_PRECOMPILE_ADDRESS,
 };
-#[cfg(not(feature = "faucet"))]
-use tn_reth::mintCall;
 use tn_types::{
     test_genesis, Address, BlsSignature, Bytes, Certificate, CommittedSubDag, ConsensusHeader,
     ConsensusOutput, GenesisAccount, ReputationScores, SealedHeader, SignatureVerificationState,
@@ -140,8 +140,8 @@ impl PipelineTestEnv {
     /// - `governance_safe_balance`: native balance of GOVERNANCE_SAFE_ADDRESS (forwarder)
     /// - `governance_eoa_balance`: native balance of governance factory EOA
     /// - `user_balance`: native balance of user factory EOA
-    /// - `_recipient_balance`: native balance of recipient factory EOA (only used under
-    ///   `feature = "faucet"`)
+    /// - `_recipient_balance`: native balance of recipient factory EOA (only used under `feature =
+    ///   "faucet"`)
     pub(crate) fn new_with_custom_state(
         total_supply: U256,
         precompile_balance: U256,

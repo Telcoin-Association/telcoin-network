@@ -6,15 +6,16 @@
 
 use alloy::sol_types::SolCall;
 use proptest::prelude::*;
+use reth_revm::primitives::{address, Address};
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
 use tn_reth::{
     burnCall, claimCall, grantMintRoleCall, hasMintRoleCall, mintCall, revokeMintRoleCall,
     test_utils::precompile_test_utils::{
         assert_not_success, assert_success, decode_u256, TestEnv, GENESIS_SUPPLY,
     },
-    totalSupplyCall, TIMELOCK_DURATION,
+    totalSupplyCall, TELCOIN_PRECOMPILE_ADDRESS, TIMELOCK_DURATION,
 };
-use tn_types::U256;
+use tn_types::{keccak256, Bytes, U256};
 
 // ==============================
 // Mint/Claim/Burn properties
@@ -124,6 +125,102 @@ proptest! {
             burnCall { amount: U256::from(amount) }.abi_encode(),
         );
         assert_not_success(&result);
+    }
+
+    // ==============================
+    // Arithmetic overflow/underflow (unit-layer mirrors of pipeline cases)
+    // ==============================
+
+    /// Claim reverts when `totalSupply + amount` would overflow `U256`.
+    /// Mirrors the pipeline-level `prop_pipeline_claim_total_supply_overflow`.
+    #[test]
+    #[cfg(not(feature = "faucet"))]
+    fn prop_claim_total_supply_overflow(amount in 1u128..1_000_000u128) {
+        let mut env = TestEnv::new();
+        env.set_total_supply(U256::MAX - U256::from(amount) + U256::from(1));
+        let supply_before = env.get_total_supply();
+
+        env.mint(GOVERNANCE_SAFE_ADDRESS, GOVERNANCE_SAFE_ADDRESS, U256::from(amount)).unwrap();
+        env.set_timestamp(1000 + TIMELOCK_DURATION + 1);
+        let result = env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            claimCall { recipient: GOVERNANCE_SAFE_ADDRESS }.abi_encode(),
+        );
+
+        assert_not_success(&result);
+        prop_assert_eq!(
+            env.get_total_supply(),
+            supply_before,
+            "total supply must be unchanged after failed claim"
+        );
+    }
+
+    /// Burn reverts when `totalSupply < amount` (underflow). The precompile balance
+    /// is ample, so the failure must come from the supply check, not the balance check.
+    /// Mirrors the pipeline-level `prop_pipeline_burn_total_supply_underflow`.
+    #[test]
+    fn prop_burn_total_supply_underflow(burn_extra in 1u64..1000u64) {
+        let mut env = TestEnv::new();
+        env.set_total_supply(U256::from(100));
+        let supply_before = env.get_total_supply();
+        let precompile_before = env.get_balance(TELCOIN_PRECOMPILE_ADDRESS);
+
+        let burn_amount = U256::from(100u64 + burn_extra);
+        let result = env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            burnCall { amount: burn_amount }.abi_encode(),
+        );
+
+        assert_not_success(&result);
+        prop_assert_eq!(
+            env.get_total_supply(),
+            supply_before,
+            "total supply must be unchanged after failed burn"
+        );
+        prop_assert_eq!(
+            env.get_balance(TELCOIN_PRECOMPILE_ADDRESS),
+            precompile_before,
+            "precompile balance must be unchanged after failed burn"
+        );
+    }
+
+    /// When the recipient's native balance is near `U256::MAX`, `balance_incr` silently
+    /// no-ops (revm's `incr_balance` uses `checked_add` and ignores overflow). The claim
+    /// tx still succeeds, `totalSupply` still increments — this is a documented
+    /// invariant gap, mirrored from the pipeline test.
+    /// Mirrors the pipeline-level `prop_pipeline_claim_balance_overflow`.
+    #[test]
+    #[cfg(not(feature = "faucet"))]
+    fn prop_claim_balance_overflow(amount in 1u128..1_000_000u128) {
+        let governance_bal = U256::MAX - U256::from(amount) + U256::from(1);
+        let mut env = TestEnv::new_with_balances(
+            governance_bal,
+            U256::from(10).pow(U256::from(18)),
+            U256::from(1000),
+        );
+        let supply_before = env.get_total_supply();
+        let balance_before = env.get_balance(GOVERNANCE_SAFE_ADDRESS);
+
+        env.mint(GOVERNANCE_SAFE_ADDRESS, GOVERNANCE_SAFE_ADDRESS, U256::from(amount)).unwrap();
+        env.set_timestamp(1000 + TIMELOCK_DURATION + 1);
+        let result = env.exec_default(
+            GOVERNANCE_SAFE_ADDRESS,
+            claimCall { recipient: GOVERNANCE_SAFE_ADDRESS }.abi_encode(),
+        );
+
+        assert_success(&result);
+        let balance_after = env.get_balance(GOVERNANCE_SAFE_ADDRESS);
+        let increase = balance_after.saturating_sub(balance_before);
+        prop_assert!(
+            increase < U256::from(amount),
+            "balance must not increase by full amount under overflow: \
+             increased by {increase}, amount was {amount}"
+        );
+        prop_assert_eq!(
+            env.get_total_supply(),
+            supply_before + U256::from(amount),
+            "total supply increments despite balance overflow (documented invariant gap)"
+        );
     }
 }
 
@@ -241,4 +338,78 @@ fn test_removed_selectors_are_rejected() {
     // totalSupply (0x18160ddd) still succeeds.
     let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, totalSupplyCall {}.abi_encode());
     assert!(decode_u256(&result) > U256::ZERO);
+}
+
+// ==============================
+// `DELEGATECALL` storage-target regression
+// ==============================
+
+/// Address used to host the `DELEGATECALL` relay contract in
+/// [`test_delegatecall_writes_target_precompile_storage`].
+const RELAY_ADDR: Address = address!("dddd0000000000000000000000000000000000d1");
+
+/// Hand-assembled minimal runtime bytecode for a `DELEGATECALL` relay.
+///
+/// Forwards calldata to `0x7e1` via `DELEGATECALL` and returns whatever the
+/// precompile returned. Used to verify revm's storage-target semantics.
+///
+/// Disassembly:
+/// ```text
+///   CALLDATASIZE; PUSH1 0; PUSH1 0; CALLDATACOPY     // mem[0..csize] = calldata
+///   PUSH1 0; PUSH1 0; CALLDATASIZE; PUSH1 0;          // retSize, retOffset, argsSize, argsOffset
+///   PUSH2 0x07e1; GAS; DELEGATECALL; POP              // delegatecall to TEL precompile
+///   RETURNDATASIZE; PUSH1 0; PUSH1 0; RETURNDATACOPY  // mem[0..rsize] = returndata
+///   RETURNDATASIZE; PUSH1 0; RETURN                   // return mem[0..rsize]
+/// ```
+const RELAY_BYTECODE: &[u8] = &[
+    0x36, 0x60, 0x00, 0x60, 0x00, 0x37, // CALLDATACOPY(0, 0, CALLDATASIZE)
+    0x60, 0x00, 0x60, 0x00, 0x36, 0x60, 0x00, 0x61, 0x07, 0xe1, 0x5a, 0xf4,
+    0x50, // DELEGATECALL
+    0x3d, 0x60, 0x00, 0x60, 0x00, 0x3e, // RETURNDATACOPY(0, 0, RETURNDATASIZE)
+    0x3d, 0x60, 0x00, 0xf3, // RETURN(0, RETURNDATASIZE)
+];
+
+/// Lock in revm's `DELEGATECALL`-into-precompile semantics: every `SSTORE` the
+/// precompile performs targets the literal `TELCOIN_PRECOMPILE_ADDRESS` it passes
+/// to `EvmInternals::sstore`, **not** the calling contract's storage.
+///
+/// A future revm upgrade that quietly changed this would silently invalidate the
+/// security rationale documented in `README.md`. This test fails in CI if that
+/// happens.
+///
+/// Test plan (mainnet feature only — exercises `mint` which writes the pending
+/// amount slot under `keccak256(governance, 0)`):
+/// 1. Deploy a relay contract that `DELEGATECALL`s `0x7e1` with the inbound calldata.
+/// 2. Send `mint(1234)` from `GOVERNANCE_SAFE_ADDRESS` to the relay. Because `msg.sender` is
+///    preserved across `DELEGATECALL`, the precompile's governance check passes inside the relay
+///    frame.
+/// 3. Assert the pending-mint slot under `TELCOIN_PRECOMPILE_ADDRESS` holds `1234`.
+/// 4. Assert the same slot under `RELAY_ADDR` is **untouched** (zero) — the `SSTORE` did not bleed
+///    into the caller's storage.
+#[test]
+#[cfg(not(feature = "faucet"))]
+fn test_delegatecall_writes_target_precompile_storage() {
+    let mut env = TestEnv::new();
+    env.deploy_code(RELAY_ADDR, Bytes::from_static(RELAY_BYTECODE));
+
+    let amount = U256::from(1234);
+    let calldata = mintCall { amount }.abi_encode();
+    let result = env.exec_to(GOVERNANCE_SAFE_ADDRESS, RELAY_ADDR, calldata, 200_000);
+    assert_success(&result);
+
+    // Pending-mint amount slot for governance: keccak256(abi.encode(GOVERNANCE_SAFE_ADDRESS, 0)).
+    let mut buf = [0u8; 64];
+    buf[12..32].copy_from_slice(GOVERNANCE_SAFE_ADDRESS.as_slice());
+    let pending_slot = U256::from_be_bytes(keccak256(buf).0);
+
+    assert_eq!(
+        env.get_storage(TELCOIN_PRECOMPILE_ADDRESS, pending_slot),
+        amount,
+        "SSTORE under DELEGATECALL must land in the precompile's storage"
+    );
+    assert_eq!(
+        env.get_storage(RELAY_ADDR, pending_slot),
+        U256::ZERO,
+        "caller's storage must NOT be written by precompile under DELEGATECALL"
+    );
 }

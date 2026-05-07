@@ -7,6 +7,7 @@ use super::*;
 use crate::evm::context::{TNEvmContext, TelcoinEvm};
 use alloy_evm::precompiles::PrecompilesMap;
 use reth_revm::{
+    bytecode::Bytecode,
     context::{
         result::{EVMError, ExecutionResult, InvalidTransaction},
         BlockEnv, Context, ContextSetters, Evm, FrameStack, TxEnv,
@@ -55,11 +56,6 @@ pub const RECIPIENT: Address = address!("222222200000000000000000000000000000000
 ///
 /// The test harness seeds `TOTAL_SUPPLY_SLOT` with `GENESIS_SUPPLY * 10^18` wei.
 pub const GENESIS_SUPPLY: u128 = 100_000_000_000; // 100B
-
-/// Telcoin chain ID forwarded to [`add_telcoin_precompile`] in tests.
-///
-/// Matches the adiri testnet chain ID (2017) used throughout the codebase.
-pub const TEST_CHAIN_ID: u64 = 2017;
 
 // --- Test environment ---
 
@@ -144,7 +140,7 @@ impl TestEnv {
         let context = Context::mainnet().with_db(db).with_block(block);
 
         let mut precompiles = PrecompilesMap::from(EthPrecompiles::default());
-        add_telcoin_precompile(&mut precompiles, TEST_CHAIN_ID);
+        add_telcoin_precompile(&mut precompiles);
 
         let evm = Evm {
             ctx: context,
@@ -171,16 +167,62 @@ impl TestEnv {
         );
     }
 
+    /// Deploy raw EVM bytecode at `addr`.
+    ///
+    /// The account is created with zero balance, nonce 1 (so it looks deployed), and a
+    /// recomputed `code_hash`. Subsequent `CALL`s targeting `addr` execute `code` instead
+    /// of being treated as a non-existent account.
+    pub fn deploy_code(&mut self, addr: Address, code: Bytes) {
+        let bytecode = Bytecode::new_raw(code);
+        let code_hash = bytecode.hash_slow();
+        self.evm.ctx.journaled_state.database.insert_account_info(
+            addr,
+            AccountInfo {
+                balance: U256::ZERO,
+                nonce: 1,
+                code_hash,
+                code: Some(bytecode),
+                ..Default::default()
+            },
+        );
+    }
+
+    /// Override the precompile's `totalSupply` storage slot.
+    ///
+    /// Useful for testing checked-arithmetic boundaries (overflow/underflow).
+    pub fn set_total_supply(&mut self, amount: U256) {
+        self.evm
+            .ctx
+            .journaled_state
+            .database
+            .insert_account_storage(TELCOIN_PRECOMPILE_ADDRESS, U256::from(100), amount)
+            .unwrap();
+    }
+
     /// Execute a precompile call with the given gas limit.
     ///
     /// Automatically increments the caller's nonce. The call targets
     /// [`TELCOIN_PRECOMPILE_ADDRESS`].
     pub fn exec(&mut self, caller: Address, calldata: Vec<u8>, gas_limit: u64) -> TestResult {
+        self.exec_to(caller, TELCOIN_PRECOMPILE_ADDRESS, calldata, gas_limit)
+    }
+
+    /// Execute a transaction targeting `target` with the given gas limit.
+    ///
+    /// Automatically increments the caller's nonce. Useful for routing through a
+    /// deployed contract (e.g. a `DELEGATECALL` relay) before reaching the precompile.
+    pub fn exec_to(
+        &mut self,
+        caller: Address,
+        target: Address,
+        calldata: Vec<u8>,
+        gas_limit: u64,
+    ) -> TestResult {
         let nonce = self.nonces.entry(caller).or_insert(0);
         self.evm.ctx.set_tx(
             TxEnv::builder()
                 .caller(caller)
-                .kind(TxKind::Call(TELCOIN_PRECOMPILE_ADDRESS))
+                .kind(TxKind::Call(target))
                 .data(calldata.into())
                 .gas_limit(gas_limit)
                 .nonce(*nonce)
@@ -239,18 +281,21 @@ impl TestEnv {
     ///
     /// Prefers the in-memory journal state; falls back to the database.
     pub fn get_total_supply(&mut self) -> U256 {
-        let slot = U256::from(100);
-        if let Some(acc) = self.evm.ctx.journaled_state.state.get(&TELCOIN_PRECOMPILE_ADDRESS) {
+        self.get_storage(TELCOIN_PRECOMPILE_ADDRESS, U256::from(100))
+    }
+
+    /// Read a storage slot from `addr`.
+    ///
+    /// Prefers the in-memory journal state (which holds uncommitted modifications from
+    /// previously executed test transactions); falls back to the database. Returns
+    /// `U256::ZERO` if the slot was never written and the database has no entry.
+    pub fn get_storage(&mut self, addr: Address, slot: U256) -> U256 {
+        if let Some(acc) = self.evm.ctx.journaled_state.state.get(&addr) {
             if let Some(cell) = acc.storage.get(&slot) {
                 return cell.present_value;
             }
         }
-        self.evm
-            .ctx
-            .journaled_state
-            .database
-            .storage(TELCOIN_PRECOMPILE_ADDRESS, slot)
-            .unwrap()
+        self.evm.ctx.journaled_state.database.storage(addr, slot).unwrap_or(U256::ZERO)
     }
 
     /// Override the block timestamp for subsequent calls. Useful for testing timelocks.

@@ -91,11 +91,7 @@ pub const TELCOIN_PRECOMPILE_ADDRESS: Address =
 const TOTAL_SUPPLY_SLOT: U256 = U256::from_limbs([100, 0, 0, 0]);
 
 /// Registers the Telcoin precompile at [`TELCOIN_PRECOMPILE_ADDRESS`] in the given map.
-///
-/// `chain_id` is reserved for future use (e.g. domain-bound features); it is currently
-/// unused by the dispatcher but kept on the registration signature for forward compatibility.
-pub fn add_telcoin_precompile(map: &mut PrecompilesMap, chain_id: u64) {
-    let _ = chain_id;
+pub fn add_telcoin_precompile(map: &mut PrecompilesMap) {
     map.apply_precompile(&TELCOIN_PRECOMPILE_ADDRESS, move |_| {
         Some(DynPrecompile::new_stateful(PrecompileId::Custom("telcoin".into()), move |input| {
             telcoin_precompile(input)
