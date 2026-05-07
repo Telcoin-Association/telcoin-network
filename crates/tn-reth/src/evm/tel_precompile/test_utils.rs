@@ -5,7 +5,6 @@
 
 use super::*;
 use crate::evm::context::{TNEvmContext, TelcoinEvm};
-use alloy::sol_types::SolCall;
 use alloy_evm::precompiles::PrecompilesMap;
 use reth_revm::{
     context::{
@@ -17,11 +16,11 @@ use reth_revm::{
     inspector::NoOpInspector,
     primitives::{address, Address, KECCAK_EMPTY},
     state::AccountInfo,
-    MainContext,
+    Database, MainContext,
 };
 use std::collections::HashMap;
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
-use tn_types::{Bytes, TxKind, B256, U256};
+use tn_types::{Bytes, TxKind, U256};
 
 // --- Type aliases ---
 
@@ -57,58 +56,10 @@ pub const RECIPIENT: Address = address!("222222200000000000000000000000000000000
 /// The test harness seeds `TOTAL_SUPPLY_SLOT` with `GENESIS_SUPPLY * 10^18` wei.
 pub const GENESIS_SUPPLY: u128 = 100_000_000_000; // 100B
 
-// --- EIP-2612 permit test utilities ---
-
-/// Telcoin chain ID used for test EIP-712 domain construction.
+/// Telcoin chain ID forwarded to [`add_telcoin_precompile`] in tests.
 ///
 /// Matches the adiri testnet chain ID (2017) used throughout the codebase.
 pub const TEST_CHAIN_ID: u64 = 2017;
-
-/// Fixed secp256k1 private key (`0x01`) used for EIP-2612 permit signing in tests.
-///
-/// The corresponding address is derived by [`permit_signer_address`]. This key is
-/// deterministic so that test signatures are reproducible.
-pub const PERMIT_SECRET: B256 = B256::new([
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-]);
-
-/// Derive the Ethereum address corresponding to [`PERMIT_SECRET`].
-pub fn permit_signer_address() -> Address {
-    use alloy::signers::local::PrivateKeySigner;
-    let signer = PrivateKeySigner::from_slice(&PERMIT_SECRET.0).unwrap();
-    signer.address()
-}
-
-/// Produce an EIP-2612 permit signature using [`PERMIT_SECRET`].
-///
-/// Computes the EIP-712 signing hash via alloy's `SolStruct` derive and signs the resulting
-/// digest. Returns `(v, r, s)` suitable for passing to the `permit` precompile function.
-pub fn sign_permit(
-    owner: Address,
-    spender: Address,
-    value: U256,
-    nonce: U256,
-    deadline: U256,
-    chain_id: u64,
-) -> (u8, B256, B256) {
-    use super::eip2612::{tel_eip712_domain, Permit};
-    use alloy::{
-        signers::{local::PrivateKeySigner, SignerSync},
-        sol_types::SolStruct,
-    };
-
-    let signer = PrivateKeySigner::from_slice(&PERMIT_SECRET.0).unwrap();
-
-    let domain = tel_eip712_domain(chain_id);
-    let permit = Permit { owner, spender, value, nonce, deadline };
-    let digest = permit.eip712_signing_hash(&domain);
-
-    let sig = signer.sign_hash_sync(&digest).unwrap();
-    let v = if sig.v() { 28u8 } else { 27u8 };
-    let r = B256::from(sig.r().to_be_bytes::<32>());
-    let s = B256::from(sig.s().to_be_bytes::<32>());
-    (v, r, s)
-}
 
 // --- Test environment ---
 
@@ -123,7 +74,6 @@ pub fn sign_permit(
 /// [`TestEnv::new`] creates accounts with 1 ETH (10^18 wei) each:
 /// - [`GOVERNANCE_SAFE_ADDRESS`] — governance caller
 /// - [`USER`] — unprivileged caller
-/// - [`permit_signer_address()`] — EIP-2612 permit signer
 ///
 /// The precompile account at [`TELCOIN_PRECOMPILE_ADDRESS`] is funded with 1000 wei and
 /// seeded with [`GENESIS_SUPPLY`] in `totalSupply`.
@@ -136,19 +86,17 @@ pub struct TestEnv {
 }
 
 impl TestEnv {
-    /// Create a test environment with default balances and a funded permit signer.
+    /// Create a test environment with default balances.
     pub fn new() -> Self {
-        let mut env = Self::new_with_balances(
+        Self::new_with_balances(
             U256::from(10).pow(U256::from(18)),
             U256::from(10).pow(U256::from(18)),
             U256::from(1000),
-        );
-        env.add_account(permit_signer_address(), U256::from(10).pow(U256::from(18)));
-        env
+        )
     }
 
     /// Create a test environment with explicit initial balances for governance, user, and
-    /// precompile accounts. Does **not** fund the permit signer — use [`Self::new`] for that.
+    /// precompile accounts.
     pub fn new_with_balances(governance_bal: U256, user_bal: U256, precompile_bal: U256) -> Self {
         let mut db = InMemoryDB::default();
 
@@ -257,36 +205,52 @@ impl TestEnv {
     pub fn mint(&mut self, caller: Address, recipient: Address, amount: U256) -> TestResult {
         let _ = recipient; // unused in mainnet mode; suppress warning in faucet mode via cfg
         #[cfg(not(feature = "faucet"))]
-        let data = super::burnable::mintCall { amount }.abi_encode();
+        let data = {
+            use alloy::sol_types::SolCall;
+            super::burnable::mintCall { amount }.abi_encode()
+        };
         #[cfg(feature = "faucet")]
-        let data = super::faucet::mintCall { recipient, amount }.abi_encode();
+        let data = {
+            use alloy::sol_types::SolCall;
+            super::faucet::mintCall { recipient, amount }.abi_encode()
+        };
         self.exec_default(caller, data)
     }
 
-    /// Query `balanceOf(account)` via the precompile and decode the result.
+    /// Read the native account balance of `account`.
+    ///
+    /// Prefers the in-memory journal state (which holds uncommitted modifications from
+    /// previously executed test transactions); falls back to the database.
     pub fn get_balance(&mut self, account: Address) -> U256 {
-        let result =
-            self.exec_default(GOVERNANCE_SAFE_ADDRESS, balanceOfCall { account }.abi_encode());
-        decode_u256(&result)
+        if let Some(acc) = self.evm.ctx.journaled_state.state.get(&account) {
+            return acc.info.balance;
+        }
+        self.evm
+            .ctx
+            .journaled_state
+            .database
+            .basic(account)
+            .unwrap()
+            .map(|info| info.balance)
+            .unwrap_or(U256::ZERO)
     }
 
-    /// Query `totalSupply()` via the precompile and decode the result.
+    /// Read the precompile's `totalSupply` slot.
+    ///
+    /// Prefers the in-memory journal state; falls back to the database.
     pub fn get_total_supply(&mut self) -> U256 {
-        let result = self.exec_default(GOVERNANCE_SAFE_ADDRESS, totalSupplyCall {}.abi_encode());
-        decode_u256(&result)
-    }
-
-    /// Query `allowance(owner, spender)` via the precompile and decode the result.
-    pub fn get_allowance(&mut self, owner: Address, spender: Address) -> U256 {
-        let result = self
-            .exec_default(GOVERNANCE_SAFE_ADDRESS, allowanceCall { owner, spender }.abi_encode());
-        decode_u256(&result)
-    }
-
-    /// Query `nonces(owner)` via the precompile and decode the result.
-    pub fn get_nonce(&mut self, owner: Address) -> U256 {
-        let result = self.exec_default(GOVERNANCE_SAFE_ADDRESS, noncesCall { owner }.abi_encode());
-        decode_u256(&result)
+        let slot = U256::from(100);
+        if let Some(acc) = self.evm.ctx.journaled_state.state.get(&TELCOIN_PRECOMPILE_ADDRESS) {
+            if let Some(cell) = acc.storage.get(&slot) {
+                return cell.present_value;
+            }
+        }
+        self.evm
+            .ctx
+            .journaled_state
+            .database
+            .storage(TELCOIN_PRECOMPILE_ADDRESS, slot)
+            .unwrap()
     }
 
     /// Override the block timestamp for subsequent calls. Useful for testing timelocks.
