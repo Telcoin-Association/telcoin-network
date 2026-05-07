@@ -358,6 +358,11 @@ impl<DB: Database> Consensus<DB> {
         loop {
             tokio::select! {
                 _ = &self.rx_shutdown => {
+                    if let Some(pack) = self.certificate_pack {
+                        if let Err(e) = pack.shutdown().await {
+                            error!(target: "epoch-manager", ?e, "error shutting down certificate pack");
+                        }
+                    }
                     return Ok(())
                 }
 
@@ -385,6 +390,10 @@ impl<DB: Database> Consensus<DB> {
         if let Some(certificate_pack) = &self.certificate_pack {
             if let Err(e) = certificate_pack.save(certificate.clone()).await {
                 tracing::error!(target: "telcoin::consensus_state", ?e, "Failed to save certificate to cert pack file");
+                // The certificate pack is in a failed state so stop using it.
+                // This is not a critical path so not stopping but if the DB gets in a failed
+                // state the node is probably not long for world...
+                self.certificate_pack = None;
             }
         }
         // Process the certificate using the selected consensus protocol.

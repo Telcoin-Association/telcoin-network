@@ -27,6 +27,7 @@ enum PackMessage {
     Contains(HeaderDigest, oneshot::Sender<bool>),
     Persist(oneshot::Sender<Result<(), PackError>>),
     Shutdown,
+    ShutdownAsync(oneshot::Sender<Result<(), PackError>>),
 }
 
 /// Manages a pack file of [`Certificate`] data, indexed by certificate digest.
@@ -69,6 +70,10 @@ fn run_pack_loop(
                 let _ = inner.persist();
                 break;
             }
+            PackMessage::ShutdownAsync(tx) => {
+                let _ = tx.send(inner.persist());
+                break;
+            }
         }
     }
 }
@@ -78,7 +83,13 @@ impl Drop for CertificatePack {
         if Arc::strong_count(&self.handle) == 1 {
             if let Some(handle) = self.handle.lock().take() {
                 if self.tx.try_send(PackMessage::Shutdown).is_ok() {
-                    if let Err(e) = handle.join() {
+                    let join_result = if tokio::runtime::Handle::try_current().is_ok() {
+                        // Don't block tokio if in a runtime.
+                        tokio::task::block_in_place(|| handle.join())
+                    } else {
+                        handle.join()
+                    };
+                    if let Err(e) = join_result {
                         error!(target: "certificate_pack", ?e, "Failed to join certificate pack thread");
                     }
                 }
@@ -89,7 +100,7 @@ impl Drop for CertificatePack {
 
 impl CertificatePack {
     /// Open (or create) a certificate pack at `path` for reading and writing.
-    pub fn open<P: AsRef<Path>>(path: P, epoch: Epoch) -> Result<Self, PackError> {
+    pub fn open<P: AsRef<Path>>(path: P, epoch: Epoch) -> Self {
         let (tx, rx) = mpsc::channel(1000);
         let path = path.as_ref().join(format!("epoch-{epoch}"));
         let (tx_error, error) = watch::channel(None);
@@ -100,7 +111,7 @@ impl CertificatePack {
                 clear_pack_loop(rx);
             }
         });
-        Ok(Self { tx, handle: Arc::new(Mutex::new(Some(handle))), error })
+        Self { tx, handle: Arc::new(Mutex::new(Some(handle))), error }
     }
 
     /// Open an existing certificate pack at `path` in read-only mode.
@@ -166,6 +177,34 @@ impl CertificatePack {
             Some(e) => e.clone(),
             None => PackError::ReceiveFailed,
         })?
+    }
+
+    /// Consume and shutdown the pack if this is the last instance (if not the last instance then is
+    /// no-op). This is safer than relying on Drop.
+    pub async fn shutdown(self) -> Result<(), PackError> {
+        if Arc::strong_count(&self.handle) == 1 {
+            let handle = self.handle.lock().take();
+            if let Some(handle) = handle {
+                let (tx, rx) = oneshot::channel();
+                let _ = self.tx.send(PackMessage::ShutdownAsync(tx)).await;
+                rx.await.map_err(|_| PackError::ReceiveFailed)??;
+                // The thread should be over or ending after the ShutdownAsync but don't block tokio
+                // just in case.
+                let join_result = tokio::task::spawn_blocking(|| handle.join()).await;
+                match join_result {
+                    Err(e) => {
+                        error!(target: "certificate_pack", ?e, "Failed to join certificate pack thread (tokio");
+                        return Err(PackError::JoinFailed);
+                    }
+                    Ok(Err(e)) => {
+                        error!(target: "certificate_pack", ?e, "Failed to join certificate pack thread");
+                        return Err(PackError::JoinFailed);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -271,6 +310,7 @@ pub enum PackError {
     ReceiveFailed,
     PersistError(String),
     CorruptPack,
+    JoinFailed,
 }
 
 impl Error for PackError {}
@@ -287,6 +327,7 @@ impl Display for PackError {
             PackError::ReceiveFailed => write!(f, "Internal channel receive failed"),
             PackError::PersistError(e) => write!(f, "Failed to persist: {e}"),
             PackError::CorruptPack => write!(f, "Pack file is corrupt"),
+            PackError::JoinFailed => write!(f, "Pack file thread failed to join"),
         }
     }
 }
@@ -326,12 +367,12 @@ mod test {
         cert
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_certificate_pack_basic() {
         let temp_dir = TempDir::with_prefix("test_certificate_pack").expect("temp dir");
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
 
-        let pack = CertificatePack::open(temp_dir.path(), 0).expect("open pack");
+        let pack = CertificatePack::open(temp_dir.path(), 0);
 
         let num_certs = 100;
         let mut certs = Vec::new();
@@ -354,10 +395,10 @@ mod test {
         assert!(!pack.contains(HeaderDigest::default()).await);
         assert!(pack.get(HeaderDigest::default()).await.is_none());
 
-        drop(pack);
+        pack.shutdown().await.unwrap();
 
         // Reopen and verify certs are still there.
-        let pack = CertificatePack::open(temp_dir.path(), 0).expect("reopen pack");
+        let pack = CertificatePack::open(temp_dir.path(), 0);
         for cert in &certs {
             assert!(pack.contains(cert.digest()).await, "should still contain cert after reopen");
         }

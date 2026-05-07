@@ -184,7 +184,7 @@ fn run_pack_loop(
 impl Drop for ConsensusPack {
     fn drop(&mut self) {
         if Arc::strong_count(&self.handle) == 1 {
-            // If we are the last ConsensusPack then shutdown thread and wait for it persist and
+            // If we are the last ConsensusPack then shutdown thread and wait for it to persist and
             // exit.
             if let Some(handle) = self.handle.lock().take() {
                 if self.tx.try_send(PackMessage::Shutdown).is_ok() {

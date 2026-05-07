@@ -182,7 +182,7 @@ where
 
         gas_accumulator.rewards_counter().set_committee(primary.current_committee().await);
         let certificate_pack = if consensus_bus.is_active_cvv() {
-            Some(CertificatePack::open(self.tn_datadir.epochs_db_path(), current_epoch)?)
+            Some(CertificatePack::open(self.tn_datadir.epochs_db_path(), current_epoch))
         } else {
             None
         };
