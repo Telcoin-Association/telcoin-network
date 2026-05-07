@@ -7,24 +7,21 @@ use super::pipeline_helpers::*;
 use alloy::sol_types::SolCall;
 use proptest::prelude::*;
 use secp256k1::rand::{rngs::StdRng, SeedableRng as _};
-use tn_reth::{
-    grantMintRoleCall, mintCall, revokeMintRoleCall, test_utils::TransactionFactory, transferCall,
-};
+use tn_reth::{grantMintRoleCall, mintCall, revokeMintRoleCall, test_utils::TransactionFactory};
 use tn_types::U256;
 
-/// Setup: fund the faucet address by transferring from user, then grant mint role.
+/// Setup: fund the faucet address with a native value transfer, then grant mint role.
 /// Returns the faucet factory.
 fn setup_faucet(env: &mut PipelineTestEnv) -> TransactionFactory {
     let faucet_factory = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(400));
     let faucet_addr = faucet_factory.address();
 
-    // Block 1: user transfers gas money to faucet
-    let fund_tx = env.user_precompile_tx(
-        transferCall {
-            to: faucet_addr,
-            amount: U256::from(10).pow(U256::from(18)) * U256::from(1_000u64),
-        }
-        .abi_encode(),
+    // Block 1: user sends a native value transfer for gas money
+    let fund_tx = PipelineTestEnv::native_transfer_tx(
+        &mut env.user_factory,
+        &env.chain,
+        faucet_addr,
+        U256::from(10).pow(U256::from(18)) * U256::from(1_000u64),
     );
     let block = env.execute_block(vec![fund_tx]).expect("fund faucet");
     assert!(env.tx_succeeded(&block, 0), "fund faucet tx should succeed");

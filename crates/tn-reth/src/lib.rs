@@ -166,10 +166,8 @@ pub mod worker;
 #[cfg(not(feature = "faucet"))]
 pub use evm::TIMELOCK_DURATION;
 pub use evm::{
-    add_telcoin_precompile, allowanceCall, approveCall, balanceOfCall, burnCall,
-    calculate_gas_penalty, claimCall, decimalsCall, grantMintRoleCall, hasMintRoleCall, mintCall,
-    nameCall, noncesCall, permitCall, revokeMintRoleCall, symbolCall, totalSupplyCall,
-    transferCall, transferFromCall, DOMAIN_SEPARATORCall, TELCOIN_PRECOMPILE_ADDRESS,
+    add_telcoin_precompile, burnCall, calculate_gas_penalty, claimCall, grantMintRoleCall,
+    hasMintRoleCall, mintCall, revokeMintRoleCall, totalSupplyCall, TELCOIN_PRECOMPILE_ADDRESS,
 };
 
 #[cfg(any(feature = "test-utils", test))]

@@ -4,7 +4,7 @@
 //! this module exercises the full TN execution pipeline: transaction signing, EIP-2718 encoding,
 //! signature recovery, block building, state persistence, and finalization.
 
-use alloy::{signers::local::PrivateKeySigner, sol_types::SolCall};
+use alloy::sol_types::SolCall;
 use reth_revm::context::result::{ExecutionResult, Output};
 use secp256k1::rand::{rngs::StdRng, SeedableRng as _};
 use std::{
@@ -13,8 +13,9 @@ use std::{
 };
 use tempfile::TempDir;
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
+#[cfg(not(feature = "faucet"))]
+use tn_reth::mintCall;
 use tn_reth::{
-    allowanceCall, balanceOfCall, mintCall, noncesCall,
     payload::TNPayload,
     test_utils::{precompile_test_utils::GENESIS_SUPPLY, TransactionFactory},
     totalSupplyCall, ExecutedBlock, NewCanonicalChain, RethChainSpec, RethEnv,
@@ -100,6 +101,7 @@ pub(crate) struct PipelineTestEnv {
     /// Regular user EOA.
     pub(crate) user_factory: TransactionFactory,
     /// Transfer recipient EOA.
+    #[cfg(feature = "faucet")]
     pub(crate) recipient_factory: TransactionFactory,
     /// Current canonical header (updated after each block).
     pub(crate) canonical_header: SealedHeader,
@@ -138,14 +140,15 @@ impl PipelineTestEnv {
     /// - `governance_safe_balance`: native balance of GOVERNANCE_SAFE_ADDRESS (forwarder)
     /// - `governance_eoa_balance`: native balance of governance factory EOA
     /// - `user_balance`: native balance of user factory EOA
-    /// - `recipient_balance`: native balance of recipient factory EOA
+    /// - `_recipient_balance`: native balance of recipient factory EOA (only used under `feature =
+    ///   "faucet"`)
     pub(crate) fn new_with_custom_state(
         total_supply: U256,
         precompile_balance: U256,
         governance_safe_balance: U256,
         governance_eoa_balance: U256,
         user_balance: U256,
-        recipient_balance: U256,
+        _recipient_balance: U256,
     ) -> Self {
         let db_permit = DbPermit::acquire();
 
@@ -153,34 +156,19 @@ impl PipelineTestEnv {
             TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(100));
         let mut user_factory =
             TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(200));
+        #[cfg(feature = "faucet")]
         let mut recipient_factory =
             TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(300));
 
-        let large_balance = U256::from(10).pow(U256::from(18)) * U256::from(1_000_000_000u64);
-
-        // Permit signer address (from known private key 0x01)
-        let permit_signer_addr = {
-            let secret = tn_types::B256::new([
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 1,
-            ]);
-            PrivateKeySigner::from_slice(&secret.0).unwrap().address()
-        };
-
         // Build genesis with funded accounts + governance forwarder + precompile storage
-        let genesis = test_genesis().extend_accounts(vec![
-            // Fund all 3 factory EOAs
+        #[allow(unused_mut)]
+        let mut accounts: Vec<(Address, GenesisAccount)> = vec![
+            // Fund factory EOAs
             (
                 governance_factory.address(),
                 GenesisAccount::default().with_balance(governance_eoa_balance),
             ),
             (user_factory.address(), GenesisAccount::default().with_balance(user_balance)),
-            (
-                recipient_factory.address(),
-                GenesisAccount::default().with_balance(recipient_balance),
-            ),
-            // Fund the permit signer
-            (permit_signer_addr, GenesisAccount::default().with_balance(large_balance)),
             // Deploy forwarder contract at GOVERNANCE_SAFE_ADDRESS
             (
                 GOVERNANCE_SAFE_ADDRESS,
@@ -201,7 +189,13 @@ impl PipelineTestEnv {
                     storage
                 })),
             ),
-        ]);
+        ];
+        #[cfg(feature = "faucet")]
+        accounts.push((
+            recipient_factory.address(),
+            GenesisAccount::default().with_balance(_recipient_balance),
+        ));
+        let genesis = test_genesis().extend_accounts(accounts);
 
         let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
         let tmp_dir = TempDir::new().expect("create temp dir");
@@ -219,6 +213,7 @@ impl PipelineTestEnv {
         // Reset nonces since these are fresh accounts
         governance_factory.set_nonce(0);
         user_factory.set_nonce(0);
+        #[cfg(feature = "faucet")]
         recipient_factory.set_nonce(0);
 
         let block_timestamp = canonical_header.timestamp + 1;
@@ -228,6 +223,7 @@ impl PipelineTestEnv {
             chain,
             governance_factory,
             user_factory,
+            #[cfg(feature = "faucet")]
             recipient_factory,
             canonical_header,
             block_timestamp,
@@ -311,26 +307,14 @@ impl PipelineTestEnv {
     }
 
     /// Create an encoded governance mint tx targeting the forwarder.
-    ///
-    /// In production mode, `recipient` is unused (mint always targets governance).
-    /// In faucet mode, `recipient` is the mint target.
-    #[allow(unused_variables)]
-    pub(crate) fn governance_mint_tx(&mut self, recipient: Address, amount: U256) -> Vec<u8> {
-        #[cfg(not(feature = "faucet"))]
-        let data = mintCall { amount }.abi_encode();
-        #[cfg(feature = "faucet")]
-        let data = mintCall { recipient, amount }.abi_encode();
-        self.governance_tx(data)
+    #[cfg(not(feature = "faucet"))]
+    pub(crate) fn governance_mint_tx(&mut self, amount: U256) -> Vec<u8> {
+        self.governance_tx(mintCall { amount }.abi_encode())
     }
 
     /// Create an encoded user tx targeting the precompile.
     pub(crate) fn user_precompile_tx(&mut self, calldata: Vec<u8>) -> Vec<u8> {
         Self::precompile_tx(&mut self.user_factory, &self.chain, calldata)
-    }
-
-    /// Create an encoded recipient tx targeting the precompile.
-    pub(crate) fn recipient_precompile_tx(&mut self, calldata: Vec<u8>) -> Vec<u8> {
-        Self::precompile_tx(&mut self.recipient_factory, &self.chain, calldata)
     }
 
     /// Get the native TEL balance of an address via `retrieve_account`.
@@ -346,29 +330,6 @@ impl PipelineTestEnv {
     pub(crate) fn get_total_supply(&self) -> U256 {
         let calldata = totalSupplyCall {}.abi_encode();
         self.read_precompile_u256(calldata)
-    }
-
-    /// Read allowance(owner, spender) from the precompile via system call.
-    pub(crate) fn get_allowance(&self, owner: Address, spender: Address) -> U256 {
-        let calldata = allowanceCall { owner, spender }.abi_encode();
-        self.read_precompile_u256(calldata)
-    }
-
-    /// Read balanceOf(account) from the precompile via system call.
-    pub(crate) fn get_precompile_balance(&self, account: Address) -> U256 {
-        let calldata = balanceOfCall { account }.abi_encode();
-        self.read_precompile_u256(calldata)
-    }
-
-    /// Read nonces(owner) from the precompile.
-    pub(crate) fn get_nonce(&self, owner: Address) -> U256 {
-        let calldata = noncesCall { owner }.abi_encode();
-        self.read_precompile_u256(calldata)
-    }
-
-    /// Return the chain ID from the chain spec.
-    pub(crate) fn chain_id(&self) -> u64 {
-        self.chain.chain().id()
     }
 
     /// Execute a read-only system call to the precompile and decode a U256 result.
@@ -397,6 +358,7 @@ impl PipelineTestEnv {
     }
 
     /// Create an encoded EIP-1559 native value transfer (no calldata).
+    #[cfg(feature = "faucet")]
     pub(crate) fn native_transfer_tx(
         factory: &mut TransactionFactory,
         chain: &Arc<RethChainSpec>,
@@ -411,16 +373,6 @@ impl PipelineTestEnv {
             amount,
             Bytes::new(),
         )
-    }
-}
-
-/// Extract the gas used by a single transaction within a block.
-pub(crate) fn tx_gas_used(block: &ExecutedBlock, tx_index: usize) -> u64 {
-    let cumulative = block.execution_output.result.receipts[tx_index].cumulative_gas_used;
-    if tx_index == 0 {
-        cumulative
-    } else {
-        cumulative - block.execution_output.result.receipts[tx_index - 1].cumulative_gas_used
     }
 }
 

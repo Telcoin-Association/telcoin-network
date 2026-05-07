@@ -1,37 +1,33 @@
-# TEL Precompile — Native ERC-20 at `0x7e1`
+# TEL Precompile — Native token issuance at `0x7e1`
 
-This directory implements a **native ERC-20 precompile** for the Telcoin (TEL) token. Unlike a standard Solidity contract, the precompile operates directly on native account balances — `balanceOf(addr)` returns the same value as `addr.balance`. This makes TEL simultaneously the chain's gas token and its primary ERC-20.
+This directory implements a **native token-issuance precompile** for the Telcoin (TEL) token. The precompile owns the on-chain mint/claim/burn lifecycle and exposes a single read-only view (`totalSupply`). It does **not** expose an ERC-20 transfer/approve/permit surface — those flows live in user-space contracts and rely on native value transfers, which are equivalent to ERC-20 transfers because TEL balances are native account balances.
 
 The precompile is registered as a `DynPrecompile` inside reth's `PrecompilesMap` at address `0x00000000000000000000000000000000000007e1`. Any `CALL` or `STATICCALL` targeting this address is intercepted by the dispatcher in `mod.rs` and routed to the appropriate handler based on the 4-byte function selector.
 
 ## Module map
 
-| File            | Purpose                                                                                                                       |
-| --------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `mod.rs`        | Top-level dispatcher: selector → handler routing, precompile registration                                                     |
-| `erc20.rs`      | Standard ERC-20: `name`, `symbol`, `decimals`, `totalSupply`, `balanceOf`, `transfer`, `approve`, `transferFrom`, `allowance` |
-| `eip2612.rs`    | EIP-2612 `permit` (gasless approvals), `nonces`, `DOMAIN_SEPARATOR`                                                           |
-| `burnable.rs`   | Timelocked `mint`/`claim` lifecycle + `burn` (mainnet)                                                                        |
-| `faucet.rs`     | Instant `mint` with role management (testnet, `faucet` feature)                                                               |
-| `helpers.rs`    | Storage slot derivation + minimal ABI encoders                                                                                |
-| `test_utils.rs` | In-memory EVM test harness (gated behind `#[cfg(test)]` / `test-utils` feature)                                               |
+| File            | Purpose                                                                                       |
+| --------------- | --------------------------------------------------------------------------------------------- |
+| `mod.rs`        | Top-level dispatcher: selector → handler routing, precompile registration                      |
+| `burnable.rs`   | Timelocked `mint`/`claim` lifecycle, `burn`, and the `totalSupply()` view (mainnet)            |
+| `faucet.rs`     | Instant `mint` with role management (testnet, `faucet` feature)                                |
+| `helpers.rs`    | Storage slot derivation + balance manipulation helpers                                         |
+| `test_utils.rs` | In-memory EVM test harness (gated behind `#[cfg(test)]` / `test-utils` feature)                |
 
 ## Storage layout
 
 All precompile-managed state lives under the precompile address (`0x7e1`) using Solidity-compatible mapping layouts:
 
-| Base slot | Type                                              | Description                                                      |
-| --------- | ------------------------------------------------- | ---------------------------------------------------------------- |
-| 0         | `mapping(address => uint256)`                     | Pending mint amounts                                             |
-| 1         | `mapping(address => uint256)`                     | Unlock timestamps (block.timestamp after which `claim` succeeds) |
-| 2         | `mapping(address => mapping(address => uint256))` | ERC-20 allowances                                                |
-| 3         | `mapping(address => bool)`                        | Mint roles (`faucet` feature only)                               |
-| 4         | `mapping(address => uint256)`                     | EIP-2612 permit nonces                                           |
-| 100       | `uint256` (plain slot)                            | Total circulating supply                                         |
+| Base slot | Type                          | Description                                                      |
+| --------- | ----------------------------- | ---------------------------------------------------------------- |
+| 0         | `mapping(address => uint256)` | Pending mint amounts                                             |
+| 1         | `mapping(address => uint256)` | Unlock timestamps (block.timestamp after which `claim` succeeds) |
+| 3         | `mapping(address => bool)`    | Mint roles (`faucet` feature only)                               |
+| 100       | `uint256` (plain slot)        | Total circulating supply                                         |
 
-Slot derivation follows standard Solidity rules — e.g., `allowance[owner][spender]` is at `keccak256(abi.encode(spender, keccak256(abi.encode(owner, 2))))`. See `helpers.rs` for the implementations.
+Slot derivation follows standard Solidity rules. See `helpers.rs` for the implementations.
 
-**Important:** Token balances are **not** in precompile storage. They are native account balances (`account.balance`), which is what makes `balanceOf` equivalent to checking the account's ether balance.
+**Important:** Token balances are **not** in precompile storage. They are native account balances (`account.balance`).
 
 ## Token lifecycle
 
@@ -51,7 +47,7 @@ burn(amount)  →  precompile.balance -= amount  (sent to address(0))
 ```
 
 - **`mint`**: Governance-only. Creates a pending mint with a 7-day timelock. A second `mint` overwrites the previous pending amount (can be used to cancel by minting 0).
-- **`claim`**: Permissioned. Only governance safe can claim mint.
+- **`claim`**: Governance-only. Finalizes the pending mint after the timelock has expired.
 - **`burn`**: Governance-only. Destroys tokens held by the precompile's own account.
 
 ### Testnet (`faucet` feature)
@@ -65,31 +61,38 @@ No pending state, no timelock. Mint roles can be granted/revoked by governance.
 
 ## Access control
 
-| Function                                        | Who can call                                       |
-| ----------------------------------------------- | -------------------------------------------------- |
-| `mint` (mainnet)                                | Governance only                                    |
-| `mint` (faucet)                                 | Governance + dynamically granted mint-role holders |
-| `claim`                                         | Anyone (after timelock)                            |
-| `burn`                                          | Governance only                                    |
-| `grantMintRole` / `revokeMintRole`              | Governance only (faucet feature)                   |
-| `transfer`, `approve`, `transferFrom`, `permit` | Any account                                        |
-| All view functions                              | Any account                                        |
+| Function                           | Who can call                                       |
+| ---------------------------------- | -------------------------------------------------- |
+| `mint` (mainnet)                   | Governance only                                    |
+| `mint` (faucet)                    | Governance + dynamically granted mint-role holders |
+| `claim`                            | Governance only (after timelock)                   |
+| `burn`                             | Governance only                                    |
+| `grantMintRole` / `revokeMintRole` | Governance only (faucet feature)                   |
+| `hasMintRole` / `totalSupply`      | Any account (read-only)                            |
 
 Governance is identified by `GOVERNANCE_SAFE_ADDRESS` from `tn-config`.
 
 ## Security considerations
 
+### No ERC-20 / EIP-2612 surface on the precompile
+
+The precompile previously exposed `transfer`, `approve`, `transferFrom`, `permit`, `nonces`, `allowance`, `name`, `symbol`, `decimals`, `balanceOf`, and `DOMAIN_SEPARATOR`. That surface has been removed.
+
+The rationale is that none of those selectors needed to live at the protocol level:
+
+- TEL **is** the native gas token. Moving TEL between accounts is `CALL <addr> <value>` — a native value transfer that updates `account.balance` directly. A precompile-level `transfer` / `transferFrom` was redundant with this primitive.
+- Allowances and nonces are user-space concerns. Any contract that wants ERC-20-style approvals or EIP-2612 permits can layer them on top of native value transfers without the protocol managing the underlying maps.
+- The remaining selectors (`mint` / `claim` / `burn` / `totalSupply`, plus `grantMintRole` / `revokeMintRole` / `hasMintRole` under the `faucet` feature) are the only ones that genuinely require protocol-level state — issuance authority and the supply counter cannot live in user space.
+
+Shrinking the surface to issuance-only is the actual reason for the deletion; the resulting protocol is simpler and exposes less authority than a full ERC-20 implementation would.
+
+#### `DELEGATECALL` semantics under revm
+
+For completeness: a contract that `DELEGATECALL`s into `0x7e1` runs the precompile's logic, but every `SSTORE` the precompile performs targets the literal address argument it passes — `TELCOIN_PRECOMPILE_ADDRESS` — not the calling contract's storage. The precompile dispatcher routes through `EvmInternals::sstore(TELCOIN_PRECOMPILE_ADDRESS, …)`, and revm's journaled state writes to the address argument verbatim with no `DELEGATECALL`-aware rewrite. A regression test in `crates/tn-reth/tests/it/tel_precompile_props.rs` (`test_delegatecall_writes_target_precompile_storage`) pins this behaviour against future revm upgrades.
+
 ### Timelock bypass (`faucet` feature)
 
 The `faucet` feature **removes the 7-day timelock** on minting. A mainnet binary must never be compiled with this feature enabled. The feature is set at compile time — there is no runtime toggle.
-
-### ERC-20 approve race condition
-
-`approve` overwrites the existing allowance without checking the current value. This is the standard ERC-20 behavior and is subject to the well-known front-running race. Users should set allowance to 0 before setting a new non-zero value, or use `permit` for atomic approval.
-
-### Signature malleability (EIP-2612)
-
-`permit` rejects signatures where `s > SECP256K1N_HALF` to prevent signature malleability. The `v` value must be exactly 27 or 28.
 
 ### Double-claim prevention
 
@@ -97,7 +100,7 @@ After `claim` succeeds, both the amount and timestamp storage slots are zeroed, 
 
 ### Native balance equivalence
 
-Since `balanceOf` reads native account balances, any direct ETH-style transfer (e.g., `CALL` with value) changes the TEL balance without going through the precompile. The precompile's `Transfer` event is only emitted for calls routed through `transfer`/`transferFrom`/`claim`. Off-chain indexers must account for both native transfers and precompile events.
+Token holdings are native account balances, so any direct value transfer (e.g., `CALL` with value) changes a holder's TEL balance without going through the precompile. Off-chain indexers that track issuance/destruction must watch the precompile's `Mint`, `Claim`, `Burn`, and `Transfer(0x0,…)`/`Transfer(…,0x0)` events; ordinary user-to-user TEL movement is observable as native value transfers in transaction traces.
 
 ### Total supply accounting
 
@@ -105,69 +108,32 @@ Since `balanceOf` reads native account balances, any direct ETH-style transfer (
 
 ## Gas costs
 
-Each handler charges a fixed gas amount upfront. The tables below compare each constant against the worst-case solidity-equivalent cost.
+Each handler charges a fixed gas amount upfront. The tables below compare each constant against the worst-case Solidity-equivalent cost.
 
 These costs do **not** include the base transaction cost (21,000) or calldata costs; those are charged by the EVM before the precompile runs.
 
 ### EVM gas reference (Cancun)
 
-| Operation            | Condition             | Gas                   |
-| -------------------- | --------------------- | --------------------- |
-| SLOAD                | Cold                  | 2,100                 |
-| SLOAD                | Warm                  | 100                   |
-| SSTORE               | Cold, 0→nonzero       | 22,100                |
-| SSTORE               | Cold, nonzero→nonzero | 5,000                 |
-| SSTORE               | Warm, 0→nonzero       | 20,000                |
-| SSTORE               | Warm, nonzero→nonzero | 2,900                 |
-| SSTORE               | Warm, nonzero→0       | 2,900 (+4,800 refund) |
-| Account access       | Cold                  | 2,600                 |
-| Account access       | Warm                  | 100                   |
-| LOG base             | —                     | 375                   |
-| LOG per topic        | —                     | 375                   |
-| LOG per data byte    | —                     | 8                     |
-| ECRECOVER precompile | —                     | 3,000                 |
+| Operation         | Condition             | Gas                   |
+| ----------------- | --------------------- | --------------------- |
+| SLOAD             | Cold                  | 2,100                 |
+| SLOAD             | Warm                  | 100                   |
+| SSTORE            | Cold, 0→nonzero       | 22,100                |
+| SSTORE            | Cold, nonzero→nonzero | 5,000                 |
+| SSTORE            | Warm, 0→nonzero       | 20,000                |
+| SSTORE            | Warm, nonzero→nonzero | 2,900                 |
+| SSTORE            | Warm, nonzero→0       | 2,900 (+4,800 refund) |
+| Account access    | Cold                  | 2,600                 |
+| Account access    | Warm                  | 100                   |
+| LOG base          | —                     | 375                   |
+| LOG per topic     | —                     | 375                   |
+| LOG per data byte | —                     | 8                     |
 
 ### View functions
 
-| Function                                            | Gas   | Notes                        |
-| --------------------------------------------------- | ----- | ---------------------------- |
-| `name`, `symbol`, `decimals`                        | 200   | Pure return, no state access |
-| `totalSupply`, `allowance`, `nonces`, `hasMintRole` | 2,100 | 1 cold SLOAD                 |
-| `balanceOf`, `DOMAIN_SEPARATOR`                     | 2,600 | 1 cold account access        |
-
-### `transfer` — 12,000 gas
-
-| Operation             | Access | Gas       |
-| --------------------- | ------ | --------- |
-| load_account(from)    | cold   | 2,600     |
-| load_account(to)      | cold   | 2,600     |
-| LOG3 (Transfer, 32 B) | —      | 1,756     |
-| **Total**             |        | **6,956** |
-
-**Status: OK** — 1.72× headroom. Gas constant covers worst-case EVM cost with margin.
-
-### `approve` — 22,000 gas
-
-| Operation             | Access          | Gas        |
-| --------------------- | --------------- | ---------- |
-| SSTORE allowance      | cold, 0→nonzero | 22,100     |
-| LOG3 (Approval, 32 B) | —               | 1,756      |
-| **Total**             |                 | **23,856** |
-
-**Status: Undercharged** — 0.92× headroom. Worst case (new approval, 0→nonzero) exceeds the gas constant by 1,856. Overwrites (nonzero→nonzero) cost only 6,756, well within budget.
-
-### `transferFrom` — 35,000 gas
-
-| Operation             | Access                | Gas        |
-| --------------------- | --------------------- | ---------- |
-| SLOAD allowance       | cold                  | 2,100      |
-| SSTORE allowance      | warm, nonzero→nonzero | 2,900      |
-| load_account(from)    | cold                  | 2,600      |
-| load_account(to)      | cold                  | 2,600      |
-| LOG3 (Transfer, 32 B) | —                     | 1,756      |
-| **Total**             |                       | **11,956** |
-
-**Status: OK** — 2.93× headroom. SSTORE is warm (same slot as prior SLOAD). Skipped entirely for infinite allowance.
+| Function                      | Gas   | Notes        |
+| ----------------------------- | ----- | ------------ |
+| `totalSupply`, `hasMintRole`  | 2,100 | 1 cold SLOAD |
 
 ### `mint` (mainnet) — 41,000 gas
 
@@ -210,19 +176,6 @@ These costs do **not** include the base transaction cost (21,000) or calldata co
 
 **Status: Undercharged** — 0.77× headroom. Gas constant is 2,362 below worst-case EVM cost.
 
-### `permit` — 72,000 gas
-
-| Operation             | Access          | Gas        |
-| --------------------- | --------------- | ---------- |
-| SLOAD nonce           | cold            | 2,100      |
-| ECRECOVER             | —               | 3,000      |
-| SSTORE nonce          | warm, 0→nonzero | 20,000     |
-| SSTORE allowance      | cold, 0→nonzero | 22,100     |
-| LOG3 (Approval, 32 B) | —               | 1,756      |
-| **Total**             |                 | **48,956** |
-
-**Status: OK** — 1.47× headroom. Worst case is first permit (nonce 0→1). Subsequent permits cost only 31,856.
-
 ### `mint` (faucet) — 30,000 gas
 
 | Operation               | Access                | Gas        |
@@ -264,6 +217,8 @@ These costs do **not** include the base transaction cost (21,000) or calldata co
 ## Testing
 
 Test infrastructure lives in `test_utils.rs` and is the single source of truth for both unit tests (in each module's `#[cfg(test)] mod tests`) and integration tests (in `crates/tn-reth/tests/it/`).
+
+Example: read totalSupply by calling `0x18160ddd` with no arguments.
 
 ```bash
 # Unit tests (mainnet mint)
