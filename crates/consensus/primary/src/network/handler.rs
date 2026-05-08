@@ -649,60 +649,66 @@ where
             .map_err(HeaderError::Storage)?;
         if let Some(vote_info) = previous_vote {
             ensure!(
-                header.epoch() == vote_info.epoch(),
+                header.epoch() >= vote_info.epoch(),
                 HeaderError::InvalidEpoch { theirs: header.epoch(), ours: vote_info.epoch() }
                     .into()
             );
-            ensure!(
-                header.round() >= vote_info.round(),
-                HeaderError::AlreadyVotedForLaterRound {
-                    theirs: header.round(),
-                    ours: vote_info.round()
-                }
-                .into()
-            );
-            if header.round() == vote_info.round() {
-                // Make sure we don't vote twice for the same authority in the same epoch/round.
-                let vote = Vote::new(
-                    &header,
-                    self.consensus_config.authority_id().expect("only validators can vote"),
-                    self.consensus_config.key_config(),
-                );
-                if vote.digest() != vote_info.vote_digest() {
-                    // Check if a certificate was already formed for this header author at this
-                    // round. If one exists, the old vote contributed to a real certificate, so
-                    // voting for a different header at the same round would be equivocation.
-                    // If no certificate exists, the old vote was never aggregated (e.g. the
-                    // proposer was killed before collecting enough votes, then restarted and
-                    // created a new header at the same round). In that case it is safe to
-                    // re-vote for the new header.
-                    let cert_exists = self
-                        .consensus_config
-                        .node_storage()
-                        .read_by_index(header.author(), header.round())
-                        .unwrap_or(None)
-                        .is_some();
-                    if cert_exists {
-                        warn!(
-                            "Authority {} submitted different header {:?} for voting",
-                            header.author(),
-                            header,
-                        );
-                        return Err(
-                            HeaderError::AlreadyVoted(header.digest(), header.round()).into()
-                        );
+            if header.epoch() == vote_info.epoch() {
+                ensure!(
+                    header.round() >= vote_info.round(),
+                    HeaderError::AlreadyVotedForLaterRound {
+                        theirs: header.round(),
+                        ours: vote_info.round()
                     }
-                    // No certificate was formed for the old vote — allow re-voting.
-                    warn!(
-                        "Authority {} re-proposing at round {} with a different header; \
-                         previous vote was for an uncertified header — allowing re-vote",
-                        header.author(),
-                        header.round(),
+                    .into()
+                );
+                if header.round() == vote_info.round() {
+                    // Make sure we don't vote twice for the same authority in the same epoch/round.
+                    let vote = Vote::new(
+                        &header,
+                        self.consensus_config.authority_id().expect("only validators can vote"),
+                        self.consensus_config.key_config(),
                     );
-                    // Fall through to create and store the new vote below.
-                } else {
-                    debug!("Resending vote {vote:?} for {} at round {}", header, header.round());
-                    return Ok(PrimaryResponse::Vote(vote));
+                    if vote.digest() != vote_info.vote_digest() {
+                        // Check if a certificate was already formed for this header author at this
+                        // round. If one exists, the old vote contributed to a real certificate, so
+                        // voting for a different header at the same round would be equivocation.
+                        // If no certificate exists, the old vote was never aggregated (e.g. the
+                        // proposer was killed before collecting enough votes, then restarted and
+                        // created a new header at the same round). In that case it is safe to
+                        // re-vote for the new header.
+                        let cert_exists = self
+                            .consensus_config
+                            .node_storage()
+                            .read_by_index(header.author(), header.round())
+                            .unwrap_or(None)
+                            .is_some();
+                        if cert_exists {
+                            warn!(
+                                "Authority {} submitted different header {:?} for voting",
+                                header.author(),
+                                header,
+                            );
+                            return Err(
+                                HeaderError::AlreadyVoted(header.digest(), header.round()).into()
+                            );
+                        }
+                        // No certificate was formed for the old vote — allow re-voting.
+                        warn!(
+                            "Authority {} re-proposing at round {} with a different header; \
+                         previous vote was for an uncertified header — allowing re-vote",
+                            header.author(),
+                            header.round(),
+                        );
+                        // Fall through to create and store the new vote below.
+                    } else {
+                        debug!(
+                            "Resending vote {vote:?} for {} at round {}",
+                            header,
+                            header.round()
+                        );
+                        return Ok(PrimaryResponse::Vote(vote));
+                    }
                 }
             }
         }

@@ -774,7 +774,11 @@ impl Inner {
             false,
         )
         .map_err(OpenError::IndexFileOpen)?;
-        let mut parent_digest = previous_epoch.final_consensus.hash;
+        let mut parent_digest = if epoch == 0 {
+            ConsensusHeader::default().digest()
+        } else {
+            previous_epoch.final_consensus.hash
+        };
         let mut batches = HashSet::new();
         while let Some(record) = next(&mut stream_iter, timeout).await? {
             match record {
