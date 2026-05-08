@@ -1251,7 +1251,7 @@ pub(crate) mod test {
     use tn_test_utils::CommitteeFixture;
     use tn_types::{
         test_genesis, BlockHash, Certificate, CertifiedBatch, CommittedSubDag, Committee,
-        ConsensusOutput, EpochRecord, Hash, ReputationScores,
+        ConsensusHeader, ConsensusOutput, EpochRecord, Hash, ReputationScores,
     };
 
     use crate::{
@@ -1359,7 +1359,7 @@ pub(crate) mod test {
 
         let num_outputs = 1000;
         let mut outputs = Vec::new();
-        let mut parent = BlockHash::default();
+        let mut parent = ConsensusHeader::default().digest();
         for i in 0..num_outputs {
             let consensus_output =
                 make_test_output(&committee, i % 4, chain.clone(), (i as u64) + 1, parent);

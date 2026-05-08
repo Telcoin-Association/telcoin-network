@@ -801,7 +801,9 @@ mod test {
     use crate::consensus::{ConsensusSlot, LatestConsensus};
     use std::{sync::Arc, time::Duration};
 
-    use tn_types::{test_genesis, BlockHash, BlockNumHash, Epoch, EpochRecord, Hash as _, B256};
+    use tn_types::{
+        test_genesis, BlockHash, BlockNumHash, ConsensusHeader, Epoch, EpochRecord, Hash as _, B256,
+    };
 
     use crate::{
         consensus::ConsensusChain,
@@ -852,7 +854,7 @@ mod test {
 
         let num_outputs = 1000;
         let mut outputs = Vec::new();
-        let mut parent = BlockHash::default();
+        let mut parent = ConsensusHeader::default().digest();
         for i in 0..num_outputs {
             let consensus_output =
                 make_test_output(&committee, i % 4, chain.clone(), (i as u64) + 1, parent);
