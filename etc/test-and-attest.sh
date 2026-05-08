@@ -21,7 +21,7 @@ if [ -z "$GITHUB_ATTESTATION_PRIVATE_KEY" ]; then
 fi
 
 # NOTE: this contract must match CI
-CONTRACT_ADDRESS="0xfb8062c74148c4763238b7a46a1b1025470f1160"
+CONTRACT_ADDRESS="0xf102928273a399cda6151b8616209af019499c84"
 RPC_ENDPOINT="https://rpc.adiri.tel"
 ATTEST_CALL="attestGitCommitHash(bytes20,bool)"
 VERIFY_CALL="gitCommitHashAttested(bytes20)"
