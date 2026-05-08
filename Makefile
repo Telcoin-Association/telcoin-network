@@ -4,6 +4,9 @@
 ROOT_DIR:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 BASE_DIR:=$(shell basename $(ROOT_DIR))
 
+# nightly toolchain used for fmt/clippy/udeps (rustfmt and clippy use nightly-only options)
+NIGHTLY:=$(shell cat $(ROOT_DIR)/rust-nightly)
+
 .DEFAULT: help
 
 # Default tag is latest if not specified
@@ -22,7 +25,7 @@ help:
 	@echo "make udeps" ;
 	@echo "    :::> Check unused dependencies in the entire project by package." ;
 	@echo "    :::> Dev needs 'cargo-udeps' installed." ;
-	@echo "    :::> Dev also needs rust nightly-2025-11-04 and protobuf (on mac). ";
+	@echo "    :::> Dev also needs the rust nightly pinned in rust-nightly and protobuf (on mac). ";
 	@echo "    :::> To install run: 'cargo install cargo-udeps --locked'." ;
 	@echo ;
 	@echo "make check" ;
@@ -48,10 +51,10 @@ help:
 	@echo "    :::> Generate HTML coverage report in target/llvm-cov/html/." ;
 	@echo ;
 	@echo "make fmt" ;
-	@echo "    :::> cargo +nightly-2026-03-20 fmt" ;
+	@echo "    :::> cargo fmt (nightly toolchain pinned in rust-nightly)" ;
 	@echo ;
 	@echo "make clippy" ;
-	@echo "    :::> Cargo +nightly-2026-03-20 clippy for all features with fix enabled." ;
+	@echo "    :::> cargo clippy for all features with fix enabled (nightly toolchain pinned in rust-nightly)." ;
 	@echo ;
 	@echo "make docker-login" ;
 	@echo "    :::> Setup docker registry using gcloud artifacts." ;
@@ -87,7 +90,7 @@ attest:
 
 # check for unused dependencies
 udeps:
-	find . -type f -name Cargo.toml -exec sed -rne 's/^name = "(.*)"/\1/p' {} + | xargs -I {} sh -c "echo '\n\n{}:' && cargo +nightly-2026-03-20 udeps --package {}" ;
+	find . -type f -name Cargo.toml -exec sed -rne 's/^name = "(.*)"/\1/p' {} + | xargs -I {} sh -c "echo '\n\n{}:' && cargo +$(NIGHTLY) udeps --package {}" ;
 
 check:
 	cargo check --workspace --all-features --all-targets ;
@@ -121,13 +124,13 @@ coverage-html:
 	cargo llvm-cov nextest --workspace --exclude tn-faucet --no-fail-fast --html ;
 	@echo "Coverage report: target/llvm-cov/html/index.html"
 
-# format using +nightly-2026-03-20 toolchain
+# format using the nightly toolchain pinned in rust-nightly
 fmt:
-	cargo +nightly-2026-03-20 fmt ;
+	cargo +$(NIGHTLY) fmt ;
 
-# clippy formatter + try to fix problems
+# clippy formatter + try to fix problems (nightly toolchain pinned in rust-nightly)
 clippy:
-	cargo +nightly-2026-03-20 clippy --workspace --all-features --fix ;
+	cargo +$(NIGHTLY) clippy --workspace --all-features --fix ;
 
 # login to gcloud artifact registry for managing docker images
 docker-login:
