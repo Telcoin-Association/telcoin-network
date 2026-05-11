@@ -118,10 +118,8 @@ async fn create_test_types(path: &Path) -> TestTypes {
 /// epoch through the [`CommitteeFixture`] builder so that the handler's view of the committee
 /// reports `epoch` rather than the default `0`.
 async fn create_test_types_at_epoch(path: &Path, epoch: Epoch) -> TestTypes {
-    let committee = CommitteeFixture::builder(MemDatabase::default)
-        .randomize_ports(true)
-        .epoch(epoch)
-        .build();
+    let committee =
+        CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).epoch(epoch).build();
     let authority = committee.first_authority();
     let config = authority.consensus_config();
     let cb = ConsensusBus::new();
@@ -188,7 +186,11 @@ async fn test_vote_succeeds_with_stale_prior_epoch_vote_info() -> eyre::Result<(
     // leaking, and the regression test pins that defence in place.
     let author_id = committee.last_authority().id();
     let stale = VoteInfo { epoch: 0, round: 5, vote_digest: VoteDigest::default() };
-    committee.first_authority().consensus_config().node_storage().insert::<Votes>(&author_id, &stale)?;
+    committee
+        .first_authority()
+        .consensus_config()
+        .node_storage()
+        .insert::<Votes>(&author_id, &stale)?;
 
     // current-epoch (epoch=1) header from the same author at round 1
     let header = committee
