@@ -11,7 +11,6 @@ mod error;
 pub mod network;
 mod primary;
 mod proposer;
-mod state_handler;
 mod state_sync;
 
 pub use state_sync::StateSynchronizer;
