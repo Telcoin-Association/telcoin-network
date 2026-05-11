@@ -3,7 +3,7 @@
 use crate::{
     error::PrimaryNetworkError,
     network::{
-        message::{ConsensusResult, PrimaryGossip},
+        message::{ConsensusResult, PrimaryGossip, PrimaryResponse},
         MissingCertificatesRequest, PendingEpochStream, RequestHandler,
         MAX_CONCURRENT_EPOCH_STREAMS, PENDING_REQUEST_TIMEOUT,
     },
@@ -20,12 +20,12 @@ use std::{
 use tempfile::TempDir;
 use tn_config::Parameters;
 use tn_network_libp2p::{GossipMessage, TopicHash};
-use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
+use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, tables::Votes};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     error::HeaderError, now, AuthorityIdentifier, BlockHash, BlockHeader, BlockNumHash,
-    BlsPublicKey, Certificate, EpochVote, ExecHeader, Hash as _, HeaderDigest, SealedHeader,
-    TaskManager, B256,
+    BlsPublicKey, Certificate, Database, Epoch, EpochVote, ExecHeader, Hash as _, HeaderDigest,
+    SealedHeader, TaskManager, VoteDigest, VoteInfo, B256,
 };
 use tracing::debug;
 
@@ -113,6 +113,41 @@ async fn create_test_types(path: &Path) -> TestTypes {
     create_test_types_with_params(path, None).await
 }
 
+/// Helper function to create an instance of [RequestHandler] for the first authority of a
+/// committee at the supplied epoch. Mirrors [`create_test_types_with_params`] but threads the
+/// epoch through the [`CommitteeFixture`] builder so that the handler's view of the committee
+/// reports `epoch` rather than the default `0`.
+async fn create_test_types_at_epoch(path: &Path, epoch: Epoch) -> TestTypes {
+    let committee = CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .epoch(epoch)
+        .build();
+    let authority = committee.first_authority();
+    let config = authority.consensus_config();
+    let cb = ConsensusBus::new();
+
+    // spawn the synchronizer
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(config.clone(), cb.clone(), task_manager.get_spawner());
+    synchronizer.spawn(&task_manager);
+
+    // last execution result
+    let parent = SealedHeader::seal_slow(ExecHeader::default());
+
+    // set the latest execution result to genesis - test headers are proposed for round 1
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(0, BlockNumHash::new(0, B256::default()), Some(parent.clone()));
+    cb.app().recent_blocks().send_replace(recent);
+
+    let consensus_chain =
+        ConsensusChain::new_for_test(path.to_owned(), committee.committee()).await.unwrap();
+    let consensus_bus = cb.app().clone();
+    let handler =
+        RequestHandler::new(config.clone(), cb.app().clone(), synchronizer, consensus_chain);
+    TestTypes { committee, handler, parent, consensus_bus, task_manager }
+}
+
 #[tokio::test]
 async fn test_vote_succeeds() -> eyre::Result<()> {
     // common types
@@ -134,6 +169,45 @@ async fn test_vote_succeeds() -> eyre::Result<()> {
     let res = handler.vote(peer, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
     assert!(res.is_ok());
+    Ok(())
+}
+
+/// Regression test: a stale `VoteInfo` from a prior epoch left over in the `Votes` table must
+/// not block a vote on a header from the current epoch. Without the explicit
+/// `header.epoch() > vote_info.epoch()` branch in the vote handler, an older entry's `round`
+/// would short-circuit the equivocation check and reject the new header as a duplicate vote.
+#[tokio::test]
+async fn test_vote_succeeds_with_stale_prior_epoch_vote_info() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types_at_epoch(temp_dir.path(), 1).await;
+
+    // Seed the Votes table with a stale entry from epoch 0 keyed under the authority that
+    // will submit the current-epoch header. F3 should clear this row on epoch close, so the
+    // scenario is theoretically impossible — but the new branch defends against the row
+    // leaking, and the regression test pins that defence in place.
+    let author_id = committee.last_authority().id();
+    let stale = VoteInfo { epoch: 0, round: 5, vote_digest: VoteDigest::default() };
+    committee.first_authority().consensus_config().node_storage().insert::<Votes>(&author_id, &stale)?;
+
+    // current-epoch (epoch=1) header from the same author at round 1
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1) // parent is 0
+        .build();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    let res = handler.vote(peer, header, vec![]).await?;
+    assert_matches!(res, PrimaryResponse::Vote(_));
+
+    // The stale row must have been overwritten with a current-epoch entry.
+    let stored: Option<VoteInfo> =
+        committee.first_authority().consensus_config().node_storage().get::<Votes>(&author_id)?;
+    let stored = stored.expect("vote info written");
+    assert_eq!(stored.epoch, committee.committee().epoch());
+    assert_eq!(stored.round, 1);
+
     Ok(())
 }
 
