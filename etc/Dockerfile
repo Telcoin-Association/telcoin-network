@@ -1,5 +1,7 @@
 FROM rust:1.94-slim-bookworm AS builder
 
+ENV RUSTUP_TOOLCHAIN=1.94
+
 WORKDIR /usr/src/telcoin-network
 
 # install dependencies

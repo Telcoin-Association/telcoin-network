@@ -195,14 +195,30 @@ sol!(
     #[sol(rpc)]
     contract WorkerConfigs {
         /// Initialize with per-worker configs and owner.
-        constructor(uint8[] memory strategies, uint64[] memory values, address owner_);
+        constructor(
+            uint8[] memory strategies,
+            uint64[] memory values,
+            uint128[] memory datas,
+            address owner_,
+        );
         /// Get the stored fee config for a worker.
-        function getWorkerConfig(uint16 workerId) external view returns (uint8 strategy, uint64 value);
+        function getWorkerConfig(uint16 workerId)
+            external view
+            returns (uint8 strategy, uint64 value, uint128 data);
+        /// Get every worker's config in a single call.
+        function getAllWorkerConfigs()
+            external view
+            returns (
+                uint16 count,
+                uint8[] memory strategies,
+                uint64[] memory values,
+                uint128[] memory datas,
+            );
         /// Set the number of workers for the next epoch.
         function setNumWorkers(uint16 numWorkers_) external;
         /// Set the config for a worker by worker id.
         /// NOTE: this must be called before calling `setNumWorkers`.
-        function setWorkerConfig(uint16 workerId, uint8 strategy, uint64 value) external;
+        function setWorkerConfig(uint16 workerId, uint8 strategy, uint64 value, uint128 data) external;
         /// Retrieve the number of workers for the protocol.
         function numWorkers() external view returns (uint16);
     }

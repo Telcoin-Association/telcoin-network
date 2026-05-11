@@ -1,9 +1,4 @@
 ---
-# faucet addresses
-"0x31ccCD419AEeafEb51B3a11Db43e8f87F65A34Fb":
-  balance: "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-
-# dev addresses
 "0x781e3f2014d83dB831df4cAA3BA78aEc57396B50": # g
   balance: "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
 "0x4f264cc3709f35f39b1fc0c2c1110141b8c44370": # g
@@ -15,8 +10,6 @@
 "0x9F35A76bE2a3A84FF0c0A6365CD3C5CeB3a7FD97": # s
   balance: "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
 "0x8133Be861AD5C9Dea396E5dE5BA1B0154E87e925": # s
-  balance: "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
-"0x5971eff642e1a4dc5a23d337a099869d944d20ab": # faucet proxy
   balance: "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
 "0xde9700e89e0999854e5bfd7357a803d8fc476bb0": # g
   balance: "0xfffffffffffffffffffffffffffffffffffffffffffffffff21f494c589bffff"
@@ -32,5 +25,21 @@
   balance: "0xC9F2C9CD04674EDEA40000000"
 "0xF5E8A439C599205C1aB06b535DE46681Aed1007a": # lz
   balance: "0xC9F2C9CD04674EDEA40000000"
-"0x0407C96C91AfE937c50058fa870a4a745FA9142e": # n
+"0x0407C96C91AfE937c50058fa870a4a745FA9142e": # ni
   balance: "0xC9F2C9CD04674EDEA40000000"
+"0x329e6cBdD16cAD2f51D97d2E8F09612f12D45A6d": # k
+  balance: "0xC9F2C9CD04674EDEA40000000"
+"0x2358CF87e62618663E781CE52EE7a7F777aC4e65": # l
+  balance: "0xC9F2C9CD04674EDEA40000000"
+"0x915Baa37AAa923A10103d8683Af2a8bAC4062091": # l
+  balance: "0xC9F2C9CD04674EDEA40000000"
+"0xa21B09Ff93A6ffc466F9d2D979fb2268fDaff248": # no
+  balance: "0xC9F2C9CD04674EDEA40000000"
+"0x89dab9f6fdc569c1bcdbd6493f25b7040b55dc79": # nv5
+  balance: "0xC9F2C9CD04674EDEA40000000"
+"0xCA4510D80e9e4023E0EdBA2bD1505C8623674Edd": # faucet
+  balance: "0xC9F2C9CD04674EDEA40000000"
+"0x000000000000000000000000000000000000b151": # precompile
+  balance: "0x0"
+  nonce: 0
+  code: "0xfe"

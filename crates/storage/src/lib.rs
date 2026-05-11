@@ -16,6 +16,7 @@ use tables::{
 };
 // Always build redb, we use it as the default for persistant consensus data.
 pub mod archive;
+pub mod certificate_pack;
 pub mod composite_db;
 pub mod consensus;
 pub mod consensus_pack;

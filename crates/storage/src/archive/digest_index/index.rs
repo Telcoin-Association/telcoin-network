@@ -25,7 +25,7 @@ use std::{
 };
 
 /// Size of a header.
-const HEADER_SIZE: usize = 72;
+const HEADER_SIZE: usize = 68;
 
 /// Header for an hdx (index) file.  This contains the hash buckets for lookups.
 /// This file is not a log file and the header and buckets will change in place over time.
@@ -35,7 +35,7 @@ struct HdxHeader {
     type_id: [u8; 8], // The characters "telcoinx"
     version: u16,     // Holds the version number
     uid: u64,         // Unique ID generated on creation
-    appnum: u64,      // Application defined constant
+    appnum: u32,      // Application defined constant
     buckets: u32,
     bucket_elements: u16,
     bucket_size: u16,
@@ -95,9 +95,9 @@ impl HdxHeader {
         buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
         let uid = u64::from_le_bytes(buf64);
         pos += 8;
-        buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
-        let appnum = u64::from_le_bytes(buf64);
-        pos += 8;
+        buf32.copy_from_slice(&buffer[pos..(pos + 4)]);
+        let appnum = u32::from_le_bytes(buf32);
+        pos += 4;
         buf32.copy_from_slice(&buffer[pos..(pos + 4)]);
         let buckets = u32::from_le_bytes(buf32);
         pos += 4;
@@ -150,8 +150,8 @@ impl HdxHeader {
         pos += 2;
         buffer[pos..(pos + 8)].copy_from_slice(&self.uid.to_le_bytes());
         pos += 8;
-        buffer[pos..(pos + 8)].copy_from_slice(&self.appnum.to_le_bytes());
-        pos += 8;
+        buffer[pos..(pos + 4)].copy_from_slice(&self.appnum.to_le_bytes());
+        pos += 4;
         buffer[pos..(pos + 4)].copy_from_slice(&self.buckets.to_le_bytes());
         pos += 4;
         buffer[pos..(pos + 2)].copy_from_slice(&self.bucket_elements.to_le_bytes());
@@ -213,7 +213,7 @@ impl HdxHeader {
     }
 
     /// Application defined constant
-    fn appnum(&self) -> u64 {
+    fn appnum(&self) -> u32 {
         self.appnum
     }
 
@@ -780,7 +780,7 @@ mod tests {
     fn test_archive_hdx_index() {
         let tmp_dir = TempDir::with_prefix("test_archive_hdx_index").expect("temp dir");
         let tmp_path = tmp_dir.path();
-        let data_header = DataHeader::new(0);
+        let data_header = DataHeader::new(0, crate::archive::pack::PackCompression::ZStd);
         let builder = BuildHasherDefault::<FxHasher>::default();
         let mut idx: HdxIndex =
             HdxIndex::open_hdx_file(tmp_path.join("index.hdx"), &data_header, builder, false)

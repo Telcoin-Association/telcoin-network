@@ -320,7 +320,9 @@ async fn test_fetch_certificates_basic() {
                     let mut certs = Vec::new();
                     // Add cert missing parent info.
                     let mut cert = certificates[num_written].clone();
-                    cert.header_mut_for_test().clear_parents_for_test();
+                    let mut ch = cert.header().clone();
+                    ch.clear_parents_for_test();
+                    cert.update_header_for_test(ch);
                     certs.push(cert);
                     // Add cert with incorrect digest.
                     let mut cert = certificates[num_written].clone();

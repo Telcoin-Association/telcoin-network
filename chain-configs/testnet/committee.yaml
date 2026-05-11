@@ -1,44 +1,54 @@
 ---
 authorities:
-  mCss5AWBd69e6NaSu6aDdnWW6q5VUojEqUz3mb4E2kRmZvpjRW6SpBCm5kDPUr3CwmWqd5b8Zqxk5RB6jm5bNPU6jUaP1ecnHBhnqeWKMr3cBCMijKcxHUxfo1m8zBAAegm:
-    protocol_key: mCss5AWBd69e6NaSu6aDdnWW6q5VUojEqUz3mb4E2kRmZvpjRW6SpBCm5kDPUr3CwmWqd5b8Zqxk5RB6jm5bNPU6jUaP1ecnHBhnqeWKMr3cBCMijKcxHUxfo1m8zBAAegm
-    execution_address: "0xefaacf04b92298a88200aa50aa6bb7bfce587b17"
-  pbYFhxoq8JG1xGws2JVazihWYMwWiW472wwtvDBZC9xGyFiVBWYn3PNXEdjtEzZssg9qjANscDqVJdy86jy6LwVBqSynXEFAMvpphybWrbvQzErPyHoxq78A9NoLjmemRQi:
-    protocol_key: pbYFhxoq8JG1xGws2JVazihWYMwWiW472wwtvDBZC9xGyFiVBWYn3PNXEdjtEzZssg9qjANscDqVJdy86jy6LwVBqSynXEFAMvpphybWrbvQzErPyHoxq78A9NoLjmemRQi
-    execution_address: "0x7489025dfbaad94f2366d88a62989147d9c8b5d3"
-  xmAQA59z9Uj1HSjm7ToFB18XzH1a8k9UfA4BVaSvPLVhDrZmG99d2x7ovHzvQEyzxLhy2ogv1iKDCFicH3kykmmFs3inGcPbdPistQyRUgHv4xcoZDa7sDx4oohupokZz7g:
-    protocol_key: xmAQA59z9Uj1HSjm7ToFB18XzH1a8k9UfA4BVaSvPLVhDrZmG99d2x7ovHzvQEyzxLhy2ogv1iKDCFicH3kykmmFs3inGcPbdPistQyRUgHv4xcoZDa7sDx4oohupokZz7g
-    execution_address: "0x3518b301b86ceb53b5a3dff62e55cd43ef59d024"
-  ydgmjCLWhMWBGBUCn67MYfJzNkuh2owEFoDk2dGqKhahAw7TEuAMGjSG5DTJ1phAoJV6iEEUAMBvtvdgrv7Arx7Q9cwgN2AwTeQshVuFpkVqNDGJqfkM7MWY8cDiSRHHQkJ:
-    protocol_key: ydgmjCLWhMWBGBUCn67MYfJzNkuh2owEFoDk2dGqKhahAw7TEuAMGjSG5DTJ1phAoJV6iEEUAMBvtvdgrv7Arx7Q9cwgN2AwTeQshVuFpkVqNDGJqfkM7MWY8cDiSRHHQkJ
+  pDmpE29YEhr93MPVPCGkWx3BsCcow4oExmxv5viJz2GTjsaXwc3YwKxE1CFdVuTVSudsFDutFSVmtgF98Abs56JZPfGQs6GzbqXDFkGA1eZx2edkwfP2Q6eRLo8coLhvTNj:
+    protocol_key: pDmpE29YEhr93MPVPCGkWx3BsCcow4oExmxv5viJz2GTjsaXwc3YwKxE1CFdVuTVSudsFDutFSVmtgF98Abs56JZPfGQs6GzbqXDFkGA1eZx2edkwfP2Q6eRLo8coLhvTNj
     execution_address: "0x0033a370616805b1fd275b7ffab83fc41d665ccb"
+  rZdhyVGJAtz7kyFtFARWVVcw5DB3o9E4GvPN6zuKfUhUBGFRvEK2PgEV44CJt9wu9GMyssFQBFXRknrenuhJixo9KCADrZzHdtcvAwAYDmcLc7Ugh9epGc5LRZC5TK2hnYA:
+    protocol_key: rZdhyVGJAtz7kyFtFARWVVcw5DB3o9E4GvPN6zuKfUhUBGFRvEK2PgEV44CJt9wu9GMyssFQBFXRknrenuhJixo9KCADrZzHdtcvAwAYDmcLc7Ugh9epGc5LRZC5TK2hnYA
+    execution_address: "0x89dab9f6fdc569c1bcdbd6493f25b7040b55dc79"
+  24JaKrebALhvhXxsAabjd5ZK22k1W4zKwGepKD5pcobQwBkZyiruYyhRM3hkLap8Ssc4qUdcRUJSrs2389hUoV7G83HKYrmkz2pTzCJiQURV5vtkrh8gFRKBQWKFTWLWah9s:
+    protocol_key: 24JaKrebALhvhXxsAabjd5ZK22k1W4zKwGepKD5pcobQwBkZyiruYyhRM3hkLap8Ssc4qUdcRUJSrs2389hUoV7G83HKYrmkz2pTzCJiQURV5vtkrh8gFRKBQWKFTWLWah9s
+    execution_address: "0x3518b301b86ceb53b5a3dff62e55cd43ef59d024"
+  26L1XwWTr6bBNnxJmDJXJgTqMAyD4ExkqwPYYJqDD3gob3jzejypQoewqRmqb9D2Yudk7zjcPqaTzFcEtXhrYXUtNx2ZYeLKC8V77LL2J136Hvw8eCGXpadGAbymThMhWYAa:
+    protocol_key: 26L1XwWTr6bBNnxJmDJXJgTqMAyD4ExkqwPYYJqDD3gob3jzejypQoewqRmqb9D2Yudk7zjcPqaTzFcEtXhrYXUtNx2ZYeLKC8V77LL2J136Hvw8eCGXpadGAbymThMhWYAa
+    execution_address: "0xefaacf04b92298a88200aa50aa6bb7bfce587b17"
+  26L3gmkBzxAxEwvVuDrxEmKf2XwYGnYj1EQSiZSX3PBAvRa6Z5tegfmDAGHTsBwdtjFuAd7ayQEemE1AUE5ajSSK8wn3uz1MY5vjbGdeh3RoUv1TKLfbNTTULq9qdtaSTHhL:
+    protocol_key: 26L3gmkBzxAxEwvVuDrxEmKf2XwYGnYj1EQSiZSX3PBAvRa6Z5tegfmDAGHTsBwdtjFuAd7ayQEemE1AUE5ajSSK8wn3uz1MY5vjbGdeh3RoUv1TKLfbNTTULq9qdtaSTHhL
+    execution_address: "0x7489025dfbaad94f2366d88a62989147d9c8b5d3"
 epoch: 0
 bootstrap_servers:
-  mCss5AWBd69e6NaSu6aDdnWW6q5VUojEqUz3mb4E2kRmZvpjRW6SpBCm5kDPUr3CwmWqd5b8Zqxk5RB6jm5bNPU6jUaP1ecnHBhnqeWKMr3cBCMijKcxHUxfo1m8zBAAegm:
+  pDmpE29YEhr93MPVPCGkWx3BsCcow4oExmxv5viJz2GTjsaXwc3YwKxE1CFdVuTVSudsFDutFSVmtgF98Abs56JZPfGQs6GzbqXDFkGA1eZx2edkwfP2Q6eRLo8coLhvTNj:
     primary:
-      network_address: /ip4/34.31.250.229/udp/49590/quic-v1/p2p/12D3KooWALMaiSKbDYntEfKzfGwdUUDLZhd3DSa7Jpictjpe1Qn8
-      network_key: 4XTTM1f3EZanfpuvYGKnQnJqTd4s13NcVLfBM338NvySAyBZE
+      network_address: /ip4/35.203.41.59/udp/49590/quic-v1/p2p/12D3KooWCnizjv4ctsBTwwYJxZP3duCuoebJfbk1fUQv6Vg1dVUh
+      network_key: 4XTTM47Qeb4XhWEK7ybzj5bGsnVraHKaknpMFPgpg8jHYbGFo
     worker:
-      network_address: /ip4/34.31.250.229/udp/49594/quic-v1/p2p/12D3KooWMjAnbym3NeU25aCi23eU85kbnyo6xxatyzDDgiDjxZQp
-      network_key: 4XTTMD3rST8E7z1bg7Ef895YJGgQGGenZ6BC8iCcyiwqGvLBv
-  pbYFhxoq8JG1xGws2JVazihWYMwWiW472wwtvDBZC9xGyFiVBWYn3PNXEdjtEzZssg9qjANscDqVJdy86jy6LwVBqSynXEFAMvpphybWrbvQzErPyHoxq78A9NoLjmemRQi:
+      network_address: /ip4/35.203.41.59/udp/49594/quic-v1/p2p/12D3KooWHGdbYerasxspuhZW4KqNMbbpqvLNCG6LGpS5yx6b8x2x
+      network_key: 4XTTM8bKFPoKfVL1UwN1vBMjCWCFVKbKpKUha12qr2Bi86ip4
+  rZdhyVGJAtz7kyFtFARWVVcw5DB3o9E4GvPN6zuKfUhUBGFRvEK2PgEV44CJt9wu9GMyssFQBFXRknrenuhJixo9KCADrZzHdtcvAwAYDmcLc7Ugh9epGc5LRZC5TK2hnYA:
     primary:
-      network_address: /ip4/35.245.21.245/udp/49590/quic-v1/p2p/12D3KooWSJrTqWZaur1owZ3ddhDWWVMayyCikSECv8RbvM7rX2Qm
-      network_key: 4XTTMHdY7gf2fXD9TyDW3kj7Lf61FTeCAseqSeLqMxajPUoBs
+      network_address: /ip4/34.105.191.161/udp/49590/quic-v1/p2p/12D3KooWBRH7XpYhxCPTrw364UnmaSYDR4hCotoTHxTWTjKfrcUm
+      network_key: 4XTTM2jxmNy1nZZX7tbVWBWgbj3Bstjgew7Qh2AsGVxwCpPFs
     worker:
-      network_address: /ip4/35.245.21.245/udp/49594/quic-v1/p2p/12D3KooWHVUFjRvP7XRrx9Nrjuti6AZMrzJD5YLnzpGuVFUQL2M3
-      network_key: 4XTTM8p9uaaPTitZWyoqGrwnYEmD2LfHfCkx2j2gfXV5wHo89
-  xmAQA59z9Uj1HSjm7ToFB18XzH1a8k9UfA4BVaSvPLVhDrZmG99d2x7ovHzvQEyzxLhy2ogv1iKDCFicH3kykmmFs3inGcPbdPistQyRUgHv4xcoZDa7sDx4oohupokZz7g:
+      network_address: /ip4/34.105.191.161/udp/49594/quic-v1/p2p/12D3KooWFf6gRgYGnob7zhSZEnswRAHs4tSuh9UZXc5HzeKNut14
+      network_key: 4XTTM6ynLGq1MQAin2MtyMpmmZkwXYZSMpN5oFpV42svusenA
+  24JaKrebALhvhXxsAabjd5ZK22k1W4zKwGepKD5pcobQwBkZyiruYyhRM3hkLap8Ssc4qUdcRUJSrs2389hUoV7G83HKYrmkz2pTzCJiQURV5vtkrh8gFRKBQWKFTWLWah9s:
     primary:
-      network_address: /ip4/34.102.122.126/udp/49590/quic-v1/p2p/12D3KooWBTX8Dyj3gYEiNsn8DNn8TjZGKbbV8LGtkFqYCxTwUsmh
-      network_key: 4XTTM2nCn58C8HuNNQYEYLQfxcLCvoGawFYt8UUFJFC5USeYo
+      network_address: /ip4/34.102.122.126/udp/49590/quic-v1/p2p/12D3KooWSwK9yPLNtDr116cX74FS4Ehs2Nx2fWAUjpnsGrNkNGKd
+      network_key: 4XTTMJFzopXoTVayf2m4wE69GCqMXW3wUnimiU3CdK5zHL36j
     worker:
-      network_address: /ip4/34.102.122.126/udp/49594/quic-v1/p2p/12D3KooWScXH2PUQkJoLFbV7h19cpHNcz1qBbpiY2P9w3n496v1v
-      network_key: 4XTTMHwCvsXwVMfvzHFwXp33Sxt2HTgpdj3KmkbZh61fg4go2
-  ydgmjCLWhMWBGBUCn67MYfJzNkuh2owEFoDk2dGqKhahAw7TEuAMGjSG5DTJ1phAoJV6iEEUAMBvtvdgrv7Arx7Q9cwgN2AwTeQshVuFpkVqNDGJqfkM7MWY8cDiSRHHQkJ:
+      network_address: /ip4/34.102.122.126/udp/49594/quic-v1/p2p/12D3KooWESQQ5KghAFnUwWJq7niJuVjrLDooNzypjmRfwsySMXhC
+      network_key: 4XTTM5m63vU9mmcv8yAmFEpc946PWotoFWDb4TyqRz7ayKJUJ
+  26L1XwWTr6bBNnxJmDJXJgTqMAyD4ExkqwPYYJqDD3gob3jzejypQoewqRmqb9D2Yudk7zjcPqaTzFcEtXhrYXUtNx2ZYeLKC8V77LL2J136Hvw8eCGXpadGAbymThMhWYAa:
     primary:
-      network_address: /ip4/34.162.82.82/udp/49590/quic-v1/p2p/12D3KooWGCBzjmYTTJ1P172DJmsrAie6J8nq5GQGwkiATv6nJUuU
-      network_key: 4XTTM7Wseav1Y4f932mUdRomgKKHkmonHCV1Wfy7vW9iKGFga
+      network_address: /ip4/34.141.203.172/udp/49590/quic-v1/p2p/12D3KooWA2LvcWr3dvLx3CFnayoY4Q1mUX1qC2RuA2iAbUXjCpjM
+      network_key: 4XTTM1M2aTfK8FHUc4riCi1hNCzfRxC1HKF38tF7vdi9GAbWT
     worker:
-      network_address: /ip4/34.162.82.82/udp/49594/quic-v1/p2p/12D3KooWSAppNsWqBCC3AMwWm2UpkUWufbJSgsP4VXEuQ2kgJEt6
-      network_key: 4XTTMHVWUE1yunZKhC2Pvt4Neu5Aa9GHtp5zJDjefSGNDG1fC
+      network_address: /ip4/34.141.203.172/udp/49594/quic-v1/p2p/12D3KooWDWAL8TE8PikV2Jxt3WSEkXCKcDKipDdVsFJVJMMxEbGz
+      network_key: 4XTTM4pqyybhD15t93yRJAYL4u7qz5tKAwSEjbTiFLayVCN46
+  26L3gmkBzxAxEwvVuDrxEmKf2XwYGnYj1EQSiZSX3PBAvRa6Z5tegfmDAGHTsBwdtjFuAd7ayQEemE1AUE5ajSSK8wn3uz1MY5vjbGdeh3RoUv1TKLfbNTTULq9qdtaSTHhL:
+    primary:
+      network_address: /ip4/34.40.242.29/udp/49590/quic-v1/p2p/12D3KooWMUuChs1v4umTNiHivmD9G764hbcTTooRrMUpLZ9Tgpn5
+      network_key: 4XTTMCoarZ1UzgGu7QNk93o6yQhjjBGbub2QfaZtaNnkzebZB
+    worker:
+      network_address: /ip4/34.40.242.29/udp/49594/quic-v1/p2p/12D3KooWE8p62tGetgUeJbKKyctPB2ky1zpahA6wPVr18R7iBtLB
+      network_key: 4XTTM5TVjt2jjW3cJLFmk6enDKdQdVfp2pNiB7iFmAejF9f7H

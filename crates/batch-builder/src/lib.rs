@@ -642,9 +642,9 @@ mod tests {
         gas_accumulator.rewards_counter().set_committee(committee);
         // specify leader for consensus output
         let mut leader_cert = Certificate::default();
-        leader_cert.header_mut_for_test().author = leader;
+        leader_cert.update_header_author_for_test(leader);
         let mut subdag = CommittedSubDag::default();
-        subdag.headers.push(leader_cert.header.clone());
+        subdag.headers.push((*leader_cert.header).clone());
         let output = ConsensusOutput::new_with_subdag(Arc::new(subdag), BlockHash::default(), 0);
 
         // receive new blocks and return non-fatal errors

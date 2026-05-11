@@ -21,7 +21,7 @@ if [ -z "$GITHUB_ATTESTATION_PRIVATE_KEY" ]; then
 fi
 
 # NOTE: this contract must match CI
-CONTRACT_ADDRESS="0xfb8062c74148c4763238b7a46a1b1025470f1160"
+CONTRACT_ADDRESS="0xf102928273a399cda6151b8616209af019499c84"
 RPC_ENDPOINT="https://rpc.adiri.tel"
 ATTEST_CALL="attestGitCommitHash(bytes20,bool)"
 VERIFY_CALL="gitCommitHashAttested(bytes20)"
@@ -45,6 +45,9 @@ fi
 cd "$(dirname "$0")/.."
 
 echo "executing bash script from $(pwd)"
+
+# nightly toolchain used for fmt/clippy (rustfmt and clippy use nightly-only options)
+NIGHTLY=$(cat rust-nightly)
 
 # Check if cargo-nextest is installed
 if ! cargo nextest --version &> /dev/null; then
@@ -76,7 +79,7 @@ if [ -n "$MODIFIED_TRACKED_FILES" ]; then
 fi
 
 # check cargo fmt first
-cargo +nightly-2026-03-20 fmt -- --check
+cargo +$NIGHTLY fmt -- --check
 
 echo "fmt passed"
 
@@ -84,9 +87,9 @@ echo "fmt passed"
 # check clippy
 #
 # default features
-cargo +nightly-2026-03-20 clippy --workspace -- -D warnings
+cargo +$NIGHTLY clippy --workspace -- -D warnings
 # all features
-cargo +nightly-2026-03-20 clippy --workspace --all-features -- -D warnings
+cargo +$NIGHTLY clippy --workspace --all-features -- -D warnings
 
 echo "clippy for workspace: default and all features passed"
 

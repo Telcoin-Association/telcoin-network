@@ -26,8 +26,7 @@ use tn_types::{Address, Bytes, U256};
 
 use crate::{
     evm::tel_precompile::{
-        burnable::{has_mint_role, Mint},
-        erc20::Transfer,
+        burnable::{has_mint_role, Mint, Transfer},
         helpers::balance_incr,
         TOTAL_SUPPLY_SLOT,
     },
@@ -204,7 +203,6 @@ mod tests {
     use super::*;
     use crate::evm::tel_precompile::{
         burnable::{burnCall, claimCall, grantMintRoleCall, hasMintRoleCall, revokeMintRoleCall},
-        erc20::{balanceOfCall, totalSupplyCall},
         test_utils::*,
     };
     use alloy::sol_types::SolCall;
@@ -302,8 +300,7 @@ mod tests {
         env.exec_default(GOVERNANCE_SAFE_ADDRESS, grantMintRoleCall { addr: FAUCET }.abi_encode())
             .unwrap();
         env.mint(FAUCET, RECIPIENT, U256::from(500)).unwrap();
-        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, totalSupplyCall {}.abi_encode());
-        assert_eq!(decode_u256(&result), genesis + U256::from(500));
+        assert_eq!(env.get_total_supply(), genesis + U256::from(500));
     }
 
     #[test]
@@ -314,11 +311,7 @@ mod tests {
             .unwrap();
         env.mint(FAUCET, RECIPIENT, U256::from(500)).unwrap();
         env.mint(FAUCET, RECIPIENT, U256::from(300)).unwrap();
-        let result = env.exec_default(
-            GOVERNANCE_SAFE_ADDRESS,
-            balanceOfCall { account: RECIPIENT }.abi_encode(),
-        );
-        assert_eq!(decode_u256(&result), U256::from(800));
+        assert_eq!(env.get_balance(RECIPIENT), U256::from(800));
     }
 
     #[test]
@@ -340,11 +333,7 @@ mod tests {
         env.exec_default(GOVERNANCE_SAFE_ADDRESS, grantMintRoleCall { addr: FAUCET }.abi_encode())
             .unwrap();
         env.mint(FAUCET, RECIPIENT, U256::from(750)).unwrap();
-        let result = env.exec_default(
-            GOVERNANCE_SAFE_ADDRESS,
-            balanceOfCall { account: RECIPIENT }.abi_encode(),
-        );
-        assert_eq!(decode_u256(&result), U256::from(750));
+        assert_eq!(env.get_balance(RECIPIENT), U256::from(750));
     }
 
     #[test]
@@ -360,8 +349,7 @@ mod tests {
             burnCall { amount: U256::from(200) }.abi_encode(),
         )
         .unwrap();
-        let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, totalSupplyCall {}.abi_encode());
-        assert_eq!(decode_u256(&result), genesis + U256::from(500) - U256::from(200));
+        assert_eq!(env.get_total_supply(), genesis + U256::from(500) - U256::from(200));
     }
 
     #[test]

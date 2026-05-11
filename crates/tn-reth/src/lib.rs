@@ -166,10 +166,8 @@ pub mod worker;
 #[cfg(not(feature = "faucet"))]
 pub use evm::TIMELOCK_DURATION;
 pub use evm::{
-    add_telcoin_precompile, allowanceCall, approveCall, balanceOfCall, burnCall,
-    calculate_gas_penalty, claimCall, decimalsCall, grantMintRoleCall, hasMintRoleCall, mintCall,
-    nameCall, noncesCall, permitCall, revokeMintRoleCall, symbolCall, totalSupplyCall,
-    transferCall, transferFromCall, DOMAIN_SEPARATORCall, TELCOIN_PRECOMPILE_ADDRESS,
+    add_telcoin_precompile, burnCall, calculate_gas_penalty, claimCall, grantMintRoleCall,
+    hasMintRoleCall, mintCall, revokeMintRoleCall, totalSupplyCall, TELCOIN_PRECOMPILE_ADDRESS,
 };
 
 #[cfg(any(feature = "test-utils", test))]
@@ -1199,8 +1197,9 @@ impl RethEnv {
             );
 
             let (strategies, values): (Vec<u8>, Vec<u64>) = worker_configs.iter().copied().unzip();
+            let datas = vec![0u128; strategies.len()];
             let constructor_args =
-                WorkerConfigs::constructorCall { strategies, values, owner_: owner_address }
+                WorkerConfigs::constructorCall { strategies, values, datas, owner_: owner_address }
                     .abi_encode();
 
             let initcode_binding =
@@ -1494,9 +1493,8 @@ impl RethEnv {
 
     /// Read fee configs for all workers from the [`WorkerConfigs`] contract at the given header.
     ///
-    /// Builds an EVM against `header`'s state, calls `numWorkers()`, then makes one
-    /// `getWorkerConfig` call per worker. Returns the on-chain worker count alongside the
-    /// decoded [`WorkerFeeConfig`]s.
+    /// Builds an EVM against `header`'s state and issues a single `getAllWorkerConfigs()` call.
+    /// Returns the on-chain worker count alongside the decoded [`WorkerFeeConfig`]s.
     fn worker_fee_configs_inner(
         &self,
         header: &SealedHeader,
@@ -1510,42 +1508,55 @@ impl RethEnv {
             .evm_factory()
             .create_evm(&mut db, self.inner.evm_config.evm_env(header)?);
 
-        let num_workers_calldata = WorkerConfigs::numWorkersCall {}.abi_encode().into();
-        let num_workers_state = self.read_state_on_chain(
+        let calldata = WorkerConfigs::getAllWorkerConfigsCall {}.abi_encode().into();
+        let result = self.read_state_on_chain(
             &mut tn_evm,
             SYSTEM_ADDRESS,
             WORKER_CONFIGS_ADDRESS,
-            num_workers_calldata,
+            calldata,
         )?;
-        let num_workers_data = match num_workers_state.result {
+        let data = match result.result {
             ExecutionResult::Success { output, .. } => output.into_data(),
-            e => eyre::bail!("failed to read num workers: {e:?}"),
+            e => eyre::bail!("failed to read worker configs: {e:?}"),
         };
-        let num_workers =
-            <WorkerConfigs::numWorkersCall as alloy::sol_types::SolCall>::abi_decode_returns(
-                &num_workers_data,
-            )? as usize;
+        let ret =
+            <WorkerConfigs::getAllWorkerConfigsCall as alloy::sol_types::SolCall>::abi_decode_returns(
+                &data,
+            )?;
+
+        let num_workers = ret.count as usize;
+        if ret.strategies.len() != num_workers
+            || ret.values.len() != num_workers
+            || ret.datas.len() != num_workers
+        {
+            eyre::bail!(
+                "worker config arity mismatch: count={num_workers}, strategies={}, values={}, datas={}",
+                ret.strategies.len(),
+                ret.values.len(),
+                ret.datas.len(),
+            );
+        }
 
         let mut configs = Vec::with_capacity(num_workers);
-        for worker_id in 0..num_workers {
-            let calldata = WorkerConfigs::getWorkerConfigCall { workerId: worker_id as u16 }
-                .abi_encode()
-                .into();
-            let state = self.read_state_on_chain(
-                &mut tn_evm,
-                SYSTEM_ADDRESS,
-                WORKER_CONFIGS_ADDRESS,
-                calldata,
-            )?;
-            let data = match state.result {
-                ExecutionResult::Success { output, .. } => output.into_data(),
-                e => eyre::bail!("failed to read worker config for worker {worker_id}: {e:?}"),
-            };
-            let ret = <WorkerConfigs::getWorkerConfigCall as alloy::sol_types::SolCall>::abi_decode_returns(&data)?;
-            let config = match ret.strategy {
-                0 => WorkerFeeConfig::Eip1559 { target_gas: ret.value },
-                1 => WorkerFeeConfig::Static { fee: ret.value },
-                s => eyre::bail!("unknown fee strategy {s} for worker {worker_id}"),
+        for (worker_id, (&strategy, &value)) in
+            ret.strategies.iter().zip(ret.values.iter()).enumerate()
+        {
+            let config = match strategy {
+                0 => WorkerFeeConfig::Eip1559 { target_gas: value },
+                1 => WorkerFeeConfig::Static { fee: value },
+                s => {
+                    // The contract rejects unknown strategies, so this branch only fires when a
+                    // future contract version introduces a strategy this node hasn't been
+                    // updated to understand. Fall back to EIP-1559 to preserve liveness instead
+                    // of halting all validators.
+                    tracing::warn!(
+                        target: "tn::reth",
+                        worker_id,
+                        strategy = s,
+                        "unknown fee strategy; falling back to strategy 0 (Eip1559)"
+                    );
+                    WorkerFeeConfig::Eip1559 { target_gas: value }
+                }
             };
             configs.push(config);
         }
@@ -1668,9 +1679,9 @@ mod tests {
         leader.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
             BlsSignature::default(),
         ));
-        leader.header_mut_for_test().created_at = tn_types::now();
-        leader.header.round = round;
-        leader.header.epoch = epoch;
+        leader.update_header_created_at_for_test(tn_types::now());
+        leader.update_header_round_for_test(round);
+        leader.update_header_epoch_for_test(epoch);
         let reputation_scores = ReputationScores::default();
         let previous_sub_dag = None;
         let sub_dag = Arc::new(CommittedSubDag::new(
@@ -2221,7 +2232,7 @@ mod tests {
         let governance = governance_multisig.address();
         let tmp_genesis = tn_types::test_genesis().extend_accounts([(
             governance,
-            GenesisAccount::default().with_balance(U256::from((50_000_000 * 10) ^ 18)),
+            GenesisAccount::default().with_balance(U256::from(parse_ether("50_000_000")?)),
         )]);
 
         // deploy with 2 workers: worker 0 = EIP-1559 (strategy 0, target 30M),

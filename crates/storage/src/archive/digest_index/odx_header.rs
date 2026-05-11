@@ -11,7 +11,7 @@ use std::{
 };
 
 /// Minimum size of an index overflow header, includes the crc32 checksum following the header.
-const MIN_HEADER_SIZE: usize = 30;
+const MIN_HEADER_SIZE: usize = 28;
 
 /// Header for an odx (index overflow) file.  This contains the overflow hash buckets for lookups.
 /// This file is an append only log file and the header and buckets will NOT change in place over
@@ -21,7 +21,7 @@ pub struct OdxHeader {
     type_id: [u8; 8], // The characters "telcoinx"
     version: u16,     // Holds the version number
     uid: u64,         // Unique ID generated on creation
-    appnum: u64,      // Application defined constant
+    appnum: u32,      // Application defined constant
     header_size: usize, /* Size of the header (not saved to file, max of bucket_size or
                        * MIN_HEADER_SIZE). */
     read_only: bool, // Is this file read only?
@@ -32,7 +32,7 @@ impl OdxHeader {
     pub fn open_odx_file<P: AsRef<Path>>(
         version: u16,
         uid: u64,
-        appnum: u64,
+        appnum: u32,
         path: P,
         read_only: bool,
     ) -> Result<(File, OdxHeader), LoadHeaderError> {
@@ -70,7 +70,7 @@ impl OdxHeader {
 
     /// Return a default OdxHeader with any values from hdx_header overridden.
     /// This includes the version, uid, appnum and bucket_size.
-    fn new(version: u16, uid: u64, appnum: u64, read_only: bool) -> Self {
+    fn new(version: u16, uid: u64, appnum: u32, read_only: bool) -> Self {
         let header_size = MIN_HEADER_SIZE;
         Self { type_id: *b"telcoinx", version, uid, appnum, header_size, read_only }
     }
@@ -85,6 +85,7 @@ impl OdxHeader {
         source.rewind()?;
         let mut buffer = vec![0_u8; header_size];
         let mut buf16 = [0_u8; 2];
+        let mut buf32 = [0_u8; 4];
         let mut buf64 = [0_u8; 8];
         let mut pos = 0;
         source.read_exact(&mut buffer[..])?;
@@ -103,8 +104,8 @@ impl OdxHeader {
         buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
         let uid = u64::from_le_bytes(buf64);
         pos += 8;
-        buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
-        let appnum = u64::from_le_bytes(buf64);
+        buf32.copy_from_slice(&buffer[pos..(pos + 4)]);
+        let appnum = u32::from_le_bytes(buf32);
         let header = Self { type_id, version, uid, appnum, header_size, read_only };
         Ok(header)
     }
@@ -122,7 +123,7 @@ impl OdxHeader {
         pos += 2;
         buffer[pos..(pos + 8)].copy_from_slice(&self.uid.to_le_bytes());
         pos += 8;
-        buffer[pos..(pos + 8)].copy_from_slice(&self.appnum.to_le_bytes());
+        buffer[pos..(pos + 4)].copy_from_slice(&self.appnum.to_le_bytes());
         add_crc32(&mut buffer);
         sync.write_all(&buffer)?;
         Ok(())
@@ -139,7 +140,7 @@ impl OdxHeader {
     }
 
     /// Application defined constant
-    pub fn appnum(&self) -> u64 {
+    pub fn appnum(&self) -> u32 {
         self.appnum
     }
 }

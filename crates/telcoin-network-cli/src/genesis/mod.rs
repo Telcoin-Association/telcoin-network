@@ -157,10 +157,6 @@ impl GenesisArgs {
     ///
     /// The worker id is validated to match the index position (0, 1, 2, ...).
     fn parse_worker_fee_configs(&self) -> eyre::Result<Vec<(u8, u64)>> {
-        if self.worker_fee_configs.is_empty() {
-            return Ok(vec![(0u8, 100_000_000_000u64)]);
-        }
-
         let mut configs: Vec<(u16, u8, u64)> = self
             .worker_fee_configs
             .iter()
@@ -329,8 +325,8 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_worker_fee_configs_empty_returns_default() {
-        let args = args_with_configs(vec![]);
+    fn test_parse_worker_fee_configs_explicit_default() {
+        let args = args_with_configs(vec!["0:0:100000000000"]);
         let result = args.parse_worker_fee_configs().unwrap();
         assert_eq!(result, vec![(0, 100_000_000_000)]);
     }

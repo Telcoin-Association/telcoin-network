@@ -7,7 +7,7 @@ use tn_primary::{
     network::PrimaryNetworkHandle,
     ConsensusBus, Primary, StateSynchronizer,
 };
-use tn_storage::consensus::ConsensusChain;
+use tn_storage::{certificate_pack::CertificatePack, consensus::ConsensusChain};
 use tn_types::{
     Committee, Database as ConsensusDatabase, Notifier, TaskManager, TimestampSec,
     DEFAULT_BAD_NODES_STAKE_THRESHOLD,
@@ -40,9 +40,10 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
         &mut self,
         task_manager: &TaskManager,
         consensus_chain: ConsensusChain,
+        certificate_pack: Option<CertificatePack>,
     ) -> eyre::Result<()> {
         // spawn primary and update `self`
-        self.spawn_primary(task_manager, consensus_chain).await?;
+        self.spawn_primary(task_manager, consensus_chain, certificate_pack).await?;
 
         Ok(())
     }
@@ -53,9 +54,11 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
         &mut self,
         task_manager: &TaskManager,
         consensus_chain: ConsensusChain,
+        certificate_pack: Option<CertificatePack>,
     ) -> SubscriberResult<()> {
-        let leader_schedule =
-            self.spawn_consensus(&self.consensus_bus, task_manager, consensus_chain).await?;
+        let leader_schedule = self
+            .spawn_consensus(&self.consensus_bus, task_manager, consensus_chain, certificate_pack)
+            .await?;
 
         self.primary.spawn(
             self.consensus_config.clone(),
@@ -74,6 +77,7 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
         consensus_bus: &ConsensusBus,
         task_manager: &TaskManager,
         mut consensus_chain: ConsensusChain,
+        certificate_pack: Option<CertificatePack>,
     ) -> SubscriberResult<LeaderSchedule> {
         let leader_schedule = LeaderSchedule::from_store(
             self.consensus_config.committee().clone(),
@@ -95,6 +99,7 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
             ordering_engine,
             task_manager,
             consensus_chain.clone(),
+            certificate_pack,
         )
         .await;
 
@@ -138,12 +143,13 @@ impl<CDB: ConsensusDatabase> PrimaryNode<CDB> {
         &self,
         task_manager: &TaskManager,
         consensus_chain: ConsensusChain,
+        certificate_pack: Option<CertificatePack>,
     ) -> eyre::Result<()>
     where
         CDB: ConsensusDatabase,
     {
         let mut guard = self.internal.write().await;
-        guard.start(task_manager, consensus_chain).await
+        guard.start(task_manager, consensus_chain, certificate_pack).await
     }
 
     /// Return a copy of the primaries consensus bus.

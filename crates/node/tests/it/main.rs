@@ -287,10 +287,10 @@ async fn test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
         if i > 0 && i % 3 == 0 {
             use tn_types::{Certificate, CommittedSubDag, ConsensusOutput, ReputationScores};
             let mut empty_leader = Certificate::default();
-            empty_leader.header.round = output.leader().round();
-            empty_leader.header.epoch = output.leader().epoch();
-            empty_leader.header.created_at = tn_types::now();
-            empty_leader.header_mut_for_test().author = leader.clone();
+            empty_leader.update_header_round_for_test(output.leader().round());
+            empty_leader.update_header_epoch_for_test(output.leader().epoch());
+            empty_leader.update_header_created_at_for_test(tn_types::now());
+            empty_leader.update_header_author_for_test(leader.clone());
 
             let empty_subdag = Arc::new(CommittedSubDag::new(
                 vec![empty_leader.clone()],
@@ -510,5 +510,5 @@ async fn spawn_consensus(
     consensus_bus.app().recent_blocks().send_modify(|blocks| {
         blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
     });
-    Consensus::spawn(config, consensus_bus, bullshark, task_manager, consensus_chain).await;
+    Consensus::spawn(config, consensus_bus, bullshark, task_manager, consensus_chain, None).await;
 }
