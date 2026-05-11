@@ -108,6 +108,25 @@ where
         let (committee, epoch_info, epoch_start) =
             self.get_committee_with_epoch_start_info(engine).await?;
         self.epoch_boundary = epoch_start + epoch_info.epochDuration as u64;
+        // Produce a "dummy" epoch 0 EpochRecord if missing.
+        // This will let us use simple code to find any epoch including 0 at startup.
+        if !self.consensus_chain.epochs().contains_epoch(0).await {
+            if committee.epoch() != 0 {
+                return Err(eyre::eyre!(
+                    "We have epoch 0 in our database if we are past epoch 0, on {}",
+                    committee.epoch()
+                ));
+            }
+            // No keys for epoch 0, fix that.
+            // We are on epoch 0 so load up that committee in Db as well.
+            let committee: Vec<BlsPublicKey> = committee.bls_keys().iter().copied().collect();
+            let next_committee = committee.clone();
+            let epoch_rec =
+                EpochRecord { epoch: 0, committee, next_committee, ..Default::default() };
+            // Save the "dummy" record, should be overwritten once epoch 0 closes.
+            // This will NOT be signed.
+            self.consensus_chain.epochs().save_dummy_epoch0(epoch_rec).await?;
+        }
 
         // The task manager that resets every epoch and manages
         // short-running tasks for the lifetime of the epoch.
@@ -125,6 +144,7 @@ where
                 // If things go down at exactly the wrong time we might have to replay the epoch end
                 // so account for that.
                 self.close_epoch(None, &gas_accumulator, target_hash).await?;
+                self.clear_consensus_db_for_next_epoch()?;
                 return Ok(RunEpochMode::NewEpoch);
             }
             // Only wait for consensus that was actually forwarded to the engine.
@@ -159,26 +179,6 @@ where
         // This needs to be created early so required machinery for other tasks exists when needed.
         let mut worker = worker_node.new_worker().await?;
         let current_epoch = primary.current_committee().await.epoch();
-
-        // Produce a "dummy" epoch 0 EpochRecord if missing.
-        // This will let us use simple code to find any epoch including 0 at startup.
-        if !self.consensus_chain.epochs().contains_epoch(0).await {
-            if current_epoch != 0 {
-                return Err(eyre::eyre!(
-                    "We have epoch 0 in our database if we are past epoch 0, on {current_epoch}"
-                ));
-            }
-            // No keys for epoch 0, fix that.
-            // We are on epoch 0 so load up that committee in Db as well.
-            let committee: Vec<BlsPublicKey> =
-                primary.current_committee().await.bls_keys().iter().copied().collect();
-            let next_committee = committee.clone();
-            let epoch_rec =
-                EpochRecord { epoch: 0, committee, next_committee, ..Default::default() };
-            // Save the "dummy" record, should be overwritten once epoch 0 closes.
-            // This will NOT be signed.
-            self.consensus_chain.epochs().save_dummy_epoch0(epoch_rec).await?;
-        }
 
         gas_accumulator.rewards_counter().set_committee(primary.current_committee().await);
         let certificate_pack = if consensus_bus.is_active_cvv() {
@@ -440,7 +440,7 @@ where
             rec
         } else if previous_epoch == 0 {
             EpochRecord {
-                // If we can't find the record then this we should be starting at epoch 0- use
+                // If we can't find the record then we should be starting at epoch 0- use
                 // this filler.
                 epoch: 0,
                 committee: committee.bls_keys().iter().copied().collect(),

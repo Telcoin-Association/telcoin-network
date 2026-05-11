@@ -774,7 +774,11 @@ impl Inner {
             false,
         )
         .map_err(OpenError::IndexFileOpen)?;
-        let mut parent_digest = previous_epoch.final_consensus.hash;
+        let mut parent_digest = if epoch == 0 {
+            ConsensusHeader::default().digest()
+        } else {
+            previous_epoch.final_consensus.hash
+        };
         let mut batches = HashSet::new();
         while let Some(record) = next(&mut stream_iter, timeout).await? {
             match record {
@@ -1247,7 +1251,7 @@ pub(crate) mod test {
     use tn_test_utils::CommitteeFixture;
     use tn_types::{
         test_genesis, BlockHash, Certificate, CertifiedBatch, CommittedSubDag, Committee,
-        ConsensusOutput, EpochRecord, Hash, ReputationScores,
+        ConsensusHeader, ConsensusOutput, EpochRecord, Hash, ReputationScores,
     };
 
     use crate::{
@@ -1355,7 +1359,7 @@ pub(crate) mod test {
 
         let num_outputs = 1000;
         let mut outputs = Vec::new();
-        let mut parent = BlockHash::default();
+        let mut parent = ConsensusHeader::default().digest();
         for i in 0..num_outputs {
             let consensus_output =
                 make_test_output(&committee, i % 4, chain.clone(), (i as u64) + 1, parent);
