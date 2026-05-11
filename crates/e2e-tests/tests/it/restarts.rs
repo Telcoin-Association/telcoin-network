@@ -1,60 +1,21 @@
-use alloy::primitives::address;
-use e2e_tests::{config_local_testnet, setup_log_dir};
+//! E2e tests for nodes crashing and rejoining and active network.
+
+use super::common::{kill_child, ProcessGuard};
+use crate::common::{
+    address_from_word, get_balance, get_balance_above_with_retry, get_block, get_block_number,
+    get_key, get_latest_consensus_header_number, get_positive_balance_with_retry,
+    network_advancing, send_and_confirm, send_tel, start_observer, start_validator, WEI_PER_TEL,
+};
+use e2e_tests::config_local_testnet;
 use escargot::CargoRun;
-use ethereum_tx_sign::{LegacyTransaction, Transaction};
 use eyre::Report;
-use jsonrpsee::rpc_params;
 use nix::{
     sys::signal::{self, Signal},
     unistd::Pid,
 };
-use secp256k1::{Keypair, Secp256k1, SecretKey};
-use serde_json::Value;
-use std::{collections::HashMap, path::Path, process::Child, time::Duration};
-use tn_types::{get_available_tcp_port, keccak256, Address};
+use std::{path::Path, process::Child, time::Duration};
+use tn_types::get_available_tcp_port;
 use tracing::{error, info};
-
-use crate::common::{call_rpc, get_block};
-
-use super::common::{kill_child, ProcessGuard};
-
-/// One unit of TEL (10^18) measured in wei.
-const WEI_PER_TEL: u128 = 1_000_000_000_000_000_000;
-
-fn send_and_confirm(
-    node: &str,
-    node_test: &str,
-    key: &str,
-    to_account: Address,
-    nonce: u128,
-) -> eyre::Result<()> {
-    let basefee_address = address!("0x9999999999999999999999999999999999999999");
-    let current = get_balance(node_test, &to_account.to_string(), 1)?;
-    let current_basefee = get_balance(node_test, &basefee_address.to_string(), 1)?;
-    let amount = 10 * WEI_PER_TEL; // 10 TEL
-    let expected = current + amount;
-    send_tel(node, key, to_account, amount, 250, 21000, nonce)?;
-
-    // sleep
-    std::thread::sleep(Duration::from_millis(1000));
-    info!(target: "restart-test", "calling get_positive_balance_with_retry...");
-
-    // get positive bal and kill child2 if error
-    let bal = get_balance_above_with_retry(node_test, &to_account.to_string(), expected - 1)?;
-
-    if expected != bal {
-        error!(target: "restart-test", "{expected} != {bal} - returning error!");
-        return Err(Report::msg(format!("Expected a balance of {expected} got {bal}!")));
-    }
-    let bal =
-        get_balance_above_with_retry(node_test, &basefee_address.to_string(), current_basefee)?;
-    let expected_bal = if nonce > 0 { current_basefee + (current_basefee / (nonce)) } else { 0 };
-    if nonce > 0 && bal < expected_bal {
-        error!(target: "restart-test", ?bal, ?expected_bal, "basefee error!");
-        return Err(Report::msg("Expected a basefee increment!".to_string()));
-    }
-    Ok(())
-}
 
 /// Run the first part tests, broken up like this to allow more robust node shutdown.
 fn run_restart_tests1(
@@ -238,32 +199,6 @@ fn run_restart_tests2(client_urls: &[String; 4]) -> eyre::Result<()> {
     }
     test_blocks_same(client_urls)?;
     Ok(())
-}
-
-fn network_advancing(client_urls: &[String; 4]) -> eyre::Result<()> {
-    // Wait for all nodes to respond to RPC.
-    // With skip-empty-execution, blocks are only produced when transactions
-    // exist or an epoch closes, so we cannot rely on block_number advancing
-    // during idle periods. Actual block production is verified later by
-    // send_and_confirm().
-    let mut i = 0;
-    loop {
-        let mut all_responsive = true;
-        for url in client_urls {
-            if get_block_number(url).is_err() {
-                all_responsive = false;
-                break;
-            }
-        }
-        if all_responsive {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_secs(1));
-        i += 1;
-        if i > 45 {
-            return Err(eyre::eyre!("Network not responding within 45 seconds!"));
-        }
-    }
 }
 
 fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
@@ -456,78 +391,6 @@ fn test_restarts_lagged_delayed() -> eyre::Result<()> {
     do_restarts(70, true, "restarts_lagged_delayed")
 }
 
-/// Start a process running a validator node.
-fn start_validator(
-    instance: usize,
-    bin: &'static CargoRun,
-    base_dir: &Path,
-    rpc_port: u16,
-    test: &str,
-    run: u32,
-) -> Child {
-    let data_dir = base_dir.join(format!("validator-{}", instance + 1));
-    let ws_port = get_available_tcp_port("127.0.0.1").expect("ws port");
-    // IPC: use temp-dir-based path to avoid cross-test conflicts
-    let ipc_path = base_dir.join(format!("validator-{}.ipc", instance + 1));
-    let mut command = bin.command();
-
-    command
-        .env("TN_BLS_PASSPHRASE", "restart_test")
-        .arg("node")
-        .arg("--datadir")
-        .arg(&*data_dir.to_string_lossy())
-        .arg("--http")
-        .arg("--http.port")
-        .arg(format!("{rpc_port}"))
-        .arg("--ws")
-        .arg("--ws.port")
-        .arg(format!("{ws_port}"))
-        .arg("--ipcpath")
-        .arg(ipc_path.to_string_lossy().as_ref())
-        .arg("--node-name")
-        .arg(format!("{test}-node{instance}"));
-
-    setup_log_dir(&mut command, instance, test, run);
-
-    command.spawn().expect("failed to execute")
-}
-
-/// Start a process running an observer node.
-fn start_observer(
-    instance: usize,
-    bin: &'static CargoRun,
-    base_dir: &Path,
-    rpc_port: u16,
-    test: &str,
-    run: u32,
-) -> Child {
-    let data_dir = base_dir.join("observer");
-    let ws_port = get_available_tcp_port("127.0.0.1").expect("ws port");
-    // IPC: use temp-dir-based path to avoid cross-test conflicts
-    let ipc_path = base_dir.join("observer.ipc");
-    let mut command = bin.command();
-    command
-        .env("TN_BLS_PASSPHRASE", "restart_test")
-        .arg("node")
-        .arg("--observer")
-        .arg("--datadir")
-        .arg(&*data_dir.to_string_lossy())
-        .arg("--http")
-        .arg("--http.port")
-        .arg(format!("{rpc_port}"))
-        .arg("--ws")
-        .arg("--ws.port")
-        .arg(format!("{ws_port}"))
-        .arg("--ipcpath")
-        .arg(ipc_path.to_string_lossy().as_ref())
-        .arg("--node-name")
-        .arg(format!("{test}-node{instance}"));
-
-    setup_log_dir(&mut command, instance, test, run);
-
-    command.spawn().expect("failed to execute")
-}
-
 fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
     info!(target: "restart-test", "calling get_block for {:?}", &client_urls[0]);
     let block0 = get_block(&client_urls[0], None)?;
@@ -558,184 +421,6 @@ fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
     }
     info!(target: "restart-test", "all rpcs returned same block hash");
     Ok(())
-}
-
-/// Send an RPC call to node to get the latest balance for address.
-/// Return a tuple of the TEL and remainder (any value left after dividing by 1_e18).
-/// Note, balance is in wei and must fit in an u128.
-fn get_balance(node: &str, address: &str, retries: usize) -> eyre::Result<u128> {
-    let res_str: String =
-        call_rpc(node, "eth_getBalance", rpc_params!(address, "latest"), retries, address)?;
-    info!(target: "restart-test", "get_balance for {node}: parsing string {res_str}");
-    let tel = u128::from_str_radix(&res_str[2..], 16)?;
-    info!(target: "restart-test", "get_balance for {node}: {tel:?}");
-    Ok(tel)
-}
-
-/// Retry up to 10 times to retrieve an account balance > 0.
-fn get_positive_balance_with_retry(node: &str, address: &str) -> eyre::Result<u128> {
-    get_balance_above_with_retry(node, address, 0)
-}
-
-/// Retry up to 45 times to retrieve an account balance > above.
-fn get_balance_above_with_retry(node: &str, address: &str, above: u128) -> eyre::Result<u128> {
-    let mut bal = get_balance(node, address, 5)?;
-    let mut i = 0;
-    while i < 45 && bal <= above {
-        std::thread::sleep(Duration::from_millis(1200));
-        i += 1;
-        bal = get_balance(node, address, 5)?;
-    }
-    if i == 45 && bal <= above {
-        error!(target:"restart-test", "get_balance_above_with_retry i == 30 - returning error!!");
-        Err(Report::msg(format!("Failed to get a balance {bal} for {address} above {above}")))
-    } else {
-        Ok(bal)
-    }
-}
-
-/// If key starts with 0x then return it otherwise generate the key from the key string.
-fn get_key(key: &str) -> String {
-    if key.starts_with("0x") {
-        key.to_string()
-    } else {
-        let (_, _, key) = account_from_word(key);
-        key
-    }
-}
-
-fn get_block_number(node: &str) -> eyre::Result<u64> {
-    let block = get_block(node, None)?;
-    Ok(u64::from_str_radix(&block["number"].as_str().unwrap_or("0x100_000")[2..], 16)?)
-}
-
-fn get_latest_consensus_header(node: &str) -> eyre::Result<HashMap<String, Value>> {
-    call_rpc(node, "tn_latestConsensusHeader", rpc_params![], 10, "tn_latestConsensusHeader")
-}
-
-fn get_latest_consensus_header_number(node: &str) -> eyre::Result<u64> {
-    let header = get_latest_consensus_header(node)?;
-    let value = header
-        .get("number")
-        .ok_or_else(|| Report::msg("tn_latestConsensusHeader missing `number` field"))?;
-
-    match value {
-        Value::Number(n) => n
-            .as_u64()
-            .ok_or_else(|| Report::msg("tn_latestConsensusHeader number is not u64-compatible")),
-        Value::String(s) if s.starts_with("0x") => {
-            u64::from_str_radix(s.trim_start_matches("0x"), 16)
-                .map_err(|e| Report::msg(format!("failed to parse consensus number hex: {e}")))
-        }
-        Value::String(s) => s
-            .parse::<u64>()
-            .map_err(|e| Report::msg(format!("failed to parse consensus number: {e}"))),
-        _ => Err(Report::msg("tn_latestConsensusHeader number has unexpected type")),
-    }
-}
-
-/// Take a string and return the deterministic account derived from it.  This is be used
-/// with similiar functionality in the test client to allow easy testing using simple strings
-/// for accounts.
-fn address_from_word(key_word: &str) -> Address {
-    let seed = keccak256(key_word.as_bytes());
-    let mut rand =
-        <secp256k1::rand::rngs::StdRng as secp256k1::rand::SeedableRng>::from_seed(seed.0);
-    let secp = Secp256k1::new();
-    let (_, public_key) = secp.generate_keypair(&mut rand);
-    // strip out the first byte because that should be the SECP256K1_TAG_PUBKEY_UNCOMPRESSED
-    // tag returned by libsecp's uncompressed pubkey serialization
-    let hash = keccak256(&public_key.serialize_uncompressed()[1..]);
-    Address::from_slice(&hash[12..])
-}
-
-/// Return the (account, public key, secret key) generated from key_word.
-fn account_from_word(key_word: &str) -> (String, String, String) {
-    let seed = keccak256(key_word.as_bytes());
-    let mut rand =
-        <secp256k1::rand::rngs::StdRng as secp256k1::rand::SeedableRng>::from_seed(seed.0);
-    let secp = Secp256k1::new();
-    let (secret_key, public_key) = secp.generate_keypair(&mut rand);
-    let keypair = Keypair::from_secret_key(&secp, &secret_key);
-    // strip out the first byte because that should be the SECP256K1_TAG_PUBKEY_UNCOMPRESSED
-    // tag returned by libsecp's uncompressed pubkey serialization
-    let hash = keccak256(&public_key.serialize_uncompressed()[1..]);
-    let address = Address::from_slice(&hash[12..]);
-    let pubkey = keypair.public_key().serialize();
-    let secret = keypair.secret_bytes();
-    (address.to_string(), const_hex::encode(pubkey), const_hex::encode(secret))
-}
-
-/// Create, sign and submit a TXN to transfer TEL from key's account to to_account.
-fn send_tel(
-    node: &str,
-    key: &str,
-    to_account: Address,
-    amount: u128,
-    gas_price: u128,
-    gas: u128,
-    nonce: u128,
-) -> eyre::Result<()> {
-    let mut to_addr = [0_u8; 20];
-    //const_hex::decode_to_slice(to_account, &mut to_addr[..])?;
-    to_addr.copy_from_slice(to_account.as_slice());
-    let (from_account, _, _) = decode_key(key)?;
-    let new_transaction = LegacyTransaction {
-        chain: 0x7e1,
-        nonce,
-        to: Some(to_addr),
-        value: amount,
-        gas_price,
-        gas,
-        data: vec![/* contract code or other data */],
-    };
-    let decoded = const_hex::decode(key)?;
-    let secret_key = SecretKey::from_byte_array(decoded.as_slice().try_into()?)?;
-    let ecdsa = new_transaction
-        .ecdsa(&secret_key.secret_bytes())
-        .map_err(|_| Report::msg("Failed to get ecdsa"))?;
-    let transaction_bytes = new_transaction.sign(&ecdsa);
-    let res_str: String = call_rpc(
-        node,
-        "eth_sendRawTransaction",
-        rpc_params!(const_hex::encode(&transaction_bytes)),
-        1,
-        transaction_bytes,
-    )?;
-    info!(target: "restart-test", "Submitted TEL transfer from {from_account} to {to_account} for {amount}: {res_str}");
-    Ok(())
-}
-
-/// Decode a secret key into it's public key and account.
-/// Returns a tuple of (account, public_key, public_key_long) as hex encoded strings.
-fn decode_key(key: &str) -> eyre::Result<(String, String, String)> {
-    match const_hex::decode(key) {
-        Ok(key) => {
-            let key_array: [u8; 32] = key
-                .as_slice()
-                .try_into()
-                .map_err(|e: std::array::TryFromSliceError| Report::msg(e.to_string()))?;
-            match SecretKey::from_byte_array(key_array) {
-                Ok(secret_key) => {
-                    let secp = Secp256k1::new();
-                    let keypair = Keypair::from_secret_key(&secp, &secret_key);
-                    let public_key = keypair.public_key();
-                    // strip out the first byte because that should be the
-                    // SECP256K1_TAG_PUBKEY_UNCOMPRESSED tag returned by
-                    // libsecp's uncompressed pubkey serialization
-                    let hash = keccak256(&public_key.serialize_uncompressed()[1..]);
-                    let address = Address::from_slice(&hash[12..]);
-                    Ok((
-                        address.to_string(),
-                        const_hex::encode(public_key.serialize()),
-                        const_hex::encode(public_key.serialize_uncompressed()),
-                    ))
-                }
-                Err(err) => Err(Report::msg(err.to_string())),
-            }
-        }
-        Err(err) => Err(Report::msg(err.to_string())),
-    }
 }
 
 /// Test that an observer started AFTER validators have already produced blocks
