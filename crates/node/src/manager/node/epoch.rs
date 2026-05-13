@@ -40,9 +40,9 @@ use tn_storage::{
 };
 use tn_types::{
     gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash, BlockNumHash, BlsPublicKey,
-    Committee, CommitteeBuilder, ConsensusOutput, Database as TNDatabase, Epoch, EpochRecord,
-    Multiaddr, NetworkPublicKey, Notifier, P2pNode, TaskJoinError, TaskManager, TaskSpawner,
-    TnReceiver, B256,
+    BlsSigner, Committee, CommitteeBuilder, ConsensusOutput, Database as TNDatabase, Epoch,
+    EpochRecord, Multiaddr, NetworkPublicKey, Notifier, P2pNode, TaskJoinError, TaskManager,
+    TaskSpawner, TnReceiver, B256,
 };
 use tn_worker::{quorum_waiter::QuorumWaiterTrait, Worker, WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::mpsc;
@@ -1072,6 +1072,10 @@ where
         bls_pubkey: BlsPublicKey,
         node_task_spawner: TaskSpawner,
     ) {
+        if bls_pubkey == self.key_config.public_key() {
+            // Don't try to dial ourselves.
+            return;
+        }
         // spawn dials on long-running task manager
         let task_name = format!("DialPeer {bls_pubkey}");
         node_task_spawner.spawn_task(task_name, async move {

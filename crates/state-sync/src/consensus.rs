@@ -93,7 +93,6 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
     consensus_bus: ConsensusBusApp,
     network: PrimaryNetworkHandle,
     consensus_chain: ConsensusChain,
-    //XXXXtask_spawner: TaskSpawner,
 ) {
     /// Attempt to request epoch packs for every epoch from current_fetch_epoch to latest epoch
     /// record.
@@ -169,7 +168,6 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
     }
     let rx_shutdown = config.shutdown().subscribe();
     let mut rx_gossip_update = consensus_bus.last_published_consensus_num_hash().subscribe();
-    //XXXXlet (tx, mut rx) = tokio::sync::mpsc::channel(10_000);
     let mut last_gossipped_epoch = None;
     let mut fetch_tasks = FuturesOrdered::new();
     let mut new_consensus = VecDeque::new();
@@ -197,13 +195,6 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
                         fetch_tasks.push_back(get_consensus_header(number, hash, &config, &consensus_bus, &network, &consensus_chain, false));
                     }
                 }
-                /* XXXX- are we overwhelming things with repeats?
-                if let Some(next) = get_consensus_header(number, hash, &config, &consensus_bus, &network, &consensus_chain).await {
-                    // Each gossip event starts a backward traversal from the new tip.
-                    // The traversal terminates naturally when it reaches an already-executed
-                    // or already-cached block, ensuring new consensus blocks are always cached.
-                    let _ = tx.send(next).await;
-                }*/
             }
             Some(res) = fetch_tasks.next() => {
                 if let Some((epoch, number, hash)) = res {
@@ -216,22 +207,6 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
                     fetch_tasks.push_back(get_consensus_header(number, hash, &config, &consensus_bus, &network, &consensus_chain, true));
                 }
             }
-
-            /*XXXXSome((epoch, number, hash)) = rx.recv() => {
-                if let Some(last_gossipped_epoch) = last_gossipped_epoch {
-                    // epochs before last_gossipped_epoch are retrieved as pack files
-                    if epoch < last_gossipped_epoch {
-                        continue;
-                    }
-                }
-                debug!(target: "state-sync", ?number, ?hash, "tracking recent consensus and detected change through gossip - requesting consensus from peer");
-
-                if let Some(next) = get_consensus_header(number, hash, &config, &consensus_bus, &network, &consensus_chain).await {
-                    let _ = tx.send(next).await;
-                }
-                // else: chain ended (block already in DB or peer fetch failed);
-                // next gossip event will start a new traversal from the latest tip.
-            }*/
 
             _ = &rx_shutdown => {
                 return;
