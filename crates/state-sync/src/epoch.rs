@@ -56,10 +56,24 @@ async fn collect_epoch_records(
     let mut best_final_consensus: Option<(Epoch, u64, B256)> = None;
     for epoch in last_epoch.. {
         // If we already have epoch record AND it's certificate then continue.
-        if let Some((_, Some(_))) = consensus_chain.epochs().get_epoch_by_number(epoch).await {
+        if let Some((rec, Some(_))) = consensus_chain.epochs().get_epoch_by_number(epoch).await {
             // Advance result_epoch so we correctly track the last confirmed epoch,
             // allowing last_epoch to advance past already-complete epochs on future calls.
             result_epoch = epoch;
+
+            let (_old_epoch, old_number, _) = consensus_bus.published_consensus_num_hash();
+            let number = rec.final_state.number;
+            let hash = rec.final_state.hash;
+            if number > old_number {
+                info!(
+                    target: "epoch-manager",
+                    "epoch sync downloaded up to epoch {result_epoch}, final consensus at block {number} ({hash}) - notifying state sync",
+                );
+                consensus_bus
+                    .last_published_consensus_num_hash()
+                    .send_replace((epoch, number, hash));
+            }
+
             continue;
         }
         // Try to recover by downloading the epoch record and cert from a peer.
