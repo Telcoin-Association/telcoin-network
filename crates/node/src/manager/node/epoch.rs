@@ -18,6 +18,7 @@ use std::{
     time::Duration,
 };
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, ConsensusConfig, NetworkConfig, TelcoinDirs};
+use tn_executor::subscriber::spawn_subscriber;
 use tn_network_libp2p::{error::NetworkError, types::NetworkHandle, TNMessage};
 use tn_primary::{
     network::{PrimaryNetwork, PrimaryNetworkHandle},
@@ -160,16 +161,17 @@ where
 
         // subscribe to output early to prevent missed messages
         let mut consensus_output = self.consensus_bus.subscribe_consensus_output();
+        let consensus_config = self.configure_consensus(engine, network_config).await?;
 
         // create primary and worker nodes
         let (primary, worker_node) = self
             .create_consensus(
                 engine,
                 &epoch_task_manager,
-                network_config,
                 epoch_mode.initial_epoch(),
                 gas_accumulator.clone(),
                 consensus_bus.clone(),
+                consensus_config.clone(),
             )
             .await?;
         // consensus config for shutdown subscribers
@@ -186,8 +188,26 @@ where
         } else {
             None
         };
-        // start primary
-        primary.start(&epoch_task_manager, self.consensus_chain.clone(), certificate_pack).await?;
+        if self.consensus_bus.is_active_cvv() {
+            // start primary
+            primary
+                .start(&epoch_task_manager, self.consensus_chain.clone(), certificate_pack)
+                .await?;
+        } else {
+            // XXXX Need executor::start (subscriber for non cvv...)
+            // Spawn the subscriber.
+            // This is mode sensitive and will the correct tasks for a non-cvv.
+            // Do not call directly for a CVV, will be handled by the primary.start() calls.
+            spawn_subscriber(
+                consensus_config.clone(),
+                consensus_config.shutdown().subscribe(),
+                consensus_bus.clone(),
+                &epoch_task_manager,
+                primary.network_handle().await,
+                self.consensus_chain.clone(),
+                self.epoch_boundary,
+            );
+        }
 
         let worker_task_manager_name = worker_task_manager_name(worker_node.id().await);
         // start batch builder
@@ -721,14 +741,12 @@ where
         &mut self,
         engine: &ExecutionNode,
         epoch_task_manager: &TaskManager,
-        network_config: &NetworkConfig,
         initial_epoch: bool,
         gas_accumulator: GasAccumulator,
         consensus_bus: ConsensusBus,
+        consensus_config: ConsensusConfig<DB>,
     ) -> eyre::Result<(PrimaryNode<DB>, WorkerNode<DB>)> {
         // create config for consensus
-        let (consensus_config, preload_keys) =
-            self.configure_consensus(engine, network_config).await?;
         let _mode = self.identify_node_mode(&consensus_config, &consensus_bus).await?;
 
         let consensus_bus_app = consensus_bus.app().clone();
@@ -756,13 +774,20 @@ where
             .await?;
 
         let primary_handle = primary.network_handle().await;
-        let prefetches = preload_keys.clone();
+        let committee = consensus_config.committee();
+        let mut prefetches = committee.bls_keys().clone();
+        let next_committee_keys = engine.validators_for_epoch(committee.epoch() + 1).await?;
+        prefetches.extend(next_committee_keys.iter());
+        prefetches.extend(engine.validators_for_epoch(committee.epoch() + 2).await?);
         // Attempt to pre-load the next couple of committee's network info.
-        let _ = primary_handle.inner_handle().find_authorities(prefetches).await;
+        let _ = primary_handle
+            .inner_handle()
+            .find_authorities(prefetches.iter().copied().collect())
+            .await;
         let worker_handle = worker.network_handle().await;
-        let prefetches = preload_keys.clone();
         // Attempt to pre-load the next couple of committee's network info.
-        let _ = worker_handle.inner_handle().find_authorities(prefetches).await;
+        let _ =
+            worker_handle.inner_handle().find_authorities(prefetches.into_iter().collect()).await;
         Ok((primary, worker))
     }
 
@@ -774,7 +799,7 @@ where
         &mut self,
         engine: &ExecutionNode,
         network_config: &NetworkConfig,
-    ) -> eyre::Result<(ConsensusConfig<DB>, Vec<BlsPublicKey>)> {
+    ) -> eyre::Result<ConsensusConfig<DB>> {
         // retrieve epoch information from canonical tip
         let (committee, epoch_info, epoch_start) =
             self.get_committee_with_epoch_start_info(engine).await?;
@@ -785,12 +810,7 @@ where
 
         debug!(target: "epoch-manager", ?validators, "creating committee for validators");
 
-        let mut next_vals: HashSet<BlsPublicKey> = HashSet::new();
-        next_vals.extend(validators.iter());
-
         let next_committee_keys = engine.validators_for_epoch(committee.epoch() + 1).await?;
-        next_vals.extend(next_committee_keys.iter());
-        next_vals.extend(engine.validators_for_epoch(committee.epoch() + 2).await?);
 
         // create config for consensus
         let consensus_config = ConsensusConfig::new_for_epoch(
@@ -802,7 +822,7 @@ where
             next_committee_keys,
         )?;
 
-        Ok((consensus_config, next_vals.into_iter().collect()))
+        Ok(consensus_config)
     }
 
     /// Create the [Committee] for the current epoch.

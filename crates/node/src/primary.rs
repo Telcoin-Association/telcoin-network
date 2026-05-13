@@ -1,7 +1,7 @@
 //! Hierarchical type to hold tasks spawned for a worker in the network.
 use std::sync::Arc;
 use tn_config::ConsensusConfig;
-use tn_executor::{Executor, SubscriberResult};
+use tn_executor::{subscriber::spawn_subscriber, SubscriberResult};
 use tn_primary::{
     consensus::{Bullshark, Consensus, LeaderSchedule},
     network::PrimaryNetworkHandle,
@@ -105,7 +105,7 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
 
         // Spawn the client executing the transactions.
         // It also synchronizes with the subscriber handler if it missed some transactions.
-        Executor::spawn(
+        spawn_subscriber(
             self.consensus_config.clone(),
             self.consensus_config.shutdown().subscribe(),
             consensus_bus.clone(),

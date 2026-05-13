@@ -318,7 +318,7 @@ async fn catch_up_consensus_from_to<DB: Database>(
             // since number <= consensus_chain.latest_consensus_number().
             header
         } else {
-            error!(
+            warn!(
                 target: "tn::observer",
                 block_number = number,
                 "Could not find header"
