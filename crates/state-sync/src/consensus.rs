@@ -126,7 +126,7 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
                 consensus_chain.epochs().record_by_epoch(*current_fetch_epoch).await
             {
                 *current_fetch_epoch += 1;
-                if epoch_record.epoch < last_gossipped_epoch.unwrap_or_default() {
+                if epoch_record.epoch < last_gossipped_epoch.unwrap_or(u32::MAX) {
                     let contains_final_header = consensus_chain
                         .consensus_header_by_number(epoch_record.final_consensus.number)
                         .await
@@ -145,11 +145,31 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
         }
     }
 
+    let mut epoch_rec = consensus_chain.epochs().latest_record().await;
+    let mut first_missing = None;
+    while let Some(rec) = epoch_rec {
+        let has_final = consensus_chain
+            .consensus_header_by_number(rec.final_consensus.number)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        epoch_rec = if !has_final {
+            first_missing = Some(rec.epoch);
+            consensus_chain.epochs().get_epoch_by_hash(rec.parent_hash).await.map(|r| r.0)
+        } else {
+            None
+        };
+    }
+    // Get the epoch of our last executed consensus.
+    let mut current_fetch_epoch = consensus_chain.latest_consensus_epoch();
+    if let Some(first_missing) = first_missing {
+        current_fetch_epoch = first_missing;
+        request_epochs(&mut current_fetch_epoch, &consensus_chain, &consensus_bus, None).await
+    }
     let rx_shutdown = config.shutdown().subscribe();
     let mut rx_gossip_update = consensus_bus.last_published_consensus_num_hash().subscribe();
     //XXXXlet (tx, mut rx) = tokio::sync::mpsc::channel(10_000);
-    // Get the epoch of our last executed consensus.
-    let mut current_fetch_epoch = consensus_chain.latest_consensus_epoch();
     let mut last_gossipped_epoch = None;
     let mut fetch_tasks = FuturesOrdered::new();
     let mut new_consensus = VecDeque::new();
