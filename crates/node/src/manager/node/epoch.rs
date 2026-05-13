@@ -824,6 +824,13 @@ where
             )?
         } else {
             let mut committee_builder = CommitteeBuilder::new(epoch);
+            for (key, bootstrap) in &self.bootstrap_servers {
+                committee_builder.add_bootstrap_server(
+                    *key,
+                    bootstrap.primary.clone(),
+                    bootstrap.worker.clone(),
+                );
+            }
 
             for validator in validators {
                 committee_builder.add_authority(validator.0, validator.1.validatorAddress);
