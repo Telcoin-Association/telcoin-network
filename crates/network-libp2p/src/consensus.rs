@@ -166,6 +166,14 @@ where
     ///
     /// The external address is self-reported and unconfirmed.
     node_record: NodeRecord,
+    /// Peers we have already pushed our [NodeRecord] to.
+    ///
+    /// A peer connecting for the first time needs our record before it can resolve
+    /// our BLS key, so we push it on `PeerConnected`. A peer that reconnects (or that
+    /// flaps repeatedly, as observed with banned peers in adiri testnet) should already have
+    /// the record in their persistent kad store. This list is per-process-lifetime in case nodes
+    /// restart.
+    published_to_peers: HashSet<PeerId>,
 }
 
 impl<Req, Res, DB, Events> ConsensusNetwork<Req, Res, DB, Events>
@@ -257,15 +265,14 @@ where
         let mut kad_config = libp2p::kad::Config::new(DEFAULT_KAD_PROTO_NAME);
         // manually add peers
         kad_config.set_kbucket_inserts(kad::BucketInserts::Manual);
-        kad_config.set_kbucket_size(network_config.libp2p_config().k_bucket_size);
-        let two_days = Some(Duration::from_secs(48 * 60 * 60));
-        let twelve_hours = Some(Duration::from_secs(12 * 60 * 60));
+        let libp2p = network_config.libp2p_config();
+        kad_config.set_kbucket_size(libp2p.k_bucket_size);
         kad_config
-            .set_record_ttl(two_days)
+            .set_record_ttl(Some(libp2p.kad_record_ttl))
             .set_record_filtering(kad::StoreInserts::FilterBoth)
-            .set_publication_interval(twelve_hours)
+            .set_publication_interval(Some(libp2p.kad_publication_interval))
             .set_query_timeout(Duration::from_secs(60))
-            .set_provider_record_ttl(two_days);
+            .set_provider_record_ttl(Some(libp2p.kad_record_ttl));
         let kad_store = KadStore::new(db.clone(), &key_config, kad_type);
         let kademlia = kad::Behaviour::with_config(peer_id, kad_store.clone(), kad_config);
 
@@ -334,6 +341,7 @@ where
             key_config,
             task_spawner,
             node_record,
+            published_to_peers: HashSet::new(),
         })
     }
 
@@ -357,11 +365,15 @@ where
     /// Return None if we don't have any confirmed external addresses yet.
     fn get_peer_record(&self) -> kad::Record {
         let key = kad::RecordKey::new(&self.key_config.primary_public_key());
+        // Leave `expires: None` for our OWN record so libp2p's PutRecordJob
+        // recomputes a fresh `now + kad_record_ttl` on every replication snapshot
+        // (see libp2p-kad jobs.rs:217-221). The configured `kad_record_ttl` still
+        // drives the wire-level expiry that remote peers store.
         kad::Record {
             key: key.clone(),
             value: encode(&self.node_record),
             publisher: Some(*self.swarm.local_peer_id()),
-            expires: None, // never expire
+            expires: None,
         }
     }
 
@@ -403,8 +415,11 @@ where
         }
     }
 
-    /// Publish our network addresses and peer id AND to the network under our BLS public key for
-    /// discovery.
+    /// Push our [NodeRecord] to a specific peer and to the DHT.
+    ///
+    /// Used on first-time connections so the remote peer can resolve our BLS key
+    /// without waiting for the kad publication interval (12h). Callers must
+    /// short-circuit on reconnects - see [`Self::published_to_peers`]
     fn publish_our_data_to_peer(&mut self, peer: PeerId) {
         let record = self.get_peer_record();
         info!(target: "network-kad", "Publishing our record to kademlia");
@@ -459,9 +474,13 @@ where
                 TNBehaviorEvent::Kademlia(event) => self.process_kad_event(event)?,
                 TNBehaviorEvent::Stream(event) => self.process_stream_event(event)?,
             },
-            SwarmEvent::ExternalAddrConfirmed { address: _ } => {
-                // New confirmed address so lets publish/update or kademlia address rocord.
-                self.provide_our_data();
+            SwarmEvent::ExternalAddrConfirmed { address } => {
+                // protocol expects static IP address
+                // emit warning if peers report different external address
+                let expected = &self.node_record.info().multiaddrs;
+                if !expected.contains(&address) {
+                    warn!(target: "network", ?expected, reported=?address, "peer reporting different external addr:")
+                }
             }
             SwarmEvent::ExpiredListenAddr { address, .. } => {
                 debug!(
@@ -736,6 +755,18 @@ where
                 // The stream (or error) will be returned to the caller via oneshot
                 // without any intermediate tracking.
                 self.swarm.behaviour_mut().stream.open_stream(peer_id, reply);
+            }
+            #[cfg(test)]
+            NetworkCommand::KadStoreGet { key, reply } => {
+                let record_key = kad::RecordKey::new(&key);
+                let record = self
+                    .swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .store_mut()
+                    .get(&record_key)
+                    .map(|cow| cow.into_owned());
+                let _ = reply.send(record);
             }
         }
 
@@ -1079,12 +1110,32 @@ where
                 self.connected_peers.retain(|peer| *peer != peer_id);
             }
             PeerEvent::PeerConnected(peer_id, addr) => {
+                // Defense in depth: even if the peer-manager `handle_established_*_connection`
+                // path lets a banned peer reach this event (observed in adiri testnet logs),
+                // refuse to register the connection with kademlia/gossipsub. Otherwise the
+                // banned peer ends up in the kad routing table and triggers a redial loop.
+                if self.swarm.behaviour().peer_manager.peer_banned(&peer_id) {
+                    debug!(
+                        target: "network",
+                        ?peer_id,
+                        "PeerConnected for banned peer — refusing to register"
+                    );
+                    let _ = self.swarm.disconnect_peer_id(peer_id);
+                    return Ok(());
+                }
+
                 // register peer for request-response behaviour
                 // NOTE: gossipsub handles `FromSwarm::ConnectionEstablished`
                 self.swarm.add_peer_address(peer_id, addr.clone());
                 // add as a kademlia peer
                 self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
-                self.publish_our_data_to_peer(peer_id);
+
+                // First-time connections need a direct record push so the peer can resolve
+                // our BLS key without waiting for the next kad publication interval. Skip
+                // on reconnects to avoid amplifying the local kad store on flapping peers
+                if self.published_to_peers.insert(peer_id) {
+                    self.publish_our_data_to_peer(peer_id);
+                }
 
                 // manage connected peers for
                 self.connected_peers.push_back(peer_id);
@@ -1221,9 +1272,6 @@ where
                     kad::QueryResult::GetRecord(Ok(
                         kad::GetRecordOk::FinishedWithNoAdditionalRecord { cache_candidates },
                     )) => {
-                        // TODO: configure caching and see issue #301
-                        // self.swarm.behaviour_mut().kademlia.put_record_to(record, peers, quorum);
-
                         debug!(target: "network-kad", ?cache_candidates, "FinishedWithNoAdditionalRecord - failed to find record");
                         self.close_kad_query(&query_id);
                     }
@@ -1244,7 +1292,7 @@ where
                         );
                     }
                     kad::QueryResult::PutRecord(Err(err)) => {
-                        error!(target: "network-kad", "Failed to put record: {err:?}");
+                        debug!(target: "network-kad", "Failed to put record: {err:?}");
                     }
                     kad::QueryResult::StartProviding(Ok(kad::AddProviderOk { key })) => {
                         debug!(

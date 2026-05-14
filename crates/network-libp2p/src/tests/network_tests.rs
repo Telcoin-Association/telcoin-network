@@ -70,6 +70,10 @@ fn create_test_peers<Req: TNMessage, Res: TNMessage>(
     (target, peers, task_manager)
 }
 
+/// ConsensusNetwork backed by in-memory kad store.
+type ConsensusNetworkMemoryDB<Req, Res> =
+    ConsensusNetwork<Req, Res, MemDatabase, mpsc::Sender<NetworkEvent<Req, Res>>>;
+
 /// A peer on TN
 struct TestPeer<Req, Res, DB = MemDatabase>
 where
@@ -83,8 +87,7 @@ where
     /// Network handle to send commands.
     network_handle: NetworkHandle<Req, Res>,
     /// The network task.
-    #[allow(clippy::type_complexity)]
-    network: Option<ConsensusNetwork<Req, Res, MemDatabase, mpsc::Sender<NetworkEvent<Req, Res>>>>,
+    network: Option<ConsensusNetworkMemoryDB<Req, Res>>,
 }
 /// A peer on TN
 struct NetworkPeer<Req, Res, DB = MemDatabase>
@@ -123,8 +126,21 @@ where
     Req: TNMessage,
     Res: TNMessage,
 {
+    create_test_types_with_config::<Req, Res>(NetworkConfig::default())
+}
+
+/// Variant of [`create_test_types`] that lets a caller customize [`NetworkConfig`]
+/// (e.g. shrink `kad_record_ttl` for a regression test).
+///
+/// The heartbeat-interval override applied by `create_test_types` is preserved here
+/// so callers can opt into a custom kad TTL without having to also remember the
+/// short heartbeat the peer manager needs in tests.
+fn create_test_types_with_config<Req, Res>(mut network_config: NetworkConfig) -> TestTypes<Req, Res>
+where
+    Req: TNMessage,
+    Res: TNMessage,
+{
     // custom network config with short heartbeat interval for peer manager
-    let mut network_config = NetworkConfig::default();
     network_config.peer_config_mut().heartbeat_interval = TEST_HEARTBEAT_INTERVAL;
 
     let all_nodes =
@@ -1691,6 +1707,104 @@ async fn test_node_record_validation() {
 }
 
 #[tokio::test]
+async fn test_local_record_has_no_expiry() {
+    let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let record = peer1.network.get_peer_record();
+    // Must be `None`. libp2p's PutRecordJob::poll only refreshes `expires` via
+    // `.or_else(...)`, so a `Some(_)` value here causes the local RecordIter to
+    // filter our row after `kad_record_ttl` and the node goes invisible. See
+    // get_peer_record() for the full reasoning.
+    assert!(
+        record.expires.is_none(),
+        "local record must have expires: None (see nemesis-1 in security-eval-kad-table-bug.md)"
+    );
+}
+
+/// End-to-end check on the nemesis-1 fix: peer 1's *own* record must survive
+/// past `kad_record_ttl` (because `get_peer_record` sets `expires: None` and
+/// libp2p's `PutRecordJob` keeps refreshing it), while peer 1's *copy of peer
+/// 2's* record must drop off the read path once `expires: Some(_)` (filled in
+/// by peer 2's libp2p before sending) lapses with no further republishes.
+#[tokio::test]
+async fn test_killed_peer_record_expires_local_record_survives() -> eyre::Result<()> {
+    // Short TTL keeps the test fast. Publication interval is the libp2p check
+    // cadence for record refresh — must be < TTL.
+    let short_ttl = Duration::from_secs(2);
+    let mut network_config = NetworkConfig::default();
+    network_config.libp2p_config_mut().kad_record_ttl = short_ttl;
+    network_config.libp2p_config_mut().kad_publication_interval = Duration::from_millis(500);
+
+    let TestTypes { peer1, peer2, _task_manager } =
+        create_test_types_with_config::<TestWorkerRequest, TestWorkerResponse>(network_config);
+
+    let NetworkPeer {
+        config: config_1, network_handle: peer1_handle, network: peer1_network, ..
+    } = peer1;
+    let NetworkPeer {
+        config: config_2, network_handle: peer2_handle, network: peer2_network, ..
+    } = peer2;
+
+    let peer1_bls = config_1.key_config().primary_public_key();
+    let peer2_bls = config_2.key_config().primary_public_key();
+    let peer2_net = config_2.primary_networkkey();
+    let peer2_addr = config_2.primary_address();
+
+    let peer1_task = tokio::spawn(async move { peer1_network.run().await });
+    let peer2_task = tokio::spawn(async move { peer2_network.run().await });
+
+    peer1_handle.start_listening(config_1.primary_address()).await?;
+    peer2_handle.start_listening(peer2_addr.clone()).await?;
+
+    // Wire peer1 -> peer2 and wait for kad cross-publication.
+    peer1_handle.add_trusted_peer_and_dial(peer2_bls, peer2_net, peer2_addr).await?;
+    wait_for_peer_discovery(&peer1_handle, peer2_bls, Duration::from_secs(5)).await?;
+
+    // Poll until peer1 has stored peer2's record. `publish_our_data_to_peer`
+    // fires on PeerConnected, but the actual record-store write only lands
+    // after a round trip.
+    let kad_recv_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if peer1_handle.kad_store_get(peer2_bls).await?.is_some() {
+            break;
+        }
+        if tokio::time::Instant::now() >= kad_recv_deadline {
+            return Err(eyre!("timed out waiting for peer1 to receive peer2's kad record"));
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Sanity: peer1's own record also present before peer2 dies.
+    assert!(
+        peer1_handle.kad_store_get(peer1_bls).await?.is_some(),
+        "own record present after startup"
+    );
+
+    // Kill peer2 — no more republishes can refresh peer1's stored copy.
+    peer2_task.abort();
+    let _ = peer2_task.await;
+
+    // Wait past kad_record_ttl. Buffer covers SystemTime/Instant rounding.
+    tokio::time::sleep(short_ttl + Duration::from_secs(1)).await;
+
+    // Invariant 1: peer1's own record (expires: None) is still readable.
+    assert!(
+        peer1_handle.kad_store_get(peer1_bls).await?.is_some(),
+        "local record must survive past kad_record_ttl (regression on nemesis-1 fix)"
+    );
+
+    // Invariant 2: peer1's copy of peer2's record (expires: Some(_)) is filtered on read.
+    assert!(
+        peer1_handle.kad_store_get(peer2_bls).await?.is_none(),
+        "expired peer record must not be returned from kad store"
+    );
+
+    peer1_task.abort();
+    let _ = peer1_task.await;
+    drop(_task_manager);
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_newer_kad_record_replaced() -> eyre::Result<()> {
     let TestTypes { peer1, mut peer2, .. } =
         create_test_types::<TestWorkerRequest, TestWorkerResponse>();
@@ -1719,7 +1833,11 @@ async fn test_newer_kad_record_replaced() -> eyre::Result<()> {
         .store_mut()
         .get(&peer2_new_record.key)
         .expect("peer2 record in local kad store");
-    assert_eq!(old_kad_record, *store_record);
+    // Records carry an `Instant` `expires`, which loses precision across the
+    // SystemTime <-> Instant round-trip in `KadRecord`. Compare the stable fields.
+    assert_eq!(old_kad_record.key, store_record.key);
+    assert_eq!(old_kad_record.value, store_record.value);
+    assert_eq!(old_kad_record.publisher, store_record.publisher);
 
     // process new put request with newer record
     network
@@ -1732,7 +1850,9 @@ async fn test_newer_kad_record_replaced() -> eyre::Result<()> {
         .store_mut()
         .get(&peer2_new_record.key)
         .expect("peer2 record in local kad store");
-    assert_eq!(*store_record, peer2_new_record);
+    assert_eq!(store_record.key, peer2_new_record.key);
+    assert_eq!(store_record.value, peer2_new_record.value);
+    assert_eq!(store_record.publisher, peer2_new_record.publisher);
 
     Ok(())
 }

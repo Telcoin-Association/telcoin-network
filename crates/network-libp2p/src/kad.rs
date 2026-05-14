@@ -56,6 +56,20 @@ impl fmt::Debug for KadRecord {
     }
 }
 
+impl KadRecord {
+    /// Returns true if the record carries an expiry that has already passed.
+    fn is_expired(&self, now: SystemTime) -> bool {
+        matches!(self.expires, Some(exp) if exp <= now)
+    }
+}
+
+impl KadProviderRecord {
+    /// Returns true if the provider record carries an expiry that has already passed.
+    fn is_expired(&self, now: SystemTime) -> bool {
+        matches!(self.expires, Some(exp) if exp <= now)
+    }
+}
+
 impl From<Record> for KadRecord {
     fn from(value: Record) -> Self {
         let expires = instant_to_system(&value.expires);
@@ -199,6 +213,78 @@ impl<DB: Database> KadStore<DB> {
         h.update(encode(key).as_ref());
         BlockHash::from_slice(h.finalize().as_bytes())
     }
+
+    /// Scan the records table and remove any rows whose expiry has passed.
+    /// Returns the number of rows actually removed and updates `num_records`.
+    fn evict_expired_records(&mut self) -> usize {
+        let now = SystemTime::now();
+        let expired_keys: Vec<BlockHash> = match self.kad_type {
+            KadStoreType::Primary => self
+                .db
+                .iter::<KadRecords>()
+                .filter_map(|(k, v)| {
+                    let r: KadRecord = decode(v.as_ref());
+                    r.is_expired(now).then_some(k)
+                })
+                .collect(),
+            KadStoreType::Worker => self
+                .db
+                .iter::<KadWorkerRecords>()
+                .filter_map(|(k, v)| {
+                    let r: KadRecord = decode(v.as_ref());
+                    r.is_expired(now).then_some(k)
+                })
+                .collect(),
+        };
+        let mut evicted = 0;
+        for k in &expired_keys {
+            let ok = match self.kad_type {
+                KadStoreType::Primary => self.db.remove::<KadRecords>(k).is_ok(),
+                KadStoreType::Worker => self.db.remove::<KadWorkerRecords>(k).is_ok(),
+            };
+            if ok {
+                evicted += 1;
+            }
+        }
+        self.num_records = self.num_records.saturating_sub(evicted);
+        evicted
+    }
+
+    /// Scan provider records and drop any key whose entire `Vec<KadProviderRecord>` has expired.
+    /// Returns the number of keys removed and updates `num_providers`.
+    fn evict_expired_providers(&mut self) -> usize {
+        let now = SystemTime::now();
+        let drop_keys: Vec<BlockHash> = match self.kad_type {
+            KadStoreType::Primary => self
+                .db
+                .iter::<KadProviderRecords>()
+                .filter_map(|(k, v)| {
+                    let recs: Vec<KadProviderRecord> = decode(v.as_ref());
+                    (!recs.is_empty() && recs.iter().all(|r| r.is_expired(now))).then_some(k)
+                })
+                .collect(),
+            KadStoreType::Worker => self
+                .db
+                .iter::<KadWorkerProviderRecords>()
+                .filter_map(|(k, v)| {
+                    let recs: Vec<KadProviderRecord> = decode(v.as_ref());
+                    (!recs.is_empty() && recs.iter().all(|r| r.is_expired(now))).then_some(k)
+                })
+                .collect(),
+        };
+        let mut evicted = 0;
+        for k in &drop_keys {
+            let ok = match self.kad_type {
+                KadStoreType::Primary => self.db.remove::<KadProviderRecords>(k).is_ok(),
+                KadStoreType::Worker => self.db.remove::<KadWorkerProviderRecords>(k).is_ok(),
+            };
+            if ok {
+                evicted += 1;
+            }
+        }
+        self.num_providers = self.num_providers.saturating_sub(evicted);
+        evicted
+    }
 }
 
 /// Iterator of KAD records.
@@ -216,10 +302,15 @@ impl<'a> Iterator for RecordIter<'a> {
     type Item = Cow<'a, Record>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.iter.next().map(|(_, r)| {
-            let r: KadRecord = decode(r.as_ref());
-            Cow::Owned(r.into())
-        })
+        let now = SystemTime::now();
+        loop {
+            let (_, raw) = self.iter.next()?;
+            let r: KadRecord = decode(raw.as_ref());
+            if r.is_expired(now) {
+                continue;
+            }
+            return Some(Cow::Owned(r.into()));
+        }
     }
 }
 
@@ -237,10 +328,12 @@ impl<DB: Database> RecordStore for KadStore<DB> {
             KadStoreType::Primary => self.db.get::<KadRecords>(&key).ok()?,
             KadStoreType::Worker => self.db.get::<KadWorkerRecords>(&key).ok()?,
         };
-        record.map(|r| {
-            let r: KadRecord = decode(r.as_ref());
-            Cow::Owned(r.into())
-        })
+        let raw = record?;
+        let r: KadRecord = decode(raw.as_ref());
+        if r.is_expired(SystemTime::now()) {
+            return None;
+        }
+        Some(Cow::Owned(r.into()))
     }
 
     fn put(&mut self, r: Record) -> libp2p::kad::store::Result<()> {
@@ -263,10 +356,13 @@ impl<DB: Database> RecordStore for KadStore<DB> {
         // Should be safe since a failure to insert indicates a fatal DB condition.
         if new_record {
             if self.num_records >= self.config.max_records {
-                return Err(Error::MaxRecords);
-            } else {
-                self.num_records += 1;
+                // Try to free a slot by evicting any records whose TTL has passed.
+                self.evict_expired_records();
+                if self.num_records >= self.config.max_records {
+                    return Err(Error::MaxRecords);
+                }
             }
+            self.num_records += 1;
         }
         match self.kad_type {
             KadStoreType::Primary => self
@@ -303,8 +399,12 @@ impl<DB: Database> RecordStore for KadStore<DB> {
     }
 
     fn add_provider(&mut self, record: ProviderRecord) -> libp2p::kad::store::Result<()> {
-        if self.config.max_provided_keys == self.num_providers {
-            return Err(Error::MaxProvidedKeys);
+        if self.num_providers >= self.config.max_provided_keys {
+            // Try to free a slot by evicting fully-expired provider key groups.
+            self.evict_expired_providers();
+            if self.num_providers >= self.config.max_provided_keys {
+                return Err(Error::MaxProvidedKeys);
+            }
         }
         let key = self.key_to_hash(&record.key);
         let kr: KadProviderRecord = record.into();
@@ -322,6 +422,9 @@ impl<DB: Database> RecordStore for KadStore<DB> {
                 }
             }
             if !found {
+                // prune expired entries before checking the cap
+                let now = SystemTime::now();
+                recs.retain(|r| !r.is_expired(now));
                 if recs.len() >= self.config.max_providers_per_key {
                     return Err(Error::MaxProvidedKeys);
                 }
@@ -356,9 +459,9 @@ impl<DB: Database> RecordStore for KadStore<DB> {
             KadStoreType::Primary => self.db.get::<KadProviderRecords>(&key),
             KadStoreType::Worker => self.db.get::<KadWorkerProviderRecords>(&key),
         } {
+            let now = SystemTime::now();
             let records: Vec<KadProviderRecord> = decode(&recs);
-            let records: Vec<ProviderRecord> = records.into_iter().map(|r| r.into()).collect();
-            records
+            records.into_iter().filter(|r| !r.is_expired(now)).map(|r| r.into()).collect()
         } else {
             vec![]
         }
@@ -733,6 +836,49 @@ mod test {
         assert_eq!(kad_store_worker.num_providers, 1);
         kad_store_worker.remove_provider(&provider_rec3.key, &provider_rec3.provider);
         assert_eq!(kad_store_worker.num_providers, 0);
+    }
+
+    /// Expired records must be filtered from `get()` and `records()` even though
+    /// they remain on disk until `put()` triggers eviction.
+    #[test]
+    fn test_kad_expired_records_filtered_on_read() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let db = open_db(tmp_dir.path());
+        let key_config =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
+        let mut kad_store = KadStore::new(db, &key_config, KadStoreType::Primary);
+
+        let expired = test_record(true);
+        kad_store.put(expired.clone()).expect("put expired record");
+        assert_eq!(kad_store.num_records, 1, "row was written to disk");
+
+        assert!(kad_store.get(&expired.key).is_none(), "get filters expired");
+        assert_eq!(kad_store.records().count(), 0, "records() filters expired");
+    }
+
+    /// When the store is full of expired records, a new put should evict them and succeed.
+    #[test]
+    fn test_kad_put_evicts_expired_when_full() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let db = open_db(tmp_dir.path());
+        let key_config =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
+        let mut kad_store = KadStore::new(db, &key_config, KadStoreType::Primary);
+
+        let config = MemoryStoreConfig::default();
+
+        // Saturate the store with already-expired records.
+        for _ in 0..config.max_records {
+            let rec = test_record(true);
+            kad_store.put(rec).expect("put expired record");
+        }
+        assert_eq!(kad_store.num_records, config.max_records);
+
+        // A live record under a brand-new key must succeed: the put path evicts expired rows.
+        let fresh = test_record(false);
+        kad_store.put(fresh.clone()).expect("eviction must make room");
+        assert_eq!(kad_store.num_records, 1, "only the fresh row should remain");
+        assert!(kad_store.get(&fresh.key).is_some(), "fresh record retained");
     }
 
     /// Test that we do not count duplicate puts against our max records.
