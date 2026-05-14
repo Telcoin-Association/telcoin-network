@@ -39,9 +39,9 @@ use tn_storage::{
 };
 use tn_types::{
     gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash, BlockNumHash, BlsPublicKey,
-    Committee, CommitteeBuilder, ConsensusOutput, Database as TNDatabase, Epoch, EpochRecord,
-    Multiaddr, NetworkPublicKey, Notifier, P2pNode, TaskJoinError, TaskManager, TaskSpawner,
-    TnReceiver, B256,
+    BlsSigner, Committee, CommitteeBuilder, ConsensusOutput, Database as TNDatabase, Epoch,
+    EpochRecord, Multiaddr, NetworkPublicKey, Notifier, P2pNode, TaskJoinError, TaskManager,
+    TaskSpawner, TnReceiver, B256,
 };
 use tn_worker::{quorum_waiter::QuorumWaiterTrait, Worker, WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::mpsc;
@@ -824,6 +824,13 @@ where
             )?
         } else {
             let mut committee_builder = CommitteeBuilder::new(epoch);
+            for (key, bootstrap) in &self.bootstrap_servers {
+                committee_builder.add_bootstrap_server(
+                    *key,
+                    bootstrap.primary.clone(),
+                    bootstrap.worker.clone(),
+                );
+            }
 
             for validator in validators {
                 committee_builder.add_authority(validator.0, validator.1.validatorAddress);
@@ -1052,6 +1059,10 @@ where
         bls_pubkey: BlsPublicKey,
         node_task_spawner: TaskSpawner,
     ) {
+        if bls_pubkey == self.key_config.public_key() {
+            // Don't dial ourselves even if we try too.
+            return;
+        }
         // spawn dials on long-running task manager
         let task_name = format!("DialPeer {bls_pubkey}");
         node_task_spawner.spawn_task(task_name, async move {
