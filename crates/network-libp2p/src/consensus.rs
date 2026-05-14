@@ -444,13 +444,17 @@ where
 
         loop {
             tokio::select! {
-                event = self.swarm.select_next_some() => self.process_event(event).await.inspect_err(|e| {
-                    error!(target: "network", ?e, "network event error")
-                })?,
+                event = self.swarm.select_next_some() => if let Err(e) = self.process_event(event).await {
+                    error!(target: "network", ?e, "network event error");
+                    if let NetworkError::AllListenersClosed = e {
+                        // In this case go ahead and kill the node.
+                        return Err(e);
+                    }
+                },
                 command = self.commands.recv() => match command {
-                    Some(c) => self.process_command(c).inspect_err(|e| {
+                    Some(c) => if let Err(e) = self.process_command(c) {
                         error!(target: "network", ?e, "network command error")
-                    })?,
+                    },
                     None => {
                         info!(target: "network", "network shutting down...");
                         return Ok(())

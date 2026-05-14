@@ -4,6 +4,8 @@
 //! tasks run for one epoch. Other resources are shared across epochs.
 //! This file defines the struct and the node/application scoped code.
 
+use std::collections::BTreeMap;
+
 use crate::{
     engine::{ExecutionNode, TnBuilder},
     health::HealthcheckServer,
@@ -11,15 +13,16 @@ use crate::{
 };
 use eyre::eyre;
 use state_sync::{request_missing_packs, spawn_fetch_consensus};
-use tn_config::{KeyConfig, NetworkConfig, TelcoinDirs};
+use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, TelcoinDirs};
 use tn_network_libp2p::{types::NetworkEvent, ConsensusNetwork};
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode, QueChannel};
 use tn_reth::{system_calls::EpochState, RethDb, RethEnv};
 use tn_storage::{consensus::ConsensusChain, open_db, DatabaseType};
 use tn_types::{
-    deconstruct_nonce, gas_accumulator::GasAccumulator, BlockNumHash, ConsensusHeader,
-    ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, Notifier, TaskError, TaskManager,
-    TaskSpawner, TimestampSec, MIN_PROTOCOL_BASE_FEE,
+    deconstruct_nonce, gas_accumulator::GasAccumulator, BlockNumHash, BlsPublicKey,
+    BootstrapServer, Committee, ConsensusHeader, ConsensusOutput, Database as TNDatabase,
+    EngineUpdate, Epoch, Notifier, TaskError, TaskManager, TaskSpawner, TimestampSec,
+    MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::mpsc;
@@ -73,6 +76,9 @@ pub(crate) struct EpochManager<P, DB> {
 
     /// Access to the epoch pack files storing consensus data.
     consensus_chain: ConsensusChain,
+
+    /// The nodes bootstrap servers.
+    bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapServer>,
 }
 
 /// Restore the [`GasAccumulator`] state after a mid-epoch restart.
@@ -179,6 +185,16 @@ where
             consensus_bus.node_mode().send_replace(NodeMode::Observer);
         }
         let worker_event_stream = QueChannel::new();
+        let bootstrap_servers = if let Ok(committee_zero) =
+            Config::load_from_path_or_default::<Committee>(
+                tn_datadir.committee_path(),
+                ConfigFmt::YAML,
+            ) {
+            committee_zero.bootstrap_servers()
+        } else {
+            error!(target: "epoch-manager", "Unable to load bootstrap servers from the genesis committee!");
+            BTreeMap::new()
+        };
 
         Self {
             builder,
@@ -195,6 +211,7 @@ where
             last_consensus_header: None,
             last_forwarded_consensus_number: 0,
             consensus_chain,
+            bootstrap_servers,
         }
     }
 
