@@ -422,6 +422,9 @@ impl<DB: Database> RecordStore for KadStore<DB> {
                 }
             }
             if !found {
+                // prune expired entries before checking the cap
+                let now = SystemTime::now();
+                recs.retain(|r| !r.is_expired(now));
                 if recs.len() >= self.config.max_providers_per_key {
                     return Err(Error::MaxProvidedKeys);
                 }

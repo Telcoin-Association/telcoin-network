@@ -309,6 +309,17 @@ where
         /// Channel for returning the established stream to application layer.
         reply: oneshot::Sender<NetworkResult<Stream>>,
     },
+    /// Read a single record from the local kad store by BLS key.
+    ///
+    /// Test-only observation hook used to assert local-store eviction
+    /// behavior from a spawned-network test. See `kad_store_get`.
+    #[cfg(test)]
+    KadStoreGet {
+        /// The BLS public key the record is stored under.
+        key: BlsPublicKey,
+        /// Reply with the record if one exists in the local store.
+        reply: oneshot::Sender<Option<libp2p::kad::Record>>,
+    },
 }
 
 /// Wrap a network response.
@@ -725,5 +736,20 @@ where
         let (reply, to_caller) = oneshot::channel();
         self.sender.send(NetworkCommand::SendRequestDirect { peer, request, reply }).await?;
         Ok(to_caller)
+    }
+
+    /// Read a single record from the local kad store by BLS key.
+    ///
+    /// Test-only observation hook so a spawned-network test can assert on
+    /// kad store contents that are otherwise unreachable once the network is
+    /// running on its own task.
+    #[cfg(test)]
+    pub(crate) async fn kad_store_get(
+        &self,
+        key: BlsPublicKey,
+    ) -> NetworkResult<Option<libp2p::kad::Record>> {
+        let (reply, rx) = oneshot::channel();
+        self.sender.send(NetworkCommand::KadStoreGet { key, reply }).await?;
+        rx.await.map_err(Into::into)
     }
 }

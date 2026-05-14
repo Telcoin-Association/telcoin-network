@@ -756,6 +756,18 @@ where
                 // without any intermediate tracking.
                 self.swarm.behaviour_mut().stream.open_stream(peer_id, reply);
             }
+            #[cfg(test)]
+            NetworkCommand::KadStoreGet { key, reply } => {
+                let record_key = kad::RecordKey::new(&key);
+                let record = self
+                    .swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .store_mut()
+                    .get(&record_key)
+                    .map(|cow| cow.into_owned());
+                let _ = reply.send(record);
+            }
         }
 
         Ok(())
