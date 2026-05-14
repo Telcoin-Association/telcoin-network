@@ -31,7 +31,7 @@ use libp2p::{
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig};
 use tn_types::{
@@ -257,15 +257,14 @@ where
         let mut kad_config = libp2p::kad::Config::new(DEFAULT_KAD_PROTO_NAME);
         // manually add peers
         kad_config.set_kbucket_inserts(kad::BucketInserts::Manual);
-        kad_config.set_kbucket_size(network_config.libp2p_config().k_bucket_size);
-        let two_days = Some(Duration::from_secs(48 * 60 * 60));
-        let twelve_hours = Some(Duration::from_secs(12 * 60 * 60));
+        let libp2p = network_config.libp2p_config();
+        kad_config.set_kbucket_size(libp2p.k_bucket_size);
         kad_config
-            .set_record_ttl(two_days)
+            .set_record_ttl(Some(libp2p.kad_record_ttl))
             .set_record_filtering(kad::StoreInserts::FilterBoth)
-            .set_publication_interval(twelve_hours)
+            .set_publication_interval(Some(libp2p.kad_publication_interval))
             .set_query_timeout(Duration::from_secs(60))
-            .set_provider_record_ttl(two_days);
+            .set_provider_record_ttl(Some(libp2p.kad_record_ttl));
         let kad_store = KadStore::new(db.clone(), &key_config, kad_type);
         let kademlia = kad::Behaviour::with_config(peer_id, kad_store.clone(), kad_config);
 
@@ -357,11 +356,14 @@ where
     /// Return None if we don't have any confirmed external addresses yet.
     fn get_peer_record(&self) -> kad::Record {
         let key = kad::RecordKey::new(&self.key_config.primary_public_key());
+        // libp2p's `set_record_ttl` drives republish, not eviction — the local store
+        // can only evict rows that carry an `expires`.
+        let expires = Instant::now().checked_add(self.config.kad_record_ttl);
         kad::Record {
             key: key.clone(),
             value: encode(&self.node_record),
             publisher: Some(*self.swarm.local_peer_id()),
-            expires: None, // never expire
+            expires,
         }
     }
 

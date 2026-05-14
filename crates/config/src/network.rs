@@ -113,6 +113,15 @@ pub struct LibP2pConfig {
     pub px_disconnect_timeout: Duration,
     /// The k-bucket size for kademlia.
     pub k_bucket_size: NonZeroUsize,
+    /// The TTL applied to kademlia records — both the libp2p record TTL and the
+    /// local store's `expires` timestamp. Drives eviction of records that are
+    /// never refreshed. Also used for provider record TTL.
+    pub kad_record_ttl: Duration,
+    /// How often this node republishes its own kademlia records.
+    ///
+    /// Must be < `kad_record_ttl`, otherwise records expire before they are
+    /// refreshed.
+    pub kad_publication_interval: Duration,
 }
 
 impl LibP2pConfig {
@@ -165,6 +174,8 @@ impl Default for LibP2pConfig {
             max_px_disconnects: 10,
             px_disconnect_timeout: Duration::from_secs(3),
             k_bucket_size: K_VALUE,
+            kad_record_ttl: Duration::from_secs(48 * 60 * 60),
+            kad_publication_interval: Duration::from_secs(12 * 60 * 60),
         }
     }
 }
