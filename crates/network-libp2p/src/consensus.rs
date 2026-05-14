@@ -1259,9 +1259,6 @@ where
                     kad::QueryResult::GetRecord(Ok(
                         kad::GetRecordOk::FinishedWithNoAdditionalRecord { cache_candidates },
                     )) => {
-                        // TODO: configure caching and see issue #301
-                        // self.swarm.behaviour_mut().kademlia.put_record_to(record, peers, quorum);
-
                         debug!(target: "network-kad", ?cache_candidates, "FinishedWithNoAdditionalRecord - failed to find record");
                         self.close_kad_query(&query_id);
                     }
@@ -1282,7 +1279,7 @@ where
                         );
                     }
                     kad::QueryResult::PutRecord(Err(err)) => {
-                        error!(target: "network-kad", "Failed to put record: {err:?}");
+                        debug!(target: "network-kad", "Failed to put record: {err:?}");
                     }
                     kad::QueryResult::StartProviding(Ok(kad::AddProviderOk { key })) => {
                         debug!(

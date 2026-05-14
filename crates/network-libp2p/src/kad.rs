@@ -458,11 +458,7 @@ impl<DB: Database> RecordStore for KadStore<DB> {
         } {
             let now = SystemTime::now();
             let records: Vec<KadProviderRecord> = decode(&recs);
-            records
-                .into_iter()
-                .filter(|r| !r.is_expired(now))
-                .map(|r| r.into())
-                .collect()
+            records.into_iter().filter(|r| !r.is_expired(now)).map(|r| r.into()).collect()
         } else {
             vec![]
         }
