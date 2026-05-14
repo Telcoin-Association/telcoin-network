@@ -31,7 +31,7 @@ use libp2p::{
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig};
 use tn_types::{
@@ -365,14 +365,15 @@ where
     /// Return None if we don't have any confirmed external addresses yet.
     fn get_peer_record(&self) -> kad::Record {
         let key = kad::RecordKey::new(&self.key_config.primary_public_key());
-        // libp2p's `set_record_ttl` drives republish, not eviction — the local store
-        // can only evict rows that carry an `expires`.
-        let expires = Instant::now().checked_add(self.config.kad_record_ttl);
+        // Leave `expires: None` for our OWN record so libp2p's PutRecordJob
+        // recomputes a fresh `now + kad_record_ttl` on every replication snapshot
+        // (see libp2p-kad jobs.rs:217-221). The configured `kad_record_ttl` still
+        // drives the wire-level expiry that remote peers store.
         kad::Record {
             key: key.clone(),
             value: encode(&self.node_record),
             publisher: Some(*self.swarm.local_peer_id()),
-            expires,
+            expires: None,
         }
     }
 
