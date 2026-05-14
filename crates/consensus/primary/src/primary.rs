@@ -6,7 +6,6 @@ use crate::{
     consensus::LeaderSchedule,
     network::{PrimaryNetworkHandle, WorkerReceiverHandler},
     proposer::Proposer,
-    state_handler::StateHandler,
     ConsensusBus, StateSynchronizer,
 };
 use std::sync::Arc;
@@ -96,18 +95,6 @@ impl<DB: Database> Primary<DB> {
             );
 
             proposer.spawn(task_manager);
-        }
-
-        if let Some(authority_id) = config.authority_id() {
-            // This only makes sense if we are a validator (i.e. have an authority id).
-            // Keeps track of the latest consensus round and allows other tasks to clean up their
-            // their internal state
-            StateHandler::spawn(
-                authority_id,
-                consensus_bus,
-                config.shutdown().subscribe(),
-                task_manager,
-            );
         }
 
         // NOTE: This log entry is used to compute performance.
