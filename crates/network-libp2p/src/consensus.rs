@@ -431,6 +431,10 @@ where
             tokio::select! {
                 event = self.swarm.select_next_some() => if let Err(e) = self.process_event(event).await {
                     error!(target: "network", ?e, "network event error");
+                    if let NetworkError::AllListenersClosed = e {
+                        // In this case go ahead and kill the node.
+                        return Err(e);
+                    }
                 },
                 command = self.commands.recv() => match command {
                     Some(c) => if let Err(e) = self.process_command(c) {
