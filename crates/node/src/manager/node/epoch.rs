@@ -193,21 +193,18 @@ where
             primary
                 .start(&epoch_task_manager, self.consensus_chain.clone(), certificate_pack)
                 .await?;
-        } else {
-            // XXXX Need executor::start (subscriber for non cvv...)
-            // Spawn the subscriber.
-            // This is mode sensitive and will the correct tasks for a non-cvv.
-            // Do not call directly for a CVV, will be handled by the primary.start() calls.
-            spawn_subscriber(
-                consensus_config.clone(),
-                consensus_config.shutdown().subscribe(),
-                consensus_bus.clone(),
-                &epoch_task_manager,
-                primary.network_handle().await,
-                self.consensus_chain.clone(),
-                self.epoch_boundary,
-            );
         }
+        // Spawn the subscriber.
+        // This is mode sensitive and will start the correct tasks for current mode.
+        spawn_subscriber(
+            consensus_config.clone(),
+            consensus_config.shutdown().subscribe(),
+            consensus_bus.clone(),
+            &epoch_task_manager,
+            primary.network_handle().await,
+            self.consensus_chain.clone(),
+            self.epoch_boundary,
+        );
 
         let worker_task_manager_name = worker_task_manager_name(worker_node.id().await);
         // start batch builder
@@ -887,13 +884,8 @@ where
         .await?;
 
         // spawn primary - create node and spawn network
-        let primary = PrimaryNode::new(
-            consensus_config.clone(),
-            consensus_bus,
-            network_handle,
-            state_sync,
-            self.epoch_boundary,
-        );
+        let primary =
+            PrimaryNode::new(consensus_config.clone(), consensus_bus, network_handle, state_sync);
 
         Ok(primary)
     }

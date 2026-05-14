@@ -22,8 +22,8 @@ use tracing::{debug, error, info, warn};
 mod epoch;
 pub use epoch::spawn_epoch_record_collector;
 mod consensus;
-pub use consensus::spawn_fetch_consensus;
 use consensus::spawn_track_recent_consensus;
+pub use consensus::{request_missing_packs, spawn_fetch_consensus};
 
 /// Sets some bus defaults.
 /// Call this somewhere when starting an epoch.

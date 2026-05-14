@@ -298,8 +298,11 @@ impl<DB: Database> Subscriber<DB> {
                 biased;
 
                 // Receive the ordered sequence of consensus messages from a consensus node.
-                // XXXX- if watiing.len() is too large then we need to error out and crash the node.  Skipping output is NOT correct.
-                Some(sub_dag) = rx_sequence.recv(), if !epoch_done && waiting.len() < Self::MAX_PENDING_PAYLOADS => {
+                Some(sub_dag) = rx_sequence.recv(), if !epoch_done => {
+                    if waiting.len() > Self::MAX_PENDING_PAYLOADS {
+                        // Too many batches in process, return error to stop the node so we don't fork skipping output.
+                        return Err(SubscriberError::TooManyBatchFetches);
+                    }
                     // Once we cross epoch boundary then process this last output then we are done.
                     if sub_dag.commit_timestamp() >= self.inner.epoch_boundary { epoch_done = true; }
                     debug!(target: "subscriber", subdag=?sub_dag.digest(), round=?sub_dag.leader_round(), "received committed subdag from consensus");

@@ -5,7 +5,7 @@ use std::{
     error::Error,
     fmt::Display,
     fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Arc,
     thread::JoinHandle,
@@ -352,8 +352,14 @@ impl ConsensusChain {
         &self.epochs
     }
 
+    /// Return true if this process is already streaming this epoch.
+    pub fn already_streaming_epoch(&self, epoch: Epoch) -> bool {
+        ImportPath::is_streaming(&self.base_path, epoch)
+    }
+
     /// Populate an epoch pack from a stream.
     /// This will resolve once the stream has been written.
+    /// Note, if called on an epoch while streaming that epoch will just return Ok(()).
     pub async fn stream_import<R: AsyncRead + Unpin>(
         &self,
         stream: R,
@@ -374,7 +380,10 @@ impl ConsensusChain {
             }
         }
         // Import path will use RAII to remove the import dir when we are done.
-        let import_path = ImportPath::new(&self.base_path, epoch);
+        let Some(import_path) = ImportPath::new(&self.base_path, epoch)? else {
+            // If this returns None then we are already importing this epoch.
+            return Ok(());
+        };
         // Store our files out of the way while we import so we don't use them until ready.
         let path = import_path.path();
         let res_pack = ConsensusPack::stream_import(
@@ -542,6 +551,14 @@ impl ConsensusChain {
             // Don't have this epoch data.
             Ok(None)
         }
+    }
+
+    /// Return true if we have a complete pack file for epoch_record.
+    pub async fn is_epoch_complete(&self, epoch_record: &EpochRecord) -> bool {
+        self.consensus_header_by_number(epoch_record.final_consensus.number)
+            .await
+            .unwrap_or_default()
+            .is_some()
     }
 
     /// Retrieve the last known ConsensusHeader that was executed.
@@ -766,6 +783,9 @@ impl From<EpochDbError> for ConsensusChainError {
     }
 }
 
+/// Lock to prevent races when creating ImportPath's.
+static IMPORT_PATH_LOCK: Mutex<()> = Mutex::new(());
+
 /// Helper to create the stream import dir and remove on Drop.
 struct ImportPath {
     path: PathBuf,
@@ -773,13 +793,33 @@ struct ImportPath {
 
 impl ImportPath {
     /// New ImportPath rooted at base_path.
-    fn new(base_path: &Path, epoch: Epoch) -> Self {
+    /// Returns None if this process is already importing for this epoch.
+    fn new(base_path: &Path, epoch: Epoch) -> io::Result<Option<Self>> {
         // Store our files out of the way while we import so we don't use them until ready.
         let path = base_path.join(format!("import-{epoch}"));
+        let pid = std::process::id();
+        let proc_path = path.join(format!("{pid}.inproc"));
+        // Grab the single lock so we can avoid races on the off chance we try to
+        // import the same epoch twice at the same time.
+        let _guard = IMPORT_PATH_LOCK.lock();
+        if proc_path.exists() {
+            // This process is already streaming this pack file so just return.
+            return Ok(None);
+        }
         // We need to start with a clean import dir since we do not restart.
         // Note, this should not exist but just in case...
         let _ = std::fs::remove_dir_all(&path);
-        Self { path }
+        // Create a sentinel for this process to avoid double streams.
+        let _ = std::fs::create_dir_all(&path);
+        File::create(proc_path)?;
+        Ok(Some(Self { path }))
+    }
+
+    /// True if this epoch is already being streamed.
+    fn is_streaming(base_path: &Path, epoch: Epoch) -> bool {
+        let pid = std::process::id();
+        let path = base_path.join(format!("import-{epoch}")).join(format!("{pid}.inproc"));
+        path.exists()
     }
 
     /// Return the contained path.

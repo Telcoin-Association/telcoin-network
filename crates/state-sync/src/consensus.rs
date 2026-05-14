@@ -1,4 +1,4 @@
-//! Tasks and helpers for collecting consensus headers trustlessly.
+//! Tasks and helpers for collecting consensus headers and epoch pack files trustlessly.
 
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
@@ -21,13 +21,12 @@ const PACK_RECORD_TIMEOUT_SECS: u64 = 10;
 async fn get_consensus_header<DB: TNDatabase>(
     number: u64,
     hash: B256,
-    config: &ConsensusConfig<DB>,
+    db: &DB,
     consensus_bus: &ConsensusBusApp,
     network: &PrimaryNetworkHandle,
     consensus_chain: &ConsensusChain,
     return_prev: bool,
 ) -> Option<(Epoch, u64, B256)> {
-    let db = config.node_storage();
     // Use the persisted ConsensusChain DB number as the cutoff, not the in-memory
     // recent_blocks tracker. The in-memory tracker can advance during a brief CvvActive
     // phase (local Bullshark commits) before the node transitions to CvvInactive, causing
@@ -36,7 +35,7 @@ async fn get_consensus_header<DB: TNDatabase>(
     if number <= consensus_chain.latest_consensus_number() {
         return None;
     }
-    if let Ok(Some(block)) = config.node_storage().get::<ConsensusHeaderCache>(&number) {
+    if let Ok(Some(block)) = db.get::<ConsensusHeaderCache>(&number) {
         return if block.number > 0 && return_prev {
             Some((
                 consensus_chain.epochs().number_to_epoch(block.number - 1),
@@ -86,88 +85,64 @@ async fn get_consensus_header<DB: TNDatabase>(
     }
 }
 
+/// Attempt to request epoch packs for every epoch from current_fetch_epoch to latest epoch
+/// record.
+async fn request_epochs(
+    current_fetch_epoch: &mut Epoch,
+    consensus_chain: &ConsensusChain,
+    consensus_bus: &ConsensusBusApp,
+    last_gossipped_epoch: Option<Epoch>,
+) {
+    // If we still have epochs to fetch then add to the queue until we are out of epoch records.
+    // For epoch 0: `saturating_sub(1)` yields 0, so record_by_epoch(0) would return the
+    // *real* epoch-0 record- use a synthetic epoch record instead.
+    let maybe_previous = if *current_fetch_epoch == 0 {
+        consensus_chain.epochs().record_by_epoch(0).await.map(|r| EpochRecord {
+            committee: r.committee.clone(),
+            next_committee: r.committee.clone(),
+            ..EpochRecord::default()
+        })
+    } else {
+        consensus_chain.epochs().record_by_epoch(current_fetch_epoch.saturating_sub(1)).await
+    };
+    if let Some(mut previous_epoch_record) = maybe_previous {
+        while let Some(epoch_record) =
+            consensus_chain.epochs().record_by_epoch(*current_fetch_epoch).await
+        {
+            *current_fetch_epoch += 1;
+            if epoch_record.epoch < last_gossipped_epoch.unwrap_or(u32::MAX) {
+                let contains_final_header = consensus_chain.is_epoch_complete(&epoch_record).await;
+                // If the pack file is missing or incomplete request it.
+                // Note since we have an epoch record this is a past epoch
+                // not the current epoch.
+                if !contains_final_header {
+                    consensus_bus
+                        .request_epoch_pack_file(previous_epoch_record, epoch_record.clone())
+                        .await;
+                }
+                previous_epoch_record = epoch_record;
+            } else {
+                break;
+            }
+        }
+    }
+}
+
 /// Spawn a long running task on task_manager that will keep the last_consensus_header watch on
 /// consensus_bus up to date. This should only be used when NOT participating in active consensus.
+/// Note, this an epoch scoped task so it will be stopped on each epoch boundary.  It should handle
+/// this but it is worth considering this will happen.  This is required because we only use this
+/// task when an observer, never as a CVV.
 pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
     config: ConsensusConfig<DB>,
     consensus_bus: ConsensusBusApp,
     network: PrimaryNetworkHandle,
     consensus_chain: ConsensusChain,
 ) {
-    /// Attempt to request epoch packs for every epoch from current_fetch_epoch to latest epoch
-    /// record.
-    async fn request_epochs(
-        current_fetch_epoch: &mut Epoch,
-        consensus_chain: &ConsensusChain,
-        consensus_bus: &ConsensusBusApp,
-        last_gossipped_epoch: Option<Epoch>,
-    ) {
-        // If we still have epochs to fetch then add to the queue until we are out of epoch records.
-        // For epoch 0: `saturating_sub(1)` yields 0, so record_by_epoch(0) would return the
-        // *real* epoch-0 record whose final_state is the end-of-epoch execution state.
-        // But epoch 0's pack was written with genesis defaults as its genesis_exec_state
-        // (BlockNumHash::default()), so passing the real epoch-0 record as `previous_epoch`
-        // to stream_import would cause verify_epoch_meta to reject the pack.
-        // Fix: synthesise a sentinel record that has the genesis defaults for final_state /
-        // final_consensus but copies the real epoch-0 committee into next_committee so the
-        // committee check in verify_epoch_meta still passes.
-        let maybe_previous = if *current_fetch_epoch == 0 {
-            consensus_chain.epochs().record_by_epoch(0).await.map(|r| EpochRecord {
-                committee: r.committee.clone(),
-                next_committee: r.committee.clone(),
-                ..EpochRecord::default()
-            })
-        } else {
-            consensus_chain.epochs().record_by_epoch(current_fetch_epoch.saturating_sub(1)).await
-        };
-        if let Some(mut previous_epoch_record) = maybe_previous {
-            while let Some(epoch_record) =
-                consensus_chain.epochs().record_by_epoch(*current_fetch_epoch).await
-            {
-                *current_fetch_epoch += 1;
-                if epoch_record.epoch < last_gossipped_epoch.unwrap_or(u32::MAX) {
-                    let contains_final_header = consensus_chain
-                        .consensus_header_by_number(epoch_record.final_consensus.number)
-                        .await
-                        .unwrap_or_default()
-                        .is_some();
-                    if !contains_final_header {
-                        consensus_bus
-                            .request_epoch_pack_file(previous_epoch_record, epoch_record.clone())
-                            .await;
-                    }
-                    previous_epoch_record = epoch_record;
-                } else {
-                    break;
-                }
-            }
-        }
-    }
-
-    let mut epoch_rec = consensus_chain.epochs().latest_record().await;
-    let mut first_missing = None;
-    while let Some(rec) = epoch_rec {
-        let has_final = consensus_chain
-            .consensus_header_by_number(rec.final_consensus.number)
-            .await
-            .ok()
-            .flatten()
-            .is_some();
-        epoch_rec = if !has_final {
-            first_missing = Some(rec.epoch);
-            consensus_chain.epochs().get_epoch_by_hash(rec.parent_hash).await.map(|r| r.0)
-        } else {
-            None
-        };
-    }
     // Get the epoch of our last executed consensus.
     let mut current_fetch_epoch = consensus_chain.latest_consensus_epoch();
-    if let Some(first_missing) = first_missing {
-        current_fetch_epoch = first_missing;
-        request_epochs(&mut current_fetch_epoch, &consensus_chain, &consensus_bus, None).await
-    }
-    let rx_shutdown = config.shutdown().subscribe();
     let mut rx_gossip_update = consensus_bus.last_published_consensus_num_hash().subscribe();
+    let rx_shutdown = config.shutdown().subscribe();
     let mut last_gossipped_epoch = None;
     let mut fetch_tasks = FuturesOrdered::new();
     let mut new_consensus = VecDeque::new();
@@ -181,9 +156,9 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
                 debug!(target: "state-sync", ?number, ?hash, "tracking recent consensus and detected change through gossip - requesting consensus from peer");
                 if last_gossipped_epoch.is_none() {
                     last_gossipped_epoch = Some(epoch);
-                    fetch_tasks.push_back(get_consensus_header(number, hash, &config, &consensus_bus, &network, &consensus_chain, true));
+                    // Start one backtracking fetch at the first consensus we get.
+                    fetch_tasks.push_back(get_consensus_header(number, hash, config.node_storage(), &consensus_bus, &network, &consensus_chain, true));
                 } else {
-                    //XXXX
                     new_consensus.push_back((epoch, number, hash));
                 }
 
@@ -192,7 +167,9 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
                 }
                 if fetch_tasks.is_empty() {
                     while let Some((_epoch, number, hash)) = new_consensus.pop_front() {
-                        fetch_tasks.push_back(get_consensus_header(number, hash, &config, &consensus_bus, &network, &consensus_chain, false));
+                        // We have bandwidth and saved consensus so fetch the next saved consensus.
+                        // Note this is non-backtracking.
+                        fetch_tasks.push_back(get_consensus_header(number, hash, config.node_storage(), &consensus_bus, &network, &consensus_chain, false));
                     }
                 }
             }
@@ -204,7 +181,8 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
                             continue;
                         }
                     }
-                    fetch_tasks.push_back(get_consensus_header(number, hash, &config, &consensus_bus, &network, &consensus_chain, true));
+                    // Now fetch the parent consensus.
+                    fetch_tasks.push_back(get_consensus_header(number, hash, config.node_storage(), &consensus_bus, &network, &consensus_chain, true));
                 }
             }
 
@@ -216,7 +194,7 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
 }
 
 /// Spawn a long running task (application scoped)
-/// that will fetch download entire pack files for epochs.
+/// that will fetch and download entire pack files for epochs.
 /// This should only be used when NOT participating in active consensus.
 /// Several of these will run but will do nothing unless requested.
 /// This works by streaming an entire epochs pack file from a peer.
@@ -241,6 +219,12 @@ pub async fn spawn_fetch_consensus(
         tokio::select! {
             Some((_permit, previous_epoch_record, epoch_record)) = next_epoch(&consensus_bus, &next_sem) => {
                 let epoch = epoch_record.epoch;
+                if consensus_chain.already_streaming_epoch(epoch) || consensus_chain.is_epoch_complete(&epoch_record).await {
+                    // If we have already streamed this epoch or are in process of streaming then continue.
+                    // Note, it is a lot less complex to do this check here than to make sure we don't request
+                    // the same pack more than once so do it this way.
+                    continue;
+                }
                 info!(target: "state-sync", "epoch consensus fetcher {task_index} retrieving epoch {epoch}");
                 let mut attempts = 1;
                 loop {
@@ -317,5 +301,32 @@ pub async fn spawn_fetch_consensus(
                 break;
             }
         }
+    }
+}
+
+/// Send a request to stream any pack files that are missing or incomplete for any epoch records we
+/// have. This should not be strictly needed but it can help with some wonky states to get synced
+/// (was added in response to an early testnet freeze).
+pub async fn request_missing_packs(
+    consensus_bus: &ConsensusBusApp,
+    consensus_chain: &ConsensusChain,
+) {
+    // If we have any epoch records with missing or incomplete pack files then request the pack
+    // files.
+    let mut epoch_rec = consensus_chain.epochs().latest_record().await;
+    let mut first_missing = None;
+    while let Some(rec) = epoch_rec {
+        let has_final = consensus_chain.is_epoch_complete(&rec).await;
+        epoch_rec = if !has_final {
+            first_missing = Some(rec.epoch);
+            consensus_chain.epochs().get_epoch_by_hash(rec.parent_hash).await.map(|r| r.0)
+        } else {
+            None
+        };
+    }
+    // Get the epoch of our last executed consensus.
+    //let mut current_fetch_epoch = consensus_chain.latest_consensus_epoch();
+    if let Some(mut first_missing) = first_missing {
+        request_epochs(&mut first_missing, consensus_chain, consensus_bus, None).await
     }
 }
