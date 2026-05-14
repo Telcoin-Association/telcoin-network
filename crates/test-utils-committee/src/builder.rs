@@ -165,7 +165,7 @@ where
         // Make the committee so we can give it the AuthorityFixtures below.
         let committee = Committee::new_for_test(
             authorities.into_iter().map(|(k, (_, _, a))| (k, a)).collect(),
-            0,
+            self.epoch,
             bootstrap_servers,
         );
         let genesis = test_genesis();

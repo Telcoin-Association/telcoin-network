@@ -432,14 +432,9 @@ async fn commit_one() {
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
     Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain, None).await;
-    let cb_clone = cb.clone();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.app().recent_blocks().send_modify(|blocks| {
         blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
-    });
-    tokio::spawn(async move {
-        let mut rx_primary = cb_clone.subscribe_committed_certificates();
-        while rx_primary.recv().await.is_some() {}
     });
 
     // Feed all certificates to the consensus. Only the last certificate should trigger
@@ -504,11 +499,6 @@ async fn dead_node() {
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
     Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain, None).await;
-    let cb_clone = cb.clone();
-    tokio::spawn(async move {
-        let mut rx_primary = cb_clone.subscribe_committed_certificates();
-        while rx_primary.recv().await.is_some() {}
-    });
 
     let cb_clone = cb.clone();
     // Feed all certificates to the consensus.
@@ -644,11 +634,6 @@ async fn not_enough_support() {
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
     Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain, None).await;
-    let cb_clone = cb.clone();
-    tokio::spawn(async move {
-        let mut rx_primary = cb_clone.subscribe_committed_certificates();
-        while rx_primary.recv().await.is_some() {}
-    });
 
     // Feed all certificates to the consensus. Only the last certificate should trigger
     // commits, so the task should not block.
@@ -749,11 +734,6 @@ async fn missing_leader() {
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
     Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain, None).await;
-    let cb_clone = cb.clone();
-    tokio::spawn(async move {
-        let mut rx_primary = cb_clone.subscribe_committed_certificates();
-        while rx_primary.recv().await.is_some() {}
-    });
 
     // Feed all certificates to the consensus. We should only commit upon receiving the last
     // certificate, so calls below should not block the task.
@@ -823,7 +803,7 @@ async fn committed_round_after_restart() {
         cb.app().recent_blocks().send_modify(|blocks| {
             blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
         });
-        let mut rx_primary = cb.subscribe_committed_certificates();
+        let mut rx_primary = cb.subscribe_committed_own_headers();
         let mut rx_output = cb.subscribe_sequence();
         let mut task_manager = TaskManager::default();
         Consensus::spawn(
@@ -1098,11 +1078,6 @@ async fn restart_with_new_committee() {
             None,
         )
         .await;
-        let cb_clone = cb.clone();
-        tokio::spawn(async move {
-            let mut rx_primary = cb_clone.subscribe_committed_certificates();
-            while rx_primary.recv().await.is_some() {}
-        });
 
         // Make certificates for rounds 1 and 2.
         let genesis =

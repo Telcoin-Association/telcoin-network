@@ -10,5 +10,6 @@ mod faucet;
 mod genesis_tests;
 mod restarts;
 mod staking;
+mod sync;
 
 fn main() {}

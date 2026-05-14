@@ -579,9 +579,6 @@ struct ConsensusBusEpochInner {
     /// New certificates from the primary. The primary should send us new certificates
     /// only if it already sent us its whole history.
     new_certificates: QueChannel<Certificate>,
-    /// Outputs the sequence of ordered certificates to the primary (for cleanup and feedback).
-    committed_headers: QueChannel<(Round, Vec<Header>)>,
-
     /// Sends missing certificates to the `CertificateFetcher`.
     /// Receives certificates with missing parents from the `Synchronizer`.
     certificate_fetcher: QueChannel<CertificateFetcherCommand>,
@@ -609,7 +606,6 @@ impl ConsensusBusEpochInner {
     fn new() -> Self {
         Self {
             new_certificates: QueChannel::new(),
-            committed_headers: QueChannel::new(),
             certificate_fetcher: QueChannel::new(),
             parents: QueChannel::new(),
             our_digests: QueChannel::new(),
@@ -682,12 +678,6 @@ impl ConsensusBus {
     /// Can only be subscribed to once.
     pub fn new_certificates(&self) -> &impl TnSender<Certificate> {
         &self.inner_epoch.new_certificates
-    }
-
-    /// Outputs the sequence of ordered certificates to the primary (for cleanup and feedback).
-    /// Can only be subscribed to once.
-    pub fn committed_certificates(&self) -> &impl TnSender<(Round, Vec<Header>)> {
-        &self.inner_epoch.committed_headers
     }
 
     /// Missing certificates.
@@ -777,11 +767,6 @@ impl ConsensusBus {
     /// Subscribe to new certificates from the primary.
     pub fn subscribe_new_certificates(&self) -> impl TnReceiver<Certificate> {
         self.inner_epoch.new_certificates.subscribe()
-    }
-
-    /// Subscribe to the sequence of ordered certificates to the primary (for cleanup and feedback).
-    pub fn subscribe_committed_certificates(&self) -> impl TnReceiver<(Round, Vec<Header>)> {
-        self.inner_epoch.committed_headers.subscribe()
     }
 
     /// Subscribe to certificates with missing parents from the `Synchronizer`.

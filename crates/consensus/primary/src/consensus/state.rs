@@ -407,10 +407,10 @@ impl<DB: Database> Consensus<DB> {
         let (outcome, committed_sub_dags) =
             self.protocol.process_certificate(&mut self.state, certificate)?;
         if self.active {
-            // We extract a list of headers from this specific validator that
-            // have been agreed upon, and signal this back to the narwhal sub-system
-            // to be used to re-send batches that have not made it to a commit.
-            let mut committed_headers = Vec::new();
+            let mut own_rounds_committed = Vec::new();
+            let mut leader_commit_round = 0;
+            let mut has_headers = false;
+            let authority_id = self.consensus_config.authority_id();
 
             // Output the sequence in the right order.
             let csd_len = committed_sub_dags.len();
@@ -437,7 +437,12 @@ impl<DB: Database> Consensus<DB> {
                 tracing::debug!(target: "telcoin::consensus_state", "Commit in Sequence {:?}", committed_sub_dag.leader().nonce());
 
                 for header in &committed_sub_dag.headers {
-                    committed_headers.push(header.clone());
+                    has_headers = true;
+                    leader_commit_round = leader_commit_round.max(header.round());
+                    // Now we are going to signal which of our own batches have been committed.
+                    if Some(header.author()) == authority_id.as_ref() {
+                        own_rounds_committed.push(header.round())
+                    }
                 }
 
                 // NOTE: The size of the sub-dag can be arbitrarily large (depending on the network
@@ -449,18 +454,10 @@ impl<DB: Database> Consensus<DB> {
                     .map_err(|_| ConsensusError::ShuttingDown)?;
             }
 
-            if !committed_headers.is_empty() {
-                // Highest committed certificate round is the leader round / commit round
-                // expected by primary.
-                let leader_commit_round = committed_headers
-                    .iter()
-                    .map(|c| c.round())
-                    .max()
-                    .expect("committed_certificates isn't empty");
-
+            if has_headers {
                 self.consensus_bus
-                    .committed_certificates()
-                    .send((leader_commit_round, committed_headers))
+                    .committed_own_headers()
+                    .send((leader_commit_round, own_rounds_committed))
                     .await
                     .map_err(|_| ConsensusError::ShuttingDown)?;
 
