@@ -166,6 +166,14 @@ where
     ///
     /// The external address is self-reported and unconfirmed.
     node_record: NodeRecord,
+    /// Peers we have already pushed our [NodeRecord] to.
+    ///
+    /// A peer connecting for the first time needs our record before it can resolve
+    /// our BLS key, so we push it on `PeerConnected`. A peer that reconnects (or that
+    /// flaps repeatedly, as observed with banned peers in adiri testnet) should already have
+    /// the record in their persistent kad store. This list is per-process-lifetime in case nodes
+    /// restart.
+    published_to_peers: HashSet<PeerId>,
 }
 
 impl<Req, Res, DB, Events> ConsensusNetwork<Req, Res, DB, Events>
@@ -333,6 +341,7 @@ where
             key_config,
             task_spawner,
             node_record,
+            published_to_peers: HashSet::new(),
         })
     }
 
@@ -405,8 +414,11 @@ where
         }
     }
 
-    /// Publish our network addresses and peer id AND to the network under our BLS public key for
-    /// discovery.
+    /// Push our [NodeRecord] to a specific peer and to the DHT.
+    ///
+    /// Used on first-time connections so the remote peer can resolve our BLS key
+    /// without waiting for the kad publication interval (12h). Callers must
+    /// short-circuit on reconnects - see [`Self::published_to_peers`]
     fn publish_our_data_to_peer(&mut self, peer: PeerId) {
         let record = self.get_peer_record();
         info!(target: "network-kad", "Publishing our record to kademlia");
@@ -461,9 +473,13 @@ where
                 TNBehaviorEvent::Kademlia(event) => self.process_kad_event(event)?,
                 TNBehaviorEvent::Stream(event) => self.process_stream_event(event)?,
             },
-            SwarmEvent::ExternalAddrConfirmed { address: _ } => {
-                // New confirmed address so lets publish/update or kademlia address rocord.
-                self.provide_our_data();
+            SwarmEvent::ExternalAddrConfirmed { address } => {
+                // protocol expects static IP address
+                // emit warning if peers report different external address
+                let expected = &self.node_record.info().multiaddrs;
+                if !expected.contains(&address) {
+                    warn!(target: "network", ?expected, reported=?address, "peer reporting different external addr:")
+                }
             }
             SwarmEvent::ExpiredListenAddr { address, .. } => {
                 debug!(
@@ -1081,12 +1097,32 @@ where
                 self.connected_peers.retain(|peer| *peer != peer_id);
             }
             PeerEvent::PeerConnected(peer_id, addr) => {
+                // Defense in depth: even if the peer-manager `handle_established_*_connection`
+                // path lets a banned peer reach this event (observed in adiri testnet logs),
+                // refuse to register the connection with kademlia/gossipsub. Otherwise the
+                // banned peer ends up in the kad routing table and triggers a redial loop.
+                if self.swarm.behaviour().peer_manager.peer_banned(&peer_id) {
+                    debug!(
+                        target: "network",
+                        ?peer_id,
+                        "PeerConnected for banned peer — refusing to register"
+                    );
+                    let _ = self.swarm.disconnect_peer_id(peer_id);
+                    return Ok(());
+                }
+
                 // register peer for request-response behaviour
                 // NOTE: gossipsub handles `FromSwarm::ConnectionEstablished`
                 self.swarm.add_peer_address(peer_id, addr.clone());
                 // add as a kademlia peer
                 self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
-                self.publish_our_data_to_peer(peer_id);
+
+                // First-time connections need a direct record push so the peer can resolve
+                // our BLS key without waiting for the next kad publication interval. Skip
+                // on reconnects to avoid amplifying the local kad store on flapping peers
+                if self.published_to_peers.insert(peer_id) {
+                    self.publish_our_data_to_peer(peer_id);
+                }
 
                 // manage connected peers for
                 self.connected_peers.push_back(peer_id);

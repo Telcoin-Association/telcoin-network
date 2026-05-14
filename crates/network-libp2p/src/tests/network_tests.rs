@@ -1719,7 +1719,11 @@ async fn test_newer_kad_record_replaced() -> eyre::Result<()> {
         .store_mut()
         .get(&peer2_new_record.key)
         .expect("peer2 record in local kad store");
-    assert_eq!(old_kad_record, *store_record);
+    // Records carry an `Instant` `expires`, which loses precision across the
+    // SystemTime <-> Instant round-trip in `KadRecord`. Compare the stable fields.
+    assert_eq!(old_kad_record.key, store_record.key);
+    assert_eq!(old_kad_record.value, store_record.value);
+    assert_eq!(old_kad_record.publisher, store_record.publisher);
 
     // process new put request with newer record
     network
@@ -1732,7 +1736,9 @@ async fn test_newer_kad_record_replaced() -> eyre::Result<()> {
         .store_mut()
         .get(&peer2_new_record.key)
         .expect("peer2 record in local kad store");
-    assert_eq!(*store_record, peer2_new_record);
+    assert_eq!(store_record.key, peer2_new_record.key);
+    assert_eq!(store_record.value, peer2_new_record.value);
+    assert_eq!(store_record.publisher, peer2_new_record.publisher);
 
     Ok(())
 }
