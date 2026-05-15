@@ -34,6 +34,12 @@ impl NetworkBehaviour for PeerManager {
             // PeerManager and Kad may initiate dials
             // intercept kad dial attempts, sanitize, and register
             if self.dial_attempt_already_registered(&peer_id) {
+                if self.peer_banned(&peer_id) {
+                    debug!(target: "peer-manager", ?peer_id, "rejecting in-flight dial for banned peer");
+                    return Err(ConnectionDenied::new(
+                        "Outbound connection to banned peer".to_string(),
+                    ));
+                }
                 // peer manager has already approved this dial attempt
                 return Ok(vec![]);
             }

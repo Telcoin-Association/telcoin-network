@@ -288,6 +288,7 @@ impl PeerManager {
         match action {
             PeerAction::Ban(ip_addrs) => {
                 debug!(target: "peer-manager", ?peer_id, ?ip_addrs, "reputation update results in ban");
+                self.temporarily_banned.insert(peer_id);
                 self.process_ban(&peer_id);
             }
             PeerAction::Disconnect => {
@@ -686,7 +687,7 @@ impl PeerManager {
 
     /// Visibility helper for behavior to evaluate pending outbound connection attempts.
     pub(super) fn can_dial(&self, peer_id: &PeerId) -> bool {
-        self.peers.can_dial(peer_id) && !self.temporarily_banned.contains(peer_id)
+        !self.peer_banned(peer_id) && self.peers.can_dial(peer_id)
     }
 
     /// Extract IP addresses from multiaddrs and check if any are banned.

@@ -3,7 +3,10 @@
 use super::*;
 use crate::common::{create_multiaddr, random_ip_addr};
 use assert_matches::assert_matches;
-use libp2p::swarm::{ConnectionId, NetworkBehaviour as _};
+use libp2p::{
+    core::Endpoint,
+    swarm::{ConnectionId, NetworkBehaviour as _},
+};
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::{
     collections::{HashMap, HashSet},
@@ -707,6 +710,93 @@ async fn test_banned_peer_dial_fails_and_ip_ban() {
     let dial_attempt =
         peer_manager.handle_pending_inbound_connection(connection_id, &local, &multiaddr);
     assert!(dial_attempt.is_err());
+}
+
+// Regression: a peer whose reputation is Banned but whose ConnectionStatus
+// has been flipped back to Disconnected (via the Unbanned transition) must
+// NOT be dialable. Pre-fix `can_dial` only consulted status + the
+// temporarily_banned LRU, so it returned `true` here and `kad` was free to
+// re-dial the banned peer.
+#[tokio::test]
+async fn test_can_dial_rejects_reputation_banned_disconnected_peer() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let peer_id = register_peer(&mut peer_manager, None);
+
+    // drive peer to reputation=Banned, ConnectionStatus=Banned
+    peer_manager.process_penalty(peer_id, Penalty::Fatal);
+    peer_manager.register_disconnected(&peer_id);
+    assert!(peer_manager.peer_banned(&peer_id));
+
+    // flip ConnectionStatus Banned -> Disconnected without touching reputation
+    let _ = peer_manager.peers.update_connection_status(&peer_id, NewConnectionStatus::Unbanned);
+
+    // clear temporarily_banned to isolate the rep-based ban check
+    peer_manager.temporarily_banned.remove(&peer_id);
+
+    // sanity: state is rep-banned + Disconnected + not temp-banned
+    assert!(!peer_manager.temporarily_banned.contains(&peer_id));
+    assert!(peer_manager.peer_banned(&peer_id), "rep+IP ban predicate still flags peer");
+    assert!(
+        peer_manager.peers.can_dial(&peer_id),
+        "low-level can_dial returns true for Disconnected status"
+    );
+
+    // The unified can_dial must reject the dial because reputation is Banned.
+    assert!(
+        !peer_manager.can_dial(&peer_id),
+        "can_dial must reject reputation-banned peer in Disconnected status"
+    );
+}
+
+// Regression: `PeerAction::Ban` must arm `temporarily_banned`, matching the
+// behavior of `Disconnect`/`DisconnectWithPX`. Without this, a peer that
+// transitions directly into the banned state via `process_ban` would slip
+// through the temp-ban LRU veto.
+#[tokio::test]
+async fn test_peer_action_ban_arms_temporarily_banned() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let peer_id = register_peer(&mut peer_manager, None);
+
+    assert!(!peer_manager.temporarily_banned.contains(&peer_id));
+
+    peer_manager.apply_peer_action(peer_id, PeerAction::Ban(Vec::new()));
+
+    assert!(
+        peer_manager.temporarily_banned.contains(&peer_id),
+        "PeerAction::Ban must arm temporarily_banned"
+    );
+}
+
+// Regression: an in-flight dial whose peer became banned mid-dial must be
+// rejected at `handle_pending_outbound_connection`. Pre-fix, the
+// `dial_attempt_already_registered` short-circuit returned `Ok(vec![])` with
+// no ban check, leaving the dial to fail later at the established stage and
+// triggering a tight retry loop.
+#[tokio::test]
+async fn test_pending_outbound_rejected_when_dialing_state_and_banned() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let peer_id = PeerId::random();
+
+    // put peer into Dialing state so `dial_attempt_already_registered` returns true
+    peer_manager.register_dial_attempt(peer_id, None);
+    assert!(peer_manager.dial_attempt_already_registered(&peer_id));
+
+    // ban the peer mid-dial via temp-ban LRU
+    peer_manager.temporarily_banned.insert(peer_id);
+    assert!(peer_manager.peer_banned(&peer_id));
+
+    let connection_id = ConnectionId::new_unchecked(0);
+    let result = peer_manager.handle_pending_outbound_connection(
+        connection_id,
+        Some(peer_id),
+        &[],
+        Endpoint::Dialer,
+    );
+
+    assert!(
+        result.is_err(),
+        "pending outbound connection must be denied for banned peer in Dialing state"
+    );
 }
 
 #[test]
