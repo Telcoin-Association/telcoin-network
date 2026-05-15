@@ -11163,7 +11163,6 @@ name = "state-sync"
 version = "0.1.0"
 dependencies = [
  "eyre",
- "futures",
  "rand 0.9.2",
  "rand_chacha 0.9.0",
  "tempfile",

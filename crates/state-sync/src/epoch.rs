@@ -62,8 +62,8 @@ async fn collect_epoch_records(
             result_epoch = epoch;
 
             let (_old_epoch, old_number, _) = consensus_bus.published_consensus_num_hash();
-            let number = rec.final_state.number;
-            let hash = rec.final_state.hash;
+            let number = rec.final_consensus.number;
+            let hash = rec.final_consensus.hash;
             if number > old_number {
                 info!(
                     target: "epoch-manager",

@@ -1,12 +1,14 @@
 //! Tasks and helpers for collecting consensus headers and epoch pack files trustlessly.
 
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
-use futures::{stream::FuturesOrdered, StreamExt as _};
 use tn_config::ConsensusConfig;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
 use tn_storage::{consensus::ConsensusChain, tables::ConsensusHeaderCache};
-use tn_types::{Database as TNDatabase, Epoch, EpochRecord, Noticer, B256};
+use tn_types::{
+    Database as TNDatabase, Epoch, EpochRecord, Noticer, TaskSpawner, TnReceiver as _,
+    TnSender as _, B256,
+};
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::{debug, error, info, warn};
 
@@ -25,7 +27,6 @@ async fn get_consensus_header<DB: TNDatabase>(
     consensus_bus: &ConsensusBusApp,
     network: &PrimaryNetworkHandle,
     consensus_chain: &ConsensusChain,
-    return_prev: bool,
 ) -> Option<(Epoch, u64, B256)> {
     // Use the persisted ConsensusChain DB number as the cutoff, not the in-memory
     // recent_blocks tracker. The in-memory tracker can advance during a brief CvvActive
@@ -36,7 +37,7 @@ async fn get_consensus_header<DB: TNDatabase>(
         return None;
     }
     if let Ok(Some(block)) = db.get::<ConsensusHeaderCache>(&number) {
-        return if block.number > 0 && return_prev {
+        return if block.number > 0 {
             Some((
                 consensus_chain.epochs().number_to_epoch(block.number - 1),
                 block.number - 1,
@@ -66,11 +67,7 @@ async fn get_consensus_header<DB: TNDatabase>(
                 consensus_bus.last_consensus_header().send_replace(Some(header));
             }
             let epoch = consensus_chain.epochs().number_to_epoch(parent_number);
-            if return_prev {
-                Some((epoch, parent_number, parent))
-            } else {
-                None
-            }
+            Some((epoch, parent_number, parent))
         }
         Err(e) => {
             warn!(
@@ -136,16 +133,10 @@ async fn request_epochs(
 pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
     config: ConsensusConfig<DB>,
     consensus_bus: ConsensusBusApp,
-    network: PrimaryNetworkHandle,
-    consensus_chain: ConsensusChain,
 ) {
     // Get the epoch of our last executed consensus.
-    let mut current_fetch_epoch = consensus_chain.latest_consensus_epoch();
     let mut rx_gossip_update = consensus_bus.last_published_consensus_num_hash().subscribe();
     let rx_shutdown = config.shutdown().subscribe();
-    let mut last_gossipped_epoch = None;
-    let mut fetch_tasks = FuturesOrdered::new();
-    let mut new_consensus = VecDeque::new();
     // This loop will track current consensus as well as try to backfill from current.
     // This task backfills the current epoch records as well as requesting entire pack files
     // be downloaded for missing historic epochs.
@@ -153,37 +144,8 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
         tokio::select! {
             _ = rx_gossip_update.changed() => {
                 let (epoch, number, hash) = *rx_gossip_update.borrow_and_update();
+                let _ = consensus_bus.consensus_request_queue().send((epoch, number, hash)).await;
                 debug!(target: "state-sync", ?number, ?hash, "tracking recent consensus and detected change through gossip - requesting consensus from peer");
-                if last_gossipped_epoch.is_none() {
-                    last_gossipped_epoch = Some(epoch);
-                    // Start one backtracking fetch at the first consensus we get.
-                    fetch_tasks.push_back(get_consensus_header(number, hash, config.node_storage(), &consensus_bus, &network, &consensus_chain, true));
-                } else {
-                    new_consensus.push_back((epoch, number, hash));
-                }
-
-                if current_fetch_epoch < epoch {
-                    request_epochs(&mut current_fetch_epoch, &consensus_chain, &consensus_bus, last_gossipped_epoch).await
-                }
-                if fetch_tasks.is_empty() {
-                    while let Some((_epoch, number, hash)) = new_consensus.pop_front() {
-                        // We have bandwidth and saved consensus so fetch the next saved consensus.
-                        // Note this is non-backtracking.
-                        fetch_tasks.push_back(get_consensus_header(number, hash, config.node_storage(), &consensus_bus, &network, &consensus_chain, false));
-                    }
-                }
-            }
-            Some(res) = fetch_tasks.next() => {
-                if let Some((epoch, number, hash)) = res {
-                    if let Some(last_gossipped_epoch) = last_gossipped_epoch {
-                        // epochs before last_gossipped_epoch are retrieved as pack files
-                        if epoch < last_gossipped_epoch {
-                            continue;
-                        }
-                    }
-                    // Now fetch the parent consensus.
-                    fetch_tasks.push_back(get_consensus_header(number, hash, config.node_storage(), &consensus_bus, &network, &consensus_chain, true));
-                }
             }
 
             _ = &rx_shutdown => {
@@ -299,6 +261,101 @@ pub async fn spawn_fetch_consensus(
             }
             _ = &rx_shutdown => {
                 break;
+            }
+        }
+    }
+}
+
+/// Retrieve a consensus headers from a peer.
+/// Start at number/hash and work backwards to end number.
+#[allow(clippy::too_many_arguments)]
+async fn get_consensus_header_range<DB: TNDatabase>(
+    number: u64,
+    hash: B256,
+    db: &DB,
+    consensus_bus: &ConsensusBusApp,
+    network: &PrimaryNetworkHandle,
+    consensus_chain: &ConsensusChain,
+    fetch_epoch: Epoch,
+    end_number: u64,
+) {
+    if number < end_number {
+        return;
+    }
+    info!(target: "state-sync", ?number, ?hash, ?end_number, ?fetch_epoch, "fetching consensus from peer");
+    let mut number = number;
+    let mut hash = hash;
+    let mut count = 1;
+    while let Some((epoch, next_number, next_hash)) =
+        get_consensus_header(number, hash, db, consensus_bus, network, consensus_chain).await
+    {
+        number = next_number;
+        hash = next_hash;
+        if number < end_number || epoch < fetch_epoch {
+            break;
+        }
+        if count % 10 == 0 {
+            info!(target: "state-sync", ?number, ?hash, ?end_number, ?fetch_epoch, "fetching consensus from peer");
+        }
+        count += 1;
+    }
+}
+
+/// Spawn a long running task (application scope) that will retrieve consensus headers when
+/// requested.
+pub async fn spawn_fetch_recent_consensus<DB: TNDatabase>(
+    db: DB,
+    consensus_bus: ConsensusBusApp,
+    network: PrimaryNetworkHandle,
+    consensus_chain: ConsensusChain,
+    rx_shutdown: Noticer,
+    task_spawner: TaskSpawner,
+) {
+    // Get the epoch of our last executed consensus.
+    let mut current_fetch_epoch = consensus_chain.latest_consensus_epoch();
+    let mut rx_consensus_request = consensus_bus.subscribe_consensus_request_queue();
+    let mut last_gossipped_epoch = None;
+    let mut last_number = None;
+    // This loop will track current consensus as well as try to backfill from current.
+    // This task backfills the current epoch records as well as requesting entire pack files
+    // be downloaded for missing historic epochs.
+    loop {
+        tokio::select! {
+            req = rx_consensus_request.recv() => {
+                let Some((epoch, number, hash)) = req else {
+                    // We lost our channel so shutdown- this is a critical task so node will stop.
+                    return;
+                };
+                debug!(target: "state-sync", ?number, ?hash, "tracking recent consensus and detected change through gossip - requesting consensus from peer");
+                let db_clone = db.clone();
+                let consensus_bus_clone = consensus_bus.clone();
+                let network_clone = network.clone();
+                let consensus_chain_clone = consensus_chain.clone();
+                if last_gossipped_epoch.is_none() {
+                    last_gossipped_epoch = Some(epoch);
+                    last_number = Some(number + 1);
+                    // Start one backtracking fetch at the first consensus we get.
+                    task_spawner.spawn_task(format!("backfilling epoch {epoch} consensus from {number}/{hash}"), async move {
+                        get_consensus_header_range(number, hash, &db_clone, &consensus_bus_clone, &network_clone, &consensus_chain_clone, epoch, 0).await;
+                        Ok(())
+                    });
+                } else {
+                    let end_number = last_number.unwrap_or_default();
+                    last_number = Some(number + 1);
+                    let min_epoch = last_gossipped_epoch.unwrap_or_default();
+                    task_spawner.spawn_task(format!("backfilling epoch {epoch} consensus from {number}/{hash} to {end_number}"), async move {
+                        get_consensus_header_range(number, hash, &db_clone, &consensus_bus_clone, &network_clone, &consensus_chain_clone, min_epoch, end_number).await;
+                        Ok(())
+                    });
+                }
+
+                if current_fetch_epoch < epoch {
+                    request_epochs(&mut current_fetch_epoch, &consensus_chain, &consensus_bus, last_gossipped_epoch).await
+                }
+            }
+
+            _ = &rx_shutdown => {
+                return;
             }
         }
     }

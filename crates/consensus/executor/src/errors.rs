@@ -137,8 +137,4 @@ pub enum SubscriberError {
     /// are behaving correctly and may indicate either a worker bug or data corruption.
     #[error("A fetched batch is missing from the collection.")]
     MissingFetchedBatch(BlockHash),
-
-    /// There are already too many batch fetches in process so can't start more.
-    #[error("There are too many batch fetches in process.")]
-    TooManyBatchFetches,
 }

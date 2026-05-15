@@ -180,7 +180,6 @@ impl<DB: Database> Subscriber<DB> {
         spawn_state_sync(
             self.config.clone(),
             self.consensus_bus.clone(),
-            self.network_handle.clone(),
             tasks,
             self.inner.consensus_chain.clone(),
         );
@@ -215,7 +214,6 @@ impl<DB: Database> Subscriber<DB> {
         spawn_state_sync(
             self.config.clone(),
             self.consensus_bus.clone(),
-            self.network_handle.clone(),
             tasks,
             self.inner.consensus_chain.clone(),
         );
@@ -298,11 +296,7 @@ impl<DB: Database> Subscriber<DB> {
                 biased;
 
                 // Receive the ordered sequence of consensus messages from a consensus node.
-                Some(sub_dag) = rx_sequence.recv(), if !epoch_done => {
-                    if waiting.len() > Self::MAX_PENDING_PAYLOADS {
-                        // Too many batches in process, return error to stop the node so we don't fork skipping output.
-                        return Err(SubscriberError::TooManyBatchFetches);
-                    }
+                Some(sub_dag) = rx_sequence.recv(), if !epoch_done && waiting.len() < Self::MAX_PENDING_PAYLOADS => {
                     // Once we cross epoch boundary then process this last output then we are done.
                     if sub_dag.commit_timestamp() >= self.inner.epoch_boundary { epoch_done = true; }
                     debug!(target: "subscriber", subdag=?sub_dag.digest(), round=?sub_dag.leader_round(), "received committed subdag from consensus");
