@@ -555,10 +555,13 @@ impl ConsensusChain {
 
     /// Return true if we have a complete pack file for epoch_record.
     pub async fn is_epoch_complete(&self, epoch_record: &EpochRecord) -> bool {
-        self.consensus_header_by_number(epoch_record.final_consensus.number)
-            .await
-            .unwrap_or_default()
-            .is_some()
+        match self.consensus_header_by_number(epoch_record.final_consensus.number).await {
+            Ok(result) => result.is_some(),
+            Err(e) => {
+                error!(target: "consensus-chain", epoch=?epoch_record.epoch, "DB error checking epoch completeness: {e}");
+                false
+            }
+        }
     }
 
     /// Retrieve the last known ConsensusHeader that was executed.
