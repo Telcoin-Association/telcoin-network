@@ -77,7 +77,9 @@ async fn get_consensus_header<DB: TNDatabase>(
                 ?number,
                 "failed to fetch consensus header from peer"
             );
-            None
+            // Return the failed data so we try again.
+            let epoch = consensus_chain.epochs().number_to_epoch(number);
+            Some((epoch, number, hash))
         }
     }
 }
@@ -294,6 +296,10 @@ async fn get_consensus_header_range<DB: TNDatabase>(
         if number < end_number || epoch < fetch_epoch {
             break;
         }
+        if consensus_chain.consensus_header_by_number(number).await.unwrap_or_default().is_some() {
+            // The next number showed up in a pack file.  We don't need to continue this download...
+            break;
+        }
         if count % 10 == 0 {
             info!(target: "state-sync", ?number, ?hash, ?end_number, ?fetch_epoch, "fetching consensus from peer");
         }
@@ -314,7 +320,7 @@ pub async fn spawn_fetch_recent_consensus<DB: TNDatabase>(
     // Get the epoch of our last executed consensus.
     let mut current_fetch_epoch = consensus_chain.latest_consensus_epoch();
     let mut rx_consensus_request = consensus_bus.subscribe_consensus_request_queue();
-    let mut last_gossipped_epoch = None;
+    let mut first_gossipped_epoch = None; // Track the first epoch we see via gossip.
     let mut last_number = None;
     // This loop will track current consensus as well as try to backfill from current.
     // This task backfills the current epoch records as well as requesting entire pack files
@@ -331,8 +337,8 @@ pub async fn spawn_fetch_recent_consensus<DB: TNDatabase>(
                 let consensus_bus_clone = consensus_bus.clone();
                 let network_clone = network.clone();
                 let consensus_chain_clone = consensus_chain.clone();
-                if last_gossipped_epoch.is_none() {
-                    last_gossipped_epoch = Some(epoch);
+                if first_gossipped_epoch.is_none() {
+                    first_gossipped_epoch = Some(epoch);
                     last_number = Some(number + 1);
                     // Start one backtracking fetch at the first consensus we get.
                     task_spawner.spawn_task(format!("backfilling epoch {epoch} consensus from {number}/{hash}"), async move {
@@ -342,7 +348,7 @@ pub async fn spawn_fetch_recent_consensus<DB: TNDatabase>(
                 } else {
                     let end_number = last_number.unwrap_or_default();
                     last_number = Some(number + 1);
-                    let min_epoch = last_gossipped_epoch.unwrap_or_default();
+                    let min_epoch = first_gossipped_epoch.unwrap_or_default();
                     task_spawner.spawn_task(format!("backfilling epoch {epoch} consensus from {number}/{hash} to {end_number}"), async move {
                         get_consensus_header_range(number, hash, &db_clone, &consensus_bus_clone, &network_clone, &consensus_chain_clone, min_epoch, end_number).await;
                         Ok(())
@@ -350,7 +356,9 @@ pub async fn spawn_fetch_recent_consensus<DB: TNDatabase>(
                 }
 
                 if current_fetch_epoch < epoch {
-                    request_epochs(&mut current_fetch_epoch, &consensus_chain, &consensus_bus, last_gossipped_epoch).await
+                    // Use Some(epoch) instead of start_gossipped_epoch- switch to pack download if we change epochs.
+                    // This will almost certainly be faster and more reliable...
+                    request_epochs(&mut current_fetch_epoch, &consensus_chain, &consensus_bus, Some(epoch)).await
                 }
             }
 
