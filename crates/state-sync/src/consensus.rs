@@ -189,7 +189,7 @@ pub async fn spawn_fetch_consensus(
     // Get the epoch of our last executed consensus.
     loop {
         tokio::select! {
-            Some((_permit, previous_epoch_record, epoch_record)) = next_epoch(&consensus_bus, &next_sem) => {
+            Some((_permit, previous_epoch_record, mut epoch_record)) = next_epoch(&consensus_bus, &next_sem) => {
                 let epoch = epoch_record.epoch;
                 if consensus_chain.already_streaming_epoch(epoch) || consensus_chain.is_epoch_complete(&epoch_record).await {
                     // If we have already streamed this epoch or are in process of streaming then continue.
@@ -238,6 +238,17 @@ pub async fn spawn_fetch_consensus(
                                 Err(e) => {
                                     error!(target: "state-sync",
                                         "failed to request epoch pack for epoch {epoch}, attempt {attempts}: {e}");
+                                    // The epoch record may have been a dummy (final_consensus.number=0)
+                                    // when first queued at startup. Refresh from DB so subsequent
+                                    // retries use the real signed cert if it has since arrived.
+                                    if let Some(fresh) = consensus_chain.epochs().record_by_epoch(epoch).await {
+                                        if fresh.final_consensus.number > epoch_record.final_consensus.number {
+                                            info!(target: "state-sync",
+                                                "refreshed epoch {epoch} record for retry: final_consensus {} -> {}",
+                                                epoch_record.final_consensus.number, fresh.final_consensus.number);
+                                            epoch_record = fresh;
+                                        }
+                                    }
                                     // Wait a beat before we try again, may have a network issue.
                                     // Wait time will increase as attempts grow.
                                     tokio::select! {
