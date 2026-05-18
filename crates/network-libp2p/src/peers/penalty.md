@@ -9,12 +9,12 @@ Treat each entry as an assertion to verify against the code.
 `Penalty` is defined in `crates/network-libp2p/src/peers/types.rs:69-86`.
 Score deltas are applied in `crates/network-libp2p/src/peers/score.rs:84-100`.
 
-| Variant           | Score Delta              | Effect                                                  | Source                                                       |
-| ----------------- | ------------------------ | ------------------------------------------------------- | ------------------------------------------------------------ |
-| `Penalty::Mild`   | `-1.0`                   | Clamped to `[min_score, max_score]`                     | `crates/network-libp2p/src/peers/score.rs:90`                |
-| `Penalty::Medium` | `-5.0`                   | Clamped to `[min_score, max_score]`                     | `crates/network-libp2p/src/peers/score.rs:91`                |
-| `Penalty::Severe` | `-10.0`                  | Clamped to `[min_score, max_score]`                     | `crates/network-libp2p/src/peers/score.rs:92`                |
-| `Penalty::Fatal`  | sets score to `min_score` (`-100.0`) | Immediate ban — score jumps below `min_score_before_ban` (`-50.0`) | `crates/network-libp2p/src/peers/score.rs:93`     |
+| Variant           | Score Delta                          | Effect                                                             | Source                                        |
+| ----------------- | ------------------------------------ | ------------------------------------------------------------------ | --------------------------------------------- |
+| `Penalty::Mild`   | `-1.0`                               | Clamped to `[min_score, max_score]`                                | `crates/network-libp2p/src/peers/score.rs:90` |
+| `Penalty::Medium` | `-5.0`                               | Clamped to `[min_score, max_score]`                                | `crates/network-libp2p/src/peers/score.rs:91` |
+| `Penalty::Severe` | `-10.0`                              | Clamped to `[min_score, max_score]`                                | `crates/network-libp2p/src/peers/score.rs:92` |
+| `Penalty::Fatal`  | sets score to `min_score` (`-100.0`) | Immediate ban — score jumps below `min_score_before_ban` (`-50.0`) | `crates/network-libp2p/src/peers/score.rs:93` |
 
 ## 2. Score Model Invariants
 
@@ -22,8 +22,8 @@ Score deltas are applied in `crates/network-libp2p/src/peers/score.rs:84-100`.
 - Default starting score: `0.0`. `crates/config/src/network.rs:436`.
 - Ban threshold (`min_score_before_ban`): `-50.0`. `crates/config/src/network.rs:443`.
 - Disconnect threshold (`min_score_before_disconnect`): `-20.0`. `crates/config/src/network.rs:442`.
-- Score halflife: `600.0` seconds; decay factor is `e^(-ln(2)/halflife * dt)`. `crates/config/src/network.rs:440`, `crates/network-libp2p/src/peers/score.rs:130-132`.
-- `banned_before_decay_secs`: `12 * 3600` (12 hours). When a peer crosses the ban threshold, `last_updated` is pushed forward by this duration so the score does not decay during the lockout. `crates/config/src/network.rs:441`, `crates/network-libp2p/src/peers/score.rs:149-154`.
+- Score halflife: `300.0` seconds; decay factor is `e^(-ln(2)/halflife * dt)`. `crates/config/src/network.rs:440`, `crates/network-libp2p/src/peers/score.rs:130-132`.
+- `banned_before_decay_secs`: `30 * 60` (30 min). When a peer crosses the ban threshold, `last_updated` is pushed forward by this duration so the score does not decay during the lockout. `crates/config/src/network.rs:441`, `crates/network-libp2p/src/peers/score.rs:149-154`.
 - Trusted peers skip penalty application entirely — `Peer::apply_penalty` short-circuits when `self.is_trusted`. `crates/network-libp2p/src/peers/peer.rs:158-161`.
 - Penalty application has no debouncing: every `process_penalty` call evaluates reputation immediately and may produce a ban on the same call. `crates/network-libp2p/src/peers/all_peers.rs:111-147`.
 - Bans surface to the rest of the swarm as `PeerEvent::Banned`, pushed by `process_ban`. `crates/network-libp2p/src/peers/manager.rs:389-401`.
@@ -36,36 +36,36 @@ All sites live in `crates/network-libp2p/src/consensus.rs`. `NetworkCommand::Rep
 
 ### 3.1 Gossip events (`process_gossip_event`, L781)
 
-| Location                                              | Trigger (immediate guard)                                          | Severity |
-| ----------------------------------------------------- | ------------------------------------------------------------------ | -------- |
-| `crates/network-libp2p/src/consensus.rs:828`          | `verify_gossip` rejected (`!valid`) — invalid topic or unauthorized publisher | `Fatal`  |
-| `crates/network-libp2p/src/consensus.rs:839`          | `GossipEvent::GossipsubNotSupported { peer_id }`                   | `Fatal`  |
-| `crates/network-libp2p/src/consensus.rs:843`          | `GossipEvent::SlowPeer { peer_id, failed_messages }`               | `Mild`   |
+| Location                                     | Trigger (immediate guard)                                                     | Severity |
+| -------------------------------------------- | ----------------------------------------------------------------------------- | -------- |
+| `crates/network-libp2p/src/consensus.rs:828` | `verify_gossip` rejected (`!valid`) — invalid topic or unauthorized publisher | `Fatal`  |
+| `crates/network-libp2p/src/consensus.rs:839` | `GossipEvent::GossipsubNotSupported { peer_id }`                              | `Fatal`  |
+| `crates/network-libp2p/src/consensus.rs:843` | `GossipEvent::SlowPeer { peer_id, failed_messages }`                          | `Mild`   |
 
 ### 3.2 Req/Res events (`process_reqres_event`, L851)
 
-| Location                                              | Trigger                                                                   | Severity |
-| ----------------------------------------------------- | ------------------------------------------------------------------------- | -------- |
-| `crates/network-libp2p/src/consensus.rs:946`          | `ReqResEvent::OutboundFailure` after PX-disconnect skip guard             | `Medium` |
-| `crates/network-libp2p/src/consensus.rs:963`          | `ReqResInboundFailure::Io(e)`                                             | `Medium` |
-| `crates/network-libp2p/src/consensus.rs:972`          | `ReqResInboundFailure::UnsupportedProtocols`                              | `Fatal`  |
-| `crates/network-libp2p/src/consensus.rs:979`          | `ReqResInboundFailure::Timeout` or `ReqResInboundFailure::ConnectionClosed` | `Mild` |
+| Location                                     | Trigger                                                                     | Severity |
+| -------------------------------------------- | --------------------------------------------------------------------------- | -------- |
+| `crates/network-libp2p/src/consensus.rs:946` | `ReqResEvent::OutboundFailure` after PX-disconnect skip guard               | `Medium` |
+| `crates/network-libp2p/src/consensus.rs:963` | `ReqResInboundFailure::Io(e)`                                               | `Medium` |
+| `crates/network-libp2p/src/consensus.rs:972` | `ReqResInboundFailure::UnsupportedProtocols`                                | `Fatal`  |
+| `crates/network-libp2p/src/consensus.rs:979` | `ReqResInboundFailure::Timeout` or `ReqResInboundFailure::ConnectionClosed` | `Mild`   |
 
 `ReqResInboundFailure::ResponseOmission` is explicitly a no-op (local error). See restraint invariants below.
 
 ### 3.3 Kademlia outbound `GetRecord` query (`process_kad_event`, L1208)
 
-| Location                                              | Trigger                                                                                                       | Severity |
-| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- | -------- |
-| `crates/network-libp2p/src/consensus.rs:1267`         | `kad::QueryResult::GetRecord(Ok(FoundRecord))` but `peer_record_valid` returned `None` (bad sig / key mismatch) | `Fatal`  |
+| Location                                      | Trigger                                                                                                         | Severity |
+| --------------------------------------------- | --------------------------------------------------------------------------------------------------------------- | -------- |
+| `crates/network-libp2p/src/consensus.rs:1267` | `kad::QueryResult::GetRecord(Ok(FoundRecord))` but `peer_record_valid` returned `None` (bad sig / key mismatch) | `Fatal`  |
 
 ### 3.4 Kad put-record handler (`process_kad_put_request`, L1362)
 
-| Location                                              | Trigger                                                                              | Severity |
-| ----------------------------------------------------- | ------------------------------------------------------------------------------------ | -------- |
-| `crates/network-libp2p/src/consensus.rs:1383`         | record was rejected AND `record.publisher.is_none()` (publisher-less record)         | `Fatal`  |
-| `crates/network-libp2p/src/consensus.rs:1406`         | `peer_record_valid(&record).is_some()` but `!is_newer_record(&record)` (stale record) | `Mild`   |
-| `crates/network-libp2p/src/consensus.rs:1413`         | `peer_record_valid(&record).is_none()` (invalid signature / wrong network key)        | `Fatal`  |
+| Location                                      | Trigger                                                                               | Severity |
+| --------------------------------------------- | ------------------------------------------------------------------------------------- | -------- |
+| `crates/network-libp2p/src/consensus.rs:1383` | record was rejected AND `record.publisher.is_none()` (publisher-less record)          | `Fatal`  |
+| `crates/network-libp2p/src/consensus.rs:1406` | `peer_record_valid(&record).is_some()` but `!is_newer_record(&record)` (stale record) | `Mild`   |
+| `crates/network-libp2p/src/consensus.rs:1413` | `peer_record_valid(&record).is_none()` (invalid signature / wrong network key)        | `Fatal`  |
 
 A rejected record from a banned source/publisher with a publisher present does
 NOT incur an extra penalty here — only the missing-publisher case is fatal. The
@@ -73,160 +73,160 @@ ban itself was applied elsewhere.
 
 ### 3.5 Kad query-result post-processing (`process_kad_query_result`, L1450)
 
-| Location                                              | Trigger                                                                | Severity |
-| ----------------------------------------------------- | ---------------------------------------------------------------------- | -------- |
-| `crates/network-libp2p/src/consensus.rs:1479`         | record valid but `query.request != key` (returned key does not match request) | `Fatal`  |
-| `crates/network-libp2p/src/consensus.rs:1488`         | `peer_record_valid(&record).is_none()` on the late-step path           | `Fatal`  |
+| Location                                      | Trigger                                                                       | Severity |
+| --------------------------------------------- | ----------------------------------------------------------------------------- | -------- |
+| `crates/network-libp2p/src/consensus.rs:1479` | record valid but `query.request != key` (returned key does not match request) | `Fatal`  |
+| `crates/network-libp2p/src/consensus.rs:1488` | `peer_record_valid(&record).is_none()` on the late-step path                  | `Fatal`  |
 
 ## 4. Penalty Application Sites — Worker Layer
 
 ### 4.1 `crates/consensus/worker/src/network/mod.rs` call sites
 
-| Location                                                          | Handler                          | Source of penalty                              |
-| ----------------------------------------------------------------- | -------------------------------- | ---------------------------------------------- |
-| `crates/consensus/worker/src/network/mod.rs:246`                  | `process_report_batch`           | `WorkerNetworkError::into() -> Option<Penalty>` |
-| `crates/consensus/worker/src/network/mod.rs:271`                  | `process_gossip`                 | `WorkerNetworkError::penalty()`                |
-| `crates/consensus/worker/src/network/mod.rs:379`                  | `process_request_batches_stream` response-error branch | `WorkerNetworkError::into() -> Option<Penalty>` |
-| `crates/consensus/worker/src/network/mod.rs:435`                  | `process_inbound_stream`         | `WorkerNetworkError::penalty()`                |
+| Location                                         | Handler                                                | Source of penalty                               |
+| ------------------------------------------------ | ------------------------------------------------------ | ----------------------------------------------- |
+| `crates/consensus/worker/src/network/mod.rs:246` | `process_report_batch`                                 | `WorkerNetworkError::into() -> Option<Penalty>` |
+| `crates/consensus/worker/src/network/mod.rs:271` | `process_gossip`                                       | `WorkerNetworkError::penalty()`                 |
+| `crates/consensus/worker/src/network/mod.rs:379` | `process_request_batches_stream` response-error branch | `WorkerNetworkError::into() -> Option<Penalty>` |
+| `crates/consensus/worker/src/network/mod.rs:435` | `process_inbound_stream`                               | `WorkerNetworkError::penalty()`                 |
 
 ### 4.2 `WorkerNetworkError::penalty()` mapping
 
 Source: `crates/consensus/worker/src/network/error.rs:76-138`.
 
-| Error variant                                                          | Severity | Source                                                  |
-| ---------------------------------------------------------------------- | -------- | ------------------------------------------------------- |
-| `BatchValidation(CanonicalChain { .. })`                               | `Mild`   | `crates/consensus/worker/src/network/error.rs:86`       |
-| `BatchValidation(InvalidEpoch { .. })`                                 | `Medium` | `crates/consensus/worker/src/network/error.rs:88-89`    |
-| `BatchValidation(InvalidTx4844(_))`                                    | `Medium` | `crates/consensus/worker/src/network/error.rs:88-89`    |
-| `BatchValidation(RecoverTransaction(..))`                              | `Severe` | `crates/consensus/worker/src/network/error.rs:91`       |
-| `BatchValidation(EmptyBatch)`                                          | `Fatal`  | `crates/consensus/worker/src/network/error.rs:93-101`   |
-| `BatchValidation(InvalidBaseFee { .. })`                               | `Fatal`  | `crates/consensus/worker/src/network/error.rs:93-101`   |
-| `BatchValidation(InvalidWorkerId { .. })`                              | `Fatal`  | `crates/consensus/worker/src/network/error.rs:93-101`   |
-| `BatchValidation(InvalidDigest)`                                       | `Fatal`  | `crates/consensus/worker/src/network/error.rs:93-101`   |
-| `BatchValidation(GasOverflow)`                                         | `Fatal`  | `crates/consensus/worker/src/network/error.rs:93-101`   |
-| `BatchValidation(CalculateMaxPossibleGas)`                             | `Fatal`  | `crates/consensus/worker/src/network/error.rs:93-101`   |
-| `BatchValidation(HeaderMaxGasExceedsGasLimit { .. })`                  | `Fatal`  | `crates/consensus/worker/src/network/error.rs:93-101`   |
-| `BatchValidation(HeaderTransactionBytesExceedsMax(_))`                 | `Fatal`  | `crates/consensus/worker/src/network/error.rs:93-101`   |
-| `InvalidRequest(_)`                                                    | `Mild`   | `crates/consensus/worker/src/network/error.rs:105-106`  |
-| `UnknownStreamRequest(_)`                                              | `Mild`   | `crates/consensus/worker/src/network/error.rs:105-106`  |
-| `StdIo(io_err)` kind `ConnectionReset`/`ConnectionAborted`/`TimedOut`/`Interrupted` | `Mild` | `crates/consensus/worker/src/network/error.rs:108-114`  |
-| `StdIo(io_err)` other kinds                                            | `Medium` | `crates/consensus/worker/src/network/error.rs:115`      |
-| `NonCommitteeBatch`                                                    | `Medium` | `crates/consensus/worker/src/network/error.rs:119`      |
-| `InvalidTopic`                                                         | `Fatal`  | `crates/consensus/worker/src/network/error.rs:121-126`  |
-| `Bcs(_)`                                                               | `Fatal`  | `crates/consensus/worker/src/network/error.rs:121-126`  |
-| `TooManyBatches { .. }`                                                | `Fatal`  | `crates/consensus/worker/src/network/error.rs:121-126`  |
-| `UnexpectedBatch(_)`                                                   | `Fatal`  | `crates/consensus/worker/src/network/error.rs:121-126`  |
-| `DuplicateBatch(_)`                                                    | `Fatal`  | `crates/consensus/worker/src/network/error.rs:121-126`  |
-| `RequestHashMismatch`                                                  | `Fatal`  | `crates/consensus/worker/src/network/error.rs:121-126`  |
-| `Timeout(_)`                                                           | None     | `crates/consensus/worker/src/network/error.rs:128-135`  |
-| `DBInsert(_)` / `DBCommit(_)` / `DBRead(_)`                            | None     | `crates/consensus/worker/src/network/error.rs:128-135`  |
-| `StreamClosed`                                                         | None     | `crates/consensus/worker/src/network/error.rs:128-135`  |
-| `Network(_)`                                                           | None     | `crates/consensus/worker/src/network/error.rs:128-135`  |
-| `BatchEpochMismatch(_, _)`                                             | None     | `crates/consensus/worker/src/network/error.rs:128-135`  |
-| `Internal(_)`                                                          | None     | `crates/consensus/worker/src/network/error.rs:128-135`  |
+| Error variant                                                                       | Severity | Source                                                 |
+| ----------------------------------------------------------------------------------- | -------- | ------------------------------------------------------ |
+| `BatchValidation(CanonicalChain { .. })`                                            | `Mild`   | `crates/consensus/worker/src/network/error.rs:86`      |
+| `BatchValidation(InvalidEpoch { .. })`                                              | `Medium` | `crates/consensus/worker/src/network/error.rs:88-89`   |
+| `BatchValidation(InvalidTx4844(_))`                                                 | `Medium` | `crates/consensus/worker/src/network/error.rs:88-89`   |
+| `BatchValidation(RecoverTransaction(..))`                                           | `Severe` | `crates/consensus/worker/src/network/error.rs:91`      |
+| `BatchValidation(EmptyBatch)`                                                       | `Fatal`  | `crates/consensus/worker/src/network/error.rs:93-101`  |
+| `BatchValidation(InvalidBaseFee { .. })`                                            | `Fatal`  | `crates/consensus/worker/src/network/error.rs:93-101`  |
+| `BatchValidation(InvalidWorkerId { .. })`                                           | `Fatal`  | `crates/consensus/worker/src/network/error.rs:93-101`  |
+| `BatchValidation(InvalidDigest)`                                                    | `Fatal`  | `crates/consensus/worker/src/network/error.rs:93-101`  |
+| `BatchValidation(GasOverflow)`                                                      | `Fatal`  | `crates/consensus/worker/src/network/error.rs:93-101`  |
+| `BatchValidation(CalculateMaxPossibleGas)`                                          | `Fatal`  | `crates/consensus/worker/src/network/error.rs:93-101`  |
+| `BatchValidation(HeaderMaxGasExceedsGasLimit { .. })`                               | `Fatal`  | `crates/consensus/worker/src/network/error.rs:93-101`  |
+| `BatchValidation(HeaderTransactionBytesExceedsMax(_))`                              | `Fatal`  | `crates/consensus/worker/src/network/error.rs:93-101`  |
+| `InvalidRequest(_)`                                                                 | `Mild`   | `crates/consensus/worker/src/network/error.rs:105-106` |
+| `UnknownStreamRequest(_)`                                                           | `Mild`   | `crates/consensus/worker/src/network/error.rs:105-106` |
+| `StdIo(io_err)` kind `ConnectionReset`/`ConnectionAborted`/`TimedOut`/`Interrupted` | `Mild`   | `crates/consensus/worker/src/network/error.rs:108-114` |
+| `StdIo(io_err)` other kinds                                                         | `Medium` | `crates/consensus/worker/src/network/error.rs:115`     |
+| `NonCommitteeBatch`                                                                 | `Medium` | `crates/consensus/worker/src/network/error.rs:119`     |
+| `InvalidTopic`                                                                      | `Fatal`  | `crates/consensus/worker/src/network/error.rs:121-126` |
+| `Bcs(_)`                                                                            | `Fatal`  | `crates/consensus/worker/src/network/error.rs:121-126` |
+| `TooManyBatches { .. }`                                                             | `Fatal`  | `crates/consensus/worker/src/network/error.rs:121-126` |
+| `UnexpectedBatch(_)`                                                                | `Fatal`  | `crates/consensus/worker/src/network/error.rs:121-126` |
+| `DuplicateBatch(_)`                                                                 | `Fatal`  | `crates/consensus/worker/src/network/error.rs:121-126` |
+| `RequestHashMismatch`                                                               | `Fatal`  | `crates/consensus/worker/src/network/error.rs:121-126` |
+| `Timeout(_)`                                                                        | None     | `crates/consensus/worker/src/network/error.rs:128-135` |
+| `DBInsert(_)` / `DBCommit(_)` / `DBRead(_)`                                         | None     | `crates/consensus/worker/src/network/error.rs:128-135` |
+| `StreamClosed`                                                                      | None     | `crates/consensus/worker/src/network/error.rs:128-135` |
+| `Network(_)`                                                                        | None     | `crates/consensus/worker/src/network/error.rs:128-135` |
+| `BatchEpochMismatch(_, _)`                                                          | None     | `crates/consensus/worker/src/network/error.rs:128-135` |
+| `Internal(_)`                                                                       | None     | `crates/consensus/worker/src/network/error.rs:128-135` |
 
 ## 5. Penalty Application Sites — Primary Layer
 
 ### 5.1 `crates/consensus/primary/src/network/mod.rs` call sites
 
-| Location                                                          | Handler                              | Source of penalty                                                         |
-| ----------------------------------------------------------------- | ------------------------------------ | ------------------------------------------------------------------------- |
-| `crates/consensus/primary/src/network/mod.rs:421`                 | `stream_import` (epoch pack download) | `Self::consensus_chain_error_to_penalty(&err)`                            |
-| `crates/consensus/primary/src/network/mod.rs:682`                 | `retrieve_missing_certs`             | `(&PrimaryNetworkError).into() -> Option<Penalty>`                         |
-| `crates/consensus/primary/src/network/mod.rs:719`                 | `retrieve_consensus_header` (any err) | hard-coded `Penalty::Mild`                                                |
-| `crates/consensus/primary/src/network/mod.rs:751`                 | `retrieve_epoch_record`              | `(&PrimaryNetworkError).into()`                                           |
-| `crates/consensus/primary/src/network/mod.rs:835`                 | `process_epoch_stream` response-err branch | `(&PrimaryNetworkError).into()`                                       |
-| `crates/consensus/primary/src/network/mod.rs:863`                 | `process_gossip`                     | `(&PrimaryNetworkError).into()`                                           |
-| `crates/consensus/primary/src/network/mod.rs:912`                 | `process_inbound_stream`             | `(&PrimaryNetworkError).into()`                                           |
+| Location                                          | Handler                                    | Source of penalty                                  |
+| ------------------------------------------------- | ------------------------------------------ | -------------------------------------------------- |
+| `crates/consensus/primary/src/network/mod.rs:421` | `stream_import` (epoch pack download)      | `Self::consensus_chain_error_to_penalty(&err)`     |
+| `crates/consensus/primary/src/network/mod.rs:682` | `retrieve_missing_certs`                   | `(&PrimaryNetworkError).into() -> Option<Penalty>` |
+| `crates/consensus/primary/src/network/mod.rs:719` | `retrieve_consensus_header` (any err)      | hard-coded `Penalty::Mild`                         |
+| `crates/consensus/primary/src/network/mod.rs:751` | `retrieve_epoch_record`                    | `(&PrimaryNetworkError).into()`                    |
+| `crates/consensus/primary/src/network/mod.rs:835` | `process_epoch_stream` response-err branch | `(&PrimaryNetworkError).into()`                    |
+| `crates/consensus/primary/src/network/mod.rs:863` | `process_gossip`                           | `(&PrimaryNetworkError).into()`                    |
+| `crates/consensus/primary/src/network/mod.rs:912` | `process_inbound_stream`                   | `(&PrimaryNetworkError).into()`                    |
 
 ### 5.2 `From<&PrimaryNetworkError> for Option<Penalty>`
 
 Source: `crates/consensus/primary/src/error/network.rs:70-132`.
 
-| Variant                                                           | Severity | Source                                                       |
-| ----------------------------------------------------------------- | -------- | ------------------------------------------------------------ |
-| `InvalidHeader(header_error)`                                     | delegates to `penalty_from_header_error` | `crates/consensus/primary/src/error/network.rs:76-78` |
-| `Certificate(CertManagerError::Certificate(CertificateError::Header(h)))` | delegates to `penalty_from_header_error` | `crates/consensus/primary/src/error/network.rs:81-83` |
-| `Certificate(CertManagerError::Certificate(CertificateError::TooOld(..)))` | `Mild`   | `crates/consensus/primary/src/error/network.rs:85`            |
-| `Certificate(CertManagerError::Certificate(CertificateError::RecoverBlsAggregateSignatureBytes))` | `Fatal`  | `crates/consensus/primary/src/error/network.rs:87-90`         |
-| `Certificate(CertManagerError::Certificate(CertificateError::Unsigned))` | `Fatal` | `crates/consensus/primary/src/error/network.rs:87-90`         |
-| `Certificate(CertManagerError::Certificate(CertificateError::Inquorate { .. }))` | `Fatal` | `crates/consensus/primary/src/error/network.rs:87-90`         |
-| `Certificate(CertManagerError::Certificate(CertificateError::InvalidSignature))` | `Fatal` | `crates/consensus/primary/src/error/network.rs:87-90`         |
-| `Certificate(CertManagerError::Certificate(CertificateError::ResChannelClosed(_)))` | None    | `crates/consensus/primary/src/error/network.rs:92-94`         |
-| `Certificate(CertManagerError::Certificate(CertificateError::TooNew(..)))` | None     | `crates/consensus/primary/src/error/network.rs:92-94`         |
-| `Certificate(CertManagerError::Certificate(CertificateError::Storage(_)))` | None     | `crates/consensus/primary/src/error/network.rs:92-94`         |
-| `Certificate(CertManagerError::UnverifiedSignature(_))`           | `Fatal`  | `crates/consensus/primary/src/error/network.rs:97`            |
-| `Certificate(CertManagerError::*)` operational variants (`PendingCertificateNotFound`, `PendingParentsMismatch`, `CertificateManagerOneshot`, `FatalForwardAcceptedCertificate`, `NoCertificateFetched`, `FatalAppendParent`, `GC`, `JoinError`, `Pending`, `Storage`, `RequestBounds`, `Timeout`, `Network`, `ChannelClosed`, `TNSend`) | None | `crates/consensus/primary/src/error/network.rs:99-113` |
-| `InvalidRequest(_)`                                               | `Mild`   | `crates/consensus/primary/src/error/network.rs:115-118`       |
-| `UnknownConsensusHeaderDigest(_)`                                 | `Mild`   | `crates/consensus/primary/src/error/network.rs:115-118`       |
-| `UnknownStreamRequest(_)`                                         | `Mild`   | `crates/consensus/primary/src/error/network.rs:115-118`       |
-| `UnknownConsensusHeaderCert(_)`                                   | `Mild`   | `crates/consensus/primary/src/error/network.rs:115-118`       |
-| `InvalidEpochRequest`                                             | `Medium` | `crates/consensus/primary/src/error/network.rs:119-120`       |
-| `StdIo(_)`                                                        | `Medium` | `crates/consensus/primary/src/error/network.rs:119-120`       |
-| `InvalidTopic`                                                    | `Fatal`  | `crates/consensus/primary/src/error/network.rs:121-122`       |
-| `Decode(_)`                                                       | `Fatal`  | `crates/consensus/primary/src/error/network.rs:121-122`       |
-| `UnavailableEpoch(_)`                                             | None     | `crates/consensus/primary/src/error/network.rs:123-129`       |
-| `UnavailableEpochDigest(_)`                                       | None     | `crates/consensus/primary/src/error/network.rs:123-129`       |
-| `PeerNotInCommittee(_)`                                           | None     | `crates/consensus/primary/src/error/network.rs:123-129`       |
-| `Storage(_)`                                                      | None     | `crates/consensus/primary/src/error/network.rs:123-129`       |
-| `Timeout(_)`                                                      | None     | `crates/consensus/primary/src/error/network.rs:123-129`       |
-| `StreamUnavailable(_)`                                            | None     | `crates/consensus/primary/src/error/network.rs:123-129`       |
-| `Internal(_)`                                                     | None     | `crates/consensus/primary/src/error/network.rs:123-129`       |
+| Variant                                                                                                                                                                                                                                                                                                                                  | Severity                                 | Source                                                  |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- | ------------------------------------------------------- |
+| `InvalidHeader(header_error)`                                                                                                                                                                                                                                                                                                            | delegates to `penalty_from_header_error` | `crates/consensus/primary/src/error/network.rs:76-78`   |
+| `Certificate(CertManagerError::Certificate(CertificateError::Header(h)))`                                                                                                                                                                                                                                                                | delegates to `penalty_from_header_error` | `crates/consensus/primary/src/error/network.rs:81-83`   |
+| `Certificate(CertManagerError::Certificate(CertificateError::TooOld(..)))`                                                                                                                                                                                                                                                               | `Mild`                                   | `crates/consensus/primary/src/error/network.rs:85`      |
+| `Certificate(CertManagerError::Certificate(CertificateError::RecoverBlsAggregateSignatureBytes))`                                                                                                                                                                                                                                        | `Fatal`                                  | `crates/consensus/primary/src/error/network.rs:87-90`   |
+| `Certificate(CertManagerError::Certificate(CertificateError::Unsigned))`                                                                                                                                                                                                                                                                 | `Fatal`                                  | `crates/consensus/primary/src/error/network.rs:87-90`   |
+| `Certificate(CertManagerError::Certificate(CertificateError::Inquorate { .. }))`                                                                                                                                                                                                                                                         | `Fatal`                                  | `crates/consensus/primary/src/error/network.rs:87-90`   |
+| `Certificate(CertManagerError::Certificate(CertificateError::InvalidSignature))`                                                                                                                                                                                                                                                         | `Fatal`                                  | `crates/consensus/primary/src/error/network.rs:87-90`   |
+| `Certificate(CertManagerError::Certificate(CertificateError::ResChannelClosed(_)))`                                                                                                                                                                                                                                                      | None                                     | `crates/consensus/primary/src/error/network.rs:92-94`   |
+| `Certificate(CertManagerError::Certificate(CertificateError::TooNew(..)))`                                                                                                                                                                                                                                                               | None                                     | `crates/consensus/primary/src/error/network.rs:92-94`   |
+| `Certificate(CertManagerError::Certificate(CertificateError::Storage(_)))`                                                                                                                                                                                                                                                               | None                                     | `crates/consensus/primary/src/error/network.rs:92-94`   |
+| `Certificate(CertManagerError::UnverifiedSignature(_))`                                                                                                                                                                                                                                                                                  | `Fatal`                                  | `crates/consensus/primary/src/error/network.rs:97`      |
+| `Certificate(CertManagerError::*)` operational variants (`PendingCertificateNotFound`, `PendingParentsMismatch`, `CertificateManagerOneshot`, `FatalForwardAcceptedCertificate`, `NoCertificateFetched`, `FatalAppendParent`, `GC`, `JoinError`, `Pending`, `Storage`, `RequestBounds`, `Timeout`, `Network`, `ChannelClosed`, `TNSend`) | None                                     | `crates/consensus/primary/src/error/network.rs:99-113`  |
+| `InvalidRequest(_)`                                                                                                                                                                                                                                                                                                                      | `Mild`                                   | `crates/consensus/primary/src/error/network.rs:115-118` |
+| `UnknownConsensusHeaderDigest(_)`                                                                                                                                                                                                                                                                                                        | `Mild`                                   | `crates/consensus/primary/src/error/network.rs:115-118` |
+| `UnknownStreamRequest(_)`                                                                                                                                                                                                                                                                                                                | `Mild`                                   | `crates/consensus/primary/src/error/network.rs:115-118` |
+| `UnknownConsensusHeaderCert(_)`                                                                                                                                                                                                                                                                                                          | `Mild`                                   | `crates/consensus/primary/src/error/network.rs:115-118` |
+| `InvalidEpochRequest`                                                                                                                                                                                                                                                                                                                    | `Medium`                                 | `crates/consensus/primary/src/error/network.rs:119-120` |
+| `StdIo(_)`                                                                                                                                                                                                                                                                                                                               | `Medium`                                 | `crates/consensus/primary/src/error/network.rs:119-120` |
+| `InvalidTopic`                                                                                                                                                                                                                                                                                                                           | `Fatal`                                  | `crates/consensus/primary/src/error/network.rs:121-122` |
+| `Decode(_)`                                                                                                                                                                                                                                                                                                                              | `Fatal`                                  | `crates/consensus/primary/src/error/network.rs:121-122` |
+| `UnavailableEpoch(_)`                                                                                                                                                                                                                                                                                                                    | None                                     | `crates/consensus/primary/src/error/network.rs:123-129` |
+| `UnavailableEpochDigest(_)`                                                                                                                                                                                                                                                                                                              | None                                     | `crates/consensus/primary/src/error/network.rs:123-129` |
+| `PeerNotInCommittee(_)`                                                                                                                                                                                                                                                                                                                  | None                                     | `crates/consensus/primary/src/error/network.rs:123-129` |
+| `Storage(_)`                                                                                                                                                                                                                                                                                                                             | None                                     | `crates/consensus/primary/src/error/network.rs:123-129` |
+| `Timeout(_)`                                                                                                                                                                                                                                                                                                                             | None                                     | `crates/consensus/primary/src/error/network.rs:123-129` |
+| `StreamUnavailable(_)`                                                                                                                                                                                                                                                                                                                   | None                                     | `crates/consensus/primary/src/error/network.rs:123-129` |
+| `Internal(_)`                                                                                                                                                                                                                                                                                                                            | None                                     | `crates/consensus/primary/src/error/network.rs:123-129` |
 
 ### 5.3 `penalty_from_header_error`
 
 Source: `crates/consensus/primary/src/error/network.rs:137-171`.
 
-| `HeaderError` variant                                             | Severity | Source                                                       |
-| ----------------------------------------------------------------- | -------- | ------------------------------------------------------------ |
-| `SyncBatches(_)`                                                  | `Mild`   | `crates/consensus/primary/src/error/network.rs:140-143`       |
-| `TooNew { .. }`                                                   | `Mild`   | `crates/consensus/primary/src/error/network.rs:140-143`       |
-| `Storage(_)`                                                      | `Mild`   | `crates/consensus/primary/src/error/network.rs:140-143`       |
-| `UnknownExecutionResult(_)`                                       | `Mild`   | `crates/consensus/primary/src/error/network.rs:140-143`       |
-| `InvalidParents`                                                  | `Medium` | `crates/consensus/primary/src/error/network.rs:145-147`       |
-| `WrongNumberOfParents(_, _)`                                      | `Medium` | `crates/consensus/primary/src/error/network.rs:145-147`       |
-| `TooOld { .. }`                                                   | `Medium` | `crates/consensus/primary/src/error/network.rs:145-147`       |
-| `InvalidTimestamp { .. }`                                         | `Severe` | `crates/consensus/primary/src/error/network.rs:149-151`       |
-| `InvalidParentRound`                                              | `Severe` | `crates/consensus/primary/src/error/network.rs:149-151`       |
-| `AlreadyVotedForLaterRound { .. }`                                | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164`       |
-| `AlreadyVoted(_, _)`                                              | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164`       |
-| `DuplicateParents`                                                | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164`       |
-| `TooManyParents(_, _)`                                            | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164`       |
-| `UnknownNetworkKey(_)`                                            | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164`       |
-| `PeerNotAuthor`                                                   | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164`       |
-| `InvalidGenesisParent(_)`                                         | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164`       |
-| `ParentMissingSignature`                                          | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164`       |
-| `InvalidParentTimestamp { .. }`                                   | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164`       |
-| `UnkownWorkerId`                                                  | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164`       |
-| `InvalidHeaderDigest`                                             | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164`       |
-| `UnknownAuthority(_)`                                             | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164`       |
-| `PendingCertificateOneshot`                                       | None     | `crates/consensus/primary/src/error/network.rs:166-169`       |
-| `TNSend(_)`                                                       | None     | `crates/consensus/primary/src/error/network.rs:166-169`       |
-| `InvalidEpoch { .. }`                                             | None     | `crates/consensus/primary/src/error/network.rs:166-169`       |
-| `ClosedWatchChannel`                                              | None     | `crates/consensus/primary/src/error/network.rs:166-169`       |
+| `HeaderError` variant              | Severity | Source                                                  |
+| ---------------------------------- | -------- | ------------------------------------------------------- |
+| `SyncBatches(_)`                   | `Mild`   | `crates/consensus/primary/src/error/network.rs:140-143` |
+| `TooNew { .. }`                    | `Mild`   | `crates/consensus/primary/src/error/network.rs:140-143` |
+| `Storage(_)`                       | `Mild`   | `crates/consensus/primary/src/error/network.rs:140-143` |
+| `UnknownExecutionResult(_)`        | `Mild`   | `crates/consensus/primary/src/error/network.rs:140-143` |
+| `InvalidParents`                   | `Medium` | `crates/consensus/primary/src/error/network.rs:145-147` |
+| `WrongNumberOfParents(_, _)`       | `Medium` | `crates/consensus/primary/src/error/network.rs:145-147` |
+| `TooOld { .. }`                    | `Medium` | `crates/consensus/primary/src/error/network.rs:145-147` |
+| `InvalidTimestamp { .. }`          | `Severe` | `crates/consensus/primary/src/error/network.rs:149-151` |
+| `InvalidParentRound`               | `Severe` | `crates/consensus/primary/src/error/network.rs:149-151` |
+| `AlreadyVotedForLaterRound { .. }` | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164` |
+| `AlreadyVoted(_, _)`               | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164` |
+| `DuplicateParents`                 | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164` |
+| `TooManyParents(_, _)`             | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164` |
+| `UnknownNetworkKey(_)`             | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164` |
+| `PeerNotAuthor`                    | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164` |
+| `InvalidGenesisParent(_)`          | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164` |
+| `ParentMissingSignature`           | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164` |
+| `InvalidParentTimestamp { .. }`    | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164` |
+| `UnkownWorkerId`                   | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164` |
+| `InvalidHeaderDigest`              | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164` |
+| `UnknownAuthority(_)`              | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164` |
+| `PendingCertificateOneshot`        | None     | `crates/consensus/primary/src/error/network.rs:166-169` |
+| `TNSend(_)`                        | None     | `crates/consensus/primary/src/error/network.rs:166-169` |
+| `InvalidEpoch { .. }`              | None     | `crates/consensus/primary/src/error/network.rs:166-169` |
+| `ClosedWatchChannel`               | None     | `crates/consensus/primary/src/error/network.rs:166-169` |
 
 ### 5.4 `consensus_chain_error_to_penalty`
 
 Source: `crates/consensus/primary/src/network/mod.rs:448-489`.
 
-| Variant                                                           | Severity | Source                                                       |
-| ----------------------------------------------------------------- | -------- | ------------------------------------------------------------ |
-| `PackError(PackError::MissingBatch)`                              | `Medium` | `crates/consensus/primary/src/network/mod.rs:451-454`        |
-| `PackError(PackError::NotConsensus)`                              | `Medium` | `crates/consensus/primary/src/network/mod.rs:451-454`        |
-| `PackError(PackError::NotBatch)`                                  | `Medium` | `crates/consensus/primary/src/network/mod.rs:451-454`        |
-| `PackError(PackError::NotEpoch)`                                  | `Medium` | `crates/consensus/primary/src/network/mod.rs:451-454`        |
-| `PackError(PackError::InvalidConsensusChain)`                     | `Severe` | `crates/consensus/primary/src/network/mod.rs:455-459`        |
-| `PackError(PackError::ExtraBatches)`                              | `Severe` | `crates/consensus/primary/src/network/mod.rs:455-459`        |
-| `PackError(PackError::MissingBatches)`                            | `Severe` | `crates/consensus/primary/src/network/mod.rs:455-459`        |
-| `PackError(PackError::CorruptPack)`                               | `Severe` | `crates/consensus/primary/src/network/mod.rs:455-459`        |
-| `PackError(PackError::InvalidEpoch)`                              | `Severe` | `crates/consensus/primary/src/network/mod.rs:455-459`        |
-| `PackError` operational variants (`IO`, `BatchLoad`, `EpochLoad`, `Append`, `IndexAppend`, `Fetch`, `Open`, `ReadOnly`, `ReadError`, `MissingAuthority`, `SendFailed`, `ReceiveFailed`, `PersistError`, `InvalidConsensusNumber`, `ConsensusNumberAlreadyAdded`, `ConsensusNumberTooLow`, `ConsensusNumberTooHigh`) | None | `crates/consensus/primary/src/network/mod.rs:460-476` |
-| `EpochMismatch`                                                   | `Mild`   | `crates/consensus/primary/src/network/mod.rs:478-480`        |
-| `PrevCommitteeEpochMismatch`                                      | `Mild`   | `crates/consensus/primary/src/network/mod.rs:478-480`        |
-| `CrcError`                                                        | `Mild`   | `crates/consensus/primary/src/network/mod.rs:478-480`        |
-| `EmptyImport`                                                     | `Severe` | `crates/consensus/primary/src/network/mod.rs:481-483`        |
-| `InvalidImport`                                                   | `Severe` | `crates/consensus/primary/src/network/mod.rs:481-483`        |
-| `StreamUnavailable` / `NoCurrentEpoch` / `EpochDbError(_)` / `IO(_)` | None  | `crates/consensus/primary/src/network/mod.rs:484-487`        |
+| Variant                                                                                                                                                                                                                                                                                                             | Severity | Source                                                |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- | ----------------------------------------------------- |
+| `PackError(PackError::MissingBatch)`                                                                                                                                                                                                                                                                                | `Medium` | `crates/consensus/primary/src/network/mod.rs:451-454` |
+| `PackError(PackError::NotConsensus)`                                                                                                                                                                                                                                                                                | `Medium` | `crates/consensus/primary/src/network/mod.rs:451-454` |
+| `PackError(PackError::NotBatch)`                                                                                                                                                                                                                                                                                    | `Medium` | `crates/consensus/primary/src/network/mod.rs:451-454` |
+| `PackError(PackError::NotEpoch)`                                                                                                                                                                                                                                                                                    | `Medium` | `crates/consensus/primary/src/network/mod.rs:451-454` |
+| `PackError(PackError::InvalidConsensusChain)`                                                                                                                                                                                                                                                                       | `Severe` | `crates/consensus/primary/src/network/mod.rs:455-459` |
+| `PackError(PackError::ExtraBatches)`                                                                                                                                                                                                                                                                                | `Severe` | `crates/consensus/primary/src/network/mod.rs:455-459` |
+| `PackError(PackError::MissingBatches)`                                                                                                                                                                                                                                                                              | `Severe` | `crates/consensus/primary/src/network/mod.rs:455-459` |
+| `PackError(PackError::CorruptPack)`                                                                                                                                                                                                                                                                                 | `Severe` | `crates/consensus/primary/src/network/mod.rs:455-459` |
+| `PackError(PackError::InvalidEpoch)`                                                                                                                                                                                                                                                                                | `Severe` | `crates/consensus/primary/src/network/mod.rs:455-459` |
+| `PackError` operational variants (`IO`, `BatchLoad`, `EpochLoad`, `Append`, `IndexAppend`, `Fetch`, `Open`, `ReadOnly`, `ReadError`, `MissingAuthority`, `SendFailed`, `ReceiveFailed`, `PersistError`, `InvalidConsensusNumber`, `ConsensusNumberAlreadyAdded`, `ConsensusNumberTooLow`, `ConsensusNumberTooHigh`) | None     | `crates/consensus/primary/src/network/mod.rs:460-476` |
+| `EpochMismatch`                                                                                                                                                                                                                                                                                                     | `Mild`   | `crates/consensus/primary/src/network/mod.rs:478-480` |
+| `PrevCommitteeEpochMismatch`                                                                                                                                                                                                                                                                                        | `Mild`   | `crates/consensus/primary/src/network/mod.rs:478-480` |
+| `CrcError`                                                                                                                                                                                                                                                                                                          | `Mild`   | `crates/consensus/primary/src/network/mod.rs:478-480` |
+| `EmptyImport`                                                                                                                                                                                                                                                                                                       | `Severe` | `crates/consensus/primary/src/network/mod.rs:481-483` |
+| `InvalidImport`                                                                                                                                                                                                                                                                                                     | `Severe` | `crates/consensus/primary/src/network/mod.rs:481-483` |
+| `StreamUnavailable` / `NoCurrentEpoch` / `EpochDbError(_)` / `IO(_)`                                                                                                                                                                                                                                                | None     | `crates/consensus/primary/src/network/mod.rs:484-487` |
 
 ## 6. Restraint Invariants (no-penalty cases)
 
