@@ -437,8 +437,15 @@ impl Default for ScoreConfig {
             min_application_score_before_ban: -60.0,
             max_score: 100.0,
             min_score: -100.0,
-            score_halflife: 600.0,
-            banned_before_decay_secs: 12 * 3600, // 12 hours
+            // 5-minute halflife: transient WAN penalties (peer flap, slow request) decay
+            // out within a couple of half-lives so they do not accumulate across the
+            // observer-join window.
+            score_halflife: 300.0,
+            // Short lockout so a peer that crosses the ban threshold can recover within
+            // one operator-attention window. DoS protection comes from the ban threshold
+            // itself, not from the lockout duration — a peer that keeps misbehaving will
+            // simply hit the threshold again.
+            banned_before_decay_secs: 30 * 60, // 30 minutes
             min_score_before_disconnect: -20.0,
             min_score_before_ban: -50.0,
         }

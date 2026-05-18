@@ -24,7 +24,7 @@ use libp2p::{
     kad::{self, store::RecordStore, Mode, QueryId},
     request_response::{
         self, Codec, Event as ReqResEvent, InboundFailure as ReqResInboundFailure,
-        InboundRequestId, OutboundRequestId,
+        InboundRequestId, OutboundFailure as ReqResOutboundFailure, OutboundRequestId,
     },
     swarm::{NetworkBehaviour, SwarmEvent},
     Multiaddr, PeerId, Swarm, SwarmBuilder,
@@ -936,8 +936,30 @@ where
                     return Ok(());
                 }
 
-                // apply penalty
-                self.swarm.behaviour_mut().peer_manager.process_penalty(peer, Penalty::Medium);
+                // Differentiate transport-level failures (peer disconnect, dial fail) from
+                // protocol-level violations. Transport failures are common on WAN and should
+                // not contribute to ban score; otherwise N in-flight requests at disconnect
+                // time cause N * Medium = instant ban.
+                match &error {
+                    ReqResOutboundFailure::DialFailure
+                    | ReqResOutboundFailure::ConnectionClosed
+                    | ReqResOutboundFailure::Io(_) => {
+                        // transport-level: no penalty
+                    }
+                    ReqResOutboundFailure::Timeout => {
+                        self.swarm
+                            .behaviour_mut()
+                            .peer_manager
+                            .process_penalty(peer, Penalty::Mild);
+                    }
+                    ReqResOutboundFailure::UnsupportedProtocols => {
+                        warn!(target: "network", ?peer, ?request_id, "outbound failure: unsupported protocol");
+                        self.swarm
+                            .behaviour_mut()
+                            .peer_manager
+                            .process_penalty(peer, Penalty::Severe);
+                    }
+                }
 
                 // try to forward error to original caller
                 let _ = self.outbound_requests.remove(&(peer, request_id)).map(|ack| {
@@ -949,28 +971,28 @@ where
                 debug!(target: "network", my_id=?self.swarm.local_peer_id(), "this node");
                 match error {
                     ReqResInboundFailure::Io(e) => {
-                        // penalize peer since this is an attack surface
+                        // attack surface, but the common cause is a peer disconnecting
+                        // mid-request on a flaky WAN link. Treat as Mild so it can accumulate
+                        // for repeat offenders without insta-banning on a single drop.
                         warn!(target: "network", ?e, ?peer, ?request_id, "inbound IO failure");
                         self.swarm
                             .behaviour_mut()
                             .peer_manager
-                            .process_penalty(peer, Penalty::Medium);
+                            .process_penalty(peer, Penalty::Mild);
                     }
                     ReqResInboundFailure::UnsupportedProtocols => {
                         warn!(target: "network", ?peer, ?request_id, ?error, "inbound failure: unsupported protocol");
 
                         // the local peer supports none of the protocols requested by the remote
+                        // Severe (not Fatal) so version skew during rolling upgrades does not
+                        // instantly ban a peer that is otherwise well-behaved.
                         self.swarm
                             .behaviour_mut()
                             .peer_manager
-                            .process_penalty(peer, Penalty::Fatal);
+                            .process_penalty(peer, Penalty::Severe);
                     }
                     ReqResInboundFailure::Timeout | ReqResInboundFailure::ConnectionClosed => {
-                        // penalty for potentially malicious request
-                        self.swarm
-                            .behaviour_mut()
-                            .peer_manager
-                            .process_penalty(peer, Penalty::Mild);
+                        // peer dropped or stalled mid-request — expected on WAN, no penalty
                     }
                     ReqResInboundFailure::ResponseOmission => { /* ignore local error */ }
                 }
@@ -1395,9 +1417,10 @@ where
                 trace!(target: "network-kad", "Got record {key} {value:?}");
                 self.swarm.behaviour_mut().peer_manager.add_known_peer(key, value.info);
             } else {
-                // mild punishment for old record
-                trace!(target: "network-kad", ?source, "processing mild penalty for old record");
-                self.swarm.behaviour_mut().peer_manager.process_penalty(source, Penalty::Mild);
+                // A peer republishing a slightly stale (but signature-valid) record is
+                // expected after restarts and benign — the local store keeps the newer
+                // version. Log only; no penalty.
+                trace!(target: "network-kad", ?source, "ignoring stale but valid kad record");
             }
         } else {
             warn!(target: "network-kad", "Received invalid peer record!");

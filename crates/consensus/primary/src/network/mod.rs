@@ -711,13 +711,14 @@ where
             tokio::select! {
                 header =
                     request_handler.retrieve_consensus_header(number, hash) => {
-                        // Penalize peer's reputation for bad request.
-                        // This could happen now and then and not be malicious so use a Mild only
-                        // to close any DOS attack.
+                        // A peer asking for a header we cannot return is not a misbehavior
+                        // signal — observers legitimately request headers that have not yet
+                        // been served. Log the miss and respond with the error; do not
+                        // penalize. DoS protection is provided by req_res concurrency limits
+                        // and gossipsub rate limits, not by penalizing sync requests.
                         if let Err(e) = &header {
                             let my_number = request_handler.consensus_chain().latest_consensus_number();
-                            tracing::warn!(target: "primary::network", ?e, ?my_number, ?number, ?hash, ?peer,  "applying penalty for failed consesus header request");
-                            network_handle.handle.report_penalty(peer, Penalty::Mild).await;
+                            tracing::debug!(target: "primary::network", ?e, ?my_number, ?number, ?hash, ?peer, "consensus header request could not be served");
                         }
                         let response = header.into_response();
                         let _ = network_handle.handle.send_response(response, channel).await;
