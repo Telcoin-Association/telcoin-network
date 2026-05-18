@@ -338,6 +338,7 @@ where
         let consensus_chain = self.consensus_chain.clone();
         let db = self.consensus_db.clone();
         let task_spawner = node_task_manager.get_spawner();
+        let rx_consensus_request = consensus_bus.subscribe_consensus_request_queue();
         node_task_manager.spawn_critical_task("fetch-recent-consensus", async move {
             spawn_fetch_recent_consensus(
                 db,
@@ -346,6 +347,7 @@ where
                 consensus_chain,
                 shutdown,
                 task_spawner,
+                rx_consensus_request,
             )
             .await;
             Ok(())

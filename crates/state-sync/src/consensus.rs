@@ -12,8 +12,8 @@ use tn_config::ConsensusConfig;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
 use tn_storage::{consensus::ConsensusChain, tables::ConsensusHeaderCache};
 use tn_types::{
-    Database as TNDatabase, Epoch, EpochRecord, Noticer, TaskSpawner, TnReceiver as _,
-    TnSender as _, B256,
+    Database as TNDatabase, Epoch, EpochRecord, Noticer, TaskSpawner, TnReceiver, TnSender as _,
+    B256,
 };
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::{debug, error, info, warn};
@@ -353,6 +353,7 @@ async fn manage_new_consensus<DB: TNDatabase>(
         *last_number = Some(number + 1);
         let tasks_clone = tasks.clone();
         // Start one backtracking fetch at the first consensus we get.
+        tasks.store(1, Ordering::Relaxed);
         task_spawner.spawn_task(
             format!("backfilling epoch {epoch} consensus from {number}/{hash}"),
             async move {
@@ -371,8 +372,10 @@ async fn manage_new_consensus<DB: TNDatabase>(
                 Ok(())
             },
         );
-        tasks.store(1, Ordering::Relaxed);
     } else {
+        // Note that the way tasks is used is open to "races" but this is a simple throttle for not
+        // firing too many fetch tasks so not worth the overhead of using a full lock here.  I.e.
+        // one more or less task won't matter.
         let task_num = tasks.load(Ordering::Relaxed);
         // Skip for now, this number will be subsumed by gossip once enough tasks end.
         if task_num < 6 {
@@ -380,6 +383,7 @@ async fn manage_new_consensus<DB: TNDatabase>(
             *last_number = Some(number + 1);
             let min_epoch = first_gossipped_epoch.unwrap_or_default();
             let tasks_clone = tasks.clone();
+            tasks.fetch_add(1, Ordering::Relaxed);
             task_spawner.spawn_task(
                 format!("backfilling epoch {epoch} consensus from {number}/{hash} to {end_number}"),
                 async move {
@@ -398,7 +402,6 @@ async fn manage_new_consensus<DB: TNDatabase>(
                     Ok(())
                 },
             );
-            tasks.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -418,10 +421,10 @@ pub async fn spawn_fetch_recent_consensus<DB: TNDatabase>(
     consensus_chain: ConsensusChain,
     rx_shutdown: Noticer,
     task_spawner: TaskSpawner,
+    mut rx_consensus_request: impl TnReceiver<(Epoch, u64, B256)>,
 ) {
     // Get the epoch of our last executed consensus.
     let mut current_fetch_epoch = consensus_chain.latest_consensus_epoch();
-    let mut rx_consensus_request = consensus_bus.subscribe_consensus_request_queue();
     let mut first_gossipped_epoch = None; // Track the first epoch we see via gossip.
     let mut last_number = None;
     let tasks = Arc::new(AtomicI32::new(0));
