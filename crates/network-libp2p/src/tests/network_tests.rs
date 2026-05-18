@@ -1394,7 +1394,6 @@ async fn test_new_epoch_unbans_committee_member_ip() -> eyre::Result<()> {
 
     // For peer2, multiaddr has the same IP as peer1 (127.0.0.1)
     let peer2_addr = peer2.config.primary_address();
-    let peer2_id = peer2.network_handle.local_peer_id().await?;
     // join network so kad record is available
     peer2.network_handle.start_listening(peer2_addr.clone()).await?;
     peer2.network_handle.dial(peer1_id, peer1_addr.clone()).await?;
@@ -1409,6 +1408,15 @@ async fn test_new_epoch_unbans_committee_member_ip() -> eyre::Result<()> {
         )
         .await?;
     target_peer.network_handle.dial_by_bls(peer1.config.key_config().primary_public_key()).await?;
+    // Explicitly add peer2 as well- we want to track it's score at the end.
+    target_peer
+        .network_handle
+        .add_explicit_peer(
+            peer2.config.key_config().primary_public_key(),
+            peer2.config.primary_networkkey(),
+            peer2.config.primary_address(),
+        )
+        .await?;
 
     // Wait for connection to establish
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1443,10 +1451,14 @@ async fn test_new_epoch_unbans_committee_member_ip() -> eyre::Result<()> {
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
 
     // verify connection established with peer2
-    let connected_peers_after = target_peer.network_handle.connected_peer_ids().await?;
-    assert!(
-        connected_peers_after.contains(&peer2_id),
-        "Peer2 should be connected despite sharing IP with banned peer1"
+    let peer2_score = target_peer
+        .network_handle
+        .peer_score(peer2.network_handle.local_peer_id().await.unwrap())
+        .await?
+        .unwrap();
+    assert_eq!(
+        peer2_score, 100.0,
+        "Peer2 should have a high score despite sharing IP with banned peer1"
     );
 
     Ok(())
