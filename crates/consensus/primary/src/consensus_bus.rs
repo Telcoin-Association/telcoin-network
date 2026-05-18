@@ -19,7 +19,7 @@ use tn_network_libp2p::types::NetworkEvent;
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{
     deconstruct_nonce, BlockHash, BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader,
-    ConsensusOutput, Epoch, EpochRecord, EpochVote, Header, Round, TnReceiver, TnSender,
+    ConsensusOutput, Epoch, EpochRecord, EpochVote, Header, Round, TnReceiver, TnSender, B256,
     CHANNEL_CAPACITY,
 };
 use tokio::{
@@ -237,6 +237,8 @@ pub struct ConsensusBusAppInner {
     /// Reciever for epoch records to download pack files for.
     epoch_request_queue_rx:
         Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(EpochRecord, EpochRecord)>>>,
+    /// Channel to request consensus headers to cache.
+    consensus_request_queue: QueChannel<(Epoch, u64, B256)>,
 }
 
 /// The thread-safe inner type that holds all the channels for inner-consensus
@@ -296,6 +298,7 @@ impl ConsensusBusApp {
                 primary_network_events: QueChannel::new_always_subscribed(),
                 epoch_request_queue_tx,
                 epoch_request_queue_rx,
+                consensus_request_queue: QueChannel::new(),
             }),
         }
     }
@@ -562,6 +565,16 @@ impl ConsensusBusApp {
     /// provide each request once.  Returns None when the underlying channel closes.
     pub async fn get_next_epoch_pack_file_request(&self) -> Option<(EpochRecord, EpochRecord)> {
         self.inner.epoch_request_queue_rx.lock().await.recv().await
+    }
+
+    /// Channel to request consensus headers to be fetched and cached.
+    pub fn consensus_request_queue(&self) -> &impl TnSender<(Epoch, u64, B256)> {
+        &self.inner.consensus_request_queue
+    }
+
+    /// Subscribe to consensus header fetch queue.
+    pub fn subscribe_consensus_request_queue(&self) -> impl TnReceiver<(Epoch, u64, B256)> {
+        self.inner.consensus_request_queue.subscribe()
     }
 }
 

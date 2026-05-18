@@ -12,7 +12,7 @@ use tn_test_utils_committee as _;
 
 use std::time::Duration;
 use tn_config::ConsensusConfig;
-use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode};
+use tn_primary::{ConsensusBusApp, NodeMode};
 use tn_storage::{consensus::ConsensusChain, tables::ConsensusHeaderCache};
 use tn_types::{
     BlockHash, ConsensusHeader, ConsensusOutput, Database, Epoch, TaskError, TaskSpawner, TnSender,
@@ -22,8 +22,8 @@ use tracing::{debug, error, info, warn};
 mod epoch;
 pub use epoch::spawn_epoch_record_collector;
 mod consensus;
-pub use consensus::spawn_fetch_consensus;
 use consensus::spawn_track_recent_consensus;
+pub use consensus::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_recent_consensus};
 
 /// Sets some bus defaults.
 /// Call this somewhere when starting an epoch.
@@ -58,7 +58,6 @@ pub async fn prime_consensus<DB: Database>(
 pub fn spawn_state_sync<DB: Database>(
     config: ConsensusConfig<DB>,
     consensus_bus: ConsensusBusApp,
-    network: PrimaryNetworkHandle,
     task_spawner: TaskSpawner,
     consensus_chain: ConsensusChain,
 ) {
@@ -69,7 +68,6 @@ pub fn spawn_state_sync<DB: Database>(
         NodeMode::CvvInactive | NodeMode::Observer => {
             // If we are not an active CVV then follow latest consensus from peers.
             let (config_clone, consensus_bus_clone) = (config.clone(), consensus_bus.clone());
-            let consensus_chain_clone = consensus_chain.clone();
             task_spawner.spawn_task(
                 "state sync: track latest consensus header from peers",
                 async move {
@@ -77,8 +75,6 @@ pub fn spawn_state_sync<DB: Database>(
                     spawn_track_recent_consensus(
                         config_clone,
                         consensus_bus_clone,
-                        network,
-                        consensus_chain_clone,
                     ).await;
                     Ok(())
                 },
@@ -318,7 +314,7 @@ async fn catch_up_consensus_from_to<DB: Database>(
             // since number <= consensus_chain.latest_consensus_number().
             header
         } else {
-            error!(
+            warn!(
                 target: "tn::observer",
                 block_number = number,
                 "Could not find header"

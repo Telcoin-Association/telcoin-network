@@ -286,18 +286,19 @@ impl PrimaryNetworkHandle {
             };
             let res = res?;
             if let Ok(NetworkResponseMessage {
-                peer: _,
+                peer,
                 result: PrimaryResponse::ConsensusHeader(header),
             }) = res
             {
                 if header.digest() == hash && header.number == number {
                     return Ok(Arc::unwrap_or_clone(header));
                 } else {
-                    return Err(NetworkError::RPCError(format!(
-                        "Returned header does not match number {number}/{} or hash {hash}/{}!",
+                    tracing::warn!(target: "primary::network", "Returned header does not match number {number}/{} or hash {hash}/{}, try again!",
                         header.number,
                         header.digest()
-                    )));
+                    );
+                    // Give the naughty peer a penalty.
+                    self.report_penalty(peer, Penalty::Medium).await;
                 }
             }
         }

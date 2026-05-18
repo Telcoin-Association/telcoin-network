@@ -415,25 +415,19 @@ where
         }
     }
 
-    /// Push our [NodeRecord] to a specific peer and to the DHT.
+    /// Push our [NodeRecord] directly to a newly-connected peer.
     ///
     /// Used on first-time connections so the remote peer can resolve our BLS key
     /// without waiting for the kad publication interval (12h). Callers must
     /// short-circuit on reconnects - see [`Self::published_to_peers`]
     fn publish_our_data_to_peer(&mut self, peer: PeerId) {
         let record = self.get_peer_record();
-        info!(target: "network-kad", "Publishing our record to kademlia");
-        // Publish to the specified peer.
+        info!(target: "network-kad", "Publishing our record to peer {peer:?}");
         let _ = self.swarm.behaviour_mut().kademlia.put_record_to(
-            record.clone(),
+            record,
             vec![peer].into_iter(),
             kad::Quorum::One,
         );
-
-        // Also publish our record locally and to the network.
-        if let Err(err) = self.swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One) {
-            error!(target: "network-kad", "Failed to publish record: {err}");
-        }
     }
 
     /// Run the network loop to process incoming gossip.

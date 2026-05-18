@@ -12,7 +12,7 @@ use crate::{
     manager::spawn_epoch_vote_collector,
 };
 use eyre::eyre;
-use state_sync::spawn_fetch_consensus;
+use state_sync::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_recent_consensus};
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, TelcoinDirs};
 use tn_network_libp2p::{types::NetworkEvent, ConsensusNetwork};
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode, QueChannel};
@@ -304,6 +304,8 @@ where
             let _ = HealthcheckServer::spawn(node_task_manager.get_spawner(), port).await;
         }
 
+        // Do a sanity check, request any pack files for complete epochs we are missing.
+        request_missing_packs(&self.consensus_bus, &self.consensus_chain).await;
         // spawn three critical workers that will fetch epoch pack files from an epoch work queue.
         // Note, these workers will just go dormant once we have caught up- that's ok.
         for i in 0..3 {
@@ -326,6 +328,30 @@ where
                 },
             );
         }
+        // Fire up a app scoped task to fetch rencent consensus.
+        // This will not be used by CVVs but won't hurt anything and
+        // will be used when not active or catching up and needs to
+        // run with app scope (not epoch).
+        let shutdown = self.node_shutdown.subscribe();
+        let consensus_bus = self.consensus_bus.clone();
+        let primary_network_handle = primary_network_handle.clone();
+        let consensus_chain = self.consensus_chain.clone();
+        let db = self.consensus_db.clone();
+        let task_spawner = node_task_manager.get_spawner();
+        let rx_consensus_request = consensus_bus.subscribe_consensus_request_queue();
+        node_task_manager.spawn_critical_task("fetch-recent-consensus", async move {
+            spawn_fetch_recent_consensus(
+                db,
+                consensus_bus,
+                primary_network_handle,
+                consensus_chain,
+                shutdown,
+                task_spawner,
+                rx_consensus_request,
+            )
+            .await;
+            Ok(())
+        });
 
         // await all tasks on epoch-task-manager or node shutdown
         let result = tokio::select! {

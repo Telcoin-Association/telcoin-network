@@ -180,7 +180,6 @@ impl<DB: Database> Subscriber<DB> {
         spawn_state_sync(
             self.config.clone(),
             self.consensus_bus.clone(),
-            self.network_handle.clone(),
             tasks,
             self.inner.consensus_chain.clone(),
         );
@@ -215,7 +214,6 @@ impl<DB: Database> Subscriber<DB> {
         spawn_state_sync(
             self.config.clone(),
             self.consensus_bus.clone(),
-            self.network_handle.clone(),
             tasks,
             self.inner.consensus_chain.clone(),
         );
