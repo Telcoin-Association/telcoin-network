@@ -154,7 +154,7 @@ struct CommitteeInner {
 impl PartialEq for CommitteeInner {
     fn eq(&self, other: &Self) -> bool {
         self.epoch == other.epoch
-            && self.quorum_threshold == other.validity_threshold
+            && self.quorum_threshold == other.quorum_threshold
             && self.validity_threshold == other.validity_threshold
             && self.authorities.eq(&other.authorities)
     }
