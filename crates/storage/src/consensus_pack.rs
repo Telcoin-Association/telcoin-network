@@ -564,7 +564,7 @@ impl Inner {
             if epoch_meta != meta {
                 return Err(PackError::InvalidEpoch(
                     epoch,
-                    "open append has unexpected meta data".to_string(),
+                    format!("open append has unexpected meta data, expected {epoch_meta:?} got {meta:?}"),
                 ));
             }
         } else {
