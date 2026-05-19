@@ -12,7 +12,7 @@ use libp2p::{
 };
 use std::{collections::HashSet, net::IpAddr, time::Instant};
 use tn_config::PeerConfig;
-use tn_types::{BlsPublicKey, NetworkPublicKey};
+use tn_types::{BlsPublicKey, NetworkPublicKey, TimestampSec};
 use tracing::error;
 
 /// Information about a given connected peer.
@@ -50,6 +50,12 @@ pub(super) struct Peer {
     /// prioritizes non-routable peers during connection limit pruning. If a peer is not in the
     /// routing table and this node needs to prune connections, then the peer may be disconnected.
     routable: bool,
+    /// Timestamp from the most recent `NetworkInfo` that produced this peer record.
+    ///
+    /// `None` for peers materialized from inbound connections before we learned
+    /// their BLS-signed kad record. Set by `Peer::new`, `Peer::new_trusted`, and
+    /// each subsequent `Peer::update_net` call.
+    record_timestamp: Option<TimestampSec>,
 }
 
 impl Peer {
@@ -58,6 +64,7 @@ impl Peer {
         bls_public_key: BlsPublicKey,
         network_key: NetworkPublicKey,
         listening_addrs: Vec<Multiaddr>,
+        timestamp: TimestampSec,
     ) -> Peer {
         Self {
             bls_public_key: Some(bls_public_key),
@@ -70,14 +77,16 @@ impl Peer {
             connection_status: Default::default(),
             connection_direction: Default::default(),
             routable: false,
+            record_timestamp: Some(timestamp),
         }
     }
 
-    /// Create a new trusted peer.
+    /// Create a new peer.
     pub(super) fn new(
         bls_public_key: BlsPublicKey,
         network_key: NetworkPublicKey,
         listening_addrs: Vec<Multiaddr>,
+        timestamp: TimestampSec,
     ) -> Peer {
         Self {
             bls_public_key: Some(bls_public_key),
@@ -90,6 +99,7 @@ impl Peer {
             connection_status: Default::default(),
             connection_direction: Default::default(),
             routable: false,
+            record_timestamp: Some(timestamp),
         }
     }
 
@@ -112,24 +122,54 @@ impl Peer {
             connection_status: Default::default(),
             connection_direction: Default::default(),
             routable: false,
+            record_timestamp: None,
         }
     }
 
-    /// Update keys and network address.
+    /// Update keys and network addresses.
+    ///
+    /// `multiaddrs` is the peer's currently advertised listening set (the dialable addresses).
+    /// `listening_addrs` is replaced so stale entries from previous records are evicted, while
+    /// `multiaddrs` (the historical observed set used for IP banning) is extended.
     pub(super) fn update_net(
         &mut self,
         bls_public_key: BlsPublicKey,
         network_key: NetworkPublicKey,
         multiaddrs: Vec<Multiaddr>,
+        timestamp: TimestampSec,
     ) {
         self.bls_public_key = Some(bls_public_key);
         self.network_key = Some(network_key);
+        self.listening_addrs = multiaddrs.clone();
         self.multiaddrs.extend(multiaddrs);
+        self.record_timestamp = Some(timestamp);
     }
 
     /// This peers Bls public key.
     pub(super) fn bls_public_key(&self) -> Option<BlsPublicKey> {
         self.bls_public_key
+    }
+
+    /// Return the timestamp from the most recent network record applied to this peer.
+    pub(super) fn record_timestamp(&self) -> Option<TimestampSec> {
+        self.record_timestamp
+    }
+
+    /// Clear the peer's BLS public key.
+    ///
+    /// Used by `AllPeers::rebind_bls` when the same BLS key is re-bound to a different `PeerId`.
+    /// The orphaned `Peer` survives with its other state intact but becomes unindexable from the
+    /// BLS side until its next `update_net`.
+    pub(super) fn clear_bls(&mut self) {
+        self.bls_public_key = None;
+    }
+
+    /// Return a clone of the peer's advertised listening multiaddrs.
+    ///
+    /// This is the set of addresses we should dial to reach the peer (the listening
+    /// addresses advertised through `NetworkInfo` / kad records).
+    pub(super) fn listening_addrs_clone(&self) -> Vec<Multiaddr> {
+        self.listening_addrs.clone()
     }
 
     /// Return a peer's reputation based on the aggregate score.
@@ -318,20 +358,6 @@ impl Peer {
             self.is_trusted = true;
             self.score = Score::new_max();
         }
-    }
-
-    /// Update multiaddrs for the peer.
-    ///
-    /// Returns a boolean indicating if the multiaddr was newly recorded.
-    pub(super) fn update_listening_addrs(&mut self, multiaddrs: Vec<Multiaddr>) -> bool {
-        let mut res = false;
-        for multiaddr in multiaddrs {
-            if !self.listening_addrs.contains(&multiaddr) {
-                self.listening_addrs.push(multiaddr);
-                res = true;
-            }
-        }
-        res
     }
 
     /// Update peer record to indicate participation in kad as a routable peer.

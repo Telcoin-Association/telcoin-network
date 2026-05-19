@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tn_config::{PeerConfig, ScoreConfig};
-use tn_types::{BlsKeypair, NetworkKeypair};
+use tn_types::{now, BlsKeypair, NetworkKeypair};
 
 /// Helper function to create a test AllPeers instance
 fn create_all_peers(peer_config: Option<PeerConfig>) -> AllPeers {
@@ -29,7 +29,7 @@ fn test_add_trusted_peer() {
     let bls = *BlsKeypair::generate(&mut rng).public();
     let net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
     let peer_id: PeerId = net.clone().into();
-    all_peers.add_trusted_peer(bls, net, vec![addr.clone()]);
+    all_peers.add_trusted_peer(bls, net, vec![addr.clone()], now());
 
     assert!(all_peers.peers.contains_key(&peer_id));
     let peer = all_peers.peers.get_mut(&peer_id).unwrap();
@@ -123,7 +123,7 @@ fn test_peer_exchange() {
         );
         let mut rng = StdRng::from_seed([i; 32]);
         let bls = *BlsKeypair::generate(&mut rng).public();
-        all_peers.upsert_peer(bls, network_key, vec![addr]);
+        all_peers.upsert_peer(bls, network_key, vec![addr], now());
     }
 
     // Add a disconnected peer
@@ -626,4 +626,186 @@ fn test_ban_action_returns_only_unbanned_ips() {
     } else {
         panic!("Expected Ban action for peer3");
     }
+}
+
+// -----------------------------------------------------------------------------
+// bls_index invariant tests
+// -----------------------------------------------------------------------------
+
+/// Helper: construct a fresh (bls, network_key, peer_id) triple from a deterministic seed.
+fn bls_net_peer(seed: u8) -> (BlsPublicKey, NetworkPublicKey, PeerId) {
+    let mut rng = StdRng::from_seed([seed; 32]);
+    let bls = *BlsKeypair::generate(&mut rng).public();
+    let net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let peer_id: PeerId = net.clone().into();
+    (bls, net, peer_id)
+}
+
+#[test]
+fn bls_rotation_same_peer_id_evicts_old_index() {
+    // Same PeerId, new BLS key — the old BLS must no longer resolve.
+    //
+    // NOTE: this should never happen. Validators can rotate peer ids
+    // but should not rotate BLS keys. This test demonstrates how the
+    // protocol handles this unexpected behavior.
+    let mut all_peers = create_all_peers(None);
+    let addr = create_multiaddr(None);
+    let (_bls1, net, peer_id) = bls_net_peer(1);
+
+    let mut rng = StdRng::from_seed([2; 32]);
+    let bls1 = *BlsKeypair::generate(&mut rng).public();
+    let mut rng = StdRng::from_seed([3; 32]);
+    let bls2 = *BlsKeypair::generate(&mut rng).public();
+
+    all_peers.upsert_peer(bls1, net.clone(), vec![addr.clone()], now());
+    assert_eq!(all_peers.peer_to_bls(&peer_id), Some(bls1));
+    assert!(all_peers.auth_to_peer(&bls1).is_some());
+
+    // rotate BLS on the same PeerId
+    all_peers.upsert_peer(bls2, net, vec![addr.clone()], now());
+
+    // bug B regression: old BLS must not resolve to a live-looking entry
+    assert!(all_peers.auth_to_peer(&bls1).is_none(), "stale BLS must not resolve");
+    assert!(!all_peers.contains_bls(&bls1));
+    assert_eq!(all_peers.auth_to_peer(&bls2).map(|(pid, _)| pid), Some(peer_id));
+    assert_eq!(all_peers.peer_to_bls(&peer_id), Some(bls2));
+}
+
+#[test]
+fn peer_id_rotation_same_bls_orphans_old_peer() {
+    // Same BLS key, new PeerId — the orphan peer record survives but loses its BLS.
+    let mut all_peers = create_all_peers(None);
+    let addr = create_multiaddr(None);
+
+    let (_, net1, peer_id_1) = bls_net_peer(4);
+    let (_, net2, peer_id_2) = bls_net_peer(5);
+    let mut rng = StdRng::from_seed([6; 32]);
+    let bls = *BlsKeypair::generate(&mut rng).public();
+
+    all_peers.upsert_peer(bls, net1, vec![addr.clone()], now());
+    all_peers.upsert_peer(bls, net2, vec![addr], now());
+
+    // index now points at the new peer
+    assert_eq!(all_peers.auth_to_peer(&bls).map(|(pid, _)| pid), Some(peer_id_2));
+    // orphan still exists in peers map but has no BLS
+    assert!(all_peers.get_peer(&peer_id_1).is_some(), "orphan peer should survive");
+    assert_eq!(all_peers.peer_to_bls(&peer_id_1), None, "orphan BLS must be cleared");
+}
+
+#[test]
+fn prune_disconnected_clears_bls_index() {
+    let config = PeerConfig { max_disconnected_peers: 2, ..PeerConfig::default() };
+    let mut all_peers = create_all_peers(Some(config));
+
+    // pre-load three disconnected peers, each with a BLS in the index
+    let mut bls_keys = Vec::new();
+    let mut peer_ids = Vec::new();
+    for i in 0..3 {
+        let (_, net, peer_id) = bls_net_peer(10 + i);
+        let mut rng = StdRng::from_seed([100 + i; 32]);
+        let bls = *BlsKeypair::generate(&mut rng).public();
+        let addr = create_multiaddr(None);
+        all_peers.upsert_peer(bls, net, vec![addr], now());
+        // age the disconnect instant so prune ordering is deterministic
+        all_peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
+        if let Some(peer) = all_peers.peers.get_mut(&peer_id) {
+            peer.set_connection_status(ConnectionStatus::Disconnected {
+                instant: Instant::now() - Duration::from_secs(i as u64 + 1),
+            });
+        }
+        bls_keys.push(bls);
+        peer_ids.push(peer_id);
+    }
+
+    assert_eq!(all_peers.disconnected_peers, 3);
+    // trigger prune via register_disconnected
+    all_peers.register_disconnected(&PeerId::random());
+
+    // the oldest peer should be pruned and its BLS no longer indexed
+    assert_eq!(all_peers.disconnected_peers, config.max_disconnected_peers);
+    let pruned = bls_keys.iter().filter(|b| !all_peers.contains_bls(b)).count();
+    assert!(pruned >= 1, "at least one BLS must be evicted from the index");
+}
+
+#[test]
+fn inbound_unknown_lifecycle() {
+    // A peer that connects inbound before we know its BLS must remain BLS-less
+    // and become indexable once upsert_peer is called.
+    let mut all_peers = create_all_peers(None);
+    let (_, net, peer_id) = bls_net_peer(42);
+    let addr = create_multiaddr(None);
+
+    // simulate inbound connection from an unknown peer (Peer::default created via ensure)
+    all_peers.update_connection_status(
+        &peer_id,
+        NewConnectionStatus::Connected {
+            multiaddr: addr.clone(),
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+
+    // no BLS known yet, and no index entry for any BLS
+    assert_eq!(all_peers.peer_to_bls(&peer_id), None);
+
+    // learn the BLS via upsert_peer (e.g. from a NodeRecord); since the network key
+    // hashes to peer_id, the same Peer entry is updated rather than replaced.
+    let mut rng = StdRng::from_seed([43; 32]);
+    let bls = *BlsKeypair::generate(&mut rng).public();
+    all_peers.upsert_peer(bls, net, vec![addr], now());
+
+    assert_eq!(all_peers.peer_to_bls(&peer_id), Some(bls));
+    assert_eq!(all_peers.auth_to_peer(&bls).map(|(pid, _)| pid), Some(peer_id));
+}
+
+#[test]
+fn new_epoch_resolves_via_index() {
+    let mut all_peers = create_all_peers(None);
+    let (_, net, peer_id) = bls_net_peer(50);
+    let mut rng = StdRng::from_seed([51; 32]);
+    let bls = *BlsKeypair::generate(&mut rng).public();
+    let addr = create_multiaddr(None);
+
+    // register the peer up-front
+    all_peers.upsert_peer(bls, net, vec![addr], now());
+    assert!(!all_peers.get_peer(&peer_id).unwrap().is_trusted());
+
+    let mut committee = HashSet::new();
+    committee.insert(bls);
+    let _actions = all_peers.new_epoch(committee);
+
+    // peer should now be trusted and present in current_committee
+    let peer = all_peers.get_peer(&peer_id).unwrap();
+    assert!(peer.is_trusted(), "committee member must be trusted after new_epoch");
+    assert!(all_peers.is_peer_validator(&peer_id));
+}
+
+#[test]
+fn new_epoch_warns_on_unknown_member() {
+    let mut all_peers = create_all_peers(None);
+    let mut rng = StdRng::from_seed([60; 32]);
+    let unknown_bls = *BlsKeypair::generate(&mut rng).public();
+
+    let mut committee = HashSet::new();
+    committee.insert(unknown_bls);
+    // should not panic and should produce no unban actions
+    let actions = all_peers.new_epoch(committee);
+    assert!(actions.is_empty());
+    assert!(!all_peers.contains_bls(&unknown_bls));
+}
+
+#[test]
+fn record_timestamp_is_indexed_by_bls() {
+    let mut all_peers = create_all_peers(None);
+    let (_, net, _peer_id) = bls_net_peer(70);
+    let mut rng = StdRng::from_seed([71; 32]);
+    let bls = *BlsKeypair::generate(&mut rng).public();
+    let addr = create_multiaddr(None);
+
+    let ts1 = now();
+    all_peers.upsert_peer(bls, net.clone(), vec![addr.clone()], ts1);
+    assert_eq!(all_peers.record_timestamp(&bls), Some(ts1));
+
+    let ts2 = ts1 + 10;
+    all_peers.upsert_peer(bls, net, vec![addr], ts2);
+    assert_eq!(all_peers.record_timestamp(&bls), Some(ts2));
 }

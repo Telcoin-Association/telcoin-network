@@ -910,4 +910,66 @@ mod test {
         assert!(matches!(kad_store.put(rec.clone()), Err(Error::MaxRecords)));
         assert!(matches!(kad_store_worker.put(rec.clone()), Err(Error::MaxRecords)));
     }
+
+    /// Restarting the node must not duplicate the own record in the backing DB.
+    ///
+    /// Locks in `Database::insert` upsert semantics: re-opening a KadStore on the
+    /// same path and re-`put`ting under the same `RecordKey` must overwrite the
+    /// existing row, leaving exactly one record. Regression guard for the
+    /// `provide_our_data()` republish that runs on every startup.
+    #[test]
+    fn test_kad_put_dedupes_on_restart() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let key_config =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
+
+        let key = RecordKey::new(&encode(&key_config.primary_public_key()));
+        let publisher = PeerId::random();
+        let expires = Instant::now().checked_add(Duration::from_secs(60 * 60 * 24));
+
+        // First "boot": open DB, put one record under the BLS-derived key.
+        let v1: Vec<u8> = vec![1, 1, 1, 1];
+        {
+            let db = open_db(tmp_dir.path());
+            let mut kad_store = KadStore::new(db.clone(), &key_config, KadStoreType::Primary);
+            let rec = Record {
+                key: key.clone(),
+                value: v1.clone(),
+                publisher: Some(publisher),
+                expires,
+            };
+            kad_store.put(rec).expect("put record");
+            assert_eq!(kad_store.num_records, 1);
+            assert_eq!(kad_store.records().count(), 1);
+            db.sync_persist();
+        }
+
+        // Second "boot": reopen the SAME DB path, put a different value under
+        // the SAME RecordKey. Must not duplicate — single row, second value wins.
+        let v2: Vec<u8> = vec![2, 2, 2, 2];
+        {
+            let db = open_db(tmp_dir.path());
+            let mut kad_store = KadStore::new(db.clone(), &key_config, KadStoreType::Primary);
+
+            // The pre-existing row from the first boot is counted at construction.
+            assert_eq!(kad_store.num_records, 1, "row from previous boot survives restart");
+            assert_eq!(kad_store.records().count(), 1);
+
+            let rec2 = Record {
+                key: key.clone(),
+                value: v2.clone(),
+                publisher: Some(publisher),
+                expires,
+            };
+            kad_store.put(rec2).expect("put record");
+
+            // The key collision must upsert, not append a new row.
+            assert_eq!(kad_store.num_records, 1, "no double-count on same-key put");
+            assert_eq!(kad_store.records().count(), 1, "no duplicate row in DB");
+
+            let got = kad_store.get(&key).expect("record present");
+            assert_eq!(got.value, v2, "second put overwrites the first");
+            db.sync_persist();
+        }
+    }
 }

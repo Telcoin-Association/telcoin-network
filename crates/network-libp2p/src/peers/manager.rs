@@ -37,14 +37,11 @@ pub(crate) struct PeerManager {
     /// The interval to perform maintenance.
     heartbeat: tokio::time::Interval,
     /// All peers for the manager.
+    ///
+    /// `AllPeers` is the single source of truth for BLS<->PeerId lookups via its internal
+    /// `bls_index`. The manager exposes [`Self::peer_to_bls`] and [`Self::auth_to_peer`] as
+    /// thin delegates so consensus-layer call sites keep their existing API surface.
     peers: AllPeers,
-    /// The collection of bls public keys to known peers.
-    /// This should incude the current and next couple of committee members network info.
-    /// This is used for bootstrapping and to make sure we know the network settings of committee
-    /// members.
-    known_peers: HashMap<BlsPublicKey, NetworkInfo>,
-    /// PeerId -> BlsPublicKey for know peers.
-    known_peerids: HashMap<PeerId, BlsPublicKey>,
     /// A queue of events that the `PeerManager` is waiting to produce.
     events: VecDeque<PeerEvent>,
     /// A queue of peers to dial.
@@ -95,8 +92,6 @@ impl PeerManager {
             config: *config,
             heartbeat,
             peers,
-            known_peers: Default::default(),
-            known_peerids: Default::default(),
             events: Default::default(),
             dial_requests: Default::default(),
             temporarily_banned,
@@ -115,18 +110,15 @@ impl PeerManager {
         reply: oneshot::Sender<NetworkResult<()>>,
     ) {
         let peer_id: PeerId = info.pubkey.clone().into();
-        let multiaddr = info.multiaddrs.clone();
-        self.peers.add_trusted_peer(bls_key, info.pubkey.clone(), multiaddr.clone());
+        let multiaddrs = info.multiaddrs.clone();
+        self.peers.add_trusted_peer(bls_key, info.pubkey, multiaddrs.clone(), info.timestamp);
 
         // remove from temporary banned and warn if peer was banned
         if self.temporarily_banned.remove(&peer_id) {
             warn!(target: "peer-manager", ?peer_id, "removed trusted peer from temporarily banned list");
         }
-        let peer_id: PeerId = info.pubkey.clone().into();
-        self.known_peerids.insert(peer_id, bls_key);
-        self.known_peers.insert(bls_key, info);
 
-        self.dial_peer(peer_id, multiaddr, Some(reply));
+        self.dial_peer(peer_id, multiaddrs, Some(reply));
     }
 
     /// Process the request to dial a peer.
@@ -610,32 +602,18 @@ impl PeerManager {
 
     /// Update the committee for the new epoch.
     pub(crate) fn new_epoch(&mut self, committee: HashSet<BlsPublicKey>) {
-        // remove from temporary banned and warn if validator was banned
-        let mut exp_committee = Vec::default();
+        // remove committee members from temporary banned list
         for bls_key in &committee {
-            if let Some(NetworkInfo { pubkey, multiaddrs: multiaddr, timestamp }) =
-                self.known_peers.get(bls_key)
-            {
-                let peer_id: PeerId = pubkey.clone().into();
+            if let Some((peer_id, _)) = self.peers.auth_to_peer(bls_key) {
                 info!(target: "peer-manager", "adding committee member {bls_key}/{peer_id}");
                 if self.temporarily_banned.remove(&peer_id) {
                     warn!(target: "peer-manager", ?peer_id, "removed committee member from temporarily banned list");
                 }
-                exp_committee.push((
-                    *bls_key,
-                    NetworkInfo {
-                        pubkey: pubkey.clone(),
-                        multiaddrs: multiaddr.clone(),
-                        timestamp: *timestamp,
-                    },
-                ));
-            } else {
-                warn!(target: "peer-manager", "unknown committee member with key {bls_key}");
             }
         }
 
-        // add trusted peer record
-        let unban_actions = self.peers.new_epoch(exp_committee);
+        // forward committee resolution + unban into AllPeers; missing members logged there
+        let unban_actions = self.peers.new_epoch(committee);
 
         // apply unban for any banned validators
         for (peer_id, action) in unban_actions {
@@ -647,10 +625,7 @@ impl PeerManager {
     /// Used for bootstrap servers or possibly committee members.
     pub(crate) fn add_known_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
         trace!(target: "peer-manager", ?bls_key, "adding known peer");
-        self.peers.upsert_peer(bls_key, info.pubkey.clone(), info.multiaddrs.clone());
-        self.known_peers.insert(bls_key, info.clone());
-        let peer_id: PeerId = info.pubkey.into();
-        self.known_peerids.insert(peer_id, bls_key);
+        self.peers.upsert_peer(bls_key, info.pubkey, info.multiaddrs, info.timestamp);
     }
 
     /// Find authorities for the epoch manager.
@@ -660,7 +635,7 @@ impl PeerManager {
         // check all peers for authority and track missing
         for bls_key in authorities {
             // identify missing authorities
-            if !self.known_peers.contains_key(&bls_key) {
+            if !self.peers.contains_bls(&bls_key) {
                 missing.push(bls_key);
             }
         }
@@ -670,19 +645,20 @@ impl PeerManager {
         self.events.push_back(PeerEvent::MissingAuthorities(missing));
     }
 
-    /// Find the peer id for an authority.
+    /// Find the peer id and known multiaddrs for an authority.
     pub(crate) fn auth_to_peer(&self, bls_key: BlsPublicKey) -> Option<(PeerId, Vec<Multiaddr>)> {
-        if let Some(NetworkInfo { pubkey, multiaddrs, .. }) = self.known_peers.get(&bls_key) {
-            Some((pubkey.clone().into(), multiaddrs.clone()))
-        } else {
-            debug!(target: "peer-manager", ?bls_key, "unknown peer for bls key");
-            None
+        match self.peers.auth_to_peer(&bls_key) {
+            Some(found) => Some(found),
+            None => {
+                debug!(target: "peer-manager", ?bls_key, "unknown peer for bls key");
+                None
+            }
         }
     }
 
     /// Find the BlsPublicKey for a known PeerId.
     pub(crate) fn peer_to_bls(&self, peer_id: &PeerId) -> Option<BlsPublicKey> {
-        self.known_peerids.get(peer_id).copied()
+        self.peers.peer_to_bls(peer_id)
     }
 
     /// Visibility helper for behavior to evaluate pending outbound connection attempts.

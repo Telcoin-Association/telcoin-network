@@ -1291,7 +1291,7 @@ where
     /// Initialize a network handle for a new epoch: register bootstrap peers (on first epoch)
     /// then update the epoch committee.
     ///
-    /// Bootstrap peers must be added BEFORE `new_epoch()` so that `known_peers` is populated
+    /// Bootstrap peers must be registered BEFORE `new_epoch()` so the `bls_index` resolves them
     /// when `new_epoch()` builds `current_committee` from it.
     async fn init_network_for_epoch<Req: TNMessage, Res: TNMessage>(
         handle: &NetworkHandle<Req, Res>,

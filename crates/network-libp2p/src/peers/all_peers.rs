@@ -2,7 +2,18 @@
 //!
 //! `AllPeers` is responsible for processing updates to peers and returns `PeerAction`s for the
 //! manager to take. Some actions are propagated up to the swarm level and affect other behaviors.
-
+//!
+//! # `bls_index` invariant
+//!
+//! `AllPeers` maintains a secondary index `bls_index: HashMap<BlsPublicKey, PeerId>` that is the
+//! inverse of `Peer::bls_public_key` for every non-`None` value. Concretely:
+//!
+//! `bls_index[bls] == pid`  iff  `peers[pid].bls_public_key == Some(bls)`
+//!
+//! Every mutation that sets, changes, or clears `Peer::bls_public_key` MUST go through
+//! [`AllPeers::rebind_bls`] (for inserts/updates) or pair the `peers.remove(...)` call with a
+//! `bls_index.remove(...)` (for evictions). Direct access to `Peer::bls_public_key` outside this
+//! module is forbidden — that is enforced by `pub(super)` visibility.
 use super::{
     banned::BannedPeers, peer::Peer, score::ReputationUpdate, status::ConnectionStatus,
     types::ConnectionDirection, PeerExchangeMap, Penalty,
@@ -11,7 +22,7 @@ use crate::{
     error::NetworkError,
     peers::{score::Reputation, status::NewConnectionStatus, types::PeerAction},
     send_or_log_error,
-    types::{NetworkInfo, NetworkResult},
+    types::NetworkResult,
 };
 use libp2p::{Multiaddr, PeerId};
 use rand::seq::SliceRandom as _;
@@ -21,7 +32,7 @@ use std::{
     net::IpAddr,
     time::{Duration, Instant},
 };
-use tn_types::{BlsPublicKey, NetworkPublicKey};
+use tn_types::{BlsPublicKey, NetworkPublicKey, TimestampSec};
 use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
 #[cfg(test)]
@@ -35,6 +46,11 @@ mod peers;
 pub(super) struct AllPeers {
     /// The collection of known connected peers, their status and reputation
     peers: HashMap<PeerId, Peer>,
+    /// Secondary index from BLS public key to PeerId.
+    ///
+    /// Maintained in lockstep with `peers[pid].bls_public_key`. See module docs for the
+    /// invariant that callers must preserve.
+    bls_index: HashMap<BlsPublicKey, PeerId>,
     /// The collection of staked current_committee at the beginning of each epoch.
     current_committee: HashSet<PeerId>,
     /// The collection of staked current_committee pub key to peerid at the beginning of each
@@ -63,6 +79,7 @@ impl AllPeers {
     ) -> Self {
         Self {
             peers: Default::default(),
+            bls_index: Default::default(),
             current_committee: Default::default(),
             current_committee_keys: Default::default(),
             banned_peers: Default::default(),
@@ -74,6 +91,36 @@ impl AllPeers {
         }
     }
 
+    /// Update `bls_index` so that `new_bls` maps to `peer_id`, evicting any orphan
+    /// forward/reverse entries the new association invalidates.
+    ///
+    /// Callers should invoke this BEFORE mutating `peers[peer_id].bls_public_key` so that any
+    /// previously-associated BLS key is observable on the peer.
+    ///
+    /// Two orphan cases:
+    ///   - The peer at `peer_id` already had a different BLS — drop that forward entry from the
+    ///     index since the peer is being re-bound.
+    ///   - The BLS key `new_bls` already pointed at a different `PeerId` (BLS rotation across
+    ///     peers). The orphan peer's `bls_public_key` is cleared via [`Peer::clear_bls`] so the
+    ///     peer record survives (it may still carry useful state) but stops being reachable via
+    ///     the index until its next `update_net`.
+    fn rebind_bls(&mut self, peer_id: PeerId, new_bls: BlsPublicKey) {
+        if let Some(peer) = self.peers.get(&peer_id) {
+            if let Some(old_bls) = peer.bls_public_key() {
+                if old_bls != new_bls {
+                    self.bls_index.remove(&old_bls);
+                }
+            }
+        }
+        if let Some(old_peer_id) = self.bls_index.insert(new_bls, peer_id) {
+            if old_peer_id != peer_id {
+                if let Some(orphan) = self.peers.get_mut(&old_peer_id) {
+                    orphan.clear_bls();
+                }
+            }
+        }
+    }
+
     /// Create a peer that is "trusted".
     ///
     /// This overwrites peer records and unbans ips.
@@ -82,25 +129,29 @@ impl AllPeers {
         bls_public_key: BlsPublicKey,
         network_key: NetworkPublicKey,
         addr: Vec<Multiaddr>,
+        timestamp: TimestampSec,
     ) {
         let peer_id: PeerId = network_key.clone().into();
-        let trusted_peer = Peer::new_trusted(bls_public_key, network_key, addr);
+        let trusted_peer = Peer::new_trusted(bls_public_key, network_key, addr, timestamp);
         let _ = self.banned_peers.remove_banned_peer(trusted_peer.known_ip_addresses());
+        self.rebind_bls(peer_id, bls_public_key);
         self.peers.insert(peer_id, trusted_peer);
     }
 
-    /// Create a peer.
+    /// Create or update a peer.
     pub(super) fn upsert_peer(
         &mut self,
         bls_public_key: BlsPublicKey,
         network_key: NetworkPublicKey,
         addrs: Vec<Multiaddr>,
+        timestamp: TimestampSec,
     ) {
         let peer_id: PeerId = network_key.clone().into();
+        self.rebind_bls(peer_id, bls_public_key);
         if let Some(peer) = self.peers.get_mut(&peer_id) {
-            peer.update_net(bls_public_key, network_key, addrs);
+            peer.update_net(bls_public_key, network_key, addrs, timestamp);
         } else {
-            let peer = Peer::new(bls_public_key, network_key, addrs);
+            let peer = Peer::new(bls_public_key, network_key, addrs, timestamp);
             self.peers.insert(peer_id, peer);
         }
     }
@@ -632,6 +683,37 @@ impl AllPeers {
         self.peers.get(peer_id)
     }
 
+    /// Return the BLS public key for a peer, if it is known.
+    pub(super) fn peer_to_bls(&self, peer_id: &PeerId) -> Option<BlsPublicKey> {
+        self.peers.get(peer_id).and_then(|p| p.bls_public_key())
+    }
+
+    /// Resolve a BLS public key to its [`PeerId`] and dialable multiaddrs.
+    ///
+    /// Returns the advertised listening addresses for the peer (the addresses to dial),
+    /// not the historical observed multiaddr set.
+    pub(super) fn auth_to_peer(&self, bls_key: &BlsPublicKey) -> Option<(PeerId, Vec<Multiaddr>)> {
+        let peer_id = self.bls_index.get(bls_key)?;
+        let peer = self.peers.get(peer_id)?;
+        Some((*peer_id, peer.listening_addrs_clone()))
+    }
+
+    /// Return the most recent record timestamp known for a peer indexed by BLS key.
+    ///
+    /// Currently only exercised by unit tests; reserved for future use by kad-record
+    /// freshness comparisons that need a BLS-keyed view of timestamps (the on-disk kad
+    /// store is the authoritative source for `is_newer_record` today).
+    #[allow(dead_code)]
+    pub(super) fn record_timestamp(&self, bls_key: &BlsPublicKey) -> Option<TimestampSec> {
+        let peer_id = self.bls_index.get(bls_key)?;
+        self.peers.get(peer_id).and_then(|p| p.record_timestamp())
+    }
+
+    /// True if a BLS public key is associated with a known peer.
+    pub(super) fn contains_bls(&self, bls_key: &BlsPublicKey) -> bool {
+        self.bls_index.contains_key(bls_key)
+    }
+
     /// Boolean indicating if this peer is a validator.
     /// This method will be updated to include nvvs as well.
     pub(super) fn is_peer_validator(&self, peer_id: &PeerId) -> bool {
@@ -771,6 +853,22 @@ impl AllPeers {
         excess_peers
     }
 
+    /// Remove a peer from `peers` and clean its `bls_index` entry if any.
+    ///
+    /// This is the only sanctioned way to drop a peer from the store; it preserves the
+    /// `bls_index <-> peers` invariant documented at the top of the module.
+    fn remove_peer(&mut self, peer_id: &PeerId) -> Option<Peer> {
+        let peer = self.peers.remove(peer_id)?;
+        if let Some(bls) = peer.bls_public_key() {
+            // only drop if the index still points back at this peer; a prior `rebind_bls` may
+            // already have detached the entry.
+            if self.bls_index.get(&bls) == Some(peer_id) {
+                self.bls_index.remove(&bls);
+            }
+        }
+        Some(peer)
+    }
+
     /// Prune excess number of banned peers to prevent exhausting memory.
     fn prune_banned_peers(&mut self) -> Vec<(PeerId, Vec<IpAddr>)> {
         let excess = self.banned_peers.total().saturating_sub(self.max_banned_peers);
@@ -787,7 +885,7 @@ impl AllPeers {
             });
 
             for (_, peer_id, ip_addrs) in excess_peers {
-                self.peers.remove(&peer_id);
+                self.remove_peer(&peer_id);
                 let ips = self.banned_peers.remove_banned_peer(ip_addrs.clone().into_iter());
                 unbanned.push((peer_id, ips));
             }
@@ -811,7 +909,7 @@ impl AllPeers {
 
             // remove peer
             for (_, peer_id, _) in excess_peers {
-                self.peers.remove(&peer_id);
+                self.remove_peer(&peer_id);
                 self.disconnected_peers = self.disconnected_peers.saturating_sub(1);
             }
         }
@@ -819,28 +917,33 @@ impl AllPeers {
 
     /// Update committee for the new epoch.
     ///
-    /// The committee is tracked to ensure priority on the network.
-    /// The banned status of any committee peer is forgiven and IPs
-    /// associated with the committee node are reset. The advertised
-    /// listening addresses are updated and the peer is marked `trusted`
-    /// so it won't incur any additional penalties.
+    /// The committee is tracked to ensure priority on the network. The banned status of any
+    /// committee peer is forgiven and IPs associated with the committee node are reset. The
+    /// advertised listening addresses are updated and the peer is marked `trusted` so it won't
+    /// incur any additional penalties.
+    ///
+    /// Each committee member is resolved via the `bls_index`. Committee members that are not
+    /// yet known to `AllPeers` are logged as a warning — callers must first register them
+    /// (e.g. via `upsert_peer`) before they appear in the committee.
     pub(super) fn new_epoch(
         &mut self,
-        committee: Vec<(BlsPublicKey, NetworkInfo)>,
+        committee: HashSet<BlsPublicKey>,
     ) -> Vec<(PeerId, PeerAction)> {
         // update current committee
         self.current_committee.clear();
         self.current_committee_keys.clear();
 
         let mut actions = Vec::with_capacity(committee.len());
-        for (bls_key, NetworkInfo { pubkey, multiaddrs: addr, .. }) in committee {
-            let peer_id: PeerId = pubkey.clone().into();
+        for bls_key in committee {
+            let Some(peer_id) = self.bls_index.get(&bls_key).copied() else {
+                warn!(target: "peer-manager", ?bls_key, "unknown committee member");
+                self.current_committee_keys.insert(bls_key, None);
+                continue;
+            };
             self.current_committee.insert(peer_id);
             self.current_committee_keys.insert(bls_key, Some(peer_id));
             // the NewConnectionStatus doesn't affect this call
             let status = self.ensure_peer_exists(&peer_id, &NewConnectionStatus::Unbanned);
-            // We have all our network settings so go ahead and make sure they are set.
-            self.upsert_peer(bls_key, pubkey, addr.clone());
 
             match status {
                 ConnectionStatus::Disconnecting { banned } => {
@@ -864,11 +967,12 @@ impl AllPeers {
                 | ConnectionStatus::Connected { .. } => { /* nothing to do */ }
             }
 
-            // already ensured peer exists
+            // already ensured peer exists; addresses were populated when the peer was
+            // first registered via `upsert_peer` (or earlier `add_known_peer`), so there
+            // is no fresh address payload to fold in here — only the trusted flag and
+            // the IP-ban cleanup.
             if let Some(peer) = self.peers.get_mut(&peer_id) {
-                // update peer regardless of connection status
                 peer.make_trusted();
-                peer.update_listening_addrs(addr);
                 self.banned_peers.remove_validator_ip(&peer_id, peer.known_ip_addresses());
             }
         }
