@@ -44,14 +44,19 @@ All sites live in `crates/network-libp2p/src/consensus.rs`. `NetworkCommand::Rep
 
 ### 3.2 Req/Res events (`process_reqres_event`, L851)
 
-| Location                                     | Trigger                                                                     | Severity |
-| -------------------------------------------- | --------------------------------------------------------------------------- | -------- |
-| `crates/network-libp2p/src/consensus.rs:946` | `ReqResEvent::OutboundFailure` after PX-disconnect skip guard               | `Medium` |
-| `crates/network-libp2p/src/consensus.rs:963` | `ReqResInboundFailure::Io(e)`                                               | `Medium` |
-| `crates/network-libp2p/src/consensus.rs:972` | `ReqResInboundFailure::UnsupportedProtocols`                                | `Fatal`  |
-| `crates/network-libp2p/src/consensus.rs:979` | `ReqResInboundFailure::Timeout` or `ReqResInboundFailure::ConnectionClosed` | `Mild`   |
+| Location                                     | Trigger                                                                                            | Severity |
+| -------------------------------------------- | -------------------------------------------------------------------------------------------------- | -------- |
+| `crates/network-libp2p/src/consensus.rs:943` | `OutboundFailure::DialFailure` / `OutboundFailure::ConnectionClosed`                               | `None`   |
+| `crates/network-libp2p/src/consensus.rs:946` | `OutboundFailure::Io(e)` with transport-flap `e.kind()` (Reset/Aborted/Timed/EOF/Pipe/Interrupted) | `None`   |
+| `crates/network-libp2p/src/consensus.rs:946` | `OutboundFailure::Io(e)` other kinds (codec violation, e.g. `io::Error::other`)                    | `Medium` |
+| `crates/network-libp2p/src/consensus.rs:961` | `OutboundFailure::Timeout`                                                                         | `Mild`   |
+| `crates/network-libp2p/src/consensus.rs:973` | `OutboundFailure::UnsupportedProtocols`                                                            | `Severe` |
+| `crates/network-libp2p/src/consensus.rs:973` | `InboundFailure::Io(e)` with transport-flap `e.kind()`                                             | `None`   |
+| `crates/network-libp2p/src/consensus.rs:973` | `InboundFailure::Io(e)` other kinds (codec violation)                                              | `Medium` |
+| `crates/network-libp2p/src/consensus.rs:992` | `InboundFailure::UnsupportedProtocols`                                                             | `Severe` |
+| `crates/network-libp2p/src/consensus.rs:995` | `InboundFailure::Timeout` / `InboundFailure::ConnectionClosed`                                     | `None`   |
 
-`ReqResInboundFailure::ResponseOmission` is explicitly a no-op (local error). See restraint invariants below.
+`InboundFailure::ResponseOmission` is explicitly a no-op (local error). See restraint invariants below.
 
 ### 3.3 Kademlia outbound `GetRecord` query (`process_kad_event`, L1208)
 
@@ -64,7 +69,7 @@ All sites live in `crates/network-libp2p/src/consensus.rs`. `NetworkCommand::Rep
 | Location                                      | Trigger                                                                               | Severity |
 | --------------------------------------------- | ------------------------------------------------------------------------------------- | -------- |
 | `crates/network-libp2p/src/consensus.rs:1383` | record was rejected AND `record.publisher.is_none()` (publisher-less record)          | `Fatal`  |
-| `crates/network-libp2p/src/consensus.rs:1406` | `peer_record_valid(&record).is_some()` but `!is_newer_record(&record)` (stale record) | `Mild`   |
+| `crates/network-libp2p/src/consensus.rs:1406` | `peer_record_valid(&record).is_some()` but `!is_newer_record(&record)` (stale record — trace log only; kad routinely replays put-records to refresh TTLs) | `None`   |
 | `crates/network-libp2p/src/consensus.rs:1413` | `peer_record_valid(&record).is_none()` (invalid signature / wrong network key)        | `Fatal`  |
 
 A rejected record from a banned source/publisher with a publisher present does
@@ -133,7 +138,7 @@ Source: `crates/consensus/worker/src/network/error.rs:76-138`.
 | ------------------------------------------------- | ------------------------------------------ | -------------------------------------------------- |
 | `crates/consensus/primary/src/network/mod.rs:421` | `stream_import` (epoch pack download)      | `Self::consensus_chain_error_to_penalty(&err)`     |
 | `crates/consensus/primary/src/network/mod.rs:682` | `retrieve_missing_certs`                   | `(&PrimaryNetworkError).into() -> Option<Penalty>` |
-| `crates/consensus/primary/src/network/mod.rs:719` | `retrieve_consensus_header` (any err)      | hard-coded `Penalty::Mild`                         |
+| `crates/consensus/primary/src/network/mod.rs:719` | `retrieve_consensus_header`                | `(&PrimaryNetworkError).into()` — only reachable variant `UnknownConsensusHeaderDigest` → `None` |
 | `crates/consensus/primary/src/network/mod.rs:751` | `retrieve_epoch_record`                    | `(&PrimaryNetworkError).into()`                    |
 | `crates/consensus/primary/src/network/mod.rs:835` | `process_epoch_stream` response-err branch | `(&PrimaryNetworkError).into()`                    |
 | `crates/consensus/primary/src/network/mod.rs:863` | `process_gossip`                           | `(&PrimaryNetworkError).into()`                    |
@@ -158,7 +163,7 @@ Source: `crates/consensus/primary/src/error/network.rs:70-132`.
 | `Certificate(CertManagerError::UnverifiedSignature(_))`                                                                                                                                                                                                                                                                                  | `Fatal`                                  | `crates/consensus/primary/src/error/network.rs:97`      |
 | `Certificate(CertManagerError::*)` operational variants (`PendingCertificateNotFound`, `PendingParentsMismatch`, `CertificateManagerOneshot`, `FatalForwardAcceptedCertificate`, `NoCertificateFetched`, `FatalAppendParent`, `GC`, `JoinError`, `Pending`, `Storage`, `RequestBounds`, `Timeout`, `Network`, `ChannelClosed`, `TNSend`) | None                                     | `crates/consensus/primary/src/error/network.rs:99-113`  |
 | `InvalidRequest(_)`                                                                                                                                                                                                                                                                                                                      | `Mild`                                   | `crates/consensus/primary/src/error/network.rs:115-118` |
-| `UnknownConsensusHeaderDigest(_)`                                                                                                                                                                                                                                                                                                        | `Mild`                                   | `crates/consensus/primary/src/error/network.rs:115-118` |
+| `UnknownConsensusHeaderDigest(_)`                                                                                                                                                                                                                                                                                                        | `None`                                   | `crates/consensus/primary/src/error/network.rs:115-117` |
 | `UnknownStreamRequest(_)`                                                                                                                                                                                                                                                                                                                | `Mild`                                   | `crates/consensus/primary/src/error/network.rs:115-118` |
 | `UnknownConsensusHeaderCert(_)`                                                                                                                                                                                                                                                                                                          | `Mild`                                   | `crates/consensus/primary/src/error/network.rs:115-118` |
 | `InvalidEpochRequest`                                                                                                                                                                                                                                                                                                                    | `Medium`                                 | `crates/consensus/primary/src/error/network.rs:119-120` |
@@ -233,7 +238,7 @@ Source: `crates/consensus/primary/src/network/mod.rs:448-489`.
 These are deliberate tolerances for benign failures. Changing any of these from
 `None` to a real penalty risks banning honest peers during normal operation.
 
-- `ReqResInboundFailure::ResponseOmission` — local error, no peer fault. `crates/network-libp2p/src/consensus.rs:981`.
+- `InboundFailure::ResponseOmission` — local error, no peer fault. `crates/network-libp2p/src/consensus.rs:981`.
 - PX-disconnect outbound failures — `pending_px_disconnects` short-circuit before penalty. `crates/network-libp2p/src/consensus.rs:940-943`.
 - `WorkerNetworkError::Timeout` / `DBInsert` / `DBCommit` / `DBRead` / `StreamClosed` / `Network` / `BatchEpochMismatch` / `Internal` — local failures or epoch-boundary races. `crates/consensus/worker/src/network/error.rs:128-135`.
 - `PrimaryNetworkError::UnavailableEpoch` / `UnavailableEpochDigest` — a peer "might not have this yet" during sync. `crates/consensus/primary/src/error/network.rs:123-124`.
@@ -257,7 +262,7 @@ What happens when a peer's score crosses `min_score_before_ban` (`-50.0`):
 4. `PeerManager::apply_peer_action` matches `PeerAction::Ban` and invokes `process_ban`, which pushes `PeerEvent::Banned(peer_id)`. `crates/network-libp2p/src/peers/manager.rs:287-292,389-401`.
 5. `ConsensusNetwork::process_peer_manager_event` consumes `PeerEvent::Banned`, blacklists the peer in gossipsub, and removes it from the kad routing table. `crates/network-libp2p/src/consensus.rs:1152-1158`.
 6. Future inbound/outbound connection attempts are denied by `handle_established_inbound_connection` / `handle_established_outbound_connection` via `peer_banned`. `crates/network-libp2p/src/peers/behavior.rs:73-107`.
-7. The score does not decay during the `banned_before_decay` window (12h by default). After expiry, `Score::update_at` resumes exponential decay using the halflife constant. `crates/network-libp2p/src/peers/score.rs:115-135`.
+7. The score does not decay during the `banned_before_decay` window (30 min by default). After expiry, `Score::update_at` resumes exponential decay using the halflife constant. `crates/network-libp2p/src/peers/score.rs:115-135`.
 
 ## 8. Open Questions / Notes
 
@@ -265,5 +270,5 @@ What happens when a peer's score crosses `min_score_before_ban` (`-50.0`):
 - `Penalty::Severe` never appears as a literal in `crates/network-libp2p/src/consensus.rs`. It only reaches `process_penalty` via app-layer error mappings: `BatchValidationError::RecoverTransaction`, `HeaderError::{InvalidTimestamp, InvalidParentRound}`, `PackError::{InvalidConsensusChain, ExtraBatches, MissingBatches, CorruptPack, InvalidEpoch}`, and `ConsensusChainError::{EmptyImport, InvalidImport}`.
 - `PeerAction::DisconnectWithPX` adds the peer to `temporarily_banned` and emits `DisconnectPeerX`. This is a soft ban that bypasses the score model and does not produce a `PeerEvent::Banned`. `crates/network-libp2p/src/peers/manager.rs:295-303`.
 - The trusted-peer short-circuit in `Peer::apply_penalty` (`crates/network-libp2p/src/peers/peer.rs:158-161`) is the only mechanism preventing scored bans of locally configured peers. There is no allowlist applied at the network-layer call sites.
-- `retrieve_consensus_header` hard-codes `Penalty::Mild` regardless of error kind (`crates/consensus/primary/src/network/mod.rs:719`). All other primary call sites route through `(&PrimaryNetworkError).into()` so changes to the error mapping propagate automatically; this site is the lone exception and must be updated by hand.
+- `retrieve_consensus_header` (`crates/consensus/primary/src/network/mod.rs:711-725`) now routes through `(&PrimaryNetworkError).into()` like the other primary call sites. The only reachable variant from this code path is `UnknownConsensusHeaderDigest`, which the central mapping now maps to `None` (observers legitimately request not-yet-served headers).
 - Penalty application is not debounced. A peer that produces many `Mild` errors in quick succession (e.g. during a sync flap) can still cross the ban threshold (`-50.0`) in fewer than ~50 events if its score has already drifted negative.
