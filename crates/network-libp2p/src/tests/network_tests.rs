@@ -498,10 +498,18 @@ async fn test_outbound_failure_malicious_request() -> eyre::Result<()> {
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
 
     // Capture the malicious peer's view of the honest responder before the request.
-    // The contract under test: a failed OutboundFailure caused by codec mismatch /
-    // transport-level errors must NOT penalize the responder — otherwise a peer who
-    // cannot satisfy a request would be banned by every requester, which is the
-    // ban-cascade that breaks observer joins on WAN.
+    //
+    // The contract under test: when a malformed *request* arrives at the responder,
+    // libp2p's `read_request` fails inside the codec and the responder drops the
+    // substream WITHOUT emitting `InboundFailure::Io` (see libp2p request-response
+    // 0.29 `lib.rs:1011-1014`). From the requester's side the failure surfaces as
+    // either `OutboundFailure::ConnectionClosed` or `OutboundFailure::Io` with a
+    // transport-flap `ErrorKind` (e.g. `UnexpectedEof`) — both are no-penalty
+    // under the new policy.
+    //
+    // The `Penalty::Medium` codec-violation path requires the malformed bytes to
+    // be a *response* (read_response on the requester returns `io::Error::other`).
+    // That is exercised separately by `test_outbound_failure_malicious_response`.
     let malicious_view_before = malicious_peer.peer_score(honest_peer_id).await?.unwrap();
 
     // honest peer returns `OutboundFailure` error
@@ -515,7 +523,10 @@ async fn test_outbound_failure_malicious_request() -> eyre::Result<()> {
     // Allow time for any penalty propagation
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Malicious peer's view of the honest peer should be unchanged.
+    // Responder's score (from the requester's view) is unchanged: a transport-level
+    // OutboundFailure for a malformed-request scenario must not penalize the
+    // responder. Otherwise a peer who cannot satisfy a request would be banned by
+    // every requester — the ban-cascade that breaks observer joins on WAN.
     let malicious_view_after = malicious_peer.peer_score(honest_peer_id).await?.unwrap();
     assert_eq!(
         malicious_view_before, malicious_view_after,
@@ -523,8 +534,9 @@ async fn test_outbound_failure_malicious_request() -> eyre::Result<()> {
     );
 
     // Note: honest peer's penalty of the malicious requester via InboundFailure is
-    // tracked separately — see Issue #250. libp2p does not reliably surface
-    // InboundFailure events for every codec mismatch scenario.
+    // NOT exercised here. libp2p request-response 0.29 does not emit
+    // InboundFailure::Io when read_request fails — see lib.rs:1011-1014.
+    // Dispatch-layer coverage for that path is tracked in Issue #250.
 
     Ok(())
 }

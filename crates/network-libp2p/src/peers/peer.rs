@@ -13,7 +13,7 @@ use libp2p::{
 use std::{collections::HashSet, net::IpAddr, time::Instant};
 use tn_config::PeerConfig;
 use tn_types::{BlsPublicKey, NetworkPublicKey};
-use tracing::error;
+use tracing::{error, warn};
 
 /// Information about a given connected peer.
 /// Note that bls_public_key and network_key are Optional.
@@ -156,7 +156,20 @@ impl Peer {
 
     /// Apply a penalty to the peer's score.
     pub(super) fn apply_penalty(&mut self, penalty: Penalty) -> Reputation {
-        if !self.is_trusted {
+        if self.is_trusted {
+            // Trusted peers (current-epoch committee, configured allowlist) bypass
+            // the score model entirely. Severe/Fatal suppressions are operationally
+            // significant: they hint that a committee member is misbehaving in ways
+            // that would normally ban an untrusted peer. Surface as a warn! so ops
+            // can correlate downstream issues with the original signal.
+            if matches!(penalty, Penalty::Severe | Penalty::Fatal) {
+                warn!(
+                    target: "peer-manager",
+                    ?penalty,
+                    "skipping severe/fatal penalty for trusted peer"
+                );
+            }
+        } else {
             self.score.apply_penalty(penalty);
         }
 

@@ -31,6 +31,7 @@ use libp2p::{
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    io::ErrorKind,
     time::Duration,
 };
 use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig};
@@ -942,16 +943,40 @@ where
                 // time cause N * Medium = instant ban.
                 match &error {
                     ReqResOutboundFailure::DialFailure
-                    | ReqResOutboundFailure::ConnectionClosed
-                    | ReqResOutboundFailure::Io(_) => {
+                    | ReqResOutboundFailure::ConnectionClosed => {
                         // transport-level: no penalty
                     }
+                    ReqResOutboundFailure::Io(e) => match e.kind() {
+                        ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::TimedOut
+                        | ErrorKind::UnexpectedEof
+                        | ErrorKind::BrokenPipe
+                        | ErrorKind::Interrupted => {
+                            // transport flap on WAN — no penalty
+                        }
+                        _ => {
+                            warn!(
+                                target: "network",
+                                ?e, ?peer, ?request_id,
+                                "outbound IO failure (likely codec violation)"
+                            );
+                            self.swarm
+                                .behaviour_mut()
+                                .peer_manager
+                                .process_penalty(peer, Penalty::Medium);
+                        }
+                    },
                     ReqResOutboundFailure::Timeout => {
                         self.swarm
                             .behaviour_mut()
                             .peer_manager
                             .process_penalty(peer, Penalty::Mild);
                     }
+                    // Severe = 5 strikes covers the typical rolling-upgrade window where
+                    // a peer sees <=5 req-res handshakes per halflife. Demote to Medium
+                    // if telemetry shows version-skewed peers banned during normal
+                    // upgrades.
                     ReqResOutboundFailure::UnsupportedProtocols => {
                         warn!(target: "network", ?peer, ?request_id, "outbound failure: unsupported protocol");
                         self.swarm
@@ -969,17 +994,32 @@ where
             ReqResEvent::InboundFailure { peer, request_id, error, connection_id: _ } => {
                 debug!(target: "network", ?peer, ?error, pending=?self.inbound_requests, "Inbound failure for req/res");
                 debug!(target: "network", my_id=?self.swarm.local_peer_id(), "this node");
-                match error {
-                    ReqResInboundFailure::Io(e) => {
-                        // attack surface, but the common cause is a peer disconnecting
-                        // mid-request on a flaky WAN link. Treat as Mild so it can accumulate
-                        // for repeat offenders without insta-banning on a single drop.
-                        warn!(target: "network", ?e, ?peer, ?request_id, "inbound IO failure");
-                        self.swarm
-                            .behaviour_mut()
-                            .peer_manager
-                            .process_penalty(peer, Penalty::Mild);
-                    }
+                match &error {
+                    ReqResInboundFailure::Io(e) => match e.kind() {
+                        ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::TimedOut
+                        | ErrorKind::UnexpectedEof
+                        | ErrorKind::BrokenPipe
+                        | ErrorKind::Interrupted => {
+                            // transport flap on WAN — no penalty
+                        }
+                        _ => {
+                            warn!(
+                                target: "network",
+                                ?e, ?peer, ?request_id,
+                                "inbound IO failure (likely codec violation)"
+                            );
+                            self.swarm
+                                .behaviour_mut()
+                                .peer_manager
+                                .process_penalty(peer, Penalty::Medium);
+                        }
+                    },
+                    // Severe = 5 strikes covers the typical rolling-upgrade window where
+                    // a peer sees <=5 req-res handshakes per halflife. Demote to Medium
+                    // if telemetry shows version-skewed peers banned during normal
+                    // upgrades.
                     ReqResInboundFailure::UnsupportedProtocols => {
                         warn!(target: "network", ?peer, ?request_id, ?error, "inbound failure: unsupported protocol");
 
