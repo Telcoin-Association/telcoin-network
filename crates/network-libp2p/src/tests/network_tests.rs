@@ -471,7 +471,6 @@ async fn test_outbound_failure_malicious_request() -> eyre::Result<()> {
     malicious_peer.start_listening(config_1.primary_address()).await?;
     honest_peer.start_listening(config_2.primary_address()).await?;
 
-    let malicious_peer_id = malicious_peer.local_peer_id().await?;
     let honest_peer_id = honest_peer.local_peer_id().await?;
     let honest_peer_addr = config_2.primary_address();
     let honest_peer_net = config_2.primary_networkkey();
@@ -498,7 +497,20 @@ async fn test_outbound_failure_malicious_request() -> eyre::Result<()> {
     // sleep for heartbeat
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
 
-    let peer_score_before_msg = honest_peer.peer_score(malicious_peer_id).await?.unwrap();
+    // Capture the malicious peer's view of the honest responder before the request.
+    //
+    // The contract under test: when a malformed *request* arrives at the responder,
+    // libp2p's `read_request` fails inside the codec and the responder drops the
+    // substream WITHOUT emitting `InboundFailure::Io` (see libp2p request-response
+    // 0.29 `lib.rs:1011-1014`). From the requester's side the failure surfaces as
+    // either `OutboundFailure::ConnectionClosed` or `OutboundFailure::Io` with a
+    // transport-flap `ErrorKind` (e.g. `UnexpectedEof`) — both are no-penalty
+    // under the new policy.
+    //
+    // The `Penalty::Medium` codec-violation path requires the malformed bytes to
+    // be a *response* (read_response on the requester returns `io::Error::other`).
+    // That is exercised separately by `test_outbound_failure_malicious_response`.
+    let malicious_view_before = malicious_peer.peer_score(honest_peer_id).await?.unwrap();
 
     // honest peer returns `OutboundFailure` error
     let response_from_peer = malicious_peer.send_request(malicious_msg, honest_bls).await?;
@@ -508,15 +520,23 @@ async fn test_outbound_failure_malicious_request() -> eyre::Result<()> {
 
     assert_matches!(res, Err(NetworkError::Outbound(_)));
 
-    // Allow time for penalty to be applied
+    // Allow time for any penalty propagation
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // TODO: the honest peer penalize the malicious requestor. see Issue #250
-    //
-    // assert honest peer's score is lower - penalties are applied immediately
-    // however, it should be the case that honest peer penalizes the malicious peer
-    let peer_score_after_msg = malicious_peer.peer_score(honest_peer_id).await?.unwrap();
-    assert!(peer_score_before_msg > peer_score_after_msg);
+    // Responder's score (from the requester's view) is unchanged: a transport-level
+    // OutboundFailure for a malformed-request scenario must not penalize the
+    // responder. Otherwise a peer who cannot satisfy a request would be banned by
+    // every requester — the ban-cascade that breaks observer joins on WAN.
+    let malicious_view_after = malicious_peer.peer_score(honest_peer_id).await?.unwrap();
+    assert_eq!(
+        malicious_view_before, malicious_view_after,
+        "requester must not penalize responder on transport-level OutboundFailure (before={malicious_view_before}, after={malicious_view_after})"
+    );
+
+    // Note: honest peer's penalty of the malicious requester via InboundFailure is
+    // NOT exercised here. libp2p request-response 0.29 does not emit
+    // InboundFailure::Io when read_request fails — see lib.rs:1011-1014.
+    // Dispatch-layer coverage for that path is tracked in Issue #250.
 
     Ok(())
 }

@@ -112,8 +112,10 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
                 | CertManagerError::ChannelClosed
                 | CertManagerError::TNSend(_) => None,
             },
-            | PrimaryNetworkError::InvalidRequest(_)
-            | PrimaryNetworkError::UnknownConsensusHeaderDigest(_)
+            // Benign "miss": observers legitimately request not-yet-served headers.
+            // No penalty so honest sync flows are not banned during catch-up.
+            PrimaryNetworkError::UnknownConsensusHeaderDigest(_) => None,
+            PrimaryNetworkError::InvalidRequest(_)
             | PrimaryNetworkError::UnknownStreamRequest(_)
             | PrimaryNetworkError::UnknownConsensusHeaderCert(_) => Some(Penalty::Mild),
             PrimaryNetworkError::InvalidEpochRequest
