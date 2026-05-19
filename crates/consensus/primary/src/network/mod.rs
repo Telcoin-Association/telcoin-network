@@ -711,14 +711,21 @@ where
             tokio::select! {
                 header =
                     request_handler.retrieve_consensus_header(number, hash) => {
-                        // A peer asking for a header we cannot return is not a misbehavior
-                        // signal — observers legitimately request headers that have not yet
-                        // been served. Log the miss and respond with the error; do not
-                        // penalize. DoS protection is provided by req_res concurrency limits
-                        // and gossipsub rate limits, not by penalizing sync requests.
-                        if let Err(e) = &header {
+                        // Route through the central PrimaryNetworkError → Penalty mapping
+                        // so every handler in this file applies penalties consistently.
+                        // The only reachable variant from this path is
+                        // UnknownConsensusHeaderDigest, which the central table now maps
+                        // to None — observers legitimately request not-yet-served headers.
+                        if let Err(ref e) = header {
+                            if let Some(penalty) = e.into() {
+                                network_handle.report_penalty(peer, penalty).await;
+                            }
                             let my_number = request_handler.consensus_chain().latest_consensus_number();
-                            tracing::debug!(target: "primary::network", ?e, ?my_number, ?number, ?hash, ?peer, "consensus header request could not be served");
+                            tracing::debug!(
+                                target: "primary::network",
+                                ?e, ?my_number, ?number, ?hash, ?peer,
+                                "consensus header request could not be served"
+                            );
                         }
                         let response = header.into_response();
                         let _ = network_handle.handle.send_response(response, channel).await;
