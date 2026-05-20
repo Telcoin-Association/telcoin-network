@@ -34,6 +34,17 @@ for cmd in cosign gh; do
   fi
 done
 
+# Fail early if any committed maintainer cert is still a placeholder. Cosign
+# would otherwise emit a confusing OpenSSL parse error instead of a clear
+# "release not yet provisioned" signal.
+for signer in "${SIGNERS[@]}"; do
+  cert=".github/release-keys/${signer}.pem"
+  if [[ ! -s "$cert" ]] || grep -q 'PLACEHOLDER' "$cert"; then
+    echo "ERROR: committed cert $cert is missing, empty, or a placeholder — this release predates key provisioning." >&2
+    exit 1
+  fi
+done
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 echo ">>> verifying release $TAG"
