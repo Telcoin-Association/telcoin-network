@@ -25,11 +25,21 @@ cd "$ROOT"
 REGISTRY="ghcr.io"
 IMAGE="telcoin-association/telcoin-network"
 
-if [[ "$TAG" == *-adiri ]]; then
-  TAGS=("--tag" "${REGISTRY}/${IMAGE}:${TAG}" "--tag" "${REGISTRY}/${IMAGE}:adiri")
-else
-  TAGS=("--tag" "${REGISTRY}/${IMAGE}:${TAG}" "--tag" "${REGISTRY}/${IMAGE}:latest")
-fi
+case "$TAG" in
+  v[0-9]*.[0-9]*.[0-9]*-adiri)
+    TAGS=("--tag" "${REGISTRY}/${IMAGE}:${TAG}" "--tag" "${REGISTRY}/${IMAGE}:adiri")
+    ;;
+  v[0-9]*.[0-9]*.[0-9]*-rc[0-9]*)
+    TAGS=("--tag" "${REGISTRY}/${IMAGE}:${TAG}")
+    ;;
+  v[0-9]*.[0-9]*.[0-9]*)
+    TAGS=("--tag" "${REGISTRY}/${IMAGE}:${TAG}" "--tag" "${REGISTRY}/${IMAGE}:latest")
+    ;;
+  *)
+    echo "tag $TAG does not match any release channel pattern (vX.Y.Z, vX.Y.Z-adiri, vX.Y.Z-rcN)" >&2
+    exit 1
+    ;;
+esac
 
 if ! docker buildx ls --format '{{.Name}}' | grep -q .; then
   echo "no docker buildx builder found — run 'make docker-builder' first." >&2

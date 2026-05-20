@@ -3,8 +3,9 @@ name: Release
 on:
   push:
     tags:
-      - 'v*.*.*'        # mainnet channel
-      - 'v*.*.*-adiri'  # testnet channel
+      - 'v[0-9]+.[0-9]+.[0-9]+'           # mainnet: strict semver, no suffix
+      - 'v[0-9]+.[0-9]+.[0-9]+-adiri'     # adiri (testnet)
+      - 'v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+'  # rc channel (no :latest)
 
 permissions:
   contents: write       # create draft release, upload assets
@@ -31,16 +32,28 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          if [[ "$TAG" == *-adiri ]]; then
-            CHANNEL=adiri
-            VERSION="${TAG%-adiri}"
-            VERSION="${VERSION#v}"
-            DOCKER_TAGS="${REGISTRY}/${IMAGE_NAME}:${TAG}"$'\n'"${REGISTRY}/${IMAGE_NAME}:adiri"
-          else
-            CHANNEL=mainnet
-            VERSION="${TAG#v}"
-            DOCKER_TAGS="${REGISTRY}/${IMAGE_NAME}:${TAG}"$'\n'"${REGISTRY}/${IMAGE_NAME}:latest"
-          fi
+          case "$TAG" in
+            v[0-9]*.[0-9]*.[0-9]*-adiri)
+              CHANNEL=adiri
+              VERSION="${TAG%-adiri}"
+              VERSION="${VERSION#v}"
+              DOCKER_TAGS="${REGISTRY}/${IMAGE_NAME}:${TAG}"$'\n'"${REGISTRY}/${IMAGE_NAME}:adiri"
+              ;;
+            v[0-9]*.[0-9]*.[0-9]*-rc[0-9]*)
+              CHANNEL=rc
+              VERSION="${TAG#v}"
+              DOCKER_TAGS="${REGISTRY}/${IMAGE_NAME}:${TAG}"
+              ;;
+            v[0-9]*.[0-9]*.[0-9]*)
+              CHANNEL=mainnet
+              VERSION="${TAG#v}"
+              DOCKER_TAGS="${REGISTRY}/${IMAGE_NAME}:${TAG}"$'\n'"${REGISTRY}/${IMAGE_NAME}:latest"
+              ;;
+            *)
+              echo "::error::tag $TAG does not match any release channel pattern" >&2
+              exit 1
+              ;;
+          esac
           {
             echo "channel=$CHANNEL"
             echo "version=$VERSION"

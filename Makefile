@@ -227,30 +227,34 @@ clean-logs:
 # These targets are the local entrypoints maintainers use to countersign and
 # publish. Documented in docs/RELEASING.md.
 
+# TAG must match one of the three release-channel patterns the workflow
+# accepts: vX.Y.Z (mainnet), vX.Y.Z-adiri (testnet), vX.Y.Z-rcN (rc).
+# Keep these guards in sync with .github/workflows/release.yaml.
+
 # Local parity build of the linux release tarball.
 release-binaries:
-	@case "$(TAG)" in v*.*.*) ;; *) echo "TAG must look like vX.Y.Z (got: $(TAG))"; exit 1;; esac
+	@case "$(TAG)" in v[0-9]*.[0-9]*.[0-9]*|v[0-9]*.[0-9]*.[0-9]*-adiri|v[0-9]*.[0-9]*.[0-9]*-rc[0-9]*) ;; *) echo "TAG must look like vX.Y.Z, vX.Y.Z-adiri, or vX.Y.Z-rcN (got: $(TAG))"; exit 1;; esac
 	./etc/scripts/release-binaries.sh $(TAG)
 
 # Manual fallback for the multi-arch ghcr.io push.
 release-image:
-	@case "$(TAG)" in v*.*.*) ;; *) echo "TAG must look like vX.Y.Z (got: $(TAG))"; exit 1;; esac
+	@case "$(TAG)" in v[0-9]*.[0-9]*.[0-9]*|v[0-9]*.[0-9]*.[0-9]*-adiri|v[0-9]*.[0-9]*.[0-9]*-rc[0-9]*) ;; *) echo "TAG must look like vX.Y.Z, vX.Y.Z-adiri, or vX.Y.Z-rcN (got: $(TAG))"; exit 1;; esac
 	./etc/scripts/release-image.sh $(TAG)
 
 # Countersign a draft release with this maintainer's YubiKey.
 release-sign:
-	@case "$(TAG)" in v*.*.*) ;; *) echo "Usage: make release-sign TAG=vX.Y.Z SIGNER=<handle> (got TAG=$(TAG))"; exit 1;; esac
+	@case "$(TAG)" in v[0-9]*.[0-9]*.[0-9]*|v[0-9]*.[0-9]*.[0-9]*-adiri|v[0-9]*.[0-9]*.[0-9]*-rc[0-9]*) ;; *) echo "Usage: make release-sign TAG=vX.Y.Z SIGNER=<handle> (got TAG=$(TAG))"; exit 1;; esac
 	@if [ -z "$(SIGNER)" ]; then echo "Usage: make release-sign TAG=vX.Y.Z SIGNER=<handle>"; exit 1; fi
 	./etc/scripts/release-sign.sh $(TAG) $(SIGNER)
 
 # Verify provenance + both maintainer signatures.
 release-verify:
-	@case "$(TAG)" in v*.*.*) ;; *) echo "TAG must look like vX.Y.Z (got: $(TAG))"; exit 1;; esac
+	@case "$(TAG)" in v[0-9]*.[0-9]*.[0-9]*|v[0-9]*.[0-9]*.[0-9]*-adiri|v[0-9]*.[0-9]*.[0-9]*-rc[0-9]*) ;; *) echo "TAG must look like vX.Y.Z, vX.Y.Z-adiri, or vX.Y.Z-rcN (got: $(TAG))"; exit 1;; esac
 	./etc/scripts/release-verify.sh $(TAG)
 
 # Pre-flight verify, then flip the draft release to published.
 release-publish:
-	@case "$(TAG)" in v*.*.*) ;; *) echo "TAG must look like vX.Y.Z (got: $(TAG))"; exit 1;; esac
+	@case "$(TAG)" in v[0-9]*.[0-9]*.[0-9]*|v[0-9]*.[0-9]*.[0-9]*-adiri|v[0-9]*.[0-9]*.[0-9]*-rc[0-9]*) ;; *) echo "TAG must look like vX.Y.Z, vX.Y.Z-adiri, or vX.Y.Z-rcN (got: $(TAG))"; exit 1;; esac
 	./etc/scripts/release-verify.sh $(TAG)
 	gh release edit $(TAG) --repo telcoin-association/telcoin-network --draft=false
 
