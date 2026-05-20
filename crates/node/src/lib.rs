@@ -7,7 +7,7 @@ use engine::TnBuilder;
 use manager::EpochManager;
 use tn_config::{KeyConfig, TelcoinDirs};
 use tn_primary::ConsensusBusApp;
-use tn_rpc::EngineToPrimary;
+use tn_rpc::{EngineToPrimary, RpcNodeInfo};
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{BlockHash, ConsensusHeader, Epoch, EpochCertificate, EpochRecord};
 use tokio::task::JoinHandle;
@@ -60,11 +60,17 @@ pub struct EngineToPrimaryRpc {
     consensus_bus: ConsensusBusApp,
     /// Consensus Chain DB
     consensus_chain: ConsensusChain,
+    /// Static node info to provide clients.
+    node_info: RpcNodeInfo,
 }
 
 impl EngineToPrimaryRpc {
-    pub fn new(consensus_bus: ConsensusBusApp, consensus_chain: ConsensusChain) -> Self {
-        Self { consensus_bus, consensus_chain }
+    pub fn new(
+        consensus_bus: ConsensusBusApp,
+        consensus_chain: ConsensusChain,
+        node_info: RpcNodeInfo,
+    ) -> Self {
+        Self { consensus_bus, consensus_chain, node_info }
     }
 
     /// Retrieve the consensus header by number.
@@ -101,6 +107,10 @@ impl EngineToPrimary for EngineToPrimaryRpc {
             (Some(epoch), _) => self.get_epoch_by_number(epoch).await,
             (None, None) => None,
         }
+    }
+
+    fn node_info(&self) -> tn_rpc::RpcNodeInfo {
+        self.node_info.clone()
     }
 }
 

@@ -31,6 +31,7 @@ use tn_reth::{
         EpochState,
     },
 };
+use tn_rpc::RpcNodeInfo;
 use tn_storage::{
     certificate_pack::CertificatePack,
     tables::{
@@ -756,8 +757,28 @@ where
             )
             .await?;
 
+        let node_info = RpcNodeInfo {
+            name: self.builder.tn_config.node_info.name.clone(),
+            bls_public_key: self.key_config.public_key(),
+            authority_id: self.key_config.public_key().into(),
+            execution_address: self.builder.tn_config.node_info.execution_address,
+            primary_network_key: self.key_config.primary_network_public_key(),
+            worker_network_key: self.key_config.worker_network_public_key(),
+            primary_external_address: self
+                .builder
+                .tn_config
+                .node_info
+                .primary_network_address()
+                .clone(),
+            worker_external_address: self
+                .builder
+                .tn_config
+                .node_info
+                .worker_network_address()
+                .clone(),
+        };
         let engine_to_primary =
-            EngineToPrimaryRpc::new(consensus_bus_app, self.consensus_chain.clone());
+            EngineToPrimaryRpc::new(consensus_bus_app, self.consensus_chain.clone(), node_info);
         // only spawns one worker for now
         let worker = self
             .spawn_worker_node_components(

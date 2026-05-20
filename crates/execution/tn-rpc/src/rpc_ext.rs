@@ -2,7 +2,7 @@
 
 use crate::{
     error::{TNRpcError, TelcoinNetworkRpcResult},
-    EngineToPrimary,
+    EngineToPrimary, RpcNodeInfo,
 };
 use async_trait::async_trait;
 use jsonrpsee::proc_macros::rpc;
@@ -14,6 +14,9 @@ use tn_types::{BlockHash, ConsensusHeader, Epoch, EpochCertificate, EpochRecord,
 /// TN-specific RPC endpoints.
 #[rpc(server, namespace = "tn")]
 pub trait TelcoinNetworkRpcExtApi {
+    /// Return the nodes information.
+    #[method(name = "info")]
+    async fn info(&self) -> TelcoinNetworkRpcResult<RpcNodeInfo>;
     /// Return the latest consensus header.
     #[method(name = "latestConsensusHeader")]
     async fn latest_consensus_header(&self) -> TelcoinNetworkRpcResult<ConsensusHeader>;
@@ -55,6 +58,9 @@ impl<N: EngineToPrimary> TelcoinNetworkRpcExtApiServer for TelcoinNetworkRpcExt<
 where
     N: Send + Sync + 'static,
 {
+    async fn info(&self) -> TelcoinNetworkRpcResult<RpcNodeInfo> {
+        Ok(self.inner_node_network.node_info())
+    }
     async fn latest_consensus_header(&self) -> TelcoinNetworkRpcResult<ConsensusHeader> {
         Ok(self.inner_node_network.get_latest_consensus_block())
     }
