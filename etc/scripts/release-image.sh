@@ -41,8 +41,12 @@ case "$TAG" in
     ;;
 esac
 
-if ! docker buildx ls --format '{{.Name}}' | grep -q .; then
-  echo "no docker buildx builder found — run 'make docker-builder' first." >&2
+# The default builder uses the `docker` driver which does not support
+# --platform linux/amd64,linux/arm64. Require a builder backed by the
+# docker-container or kubernetes driver — that is what `make docker-builder`
+# creates.
+if ! docker buildx ls | awk 'NR>1 && $2 ~ /(docker-container|kubernetes)/ {found=1} END {exit !found}'; then
+  echo "no multi-platform-capable buildx builder found — run 'make docker-builder' first." >&2
   exit 2
 fi
 
