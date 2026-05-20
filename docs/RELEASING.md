@@ -77,8 +77,10 @@ git tag -s v0.6.0-adiri -m "v0.6.0-adiri"
 git push origin v0.6.0-adiri
 ```
 
-Use `-s` to GPG-sign the tag if you have a GPG key configured.
-Tag protection on the repo (recommended setting) requires signed tags and forbids delete/recreate.
+The tag **must** be GPG-signed (`-s`) with a key listed in `.github/maintainer-gpg-keys/`.
+CI runs `git tag -v "$TAG"` against the in-repo allowlist as the first gated step of the workflow and refuses to draft a release if the signature is missing, bad, or made by a key outside the allowlist.
+The policy lives in `.github/workflows/release.yaml`, not in a repo setting that can be silently toggled off.
+Adding or rotating a maintainer key requires a PR reviewed by the *other* maintainer; the procedure is in [.github/maintainer-gpg-keys/README.md](../.github/maintainer-gpg-keys/README.md).
 
 The push triggers `.github/workflows/release.yaml`. Watch it run with:
 

@@ -29,6 +29,9 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: guard against placeholder release keys
         run: |
@@ -43,6 +46,97 @@ jobs:
               exit 1
             fi
           done
+
+      - name: verify GPG-signed tag against maintainer allowlist
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # Refuse to run against placeholder GPG keys for the same reason as
+          # the release-keys guard: cosmetic CI pass with no real signature
+          # check is worse than no check at all.
+          shopt -s nullglob
+          allowlist=(.github/maintainer-gpg-keys/*.asc)
+          if [[ ${#allowlist[@]} -eq 0 ]]; then
+            echo "::error::no maintainer GPG keys found in .github/maintainer-gpg-keys/" >&2
+            exit 1
+          fi
+          for f in "${allowlist[@]}"; do
+            if [[ ! -s "$f" ]]; then
+              echo "::error file=$f::maintainer-gpg-keys file is missing or empty" >&2
+              exit 1
+            fi
+            if grep -q 'PLACEHOLDER' "$f"; then
+              echo "::error file=$f::maintainer-gpg-keys file is still a placeholder — provision a real key before tagging a release" >&2
+              exit 1
+            fi
+          done
+
+          # Build a throwaway GPG keyring containing only the allowlisted keys.
+          GNUPGHOME="$(mktemp -d)"
+          chmod 700 "$GNUPGHOME"
+          export GNUPGHOME
+
+          allowed_fpr=()
+          for f in "${allowlist[@]}"; do
+            gpg --batch --quiet --import "$f"
+            while IFS= read -r line; do
+              # `fpr` lines from --with-colons: fpr:::::::::FINGERPRINT::
+              fpr="$(echo "$line" | awk -F: '$1=="fpr" {print $10; exit}')"
+              if [[ -n "$fpr" ]]; then
+                allowed_fpr+=("$fpr")
+              fi
+            done < <(gpg --batch --with-colons --import-options show-only --import "$f")
+          done
+
+          if [[ ${#allowed_fpr[@]} -eq 0 ]]; then
+            echo "::error::failed to extract any allowlisted GPG fingerprints" >&2
+            exit 1
+          fi
+
+          # Verify the tag is signed and capture gpg's output.
+          verify_out="$(git tag -v "$TAG" 2>&1)" || {
+            echo "::error::git tag -v failed for $TAG:" >&2
+            echo "$verify_out" >&2
+            exit 1
+          }
+
+          if ! grep -q 'Good signature' <<< "$verify_out"; then
+            echo "::error::tag $TAG does not carry a Good signature" >&2
+            echo "$verify_out" >&2
+            exit 1
+          fi
+
+          # Extract the full 40-char primary-key fingerprint. GPG prints it on
+          # a "Primary key fingerprint:" line with spaces between groups of
+          # four hex chars; strip the spaces to get the bare fingerprint.
+          # Reject the 16-char short key id form — it is collision-prone.
+          signing_fpr="$(echo "$verify_out" \
+            | grep 'Primary key fingerprint:' \
+            | head -n1 \
+            | sed -E 's/.*Primary key fingerprint:[[:space:]]*//' \
+            | tr -d ' ')"
+          if [[ -z "$signing_fpr" ]]; then
+            echo "::error::could not extract Primary key fingerprint from gpg output" >&2
+            echo "$verify_out" >&2
+            exit 1
+          fi
+
+          matched=0
+          for fpr in "${allowed_fpr[@]}"; do
+            if [[ "$fpr" == "$signing_fpr" ]]; then
+              matched=1
+              break
+            fi
+          done
+          if [[ $matched -eq 0 ]]; then
+            echo "::error::tag $TAG signed by $signing_fpr — not in maintainer allowlist" >&2
+            printf '  allowed: %s\n' "${allowed_fpr[@]}" >&2
+            exit 1
+          fi
+
+          echo ">>> tag $TAG verified against maintainer key $signing_fpr"
 
       - id: c
         env:

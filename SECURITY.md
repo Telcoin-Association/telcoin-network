@@ -89,6 +89,22 @@ previous key is retired. Past releases remain verifiable using the cert that
 signed them at the time — committed certs are version-controlled and never
 overwritten in place.
 
+### Maintainer tag-signing GPG keys
+
+The release workflow refuses to draft a release unless the pushed tag is
+GPG-signed by a maintainer key whose public key lives in
+`.github/maintainer-gpg-keys/<handle>.asc` at that commit. Fingerprints
+are recorded here so a tampered repo cannot silently swap the key it ships:
+
+| Handle | GPG fingerprint (40 hex) | First release signed |
+|--------|--------------------------|----------------------|
+| @grantkee   | _to be recorded on first release_ | _pending_ |
+| @sstanfield | _to be recorded on first release_ | _pending_ |
+
+Rotation follows the same rules as the signing certs: never overwrite an
+existing `.asc` in place; add a new file with a suffix and update this
+table with the date the previous key is retired.
+
 ## Credits & Acknowledgments
 
 We thank all security researchers who responsibly disclose vulnerabilities.
