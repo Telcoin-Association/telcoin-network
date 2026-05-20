@@ -83,7 +83,6 @@ for asset in "$WORK"/*.tar.gz "$WORK"/SHA256SUMS; do
     cosign verify-blob \
       --key "$cert" \
       --signature "$sig" \
-      --insecure-ignore-tlog \
       "$asset"
   done
 done
@@ -110,7 +109,6 @@ for signer in "${SIGNERS[@]}"; do
   echo ">>> [image] ${IMAGE}@${DIGEST} — $signer"
   cosign verify \
     --key "$cert" \
-    --insecure-ignore-tlog \
     "${IMAGE}@${DIGEST}"
 done
 

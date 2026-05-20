@@ -117,7 +117,6 @@ for asset in "$WORK"/*.tar.gz "$WORK"/SHA256SUMS; do
   cosign sign-blob \
     --yes \
     --key "$COSIGN_KEY" \
-    --tlog-upload=false \
     --output-signature "$WORK/${base}.${SIGNER}.sig" \
     --output-certificate "$WORK/${base}.${SIGNER}.pem" \
     "$asset"
@@ -153,7 +152,6 @@ echo ">>> signing image ${IMAGE}@${DIGEST}"
 cosign sign \
   --yes \
   --key "$COSIGN_KEY" \
-  --tlog-upload=false \
   "${IMAGE}@${DIGEST}"
 
 echo ">>> done. Two-of-two: confirm the other maintainer has signed, then run 'make release-publish TAG=$TAG'."
