@@ -613,11 +613,22 @@ impl PeerManager {
         }
 
         // forward committee resolution + unban into AllPeers; missing members logged there
-        let unban_actions = self.peers.new_epoch(committee);
+        let (unban_actions, unresolved) = self.peers.new_epoch(committee);
 
         // apply unban for any banned validators
         for (peer_id, action) in unban_actions {
             self.apply_peer_action(peer_id, action);
+        }
+
+        // ask kad to look up any committee BLS we couldn't resolve locally; when the
+        // record arrives, `add_known_peer → upsert_peer` will promote the peer.
+        if !unresolved.is_empty() {
+            debug!(
+                target: "peer-manager",
+                count = unresolved.len(),
+                "committee BLS keys unresolved; requesting kad records"
+            );
+            self.events.push_back(PeerEvent::MissingAuthorities(unresolved));
         }
     }
 
@@ -625,7 +636,12 @@ impl PeerManager {
     /// Used for bootstrap servers or possibly committee members.
     pub(crate) fn add_known_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
         trace!(target: "peer-manager", ?bls_key, "adding known peer");
-        self.peers.upsert_peer(bls_key, info.pubkey, info.multiaddrs, info.timestamp);
+        if let Some((peer_id, action)) =
+            self.peers.upsert_peer(bls_key, info.pubkey, info.multiaddrs, info.timestamp)
+        {
+            trace!(target: "peer-manager", ?bls_key, ?peer_id, "promoted unresolved committee member via upsert_peer");
+            self.apply_peer_action(peer_id, action);
+        }
     }
 
     /// Find authorities for the epoch manager.

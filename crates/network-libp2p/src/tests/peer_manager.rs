@@ -16,7 +16,7 @@ use std::{
 use tn_config::{KeyConfig, NetworkConfig, ScoreConfig};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
-use tn_types::{now, BlsKeypair, NetworkKeypair, NetworkPublicKey};
+use tn_types::{now, BlsKeypair, BlsPublicKey, NetworkKeypair, NetworkPublicKey};
 use tokio::time::{sleep, timeout};
 
 fn create_test_peer_manager(network_config: Option<NetworkConfig>) -> PeerManager {
@@ -564,6 +564,28 @@ async fn test_is_validator() {
 
     // Verify random peer is not a validator
     assert!(!peer_manager.is_peer_validator(&random_peer_id));
+}
+
+#[tokio::test]
+async fn peer_manager_new_epoch_emits_missing_authorities() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let mut rng = StdRng::from_seed([200; 32]);
+    let unknown_bls = *BlsKeypair::generate(&mut rng).public();
+
+    let mut committee = HashSet::new();
+    committee.insert(unknown_bls);
+    peer_manager.new_epoch(committee);
+
+    let events = collect_all_events(&mut peer_manager);
+    let missing: Vec<&Vec<BlsPublicKey>> = events
+        .iter()
+        .filter_map(|e| match e {
+            PeerEvent::MissingAuthorities(keys) => Some(keys),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(missing.len(), 1, "expected exactly one MissingAuthorities event");
+    assert_eq!(*missing[0], vec![unknown_bls]);
 }
 
 #[tokio::test]

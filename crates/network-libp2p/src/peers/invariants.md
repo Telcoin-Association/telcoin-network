@@ -310,8 +310,29 @@ This section covers the `bls_index ↔ Peer::bls_public_key` correspondence and 
 
 - **Statement:** `AllPeers::new_epoch` walks each committee peer's `ConnectionStatus`; if `Banned { .. }` or `Disconnecting { banned: true }`, it calls `update_connection_status(.., Unbanned)` and emits the corresponding `PeerAction::Unban`.
 - **Why:** Combined with INV-032, this is the _active_ part of validator forgiveness — `make_trusted` alone would not move the connection state out of `Banned`.
-- **Enforced at:** `all_peers.rs:948-963` (the `Disconnecting { banned: true }` and `Banned` arms inside `new_epoch`).
+- **Enforced at:** `all_peers.rs` (the `Disconnecting { banned: true }` and `Banned` arms inside `promote_committee_member`, which is invoked from both `new_epoch` and `upsert_peer`).
 - **Violation impact:** A validator that was banned mid-epoch would stay `Banned` into the next epoch, blocking reconnection until manual operator intervention.
+
+### INV-045 — Committee and trusted peers are never evicted by ban/disconnect pruning
+
+- **Statement:** Neither `prune_banned_peers` nor `prune_disconnected_peers` may remove a peer satisfying `AllPeers::is_protected` (member of `current_committee` or `Peer::is_trusted`). `collect_excess_peers` skips such peers entirely. If the resulting eviction set is smaller than the requested excess, both pruners emit a single `warn!` naming both numbers and accept the temporary overshoot.
+- **Why:** Without this protection, a sitting committee validator that hits the `Banned` connection state (operator-issued ban, state-machine `Disconnecting{banned:true}` path, or accidental score collapse before trust was set) can be evicted by `remove_peer`, which also drops its `bls_index` entry. The next `new_epoch` then resolves the BLS to nothing, and the validator is silently locked out of its own committee (F-1). Persistent `is_trusted` plus this guard give the "once-staked, never-forgotten" property without requiring a new permanent flag.
+- **Enforced at:** `all_peers.rs` (`is_protected` helper; the `is_protected` early-`continue` in `collect_excess_peers`; the warn-on-shortfall block inside `prune_banned_peers` and `prune_disconnected_peers`).
+- **Violation impact:** Committee validators may be silently locked out of their epoch after a transient ban; correlated bans from a coordinated peer could drop multiple validators at once.
+
+### INV-046 — Unresolved committee BLS keys are surfaced for kad lookup
+
+- **Statement:** Every BLS key in `current_committee_keys` whose value is `None` is reported in the second element of the `AllPeers::new_epoch` return tuple, and `PeerManager::new_epoch` pushes a single `PeerEvent::MissingAuthorities(unresolved)` event onto its queue. `ConsensusNetwork` consumes that event and issues `kad.get_record(bls_key)` for each entry.
+- **Why:** A committee member that this node has never observed (cold restart, network partition, late-arriving validator) cannot be resolved from `bls_index` alone. Without an active discovery signal the node has no way to dial that validator until kad happens to walk into them — which may be never on a small network.
+- **Enforced at:** `all_peers.rs` (`new_epoch` collects `unresolved`), `manager.rs` (pushes `PeerEvent::MissingAuthorities` when `unresolved` is non-empty), `consensus.rs` (consumer of `MissingAuthorities`).
+- **Violation impact:** New or rebooting committee members would only be reachable opportunistically via kad's own discovery cycle; epoch participation could lag by minutes or fail entirely for nodes behind partitions.
+
+### INV-047 — Resolved committee BLS keys map to trusted committee peers
+
+- **Statement:** If `current_committee_keys[bls] == Some(peer_id)`, then `peer_id ∈ current_committee` and `peers[peer_id].is_trusted == true`. The promotion helper `AllPeers::promote_committee_member` is the single funnel that establishes this triple, called from both `new_epoch` (BLS resolved up front) and `upsert_peer` (BLS resolved later by a kad lookup).
+- **Why:** The trio (`current_committee_keys`, `current_committee`, `is_trusted`) must stay consistent so that `is_peer_validator` and `prune_connected_peers` (INV-033) and the pruning protection (INV-045) all see the same committee membership. Splitting the promotion logic between two call sites was the original source of F-1: a kad-driven `add_known_peer` could refresh `bls_index` without updating committee state, so the next read of `is_peer_validator` would lie.
+- **Enforced at:** `all_peers.rs` (`promote_committee_member` writes all three; `new_epoch` and `upsert_peer` are the only callers).
+- **Violation impact:** A "resolved" committee entry with a peer that is not trusted or not in `current_committee` would let `prune_banned_peers` evict the validator (defeats INV-045) or let `process_penalty` ban it (defeats INV-002).
 
 ## 9. Heartbeat & periodic maintenance
 

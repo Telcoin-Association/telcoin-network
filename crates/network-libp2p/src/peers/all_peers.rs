@@ -139,13 +139,19 @@ impl AllPeers {
     }
 
     /// Create or update a peer.
+    ///
+    /// If the freshly-bound BLS key is in `current_committee_keys` with an unresolved
+    /// (`None`) value, the peer is promoted to committee membership: it is inserted into
+    /// `current_committee`, marked trusted, and any pending ban is lifted. The returned
+    /// `(PeerId, PeerAction)` carries the `Unban` action so the caller can flow it through
+    /// `PeerManager::apply_peer_action`. `None` is returned when no promotion happened.
     pub(super) fn upsert_peer(
         &mut self,
         bls_public_key: BlsPublicKey,
         network_key: NetworkPublicKey,
         addrs: Vec<Multiaddr>,
         timestamp: TimestampSec,
-    ) {
+    ) -> Option<(PeerId, PeerAction)> {
         let peer_id: PeerId = network_key.clone().into();
         self.rebind_bls(peer_id, bls_public_key);
         if let Some(peer) = self.peers.get_mut(&peer_id) {
@@ -153,6 +159,13 @@ impl AllPeers {
         } else {
             let peer = Peer::new(bls_public_key, network_key, addrs, timestamp);
             self.peers.insert(peer_id, peer);
+        }
+
+        // self-heal: promote an unresolved committee BLS now that the peer is known.
+        if self.current_committee_keys.get(&bls_public_key) == Some(&None) {
+            self.promote_committee_member(bls_public_key, peer_id).map(|a| (peer_id, a))
+        } else {
+            None
         }
     }
 
@@ -816,10 +829,21 @@ impl AllPeers {
         (action, pruned_peers)
     }
 
+    /// True if a peer must be preserved by ban/disconnect pruning.
+    ///
+    /// Current committee validators and any trusted peer (operator-pinned or once-staked)
+    /// are skipped by `collect_excess_peers`. This is the single source of truth for
+    /// "do not evict" — pruning protection plus the persistent `is_trusted` flag give the
+    /// "once-staked, never-forgotten" guarantee without any new permanent flag.
+    pub(super) fn is_protected(&self, peer_id: &PeerId, peer: &Peer) -> bool {
+        self.current_committee.contains(peer_id) || peer.is_trusted()
+    }
+
     /// Filter peers based on connection status.
     ///
-    /// This creates a min-heap with the excess number of peers.
-    /// Used by Self::prune_banned_peers and Self::prune_disconnected_peers.
+    /// This creates a min-heap with the excess number of peers. Protected peers
+    /// (committee members and trusted peers) are skipped entirely so they cannot be
+    /// evicted by `prune_banned_peers` or `prune_disconnected_peers`.
     fn collect_excess_peers<F>(
         &self,
         excess: usize,
@@ -832,6 +856,10 @@ impl AllPeers {
         let mut excess_peers = BinaryHeap::with_capacity(excess);
 
         for (peer_id, peer) in &self.peers {
+            // committee/trusted peers are never evicted
+            if self.is_protected(peer_id, peer) {
+                continue;
+            }
             if let Some(instant) = filter(peer.connection_status()) {
                 // min-heap sorted by instant (oldest first)
                 let entry =
@@ -884,6 +912,15 @@ impl AllPeers {
                 }
             });
 
+            if excess_peers.len() < excess {
+                warn!(
+                    target: "peer-manager",
+                    requested = excess,
+                    evicted = excess_peers.len(),
+                    "banned peer prune capped by protected (committee/trusted) peers"
+                );
+            }
+
             for (_, peer_id, ip_addrs) in excess_peers {
                 self.remove_peer(&peer_id);
                 let ips = self.banned_peers.remove_banned_peer(ip_addrs.clone().into_iter());
@@ -907,12 +944,67 @@ impl AllPeers {
                 }
             });
 
+            if excess_peers.len() < excess {
+                warn!(
+                    target: "peer-manager",
+                    requested = excess,
+                    evicted = excess_peers.len(),
+                    "disconnected peer prune capped by protected (committee/trusted) peers"
+                );
+            }
+
             // remove peer
             for (_, peer_id, _) in excess_peers {
                 self.remove_peer(&peer_id);
                 self.disconnected_peers = self.disconnected_peers.saturating_sub(1);
             }
         }
+    }
+
+    /// Promote a known peer to committee membership.
+    ///
+    /// Binds `bls_key → Some(peer_id)` in `current_committee_keys`, inserts the peer into
+    /// `current_committee`, marks the peer trusted, drops its IPs from the banned set, and
+    /// returns an `Unban` action if the peer was in `Banned` or `Disconnecting { banned: true }`.
+    /// Shared between `new_epoch` (BLS resolved up-front) and `upsert_peer` (BLS resolved
+    /// later via kad after an initial `new_epoch` miss).
+    fn promote_committee_member(
+        &mut self,
+        bls_key: BlsPublicKey,
+        peer_id: PeerId,
+    ) -> Option<PeerAction> {
+        self.current_committee.insert(peer_id);
+        self.current_committee_keys.insert(bls_key, Some(peer_id));
+
+        // the NewConnectionStatus doesn't affect this call
+        let status = self.ensure_peer_exists(&peer_id, &NewConnectionStatus::Unbanned);
+
+        let unban_action = match status {
+            ConnectionStatus::Disconnecting { banned: true } => {
+                warn!(target: "peer-manager", ?peer_id, "unbanning committee member that was disconnecting pending ban");
+                Some(self.update_connection_status(&peer_id, NewConnectionStatus::Unbanned))
+            }
+            ConnectionStatus::Banned { .. } => {
+                warn!(target: "peer-manager", ?peer_id, "unbanning banned committee member");
+                Some(self.update_connection_status(&peer_id, NewConnectionStatus::Unbanned))
+            }
+            ConnectionStatus::Disconnecting { banned: false }
+            | ConnectionStatus::Disconnected { .. }
+            | ConnectionStatus::Dialing { .. }
+            | ConnectionStatus::Unknown
+            | ConnectionStatus::Connected { .. } => None,
+        };
+
+        // already ensured peer exists; addresses were populated when the peer was
+        // first registered via `upsert_peer` (or earlier `add_known_peer`), so there
+        // is no fresh address payload to fold in here — only the trusted flag and
+        // the IP-ban cleanup.
+        if let Some(peer) = self.peers.get_mut(&peer_id) {
+            peer.make_trusted();
+            self.banned_peers.remove_validator_ip(&peer_id, peer.known_ip_addresses());
+        }
+
+        unban_action
     }
 
     /// Update committee for the new epoch.
@@ -922,63 +1014,34 @@ impl AllPeers {
     /// advertised listening addresses are updated and the peer is marked `trusted` so it won't
     /// incur any additional penalties.
     ///
-    /// Each committee member is resolved via the `bls_index`. Committee members that are not
-    /// yet known to `AllPeers` are logged as a warning — callers must first register them
-    /// (e.g. via `upsert_peer`) before they appear in the committee.
+    /// Each committee member is resolved via the `bls_index`. Members not yet known to
+    /// `AllPeers` are recorded in `current_committee_keys` with a `None` value and returned
+    /// in the second element of the tuple — callers can then issue a kad lookup. When that
+    /// lookup later resolves and `upsert_peer` runs, the same promotion logic runs there
+    /// (see `promote_committee_member`).
     pub(super) fn new_epoch(
         &mut self,
         committee: HashSet<BlsPublicKey>,
-    ) -> Vec<(PeerId, PeerAction)> {
+    ) -> (Vec<(PeerId, PeerAction)>, Vec<BlsPublicKey>) {
         // update current committee
         self.current_committee.clear();
         self.current_committee_keys.clear();
 
         let mut actions = Vec::with_capacity(committee.len());
+        let mut unresolved = Vec::new();
         for bls_key in committee {
             let Some(peer_id) = self.bls_index.get(&bls_key).copied() else {
                 warn!(target: "peer-manager", ?bls_key, "unknown committee member");
                 self.current_committee_keys.insert(bls_key, None);
+                unresolved.push(bls_key);
                 continue;
             };
-            self.current_committee.insert(peer_id);
-            self.current_committee_keys.insert(bls_key, Some(peer_id));
-            // the NewConnectionStatus doesn't affect this call
-            let status = self.ensure_peer_exists(&peer_id, &NewConnectionStatus::Unbanned);
-
-            match status {
-                ConnectionStatus::Disconnecting { banned } => {
-                    // unban peer
-                    if banned {
-                        warn!(target: "peer-manager", ?peer_id, "unbanning committee member that was disconnecting pending ban");
-                        let action =
-                            self.update_connection_status(&peer_id, NewConnectionStatus::Unbanned);
-                        actions.push((peer_id, action));
-                    }
-                }
-                ConnectionStatus::Banned { .. } => {
-                    warn!(target: "peer-manager", ?peer_id, "unbanning committee member that was disconnecting pending ban");
-                    let action =
-                        self.update_connection_status(&peer_id, NewConnectionStatus::Unbanned);
-                    actions.push((peer_id, action));
-                }
-                ConnectionStatus::Disconnected { .. }
-                | ConnectionStatus::Dialing { .. }
-                | ConnectionStatus::Unknown
-                | ConnectionStatus::Connected { .. } => { /* nothing to do */ }
-            }
-
-            // already ensured peer exists; addresses were populated when the peer was
-            // first registered via `upsert_peer` (or earlier `add_known_peer`), so there
-            // is no fresh address payload to fold in here — only the trusted flag and
-            // the IP-ban cleanup.
-            if let Some(peer) = self.peers.get_mut(&peer_id) {
-                peer.make_trusted();
-                self.banned_peers.remove_validator_ip(&peer_id, peer.known_ip_addresses());
+            if let Some(action) = self.promote_committee_member(bls_key, peer_id) {
+                actions.push((peer_id, action));
             }
         }
 
-        // return any unban actions for committee peers
-        actions
+        (actions, unresolved)
     }
 
     /// Check if a peer is eligible for dial attempt.
