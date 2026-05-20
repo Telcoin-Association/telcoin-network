@@ -67,7 +67,9 @@ Every published release carries two independent attestations:
    `gh attestation verify`.
 2. Two maintainer countersignatures produced locally with `cosign` and a
    YubiKey (PIV slot 9c, ECCP256, touch-required). Two-of-two: one
-   compromised key cannot ship a release.
+   compromised key cannot ship a release. Each maintainer signing event
+   is also recorded in the Sigstore Rekor public transparency log, so a
+   silent re-sign after the fact is detectable.
 
 Operators verify a downloaded tarball or pulled image with the commands in
 [`docs/INSTALL.md`](docs/INSTALL.md), or in one shot with

@@ -62,12 +62,11 @@ for s in grantkee sstanfield; do
   cosign verify-blob \
     --key "tn-verify/.github/release-keys/${s}.pem" \
     --signature "${ASSET}.${s}.sig" \
-    --insecure-ignore-tlog \
     "$ASSET"
 done
 ```
 
-`--insecure-ignore-tlog` is correct here: maintainer signatures are deliberately *not* on Rekor (CI provenance already is, and maintainer identities are pinned by the certs committed at the tag).
+Each maintainer signing event is also recorded in the public Sigstore Rekor transparency log; `cosign verify-blob` checks the Rekor entry by default and will fail if one is missing or tampered with.
 
 If both maintainer verifications print `Verified OK`, you have a release that:
 
@@ -108,7 +107,6 @@ git clone --depth=1 --branch "$TAG" \
 for s in grantkee sstanfield; do
   cosign verify \
     --key "tn-verify/.github/release-keys/${s}.pem" \
-    --insecure-ignore-tlog \
     "${REPO}@${DIGEST}"
 done
 
