@@ -22,6 +22,10 @@ Tag pattern controls the channel:
 |---------|---------|------------|
 | `vX.Y.Z`        | mainnet | `:vX.Y.Z`, `:latest` |
 | `vX.Y.Z-adiri`  | adiri (testnet) | `:vX.Y.Z-adiri`, `:adiri` |
+| `vX.Y.Z-rcN`    | rc (release candidate) | `:vX.Y.Z-rcN` (never `:latest`) |
+
+Tags that do not match one of these three patterns are rejected by both the workflow trigger and the meta job's case statement, so `git push origin v0.6.0-beta` or `v1.2.3.4` will not start a release run.
+Rc tags never overwrite the mainnet `:latest` rolling tag.
 
 The two channels coexist on the same commit if you tag twice, but normally mainnet releases come from a different commit than adiri releases.
 
