@@ -562,7 +562,10 @@ impl Inner {
         if let Ok(meta) = data.fetch(DATA_HEADER_BYTES as u64) {
             let meta = meta.into_epoch()?;
             if epoch_meta != meta {
-                return Err(PackError::InvalidEpoch);
+                return Err(PackError::InvalidEpoch(
+                    epoch,
+                    format!("open append has unexpected meta data, expected {epoch_meta:?} got {meta:?}"),
+                ));
             }
         } else {
             data.append(&PackRecord::EpochMeta(epoch_meta.clone()))
@@ -694,23 +697,47 @@ impl Inner {
         epoch_meta: &EpochMeta,
     ) -> Result<(), PackError> {
         if epoch != epoch_meta.epoch {
-            return Err(PackError::InvalidEpoch);
+            return Err(PackError::InvalidEpoch(
+                epoch,
+                format!("meta data epoch is {}", epoch_meta.epoch),
+            ));
         }
         let start_consensus_number =
             if epoch == 0 { 1 } else { previous_epoch.final_consensus.number + 1 };
         if start_consensus_number != epoch_meta.start_consensus_number {
-            return Err(PackError::InvalidEpoch);
+            return Err(PackError::InvalidEpoch(
+                epoch,
+                format!(
+                    "expected start consensus number {start_consensus_number}, got {}",
+                    epoch_meta.start_consensus_number
+                ),
+            ));
         }
         if previous_epoch.final_state != epoch_meta.genesis_exec_state {
-            return Err(PackError::InvalidEpoch);
+            return Err(PackError::InvalidEpoch(
+                epoch,
+                format!(
+                    "expected final state {:?} meta final state {:?}",
+                    previous_epoch.final_state, epoch_meta.genesis_exec_state
+                ),
+            ));
         }
         if previous_epoch.final_consensus != epoch_meta.genesis_consensus {
-            return Err(PackError::InvalidEpoch);
+            return Err(PackError::InvalidEpoch(
+                epoch,
+                format!(
+                    "expected final consensus {:?} meta final consensus {:?}",
+                    previous_epoch.final_consensus, epoch_meta.genesis_consensus
+                ),
+            ));
         }
         let committee: BTreeSet<BlsPublicKey> =
             previous_epoch.next_committee.iter().copied().collect();
         if epoch_meta.committee.bls_keys() != committee {
-            return Err(PackError::InvalidEpoch);
+            return Err(PackError::InvalidEpoch(
+                epoch,
+                "epoch meta has unexpected committee".to_string(),
+            ));
         }
         Ok(())
     }
@@ -1164,7 +1191,7 @@ pub enum PackError {
     InvalidConsensusChain,
     ExtraBatches,
     MissingBatches,
-    InvalidEpoch,
+    InvalidEpoch(Epoch, String),
     SendFailed,
     ReceiveFailed,
     PersistError(String),
@@ -1196,7 +1223,9 @@ impl Display for PackError {
             PackError::InvalidConsensusChain => write!(f, "Broken consensus record chain"),
             PackError::ExtraBatches => write!(f, "Extra batches in pack file"),
             PackError::MissingBatches => write!(f, "Missing batches in pack file"),
-            PackError::InvalidEpoch => write!(f, "Epoch meta data incorrect"),
+            PackError::InvalidEpoch(epoch, msg) => {
+                write!(f, "Epoch meta data incorrect, epoch {epoch}: {msg}")
+            }
             PackError::SendFailed => write!(f, "Internal channel send failed"),
             PackError::ReceiveFailed => write!(f, "Internal channel receive failed"),
             PackError::PersistError(e) => write!(f, "Failed to persist: {e}"),

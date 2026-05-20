@@ -457,7 +457,7 @@ impl PrimaryNetworkHandle {
                 | PackError::ExtraBatches
                 | PackError::MissingBatches
                 | PackError::CorruptPack
-                | PackError::InvalidEpoch => Some(Penalty::Severe),
+                | PackError::InvalidEpoch(_, _) => Some(Penalty::Severe),
                 PackError::IO(_)
                 | PackError::BatchLoad(_)
                 | PackError::EpochLoad(_)
