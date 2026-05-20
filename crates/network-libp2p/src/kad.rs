@@ -932,12 +932,8 @@ mod test {
         {
             let db = open_db(tmp_dir.path());
             let mut kad_store = KadStore::new(db.clone(), &key_config, KadStoreType::Primary);
-            let rec = Record {
-                key: key.clone(),
-                value: v1.clone(),
-                publisher: Some(publisher),
-                expires,
-            };
+            let rec =
+                Record { key: key.clone(), value: v1.clone(), publisher: Some(publisher), expires };
             kad_store.put(rec).expect("put record");
             assert_eq!(kad_store.num_records, 1);
             assert_eq!(kad_store.records().count(), 1);
@@ -955,12 +951,8 @@ mod test {
             assert_eq!(kad_store.num_records, 1, "row from previous boot survives restart");
             assert_eq!(kad_store.records().count(), 1);
 
-            let rec2 = Record {
-                key: key.clone(),
-                value: v2.clone(),
-                publisher: Some(publisher),
-                expires,
-            };
+            let rec2 =
+                Record { key: key.clone(), value: v2.clone(), publisher: Some(publisher), expires };
             kad_store.put(rec2).expect("put record");
 
             // The key collision must upsert, not append a new row.

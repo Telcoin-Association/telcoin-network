@@ -645,9 +645,9 @@ fn bls_net_peer(seed: u8) -> (BlsPublicKey, NetworkPublicKey, PeerId) {
 fn bls_rotation_same_peer_id_evicts_old_index() {
     // Same PeerId, new BLS key — the old BLS must no longer resolve.
     //
-    // NOTE: this should never happen. Validators can rotate peer ids
-    // but should not rotate BLS keys. This test demonstrates how the
-    // protocol handles this unexpected behavior.
+    // NOTE: Validators can rotate peer ids but should not rotate BLS keys.
+    // Observer nodes are discouraged from doing this but technically capable.
+    // This test demonstrates how the protocol handles this behavior.
     let mut all_peers = create_all_peers(None);
     let addr = create_multiaddr(None);
     let (_bls1, net, peer_id) = bls_net_peer(1);
@@ -808,4 +808,105 @@ fn record_timestamp_is_indexed_by_bls() {
     let ts2 = ts1 + 10;
     all_peers.upsert_peer(bls, net, vec![addr], ts2);
     assert_eq!(all_peers.record_timestamp(&bls), Some(ts2));
+}
+
+/// PoC test when a committee member is banned and then evicted by
+/// `prune_banned_peers` before the next epoch boundary, the `bls_index` entry is
+/// dropped along with the peer record. `new_epoch` then cannot resolve the BLS key
+/// to a `PeerId`, logs the "unknown committee member" warning, and the member is
+/// NOT added to `current_committee`, NOT unbanned, and NOT marked trusted.
+///
+/// Before this refactor `PeerManager::known_peers` survived pruning (it was never
+/// pruned), so this lookup succeeded. The new code makes pruning destructive for
+/// committee-resolution as well.
+#[test]
+fn test_banned_committee_member_pruned_then_new_epoch_lockout() {
+    // Set max_banned_peers = 0 so that ANY banned peer is excess and gets pruned
+    // on the next register_disconnected call. With a single banned peer (peer A),
+    // the prune heap is unambiguous: peer A is the one evicted.
+    let config = PeerConfig { max_banned_peers: 0, ..PeerConfig::default() };
+    let mut all_peers = create_all_peers(Some(config));
+
+    // Peer A: the validator we care about. Register via upsert_peer to populate
+    // both `peers` and `bls_index`.
+    let (_, net_a, peer_a) = bls_net_peer(80);
+    let mut rng = StdRng::from_seed([81; 32]);
+    let bls_a = *BlsKeypair::generate(&mut rng).public();
+    let addr_a = create_multiaddr(Some(IpAddr::V4("10.0.0.10".parse().unwrap())));
+    all_peers.upsert_peer(bls_a, net_a.clone(), vec![addr_a.clone()], now());
+    assert!(all_peers.contains_bls(&bls_a), "precondition: bls_a indexed");
+
+    // Drive peer A into Banned: Connected -> Disconnecting{banned:true} -> Disconnected.
+    // The Disconnected transition runs handle_disconnected_and_banned which promotes
+    // the peer's status to Banned and adds the IP ban record. Peer A is now the sole
+    // banned peer (banned_peers.total() == 1).
+    all_peers.update_connection_status(
+        &peer_a,
+        NewConnectionStatus::Connected {
+            multiaddr: addr_a.clone(),
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+    all_peers
+        .update_connection_status(&peer_a, NewConnectionStatus::Disconnecting { banned: true });
+    let action_a = all_peers.update_connection_status(&peer_a, NewConnectionStatus::Disconnected);
+    assert!(matches!(action_a, PeerAction::Ban(_)), "peer A must transition to Ban");
+    assert_eq!(all_peers.banned_peers.total(), 1);
+    assert!(matches!(
+        all_peers.peers.get(&peer_a).map(|p| *p.connection_status()),
+        Some(ConnectionStatus::Banned { .. })
+    ));
+
+    // Trigger pruning. register_disconnected on any random peer runs the prune
+    // pipeline. With max_banned_peers == 0 and one banned peer, peer A is excess
+    // and is evicted via remove_peer (which clears bls_index too).
+    let (_, pruned) = all_peers.register_disconnected(&PeerId::random());
+    assert_eq!(pruned.len(), 1, "exactly one banned peer must be pruned");
+    assert_eq!(pruned[0].0, peer_a, "peer A is the pruned banned entry");
+
+    // === F-1 ASSERTION 1: bls_index entry is dropped ===
+    assert!(
+        !all_peers.contains_bls(&bls_a),
+        "F-1 confirmed: pruning a banned peer drops its bls_index entry"
+    );
+    assert!(
+        all_peers.peers.get(&peer_a).is_none(),
+        "F-1 confirmed: pruning removes the peer record entirely"
+    );
+
+    // The next epoch boundary forwards the same BLS key into new_epoch. Because
+    // bls_index no longer has it, the warning "unknown committee member" fires
+    // and the peer is NOT re-added to current_committee, NOT unbanned, NOT trusted.
+    let mut committee = HashSet::new();
+    committee.insert(bls_a);
+    let actions = all_peers.new_epoch(committee);
+
+    // No unban action emitted because the committee member could not be resolved.
+    assert!(
+        actions.is_empty(),
+        "F-1 confirmed: new_epoch emits no actions for an unresolvable committee member"
+    );
+
+    // current_committee_keys records the BLS as missing (None value).
+    assert_eq!(
+        all_peers.current_committee_keys.get(&bls_a),
+        Some(&None),
+        "F-1 confirmed: bls is recorded with None peer_id in current_committee_keys"
+    );
+
+    // current_committee does NOT contain the old peer_id — peer was not re-added.
+    assert!(
+        !all_peers.current_committee.contains(&peer_a),
+        "F-1 confirmed: pruned peer not re-added to current_committee"
+    );
+    assert!(
+        !all_peers.is_peer_validator(&peer_a),
+        "F-1 confirmed: pruned peer is not treated as a validator after new_epoch"
+    );
+
+    // The peer record itself is still absent: no resurrection.
+    assert!(
+        all_peers.get_peer(&peer_a).is_none(),
+        "F-1 confirmed: peer record not auto-resurrected by new_epoch"
+    );
 }

@@ -102,8 +102,8 @@ impl AllPeers {
     ///     index since the peer is being re-bound.
     ///   - The BLS key `new_bls` already pointed at a different `PeerId` (BLS rotation across
     ///     peers). The orphan peer's `bls_public_key` is cleared via [`Peer::clear_bls`] so the
-    ///     peer record survives (it may still carry useful state) but stops being reachable via
-    ///     the index until its next `update_net`.
+    ///     peer record survives (it may still carry useful state) but stops being reachable via the
+    ///     index until its next `update_net`.
     fn rebind_bls(&mut self, peer_id: PeerId, new_bls: BlsPublicKey) {
         if let Some(peer) = self.peers.get(&peer_id) {
             if let Some(old_bls) = peer.bls_public_key() {
