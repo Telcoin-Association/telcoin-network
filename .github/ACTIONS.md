@@ -29,35 +29,20 @@ To bump nightly: edit `rust-nightly`. To bump stable: edit `rust-toolchain.toml`
 ## Public release pipeline (`release.yaml`)
 
 Triggered on tag push (`v*.*.*` for mainnet, `v*.*.*-adiri` for testnet).
-Independent of the on-chain attestation flow above — the two serve different
-audiences.
+Independent of the on-chain attestation flow above — the two serve different audiences.
 
 The workflow:
 
 1. `meta` — derives channel + image tag list from the git tag.
-2. `build-binary` — matrix on x86_64 + aarch64 linux runners, runs
-   `cargo build --release`, strips, tars, sha256sums, and emits SLSA build
-   provenance via `actions/attest-build-provenance@v2`.
-3. `build-image` — `docker buildx` multi-arch (linux/amd64 + linux/arm64) push
-   to `ghcr.io/telcoin-association/telcoin-network`, with provenance + SBOM
-   pushed alongside.
-4. `draft-release` — aggregates `SHA256SUMS`, creates a **draft** GitHub
-   Release containing the tarballs, the checksums file, and the image digest
-   in the release body.
+2. `build-binary` — matrix on x86_64 + aarch64 linux runners, runs `cargo build --release`, strips, tars, sha256sums, and emits SLSA build provenance via `actions/attest-build-provenance@v2`.
+3. `build-image` — `docker buildx` multi-arch (linux/amd64 + linux/arm64) push to `ghcr.io/telcoin-association/telcoin-network`, with provenance + SBOM pushed alongside.
+4. `draft-release` — aggregates `SHA256SUMS`, creates a **draft** GitHub Release containing the tarballs, the checksums file, and the image digest in the release body.
 
-The draft sits unpublished until two maintainers run `make release-sign` from
-their laptops with their respective YubiKeys. See
-[`docs/RELEASING.md`](../docs/RELEASING.md) for the full runbook and
-[`docs/INSTALL.md`](../docs/INSTALL.md) for the operator-side verification
-commands.
+The draft sits unpublished until two maintainers run `make release-sign` with their respective hardware keys. See [`docs/RELEASING.md`](../docs/RELEASING.md) for the full runbook and [`docs/INSTALL.md`](../docs/INSTALL.md) for the operator-side verification commands.
 
 The maintainer countersignature certs live in [`release-keys/`](release-keys/).
-They are pinned at the tag — operators clone the repo at `$TAG` and use those
-certs as the trust anchor.
+They are pinned at the tag — operators clone the repo at `$TAG` and use those certs as the trust anchor.
 
 ## Why both?
 
-The on-chain attestation is governance evidence ("the team approved this
-commit"). The release pipeline produces verifiable artifacts ("anyone can
-prove the binary they downloaded came from this commit, signed by the team").
-They overlap zero. Don't conflate them.
+The on-chain attestation is governance evidence ("the team approved this commit"). The release pipeline produces verifiable artifacts ("anyone can prove the binary they downloaded came from this commit, signed by the team"). They overlap zero. Don't conflate them.
