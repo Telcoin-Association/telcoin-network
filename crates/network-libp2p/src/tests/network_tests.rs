@@ -12,7 +12,7 @@ use tn_config::{ConsensusConfig, NetworkConfig};
 use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
-use tn_types::{Certificate, Header, TaskManager};
+use tn_types::{now, Certificate, Header, TaskManager};
 use tokio::{sync::mpsc, time::timeout};
 
 /// Test topic for gossip.

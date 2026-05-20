@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tn_config::{PeerConfig, ScoreConfig};
-use tn_types::{now, BlsKeypair, NetworkKeypair};
+use tn_types::{BlsKeypair, NetworkKeypair};
 
 /// Helper function to create a test AllPeers instance
 fn create_all_peers(peer_config: Option<PeerConfig>) -> AllPeers {
@@ -29,7 +29,7 @@ fn test_add_trusted_peer() {
     let bls = *BlsKeypair::generate(&mut rng).public();
     let net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
     let peer_id: PeerId = net.clone().into();
-    all_peers.add_trusted_peer(bls, net, vec![addr.clone()], now());
+    all_peers.add_trusted_peer(bls, net, vec![addr.clone()]);
 
     assert!(all_peers.peers.contains_key(&peer_id));
     let peer = all_peers.peers.get_mut(&peer_id).unwrap();
@@ -123,7 +123,7 @@ fn test_peer_exchange() {
         );
         let mut rng = StdRng::from_seed([i; 32]);
         let bls = *BlsKeypair::generate(&mut rng).public();
-        all_peers.upsert_peer(bls, network_key, vec![addr], now());
+        all_peers.upsert_peer(bls, network_key, vec![addr]);
     }
 
     // Add a disconnected peer
@@ -657,12 +657,12 @@ fn bls_rotation_same_peer_id_evicts_old_index() {
     let mut rng = StdRng::from_seed([3; 32]);
     let bls2 = *BlsKeypair::generate(&mut rng).public();
 
-    all_peers.upsert_peer(bls1, net.clone(), vec![addr.clone()], now());
+    all_peers.upsert_peer(bls1, net.clone(), vec![addr.clone()]);
     assert_eq!(all_peers.peer_to_bls(&peer_id), Some(bls1));
     assert!(all_peers.auth_to_peer(&bls1).is_some());
 
     // rotate BLS on the same PeerId
-    all_peers.upsert_peer(bls2, net, vec![addr.clone()], now());
+    all_peers.upsert_peer(bls2, net, vec![addr.clone()]);
 
     // bug B regression: old BLS must not resolve to a live-looking entry
     assert!(all_peers.auth_to_peer(&bls1).is_none(), "stale BLS must not resolve");
@@ -682,8 +682,8 @@ fn peer_id_rotation_same_bls_orphans_old_peer() {
     let mut rng = StdRng::from_seed([6; 32]);
     let bls = *BlsKeypair::generate(&mut rng).public();
 
-    all_peers.upsert_peer(bls, net1, vec![addr.clone()], now());
-    all_peers.upsert_peer(bls, net2, vec![addr], now());
+    all_peers.upsert_peer(bls, net1, vec![addr.clone()]);
+    all_peers.upsert_peer(bls, net2, vec![addr]);
 
     // index now points at the new peer
     assert_eq!(all_peers.auth_to_peer(&bls).map(|(pid, _)| pid), Some(peer_id_2));
@@ -705,7 +705,7 @@ fn prune_disconnected_clears_bls_index() {
         let mut rng = StdRng::from_seed([100 + i; 32]);
         let bls = *BlsKeypair::generate(&mut rng).public();
         let addr = create_multiaddr(None);
-        all_peers.upsert_peer(bls, net, vec![addr], now());
+        all_peers.upsert_peer(bls, net, vec![addr]);
         // age the disconnect instant so prune ordering is deterministic
         all_peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
         if let Some(peer) = all_peers.peers.get_mut(&peer_id) {
@@ -751,7 +751,7 @@ fn inbound_unknown_lifecycle() {
     // hashes to peer_id, the same Peer entry is updated rather than replaced.
     let mut rng = StdRng::from_seed([43; 32]);
     let bls = *BlsKeypair::generate(&mut rng).public();
-    all_peers.upsert_peer(bls, net, vec![addr], now());
+    all_peers.upsert_peer(bls, net, vec![addr]);
 
     assert_eq!(all_peers.peer_to_bls(&peer_id), Some(bls));
     assert_eq!(all_peers.auth_to_peer(&bls).map(|(pid, _)| pid), Some(peer_id));
@@ -766,7 +766,7 @@ fn new_epoch_resolves_via_index() {
     let addr = create_multiaddr(None);
 
     // register the peer up-front
-    all_peers.upsert_peer(bls, net, vec![addr], now());
+    all_peers.upsert_peer(bls, net, vec![addr]);
     assert!(!all_peers.get_peer(&peer_id).unwrap().is_trusted());
 
     let mut committee = HashSet::new();
@@ -795,23 +795,6 @@ fn new_epoch_warns_on_unknown_member() {
     assert!(!all_peers.contains_bls(&unknown_bls));
 }
 
-#[test]
-fn record_timestamp_is_indexed_by_bls() {
-    let mut all_peers = create_all_peers(None);
-    let (_, net, _peer_id) = bls_net_peer(70);
-    let mut rng = StdRng::from_seed([71; 32]);
-    let bls = *BlsKeypair::generate(&mut rng).public();
-    let addr = create_multiaddr(None);
-
-    let ts1 = now();
-    all_peers.upsert_peer(bls, net.clone(), vec![addr.clone()], ts1);
-    assert_eq!(all_peers.record_timestamp(&bls), Some(ts1));
-
-    let ts2 = ts1 + 10;
-    all_peers.upsert_peer(bls, net, vec![addr], ts2);
-    assert_eq!(all_peers.record_timestamp(&bls), Some(ts2));
-}
-
 /// Regression: a committee validator that gets banned mid-epoch must survive
 /// `prune_banned_peers` (it is protected by `is_protected`), and the next `new_epoch`
 /// must reaffirm it as a trusted committee member — no kad re-discovery required.
@@ -826,7 +809,7 @@ fn test_banned_committee_member_survives_prune_and_remains_committee() {
     let mut rng = StdRng::from_seed([81; 32]);
     let bls_a = *BlsKeypair::generate(&mut rng).public();
     let addr_a = create_multiaddr(Some(IpAddr::V4("10.0.0.10".parse().unwrap())));
-    all_peers.upsert_peer(bls_a, net_a.clone(), vec![addr_a.clone()], now());
+    all_peers.upsert_peer(bls_a, net_a.clone(), vec![addr_a.clone()]);
     assert!(all_peers.contains_bls(&bls_a), "precondition: bls_a indexed");
 
     // Promote peer A to committee FIRST so it is `is_trusted == true` going into the
@@ -909,7 +892,7 @@ fn prune_skips_protected_peer_logs_warn() {
     let mut rng = StdRng::from_seed([91; 32]);
     let bls_t = *BlsKeypair::generate(&mut rng).public();
     let addr_t = create_multiaddr(Some(IpAddr::V4("10.0.1.1".parse().unwrap())));
-    all_peers.add_trusted_peer(bls_t, net_t, vec![addr_t.clone()], now());
+    all_peers.add_trusted_peer(bls_t, net_t, vec![addr_t.clone()]);
     all_peers
         .update_connection_status(&peer_t, NewConnectionStatus::Disconnecting { banned: true });
     let action = all_peers.update_connection_status(&peer_t, NewConnectionStatus::Disconnected);
@@ -966,7 +949,7 @@ fn prune_with_only_protected_peers_keeps_all() {
         let net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
         let peer_id: PeerId = net.clone().into();
         let addr = create_multiaddr(None);
-        all_peers.add_trusted_peer(bls, net, vec![addr], now());
+        all_peers.add_trusted_peer(bls, net, vec![addr]);
         peer_ids.push(peer_id);
     }
 
@@ -1026,7 +1009,7 @@ fn upsert_peer_promotes_unresolved_committee_member() {
     // The peer is freshly inserted (no prior connection state), so no Unban action
     // is required — promote_committee_member returns None and upsert_peer reports None.
     // The promotion side effects must still land.
-    let promoted = all_peers.upsert_peer(bls_a, net_a, vec![addr_a], now());
+    let promoted = all_peers.upsert_peer(bls_a, net_a, vec![addr_a]);
     assert!(promoted.is_none(), "no unban action needed for a freshly-inserted committee peer");
 
     // promotion side-effects
@@ -1050,7 +1033,7 @@ fn upsert_peer_promotes_banned_committee_member_via_kad() {
     // forgotten by `bls_index` via a rotation orphan (or equivalent). Here we use a
     // direct BLS rotation so the original bls_a is no longer indexed, but the peer
     // record at peer_a survives in Banned state.
-    all_peers.upsert_peer(bls_a, net_a.clone(), vec![addr_a.clone()], now());
+    all_peers.upsert_peer(bls_a, net_a.clone(), vec![addr_a.clone()]);
     all_peers.update_connection_status(
         &peer_a,
         NewConnectionStatus::Connected {
@@ -1070,7 +1053,7 @@ fn upsert_peer_promotes_banned_committee_member_via_kad() {
     // bls_index, so the next new_epoch will treat it as unresolved.
     let mut rng2 = StdRng::from_seed([127; 32]);
     let other_bls = *BlsKeypair::generate(&mut rng2).public();
-    all_peers.upsert_peer(other_bls, net_a.clone(), vec![addr_a.clone()], now());
+    all_peers.upsert_peer(other_bls, net_a.clone(), vec![addr_a.clone()]);
     assert!(!all_peers.contains_bls(&bls_a));
 
     // new_epoch records bls_a as unresolved.
@@ -1081,7 +1064,7 @@ fn upsert_peer_promotes_banned_committee_member_via_kad() {
 
     // Simulate a kad result that re-binds bls_a back to peer_a — upsert_peer must
     // surface the Unban action AND apply the promotion side effects.
-    let promoted = all_peers.upsert_peer(bls_a, net_a, vec![addr_a], now());
+    let promoted = all_peers.upsert_peer(bls_a, net_a, vec![addr_a]);
     let (promoted_peer, action) =
         promoted.expect("promotion must surface an unban action for the banned committee peer");
     assert_eq!(promoted_peer, peer_a);

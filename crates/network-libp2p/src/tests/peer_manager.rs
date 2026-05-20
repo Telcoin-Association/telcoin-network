@@ -16,7 +16,7 @@ use std::{
 use tn_config::{KeyConfig, NetworkConfig, ScoreConfig};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
-use tn_types::{now, BlsKeypair, BlsPublicKey, NetworkKeypair, NetworkPublicKey};
+use tn_types::{BlsKeypair, BlsPublicKey, NetworkKeypair, NetworkPublicKey};
 use tokio::time::{sleep, timeout};
 
 fn create_test_peer_manager(network_config: Option<NetworkConfig>) -> PeerManager {
@@ -139,7 +139,8 @@ async fn test_add_trusted_peer() {
     // Add trusted peer
     peer_manager.add_trusted_peer_and_dial(
         peer_bls,
-        NetworkInfo { pubkey: peer_netkey, multiaddrs: vec![multiaddr.clone()], timestamp: now() },
+        peer_netkey,
+        vec![multiaddr.clone()],
         sender,
     );
 
@@ -551,12 +552,11 @@ async fn test_is_validator() {
     let validator = *authority_1.authority().protocol_key();
     let random_peer_id = PeerId::random();
 
-    let info = NetworkInfo {
-        pubkey: config.key_config().primary_network_public_key(),
-        multiaddrs: vec![config.primary_address()],
-        timestamp: now(),
-    };
-    peer_manager.add_known_peer(validator, info);
+    peer_manager.add_known_peer(
+        validator,
+        config.key_config().primary_network_public_key(),
+        vec![config.primary_address()],
+    );
 
     // update epoch with random multiaddr
     let committee = config.committee_pub_keys();
@@ -649,10 +649,7 @@ async fn test_peers_for_exchange() {
         assert!(peer_manager.register_peer_connection(&peer_id, connection));
         let mut rng = StdRng::from_seed([i; 32]);
         let bls = *BlsKeypair::generate(&mut rng).public();
-        peer_manager.add_known_peer(
-            bls,
-            NetworkInfo { pubkey: network_key, multiaddrs: vec![addr], timestamp: now() },
-        );
+        peer_manager.add_known_peer(bls, network_key, vec![addr]);
     }
 
     // Get peers for exchange

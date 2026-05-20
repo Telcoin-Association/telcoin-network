@@ -12,7 +12,7 @@ use libp2p::{
 };
 use std::{collections::HashSet, net::IpAddr, time::Instant};
 use tn_config::PeerConfig;
-use tn_types::{BlsPublicKey, NetworkPublicKey, TimestampSec};
+use tn_types::{BlsPublicKey, NetworkPublicKey};
 use tracing::error;
 
 /// Information about a given connected peer.
@@ -50,12 +50,6 @@ pub(super) struct Peer {
     /// prioritizes non-routable peers during connection limit pruning. If a peer is not in the
     /// routing table and this node needs to prune connections, then the peer may be disconnected.
     routable: bool,
-    /// Timestamp from the most recent `NetworkInfo` that produced this peer record.
-    ///
-    /// `None` for peers materialized from inbound connections before we learned
-    /// their BLS-signed kad record. Set by `Peer::new`, `Peer::new_trusted`, and
-    /// each subsequent `Peer::update_net` call.
-    record_timestamp: Option<TimestampSec>,
 }
 
 impl Peer {
@@ -64,7 +58,6 @@ impl Peer {
         bls_public_key: BlsPublicKey,
         network_key: NetworkPublicKey,
         listening_addrs: Vec<Multiaddr>,
-        timestamp: TimestampSec,
     ) -> Peer {
         Self {
             bls_public_key: Some(bls_public_key),
@@ -77,7 +70,6 @@ impl Peer {
             connection_status: Default::default(),
             connection_direction: Default::default(),
             routable: false,
-            record_timestamp: Some(timestamp),
         }
     }
 
@@ -86,7 +78,6 @@ impl Peer {
         bls_public_key: BlsPublicKey,
         network_key: NetworkPublicKey,
         listening_addrs: Vec<Multiaddr>,
-        timestamp: TimestampSec,
     ) -> Peer {
         Self {
             bls_public_key: Some(bls_public_key),
@@ -99,7 +90,6 @@ impl Peer {
             connection_status: Default::default(),
             connection_direction: Default::default(),
             routable: false,
-            record_timestamp: Some(timestamp),
         }
     }
 
@@ -122,7 +112,6 @@ impl Peer {
             connection_status: Default::default(),
             connection_direction: Default::default(),
             routable: false,
-            record_timestamp: None,
         }
     }
 
@@ -136,23 +125,16 @@ impl Peer {
         bls_public_key: BlsPublicKey,
         network_key: NetworkPublicKey,
         multiaddrs: Vec<Multiaddr>,
-        timestamp: TimestampSec,
     ) {
         self.bls_public_key = Some(bls_public_key);
         self.network_key = Some(network_key);
         self.listening_addrs = multiaddrs.clone();
         self.multiaddrs.extend(multiaddrs);
-        self.record_timestamp = Some(timestamp);
     }
 
     /// This peers Bls public key.
     pub(super) fn bls_public_key(&self) -> Option<BlsPublicKey> {
         self.bls_public_key
-    }
-
-    /// Return the timestamp from the most recent network record applied to this peer.
-    pub(super) fn record_timestamp(&self) -> Option<TimestampSec> {
-        self.record_timestamp
     }
 
     /// Clear the peer's BLS public key.

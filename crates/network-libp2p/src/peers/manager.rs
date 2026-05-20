@@ -9,10 +9,8 @@ use super::{
     PeerEvent, PeerExchangeMap, Penalty,
 };
 use crate::{
-    error::NetworkError,
-    peers::status::ConnectionStatus,
-    send_or_log_error,
-    types::{NetworkInfo, NetworkResult},
+    error::NetworkError, peers::status::ConnectionStatus, send_or_log_error,
+    types::NetworkResult,
 };
 use libp2p::{core::ConnectedPoint, kad::PeerInfo, multiaddr::Protocol, Multiaddr, PeerId};
 use rand::seq::{IteratorRandom as _, SliceRandom as _};
@@ -22,7 +20,7 @@ use std::{
     task::Context,
 };
 use tn_config::PeerConfig;
-use tn_types::BlsPublicKey;
+use tn_types::{BlsPublicKey, NetworkPublicKey};
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, trace, warn};
 
@@ -106,12 +104,12 @@ impl PeerManager {
     pub(crate) fn add_trusted_peer_and_dial(
         &mut self,
         bls_key: BlsPublicKey,
-        info: NetworkInfo,
+        network_key: NetworkPublicKey,
+        multiaddrs: Vec<Multiaddr>,
         reply: oneshot::Sender<NetworkResult<()>>,
     ) {
-        let peer_id: PeerId = info.pubkey.clone().into();
-        let multiaddrs = info.multiaddrs.clone();
-        self.peers.add_trusted_peer(bls_key, info.pubkey, multiaddrs.clone(), info.timestamp);
+        let peer_id: PeerId = network_key.clone().into();
+        self.peers.add_trusted_peer(bls_key, network_key, multiaddrs.clone());
 
         // remove from temporary banned and warn if peer was banned
         if self.temporarily_banned.remove(&peer_id) {
@@ -634,10 +632,15 @@ impl PeerManager {
 
     /// Add a known peer to the known list.
     /// Used for bootstrap servers or possibly committee members.
-    pub(crate) fn add_known_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
+    pub(crate) fn add_known_peer(
+        &mut self,
+        bls_key: BlsPublicKey,
+        network_key: NetworkPublicKey,
+        listening_addrs: Vec<Multiaddr>,
+    ) {
         trace!(target: "peer-manager", ?bls_key, "adding known peer");
         if let Some((peer_id, action)) =
-            self.peers.upsert_peer(bls_key, info.pubkey, info.multiaddrs, info.timestamp)
+            self.peers.upsert_peer(bls_key, network_key, listening_addrs)
         {
             trace!(target: "peer-manager", ?bls_key, ?peer_id, "promoted unresolved committee member via upsert_peer");
             self.apply_peer_action(peer_id, action);

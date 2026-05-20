@@ -32,7 +32,7 @@ use std::{
     net::IpAddr,
     time::{Duration, Instant},
 };
-use tn_types::{BlsPublicKey, NetworkPublicKey, TimestampSec};
+use tn_types::{BlsPublicKey, NetworkPublicKey};
 use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
 #[cfg(test)]
@@ -129,10 +129,9 @@ impl AllPeers {
         bls_public_key: BlsPublicKey,
         network_key: NetworkPublicKey,
         addr: Vec<Multiaddr>,
-        timestamp: TimestampSec,
     ) {
         let peer_id: PeerId = network_key.clone().into();
-        let trusted_peer = Peer::new_trusted(bls_public_key, network_key, addr, timestamp);
+        let trusted_peer = Peer::new_trusted(bls_public_key, network_key, addr);
         let _ = self.banned_peers.remove_banned_peer(trusted_peer.known_ip_addresses());
         self.rebind_bls(peer_id, bls_public_key);
         self.peers.insert(peer_id, trusted_peer);
@@ -150,14 +149,13 @@ impl AllPeers {
         bls_public_key: BlsPublicKey,
         network_key: NetworkPublicKey,
         addrs: Vec<Multiaddr>,
-        timestamp: TimestampSec,
     ) -> Option<(PeerId, PeerAction)> {
         let peer_id: PeerId = network_key.clone().into();
         self.rebind_bls(peer_id, bls_public_key);
         if let Some(peer) = self.peers.get_mut(&peer_id) {
-            peer.update_net(bls_public_key, network_key, addrs, timestamp);
+            peer.update_net(bls_public_key, network_key, addrs);
         } else {
-            let peer = Peer::new(bls_public_key, network_key, addrs, timestamp);
+            let peer = Peer::new(bls_public_key, network_key, addrs);
             self.peers.insert(peer_id, peer);
         }
 
@@ -709,17 +707,6 @@ impl AllPeers {
         let peer_id = self.bls_index.get(bls_key)?;
         let peer = self.peers.get(peer_id)?;
         Some((*peer_id, peer.listening_addrs_clone()))
-    }
-
-    /// Return the most recent record timestamp known for a peer indexed by BLS key.
-    ///
-    /// Currently only exercised by unit tests; reserved for future use by kad-record
-    /// freshness comparisons that need a BLS-keyed view of timestamps (the on-disk kad
-    /// store is the authoritative source for `is_newer_record` today).
-    #[allow(dead_code)]
-    pub(super) fn record_timestamp(&self, bls_key: &BlsPublicKey) -> Option<TimestampSec> {
-        let peer_id = self.bls_index.get(bls_key)?;
-        self.peers.get(peer_id).and_then(|p| p.record_timestamp())
     }
 
     /// True if a BLS public key is associated with a known peer.

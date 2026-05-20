@@ -56,7 +56,7 @@ This section covers the `bls_index ↔ Peer::bls_public_key` correspondence and 
 
 ### INV-044 — Rotation preserves the orphan Peer record
 
-- **Statement:** When `rebind_bls(pid, bls)` rebinds `bls` from an existing `old_pid` to a different `pid`, the `Peer` record at `old_pid` is retained in `peers` with `bls_public_key = None`; all other fields (score, connection status, observed IPs, listening addrs, `record_timestamp`) are preserved. The orphan is unreachable from the BLS index until its next `update_net` rebinds it.
+- **Statement:** When `rebind_bls(pid, bls)` rebinds `bls` from an existing `old_pid` to a different `pid`, the `Peer` record at `old_pid` is retained in `peers` with `bls_public_key = None`; all other fields (score, connection status, observed IPs, listening addrs) are preserved. The orphan is unreachable from the BLS index until its next `update_net` rebinds it.
 - **Why:** Score and connection history must survive a network-key rotation so that a peer cannot launder accrued penalties by rotating its libp2p identity while reusing its BLS key. The retained state is also useful for in-flight connection accounting when the old endpoint has not yet disconnected.
 - **Enforced at:** `all_peers.rs:115-121` (the orphan-clearing branch of `rebind_bls`), `peer.rs:158-165` (`clear_bls`); test coverage at `tests/peers.rs:675-693` (`peer_id_rotation_same_bls_orphans_old_peer`) and `tests/peers.rs:645-672` (`bls_rotation_same_peer_id_evicts_old_index`).
 - **Violation impact:** Either dropping the orphan eagerly (losing score history → laundering channel) or leaving the BLS index pointing at the old `PeerId` (consensus loses the validator from `auth_to_peer`). The connected-orphan cleanup itself is lazy and not explicitly bounded — see Appendix A10.
@@ -460,18 +460,6 @@ These properties are _expected_ by readers of the code but not _guaranteed_ by c
 **Where:** `all_peers.rs:115-121` (`rebind_bls` clears `Peer::bls_public_key` but does not change `connection_status`); `:898-916` (`prune_disconnected_peers` only evicts peers in `ConnectionStatus::Disconnected`).
 **Symptom:** When a validator rotates its `PeerId` under the same BLS key (INV-044), the old `Peer` record is retained with `bls_public_key = None`. If the old endpoint stays `Connected`, that orphan record lives in `peers` indefinitely — there is no per-`PeerId` cap and no orphan-specific sweeper. Aggregate `max_peers()` bounds the connected pool overall, but a flood of rotated identities held open could exhaust slots that would otherwise serve legitimate peers.
 **Mitigation:** Either disconnect the orphan's `PeerId` eagerly inside `rebind_bls`, or sweep `peers` for `bls_public_key == None && connection_status.is_connected()` during heartbeat and disconnect them.
-
-### A11 — record_timestamp lifecycle is undocumented
-
-**Where:** `peer.rs:58` (field), `:141-146` (set by `update_net`), `:154-156` (`record_timestamp` accessor); `all_peers.rs:707-711` (forward by BLS key).
-**Symptom:** The intended monotonicity, freshness window, and dedup semantics of `record_timestamp` are not specified. Callers (kad signed-record dedup logic) need to know whether older timestamps may overwrite newer ones, whether equality should be tied, and what an `update_net` with a regressing timestamp means. The current implementation unconditionally overwrites on each `update_net` call (`peer.rs:145`), so a slower-arriving older record from a gossip race could regress the timestamp.
-**Mitigation:** Either document the monotonicity contract here as a numbered invariant once kad dedup lands, or reject `update_net` calls with a non-monotonic timestamp at the `AllPeers` boundary.
-
-### A12 — clear_bls does not clear record_timestamp
-
-**Where:** `peer.rs:163-165` (`clear_bls` only nulls `bls_public_key`).
-**Symptom:** After a rotation, the orphaned `Peer` retains the `record_timestamp` from its previous BLS binding. If a future caller treats `record_timestamp` as scoped to the current BLS (e.g., "freshness of the BLS-signed network record for this validator"), the stale value will be misinterpreted. Today `record_timestamp` is only read via the BLS-keyed accessor `AllPeers::record_timestamp(bls_key)` (`all_peers.rs:707-711`), which resolves through `bls_index` — so the orphan's stale value is unreachable through the supported API. The footgun is latent until a new caller reads the field by `PeerId` directly.
-**Mitigation:** Decide whether `record_timestamp` is scoped to the BLS binding (clear it inside `clear_bls`) or to the `Peer` record (keep, but document). Today's behavior is the latter by omission, not by design.
 
 ## Appendix B. Configuration knobs referenced by these invariants
 

@@ -10,7 +10,7 @@ use crate::{
     send_or_log_error,
     stream::{StreamBehavior, StreamEvent},
     types::{
-        KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo, NetworkResponseMessage,
+        KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResponseMessage,
         NetworkResponseSender, NetworkResult, NodeRecord,
     },
     PeerExchangeMap,
@@ -35,7 +35,7 @@ use std::{
 };
 use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig};
 use tn_types::{
-    decode, encode, now, try_decode, BlsPublicKey, BlsSigner, Database, NetworkKeypair,
+    decode, encode, try_decode, BlsPublicKey, BlsSigner, Database, NetworkKeypair,
     NetworkPublicKey, TaskSpawner, TnSender,
 };
 use tokio::sync::{
@@ -285,7 +285,11 @@ where
             match BlsPublicKey::from_literal_bytes(record.key.as_ref()) {
                 Ok(key) => {
                     let record: NodeRecord = decode(&record.value);
-                    behavior.peer_manager.add_known_peer(key, record.info);
+                    behavior.peer_manager.add_known_peer(
+                        key,
+                        record.info.pubkey,
+                        record.info.multiaddrs,
+                    );
                 }
                 // How did we get a KAD record with a broken key?
                 Err(error) => {
@@ -534,11 +538,8 @@ where
                 // update peer manager
                 self.swarm.behaviour_mut().peer_manager.add_trusted_peer_and_dial(
                     bls_pubkey,
-                    NetworkInfo {
-                        pubkey: network_pubkey,
-                        multiaddrs: vec![addr],
-                        timestamp: now(),
-                    },
+                    network_pubkey,
+                    vec![addr],
                     reply,
                 );
             }
@@ -546,11 +547,8 @@ where
                 // update peer manager
                 self.swarm.behaviour_mut().peer_manager.add_known_peer(
                     bls_pubkey,
-                    NetworkInfo {
-                        pubkey: network_pubkey,
-                        multiaddrs: vec![addr],
-                        timestamp: now(),
-                    },
+                    network_pubkey,
+                    vec![addr],
                 );
                 let _ = reply.send(Ok(()));
             }
@@ -559,14 +557,7 @@ where
                 let peer = &mut self.swarm.behaviour_mut().peer_manager;
                 for (bls, info) in peers {
                     if peer.auth_to_peer(bls).is_none() {
-                        peer.add_known_peer(
-                            bls,
-                            NetworkInfo {
-                                pubkey: info.network_key,
-                                multiaddrs: vec![info.network_address],
-                                timestamp: now(),
-                            },
-                        );
+                        peer.add_known_peer(bls, info.network_key, vec![info.network_address]);
                     }
                 }
                 let _ = reply.send(Ok(()));
@@ -1393,7 +1384,11 @@ where
                     .put(record)
                     .map_err(|e| NetworkError::StoreKademliaRecord(e.to_string()))?;
                 trace!(target: "network-kad", "Got record {key} {value:?}");
-                self.swarm.behaviour_mut().peer_manager.add_known_peer(key, value.info);
+                self.swarm.behaviour_mut().peer_manager.add_known_peer(
+                    key,
+                    value.info.pubkey,
+                    value.info.multiaddrs,
+                );
             } else {
                 // mild punishment for old record
                 trace!(target: "network-kad", ?source, "processing mild penalty for old record");
@@ -1493,10 +1488,11 @@ where
     fn close_kad_query(&mut self, query_id: &QueryId) {
         if let Some(query) = self.kad_record_queries.remove(query_id) {
             if let Some(node_record) = query.result {
-                self.swarm
-                    .behaviour_mut()
-                    .peer_manager
-                    .add_known_peer(query.request, node_record.info);
+                self.swarm.behaviour_mut().peer_manager.add_known_peer(
+                    query.request,
+                    node_record.info.pubkey,
+                    node_record.info.multiaddrs,
+                );
             }
         }
     }
