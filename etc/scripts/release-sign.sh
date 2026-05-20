@@ -61,6 +61,18 @@ for cmd in cosign gh; do
   fi
 done
 
+# Fail loudly if any committed maintainer cert is still a placeholder.
+# Without this the YubiKey would sign happily but every operator running
+# release-verify.sh would later hit an opaque OpenSSL parse error.
+SIGNERS=(grantkee sstanfield)
+for signer in "${SIGNERS[@]}"; do
+  cert=".github/release-keys/${signer}.pem"
+  if [[ ! -s "$cert" ]] || grep -q 'PLACEHOLDER' "$cert"; then
+    echo "ERROR: committed cert $cert is missing, empty, or a placeholder — this release predates key provisioning." >&2
+    exit 1
+  fi
+done
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 echo ">>> work dir: $WORK"

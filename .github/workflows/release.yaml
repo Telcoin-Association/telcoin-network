@@ -27,6 +27,23 @@ jobs:
       tag: ${{ github.ref_name }}
       docker_tags: ${{ steps.c.outputs.docker_tags }}
     steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: guard against placeholder release keys
+        run: |
+          set -euo pipefail
+          for f in .github/release-keys/grantkee.pem .github/release-keys/sstanfield.pem; do
+            if [[ ! -s "$f" ]]; then
+              echo "::error file=$f::release-key file is missing or empty" >&2
+              exit 1
+            fi
+            if grep -q 'PLACEHOLDER' "$f"; then
+              echo "::error file=$f::release-key file is still a placeholder — provision a real PEM before tagging a release" >&2
+              exit 1
+            fi
+          done
+
       - id: c
         env:
           TAG: ${{ github.ref_name }}
