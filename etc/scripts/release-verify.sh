@@ -27,7 +27,7 @@ REGISTRY="ghcr.io"
 IMAGE="${REGISTRY}/${REPO}"
 SIGNERS=(grantkee sstanfield)
 
-for cmd in cosign gh; do
+for cmd in cosign gh docker jq; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     echo "missing required command: $cmd" >&2
     exit 2
@@ -89,10 +89,13 @@ for asset in "$WORK"/*.tar.gz "$WORK"/SHA256SUMS; do
 done
 
 # 3) Image signatures by digest.
-DIGEST="$(gh release view "$TAG" --repo "$REPO" --json body --jq .body \
-  | grep -oE 'sha256:[a-f0-9]{64}' | head -n1)"
-if [[ -z "$DIGEST" ]]; then
-  echo "could not extract image digest from release body" >&2
+#
+# Resolve the digest from the registry rather than the release body.
+# Keeps sign and verify in agreement on a single source of truth.
+DIGEST="$(docker buildx imagetools inspect "${IMAGE}:${TAG}" \
+  --format '{{ json .Manifest }}' | jq -r .digest)"
+if [[ -z "$DIGEST" || "$DIGEST" != sha256:* ]]; then
+  echo "could not resolve image digest for ${IMAGE}:${TAG} from registry" >&2
   exit 1
 fi
 
