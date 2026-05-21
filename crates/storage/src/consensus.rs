@@ -30,6 +30,7 @@ use tracing::error;
 use crate::{
     consensus_pack::{ConsensusPack, PackError, DATA_NAME},
     epoch_records::{EpochDbError, EpochRecordDb},
+    traits::{ConsensusChainReader, ConsensusChainWriter},
 };
 
 pub trait ReadStream: AsyncRead + AsyncSeek + Send + Unpin {}
@@ -725,6 +726,145 @@ impl ConsensusChain {
         pack.persist().await?; // Surface any open errors.
         self.recent_packs.lock().push_back(pack.clone());
         Ok(pack)
+    }
+}
+
+impl ConsensusChainReader for ConsensusChain {
+    fn consensus_header_by_digest(
+        &self,
+        epoch: Epoch,
+        digest: B256,
+    ) -> impl std::future::Future<Output = Result<Option<ConsensusHeader>, ConsensusChainError>> + Send
+    {
+        ConsensusChain::consensus_header_by_digest(self, epoch, digest)
+    }
+
+    fn consensus_header_by_number(
+        &self,
+        number: u64,
+    ) -> impl std::future::Future<Output = Result<Option<ConsensusHeader>, ConsensusChainError>> + Send
+    {
+        ConsensusChain::consensus_header_by_number(self, number)
+    }
+
+    fn consensus_header_latest(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Option<ConsensusHeader>, ConsensusChainError>> + Send
+    {
+        ConsensusChain::consensus_header_latest(self)
+    }
+
+    fn latest_consensus_header_from_pack(
+        &self,
+        epoch: Epoch,
+    ) -> impl std::future::Future<Output = Result<Option<ConsensusHeader>, ConsensusChainError>> + Send
+    {
+        ConsensusChain::latest_consensus_header_from_pack(self, epoch)
+    }
+
+    fn latest_consensus_number(&self) -> u64 {
+        ConsensusChain::latest_consensus_number(self)
+    }
+
+    fn latest_consensus_epoch(&self) -> Epoch {
+        ConsensusChain::latest_consensus_epoch(self)
+    }
+
+    fn read_last_committed(
+        &self,
+        epoch: Epoch,
+    ) -> impl std::future::Future<Output = HashMap<AuthorityIdentifier, Round>> + Send {
+        ConsensusChain::read_last_committed(self, epoch)
+    }
+
+    fn read_latest_commit_with_final_reputation_scores(
+        &self,
+        epoch: Epoch,
+    ) -> impl std::future::Future<Output = Option<Arc<CommittedSubDag>>> + Send {
+        ConsensusChain::read_latest_commit_with_final_reputation_scores(self, epoch)
+    }
+
+    fn get_consensus_output_current(
+        &self,
+        number: u64,
+    ) -> impl std::future::Future<Output = Result<ConsensusOutput, ConsensusChainError>> + Send
+    {
+        ConsensusChain::get_consensus_output_current(self, number)
+    }
+
+    fn is_epoch_complete(
+        &self,
+        epoch_record: &EpochRecord,
+    ) -> impl std::future::Future<Output = bool> + Send {
+        ConsensusChain::is_epoch_complete(self, epoch_record)
+    }
+
+    fn contains_current_batch(
+        &self,
+        digest: BlockHash,
+    ) -> impl std::future::Future<Output = bool> + Send {
+        ConsensusChain::contains_current_batch(self, digest)
+    }
+
+    fn get_batches<'a>(
+        &'a self,
+        epoch: Epoch,
+        digests: impl Iterator<Item = &'a BlockHash> + Send + 'a,
+    ) -> impl std::future::Future<Output = Vec<Batch>> + Send + 'a {
+        ConsensusChain::get_batches(self, epoch, digests)
+    }
+
+    fn count_leaders(
+        &self,
+        last_executed_round: Round,
+        rewards_counter: RewardsCounter,
+    ) -> impl std::future::Future<Output = Result<(), ConsensusChainError>> + Send {
+        ConsensusChain::count_leaders(self, last_executed_round, rewards_counter)
+    }
+
+    fn get_epoch_stream(
+        &self,
+        epoch: Epoch,
+    ) -> impl std::future::Future<Output = Result<Box<dyn ReadStream>, ConsensusChainError>> + Send
+    {
+        ConsensusChain::get_epoch_stream(self, epoch)
+    }
+
+    fn already_streaming_epoch(&self, epoch: Epoch) -> bool {
+        ConsensusChain::already_streaming_epoch(self, epoch)
+    }
+}
+
+impl ConsensusChainWriter for ConsensusChain {
+    fn save_consensus_output(
+        &self,
+        consensus: ConsensusOutput,
+    ) -> impl std::future::Future<Output = Result<(), ConsensusChainError>> + Send {
+        ConsensusChain::save_consensus_output(self, consensus)
+    }
+
+    fn new_epoch(
+        &self,
+        previous_epoch: EpochRecord,
+        committee: Committee,
+    ) -> impl std::future::Future<Output = Result<(), ConsensusChainError>> + Send {
+        ConsensusChain::new_epoch(self, previous_epoch, committee)
+    }
+
+    fn stream_import<R: AsyncRead + Unpin + Send>(
+        &self,
+        stream: R,
+        epoch_record: &EpochRecord,
+        previous_epoch: &EpochRecord,
+        timeout: Duration,
+    ) -> impl std::future::Future<Output = Result<(), ConsensusChainError>> + Send {
+        ConsensusChain::stream_import(self, stream, epoch_record, previous_epoch, timeout)
+    }
+
+    fn persist_current(
+        &self,
+    ) -> impl std::future::Future<Output = Result<(), ConsensusChainError>> + Send {
+        ConsensusChain::persist_current(self)
     }
 }
 

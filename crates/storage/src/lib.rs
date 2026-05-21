@@ -26,6 +26,9 @@ pub mod layered_db;
 pub mod mdbx;
 pub mod mem_db;
 pub mod redb;
+pub mod traits;
+
+pub use traits::{ConsensusChainReader, ConsensusChainWriter, UnifiedStore};
 
 pub use tn_types::error::StoreError;
 
