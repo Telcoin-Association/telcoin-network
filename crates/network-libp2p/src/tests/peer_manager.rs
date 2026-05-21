@@ -137,12 +137,7 @@ async fn test_add_trusted_peer() {
     let (sender, _receiver) = oneshot::channel();
 
     // Add trusted peer
-    peer_manager.add_trusted_peer_and_dial(
-        peer_bls,
-        peer_netkey,
-        vec![multiaddr.clone()],
-        sender,
-    );
+    peer_manager.add_trusted_peer_and_dial(peer_bls, peer_netkey, vec![multiaddr.clone()], sender);
 
     let score = peer_manager.peer_score(&peer_id).unwrap();
     assert_eq!(score, config.max_score);

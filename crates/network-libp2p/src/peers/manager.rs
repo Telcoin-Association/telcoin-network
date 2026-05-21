@@ -9,8 +9,7 @@ use super::{
     PeerEvent, PeerExchangeMap, Penalty,
 };
 use crate::{
-    error::NetworkError, peers::status::ConnectionStatus, send_or_log_error,
-    types::NetworkResult,
+    error::NetworkError, peers::status::ConnectionStatus, send_or_log_error, types::NetworkResult,
 };
 use libp2p::{core::ConnectedPoint, kad::PeerInfo, multiaddr::Protocol, Multiaddr, PeerId};
 use rand::seq::{IteratorRandom as _, SliceRandom as _};
