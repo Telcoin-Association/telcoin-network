@@ -692,6 +692,56 @@ fn peer_id_rotation_same_bls_orphans_old_peer() {
     assert_eq!(all_peers.peer_to_bls(&peer_id_1), None, "orphan BLS must be cleared");
 }
 
+/// Regression rotation arm of `upsert_peer`: a sitting committee validator
+/// that rotates its libp2p PeerId mid-epoch (operator-driven keypair seed change)
+/// must have the *new* PeerId promoted into the committee, the *old* PeerId removed
+/// from `current_committee`, and the orphan record retained with `is_trusted == true`
+/// so INV-045 pruning protection still applies.
+#[test]
+fn committee_member_rotation_promotes_new_peer_id() {
+    let mut all_peers = create_all_peers(None);
+    let addr = create_multiaddr(None);
+
+    let (_, net_a, peer_a) = bls_net_peer(70);
+    let (_, net_b, peer_b) = bls_net_peer(71);
+    let mut rng = StdRng::from_seed([72; 32]);
+    let bls = *BlsKeypair::generate(&mut rng).public();
+
+    // new_epoch with an unknown BLS — committee_keys[bls] = None.
+    let mut committee = HashSet::new();
+    committee.insert(bls);
+    let (_actions, unresolved) = all_peers.new_epoch(committee);
+    assert_eq!(unresolved, vec![bls], "BLS is unknown before any upsert");
+
+    // First upsert promotes via the unresolved arm (existing behavior).
+    all_peers.upsert_peer(bls, net_a, vec![addr.clone()]);
+    assert_eq!(all_peers.auth_to_peer(&bls).map(|(pid, _)| pid), Some(peer_a));
+    assert!(all_peers.is_peer_validator(&peer_a), "peer_a must be the sitting CVV");
+    assert!(all_peers.get_peer(&peer_a).unwrap().is_trusted());
+    assert_eq!(all_peers.current_committee_keys.get(&bls), Some(&Some(peer_a)));
+
+    // Second upsert with the same BLS but a different PeerId — the rotation arm
+    // must (a) promote peer_b, (b) evict peer_a from current_committee, and
+    // (c) leave peer_a's record alive with is_trusted preserved.
+    all_peers.upsert_peer(bls, net_b, vec![addr]);
+
+    // peer_b is the new sitting CVV.
+    assert_eq!(all_peers.auth_to_peer(&bls).map(|(pid, _)| pid), Some(peer_b));
+    assert!(all_peers.is_peer_validator(&peer_b), "peer_b must be the sitting CVV after rotation");
+    assert!(all_peers.get_peer(&peer_b).unwrap().is_trusted());
+    assert_eq!(all_peers.current_committee_keys.get(&bls), Some(&Some(peer_b)));
+
+    // peer_a is no longer in current_committee, but its record survives with
+    // is_trusted == true and bls_public_key cleared (rebind_bls handled the index).
+    assert!(
+        !all_peers.is_peer_validator(&peer_a),
+        "stale peer_a must be removed from current_committee"
+    );
+    let orphan = all_peers.get_peer(&peer_a).expect("orphan peer record must survive");
+    assert!(orphan.is_trusted(), "INV-045: orphan keeps is_trusted so pruning protection holds");
+    assert_eq!(all_peers.peer_to_bls(&peer_a), None, "orphan BLS must be cleared by rebind_bls");
+}
+
 #[test]
 fn prune_disconnected_clears_bls_index() {
     let config = PeerConfig { max_disconnected_peers: 2, ..PeerConfig::default() };

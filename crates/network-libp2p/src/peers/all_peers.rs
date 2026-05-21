@@ -34,7 +34,7 @@ use std::{
 };
 use tn_types::{BlsPublicKey, NetworkPublicKey};
 use tokio::sync::oneshot;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 #[cfg(test)]
 #[path = "../tests/peers.rs"]
 mod peers;
@@ -139,11 +139,20 @@ impl AllPeers {
 
     /// Create or update a peer.
     ///
-    /// If the freshly-bound BLS key is in `current_committee_keys` with an unresolved
-    /// (`None`) value, the peer is promoted to committee membership: it is inserted into
-    /// `current_committee`, marked trusted, and any pending ban is lifted. The returned
-    /// `(PeerId, PeerAction)` carries the `Unban` action so the caller can flow it through
-    /// `PeerManager::apply_peer_action`. `None` is returned when no promotion happened.
+    /// Two promotion shapes flow through this helper:
+    ///   1. **Unresolved arm:** `current_committee_keys[bls] == Some(&None)` — `new_epoch` saw the
+    ///      committee BLS but had no peer for it; this kad-driven upsert resolves it.
+    ///   2. **Rotation arm:** `current_committee_keys[bls] == Some(&Some(other_pid))` with
+    ///      `other_pid != peer_id` — a sitting committee validator rotated its libp2p PeerId
+    ///      mid-epoch (operator-driven keypair seed change in `config/src/keys.rs`). The stale
+    ///      `other_pid` is removed from `current_committee` before re-promotion so the orphan stops
+    ///      being treated as a committee member; the orphan record itself survives with `is_trusted
+    ///      == true` per INV-045 (once-staked, never-forgotten).
+    ///
+    /// In either shape the peer is inserted into `current_committee`, marked trusted, and any
+    /// pending ban is lifted. The returned `(PeerId, PeerAction)` carries the `Unban` action
+    /// so the caller can flow it through `PeerManager::apply_peer_action`. `None` is returned
+    /// when no promotion happened.
     pub(super) fn upsert_peer(
         &mut self,
         bls_public_key: BlsPublicKey,
@@ -159,8 +168,23 @@ impl AllPeers {
             self.peers.insert(peer_id, peer);
         }
 
-        // self-heal: promote an unresolved committee BLS now that the peer is known.
-        if self.current_committee_keys.get(&bls_public_key) == Some(&None) {
+        // self-heal: promote an unresolved committee BLS, or rotate the committee PeerId
+        // mapping when a sitting validator changed its libp2p keypair mid-epoch.
+        let should_promote = match self.current_committee_keys.get(&bls_public_key) {
+            Some(&None) => true,
+            Some(&Some(other_pid)) if other_pid != peer_id => {
+                // Validator rotated PeerId mid-epoch — evict the stale CVV mapping
+                // before promote_committee_member rewrites the triple. The orphan
+                // peer record itself stays in `peers` and retains `is_trusted` so
+                // pruning protection (INV-045) still applies.
+                info!(target: "peer-manager", prev=?other_pid, new=?peer_id, "new peer id for committee validator {bls_public_key}");
+                self.current_committee.remove(&other_pid);
+                true
+            }
+            _ => false,
+        };
+
+        if should_promote {
             self.promote_committee_member(bls_public_key, peer_id).map(|a| (peer_id, a))
         } else {
             None
