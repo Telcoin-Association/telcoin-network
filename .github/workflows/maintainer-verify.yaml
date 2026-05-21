@@ -4,22 +4,24 @@ on:
     branches: [main]
     types: [opened, synchronize, reopened, review_requested, ready_for_review]
 
+# Narrow GITHUB_TOKEN to read-only (we only read the PR head SHA).
+permissions:
+  contents: read
+
+# Cancel any in-flight run for the same PR when a new commit lands.
+concurrency:
+  group: maintainer-verify-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   verify-on-chain:
     environment: merge-into-main
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: true
-      matrix:
-        os: [ubuntu-latest]
+    runs-on: ubuntu-latest
     steps:
-      # checkout repo to use `verify_commit_hash.sh`
       - name: checkout repo
-        uses: actions/checkout@v4
-      # install foundry toolchain for casting txs
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
       - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
-      # query adiri for commit hash
+        uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1.8.0
       - name: verify commit hash on adiri
         env:
           COMMIT_HASH: ${{ github.event.pull_request.head.sha }}
