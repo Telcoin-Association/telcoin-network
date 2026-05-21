@@ -8,7 +8,7 @@ use std::{
 
 use crate::archive::{
     crc::{add_crc32, check_crc},
-    data_file::DataFile,
+    data_file::{fsync_directory, DataFile},
     error::{
         commit::CommitError, fetch::FetchError, insert::AppendError, load_header::LoadHeaderError,
     },
@@ -124,10 +124,17 @@ impl PositionIndex {
         read_only: bool,
     ) -> Result<PositionIndex, LoadHeaderError> {
         let dir = dir.as_ref();
-        let _ = fs::create_dir(dir);
+        let dir_created = fs::create_dir(dir).is_ok();
+        if dir_created {
+            // The index directory is brand new; fsync the parent so the entry survives a crash.
+            if let Some(parent) = dir.parent() {
+                let _ = fsync_directory(parent);
+            }
+        }
         let mut pdx_file = DataFile::open(dir.join("index.pdx"), read_only)?;
 
-        let header = if pdx_file.is_empty() {
+        let was_empty = pdx_file.is_empty();
+        let header = if was_empty {
             if read_only {
                 return Err(LoadHeaderError::ReadOnlyEmpty);
             }
@@ -148,6 +155,11 @@ impl PositionIndex {
             }
             header
         };
+        if was_empty {
+            // index.pdx was just created and its header written; fsync the directory so the entry
+            // is durable.
+            let _ = fsync_directory(dir);
+        }
         Ok(Self { _header: header, pdx_file, _index_dir: dir.to_owned() })
     }
 

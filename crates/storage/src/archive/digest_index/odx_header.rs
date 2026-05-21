@@ -2,6 +2,7 @@
 
 use crate::archive::{
     crc::{add_crc32, check_crc},
+    data_file::fsync_directory,
     error::load_header::LoadHeaderError,
 };
 use std::{
@@ -65,6 +66,13 @@ impl OdxHeader {
             }
             header
         };
+        if file_end == 0 {
+            // New odx file was just created and its header written; fsync the parent so the entry
+            // is durable.
+            if let Some(parent) = path.parent() {
+                let _ = fsync_directory(parent);
+            }
+        }
         Ok((file, header))
     }
 
