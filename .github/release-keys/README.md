@@ -19,6 +19,17 @@ The matching private key never leaves the YubiKey.
 
 One-time setup per maintainer. Requires `ykman` from the Yubico Authenticator suite.
 
+Before running any `ykman piv` command, confirm the PIV application is enabled over USB — PIV rides on the CCID interface, and a YubiKey shipped with CCID off will fail with `Command requires one of the following USB interfaces to be enabled: 'CCID'`.
+
+```bash
+# 0. Check which applications are enabled over USB.
+#    PIV must appear in the "Enabled USB interfaces" list.
+ykman config usb --list
+
+# If PIV is missing, enable it and replug the key so the OS re-enumerates.
+ykman config usb --enable piv
+```
+
 ```bash
 # 1. Generate an ECCP256 keypair in PIV slot 9c.
 #    Slot 9c policy = touch + PIN required for every signature.
