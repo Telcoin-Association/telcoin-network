@@ -335,6 +335,9 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
                 hdx_file.write_all(&chunk[..n * bucket_size])?;
                 remaining -= n;
             }
+            // Header and initial buckets were just written; fsync the directory so the index.hdx
+            // entry is durable.
+            let _ = fsync_directory(dir);
             (header, bloom)
         } else {
             let header = HdxHeader::load_header(&mut hdx_file)?;
@@ -359,11 +362,6 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             let bloom: Bloom = bloom_bits.try_into()?;
             (header, bloom)
         };
-        if file_end == 0 {
-            // Header and initial buckets were just written; fsync the directory so the index.hdx
-            // entry is durable.
-            let _ = fsync_directory(dir);
-        }
         let (odx_file, _odx_header) = OdxHeader::open_odx_file(
             header.version(),
             header.uid(),

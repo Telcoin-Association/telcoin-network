@@ -51,6 +51,11 @@ impl OdxHeader {
             }
             let header = OdxHeader::new(version, uid, appnum, read_only);
             header.write_header(&mut file)?;
+            // New odx file was just created and its header written; fsync the parent so the entry
+            // is durable.
+            if let Some(parent) = path.parent() {
+                let _ = fsync_directory(parent);
+            }
             header
         } else {
             let header = OdxHeader::load_header(&mut file, read_only)?;
@@ -66,13 +71,6 @@ impl OdxHeader {
             }
             header
         };
-        if file_end == 0 {
-            // New odx file was just created and its header written; fsync the parent so the entry
-            // is durable.
-            if let Some(parent) = path.parent() {
-                let _ = fsync_directory(parent);
-            }
-        }
         Ok((file, header))
     }
 

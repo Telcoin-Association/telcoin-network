@@ -20,6 +20,12 @@ const WRITE_BUFFER_SIZE: usize = 16 * 1024; // 16kb
 /// fsync can leave the filesystem with the entry missing even though the file's
 /// own data and metadata are durable.  Calling this on the parent directory
 /// closes that gap.
+///
+/// # Precondition
+///
+/// `path` must refer to a directory.  Passing a regular file silently fsyncs
+/// that file's contents instead of providing the directory-entry durability
+/// guarantee callers expect, so all in-crate call sites pass a directory.
 pub(crate) fn fsync_directory(path: &Path) -> Result<(), io::Error> {
     File::open(path)?.sync_all()
 }

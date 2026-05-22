@@ -140,6 +140,9 @@ impl PositionIndex {
             }
             let mut header = PdxHeader::from_data_header(data_header);
             header.write_header(&mut pdx_file)?;
+            // index.pdx was just created and its header written; fsync the directory so the entry
+            // is durable.
+            let _ = fsync_directory(dir);
             header
         } else {
             let header = PdxHeader::load_header(&mut pdx_file)?;
@@ -155,11 +158,6 @@ impl PositionIndex {
             }
             header
         };
-        if was_empty {
-            // index.pdx was just created and its header written; fsync the directory so the entry
-            // is durable.
-            let _ = fsync_directory(dir);
-        }
         Ok(Self { _header: header, pdx_file, _index_dir: dir.to_owned() })
     }
 
