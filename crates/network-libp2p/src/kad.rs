@@ -20,6 +20,7 @@ use tn_storage::tables::{
     KadProviderRecords, KadRecords, KadWorkerProviderRecords, KadWorkerRecords,
 };
 use tn_types::{decode, encode, BlockHash, Database, DefaultHashFunction};
+use tracing::info;
 
 /// The TN-specific kad protocol.
 pub(crate) const DEFAULT_KAD_PROTO_NAME: StreamProtocol = StreamProtocol::new("/tn-kad/1.0.0");
@@ -243,6 +244,7 @@ impl<DB: Database> KadStore<DB> {
                 KadStoreType::Worker => self.db.remove::<KadWorkerRecords>(k).is_ok(),
             };
             if ok {
+                info!(target: "network-kad", type=?self.kad_type, "evict expired record {k}");
                 evicted += 1;
             }
         }
@@ -279,6 +281,7 @@ impl<DB: Database> KadStore<DB> {
                 KadStoreType::Worker => self.db.remove::<KadWorkerProviderRecords>(k).is_ok(),
             };
             if ok {
+                info!(target: "network-kad", type=?self.kad_type, "evict expired provider {k}");
                 evicted += 1;
             }
         }
