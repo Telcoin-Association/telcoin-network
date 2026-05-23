@@ -457,7 +457,7 @@ impl PrimaryNetworkHandle {
                 | PackError::ExtraBatches
                 | PackError::MissingBatches
                 | PackError::CorruptPack
-                | PackError::InvalidEpoch => Some(Penalty::Severe),
+                | PackError::InvalidEpoch(_, _) => Some(Penalty::Severe),
                 PackError::IO(_)
                 | PackError::BatchLoad(_)
                 | PackError::EpochLoad(_)
@@ -711,13 +711,21 @@ where
             tokio::select! {
                 header =
                     request_handler.retrieve_consensus_header(number, hash) => {
-                        // Penalize peer's reputation for bad request.
-                        // This could happen now and then and not be malicious so use a Mild only
-                        // to close any DOS attack.
-                        if let Err(e) = &header {
+                        // Route through the central PrimaryNetworkError → Penalty mapping
+                        // so every handler in this file applies penalties consistently.
+                        // The only reachable variant from this path is
+                        // UnknownConsensusHeaderDigest, which the central table now maps
+                        // to None — observers legitimately request not-yet-served headers.
+                        if let Err(ref e) = header {
+                            if let Some(penalty) = e.into() {
+                                network_handle.report_penalty(peer, penalty).await;
+                            }
                             let my_number = request_handler.consensus_chain().latest_consensus_number();
-                            tracing::warn!(target: "primary::network", ?e, ?my_number, ?number, ?hash, ?peer,  "applying penalty for failed consesus header request");
-                            network_handle.handle.report_penalty(peer, Penalty::Mild).await;
+                            tracing::debug!(
+                                target: "primary::network",
+                                ?e, ?my_number, ?number, ?hash, ?peer,
+                                "consensus header request could not be served"
+                            );
                         }
                         let response = header.into_response();
                         let _ = network_handle.handle.send_response(response, channel).await;
