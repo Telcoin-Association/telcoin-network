@@ -1482,7 +1482,7 @@ where
                 try_decode::<NodeRecord>(&record.value),
             ) {
                 (Ok(existing_record), Ok(new_record)) => {
-                    // return true if the new record is newer or equal (republish TTL)
+                    // return true if the new record is newer
                     existing_record.info.timestamp <= new_record.info.timestamp
                 }
                 _ => false,

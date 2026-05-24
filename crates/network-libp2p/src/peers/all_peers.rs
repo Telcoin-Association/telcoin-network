@@ -14,6 +14,15 @@
 //! [`AllPeers::rebind_bls`] (for inserts/updates) or pair the `peers.remove(...)` call with a
 //! `bls_index.remove(...)` (for evictions). Direct access to `Peer::bls_public_key` outside this
 //! module is forbidden — that is enforced by `pub(super)` visibility.
+//!
+//! ## Committee lock exception
+//!
+//! When `rebind_bls` is called for a BLS key that is already promoted in
+//! `current_committee_keys` with a *different* `PeerId`, the rebind is skipped to prevent
+//! cross-contamination from worker-network kad records. The caller's `Peer` record still
+//! gets `bls_public_key = Some(bls)` via `update_net`, creating a temporary state where two
+//! peers claim the same BLS but `bls_index` only points to the promoted one. This exception
+//! is cleared automatically when `new_epoch` resets `current_committee_keys`.
 use super::{
     banned::BannedPeers, peer::Peer, score::ReputationUpdate, status::ConnectionStatus,
     types::ConnectionDirection, PeerExchangeMap, Penalty,
@@ -34,7 +43,7 @@ use std::{
 };
 use tn_types::{BlsPublicKey, NetworkPublicKey};
 use tokio::sync::oneshot;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 #[cfg(test)]
 #[path = "../tests/peers.rs"]
 mod peers;
@@ -105,6 +114,29 @@ impl AllPeers {
     ///     peer record survives (it may still carry useful state) but stops being reachable via the
     ///     index until its next `update_net`.
     fn rebind_bls(&mut self, peer_id: PeerId, new_bls: BlsPublicKey) {
+        // Layer 1: lock bls_index for promoted committee members.
+        //
+        // During staggered restarts, primary and worker networks both publish kad records
+        // keyed on the same BLS public key but with different PeerIds. If a worker-network
+        // record arrives after new_epoch promoted the primary PeerId, rebinding would corrupt
+        // bls_index and leave the real committee member unprotected from penalties.
+        //
+        // Guard: if new_bls is already promoted (Some(existing_peer_id)) and the caller is
+        // a *different* PeerId, skip the rebind entirely. The caller's Peer record still
+        // gets bls_public_key set via update_net (a controlled invariant exception — two
+        // peers claim the same BLS, but bls_index only points to the promoted one).
+        if let Some(Some(existing_peer_id)) = self.current_committee_keys.get(&new_bls) {
+            if *existing_peer_id != peer_id {
+                warn!(
+                    target: "peer-manager",
+                    ?peer_id,
+                    ?existing_peer_id,
+                    "rebind_bls: skipping — BLS key is locked to promoted committee member"
+                );
+                return;
+            }
+        }
+
         if let Some(peer) = self.peers.get(&peer_id) {
             if let Some(old_bls) = peer.bls_public_key() {
                 if old_bls != new_bls {
@@ -139,20 +171,11 @@ impl AllPeers {
 
     /// Create or update a peer.
     ///
-    /// Two promotion shapes flow through this helper:
-    ///   1. **Unresolved arm:** `current_committee_keys[bls] == Some(&None)` — `new_epoch` saw the
-    ///      committee BLS but had no peer for it; this kad-driven upsert resolves it.
-    ///   2. **Rotation arm:** `current_committee_keys[bls] == Some(&Some(other_pid))` with
-    ///      `other_pid != peer_id` — a sitting committee validator rotated its libp2p PeerId
-    ///      mid-epoch (operator-driven keypair seed change in `config/src/keys.rs`). The stale
-    ///      `other_pid` is removed from `current_committee` before re-promotion so the orphan stops
-    ///      being treated as a committee member; the orphan record itself survives with `is_trusted
-    ///      == true` per INV-045 (once-staked, never-forgotten).
-    ///
-    /// In either shape the peer is inserted into `current_committee`, marked trusted, and any
-    /// pending ban is lifted. The returned `(PeerId, PeerAction)` carries the `Unban` action
-    /// so the caller can flow it through `PeerManager::apply_peer_action`. `None` is returned
-    /// when no promotion happened.
+    /// If the peer's BLS key was recorded as unresolved by `new_epoch` (i.e.
+    /// `current_committee_keys[bls] == None`), the peer is promoted into `current_committee`,
+    /// marked trusted, and any pending ban is lifted. The returned `(PeerId, PeerAction)` carries
+    /// the `Unban` action so the caller can flow it through `PeerManager::apply_peer_action`.
+    /// `None` is returned when no promotion happened.
     pub(super) fn upsert_peer(
         &mut self,
         bls_public_key: BlsPublicKey,
@@ -168,21 +191,11 @@ impl AllPeers {
             self.peers.insert(peer_id, peer);
         }
 
-        // self-heal: promote an unresolved committee BLS, or rotate the committee PeerId
-        // mapping when a sitting validator changed its libp2p keypair mid-epoch.
-        let should_promote = match self.current_committee_keys.get(&bls_public_key) {
-            Some(&None) => true,
-            Some(&Some(other_pid)) if other_pid != peer_id => {
-                // Validator rotated PeerId mid-epoch — evict the stale CVV mapping
-                // before promote_committee_member rewrites the triple. The orphan
-                // peer record itself stays in `peers` and retains `is_trusted` so
-                // pruning protection (INV-045) still applies.
-                info!(target: "peer-manager", prev=?other_pid, new=?peer_id, "new peer id for committee validator {bls_public_key}");
-                self.current_committee.remove(&other_pid);
-                true
-            }
-            _ => false,
-        };
+        // self-heal: promote an unresolved committee BLS when the kad lookup resolves it.
+        let should_promote = matches!(
+            self.current_committee_keys.get(&bls_public_key),
+            Some(&None)
+        );
 
         if should_promote {
             self.promote_committee_member(bls_public_key, peer_id).map(|a| (peer_id, a))
@@ -196,6 +209,26 @@ impl AllPeers {
     /// This method is called when the application layer identifies a problem and reports a peer.
     pub(super) fn process_penalty(&mut self, peer_id: &PeerId, penalty: Penalty) -> PeerAction {
         if let Some(peer) = self.peers.get_mut(peer_id) {
+            // Layer 2: committee BLS keys are immune to penalties.
+            //
+            // During cross-contamination, the real committee member may connect with the
+            // correct PeerId but not be the one promoted by new_epoch (bls_index points
+            // elsewhere due to a worker-network kad record). The is_trusted flag on this
+            // peer may be false, but its BLS key still identifies it as a committee member.
+            if let Some(bls_key) = peer.bls_public_key() {
+                if self.current_committee_keys.contains_key(&bls_key) {
+                    if matches!(penalty, Penalty::Severe | Penalty::Fatal) {
+                        warn!(
+                            target: "peer-manager",
+                            ?peer_id,
+                            ?penalty,
+                            "blocked penalty against committee member (BLS-based protection)"
+                        );
+                    }
+                    return PeerAction::NoAction;
+                }
+            }
+
             let prior_reputation = peer.reputation();
             let new_reputation = peer.apply_penalty(penalty);
             debug!(target: "peer-manager", ?peer_id, ?prior_reputation, ?new_reputation);

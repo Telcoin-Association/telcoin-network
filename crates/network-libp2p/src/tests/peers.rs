@@ -692,13 +692,12 @@ fn peer_id_rotation_same_bls_orphans_old_peer() {
     assert_eq!(all_peers.peer_to_bls(&peer_id_1), None, "orphan BLS must be cleared");
 }
 
-/// Regression rotation arm of `upsert_peer`: a sitting committee validator
-/// that rotates its libp2p PeerId mid-epoch (operator-driven keypair seed change)
-/// must have the *new* PeerId promoted into the committee, the *old* PeerId removed
-/// from `current_committee`, and the orphan record retained with `is_trusted == true`
-/// so INV-045 pruning protection still applies.
+/// After the unresolved arm promotes peer_a, a second upsert with a different
+/// PeerId for the same BLS key must NOT re-promote. Mid-epoch PeerId rotation
+/// via upsert is intentionally disabled to prevent primary/worker network
+/// cross-contamination from causing flip-flop loops that stall consensus.
 #[test]
-fn committee_member_rotation_promotes_new_peer_id() {
+fn upsert_peer_does_not_rotate_committee_member() {
     let mut all_peers = create_all_peers(None);
     let addr = create_multiaddr(None);
 
@@ -713,33 +712,45 @@ fn committee_member_rotation_promotes_new_peer_id() {
     let (_actions, unresolved) = all_peers.new_epoch(committee);
     assert_eq!(unresolved, vec![bls], "BLS is unknown before any upsert");
 
-    // First upsert promotes via the unresolved arm (existing behavior).
+    // First upsert promotes via the unresolved arm.
     all_peers.upsert_peer(bls, net_a, vec![addr.clone()]);
     assert_eq!(all_peers.auth_to_peer(&bls).map(|(pid, _)| pid), Some(peer_a));
     assert!(all_peers.is_peer_validator(&peer_a), "peer_a must be the sitting CVV");
     assert!(all_peers.get_peer(&peer_a).unwrap().is_trusted());
     assert_eq!(all_peers.current_committee_keys.get(&bls), Some(&Some(peer_a)));
 
-    // Second upsert with the same BLS but a different PeerId — the rotation arm
-    // must (a) promote peer_b, (b) evict peer_a from current_committee, and
-    // (c) leave peer_a's record alive with is_trusted preserved.
-    all_peers.upsert_peer(bls, net_b, vec![addr]);
+    // Second upsert with the same BLS but a different PeerId — rotation arm is
+    // disabled, so no re-promotion occurs. peer_a stays in current_committee.
+    let result = all_peers.upsert_peer(bls, net_b, vec![addr]);
+    assert!(result.is_none(), "rotation must not trigger promotion");
 
-    // peer_b is the new sitting CVV.
-    assert_eq!(all_peers.auth_to_peer(&bls).map(|(pid, _)| pid), Some(peer_b));
-    assert!(all_peers.is_peer_validator(&peer_b), "peer_b must be the sitting CVV after rotation");
-    assert!(all_peers.get_peer(&peer_b).unwrap().is_trusted());
-    assert_eq!(all_peers.current_committee_keys.get(&bls), Some(&Some(peer_b)));
+    // peer_a remains the sitting CVV
+    assert!(all_peers.is_peer_validator(&peer_a), "peer_a must remain in current_committee");
+    assert_eq!(all_peers.current_committee_keys.get(&bls), Some(&Some(peer_a)));
 
-    // peer_a is no longer in current_committee, but its record survives with
-    // is_trusted == true and bls_public_key cleared (rebind_bls handled the index).
-    assert!(
-        !all_peers.is_peer_validator(&peer_a),
-        "stale peer_a must be removed from current_committee"
+    // Layer 1: bls_index stays locked to peer_a (rebind_bls skipped for promoted BLS)
+    assert_eq!(
+        all_peers.auth_to_peer(&bls).map(|(pid, _)| pid),
+        Some(peer_a),
+        "bls_index must stay locked to promoted peer_a"
     );
-    let orphan = all_peers.get_peer(&peer_a).expect("orphan peer record must survive");
-    assert!(orphan.is_trusted(), "INV-045: orphan keeps is_trusted so pruning protection holds");
-    assert_eq!(all_peers.peer_to_bls(&peer_a), None, "orphan BLS must be cleared by rebind_bls");
+
+    // peer_a's BLS is NOT cleared because rebind_bls was skipped
+    let promoted = all_peers.get_peer(&peer_a).expect("promoted peer record must survive");
+    assert!(promoted.is_trusted(), "promoted peer keeps is_trusted");
+    assert_eq!(
+        all_peers.peer_to_bls(&peer_a),
+        Some(bls),
+        "promoted peer's BLS must NOT be cleared when rebind is locked"
+    );
+
+    // peer_b still has bls_public_key set via update_net (controlled invariant exception)
+    let contaminant = all_peers.get_peer(&peer_b).expect("contaminant peer record must exist");
+    assert_eq!(
+        contaminant.bls_public_key(),
+        Some(bls),
+        "contaminant peer gets BLS via update_net (controlled exception)"
+    );
 }
 
 #[test]
@@ -1122,4 +1133,153 @@ fn upsert_peer_promotes_banned_committee_member_via_kad() {
     assert!(all_peers.current_committee.contains(&peer_a));
     assert!(all_peers.get_peer(&peer_a).unwrap().is_trusted());
     assert_eq!(all_peers.current_committee_keys.get(&bls_a), Some(&Some(peer_a)));
+}
+
+// ---------------------------------------------------------------------------
+// Cross-contamination defense tests (Layer 1 + Layer 2)
+// ---------------------------------------------------------------------------
+
+/// Full scenario: worker-network kad record contaminates bls_index, then the real
+/// primary PeerId connects and receives a Fatal penalty — both layers must cooperate
+/// to prevent the ban.
+#[test]
+fn cross_contamination_penalty_blocked_by_committee_bls() {
+    let mut all_peers = create_all_peers(None);
+
+    let (_, worker_net, worker_pid) = bls_net_peer(130);
+    let (_, primary_net, primary_pid) = bls_net_peer(131);
+    let mut rng = StdRng::from_seed([132; 32]);
+    let bls = *BlsKeypair::generate(&mut rng).public();
+    let addr = create_multiaddr(None);
+
+    // Step 1: worker-network kad record arrives first — registers wrong PeerId.
+    all_peers.upsert_peer(bls, worker_net, vec![addr.clone()]);
+    assert_eq!(all_peers.auth_to_peer(&bls).map(|(pid, _)| pid), Some(worker_pid));
+
+    // Step 2: new_epoch promotes the wrong PeerId (worker).
+    let mut committee = HashSet::new();
+    committee.insert(bls);
+    let (_actions, unresolved) = all_peers.new_epoch(committee);
+    assert!(unresolved.is_empty(), "worker_pid is in bls_index");
+    assert!(all_peers.is_peer_validator(&worker_pid));
+    assert_eq!(all_peers.current_committee_keys.get(&bls), Some(&Some(worker_pid)));
+
+    // Step 3: real primary-network upsert — Layer 1 locks bls_index to worker_pid.
+    let result = all_peers.upsert_peer(bls, primary_net, vec![addr.clone()]);
+    assert!(result.is_none(), "no re-promotion");
+    assert_eq!(
+        all_peers.auth_to_peer(&bls).map(|(pid, _)| pid),
+        Some(worker_pid),
+        "bls_index stays locked to promoted worker_pid"
+    );
+
+    // primary_pid still gets bls_public_key via update_net (controlled exception).
+    assert_eq!(all_peers.get_peer(&primary_pid).unwrap().bls_public_key(), Some(bls));
+
+    // Step 4: connect the primary peer so it can receive penalties.
+    all_peers.update_connection_status(
+        &primary_pid,
+        NewConnectionStatus::Connected {
+            multiaddr: addr,
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+
+    // Step 5: Layer 2 — Fatal penalty against primary_pid is blocked by BLS check.
+    let action = all_peers.process_penalty(&primary_pid, Penalty::Fatal);
+    assert!(
+        matches!(action, PeerAction::NoAction),
+        "Fatal penalty must be blocked for committee BLS holder"
+    );
+
+    // primary_pid is NOT banned.
+    assert!(
+        !all_peers.peer_banned(&primary_pid),
+        "primary_pid must not be banned — committee BLS protection"
+    );
+    let peer = all_peers.get_peer(&primary_pid).unwrap();
+    assert!(
+        peer.connection_status().is_connected(),
+        "primary_pid must remain connected after blocked penalty"
+    );
+}
+
+/// Unit test for Layer 1: rebind_bls is locked for promoted committee members.
+#[test]
+fn rebind_bls_locked_for_promoted_committee_member() {
+    let mut all_peers = create_all_peers(None);
+    let addr = create_multiaddr(None);
+
+    let (_, net_a, peer_a) = bls_net_peer(140);
+    let (_, net_b, _peer_b) = bls_net_peer(141);
+    let mut rng = StdRng::from_seed([142; 32]);
+    let bls = *BlsKeypair::generate(&mut rng).public();
+
+    // Register peer_a and promote via new_epoch.
+    all_peers.upsert_peer(bls, net_a, vec![addr.clone()]);
+    let mut committee = HashSet::new();
+    committee.insert(bls);
+    all_peers.new_epoch(committee);
+    assert_eq!(all_peers.current_committee_keys.get(&bls), Some(&Some(peer_a)));
+
+    // Attempt rebind to peer_b — must be rejected.
+    all_peers.upsert_peer(bls, net_b, vec![addr]);
+
+    // bls_index still points to peer_a.
+    assert_eq!(
+        all_peers.auth_to_peer(&bls).map(|(pid, _)| pid),
+        Some(peer_a),
+        "bls_index must remain locked to peer_a"
+    );
+
+    // peer_a's BLS is NOT cleared.
+    assert_eq!(
+        all_peers.peer_to_bls(&peer_a),
+        Some(bls),
+        "promoted peer_a must retain its BLS"
+    );
+}
+
+/// Unit test for Layer 2: committee BLS holders are immune to penalties.
+#[test]
+fn committee_bls_penalty_protection() {
+    let mut all_peers = create_all_peers(None);
+    let addr = create_multiaddr(None);
+
+    let (_, net, peer_id) = bls_net_peer(150);
+    let mut rng = StdRng::from_seed([151; 32]);
+    let bls = *BlsKeypair::generate(&mut rng).public();
+
+    // Register and connect the peer.
+    all_peers.upsert_peer(bls, net, vec![addr.clone()]);
+    all_peers.update_connection_status(
+        &peer_id,
+        NewConnectionStatus::Connected {
+            multiaddr: addr,
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+
+    // Promote via new_epoch so BLS is in current_committee_keys.
+    let mut committee = HashSet::new();
+    committee.insert(bls);
+    all_peers.new_epoch(committee);
+    assert!(all_peers.is_peer_validator(&peer_id));
+
+    // Apply Fatal penalty — must be blocked.
+    let action = all_peers.process_penalty(&peer_id, Penalty::Fatal);
+    assert!(matches!(action, PeerAction::NoAction), "Fatal must be blocked for committee member");
+    assert!(!all_peers.peer_banned(&peer_id), "committee member must not be banned");
+
+    // Apply Severe penalty — also blocked.
+    let action = all_peers.process_penalty(&peer_id, Penalty::Severe);
+    assert!(matches!(action, PeerAction::NoAction), "Severe must be blocked for committee member");
+
+    // Apply Mild penalty — also blocked (all penalties blocked for committee BLS).
+    let action = all_peers.process_penalty(&peer_id, Penalty::Mild);
+    assert!(matches!(action, PeerAction::NoAction), "Mild must be blocked for committee member");
+
+    // Peer remains connected and not banned.
+    let peer = all_peers.get_peer(&peer_id).unwrap();
+    assert!(peer.connection_status().is_connected());
 }

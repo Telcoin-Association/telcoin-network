@@ -1004,6 +1004,7 @@ where
             network_handle.inner_handle(),
             bootstrap_peers,
             committee_keys.clone(),
+            initial_epoch,
         )
         .await?;
 
@@ -1138,6 +1139,7 @@ where
             network_handle.inner_handle(),
             bootstrap_peers,
             committee_keys.clone(),
+            initial_epoch,
         )
         .await?;
 
@@ -1286,7 +1288,7 @@ where
             .unwrap_or(Ok(fallback))
     }
 
-    /// Initialize a network handle for a new epoch: register bootstrap peers
+    /// Initialize a network handle for a new epoch: register bootstrap peers (on first epoch)
     /// then update the epoch committee.
     ///
     /// Bootstrap peers must be registered BEFORE `new_epoch()` so the `bls_index` resolves them
@@ -1295,8 +1297,11 @@ where
         handle: &NetworkHandle<Req, Res>,
         bootstrap_peers: BTreeMap<BlsPublicKey, P2pNode>,
         committee_keys: HashSet<BlsPublicKey>,
+        initial_epoch: bool,
     ) -> eyre::Result<()> {
-        handle.add_bootstrap_peers(bootstrap_peers).await?;
+        if initial_epoch {
+            handle.add_bootstrap_peers(bootstrap_peers).await?;
+        }
         handle.new_epoch(committee_keys).await?;
         Ok(())
     }
