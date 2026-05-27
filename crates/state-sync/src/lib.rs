@@ -303,11 +303,13 @@ async fn catch_up_consensus_from_to<DB: Database>(
         let mut remove_cache = false;
         // Check if we already have this consensus output in our local DB.
         // We will be verifying and loading these records elsewhere.
-        let consensus_header = if number == max_consensus_height {
-            max_consensus.clone()
-        } else if let Ok(Some(header)) = db.get::<ConsensusHeaderCache>(&number) {
+        let consensus_header = if let Ok(Some(header)) = db.get::<ConsensusHeaderCache>(&number) {
+            // Always check the cache first, even if on max_consesus_height so we evict this record
+            // if cached.
             remove_cache = true;
             header
+        } else if number == max_consensus_height {
+            max_consensus.clone()
         } else if let Ok(Some(header)) = consensus_chain.consensus_header_by_number(number).await {
             // Block already in local ConsensusChain DB (e.g., processed before a restart).
             // Use it to advance the parent-chain verification; execution will be skipped below

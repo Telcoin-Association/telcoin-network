@@ -426,7 +426,7 @@ impl<T: Table, DB: Database> InsertTrait<DB> for KeyValueInsert<T> {
         let _ = mem_db.remove::<T>(&self.key);
     }
     fn name(&self) -> &str {
-        &T::NAME
+        T::NAME
     }
 }
 
@@ -440,7 +440,7 @@ impl<T: Table, DB: Database> RemoveTrait<DB> for KeyRemove<T> {
     }
 
     fn name(&self) -> &str {
-        &T::NAME
+        T::NAME
     }
 }
 
@@ -454,7 +454,7 @@ impl<T: Table, DB: Database> ClearTrait<DB> for ClearTable<T> {
     }
 
     fn name(&self) -> &str {
-        &T::NAME
+        T::NAME
     }
 }
 

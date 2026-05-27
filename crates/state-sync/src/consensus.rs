@@ -423,6 +423,12 @@ pub async fn spawn_fetch_recent_consensus<DB: TNDatabase>(
     task_spawner: TaskSpawner,
     mut rx_consensus_request: impl TnReceiver<(Epoch, u64, B256)>,
 ) {
+    // Attempt to clear the consensus header cache on startup.
+    // This should not really be needed (records are evicted as they are processed) but
+    // should not hurt and can clear up an issue if something interferes with eviction.
+    // Note, on longer shutdowns this will have no real effect but could lead to churn
+    // if a node is being restarted relatively quickly.
+    let _ = db.clear_table::<ConsensusHeaderCache>();
     // Get the epoch of our last executed consensus.
     let mut current_fetch_epoch = consensus_chain.latest_consensus_epoch();
     let mut first_gossipped_epoch = None; // Track the first epoch we see via gossip.
