@@ -146,7 +146,7 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatab
         } else {
             const EPOCH_MAX: usize = 128 * MEGABYTE;
             const KAD_MAX: usize = 64 * MEGABYTE;
-            const CACHE_MAX: usize = 512 * MEGABYTE;
+            const CACHE_MAX: usize = 1024 * MEGABYTE;
             const GROWTH: usize = 8 * MEGABYTE;
             const CACHE_GROWTH: usize = 64 * MEGABYTE;
         }
