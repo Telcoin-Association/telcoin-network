@@ -33,6 +33,7 @@ pub fn launch_node<P>(
     builder: TnBuilder,
     tn_datadir: P,
     key_config: KeyConfig,
+    version: &'static str,
 ) -> JoinHandle<eyre::Result<()>>
 where
     P: TelcoinDirs + Clone + 'static,
@@ -45,7 +46,7 @@ where
     tokio::spawn(async move {
         // create the epoch manager
         let mut epoch_manager =
-            EpochManager::new(builder, tn_datadir, consensus_db, key_config).await;
+            EpochManager::new(builder, tn_datadir, consensus_db, key_config, version).await;
         let result = epoch_manager.run().await;
         if let Err(err) = &result {
             tracing::error!("Error running node: {err}");

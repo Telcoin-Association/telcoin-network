@@ -14,12 +14,14 @@ use tn_types::{
 /// Contain the nodes identifying info to provide over RPC.
 #[derive(PartialEq, Serialize, Deserialize, Clone, Debug)]
 pub struct RpcNodeInfo {
+    /// Chain id this node is part of.
+    pub chain_id: u64,
+    /// The version of the running software.
+    pub version: &'static str,
     /// The name for the validator. The default value
-    /// is the hashed value of the validator's
-    /// execution address. The operator can overwrite
+    /// is the base58 encoding of the first 8 bytes of the BLS public key
+    /// prepended with 'node-'. The operator can overwrite
     /// this value since it is not used when writing to file.
-    ///
-    /// Keccak256(Address)
     pub name: String,
     /// The nodes BLS public key.
     pub bls_public_key: BlsPublicKey,
@@ -30,7 +32,7 @@ pub struct RpcNodeInfo {
     pub execution_address: Address,
     /// Network public key for the primary network.
     pub primary_network_key: NetworkPublicKey,
-    /// Network public key for the workes network.
+    /// Network public key for the workers network.
     pub worker_network_key: NetworkPublicKey,
     /// Network external address for the primary network.
     pub primary_external_address: Multiaddr,

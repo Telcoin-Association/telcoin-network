@@ -106,7 +106,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         launcher: L,
     ) -> eyre::Result<JoinHandle<eyre::Result<()>>>
     where
-        L: FnOnce(TnBuilder, Ext, PathBuf, KeyConfig) -> JoinHandle<eyre::Result<()>>,
+        L: FnOnce(TnBuilder, Ext, PathBuf, KeyConfig, &'static str) -> JoinHandle<eyre::Result<()>>,
     {
         info!(target: "cli", "telcoin-network {} starting", SHORT_VERSION);
 
@@ -171,6 +171,6 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         let reth_db = tn_reth::RethEnv::new_database(&node_config, tn_datadir.reth_db_path())?;
         let builder = TnBuilder { node_config, tn_config, metrics, healthcheck, reth_db };
 
-        Ok(launcher(builder, ext, tn_datadir, key_config))
+        Ok(launcher(builder, ext, tn_datadir, key_config, SHORT_VERSION))
     }
 }

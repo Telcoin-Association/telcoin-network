@@ -15,6 +15,8 @@ use tn_types::{BlockHash, ConsensusHeader, Epoch, EpochCertificate, EpochRecord,
 #[rpc(server, namespace = "tn")]
 pub trait TelcoinNetworkRpcExtApi {
     /// Return the nodes information.
+    /// To include, names, ids, public keys, network addressed etc.
+    /// This should be all the publicly available information to identify and connect to this node.
     #[method(name = "info")]
     async fn info(&self) -> TelcoinNetworkRpcResult<RpcNodeInfo>;
     /// Return the latest consensus header.

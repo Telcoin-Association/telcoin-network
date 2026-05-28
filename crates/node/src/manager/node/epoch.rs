@@ -757,10 +757,12 @@ where
             )
             .await?;
 
+        let public_key = self.key_config.public_key();
         let node_info = RpcNodeInfo {
+            chain_id: engine.get_reth_env().await.chainspec().chain_id(),
             name: self.builder.tn_config.node_info.name.clone(),
-            bls_public_key: self.key_config.public_key(),
-            authority_id: self.key_config.public_key().into(),
+            bls_public_key: public_key,
+            authority_id: public_key.into(),
             execution_address: self.builder.tn_config.node_info.execution_address,
             primary_network_key: self.key_config.primary_network_public_key(),
             worker_network_key: self.key_config.worker_network_public_key(),
@@ -776,6 +778,7 @@ where
                 .node_info
                 .worker_network_address()
                 .clone(),
+            version: self.version_str,
         };
         let engine_to_primary =
             EngineToPrimaryRpc::new(consensus_bus_app, self.consensus_chain.clone(), node_info);
