@@ -4,6 +4,7 @@ use tn_types::B256;
 
 use crate::archive::{
     crc::{add_crc32, check_crc},
+    data_file::fsync_directory,
     digest_index::{
         bloom::{Bloom, BLOOM_SIZE_BYTES},
         bucket_iter::BucketIter,
@@ -292,7 +293,13 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         read_only: bool,
     ) -> Result<HdxIndex<KSIZE, S>, LoadHeaderError> {
         let dir = dir.as_ref();
-        let _ = fs::create_dir(dir);
+        let dir_created = fs::create_dir(dir).is_ok();
+        if dir_created {
+            // The index directory is brand new; fsync the parent so the entry survives a crash.
+            if let Some(parent) = dir.parent() {
+                let _ = fsync_directory(parent);
+            }
+        }
         let mut hdx_file = if read_only {
             OpenOptions::new().read(true).write(false).open(dir.join("index.hdx"))?
         } else {
@@ -328,6 +335,9 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
                 hdx_file.write_all(&chunk[..n * bucket_size])?;
                 remaining -= n;
             }
+            // Header and initial buckets were just written; fsync the directory so the index.hdx
+            // entry is durable.
+            let _ = fsync_directory(dir);
             (header, bloom)
         } else {
             let header = HdxHeader::load_header(&mut hdx_file)?;

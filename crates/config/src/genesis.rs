@@ -187,11 +187,9 @@ impl NetworkGenesis {
 #[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
 pub struct NodeInfo {
     /// The name for the validator. The default value
-    /// is the hashed value of the validator's
-    /// execution address. The operator can overwrite
+    /// is the base58 encoding of the first 8 bytes of the BLS public key
+    /// prepended with 'node-'. The operator can overwrite
     /// this value since it is not used when writing to file.
-    ///
-    /// Keccak256(Address)
     pub name: String,
     /// [BlsPublicKey] to verify signature.
     pub bls_public_key: BlsPublicKey,

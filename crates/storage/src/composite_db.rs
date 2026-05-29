@@ -261,8 +261,7 @@ mod test {
     fn open_redb(path: &Path) -> CompositeDatabase<ReDB> {
         let db = ReDB::open(path.join("redb")).expect("Cannot open database");
 
-        let db =
-            CompositeDatabase::open(db.clone(), db.clone(), db.clone(), db.clone(), db.clone(), db);
+        let db = CompositeDatabase::open(db.clone(), db.clone(), db);
         db.open_table::<TestTable>().expect("failed to open table!");
         db
     }

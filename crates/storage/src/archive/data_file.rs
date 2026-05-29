@@ -12,6 +12,24 @@ use crate::archive::error::rename::RenameError;
 const READ_BUFFER_SIZE: usize = 16 * 1024; // 16kb
 const WRITE_BUFFER_SIZE: usize = 16 * 1024; // 16kb
 
+/// Fsync a directory so recent directory-entry changes (file creates, renames)
+/// are durable on Unix.
+///
+/// `File::sync_all` on a regular file does not flush the parent directory entry
+/// that names it.  A crash between a create/rename and a subsequent directory
+/// fsync can leave the filesystem with the entry missing even though the file's
+/// own data and metadata are durable.  Calling this on the parent directory
+/// closes that gap.
+///
+/// # Precondition
+///
+/// `path` must refer to a directory.  Passing a regular file silently fsyncs
+/// that file's contents instead of providing the directory-entry durability
+/// guarantee callers expect, so all in-crate call sites pass a directory.
+pub(crate) fn fsync_directory(path: &Path) -> Result<(), io::Error> {
+    File::open(path)?.sync_all()
+}
+
 /// Wrapper around a file that implements read and write buffers and manages
 /// them seamlessly via standard IO traits.
 #[derive(Debug)]
@@ -38,7 +56,12 @@ impl DataFile {
             // If we are opening for write then make sure the file exists.
             // This function will create it if it does not exist or produce
             // an error if it does so ignore the errors.
-            let _ = File::create_new(path);
+            if File::create_new(path).is_ok() {
+                // New file was created; fsync the parent so the directory entry is durable.
+                if let Some(parent) = path.parent() {
+                    let _ = fsync_directory(parent);
+                }
+            }
         }
         let mut data_file = OpenOptions::new().read(true).append(!read_only).open(path)?;
         let data_file_end = data_file.seek(SeekFrom::End(0))?;
@@ -164,9 +187,21 @@ impl DataFile {
         if path.exists() {
             return Err(RenameError::FilesExist);
         }
+        let old_parent = self.data_file_path.parent().map(Path::to_owned);
         let res = fs::rename(&self.data_file_path, path);
         if res.is_ok() {
             self.data_file_path = path.to_owned();
+            // Fsync the new path's parent so the rename is durable on the entry side.
+            if let Some(new_parent) = path.parent() {
+                fsync_directory(new_parent).map_err(RenameError::RenameIO)?;
+            }
+            // If the source was in a different directory, fsync that too so the old entry's
+            // removal is durable.
+            if let Some(old_parent) = &old_parent {
+                if path.parent() != Some(old_parent.as_path()) {
+                    fsync_directory(old_parent).map_err(RenameError::RenameIO)?;
+                }
+            }
         }
         res.map_err(RenameError::RenameIO)
     }

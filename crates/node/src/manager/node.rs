@@ -79,6 +79,9 @@ pub(crate) struct EpochManager<P, DB> {
 
     /// The nodes bootstrap servers.
     bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapServer>,
+
+    /// The version string for the running node.
+    version_str: &'static str,
 }
 
 /// Restore the [`GasAccumulator`] state after a mid-epoch restart.
@@ -167,6 +170,7 @@ where
         tn_datadir: P,
         consensus_db: DB,
         key_config: KeyConfig,
+        version_str: &'static str,
     ) -> Self {
         // Note this can only fail if the consensus DB is very broken (bad path for instance).
         // So we will panic for now, this will kill the node on startup for a critical error.
@@ -212,6 +216,7 @@ where
             last_forwarded_consensus_number: 0,
             consensus_chain,
             bootstrap_servers,
+            version_str,
         }
     }
 

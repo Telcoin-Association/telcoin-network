@@ -15,11 +15,12 @@ use std::{
 use parking_lot::Mutex;
 use tn_types::{
     gas_accumulator::RewardsCounter, AuthorityIdentifier, Batch, BlockHash, BlockNumHash,
-    CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput, Epoch, EpochRecord, Round, B256,
+    CommittedSubDag, Committee, ConsensusChainReader, ConsensusChainWriter, ConsensusHeader,
+    ConsensusOutput, Epoch, EpochRecord, ReadStream, Round, B256,
 };
 use tokio::{
     fs::File as AsyncFile,
-    io::{AsyncRead, AsyncSeek},
+    io::AsyncRead,
     sync::{
         mpsc::{self, Sender},
         oneshot,
@@ -31,9 +32,6 @@ use crate::{
     consensus_pack::{ConsensusPack, PackError, DATA_NAME},
     epoch_records::{EpochDbError, EpochRecordDb},
 };
-
-pub trait ReadStream: AsyncRead + AsyncSeek + Send + Unpin {}
-impl ReadStream for AsyncFile {}
 
 /// Simple enum for which of two saved consensus states we are using.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -725,6 +723,121 @@ impl ConsensusChain {
         pack.persist().await?; // Surface any open errors.
         self.recent_packs.lock().push_back(pack.clone());
         Ok(pack)
+    }
+}
+
+impl ConsensusChainReader for ConsensusChain {
+    async fn consensus_header_by_digest(
+        &self,
+        epoch: Epoch,
+        digest: B256,
+    ) -> eyre::Result<Option<ConsensusHeader>> {
+        ConsensusChain::consensus_header_by_digest(self, epoch, digest).await.map_err(Into::into)
+    }
+
+    async fn consensus_header_by_number(
+        &self,
+        number: u64,
+    ) -> eyre::Result<Option<ConsensusHeader>> {
+        ConsensusChain::consensus_header_by_number(self, number).await.map_err(Into::into)
+    }
+
+    async fn consensus_header_latest(&self) -> eyre::Result<Option<ConsensusHeader>> {
+        ConsensusChain::consensus_header_latest(self).await.map_err(Into::into)
+    }
+
+    async fn latest_consensus_header_from_pack(
+        &self,
+        epoch: Epoch,
+    ) -> eyre::Result<Option<ConsensusHeader>> {
+        ConsensusChain::latest_consensus_header_from_pack(self, epoch).await.map_err(Into::into)
+    }
+
+    fn latest_consensus_number(&self) -> u64 {
+        ConsensusChain::latest_consensus_number(self)
+    }
+
+    fn latest_consensus_epoch(&self) -> Epoch {
+        ConsensusChain::latest_consensus_epoch(self)
+    }
+
+    async fn read_last_committed(&self, epoch: Epoch) -> HashMap<AuthorityIdentifier, Round> {
+        ConsensusChain::read_last_committed(self, epoch).await
+    }
+
+    async fn read_latest_commit_with_final_reputation_scores(
+        &self,
+        epoch: Epoch,
+    ) -> Option<Arc<CommittedSubDag>> {
+        ConsensusChain::read_latest_commit_with_final_reputation_scores(self, epoch).await
+    }
+
+    async fn get_consensus_output_current(&self, number: u64) -> eyre::Result<ConsensusOutput> {
+        ConsensusChain::get_consensus_output_current(self, number).await.map_err(Into::into)
+    }
+
+    async fn is_epoch_complete(&self, epoch_record: &EpochRecord) -> bool {
+        ConsensusChain::is_epoch_complete(self, epoch_record).await
+    }
+
+    async fn contains_current_batch(&self, digest: BlockHash) -> bool {
+        ConsensusChain::contains_current_batch(self, digest).await
+    }
+
+    async fn get_batches<'a>(
+        &'a self,
+        epoch: Epoch,
+        digests: impl Iterator<Item = &'a BlockHash> + Send + 'a,
+    ) -> Vec<Batch> {
+        ConsensusChain::get_batches(self, epoch, digests).await
+    }
+
+    async fn count_leaders(
+        &self,
+        last_executed_round: Round,
+        rewards_counter: RewardsCounter,
+    ) -> eyre::Result<()> {
+        ConsensusChain::count_leaders(self, last_executed_round, rewards_counter)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn get_epoch_stream(&self, epoch: Epoch) -> eyre::Result<Box<dyn ReadStream>> {
+        ConsensusChain::get_epoch_stream(self, epoch).await.map_err(Into::into)
+    }
+
+    fn already_streaming_epoch(&self, epoch: Epoch) -> bool {
+        ConsensusChain::already_streaming_epoch(self, epoch)
+    }
+}
+
+impl ConsensusChainWriter for ConsensusChain {
+    async fn save_consensus_output(&self, consensus: ConsensusOutput) -> eyre::Result<()> {
+        ConsensusChain::save_consensus_output(self, consensus).await.map_err(Into::into)
+    }
+
+    async fn new_epoch(
+        &self,
+        previous_epoch: EpochRecord,
+        committee: Committee,
+    ) -> eyre::Result<()> {
+        ConsensusChain::new_epoch(self, previous_epoch, committee).await.map_err(Into::into)
+    }
+
+    async fn stream_import<R: AsyncRead + Unpin + Send>(
+        &self,
+        stream: R,
+        epoch_record: &EpochRecord,
+        previous_epoch: &EpochRecord,
+        timeout: Duration,
+    ) -> eyre::Result<()> {
+        ConsensusChain::stream_import(self, stream, epoch_record, previous_epoch, timeout)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn persist_current(&self) -> eyre::Result<()> {
+        ConsensusChain::persist_current(self).await.map_err(Into::into)
     }
 }
 
