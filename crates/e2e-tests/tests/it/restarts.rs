@@ -3,7 +3,7 @@
 use super::common::{kill_child, ProcessGuard};
 use crate::common::{
     address_from_word, get_balance, get_balance_above_with_retry, get_block, get_block_number,
-    get_key, get_latest_consensus_header_number, get_positive_balance_with_retry,
+    get_key, get_latest_consensus_header_number, get_node_info, get_positive_balance_with_retry,
     network_advancing, send_and_confirm, send_tel, start_observer, start_validator, WEI_PER_TEL,
 };
 use e2e_tests::config_local_testnet;
@@ -33,6 +33,30 @@ fn run_restart_tests1(
     })?;
     std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will fail if a node is lagging.
 
+    let info = get_node_info(&client_urls[0]).unwrap();
+    assert_eq!(
+        info.get("execution_address").unwrap(),
+        "0x1111111111111111111111111111111111111111"
+    );
+    assert_eq!(info.get("chain_id").unwrap(), &serde_json::Value::Number(2017.into()));
+    let info = get_node_info(&client_urls[1]).unwrap();
+    assert_eq!(
+        info.get("execution_address").unwrap(),
+        "0x2222222222222222222222222222222222222222"
+    );
+    assert_eq!(info.get("chain_id").unwrap(), &serde_json::Value::Number(2017.into()));
+    let info = get_node_info(&client_urls[2]).unwrap();
+    assert_eq!(
+        info.get("execution_address").unwrap(),
+        "0x3333333333333333333333333333333333333333"
+    );
+    assert_eq!(info.get("chain_id").unwrap(), &serde_json::Value::Number(2017.into()));
+    let info = get_node_info(&client_urls[3]).unwrap();
+    assert_eq!(
+        info.get("execution_address").unwrap(),
+        "0x4444444444444444444444444444444444444444"
+    );
+    assert_eq!(info.get("chain_id").unwrap(), &serde_json::Value::Number(2017.into()));
     let key = get_key("test-source");
     let to_account = address_from_word("testing");
 

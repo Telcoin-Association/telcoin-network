@@ -5,14 +5,14 @@ mod error;
 mod rpc_ext;
 
 pub use rpc_ext::{TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tn_types::{
     Address, AuthorityIdentifier, BlockHash, BlsPublicKey, ConsensusHeader, Epoch,
     EpochCertificate, EpochRecord, Multiaddr, NetworkPublicKey,
 };
 
 /// Contain the nodes identifying info to provide over RPC.
-#[derive(PartialEq, Serialize, Deserialize, Clone, Debug)]
+#[derive(PartialEq, Serialize, Clone, Debug)]
 pub struct RpcNodeInfo {
     /// Chain id this node is part of.
     pub chain_id: u64,
@@ -51,5 +51,5 @@ pub trait EngineToPrimary {
         hash: Option<BlockHash>,
     ) -> impl std::future::Future<Output = Option<(EpochRecord, EpochCertificate)>> + Send;
     /// Return the nodes static information.
-    fn node_info(&self) -> RpcNodeInfo;
+    fn node_info(&self) -> &RpcNodeInfo;
 }

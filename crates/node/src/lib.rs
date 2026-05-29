@@ -27,7 +27,7 @@ use tempfile as _;
 ///
 /// Worker, Primary, and Execution.
 /// This will possibly "loop" to launch multiple times in response to
-/// a nodes mode changes.  This ensures a clean state and fresh tasks
+/// a node's mode changes.  This ensures a clean state and fresh tasks
 /// when switching modes.
 pub fn launch_node<P>(
     builder: TnBuilder,
@@ -110,8 +110,8 @@ impl EngineToPrimary for EngineToPrimaryRpc {
         }
     }
 
-    fn node_info(&self) -> tn_rpc::RpcNodeInfo {
-        self.node_info.clone()
+    fn node_info(&self) -> &tn_rpc::RpcNodeInfo {
+        &self.node_info
     }
 }
 

@@ -14,7 +14,7 @@ use tn_types::{BlockHash, ConsensusHeader, Epoch, EpochCertificate, EpochRecord,
 /// TN-specific RPC endpoints.
 #[rpc(server, namespace = "tn")]
 pub trait TelcoinNetworkRpcExtApi {
-    /// Return the nodes information.
+    /// Return the node's information.
     /// To include, names, ids, public keys, network addressed etc.
     /// This should be all the publicly available information to identify and connect to this node.
     #[method(name = "info")]
@@ -61,7 +61,7 @@ where
     N: Send + Sync + 'static,
 {
     async fn info(&self) -> TelcoinNetworkRpcResult<RpcNodeInfo> {
-        Ok(self.inner_node_network.node_info())
+        Ok(self.inner_node_network.node_info().clone())
     }
     async fn latest_consensus_header(&self) -> TelcoinNetworkRpcResult<ConsensusHeader> {
         Ok(self.inner_node_network.get_latest_consensus_block())

@@ -425,6 +425,11 @@ pub(crate) fn get_latest_consensus_header(node: &str) -> eyre::Result<HashMap<St
     call_rpc(node, "tn_latestConsensusHeader", rpc_params![], 10, "tn_latestConsensusHeader")
 }
 
+/// Retrieve a node's latest consensus header.
+pub(crate) fn get_node_info(node: &str) -> eyre::Result<HashMap<String, Value>> {
+    call_rpc(node, "tn_info", rpc_params![], 10, "tn_info")
+}
+
 /// Query a node's highest consensus chain block height.
 /// NOTE: consensus chain is required to grow to detect byzantine validators.
 pub(crate) fn get_latest_consensus_header_number(node: &str) -> eyre::Result<u64> {
