@@ -51,6 +51,7 @@ fn create_test_peers<Req: TNMessage, Res: TNMessage>(
                 task_manager.get_spawner(),
                 KadStoreType::Primary,
                 config.primary_address(),
+                None,
             )
             .expect("peer1 network created");
 
@@ -150,6 +151,7 @@ where
             task_manager.get_spawner(),
             KadStoreType::Primary,
             config_1.primary_address(),
+            None,
         )
         .expect("peer1 network created");
     let network_handle_1 = peer1_network.network_handle();
@@ -172,6 +174,7 @@ where
             task_manager.get_spawner(),
             KadStoreType::Primary,
             config_2.primary_address(),
+            None,
         )
         .expect("peer2 network created");
     let network_handle_2 = peer2_network.network_handle();
@@ -1732,6 +1735,176 @@ async fn test_newer_kad_record_replaced() -> eyre::Result<()> {
         .get(&peer2_new_record.key)
         .expect("peer2 record in local kad store");
     assert_eq!(*store_record, peer2_new_record);
+
+    Ok(())
+}
+
+/// A validator that advertises an [`RpcInfo`] on its worker [`NodeRecord`] is
+/// discoverable from a new node that joins the network and runs
+/// `find_authorities`. The new node's `get_all_validator_rpcs` exposes exactly
+/// the advertised entry, and lookups for non-advertising validators return
+/// `None`.
+#[tokio::test]
+async fn test_advertise_rpc_via_kad() -> eyre::Result<()> {
+    use crate::types::RpcInfo;
+
+    let num_network_peers = 5;
+
+    // Set up multiple peers with the default config
+    let (mut target_peer, mut committee, _) =
+        create_test_peers::<TestWorkerRequest, TestWorkerResponse>(
+            NonZeroUsize::new(num_network_peers).unwrap(),
+            None,
+        );
+
+    // inject an RPC descriptor into target peer's signed node record before spawn —
+    // simulates a validator that configured an `rpc` endpoint.
+    let rpc = RpcInfo {
+        http: "https://node1.example:8545/".parse().expect("http url"),
+        ws: Some("wss://node1.example:8546/".parse().expect("ws url")),
+    };
+    let mut target_network = target_peer.network.take().expect("target network is some");
+    let mut target_info = target_network.node_record.info.clone();
+    target_info.rpc = Some(rpc.clone());
+    let target_signature =
+        target_peer.config.key_config().request_signature_direct(&encode(&target_info));
+    target_network.node_record = NodeRecord { info: target_info, signature: target_signature };
+
+    let target_peer_bls = target_peer.config.key_config().primary_public_key();
+    let target_peer_net = target_peer.config.primary_networkkey();
+    let target_peer_addr = target_peer.config.primary_address();
+    let id = target_peer.config.authority().as_ref().expect("authority").id();
+    tokio::spawn(async move {
+        let res = target_network.run().await;
+        debug!(target: "network", ?id, ?res, "network shutdown");
+    });
+    target_peer.network_handle.start_listening(target_peer_addr.clone()).await?;
+
+    // spawn the rest of the committee, connect each to target
+    for peer in committee.iter_mut() {
+        let peer_network = peer.network.take().expect("peer network is some");
+        let id = peer.config.authority().as_ref().expect("authority").id();
+        tokio::spawn(async move {
+            let res = peer_network.run().await;
+            debug!(target: "network", ?id, ?res, "network shutdown");
+        });
+        peer.network_handle.start_listening(peer.config.primary_address()).await?;
+        peer.network_handle
+            .add_trusted_peer_and_dial(
+                target_peer_bls,
+                target_peer_net.clone(),
+                target_peer_addr.clone(),
+            )
+            .await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+
+    // spawn the 6th non-validator peer
+    let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let NetworkPeer { config: nvv_config, network_handle: nvv, network, .. } = peer1;
+    tokio::spawn(async move {
+        network.run().await.expect("nvv network run failed!");
+    });
+    nvv.start_listening(nvv_config.primary_address()).await?;
+    nvv.add_trusted_peer_and_dial(
+        target_peer_bls,
+        target_peer_net.clone(),
+        target_peer_addr.clone(),
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+
+    // ask the network to locate every committee member via kad
+    let authorities: Vec<BlsPublicKey> =
+        committee.iter().map(|p| p.config.key_config().primary_public_key()).collect();
+    nvv.find_authorities(authorities.clone()).await?;
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 5)).await;
+
+    // snapshot the advertised RPCs known on the NVV; only the target advertised
+    let mut all = nvv.get_all_validator_rpcs().await?;
+    all.sort_by_key(|(bls, _)| *bls);
+    assert_eq!(all.len(), 1, "exactly one advertised rpc expected; got {all:?}");
+    let (key, advertised) = &all[0];
+    assert_eq!(*key, target_peer_bls);
+    assert_eq!(*advertised, rpc);
+
+    // direct lookup for the advertising peer matches
+    assert_eq!(nvv.get_validator_rpc(target_peer_bls).await?, Some(rpc));
+    // and a non-advertising peer returns None
+    let other_bls = committee[0].config.key_config().primary_public_key();
+    assert_eq!(nvv.get_validator_rpc(other_bls).await?, None);
+
+    Ok(())
+}
+
+/// Documents the rollout contract: a pre-upgrade kad record (no `rpc` field)
+/// surviving in a peer's persistent kad store after restart is inert. The
+/// upgraded code rejects it via signature/decode and never promotes it into
+/// `known_peers`, so RPC lookups for the owner return `None`.
+#[tokio::test]
+async fn test_pre_upgrade_record_does_not_corrupt_view() -> eyre::Result<()> {
+    use libp2p::kad;
+    use serde::{Deserialize, Serialize};
+    use tn_types::{BlsSignature, Multiaddr, NetworkPublicKey, TimestampSec};
+
+    /// Pre-upgrade NetworkInfo shape (no `rpc` field). Field order MUST mirror
+    /// the historical layout so encoded bytes match what an old peer would
+    /// have written to disk.
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    struct OldNetworkInfo {
+        pubkey: NetworkPublicKey,
+        multiaddrs: Vec<Multiaddr>,
+        timestamp: TimestampSec,
+    }
+
+    /// Pre-upgrade NodeRecord shape.
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    struct OldNodeRecord {
+        info: OldNetworkInfo,
+        signature: BlsSignature,
+    }
+
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let owner_bls = peer2.config.key_config().primary_public_key();
+    let owner_peer_id = *peer2.network.swarm.local_peer_id();
+
+    // build a valid pre-upgrade record signed with peer2's BLS key
+    let old_info = OldNetworkInfo {
+        pubkey: peer2.config.key_config().primary_network_public_key(),
+        multiaddrs: vec![peer2.config.primary_address()],
+        timestamp: now(),
+    };
+    let signature = peer2.config.key_config().request_signature_direct(&encode(&old_info));
+    let old_record = OldNodeRecord { info: old_info, signature };
+
+    let kad_record = kad::Record {
+        key: kad::RecordKey::new(&owner_bls),
+        value: encode(&old_record),
+        publisher: Some(owner_peer_id),
+        expires: None,
+    };
+
+    // peer_record_valid must reject pre-upgrade bytes (decode mismatch on
+    // `try_decode::<NodeRecord>`).
+    assert!(network.peer_record_valid(&kad_record).is_none());
+
+    // inject directly into the local kad store, simulating a record that
+    // survived a node restart from before the upgrade.
+    network.swarm.behaviour_mut().kademlia.store_mut().put(kad_record.clone())?;
+
+    // simulate processing an inbound put request carrying the old record —
+    // must not panic and must not promote it into `known_peers`.
+    network.process_kad_put_request(owner_peer_id, kad_record)?;
+
+    // the owner is not in known_peers so RPC lookups return None.
+    let rpc = network.swarm.behaviour().peer_manager.get_rpc(&owner_bls);
+    assert!(rpc.is_none(), "old-format record must not be promoted");
+    let all = network.swarm.behaviour().peer_manager.all_rpcs();
+    assert!(all.is_empty(), "old-format record must not appear in all_rpcs");
 
     Ok(())
 }

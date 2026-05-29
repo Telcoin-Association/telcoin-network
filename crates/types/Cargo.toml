@@ -28,6 +28,7 @@ serde_with = { workspace = true }
 serde_yaml = { workspace = true }
 serde_repr = { workspace = true }
 thiserror = { workspace = true }
+url = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "macros", "signal"] }
 tracing = { workspace = true }
 eyre = { workspace = true }

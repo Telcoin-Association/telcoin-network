@@ -11,7 +11,7 @@ use crate::{
     stream::{StreamBehavior, StreamEvent},
     types::{
         KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo, NetworkResult,
-        NodeRecord,
+        NodeRecord, RpcInfo,
     },
     PeerExchangeMap,
 };
@@ -194,6 +194,7 @@ where
             task_manager,
             KadStoreType::Primary,
             external_addr,
+            None,
         )
     }
 
@@ -205,6 +206,7 @@ where
         db: DB,
         task_manager: TaskSpawner,
         external_addr: Multiaddr,
+        rpc: Option<RpcInfo>,
     ) -> NetworkResult<Self> {
         let network_key = key_config.worker_network_keypair().clone();
         Self::new(
@@ -216,6 +218,7 @@ where
             task_manager,
             KadStoreType::Worker,
             external_addr,
+            rpc,
         )
     }
 
@@ -230,6 +233,7 @@ where
         task_spawner: TaskSpawner,
         kad_type: KadStoreType,
         external_addr: Multiaddr,
+        rpc: Option<RpcInfo>,
     ) -> NetworkResult<Self> {
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             // explicitly set default
@@ -317,7 +321,7 @@ where
         let (handle, commands) = tokio::sync::mpsc::channel(100);
         let config = network_config.libp2p_config().clone();
         let pending_px_disconnects = HashMap::with_capacity(config.max_px_disconnects);
-        let node_record = Self::create_node_record(external_addr, &key_config, network_pubkey);
+        let node_record = Self::create_node_record(external_addr, &key_config, network_pubkey, rpc);
 
         Ok(Self {
             swarm,
@@ -347,8 +351,9 @@ where
         external_addr: Multiaddr,
         key_config: &KeyConfig,
         network_pubkey: NetworkPublicKey,
+        rpc: Option<RpcInfo>,
     ) -> NodeRecord {
-        NodeRecord::build(network_pubkey, external_addr, |data| {
+        NodeRecord::build(network_pubkey, external_addr, rpc, |data| {
             key_config.request_signature_direct(data)
         })
     }
@@ -372,11 +377,11 @@ where
         let node_record = try_decode::<NodeRecord>(record.value.as_ref()).ok()?;
 
         // verify bls signature
-        let verified = node_record.verify(&key)?;
+        let (pubkey, mut node_record) = node_record.verify(&key)?;
 
         // verify publisher matches the network public key in the record
         // this prevents replay attacks where malicious nodes republish outdated records
-        let expected_peer_id: PeerId = verified.1.info.pubkey.clone().into();
+        let expected_peer_id: PeerId = node_record.info.pubkey.clone().into();
         if record.publisher != Some(expected_peer_id) {
             warn!(
                 target: "network-kad",
@@ -386,7 +391,21 @@ where
             return None;
         }
 
-        Some(verified)
+        // signature verification proves authenticity but not scheme correctness; drop a
+        // malformed advertised endpoint so only well-formed RPC info is ever cached in
+        // `known_peers`. the rest of the (signed, authentic) record is still usable.
+        if let Some(rpc) = &node_record.info.rpc {
+            if let Err(err) = rpc.validate() {
+                warn!(
+                    target: "network-kad",
+                    ?err,
+                    "dropping malformed advertised RPC endpoint from peer record"
+                );
+                node_record.info.rpc = None;
+            }
+        }
+
+        Some((pubkey, node_record))
     }
 
     /// Publish and provide our network addresses and peer id under our BLS public key for
@@ -521,6 +540,7 @@ where
                         pubkey: network_pubkey,
                         multiaddrs: vec![addr],
                         timestamp: now(),
+                        rpc: None,
                     },
                     reply,
                 );
@@ -533,6 +553,7 @@ where
                         pubkey: network_pubkey,
                         multiaddrs: vec![addr],
                         timestamp: now(),
+                        rpc: None,
                     },
                 );
                 let _ = reply.send(Ok(()));
@@ -548,6 +569,7 @@ where
                                 pubkey: info.network_key,
                                 multiaddrs: vec![info.network_address],
                                 timestamp: now(),
+                                rpc: None,
                             },
                         );
                     }
@@ -710,6 +732,14 @@ where
             NetworkCommand::FindAuthorities { bls_keys } => {
                 // this will trigger a PeerEvent to fetch records through kad if not in the peer map
                 self.swarm.behaviour_mut().peer_manager.find_authorities(bls_keys);
+            }
+            NetworkCommand::GetValidatorRpc { bls_key, reply } => {
+                let rpc = self.swarm.behaviour().peer_manager.get_rpc(&bls_key);
+                send_or_log_error!(reply, rpc, "GetValidatorRpc");
+            }
+            NetworkCommand::GetAllValidatorRpcs { reply } => {
+                let rpcs = self.swarm.behaviour().peer_manager.all_rpcs();
+                send_or_log_error!(reply, rpcs, "GetAllValidatorRpcs");
             }
             NetworkCommand::OpenStream { peer, reply } => {
                 // Look up the peer's PeerId from their BLS key

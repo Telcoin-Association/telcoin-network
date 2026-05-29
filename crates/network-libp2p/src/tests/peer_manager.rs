@@ -136,7 +136,12 @@ async fn test_add_trusted_peer() {
     // Add trusted peer
     peer_manager.add_trusted_peer_and_dial(
         peer_bls,
-        NetworkInfo { pubkey: peer_netkey, multiaddrs: vec![multiaddr.clone()], timestamp: now() },
+        NetworkInfo {
+            pubkey: peer_netkey,
+            multiaddrs: vec![multiaddr.clone()],
+            timestamp: now(),
+            rpc: None,
+        },
         sender,
     );
 
@@ -552,6 +557,7 @@ async fn test_is_validator() {
         pubkey: config.key_config().primary_network_public_key(),
         multiaddrs: vec![config.primary_address()],
         timestamp: now(),
+        rpc: None,
     };
     peer_manager.add_known_peer(validator, info);
 
@@ -626,7 +632,12 @@ async fn test_peers_for_exchange() {
         let bls = *BlsKeypair::generate(&mut rng).public();
         peer_manager.add_known_peer(
             bls,
-            NetworkInfo { pubkey: network_key, multiaddrs: vec![addr], timestamp: now() },
+            NetworkInfo {
+                pubkey: network_key,
+                multiaddrs: vec![addr],
+                timestamp: now(),
+                rpc: None,
+            },
         );
     }
 

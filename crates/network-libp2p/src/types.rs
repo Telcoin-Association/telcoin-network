@@ -13,6 +13,9 @@ use libp2p::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use tn_types::{encode, now, BlsPublicKey, BlsSignature, NetworkPublicKey, P2pNode, TimestampSec};
+// Re-export the shared RPC endpoint type so callers can keep referring to
+// `network_libp2p::types::RpcInfo`. The canonical definition lives in `tn_types`.
+pub use tn_types::RpcInfo;
 use tokio::sync::{mpsc, oneshot};
 
 #[cfg(test)]
@@ -309,6 +312,18 @@ where
         /// Channel for returning the established stream to application layer.
         reply: oneshot::Sender<NetworkResult<Stream>>,
     },
+    /// Look up the most-recently-fetched RPC info for a known authority.
+    GetValidatorRpc {
+        /// The authority's BLS public key.
+        bls_key: BlsPublicKey,
+        /// The reply to caller.
+        reply: oneshot::Sender<Option<RpcInfo>>,
+    },
+    /// Snapshot of all known authority RPCs.
+    GetAllValidatorRpcs {
+        /// The reply to caller.
+        reply: oneshot::Sender<Vec<(BlsPublicKey, RpcInfo)>>,
+    },
 }
 
 /// Network handle.
@@ -554,6 +569,28 @@ where
         self.sender.send(NetworkCommand::OpenStream { peer, reply }).await?;
         rx.await.map_err(Into::into)
     }
+
+    /// Look up the most-recently-fetched RPC info for a known authority.
+    ///
+    /// Returns `None` if the authority is unknown or has not advertised RPC info.
+    /// Callers that need fresh data should call [`Self::find_authorities`] first
+    /// and wait for discovery to complete.
+    pub async fn get_validator_rpc(&self, bls_key: BlsPublicKey) -> NetworkResult<Option<RpcInfo>> {
+        let (reply, rx) = oneshot::channel();
+        self.sender.send(NetworkCommand::GetValidatorRpc { bls_key, reply }).await?;
+        rx.await.map_err(Into::into)
+    }
+
+    /// Snapshot of all known authority RPCs.
+    ///
+    /// Returns the RPC info for every known authority that has advertised it.
+    /// Callers that need fresh data should call [`Self::find_authorities`] first
+    /// and wait for discovery to complete.
+    pub async fn get_all_validator_rpcs(&self) -> NetworkResult<Vec<(BlsPublicKey, RpcInfo)>> {
+        let (reply, rx) = oneshot::channel();
+        self.sender.send(NetworkCommand::GetAllValidatorRpcs { reply }).await?;
+        rx.await.map_err(Into::into)
+    }
 }
 
 /// List of addresses for a node, signature will be the nodes BLS signature
@@ -572,11 +609,16 @@ pub struct NodeRecord {
 
 impl NodeRecord {
     /// Helper method to build a signed node record.
-    pub fn build<F>(pubkey: NetworkPublicKey, multiaddr: Multiaddr, signer: F) -> NodeRecord
+    pub fn build<F>(
+        pubkey: NetworkPublicKey,
+        multiaddr: Multiaddr,
+        rpc: Option<RpcInfo>,
+        signer: F,
+    ) -> NodeRecord
     where
         F: FnOnce(&[u8]) -> BlsSignature,
     {
-        let info = NetworkInfo { pubkey, multiaddrs: vec![multiaddr], timestamp: now() };
+        let info = NetworkInfo { pubkey, multiaddrs: vec![multiaddr], timestamp: now(), rpc };
         let data = encode(&info);
         let signature = signer(&data);
         Self { info, signature }
@@ -608,6 +650,12 @@ pub struct NetworkInfo {
     /// The timestamps when this was published.
     /// Useful for nodes to compare latest records.
     pub timestamp: TimestampSec,
+    /// Optional JSON-RPC endpoint information for this node.
+    ///
+    /// Populated only on worker [NodeRecord]s of validators that opt-in to
+    /// advertising RPC publicly. `None` on primary records and on validators
+    /// that do not expose RPC publicly.
+    pub rpc: Option<RpcInfo>,
 }
 
 /// Outbound kad query from this node.

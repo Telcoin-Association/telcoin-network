@@ -12,7 +12,7 @@ use crate::{
     error::NetworkError,
     peers::status::ConnectionStatus,
     send_or_log_error,
-    types::{NetworkInfo, NetworkResult},
+    types::{NetworkInfo, NetworkResult, RpcInfo},
 };
 use libp2p::{core::ConnectedPoint, kad::PeerInfo, multiaddr::Protocol, Multiaddr, PeerId};
 use rand::seq::{IteratorRandom as _, SliceRandom as _};
@@ -612,7 +612,7 @@ impl PeerManager {
         // remove from temporary banned and warn if validator was banned
         let mut exp_committee = Vec::default();
         for bls_key in &committee {
-            if let Some(NetworkInfo { pubkey, multiaddrs: multiaddr, timestamp }) =
+            if let Some(NetworkInfo { pubkey, multiaddrs: multiaddr, timestamp, rpc }) =
                 self.known_peers.get(bls_key)
             {
                 let peer_id: PeerId = pubkey.clone().into();
@@ -626,6 +626,7 @@ impl PeerManager {
                         pubkey: pubkey.clone(),
                         multiaddrs: multiaddr.clone(),
                         timestamp: *timestamp,
+                        rpc: rpc.clone(),
                     },
                 ));
             } else {
@@ -667,6 +668,20 @@ impl PeerManager {
         // emit event for kad to try to discover
         trace!(target: "peer-manager", ?missing, "requesting kad records");
         self.events.push_back(PeerEvent::MissingAuthorities(missing));
+    }
+
+    /// Return the most-recently-fetched [RpcInfo] for the given authority,
+    /// if any has been advertised.
+    pub(crate) fn get_rpc(&self, bls_key: &BlsPublicKey) -> Option<RpcInfo> {
+        self.known_peers.get(bls_key).and_then(|info| info.rpc.clone())
+    }
+
+    /// Return a snapshot of every known authority that has advertised an [RpcInfo].
+    pub(crate) fn all_rpcs(&self) -> Vec<(BlsPublicKey, RpcInfo)> {
+        self.known_peers
+            .iter()
+            .filter_map(|(bls, info)| info.rpc.clone().map(|rpc| (*bls, rpc)))
+            .collect()
     }
 
     /// Find the peer id for an authority.
