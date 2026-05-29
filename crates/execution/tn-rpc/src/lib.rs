@@ -11,7 +11,7 @@ use tn_types::{
     EpochCertificate, EpochRecord, Multiaddr, NetworkPublicKey,
 };
 
-/// Contain the nodes identifying info to provide over RPC.
+/// Contain the node's identifying info to provide over RPC.
 #[derive(PartialEq, Serialize, Clone, Debug)]
 pub struct RpcNodeInfo {
     /// Chain id this node is part of.
@@ -23,9 +23,9 @@ pub struct RpcNodeInfo {
     /// prepended with 'node-'. The operator can overwrite
     /// this value since it is not used when writing to file.
     pub name: String,
-    /// The nodes BLS public key.
+    /// The node's BLS public key.
     pub bls_public_key: BlsPublicKey,
-    /// The nodes authority id (hash of BLS key).
+    /// The node's authority id (hash of BLS key).
     /// Used for some tables (like reputation).
     pub authority_id: AuthorityIdentifier,
     /// Address that will receive rewards if this node participates in consensus.
@@ -50,6 +50,6 @@ pub trait EngineToPrimary {
         epoch: Option<Epoch>,
         hash: Option<BlockHash>,
     ) -> impl std::future::Future<Output = Option<(EpochRecord, EpochCertificate)>> + Send;
-    /// Return the nodes static information.
+    /// Return the node's static information.
     fn node_info(&self) -> &RpcNodeInfo;
 }
