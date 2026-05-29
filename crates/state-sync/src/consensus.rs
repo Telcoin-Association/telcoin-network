@@ -33,7 +33,7 @@ async fn get_consensus_header<DB: TNDatabase>(
     consensus_bus: &ConsensusBusApp,
     network: &PrimaryNetworkHandle,
     consensus_chain: &ConsensusChain,
-) -> Option<(Epoch, u64, B256)> {
+) -> Option<(u64, B256)> {
     // Use the persisted ConsensusChain DB number as the cutoff, not the in-memory
     // recent_blocks tracker. The in-memory tracker can advance during a brief CvvActive
     // phase (local Bullshark commits) before the node transitions to CvvInactive, causing
@@ -43,15 +43,7 @@ async fn get_consensus_header<DB: TNDatabase>(
         return None;
     }
     if let Ok(Some(block)) = db.get::<ConsensusHeaderCache>(&number) {
-        return if block.number > 0 {
-            Some((
-                consensus_chain.epochs().number_to_epoch(block.number - 1),
-                block.number - 1,
-                block.parent_hash,
-            ))
-        } else {
-            None
-        };
+        return if block.number > 0 { Some((block.number - 1, block.parent_hash)) } else { None };
     }
     // request consensus from any peer
     match network.request_consensus(number, hash).await {
@@ -72,8 +64,7 @@ async fn get_consensus_header<DB: TNDatabase>(
                 // Update our last seen valid consensus header if it is newer.
                 consensus_bus.last_consensus_header().send_replace(Some(header));
             }
-            let epoch = consensus_chain.epochs().number_to_epoch(parent_number);
-            Some((epoch, parent_number, parent))
+            Some((parent_number, parent))
         }
         Err(e) => {
             warn!(
@@ -86,8 +77,7 @@ async fn get_consensus_header<DB: TNDatabase>(
             // Return the failed data so we try again.
             // We will not be able to progress without this info so pause and keep trying...
             tokio::time::sleep(Duration::from_secs(5)).await;
-            let epoch = consensus_chain.epochs().number_to_epoch(number);
-            Some((epoch, number, hash))
+            Some((number, hash))
         }
     }
 }
@@ -289,7 +279,6 @@ pub async fn spawn_fetch_consensus(
 
 /// Retrieve a consensus headers from a peer.
 /// Start at number/hash and work backwards to end number.
-#[allow(clippy::too_many_arguments)]
 async fn get_consensus_header_range<DB: TNDatabase>(
     number: u64,
     hash: B256,
@@ -297,22 +286,21 @@ async fn get_consensus_header_range<DB: TNDatabase>(
     consensus_bus: &ConsensusBusApp,
     network: &PrimaryNetworkHandle,
     consensus_chain: &ConsensusChain,
-    fetch_epoch: Epoch,
     end_number: u64,
 ) {
     if number < end_number {
         return;
     }
-    info!(target: "state-sync", ?number, ?hash, ?end_number, ?fetch_epoch, "fetching consensus from peer");
+    info!(target: "state-sync", ?number, ?hash, ?end_number, "fetching consensus from peer");
     let mut number = number;
     let mut hash = hash;
     let mut count = 1;
-    while let Some((epoch, next_number, next_hash)) =
+    while let Some((next_number, next_hash)) =
         get_consensus_header(number, hash, db, consensus_bus, network, consensus_chain).await
     {
         number = next_number;
         hash = next_hash;
-        if number < end_number || epoch < fetch_epoch {
+        if number < end_number {
             break;
         }
         if consensus_chain.consensus_header_by_number(number).await.unwrap_or_default().is_some() {
@@ -320,7 +308,7 @@ async fn get_consensus_header_range<DB: TNDatabase>(
             break;
         }
         if count % 10 == 0 {
-            info!(target: "state-sync", ?number, ?hash, ?end_number, ?fetch_epoch, "fetching consensus from peer");
+            info!(target: "state-sync", ?number, ?hash, ?end_number, "fetching consensus from peer");
         }
         count += 1;
     }
@@ -364,7 +352,6 @@ async fn manage_new_consensus<DB: TNDatabase>(
                     &consensus_bus_clone,
                     &network_clone,
                     &consensus_chain_clone,
-                    epoch,
                     0,
                 )
                 .await;
@@ -381,7 +368,6 @@ async fn manage_new_consensus<DB: TNDatabase>(
         if task_num < 6 {
             let end_number = last_number.unwrap_or_default();
             *last_number = Some(number + 1);
-            let min_epoch = first_gossipped_epoch.unwrap_or_default();
             let tasks_clone = tasks.clone();
             tasks.fetch_add(1, Ordering::Relaxed);
             task_spawner.spawn_task(
@@ -394,7 +380,6 @@ async fn manage_new_consensus<DB: TNDatabase>(
                         &consensus_bus_clone,
                         &network_clone,
                         &consensus_chain_clone,
-                        min_epoch,
                         end_number,
                     )
                     .await;
@@ -428,7 +413,9 @@ pub async fn spawn_fetch_recent_consensus<DB: TNDatabase>(
     // should not hurt and can clear up an issue if something interferes with eviction.
     // Note, on longer shutdowns this will have no real effect but could lead to churn
     // if a node is being restarted relatively quickly.
-    let _ = db.clear_table::<ConsensusHeaderCache>();
+    if let Err(e) = db.clear_table::<ConsensusHeaderCache>() {
+        error!(target: "state-sync", ?e, "Error clearing consensus header cache, ignoring...");
+    }
     // Get the epoch of our last executed consensus.
     let mut current_fetch_epoch = consensus_chain.latest_consensus_epoch();
     let mut first_gossipped_epoch = None; // Track the first epoch we see via gossip.
