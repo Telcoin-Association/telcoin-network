@@ -2,7 +2,10 @@
 
 #![allow(unused_crate_dependencies)]
 
-use std::sync::Arc;
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+};
 use tempfile::TempDir;
 use tn_executor::subscriber::spawn_subscriber;
 use tn_network_libp2p::types::{MessageId, NetworkCommand};
@@ -15,7 +18,8 @@ use tn_primary::{
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
 use tn_test_utils::{create_signed_certificates_for_rounds, CommitteeFixture};
 use tn_types::{
-    BlockNumHash, ExecHeader, SealedHeader, TaskManager, TnReceiver as _, TnSender as _, B256,
+    now, test_chain_spec_arc, Batch, BlockHash, BlockNumHash, ExecHeader, Hash as _, HeaderBuilder,
+    HeaderDigest, SealedHeader, TaskManager, TnReceiver as _, TnSender as _, WorkerId, B256,
     DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::sync::mpsc;
@@ -345,6 +349,195 @@ async fn test_executor_batch_fetching() -> eyre::Result<()> {
         total_batches_received,
         batch_count
     );
+
+    Ok(())
+}
+
+/// Creates a random payload with the given number of batches.
+///
+/// Returns the payload map for a header and the batch map for the mock client.
+fn random_payload(count: usize) -> (HashMap<BlockHash, Batch>, Vec<(Batch, WorkerId)>) {
+    let chain = test_chain_spec_arc();
+    let mut batch_map = HashMap::new();
+    let mut payload_entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let batch = tn_reth::test_utils::batch(chain.clone());
+        let d = batch.digest();
+        batch_map.insert(d, batch.clone());
+        payload_entries.push((batch, 0));
+    }
+    (batch_map, payload_entries)
+}
+
+/// Test that duplicate batch digests within a single committed SubDag are handled gracefully.
+///
+/// Constructs a DAG where one authority includes the same batch digest in certificates at two
+/// different rounds. When Bullshark commits a SubDag containing both certificates, the
+/// subscriber must not crash with `MissingFetchedBatch` on the second occurrence.
+#[tokio::test]
+async fn test_duplicate_batch_digest() -> eyre::Result<()> {
+    let num_sub_dags_per_schedule = 100;
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config().clone();
+    let task_manager = TaskManager::new("duplicate batch tests");
+    let rx_shutdown = config.shutdown().subscribe();
+    let consensus_bus = ConsensusBus::new();
+    let temp_dir = TempDir::with_prefix("test_duplicate_batch_digest").unwrap();
+    let mut consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
+
+    let mut consensus_output = consensus_bus.app().subscribe_consensus_output();
+
+    // network mock to handle publish commands
+    let (tx, mut rx) = mpsc::channel(5);
+    tokio::spawn(async move {
+        while let Some(com) = rx.recv().await {
+            if let NetworkCommand::Publish { topic: _, msg: _, reply } = com {
+                reply.send(Ok(MessageId::new(&[0]))).unwrap();
+            }
+        }
+    });
+    let network = PrimaryNetworkHandle::new_for_test(tx);
+
+    spawn_subscriber(
+        config.clone(),
+        rx_shutdown,
+        consensus_bus.clone(),
+        &task_manager,
+        network,
+        consensus_chain.clone(),
+        u64::max_value(),
+    );
+    tokio::task::yield_now().await;
+
+    // collect authority ids in order
+    let authorities: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+
+    // the batch that will appear in two different certificates (authority[2], rounds 2 and 3)
+    let chain = test_chain_spec_arc();
+    let shared_batch = tn_reth::test_utils::batch(chain);
+    let shared_digest = shared_batch.digest();
+
+    // accumulate all batches for the mock client
+    let mut all_batches: HashMap<BlockHash, Batch> = HashMap::new();
+    all_batches.insert(shared_digest, shared_batch.clone());
+
+    // genesis parents for round 1
+    let mut parents: BTreeSet<HeaderDigest> = fixture.genesis().collect();
+    let mut all_certificates = Vec::new();
+
+    // build 5 rounds of certificates
+    for round in 1u32..=5 {
+        let mut round_digests = BTreeSet::new();
+
+        for (idx, auth_id) in authorities.iter().enumerate() {
+            // authority[2] gets the shared batch in rounds 2 and 3
+            let use_shared = idx == 2 && (round == 2 || round == 3);
+
+            let (batch_map, payload_entries) = if use_shared {
+                // include the shared batch plus some random ones
+                let (mut bmap, mut entries) = random_payload(2);
+                bmap.insert(shared_digest, shared_batch.clone());
+                entries.push((shared_batch.clone(), 0));
+                (bmap, entries)
+            } else {
+                random_payload(3)
+            };
+
+            all_batches.extend(batch_map);
+
+            // build header using with_payload_batch for each batch
+            let mut builder = HeaderBuilder::default()
+                .author(auth_id.clone())
+                .round(round)
+                .epoch(0)
+                .parents(parents.clone())
+                .created_at(now());
+
+            for (batch, worker_id) in payload_entries {
+                builder = builder.with_payload_batch(batch, worker_id);
+            }
+
+            let header = builder.build();
+            let cert = fixture.certificate(&header);
+            round_digests.insert(cert.digest());
+            all_certificates.push(cert);
+        }
+
+        parents = round_digests;
+    }
+
+    // set up mock worker with all batches
+    let mock_client = Arc::new(MockPrimaryToWorkerClient { batches: all_batches });
+    config.local_network().set_primary_to_worker_local_handler(mock_client);
+
+    let leader_schedule = LeaderSchedule::from_store(
+        committee.clone(),
+        &mut consensus_chain,
+        DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    )
+    .await;
+    let bullshark = Bullshark::new(
+        committee.clone(),
+        num_sub_dags_per_schedule,
+        leader_schedule,
+        DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    );
+
+    let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
+    consensus_bus.app().recent_blocks().send_modify(|blocks| {
+        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+    });
+    let task_manager2 = TaskManager::default();
+    Consensus::spawn(
+        config.clone(),
+        &consensus_bus,
+        bullshark,
+        &task_manager2,
+        consensus_chain,
+        None,
+    )
+    .await;
+
+    // feed all certificates to trigger subdag commits
+    for certificate in all_certificates.iter() {
+        consensus_bus.new_certificates().send(certificate.clone()).await.unwrap();
+    }
+
+    // collect outputs with a timeout to avoid hanging
+    let expected_outputs = 2;
+    let mut outputs_received = 0;
+    let mut found_shared_digest = false;
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while let Some(output) = consensus_output.recv().await {
+            // check if any output contains the shared digest
+            for digest in output.batch_digests() {
+                if *digest == shared_digest {
+                    found_shared_digest = true;
+                }
+            }
+
+            outputs_received += 1;
+            if outputs_received >= expected_outputs {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "Timed out waiting for consensus outputs — subscriber may have crashed"
+    );
+    assert!(
+        outputs_received >= expected_outputs,
+        "Expected at least {expected_outputs} outputs, got {outputs_received}"
+    );
+    assert!(found_shared_digest, "The shared batch digest should appear in at least one output");
 
     Ok(())
 }
