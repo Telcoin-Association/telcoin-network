@@ -220,8 +220,8 @@ pub fn spawn_local_testnet(
                 match command.execute(
                     dir,
                     key_config,
-                    |builder, _: NoArgs, tn_datadir, passphrase| {
-                        launch_node(builder, tn_datadir, passphrase)
+                    |builder, _: NoArgs, tn_datadir, passphrase, version| {
+                        launch_node(builder, tn_datadir, passphrase, version)
                     },
                 ) {
                     Ok(handle) => {

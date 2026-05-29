@@ -90,8 +90,8 @@ fn main() {
         std::process::exit(1);
     }
 
-    if let Err(err) = cli.run(passphrase, |builder, _, tn_datadir, key_config| {
-        launch_node(builder, tn_datadir, key_config)
+    if let Err(err) = cli.run(passphrase, |builder, _, tn_datadir, key_config, version| {
+        launch_node(builder, tn_datadir, key_config, version)
     }) {
         eprintln!("Error: {err:?}");
         std::process::exit(1);
