@@ -43,7 +43,7 @@ use tn_types::{
     gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash, BlockNumHash, BlsPublicKey,
     BlsSigner, Committee, CommitteeBuilder, ConsensusOutput, Database as TNDatabase, Epoch,
     EpochRecord, Multiaddr, NetworkPublicKey, Notifier, P2pNode, TaskJoinError, TaskManager,
-    TaskSpawner, TnReceiver, B256,
+    TaskSpawner, TimestampSec, TnReceiver, B256,
 };
 use tn_worker::{quorum_waiter::QuorumWaiterTrait, Worker, WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::mpsc;
@@ -109,6 +109,10 @@ where
         // ourselves... Note, any consensus output to replay should be in the same epoch...
         let (committee, epoch_info, epoch_start) =
             self.get_committee_with_epoch_start_info(engine).await?;
+        // Capture the just-closed epoch's boundary before overwriting it so the network can record
+        // when the previous epoch ended (a future PR uses this to accept late gossip from the
+        // previous committee). On the initial epoch this is the `0` sentinel.
+        self.previous_epoch_boundary = self.epoch_boundary;
         self.epoch_boundary = epoch_start + epoch_info.epochDuration as u64;
         // Produce a "dummy" epoch 0 EpochRecord if missing.
         // This will let us use simple code to find any epoch including 0 at startup.
@@ -484,7 +488,10 @@ where
             if primary_network_handle.connected_peers_count().await.unwrap_or_default() == 0 {
                 let committee_keys: HashSet<BlsPublicKey> =
                     committee.bls_keys().into_iter().collect();
-                let _ = primary_network_handle.inner_handle().new_epoch(committee_keys).await;
+                let _ = primary_network_handle
+                    .inner_handle()
+                    .prepare_committee_dial(committee_keys)
+                    .await;
                 for bls_key in committee.bls_keys() {
                     self.dial_peer_bls(
                         primary_network_handle.inner_handle().clone(),
@@ -1024,10 +1031,14 @@ where
             .iter()
             .map(|(k, v)| (*k, v.primary.clone()))
             .collect();
+        let next_committee_keys: HashSet<BlsPublicKey> =
+            consensus_config.next_committee_keys().iter().copied().collect();
         Self::init_network_for_epoch(
             network_handle.inner_handle(),
             bootstrap_peers,
             committee_keys.clone(),
+            next_committee_keys,
+            self.previous_epoch_boundary,
             initial_epoch,
         )
         .await?;
@@ -1159,10 +1170,14 @@ where
             .iter()
             .map(|(k, v)| (*k, v.worker.clone()))
             .collect();
+        let next_committee_keys: HashSet<BlsPublicKey> =
+            consensus_config.next_committee_keys().iter().copied().collect();
         Self::init_network_for_epoch(
             network_handle.inner_handle(),
             bootstrap_peers,
             committee_keys.clone(),
+            next_committee_keys,
+            self.previous_epoch_boundary,
             initial_epoch,
         )
         .await?;
@@ -1312,21 +1327,28 @@ where
             .unwrap_or(Ok(fallback))
     }
 
-    /// Initialize a network handle for a new epoch: register bootstrap peers (on first epoch)
-    /// then update the epoch committee.
+    /// Initialize a network handle for a new epoch.
     ///
-    /// Bootstrap peers must be added BEFORE `new_epoch()` so that `known_peers` is populated
-    /// when `new_epoch()` builds `current_committee` from it.
+    /// On the initial epoch this registers bootstrap peers and then seeds the previous/current/next
+    /// committees (`initialize_committees`). On every subsequent epoch it rotates the committees
+    /// forward (`next_committee`), recording the just-completed epoch's end timestamp.
+    ///
+    /// Bootstrap peers must be added BEFORE `initialize_committees` so that `known_peers` is
+    /// populated when the peer manager resolves the committees from it.
     async fn init_network_for_epoch<Req: TNMessage, Res: TNMessage>(
         handle: &NetworkHandle<Req, Res>,
         bootstrap_peers: BTreeMap<BlsPublicKey, P2pNode>,
         committee_keys: HashSet<BlsPublicKey>,
+        next_committee_keys: HashSet<BlsPublicKey>,
+        epoch_end_timestamp: TimestampSec,
         initial_epoch: bool,
     ) -> eyre::Result<()> {
         if initial_epoch {
             handle.add_bootstrap_peers(bootstrap_peers).await?;
+            handle.initialize_committees(committee_keys, next_committee_keys).await?;
+        } else {
+            handle.next_committee(next_committee_keys, epoch_end_timestamp).await?;
         }
-        handle.new_epoch(committee_keys).await?;
         Ok(())
     }
 

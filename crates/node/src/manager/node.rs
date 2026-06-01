@@ -58,6 +58,13 @@ pub(crate) struct EpochManager<P, DB> {
     /// If the timestamp of the leader is >= the epoch_boundary then the
     /// manager closes the epoch after the engine executes all data.
     epoch_boundary: TimestampSec,
+    /// The boundary (end timestamp) of the previous epoch.
+    ///
+    /// Captured at the start of each epoch before [`Self::epoch_boundary`] is overwritten, and
+    /// handed to the network as `epoch_end_timestamp` on rotation so it can later accept late
+    /// gossip from the just-completed committee. The `0` sentinel means no previous epoch boundary
+    /// has been observed yet (initial epoch / fresh process).
+    previous_epoch_boundary: TimestampSec,
     /// Reth DB, keep for entire execution.
     reth_db: RethDb,
     /// Consensus DB, keep for entire execution.
@@ -208,6 +215,7 @@ where
             key_config,
             node_shutdown,
             epoch_boundary: Default::default(),
+            previous_epoch_boundary: Default::default(),
             reth_db,
             consensus_db,
             consensus_bus,
