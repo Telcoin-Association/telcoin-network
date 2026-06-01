@@ -439,27 +439,16 @@ impl<DB: Database> Subscriber<DB> {
 
             // retrieve fetched batch by digest
             for digest in header.payload().keys() {
+                let batch = fetched_batches.remove(digest).ok_or(SubscriberError::MissingFetchedBatch(*digest)).inspect_err(|_| {
+                    error!(target: "subscriber", "[Protocol violation] Batch not found in fetched batches from workers of certificate signers");
+                })?;
+
                 debug!(
                     target: "subscriber",
-                    ?digest,
-                    "fetching batch",
+                    "Adding fetched batch {digest} from certificate {} to consensus output",
+                    header.digest()
                 );
-
-                let batch = fetched_batches.remove(digest);
-                if let Some(batch) = batch {
-                    debug!(
-                        target: "subscriber",
-                        "Adding fetched batch {digest} from certificate {} to consensus output",
-                        header.digest()
-                    );
-
-                    cert_batches.push(batch.clone());
-                } else {
-                    if !batch_digests.contains(digest) {
-                        error!(target: "subscriber", ?digest, "[Protocol violation] Batch not found in fetched batches from workers of certificate signers");
-                        return Err(SubscriberError::MissingFetchedBatch(*digest));
-                    }
-                }
+                cert_batches.push(batch);
             }
 
             // main collection for execution
