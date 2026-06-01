@@ -2,9 +2,11 @@
 
 use super::*;
 use crate::consensus::LeaderSwapTable;
+use indexmap::IndexMap;
+use std::collections::BTreeSet;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils_committee::CommitteeFixture;
-use tn_types::B256;
+use tn_types::{now, HeaderBuilder, B256};
 
 #[tokio::test]
 async fn test_empty_proposal() {
@@ -128,5 +130,145 @@ async fn test_equivocation_protection_after_restart() {
     let new_header = rx_headers.recv().await.unwrap();
     if new_header.round() == header.round() {
         assert_eq!(header, new_header);
+    }
+}
+
+/// Helper to build a header with the given author, round, and payload digests.
+fn build_test_header(author: &AuthorityIdentifier, round: Round, digests: &[BlockHash]) -> Header {
+    let mut payload = IndexMap::new();
+    for &d in digests {
+        payload.insert(d, 0u16);
+    }
+    HeaderBuilder::default()
+        .author(author.clone())
+        .round(round)
+        .epoch(0)
+        .parents(BTreeSet::new())
+        .created_at(now())
+        .payload(payload)
+        .build()
+}
+
+#[tokio::test]
+async fn test_process_committed_headers() {
+    // -- shared setup helper --
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+    let author = primary.id();
+
+    // --- Scenario A: header at round > max_committed_round is NOT re-queued ---
+    {
+        let cb = ConsensusBus::new();
+        let task_manager = TaskManager::default();
+        let mut proposer = Proposer::new(
+            primary.consensus_config(),
+            primary.consensus_config().authority_id().expect("authority"),
+            cb.clone(),
+            LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+            task_manager.get_spawner(),
+        );
+
+        // insert headers at rounds 4, 5, 6 with distinct digests
+        let d4 = B256::random();
+        let d5 = B256::random();
+        let d6 = B256::random();
+        proposer.proposed_headers.insert(4, build_test_header(&author, 4, &[d4]));
+        proposer.proposed_headers.insert(5, build_test_header(&author, 5, &[d5]));
+        proposer.proposed_headers.insert(6, build_test_header(&author, 6, &[d6]));
+
+        // commit rounds 4 and 5 => max_committed_round = 5
+        // round 6 > 5 so it should NOT be re-queued
+        proposer.process_committed_headers(6, vec![4, 5]);
+
+        // nothing re-queued because the only uncommitted header (round 6) is above
+        // max_committed_round
+        assert!(proposer.digests.is_empty(), "round 6 should not be re-queued");
+
+        // rounds 4, 5 removed as committed; only round 6 remains
+        assert_eq!(proposer.proposed_headers.len(), 1);
+        assert!(
+            proposer.proposed_headers.contains_key(&6),
+            "round 6 header should still be in proposed_headers"
+        );
+    }
+
+    // --- Scenario B: header at round <= max_committed_round IS re-queued ---
+    {
+        let cb = ConsensusBus::new();
+        let task_manager = TaskManager::default();
+        let mut proposer = Proposer::new(
+            primary.consensus_config(),
+            primary.consensus_config().authority_id().expect("authority"),
+            cb.clone(),
+            LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+            task_manager.get_spawner(),
+        );
+
+        // insert headers at rounds 3, 4, 5
+        let d3a = B256::random();
+        let d3b = B256::random();
+        let d4 = B256::random();
+        let d5 = B256::random();
+        proposer.proposed_headers.insert(3, build_test_header(&author, 3, &[d3a, d3b]));
+        proposer.proposed_headers.insert(4, build_test_header(&author, 4, &[d4]));
+        proposer.proposed_headers.insert(5, build_test_header(&author, 5, &[d5]));
+
+        // commit rounds 4 and 5 => max_committed_round = 5
+        // round 3 <= 5 and NOT in committed list => its digests are re-queued
+        proposer.process_committed_headers(5, vec![4, 5]);
+
+        // round 3's digests should have been prepended to self.digests
+        assert!(!proposer.digests.is_empty(), "round 3 digests should be re-queued");
+        assert_eq!(proposer.digests.len(), 2, "round 3 had two digests");
+
+        // verify the re-queued digests match round 3's payload
+        let requeued: Vec<BlockHash> = proposer.digests.iter().map(|pd| pd.digest).collect();
+        assert!(requeued.contains(&d3a), "d3a should be re-queued");
+        assert!(requeued.contains(&d3b), "d3b should be re-queued");
+
+        // round 3 should also be removed from proposed_headers
+        assert!(
+            !proposer.proposed_headers.contains_key(&3),
+            "round 3 should be removed after re-queue"
+        );
+
+        // committed rounds 4, 5 also removed
+        assert!(proposer.proposed_headers.is_empty(), "all headers should be removed");
+    }
+
+    // --- Scenario C: empty committed headers ---
+    {
+        let cb = ConsensusBus::new();
+        let task_manager = TaskManager::default();
+        let mut proposer = Proposer::new(
+            primary.consensus_config(),
+            primary.consensus_config().authority_id().expect("authority"),
+            cb.clone(),
+            LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+            task_manager.get_spawner(),
+        );
+
+        // insert headers at rounds 4, 5, 6
+        let d4 = B256::random();
+        let d5 = B256::random();
+        let d6 = B256::random();
+        proposer.proposed_headers.insert(4, build_test_header(&author, 4, &[d4]));
+        proposer.proposed_headers.insert(5, build_test_header(&author, 5, &[d5]));
+        proposer.proposed_headers.insert(6, build_test_header(&author, 6, &[d6]));
+
+        // empty committed list => max_committed_round = 0
+        // all rounds > 0 so nothing is re-queued
+        proposer.process_committed_headers(6, vec![]);
+
+        assert!(proposer.digests.is_empty(), "no digests should be re-queued");
+        assert_eq!(
+            proposer.proposed_headers.len(),
+            3,
+            "all headers should remain in proposed_headers"
+        );
+        assert!(proposer.proposed_headers.contains_key(&4));
+        assert!(proposer.proposed_headers.contains_key(&5));
+        assert!(proposer.proposed_headers.contains_key(&6));
     }
 }

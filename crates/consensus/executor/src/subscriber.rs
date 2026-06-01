@@ -4,7 +4,7 @@ use crate::{errors::SubscriberResult, SubscriberError};
 use futures::{stream::FuturesOrdered, StreamExt};
 use state_sync::{last_consensus_parent, save_consensus, spawn_state_sync};
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -430,6 +430,7 @@ impl<DB: Database> Subscriber<DB> {
         // SAFETY: 10-node committees * 6-round commit max * 5 batch max = 300 max batch digests
         // possible 32bytes * 300 = 9.6 kb => well within 1MB max message size
         let mut fetched_batches = self.fetch_batches_from_peers(batch_set).await?;
+        let fetched_digests: HashSet<BlockHash> = fetched_batches.keys().copied().collect();
 
         let mut batches = Vec::with_capacity(num_certs);
         // map all fetched batches to their respective certificates for applying block rewards
@@ -439,16 +440,29 @@ impl<DB: Database> Subscriber<DB> {
 
             // retrieve fetched batch by digest
             for digest in header.payload().keys() {
-                let batch = fetched_batches.remove(digest).ok_or(SubscriberError::MissingFetchedBatch(*digest)).inspect_err(|_| {
-                    error!(target: "subscriber", "[Protocol violation] Batch not found in fetched batches from workers of certificate signers");
-                })?;
-
                 debug!(
                     target: "subscriber",
-                    "Adding fetched batch {digest} from certificate {} to consensus output",
-                    header.digest()
+                    ?digest,
+                    "fetching batch",
                 );
-                cert_batches.push(batch);
+
+                let batch = fetched_batches.remove(digest);
+                if let Some(batch) = batch {
+                    debug!(
+                        target: "subscriber",
+                        "Adding fetched batch {digest} from certificate {} to consensus output",
+                        header.digest()
+                    );
+
+                    cert_batches.push(batch);
+                } else {
+                    // if the batch is a duplicate, the engine will ignore
+                    warn!(target: "subscriber", ?digest, ?batch_digests, "failed to remove fetched batch - possible duplicate");
+                    if !fetched_digests.contains(digest) {
+                        error!(target: "subscriber", ?digest, "[Protocol violation] Batch not found in fetched batches from workers of certificate signers");
+                        return Err(SubscriberError::MissingFetchedBatch(*digest));
+                    }
+                }
             }
 
             // main collection for execution
