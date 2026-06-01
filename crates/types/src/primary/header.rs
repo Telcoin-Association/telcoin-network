@@ -113,7 +113,8 @@ impl Header {
 
         // Note that self.digest() MUST be set correctly so no need to check.  We could add a panic
         // here but it is inexpressable outside of a bug in this module so no need to calc
-        // the digest.
+        // the digest.  Use a debug assert just in case on debug builds.
+        debug_assert_eq!(Hash::digest(&*self.inner), self.inner.digest);
 
         // Ensure authority is in the current committee.
         committee
@@ -374,7 +375,6 @@ mod test {
 
     use alloy::{eips::BlockNumHash, primitives::BlockHash};
     use indexmap::IndexMap;
-    use once_cell::sync::OnceCell;
     use serde::{Deserialize, Serialize};
 
     use crate::{
@@ -403,14 +403,11 @@ mod test {
         /// execution result in a signed and validated structure which validates
         /// this execution block as well.
         pub latest_execution_block: BlockNumHash,
-        /// The [HeaderDigest].
-        #[serde(skip)]
-        pub digest: OnceCell<HeaderDigest>,
     }
 
     /// Simple test to make sure that moving to the inner Arc on Header will not
     /// change the serialized data.  If this test breaks it may indicate a fork
-    /// was introduced.
+    /// was introduced.  This test may also outlive it's usefulness.
     #[test]
     fn test_header_serde() {
         let mut test_header = HeaderData::default();
