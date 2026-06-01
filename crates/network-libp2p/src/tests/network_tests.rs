@@ -1340,10 +1340,13 @@ async fn test_new_epoch_unbans_committee_members() -> eyre::Result<()> {
         .into_iter()
         .collect();
 
-    // Send NewEpoch command to peer1
+    // Seed peer1's committee with peer2
     let handle = peer1.clone();
     tokio::spawn(async move {
-        handle.new_epoch(committee).await.expect("Failed to send NewEpoch command");
+        handle
+            .initialize_committees(committee, Default::default())
+            .await
+            .expect("Failed to send InitializeCommittees command");
     })
     .await?;
 
@@ -1465,7 +1468,7 @@ async fn test_new_epoch_unbans_committee_member_ip() -> eyre::Result<()> {
         .into_iter()
         .collect();
 
-    target_peer.network_handle.new_epoch(committee).await?;
+    target_peer.network_handle.initialize_committees(committee, Default::default()).await?;
 
     // wait for connection to establish
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
@@ -1541,10 +1544,13 @@ async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> 
         .into_iter()
         .collect();
 
-    // Send NewEpoch command to peer1
+    // Seed peer1's committee with peer2
     let handle = peer1.clone();
     tokio::spawn(async move {
-        handle.new_epoch(committee).await.expect("Failed to send NewEpoch command");
+        handle
+            .initialize_committees(committee, Default::default())
+            .await
+            .expect("Failed to send InitializeCommittees command");
     })
     .await?;
 
@@ -1567,6 +1573,151 @@ async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> 
     // Verify connection is established
     let connected_peers_after = peer1.connected_peer_ids().await?;
     assert!(connected_peers_after.contains(&peer2_id), "Peer2 should be connected after new epoch");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rotate_does_not_disconnect_previous_committee() -> eyre::Result<()> {
+    // Start with two peers
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let NetworkPeer { config: config_1, network_handle: peer1, network, .. } = peer1;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+
+    let NetworkPeer { config: config_2, network_handle: peer2, network, .. } = peer2;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+
+    peer1.start_listening(config_1.primary_address()).await?;
+    peer2.start_listening(config_2.primary_address()).await?;
+
+    let peer2_id = peer2.local_peer_id().await?;
+    let peer2_bls = config_2.key_config().primary_public_key();
+
+    // Connect peer1 -> peer2
+    peer1
+        .add_explicit_peer(
+            peer2_bls,
+            config_2.key_config().primary_network_public_key(),
+            config_2.primary_address(),
+        )
+        .await?;
+    peer1.dial_by_bls(peer2_bls).await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        peer1.connected_peer_ids().await?.contains(&peer2_id),
+        "peer2 should be connected before rotation"
+    );
+
+    // peer2 is in the CURRENT committee for this epoch
+    peer1.initialize_committees(vec![peer2_bls].into_iter().collect(), Default::default()).await?;
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+
+    // Rotate to the next epoch whose `next` committee does NOT contain peer2:
+    // previous <- current ({peer2}), current <- next ({}), next <- {}. peer2 drops out of
+    // `current` into `previous` and must NOT be disconnected, since it still counts as a validator
+    // (is_peer_validator spans the previous committee).
+    peer1.next_committee(Default::default(), 1234).await?;
+
+    // Let several heartbeats run so any pruning of non-validator peers would take effect.
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 3)).await;
+
+    assert!(
+        peer1.connected_peer_ids().await?.contains(&peer2_id),
+        "peer2 must stay connected after rotating into the previous committee"
+    );
+    // peer2 was made trusted when it entered the committee; trust (and max score) survive rotation.
+    let peer2_score = peer1.peer_score(peer2_id).await?.expect("peer2 score");
+    assert_eq!(
+        peer2_score,
+        config_1.network_config().peer_config().score_config.max_score,
+        "previous-committee peer should retain validator (max) score"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_gossip_explicit_peer_includes_next_committee() -> eyre::Result<()> {
+    // peer1 publishes; peer2 only ever appears in peer1's `next` committee and receives gossip.
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let NetworkPeer { config: config_1, network_handle: publisher, network, .. } = peer1;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+
+    let NetworkPeer {
+        config: config_2,
+        network_handle: next_peer,
+        network_events: mut next_peer_events,
+        network,
+    } = peer2;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+
+    publisher.start_listening(config_1.primary_address()).await?;
+    next_peer.start_listening(config_2.primary_address()).await?;
+    let publisher_addr =
+        publisher.listeners().await?.first().expect("publisher listen addr").clone();
+
+    let next_bls = config_2.key_config().primary_public_key();
+    let next_id = next_peer.local_peer_id().await?;
+
+    // Register peer2's network info with peer1, then place peer2 ONLY in peer1's `next` committee
+    // (peer1 never had peer2 in `current`). When peer2 connects, peer1's PeerConnected handler must
+    // treat it as important (is_peer_validator now spans `next`) and add it as a gossipsub explicit
+    // peer, so gossip reaches it.
+    publisher
+        .add_explicit_peer(
+            next_bls,
+            config_2.key_config().primary_network_public_key(),
+            config_2.primary_address(),
+        )
+        .await?;
+    publisher
+        .initialize_committees(Default::default(), vec![next_bls].into_iter().collect())
+        .await?;
+
+    // peer2 subscribes with peer1 as the authorized publisher and dials peer1.
+    next_peer
+        .subscribe_with_publishers(
+            TEST_TOPIC.into(),
+            vec![config_1.key_config().primary_public_key()].into_iter().collect(),
+        )
+        .await?;
+    next_peer
+        .add_trusted_peer_and_dial(
+            config_1.key_config().primary_public_key(),
+            config_1.key_config().primary_network_public_key(),
+            publisher_addr,
+        )
+        .await?;
+
+    // Allow the connection to establish and gossipsub to graft.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert!(
+        publisher.connected_peer_ids().await?.contains(&next_id),
+        "next-committee peer should be connected to the publisher"
+    );
+
+    // Publish and confirm the next-committee peer receives the gossip.
+    let block = fixture_batch_with_transactions(10).seal_slow();
+    let expected = Vec::from(&block);
+    publisher.publish(TEST_TOPIC.into(), expected.clone()).await?;
+    let event =
+        timeout(Duration::from_secs(2), next_peer_events.recv()).await?.expect("gossip received");
+    if let NetworkEvent::Gossip(msg, _) = event {
+        assert_eq!(msg.data, expected);
+    } else {
+        panic!("unexpected network event received");
+    }
 
     Ok(())
 }
@@ -1734,7 +1885,7 @@ async fn test_node_record_validation() {
     assert!(network.peer_record_valid(&peer_record).is_none());
 
     // assert publisher mismatch fails
-    peer_record.publisher = Some(peer2.network.swarm.local_peer_id().clone());
+    peer_record.publisher = Some(*peer2.network.swarm.local_peer_id());
     assert!(network.peer_record_valid(&peer_record).is_none());
 }
 

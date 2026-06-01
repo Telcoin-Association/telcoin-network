@@ -549,6 +549,7 @@ async fn test_is_validator() {
     let config = authority_1.consensus_config();
     let mut peer_manager = PeerManager::new(config.network_config().peer_config());
     let validator = *authority_1.authority().protocol_key();
+    let validator_peer_id: PeerId = config.key_config().primary_network_public_key().into();
     let random_peer_id = PeerId::random();
 
     let info = NetworkInfo {
@@ -558,12 +559,63 @@ async fn test_is_validator() {
     };
     peer_manager.add_known_peer(validator, info);
 
-    // update epoch with random multiaddr
+    // seed the current committee (no next committee for this test)
     let committee = config.committee_pub_keys();
-    peer_manager.new_epoch(committee);
+    peer_manager.initialize_committees(committee, HashSet::new());
+
+    // Verify the registered committee member is a validator
+    assert!(peer_manager.is_peer_validator(&validator_peer_id));
 
     // Verify random peer is not a validator
     assert!(!peer_manager.is_peer_validator(&random_peer_id));
+}
+
+#[tokio::test]
+async fn test_next_committee_triggers_missing_authorities_for_unknown_next_keys() {
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // generate a bls key that was never registered via add_known_peer
+    let unknown_bls = *BlsKeypair::generate(&mut StdRng::from_seed([9; 32])).public();
+
+    // rotate to a next committee that contains the unknown key
+    peer_manager.next_committee(HashSet::from([unknown_bls]), 100);
+
+    // exactly one MissingAuthorities event referencing the unknown key should be emitted
+    let events = collect_all_events(&mut peer_manager);
+    let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
+    assert!(missing_events.len() == 1, "Expect one missing authorities event");
+    assert_matches!(
+        missing_events.first().unwrap(),
+        PeerEvent::MissingAuthorities(missing) if missing.contains(&unknown_bls)
+    );
+}
+
+#[tokio::test]
+async fn test_prepare_committee_dial_unbans_without_touching_slots() {
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // build a known committee member
+    let mut rng = StdRng::from_seed([3; 32]);
+    let bls = *BlsKeypair::generate(&mut rng).public();
+    let netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let peer_id: PeerId = netkey.clone().into();
+    let info =
+        NetworkInfo { pubkey: netkey, multiaddrs: vec![create_multiaddr(None)], timestamp: now() };
+    peer_manager.add_known_peer(bls, info);
+
+    // manually temp-ban the peer
+    peer_manager.temporarily_banned.insert(peer_id);
+    assert!(peer_manager.peer_banned(&peer_id));
+
+    // prepare the committee for dialing
+    peer_manager.prepare_committee_dial(HashSet::from([bls]));
+
+    // the peer is unbanned but the committee slots remain untouched
+    assert!(!peer_manager.peer_banned(&peer_id), "prepare_committee_dial should unban the peer");
+    assert!(
+        !peer_manager.is_peer_validator(&peer_id),
+        "prepare_committee_dial must not populate committee slots"
+    );
 }
 
 #[tokio::test]

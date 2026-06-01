@@ -3,8 +3,9 @@
 use super::*;
 use crate::common::{create_multiaddr, ensure_score_config, random_ip_addr};
 use libp2p::PeerId;
-use rand::{rngs::StdRng, SeedableRng as _};
+use rand::{rngs::StdRng, Rng as _, SeedableRng as _};
 use std::{
+    collections::HashSet,
     net::IpAddr,
     time::{Duration, Instant},
 };
@@ -625,5 +626,219 @@ fn test_ban_action_returns_only_unbanned_ips() {
         assert!(!ips.contains(&ip1), "Should NOT include ip1 as it's already IP-banned");
     } else {
         panic!("Expected Ban action for peer3");
+    }
+}
+
+/// Build a distinct committee member: (bls key, network info, derived peer id).
+fn committee_member(rng: &mut StdRng) -> (BlsPublicKey, NetworkInfo, PeerId) {
+    let bls = *BlsKeypair::generate(rng).public();
+    let net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let peer_id: PeerId = net.clone().into();
+    let info = NetworkInfo { pubkey: net, multiaddrs: vec![create_multiaddr(None)], timestamp: 0 };
+    (bls, info, peer_id)
+}
+
+#[test]
+fn test_initialize_committees_seeds_current_and_next() {
+    let mut rng = StdRng::from_seed([10; 32]);
+    let mut all_peers = create_all_peers(None);
+
+    let (c_bls, c_info, c_peer_id) = committee_member(&mut rng);
+    let (n_bls, n_info, n_peer_id) = committee_member(&mut rng);
+
+    all_peers.initialize_committees(vec![(c_bls, c_info)], vec![(n_bls, n_info)]);
+
+    assert!(all_peers.current_committee.contains(&c_peer_id));
+    assert!(all_peers.next_committee.contains(&n_peer_id));
+    assert!(all_peers.previous_committee.is_empty());
+    assert!(all_peers.is_peer_validator(&c_peer_id));
+    assert!(all_peers.is_peer_validator(&n_peer_id));
+    assert!(!all_peers.is_peer_validator(&PeerId::random()));
+}
+
+#[test]
+fn test_rotate_to_next_epoch_shifts_queue() {
+    let mut rng = StdRng::from_seed([11; 32]);
+    let mut all_peers = create_all_peers(None);
+
+    let (a_bls, a_info, a_id) = committee_member(&mut rng);
+    let (b_bls, b_info, b_id) = committee_member(&mut rng);
+    let (c_bls, c_info, c_id) = committee_member(&mut rng);
+    let (d_bls, d_info, d_id) = committee_member(&mut rng);
+
+    // initialize with current={A}, next={B}
+    all_peers.initialize_committees(vec![(a_bls, a_info)], vec![(b_bls, b_info)]);
+
+    // rotate: previous <- current({A}), current <- next({B}), next <- {C}
+    all_peers.rotate_to_next_epoch(vec![(c_bls, c_info)], 1);
+    assert_eq!(all_peers.previous_committee, HashSet::from([a_id]));
+    assert_eq!(all_peers.current_committee, HashSet::from([b_id]));
+    assert_eq!(all_peers.next_committee, HashSet::from([c_id]));
+
+    // rotate again: previous <- current({B}), current <- next({C}), next <- {D}
+    all_peers.rotate_to_next_epoch(vec![(d_bls, d_info)], 2);
+    assert_eq!(all_peers.previous_committee, HashSet::from([b_id]));
+    assert_eq!(all_peers.current_committee, HashSet::from([c_id]));
+    assert_eq!(all_peers.next_committee, HashSet::from([d_id]));
+}
+
+#[test]
+fn test_rotate_records_epoch_end_timestamp() {
+    let mut rng = StdRng::from_seed([12; 32]);
+    let mut all_peers = create_all_peers(None);
+
+    let (c_bls, c_info, _) = committee_member(&mut rng);
+    let (n_bls, n_info, _) = committee_member(&mut rng);
+    all_peers.initialize_committees(vec![(c_bls, c_info)], vec![(n_bls, n_info)]);
+
+    let (m_bls, m_info, _) = committee_member(&mut rng);
+    all_peers.rotate_to_next_epoch(vec![(m_bls, m_info)], 4242);
+    assert_eq!(all_peers.epoch_end_timestamp, 4242);
+
+    let (m2_bls, m2_info, _) = committee_member(&mut rng);
+    all_peers.rotate_to_next_epoch(vec![(m2_bls, m2_info)], 5000);
+    assert_eq!(all_peers.epoch_end_timestamp, 5000);
+}
+
+#[test]
+fn test_rotate_committees_no_change() {
+    let mut rng = StdRng::from_seed([13; 32]);
+    let mut all_peers = create_all_peers(None);
+
+    let (x_bls, x_info, x_id) = committee_member(&mut rng);
+
+    // X is in both current and next
+    all_peers.initialize_committees(vec![(x_bls, x_info.clone())], vec![(x_bls, x_info.clone())]);
+
+    // rotate with X again as the incoming next
+    all_peers.rotate_to_next_epoch(vec![(x_bls, x_info.clone())], 1);
+
+    // full overlap keeps X a validator and present in both current and next
+    assert!(all_peers.is_peer_validator(&x_id));
+    assert!(all_peers.current_committee.contains(&x_id));
+    assert!(all_peers.next_committee.contains(&x_id));
+}
+
+#[test]
+fn test_rotate_committees_full_turnover() {
+    let mut rng = StdRng::from_seed([14; 32]);
+    let mut all_peers = create_all_peers(None);
+
+    let (a_bls, a_info, a_id) = committee_member(&mut rng);
+    let (b_bls, b_info, b_id) = committee_member(&mut rng);
+    let (c_bls, c_info, c_id) = committee_member(&mut rng);
+
+    // initialize with current={A}, next={B}
+    all_peers.initialize_committees(vec![(a_bls, a_info)], vec![(b_bls, b_info)]);
+
+    // rotate in disjoint C: three disjoint slots placed correctly
+    all_peers.rotate_to_next_epoch(vec![(c_bls, c_info)], 1);
+    assert_eq!(all_peers.previous_committee, HashSet::from([a_id]));
+    assert_eq!(all_peers.current_committee, HashSet::from([b_id]));
+    assert_eq!(all_peers.next_committee, HashSet::from([c_id]));
+}
+
+#[test]
+fn test_is_peer_validator_returns_true_for_all_three_slots() {
+    let mut all_peers = create_all_peers(None);
+
+    let prev_id = PeerId::random();
+    let curr_id = PeerId::random();
+    let next_id = PeerId::random();
+
+    all_peers.previous_committee.insert(prev_id);
+    all_peers.current_committee.insert(curr_id);
+    all_peers.next_committee.insert(next_id);
+
+    assert!(all_peers.is_peer_validator(&prev_id));
+    assert!(all_peers.is_peer_validator(&curr_id));
+    assert!(all_peers.is_peer_validator(&next_id));
+    assert!(!all_peers.is_peer_validator(&PeerId::random()));
+}
+
+#[test]
+fn test_rotate_does_not_re_apply_unban_to_previous() {
+    let mut rng = StdRng::from_seed([15; 32]);
+    let mut all_peers = create_all_peers(None);
+
+    // P is placed directly in the current committee, then driven to banned
+    let (_p_bls, _p_info, p_id) = committee_member(&mut rng);
+    all_peers.current_committee.insert(p_id);
+    all_peers.update_connection_status(&p_id, NewConnectionStatus::Disconnected);
+    all_peers.update_connection_status(&p_id, NewConnectionStatus::Banned);
+    assert!(all_peers.peer_banned(&p_id));
+
+    // Q is the disjoint incoming next committee
+    let (q_bls, q_info, _q_id) = committee_member(&mut rng);
+    let actions = all_peers.rotate_to_next_epoch(vec![(q_bls, q_info)], 1);
+
+    // P moved current -> previous and is NOT in the incoming set, so it stays banned
+    assert!(all_peers.peer_banned(&p_id));
+    // rotate only unbans the incoming `next`, so no action targets P
+    assert!(!actions.iter().any(|(id, _)| *id == p_id));
+}
+
+#[test]
+fn test_rotate_preserves_existing_trust() {
+    let mut rng = StdRng::from_seed([16; 32]);
+    let mut all_peers = create_all_peers(None);
+
+    // M is in the current committee and made trusted by initialize_committees
+    let (m_bls, m_info, m_id) = committee_member(&mut rng);
+    all_peers.initialize_committees(vec![(m_bls, m_info)], vec![]);
+    assert!(all_peers.get_peer(&m_id).unwrap().is_trusted());
+
+    // rotate in a disjoint member; M moves current -> previous
+    let (other_bls, other_info, _other_id) = committee_member(&mut rng);
+    all_peers.rotate_to_next_epoch(vec![(other_bls, other_info)], 1);
+
+    // make_trusted is a one-way ratchet, so M remains trusted after demotion
+    assert!(all_peers.get_peer(&m_id).unwrap().is_trusted());
+}
+
+#[test]
+fn test_rotation_invariants_under_random_committees() {
+    // Property-style coverage without a proptest dependency: across many epochs with random
+    // committee sizes, the queue must always shift correctly (previous <- current <- next <-
+    // new_next), each slot stays bounded by the committee size that produced it, and
+    // epoch_end_timestamp records the last timestamp passed in (monotonic as timestamps increase).
+    let mut rng = StdRng::from_seed([42; 32]);
+    let mut all_peers = create_all_peers(None);
+
+    // Mirror of the expected `current`/`next` slot contents (which carry across rounds) and the
+    // committee sizes that produced them. The initial AllPeers slots are all empty.
+    let mut current: HashSet<PeerId> = HashSet::new();
+    let mut next: HashSet<PeerId> = HashSet::new();
+    let mut prev_size = 0usize;
+    let mut curr_size = 0usize;
+
+    for round in 0..32u64 {
+        let size = rng.random_range(0..=5usize);
+        let members: Vec<(BlsPublicKey, NetworkInfo, PeerId)> =
+            (0..size).map(|_| committee_member(&mut rng)).collect();
+        let new_next_ids: HashSet<PeerId> = members.iter().map(|(_, _, id)| *id).collect();
+        let new_next: Vec<(BlsPublicKey, NetworkInfo)> =
+            members.into_iter().map(|(b, i, _)| (b, i)).collect();
+
+        let ts = round + 1;
+        all_peers.rotate_to_next_epoch(new_next, ts);
+
+        // expected shift
+        let previous = std::mem::take(&mut current);
+        current = std::mem::take(&mut next);
+        next = new_next_ids;
+
+        assert_eq!(all_peers.previous_committee, previous, "previous slot after round {round}");
+        assert_eq!(all_peers.current_committee, current, "current slot after round {round}");
+        assert_eq!(all_peers.next_committee, next, "next slot after round {round}");
+        assert_eq!(all_peers.epoch_end_timestamp, ts, "timestamp after round {round}");
+
+        // each slot is bounded by the committee size that produced it (sets dedup, so `<=`)
+        assert!(all_peers.next_committee.len() <= size);
+        assert!(all_peers.current_committee.len() <= curr_size);
+        assert!(all_peers.previous_committee.len() <= prev_size);
+
+        prev_size = curr_size;
+        curr_size = size;
     }
 }
