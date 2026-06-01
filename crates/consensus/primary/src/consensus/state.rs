@@ -419,7 +419,7 @@ impl<DB: Database> Consensus<DB> {
                 // This will force the follow function to not outrun execution...  this is probably
                 // fine. Also once we can follow gossiped consensus output this will not really be
                 // an issue (except during initial catch up).
-                let base_execution_block = committed_sub_dag.leader().latest_execution_block;
+                let base_execution_block = committed_sub_dag.leader().latest_execution_block();
                 if self.consensus_bus.app().wait_for_execution(base_execution_block).await.is_err()
                 {
                     // This seems to be a bogus sub dag, we are out of sync...

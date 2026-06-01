@@ -316,27 +316,6 @@ async fn test_vote_fails_unknown_execution_result() -> eyre::Result<()> {
 }
 
 #[tokio::test]
-async fn test_vote_fails_invalid_header_digest() -> eyre::Result<()> {
-    // common types
-    let temp_dir = TempDir::new().unwrap();
-    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
-        create_test_types(temp_dir.path()).await;
-
-    let parents = Vec::new();
-
-    // create header proposed by last peer in the committee for round 1
-    let mut header = committee.header_from_last_authority();
-    // change values so digest doesn't match
-    header.latest_execution_block = BlockNumHash::new(0, BlockHash::random());
-    let peer = *committee.last_authority().authority().protocol_key();
-
-    // process vote
-    let res = handler.vote(peer, header, parents).await;
-    assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidHeaderDigest)));
-    Ok(())
-}
-
-#[tokio::test]
 async fn test_vote_fails_invalid_timestamp() -> eyre::Result<()> {
     // common types
     let temp_dir = TempDir::new().unwrap();

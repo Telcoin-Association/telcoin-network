@@ -205,9 +205,6 @@ pub enum HeaderError {
     /// Invalid header request
     #[error("Invalid epoch. Peer proposed epoch {theirs}, but expected {ours})")]
     InvalidEpoch { theirs: Epoch, ours: Epoch },
-    /// The expected digest does not match the peer's sealed header.
-    #[error("Invalid header digest")]
-    InvalidHeaderDigest,
     /// The author is not in the current committee.
     #[error("Received message from unknown authority {0}")]
     UnknownAuthority(String),

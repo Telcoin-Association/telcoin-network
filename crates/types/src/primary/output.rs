@@ -321,7 +321,7 @@ impl CommittedSubDag {
                 BlsSignature::default()
             });
         let randomness = keccak256(randomness.to_bytes());
-        let headers = certificates.into_iter().map(|c| Arc::unwrap_or_clone(c.header)).collect();
+        let headers = certificates.into_iter().map(|c| c.into_header()).collect();
         Self { headers, reputation_score, commit_timestamp, randomness }
     }
 
