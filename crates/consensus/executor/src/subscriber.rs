@@ -455,7 +455,6 @@ impl<DB: Database> Subscriber<DB> {
 
                     cert_batches.push(batch.clone());
                 } else {
-                    // TODO: log warning
                     if !batch_digests.contains(digest) {
                         error!(target: "subscriber", ?digest, "[Protocol violation] Batch not found in fetched batches from workers of certificate signers");
                         return Err(SubscriberError::MissingFetchedBatch(*digest));
