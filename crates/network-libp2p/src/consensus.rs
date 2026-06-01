@@ -811,7 +811,7 @@ where
                     self.swarm
                         .behaviour_mut()
                         .peer_manager
-                        .process_penalty(propagation_source, Penalty::Fatal);
+                        .process_penalty(propagation_source, Penalty::Mild);
                 }
             }
             GossipEvent::Subscribed { peer_id, topic } => {
