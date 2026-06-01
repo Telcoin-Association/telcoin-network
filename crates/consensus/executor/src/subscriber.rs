@@ -4,7 +4,7 @@ use crate::{errors::SubscriberResult, SubscriberError};
 use futures::{stream::FuturesOrdered, StreamExt};
 use state_sync::{last_consensus_parent, save_consensus, spawn_state_sync};
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -430,6 +430,7 @@ impl<DB: Database> Subscriber<DB> {
         // SAFETY: 10-node committees * 6-round commit max * 5 batch max = 300 max batch digests
         // possible 32bytes * 300 = 9.6 kb => well within 1MB max message size
         let mut fetched_batches = self.fetch_batches_from_peers(batch_set).await?;
+        let fetched_digests: HashSet<BlockHash> = fetched_batches.keys().copied().collect();
 
         let mut batches = Vec::with_capacity(num_certs);
         // map all fetched batches to their respective certificates for applying block rewards
@@ -455,10 +456,9 @@ impl<DB: Database> Subscriber<DB> {
 
                     cert_batches.push(batch);
                 } else {
-                    warn!(target: "subscriber", ?digest, ?batch_digests, "railed to remove fetched batch - possible duplicate");
-
                     // if the batch is a duplicate, the engine will ignore
-                    if !batch_digests.contains(digest) {
+                    warn!(target: "subscriber", ?digest, ?batch_digests, "failed to remove fetched batch - possible duplicate");
+                    if !fetched_digests.contains(digest) {
                         error!(target: "subscriber", ?digest, "[Protocol violation] Batch not found in fetched batches from workers of certificate signers");
                         return Err(SubscriberError::MissingFetchedBatch(*digest));
                     }
