@@ -109,11 +109,12 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
     ///     pub enable: bool,
     /// }
     ///
-    /// if let Err(err) = telcoin_network_cli::cli::Cli::<MyArgs>::parse()
-    ///     .run(None, |builder, _, tn_datadir, passphrase| {
-    ///         launch_node(builder, tn_datadir, passphrase)
-    ///     })
-    /// {
+    /// if let Err(err) = telcoin_network_cli::cli::Cli::<MyArgs>::parse().run(
+    ///     None,
+    ///     |builder, _, tn_datadir, passphrase, version| {
+    ///         launch_node(builder, tn_datadir, passphrase, version)
+    ///     },
+    /// ) {
     ///     eprintln!("Error: {err:?}");
     ///     std::process::exit(1);
     /// }

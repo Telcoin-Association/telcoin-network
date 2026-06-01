@@ -807,6 +807,7 @@ impl Inner {
             previous_epoch.final_consensus.hash
         };
         let mut batches = HashSet::new();
+        let mut referenced_batches = HashSet::new();
         while let Some(record) = next(&mut stream_iter, timeout).await? {
             match record {
                 PackRecord::EpochMeta(_epoch_meta) => {
@@ -831,14 +832,22 @@ impl Inner {
                     }
                     for header in &consensus_header.sub_dag.headers {
                         for (digest, _) in header.payload().iter() {
-                            if !batches.remove(digest) {
+                            if !batches.contains(digest) {
                                 return Err(PackError::MissingBatches);
                             }
+                            referenced_batches.insert(*digest);
                         }
                     }
-                    if !batches.is_empty() {
+                    // batches.len() will generally equal referenced_batches.len() but if it is
+                    // greater than we had batches that were not accounted for.
+                    // It is possible (at time of writing) for a batch to
+                    // be in more than one subdag.  This is also why we don't just
+                    // remove batches as we check above.
+                    if batches.len() > referenced_batches.len() {
                         return Err(PackError::ExtraBatches);
                     }
+                    batches.clear();
+                    referenced_batches.clear();
                     let consensus_digest = consensus_header.digest();
                     parent_digest = consensus_digest;
                     let consensus_number = consensus_header.number;

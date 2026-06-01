@@ -129,12 +129,12 @@ fn db_run<DB: Database>(db: DB, mem_db: Option<MemDatabase>, rx: Receiver<DBMess
             DBMessage::Insert(ins) => {
                 if let Some((txn, _)) = &mut txn {
                     if let Err(e) = ins.insert_txn(txn) {
-                        tracing::error!(target: "layered_db_runner", "DB TXN Insert: {e}")
+                        tracing::error!(target: "layered_db_runner", "DB TXN Insert {}: {e}", ins.name())
                     }
                     committed_inserts.push(ins);
                 } else {
                     if let Err(e) = ins.insert(&db) {
-                        tracing::error!(target: "layered_db_runner", "DB Insert: {e}");
+                        tracing::error!(target: "layered_db_runner", "DB Insert {}: {e}", ins.name());
                     }
                     if let Some(mem_db) = mem_db.as_ref() {
                         ins.clear_insert_mem(mem_db);
@@ -144,19 +144,19 @@ fn db_run<DB: Database>(db: DB, mem_db: Option<MemDatabase>, rx: Receiver<DBMess
             DBMessage::Remove(rm) => {
                 if let Some((txn, _)) = &mut txn {
                     if let Err(e) = rm.remove_txn(txn) {
-                        tracing::error!(target: "layered_db_runner", "DB TXN Remove: {e}")
+                        tracing::error!(target: "layered_db_runner", "DB TXN Remove {}: {e}", rm.name())
                     }
                 } else if let Err(e) = rm.remove(&db) {
-                    tracing::error!(target: "layered_db_runner", "DB Remove: {e}")
+                    tracing::error!(target: "layered_db_runner", "DB Remove {}: {e}", rm.name())
                 }
             }
             DBMessage::Clear(clr) => {
                 if let Some((txn, _)) = &mut txn {
                     if let Err(e) = clr.clear_table_txn(txn) {
-                        tracing::error!(target: "layered_db_runner", "DB TXN Clear table: {e}")
+                        tracing::error!(target: "layered_db_runner", "DB TXN Clear table {}: {e}", clr.name())
                     }
                 } else if let Err(e) = clr.clear_table(&db) {
-                    tracing::error!(target: "layered_db_runner", "DB Clear: {e}")
+                    tracing::error!(target: "layered_db_runner", "DB Clear {}: {e}", clr.name())
                 }
             }
             DBMessage::CaughtUp(tx) => {
@@ -382,6 +382,7 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
 }
 
 trait InsertTrait<DB: Database>: Send + 'static {
+    fn name(&self) -> &str;
     fn insert(&self, db: &DB) -> eyre::Result<()>;
     fn insert_txn(&self, txn: &mut DB::TXMut<'_>) -> eyre::Result<()>;
     /// Clear the inserted data from the memdb if present.
@@ -389,11 +390,13 @@ trait InsertTrait<DB: Database>: Send + 'static {
 }
 
 trait RemoveTrait<DB: Database>: Send + 'static {
+    fn name(&self) -> &str;
     fn remove(&self, db: &DB) -> eyre::Result<()>;
     fn remove_txn(&self, txn: &mut DB::TXMut<'_>) -> eyre::Result<()>;
 }
 
 trait ClearTrait<DB: Database>: Send + 'static {
+    fn name(&self) -> &str;
     fn clear_table(&self, db: &DB) -> eyre::Result<()>;
     fn clear_table_txn(&self, txn: &mut DB::TXMut<'_>) -> eyre::Result<()>;
 }
@@ -422,6 +425,9 @@ impl<T: Table, DB: Database> InsertTrait<DB> for KeyValueInsert<T> {
         // Best effort to avoid memory growing forever.
         let _ = mem_db.remove::<T>(&self.key);
     }
+    fn name(&self) -> &str {
+        T::NAME
+    }
 }
 
 impl<T: Table, DB: Database> RemoveTrait<DB> for KeyRemove<T> {
@@ -432,6 +438,10 @@ impl<T: Table, DB: Database> RemoveTrait<DB> for KeyRemove<T> {
     fn remove_txn(&self, txn: &mut <DB as Database>::TXMut<'_>) -> eyre::Result<()> {
         txn.remove::<T>(&self.key)
     }
+
+    fn name(&self) -> &str {
+        T::NAME
+    }
 }
 
 impl<T: Table, DB: Database> ClearTrait<DB> for ClearTable<T> {
@@ -441,6 +451,10 @@ impl<T: Table, DB: Database> ClearTrait<DB> for ClearTable<T> {
 
     fn clear_table_txn(&self, txn: &mut <DB as Database>::TXMut<'_>) -> eyre::Result<()> {
         txn.clear_table::<T>()
+    }
+
+    fn name(&self) -> &str {
+        T::NAME
     }
 }
 
