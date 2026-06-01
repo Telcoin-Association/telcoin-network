@@ -94,16 +94,6 @@ where
     Req: TNMessage,
     Res: TNMessage,
 {
-    /// Update the list of authorized publishers.
-    ///
-    /// This list is used to verify messages came from an authorized source.
-    /// Only valid for Subscriber implementations.
-    UpdateAuthorizedPublishers {
-        /// The unique set of authorized peers by topic.
-        authorities: HashMap<String, Option<HashSet<BlsPublicKey>>>,
-        /// The acknowledgement that the set was updated.
-        reply: oneshot::Sender<NetworkResult<()>>,
-    },
     /// Start listening on the provided multiaddr.
     ///
     /// Return the result to caller.
@@ -362,16 +352,6 @@ where
     pub fn new_for_test() -> Self {
         let (sender, _) = mpsc::channel(100);
         Self { sender }
-    }
-
-    /// Update the list of authorized publishers.
-    pub async fn update_authorized_publishers(
-        &self,
-        authorities: HashMap<String, Option<HashSet<BlsPublicKey>>>,
-    ) -> NetworkResult<()> {
-        let (reply, ack) = oneshot::channel();
-        self.sender.send(NetworkCommand::UpdateAuthorizedPublishers { authorities, reply }).await?;
-        ack.await?
     }
 
     /// Start swarm listening on the given address. Returns an error if the address is not
