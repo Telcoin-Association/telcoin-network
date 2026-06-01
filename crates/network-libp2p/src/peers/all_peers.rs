@@ -21,7 +21,7 @@ use std::{
     net::IpAddr,
     time::{Duration, Instant},
 };
-use tn_types::{BlsPublicKey, NetworkPublicKey};
+use tn_types::{BlsPublicKey, NetworkPublicKey, TimestampSec};
 use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
 #[cfg(test)]
@@ -35,11 +35,23 @@ mod peers;
 pub(super) struct AllPeers {
     /// The collection of known connected peers, their status and reputation
     peers: HashMap<PeerId, Peer>,
-    /// The collection of staked current_committee at the beginning of each epoch.
+    /// Peers in the previous epoch's committee.
+    ///
+    /// Retained for one rotation so late gossip from the just-completed committee still counts as
+    /// validator traffic and those peers are not pruned mid-rotation.
+    previous_committee: HashSet<PeerId>,
+    /// Peers in the current epoch's committee.
     current_committee: HashSet<PeerId>,
-    /// The collection of staked current_committee pub key to peerid at the beginning of each
-    /// epoch.
-    current_committee_keys: HashMap<BlsPublicKey, Option<PeerId>>,
+    /// Peers in the next epoch's committee, pre-emptively trusted so they are not banned before
+    /// they begin voting.
+    next_committee: HashSet<PeerId>,
+    /// Timestamp (sec) at which the previous epoch closed. Recorded on every rotation; the `0`
+    /// sentinel means no previous epoch boundary has been observed yet (initial epoch).
+    ///
+    /// Stored ahead of its consumer: a future PR reads this to accept late gossipsub messages from
+    /// the previous committee within a grace window.
+    #[allow(dead_code)]
+    epoch_end_timestamp: TimestampSec,
     /// Information for peers that scored poorly enough to become banned.
     banned_peers: BannedPeers,
     /// The number of peers that have disconnected from this node.
@@ -63,8 +75,10 @@ impl AllPeers {
     ) -> Self {
         Self {
             peers: Default::default(),
+            previous_committee: Default::default(),
             current_committee: Default::default(),
-            current_committee_keys: Default::default(),
+            next_committee: Default::default(),
+            epoch_end_timestamp: Default::default(),
             banned_peers: Default::default(),
             disconnected_peers: 0,
             pending_dials: Default::default(),
@@ -632,15 +646,15 @@ impl AllPeers {
         self.peers.get(peer_id)
     }
 
-    /// Boolean indicating if this peer is a validator.
-    /// This method will be updated to include nvvs as well.
+    /// Boolean indicating if this peer is a validator in the previous, current, or next committee.
+    ///
+    /// Membership spans all three tracked committees so peers from the just-completed epoch are not
+    /// pruned while late gossip may still arrive, and next-epoch peers are protected before they
+    /// begin voting. (NVV support remains future work.)
     pub(super) fn is_peer_validator(&self, peer_id: &PeerId) -> bool {
-        self.is_peer_cvv(peer_id)
-    }
-
-    /// Boolean indicating if this peer is in the current committee of voting validators.
-    fn is_peer_cvv(&self, peer_id: &PeerId) -> bool {
-        self.current_committee.contains(peer_id)
+        self.previous_committee.contains(peer_id)
+            || self.current_committee.contains(peer_id)
+            || self.next_committee.contains(peer_id)
     }
 
     /// Boolean indicating if the ip address is associated with a banned peer.
@@ -817,26 +831,75 @@ impl AllPeers {
         }
     }
 
-    /// Update committee for the new epoch.
+    /// Seed the committee slots on the initial epoch.
     ///
-    /// The committee is tracked to ensure priority on the network.
-    /// The banned status of any committee peer is forgiven and IPs
-    /// associated with the committee node are reset. The advertised
-    /// listening addresses are updated and the peer is marked `trusted`
-    /// so it won't incur any additional penalties.
-    pub(super) fn new_epoch(
+    /// The previous slot is empty (no epoch has closed yet); `current` and `next` are recorded so
+    /// peers in either committee count as validators. Banned or disconnecting members of either
+    /// committee are forgiven, their advertised addresses refreshed, and they are marked `trusted`.
+    /// Peers that appear in both committees are processed once.
+    pub(super) fn initialize_committees(
+        &mut self,
+        current: Vec<(BlsPublicKey, NetworkInfo)>,
+        next: Vec<(BlsPublicKey, NetworkInfo)>,
+    ) -> Vec<(PeerId, PeerAction)> {
+        self.previous_committee = HashSet::new();
+        self.current_committee = current.iter().map(|(_, ni)| ni.pubkey.clone().into()).collect();
+        self.next_committee = next.iter().map(|(_, ni)| ni.pubkey.clone().into()).collect();
+
+        // unban + trust every member once (peers in both committees are handled a single time)
+        let mut processed: HashSet<PeerId> = HashSet::new();
+        let members: Vec<(BlsPublicKey, NetworkInfo)> = current
+            .into_iter()
+            .chain(next)
+            .filter(|(_, ni)| processed.insert(ni.pubkey.clone().into()))
+            .collect();
+        self.apply_committee_membership(members)
+    }
+
+    /// Rotate the committee slots forward at an epoch boundary.
+    ///
+    /// `previous <- current`, `current <- next`, `next <- new_next`, and the timestamp at which the
+    /// just-completed epoch ended is recorded. Only the incoming `next` committee is run through the
+    /// unban + trust loop: `Peer::make_trusted` is a one-way ratchet, so peers that already passed
+    /// through the committee in a prior rotation keep their trust, and re-applying it to the
+    /// previous or current slots is wasted work.
+    pub(super) fn rotate_to_next_epoch(
+        &mut self,
+        new_next: Vec<(BlsPublicKey, NetworkInfo)>,
+        epoch_end_timestamp: TimestampSec,
+    ) -> Vec<(PeerId, PeerAction)> {
+        self.previous_committee = std::mem::take(&mut self.current_committee);
+        self.current_committee = std::mem::take(&mut self.next_committee);
+        self.next_committee = new_next.iter().map(|(_, ni)| ni.pubkey.clone().into()).collect();
+        self.epoch_end_timestamp = epoch_end_timestamp;
+        self.apply_committee_membership(new_next)
+    }
+
+    /// Forgive bans and refresh trust for a committee WITHOUT touching the committee slots.
+    ///
+    /// Used only by the deadlock-breaker pre-dial path: it unbans committee peers so a subsequent
+    /// dial loop can connect, but leaves previous/current/next untouched because the real slot
+    /// update follows shortly after via `initialize_committees` / `rotate_to_next_epoch`.
+    pub(super) fn mark_committee_for_dial(
         &mut self,
         committee: Vec<(BlsPublicKey, NetworkInfo)>,
     ) -> Vec<(PeerId, PeerAction)> {
-        // update current committee
-        self.current_committee.clear();
-        self.current_committee_keys.clear();
+        self.apply_committee_membership(committee)
+    }
 
+    /// Forgive bans, refresh advertised addresses, and mark each committee peer `trusted`.
+    ///
+    /// The banned status of any committee peer is forgiven and IPs associated with the committee
+    /// node are reset. The advertised listening addresses are updated and the peer is marked
+    /// `trusted` so it won't incur any additional penalties. Returns the unban actions for the
+    /// manager to apply; the committee slots are owned by the callers.
+    fn apply_committee_membership(
+        &mut self,
+        committee: Vec<(BlsPublicKey, NetworkInfo)>,
+    ) -> Vec<(PeerId, PeerAction)> {
         let mut actions = Vec::with_capacity(committee.len());
         for (bls_key, NetworkInfo { pubkey, multiaddrs: addr, .. }) in committee {
             let peer_id: PeerId = pubkey.clone().into();
-            self.current_committee.insert(peer_id);
-            self.current_committee_keys.insert(bls_key, Some(peer_id));
             // the NewConnectionStatus doesn't affect this call
             let status = self.ensure_peer_exists(&peer_id, &NewConnectionStatus::Unbanned);
             // We have all our network settings so go ahead and make sure they are set.

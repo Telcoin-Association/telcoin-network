@@ -289,9 +289,25 @@ where
         /// The reply to caller.
         reply: oneshot::Sender<PeerExchangeMap>,
     },
-    /// Start a new epoch.
-    NewEpoch {
-        /// The epoch committee.
+    /// Seed the previous/current/next committees on the initial epoch.
+    InitializeCommittees {
+        /// The current epoch committee.
+        current: HashSet<BlsPublicKey>,
+        /// The next epoch committee.
+        next: HashSet<BlsPublicKey>,
+    },
+    /// Rotate committees forward at an epoch boundary (`previous <- current`, `current <- next`,
+    /// `next <- next_committee`).
+    NextCommittee {
+        /// The new next committee.
+        next_committee: HashSet<BlsPublicKey>,
+        /// Timestamp (sec) at which the just-completed epoch ended.
+        epoch_end_timestamp: TimestampSec,
+    },
+    /// Pre-dial recovery: forgive bans for a committee so it can be dialed, without mutating the
+    /// committee slots.
+    PrepareCommitteeDial {
+        /// The committee whose peers should be unbanned for dialing.
         committee: HashSet<BlsPublicKey>,
     },
     /// Find authorities for a future committee by bls key and return to sender.
@@ -556,9 +572,38 @@ where
         res.await.map_err(Into::into)
     }
 
-    /// Create a [PeerExchangeMap] for exchanging peers.
-    pub async fn new_epoch(&self, committee: HashSet<BlsPublicKey>) -> NetworkResult<()> {
-        self.sender.send(NetworkCommand::NewEpoch { committee }).await?;
+    /// Seed the previous/current/next committees on the initial epoch.
+    pub async fn initialize_committees(
+        &self,
+        current: HashSet<BlsPublicKey>,
+        next: HashSet<BlsPublicKey>,
+    ) -> NetworkResult<()> {
+        self.sender.send(NetworkCommand::InitializeCommittees { current, next }).await?;
+        Ok(())
+    }
+
+    /// Rotate committees forward at an epoch boundary, recording the just-completed epoch's end
+    /// timestamp.
+    pub async fn next_committee(
+        &self,
+        next_committee: HashSet<BlsPublicKey>,
+        epoch_end_timestamp: TimestampSec,
+    ) -> NetworkResult<()> {
+        self.sender
+            .send(NetworkCommand::NextCommittee { next_committee, epoch_end_timestamp })
+            .await?;
+        Ok(())
+    }
+
+    /// Forgive bans for a committee so it can be dialed, without mutating the committee slots.
+    ///
+    /// Used by the deadlock-breaker pre-dial path; the real slot update follows via
+    /// [`Self::initialize_committees`] or [`Self::next_committee`].
+    pub async fn prepare_committee_dial(
+        &self,
+        committee: HashSet<BlsPublicKey>,
+    ) -> NetworkResult<()> {
+        self.sender.send(NetworkCommand::PrepareCommitteeDial { committee }).await?;
         Ok(())
     }
 

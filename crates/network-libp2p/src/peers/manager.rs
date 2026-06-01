@@ -22,7 +22,7 @@ use std::{
     task::Context,
 };
 use tn_config::PeerConfig;
-use tn_types::BlsPublicKey;
+use tn_types::{BlsPublicKey, TimestampSec};
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, trace, warn};
 
@@ -326,9 +326,9 @@ impl PeerManager {
 
     /// Returns a boolean if the peer is a known validator.
     ///
-    /// `AllPeers` only tracks CVVs for now. (current voting validators)
-    ///
-    /// This method will be extended to support any staked validator.
+    /// Membership spans the previous, current, and next committees tracked by `AllPeers`, so peers
+    /// from the just-completed epoch and the upcoming epoch both count. (NVV support remains future
+    /// work.)
     pub(super) fn is_peer_validator(&self, peer_id: &PeerId) -> bool {
         self.peers.is_peer_validator(peer_id)
     }
@@ -608,11 +608,61 @@ impl PeerManager {
             || self.peers.get_peer(peer_id).map(|p| p.is_trusted()).unwrap_or_default()
     }
 
-    /// Update the committee for the new epoch.
-    pub(crate) fn new_epoch(&mut self, committee: HashSet<BlsPublicKey>) {
-        // remove from temporary banned and warn if validator was banned
-        let mut exp_committee = Vec::default();
-        for bls_key in &committee {
+    /// Seed the previous/current/next committees on the initial epoch.
+    ///
+    /// `current` and `next` are resolved to known network info and handed to the peer store, which
+    /// records both as validators and forgives any bans. Unknown `next` keys trigger a kad lookup
+    /// (see [`Self::trigger_missing_authorities`]) since the next committee is the most likely
+    /// source of peers we have never connected to.
+    pub(crate) fn initialize_committees(
+        &mut self,
+        current: HashSet<BlsPublicKey>,
+        next: HashSet<BlsPublicKey>,
+    ) {
+        let current = self.resolve_committee(&current);
+        let resolved_next = self.resolve_committee(&next);
+        self.trigger_missing_authorities(&next);
+        let unban_actions = self.peers.initialize_committees(current, resolved_next);
+        self.apply_unban_actions(unban_actions);
+    }
+
+    /// Rotate the committees forward at an epoch boundary: `previous <- current`,
+    /// `current <- next`, `next <- new_next`, recording the just-closed epoch's end timestamp.
+    ///
+    /// Only the incoming `next` committee is resolved and run through the unban loop. Unknown `next`
+    /// keys trigger a kad lookup.
+    pub(crate) fn next_committee(
+        &mut self,
+        next: HashSet<BlsPublicKey>,
+        epoch_end_timestamp: TimestampSec,
+    ) {
+        let resolved_next = self.resolve_committee(&next);
+        self.trigger_missing_authorities(&next);
+        let unban_actions = self.peers.rotate_to_next_epoch(resolved_next, epoch_end_timestamp);
+        self.apply_unban_actions(unban_actions);
+    }
+
+    /// Pre-dial recovery: forgive bans for a committee so a subsequent dial loop can connect,
+    /// WITHOUT mutating the committee slots.
+    ///
+    /// Used by the deadlock-breaker path while waiting for an epoch record; the real slot update
+    /// follows shortly after via [`Self::initialize_committees`] or [`Self::next_committee`].
+    pub(crate) fn prepare_committee_dial(&mut self, committee: HashSet<BlsPublicKey>) {
+        let committee = self.resolve_committee(&committee);
+        let unban_actions = self.peers.mark_committee_for_dial(committee);
+        self.apply_unban_actions(unban_actions);
+    }
+
+    /// Resolve committee bls keys to known network info, forgiving temporary bans along the way.
+    ///
+    /// Keys with no known network info are skipped with a warning; callers that need to chase them
+    /// down should also call [`Self::trigger_missing_authorities`].
+    fn resolve_committee(
+        &mut self,
+        committee: &HashSet<BlsPublicKey>,
+    ) -> Vec<(BlsPublicKey, NetworkInfo)> {
+        let mut exp_committee = Vec::with_capacity(committee.len());
+        for bls_key in committee {
             if let Some(NetworkInfo { pubkey, multiaddrs: multiaddr, timestamp }) =
                 self.known_peers.get(bls_key)
             {
@@ -633,12 +683,22 @@ impl PeerManager {
                 warn!(target: "peer-manager", "unknown committee member with key {bls_key}");
             }
         }
+        exp_committee
+    }
 
-        // add trusted peer record
-        let unban_actions = self.peers.new_epoch(exp_committee);
+    /// Emit a [`PeerEvent::MissingAuthorities`] for any committee keys with no known network info so
+    /// kad discovery can chase them.
+    fn trigger_missing_authorities(&mut self, committee: &HashSet<BlsPublicKey>) {
+        let missing: Vec<BlsPublicKey> =
+            committee.iter().filter(|k| !self.known_peers.contains_key(k)).copied().collect();
+        if !missing.is_empty() {
+            self.events.push_back(PeerEvent::MissingAuthorities(missing));
+        }
+    }
 
-        // apply unban for any banned validators
-        for (peer_id, action) in unban_actions {
+    /// Apply unban actions returned by the peer store.
+    fn apply_unban_actions(&mut self, actions: Vec<(PeerId, PeerAction)>) {
+        for (peer_id, action) in actions {
             self.apply_peer_action(peer_id, action);
         }
     }
