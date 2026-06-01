@@ -493,7 +493,7 @@ impl<DB: Database> RecordStore for KadStore<DB> {
                 .is_ok()
                 {
                     // Provider is empty and we removed it so dec num_providers.
-                    self.num_records = self.num_records.saturating_sub(1);
+                    self.num_providers = self.num_providers.saturating_sub(1);
                 }
             } else {
                 let _ = match self.kad_type {

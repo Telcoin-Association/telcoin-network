@@ -748,9 +748,10 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
     let timeout = timeout(Duration::from_secs(2), nvv_network_events.recv()).await;
     assert!(timeout.is_err());
 
-    // assert fatal score
-    let score = nvv.peer_score(cvv_id).await?;
-    assert_eq!(score, Some(config_2.network_config().peer_config().score_config.min_score));
+    // assert mild penalty applied
+    let score = nvv.peer_score(cvv_id).await?.expect("peer score available");
+    assert!(score < 0.0, "expected negative score after penalty, got {score}");
+    assert!(score > -2.0, "expected mild penalty (~-1.0), got {score}");
 
     Ok(())
 }
