@@ -1233,11 +1233,7 @@ fn rebind_bls_locked_for_promoted_committee_member() {
     );
 
     // peer_a's BLS is NOT cleared.
-    assert_eq!(
-        all_peers.peer_to_bls(&peer_a),
-        Some(bls),
-        "promoted peer_a must retain its BLS"
-    );
+    assert_eq!(all_peers.peer_to_bls(&peer_a), Some(bls), "promoted peer_a must retain its BLS");
 }
 
 /// Unit test for Layer 2: committee BLS holders are immune to penalties.

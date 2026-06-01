@@ -192,10 +192,8 @@ impl AllPeers {
         }
 
         // self-heal: promote an unresolved committee BLS when the kad lookup resolves it.
-        let should_promote = matches!(
-            self.current_committee_keys.get(&bls_public_key),
-            Some(&None)
-        );
+        let should_promote =
+            matches!(self.current_committee_keys.get(&bls_public_key), Some(&None));
 
         if should_promote {
             self.promote_committee_member(bls_public_key, peer_id).map(|a| (peer_id, a))
