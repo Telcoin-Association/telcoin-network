@@ -289,18 +289,14 @@ where
         /// The reply to caller.
         reply: oneshot::Sender<PeerExchangeMap>,
     },
-    /// Seed the previous/current/next committees on the initial epoch.
-    InitializeCommittees {
+    /// Set the previous/current/next committees directly from authoritative state, every epoch.
+    UpdateCommittees {
+        /// The previous epoch committee.
+        previous: HashSet<BlsPublicKey>,
         /// The current epoch committee.
         current: HashSet<BlsPublicKey>,
         /// The next epoch committee.
         next: HashSet<BlsPublicKey>,
-    },
-    /// Rotate committees forward at an epoch boundary (`previous <- current`, `current <- next`,
-    /// `next <- next_committee`).
-    NextCommittee {
-        /// The new next committee.
-        next_committee: HashSet<BlsPublicKey>,
         /// Timestamp (sec) at which the just-completed epoch ended.
         epoch_end_timestamp: TimestampSec,
     },
@@ -572,25 +568,17 @@ where
         res.await.map_err(Into::into)
     }
 
-    /// Seed the previous/current/next committees on the initial epoch.
-    pub async fn initialize_committees(
+    /// Set the previous/current/next committees directly from authoritative state, every epoch,
+    /// recording the just-completed epoch's end timestamp.
+    pub async fn update_committees(
         &self,
+        previous: HashSet<BlsPublicKey>,
         current: HashSet<BlsPublicKey>,
         next: HashSet<BlsPublicKey>,
-    ) -> NetworkResult<()> {
-        self.sender.send(NetworkCommand::InitializeCommittees { current, next }).await?;
-        Ok(())
-    }
-
-    /// Rotate committees forward at an epoch boundary, recording the just-completed epoch's end
-    /// timestamp.
-    pub async fn next_committee(
-        &self,
-        next_committee: HashSet<BlsPublicKey>,
         epoch_end_timestamp: TimestampSec,
     ) -> NetworkResult<()> {
         self.sender
-            .send(NetworkCommand::NextCommittee { next_committee, epoch_end_timestamp })
+            .send(NetworkCommand::UpdateCommittees { previous, current, next, epoch_end_timestamp })
             .await?;
         Ok(())
     }
@@ -598,7 +586,7 @@ where
     /// Forgive bans for a committee so it can be dialed, without mutating the committee slots.
     ///
     /// Used by the deadlock-breaker pre-dial path; the real slot update follows via
-    /// [`Self::initialize_committees`] or [`Self::next_committee`].
+    /// [`Self::update_committees`].
     pub async fn prepare_committee_dial(
         &self,
         committee: HashSet<BlsPublicKey>,

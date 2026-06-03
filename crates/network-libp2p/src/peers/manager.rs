@@ -608,40 +608,34 @@ impl PeerManager {
             || self.peers.get_peer(peer_id).map(|p| p.is_trusted()).unwrap_or_default()
     }
 
-    /// Seed the previous/current/next committees on the initial epoch.
+    /// Set the previous/current/next committees directly from authoritative state, every epoch.
     ///
-    /// `current` and `next` are resolved to known network info and handed to the peer store, which
-    /// records both as validators and forgives any bans. Unknown keys in either committee trigger a
-    /// kad lookup (see [`Self::trigger_missing_authorities`]). The `next` committee is the most
-    /// likely source of peers we have never connected to, but `current` members may also be unknown
-    /// when a restart seeds the committees late (the initial epoch returned early before network
-    /// setup), so chase both.
-    pub(crate) fn initialize_committees(
+    /// All three committees are resolved to known network info and handed to the peer store, which
+    /// overwrites the three slots, demotes any peer that fell out of the window, records both new
+    /// members as validators, and forgives any bans. Unknown keys in `current` and `next` trigger a
+    /// kad lookup (see [`Self::trigger_missing_authorities`]) — but **not** `previous`, whose peers
+    /// are rotating out and are only resolved so already-known previous members still get
+    /// unban/refresh. The `next` committee is the most likely source of peers we have never
+    /// connected to, but `current` members may also be unknown when a restart seeds the committees
+    /// late (the initial epoch returned early before network setup), so chase both.
+    pub(crate) fn update_committees(
         &mut self,
+        previous: HashSet<BlsPublicKey>,
         current: HashSet<BlsPublicKey>,
-        next: HashSet<BlsPublicKey>,
-    ) {
-        self.trigger_missing_authorities(&current);
-        self.trigger_missing_authorities(&next);
-        let resolved_current = self.resolve_committee(&current);
-        let resolved_next = self.resolve_committee(&next);
-        let unban_actions = self.peers.initialize_committees(resolved_current, resolved_next);
-        self.apply_unban_actions(unban_actions);
-    }
-
-    /// Rotate the committees forward at an epoch boundary: `previous <- current`,
-    /// `current <- next`, `next <- new_next`, recording the just-closed epoch's end timestamp.
-    ///
-    /// Only the incoming `next` committee is resolved and run through the unban loop. Unknown `next`
-    /// keys trigger a kad lookup.
-    pub(crate) fn next_committee(
-        &mut self,
         next: HashSet<BlsPublicKey>,
         epoch_end_timestamp: TimestampSec,
     ) {
-        let resolved_next = self.resolve_committee(&next);
+        self.trigger_missing_authorities(&current);
         self.trigger_missing_authorities(&next);
-        let unban_actions = self.peers.rotate_to_next_epoch(resolved_next, epoch_end_timestamp);
+        let resolved_previous = self.resolve_committee(&previous);
+        let resolved_current = self.resolve_committee(&current);
+        let resolved_next = self.resolve_committee(&next);
+        let unban_actions = self.peers.update_committees(
+            resolved_previous,
+            resolved_current,
+            resolved_next,
+            epoch_end_timestamp,
+        );
         self.apply_unban_actions(unban_actions);
     }
 
@@ -649,7 +643,7 @@ impl PeerManager {
     /// WITHOUT mutating the committee slots.
     ///
     /// Used by the deadlock-breaker path while waiting for an epoch record; the real slot update
-    /// follows shortly after via [`Self::initialize_committees`] or [`Self::next_committee`].
+    /// follows shortly after via [`Self::update_committees`].
     pub(crate) fn prepare_committee_dial(&mut self, committee: HashSet<BlsPublicKey>) {
         let committee = self.resolve_committee(&committee);
         let unban_actions = self.peers.mark_committee_for_dial(committee);

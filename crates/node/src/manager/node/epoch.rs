@@ -169,13 +169,13 @@ where
         let consensus_config = self.configure_consensus(engine, network_config).await?;
 
         // The networks need their one-time, per-process setup (start listening, register bootstrap
-        // peers, seed the previous/current/next committee slots) on the first iteration that
-        // actually reaches `create_consensus`. This is usually the `Initial` epoch, but the replay
-        // above can return early (line ~154) before `create_consensus` on a restart that
-        // replays-and-closes an epoch boundary, so the first real setup then happens on a following
-        // `NewEpoch` iteration. Drive the decision off whether the network has actually been set up
-        // yet (not off `RunEpochMode::Initial`) so the setup (and committee seeding) is never
-        // skipped on that restart path.
+        // peers) on the first iteration that actually reaches `create_consensus`. This is usually
+        // the `Initial` epoch, but the replay above can return early (line ~154) before
+        // `create_consensus` on a restart that replays-and-closes an epoch boundary, so the first
+        // real setup then happens on a following `NewEpoch` iteration. Drive the decision off
+        // whether the network has actually been set up yet (not off `RunEpochMode::Initial`) so the
+        // setup is never skipped on that restart path. (Committee slots are set every epoch
+        // regardless via `update_committees`.)
         let network_first_init = epoch_mode.initial_epoch() || !self.network_initialized;
 
         // create primary and worker nodes
@@ -1045,9 +1045,12 @@ where
             .collect();
         let next_committee_keys: HashSet<BlsPublicKey> =
             consensus_config.next_committee_keys().iter().copied().collect();
+        let previous_committee_keys =
+            self.previous_committee_keys(consensus_config.committee().epoch()).await;
         Self::init_network_for_epoch(
             network_handle.inner_handle(),
             bootstrap_peers,
+            previous_committee_keys,
             committee_keys.clone(),
             next_committee_keys,
             self.previous_epoch_boundary,
@@ -1184,9 +1187,12 @@ where
             .collect();
         let next_committee_keys: HashSet<BlsPublicKey> =
             consensus_config.next_committee_keys().iter().copied().collect();
+        let previous_committee_keys =
+            self.previous_committee_keys(consensus_config.committee().epoch()).await;
         Self::init_network_for_epoch(
             network_handle.inner_handle(),
             bootstrap_peers,
+            previous_committee_keys,
             committee_keys.clone(),
             next_committee_keys,
             self.previous_epoch_boundary,
@@ -1339,17 +1345,37 @@ where
             .unwrap_or(Ok(fallback))
     }
 
+    /// Read the previous epoch's committee from the persisted epoch records.
+    ///
+    /// Empty for epoch 0 (no previous) or if the prior record isn't available yet (degrades to
+    /// pre-tracking behavior rather than failing network setup). Returns the *active* committee of
+    /// epoch `N-1` (`record.committee`), not its `next_committee` (which equals the current
+    /// committee by the invariant enforced when epoch records are built).
+    async fn previous_committee_keys(&self, epoch: Epoch) -> HashSet<BlsPublicKey> {
+        if epoch == 0 {
+            return HashSet::new();
+        }
+        self.consensus_chain
+            .epochs()
+            .record_by_epoch(epoch - 1)
+            .await
+            .map(|rec| rec.committee.into_iter().collect())
+            .unwrap_or_default()
+    }
+
     /// Initialize a network handle for a new epoch.
     ///
-    /// On the initial epoch this registers bootstrap peers and then seeds the previous/current/next
-    /// committees (`initialize_committees`). On every subsequent epoch it rotates the committees
-    /// forward (`next_committee`), recording the just-completed epoch's end timestamp.
+    /// On the initial epoch this registers bootstrap peers and starts listening (the one-time,
+    /// per-process setup gated on `initial_epoch`). Every epoch — initial or not — it sets the
+    /// previous/current/next committee slots directly from authoritative state via
+    /// `update_committees`, recording the just-completed epoch's end timestamp.
     ///
-    /// Bootstrap peers must be added BEFORE `initialize_committees` so that `known_peers` is
-    /// populated when the peer manager resolves the committees from it.
+    /// On the initial epoch, bootstrap peers must be added BEFORE `update_committees` so that
+    /// `known_peers` is populated when the peer manager resolves the committees from it.
     async fn init_network_for_epoch<Req: TNMessage, Res: TNMessage>(
         handle: &NetworkHandle<Req, Res>,
         bootstrap_peers: BTreeMap<BlsPublicKey, P2pNode>,
+        previous_committee_keys: HashSet<BlsPublicKey>,
         committee_keys: HashSet<BlsPublicKey>,
         next_committee_keys: HashSet<BlsPublicKey>,
         epoch_end_timestamp: TimestampSec,
@@ -1357,10 +1383,15 @@ where
     ) -> eyre::Result<()> {
         if initial_epoch {
             handle.add_bootstrap_peers(bootstrap_peers).await?;
-            handle.initialize_committees(committee_keys, next_committee_keys).await?;
-        } else {
-            handle.next_committee(next_committee_keys, epoch_end_timestamp).await?;
         }
+        handle
+            .update_committees(
+                previous_committee_keys,
+                committee_keys,
+                next_committee_keys,
+                epoch_end_timestamp,
+            )
+            .await?;
         Ok(())
     }
 

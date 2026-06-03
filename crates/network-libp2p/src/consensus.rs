@@ -709,25 +709,24 @@ where
                 let peers = self.swarm.behaviour_mut().peer_manager.peers_for_exchange();
                 send_or_log_error!(reply, peers, "PeersForExchange");
             }
-            NetworkCommand::InitializeCommittees { current, next } => {
+            NetworkCommand::UpdateCommittees { previous, current, next, epoch_end_timestamp } => {
                 // The network mirrors three of the on-chain registry's committees: previous,
                 // current, and next. Peers in any of the three count as validators so the
                 // just-completed committee is not pruned while late gossip may still arrive and
                 // next-epoch peers are protected before they begin voting. (NVV support and
                 // late-gossip acceptance remain future work.)
                 //
-                // On the initial epoch the previous slot is empty; seed current and next here.
-                info!(target: "network", this_node=?self.swarm.local_peer_id(), "initializing previous/current/next committees");
-                self.swarm.behaviour_mut().peer_manager.initialize_committees(current, next);
-            }
-            NetworkCommand::NextCommittee { next_committee, epoch_end_timestamp } => {
-                // Rotate the committees forward (previous <- current, current <- next, next <- arg)
-                // and record when the just-completed epoch ended.
-                info!(target: "network", this_node=?self.swarm.local_peer_id(), ?epoch_end_timestamp, "rotating committees for next epoch");
-                self.swarm
-                    .behaviour_mut()
-                    .peer_manager
-                    .next_committee(next_committee, epoch_end_timestamp);
+                // All three slots are set directly from authoritative state every epoch (no
+                // positional rotation), so current/previous self-correct against on-chain state and
+                // any peer that exits the three-slot window is demoted. The just-completed epoch's
+                // end timestamp is recorded.
+                info!(target: "network", this_node=?self.swarm.local_peer_id(), ?epoch_end_timestamp, "updating previous/current/next committees");
+                self.swarm.behaviour_mut().peer_manager.update_committees(
+                    previous,
+                    current,
+                    next,
+                    epoch_end_timestamp,
+                );
             }
             NetworkCommand::PrepareCommitteeDial { committee } => {
                 // Deadlock-breaker pre-dial: forgive bans so the committee can be dialed without

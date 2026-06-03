@@ -66,7 +66,7 @@ pub(crate) struct EpochManager<P, DB> {
     /// has been observed yet (initial epoch / fresh process).
     previous_epoch_boundary: TimestampSec,
     /// Whether the long-running p2p networks have completed their one-time, per-process setup
-    /// (start listening, register bootstrap peers, seed the previous/current/next committee slots).
+    /// (start listening, register bootstrap peers).
     ///
     /// This setup normally runs on the `Initial` epoch, but the `Initial` iteration can return
     /// early from [`EpochManager::replay_missed_consensus`] — when a restart must replay-and-close
@@ -74,6 +74,9 @@ pub(crate) struct EpochManager<P, DB> {
     /// on the first following `NewEpoch` iteration instead. Gating on this flag, rather than on
     /// [`RunEpochMode::Initial`], guarantees the networks are set up exactly once even on that
     /// restart path (mirrors the `are_workers_initialized` guard used for worker components).
+    ///
+    /// Committee slots are NOT gated on this flag — they are set every epoch from authoritative
+    /// state via `update_committees`.
     network_initialized: bool,
     /// Reth DB, keep for entire execution.
     reth_db: RethDb,

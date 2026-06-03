@@ -37,16 +37,17 @@ pub(super) struct AllPeers {
     peers: HashMap<PeerId, Peer>,
     /// Peers in the previous epoch's committee.
     ///
-    /// Retained for one rotation so late gossip from the just-completed committee still counts as
-    /// validator traffic and those peers are not pruned mid-rotation.
+    /// Set every epoch from authoritative state so late gossip from the just-completed committee
+    /// still counts as validator traffic and those peers are not pruned mid-rotation.
     previous_committee: HashSet<PeerId>,
     /// Peers in the current epoch's committee.
     current_committee: HashSet<PeerId>,
     /// Peers in the next epoch's committee, pre-emptively trusted so they are not banned before
     /// they begin voting.
     next_committee: HashSet<PeerId>,
-    /// Timestamp (sec) at which the previous epoch closed. Recorded on every rotation; the `0`
-    /// sentinel means no previous epoch boundary has been observed yet (initial epoch).
+    /// Timestamp (sec) at which the previous epoch closed. Set every epoch from authoritative
+    /// state; the `0` sentinel means no previous epoch boundary has been observed yet (initial
+    /// epoch).
     ///
     /// Stored ahead of its consumer: a future PR reads this to accept late gossipsub messages from
     /// the previous committee within a grace window.
@@ -831,55 +832,71 @@ impl AllPeers {
         }
     }
 
-    /// Seed the committee slots on the initial epoch.
+    /// Set the previous/current/next committee slots directly from authoritative state.
     ///
-    /// The previous slot is empty (no epoch has closed yet); `current` and `next` are recorded so
-    /// peers in either committee count as validators. Banned or disconnecting members of either
-    /// committee are forgiven, their advertised addresses refreshed, and they are marked `trusted`.
-    /// Peers that appear in both committees are processed once.
-    pub(super) fn initialize_committees(
+    /// Called every epoch with the three committees read from the persisted epoch records. All
+    /// three slots are overwritten (no positional rotation), so `current` and `previous` are always
+    /// re-validated against authoritative state rather than derived from a prior prediction. The
+    /// just-completed epoch's end timestamp is recorded.
+    ///
+    /// Any peer that was tracked in one of the three slots before this update but is absent from all
+    /// three afterward is demoted via [`Peer::make_untrusted`], bounding committee-derived trust to
+    /// the three-slot window. Members of the new committees are forgiven any bans, have their
+    /// advertised addresses refreshed, and are marked `trusted`; peers appearing in more than one
+    /// committee are processed once. The demote and re-trust sets are disjoint by construction, so
+    /// no peer is demoted then re-trusted in a single call.
+    pub(super) fn update_committees(
         &mut self,
+        previous: Vec<(BlsPublicKey, NetworkInfo)>,
         current: Vec<(BlsPublicKey, NetworkInfo)>,
         next: Vec<(BlsPublicKey, NetworkInfo)>,
+        epoch_end_timestamp: TimestampSec,
     ) -> Vec<(PeerId, PeerAction)> {
-        self.previous_committee = HashSet::new();
+        // capture the peers tracked across all three slots before the overwrite
+        let previously_tracked: HashSet<PeerId> = self
+            .previous_committee
+            .iter()
+            .chain(self.current_committee.iter())
+            .chain(self.next_committee.iter())
+            .copied()
+            .collect();
+
+        // overwrite all three slots directly from authoritative state
+        self.previous_committee = previous.iter().map(|(_, ni)| ni.pubkey.clone().into()).collect();
         self.current_committee = current.iter().map(|(_, ni)| ni.pubkey.clone().into()).collect();
         self.next_committee = next.iter().map(|(_, ni)| ni.pubkey.clone().into()).collect();
+        self.epoch_end_timestamp = epoch_end_timestamp;
 
-        // unban + trust every member once (peers in both committees are handled a single time)
+        // demote any peer that fell out of all three slots, returning it to the normal score model
+        let still_tracked: HashSet<PeerId> = self
+            .previous_committee
+            .iter()
+            .chain(self.current_committee.iter())
+            .chain(self.next_committee.iter())
+            .copied()
+            .collect();
+        for peer_id in previously_tracked.difference(&still_tracked) {
+            if let Some(peer) = self.peers.get_mut(peer_id) {
+                peer.make_untrusted();
+            }
+        }
+
+        // unban + trust every member once (peers in multiple committees are handled a single time)
         let mut processed: HashSet<PeerId> = HashSet::new();
-        let members: Vec<(BlsPublicKey, NetworkInfo)> = current
+        let members: Vec<(BlsPublicKey, NetworkInfo)> = previous
             .into_iter()
+            .chain(current)
             .chain(next)
             .filter(|(_, ni)| processed.insert(ni.pubkey.clone().into()))
             .collect();
         self.apply_committee_membership(members)
     }
 
-    /// Rotate the committee slots forward at an epoch boundary.
-    ///
-    /// `previous <- current`, `current <- next`, `next <- new_next`, and the timestamp at which the
-    /// just-completed epoch ended is recorded. Only the incoming `next` committee is run through the
-    /// unban + trust loop: `Peer::make_trusted` is a one-way ratchet, so peers that already passed
-    /// through the committee in a prior rotation keep their trust, and re-applying it to the
-    /// previous or current slots is wasted work.
-    pub(super) fn rotate_to_next_epoch(
-        &mut self,
-        new_next: Vec<(BlsPublicKey, NetworkInfo)>,
-        epoch_end_timestamp: TimestampSec,
-    ) -> Vec<(PeerId, PeerAction)> {
-        self.previous_committee = std::mem::take(&mut self.current_committee);
-        self.current_committee = std::mem::take(&mut self.next_committee);
-        self.next_committee = new_next.iter().map(|(_, ni)| ni.pubkey.clone().into()).collect();
-        self.epoch_end_timestamp = epoch_end_timestamp;
-        self.apply_committee_membership(new_next)
-    }
-
     /// Forgive bans and refresh trust for a committee WITHOUT touching the committee slots.
     ///
     /// Used only by the deadlock-breaker pre-dial path: it unbans committee peers so a subsequent
     /// dial loop can connect, but leaves previous/current/next untouched because the real slot
-    /// update follows shortly after via `initialize_committees` / `rotate_to_next_epoch`.
+    /// update follows shortly after via `update_committees`.
     pub(super) fn mark_committee_for_dial(
         &mut self,
         committee: Vec<(BlsPublicKey, NetworkInfo)>,

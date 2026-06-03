@@ -1344,9 +1344,14 @@ async fn test_new_epoch_unbans_committee_members() -> eyre::Result<()> {
     let handle = peer1.clone();
     tokio::spawn(async move {
         handle
-            .initialize_committees(committee, Default::default())
+            .update_committees(
+                Default::default(),
+                committee,
+                Default::default(),
+                Default::default(),
+            )
             .await
-            .expect("Failed to send InitializeCommittees command");
+            .expect("Failed to send UpdateCommittees command");
     })
     .await?;
 
@@ -1468,7 +1473,10 @@ async fn test_new_epoch_unbans_committee_member_ip() -> eyre::Result<()> {
         .into_iter()
         .collect();
 
-    target_peer.network_handle.initialize_committees(committee, Default::default()).await?;
+    target_peer
+        .network_handle
+        .update_committees(Default::default(), committee, Default::default(), Default::default())
+        .await?;
 
     // wait for connection to establish
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
@@ -1548,9 +1556,14 @@ async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> 
     let handle = peer1.clone();
     tokio::spawn(async move {
         handle
-            .initialize_committees(committee, Default::default())
+            .update_committees(
+                Default::default(),
+                committee,
+                Default::default(),
+                Default::default(),
+            )
             .await
-            .expect("Failed to send InitializeCommittees command");
+            .expect("Failed to send UpdateCommittees command");
     })
     .await?;
 
@@ -1614,14 +1627,28 @@ async fn test_rotate_does_not_disconnect_previous_committee() -> eyre::Result<()
     );
 
     // peer2 is in the CURRENT committee for this epoch
-    peer1.initialize_committees(vec![peer2_bls].into_iter().collect(), Default::default()).await?;
+    peer1
+        .update_committees(
+            Default::default(),
+            vec![peer2_bls].into_iter().collect(),
+            Default::default(),
+            0,
+        )
+        .await?;
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
 
-    // Rotate to the next epoch whose `next` committee does NOT contain peer2:
-    // previous <- current ({peer2}), current <- next ({}), next <- {}. peer2 drops out of
-    // `current` into `previous` and must NOT be disconnected, since it still counts as a validator
-    // (is_peer_validator spans the previous committee).
-    peer1.next_committee(Default::default(), 1234).await?;
+    // Update to the next epoch where peer2 has rotated out of `current` into `previous`: it is
+    // placed explicitly in the previous slot and absent from current/next. peer2 must NOT be
+    // disconnected, since it still counts as a validator (is_peer_validator spans the previous
+    // committee).
+    peer1
+        .update_committees(
+            vec![peer2_bls].into_iter().collect(),
+            Default::default(),
+            Default::default(),
+            1234,
+        )
+        .await?;
 
     // Let several heartbeats run so any pruning of non-validator peers would take effect.
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 3)).await;
@@ -1630,7 +1657,8 @@ async fn test_rotate_does_not_disconnect_previous_committee() -> eyre::Result<()
         peer1.connected_peer_ids().await?.contains(&peer2_id),
         "peer2 must stay connected after rotating into the previous committee"
     );
-    // peer2 was made trusted when it entered the committee; trust (and max score) survive rotation.
+    // peer2 stays trusted because it is still inside the three-slot window (now in `previous`), so
+    // it keeps the validator (max) score it was given on entering the committee.
     let peer2_score = peer1.peer_score(peer2_id).await?.expect("peer2 score");
     assert_eq!(
         peer2_score,
@@ -1681,7 +1709,12 @@ async fn test_gossip_explicit_peer_includes_next_committee() -> eyre::Result<()>
         )
         .await?;
     publisher
-        .initialize_committees(Default::default(), vec![next_bls].into_iter().collect())
+        .update_committees(
+            Default::default(),
+            Default::default(),
+            vec![next_bls].into_iter().collect(),
+            0,
+        )
         .await?;
 
     // peer2 subscribes with peer1 as the authorized publisher and dials peer1.

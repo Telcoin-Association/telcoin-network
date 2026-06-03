@@ -559,9 +559,9 @@ async fn test_is_validator() {
     };
     peer_manager.add_known_peer(validator, info);
 
-    // seed the current committee (no next committee for this test)
+    // set the current committee (no previous/next committee for this test)
     let committee = config.committee_pub_keys();
-    peer_manager.initialize_committees(committee, HashSet::new());
+    peer_manager.update_committees(HashSet::new(), committee, HashSet::new(), 0);
 
     // Verify the registered committee member is a validator
     assert!(peer_manager.is_peer_validator(&validator_peer_id));
@@ -571,14 +571,19 @@ async fn test_is_validator() {
 }
 
 #[tokio::test]
-async fn test_next_committee_triggers_missing_authorities_for_unknown_next_keys() {
+async fn test_update_committees_triggers_missing_authorities_for_unknown_next_keys() {
     let mut peer_manager = create_test_peer_manager(None);
 
     // generate a bls key that was never registered via add_known_peer
     let unknown_bls = *BlsKeypair::generate(&mut StdRng::from_seed([9; 32])).public();
 
-    // rotate to a next committee that contains the unknown key
-    peer_manager.next_committee(HashSet::from([unknown_bls]), 100);
+    // update with a next committee that contains the unknown key
+    peer_manager.update_committees(
+        HashSet::new(),
+        HashSet::new(),
+        HashSet::from([unknown_bls]),
+        100,
+    );
 
     // exactly one MissingAuthorities event referencing the unknown key should be emitted
     let events = collect_all_events(&mut peer_manager);
@@ -587,6 +592,30 @@ async fn test_next_committee_triggers_missing_authorities_for_unknown_next_keys(
     assert_matches!(
         missing_events.first().unwrap(),
         PeerEvent::MissingAuthorities(missing) if missing.contains(&unknown_bls)
+    );
+}
+
+#[tokio::test]
+async fn test_update_committees_does_not_trigger_for_unknown_previous() {
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // generate a bls key that was never registered via add_known_peer
+    let unknown_bls = *BlsKeypair::generate(&mut StdRng::from_seed([9; 32])).public();
+
+    // the unknown key appears ONLY in the previous committee (peers rotating out are not chased)
+    peer_manager.update_committees(
+        HashSet::from([unknown_bls]),
+        HashSet::new(),
+        HashSet::new(),
+        100,
+    );
+
+    // no MissingAuthorities event should be emitted for a previous-only unknown key
+    let events = collect_all_events(&mut peer_manager);
+    let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
+    assert!(
+        missing_events.is_empty(),
+        "previous-committee-only unknown keys must not trigger MissingAuthorities"
     );
 }
 

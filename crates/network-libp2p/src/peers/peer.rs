@@ -333,6 +333,19 @@ impl Peer {
         }
     }
 
+    /// Revoke a peer's trusted status, returning it to the normal score model.
+    ///
+    /// Called when a peer rotates out of all three committee slots. Only the flag is cleared;
+    /// the score is left as-is so the demoted peer gets a soft landing (heartbeat decay and
+    /// penalties resume immediately now that `is_trusted` is false).
+    ///
+    /// NOTE: `is_trusted` currently conflates committee-derived trust with operator-allowlist
+    /// trust (`new_trusted`/`add_trusted_peer`); demoting clears both for a peer that was in a
+    /// committee. Splitting the two provenances is tracked as a follow-up.
+    pub(super) fn make_untrusted(&mut self) {
+        self.is_trusted = false;
+    }
+
     /// Update multiaddrs for the peer.
     ///
     /// Returns a boolean indicating if the multiaddr was newly recorded.

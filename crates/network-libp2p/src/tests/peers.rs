@@ -638,26 +638,46 @@ fn committee_member(rng: &mut StdRng) -> (BlsPublicKey, NetworkInfo, PeerId) {
     (bls, info, peer_id)
 }
 
+/// Build a committee of `size` distinct members plus the set of their derived peer ids.
+fn random_committee(
+    rng: &mut StdRng,
+    size: usize,
+) -> (Vec<(BlsPublicKey, NetworkInfo)>, HashSet<PeerId>) {
+    let members: Vec<(BlsPublicKey, NetworkInfo, PeerId)> =
+        (0..size).map(|_| committee_member(rng)).collect();
+    let ids: HashSet<PeerId> = members.iter().map(|(_, _, id)| *id).collect();
+    let committee = members.into_iter().map(|(b, i, _)| (b, i)).collect();
+    (committee, ids)
+}
+
 #[test]
-fn test_initialize_committees_seeds_current_and_next() {
+fn test_update_committees_sets_all_three_slots() {
     let mut rng = StdRng::from_seed([10; 32]);
     let mut all_peers = create_all_peers(None);
 
+    let (p_bls, p_info, p_peer_id) = committee_member(&mut rng);
     let (c_bls, c_info, c_peer_id) = committee_member(&mut rng);
     let (n_bls, n_info, n_peer_id) = committee_member(&mut rng);
 
-    all_peers.initialize_committees(vec![(c_bls, c_info)], vec![(n_bls, n_info)]);
+    all_peers.update_committees(
+        vec![(p_bls, p_info)],
+        vec![(c_bls, c_info)],
+        vec![(n_bls, n_info)],
+        7,
+    );
 
+    assert!(all_peers.previous_committee.contains(&p_peer_id));
     assert!(all_peers.current_committee.contains(&c_peer_id));
     assert!(all_peers.next_committee.contains(&n_peer_id));
-    assert!(all_peers.previous_committee.is_empty());
+    assert_eq!(all_peers.epoch_end_timestamp, 7);
+    assert!(all_peers.is_peer_validator(&p_peer_id));
     assert!(all_peers.is_peer_validator(&c_peer_id));
     assert!(all_peers.is_peer_validator(&n_peer_id));
     assert!(!all_peers.is_peer_validator(&PeerId::random()));
 }
 
 #[test]
-fn test_rotate_to_next_epoch_shifts_queue() {
+fn test_update_committees_overwrites_slots_directly() {
     let mut rng = StdRng::from_seed([11; 32]);
     let mut all_peers = create_all_peers(None);
 
@@ -665,62 +685,80 @@ fn test_rotate_to_next_epoch_shifts_queue() {
     let (b_bls, b_info, b_id) = committee_member(&mut rng);
     let (c_bls, c_info, c_id) = committee_member(&mut rng);
     let (d_bls, d_info, d_id) = committee_member(&mut rng);
+    let (e_bls, e_info, e_id) = committee_member(&mut rng);
+    let (f_bls, f_info, f_id) = committee_member(&mut rng);
 
-    // initialize with current={A}, next={B}
-    all_peers.initialize_committees(vec![(a_bls, a_info)], vec![(b_bls, b_info)]);
-
-    // rotate: previous <- current({A}), current <- next({B}), next <- {C}
-    all_peers.rotate_to_next_epoch(vec![(c_bls, c_info)], 1);
+    // first update: previous={A}, current={B}, next={C}
+    all_peers.update_committees(
+        vec![(a_bls, a_info)],
+        vec![(b_bls, b_info)],
+        vec![(c_bls, c_info)],
+        1,
+    );
     assert_eq!(all_peers.previous_committee, HashSet::from([a_id]));
     assert_eq!(all_peers.current_committee, HashSet::from([b_id]));
     assert_eq!(all_peers.next_committee, HashSet::from([c_id]));
 
-    // rotate again: previous <- current({B}), current <- next({C}), next <- {D}
-    all_peers.rotate_to_next_epoch(vec![(d_bls, d_info)], 2);
-    assert_eq!(all_peers.previous_committee, HashSet::from([b_id]));
-    assert_eq!(all_peers.current_committee, HashSet::from([c_id]));
-    assert_eq!(all_peers.next_committee, HashSet::from([d_id]));
+    // second update: each slot is set directly from its arg, NOT positionally shifted from the
+    // prior round (otherwise current would be the prior next, {C}).
+    all_peers.update_committees(
+        vec![(d_bls, d_info)],
+        vec![(e_bls, e_info)],
+        vec![(f_bls, f_info)],
+        2,
+    );
+    assert_eq!(all_peers.previous_committee, HashSet::from([d_id]));
+    assert_eq!(all_peers.current_committee, HashSet::from([e_id]));
+    assert_eq!(all_peers.next_committee, HashSet::from([f_id]));
 }
 
 #[test]
-fn test_rotate_records_epoch_end_timestamp() {
+fn test_update_committees_records_epoch_end_timestamp() {
     let mut rng = StdRng::from_seed([12; 32]);
     let mut all_peers = create_all_peers(None);
 
     let (c_bls, c_info, _) = committee_member(&mut rng);
     let (n_bls, n_info, _) = committee_member(&mut rng);
-    all_peers.initialize_committees(vec![(c_bls, c_info)], vec![(n_bls, n_info)]);
-
-    let (m_bls, m_info, _) = committee_member(&mut rng);
-    all_peers.rotate_to_next_epoch(vec![(m_bls, m_info)], 4242);
+    all_peers.update_committees(vec![], vec![(c_bls, c_info)], vec![(n_bls, n_info)], 4242);
     assert_eq!(all_peers.epoch_end_timestamp, 4242);
 
-    let (m2_bls, m2_info, _) = committee_member(&mut rng);
-    all_peers.rotate_to_next_epoch(vec![(m2_bls, m2_info)], 5000);
+    let (m_bls, m_info, _) = committee_member(&mut rng);
+    all_peers.update_committees(vec![], vec![(m_bls, m_info)], vec![], 5000);
     assert_eq!(all_peers.epoch_end_timestamp, 5000);
 }
 
 #[test]
-fn test_rotate_committees_no_change() {
+fn test_update_committees_no_change() {
     let mut rng = StdRng::from_seed([13; 32]);
     let mut all_peers = create_all_peers(None);
 
     let (x_bls, x_info, x_id) = committee_member(&mut rng);
 
     // X is in both current and next
-    all_peers.initialize_committees(vec![(x_bls, x_info.clone())], vec![(x_bls, x_info.clone())]);
+    all_peers.update_committees(
+        vec![],
+        vec![(x_bls, x_info.clone())],
+        vec![(x_bls, x_info.clone())],
+        1,
+    );
 
-    // rotate with X again as the incoming next
-    all_peers.rotate_to_next_epoch(vec![(x_bls, x_info.clone())], 1);
+    // repeat the same membership next epoch
+    all_peers.update_committees(
+        vec![],
+        vec![(x_bls, x_info.clone())],
+        vec![(x_bls, x_info.clone())],
+        2,
+    );
 
-    // full overlap keeps X a validator and present in both current and next
+    // full overlap keeps X a validator, present in both current and next, never demoted
     assert!(all_peers.is_peer_validator(&x_id));
     assert!(all_peers.current_committee.contains(&x_id));
     assert!(all_peers.next_committee.contains(&x_id));
+    assert!(all_peers.get_peer(&x_id).unwrap().is_trusted());
 }
 
 #[test]
-fn test_rotate_committees_full_turnover() {
+fn test_update_committees_full_turnover() {
     let mut rng = StdRng::from_seed([14; 32]);
     let mut all_peers = create_all_peers(None);
 
@@ -728,43 +766,32 @@ fn test_rotate_committees_full_turnover() {
     let (b_bls, b_info, b_id) = committee_member(&mut rng);
     let (c_bls, c_info, c_id) = committee_member(&mut rng);
 
-    // initialize with current={A}, next={B}
-    all_peers.initialize_committees(vec![(a_bls, a_info)], vec![(b_bls, b_info)]);
-
-    // rotate in disjoint C: three disjoint slots placed correctly
-    all_peers.rotate_to_next_epoch(vec![(c_bls, c_info)], 1);
-    assert_eq!(all_peers.previous_committee, HashSet::from([a_id]));
-    assert_eq!(all_peers.current_committee, HashSet::from([b_id]));
-    assert_eq!(all_peers.next_committee, HashSet::from([c_id]));
-}
-
-#[test]
-fn test_rotate_on_never_seeded_slots_leaves_current_empty() {
-    // Guards the regression fixed by `EpochManager::network_initialized`. Rotation is positional
-    // (previous <- current <- next <- new_next): rotating before the slots were ever seeded by
-    // `initialize_committees` carries the empty seed forward, leaving `current` empty for a full
-    // epoch. The epoch manager must therefore SEED on the first network setup -- never ROTATE --
-    // even when that setup happens late on a post-restart `NewEpoch` iteration. Seeding (shown
-    // second) populates `current` immediately; rotating (shown first) does not.
-    let mut rng = StdRng::from_seed([99; 32]);
-
-    // rotate-on-never-seeded: the incoming committee lands in `next`, `current` stays empty.
-    let mut rotated = create_all_peers(None);
-    let (n_bls, n_info, n_id) = committee_member(&mut rng);
-    rotated.rotate_to_next_epoch(vec![(n_bls, n_info)], 1);
-    assert_eq!(rotated.next_committee, HashSet::from([n_id]));
-    assert!(
-        rotated.current_committee.is_empty(),
-        "rotating before seeding must leave current empty (the bug the epoch-manager fix avoids)"
+    // initialize with previous={A}, current={B}, next={C}
+    all_peers.update_committees(
+        vec![(a_bls, a_info)],
+        vec![(b_bls, b_info)],
+        vec![(c_bls, c_info)],
+        1,
     );
 
-    // seed-on-first-init: `current` is populated immediately and recognized as a validator.
-    let mut seeded = create_all_peers(None);
-    let (c_bls, c_info, c_id) = committee_member(&mut rng);
-    let (x_bls, x_info, _x_id) = committee_member(&mut rng);
-    seeded.initialize_committees(vec![(c_bls, c_info)], vec![(x_bls, x_info)]);
-    assert!(seeded.current_committee.contains(&c_id));
-    assert!(seeded.is_peer_validator(&c_id));
+    // a fully disjoint set replaces every slot directly
+    let (d_bls, d_info, d_id) = committee_member(&mut rng);
+    let (e_bls, e_info, e_id) = committee_member(&mut rng);
+    let (f_bls, f_info, f_id) = committee_member(&mut rng);
+    all_peers.update_committees(
+        vec![(d_bls, d_info)],
+        vec![(e_bls, e_info)],
+        vec![(f_bls, f_info)],
+        2,
+    );
+    assert_eq!(all_peers.previous_committee, HashSet::from([d_id]));
+    assert_eq!(all_peers.current_committee, HashSet::from([e_id]));
+    assert_eq!(all_peers.next_committee, HashSet::from([f_id]));
+
+    // every member of the fully-replaced window is gone
+    assert!(!all_peers.is_peer_validator(&a_id));
+    assert!(!all_peers.is_peer_validator(&b_id));
+    assert!(!all_peers.is_peer_validator(&c_id));
 }
 
 #[test]
@@ -786,88 +813,154 @@ fn test_is_peer_validator_returns_true_for_all_three_slots() {
 }
 
 #[test]
-fn test_rotate_does_not_re_apply_unban_to_previous() {
-    let mut rng = StdRng::from_seed([15; 32]);
-    let mut all_peers = create_all_peers(None);
-
-    // P is placed directly in the current committee, then driven to banned
-    let (_p_bls, _p_info, p_id) = committee_member(&mut rng);
-    all_peers.current_committee.insert(p_id);
-    all_peers.update_connection_status(&p_id, NewConnectionStatus::Disconnected);
-    all_peers.update_connection_status(&p_id, NewConnectionStatus::Banned);
-    assert!(all_peers.peer_banned(&p_id));
-
-    // Q is the disjoint incoming next committee
-    let (q_bls, q_info, _q_id) = committee_member(&mut rng);
-    let actions = all_peers.rotate_to_next_epoch(vec![(q_bls, q_info)], 1);
-
-    // P moved current -> previous and is NOT in the incoming set, so it stays banned
-    assert!(all_peers.peer_banned(&p_id));
-    // rotate only unbans the incoming `next`, so no action targets P
-    assert!(!actions.iter().any(|(id, _)| *id == p_id));
-}
-
-#[test]
-fn test_rotate_preserves_existing_trust() {
+fn test_update_committees_in_window_peer_stays_trusted() {
     let mut rng = StdRng::from_seed([16; 32]);
     let mut all_peers = create_all_peers(None);
 
-    // M is in the current committee and made trusted by initialize_committees
+    // M starts in the current committee and is made trusted by update_committees
     let (m_bls, m_info, m_id) = committee_member(&mut rng);
-    all_peers.initialize_committees(vec![(m_bls, m_info)], vec![]);
+    all_peers.update_committees(vec![], vec![(m_bls, m_info.clone())], vec![], 1);
     assert!(all_peers.get_peer(&m_id).unwrap().is_trusted());
 
-    // rotate in a disjoint member; M moves current -> previous
+    // next epoch: M moves to the previous slot (still in-window) alongside a disjoint current
     let (other_bls, other_info, _other_id) = committee_member(&mut rng);
-    all_peers.rotate_to_next_epoch(vec![(other_bls, other_info)], 1);
+    all_peers.update_committees(vec![(m_bls, m_info)], vec![(other_bls, other_info)], vec![], 2);
 
-    // make_trusted is a one-way ratchet, so M remains trusted after demotion
+    // M is still inside the three-slot window (now in previous), so it stays trusted -- not via a
+    // one-way ratchet, but because it is still a tracked committee member.
+    assert!(all_peers.previous_committee.contains(&m_id));
+    assert!(all_peers.is_peer_validator(&m_id));
     assert!(all_peers.get_peer(&m_id).unwrap().is_trusted());
 }
 
 #[test]
-fn test_rotation_invariants_under_random_committees() {
+fn test_update_committees_demotes_peer_that_exits_window() {
+    let mut rng = StdRng::from_seed([22; 32]);
+    let mut all_peers = create_all_peers(None);
+
+    // E starts trusted as a current-committee member
+    let (e_bls, e_info, e_id) = committee_member(&mut rng);
+    all_peers.update_committees(vec![], vec![(e_bls, e_info)], vec![], 1);
+    assert!(all_peers.get_peer(&e_id).unwrap().is_trusted());
+    assert!(all_peers.is_peer_validator(&e_id));
+
+    // next epoch's three slots do not include E at all
+    let (f_bls, f_info, _f_id) = committee_member(&mut rng);
+    all_peers.update_committees(vec![], vec![(f_bls, f_info)], vec![], 2);
+
+    // E fell out of the window: demoted to untrusted and no longer counts as a validator
+    assert!(!all_peers.get_peer(&e_id).unwrap().is_trusted());
+    assert!(!all_peers.is_peer_validator(&e_id));
+}
+
+#[test]
+fn test_update_committees_does_not_demote_operator_trusted_peer_never_in_committee() {
+    let mut rng = StdRng::from_seed([23; 32]);
+    let mut all_peers = create_all_peers(None);
+
+    // operator-allowlisted trusted peer that is never part of any committee
+    let op_bls = *BlsKeypair::generate(&mut rng).public();
+    let op_net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let op_id: PeerId = op_net.clone().into();
+    all_peers.add_trusted_peer(op_bls, op_net, vec![create_multiaddr(None)]);
+    assert!(all_peers.get_peer(&op_id).unwrap().is_trusted());
+
+    // a committee update that does not involve the operator peer
+    let (c_bls, c_info, _c_id) = committee_member(&mut rng);
+    all_peers.update_committees(vec![], vec![(c_bls, c_info)], vec![], 1);
+
+    // the operator peer was never tracked in a committee slot, so demotion does not touch it
+    assert!(all_peers.get_peer(&op_id).unwrap().is_trusted());
+}
+
+#[test]
+fn test_update_committees_current_is_authoritative() {
+    // Finding #2: `current` is set directly from authoritative state, never carried over from the
+    // previously-predicted `next`. When the new `current` differs from the prior `next`, the slot
+    // must reflect the authoritative arg rather than the stale prediction.
+    let mut rng = StdRng::from_seed([20; 32]);
+    let mut all_peers = create_all_peers(None);
+
+    let (predicted_bls, predicted_info, predicted_id) = committee_member(&mut rng);
+    let (actual_bls, actual_info, actual_id) = committee_member(&mut rng);
+
+    // epoch N predicts next = {predicted}
+    all_peers.update_committees(vec![], vec![], vec![(predicted_bls, predicted_info)], 1);
+    assert_eq!(all_peers.next_committee, HashSet::from([predicted_id]));
+
+    // epoch N+1's authoritative current is {actual}, which differs from the prediction
+    all_peers.update_committees(vec![], vec![(actual_bls, actual_info)], vec![], 2);
+
+    // current matches the authoritative arg, not the stale prediction
+    assert_eq!(all_peers.current_committee, HashSet::from([actual_id]));
+    assert!(!all_peers.current_committee.contains(&predicted_id));
+}
+
+#[test]
+fn test_update_committees_populates_previous() {
+    // Finding #4: a non-empty `previous` arg lands in the slot. After a restart the previous
+    // committee is read from authoritative state rather than reset to empty, so just-rotated-out
+    // peers keep validator protection for the duration of the window.
+    let mut rng = StdRng::from_seed([21; 32]);
+    let mut all_peers = create_all_peers(None);
+
+    let (p_bls, p_info, p_id) = committee_member(&mut rng);
+    let (c_bls, c_info, _c_id) = committee_member(&mut rng);
+
+    all_peers.update_committees(vec![(p_bls, p_info)], vec![(c_bls, c_info)], vec![], 9);
+
+    assert_eq!(all_peers.previous_committee, HashSet::from([p_id]));
+    assert!(all_peers.is_peer_validator(&p_id));
+    assert!(all_peers.get_peer(&p_id).unwrap().is_trusted());
+}
+
+#[test]
+fn test_update_committees_invariants_under_random_committees() {
     // Property-style coverage without a proptest dependency: across many epochs with random
-    // committee sizes, the queue must always shift correctly (previous <- current <- next <-
-    // new_next), each slot stays bounded by the committee size that produced it, and
-    // epoch_end_timestamp records the last timestamp passed in (monotonic as timestamps increase).
+    // committees in each slot, every slot must equal exactly the set it was given,
+    // epoch_end_timestamp records the last timestamp passed in, every union member is trusted, and
+    // every peer tracked last round but absent this round is demoted to untrusted.
     let mut rng = StdRng::from_seed([42; 32]);
     let mut all_peers = create_all_peers(None);
 
-    // Mirror of the expected `current`/`next` slot contents (which carry across rounds) and the
-    // committee sizes that produced them. The initial AllPeers slots are all empty.
-    let mut current: HashSet<PeerId> = HashSet::new();
-    let mut next: HashSet<PeerId> = HashSet::new();
-    let mut prev_size = 0usize;
-    let mut curr_size = 0usize;
+    let mut prev_union: HashSet<PeerId> = HashSet::new();
 
     for round in 0..32u64 {
-        let size = rng.random_range(0..=5usize);
-        let members: Vec<(BlsPublicKey, NetworkInfo, PeerId)> =
-            (0..size).map(|_| committee_member(&mut rng)).collect();
-        let new_next_ids: HashSet<PeerId> = members.iter().map(|(_, _, id)| *id).collect();
-        let new_next: Vec<(BlsPublicKey, NetworkInfo)> =
-            members.into_iter().map(|(b, i, _)| (b, i)).collect();
+        let prev_size = rng.random_range(0..=4usize);
+        let (previous, prev_ids) = random_committee(&mut rng, prev_size);
+        let curr_size = rng.random_range(0..=4usize);
+        let (current, curr_ids) = random_committee(&mut rng, curr_size);
+        let next_size = rng.random_range(0..=4usize);
+        let (next, next_ids) = random_committee(&mut rng, next_size);
 
         let ts = round + 1;
-        all_peers.rotate_to_next_epoch(new_next, ts);
+        all_peers.update_committees(previous, current, next, ts);
 
-        // expected shift
-        let previous = std::mem::take(&mut current);
-        current = std::mem::take(&mut next);
-        next = new_next_ids;
-
-        assert_eq!(all_peers.previous_committee, previous, "previous slot after round {round}");
-        assert_eq!(all_peers.current_committee, current, "current slot after round {round}");
-        assert_eq!(all_peers.next_committee, next, "next slot after round {round}");
+        // each slot equals exactly its input set (direct set, no positional shift)
+        assert_eq!(all_peers.previous_committee, prev_ids, "previous slot after round {round}");
+        assert_eq!(all_peers.current_committee, curr_ids, "current slot after round {round}");
+        assert_eq!(all_peers.next_committee, next_ids, "next slot after round {round}");
         assert_eq!(all_peers.epoch_end_timestamp, ts, "timestamp after round {round}");
 
-        // each slot is bounded by the committee size that produced it (sets dedup, so `<=`)
-        assert!(all_peers.next_committee.len() <= size);
-        assert!(all_peers.current_committee.len() <= curr_size);
-        assert!(all_peers.previous_committee.len() <= prev_size);
+        // every member of the new window is trusted
+        let union: HashSet<PeerId> =
+            prev_ids.iter().chain(curr_ids.iter()).chain(next_ids.iter()).copied().collect();
+        for id in &union {
+            assert!(
+                all_peers.get_peer(id).unwrap().is_trusted(),
+                "union member {id} should be trusted after round {round}"
+            );
+        }
 
-        prev_size = curr_size;
-        curr_size = size;
+        // every peer tracked last round but absent this round is demoted (all ids are distinct
+        // across rounds, so the entire prior union should now be untrusted)
+        for id in prev_union.difference(&union) {
+            assert!(
+                !all_peers.get_peer(id).unwrap().is_trusted(),
+                "exited peer {id} should be untrusted after round {round}"
+            );
+        }
+
+        prev_union = union;
     }
 }
