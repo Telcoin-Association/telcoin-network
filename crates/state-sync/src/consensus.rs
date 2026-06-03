@@ -224,31 +224,8 @@ pub async fn spawn_fetch_consensus(
                                             "Unable to find header by number for new pack file"),
                                     }
                                 }
-                                Err(e) => {
-                                    error!(target: "state-sync",
-                                        "failed to request epoch pack for epoch {epoch}, attempt {attempts}: {e}");
-                                    // The epoch record may have been a dummy (final_consensus.number=0)
-                                    // when first queued at startup. Refresh from DB so subsequent
-                                    // retries use the real signed cert if it has since arrived.
-                                    if let Some(fresh) = consensus_chain.epochs().record_by_epoch(epoch).await {
-                                        if fresh.final_consensus.number > epoch_record.final_consensus.number {
-                                            info!(target: "state-sync",
-                                                "refreshed epoch {epoch} record for retry: final_consensus {} -> {}",
-                                                epoch_record.final_consensus.number, fresh.final_consensus.number);
-                                            epoch_record = fresh;
-                                        }
-                                    }
-                                    // Wait a beat before we try again, may have a network issue.
-                                    // Wait time will increase as attempts grow.
-                                    tokio::select! {
-                                        _ = &rx_shutdown => {
-                                            info!(target: "state-sync",
-                                                "epoch consensus fetcher {task_index} shutting down during pack fetch");
-                                            return;
-                                        },
-                                        _ = tokio::time::sleep(Duration::from_secs(((attempts / 10) + 1) * PACK_DOWNLOAD_RETRY_SECS)) => { }
-                                    }
-                                }
+                                Err(e) => error!(target: "state-sync",
+                                        "failed to request epoch pack for epoch {epoch}, attempt {attempts}: {e}"),
                             }
                         }
                         _ = &rx_shutdown => {
@@ -265,6 +242,27 @@ pub async fn spawn_fetch_consensus(
                             "failed to request epoch pack for epoch {epoch}, after {attempts}, will try to again later (WE ARE STUCK)");
                         consensus_bus.request_epoch_pack_file(previous_epoch_record, epoch_record).await;
                         break;
+                    }
+                    // The epoch record may have been a dummy (final_consensus.number=0)
+                    // when first queued at startup. Refresh from DB so subsequent
+                    // retries use the real signed cert if it has since arrived.
+                    if let Some(fresh) = consensus_chain.epochs().record_by_epoch(epoch).await {
+                        if fresh.final_consensus.number > epoch_record.final_consensus.number {
+                            info!(target: "state-sync",
+                                "refreshed epoch {epoch} record for retry: final_consensus {} -> {}",
+                                epoch_record.final_consensus.number, fresh.final_consensus.number);
+                            epoch_record = fresh;
+                        }
+                    }
+                    // Wait a beat before we try again, may have a network issue.
+                    // Wait time will increase as attempts grow.
+                    tokio::select! {
+                        _ = &rx_shutdown => {
+                            info!(target: "state-sync",
+                                "epoch consensus fetcher {task_index} shutting down during pack fetch");
+                            return;
+                        },
+                        _ = tokio::time::sleep(Duration::from_secs(((attempts / 10) + 1) * PACK_DOWNLOAD_RETRY_SECS)) => { }
                     }
                     attempts += 1;
                 }

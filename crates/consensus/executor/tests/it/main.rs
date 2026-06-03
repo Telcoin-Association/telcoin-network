@@ -457,7 +457,7 @@ async fn test_duplicate_batch_digest() -> eyre::Result<()> {
                 .created_at(now());
 
             for (batch, worker_id) in payload_entries {
-                builder = builder.with_payload_batch(batch, worker_id);
+                builder = builder.with_payload_batch(&batch, worker_id);
             }
 
             let header = builder.build();
