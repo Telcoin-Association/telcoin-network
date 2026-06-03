@@ -839,12 +839,12 @@ impl AllPeers {
     /// re-validated against authoritative state rather than derived from a prior prediction. The
     /// just-completed epoch's end timestamp is recorded.
     ///
-    /// Any peer that was tracked in one of the three slots before this update but is absent from all
-    /// three afterward is demoted via [`Peer::make_untrusted`], bounding committee-derived trust to
-    /// the three-slot window. Members of the new committees are forgiven any bans, have their
-    /// advertised addresses refreshed, and are marked `trusted`; peers appearing in more than one
-    /// committee are processed once. The demote and re-trust sets are disjoint by construction, so
-    /// no peer is demoted then re-trusted in a single call.
+    /// Any peer that was tracked in one of the three slots before this update but is absent from
+    /// all three afterward is demoted via [`Peer::make_untrusted`], bounding committee-derived
+    /// trust to the three-slot window. Members of the new committees are forgiven any bans,
+    /// have their advertised addresses refreshed, and are marked `trusted`; peers appearing in
+    /// more than one committee are processed once. The demote and re-trust sets are disjoint by
+    /// construction, so no peer is demoted then re-trusted in a single call.
     pub(super) fn update_committees(
         &mut self,
         previous: Vec<(BlsPublicKey, NetworkInfo)>,

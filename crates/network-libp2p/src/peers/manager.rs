@@ -683,8 +683,8 @@ impl PeerManager {
         exp_committee
     }
 
-    /// Emit a [`PeerEvent::MissingAuthorities`] for any committee keys with no known network info so
-    /// kad discovery can chase them.
+    /// Emit a [`PeerEvent::MissingAuthorities`] for any committee keys with no known network info
+    /// so kad discovery can chase them.
     fn trigger_missing_authorities(&mut self, committee: &HashSet<BlsPublicKey>) {
         let missing: Vec<BlsPublicKey> =
             committee.iter().filter(|k| !self.known_peers.contains_key(k)).copied().collect();
