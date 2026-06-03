@@ -560,6 +560,41 @@ impl ConsensusBusApp {
         let _ = self.inner.epoch_request_queue_tx.send((previous_epoch_record, epoch_record)).await;
     }
 
+    /// Send a request to download the epoch pack file for the provided Epoch.
+    /// Use this when you only have the epoch vs the EpochRecords.
+    pub async fn request_epoch_pack_file_by_epoch(
+        &self,
+        current_epoch: Epoch,
+        consensus_chain: &ConsensusChain,
+    ) {
+        // We are starting a new epoch behind consensus so make sure we have the pack file.
+        // If we still have epochs to fetch then add to the queue until we are out of epoch records.
+        // For epoch 0: `saturating_sub(1)` yields 0, so record_by_epoch(0) would return the
+        // *real* epoch-0 record- use a synthetic epoch record instead.
+        let maybe_previous = if current_epoch == 0 {
+            consensus_chain.epochs().record_by_epoch(0).await.map(|r| EpochRecord {
+                committee: r.committee.clone(),
+                next_committee: r.committee.clone(),
+                ..EpochRecord::default()
+            })
+        } else {
+            consensus_chain.epochs().record_by_epoch(current_epoch.saturating_sub(1)).await
+        };
+        if let Some(previous_epoch_record) = maybe_previous {
+            if let Some(epoch_record) =
+                consensus_chain.epochs().record_by_epoch(current_epoch).await
+            {
+                let contains_final_header = consensus_chain.is_epoch_complete(&epoch_record).await;
+                // If the pack file is missing or incomplete request it.
+                // Note since we have an epoch record this is a past epoch
+                // not the current epoch.
+                if !contains_final_header {
+                    self.request_epoch_pack_file(previous_epoch_record, epoch_record.clone()).await;
+                }
+            }
+        }
+    }
+
     /// Retrieve the next request to down load an epoch pack file.
     /// Will not resolve until a request is ready and will only ever
     /// provide each request once.  Returns None when the underlying channel closes.

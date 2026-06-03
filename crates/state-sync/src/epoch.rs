@@ -8,7 +8,7 @@ use std::{collections::BTreeSet, time::Duration};
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{BlsPublicKey, Epoch, EpochRecord, Noticer, TaskSpawner, B256};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 /// How long to wait before retrying a failed epoch record collection.
 const EPOCH_COLLECT_RETRY_SECS: u64 = 5;
@@ -65,9 +65,9 @@ async fn collect_epoch_records(
             let number = rec.final_consensus.number;
             let hash = rec.final_consensus.hash;
             if number > old_number {
-                info!(
+                debug!(
                     target: "epoch-manager",
-                    "epoch sync downloaded up to epoch {result_epoch}, final consensus at block {number} ({hash}) - notifying state sync",
+                    "epoch record sync downloaded up to epoch {result_epoch}, final consensus at block {number} ({hash}) - notifying state sync",
                 );
                 consensus_bus
                     .last_published_consensus_num_hash()
@@ -166,7 +166,7 @@ async fn collect_epoch_records(
         if number > old_number {
             info!(
                 target: "epoch-manager",
-                "epoch sync downloaded up to epoch {result_epoch}, final consensus at block {number} ({hash}) - notifying state sync",
+                "updating last published consensus num hash up to epoch {result_epoch}, final consensus at block {number} ({hash}) - notifying state sync",
             );
             consensus_bus.last_published_consensus_num_hash().send_replace((epoch, number, hash));
         }
