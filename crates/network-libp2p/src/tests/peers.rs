@@ -739,6 +739,35 @@ fn test_rotate_committees_full_turnover() {
 }
 
 #[test]
+fn test_rotate_on_never_seeded_slots_leaves_current_empty() {
+    // Guards the regression fixed by `EpochManager::network_initialized`. Rotation is positional
+    // (previous <- current <- next <- new_next): rotating before the slots were ever seeded by
+    // `initialize_committees` carries the empty seed forward, leaving `current` empty for a full
+    // epoch. The epoch manager must therefore SEED on the first network setup -- never ROTATE --
+    // even when that setup happens late on a post-restart `NewEpoch` iteration. Seeding (shown
+    // second) populates `current` immediately; rotating (shown first) does not.
+    let mut rng = StdRng::from_seed([99; 32]);
+
+    // rotate-on-never-seeded: the incoming committee lands in `next`, `current` stays empty.
+    let mut rotated = create_all_peers(None);
+    let (n_bls, n_info, n_id) = committee_member(&mut rng);
+    rotated.rotate_to_next_epoch(vec![(n_bls, n_info)], 1);
+    assert_eq!(rotated.next_committee, HashSet::from([n_id]));
+    assert!(
+        rotated.current_committee.is_empty(),
+        "rotating before seeding must leave current empty (the bug the epoch-manager fix avoids)"
+    );
+
+    // seed-on-first-init: `current` is populated immediately and recognized as a validator.
+    let mut seeded = create_all_peers(None);
+    let (c_bls, c_info, c_id) = committee_member(&mut rng);
+    let (x_bls, x_info, _x_id) = committee_member(&mut rng);
+    seeded.initialize_committees(vec![(c_bls, c_info)], vec![(x_bls, x_info)]);
+    assert!(seeded.current_committee.contains(&c_id));
+    assert!(seeded.is_peer_validator(&c_id));
+}
+
+#[test]
 fn test_is_peer_validator_returns_true_for_all_three_slots() {
     let mut all_peers = create_all_peers(None);
 

@@ -65,6 +65,16 @@ pub(crate) struct EpochManager<P, DB> {
     /// gossip from the just-completed committee. The `0` sentinel means no previous epoch boundary
     /// has been observed yet (initial epoch / fresh process).
     previous_epoch_boundary: TimestampSec,
+    /// Whether the long-running p2p networks have completed their one-time, per-process setup
+    /// (start listening, register bootstrap peers, seed the previous/current/next committee slots).
+    ///
+    /// This setup normally runs on the `Initial` epoch, but the `Initial` iteration can return
+    /// early from [`EpochManager::replay_missed_consensus`] — when a restart must replay-and-close
+    /// an epoch boundary — *before* `create_consensus` runs the setup. In that case the setup runs
+    /// on the first following `NewEpoch` iteration instead. Gating on this flag, rather than on
+    /// [`RunEpochMode::Initial`], guarantees the networks are set up exactly once even on that
+    /// restart path (mirrors the `are_workers_initialized` guard used for worker components).
+    network_initialized: bool,
     /// Reth DB, keep for entire execution.
     reth_db: RethDb,
     /// Consensus DB, keep for entire execution.
@@ -216,6 +226,7 @@ where
             node_shutdown,
             epoch_boundary: Default::default(),
             previous_epoch_boundary: Default::default(),
+            network_initialized: false,
             reth_db,
             consensus_db,
             consensus_bus,

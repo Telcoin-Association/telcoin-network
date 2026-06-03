@@ -168,17 +168,29 @@ where
         let mut consensus_output = self.consensus_bus.subscribe_consensus_output();
         let consensus_config = self.configure_consensus(engine, network_config).await?;
 
+        // The networks need their one-time, per-process setup (start listening, register bootstrap
+        // peers, seed the previous/current/next committee slots) on the first iteration that
+        // actually reaches `create_consensus`. This is usually the `Initial` epoch, but the replay
+        // above can return early (line ~154) before `create_consensus` on a restart that
+        // replays-and-closes an epoch boundary, so the first real setup then happens on a following
+        // `NewEpoch` iteration. Drive the decision off whether the network has actually been set up
+        // yet (not off `RunEpochMode::Initial`) so the setup (and committee seeding) is never
+        // skipped on that restart path.
+        let network_first_init = epoch_mode.initial_epoch() || !self.network_initialized;
+
         // create primary and worker nodes
         let (primary, worker_node) = self
             .create_consensus(
                 engine,
                 &epoch_task_manager,
-                epoch_mode.initial_epoch(),
+                network_first_init,
                 gas_accumulator.clone(),
                 consensus_bus.clone(),
                 consensus_config.clone(),
             )
             .await?;
+        // Networks are now set up; subsequent epochs rotate committees instead of re-seeding.
+        self.network_initialized = true;
         // consensus config for shutdown subscribers
         let consensus_shutdown = primary.shutdown_signal().await;
         let epoch_shutdown_rx = consensus_shutdown.subscribe();

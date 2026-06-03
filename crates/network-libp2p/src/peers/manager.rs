@@ -611,18 +611,21 @@ impl PeerManager {
     /// Seed the previous/current/next committees on the initial epoch.
     ///
     /// `current` and `next` are resolved to known network info and handed to the peer store, which
-    /// records both as validators and forgives any bans. Unknown `next` keys trigger a kad lookup
-    /// (see [`Self::trigger_missing_authorities`]) since the next committee is the most likely
-    /// source of peers we have never connected to.
+    /// records both as validators and forgives any bans. Unknown keys in either committee trigger a
+    /// kad lookup (see [`Self::trigger_missing_authorities`]). The `next` committee is the most
+    /// likely source of peers we have never connected to, but `current` members may also be unknown
+    /// when a restart seeds the committees late (the initial epoch returned early before network
+    /// setup), so chase both.
     pub(crate) fn initialize_committees(
         &mut self,
         current: HashSet<BlsPublicKey>,
         next: HashSet<BlsPublicKey>,
     ) {
-        let current = self.resolve_committee(&current);
-        let resolved_next = self.resolve_committee(&next);
+        self.trigger_missing_authorities(&current);
         self.trigger_missing_authorities(&next);
-        let unban_actions = self.peers.initialize_committees(current, resolved_next);
+        let resolved_current = self.resolve_committee(&current);
+        let resolved_next = self.resolve_committee(&next);
+        let unban_actions = self.peers.initialize_committees(resolved_current, resolved_next);
         self.apply_unban_actions(unban_actions);
     }
 
