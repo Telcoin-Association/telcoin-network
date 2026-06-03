@@ -852,7 +852,7 @@ fn test_update_committees_does_not_demote_operator_trusted_peer_never_in_committ
 
 #[test]
 fn test_update_committees_current_is_authoritative() {
-    // Finding #2: `current` is set directly from authoritative state, never carried over from the
+    // `current` is set directly from authoritative state, never carried over from the
     // previously-predicted `next`. When the new `current` differs from the prior `next`, the slot
     // must reflect the authoritative arg rather than the stale prediction.
     let mut rng = StdRng::from_seed([20; 32]);
@@ -875,7 +875,7 @@ fn test_update_committees_current_is_authoritative() {
 
 #[test]
 fn test_update_committees_populates_previous() {
-    // Finding #4: a non-empty `previous` arg lands in the slot. After a restart the previous
+    // a non-empty `previous` arg lands in the slot. After a restart the previous
     // committee is read from authoritative state rather than reset to empty, so just-rotated-out
     // peers keep validator protection for the duration of the window.
     let mut rng = StdRng::from_seed([21; 32]);

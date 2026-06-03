@@ -341,7 +341,7 @@ impl Peer {
     ///
     /// NOTE: `is_trusted` currently conflates committee-derived trust with operator-allowlist
     /// trust (`new_trusted`/`add_trusted_peer`); demoting clears both for a peer that was in a
-    /// committee. Splitting the two provenances is tracked as a follow-up.
+    /// committee.
     pub(super) fn make_untrusted(&mut self) {
         self.is_trusted = false;
     }

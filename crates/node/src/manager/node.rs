@@ -62,13 +62,13 @@ pub(crate) struct EpochManager<P, DB> {
     /// (start listening, register bootstrap peers).
     ///
     /// This setup normally runs on the `Initial` epoch, but the `Initial` iteration can return
-    /// early from [`EpochManager::replay_missed_consensus`] — when a restart must replay-and-close
-    /// an epoch boundary — *before* `create_consensus` runs the setup. In that case the setup runs
+    /// early from [`EpochManager::replay_missed_consensus`] - when a restart must replay-and-close
+    /// an epoch boundary - *before* `create_consensus` runs the setup. In that case the setup runs
     /// on the first following `NewEpoch` iteration instead. Gating on this flag, rather than on
     /// [`RunEpochMode::Initial`], guarantees the networks are set up exactly once even on that
     /// restart path (mirrors the `are_workers_initialized` guard used for worker components).
     ///
-    /// Committee slots are NOT gated on this flag — they are set every epoch from authoritative
+    /// Committee slots are NOT gated on this flag. They are set every epoch from authoritative
     /// state via `update_committees`.
     network_initialized: bool,
     /// Reth DB, keep for entire execution.

@@ -166,7 +166,7 @@ where
 
         // The networks need their one-time, per-process setup (start listening, register bootstrap
         // peers) on the first iteration that actually reaches `create_consensus`. This is usually
-        // the `Initial` epoch, but the replay above can return early (line ~154) before
+        // the `Initial` epoch, but the replay above can return early before
         // `create_consensus` on a restart that replays-and-closes an epoch boundary, so the first
         // real setup then happens on a following `NewEpoch` iteration. Drive the decision off
         // whether the network has actually been set up yet (not off `RunEpochMode::Initial`) so the
@@ -1342,7 +1342,7 @@ where
     /// Read the previous epoch's committee from the persisted epoch records.
     ///
     /// Empty for epoch 0 (no previous) or if the prior record isn't available yet (degrades to
-    /// pre-tracking behavior rather than failing network setup). Returns the *active* committee of
+    /// pre-tracking behavior rather than failing network setup). Returns the active committee of
     /// epoch `N-1` (`record.committee`), not its `next_committee` (which equals the current
     /// committee by the invariant enforced when epoch records are built).
     async fn previous_committee_keys(&self, epoch: Epoch) -> HashSet<BlsPublicKey> {
@@ -1360,12 +1360,12 @@ where
     /// Initialize a network handle for a new epoch.
     ///
     /// On the initial epoch this registers bootstrap peers and starts listening (the one-time,
-    /// per-process setup gated on `initial_epoch`). Every epoch — initial or not — it sets the
+    /// per-process setup gated on `initial_epoch`). Every epoch sets the
     /// previous/current/next committee slots directly from authoritative state via
     /// `update_committees`.
     ///
     /// On the initial epoch, bootstrap peers must be added BEFORE `update_committees` so that
-    /// `known_peers` is populated when the peer manager resolves the committees from it.
+    /// `known_peers` is populated when the peer manager resolves the committees.
     async fn init_network_for_epoch<Req: TNMessage, Res: TNMessage>(
         handle: &NetworkHandle<Req, Res>,
         bootstrap_peers: BTreeMap<BlsPublicKey, P2pNode>,
