@@ -663,13 +663,11 @@ fn test_update_committees_sets_all_three_slots() {
         vec![(p_bls, p_info)],
         vec![(c_bls, c_info)],
         vec![(n_bls, n_info)],
-        7,
     );
 
     assert!(all_peers.previous_committee.contains(&p_peer_id));
     assert!(all_peers.current_committee.contains(&c_peer_id));
     assert!(all_peers.next_committee.contains(&n_peer_id));
-    assert_eq!(all_peers.epoch_end_timestamp, 7);
     assert!(all_peers.is_peer_validator(&p_peer_id));
     assert!(all_peers.is_peer_validator(&c_peer_id));
     assert!(all_peers.is_peer_validator(&n_peer_id));
@@ -693,7 +691,6 @@ fn test_update_committees_overwrites_slots_directly() {
         vec![(a_bls, a_info)],
         vec![(b_bls, b_info)],
         vec![(c_bls, c_info)],
-        1,
     );
     assert_eq!(all_peers.previous_committee, HashSet::from([a_id]));
     assert_eq!(all_peers.current_committee, HashSet::from([b_id]));
@@ -705,26 +702,10 @@ fn test_update_committees_overwrites_slots_directly() {
         vec![(d_bls, d_info)],
         vec![(e_bls, e_info)],
         vec![(f_bls, f_info)],
-        2,
     );
     assert_eq!(all_peers.previous_committee, HashSet::from([d_id]));
     assert_eq!(all_peers.current_committee, HashSet::from([e_id]));
     assert_eq!(all_peers.next_committee, HashSet::from([f_id]));
-}
-
-#[test]
-fn test_update_committees_records_epoch_end_timestamp() {
-    let mut rng = StdRng::from_seed([12; 32]);
-    let mut all_peers = create_all_peers(None);
-
-    let (c_bls, c_info, _) = committee_member(&mut rng);
-    let (n_bls, n_info, _) = committee_member(&mut rng);
-    all_peers.update_committees(vec![], vec![(c_bls, c_info)], vec![(n_bls, n_info)], 4242);
-    assert_eq!(all_peers.epoch_end_timestamp, 4242);
-
-    let (m_bls, m_info, _) = committee_member(&mut rng);
-    all_peers.update_committees(vec![], vec![(m_bls, m_info)], vec![], 5000);
-    assert_eq!(all_peers.epoch_end_timestamp, 5000);
 }
 
 #[test]
@@ -739,7 +720,6 @@ fn test_update_committees_no_change() {
         vec![],
         vec![(x_bls, x_info.clone())],
         vec![(x_bls, x_info.clone())],
-        1,
     );
 
     // repeat the same membership next epoch
@@ -747,7 +727,6 @@ fn test_update_committees_no_change() {
         vec![],
         vec![(x_bls, x_info.clone())],
         vec![(x_bls, x_info.clone())],
-        2,
     );
 
     // full overlap keeps X a validator, present in both current and next, never demoted
@@ -771,7 +750,6 @@ fn test_update_committees_full_turnover() {
         vec![(a_bls, a_info)],
         vec![(b_bls, b_info)],
         vec![(c_bls, c_info)],
-        1,
     );
 
     // a fully disjoint set replaces every slot directly
@@ -782,7 +760,6 @@ fn test_update_committees_full_turnover() {
         vec![(d_bls, d_info)],
         vec![(e_bls, e_info)],
         vec![(f_bls, f_info)],
-        2,
     );
     assert_eq!(all_peers.previous_committee, HashSet::from([d_id]));
     assert_eq!(all_peers.current_committee, HashSet::from([e_id]));
@@ -819,12 +796,12 @@ fn test_update_committees_in_window_peer_stays_trusted() {
 
     // M starts in the current committee and is made trusted by update_committees
     let (m_bls, m_info, m_id) = committee_member(&mut rng);
-    all_peers.update_committees(vec![], vec![(m_bls, m_info.clone())], vec![], 1);
+    all_peers.update_committees(vec![], vec![(m_bls, m_info.clone())], vec![]);
     assert!(all_peers.get_peer(&m_id).unwrap().is_trusted());
 
     // next epoch: M moves to the previous slot (still in-window) alongside a disjoint current
     let (other_bls, other_info, _other_id) = committee_member(&mut rng);
-    all_peers.update_committees(vec![(m_bls, m_info)], vec![(other_bls, other_info)], vec![], 2);
+    all_peers.update_committees(vec![(m_bls, m_info)], vec![(other_bls, other_info)], vec![]);
 
     // M is still inside the three-slot window (now in previous), so it stays trusted -- not via a
     // one-way ratchet, but because it is still a tracked committee member.
@@ -840,13 +817,13 @@ fn test_update_committees_demotes_peer_that_exits_window() {
 
     // E starts trusted as a current-committee member
     let (e_bls, e_info, e_id) = committee_member(&mut rng);
-    all_peers.update_committees(vec![], vec![(e_bls, e_info)], vec![], 1);
+    all_peers.update_committees(vec![], vec![(e_bls, e_info)], vec![]);
     assert!(all_peers.get_peer(&e_id).unwrap().is_trusted());
     assert!(all_peers.is_peer_validator(&e_id));
 
     // next epoch's three slots do not include E at all
     let (f_bls, f_info, _f_id) = committee_member(&mut rng);
-    all_peers.update_committees(vec![], vec![(f_bls, f_info)], vec![], 2);
+    all_peers.update_committees(vec![], vec![(f_bls, f_info)], vec![]);
 
     // E fell out of the window: demoted to untrusted and no longer counts as a validator
     assert!(!all_peers.get_peer(&e_id).unwrap().is_trusted());
@@ -867,7 +844,7 @@ fn test_update_committees_does_not_demote_operator_trusted_peer_never_in_committ
 
     // a committee update that does not involve the operator peer
     let (c_bls, c_info, _c_id) = committee_member(&mut rng);
-    all_peers.update_committees(vec![], vec![(c_bls, c_info)], vec![], 1);
+    all_peers.update_committees(vec![], vec![(c_bls, c_info)], vec![]);
 
     // the operator peer was never tracked in a committee slot, so demotion does not touch it
     assert!(all_peers.get_peer(&op_id).unwrap().is_trusted());
@@ -885,11 +862,11 @@ fn test_update_committees_current_is_authoritative() {
     let (actual_bls, actual_info, actual_id) = committee_member(&mut rng);
 
     // epoch N predicts next = {predicted}
-    all_peers.update_committees(vec![], vec![], vec![(predicted_bls, predicted_info)], 1);
+    all_peers.update_committees(vec![], vec![], vec![(predicted_bls, predicted_info)]);
     assert_eq!(all_peers.next_committee, HashSet::from([predicted_id]));
 
     // epoch N+1's authoritative current is {actual}, which differs from the prediction
-    all_peers.update_committees(vec![], vec![(actual_bls, actual_info)], vec![], 2);
+    all_peers.update_committees(vec![], vec![(actual_bls, actual_info)], vec![]);
 
     // current matches the authoritative arg, not the stale prediction
     assert_eq!(all_peers.current_committee, HashSet::from([actual_id]));
@@ -907,7 +884,7 @@ fn test_update_committees_populates_previous() {
     let (p_bls, p_info, p_id) = committee_member(&mut rng);
     let (c_bls, c_info, _c_id) = committee_member(&mut rng);
 
-    all_peers.update_committees(vec![(p_bls, p_info)], vec![(c_bls, c_info)], vec![], 9);
+    all_peers.update_committees(vec![(p_bls, p_info)], vec![(c_bls, c_info)], vec![]);
 
     assert_eq!(all_peers.previous_committee, HashSet::from([p_id]));
     assert!(all_peers.is_peer_validator(&p_id));
@@ -917,9 +894,9 @@ fn test_update_committees_populates_previous() {
 #[test]
 fn test_update_committees_invariants_under_random_committees() {
     // Property-style coverage without a proptest dependency: across many epochs with random
-    // committees in each slot, every slot must equal exactly the set it was given,
-    // epoch_end_timestamp records the last timestamp passed in, every union member is trusted, and
-    // every peer tracked last round but absent this round is demoted to untrusted.
+    // committees in each slot, every slot must equal exactly the set it was given, every union
+    // member is trusted, and every peer tracked last round but absent this round is demoted to
+    // untrusted.
     let mut rng = StdRng::from_seed([42; 32]);
     let mut all_peers = create_all_peers(None);
 
@@ -933,14 +910,12 @@ fn test_update_committees_invariants_under_random_committees() {
         let next_size = rng.random_range(0..=4usize);
         let (next, next_ids) = random_committee(&mut rng, next_size);
 
-        let ts = round + 1;
-        all_peers.update_committees(previous, current, next, ts);
+        all_peers.update_committees(previous, current, next);
 
         // each slot equals exactly its input set (direct set, no positional shift)
         assert_eq!(all_peers.previous_committee, prev_ids, "previous slot after round {round}");
         assert_eq!(all_peers.current_committee, curr_ids, "current slot after round {round}");
         assert_eq!(all_peers.next_committee, next_ids, "next slot after round {round}");
-        assert_eq!(all_peers.epoch_end_timestamp, ts, "timestamp after round {round}");
 
         // every member of the new window is trusted
         let union: HashSet<PeerId> =

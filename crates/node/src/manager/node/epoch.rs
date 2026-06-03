@@ -43,7 +43,7 @@ use tn_types::{
     gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash, BlockNumHash, BlsPublicKey,
     BlsSigner, Committee, CommitteeBuilder, ConsensusOutput, Database as TNDatabase, Epoch,
     EpochRecord, Multiaddr, NetworkPublicKey, Notifier, P2pNode, TaskJoinError, TaskManager,
-    TaskSpawner, TimestampSec, TnReceiver, B256,
+    TaskSpawner, TnReceiver, B256,
 };
 use tn_worker::{quorum_waiter::QuorumWaiterTrait, Worker, WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::mpsc;
@@ -109,10 +109,6 @@ where
         // ourselves... Note, any consensus output to replay should be in the same epoch...
         let (committee, epoch_info, epoch_start) =
             self.get_committee_with_epoch_start_info(engine).await?;
-        // Capture the just-closed epoch's boundary before overwriting it so the network can record
-        // when the previous epoch ended (a future PR uses this to accept late gossip from the
-        // previous committee). On the initial epoch this is the `0` sentinel.
-        self.previous_epoch_boundary = self.epoch_boundary;
         self.epoch_boundary = epoch_start + epoch_info.epochDuration as u64;
         // Produce a "dummy" epoch 0 EpochRecord if missing.
         // This will let us use simple code to find any epoch including 0 at startup.
@@ -1053,7 +1049,6 @@ where
             previous_committee_keys,
             committee_keys.clone(),
             next_committee_keys,
-            self.previous_epoch_boundary,
             initial_epoch,
         )
         .await?;
@@ -1195,7 +1190,6 @@ where
             previous_committee_keys,
             committee_keys.clone(),
             next_committee_keys,
-            self.previous_epoch_boundary,
             initial_epoch,
         )
         .await?;
@@ -1368,7 +1362,7 @@ where
     /// On the initial epoch this registers bootstrap peers and starts listening (the one-time,
     /// per-process setup gated on `initial_epoch`). Every epoch — initial or not — it sets the
     /// previous/current/next committee slots directly from authoritative state via
-    /// `update_committees`, recording the just-completed epoch's end timestamp.
+    /// `update_committees`.
     ///
     /// On the initial epoch, bootstrap peers must be added BEFORE `update_committees` so that
     /// `known_peers` is populated when the peer manager resolves the committees from it.
@@ -1378,19 +1372,13 @@ where
         previous_committee_keys: HashSet<BlsPublicKey>,
         committee_keys: HashSet<BlsPublicKey>,
         next_committee_keys: HashSet<BlsPublicKey>,
-        epoch_end_timestamp: TimestampSec,
         initial_epoch: bool,
     ) -> eyre::Result<()> {
         if initial_epoch {
             handle.add_bootstrap_peers(bootstrap_peers).await?;
         }
         handle
-            .update_committees(
-                previous_committee_keys,
-                committee_keys,
-                next_committee_keys,
-                epoch_end_timestamp,
-            )
+            .update_committees(previous_committee_keys, committee_keys, next_committee_keys)
             .await?;
         Ok(())
     }

@@ -297,8 +297,6 @@ where
         current: HashSet<BlsPublicKey>,
         /// The next epoch committee.
         next: HashSet<BlsPublicKey>,
-        /// Timestamp (sec) at which the just-completed epoch ended.
-        epoch_end_timestamp: TimestampSec,
     },
     /// Pre-dial recovery: forgive bans for a committee so it can be dialed, without mutating the
     /// committee slots.
@@ -568,18 +566,14 @@ where
         res.await.map_err(Into::into)
     }
 
-    /// Set the previous/current/next committees directly from authoritative state, every epoch,
-    /// recording the just-completed epoch's end timestamp.
+    /// Set the previous/current/next committees directly from authoritative state, every epoch.
     pub async fn update_committees(
         &self,
         previous: HashSet<BlsPublicKey>,
         current: HashSet<BlsPublicKey>,
         next: HashSet<BlsPublicKey>,
-        epoch_end_timestamp: TimestampSec,
     ) -> NetworkResult<()> {
-        self.sender
-            .send(NetworkCommand::UpdateCommittees { previous, current, next, epoch_end_timestamp })
-            .await?;
+        self.sender.send(NetworkCommand::UpdateCommittees { previous, current, next }).await?;
         Ok(())
     }
 

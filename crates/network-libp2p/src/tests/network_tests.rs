@@ -1344,12 +1344,7 @@ async fn test_new_epoch_unbans_committee_members() -> eyre::Result<()> {
     let handle = peer1.clone();
     tokio::spawn(async move {
         handle
-            .update_committees(
-                Default::default(),
-                committee,
-                Default::default(),
-                Default::default(),
-            )
+            .update_committees(Default::default(), committee, Default::default())
             .await
             .expect("Failed to send UpdateCommittees command");
     })
@@ -1475,7 +1470,7 @@ async fn test_new_epoch_unbans_committee_member_ip() -> eyre::Result<()> {
 
     target_peer
         .network_handle
-        .update_committees(Default::default(), committee, Default::default(), Default::default())
+        .update_committees(Default::default(), committee, Default::default())
         .await?;
 
     // wait for connection to establish
@@ -1556,12 +1551,7 @@ async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> 
     let handle = peer1.clone();
     tokio::spawn(async move {
         handle
-            .update_committees(
-                Default::default(),
-                committee,
-                Default::default(),
-                Default::default(),
-            )
+            .update_committees(Default::default(), committee, Default::default())
             .await
             .expect("Failed to send UpdateCommittees command");
     })
@@ -1632,7 +1622,6 @@ async fn test_rotate_does_not_disconnect_previous_committee() -> eyre::Result<()
             Default::default(),
             vec![peer2_bls].into_iter().collect(),
             Default::default(),
-            0,
         )
         .await?;
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
@@ -1646,7 +1635,6 @@ async fn test_rotate_does_not_disconnect_previous_committee() -> eyre::Result<()
             vec![peer2_bls].into_iter().collect(),
             Default::default(),
             Default::default(),
-            1234,
         )
         .await?;
 
@@ -1713,7 +1701,6 @@ async fn test_gossip_explicit_peer_includes_next_committee() -> eyre::Result<()>
             Default::default(),
             Default::default(),
             vec![next_bls].into_iter().collect(),
-            0,
         )
         .await?;
 

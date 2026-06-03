@@ -21,7 +21,7 @@ use std::{
     net::IpAddr,
     time::{Duration, Instant},
 };
-use tn_types::{BlsPublicKey, NetworkPublicKey, TimestampSec};
+use tn_types::{BlsPublicKey, NetworkPublicKey};
 use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
 #[cfg(test)]
@@ -45,14 +45,6 @@ pub(super) struct AllPeers {
     /// Peers in the next epoch's committee, pre-emptively trusted so they are not banned before
     /// they begin voting.
     next_committee: HashSet<PeerId>,
-    /// Timestamp (sec) at which the previous epoch closed. Set every epoch from authoritative
-    /// state; the `0` sentinel means no previous epoch boundary has been observed yet (initial
-    /// epoch).
-    ///
-    /// Stored ahead of its consumer: a future PR reads this to accept late gossipsub messages from
-    /// the previous committee within a grace window.
-    #[allow(dead_code)]
-    epoch_end_timestamp: TimestampSec,
     /// Information for peers that scored poorly enough to become banned.
     banned_peers: BannedPeers,
     /// The number of peers that have disconnected from this node.
@@ -79,7 +71,6 @@ impl AllPeers {
             previous_committee: Default::default(),
             current_committee: Default::default(),
             next_committee: Default::default(),
-            epoch_end_timestamp: Default::default(),
             banned_peers: Default::default(),
             disconnected_peers: 0,
             pending_dials: Default::default(),
@@ -836,8 +827,7 @@ impl AllPeers {
     ///
     /// Called every epoch with the three committees read from the persisted epoch records. All
     /// three slots are overwritten (no positional rotation), so `current` and `previous` are always
-    /// re-validated against authoritative state rather than derived from a prior prediction. The
-    /// just-completed epoch's end timestamp is recorded.
+    /// re-validated against authoritative state rather than derived from a prior prediction.
     ///
     /// Any peer that was tracked in one of the three slots before this update but is absent from
     /// all three afterward is demoted via [`Peer::make_untrusted`], bounding committee-derived
@@ -850,7 +840,6 @@ impl AllPeers {
         previous: Vec<(BlsPublicKey, NetworkInfo)>,
         current: Vec<(BlsPublicKey, NetworkInfo)>,
         next: Vec<(BlsPublicKey, NetworkInfo)>,
-        epoch_end_timestamp: TimestampSec,
     ) -> Vec<(PeerId, PeerAction)> {
         // capture the peers tracked across all three slots before the overwrite
         let previously_tracked: HashSet<PeerId> = self
@@ -865,7 +854,6 @@ impl AllPeers {
         self.previous_committee = previous.iter().map(|(_, ni)| ni.pubkey.clone().into()).collect();
         self.current_committee = current.iter().map(|(_, ni)| ni.pubkey.clone().into()).collect();
         self.next_committee = next.iter().map(|(_, ni)| ni.pubkey.clone().into()).collect();
-        self.epoch_end_timestamp = epoch_end_timestamp;
 
         // demote any peer that fell out of all three slots, returning it to the normal score model
         let still_tracked: HashSet<PeerId> = self

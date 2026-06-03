@@ -561,7 +561,7 @@ async fn test_is_validator() {
 
     // set the current committee (no previous/next committee for this test)
     let committee = config.committee_pub_keys();
-    peer_manager.update_committees(HashSet::new(), committee, HashSet::new(), 0);
+    peer_manager.update_committees(HashSet::new(), committee, HashSet::new());
 
     // Verify the registered committee member is a validator
     assert!(peer_manager.is_peer_validator(&validator_peer_id));
@@ -578,12 +578,7 @@ async fn test_update_committees_triggers_missing_authorities_for_unknown_next_ke
     let unknown_bls = *BlsKeypair::generate(&mut StdRng::from_seed([9; 32])).public();
 
     // update with a next committee that contains the unknown key
-    peer_manager.update_committees(
-        HashSet::new(),
-        HashSet::new(),
-        HashSet::from([unknown_bls]),
-        100,
-    );
+    peer_manager.update_committees(HashSet::new(), HashSet::new(), HashSet::from([unknown_bls]));
 
     // exactly one MissingAuthorities event referencing the unknown key should be emitted
     let events = collect_all_events(&mut peer_manager);
@@ -603,12 +598,7 @@ async fn test_update_committees_does_not_trigger_for_unknown_previous() {
     let unknown_bls = *BlsKeypair::generate(&mut StdRng::from_seed([9; 32])).public();
 
     // the unknown key appears ONLY in the previous committee (peers rotating out are not chased)
-    peer_manager.update_committees(
-        HashSet::from([unknown_bls]),
-        HashSet::new(),
-        HashSet::new(),
-        100,
-    );
+    peer_manager.update_committees(HashSet::from([unknown_bls]), HashSet::new(), HashSet::new());
 
     // no MissingAuthorities event should be emitted for a previous-only unknown key
     let events = collect_all_events(&mut peer_manager);

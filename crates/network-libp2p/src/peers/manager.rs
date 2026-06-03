@@ -22,7 +22,7 @@ use std::{
     task::Context,
 };
 use tn_config::PeerConfig;
-use tn_types::{BlsPublicKey, TimestampSec};
+use tn_types::BlsPublicKey;
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, trace, warn};
 
@@ -623,19 +623,14 @@ impl PeerManager {
         previous: HashSet<BlsPublicKey>,
         current: HashSet<BlsPublicKey>,
         next: HashSet<BlsPublicKey>,
-        epoch_end_timestamp: TimestampSec,
     ) {
         self.trigger_missing_authorities(&current);
         self.trigger_missing_authorities(&next);
         let resolved_previous = self.resolve_committee(&previous);
         let resolved_current = self.resolve_committee(&current);
         let resolved_next = self.resolve_committee(&next);
-        let unban_actions = self.peers.update_committees(
-            resolved_previous,
-            resolved_current,
-            resolved_next,
-            epoch_end_timestamp,
-        );
+        let unban_actions =
+            self.peers.update_committees(resolved_previous, resolved_current, resolved_next);
         self.apply_unban_actions(unban_actions);
     }
 
