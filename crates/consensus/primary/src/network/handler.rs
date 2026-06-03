@@ -207,14 +207,14 @@ where
                 // process certificate
                 cert.validate_received().map_err(CertManagerError::from)?;
 
-                let epoch = cert.header().epoch;
+                let epoch = cert.header().epoch();
                 // Early verify so we can detect we are behind.
                 // The verification is cached in the cert so this should not be too expensive.
                 if let Some(committee) = self.get_committee(epoch).await {
                     match cert.verify_cert(&committee) {
                         Ok(()) => {
                             if self.consensus_bus.is_cvv() {
-                                if self.behind_consensus(epoch, cert.header().round, None).await {
+                                if self.behind_consensus(epoch, cert.header().round(), None).await {
                                     warn!(target: "primary", "certificate indicates we are behind, go to catchup mode!");
                                     return Ok(());
                                 }
@@ -346,7 +346,7 @@ where
         // This should keep a malicious validator from corrupting another
         // nodes vote cache.
         // This relies on libp2p to manage peer ids that are used to get the bls key.
-        let committee_peer = header.author.clone();
+        let committee_peer = header.author().clone();
         let auth_id: AuthorityIdentifier = peer.into();
         if let Some(auth) = self.consensus_config.committee().authority(&committee_peer) {
             // We err on the side of caution here, if auths peer id is not known fail but we
@@ -497,14 +497,14 @@ where
         // if peer is ahead, wait for execution to catch up
         // NOTE: this doesn't hurt since this node shouldn't vote until execution is caught up
         // ensure execution results match if this succeeds.
-        if self.consensus_bus.wait_for_execution(header.latest_execution_block).await.is_err() {
+        if self.consensus_bus.wait_for_execution(header.latest_execution_block()).await.is_err() {
             error!(
                 target: "primary",
-                peer_hash = ?header.latest_execution_block,
+                peer_hash = ?header.latest_execution_block(),
                 expected = ?self.consensus_bus.latest_execution_block_num_hash(),
                 "unexpected execution result received"
             );
-            return Err(HeaderError::UnknownExecutionResult(header.latest_execution_block).into());
+            return Err(HeaderError::UnknownExecutionResult(header.latest_execution_block()).into());
         }
         debug!(target: "primary", ?header, round = header.round(), "Processing vote request from peer");
 
@@ -575,7 +575,7 @@ where
                 header.created_at() >= parent.header().created_at(),
                 HeaderError::InvalidParentTimestamp {
                     header: *header.created_at(),
-                    parent: *parent.header.created_at()
+                    parent: *parent.header().created_at()
                 }
                 .into()
             );

@@ -1289,7 +1289,7 @@ pub(crate) mod test {
     use tn_test_utils::CommitteeFixture;
     use tn_types::{
         test_genesis, BlockHash, Certificate, CertifiedBatch, CommittedSubDag, Committee,
-        ConsensusHeader, ConsensusOutput, EpochRecord, Hash, ReputationScores,
+        ConsensusHeader, ConsensusOutput, EpochRecord, Hash, HeaderBuilder, ReputationScores,
     };
 
     use crate::{
@@ -1320,9 +1320,9 @@ pub(crate) mod test {
         // update cert
         leader_1.update_header_author_for_test(authority_1);
         for batch in &batches_1 {
-            let mut ch = leader_1.header().clone();
-            ch.payload.insert(batch.digest(), 0_u16);
-            leader_1.update_header_for_test(ch);
+            let mut builder = HeaderBuilder::from_header(leader_1.header());
+            builder = builder.with_payload_batch(&batch, 0_u16);
+            leader_1.update_header_for_test(builder.build());
         }
         let sub_dag_index_1 = 1;
         leader_1.update_header_round_for_test(sub_dag_index_1 as u32);
