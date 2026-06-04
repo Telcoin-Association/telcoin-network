@@ -61,7 +61,7 @@ pub fn execute_consensus_output(
     let mut ancestors: Vec<DeferredTrieData> = Vec::with_capacity(batches.len().max(1));
 
     if batches.is_empty() {
-        if !output.close_epoch {
+        if !output.close_epoch() {
             // Skip execution entirely — no batches and epoch is not closing.
             // Leader count was already incremented above for rewards tracking.
             info!(target: "engine", "skipping execution for empty non-epoch-closing output");

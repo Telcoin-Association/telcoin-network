@@ -11822,7 +11822,6 @@ dependencies = [
  "hex",
  "indexmap 2.13.0",
  "libp2p",
- "once_cell",
  "parking_lot",
  "proptest",
  "rand 0.9.2",

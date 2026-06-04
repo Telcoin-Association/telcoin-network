@@ -7,7 +7,6 @@ use crate::{
     Epoch, Hash, Header, ReputationScores, Round, SealedHeader, TimestampSec, B256,
 };
 use alloy::primitives::keccak256;
-use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
@@ -28,7 +27,7 @@ pub type SequenceNumber = u64;
 /// - latest canonical tip when execution produced a block (`None` when execution was skipped)
 pub type EngineUpdate = (Round, BlockNumHash, Option<SealedHeader>);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 /// Struct that contains all necessary information for executing a batch post-consensus.
 pub struct CertifiedBatch {
     /// The ECDSA address of the authority that produced the batch. This address is used as the
@@ -39,7 +38,7 @@ pub struct CertifiedBatch {
     pub batches: Vec<Batch>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct ConsensusOutputInner {
     /// The committed subdag that triggered this output.
     sub_dag: Arc<CommittedSubDag>,
@@ -71,9 +70,31 @@ pub struct ConsensusOutput {
     /// Boolean indicating if this is the last output for the epoch.
     ///
     /// The engine should make a system call to consensus registry contract to close the epoch.
-    pub close_epoch: bool,
+    close_epoch: bool,
     /// Cached digest of the consensus header for this output.
-    pub consensus_header_hash_cache: OnceCell<B256>,
+    consensus_header_hash_cache: B256,
+}
+
+impl Serialize for ConsensusOutput {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let ok = self.inner.serialize(serializer)?;
+        Ok(ok)
+    }
+}
+
+impl<'de> Deserialize<'de> for ConsensusOutput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let inner = ConsensusOutputInner::deserialize(deserializer)?;
+        let consensus_header_hash_cache =
+            ConsensusHeader::digest_from_parts(inner.parent_hash, &inner.sub_dag, inner.number);
+        Ok(Self { inner: Arc::new(inner), close_epoch: false, consensus_header_hash_cache })
+    }
 }
 
 impl ConsensusOutput {
@@ -86,18 +107,17 @@ impl ConsensusOutput {
         batch_digests: VecDeque<BlockHash>,
         batches: Vec<CertifiedBatch>,
     ) -> Self {
-        ConsensusOutput {
-            inner: Arc::new(ConsensusOutputInner {
-                sub_dag: sub_dag.clone(),
-                parent_hash,
-                number,
-                batch_digests,
-                batches,
-                ..Default::default()
-            }),
-            close_epoch,
-            consensus_header_hash_cache: OnceCell::default(),
-        }
+        let inner = Arc::new(ConsensusOutputInner {
+            sub_dag: sub_dag.clone(),
+            parent_hash,
+            number,
+            batch_digests,
+            batches,
+            ..Default::default()
+        });
+        let consensus_header_hash_cache =
+            ConsensusHeader::digest_from_parts(inner.parent_hash, &inner.sub_dag, inner.number);
+        ConsensusOutput { inner, close_epoch, consensus_header_hash_cache }
     }
     pub fn new_with_subdag(
         sub_dag: Arc<CommittedSubDag>,
@@ -198,13 +218,7 @@ impl ConsensusOutput {
 
     /// Return the hash of the consensus header that matches this output.
     pub fn consensus_header_hash(&self) -> B256 {
-        *self.consensus_header_hash_cache.get_or_init(|| {
-            ConsensusHeader::digest_from_parts(
-                self.inner.parent_hash,
-                &self.inner.sub_dag,
-                self.inner.number,
-            )
-        })
+        self.consensus_header_hash_cache
     }
 
     /// Return number/hash tuple for this consensus output.
@@ -221,6 +235,18 @@ impl ConsensusOutput {
         self.close_epoch.then_some(
             self.inner.batch_digests.is_empty() || (index + 1) >= self.inner.batch_digests.len(),
         )
+    }
+
+    /// Set the close epoch feild, this is the last consensus output for an epoch.
+    pub fn set_epoch_close(&mut self) {
+        self.close_epoch = true;
+    }
+
+    /// Boolean indicating if this is the last output for the epoch.
+    ///
+    /// The engine should make a system call to consensus registry contract to close the epoch.
+    pub fn close_epoch(&self) -> bool {
+        self.close_epoch
     }
 
     /// Generate the source of randomness to shuffle future committees at the epoch boundary. The
