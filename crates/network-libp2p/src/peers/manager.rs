@@ -514,7 +514,7 @@ impl PeerManager {
             .iter()
             .filter_map(|(peer_id, peer)| {
                 if !self.is_peer_validator(peer_id) && !peer.is_trusted() {
-                    Some(**peer_id)
+                    Some(*peer_id)
                 } else {
                     None
                 }
