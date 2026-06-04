@@ -94,10 +94,11 @@ impl AllPeers {
     /// A peer is `Confirmed` once its bls key is known (committee/trusted/known peers); otherwise
     /// it is `Unidentified` and keyed by its libp2p id.
     fn identity_for(&self, peer_id: &PeerId) -> PeerIdentity {
-        match self.confirmed.get(peer_id) {
-            Some(bls_public_key) => PeerIdentity::Confirmed(*bls_public_key),
-            None => PeerIdentity::Unidentified(*peer_id),
-        }
+        self.confirmed
+            .get(peer_id)
+            .map_or(PeerIdentity::Unidentified(*peer_id), |bls_public_key| {
+                PeerIdentity::Confirmed(*bls_public_key)
+            })
     }
 
     /// Recover the libp2p [PeerId] for a stored peer.
@@ -732,7 +733,10 @@ impl AllPeers {
     /// Gives the ids of all known connected peers.
     pub(super) fn connected_peer_ids(&self) -> impl Iterator<Item = PeerId> + '_ {
         self.peers.iter().filter_map(|(id, peer)| {
-            peer.connection_status().is_connected().then(|| Self::peer_id_for(id, peer)).flatten()
+            peer.connection_status()
+                .is_connected()
+                .then_some(())
+                .and_then(|()| Self::peer_id_for(id, peer))
         })
     }
 
@@ -743,8 +747,8 @@ impl AllPeers {
             .filter_map(|(id, peer)| {
                 let status = peer.connection_status();
                 (status.is_connected() || status.is_dialing())
-                    .then(|| Self::peer_id_for(id, peer))
-                    .flatten()
+                    .then_some(())
+                    .and_then(|()| Self::peer_id_for(id, peer))
             })
             .collect()
     }
