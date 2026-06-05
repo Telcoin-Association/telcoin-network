@@ -43,17 +43,16 @@ pub(super) struct AllPeers {
     /// inbound or kad-dialed peers that have no known bls key yet are keyed by their libp2p
     /// [PeerId] (`Unidentified`).
     peers: HashMap<PeerIdentity, Peer>,
-    /// Resolution index from a libp2p [PeerId] to the [BlsPublicKey] of a `Confirmed` peer.
+    /// Inbound boundary resolver: maps a libp2p [PeerId] to the [BlsPublicKey] of a `Confirmed`
+    /// peer.
     ///
-    /// libp2p connection events only carry a [PeerId], so this index recovers the `Confirmed`
-    /// identity of a known peer. It is kept in lockstep with the `Confirmed` entries in `peers`:
-    /// an entry exists here iff the peer is stored under a [PeerIdentity::Confirmed] key.
-    confirmed: HashMap<PeerId, BlsPublicKey>,
+    /// libp2p connection events only carry a [PeerId], so this is the single point where a libp2p
+    /// id is translated to the telcoin-domain identity that keys `peers`. It is kept in lockstep
+    /// with the `Confirmed` entries in `peers`: an entry exists here iff the peer is stored under a
+    /// [PeerIdentity::Confirmed] key.
+    bls_by_peer_id: HashMap<PeerId, BlsPublicKey>,
     /// The collection of staked current_committee at the beginning of each epoch.
     current_committee: HashSet<BlsPublicKey>,
-    /// The collection of staked current_committee pub key to peerid at the beginning of each
-    /// epoch.
-    current_committee_keys: HashMap<BlsPublicKey, Option<PeerId>>,
     /// Information for peers that scored poorly enough to become banned.
     banned_peers: BannedPeers,
     /// The number of peers that have disconnected from this node.
@@ -77,9 +76,8 @@ impl AllPeers {
     ) -> Self {
         Self {
             peers: Default::default(),
-            confirmed: Default::default(),
+            bls_by_peer_id: Default::default(),
             current_committee: Default::default(),
-            current_committee_keys: Default::default(),
             banned_peers: Default::default(),
             disconnected_peers: 0,
             pending_dials: Default::default(),
@@ -94,7 +92,7 @@ impl AllPeers {
     /// A peer is `Confirmed` once its bls key is known (committee/trusted/known peers); otherwise
     /// it is `Unidentified` and keyed by its libp2p id.
     fn identity_for(&self, peer_id: &PeerId) -> PeerIdentity {
-        self.confirmed
+        self.bls_by_peer_id
             .get(peer_id)
             .map_or(PeerIdentity::Unidentified(*peer_id), |bls_public_key| {
                 PeerIdentity::Confirmed(*bls_public_key)
@@ -112,12 +110,12 @@ impl AllPeers {
         }
     }
 
-    /// Remove a peer from the collection, keeping the `confirmed` resolution index in sync.
+    /// Remove a peer from the collection, keeping the `bls_by_peer_id` resolution index in sync.
     fn evict(&mut self, identity: &PeerIdentity) -> Option<Peer> {
         let removed = self.peers.remove(identity);
         if let (PeerIdentity::Confirmed(_), Some(peer)) = (identity, removed.as_ref()) {
             if let Some(peer_id) = peer.peer_id() {
-                self.confirmed.remove(&peer_id);
+                self.bls_by_peer_id.remove(&peer_id);
             }
         }
         removed
@@ -137,7 +135,7 @@ impl AllPeers {
         let _ = self.banned_peers.remove_banned_peer(trusted_peer.known_ip_addresses());
         // overwrite any prior record and key the peer by its confirmed (bls) identity
         self.peers.remove(&PeerIdentity::Unidentified(peer_id));
-        self.confirmed.insert(peer_id, bls_public_key);
+        self.bls_by_peer_id.insert(peer_id, bls_public_key);
         self.peers.insert(PeerIdentity::Confirmed(bls_public_key), trusted_peer);
     }
 
@@ -159,7 +157,7 @@ impl AllPeers {
             }
             None => Peer::new(bls_public_key, network_key, addrs),
         };
-        self.confirmed.insert(peer_id, bls_public_key);
+        self.bls_by_peer_id.insert(peer_id, bls_public_key);
         self.peers.insert(PeerIdentity::Confirmed(bls_public_key), peer);
     }
 
@@ -912,13 +910,11 @@ impl AllPeers {
     ) -> Vec<(PeerId, PeerAction)> {
         // update current committee
         self.current_committee.clear();
-        self.current_committee_keys.clear();
 
         let mut actions = Vec::with_capacity(committee.len());
         for (bls_key, NetworkInfo { pubkey, multiaddrs: addr, .. }) in committee {
             let peer_id: PeerId = pubkey.clone().into();
             self.current_committee.insert(bls_key);
-            self.current_committee_keys.insert(bls_key, Some(peer_id));
             // the NewConnectionStatus doesn't affect this call
             let status = self.ensure_peer_exists(&peer_id, &NewConnectionStatus::Unbanned);
             // We have all our network settings so go ahead and make sure they are set. This also
