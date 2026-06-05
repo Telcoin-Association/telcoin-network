@@ -761,6 +761,14 @@ where
     ) -> eyre::Result<(PrimaryNode<DB>, WorkerNode<DB>)> {
         // create config for consensus
         let _mode = self.identify_node_mode(&consensus_config, &consensus_bus).await?;
+        let epoch = consensus_config.committee().epoch();
+
+        // previous committee from on-chain state - canonical source of truth
+        let previous_committee_keys: HashSet<BlsPublicKey> = if epoch == 0 {
+            HashSet::new() // no previous committee
+        } else {
+            engine.validators_for_epoch(epoch - 1).await?.into_iter().collect()
+        };
 
         let consensus_bus_app = consensus_bus.app().clone();
         let primary = self
@@ -769,6 +777,7 @@ where
                 epoch_task_manager.get_spawner(),
                 initial_epoch,
                 consensus_bus,
+                previous_committee_keys.clone(),
             )
             .await?;
 
@@ -806,6 +815,7 @@ where
                 initial_epoch,
                 engine_to_primary,
                 gas_accumulator,
+                previous_committee_keys,
             )
             .await?;
 
@@ -906,6 +916,7 @@ where
         epoch_task_spawner: TaskSpawner,
         initial_epoch: bool,
         consensus_bus: ConsensusBus,
+        previous_committee_keys: HashSet<BlsPublicKey>,
     ) -> eyre::Result<PrimaryNode<DB>> {
         let state_sync = StateSynchronizer::new(
             consensus_config.clone(),
@@ -926,6 +937,7 @@ where
             &network_handle,
             initial_epoch,
             consensus_bus.clone(),
+            previous_committee_keys,
         )
         .await?;
 
@@ -937,6 +949,7 @@ where
     }
 
     /// Create a [WorkerNode].
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_worker_node_components(
         &mut self,
         consensus_config: &ConsensusConfig<DB>,
@@ -945,6 +958,7 @@ where
         initial_epoch: bool,
         engine_to_primary: EngineToPrimaryRpc,
         gas_accumulator: GasAccumulator,
+        previous_committee_keys: HashSet<BlsPublicKey>,
     ) -> eyre::Result<WorkerNode<DB>> {
         // only support one worker for now (with id 0) - otherwise, loop here
         let worker_id = 0;
@@ -995,6 +1009,7 @@ where
             epoch_task_spawner,
             &network_handle,
             initial_epoch,
+            previous_committee_keys,
         )
         .await?;
 
@@ -1012,6 +1027,7 @@ where
     /// Create the primary network for the specific epoch.
     ///
     /// This is not the swarm level, but the [PrimaryNetwork] interface.
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_primary_network_for_epoch(
         &mut self,
         consensus_config: &ConsensusConfig<DB>,
@@ -1020,6 +1036,7 @@ where
         network_handle: &PrimaryNetworkHandle,
         initial_epoch: bool,
         consensus_bus: ConsensusBus,
+        previous_committee_keys: HashSet<BlsPublicKey>,
     ) -> eyre::Result<()> {
         // get event streams for the primary network handler
         let rx_event_stream = self.consensus_bus.subscribe_primary_network_events();
@@ -1041,8 +1058,6 @@ where
             .collect();
         let next_committee_keys: HashSet<BlsPublicKey> =
             consensus_config.next_committee_keys().iter().copied().collect();
-        let previous_committee_keys =
-            self.previous_committee_keys(consensus_config.committee().epoch()).await;
         Self::init_network_for_epoch(
             network_handle.inner_handle(),
             bootstrap_peers,
@@ -1154,6 +1169,7 @@ where
     }
 
     /// Create the worker network.
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_worker_network_for_epoch(
         &mut self,
         consensus_config: &ConsensusConfig<DB>,
@@ -1162,6 +1178,7 @@ where
         epoch_task_spawner: TaskSpawner,
         network_handle: &WorkerNetworkHandle,
         initial_epoch: bool,
+        previous_committee_keys: HashSet<BlsPublicKey>,
     ) -> eyre::Result<()> {
         // get event streams for the worker network handler
         let rx_event_stream = self.worker_event_stream.subscribe();
@@ -1182,8 +1199,6 @@ where
             .collect();
         let next_committee_keys: HashSet<BlsPublicKey> =
             consensus_config.next_committee_keys().iter().copied().collect();
-        let previous_committee_keys =
-            self.previous_committee_keys(consensus_config.committee().epoch()).await;
         Self::init_network_for_epoch(
             network_handle.inner_handle(),
             bootstrap_peers,
@@ -1337,24 +1352,6 @@ where
                     })
             })
             .unwrap_or(Ok(fallback))
-    }
-
-    /// Read the previous epoch's committee from the persisted epoch records.
-    ///
-    /// Empty for epoch 0 (no previous) or if the prior record isn't available yet (degrades to
-    /// pre-tracking behavior rather than failing network setup). Returns the active committee of
-    /// epoch `N-1` (`record.committee`), not its `next_committee` (which equals the current
-    /// committee by the invariant enforced when epoch records are built).
-    async fn previous_committee_keys(&self, epoch: Epoch) -> HashSet<BlsPublicKey> {
-        if epoch == 0 {
-            return HashSet::new();
-        }
-        self.consensus_chain
-            .epochs()
-            .record_by_epoch(epoch - 1)
-            .await
-            .map(|rec| rec.committee.into_iter().collect())
-            .unwrap_or_default()
     }
 
     /// Initialize a network handle for a new epoch.
