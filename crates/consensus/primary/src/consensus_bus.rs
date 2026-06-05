@@ -325,6 +325,20 @@ impl ConsensusBusApp {
         &self.inner.tx_requested_missing_epoch
     }
 
+    /// Update requested missing epoch if epoch is newer than the current value.
+    /// Return true if it updates.
+    pub fn request_missing_epoch_if_newer(&self, epoch: Epoch) -> bool {
+        let latest_missing = *self.requested_missing_epoch().borrow();
+        if epoch > latest_missing {
+            // Not sure we can sanity check this epoch.  However if it is bogus the code
+            // to handle it should be fine, it stops when out of epochs.
+            self.requested_missing_epoch().send_replace(epoch);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Signals a new round
     pub fn primary_round_updates(&self) -> &watch::Sender<Round> {
         &self.inner.tx_primary_round_updates
@@ -361,11 +375,42 @@ impl ConsensusBusApp {
         &self.inner.tx_last_consensus_header
     }
 
+    /// Update last consensus header if header is newer than the current value.
+    /// Return true if it was updated.
+    pub fn send_last_consensus_header_if_newer(&self, header: ConsensusHeader) -> bool {
+        let last_seen_header_number =
+            self.last_consensus_header().borrow().as_ref().map(|h| h.number).unwrap_or_default();
+        if header.number > last_seen_header_number {
+            // Update our last seen valid consensus header if it is newer.
+            self.last_consensus_header().send_replace(Some(header));
+            true
+        } else {
+            false
+        }
+    }
+
     /// Track the latest published consensus header block number and hash seen on the gossip
     /// network. This value will have been verified and can be trusted to be the correct hash
     /// for block number.  DO NOT send unverified values to this watch.
     pub fn last_published_consensus_num_hash(&self) -> &watch::Sender<(Epoch, u64, BlockHash)> {
         &self.inner.tx_last_published_consensus_num_hash
+    }
+
+    /// Update the last published consensus epoch, number and hash if number is greater than current
+    /// value. Return true if it was updated.
+    pub fn publish_consenus_num_hash_if_newer(
+        &self,
+        epoch: Epoch,
+        number: u64,
+        hash: B256,
+    ) -> bool {
+        let (_old_epoch, old_number, _) = self.published_consensus_num_hash();
+        if number > old_number {
+            self.last_published_consensus_num_hash().send_replace((epoch, number, hash));
+            true
+        } else {
+            false
+        }
     }
 
     /// Returns the latest verified consensus block number and hash from gossip.

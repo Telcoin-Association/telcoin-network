@@ -488,17 +488,17 @@ impl ConsensusChain {
         &self,
         consensus: ConsensusOutput,
     ) -> Result<(), ConsensusChainError> {
-        if let Some(pack) = &self.current_pack() {
-            if consensus.number() > self.latest_consensus.number() {
-                let epoch = consensus.sub_dag().leader_epoch();
-                let number = consensus.number();
+        let number = consensus.number();
+        if number > self.latest_consensus.number() {
+            let epoch = consensus.sub_dag().leader_epoch();
+            self.latest_consensus.update(epoch, number).await;
+            // We may be replaying consensus from old epochs and not have a current pack to save
+            // too.
+            if let Some(pack) = &self.current_pack() {
                 pack.save_consensus_output(consensus).await?;
-                self.latest_consensus.update(epoch, number).await;
             }
-            Ok(())
-        } else {
-            Ok(()) // If no current then this is a no-op.
         }
+        Ok(())
     }
 
     /// Load and return the consensus output from the current epoch.
@@ -853,6 +853,7 @@ pub enum ConsensusChainError {
     EmptyImport,
     InvalidImport,
     StreamUnavailable,
+    InvalidSave,
 }
 
 impl Error for ConsensusChainError {}
@@ -876,6 +877,9 @@ impl Display for ConsensusChainError {
             }
             ConsensusChainError::StreamUnavailable => {
                 write!(f, "Incomplete data to stream a pack file")
+            }
+            ConsensusChainError::InvalidSave => {
+                write!(f, "Saved when no current pack and does not already exist")
             }
         }
     }

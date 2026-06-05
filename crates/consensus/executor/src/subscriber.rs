@@ -305,20 +305,8 @@ impl<DB: Database> Subscriber<DB> {
                     // then MAX_PENDING_PAYLOADS is pending
                     let parent_hash = last_parent;
                     let number = last_number + 1;
-                    last_parent = ConsensusHeader::digest_from_parts(parent_hash, &sub_dag, number);
-
-                    // Record the latest ConsensusHeader, we probably don't need this in this mode but keep it up to date anyway.
-                    // Note we don't bother sending this to the consensus header channel since not needed when an active CVV.
-                    self.consensus_bus.last_consensus_header().send_replace(Some(ConsensusHeader { parent_hash, sub_dag: sub_dag.clone(), number, extra: B256::default() }));
-                    let epoch = sub_dag.leader_epoch();
-                    let round = sub_dag.leader_round();
-                    let consensus_result_hash = ConsensusResult::digest_data(epoch, round, number, last_parent);
-                    let sig =
-                        self.config.key_config().request_signature_direct(&encode(&to_intent_message(consensus_result_hash)));
-                    if let Err(e) = self.network_handle.publish_consensus(epoch, round, number, last_parent, self.config.key_config().public_key(), sig).await {
-                        error!(target: "subscriber", "error publishing latest consensus to network {:?}: {}", self.inner.authority_id, e);
-                    }
                     last_number += 1;
+                    last_parent = ConsensusHeader::digest_from_parts(parent_hash, &sub_dag, number);
                     waiting.push_back(self.fetch_batches(sub_dag, parent_hash, number));
                 },
 
@@ -332,6 +320,22 @@ impl<DB: Database> Subscriber<DB> {
                             debug!(target: "subscriber", output=?output.digest(), "saving next output");
                             save_consensus(output.clone(), &mut consensus_chain).await?;
                             debug!(target: "subscriber", "broadcasting output...");
+                            // Publish the consensus result now that we are totally finished.
+                            let parent_hash = output.parent_hash();
+                            let number = output.number();
+                            let this_digest = ConsensusHeader::digest_from_parts(parent_hash, output.sub_dag(), number);
+
+                            // Record the latest ConsensusHeader, we probably don't need this in this mode but keep it up to date anyway.
+                            // Note we don't bother sending this to the consensus header channel since not needed when an active CVV.
+                            self.consensus_bus.last_consensus_header().send_replace(Some(ConsensusHeader { parent_hash, sub_dag: output.sub_dag_clone(), number, extra: B256::default() }));
+                            let epoch = output.sub_dag().leader_epoch();
+                            let round = output.sub_dag().leader_round();
+                            let consensus_result_hash = ConsensusResult::digest_data(epoch, round, number, this_digest);
+                            let sig =
+                                self.config.key_config().request_signature_direct(&encode(&to_intent_message(consensus_result_hash)));
+                            if let Err(e) = self.network_handle.publish_consensus(epoch, round, number, this_digest, self.config.key_config().public_key(), sig).await {
+                                error!(target: "subscriber", "error publishing latest consensus to network {:?}: {}", self.inner.authority_id, e);
+                            }
                             if let Err(e) = self.consensus_bus.consensus_output().send(output).await {
                                 error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self.inner.authority_id, e);
                                 return Err(SubscriberError::ClosedChannel("failed to broadcast consensus output".to_string()));
