@@ -48,8 +48,8 @@ pub(super) struct AllPeers {
     ///
     /// libp2p connection events only carry a [PeerId], so this is the single point where a libp2p
     /// id is translated to the telcoin-domain identity that keys `peers`. It is kept in lockstep
-    /// with the `Confirmed` entries in `peers`: an entry exists here iff the peer is stored under a
-    /// [PeerIdentity::Confirmed] key.
+    /// with the `Confirmed` entries in `peers`: an entry exists here iff the peer is stored under
+    /// a [PeerIdentity::Confirmed] key.
     bls_by_peer_id: HashMap<PeerId, BlsPublicKey>,
     /// The collection of staked current_committee at the beginning of each epoch.
     current_committee: HashSet<BlsPublicKey>,
