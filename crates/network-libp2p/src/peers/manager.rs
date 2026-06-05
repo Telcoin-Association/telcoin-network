@@ -513,7 +513,7 @@ impl PeerManager {
         let ready_to_prune = connected_peers
             .iter()
             .filter_map(|(peer_id, peer)| {
-                if !self.is_peer_validator(peer_id) && !peer.is_trusted() {
+                if !self.is_peer_validator(peer_id) && !peer.is_operator_allowlisted() {
                     Some(**peer_id)
                 } else {
                     None
@@ -602,10 +602,10 @@ impl PeerManager {
         self.peers.get_peer(peer_id).map(|peer| peer.score().aggregate_score())
     }
 
-    /// Bool indicating if the peer is trusted or a validator.
+    /// Bool indicating if the peer is operator-allowlisted or a validator.
     pub(crate) fn peer_is_important(&self, peer_id: &PeerId) -> bool {
         self.is_peer_validator(peer_id)
-            || self.peers.get_peer(peer_id).map(|p| p.is_trusted()).unwrap_or_default()
+            || self.peers.get_peer(peer_id).map(|p| p.is_operator_allowlisted()).unwrap_or_default()
     }
 
     /// Update the committee for the new epoch.

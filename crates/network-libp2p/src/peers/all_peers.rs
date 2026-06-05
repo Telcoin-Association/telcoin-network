@@ -4,8 +4,12 @@
 //! manager to take. Some actions are propagated up to the swarm level and affect other behaviors.
 
 use super::{
-    banned::BannedPeers, peer::Peer, score::ReputationUpdate, status::ConnectionStatus,
-    types::ConnectionDirection, PeerExchangeMap, Penalty,
+    banned::BannedPeers,
+    peer::Peer,
+    score::ReputationUpdate,
+    status::ConnectionStatus,
+    types::{ConnectionDirection, TrustBasis},
+    PeerExchangeMap, Penalty,
 };
 use crate::{
     error::NetworkError,
@@ -109,9 +113,10 @@ impl AllPeers {
     ///
     /// This method is called when the application layer identifies a problem and reports a peer.
     pub(super) fn process_penalty(&mut self, peer_id: &PeerId, penalty: Penalty) -> PeerAction {
+        let exemption = self.trust_basis(peer_id);
         if let Some(peer) = self.peers.get_mut(peer_id) {
             let prior_reputation = peer.reputation();
-            let new_reputation = peer.apply_penalty(penalty);
+            let new_reputation = peer.apply_penalty(penalty, exemption);
             debug!(target: "peer-manager", ?peer_id, ?prior_reputation, ?new_reputation);
 
             if new_reputation == prior_reputation {
@@ -179,8 +184,9 @@ impl AllPeers {
 
         // ensure peer is banned if the new state is Banned
         if matches!(new_status, &NewConnectionStatus::Banned) {
+            let exemption = self.trust_basis(peer_id);
             if let Some(peer) = self.peers.get_mut(peer_id) {
-                peer.ensure_banned(peer_id);
+                peer.ensure_banned(peer_id, exemption);
             } else {
                 // unreachable
                 error!(target: "peer-manager", ?peer_id, "impossible - peer was just created if it didn't already exist");
@@ -233,8 +239,10 @@ impl AllPeers {
     /// See [Self::apply_penalty] for ban logic.
     fn update_peer_scores(&mut self) -> Vec<(PeerId, PeerAction)> {
         // filter peers that are eligible to become unbanned
+        let committee = &self.current_committee;
         let unbanned_peers = self.peers.iter_mut().filter_map(|(id, peer)| {
-            let update = peer.heartbeat();
+            let exemption = Self::exemption(id, peer, committee);
+            let update = peer.heartbeat(exemption);
             match update {
                 ReputationUpdate::Unbanned => {
                     Some(*id)
@@ -643,6 +651,31 @@ impl AllPeers {
         self.current_committee.contains(peer_id)
     }
 
+    /// The [TrustBasis] exempting `peer` from the score model this epoch, if any.
+    ///
+    /// Validator status is derived live from `committee` (it is never stored on the peer, so it
+    /// cannot drift out of sync with rotation); operator allowlisting is read from the peer.
+    /// Validator takes precedence in the reported basis as it is the operationally significant
+    /// signal when a penalty is suppressed.
+    fn exemption(peer_id: &PeerId, peer: &Peer, committee: &HashSet<PeerId>) -> Option<TrustBasis> {
+        if committee.contains(peer_id) {
+            Some(TrustBasis::Validator)
+        } else if peer.is_operator_allowlisted() {
+            Some(TrustBasis::Operator)
+        } else {
+            None
+        }
+    }
+
+    /// The [TrustBasis] exempting the peer identified by `peer_id`, if it is known and exempt.
+    ///
+    /// `None` means the peer is subject to the normal score model.
+    fn trust_basis(&self, peer_id: &PeerId) -> Option<TrustBasis> {
+        self.peers
+            .get(peer_id)
+            .and_then(|peer| Self::exemption(peer_id, peer, &self.current_committee))
+    }
+
     /// Boolean indicating if the ip address is associated with a banned peer.
     pub(super) fn ip_banned(&self, ip: &IpAddr) -> bool {
         self.banned_peers.ip_banned(ip)
@@ -822,8 +855,10 @@ impl AllPeers {
     /// The committee is tracked to ensure priority on the network.
     /// The banned status of any committee peer is forgiven and IPs
     /// associated with the committee node are reset. The advertised
-    /// listening addresses are updated and the peer is marked `trusted`
-    /// so it won't incur any additional penalties.
+    /// listening addresses are updated and the peer's score is reset to max. No trust flag is
+    /// stored: a committee member's validator exemption is derived from its membership in
+    /// `current_committee`, so it bypasses penalties only while it remains in the committee
+    /// (operator-allowlisted peers keep their exemption regardless).
     pub(super) fn new_epoch(
         &mut self,
         committee: Vec<(BlsPublicKey, NetworkInfo)>,
@@ -866,8 +901,9 @@ impl AllPeers {
 
             // already ensured peer exists
             if let Some(peer) = self.peers.get_mut(&peer_id) {
-                // update peer regardless of connection status
-                peer.make_trusted();
+                // update peer regardless of connection status; validator trust is derived from
+                // `current_committee`, so we only prime the score (no trust flag is stored)
+                peer.reset_score_to_max();
                 peer.update_listening_addrs(addr);
                 self.banned_peers.remove_validator_ip(&peer_id, peer.known_ip_addresses());
             }

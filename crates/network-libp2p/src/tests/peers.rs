@@ -283,6 +283,36 @@ fn test_is_validator() {
     assert!(!all_peers.is_peer_validator(&PeerId::random()));
 }
 
+/// Regression guard for issue #715: a validator's exemption is derived from committee
+/// membership, not a stored flag, so rotating out of the committee revokes the exemption
+/// (and, because operator trust is separate, never touches an operator allowlist).
+#[test]
+fn test_committee_rotation_revokes_validator_exemption() {
+    ensure_score_config(None);
+    let mut all_peers = AllPeers::new(Duration::from_secs(5), 10, 10);
+
+    // a committee validator that the operator did NOT allowlist
+    let mut rng = StdRng::from_seed([0; 32]);
+    let bls = *BlsKeypair::generate(&mut rng).public();
+    let net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let peer_id: PeerId = net.clone().into();
+    all_peers.upsert_peer(bls, net, vec![]);
+    all_peers.current_committee.insert(peer_id);
+
+    // while in the committee the peer is exempt: a fatal penalty is suppressed and its
+    // reputation is unaffected
+    let action = all_peers.process_penalty(&peer_id, Penalty::Fatal);
+    assert!(matches!(action, PeerAction::NoAction));
+    assert_eq!(all_peers.get_peer(&peer_id).unwrap().reputation(), Reputation::Trusted);
+
+    // rotate the validator out of the committee
+    all_peers.current_committee.clear();
+
+    // the exemption is gone: the same fatal penalty now lands and the peer is banned
+    let _ = all_peers.process_penalty(&peer_id, Penalty::Fatal);
+    assert_eq!(all_peers.get_peer(&peer_id).unwrap().reputation(), Reputation::Banned);
+}
+
 #[test]
 fn test_ip_and_peer_banned() {
     let mut all_peers = create_all_peers(None);
