@@ -327,16 +327,17 @@ impl ConsensusBusApp {
 
     /// Update requested missing epoch if epoch is newer than the current value.
     /// Return true if it updates.
-    pub fn request_missing_epoch_if_newer(&self, epoch: Epoch) -> bool {
-        let latest_missing = *self.requested_missing_epoch().borrow();
-        if epoch > latest_missing {
-            // Not sure we can sanity check this epoch.  However if it is bogus the code
-            // to handle it should be fine, it stops when out of epochs.
-            self.requested_missing_epoch().send_replace(epoch);
-            true
-        } else {
-            false
-        }
+    pub fn set_request_missing_epoch_if_newer(&self, epoch: Epoch) -> bool {
+        self.requested_missing_epoch().send_if_modified(|state| {
+            if epoch > *state {
+                // Not sure we can sanity check this epoch.  However if it is bogus the code
+                // to handle it should be fine, it stops when out of epochs.
+                *state = epoch;
+                true
+            } else {
+                false
+            }
+        })
     }
 
     /// Signals a new round
@@ -378,15 +379,15 @@ impl ConsensusBusApp {
     /// Update last consensus header if header is newer than the current value.
     /// Return true if it was updated.
     pub fn send_last_consensus_header_if_newer(&self, header: ConsensusHeader) -> bool {
-        let last_seen_header_number =
-            self.last_consensus_header().borrow().as_ref().map(|h| h.number).unwrap_or_default();
-        if header.number > last_seen_header_number {
-            // Update our last seen valid consensus header if it is newer.
-            self.last_consensus_header().send_replace(Some(header));
-            true
-        } else {
-            false
-        }
+        self.last_consensus_header().send_if_modified(|state| {
+            if header.number > state.as_ref().map(|h| h.number).unwrap_or_default() {
+                // Update our last seen valid consensus header if it is newer.
+                *state = Some(header);
+                true
+            } else {
+                false
+            }
+        })
     }
 
     /// Track the latest published consensus header block number and hash seen on the gossip
@@ -398,19 +399,22 @@ impl ConsensusBusApp {
 
     /// Update the last published consensus epoch, number and hash if number is greater than current
     /// value. Return true if it was updated.
-    pub fn publish_consenus_num_hash_if_newer(
+    pub fn publish_consensus_num_hash_if_newer(
         &self,
         epoch: Epoch,
         number: u64,
         hash: B256,
     ) -> bool {
-        let (_old_epoch, old_number, _) = self.published_consensus_num_hash();
-        if number > old_number {
-            self.last_published_consensus_num_hash().send_replace((epoch, number, hash));
-            true
-        } else {
-            false
-        }
+        self.last_published_consensus_num_hash().send_if_modified(|state| {
+            if number > state.1 {
+                state.0 = epoch;
+                state.1 = number;
+                state.2 = hash;
+                true
+            } else {
+                false
+            }
+        })
     }
 
     /// Returns the latest verified consensus block number and hash from gossip.

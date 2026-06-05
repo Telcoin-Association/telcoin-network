@@ -485,7 +485,6 @@ impl PrimaryNetworkHandle {
             ConsensusChainError::StreamUnavailable
             | ConsensusChainError::NoCurrentEpoch
             | ConsensusChainError::EpochDbError(_)
-            | ConsensusChainError::InvalidSave
             | ConsensusChainError::IO(_) => None,
         }
     }

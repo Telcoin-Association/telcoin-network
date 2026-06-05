@@ -299,7 +299,7 @@ where
                 } else {
                     // Not sure we can sanity check this epoch.  However if it is bogus the code
                     // to handle it should be fine, it stops when out of epochs.
-                    self.consensus_bus.request_missing_epoch_if_newer(epoch);
+                    self.consensus_bus.set_request_missing_epoch_if_newer(epoch);
                 }
             }
             PrimaryGossip::EpochVote(vote) => {
@@ -850,10 +850,11 @@ where
         let mut my_number = self.consensus_chain.latest_consensus_number();
         // If we are behind then wait up to two seconds to catch up.
         let mut count = 0;
-        while my_number < number {
+        let delta = number.saturating_sub(my_number);
+        while my_number < number && delta < 4 {
             tokio::time::sleep(Duration::from_millis(100)).await;
             my_number = self.consensus_chain.latest_consensus_number();
-            if count > 20 {
+            if count >= 20 {
                 // Don't wait more than 2 seconds for this to show up.
                 return Err(PrimaryNetworkError::UnknownConsensusHeaderDigest(hash));
             }
