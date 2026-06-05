@@ -5,7 +5,7 @@ use crate::common::{create_multiaddr, ensure_score_config, random_ip_addr};
 use libp2p::PeerId;
 use rand::{rngs::StdRng, Rng as _, SeedableRng as _};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::IpAddr,
     time::{Duration, Instant},
 };
@@ -642,11 +642,11 @@ fn committee_member(rng: &mut StdRng) -> (BlsPublicKey, NetworkInfo, PeerId) {
 fn random_committee(
     rng: &mut StdRng,
     size: usize,
-) -> (Vec<(BlsPublicKey, NetworkInfo)>, HashSet<PeerId>) {
+) -> (HashMap<PeerId, (BlsPublicKey, NetworkInfo)>, HashSet<PeerId>) {
     let members: Vec<(BlsPublicKey, NetworkInfo, PeerId)> =
         (0..size).map(|_| committee_member(rng)).collect();
     let ids: HashSet<PeerId> = members.iter().map(|(_, _, id)| *id).collect();
-    let committee = members.into_iter().map(|(b, i, _)| (b, i)).collect();
+    let committee = members.into_iter().map(|(b, i, id)| (id, (b, i))).collect();
     (committee, ids)
 }
 
@@ -660,9 +660,9 @@ fn test_update_committees_sets_all_three_slots() {
     let (n_bls, n_info, n_peer_id) = committee_member(&mut rng);
 
     all_peers.update_committees(
-        vec![(p_bls, p_info)],
-        vec![(c_bls, c_info)],
-        vec![(n_bls, n_info)],
+        HashMap::from([(p_peer_id, (p_bls, p_info))]),
+        HashMap::from([(c_peer_id, (c_bls, c_info))]),
+        HashMap::from([(n_peer_id, (n_bls, n_info))]),
     );
 
     assert!(all_peers.previous_committee.contains(&p_peer_id));
@@ -688,9 +688,9 @@ fn test_update_committees_overwrites_slots_directly() {
 
     // first update: previous={A}, current={B}, next={C}
     all_peers.update_committees(
-        vec![(a_bls, a_info)],
-        vec![(b_bls, b_info)],
-        vec![(c_bls, c_info)],
+        HashMap::from([(a_id, (a_bls, a_info))]),
+        HashMap::from([(b_id, (b_bls, b_info))]),
+        HashMap::from([(c_id, (c_bls, c_info))]),
     );
     assert_eq!(all_peers.previous_committee, HashSet::from([a_id]));
     assert_eq!(all_peers.current_committee, HashSet::from([b_id]));
@@ -699,9 +699,9 @@ fn test_update_committees_overwrites_slots_directly() {
     // second update: each slot is set directly from its arg, NOT positionally shifted from the
     // prior round (otherwise current would be the prior next, {C}).
     all_peers.update_committees(
-        vec![(d_bls, d_info)],
-        vec![(e_bls, e_info)],
-        vec![(f_bls, f_info)],
+        HashMap::from([(d_id, (d_bls, d_info))]),
+        HashMap::from([(e_id, (e_bls, e_info))]),
+        HashMap::from([(f_id, (f_bls, f_info))]),
     );
     assert_eq!(all_peers.previous_committee, HashSet::from([d_id]));
     assert_eq!(all_peers.current_committee, HashSet::from([e_id]));
@@ -717,16 +717,16 @@ fn test_update_committees_no_change() {
 
     // X is in both current and next
     all_peers.update_committees(
-        vec![],
-        vec![(x_bls, x_info.clone())],
-        vec![(x_bls, x_info.clone())],
+        HashMap::new(),
+        HashMap::from([(x_id, (x_bls, x_info.clone()))]),
+        HashMap::from([(x_id, (x_bls, x_info.clone()))]),
     );
 
     // repeat the same membership next epoch
     all_peers.update_committees(
-        vec![],
-        vec![(x_bls, x_info.clone())],
-        vec![(x_bls, x_info.clone())],
+        HashMap::new(),
+        HashMap::from([(x_id, (x_bls, x_info.clone()))]),
+        HashMap::from([(x_id, (x_bls, x_info.clone()))]),
     );
 
     // full overlap keeps X a validator, present in both current and next, never demoted
@@ -747,9 +747,9 @@ fn test_update_committees_full_turnover() {
 
     // initialize with previous={A}, current={B}, next={C}
     all_peers.update_committees(
-        vec![(a_bls, a_info)],
-        vec![(b_bls, b_info)],
-        vec![(c_bls, c_info)],
+        HashMap::from([(a_id, (a_bls, a_info))]),
+        HashMap::from([(b_id, (b_bls, b_info))]),
+        HashMap::from([(c_id, (c_bls, c_info))]),
     );
 
     // a fully disjoint set replaces every slot directly
@@ -757,9 +757,9 @@ fn test_update_committees_full_turnover() {
     let (e_bls, e_info, e_id) = committee_member(&mut rng);
     let (f_bls, f_info, f_id) = committee_member(&mut rng);
     all_peers.update_committees(
-        vec![(d_bls, d_info)],
-        vec![(e_bls, e_info)],
-        vec![(f_bls, f_info)],
+        HashMap::from([(d_id, (d_bls, d_info))]),
+        HashMap::from([(e_id, (e_bls, e_info))]),
+        HashMap::from([(f_id, (f_bls, f_info))]),
     );
     assert_eq!(all_peers.previous_committee, HashSet::from([d_id]));
     assert_eq!(all_peers.current_committee, HashSet::from([e_id]));
@@ -796,12 +796,20 @@ fn test_update_committees_in_window_peer_stays_trusted() {
 
     // M starts in the current committee and is made trusted by update_committees
     let (m_bls, m_info, m_id) = committee_member(&mut rng);
-    all_peers.update_committees(vec![], vec![(m_bls, m_info.clone())], vec![]);
+    all_peers.update_committees(
+        HashMap::new(),
+        HashMap::from([(m_id, (m_bls, m_info.clone()))]),
+        HashMap::new(),
+    );
     assert!(all_peers.get_peer(&m_id).unwrap().is_trusted());
 
     // next epoch: M moves to the previous slot (still in-window) alongside a disjoint current
-    let (other_bls, other_info, _other_id) = committee_member(&mut rng);
-    all_peers.update_committees(vec![(m_bls, m_info)], vec![(other_bls, other_info)], vec![]);
+    let (other_bls, other_info, other_id) = committee_member(&mut rng);
+    all_peers.update_committees(
+        HashMap::from([(m_id, (m_bls, m_info))]),
+        HashMap::from([(other_id, (other_bls, other_info))]),
+        HashMap::new(),
+    );
 
     // M is still inside the three-slot window (now in previous), so it stays trusted -- not via a
     // one-way ratchet, but because it is still a tracked committee member.
@@ -817,13 +825,21 @@ fn test_update_committees_demotes_peer_that_exits_window() {
 
     // E starts trusted as a current-committee member
     let (e_bls, e_info, e_id) = committee_member(&mut rng);
-    all_peers.update_committees(vec![], vec![(e_bls, e_info)], vec![]);
+    all_peers.update_committees(
+        HashMap::new(),
+        HashMap::from([(e_id, (e_bls, e_info))]),
+        HashMap::new(),
+    );
     assert!(all_peers.get_peer(&e_id).unwrap().is_trusted());
     assert!(all_peers.is_peer_validator(&e_id));
 
     // next epoch's three slots do not include E at all
-    let (f_bls, f_info, _f_id) = committee_member(&mut rng);
-    all_peers.update_committees(vec![], vec![(f_bls, f_info)], vec![]);
+    let (f_bls, f_info, f_id) = committee_member(&mut rng);
+    all_peers.update_committees(
+        HashMap::new(),
+        HashMap::from([(f_id, (f_bls, f_info))]),
+        HashMap::new(),
+    );
 
     // E fell out of the window: demoted to untrusted and no longer counts as a validator
     assert!(!all_peers.get_peer(&e_id).unwrap().is_trusted());
@@ -843,8 +859,12 @@ fn test_update_committees_does_not_demote_operator_trusted_peer_never_in_committ
     assert!(all_peers.get_peer(&op_id).unwrap().is_trusted());
 
     // a committee update that does not involve the operator peer
-    let (c_bls, c_info, _c_id) = committee_member(&mut rng);
-    all_peers.update_committees(vec![], vec![(c_bls, c_info)], vec![]);
+    let (c_bls, c_info, c_id) = committee_member(&mut rng);
+    all_peers.update_committees(
+        HashMap::new(),
+        HashMap::from([(c_id, (c_bls, c_info))]),
+        HashMap::new(),
+    );
 
     // the operator peer was never tracked in a committee slot, so demotion does not touch it
     assert!(all_peers.get_peer(&op_id).unwrap().is_trusted());
@@ -862,11 +882,19 @@ fn test_update_committees_current_is_authoritative() {
     let (actual_bls, actual_info, actual_id) = committee_member(&mut rng);
 
     // epoch N predicts next = {predicted}
-    all_peers.update_committees(vec![], vec![], vec![(predicted_bls, predicted_info)]);
+    all_peers.update_committees(
+        HashMap::new(),
+        HashMap::new(),
+        HashMap::from([(predicted_id, (predicted_bls, predicted_info))]),
+    );
     assert_eq!(all_peers.next_committee, HashSet::from([predicted_id]));
 
     // epoch N+1's authoritative current is {actual}, which differs from the prediction
-    all_peers.update_committees(vec![], vec![(actual_bls, actual_info)], vec![]);
+    all_peers.update_committees(
+        HashMap::new(),
+        HashMap::from([(actual_id, (actual_bls, actual_info))]),
+        HashMap::new(),
+    );
 
     // current matches the authoritative arg, not the stale prediction
     assert_eq!(all_peers.current_committee, HashSet::from([actual_id]));
@@ -882,9 +910,13 @@ fn test_update_committees_populates_previous() {
     let mut all_peers = create_all_peers(None);
 
     let (p_bls, p_info, p_id) = committee_member(&mut rng);
-    let (c_bls, c_info, _c_id) = committee_member(&mut rng);
+    let (c_bls, c_info, c_id) = committee_member(&mut rng);
 
-    all_peers.update_committees(vec![(p_bls, p_info)], vec![(c_bls, c_info)], vec![]);
+    all_peers.update_committees(
+        HashMap::from([(p_id, (p_bls, p_info))]),
+        HashMap::from([(c_id, (c_bls, c_info))]),
+        HashMap::new(),
+    );
 
     assert_eq!(all_peers.previous_committee, HashSet::from([p_id]));
     assert!(all_peers.is_peer_validator(&p_id));

@@ -652,8 +652,8 @@ impl PeerManager {
     fn resolve_committee(
         &mut self,
         committee: &HashSet<BlsPublicKey>,
-    ) -> Vec<(BlsPublicKey, NetworkInfo)> {
-        let mut exp_committee = Vec::with_capacity(committee.len());
+    ) -> HashMap<PeerId, (BlsPublicKey, NetworkInfo)> {
+        let mut exp_committee = HashMap::with_capacity(committee.len());
         for bls_key in committee {
             if let Some(NetworkInfo { pubkey, multiaddrs: multiaddr, timestamp }) =
                 self.known_peers.get(bls_key)
@@ -663,14 +663,17 @@ impl PeerManager {
                 if self.temporarily_banned.remove(&peer_id) {
                     warn!(target: "peer-manager", ?peer_id, "removed committee member from temporarily banned list");
                 }
-                exp_committee.push((
-                    *bls_key,
-                    NetworkInfo {
-                        pubkey: pubkey.clone(),
-                        multiaddrs: multiaddr.clone(),
-                        timestamp: *timestamp,
-                    },
-                ));
+                exp_committee.insert(
+                    peer_id,
+                    (
+                        *bls_key,
+                        NetworkInfo {
+                            pubkey: pubkey.clone(),
+                            multiaddrs: multiaddr.clone(),
+                            timestamp: *timestamp,
+                        },
+                    ),
+                );
             } else {
                 warn!(target: "peer-manager", "unknown committee member with key {bls_key}");
             }

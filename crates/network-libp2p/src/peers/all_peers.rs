@@ -833,13 +833,13 @@ impl AllPeers {
     /// all three afterward is demoted via [`Peer::make_untrusted`], bounding committee-derived
     /// trust to the three-slot window. Members of the new committees are forgiven any bans,
     /// have their advertised addresses refreshed, and are marked `trusted`; peers appearing in
-    /// more than one committee are processed once. The demote and re-trust sets are disjoint by
-    /// construction, so no peer is demoted then re-trusted in a single call.
+    /// more than one committee are processed once by map construction. The demote and re-trust
+    /// sets are disjoint by construction, so no peer is demoted then re-trusted in a single call.
     pub(super) fn update_committees(
         &mut self,
-        previous: Vec<(BlsPublicKey, NetworkInfo)>,
-        current: Vec<(BlsPublicKey, NetworkInfo)>,
-        next: Vec<(BlsPublicKey, NetworkInfo)>,
+        previous: HashMap<PeerId, (BlsPublicKey, NetworkInfo)>,
+        current: HashMap<PeerId, (BlsPublicKey, NetworkInfo)>,
+        next: HashMap<PeerId, (BlsPublicKey, NetworkInfo)>,
     ) -> Vec<(PeerId, PeerAction)> {
         // capture the peers tracked across all three slots before the overwrite
         let previously_tracked: HashSet<PeerId> = self
@@ -851,32 +851,26 @@ impl AllPeers {
             .collect();
 
         // overwrite all three slots directly from authoritative state
-        self.previous_committee = previous.iter().map(|(_, ni)| ni.pubkey.clone().into()).collect();
-        self.current_committee = current.iter().map(|(_, ni)| ni.pubkey.clone().into()).collect();
-        self.next_committee = next.iter().map(|(_, ni)| ni.pubkey.clone().into()).collect();
+        self.previous_committee = previous.keys().copied().collect();
+        self.current_committee = current.keys().copied().collect();
+        self.next_committee = next.keys().copied().collect();
+
+        // merge the three committees; duplicates across slots collapse via map semantics
+        let mut members = previous;
+        members.extend(current);
+        members.extend(next);
 
         // demote any peer that fell out of all three slots, returning it to the normal score model
-        let still_tracked: HashSet<PeerId> = self
-            .previous_committee
-            .iter()
-            .chain(self.current_committee.iter())
-            .chain(self.next_committee.iter())
-            .copied()
-            .collect();
-        for peer_id in previously_tracked.difference(&still_tracked) {
-            if let Some(peer) = self.peers.get_mut(peer_id) {
-                peer.make_untrusted();
+        // (members.keys() is the union of the three new slots)
+        for peer_id in &previously_tracked {
+            if !members.contains_key(peer_id) {
+                if let Some(peer) = self.peers.get_mut(peer_id) {
+                    peer.make_untrusted();
+                }
             }
         }
 
-        // unban + trust every member once (peers in multiple committees are handled a single time)
-        let mut processed: HashSet<PeerId> = HashSet::new();
-        let members: Vec<(BlsPublicKey, NetworkInfo)> = previous
-            .into_iter()
-            .chain(current)
-            .chain(next)
-            .filter(|(_, ni)| processed.insert(ni.pubkey.clone().into()))
-            .collect();
+        // unban + trust every member once
         self.apply_committee_membership(members)
     }
 
@@ -887,7 +881,7 @@ impl AllPeers {
     /// update follows shortly after via `update_committees`.
     pub(super) fn mark_committee_for_dial(
         &mut self,
-        committee: Vec<(BlsPublicKey, NetworkInfo)>,
+        committee: HashMap<PeerId, (BlsPublicKey, NetworkInfo)>,
     ) -> Vec<(PeerId, PeerAction)> {
         self.apply_committee_membership(committee)
     }
@@ -900,11 +894,10 @@ impl AllPeers {
     /// manager to apply; the committee slots are owned by the callers.
     fn apply_committee_membership(
         &mut self,
-        committee: Vec<(BlsPublicKey, NetworkInfo)>,
+        committee: HashMap<PeerId, (BlsPublicKey, NetworkInfo)>,
     ) -> Vec<(PeerId, PeerAction)> {
         let mut actions = Vec::with_capacity(committee.len());
-        for (bls_key, NetworkInfo { pubkey, multiaddrs: addr, .. }) in committee {
-            let peer_id: PeerId = pubkey.clone().into();
+        for (peer_id, (bls_key, NetworkInfo { pubkey, multiaddrs: addr, .. })) in committee {
             // the NewConnectionStatus doesn't affect this call
             let status = self.ensure_peer_exists(&peer_id, &NewConnectionStatus::Unbanned);
             // We have all our network settings so go ahead and make sure they are set.
