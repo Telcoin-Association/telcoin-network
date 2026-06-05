@@ -134,11 +134,6 @@ impl ConsensusOutput {
         &self.inner.sub_dag
     }
 
-    /// Return the contained sub dag (cloned).
-    pub fn sub_dag_clone(&self) -> Arc<CommittedSubDag> {
-        self.inner.sub_dag.clone()
-    }
-
     /// The leader for the round
     pub fn leader(&self) -> &Header {
         self.inner.sub_dag.leader()
