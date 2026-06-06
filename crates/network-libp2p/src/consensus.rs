@@ -377,7 +377,7 @@ where
         let node_record = try_decode::<NodeRecord>(record.value.as_ref()).ok()?;
 
         // verify bls signature
-        let (pubkey, mut node_record) = node_record.verify(&key)?;
+        let (pubkey, node_record) = node_record.verify(&key)?;
 
         // verify publisher matches the network public key in the record
         // this prevents replay attacks where malicious nodes republish outdated records
@@ -389,20 +389,6 @@ where
                 record.publisher, expected_peer_id
             );
             return None;
-        }
-
-        // signature verification proves authenticity but not scheme correctness; drop a
-        // malformed advertised endpoint so only well-formed RPC info is ever cached in
-        // `known_peers`. the rest of the (signed, authentic) record is still usable.
-        if let Some(rpc) = &node_record.info.rpc {
-            if let Err(err) = rpc.validate() {
-                warn!(
-                    target: "network-kad",
-                    ?err,
-                    "dropping malformed advertised RPC endpoint from peer record"
-                );
-                node_record.info.rpc = None;
-            }
         }
 
         Some((pubkey, node_record))

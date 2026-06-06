@@ -645,7 +645,21 @@ impl PeerManager {
 
     /// Add a known peer to the known list.
     /// Used for bootstrap servers or possibly committee members.
-    pub(crate) fn add_known_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
+    pub(crate) fn add_known_peer(&mut self, bls_key: BlsPublicKey, mut info: NetworkInfo) {
+        // signature verification proves authenticity but not scheme correctness; drop a
+        // malformed advertised endpoint so only well-formed RPC info is ever cached in
+        // `known_peers`. the rest of the (signed, authentic) record is still usable.
+        if let Some(rpc) = &info.rpc {
+            if let Err(err) = rpc.validate() {
+                warn!(
+                    target: "peer-manager",
+                    ?err,
+                    ?bls_key,
+                    "dropping malformed advertised RPC endpoint from peer record"
+                );
+                info.rpc = None;
+            }
+        }
         trace!(target: "peer-manager", ?bls_key, "adding known peer");
         self.peers.upsert_peer(bls_key, info.pubkey.clone(), info.multiaddrs.clone());
         self.known_peers.insert(bls_key, info.clone());
