@@ -12,7 +12,9 @@ use libp2p::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use tn_types::{encode, now, BlsPublicKey, BlsSignature, NetworkPublicKey, P2pNode, TimestampSec};
+use tn_types::{
+    encode, now, try_decode, BlsPublicKey, BlsSignature, NetworkPublicKey, P2pNode, TimestampSec,
+};
 // Re-export the shared RPC endpoint type so callers can keep referring to
 // `network_libp2p::types::RpcInfo`. The canonical definition lives in `tn_types`.
 pub use tn_types::RpcInfo;
@@ -607,6 +609,41 @@ pub struct NodeRecord {
     pub signature: BlsSignature,
 }
 
+/// Pre-`rpc` [NetworkInfo] layout.
+///
+/// BCS is not self-describing, so records encoded and signed by pre-upgrade
+/// software fail to decode under the current schema. This mirror preserves the
+/// exact historical field order so legacy bytes can still be decoded (and their
+/// signatures verified over the legacy encoding).
+#[derive(Serialize, Deserialize)]
+struct LegacyNetworkInfo {
+    /// The node's [NetworkPublicKey].
+    pubkey: NetworkPublicKey,
+    /// Network address for node.
+    multiaddrs: Vec<Multiaddr>,
+    /// The timestamps when this was published.
+    timestamp: TimestampSec,
+}
+
+/// Pre-`rpc` [NodeRecord] layout. See [LegacyNetworkInfo].
+#[derive(Serialize, Deserialize)]
+struct LegacyNodeRecord {
+    /// The network information contained within the record.
+    info: LegacyNetworkInfo,
+    /// Signature of the info field with the node's BLS key.
+    signature: BlsSignature,
+}
+
+impl From<LegacyNodeRecord> for NodeRecord {
+    fn from(legacy: LegacyNodeRecord) -> Self {
+        let LegacyNodeRecord {
+            info: LegacyNetworkInfo { pubkey, multiaddrs, timestamp },
+            signature,
+        } = legacy;
+        Self { info: NetworkInfo { pubkey, multiaddrs, timestamp, rpc: None }, signature }
+    }
+}
+
 impl NodeRecord {
     /// Helper method to build a signed node record.
     pub fn build<F>(
@@ -637,6 +674,43 @@ impl NodeRecord {
     /// Return a reference to the record's [NetworkInfo].
     pub fn info(&self) -> &NetworkInfo {
         &self.info
+    }
+
+    /// Decode a [NodeRecord] from bytes, falling back to the pre-`rpc` legacy
+    /// layout (with `rpc: None`) for records produced by pre-upgrade software.
+    ///
+    /// The fallback order is deterministic: legacy bytes always fail the
+    /// current-layout decode (the first signature byte of a compressed BLS
+    /// signature is never a valid `Option` tag), and current bytes always fail
+    /// the legacy decode (trailing bytes).
+    ///
+    /// Does NOT verify the signature — use [Self::decode_and_verify] when
+    /// authenticity matters.
+    pub fn try_decode_compat(value: &[u8]) -> Option<NodeRecord> {
+        try_decode::<NodeRecord>(value)
+            .ok()
+            .or_else(|| try_decode::<LegacyNodeRecord>(value).ok().map(Into::into))
+    }
+
+    /// Decode a [NodeRecord] (with legacy fallback) and verify its BLS
+    /// signature against the layout it was actually signed over.
+    ///
+    /// Legacy records were signed over the legacy `info` encoding; re-encoding
+    /// under the current schema would insert the `rpc` Option tag and break
+    /// verification, so each layout verifies against its own re-encoding.
+    pub fn decode_and_verify(
+        value: &[u8],
+        key: &BlsPublicKey,
+    ) -> Option<(BlsPublicKey, NodeRecord)> {
+        if let Ok(record) = try_decode::<NodeRecord>(value) {
+            return record.verify(key);
+        }
+        let legacy = try_decode::<LegacyNodeRecord>(value).ok()?;
+        if legacy.signature.verify_raw(&encode(&legacy.info), key) {
+            Some((*key, legacy.into()))
+        } else {
+            None
+        }
     }
 }
 

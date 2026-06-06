@@ -1839,12 +1839,12 @@ async fn test_advertise_rpc_via_kad() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Documents the rollout contract: a pre-upgrade kad record (no `rpc` field)
-/// surviving in a peer's persistent kad store after restart is inert. The
-/// upgraded code rejects it via signature/decode and never promotes it into
-/// `known_peers`, so RPC lookups for the owner return `None`.
+/// Documents the rolling-upgrade contract: a pre-upgrade kad record (no `rpc`
+/// field) decodes through the legacy fallback, verifies against the legacy
+/// encoding it was signed over, and is promoted into `known_peers` with
+/// `rpc: None`. The honest not-yet-upgraded sender is not penalized.
 #[tokio::test]
-async fn test_pre_upgrade_record_does_not_corrupt_view() -> eyre::Result<()> {
+async fn test_pre_upgrade_record_accepted_with_default_rpc() -> eyre::Result<()> {
     use libp2p::kad;
     use serde::{Deserialize, Serialize};
     use tn_types::{BlsSignature, Multiaddr, NetworkPublicKey, TimestampSec};
@@ -1888,23 +1888,143 @@ async fn test_pre_upgrade_record_does_not_corrupt_view() -> eyre::Result<()> {
         expires: None,
     };
 
-    // peer_record_valid must reject pre-upgrade bytes (decode mismatch on
-    // `try_decode::<NodeRecord>`).
-    assert!(network.peer_record_valid(&kad_record).is_none());
+    // peer_record_valid accepts pre-upgrade bytes via the legacy decode
+    // fallback; the missing rpc field defaults to None.
+    let (key, node_record) =
+        network.peer_record_valid(&kad_record).expect("legacy record accepted");
+    assert_eq!(key, owner_bls);
+    assert!(node_record.info.rpc.is_none());
+    assert_eq!(node_record.info.multiaddrs, vec![peer2.config.primary_address()]);
 
-    // inject directly into the local kad store, simulating a record that
-    // survived a node restart from before the upgrade.
-    network.swarm.behaviour_mut().kademlia.store_mut().put(kad_record.clone())?;
+    // an inbound put request stores the record and promotes it into `known_peers`
+    network.process_kad_put_request(owner_peer_id, kad_record.clone())?;
+    assert!(network.swarm.behaviour_mut().kademlia.store_mut().get(&kad_record.key).is_some());
 
-    // simulate processing an inbound put request carrying the old record —
-    // must not panic and must not promote it into `known_peers`.
-    network.process_kad_put_request(owner_peer_id, kad_record)?;
+    let (peer_id, multiaddrs) = network
+        .swarm
+        .behaviour()
+        .peer_manager
+        .auth_to_peer(owner_bls)
+        .expect("legacy record promoted into known_peers");
+    assert_eq!(peer_id, owner_peer_id);
+    assert_eq!(multiaddrs, vec![peer2.config.primary_address()]);
 
-    // the owner is not in known_peers so RPC lookups return None.
-    let rpc = network.swarm.behaviour().peer_manager.get_rpc(&owner_bls);
-    assert!(rpc.is_none(), "old-format record must not be promoted");
-    let all = network.swarm.behaviour().peer_manager.all_rpcs();
-    assert!(all.is_empty(), "old-format record must not appear in all_rpcs");
+    // no rpc was advertised so lookups return None
+    assert!(network.swarm.behaviour().peer_manager.get_rpc(&owner_bls).is_none());
+    assert!(network.swarm.behaviour().peer_manager.all_rpcs().is_empty());
+
+    // honest pre-upgrade sender is not penalized
+    assert!(!network.swarm.behaviour().peer_manager.peer_banned(&owner_peer_id));
+
+    Ok(())
+}
+
+/// Startup over a kad store holding a pre-upgrade record and a corrupt record:
+/// the node constructs cleanly (no panicking decode), the legacy peer is
+/// promoted into `known_peers` with `rpc: None`, and the corrupt record is
+/// purged from the persistent store. The legacy record's original signed bytes
+/// are preserved.
+#[tokio::test]
+async fn test_startup_tolerates_legacy_and_corrupt_kad_records() -> eyre::Result<()> {
+    use libp2p::kad;
+    use serde::{Deserialize, Serialize};
+    use tn_types::{BlsKeypair, BlsSignature, Multiaddr, NetworkPublicKey, TimestampSec};
+
+    /// Pre-upgrade NetworkInfo shape (no `rpc` field).
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    struct OldNetworkInfo {
+        pubkey: NetworkPublicKey,
+        multiaddrs: Vec<Multiaddr>,
+        timestamp: TimestampSec,
+    }
+
+    /// Pre-upgrade NodeRecord shape.
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    struct OldNodeRecord {
+        info: OldNetworkInfo,
+        signature: BlsSignature,
+    }
+
+    let all_nodes = CommitteeFixture::builder(MemDatabase::default)
+        .with_network_config(NetworkConfig::default())
+        .build();
+    let mut authorities = all_nodes.authorities();
+    let authority_1 = authorities.next().expect("first authority");
+    let authority_2 = authorities.next().expect("second authority");
+    let config_1 = authority_1.consensus_config();
+    let config_2 = authority_2.consensus_config();
+    let task_manager = TaskManager::default();
+
+    let owner_bls = config_2.key_config().primary_public_key();
+    let garbage_bls = *BlsKeypair::generate(&mut rand::rng()).public();
+    let db = MemDatabase::default();
+
+    // seed the DB before the network starts, simulating records that survived
+    // a node restart from before the upgrade
+    {
+        let mut kad_store = KadStore::new(db.clone(), config_1.key_config(), KadStoreType::Primary);
+
+        // valid pre-upgrade record signed by authority 2 over the legacy encoding
+        let old_info = OldNetworkInfo {
+            pubkey: config_2.key_config().primary_network_public_key(),
+            multiaddrs: vec![config_2.primary_address()],
+            timestamp: now(),
+        };
+        let signature = config_2.key_config().request_signature_direct(&encode(&old_info));
+        let old_record = OldNodeRecord { info: old_info, signature };
+        kad_store.put(kad::Record {
+            key: kad::RecordKey::new(&owner_bls),
+            value: encode(&old_record),
+            publisher: None,
+            expires: None,
+        })?;
+
+        // garbage bytes under a valid BLS key — fails both decode layouts
+        kad_store.put(kad::Record {
+            key: kad::RecordKey::new(&garbage_bls),
+            value: vec![0xde, 0xad, 0xbe, 0xef],
+            publisher: None,
+            expires: None,
+        })?;
+    }
+
+    // construct the network over the seeded DB — this is the startup path that
+    // panicked on pre-upgrade bytes before the compat decode
+    let (tx, _network_events) = mpsc::channel(10);
+    let network_key = config_1.key_config().primary_network_keypair().clone();
+    let network = ConsensusNetwork::<
+        TestWorkerRequest,
+        TestWorkerResponse,
+        MemDatabase,
+        mpsc::Sender<NetworkEvent<TestWorkerRequest, TestWorkerResponse>>,
+    >::new(
+        config_1.network_config(),
+        tx,
+        config_1.key_config().clone(),
+        network_key,
+        db.clone(),
+        task_manager.get_spawner(),
+        KadStoreType::Primary,
+        config_1.primary_address(),
+        None,
+    )
+    .expect("network constructs over a store holding legacy + corrupt records");
+
+    // the legacy peer was promoted with multiaddrs intact and rpc defaulted
+    let (_, multiaddrs) = network
+        .swarm
+        .behaviour()
+        .peer_manager
+        .auth_to_peer(owner_bls)
+        .expect("legacy peer in known_peers");
+    assert_eq!(multiaddrs, vec![config_2.primary_address()]);
+    assert!(network.swarm.behaviour().peer_manager.get_rpc(&owner_bls).is_none());
+
+    // the corrupt record was purged from the persistent store; the legacy
+    // record's original signed bytes were preserved
+    let store = KadStore::new(db, config_1.key_config(), KadStoreType::Primary);
+    assert!(store.get(&kad::RecordKey::new(&garbage_bls)).is_none(), "corrupt record purged");
+    assert!(store.get(&kad::RecordKey::new(&owner_bls)).is_some(), "legacy record preserved");
 
     Ok(())
 }

@@ -35,8 +35,8 @@ use std::{
 };
 use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig};
 use tn_types::{
-    decode, encode, now, try_decode, BlsPublicKey, BlsSigner, Database, NetworkKeypair,
-    NetworkPublicKey, TaskSpawner, TnSender,
+    encode, now, BlsPublicKey, BlsSigner, Database, NetworkKeypair, NetworkPublicKey, TaskSpawner,
+    TnSender,
 };
 use tokio::sync::{
     mpsc::{Receiver, Sender},
@@ -270,25 +270,43 @@ where
             .set_publication_interval(twelve_hours)
             .set_query_timeout(Duration::from_secs(60))
             .set_provider_record_ttl(two_days);
-        let kad_store = KadStore::new(db.clone(), &key_config, kad_type);
+        let mut kad_store = KadStore::new(db.clone(), &key_config, kad_type);
+
+        // Load the Kad records from DB for the local peer cache, decoding with a legacy
+        // fallback so records persisted by pre-upgrade software still load. Collect
+        // corrupt entries (undecodable values or broken keys) for removal.
+        let mut known = Vec::new();
+        let mut corrupt = Vec::new();
+        for record in kad_store.records() {
+            match BlsPublicKey::from_literal_bytes(record.key.as_ref()) {
+                Ok(key) => match NodeRecord::try_decode_compat(record.value.as_ref()) {
+                    Some(node_record) => known.push((key, node_record.info)),
+                    None => corrupt.push(record.key.clone()),
+                },
+                // How did we get a KAD record with a broken key?
+                Err(error) => {
+                    error!(target: "network-kad", ?error, "Invalid/corrupt KAD DB store!");
+                    corrupt.push(record.key.clone());
+                }
+            }
+        }
+
+        // Purge corrupt records before the store is cloned into the kademlia behaviour
+        // so its record accounting stays accurate.
+        for key in corrupt {
+            warn!(target: "network-kad", ?key, "removing undecodable record from kad store");
+            kad_store.remove(&key);
+        }
+
         let kademlia = kad::Behaviour::with_config(peer_id, kad_store.clone(), kad_config);
 
         // create custom behavior
         let mut behavior =
             TNBehavior::new(gossipsub, req_res, kademlia, network_config.peer_config());
 
-        // Load the Kad records from DB into the local peer cache.
-        for record in kad_store.records() {
-            match BlsPublicKey::from_literal_bytes(record.key.as_ref()) {
-                Ok(key) => {
-                    let record: NodeRecord = decode(&record.value);
-                    behavior.peer_manager.add_known_peer(key, record.info);
-                }
-                // How did we get a KAD record with a broken key?
-                Err(error) => {
-                    error!(target: "network-kad", ?error, "Invalid/corrupt KAD DB store!");
-                }
-            }
+        // Promote the surviving records into the local peer cache.
+        for (key, info) in known {
+            behavior.peer_manager.add_known_peer(key, info);
         }
 
         let network_pubkey = keypair.public().into();
@@ -374,10 +392,9 @@ where
     /// matches the network key.
     fn peer_record_valid(&self, record: &kad::Record) -> Option<(BlsPublicKey, NodeRecord)> {
         let key = BlsPublicKey::from_literal_bytes(record.key.as_ref()).ok()?;
-        let node_record = try_decode::<NodeRecord>(record.value.as_ref()).ok()?;
 
-        // verify bls signature
-        let (pubkey, node_record) = node_record.verify(&key)?;
+        // decode (with legacy fallback for pre-upgrade peers) and verify bls signature
+        let (pubkey, node_record) = NodeRecord::decode_and_verify(record.value.as_ref(), &key)?;
 
         // verify publisher matches the network public key in the record
         // this prevents replay attacks where malicious nodes republish outdated records
@@ -1383,10 +1400,10 @@ where
 
         if let Some(existing) = store.get(&record.key) {
             match (
-                try_decode::<NodeRecord>(&existing.value),
-                try_decode::<NodeRecord>(&record.value),
+                NodeRecord::try_decode_compat(&existing.value),
+                NodeRecord::try_decode_compat(&record.value),
             ) {
-                (Ok(existing_record), Ok(new_record)) => {
+                (Some(existing_record), Some(new_record)) => {
                     // return true if the new record is newer
                     existing_record.info.timestamp < new_record.info.timestamp
                 }
