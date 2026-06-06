@@ -64,7 +64,7 @@ struct ConsensusOutputInner {
 
 /// The output of Consensus, which includes all the blocks for each certificate in the sub dag
 /// It is sent to the the ExecutionState handle_consensus_transaction
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ConsensusOutput {
     inner: Arc<ConsensusOutputInner>,
     /// Boolean indicating if this is the last output for the epoch.
@@ -75,6 +75,11 @@ pub struct ConsensusOutput {
     consensus_header_hash_cache: B256,
 }
 
+// NOTE: only [Self::inner] is serialized. `close_epoch` is intentionally NOT part of the
+// serialized form: it is a transient, locally-derived flag (not part of the consensus header
+// digest) and is always recomputed from `committed_at() >= epoch_boundary`. Any consumer that
+// deserializes a [ConsensusOutput] MUST recompute it via `EpochManager::process_output` before
+// trusting [ConsensusOutput::close_epoch] — a deserialized output always reports `false`.
 impl Serialize for ConsensusOutput {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -233,7 +238,7 @@ impl ConsensusOutput {
         )
     }
 
-    /// Set the close epoch feild, this is the last consensus output for an epoch.
+    /// Set the close epoch field, this is the last consensus output for an epoch.
     pub fn set_epoch_close(&mut self) {
         self.close_epoch = true;
     }
