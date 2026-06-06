@@ -4,7 +4,6 @@
 use futures::future::join_all;
 use std::{
     collections::{BTreeSet, HashSet},
-    sync::Arc,
     time::Instant,
 };
 use tempfile::TempDir;
@@ -119,13 +118,13 @@ async fn test_consensus_store_read_latest_final_reputation_scores() {
     // AND we add some commits without any final scores
     for sequence_number in 0..10 {
         let cert = Certificate::default();
-        let sub_dag = Arc::new(CommittedSubDag::new(
+        let sub_dag = CommittedSubDag::new(
             vec![cert.clone()],
             cert,
             sequence_number,
             ReputationScores::new(&committee),
             None,
-        ));
+        );
 
         consensus_chain.write_subdag_for_test(sequence_number, sub_dag).await;
     }
@@ -147,8 +146,7 @@ async fn test_consensus_store_read_latest_final_reputation_scores() {
         }
 
         let cert = Certificate::default();
-        let sub_dag =
-            Arc::new(CommittedSubDag::new(vec![cert.clone()], cert, sequence_number, scores, None));
+        let sub_dag = CommittedSubDag::new(vec![cert.clone()], cert, sequence_number, scores, None);
 
         consensus_chain.write_subdag_for_test(sequence_number, sub_dag).await;
     }
@@ -159,7 +157,7 @@ async fn test_consensus_store_read_latest_final_reputation_scores() {
         .await
         .unwrap();
 
-    assert!(commit.reputation_score.final_of_schedule);
+    assert!(commit.reputation_scores().final_of_schedule);
 }
 
 #[tokio::test]

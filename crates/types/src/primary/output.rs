@@ -41,7 +41,7 @@ pub struct CertifiedBatch {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ConsensusOutputInner {
     /// The committed subdag that triggered this output.
-    sub_dag: Arc<CommittedSubDag>,
+    sub_dag: CommittedSubDag,
     /// Matches certificates in the `sub_dag` one-to-one.
     ///
     /// This field is not included in [Self] digest. To validate,
@@ -100,7 +100,7 @@ impl<'de> Deserialize<'de> for ConsensusOutput {
 impl ConsensusOutput {
     /// Create a
     pub fn new(
-        sub_dag: Arc<CommittedSubDag>,
+        sub_dag: CommittedSubDag,
         parent_hash: BlockHash,
         number: u64,
         close_epoch: bool,
@@ -119,15 +119,11 @@ impl ConsensusOutput {
             ConsensusHeader::digest_from_parts(inner.parent_hash, &inner.sub_dag, inner.number);
         ConsensusOutput { inner, close_epoch, consensus_header_hash_cache }
     }
-    pub fn new_with_subdag(
-        sub_dag: Arc<CommittedSubDag>,
-        parent_hash: BlockHash,
-        number: u64,
-    ) -> Self {
+    pub fn new_with_subdag(sub_dag: CommittedSubDag, parent_hash: BlockHash, number: u64) -> Self {
         Self::new(sub_dag, parent_hash, number, false, VecDeque::new(), Vec::new())
     }
     pub fn new_closed_with_subdag(
-        sub_dag: Arc<CommittedSubDag>,
+        sub_dag: CommittedSubDag,
         parent_hash: BlockHash,
         number: u64,
     ) -> Self {
@@ -255,7 +251,7 @@ impl ConsensusOutput {
     /// NOTE: this cannot fail - uses [BlsSignature::default] and is considered acceptable with
     /// permissioned validator set, but should never happen.
     pub fn keccak_leader_sigs(&self) -> B256 {
-        self.inner.sub_dag.randomness
+        self.inner.sub_dag.inner.randomness
     }
 
     /// The parent hash for this output.
@@ -286,17 +282,13 @@ impl Display for ConsensusOutput {
     }
 }
 
-/// Contains the committed output from Bullshark consensus.
-/// Note it stores Headers without certificates, all validation
-/// should be complete.  Future validation can be done by verifying
-/// the consensus chain against signed checkpoints (like epoch records).
 #[derive(PartialEq, Serialize, Deserialize, Debug)]
-pub struct CommittedSubDag {
+struct CommittedSubDagInner {
     /// The sequence of committed certificates.
     /// Note the last element MUST be the leader.
-    pub headers: Vec<Header>,
+    headers: Vec<Header>,
     /// The so far calculated reputation score for nodes
-    pub reputation_score: ReputationScores,
+    reputation_scores: ReputationScores,
     /// The timestamp that should identify this commit. This is guaranteed to be monotonically
     /// incremented. This is not necessarily the leader's timestamp. We compare the leader's
     /// timestamp with the previously committed sub dag timestamp and we always keep the max.
@@ -307,16 +299,46 @@ pub struct CommittedSubDag {
     randomness: B256,
 }
 
+/// Contains the committed output from Bullshark consensus.
+/// Note it stores Headers without certificates, all validation
+/// should be complete.  Future validation can be done by verifying
+/// the consensus chain against signed checkpoints (like epoch records).
+#[derive(Clone, PartialEq, Debug)]
+pub struct CommittedSubDag {
+    inner: Arc<CommittedSubDagInner>,
+}
+
+impl Serialize for CommittedSubDag {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let ok = self.inner.serialize(serializer)?;
+        Ok(ok)
+    }
+}
+
+impl<'de> Deserialize<'de> for CommittedSubDag {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let inner = CommittedSubDagInner::deserialize(deserializer)?;
+        Ok(Self { inner: Arc::new(inner) })
+    }
+}
+
 impl Default for CommittedSubDag {
     fn default() -> Self {
         // Override default so we have one default header (the leader)
         // so a default value won't panic when used.
-        Self {
+        let inner = Arc::new(CommittedSubDagInner {
             headers: vec![Header::default()],
-            reputation_score: Default::default(),
+            reputation_scores: Default::default(),
             commit_timestamp: Default::default(),
             randomness: Default::default(),
-        }
+        });
+        Self { inner }
     }
 }
 
@@ -327,12 +349,13 @@ impl CommittedSubDag {
         certificates: Vec<Certificate>,
         leader: Certificate,
         sub_dag_index: SequenceNumber,
-        reputation_score: ReputationScores,
-        previous_sub_dag: Option<Arc<CommittedSubDag>>,
+        reputation_scores: ReputationScores,
+        previous_sub_dag: Option<CommittedSubDag>,
     ) -> Self {
         // Narwhal enforces some invariants on the header.created_at, so we can use it as a
         // timestamp.
-        let previous_sub_dag_ts = previous_sub_dag.map(|s| s.commit_timestamp).unwrap_or_default();
+        let previous_sub_dag_ts =
+            previous_sub_dag.map(|s| s.inner.commit_timestamp).unwrap_or_default();
         let commit_timestamp = previous_sub_dag_ts.max(*leader.header().created_at());
 
         if previous_sub_dag_ts > *leader.header().created_at() {
@@ -348,12 +371,31 @@ impl CommittedSubDag {
             });
         let randomness = keccak256(randomness.to_bytes());
         let headers = certificates.into_iter().map(|c| c.into_header()).collect();
-        Self { headers, reputation_score, commit_timestamp, randomness }
+        let inner = Arc::new(CommittedSubDagInner {
+            headers,
+            reputation_scores,
+            commit_timestamp,
+            randomness,
+        });
+        Self { inner }
+    }
+
+    /// Make a default with just headers for testing.
+    pub fn new_with_headers_for_test(headers: Vec<Header>) -> Self {
+        // Override default so we have one default header (the leader)
+        // so a default value won't panic when used.
+        let inner = Arc::new(CommittedSubDagInner {
+            headers,
+            reputation_scores: Default::default(),
+            commit_timestamp: Default::default(),
+            randomness: Default::default(),
+        });
+        Self { inner }
     }
 
     /// How many consensus headers are in this sub dag (including the leader).
     pub fn len(&self) -> usize {
-        self.headers.len()
+        self.inner.headers.len()
     }
 
     /// Is this empty (i.e. contains no headers).
@@ -363,12 +405,12 @@ impl CommittedSubDag {
 
     /// Number of batches contained in the sub dag.
     pub fn num_primary_batches(&self) -> usize {
-        self.headers.iter().map(|x| x.payload().len()).sum()
+        self.inner.headers.iter().map(|x| x.payload().len()).sum()
     }
 
     /// The leader header responsible for committing this sub-dag.
     pub fn leader(&self) -> &Header {
-        self.headers.last().expect("sub dag MUST have a leader")
+        self.inner.headers.last().expect("sub dag MUST have a leader")
     }
 
     /// The Certificate's round.
@@ -386,15 +428,19 @@ impl CommittedSubDag {
         // If commit_timestamp is zero, then safely assume that this is an upgraded node that is
         // replaying this commit and field is never initialised. It's safe to fallback on leader's
         // timestamp.
-        if self.commit_timestamp == 0 {
+        if self.inner.commit_timestamp == 0 {
             return *self.leader().created_at();
         }
-        self.commit_timestamp
+        self.inner.commit_timestamp
     }
 
     /// Return the Certificates for this SubDag.
     pub fn headers(&self) -> &[Header] {
-        &self.headers
+        &self.inner.headers
+    }
+
+    pub fn reputation_scores(&self) -> &ReputationScores {
+        &self.inner.reputation_scores
     }
 }
 
@@ -405,12 +451,12 @@ impl Hash<{ crypto::DIGEST_LENGTH }> for CommittedSubDag {
         let mut hasher = crypto::DefaultHashFunction::new();
         // Instead of hashing serialized CommittedSubDag, hash the certificate digests instead.
         // Signatures in the certificates are not part of the commitment.
-        for cert in &self.headers {
+        for cert in &self.inner.headers {
             hasher.update(cert.digest().as_ref());
         }
-        hasher.update(encode(&self.reputation_score).as_ref());
-        hasher.update(encode(&self.commit_timestamp).as_ref());
-        hasher.update(self.randomness.as_ref());
+        hasher.update(encode(&self.inner.reputation_scores).as_ref());
+        hasher.update(encode(&self.inner.commit_timestamp).as_ref());
+        hasher.update(self.inner.randomness.as_ref());
         ConsensusDigest(Digest { digest: hasher.finalize().into() })
     }
 }

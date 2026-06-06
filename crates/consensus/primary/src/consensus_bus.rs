@@ -644,7 +644,7 @@ struct ConsensusBusEpochInner {
     committed_own_headers: QueChannel<(Round, Vec<Round>)>,
 
     /// Outputs the sequence of ordered certificates to the application layer.
-    sequence: QueChannel<Arc<CommittedSubDag>>,
+    sequence: QueChannel<CommittedSubDag>,
 
     /// Messages to the Certificate Manager.
     certificate_manager: QueChannel<CertificateManagerCommand>,
@@ -769,7 +769,7 @@ impl ConsensusBus {
 
     /// Outputs the sequence of ordered certificates from consensus.
     /// Can only be subscribed to once.
-    pub fn sequence(&self) -> &impl TnSender<Arc<CommittedSubDag>> {
+    pub fn sequence(&self) -> &impl TnSender<CommittedSubDag> {
         &self.inner_epoch.sequence
     }
 
@@ -844,7 +844,7 @@ impl ConsensusBus {
     }
 
     /// Subscribe to sequence of ordered certificates to the application layer.
-    pub fn subscribe_sequence(&self) -> impl TnReceiver<Arc<CommittedSubDag>> {
+    pub fn subscribe_sequence(&self) -> impl TnReceiver<CommittedSubDag> {
         self.inner_epoch.sequence.subscribe()
     }
 

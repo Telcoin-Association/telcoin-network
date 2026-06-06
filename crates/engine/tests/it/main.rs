@@ -144,14 +144,13 @@ async fn test_empty_output_skips_execution() -> eyre::Result<()> {
     let previous_sub_dag = None;
     leader.update_header_author_for_test(leader_id);
 
-    let sub_dag: Arc<CommittedSubDag> = CommittedSubDag::new(
+    let sub_dag: CommittedSubDag = CommittedSubDag::new(
         vec![leader.clone()],
         leader,
         sub_dag_index,
         reputation_scores,
         previous_sub_dag,
-    )
-    .into();
+    );
     let consensus_output = ConsensusOutput::new_with_subdag(sub_dag, BlockHash::default(), 0);
 
     let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
@@ -250,13 +249,13 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
     let previous_sub_dag = None;
     leader.update_header_author_for_test(leader_id);
 
-    let subdag = Arc::new(CommittedSubDag::new(
+    let subdag = CommittedSubDag::new(
         vec![leader.clone()],
         leader,
         sub_dag_index,
         reputation_scores,
         previous_sub_dag,
-    ));
+    );
     let consensus_output =
         ConsensusOutput::new(subdag, BlockHash::default(), 0, true, VecDeque::new(), vec![]);
     let consensus_output_hash = consensus_output.consensus_header_hash();
@@ -425,13 +424,13 @@ async fn test_empty_output_increments_leader_count() -> eyre::Result<()> {
     let previous_sub_dag = None;
     leader.update_header_author_for_test(leader_id);
 
-    let subdag = Arc::new(CommittedSubDag::new(
+    let subdag = CommittedSubDag::new(
         vec![leader.clone()],
         leader,
         sub_dag_index,
         reputation_scores,
         previous_sub_dag,
-    ));
+    );
     let consensus_output =
         ConsensusOutput::new(subdag, BlockHash::default(), 0, false, VecDeque::new(), vec![]);
 
@@ -708,13 +707,13 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
     let mut batch_digests_1: VecDeque<BlockHash> = batches_1.iter().map(|b| b.digest()).collect();
-    let subdag_1 = Arc::new(CommittedSubDag::new(
+    let subdag_1 = CommittedSubDag::new(
         vec![Certificate::default(), leader_1.clone()],
         leader_1,
         sub_dag_index_1,
         reputation_scores,
         previous_sub_dag,
-    ));
+    );
     let consensus_output_1 = ConsensusOutput::new(
         subdag_1.clone(),
         BlockHash::default(),
@@ -1219,13 +1218,13 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     let mut batch_digests_1: VecDeque<BlockHash> = batches_1.iter().map(|b| b.digest()).collect();
     let mut cert_1 = Certificate::default();
     cert_1.update_header_round_for_test(1);
-    let subdag_1 = Arc::new(CommittedSubDag::new(
+    let subdag_1 = CommittedSubDag::new(
         vec![leader_1.clone()],
         leader_1,
         sub_dag_index_1,
         reputation_scores,
         previous_sub_dag,
-    ));
+    );
     let consensus_output_1 = ConsensusOutput::new(
         subdag_1.clone(),
         BlockHash::default(),
@@ -1247,14 +1246,13 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     let batch_digests_2: VecDeque<BlockHash> = batches_2.iter().map(|b| b.digest()).collect();
     let mut cert_2 = Certificate::default();
     cert_2.update_header_round_for_test(2);
-    let subdag_2: Arc<CommittedSubDag> = CommittedSubDag::new(
+    let subdag_2 = CommittedSubDag::new(
         vec![leader_2.clone()],
         leader_2,
         sub_dag_index_2,
         reputation_scores,
         previous_sub_dag,
-    )
-    .into();
+    );
     let consensus_output_2 = ConsensusOutput::new(
         subdag_2.clone(),
         consensus_output_1.consensus_header_hash(),
@@ -1600,13 +1598,13 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
     let batch_digests_1: VecDeque<BlockHash> = batches_1.iter().map(|b| b.digest()).collect();
-    let subdag_1 = Arc::new(CommittedSubDag::new(
+    let subdag_1 = CommittedSubDag::new(
         vec![leader_1.clone()],
         leader_1,
         sub_dag_index_1,
         reputation_scores,
         previous_sub_dag,
-    ));
+    );
     let consensus_output_1 = ConsensusOutput::new(
         subdag_1.clone(),
         BlockHash::default(),
@@ -1625,14 +1623,13 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = Some(subdag_1.clone());
     let batch_digests_2: VecDeque<BlockHash> = batches_2.iter().map(|b| b.digest()).collect();
-    let subdag_2: Arc<CommittedSubDag> = CommittedSubDag::new(
+    let subdag_2 = CommittedSubDag::new(
         vec![Certificate::default(), leader_2.clone()],
         leader_2,
         sub_dag_index_2,
         reputation_scores,
         previous_sub_dag,
-    )
-    .into();
+    );
     let consensus_output_2 = ConsensusOutput::new(
         subdag_2,
         consensus_output_1.consensus_header_hash(),
@@ -1836,13 +1833,13 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
     let previous_sub_dag = None;
     let batch_digest = batch.digest();
     let batch_digests = VecDeque::from([batch_digest]);
-    let subdag = Arc::new(CommittedSubDag::new(
+    let subdag = CommittedSubDag::new(
         vec![Certificate::default(), leader.clone()],
         leader,
         sub_dag_index,
         reputation_scores,
         previous_sub_dag,
-    ));
+    );
     let consensus_output = ConsensusOutput::new(
         subdag.clone(),
         BlockHash::default(),
@@ -2141,13 +2138,13 @@ async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
     let previous_sub_dag = None;
     let batch_digest = batch.digest();
     let batch_digests = VecDeque::from([batch_digest]);
-    let subdag = Arc::new(CommittedSubDag::new(
+    let subdag = CommittedSubDag::new(
         vec![Certificate::default(), leader.clone()],
         leader,
         sub_dag_index,
         reputation_scores,
         previous_sub_dag,
-    ));
+    );
     let consensus_output = ConsensusOutput::new(
         subdag.clone(),
         BlockHash::default(),

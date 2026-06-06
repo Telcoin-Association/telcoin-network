@@ -6,10 +6,7 @@
 
 #![allow(unused_crate_dependencies)]
 
-use std::{
-    collections::{BTreeSet, VecDeque},
-    sync::Arc,
-};
+use std::collections::{BTreeSet, VecDeque};
 use tempfile::TempDir;
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
 use tn_test_utils_committee::CommitteeFixture;
@@ -33,8 +30,7 @@ async fn test_sync_save_consensus() {
 
     // Create a CommittedSubDag
     let reputation = ReputationScores::new(&committee);
-    let sub_dag =
-        Arc::new(CommittedSubDag::new(certificates.clone(), leader.clone(), 0, reputation, None));
+    let sub_dag = CommittedSubDag::new(certificates.clone(), leader.clone(), 0, reputation, None);
 
     // Create ConsensusOutput using struct initialization
     let output = ConsensusOutput::new(sub_dag, B256::ZERO, 1, false, VecDeque::new(), vec![]);
@@ -49,7 +45,7 @@ async fn test_sync_save_consensus() {
     let saved_header = saved.unwrap();
     assert_eq!(saved_header.number, 1, "Consensus number should be 1");
     assert_eq!(
-        saved_header.sub_dag.headers.len(),
+        saved_header.sub_dag.headers().len(),
         certificates.len(),
         "Should have same number of certificates"
     );
@@ -76,8 +72,7 @@ async fn test_sync_parent_hash_chain() {
     for i in 1..=3u64 {
         let leader = certificates.last().cloned().unwrap();
         let reputation = ReputationScores::new(&committee);
-        let sub_dag =
-            Arc::new(CommittedSubDag::new(certificates.clone(), leader, i - 1, reputation, None));
+        let sub_dag = CommittedSubDag::new(certificates.clone(), leader, i - 1, reputation, None);
 
         let output =
             ConsensusOutput::new(sub_dag.clone(), parent_hash, i, false, VecDeque::new(), vec![]);
@@ -124,7 +119,7 @@ async fn test_sync_lookup_by_hash() {
     let leader = certificates.last().cloned().unwrap();
 
     let reputation = ReputationScores::new(&committee);
-    let sub_dag = Arc::new(CommittedSubDag::new(certificates, leader, 0, reputation, None));
+    let sub_dag = CommittedSubDag::new(certificates, leader, 0, reputation, None);
 
     let output =
         ConsensusOutput::new(sub_dag.clone(), B256::ZERO, 1, false, VecDeque::new(), vec![]);
@@ -216,7 +211,7 @@ async fn test_digest_mismatch_detection() {
     let leader = certificates.last().cloned().unwrap();
 
     let reputation = ReputationScores::new(&committee);
-    let sub_dag = Arc::new(CommittedSubDag::new(certificates, leader, 0, reputation, None));
+    let sub_dag = CommittedSubDag::new(certificates, leader, 0, reputation, None);
 
     // Save block 1 with correct parent (ZERO)
     let output1 = ConsensusOutput::new(sub_dag, B256::ZERO, 1, false, VecDeque::new(), vec![]);

@@ -272,7 +272,7 @@ impl<DB: Database> Subscriber<DB> {
     async fn run(
         self,
         rx_shutdown: Noticer,
-        mut rx_sequence: impl TnReceiver<Arc<CommittedSubDag>>,
+        mut rx_sequence: impl TnReceiver<CommittedSubDag>,
         mut consensus_chain: ConsensusChain,
     ) -> SubscriberResult<()> {
         // It's important to have the futures in ordered fashion as we want
@@ -405,7 +405,7 @@ impl<DB: Database> Subscriber<DB> {
     #[instrument(level = "debug", skip_all, fields(number))]
     async fn fetch_batches(
         &self,
-        sub_dag: Arc<CommittedSubDag>,
+        sub_dag: CommittedSubDag,
         parent_hash: B256,
         number: u64,
     ) -> SubscriberResult<ConsensusOutput> {

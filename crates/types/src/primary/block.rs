@@ -9,7 +9,6 @@
 use super::{CommittedSubDag, ConsensusOutput};
 use crate::{crypto, BlockHash, Certificate, Hash, B256};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
 /// Header for the consensus chain.
 ///
@@ -21,7 +20,7 @@ pub struct ConsensusHeader {
     pub parent_hash: B256,
 
     /// This is the committed sub dag used to extend the execution chain.
-    pub sub_dag: Arc<CommittedSubDag>,
+    pub sub_dag: CommittedSubDag,
 
     /// A scalar value equal to the number of ancestor blocks. The genesis block has a number of
     /// zero.
@@ -59,13 +58,13 @@ impl ConsensusHeader {
 impl Default for ConsensusHeader {
     fn default() -> Self {
         let cert = Certificate::default();
-        let sub_dag = Arc::new(CommittedSubDag::new(
+        let sub_dag = CommittedSubDag::new(
             vec![cert.clone()],
             cert,
             0,
             crate::ReputationScores::default(),
             None,
-        ));
+        );
         Self { parent_hash: B256::default(), sub_dag, number: 0, extra: B256::default() }
     }
 }

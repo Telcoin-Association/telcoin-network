@@ -4,7 +4,7 @@
 //! - Subdags persist across restarts
 //! - DAG can be reconstructed from storage
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::collections::BTreeSet;
 use tempfile::TempDir;
 use tn_storage::{
     consensus::ConsensusChain,
@@ -42,8 +42,7 @@ async fn test_subdag_persists_restart() {
         for idx in 0..5u64 {
             let leader = certificates.last().cloned().unwrap();
             let reputation = ReputationScores::new(&committee);
-            let subdag =
-                Arc::new(CommittedSubDag::new(certificates.clone(), leader, idx, reputation, None));
+            let subdag = CommittedSubDag::new(certificates.clone(), leader, idx, reputation, None);
 
             consensus_chain.write_subdag_for_test(idx, subdag).await;
         }
@@ -73,7 +72,11 @@ async fn test_subdag_persists_restart() {
             leader_digest,
             "Leader should persist across restart"
         );
-        assert_eq!(latest_subdag.headers.len(), certificates.len(), "Certificates should persist");
+        assert_eq!(
+            latest_subdag.headers().len(),
+            certificates.len(),
+            "Certificates should persist"
+        );
     }
 }
 
@@ -99,8 +102,7 @@ async fn test_subdag_persists_multiple_writes() {
     for idx in 0..3u64 {
         let leader = certs_epoch0.last().cloned().unwrap();
         let reputation = ReputationScores::new(&committee_epoch0);
-        let subdag =
-            Arc::new(CommittedSubDag::new(certs_epoch0.clone(), leader, idx, reputation, None));
+        let subdag = CommittedSubDag::new(certs_epoch0.clone(), leader, idx, reputation, None);
         consensus_chain.write_subdag_for_test(idx, subdag).await;
     }
     consensus_chain.persist_current().await.unwrap();
@@ -123,8 +125,7 @@ async fn test_subdag_persists_multiple_writes() {
     for idx in 3..6u64 {
         let leader = certs_epoch1.last().cloned().unwrap();
         let reputation = ReputationScores::new(&committee_epoch1);
-        let subdag =
-            Arc::new(CommittedSubDag::new(certs_epoch1.clone(), leader, idx, reputation, None));
+        let subdag = CommittedSubDag::new(certs_epoch1.clone(), leader, idx, reputation, None);
         consensus_chain.write_subdag_for_test(idx, subdag).await;
     }
     consensus_chain.persist_current().await.unwrap();
@@ -249,13 +250,8 @@ async fn test_last_committed_persists() {
     // Create subdags with different leaders to track last committed per authority
     for (idx, cert) in certificates.iter().enumerate() {
         let reputation = ReputationScores::new(&committee);
-        let subdag = Arc::new(CommittedSubDag::new(
-            vec![cert.clone()],
-            cert.clone(),
-            idx as u64,
-            reputation,
-            None,
-        ));
+        let subdag =
+            CommittedSubDag::new(vec![cert.clone()], cert.clone(), idx as u64, reputation, None);
         consensus_chain.write_subdag_for_test(idx as u64, subdag).await;
     }
     consensus_chain.persist_current().await.unwrap();
