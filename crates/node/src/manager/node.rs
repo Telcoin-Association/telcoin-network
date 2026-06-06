@@ -17,8 +17,8 @@ use tn_reth::{system_calls::EpochState, RethDb, RethEnv};
 use tn_storage::{consensus::ConsensusChain, open_db, DatabaseType};
 use tn_types::{
     deconstruct_nonce, gas_accumulator::GasAccumulator, BlockNumHash, ConsensusHeader,
-    ConsensusOutput, Database as TNDatabase, EngineUpdate, Notifier, RpcInfo, TaskManager,
-    TaskSpawner, TimestampSec, MIN_PROTOCOL_BASE_FEE,
+    ConsensusOutput, Database as TNDatabase, EngineUpdate, Notifier, TaskManager, TaskSpawner,
+    TimestampSec, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::mpsc;
@@ -347,7 +347,9 @@ where
         // configure RPC leave the descriptor `None`. fail fast on a misconfigured
         // endpoint rather than advertising something peers will reject.
         let worker_rpc = self.builder.tn_config.node_info.p2p_info.worker.rpc.clone();
-        worker_rpc.as_ref().map(RpcInfo::validate).transpose()?;
+        if let Some(rpc) = &worker_rpc {
+            rpc.validate()?;
+        }
 
         // create long-running network task for worker
         let worker_network = ConsensusNetwork::new_for_worker(
