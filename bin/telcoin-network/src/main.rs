@@ -131,7 +131,7 @@ fn main() {
             launcher
         });
 
-        launch_node(builder, tn_datadir, key_config, exex_launcher, version)
+        launch_node(builder, tn_datadir, key_config, version, exex_launcher)
     }) {
         eprintln!("Error: {err:?}");
         std::process::exit(1);

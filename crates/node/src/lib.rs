@@ -58,8 +58,8 @@ pub fn launch_node<P>(
     builder: TnBuilder,
     tn_datadir: P,
     key_config: KeyConfig,
-    exex_launcher: Option<tn_exex::TnExExLauncher>,
     version: &'static str,
+    exex_launcher: Option<tn_exex::TnExExLauncher>,
 ) -> JoinHandle<eyre::Result<()>>
 where
     P: TelcoinDirs + Clone + 'static,
