@@ -1404,27 +1404,30 @@ impl RethEnv {
         &self,
         epoch: u32,
     ) -> eyre::Result<Vec<ConsensusRegistry::ValidatorInfo>> {
-        // create EVM with latest state
-        let canonical_tip = self.canonical_tip();
-        debug!(target: "engine", ?canonical_tip, "retrieving validators for epoch {epoch}");
-        let state_provider =
-            self.inner.blockchain_provider.state_by_block_hash(canonical_tip.hash())?;
-        let state = StateProviderDatabase::new(&state_provider);
-        let mut db = State::builder().with_database(state).with_bundle_update().build();
-        debug!(target: "engine", state=?db.bundle_state, hashes=?db.block_hashes, "retrieving epoch state from canonical tip");
-        let mut tn_evm = self
-            .inner
-            .evm_config
-            .evm_factory()
-            .create_evm(&mut db, self.inner.evm_config.evm_env(&canonical_tip)?);
-
-        self.get_committee_validators_by_epoch(epoch, &mut tn_evm)
+        debug!(target: "engine", "retrieving validators for epoch {epoch}");
+        let calldata = ConsensusRegistry::getCommitteeValidatorsCall { epoch }.abi_encode().into();
+        self.read_consensus_registry(calldata)
     }
 
     /// Read the BLS pubkeys for the committee of the provided epoch from the [ConsensusRegistry]
     /// on-chain.
     pub fn bls_pubkeys_for_epoch(&self, epoch: u32) -> eyre::Result<Vec<alloy::primitives::Bytes>> {
+        let calldata = ConsensusRegistry::getCommitteeBlsPubkeysCall { epoch }.abi_encode().into();
+        self.read_consensus_registry(calldata)
+    }
+
+    /// Build an EVM at the canonical tip, execute a read-only [ConsensusRegistry] call, and
+    /// decode the returned data to `T`.
+    pub fn read_consensus_registry<T>(&self, calldata: Bytes) -> eyre::Result<T>
+    where
+        T: alloy::sol_types::SolValue,
+        T: From<
+            <<T as alloy::sol_types::SolValue>::SolType as alloy::sol_types::SolType>::RustType,
+        >,
+    {
+        // create EVM with latest state
         let canonical_tip = self.canonical_tip();
+        debug!(target: "engine", ?canonical_tip, "reading consensus registry at canonical tip");
         let state_provider =
             self.inner.blockchain_provider.state_by_block_hash(canonical_tip.hash())?;
         let state = StateProviderDatabase::new(&state_provider);
@@ -1435,7 +1438,7 @@ impl RethEnv {
             .evm_factory()
             .create_evm(&mut db, self.inner.evm_config.evm_env(&canonical_tip)?);
 
-        self.get_committee_bls_pubkeys_by_epoch(epoch, &mut tn_evm)
+        self.call_consensus_registry(&mut tn_evm, calldata)
     }
 
     /// Extract the epoch number from a header's nonce.

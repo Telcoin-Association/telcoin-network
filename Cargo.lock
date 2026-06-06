@@ -11752,6 +11752,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tn-reth",
  "tn-types",
+ "tokio",
 ]
 
 [[package]]

@@ -17,6 +17,9 @@ pub enum TNRpcError {
     /// Requested item not found.
     #[error("Not Found.")]
     NotFound,
+    /// On-chain ConsensusRegistry read failed (EVM revert, decode error, or task join failure).
+    #[error("ConsensusRegistry read failed: {0}")]
+    ContractCall(String),
 }
 
 impl From<TNRpcError> for jsonrpsee_types::ErrorObject<'static> {
@@ -24,6 +27,7 @@ impl From<TNRpcError> for jsonrpsee_types::ErrorObject<'static> {
         match error {
             TNRpcError::InvalidProofOfPossession => rpc_error(401, error.to_string(), None),
             TNRpcError::NotFound => rpc_error(401, error.to_string(), None),
+            TNRpcError::ContractCall(_) => rpc_error(-32000, error.to_string(), None),
         }
     }
 }

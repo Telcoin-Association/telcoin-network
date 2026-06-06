@@ -76,6 +76,9 @@ async fn test_epoch_boundary_inner(
         timeout(Duration::from_secs((EPOCH_DURATION * 2 + 11) as u64), pending.watch()).await??;
     }
 
+    // cross-check the `tn` namespace ConsensusRegistry endpoints against direct eth_call reads
+    assert_tn_registry_endpoints(&provider).await?;
+
     // retrieve current committee
     let consensus_registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &provider);
     let mut current_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
@@ -173,6 +176,48 @@ async fn test_epoch_boundary_inner(
         // return error if loop didn't return
         Err(eyre::eyre!("new validator not shuffled into committee!"))
     }
+}
+
+/// Cross-check the `tn` namespace ConsensusRegistry endpoints against direct `eth_call` reads.
+///
+/// Both read paths resolve state at the canonical tip, so results must match modulo an epoch
+/// rolling between requests (handled by retrying).
+async fn assert_tn_registry_endpoints<P: Provider>(provider: &P) -> eyre::Result<()> {
+    let consensus_registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, provider);
+
+    // the epoch can roll between reads, so retry until all reads land in the same epoch
+    let mut attempts = 0;
+    let epoch_info = loop {
+        let from_contract = consensus_registry.getCurrentEpochInfo().call().await?;
+        let from_tn: ConsensusRegistry::EpochInfo =
+            provider.raw_request("tn_getCurrentEpochInfo".into(), ()).await?;
+        let epoch_from_tn: u32 = provider.raw_request("tn_getCurrentEpoch".into(), ()).await?;
+        if from_tn == from_contract && epoch_from_tn == from_tn.epochId {
+            break from_tn;
+        }
+        attempts += 1;
+        assert!(
+            attempts < 3,
+            "tn registry endpoints never converged with eth_call reads: \
+             tn={from_tn:?} contract={from_contract:?} epoch={epoch_from_tn}"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
+
+    // all validators regardless of status
+    let validators: Vec<ConsensusRegistry::ValidatorInfo> =
+        provider.raw_request("tn_getValidators".into(), ("Any",)).await?;
+    assert!(!validators.is_empty(), "tn_getValidators(\"Any\") returned no validators");
+
+    // round-trip a known validator: committee members are guaranteed to be registered
+    let known_validator =
+        *epoch_info.committee.first().ok_or_else(|| eyre::eyre!("empty committee"))?;
+    let from_contract = consensus_registry.getValidator(known_validator).call().await?;
+    let from_tn: ConsensusRegistry::ValidatorInfo =
+        provider.raw_request("tn_getValidator".into(), (known_validator,)).await?;
+    assert_eq!(from_tn, from_contract, "tn_getValidator mismatch for {known_validator}");
+
+    Ok(())
 }
 
 async fn loop_epochs(start: u32, iterations: u32, rpc_url: &str) -> eyre::Result<u32> {
