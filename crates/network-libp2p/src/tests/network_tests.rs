@@ -1688,7 +1688,7 @@ async fn test_node_record_validation() {
     assert!(network.peer_record_valid(&peer_record).is_none());
 
     // assert publisher mismatch fails
-    peer_record.publisher = Some(peer2.network.swarm.local_peer_id().clone());
+    peer_record.publisher = Some(*peer2.network.swarm.local_peer_id());
     assert!(network.peer_record_valid(&peer_record).is_none());
 }
 
@@ -1914,6 +1914,59 @@ async fn test_pre_upgrade_record_accepted_with_default_rpc() -> eyre::Result<()>
     assert!(network.swarm.behaviour().peer_manager.all_rpcs().is_empty());
 
     // honest pre-upgrade sender is not penalized
+    assert!(!network.swarm.behaviour().peer_manager.peer_banned(&owner_peer_id));
+
+    Ok(())
+}
+
+/// A signed record advertising an RPC endpoint with a well-formed URL but the
+/// wrong scheme is accepted (the signature is authentic) and promoted with the
+/// malformed endpoint stripped, without penalizing the sender.
+#[tokio::test]
+async fn test_malformed_rpc_scheme_stripped_on_promotion() -> eyre::Result<()> {
+    use libp2p::kad;
+
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let owner_bls = peer2.config.key_config().primary_public_key();
+    let owner_peer_id = *peer2.network.swarm.local_peer_id();
+
+    // parseable url with a scheme RpcInfo::validate rejects
+    let rpc = RpcInfo { http: "ftp://validator.example.com:8545/".parse()?, ws: None };
+    let key_config = peer2.config.key_config();
+    let node_record = NodeRecord::build(
+        key_config.primary_network_public_key(),
+        peer2.config.primary_address(),
+        Some(rpc),
+        |data| key_config.request_signature_direct(data),
+    );
+
+    let kad_record = kad::Record {
+        key: kad::RecordKey::new(&owner_bls),
+        value: encode(&node_record),
+        publisher: Some(owner_peer_id),
+        expires: None,
+    };
+
+    network.process_kad_put_request(owner_peer_id, kad_record.clone())?;
+
+    // the record was stored — the signature is authentic
+    assert!(network.swarm.behaviour_mut().kademlia.store_mut().get(&kad_record.key).is_some());
+
+    // promoted into known_peers with multiaddrs intact but the rpc stripped
+    let (peer_id, multiaddrs) = network
+        .swarm
+        .behaviour()
+        .peer_manager
+        .auth_to_peer(owner_bls)
+        .expect("record promoted into known_peers");
+    assert_eq!(peer_id, owner_peer_id);
+    assert_eq!(multiaddrs, vec![peer2.config.primary_address()]);
+    assert!(network.swarm.behaviour().peer_manager.get_rpc(&owner_bls).is_none());
+    assert!(network.swarm.behaviour().peer_manager.all_rpcs().is_empty());
+
+    // the sender was not penalized
     assert!(!network.swarm.behaviour().peer_manager.peer_banned(&owner_peer_id));
 
     Ok(())
