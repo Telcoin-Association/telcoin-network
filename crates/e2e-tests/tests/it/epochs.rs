@@ -209,6 +209,31 @@ async fn assert_tn_registry_endpoints<P: Provider>(provider: &P) -> eyre::Result
         provider.raw_request("tn_getValidators".into(), ("Any",)).await?;
     assert!(!validators.is_empty(), "tn_getValidators(\"Any\") returned no validators");
 
+    // `Undefined` (0) reverts on-chain: expect an eth_call-style error (code 3 with revert
+    // bytes in `data`) rather than a leaked internal error string
+    let revert_err = provider
+        .raw_request::<_, Vec<ConsensusRegistry::ValidatorInfo>>(
+            "tn_getValidators".into(),
+            ("Undefined",),
+        )
+        .await
+        .expect_err("tn_getValidators(\"Undefined\") must revert");
+    let resp = revert_err.as_error_resp().expect("revert surfaces as a JSON-RPC error response");
+    assert_eq!(resp.code, 3, "on-chain revert must map to code 3: {resp:?}");
+    assert!(
+        resp.message.starts_with("execution reverted"),
+        "revert message must match eth_call style: {resp:?}"
+    );
+    assert!(resp.as_revert_data().is_some(), "revert bytes must be in error data: {resp:?}");
+
+    // a guaranteed-absent epoch record returns EIP-1474 resource-not-found
+    let not_found_err = provider
+        .raw_request::<_, (EpochRecord, EpochCertificate)>("tn_epochRecord".into(), (u32::MAX,))
+        .await
+        .expect_err("epoch record for u32::MAX must not exist");
+    let resp = not_found_err.as_error_resp().expect("not found surfaces as a JSON-RPC error");
+    assert_eq!(resp.code, -32001, "missing record must map to -32001: {resp:?}");
+
     // round-trip a known validator: committee members are guaranteed to be registered
     let known_validator =
         *epoch_info.committee.first().ok_or_else(|| eyre::eyre!("empty committee"))?;

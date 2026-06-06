@@ -11745,6 +11745,7 @@ dependencies = [
 name = "tn-rpc"
 version = "0.1.0"
 dependencies = [
+ "alloy",
  "async-trait",
  "jsonrpsee",
  "jsonrpsee-types",
@@ -11753,6 +11754,7 @@ dependencies = [
  "tn-reth",
  "tn-types",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -7,7 +7,7 @@ use crate::{
 use async_trait::async_trait;
 use jsonrpsee::proc_macros::rpc;
 use serde::{Deserialize, Serialize};
-use tn_reth::{system_calls::ConsensusRegistry, ChainSpec, RethEnv};
+use tn_reth::{error::RegistryReadError, system_calls::ConsensusRegistry, ChainSpec, RethEnv};
 use tn_types::{
     Address, BlockHash, Bytes, ConsensusHeader, Epoch, EpochCertificate, EpochRecord, Genesis,
     SolCall, SolType, SolValue, B256, U256,
@@ -359,6 +359,9 @@ impl<N: EngineToPrimary> TelcoinNetworkRpcExt<N> {
     ///
     /// EVM reads are synchronous database/CPU work, so they run on a blocking task to avoid
     /// stalling the async runtime on a public endpoint.
+    ///
+    /// On-chain reverts surface to the client eth_call-style (code 3 with revert bytes in
+    /// `data`); internal failures are logged server-side and return a generic error.
     async fn registry_read<T>(&self, calldata: Bytes) -> TelcoinNetworkRpcResult<T>
     where
         T: SolValue + Send + 'static,
@@ -367,7 +370,22 @@ impl<N: EngineToPrimary> TelcoinNetworkRpcExt<N> {
         let evm = self.evm_state.clone();
         tokio::task::spawn_blocking(move || evm.read_consensus_registry::<T>(calldata))
             .await
-            .map_err(|e| TNRpcError::ContractCall(format!("task join error: {e}")))?
-            .map_err(|e| TNRpcError::ContractCall(e.to_string()))
+            .map_err(|e| {
+                tracing::warn!(target: "tn::rpc", error = %e, "registry read task join error");
+                TNRpcError::Internal
+            })?
+            .map_err(|report| match report.downcast_ref::<RegistryReadError>() {
+                Some(RegistryReadError::Revert { output, .. }) => {
+                    TNRpcError::Revert { message: report.to_string(), output: output.clone() }
+                }
+                _ => {
+                    tracing::debug!(
+                        target: "tn::rpc",
+                        error = ?report,
+                        "consensus registry read failed"
+                    );
+                    TNRpcError::Internal
+                }
+            })
     }
 }

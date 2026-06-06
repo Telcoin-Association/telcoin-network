@@ -36,7 +36,7 @@ use alloy::{
 use alloy_evm::Evm;
 use clap::Parser;
 use dirs::path_to_datadir;
-use error::{TnRethError, TnRethResult};
+use error::{RegistryReadError, TnRethError, TnRethResult};
 use evm::TnEvmConfig;
 use eyre::OptionExt;
 use jsonrpsee::Methods;
@@ -1613,18 +1613,29 @@ impl RethEnv {
             <<T as alloy::sol_types::SolValue>::SolType as alloy::sol_types::SolType>::RustType,
         >,
     {
-        let state =
-            self.read_state_on_chain(evm, SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)?;
+        let state = self
+            .read_state_on_chain(evm, SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)
+            .map_err(|e| RegistryReadError::Internal(e.to_string()))?;
 
-        // retrieve data from state
+        // retrieve data from state, distinguishing user-triggerable reverts from node faults
         match state.result {
             ExecutionResult::Success { output, .. } => {
                 let data = output.into_data();
                 // use SolValue to decode the result
-                let decoded = alloy::sol_types::SolValue::abi_decode(&data)?;
-                Ok(decoded)
+                alloy::sol_types::SolValue::abi_decode(&data).map_err(|e| {
+                    RegistryReadError::Internal(format!("registry return decode failed: {e}"))
+                        .into()
+                })
             }
-            e => Err(eyre::eyre!("failed to read validators from state: {e:?}")),
+            ExecutionResult::Revert { output, .. } => Err(RegistryReadError::Revert {
+                reason: alloy::sol_types::decode_revert_reason(&output),
+                output,
+            }
+            .into()),
+            ExecutionResult::Halt { reason, gas_used } => Err(RegistryReadError::Internal(
+                format!("registry call halted: {reason:?} (gas {gas_used})"),
+            )
+            .into()),
         }
     }
 

@@ -173,7 +173,7 @@ sol!(
         function proofOfPossessionMessage(
             bytes memory blsPubkey,
             address validatorAddress
-        ) external pure returns (bytes memory);
+        ) external view returns (bytes memory);
         /// Mint an NFT for validator to stake.
         function mint(address validatorAddress) external override onlyOwner;
         /// Stake to the consensus registry.
