@@ -1224,9 +1224,15 @@ where
                     kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(
                         kad::PeerRecord { record, peer },
                     ))) => {
-                        if let Some((key, value)) = self.peer_record_valid(&record) {
-                            trace!(target: "network-kad", "Got record {key} {value:?}");
-                            self.process_kad_query_result(&query_id, record, peer, step.last);
+                        if let Some((key, node_record)) = self.peer_record_valid(&record) {
+                            trace!(target: "network-kad", "Got record {key} {node_record:?}");
+                            self.process_kad_query_result(
+                                &query_id,
+                                key,
+                                node_record,
+                                peer,
+                                step.last,
+                            );
                         } else {
                             trace!(target: "network-kad", "Received invalid peer record!");
 
@@ -1415,50 +1421,36 @@ where
         }
     }
 
-    /// Logic to process a kad record request.
+    /// Logic to process a kad record query result.
     ///
-    /// This method checks:
-    /// - the peer record is signed
+    /// The record arrives pre-validated — the caller already checked the signature
+    /// and publisher via [`Self::peer_record_valid`]. This method checks:
     /// - the returned key matches the request
     /// - the latest node record is used
     fn process_kad_query_result(
         &mut self,
         query_id: &QueryId,
-        record: kad::Record,
+        key: BlsPublicKey,
+        new_record: NodeRecord,
         peer: Option<PeerId>,
         is_last_step: bool,
     ) {
-        // ensure returned record is valid, otherwise assess penalty
-        if let Some((key, new_record)) = self.peer_record_valid(&record) {
-            trace!(target: "network-kad", "Got record {key} {new_record:?}");
-            // return if query id unknown - should not happen
-            let Some(query) = self.kad_record_queries.get_mut(query_id) else { return };
+        // return if query id unknown - should not happen
+        let Some(query) = self.kad_record_queries.get_mut(query_id) else { return };
 
-            // ensure returned value matches request
-            if query.request == key {
-                match &mut query.result {
-                    None => query.result = Some(new_record),
-                    Some(tracked) if tracked.info.timestamp < new_record.info.timestamp => {
-                        *tracked = new_record
-                    }
-                    Some(_) => {} // keep existing record
+        // ensure returned value matches request
+        if query.request == key {
+            match &mut query.result {
+                None => query.result = Some(new_record),
+                Some(tracked) if tracked.info.timestamp < new_record.info.timestamp => {
+                    *tracked = new_record
                 }
-            } else {
-                // assess penalty for returning record that doesn't match key
-                if let Some(peer_id) = peer {
-                    trace!(target: "network-kad", ?peer_id, "processing fatal penalty for query record key mismatch");
-                    self.swarm
-                        .behaviour_mut()
-                        .peer_manager
-                        .process_penalty(peer_id, Penalty::Fatal);
-                }
+                Some(_) => {} // keep existing record
             }
         } else {
-            // record signature invalid
-            warn!(target: "network-kad", "Received invalid peer record!");
-
-            // assess penalty for invalid peer record
+            // assess penalty for returning record that doesn't match key
             if let Some(peer_id) = peer {
+                trace!(target: "network-kad", ?peer_id, "processing fatal penalty for query record key mismatch");
                 self.swarm.behaviour_mut().peer_manager.process_penalty(peer_id, Penalty::Fatal);
             }
         }
