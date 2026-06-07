@@ -10,7 +10,7 @@ use std::{collections::HashMap, num::NonZeroUsize};
 use tn_network_libp2p::types::{NetworkCommand, NetworkHandle, NetworkResponseMessage};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils_committee::{AuthorityFixture, CommitteeFixture};
-use tn_types::{BlsKeypair, BlsSigner, Epoch, Round, SignatureVerificationState, TnSender};
+use tn_types::{BlsKeypair, BlsSigner, SignatureVerificationState, TnSender};
 use tokio::sync::mpsc;
 
 // ===== Certifier test harness =====
@@ -25,7 +25,6 @@ use tokio::sync::mpsc;
 /// Holds the committee fixture, a live `Certifier` task (spawned on the last
 /// authority), the consensus bus for sending headers and receiving certs, and
 /// the raw network receiver for simulating peer vote responses.
-#[allow(dead_code)]
 struct CertifierContext {
     /// All authorities + their configs.
     fixture: CommitteeFixture<MemDatabase>,
@@ -40,7 +39,6 @@ struct CertifierContext {
     network_rx: mpsc::Receiver<NetworkCommand<PrimaryRequest, PrimaryResponse>>,
 }
 
-#[allow(dead_code)]
 impl CertifierContext {
     /// 4-authority context; `Certifier` spawned on the last authority.
     fn new() -> Self {
@@ -89,14 +87,12 @@ impl CertifierContext {
     }
 
     /// Build a valid header from the proposer authority.
-    #[allow(dead_code)]
     fn proposer_header(&self) -> Header {
         let committee = self.fixture.committee();
         self.proposer().header(&committee)
     }
 
     /// Subscribe to new certificates produced by the running certifier.
-    #[allow(dead_code)]
     fn subscribe_new_certificates(&self) -> impl TnReceiver<Certificate> {
         self.consensus_bus.subscribe_new_certificates()
     }
@@ -105,40 +101,17 @@ impl CertifierContext {
 // ----- Vote response configuration -----
 
 /// How a mock peer should respond when the certifier requests its vote.
-#[allow(dead_code)]
 enum VoteResponseConfig {
     /// Return a valid, correctly-signed vote.
     ValidVote,
-    /// Return a vote with one field tampered (triggers a `DagError` in the certifier).
-    TamperedVote(TamperedVoteField),
-    /// Respond with `PrimaryResponse::MissingParents` for the given digests.
-    MissingParents(Vec<HeaderDigest>),
     /// Return a fatal `NetworkError::RPCError` — vote task exits immediately, no retry.
     ///
     /// To simulate a transient (retryable) error, use [`build_peer_response`] directly
     /// with e.g. `Err(NetworkError::Timeout)`.
     FatalNetworkError,
-    /// Return a transient error (`NetworkError::Timeout`) — certifier retries this peer.
-    TransientNetworkError,
-}
-
-/// Which single field inside the returned [`Vote`] should be replaced with a wrong value.
-#[allow(dead_code)]
-enum TamperedVoteField {
-    /// `vote.author` set to a different authority's id.
-    WrongAuthor(AuthorityIdentifier),
-    /// `vote.header_digest` set to a different digest.
-    WrongHeaderDigest(HeaderDigest),
-    /// `vote.origin` set to a different authority's id.
-    WrongOrigin(AuthorityIdentifier),
-    /// `vote.epoch` set to a wrong epoch number.
-    WrongEpoch(Epoch),
-    /// `vote.round` set to a wrong round number.
-    WrongRound(Round),
 }
 
 /// Build a single network response for `peer` according to `config`.
-#[allow(dead_code)]
 fn build_peer_response(
     peer: &AuthorityFixture<MemDatabase>,
     header: &Header,
@@ -153,22 +126,6 @@ fn build_peer_response(
         VoteResponseConfig::FatalNetworkError => {
             Err(NetworkError::RPCError("mock fatal peer error".to_string()))
         }
-        VoteResponseConfig::TransientNetworkError => Err(NetworkError::Timeout),
-        VoteResponseConfig::MissingParents(digests) => Ok(NetworkResponseMessage {
-            peer: peer_key,
-            result: PrimaryResponse::MissingParents(digests.clone()),
-        }),
-        VoteResponseConfig::TamperedVote(field) => {
-            let mut vote = Vote::new(header, peer.id(), peer.consensus_config().key_config());
-            match field {
-                TamperedVoteField::WrongAuthor(id) => vote.author = id.clone(),
-                TamperedVoteField::WrongHeaderDigest(d) => vote.header_digest = *d,
-                TamperedVoteField::WrongOrigin(id) => vote.origin = id.clone(),
-                TamperedVoteField::WrongEpoch(e) => vote.epoch = *e,
-                TamperedVoteField::WrongRound(r) => vote.round = *r,
-            }
-            Ok(NetworkResponseMessage { peer: peer_key, result: PrimaryResponse::Vote(vote) })
-        }
     }
 }
 
@@ -176,7 +133,6 @@ fn build_peer_response(
 ///
 /// For any peer not in `peer_configs`, [`VoteResponseConfig::ValidVote`] is used.
 /// Returns after `fixture.num_authorities() - 1` requests have been answered.
-#[allow(dead_code)]
 async fn drive_vote_requests(
     network_rx: &mut mpsc::Receiver<NetworkCommand<PrimaryRequest, PrimaryResponse>>,
     fixture: &CommitteeFixture<MemDatabase>,
@@ -251,7 +207,7 @@ async fn missing_parents_happy_path() {
         .id();
 
     // Use the first genesis cert digest as the "missing" parent the peer asks for.
-    let missing_digest = genesis_certs[0].header.digest();
+    let missing_digest = genesis_certs[0].header().digest();
     assert!(
         header.parents().contains(&missing_digest),
         "precondition: genesis digest is in header parents"
@@ -981,7 +937,6 @@ async fn duplicate_vote_same_peer() {
     // For the first non-proposer peer we process two requests (duplicate), for others one.
     let num_peers = cx.fixture.num_authorities() - 1;
     let mut handled = 0;
-    let mut duplicate_peer_id: Option<AuthorityIdentifier> = None;
     while let Some(req) = cx.network_rx.recv().await {
         let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
         else {
@@ -1000,15 +955,6 @@ async fn duplicate_vote_same_peer() {
             .send(Ok(NetworkResponseMessage { peer, result: PrimaryResponse::Vote(vote.clone()) }))
             .unwrap();
         handled += 1;
-
-        // Artificially inject a second vote from the same peer by sending it through the
-        // consensus bus votes channel (bypassing the network mock).
-        // Since we can't easily re-inject into the certifier's internal channel, we rely on
-        // the certifier's VotesAggregator dedup: it silently ignores duplicate authors.
-        // Test that cert still forms with remaining unique votes.
-        if duplicate_peer_id.is_none() {
-            duplicate_peer_id = Some(authority.id());
-        }
 
         if handled >= num_peers {
             break;
