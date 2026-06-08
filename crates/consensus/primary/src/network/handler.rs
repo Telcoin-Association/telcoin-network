@@ -850,15 +850,17 @@ where
         let mut my_number = self.consensus_chain.latest_consensus_number();
         // If we are behind then wait up to two seconds to catch up.
         let mut count = 0;
-        let delta = number.saturating_sub(my_number);
-        while my_number < number && delta < 4 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            my_number = self.consensus_chain.latest_consensus_number();
-            if count >= 20 {
-                // Don't wait more than 2 seconds for this to show up.
-                return Err(PrimaryNetworkError::UnknownConsensusHeaderDigest(hash));
+        if number.saturating_sub(my_number) < 4 {
+            // Only wait if we are close.
+            while my_number < number {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                my_number = self.consensus_chain.latest_consensus_number();
+                if count >= 20 {
+                    // Don't wait more than 2 seconds for this to show up.
+                    return Err(PrimaryNetworkError::UnknownConsensusHeaderDigest(hash));
+                }
+                count += 1;
             }
-            count += 1;
         }
         let header = self.get_header_by_hash(number, hash).await?;
         Ok(PrimaryResponse::ConsensusHeader(Arc::new(header)))
