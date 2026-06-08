@@ -559,11 +559,7 @@ async fn wrong_epoch_header_rejected() {
 
     // No vote requests should arrive (certifier rejects before sending requests).
     assert!(
-        tokio::time::timeout(Duration::from_secs(2), cx.network_rx.recv()).await.is_err()
-            || matches!(
-                tokio::time::timeout(Duration::from_millis(100), cx.network_rx.recv()).await,
-                Err(_)
-            ),
+        tokio::time::timeout(Duration::from_secs(2), cx.network_rx.recv()).await.is_err(),
         "certifier should not send vote requests for wrong-epoch header"
     );
 
