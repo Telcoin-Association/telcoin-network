@@ -24,8 +24,9 @@ use tn_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
     now, to_intent_message, try_decode, AuthorityIdentifier, BlockHash, BlsPublicKey, Certificate,
-    ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord, Hash as _, Header,
-    HeaderDigest, ProtocolSignature, Round, SignatureVerificationState, TnSender as _, Vote, B256,
+    ConsensusHeader, ConsensusHeaderDigest, Database, Epoch, EpochCertificate, EpochRecord,
+    Hash as _, Header, HeaderDigest, ProtocolSignature, Round, SignatureVerificationState,
+    TnSender as _, Vote, B256,
 };
 use tokio::{io::AsyncReadExt, sync::Mutex as TokioMutex, time::timeout};
 use tracing::{debug, error, info, warn};
@@ -845,7 +846,7 @@ where
     pub(super) async fn retrieve_consensus_header(
         &self,
         number: u64,
-        hash: BlockHash,
+        hash: ConsensusHeaderDigest,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
         let mut my_number = self.consensus_chain.latest_consensus_number();
         // If we are behind then wait up to two seconds to catch up.
@@ -885,7 +886,7 @@ where
     async fn get_header_by_hash(
         &self,
         number: u64,
-        hash: BlockHash,
+        hash: ConsensusHeaderDigest,
     ) -> PrimaryNetworkResult<ConsensusHeader> {
         let epoch = self.consensus_chain.epochs().number_to_epoch(number);
         match self.consensus_chain.consensus_header_by_digest(epoch, hash).await {

@@ -8,7 +8,7 @@
 
 use crate::{
     crypto, encode, serde::RoaringBitmapSerde, BlockHash, BlsAggregateSignature, BlsPublicKey,
-    BlsSignature, BlsSigner, Epoch, Intent, IntentMessage, IntentScope,
+    BlsSignature, BlsSigner, ConsensusNumHash, Epoch, Intent, IntentMessage, IntentScope,
     ValidatorAggregateSignature as _, B256,
 };
 use alloy::eips::BlockNumHash;
@@ -34,7 +34,7 @@ pub struct EpochRecord {
     pub final_state: BlockNumHash,
     /// The hash and consensus block number of the last ['ConsensusHeader'] of this epoch.
     /// Can be used as a signed checkpoint for consensus (with the certificate).
-    pub final_consensus: BlockNumHash,
+    pub final_consensus: ConsensusNumHash,
 }
 
 impl EpochRecord {
@@ -196,7 +196,7 @@ mod test {
             next_committee: vec![com1.public_key(), com2.public_key(), com3.public_key()],
             parent_hash: B256::default(),
             final_state: BlockNumHash::default(),
-            final_consensus: BlockNumHash::default(),
+            final_consensus: ConsensusNumHash::default(),
         };
         let vote1 = record.sign_vote(&com1);
         let vote2 = record.sign_vote(&com2);

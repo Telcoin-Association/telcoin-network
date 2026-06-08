@@ -16,8 +16,9 @@ use tn_config::{ConsensusConfig, NetworkConfig};
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, CertificateStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    AuthorityIdentifier, BlockHash, BlockNumHash, EpochRecord, ExecHeader, Header, Notifier,
-    SealedHeader, TaskManager, TnReceiver, TnSender, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    AuthorityIdentifier, BlockHash, ConsensusHeaderDigest, ConsensusNumHash, EpochRecord,
+    ExecHeader, Header, Notifier, SealedHeader, TaskManager, TnReceiver, TnSender, B256,
+    DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tracing::info;
 
@@ -434,7 +435,11 @@ async fn commit_one() {
     Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain, None).await;
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
 
     // Feed all certificates to the consensus. Only the last certificate should trigger
@@ -494,7 +499,7 @@ async fn dead_node() {
             .unwrap();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(0, ConsensusNumHash::default(), Some(dummy_parent))
     });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
@@ -629,7 +634,7 @@ async fn not_enough_support() {
             .unwrap();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(0, ConsensusNumHash::default(), Some(dummy_parent))
     });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
@@ -729,7 +734,7 @@ async fn missing_leader() {
             .unwrap();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(0, ConsensusNumHash::default(), Some(dummy_parent))
     });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
@@ -801,7 +806,7 @@ async fn committed_round_after_restart() {
         let cb = ConsensusBus::new();
         let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
         cb.app().recent_blocks().send_modify(|blocks| {
-            blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+            blocks.push_latest(0, ConsensusNumHash::default(), Some(dummy_parent))
         });
         let mut rx_primary = cb.subscribe_committed_own_headers();
         let mut rx_output = cb.subscribe_sequence();
@@ -1055,9 +1060,9 @@ async fn restart_with_new_committee() {
             committee: committee.bls_keys().iter().copied().collect(),
             next_committee: committee.bls_keys().iter().copied().collect(),
             parent_hash: prev_epoch_digest,
-            final_consensus: BlockNumHash {
+            final_consensus: ConsensusNumHash {
                 number: last.map(|l| l.number).unwrap_or_default(),
-                hash: BlockHash::default(),
+                hash: ConsensusHeaderDigest::default(),
             },
             ..Default::default()
         };
@@ -1065,7 +1070,7 @@ async fn restart_with_new_committee() {
         consensus_chain.new_epoch(previous_epoch, committee.clone()).await.unwrap();
         let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
         cb.app().recent_blocks().send_modify(|blocks| {
-            blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+            blocks.push_latest(0, ConsensusNumHash::default(), Some(dummy_parent))
         });
         let mut rx_output = cb.subscribe_sequence();
         let mut task_manager = TaskManager::default();

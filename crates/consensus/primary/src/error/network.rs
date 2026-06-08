@@ -5,7 +5,7 @@ use tn_network_libp2p::Penalty;
 use tn_storage::StoreError;
 use tn_types::{
     error::{CertificateError, HeaderError},
-    BcsError, BlockHash, BlsPublicKey, Epoch,
+    BcsError, BlockHash, BlsPublicKey, ConsensusHeaderDigest, Epoch,
 };
 
 /// Result alias for results that possibly return [`PrimaryNetworkError`].
@@ -37,10 +37,10 @@ pub(crate) enum PrimaryNetworkError {
     Internal(String),
     /// Unknown consensus header.
     #[error("Unknown consensus header: {0}")]
-    UnknownConsensusHeaderDigest(BlockHash),
+    UnknownConsensusHeaderDigest(ConsensusHeaderDigest),
     /// Unknown consensus header certificate.
     #[error("Unknown consensus header certificate for: {0}")]
-    UnknownConsensusHeaderCert(BlockHash),
+    UnknownConsensusHeaderCert(ConsensusHeaderDigest),
     /// Peer that is not committee published invalid gosip.
     /// Temparily disabled, will be back soon.
     #[error("Peer {0} is not in the committee!")]

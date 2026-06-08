@@ -21,8 +21,8 @@ use tn_reth::{
 use tn_rpc::EngineToPrimary;
 use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator},
-    BatchSender, BatchValidation, BlsPublicKey, ConsensusOutput, EngineUpdate, Epoch, ExecHeader,
-    Noticer, SealedHeader, TaskSpawner, WorkerId, B256,
+    BatchSender, BatchValidation, BlsPublicKey, ConsensusHeaderDigest, ConsensusOutput,
+    EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::{mpsc, RwLock};
@@ -138,7 +138,7 @@ impl ExecutionNode {
     }
 
     /// Retrieve the last executed block from the database to restore consensus.
-    pub async fn last_executed_output(&self) -> eyre::Result<B256> {
+    pub async fn last_executed_output(&self) -> eyre::Result<ConsensusHeaderDigest> {
         let guard = self.internal.read().await;
         guard.last_executed_output()
     }

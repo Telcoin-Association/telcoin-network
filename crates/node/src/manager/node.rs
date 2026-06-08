@@ -19,10 +19,10 @@ use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode, QueCh
 use tn_reth::{system_calls::EpochState, RethDb, RethEnv};
 use tn_storage::{consensus::ConsensusChain, open_db, DatabaseType};
 use tn_types::{
-    deconstruct_nonce, gas_accumulator::GasAccumulator, BlockNumHash, BlsPublicKey,
-    BootstrapServer, Committee, ConsensusHeader, ConsensusOutput, Database as TNDatabase,
-    EngineUpdate, Epoch, Notifier, TaskError, TaskManager, TaskSpawner, TimestampSec,
-    MIN_PROTOCOL_BASE_FEE,
+    deconstruct_nonce, gas_accumulator::GasAccumulator, BlsPublicKey, BootstrapServer, Committee,
+    ConsensusHeader, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput,
+    Database as TNDatabase, EngineUpdate, Epoch, Notifier, TaskError, TaskManager, TaskSpawner,
+    TimestampSec, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::mpsc;
@@ -524,15 +524,16 @@ where
             // On restore, use the block's consensus hash from parent_beacon_block_root.
             // Round is set to 0 since we don't persist it; consensus number/hash still allows
             // wait_for_consensus_execution to resolve hash lookups.
-            let consensus_hash = recent_block.parent_beacon_block_root.unwrap_or_default();
+            let consensus_hash: ConsensusHeaderDigest =
+                recent_block.parent_beacon_block_root.unwrap_or_default().into();
             let (epoch, round) = deconstruct_nonce(recent_block.nonce.into());
             let consensus_number = self
                 .consensus_chain
-                .consensus_header_by_digest(epoch, consensus_hash)
+                .consensus_header_by_digest(epoch, consensus_hash.into())
                 .await?
                 .map(|h| h.number)
                 .unwrap_or_default();
-            let consensus_num_hash = BlockNumHash::new(consensus_number, consensus_hash);
+            let consensus_num_hash = ConsensusNumHash::new(consensus_number, consensus_hash);
             self.consensus_bus.recent_blocks().send_modify(|blocks| {
                 blocks.push_latest(round, consensus_num_hash, Some(recent_block))
             });

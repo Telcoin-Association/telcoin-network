@@ -7,7 +7,9 @@ use std::{collections::BTreeSet, time::Duration};
 
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
 use tn_storage::consensus::ConsensusChain;
-use tn_types::{BlsPublicKey, Epoch, EpochRecord, Noticer, TaskSpawner, B256};
+use tn_types::{
+    BlsPublicKey, ConsensusHeaderDigest, Epoch, EpochRecord, Noticer, TaskSpawner, B256,
+};
 use tracing::{debug, error, info};
 
 /// How long to wait before retrying a failed epoch record collection.
@@ -53,7 +55,7 @@ async fn collect_epoch_records(
     // Track the highest final_consensus seen across all downloaded epoch records.
     // We emit a single state-sync notification at the end rather than one per epoch,
     // to avoid flooding peers with concurrent request_consensus calls during catch-up.
-    let mut best_final_consensus: Option<(Epoch, u64, B256)> = None;
+    let mut best_final_consensus: Option<(Epoch, u64, ConsensusHeaderDigest)> = None;
     for epoch in last_epoch.. {
         // If we already have epoch record AND it's certificate then continue.
         if let Some((rec, Some(_))) = consensus_chain.epochs().get_epoch_by_number(epoch).await {
@@ -116,7 +118,7 @@ async fn collect_epoch_records(
                         "retrieved cert for epoch {epoch}: {epoch_hash} from a peer",
                     );
                     // Track the highest final_consensus across downloaded epochs.
-                    if final_consensus.hash != B256::default()
+                    if final_consensus.hash != ConsensusHeaderDigest::default()
                         && final_consensus.number
                             > best_final_consensus.map(|(_, n, _)| n).unwrap_or(0)
                     {
@@ -218,7 +220,7 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
-    use tn_types::{BlockNumHash, BlsKeypair};
+    use tn_types::{BlockNumHash, BlsKeypair, ConsensusNumHash};
 
     /// Generate a deterministic test BLS public key from a seed.
     fn test_bls_key(seed: u8) -> BlsPublicKey {
@@ -234,7 +236,7 @@ mod tests {
             next_committee: vec![],
             parent_hash: B256::ZERO,
             final_state: BlockNumHash::default(),
-            final_consensus: BlockNumHash::default(),
+            final_consensus: ConsensusNumHash::default(),
         }
     }
 

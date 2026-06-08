@@ -15,7 +15,8 @@ use tn_config::ConsensusConfig;
 use tn_primary::{ConsensusBusApp, NodeMode};
 use tn_storage::{consensus::ConsensusChain, tables::ConsensusHeaderCache};
 use tn_types::{
-    BlockHash, ConsensusHeader, ConsensusOutput, Database, Epoch, TaskError, TaskSpawner, TnSender,
+    ConsensusHeader, ConsensusHeaderDigest, ConsensusOutput, Database, Epoch, TaskError,
+    TaskSpawner, TnSender,
 };
 use tracing::{debug, error, info, warn};
 
@@ -128,7 +129,7 @@ pub async fn last_executed_consensus_block(
 pub async fn last_consensus_parent(
     consensus_bus: &ConsensusBusApp,
     consensus_chain: &ConsensusChain,
-) -> (BlockHash, u64) {
+) -> (ConsensusHeaderDigest, u64) {
     let last_executed =
         last_executed_consensus_block(consensus_bus, consensus_chain).await.unwrap_or_default();
     let last_db = consensus_chain

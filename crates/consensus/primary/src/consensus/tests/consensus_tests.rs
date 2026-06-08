@@ -12,8 +12,9 @@ use tempfile::TempDir;
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, CertificateStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    BlockNumHash, Certificate, ExecHeader, Hash as _, Header, HeaderDigest, ReputationScores,
-    SealedHeader, TaskManager, TnReceiver, TnSender, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    Certificate, ConsensusHeaderDigest, ConsensusNumHash, ExecHeader, Hash as _, Header,
+    HeaderDigest, ReputationScores, SealedHeader, TaskManager, TnReceiver, TnSender, B256,
+    DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::fs::create_dir_all;
 
@@ -66,7 +67,11 @@ async fn test_consensus_recovery_with_bullshark() {
     let cb = ConsensusBus::new();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
@@ -159,7 +164,11 @@ async fn test_consensus_recovery_with_bullshark() {
     let cb = ConsensusBus::new();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
@@ -221,7 +230,11 @@ async fn test_consensus_recovery_with_bullshark() {
     let cb = ConsensusBus::new();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();

@@ -755,8 +755,9 @@ mod test {
     use roaring::RoaringBitmap;
     use tempfile::TempDir;
     use tn_types::{
-        BlockNumHash, BlsAggregateSignature, BlsKeypair, BlsPublicKey, BlsSignature, BlsSigner,
-        Epoch, EpochCertificate, EpochRecord, Signer as _, B256,
+        BlsAggregateSignature, BlsKeypair, BlsPublicKey, BlsSignature, BlsSigner,
+        ConsensusHeaderDigest, ConsensusNumHash, Epoch, EpochCertificate, EpochRecord, Signer as _,
+        B256,
     };
 
     use crate::epoch_records::{EpochRecordDb, RECORDS_NAME};
@@ -793,7 +794,10 @@ mod test {
             committee: committee.clone(),
             next_committee: committee,
             parent_hash,
-            final_consensus: BlockNumHash::new((epoch as u64 + 1) * 10, B256::default()),
+            final_consensus: ConsensusNumHash::new(
+                (epoch as u64 + 1) * 10,
+                ConsensusHeaderDigest::default(),
+            ),
             ..Default::default()
         };
 

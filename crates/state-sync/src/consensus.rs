@@ -12,8 +12,8 @@ use tn_config::ConsensusConfig;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
 use tn_storage::{consensus::ConsensusChain, tables::ConsensusHeaderCache};
 use tn_types::{
-    Database as TNDatabase, Epoch, EpochRecord, Noticer, TaskSpawner, TnReceiver, TnSender as _,
-    B256,
+    ConsensusHeaderDigest, Database as TNDatabase, Epoch, EpochRecord, Noticer, TaskSpawner,
+    TnReceiver, TnSender as _,
 };
 use tracing::{debug, error, info, warn};
 
@@ -33,7 +33,7 @@ enum ConsensusHeaderResult {
 /// make is that the returned header matches the hash.
 async fn get_consensus_header<DB: TNDatabase>(
     number: u64,
-    hash: B256,
+    hash: ConsensusHeaderDigest,
     db: &DB,
     consensus_bus: &ConsensusBusApp,
     network: &PrimaryNetworkHandle,
@@ -260,7 +260,7 @@ pub async fn spawn_fetch_consensus(
 /// Start at number/hash and work backwards to end number.
 async fn get_consensus_header_range<DB: TNDatabase>(
     number: u64,
-    hash: B256,
+    hash: ConsensusHeaderDigest,
     db: &DB,
     consensus_bus: &ConsensusBusApp,
     network: &PrimaryNetworkHandle,
@@ -314,7 +314,7 @@ async fn manage_new_consensus<DB: TNDatabase>(
     tasks: Arc<AtomicI32>,
     epoch: Epoch,
     number: u64,
-    hash: B256,
+    hash: ConsensusHeaderDigest,
     first_gossipped_epoch: &mut Option<Epoch>,
     last_number: &mut Option<u64>,
     current_fetch_epoch: &mut Epoch,
@@ -371,7 +371,7 @@ pub async fn spawn_fetch_recent_consensus<DB: TNDatabase>(
     consensus_chain: ConsensusChain,
     rx_shutdown: Noticer,
     task_spawner: TaskSpawner,
-    mut rx_consensus_request: impl TnReceiver<(Epoch, u64, B256)>,
+    mut rx_consensus_request: impl TnReceiver<(Epoch, u64, ConsensusHeaderDigest)>,
 ) {
     // Attempt to clear the consensus header cache on startup.
     // This should not really be needed (records are evicted as they are processed) but

@@ -40,10 +40,10 @@ use tn_storage::{
     },
 };
 use tn_types::{
-    gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash, BlockNumHash, BlsPublicKey,
-    BlsSigner, Committee, CommitteeBuilder, ConsensusOutput, Database as TNDatabase, Epoch,
-    EpochRecord, Multiaddr, NetworkPublicKey, Notifier, P2pNode, TaskJoinError, TaskManager,
-    TaskSpawner, TnReceiver, B256,
+    gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash, BlsPublicKey, BlsSigner,
+    Committee, CommitteeBuilder, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput,
+    Database as TNDatabase, Epoch, EpochRecord, Multiaddr, NetworkPublicKey, Notifier, P2pNode,
+    TaskJoinError, TaskManager, TaskSpawner, TnReceiver, B256,
 };
 use tn_worker::{quorum_waiter::QuorumWaiterTrait, Worker, WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::mpsc;
@@ -55,9 +55,9 @@ const EPOCH_TASK_MANAGER: &str = "Epoch Task Manager";
 /// Result from replaying missed consensus outputs.
 struct ReplayResult {
     /// If the epoch boundary was crossed during replay, this is the hash to close the epoch with.
-    epoch_close_hash: Option<BlockHash>,
+    epoch_close_hash: Option<ConsensusHeaderDigest>,
     /// The hash of the last consensus output that was actually forwarded to the engine.
-    last_replayed_hash: Option<BlockHash>,
+    last_replayed_hash: Option<ConsensusHeaderDigest>,
 }
 
 /// Modes for an epoch.
@@ -554,7 +554,7 @@ where
         &mut self,
         consensus_output: &mut impl TnReceiver<ConsensusOutput>,
         to_engine: &mpsc::Sender<ConsensusOutput>,
-    ) -> Option<BlockHash> {
+    ) -> Option<ConsensusHeaderDigest> {
         // Phase 1: Drain broadcast channel (existing behavior)
         while let Ok(output) = consensus_output.try_recv() {
             let result = if output.committed_at() >= self.epoch_boundary {
@@ -668,7 +668,7 @@ where
             next_committee: next_committee_keys,
             parent_hash,
             final_state: parent_state,
-            final_consensus: BlockNumHash::new(last_consensus_header.number, target_hash),
+            final_consensus: ConsensusNumHash::new(last_consensus_header.number, target_hash),
         };
 
         self.consensus_chain.epochs().save_record(epoch_rec.clone()).await?;
@@ -684,7 +684,7 @@ where
         &mut self,
         to_engine: &mpsc::Sender<ConsensusOutput>,
         consensus_output: &mut impl TnReceiver<ConsensusOutput>,
-    ) -> eyre::Result<B256> {
+    ) -> eyre::Result<ConsensusHeaderDigest> {
         // receive output from consensus and forward to engine
         while let Some(mut output) = consensus_output.recv().await {
             // observe epoch boundary to initiate epoch transition
@@ -730,7 +730,7 @@ where
         &self,
         shutdown_consensus: Option<Notifier>,
         gas_accumulator: &GasAccumulator,
-        target_hash: B256,
+        target_hash: ConsensusHeaderDigest,
     ) -> eyre::Result<()> {
         // begin consensus shutdown while engine executes
         if let Some(s) = shutdown_consensus {

@@ -18,9 +18,9 @@ use tn_config::Parameters;
 use tn_network_libp2p::types::NetworkEvent;
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{
-    deconstruct_nonce, BlockHash, BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader,
-    ConsensusOutput, Epoch, EpochRecord, EpochVote, Header, Round, TnReceiver, TnSender, B256,
-    CHANNEL_CAPACITY,
+    deconstruct_nonce, BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader,
+    ConsensusHeaderDigest, ConsensusOutput, Epoch, EpochRecord, EpochVote, Header, Round,
+    TnReceiver, TnSender, CHANNEL_CAPACITY,
 };
 use tokio::{
     sync::{
@@ -215,7 +215,7 @@ pub struct ConsensusBusAppInner {
     /// Watch tracking most recently seen consensus header.
     tx_last_consensus_header: watch::Sender<Option<ConsensusHeader>>,
     /// Watch tracking the last gossipped consensus block number and hash.
-    tx_last_published_consensus_num_hash: watch::Sender<(Epoch, u64, BlockHash)>,
+    tx_last_published_consensus_num_hash: watch::Sender<(Epoch, u64, ConsensusHeaderDigest)>,
 
     /// Consensus header.  Note this can be used to create consensus output to execute for non
     /// validators.
@@ -238,7 +238,7 @@ pub struct ConsensusBusAppInner {
     epoch_request_queue_rx:
         Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(EpochRecord, EpochRecord)>>>,
     /// Channel to request consensus headers to cache.
-    consensus_request_queue: QueChannel<(Epoch, u64, B256)>,
+    consensus_request_queue: QueChannel<(Epoch, u64, ConsensusHeaderDigest)>,
 }
 
 /// The thread-safe inner type that holds all the channels for inner-consensus
@@ -269,7 +269,7 @@ impl ConsensusBusApp {
         let (tx_primary_round_updates, _) = watch::channel(0u32);
         let (tx_last_consensus_header, _) = watch::channel(None);
         let (tx_last_published_consensus_num_hash, _) =
-            watch::channel((0, 0, BlockHash::default()));
+            watch::channel((0, 0, ConsensusHeaderDigest::default()));
 
         let (tx_recent_blocks, _) = watch::channel(RecentBlocks::new(recent_blocks as usize));
         let (tx_sync_status, _) = watch::channel(NodeMode::default());
@@ -393,7 +393,9 @@ impl ConsensusBusApp {
     /// Track the latest published consensus header block number and hash seen on the gossip
     /// network. This value will have been verified and can be trusted to be the correct hash
     /// for block number.  DO NOT send unverified values to this watch.
-    pub fn last_published_consensus_num_hash(&self) -> &watch::Sender<(Epoch, u64, BlockHash)> {
+    pub fn last_published_consensus_num_hash(
+        &self,
+    ) -> &watch::Sender<(Epoch, u64, ConsensusHeaderDigest)> {
         &self.inner.tx_last_published_consensus_num_hash
     }
 
@@ -418,7 +420,7 @@ impl ConsensusBusApp {
     }
 
     /// Returns the latest verified consensus block number and hash from gossip.
-    pub fn published_consensus_num_hash(&self) -> (Epoch, u64, BlockHash) {
+    pub fn published_consensus_num_hash(&self) -> (Epoch, u64, ConsensusHeaderDigest) {
         *self.inner.tx_last_published_consensus_num_hash.borrow()
     }
 
@@ -550,7 +552,7 @@ impl ConsensusBusApp {
     /// Note if the chain is not advancing this may never return.
     pub async fn wait_for_consensus_execution(
         &self,
-        hash: BlockHash,
+        hash: ConsensusHeaderDigest,
     ) -> Result<(), WaitForExecutionElapsed> {
         let mut watch_execution_result = self.recent_blocks().subscribe();
         if self.recent_blocks().borrow().contains_consensus(hash) {
@@ -577,7 +579,7 @@ impl ConsensusBusApp {
         let parent_beacon_block_root = header.parent_beacon_block_root;
         if let Some(consensus_hash) = parent_beacon_block_root {
             consensus_chain
-                .consensus_header_by_digest(epoch, consensus_hash)
+                .consensus_header_by_digest(epoch, consensus_hash.into())
                 .await
                 .unwrap_or_default()
         } else {
@@ -652,12 +654,14 @@ impl ConsensusBusApp {
     }
 
     /// Channel to request consensus headers to be fetched and cached.
-    pub fn consensus_request_queue(&self) -> &impl TnSender<(Epoch, u64, B256)> {
+    pub fn consensus_request_queue(&self) -> &impl TnSender<(Epoch, u64, ConsensusHeaderDigest)> {
         &self.inner.consensus_request_queue
     }
 
     /// Subscribe to consensus header fetch queue.
-    pub fn subscribe_consensus_request_queue(&self) -> impl TnReceiver<(Epoch, u64, B256)> {
+    pub fn subscribe_consensus_request_queue(
+        &self,
+    ) -> impl TnReceiver<(Epoch, u64, ConsensusHeaderDigest)> {
         self.inner.consensus_request_queue.subscribe()
     }
 }
