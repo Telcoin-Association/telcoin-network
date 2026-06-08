@@ -366,7 +366,7 @@ impl ConsensusChain {
         timeout: Duration,
     ) -> Result<(), ConsensusChainError> {
         let epoch = epoch_record.epoch;
-        let epoch_final_hash: ConsensusHeaderDigest = epoch_record.final_consensus.hash.into();
+        let epoch_final_hash = epoch_record.final_consensus.hash;
         if let Ok(pack) = self.get_static(epoch).await {
             if let Some(last_header) = pack.latest_consensus_header().await {
                 if epoch_record.final_consensus.number == last_header.number
@@ -459,8 +459,7 @@ impl ConsensusChain {
             if let Some((epoch_record, _)) = self.epochs().get_epoch_by_number(epoch).await {
                 match pack.latest_consensus_header().await {
                     Some(last_header) => {
-                        let epoch_final_hash: ConsensusHeaderDigest =
-                            epoch_record.final_consensus.hash.into();
+                        let epoch_final_hash = epoch_record.final_consensus.hash;
                         if epoch_record.final_consensus.number == last_header.number
                             && epoch_final_hash == last_header.digest()
                         {

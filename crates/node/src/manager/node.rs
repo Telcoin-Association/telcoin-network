@@ -529,7 +529,7 @@ where
             let (epoch, round) = deconstruct_nonce(recent_block.nonce.into());
             let consensus_number = self
                 .consensus_chain
-                .consensus_header_by_digest(epoch, consensus_hash.into())
+                .consensus_header_by_digest(epoch, consensus_hash)
                 .await?
                 .map(|h| h.number)
                 .unwrap_or_default();

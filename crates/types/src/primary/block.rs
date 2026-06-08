@@ -6,8 +6,6 @@
 //! or observer) or any task that requires realtime or historic consesus data
 //! if not directly participating in consesus.
 
-use std::fmt;
-
 use super::{CommittedSubDag, ConsensusOutput};
 use crate::{crypto, Certificate, Digest, Hash, B256};
 use serde::{Deserialize, Serialize};
@@ -94,56 +92,9 @@ impl From<&ConsensusHeader> for Vec<u8> {
     }
 }
 
-// Digest of ConsensusHeader
-#[derive(
-    Clone, Copy, Default, PartialEq, Eq, std::hash::Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
-pub struct ConsensusHeaderDigest(Digest<{ crypto::DIGEST_LENGTH }>);
-
-impl AsRef<[u8]> for ConsensusHeaderDigest {
-    fn as_ref(&self) -> &[u8] {
-        &self.0.digest
-    }
-}
-
-impl From<ConsensusHeaderDigest> for Digest<{ crypto::DIGEST_LENGTH }> {
-    fn from(d: ConsensusHeaderDigest) -> Self {
-        d.0
-    }
-}
-
-// Convenience function for casting `ConsensusHeaderDigest` into EL B256.
-// note: these are both 32-bytes
-impl From<ConsensusHeaderDigest> for B256 {
-    fn from(value: ConsensusHeaderDigest) -> Self {
-        B256::from_slice(value.as_ref())
-    }
-}
-
-// Convenience function for casting `ConsensusHeaderDigest` into EL B256.
-// note: these are both 32-bytes
-impl From<B256> for ConsensusHeaderDigest {
-    fn from(value: B256) -> Self {
-        Self(Digest { digest: value.into() })
-    }
-}
-
-impl From<[u8; 32]> for ConsensusHeaderDigest {
-    fn from(value: [u8; 32]) -> Self {
-        Self(Digest { digest: value.into() })
-    }
-}
-
-impl fmt::Debug for ConsensusHeaderDigest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl fmt::Display for ConsensusHeaderDigest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(f, "{}", self.0.to_string().get(0..16).ok_or(fmt::Error)?)
-    }
+crate::crypto::digest_newtype! {
+    /// Digest of a [`ConsensusHeader`].
+    pub struct ConsensusHeaderDigest;
 }
 
 /// A consensus header number and a hash.

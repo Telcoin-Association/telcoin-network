@@ -805,7 +805,7 @@ impl Inner {
         let mut parent_digest = if epoch == 0 {
             ConsensusHeader::default().digest()
         } else {
-            previous_epoch.final_consensus.hash.into()
+            previous_epoch.final_consensus.hash
         };
         let mut batches = HashSet::new();
         let mut referenced_batches = HashSet::new();

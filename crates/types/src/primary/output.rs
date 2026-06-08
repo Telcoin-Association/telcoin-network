@@ -471,45 +471,12 @@ impl Hash<{ crypto::DIGEST_LENGTH }> for CommittedSubDag {
     }
 }
 
-// Convenience function for casting `ConsensusDigest` into EL B256.
-// note: these are both 32-bytes
-impl From<ConsensusDigest> for B256 {
-    fn from(value: ConsensusDigest) -> Self {
-        B256::from_slice(value.as_ref())
-    }
-}
-
 /// Shutdown token dropped when a task is properly shut down.
 pub type ShutdownToken = mpsc::Sender<()>;
 
-// Digest of ConsususOutput and CommittedSubDag
-#[derive(
-    Clone, Copy, Default, PartialEq, Eq, std::hash::Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
-pub struct ConsensusDigest(Digest<{ crypto::DIGEST_LENGTH }>);
-
-impl AsRef<[u8]> for ConsensusDigest {
-    fn as_ref(&self) -> &[u8] {
-        &self.0.digest
-    }
-}
-
-impl From<ConsensusDigest> for Digest<{ crypto::DIGEST_LENGTH }> {
-    fn from(d: ConsensusDigest) -> Self {
-        d.0
-    }
-}
-
-impl fmt::Debug for ConsensusDigest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl fmt::Display for ConsensusDigest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(f, "{}", self.0.to_string().get(0..16).ok_or(fmt::Error)?)
-    }
+crate::crypto::digest_newtype! {
+    /// Digest of a [`ConsensusOutput`]/[`CommittedSubDag`].
+    pub struct ConsensusDigest;
 }
 
 // See test_utils output_tests.rs for this modules tests.
