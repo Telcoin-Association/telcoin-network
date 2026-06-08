@@ -43,7 +43,7 @@ use tn_types::{
     gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash, BlockNumHash, BlsPublicKey,
     BlsSigner, Committee, CommitteeBuilder, ConsensusOutput, Database as TNDatabase, Epoch,
     EpochRecord, Multiaddr, NetworkPublicKey, Notifier, P2pNode, TaskJoinError, TaskManager,
-    TaskSpawner, TnReceiver, B256,
+    TaskSpawner, TnReceiver, B256, DEFAULT_WORKER_ID,
 };
 use tn_worker::{quorum_waiter::QuorumWaiterTrait, Worker, WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::mpsc;
@@ -942,7 +942,7 @@ where
         gas_accumulator: GasAccumulator,
     ) -> eyre::Result<WorkerNode<DB>> {
         // only support one worker for now (with id 0) - otherwise, loop here
-        let worker_id = 0;
+        let worker_id = DEFAULT_WORKER_ID;
         let base_fee = gas_accumulator.base_fee(worker_id);
 
         // update the network handle's task spawner for reporting batches in the epoch

@@ -19,10 +19,7 @@ use tn_config::KeyConfig;
 use tn_storage::tables::{
     KadProviderRecords, KadRecords, KadWorkerProviderRecords, KadWorkerRecords,
 };
-use tn_types::{decode, encode, BlockHash, Database, DefaultHashFunction};
-
-/// The TN-specific kad protocol.
-pub(crate) const DEFAULT_KAD_PROTO_NAME: StreamProtocol = StreamProtocol::new("/tn-kad/1.0.0");
+use tn_types::{decode, encode, BlockHash, Database, DefaultHashFunction, WorkerId};
 
 /// A record stored in the DHT.
 /// This is a "shadow" struct for a kad Record so we can serialize/deserialize
@@ -162,13 +159,40 @@ fn instant_to_system(expires: &Option<Instant>) -> Option<SystemTime> {
     }
 }
 
-/// The type of the Kad store, primary or worker.
+/// The role of a consensus network instance — primary or worker.
+///
+/// A node runs both as fully isolated libp2p swarms in one process. This is the
+/// one source of truth for everything that must differ: the kad store's backing
+/// tables and the wire protocol names that keep the two from ever negotiating a
+/// connection with one another.
 #[derive(Copy, Clone, Debug)]
-pub enum KadStoreType {
-    /// Primary network KadStore.
+pub enum NetworkType {
+    /// Primary network.
     Primary,
-    /// Worker network KadStore.
-    Worker,
+    /// Worker network.
+    Worker(WorkerId),
+}
+
+impl NetworkType {
+    /// Request-response wire protocol, isolated per role (and per worker).
+    pub(crate) fn req_res_protocol(&self) -> StreamProtocol {
+        match self {
+            Self::Primary => StreamProtocol::new("/tn-primary/0.0.1"),
+            Self::Worker(id) => StreamProtocol::try_from_owned(format!("/tn-worker-{id}/0.0.1"))
+                .expect("worker req-res protocol name starts with '/'"),
+        }
+    }
+
+    /// Kademlia wire protocol, isolated per role (and per worker).
+    pub(crate) fn kad_protocol(&self) -> StreamProtocol {
+        match self {
+            Self::Primary => StreamProtocol::new("/tn-primary-kad/1.0.0"),
+            Self::Worker(id) => {
+                StreamProtocol::try_from_owned(format!("/tn-worker-{id}-kad/1.0.0"))
+                    .expect("worker kad protocol name starts with '/'")
+            }
+        }
+    }
 }
 
 /// Provide a persistant store for kademlia data.
@@ -187,20 +211,20 @@ pub struct KadStore<DB> {
     /// Tracks to number of provider records in DB.
     num_providers: usize,
     /// Index used for database retrieval with multiple KAD tables.
-    kad_type: KadStoreType,
+    kad_type: NetworkType,
 }
 
 impl<DB: Database> KadStore<DB> {
     /// Create a new KadStore backed by db.
-    pub fn new(db: DB, key_config: &KeyConfig, kad_type: KadStoreType) -> Self {
+    pub fn new(db: DB, key_config: &KeyConfig, kad_type: NetworkType) -> Self {
         let node_key = RecordKey::new(&encode(&key_config.primary_public_key()));
         // Defaults for sanity.
         let config = MemoryStoreConfig::default();
         let (num_records, num_providers) = match kad_type {
-            KadStoreType::Primary => {
+            NetworkType::Primary => {
                 (db.iter::<KadRecords>().count(), db.iter::<KadProviderRecords>().count())
             }
-            KadStoreType::Worker => (
+            NetworkType::Worker(_) => (
                 db.iter::<KadWorkerRecords>().count(),
                 db.iter::<KadWorkerProviderRecords>().count(),
             ),
@@ -219,7 +243,7 @@ impl<DB: Database> KadStore<DB> {
     fn evict_expired_records(&mut self) -> usize {
         let now = SystemTime::now();
         let expired_keys: Vec<BlockHash> = match self.kad_type {
-            KadStoreType::Primary => self
+            NetworkType::Primary => self
                 .db
                 .iter::<KadRecords>()
                 .filter_map(|(k, v)| {
@@ -227,7 +251,7 @@ impl<DB: Database> KadStore<DB> {
                     r.is_expired(now).then_some(k)
                 })
                 .collect(),
-            KadStoreType::Worker => self
+            NetworkType::Worker(_) => self
                 .db
                 .iter::<KadWorkerRecords>()
                 .filter_map(|(k, v)| {
@@ -239,8 +263,8 @@ impl<DB: Database> KadStore<DB> {
         let mut evicted = 0;
         for k in &expired_keys {
             let ok = match self.kad_type {
-                KadStoreType::Primary => self.db.remove::<KadRecords>(k).is_ok(),
-                KadStoreType::Worker => self.db.remove::<KadWorkerRecords>(k).is_ok(),
+                NetworkType::Primary => self.db.remove::<KadRecords>(k).is_ok(),
+                NetworkType::Worker(_) => self.db.remove::<KadWorkerRecords>(k).is_ok(),
             };
             if ok {
                 evicted += 1;
@@ -255,7 +279,7 @@ impl<DB: Database> KadStore<DB> {
     fn evict_expired_providers(&mut self) -> usize {
         let now = SystemTime::now();
         let drop_keys: Vec<BlockHash> = match self.kad_type {
-            KadStoreType::Primary => self
+            NetworkType::Primary => self
                 .db
                 .iter::<KadProviderRecords>()
                 .filter_map(|(k, v)| {
@@ -263,7 +287,7 @@ impl<DB: Database> KadStore<DB> {
                     (!recs.is_empty() && recs.iter().all(|r| r.is_expired(now))).then_some(k)
                 })
                 .collect(),
-            KadStoreType::Worker => self
+            NetworkType::Worker(_) => self
                 .db
                 .iter::<KadWorkerProviderRecords>()
                 .filter_map(|(k, v)| {
@@ -275,8 +299,8 @@ impl<DB: Database> KadStore<DB> {
         let mut evicted = 0;
         for k in &drop_keys {
             let ok = match self.kad_type {
-                KadStoreType::Primary => self.db.remove::<KadProviderRecords>(k).is_ok(),
-                KadStoreType::Worker => self.db.remove::<KadWorkerProviderRecords>(k).is_ok(),
+                NetworkType::Primary => self.db.remove::<KadProviderRecords>(k).is_ok(),
+                NetworkType::Worker(_) => self.db.remove::<KadWorkerProviderRecords>(k).is_ok(),
             };
             if ok {
                 evicted += 1;
@@ -325,8 +349,8 @@ impl<DB: Database> RecordStore for KadStore<DB> {
     fn get(&self, k: &RecordKey) -> Option<Cow<'_, Record>> {
         let key = self.key_to_hash(k);
         let record = match self.kad_type {
-            KadStoreType::Primary => self.db.get::<KadRecords>(&key).ok()?,
-            KadStoreType::Worker => self.db.get::<KadWorkerRecords>(&key).ok()?,
+            NetworkType::Primary => self.db.get::<KadRecords>(&key).ok()?,
+            NetworkType::Worker(_) => self.db.get::<KadWorkerRecords>(&key).ok()?,
         };
         let raw = record?;
         let r: KadRecord = decode(raw.as_ref());
@@ -345,10 +369,10 @@ impl<DB: Database> RecordStore for KadStore<DB> {
         let kr: KadRecord = r.into();
         // Are we adding a new record or replacing an existing?
         let new_record = match self.kad_type {
-            KadStoreType::Primary => {
+            NetworkType::Primary => {
                 self.db.get::<KadRecords>(&key).map_err(|_| Error::ValueTooLarge)?.is_none()
             }
-            KadStoreType::Worker => {
+            NetworkType::Worker(_) => {
                 self.db.get::<KadWorkerRecords>(&key).map_err(|_| Error::ValueTooLarge)?.is_none()
             }
         };
@@ -365,11 +389,11 @@ impl<DB: Database> RecordStore for KadStore<DB> {
             self.num_records += 1;
         }
         match self.kad_type {
-            KadStoreType::Primary => self
+            NetworkType::Primary => self
                 .db
                 .insert::<KadRecords>(&key, &encode(&kr))
                 .map_err(|_| Error::ValueTooLarge)?,
-            KadStoreType::Worker => self
+            NetworkType::Worker(_) => self
                 .db
                 .insert::<KadWorkerRecords>(&key, &encode(&kr))
                 .map_err(|_| Error::ValueTooLarge)?,
@@ -380,8 +404,8 @@ impl<DB: Database> RecordStore for KadStore<DB> {
     fn remove(&mut self, k: &RecordKey) {
         let key = self.key_to_hash(k);
         if match self.kad_type {
-            KadStoreType::Primary => self.db.remove::<KadRecords>(&key),
-            KadStoreType::Worker => self.db.remove::<KadWorkerRecords>(&key),
+            NetworkType::Primary => self.db.remove::<KadRecords>(&key),
+            NetworkType::Worker(_) => self.db.remove::<KadWorkerRecords>(&key),
         }
         .is_ok()
         {
@@ -392,8 +416,8 @@ impl<DB: Database> RecordStore for KadStore<DB> {
 
     fn records(&self) -> Self::RecordsIter<'_> {
         let iter = match self.kad_type {
-            KadStoreType::Primary => self.db.iter::<KadRecords>(),
-            KadStoreType::Worker => self.db.iter::<KadWorkerRecords>(),
+            NetworkType::Primary => self.db.iter::<KadRecords>(),
+            NetworkType::Worker(_) => self.db.iter::<KadWorkerRecords>(),
         };
         RecordIter { iter }
     }
@@ -410,8 +434,8 @@ impl<DB: Database> RecordStore for KadStore<DB> {
         let kr: KadProviderRecord = record.into();
         let mut inc_providers = false;
         let records: Vec<KadProviderRecord> = if let Ok(Some(recs)) = match self.kad_type {
-            KadStoreType::Primary => self.db.get::<KadProviderRecords>(&key),
-            KadStoreType::Worker => self.db.get::<KadWorkerProviderRecords>(&key),
+            NetworkType::Primary => self.db.get::<KadProviderRecords>(&key),
+            NetworkType::Worker(_) => self.db.get::<KadWorkerProviderRecords>(&key),
         } {
             let mut recs: Vec<KadProviderRecord> = decode(&recs);
             let mut found = false;
@@ -436,11 +460,11 @@ impl<DB: Database> RecordStore for KadStore<DB> {
             vec![kr]
         };
         match self.kad_type {
-            KadStoreType::Primary => self
+            NetworkType::Primary => self
                 .db
                 .insert::<KadProviderRecords>(&key, &encode(&records))
                 .map_err(|_| libp2p::kad::store::Error::ValueTooLarge)?,
-            KadStoreType::Worker => self
+            NetworkType::Worker(_) => self
                 .db
                 .insert::<KadWorkerProviderRecords>(&key, &encode(&records))
                 .map_err(|_| libp2p::kad::store::Error::ValueTooLarge)?,
@@ -456,8 +480,8 @@ impl<DB: Database> RecordStore for KadStore<DB> {
     fn providers(&self, key: &RecordKey) -> Vec<ProviderRecord> {
         let key = self.key_to_hash(key);
         if let Ok(Some(recs)) = match self.kad_type {
-            KadStoreType::Primary => self.db.get::<KadProviderRecords>(&key),
-            KadStoreType::Worker => self.db.get::<KadWorkerProviderRecords>(&key),
+            NetworkType::Primary => self.db.get::<KadProviderRecords>(&key),
+            NetworkType::Worker(_) => self.db.get::<KadWorkerProviderRecords>(&key),
         } {
             let now = SystemTime::now();
             let records: Vec<KadProviderRecord> = decode(&recs);
@@ -476,16 +500,16 @@ impl<DB: Database> RecordStore for KadStore<DB> {
     fn remove_provider(&mut self, key: &RecordKey, p: &PeerId) {
         let key = self.key_to_hash(key);
         if let Ok(Some(recs)) = match self.kad_type {
-            KadStoreType::Primary => self.db.get::<KadProviderRecords>(&key),
-            KadStoreType::Worker => self.db.get::<KadWorkerProviderRecords>(&key),
+            NetworkType::Primary => self.db.get::<KadProviderRecords>(&key),
+            NetworkType::Worker(_) => self.db.get::<KadWorkerProviderRecords>(&key),
         } {
             let records: Vec<KadProviderRecord> = decode(&recs);
             let records: Vec<KadProviderRecord> =
                 records.into_iter().filter(|r| r.provider != *p).collect();
             if records.is_empty() {
                 if match self.kad_type {
-                    KadStoreType::Primary => self.db.remove::<KadProviderRecords>(&key),
-                    KadStoreType::Worker => self.db.remove::<KadWorkerProviderRecords>(&key),
+                    NetworkType::Primary => self.db.remove::<KadProviderRecords>(&key),
+                    NetworkType::Worker(_) => self.db.remove::<KadWorkerProviderRecords>(&key),
                 }
                 .is_ok()
                 {
@@ -494,10 +518,10 @@ impl<DB: Database> RecordStore for KadStore<DB> {
                 }
             } else {
                 let _ = match self.kad_type {
-                    KadStoreType::Primary => {
+                    NetworkType::Primary => {
                         self.db.insert::<KadProviderRecords>(&key, &encode(&records))
                     }
-                    KadStoreType::Worker => {
+                    NetworkType::Worker(_) => {
                         self.db.insert::<KadWorkerProviderRecords>(&key, &encode(&records))
                     }
                 };
@@ -663,8 +687,8 @@ mod test {
         let db = open_db(tmp_dir.path());
         let key_config =
             KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
-        let mut kad_store = KadStore::new(db.clone(), &key_config, KadStoreType::Primary);
-        let mut kad_store_worker = KadStore::new(db, &key_config, KadStoreType::Worker);
+        let mut kad_store = KadStore::new(db.clone(), &key_config, NetworkType::Primary);
+        let mut kad_store_worker = KadStore::new(db, &key_config, NetworkType::Worker(0));
 
         let rec = test_record(false);
         let rec2 = test_record(false);
@@ -846,7 +870,7 @@ mod test {
         let db = open_db(tmp_dir.path());
         let key_config =
             KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
-        let mut kad_store = KadStore::new(db, &key_config, KadStoreType::Primary);
+        let mut kad_store = KadStore::new(db, &key_config, NetworkType::Primary);
 
         let expired = test_record(true);
         kad_store.put(expired.clone()).expect("put expired record");
@@ -863,7 +887,7 @@ mod test {
         let db = open_db(tmp_dir.path());
         let key_config =
             KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
-        let mut kad_store = KadStore::new(db, &key_config, KadStoreType::Primary);
+        let mut kad_store = KadStore::new(db, &key_config, NetworkType::Primary);
 
         let config = MemoryStoreConfig::default();
 
@@ -888,8 +912,8 @@ mod test {
         let db = open_db(tmp_dir.path());
         let key_config =
             KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
-        let mut kad_store = KadStore::new(db.clone(), &key_config, KadStoreType::Primary);
-        let mut kad_store_worker = KadStore::new(db, &key_config, KadStoreType::Worker);
+        let mut kad_store = KadStore::new(db.clone(), &key_config, NetworkType::Primary);
+        let mut kad_store_worker = KadStore::new(db, &key_config, NetworkType::Worker(0));
 
         let config = MemoryStoreConfig::default();
 
@@ -909,5 +933,18 @@ mod test {
         // Should be full now so get max errors.
         assert!(matches!(kad_store.put(rec.clone()), Err(Error::MaxRecords)));
         assert!(matches!(kad_store_worker.put(rec.clone()), Err(Error::MaxRecords)));
+    }
+
+    /// Lock the per-role wire-protocol names. These strings are a peer-compatibility
+    /// contract: a silent change would prevent peers from negotiating sessions.
+    #[test]
+    fn test_network_type_protocol_names() {
+        assert_eq!(NetworkType::Primary.req_res_protocol().as_ref(), "/tn-primary/0.0.1");
+        assert_eq!(NetworkType::Primary.kad_protocol().as_ref(), "/tn-primary-kad/1.0.0");
+        assert_eq!(NetworkType::Worker(0).req_res_protocol().as_ref(), "/tn-worker-0/0.0.1");
+        assert_eq!(NetworkType::Worker(0).kad_protocol().as_ref(), "/tn-worker-0-kad/1.0.0");
+        // worker id is interpolated, not literal
+        assert_eq!(NetworkType::Worker(3).req_res_protocol().as_ref(), "/tn-worker-3/0.0.1");
+        assert_eq!(NetworkType::Worker(3).kad_protocol().as_ref(), "/tn-worker-3-kad/1.0.0");
     }
 }

@@ -49,7 +49,7 @@ fn create_test_peers<Req: TNMessage, Res: TNMessage>(
                 network_key,
                 db,
                 task_manager.get_spawner(),
-                KadStoreType::Primary,
+                NetworkType::Primary,
                 config.primary_address(),
             )
             .expect("peer1 network created");
@@ -164,7 +164,7 @@ where
             network_key_1,
             MemDatabase::default(),
             task_manager.get_spawner(),
-            KadStoreType::Primary,
+            NetworkType::Primary,
             config_1.primary_address(),
         )
         .expect("peer1 network created");
@@ -186,7 +186,7 @@ where
             network_key_2,
             MemDatabase::default(),
             task_manager.get_spawner(),
-            KadStoreType::Primary,
+            NetworkType::Primary,
             config_2.primary_address(),
         )
         .expect("peer2 network created");
@@ -612,6 +612,138 @@ async fn test_outbound_failure_malicious_response() -> eyre::Result<()> {
     // OutboundFailure::Io(Custom { kind: Other, error: Custom("Invalid value was given to the
     // function") })
     assert_matches!(res, Err(NetworkError::Outbound(_)));
+
+    Ok(())
+}
+
+/// Regression test for cross-role network isolation.
+///
+/// A single node runs a primary and a worker `ConsensusNetwork` in the same
+/// process; they must never negotiate a working session with one another. Before
+/// role-derived protocol names, both spoke `/telcoin-network/0.0.0` (req/res) and
+/// `/tn-kad/1.0.0` (kad). Because kad records are keyed on the validator's BLS
+/// pubkey — identical for that validator's worker and primary — a primary could
+/// ingest a *worker's* `NodeRecord` and then dial/RPC it with primary protocols,
+/// penalizing and banning otherwise-healthy peers.
+///
+/// With `NetworkType::Primary` → `/tn-primary/*` and `NetworkType::Worker(0)` →
+/// `/tn-worker-0/*`, the cross-role substreams never negotiate: kad never exchanges
+/// records (so the worker's pushed record never resolves on the primary) and a
+/// req/res request surfaces an `OutboundFailure`. Both networks use IDENTICAL
+/// req/res message types here, so the only thing that can differ is the
+/// role-derived protocol name.
+#[tokio::test]
+async fn test_primary_worker_protocol_isolation() -> eyre::Result<()> {
+    // build two networks from the same committee
+    let mut network_config = NetworkConfig::default();
+    network_config.peer_config_mut().heartbeat_interval = TEST_HEARTBEAT_INTERVAL;
+
+    let all_nodes =
+        CommitteeFixture::builder(MemDatabase::default).with_network_config(network_config).build();
+    let mut authorities = all_nodes.authorities();
+    let config_1 = authorities.next().expect("first authority").consensus_config();
+    let config_2 = authorities.next().expect("second authority").consensus_config();
+    let (tx1, _events_1) = mpsc::channel(10);
+    let (tx2, _events_2) = mpsc::channel(10);
+    let task_manager = TaskManager::default();
+
+    // peer1: PRIMARY role
+    let primary_network = ConsensusNetwork::<
+        TestWorkerRequest,
+        TestWorkerResponse,
+        MemDatabase,
+        mpsc::Sender<NetworkEvent<TestWorkerRequest, TestWorkerResponse>>,
+    >::new(
+        config_1.network_config(),
+        tx1,
+        config_1.key_config().clone(),
+        config_1.key_config().primary_network_keypair().clone(),
+        MemDatabase::default(),
+        task_manager.get_spawner(),
+        NetworkType::Primary,
+        config_1.primary_address(),
+    )
+    .expect("primary network created");
+    let primary = primary_network.network_handle();
+    tokio::spawn(async move {
+        primary_network.run().await.expect("primary network run failed!");
+    });
+
+    // peer2: WORKER role
+    let worker_network = ConsensusNetwork::<
+        TestWorkerRequest,
+        TestWorkerResponse,
+        MemDatabase,
+        mpsc::Sender<NetworkEvent<TestWorkerRequest, TestWorkerResponse>>,
+    >::new(
+        config_2.network_config(),
+        tx2,
+        config_2.key_config().clone(),
+        config_2.key_config().worker_network_keypair().clone(),
+        MemDatabase::default(),
+        task_manager.get_spawner(),
+        NetworkType::Worker(0),
+        config_2.worker_address(),
+    )
+    .expect("worker network created");
+    let worker = worker_network.network_handle();
+    tokio::spawn(async move {
+        worker_network.run().await.expect("worker network run failed!");
+    });
+
+    // start listening
+    primary.start_listening(config_1.primary_address()).await?;
+    worker.start_listening(config_2.worker_address()).await?;
+    let worker_addr = worker.listeners().await?.first().expect("worker listen addr").clone();
+    let primary_peer_id = primary.local_peer_id().await?;
+
+    // the BLS key is identical for both of the validator's networks — exactly the
+    // shared key that previously let a worker's record contaminate a primary store.
+    let primary_bls = config_1.key_config().primary_public_key();
+    let worker_bls = config_2.key_config().primary_public_key();
+
+    // primary dials the worker across roles
+    primary
+        .add_explicit_peer(
+            worker_bls,
+            config_2.key_config().worker_network_public_key(),
+            worker_addr,
+        )
+        .await?;
+    primary.dial_by_bls(worker_bls).await?;
+
+    // allow the QUIC transport to connect and the kad/req-res substreams to (fail
+    // to) negotiate
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // positive control: the transport connection IS established across roles — the
+    // worker sees the primary's peer id — so the isolation below is protocol-level,
+    // not a failed dial.
+    assert!(
+        worker.connected_peer_ids().await?.contains(&primary_peer_id),
+        "transport connection across roles should establish"
+    );
+
+    // kad isolation: the primary pushes its record to the worker on connect, but
+    // the worker speaks a different kad protocol and never ingests it, so the
+    // worker never resolves the primary's BLS key. (The worker did NOT add the
+    // primary as an explicit peer, so a resolved BLS key could only come from kad.)
+    assert!(
+        !worker.connected_peers().await?.contains(&primary_bls),
+        "worker resolved primary's BLS key — kad records crossed roles"
+    );
+
+    // req/res isolation: a request to the worker cannot negotiate a protocol —
+    // the worker speaks `/tn-worker-0/*`, not the primary's `/tn-primary/*`. With
+    // identical message types, this can ONLY be a protocol-name mismatch.
+    let req = TestWorkerRequest::MissingBatches(vec![]);
+    let reply = primary.send_request(req, worker_bls).await?;
+    let res = timeout(Duration::from_secs(5), reply).await?.expect("reply channel");
+    assert_matches!(
+        res,
+        Err(NetworkError::Outbound(_)),
+        "cross-role req/res must fail to negotiate a protocol"
+    );
 
     Ok(())
 }

@@ -5,7 +5,7 @@
 use crate::{
     codec::{TNCodec, TNMessage},
     error::NetworkError,
-    kad::{KadStore, KadStoreType, DEFAULT_KAD_PROTO_NAME},
+    kad::{KadStore, NetworkType},
     peers::{self, PeerEvent, PeerManager, Penalty},
     send_or_log_error,
     stream::{StreamBehavior, StreamEvent},
@@ -25,6 +25,7 @@ use libp2p::{
     request_response::{
         self, Codec, Event as ReqResEvent, InboundFailure as ReqResInboundFailure,
         InboundRequestId, OutboundFailure as ReqResOutboundFailure, OutboundRequestId,
+        ProtocolSupport,
     },
     swarm::{NetworkBehaviour, SwarmEvent},
     Multiaddr, PeerId, Swarm, SwarmBuilder,
@@ -37,7 +38,7 @@ use std::{
 use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig};
 use tn_types::{
     decode, encode, now, try_decode, BlsPublicKey, BlsSigner, Database, NetworkKeypair,
-    NetworkPublicKey, TaskSpawner, TnSender,
+    NetworkPublicKey, TaskSpawner, TnSender, WorkerId,
 };
 use tokio::sync::{
     mpsc::{Receiver, Sender},
@@ -201,13 +202,14 @@ where
             network_key,
             db,
             task_manager,
-            KadStoreType::Primary,
+            NetworkType::Primary,
             external_addr,
         )
     }
 
     /// Convenience method for spawning a worker network instance.
     pub fn new_for_worker(
+        worker_id: WorkerId,
         network_config: &NetworkConfig,
         event_stream: Events,
         key_config: KeyConfig,
@@ -223,7 +225,7 @@ where
             network_key,
             db,
             task_manager,
-            KadStoreType::Worker,
+            NetworkType::Worker(worker_id),
             external_addr,
         )
     }
@@ -237,7 +239,7 @@ where
         keypair: NetworkKeypair,
         db: DB,
         task_spawner: TaskSpawner,
-        kad_type: KadStoreType,
+        network_type: NetworkType,
         external_addr: Multiaddr,
     ) -> NetworkResult<Self> {
         let gossipsub_config = gossipsub::ConfigBuilder::default()
@@ -259,11 +261,11 @@ where
 
         let req_res = request_response::Behaviour::with_codec(
             tn_codec,
-            network_config.libp2p_config().supported_req_res_protocols.clone(),
+            vec![(network_type.req_res_protocol(), ProtocolSupport::Full)],
             request_response::Config::default(),
         );
         let peer_id: PeerId = keypair.public().into();
-        let mut kad_config = libp2p::kad::Config::new(DEFAULT_KAD_PROTO_NAME);
+        let mut kad_config = libp2p::kad::Config::new(network_type.kad_protocol());
         // manually add peers
         kad_config.set_kbucket_inserts(kad::BucketInserts::Manual);
         let libp2p = network_config.libp2p_config();
@@ -274,7 +276,7 @@ where
             .set_publication_interval(Some(libp2p.kad_publication_interval))
             .set_query_timeout(Duration::from_secs(60))
             .set_provider_record_ttl(Some(libp2p.kad_record_ttl));
-        let kad_store = KadStore::new(db.clone(), &key_config, kad_type);
+        let kad_store = KadStore::new(db.clone(), &key_config, network_type);
         let kademlia = kad::Behaviour::with_config(peer_id, kad_store.clone(), kad_config);
 
         // create custom behavior
