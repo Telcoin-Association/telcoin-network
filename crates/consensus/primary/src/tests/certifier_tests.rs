@@ -923,7 +923,7 @@ async fn vote_unknown_authority() {
 // remaining peers can still form a certificate.
 // ---------------------------------------------------------------------------
 #[tokio::test(flavor = "current_thread")]
-async fn duplicate_vote_same_peer() {
+async fn duplicate_vote_rejected_quorum_still_forms() {
     let cx = CertifierContext::new();
     let header = cx.proposer_header();
     let proposer_id = cx.proposer().id();
