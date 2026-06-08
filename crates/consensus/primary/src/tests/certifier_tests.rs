@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::{
+    aggregators::VotesAggregator,
     network::{PrimaryRequest, PrimaryResponse},
     ConsensusBus,
 };
@@ -10,7 +11,7 @@ use std::{collections::HashMap, num::NonZeroUsize};
 use tn_network_libp2p::types::{NetworkCommand, NetworkHandle, NetworkResponseMessage};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils_committee::{AuthorityFixture, CommitteeFixture};
-use tn_types::{BlsKeypair, BlsSigner, SignatureVerificationState, TnSender};
+use tn_types::{error::DagError, BlsKeypair, BlsSigner, SignatureVerificationState, TnSender};
 use tokio::sync::mpsc;
 
 // ===== Certifier test harness =====
@@ -917,50 +918,42 @@ async fn vote_unknown_authority() {
 
 // ---------------------------------------------------------------------------
 // T14: duplicate_vote_same_peer
-// The same peer sends two identical votes for the same header.  VotesAggregator
-// deduplicates, so the cert is assembled from the proposer's self-vote plus the
-// unique votes of the remaining peers — a full quorum still forms.
+// The same peer sends two identical votes for the same header. The second vote
+// must be rejected with `DagError::AuthorityReuse`, while unique votes from the
+// remaining peers can still form a certificate.
 // ---------------------------------------------------------------------------
 #[tokio::test(flavor = "current_thread")]
 async fn duplicate_vote_same_peer() {
-    let mut cx = CertifierContext::new();
+    let cx = CertifierContext::new();
     let header = cx.proposer_header();
     let proposer_id = cx.proposer().id();
-    let mut cert_rx = cx.subscribe_new_certificates();
+    let committee = cx.fixture.committee();
+    let mut agg = VotesAggregator::new();
 
-    cx.consensus_bus.headers().send(header.clone()).await.unwrap();
+    let mut peers = cx.fixture.authorities().filter(|a| a.id() != proposer_id);
+    let dup = peers.next().expect("at least one non-proposer peer");
 
-    // For the first non-proposer peer we process two requests (duplicate), for others one.
-    let num_peers = cx.fixture.num_authorities() - 1;
-    let mut handled = 0;
-    while let Some(req) = cx.network_rx.recv().await {
-        let NetworkCommand::SendRequest { peer, request: PrimaryRequest::Vote { .. }, reply } = req
-        else {
-            continue;
-        };
-        let authority = cx
-            .fixture
-            .authorities()
-            .find(|a| a.authority().protocol_key() == &peer)
-            .expect("committee member");
-        if authority.id() == proposer_id {
-            continue;
-        }
-        let vote = Vote::new(&header, authority.id(), authority.consensus_config().key_config());
-        reply
-            .send(Ok(NetworkResponseMessage { peer, result: PrimaryResponse::Vote(vote.clone()) }))
-            .unwrap();
-        handled += 1;
+    // First vote from `dup` is accepted.
+    let v1 = Vote::new(&header, dup.id(), dup.consensus_config().key_config());
+    assert!(matches!(agg.append(v1, &committee, &header), Ok(None)));
 
-        if handled >= num_peers {
+    // Second vote from the same author is rejected.
+    let v2 = Vote::new(&header, dup.id(), dup.consensus_config().key_config());
+    assert!(matches!(agg.append(v2, &committee, &header), Err(DagError::AuthorityReuse(_))));
+
+    // Unique votes from other peers still allow quorum to form.
+    let mut cert = None;
+    for peer in peers {
+        let vote = Vote::new(&header, peer.id(), peer.consensus_config().key_config());
+        cert = agg
+            .append(vote, &committee, &header)
+            .expect("unique peer vote should be accepted");
+        if cert.is_some() {
             break;
         }
     }
 
-    let cert = tokio::time::timeout(Duration::from_secs(10), cert_rx.recv())
-        .await
-        .expect("cert forms despite duplicate vote concern")
-        .expect("cert_rx channel open");
+    let cert = cert.expect("certificate should form from unique non-duplicate votes");
     assert_eq!(cert.header().digest(), header.digest());
 }
 
