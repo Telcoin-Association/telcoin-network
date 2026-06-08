@@ -945,9 +945,7 @@ async fn duplicate_vote_rejected_quorum_still_forms() {
     let mut cert = None;
     for peer in peers {
         let vote = Vote::new(&header, peer.id(), peer.consensus_config().key_config());
-        cert = agg
-            .append(vote, &committee, &header)
-            .expect("unique peer vote should be accepted");
+        cert = agg.append(vote, &committee, &header).expect("unique peer vote should be accepted");
         if cert.is_some() {
             break;
         }
