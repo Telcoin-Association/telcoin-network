@@ -9,7 +9,7 @@ use crate::{
 use rand::{rngs::StdRng, SeedableRng};
 use std::{collections::HashMap, num::NonZeroUsize};
 use tn_network_libp2p::types::{NetworkCommand, NetworkHandle, NetworkResponseMessage};
-use tn_storage::mem_db::MemDatabase;
+use tn_storage::{mem_db::MemDatabase, tables::ProposedCertificates};
 use tn_test_utils_committee::{AuthorityFixture, CommitteeFixture};
 use tn_types::{error::DagError, BlsKeypair, BlsSigner, SignatureVerificationState, TnSender};
 use tokio::sync::mpsc;
@@ -1095,6 +1095,7 @@ async fn propose_header_failure() {
     let mut cx = CertifierContext::new();
     let committee = cx.fixture.committee();
     let header = cx.proposer().header(&committee);
+    let proposed_digest = header.digest();
     let proposer_id = cx.proposer().id();
     let mut cert_rx = cx.subscribe_new_certificates();
 
@@ -1110,9 +1111,27 @@ async fn propose_header_failure() {
     drive_vote_requests(&mut cx.network_rx, &cx.fixture, &proposer_id, &header, &peer_configs)
         .await;
 
-    if let Ok(result) = tokio::time::timeout(Duration::from_secs(5), cert_rx.recv()).await {
+    // Fatal peer errors should cause proposal failure without publishing a cert.
+    // Yield a few times so the certifier can process all vote task results, then
+    // assert the cert channel is still empty without relying on wall-clock time.
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+
+    if let Ok(result) = cert_rx.try_recv() {
         panic!("expected no certificate to form; got {result:?}");
     }
+
+    let stored = cx
+        .proposer()
+        .consensus_config()
+        .node_storage()
+        .get::<ProposedCertificates>(&proposed_digest)
+        .expect("reading proposed certificates should succeed");
+    assert!(
+        stored.is_none(),
+        "failed proposal should not persist a proposed certificate for {proposed_digest:?}"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
