@@ -5,7 +5,7 @@ use tn_network_libp2p::Penalty;
 use tn_storage::StoreError;
 use tn_types::{
     error::{CertificateError, HeaderError},
-    BcsError, BlockHash, BlsPublicKey, ConsensusHeaderDigest, Epoch,
+    BcsError, BlockHash, BlsPublicKey, ConsensusHeaderDigest, Epoch, EpochDigest,
 };
 
 /// Result alias for results that possibly return [`PrimaryNetworkError`].
@@ -50,7 +50,7 @@ pub(crate) enum PrimaryNetworkError {
     UnavailableEpoch(Epoch),
     /// Unavaliable epoch hash (either it is invalid or this node does not have it).
     #[error("Unknown epoch record digest: {0}")]
-    UnavailableEpochDigest(BlockHash),
+    UnavailableEpochDigest(EpochDigest),
     /// Invalid epoch request.
     #[error("Must suply an epoch or hash when requesting an epoch record")]
     InvalidEpochRequest,

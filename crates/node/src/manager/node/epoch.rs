@@ -42,8 +42,8 @@ use tn_storage::{
 use tn_types::{
     gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash, BlsPublicKey, BlsSigner,
     Committee, CommitteeBuilder, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput,
-    Database as TNDatabase, Epoch, EpochRecord, Multiaddr, NetworkPublicKey, Notifier, P2pNode,
-    TaskJoinError, TaskManager, TaskSpawner, TnReceiver, B256,
+    Database as TNDatabase, Epoch, EpochDigest, EpochRecord, Multiaddr, NetworkPublicKey, Notifier,
+    P2pNode, TaskJoinError, TaskManager, TaskSpawner, TnReceiver,
 };
 use tn_worker::{quorum_waiter::QuorumWaiterTrait, Worker, WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::mpsc;
@@ -634,7 +634,7 @@ where
         let committee_keys = engine.validators_for_epoch(epoch).await?;
         let next_committee_keys = engine.validators_for_epoch(epoch + 1).await?;
         let parent_hash = if epoch == 0 {
-            B256::default()
+            EpochDigest::default()
         } else if let Some(prev) = self.consensus_chain.epochs().record_by_epoch(epoch - 1).await {
             if committee_keys != prev.next_committee {
                 error!(

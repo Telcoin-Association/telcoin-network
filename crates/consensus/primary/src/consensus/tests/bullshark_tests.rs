@@ -16,7 +16,7 @@ use tn_config::{ConsensusConfig, NetworkConfig};
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, CertificateStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    AuthorityIdentifier, BlockHash, ConsensusHeaderDigest, ConsensusNumHash, EpochRecord,
+    AuthorityIdentifier, ConsensusHeaderDigest, ConsensusNumHash, EpochDigest, EpochRecord,
     ExecHeader, Header, Notifier, SealedHeader, TaskManager, TnReceiver, TnSender, B256,
     DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
@@ -1031,7 +1031,7 @@ async fn restart_with_new_committee() {
     let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
     let temp_dir = TempDir::new().unwrap();
     let consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).unwrap();
-    let mut prev_epoch_digest = BlockHash::default();
+    let mut prev_epoch_digest = EpochDigest::default();
 
     // Run for a few epochs.
     for epoch in 0..5 {

@@ -10,8 +10,8 @@ use std::{
 use tn_network_libp2p::{types::IntoRpcError, PeerExchangeMap, TNMessage};
 use tn_types::{
     error::HeaderError, AuthorityIdentifier, BlockHash, BlsPublicKey, BlsSignature, Certificate,
-    ConsensusHeader, ConsensusHeaderDigest, Epoch, EpochCertificate, EpochRecord, EpochVote,
-    Header, HeaderDigest, Round, Vote, B256,
+    ConsensusHeader, ConsensusHeaderDigest, Epoch, EpochCertificate, EpochDigest, EpochRecord,
+    EpochVote, Header, HeaderDigest, Round, Vote, B256,
 };
 
 /// Info that is published (via gossip) by validators once they reach consensus.
@@ -132,7 +132,7 @@ pub enum PrimaryRequest {
         /// Block number requesting if not None.
         epoch: Option<Epoch>,
         /// Block hash requesting if not None.
-        hash: Option<BlockHash>,
+        hash: Option<EpochDigest>,
     },
     /// Request to stream a pack file of the consensus data for epoch.
     StreamEpoch {

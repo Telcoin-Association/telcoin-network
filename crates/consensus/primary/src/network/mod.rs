@@ -34,9 +34,9 @@ use tn_storage::{
     PayloadStore,
 };
 use tn_types::{
-    encode, BlockHash, BlsPublicKey, BlsSignature, Certificate, ConsensusHeader,
-    ConsensusHeaderDigest, Database, Epoch, EpochCertificate, EpochRecord, EpochVote, Header,
-    HeaderDigest, Round, TaskError, TaskSpawner, TnReceiver, TnSender, Vote, B256,
+    encode, BlsPublicKey, BlsSignature, Certificate, ConsensusHeader, ConsensusHeaderDigest,
+    Database, Epoch, EpochCertificate, EpochDigest, EpochRecord, EpochVote, Header, HeaderDigest,
+    Round, TaskError, TaskSpawner, TnReceiver, TnSender, Vote, B256,
 };
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
@@ -309,7 +309,7 @@ impl PrimaryNetworkHandle {
     pub async fn request_epoch_cert(
         &self,
         epoch: Option<Epoch>,
-        hash: Option<BlockHash>,
+        hash: Option<EpochDigest>,
     ) -> NetworkResult<(EpochRecord, EpochCertificate)> {
         let request = PrimaryRequest::EpochRecord { epoch, hash };
         // Try up to three times (from three peers) to get consensus.
@@ -742,7 +742,7 @@ where
         &self,
         peer: BlsPublicKey,
         epoch: Option<Epoch>,
-        hash: Option<BlockHash>,
+        hash: Option<EpochDigest>,
         channel: ResponseChannel<PrimaryResponse>,
         cancel: oneshot::Receiver<()>,
     ) {

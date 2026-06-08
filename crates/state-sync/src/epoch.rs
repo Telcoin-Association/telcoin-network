@@ -8,7 +8,7 @@ use std::{collections::BTreeSet, time::Duration};
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{
-    BlsPublicKey, ConsensusHeaderDigest, Epoch, EpochRecord, Noticer, TaskSpawner, B256,
+    BlsPublicKey, ConsensusHeaderDigest, Epoch, EpochDigest, EpochRecord, Noticer, TaskSpawner,
 };
 use tracing::{debug, error, info};
 
@@ -84,7 +84,7 @@ async fn collect_epoch_records(
                         .get_committee_keys(0)
                         .await
                         .expect("always can retrieve epoch 0 committee");
-                    (B256::default(), committee)
+                    (EpochDigest::default(), committee)
                 } else if let Some(prev) = consensus_chain.epochs().record_by_epoch(epoch - 1).await
                 {
                     (prev.digest(), prev.next_committee.iter().copied().collect())
@@ -220,7 +220,7 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
-    use tn_types::{BlockNumHash, BlsKeypair, ConsensusNumHash};
+    use tn_types::{BlockNumHash, BlsKeypair, ConsensusNumHash, B256};
 
     /// Generate a deterministic test BLS public key from a seed.
     fn test_bls_key(seed: u8) -> BlsPublicKey {
@@ -234,7 +234,7 @@ mod tests {
             epoch: 1,
             committee,
             next_committee: vec![],
-            parent_hash: B256::ZERO,
+            parent_hash: B256::ZERO.into(),
             final_state: BlockNumHash::default(),
             final_consensus: ConsensusNumHash::default(),
         }

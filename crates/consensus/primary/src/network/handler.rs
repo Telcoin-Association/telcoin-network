@@ -24,9 +24,9 @@ use tn_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
     now, to_intent_message, try_decode, AuthorityIdentifier, BlockHash, BlsPublicKey, Certificate,
-    ConsensusHeader, ConsensusHeaderDigest, Database, Epoch, EpochCertificate, EpochRecord,
-    Hash as _, Header, HeaderDigest, ProtocolSignature, Round, SignatureVerificationState,
-    TnSender as _, Vote, B256,
+    ConsensusHeader, ConsensusHeaderDigest, Database, Epoch, EpochCertificate, EpochDigest,
+    EpochRecord, Hash as _, Header, HeaderDigest, ProtocolSignature, Round,
+    SignatureVerificationState, TnSender as _, Vote, B256,
 };
 use tokio::{io::AsyncReadExt, sync::Mutex as TokioMutex, time::timeout};
 use tracing::{debug, error, info, warn};
@@ -871,7 +871,7 @@ where
     pub(super) async fn retrieve_epoch_record(
         &self,
         epoch: Option<Epoch>,
-        hash: Option<BlockHash>,
+        hash: Option<EpochDigest>,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
         let (record, certificate) = match (epoch, hash) {
             (_, Some(hash)) => self.get_epoch_by_hash(hash).await?,
@@ -921,7 +921,7 @@ where
     /// Retrieve the consensus header by hash
     async fn get_epoch_by_hash(
         &self,
-        hash: BlockHash,
+        hash: EpochDigest,
     ) -> PrimaryNetworkResult<(EpochRecord, EpochCertificate)> {
         match self.consensus_chain.epochs().get_epoch_by_hash(hash).await {
             Some((record, Some(cert))) => Ok((record, cert)),
