@@ -271,18 +271,29 @@ where
     fn shuffle_new_committee(&mut self, randomness: B256) -> TnRethResult<Vec<Address>> {
         let new_committee_size = self.next_committee_size()?;
 
-        // read all active validators from consensus registry
-        let calldata =
-            ConsensusRegistry::getValidatorsCall { status: ValidatorStatus::Active.into() }
+        // Read the committee-eligible validator pool from the consensus registry. The registry's
+        // per-status `getValidators`/`getValidatorsInfo` return ONLY the exact status set; the
+        // committee-eligible pool is the union of `{ Active, PendingActivation, PendingExit }` (the
+        // statuses for which `_eligibleForCommitteeNextEpoch` is true). The registry computes the
+        // O(1) eligible *count* on-chain and expects the protocol to assemble the eligible *pool* by
+        // unioning these queries off-chain. We use `getValidatorsInfo` (full structs) because the
+        // pending-exit validators are separated out below by `currentStatus`.
+        let mut all_active_validators: Vec<ConsensusRegistry::ValidatorInfo> = Vec::new();
+        for status in [
+            ValidatorStatus::Active,
+            ValidatorStatus::PendingActivation,
+            ValidatorStatus::PendingExit,
+        ] {
+            let calldata = ConsensusRegistry::getValidatorsInfoCall { status: status.into() }
                 .abi_encode()
                 .into();
-        let state =
-            self.read_state_on_chain(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)?;
-
-        trace!(target: "engine", "get validators call:\n{:?}", state);
-
-        let all_active_validators: Vec<ConsensusRegistry::ValidatorInfo> =
-            alloy::sol_types::SolValue::abi_decode(&state)?;
+            let state =
+                self.read_state_on_chain(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)?;
+            trace!(target: "engine", ?status, "get validators call:\n{:?}", state);
+            let validators: Vec<ConsensusRegistry::ValidatorInfo> =
+                alloy::sol_types::SolValue::abi_decode(&state)?;
+            all_active_validators.extend(validators);
+        }
 
         debug!(target: "engine",  "validators pre-shuffle {:?}", all_active_validators);
 
