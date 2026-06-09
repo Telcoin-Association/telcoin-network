@@ -8,11 +8,13 @@ use libp2p::{
     core::transport::ListenerId,
     gossipsub::{PublishError, SubscriptionError, TopicHash},
     request_response::ResponseChannel,
-    Multiaddr, PeerId, Stream, TransportError,
+    Multiaddr, PeerId, Stream, StreamProtocol, TransportError,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use tn_types::{encode, now, BlsPublicKey, BlsSignature, NetworkPublicKey, P2pNode, TimestampSec};
+use tn_types::{
+    encode, now, BlsPublicKey, BlsSignature, NetworkPublicKey, P2pNode, TimestampSec, WorkerId,
+};
 use tokio::sync::{mpsc, oneshot};
 
 #[cfg(test)]
@@ -52,6 +54,42 @@ pub const WORKER_BATCH_TOPIC: &str = "tn_batches";
 pub const PRIMARY_CERT_TOPIC: &str = "tn_certificates";
 /// The topic for NVVs to subscribe to for published consensus chain.
 pub const CONSENSUS_HEADER_TOPIC: &str = "tn_consensus_headers";
+
+/// The role of a consensus network instance: primary or worker.
+///
+/// A node runs both as fully isolated libp2p swarms in one process. This is the
+/// one source of truth for everything that must differ: the kad store's backing
+/// tables and the wire protocol names that keep the two from ever negotiating a
+/// connection with one another.
+#[derive(Copy, Clone, Debug)]
+pub enum NetworkType {
+    /// Primary network.
+    Primary,
+    /// Worker network.
+    Worker(WorkerId),
+}
+
+impl NetworkType {
+    /// Request-response wire protocol, isolated per role (and per worker).
+    pub(crate) fn req_res_protocol(&self) -> StreamProtocol {
+        match self {
+            Self::Primary => StreamProtocol::new("/tn-primary/0.0.1"),
+            Self::Worker(id) => StreamProtocol::try_from_owned(format!("/tn-worker-{id}/0.0.1"))
+                .expect("worker req-res protocol name starts with '/'"),
+        }
+    }
+
+    /// Kademlia wire protocol, isolated per role (and per worker).
+    pub(crate) fn kad_protocol(&self) -> StreamProtocol {
+        match self {
+            Self::Primary => StreamProtocol::new("/tn-primary-kad/0.0.1"),
+            Self::Worker(id) => {
+                StreamProtocol::try_from_owned(format!("/tn-worker-{id}-kad/0.0.1"))
+                    .expect("worker kad protocol name starts with '/'")
+            }
+        }
+    }
+}
 
 /// Events created from network activity.
 #[derive(Debug)]

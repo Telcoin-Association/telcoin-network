@@ -22,7 +22,7 @@ use tn_types::{
     deconstruct_nonce, gas_accumulator::GasAccumulator, BlockNumHash, BlsPublicKey,
     BootstrapServer, Committee, ConsensusHeader, ConsensusOutput, Database as TNDatabase,
     EngineUpdate, Epoch, Notifier, TaskError, TaskManager, TaskSpawner, TimestampSec,
-    MIN_PROTOCOL_BASE_FEE,
+    DEFAULT_WORKER_ID, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::mpsc;
@@ -421,6 +421,7 @@ where
 
         // create long-running network task for worker
         let worker_network = ConsensusNetwork::new_for_worker(
+            DEFAULT_WORKER_ID,
             network_config,
             self.worker_event_stream.clone(),
             self.key_config.clone(),
