@@ -939,9 +939,9 @@ impl AllPeers {
     ///
     /// The complete committee sets are stored directly, keyed by [BlsPublicKey]. Committee
     /// membership is a consensus-domain fact that is always known, so a member whose libp2p
-    /// [PeerId] has not been discovered yet is still retained in its slot and counts as a validator;
-    /// the unban/trust pass for it then runs lazily once discovery confirms its network identity
-    /// (see [`Self::apply_membership_if_committee`]).
+    /// [PeerId] has not been discovered yet is still retained in its slot and counts as a
+    /// validator; the unban/trust pass for it then runs lazily once discovery confirms its
+    /// network identity (see [`Self::apply_membership_if_committee`]).
     ///
     /// Any member that was tracked in one of the three slots before this update but is absent from
     /// all three afterward is demoted via [`Peer::make_untrusted`] when a `Confirmed` record exists
@@ -1001,11 +1001,11 @@ impl AllPeers {
 
     /// Lazily apply committee trust to a single member the moment its network identity is learned.
     ///
-    /// Called from the discovery path ([`super::manager::PeerManager::add_known_peer`]) after a peer
-    /// is re-keyed onto its `Confirmed` identity. If the member belongs to any tracked committee
-    /// slot it is unbanned/trusted immediately, closing the trust window for members that were
-    /// tracked by [`Self::update_committees`] before their [PeerId] was known. A no-op for peers
-    /// that are not in any tracked committee.
+    /// Called from the discovery path ([`super::manager::PeerManager::add_known_peer`]) after a
+    /// peer is re-keyed onto its `Confirmed` identity. If the member belongs to any tracked
+    /// committee slot it is unbanned/trusted immediately, closing the trust window for members
+    /// that were tracked by [`Self::update_committees`] before their [PeerId] was known. A
+    /// no-op for peers that are not in any tracked committee.
     pub(super) fn apply_membership_if_committee(
         &mut self,
         bls_key: BlsPublicKey,

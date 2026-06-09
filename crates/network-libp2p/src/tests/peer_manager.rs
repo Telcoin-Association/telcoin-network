@@ -640,9 +640,10 @@ async fn test_prepare_committee_dial_unbans_without_touching_slots() {
 #[tokio::test]
 async fn test_add_known_peer_closes_validator_gap_on_discovery() {
     // GAP FIX (full): a committee member set by bls before its network identity is known is tracked
-    // in the slot but does not yet resolve to a validator by its libp2p id. The moment kad discovery
-    // confirms the identity via `add_known_peer`, the lazy-trust hook makes it a validator and marks
-    // it important -- without waiting for the next epoch's `update_committees`.
+    // in the slot but does not yet resolve to a validator by its libp2p id. The moment kad
+    // discovery confirms the identity via `add_known_peer`, the lazy-trust hook makes it a
+    // validator and marks it important -- without waiting for the next epoch's
+    // `update_committees`.
     let mut peer_manager = create_test_peer_manager(None);
 
     // a committee member whose network identity is not yet known to this node

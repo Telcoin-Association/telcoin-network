@@ -605,17 +605,19 @@ impl PeerManager {
 
     /// Set the previous/current/next committees directly from authoritative state, every epoch.
     ///
-    /// The three committees are handed to the peer store keyed by [`BlsPublicKey`], which overwrites
-    /// the three slots with the complete sets, demotes any member that fell out of the window,
-    /// records every member as a validator (even those whose network identity is not yet known),
-    /// and forgives any bans for members already discovered. Unknown keys in `current` and `next`
-    /// trigger a kad lookup (see [`Self::trigger_missing_authorities`]) — but **not** `previous`,
-    /// whose peers are rotating out. The `next` committee is the most likely source of peers we have
-    /// never connected to, but `current` members may also be unknown when a restart seeds the
-    /// committees late (the initial epoch returned early before network setup), so chase both.
+    /// The three committees are handed to the peer store keyed by [`BlsPublicKey`], which
+    /// overwrites the three slots with the complete sets, demotes any member that fell out of
+    /// the window, records every member as a validator (even those whose network identity is
+    /// not yet known), and forgives any bans for members already discovered. Unknown keys in
+    /// `current` and `next` trigger a kad lookup (see [`Self::trigger_missing_authorities`]) —
+    /// but **not** `previous`, whose peers are rotating out. The `next` committee is the most
+    /// likely source of peers we have never connected to, but `current` members may also be
+    /// unknown when a restart seeds the committees late (the initial epoch returned early
+    /// before network setup), so chase both.
     ///
-    /// Members are also lifted out of the manager's temporary-ban cache so a follow-up dial loop can
-    /// reach them; members discovered only later are forgiven lazily by [`Self::add_known_peer`].
+    /// Members are also lifted out of the manager's temporary-ban cache so a follow-up dial loop
+    /// can reach them; members discovered only later are forgiven lazily by
+    /// [`Self::add_known_peer`].
     pub(crate) fn update_committees(
         &mut self,
         previous: HashSet<BlsPublicKey>,
@@ -647,7 +649,8 @@ impl PeerManager {
     ///
     /// The temporary-ban cache is a network-layer reconnection guard kept separate from peer state;
     /// committee members must bypass it so they can be (re)dialed. Members with no known network
-    /// info yet are skipped here and forgiven lazily once discovered (see [`Self::add_known_peer`]).
+    /// info yet are skipped here and forgiven lazily once discovered (see
+    /// [`Self::add_known_peer`]).
     fn forgive_temporarily_banned(&mut self, committee: &HashSet<BlsPublicKey>) {
         for bls_key in committee {
             if let Some((peer_id, _)) = self.auth_to_peer(*bls_key) {
@@ -681,10 +684,10 @@ impl PeerManager {
         trace!(target: "peer-manager", ?bls_key, "adding known peer");
         self.peers.upsert_peer(bls_key, info.pubkey.clone(), info.multiaddrs.clone());
         self.known_peers.insert(bls_key, info);
-        // FULL FIX: if this newly-discovered peer belongs to a tracked committee, unban/trust it now
+        // if this newly-discovered peer belongs to a tracked committee, unban/trust it now
         // (closing the trust window) instead of waiting for the next epoch's `update_committees`.
-        // `upsert_peer` just re-keyed it onto its `Confirmed` identity, so the trust pass can resolve
-        // its peer id immediately.
+        // `upsert_peer` just re-keyed it onto its `Confirmed` identity, so the trust pass can
+        // resolve its peer id immediately.
         let unban_actions = self.peers.apply_membership_if_committee(bls_key);
         self.apply_unban_actions(unban_actions);
     }

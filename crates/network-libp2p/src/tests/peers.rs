@@ -876,7 +876,8 @@ fn test_undiscovered_committee_member_banned_then_unbanned_on_discovery() {
     assert!(all_peers.peer_banned(&peer_id), "member should be banned during the window");
     assert!(!all_peers.is_peer_validator(&peer_id), "still unidentified, still not a validator");
 
-    // kad resolves the bls: re-key the Unidentified record onto Confirmed, then apply committee trust
+    // kad resolves the bls: re-key the Unidentified record onto Confirmed, then apply committee
+    // trust
     all_peers.upsert_peer(bls, net, vec![create_multiaddr(None)]);
     let actions = all_peers.apply_membership_if_committee(bls);
 
