@@ -405,7 +405,7 @@ impl ConsensusBusApp {
         &self,
         epoch: Epoch,
         number: u64,
-        hash: B256,
+        hash: ConsensusHeaderDigest,
     ) -> bool {
         self.last_published_consensus_num_hash().send_if_modified(|state| {
             if number > state.1 {

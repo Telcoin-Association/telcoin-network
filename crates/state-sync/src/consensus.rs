@@ -23,7 +23,7 @@ const PACK_RECORD_TIMEOUT_SECS: u64 = 10;
 
 enum ConsensusHeaderResult {
     Done,
-    Continue(u64, B256),
+    Continue(u64, ConsensusHeaderDigest),
     Retry,
 }
 

@@ -19,7 +19,7 @@ use tn_types::{
     encode, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash, BlsSigner as _,
     CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusHeaderDigest,
     ConsensusOutput, Database, Hash as _, Noticer, TaskManager, TaskSpawner, Timestamp,
-    TimestampSec, TnReceiver, TnSender, B256,
+    TimestampSec, TnReceiver, TnSender,
 };
 use tracing::{debug, error, info, instrument, warn};
 
