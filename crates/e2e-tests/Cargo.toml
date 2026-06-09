@@ -30,6 +30,7 @@ escargot = { workspace = true }
 alloy = { workspace = true }
 
 [dev-dependencies]
+tn-exex = { workspace = true }
 tn-reth = { workspace = true, features = ["test-utils"] }
 tempfile = { workspace = true }
 serde_json = { workspace = true }

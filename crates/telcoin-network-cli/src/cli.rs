@@ -112,7 +112,7 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
     /// if let Err(err) = telcoin_network_cli::cli::Cli::<MyArgs>::parse().run(
     ///     None,
     ///     |builder, _, tn_datadir, passphrase, version| {
-    ///         launch_node(builder, tn_datadir, passphrase, version)
+    ///         launch_node(builder, tn_datadir, passphrase, version, None)
     ///     },
     /// ) {
     ///     eprintln!("Error: {err:?}");

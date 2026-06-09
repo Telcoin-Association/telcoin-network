@@ -4,7 +4,7 @@ use crate::{
     aggregators::VotesAggregator,
     network::{PrimaryNetworkHandle, RequestVoteResult},
     state_sync::StateSynchronizer,
-    ConsensusBus,
+    ConsensusBus, ConsensusBusApp,
 };
 use std::{sync::Arc, time::Duration};
 use tn_config::{ConsensusConfig, KeyConfig};
@@ -52,6 +52,8 @@ pub(crate) struct Certifier<DB> {
     /// Should not generally happen but can lead to leader cert equivocation
     /// if it does so be really sure.
     proposal_lock: Arc<Mutex<()>>,
+    /// App-lifetime consensus bus for ExEx notifications.
+    consensus_bus_app: ConsensusBusApp,
 }
 
 impl<DB: Database> Certifier<DB> {
@@ -106,6 +108,7 @@ impl<DB: Database> Certifier<DB> {
                 task_spawner,
                 new_proposal: Notifier::new(),
                 proposal_lock: Arc::new(Mutex::new(())),
+                consensus_bus_app: consensus_bus.app().clone(),
             }
             .run(rx_headers)
             .await;
@@ -438,6 +441,9 @@ impl<DB: Database> Certifier<DB> {
                             error!(target: "primary::certifier", "error accepting own certificate: {e}");
                             return Err(e.into());
                         }
+
+                        // Notify ExEx consumers about the new own certificate
+                        let _ = self.consensus_bus_app.exex_certificates().send(Arc::new(certificate.clone()));
 
                         // try to publish the certificate on gossip network
                         if let Err(e) = self.network.publish_certificate(certificate).await {

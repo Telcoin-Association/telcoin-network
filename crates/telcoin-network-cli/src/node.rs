@@ -58,6 +58,16 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     #[arg(long, value_name = "OBSERVER", global = true, default_value_t = false)]
     pub observer: bool,
 
+    /// Enable Execution Extensions by ID.
+    ///
+    /// Can be specified multiple times to enable multiple ExExes.
+    /// ExExes receive real-time notifications of committed chain state transitions.
+    /// Observer nodes are the recommended deployment target for ExExes.
+    ///
+    /// Example: --exex my-indexer --exex bridge-relayer
+    #[arg(long = "exex", value_name = "EXEX_ID", global = true)]
+    pub exex: Vec<String>,
+
     /// Sets all ports to unused, allowing the OS to choose random unused ports when sockets are
     /// bound.
     ///
@@ -144,10 +154,19 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         debug!(target: "cli", validator = ?tn_config.node_info.name, "tn datadir for node command: {tn_datadir:?}");
         info!(target: "cli", validator = ?tn_config.node_info.name, "config loaded");
 
+        // Merge CLI exex flags into config
+        let mut tn_config = tn_config;
+        if !self.exex.is_empty() {
+            use tn_config::ExExConfig;
+            tn_config.exex = self.exex.iter().map(|id| ExExConfig::new(id.clone())).collect();
+            info!(target: "cli", exex_count = tn_config.exex.len(), exex_ids = ?tn_config.exex.iter().map(|e| &e.id).collect::<Vec<_>>(), "ExExes enabled via CLI");
+        }
+
         // get the worker's transaction address from the config
         let Self {
             chain: _,    // Used above
             observer: _, // Used above
+            exex: _,     // Used above
             metrics,
             instance,
             with_unused_ports,

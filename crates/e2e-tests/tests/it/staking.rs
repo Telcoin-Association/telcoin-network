@@ -60,7 +60,7 @@ fn execute_and_commit(
     let state = reth_env.canonical_in_memory_state();
     state.update_chain(NewCanonicalChain::Commit { new: vec![block.clone()] });
     state.set_canonical_head(header.clone());
-    reth_env.finish_executing_output(vec![block], None)?;
+    reth_env.finish_executing_output(vec![block], None, tn_reth::exex_handle::EmptyExExHandle)?;
     reth_env.finalize_block(header.clone())?;
     Ok(header)
 }

@@ -71,6 +71,8 @@ pub struct ExecutorEngine {
     /// Sends (leader_round, consensus_num_hash, Option<SealedHeader>) after each
     /// ConsensusOutput is processed.
     engine_update_tx: mpsc::Sender<EngineUpdate>,
+    /// ExEx manager handle for notifying Execution Extensions.
+    exex_handle: tn_exex::TnExExManagerHandle,
 }
 
 impl ExecutorEngine {
@@ -90,6 +92,7 @@ impl ExecutorEngine {
         task_spawner: TaskSpawner,
         gas_accumulator: GasAccumulator,
         engine_update_tx: mpsc::Sender<EngineUpdate>,
+        exex_handle: tn_exex::TnExExManagerHandle,
     ) -> Self {
         let consensus_output_stream = ReceiverStream::new(rx_consensus_output);
 
@@ -104,6 +107,7 @@ impl ExecutorEngine {
             task_spawner,
             gas_accumulator,
             engine_update_tx,
+            exex_handle,
         }
     }
 
@@ -123,15 +127,20 @@ impl ExecutorEngine {
 
             let gas_accumulator = self.gas_accumulator.clone();
             let engine_update_tx = self.engine_update_tx.clone();
+            let exex_handle = self.exex_handle.clone();
             // spawn blocking task and return future
             self.task_spawner.spawn_blocking_task(task_name, move || {
                 // this is safe to call on blocking thread without a semaphore bc it's held in
                 // Self::pending_tesk as a single `Option`
-                let result =
-                    execute_consensus_output(build_args, gas_accumulator, engine_update_tx)
-                        .inspect_err(|e| {
-                            error!(target: "engine", ?e, "error executing consensus output");
-                        });
+                let result = execute_consensus_output(
+                    build_args,
+                    gas_accumulator,
+                    engine_update_tx,
+                    exex_handle,
+                )
+                .inspect_err(|e| {
+                    error!(target: "engine", ?e, "error executing consensus output");
+                });
                 if let Err(e) = tx.send(result) {
                     warn!(target: "engine", ?e, "error sending result from execute_consensus_output")
                 }

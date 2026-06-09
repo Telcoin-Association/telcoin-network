@@ -221,7 +221,7 @@ pub fn spawn_local_testnet(
                     dir,
                     key_config,
                     |builder, _: NoArgs, tn_datadir, passphrase, version| {
-                        launch_node(builder, tn_datadir, passphrase, version)
+                        launch_node(builder, tn_datadir, passphrase, version, None)
                     },
                 ) {
                     Ok(handle) => {
