@@ -706,21 +706,23 @@ where
                 let peers = self.swarm.behaviour_mut().peer_manager.peers_for_exchange();
                 send_or_log_error!(reply, peers, "PeersForExchange");
             }
-            NetworkCommand::NewEpoch { committee } => {
-                // at the start of a new epoch, each node needs to know:
-                // - the current committee
-                // - all staked nodes who will vote at the end of the epoch
-                //      - only synced nodes can vote
+            NetworkCommand::UpdateCommittees { previous, current, next } => {
+                // The network mirrors three of the on-chain registry's committees: previous,
+                // current, and next. Peers in any of the three count as validators so the
+                // just-completed committee is not pruned while late gossip may still arrive and
+                // next-epoch peers are protected before they begin voting. (NVV support and
+                // late-gossip acceptance remain future work.)
                 //
-                // once a node stakes and tries to sync, it would be nice
-                // if it could receive priority on the network for syncing
-                // state
-                //
-                // for now, this only supports the current committee for the epoch
-
-                info!(target: "network", this_node=?self.swarm.local_peer_id(), "network update for next committee - ensuring no committee members are banned");
-                // ensure that the next committee isn't banned
-                self.swarm.behaviour_mut().peer_manager.new_epoch(committee);
+                // All three slots are set directly from authoritative state every epoch (no
+                // positional rotation), so current/previous self-correct against on-chain state and
+                // any peer that exits the three-slot window is demoted.
+                info!(target: "network", this_node=?self.swarm.local_peer_id(), "updating previous/current/next committees");
+                self.swarm.behaviour_mut().peer_manager.update_committees(previous, current, next);
+            }
+            NetworkCommand::PrepareCommitteeDial { committee } => {
+                // Deadlock-breaker pre-dial: forgive bans so the committee can be dialed without
+                // mutating the committee slots (the real slot update follows shortly after).
+                self.swarm.behaviour_mut().peer_manager.prepare_committee_dial(committee);
             }
             NetworkCommand::FindAuthorities { bls_keys } => {
                 // this will trigger a PeerEvent to fetch records through kad if not in the peer map

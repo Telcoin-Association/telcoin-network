@@ -549,6 +549,7 @@ async fn test_is_validator() {
     let config = authority_1.consensus_config();
     let mut peer_manager = PeerManager::new(config.network_config().peer_config());
     let validator = *authority_1.authority().protocol_key();
+    let validator_peer_id: PeerId = config.key_config().primary_network_public_key().into();
     let random_peer_id = PeerId::random();
 
     let info = NetworkInfo {
@@ -558,12 +559,116 @@ async fn test_is_validator() {
     };
     peer_manager.add_known_peer(validator, info);
 
-    // update epoch with random multiaddr
+    // set the current committee (no previous/next committee for this test)
     let committee = config.committee_pub_keys();
-    peer_manager.new_epoch(committee);
+    peer_manager.update_committees(HashSet::new(), committee, HashSet::new());
+
+    // Verify the registered committee member is a validator
+    assert!(peer_manager.is_peer_validator(&validator_peer_id));
 
     // Verify random peer is not a validator
     assert!(!peer_manager.is_peer_validator(&random_peer_id));
+}
+
+#[tokio::test]
+async fn test_update_committees_triggers_missing_authorities_for_unknown_next_keys() {
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // generate a bls key that was never registered via add_known_peer
+    let unknown_bls = *BlsKeypair::generate(&mut StdRng::from_seed([9; 32])).public();
+
+    // update with a next committee that contains the unknown key
+    peer_manager.update_committees(HashSet::new(), HashSet::new(), HashSet::from([unknown_bls]));
+
+    // exactly one MissingAuthorities event referencing the unknown key should be emitted
+    let events = collect_all_events(&mut peer_manager);
+    let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
+    assert!(missing_events.len() == 1, "Expect one missing authorities event");
+    assert_matches!(
+        missing_events.first().unwrap(),
+        PeerEvent::MissingAuthorities(missing) if missing.contains(&unknown_bls)
+    );
+}
+
+#[tokio::test]
+async fn test_update_committees_does_not_trigger_for_unknown_previous() {
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // generate a bls key that was never registered via add_known_peer
+    let unknown_bls = *BlsKeypair::generate(&mut StdRng::from_seed([9; 32])).public();
+
+    // the unknown key appears ONLY in the previous committee (peers rotating out are not chased)
+    peer_manager.update_committees(HashSet::from([unknown_bls]), HashSet::new(), HashSet::new());
+
+    // no MissingAuthorities event should be emitted for a previous-only unknown key
+    let events = collect_all_events(&mut peer_manager);
+    let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
+    assert!(
+        missing_events.is_empty(),
+        "previous-committee-only unknown keys must not trigger MissingAuthorities"
+    );
+}
+
+#[tokio::test]
+async fn test_prepare_committee_dial_unbans_without_touching_slots() {
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // build a known committee member
+    let mut rng = StdRng::from_seed([3; 32]);
+    let bls = *BlsKeypair::generate(&mut rng).public();
+    let netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let peer_id: PeerId = netkey.clone().into();
+    let info =
+        NetworkInfo { pubkey: netkey, multiaddrs: vec![create_multiaddr(None)], timestamp: now() };
+    peer_manager.add_known_peer(bls, info);
+
+    // manually temp-ban the peer
+    peer_manager.temporarily_banned.insert(peer_id);
+    assert!(peer_manager.peer_banned(&peer_id));
+
+    // prepare the committee for dialing
+    peer_manager.prepare_committee_dial(HashSet::from([bls]));
+
+    // the peer is unbanned but the committee slots remain untouched
+    assert!(!peer_manager.peer_banned(&peer_id), "prepare_committee_dial should unban the peer");
+    assert!(
+        !peer_manager.is_peer_validator(&peer_id),
+        "prepare_committee_dial must not populate committee slots"
+    );
+}
+
+#[tokio::test]
+async fn test_add_known_peer_closes_validator_gap_on_discovery() {
+    // GAP FIX (full): a committee member set by bls before its network identity is known is tracked
+    // in the slot but does not yet resolve to a validator by its libp2p id. The moment kad
+    // discovery confirms the identity via `add_known_peer`, the lazy-trust hook makes it a
+    // validator and marks it important -- without waiting for the next epoch's
+    // `update_committees`.
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // a committee member whose network identity is not yet known to this node
+    let mut rng = StdRng::from_seed([7; 32]);
+    let bls = *BlsKeypair::generate(&mut rng).public();
+    let netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let peer_id: PeerId = netkey.clone().into();
+    let info =
+        NetworkInfo { pubkey: netkey, multiaddrs: vec![create_multiaddr(None)], timestamp: now() };
+
+    // set the current committee with the member present by bls, BEFORE discovering its peer id
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+
+    // GAP: the member is tracked by bls, but its libp2p id does not resolve to a validator yet
+    assert!(!peer_manager.is_peer_validator(&peer_id), "unknown peer id must not resolve yet");
+
+    // kad discovery confirms the network identity, which applies committee trust immediately
+    peer_manager.add_known_peer(bls, info);
+
+    // gap closed the instant discovery completed: validator + important (trusted)
+    assert!(peer_manager.is_peer_validator(&peer_id), "discovered member must now be a validator");
+    assert!(
+        peer_manager.peer_is_important(&peer_id),
+        "discovered member must be trusted/important"
+    );
 }
 
 #[tokio::test]

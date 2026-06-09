@@ -317,9 +317,19 @@ where
         /// The reply to caller.
         reply: oneshot::Sender<PeerExchangeMap>,
     },
-    /// Start a new epoch.
-    NewEpoch {
-        /// The epoch committee.
+    /// Set the previous/current/next committees directly from authoritative state, every epoch.
+    UpdateCommittees {
+        /// The previous epoch committee.
+        previous: HashSet<BlsPublicKey>,
+        /// The current epoch committee.
+        current: HashSet<BlsPublicKey>,
+        /// The next epoch committee.
+        next: HashSet<BlsPublicKey>,
+    },
+    /// Pre-dial recovery: forgive bans for a committee so it can be dialed, without mutating the
+    /// committee slots.
+    PrepareCommitteeDial {
+        /// The committee whose peers should be unbanned for dialing.
         committee: HashSet<BlsPublicKey>,
     },
     /// Find authorities for a future committee by bls key and return to sender.
@@ -574,9 +584,26 @@ where
         res.await.map_err(Into::into)
     }
 
-    /// Create a [PeerExchangeMap] for exchanging peers.
-    pub async fn new_epoch(&self, committee: HashSet<BlsPublicKey>) -> NetworkResult<()> {
-        self.sender.send(NetworkCommand::NewEpoch { committee }).await?;
+    /// Set the previous/current/next committees directly from authoritative state, every epoch.
+    pub async fn update_committees(
+        &self,
+        previous: HashSet<BlsPublicKey>,
+        current: HashSet<BlsPublicKey>,
+        next: HashSet<BlsPublicKey>,
+    ) -> NetworkResult<()> {
+        self.sender.send(NetworkCommand::UpdateCommittees { previous, current, next }).await?;
+        Ok(())
+    }
+
+    /// Forgive bans for a committee so it can be dialed, without mutating the committee slots.
+    ///
+    /// Used by the deadlock-breaker pre-dial path; the real slot update follows via
+    /// [`Self::update_committees`].
+    pub async fn prepare_committee_dial(
+        &self,
+        committee: HashSet<BlsPublicKey>,
+    ) -> NetworkResult<()> {
+        self.sender.send(NetworkCommand::PrepareCommitteeDial { committee }).await?;
         Ok(())
     }
 
