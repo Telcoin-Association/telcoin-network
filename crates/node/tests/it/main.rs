@@ -292,13 +292,13 @@ async fn test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
             empty_leader.update_header_created_at_for_test(tn_types::now());
             empty_leader.update_header_author_for_test(leader.clone());
 
-            let empty_subdag = Arc::new(CommittedSubDag::new(
+            let empty_subdag = CommittedSubDag::new(
                 vec![empty_leader.clone()],
                 empty_leader,
                 synthetic_number,
                 ReputationScores::default(),
                 None,
-            ));
+            );
             let empty_output = ConsensusOutput::new(
                 empty_subdag.clone(),
                 output.parent_hash(),

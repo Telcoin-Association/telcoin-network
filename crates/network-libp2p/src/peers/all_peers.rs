@@ -8,7 +8,7 @@ use super::{
     peer::Peer,
     score::ReputationUpdate,
     status::ConnectionStatus,
-    types::{ConnectionDirection, TrustBasis},
+    types::{ConnectionDirection, PeerIdentity, TrustBasis},
     PeerExchangeMap, Penalty,
 };
 use crate::{
@@ -37,13 +37,22 @@ mod peers;
 /// This keeps track of [Peer], [BannedPeers], and the number of disconnected peers.
 #[derive(Debug)]
 pub(super) struct AllPeers {
-    /// The collection of known connected peers, their status and reputation
-    peers: HashMap<PeerId, Peer>,
+    /// The collection of known peers, keyed by their domain [PeerIdentity].
+    ///
+    /// Committee/trusted/known peers are keyed by their [BlsPublicKey] (`Confirmed`); anonymous
+    /// inbound or kad-dialed peers that have no known bls key yet are keyed by their libp2p
+    /// [PeerId] (`Unidentified`).
+    peers: HashMap<PeerIdentity, Peer>,
+    /// Inbound boundary resolver: maps a libp2p [PeerId] to the [BlsPublicKey] of a `Confirmed`
+    /// peer.
+    ///
+    /// libp2p connection events only carry a [PeerId], so this is the single point where a libp2p
+    /// id is translated to the telcoin-domain identity that keys `peers`. It is kept in lockstep
+    /// with the `Confirmed` entries in `peers`: an entry exists here iff the peer is stored under
+    /// a [PeerIdentity::Confirmed] key.
+    bls_by_peer_id: HashMap<PeerId, BlsPublicKey>,
     /// The collection of staked current_committee at the beginning of each epoch.
-    current_committee: HashSet<PeerId>,
-    /// The collection of staked current_committee pub key to peerid at the beginning of each
-    /// epoch.
-    current_committee_keys: HashMap<BlsPublicKey, Option<PeerId>>,
+    current_committee: HashSet<BlsPublicKey>,
     /// Information for peers that scored poorly enough to become banned.
     banned_peers: BannedPeers,
     /// The number of peers that have disconnected from this node.
@@ -67,8 +76,8 @@ impl AllPeers {
     ) -> Self {
         Self {
             peers: Default::default(),
+            bls_by_peer_id: Default::default(),
             current_committee: Default::default(),
-            current_committee_keys: Default::default(),
             banned_peers: Default::default(),
             disconnected_peers: 0,
             pending_dials: Default::default(),
@@ -76,6 +85,40 @@ impl AllPeers {
             max_banned_peers,
             max_disconnected_peers,
         }
+    }
+
+    /// Resolve a libp2p [PeerId] to the [PeerIdentity] used to key the peer collection.
+    ///
+    /// A peer is `Confirmed` once its bls key is known (committee/trusted/known peers); otherwise
+    /// it is `Unidentified` and keyed by its libp2p id.
+    fn identity_for(&self, peer_id: &PeerId) -> PeerIdentity {
+        self.bls_by_peer_id
+            .get(peer_id)
+            .map_or(PeerIdentity::Unidentified(*peer_id), |bls_public_key| {
+                PeerIdentity::Confirmed(*bls_public_key)
+            })
+    }
+
+    /// Recover the libp2p [PeerId] for a stored peer.
+    ///
+    /// `Unidentified` peers carry their id in the key; `Confirmed` peers derive it from their
+    /// network key, which is always set whenever a bls key is recorded.
+    fn peer_id_for(identity: &PeerIdentity, peer: &Peer) -> Option<PeerId> {
+        match identity {
+            PeerIdentity::Unidentified(peer_id) => Some(*peer_id),
+            PeerIdentity::Confirmed(_) => peer.peer_id(),
+        }
+    }
+
+    /// Remove a peer from the collection, keeping the `bls_by_peer_id` resolution index in sync.
+    fn evict(&mut self, identity: &PeerIdentity) -> Option<Peer> {
+        let removed = self.peers.remove(identity);
+        if let (PeerIdentity::Confirmed(_), Some(peer)) = (identity, removed.as_ref()) {
+            if let Some(peer_id) = peer.peer_id() {
+                self.bls_by_peer_id.remove(&peer_id);
+            }
+        }
+        removed
     }
 
     /// Create a peer that is "trusted".
@@ -90,7 +133,10 @@ impl AllPeers {
         let peer_id: PeerId = network_key.clone().into();
         let trusted_peer = Peer::new_trusted(bls_public_key, network_key, addr);
         let _ = self.banned_peers.remove_banned_peer(trusted_peer.known_ip_addresses());
-        self.peers.insert(peer_id, trusted_peer);
+        // overwrite any prior record and key the peer by its confirmed (bls) identity
+        self.peers.remove(&PeerIdentity::Unidentified(peer_id));
+        self.bls_by_peer_id.insert(peer_id, bls_public_key);
+        self.peers.insert(PeerIdentity::Confirmed(bls_public_key), trusted_peer);
     }
 
     /// Create a peer.
@@ -101,12 +147,18 @@ impl AllPeers {
         addrs: Vec<Multiaddr>,
     ) {
         let peer_id: PeerId = network_key.clone().into();
-        if let Some(peer) = self.peers.get_mut(&peer_id) {
-            peer.update_net(bls_public_key, network_key, addrs);
-        } else {
-            let peer = Peer::new(bls_public_key, network_key, addrs);
-            self.peers.insert(peer_id, peer);
-        }
+        // migrate any existing record (anonymous or already-confirmed) onto the confirmed identity,
+        // preserving its accumulated state; otherwise create a fresh peer
+        let current = self.identity_for(&peer_id);
+        let peer = match self.peers.remove(&current) {
+            Some(mut peer) => {
+                peer.update_net(bls_public_key, network_key, addrs);
+                peer
+            }
+            None => Peer::new(bls_public_key, network_key, addrs),
+        };
+        self.bls_by_peer_id.insert(peer_id, bls_public_key);
+        self.peers.insert(PeerIdentity::Confirmed(bls_public_key), peer);
     }
 
     /// Handle reported action.
@@ -114,7 +166,8 @@ impl AllPeers {
     /// This method is called when the application layer identifies a problem and reports a peer.
     pub(super) fn process_penalty(&mut self, peer_id: &PeerId, penalty: Penalty) -> PeerAction {
         let exemption = self.trust_basis(peer_id);
-        if let Some(peer) = self.peers.get_mut(peer_id) {
+        let id = self.identity_for(peer_id);
+        if let Some(peer) = self.peers.get_mut(&id) {
             let prior_reputation = peer.reputation();
             let new_reputation = peer.apply_penalty(penalty, exemption);
             debug!(target: "peer-manager", ?peer_id, ?prior_reputation, ?new_reputation);
@@ -167,7 +220,8 @@ impl AllPeers {
         peer_id: &PeerId,
         new_status: &NewConnectionStatus,
     ) -> ConnectionStatus {
-        if !self.peers.contains_key(peer_id) {
+        let id = self.identity_for(peer_id);
+        if !self.peers.contains_key(&id) {
             // initialize unknown peer and log warning if status update is invalid for unknown peers
             if !new_status.valid_initial_state() {
                 warn!(target: "peer-manager",
@@ -179,13 +233,13 @@ impl AllPeers {
             }
 
             // add default peer
-            self.peers.insert(*peer_id, Peer::default());
+            self.peers.insert(id, Peer::default());
         }
 
         // ensure peer is banned if the new state is Banned
         if matches!(new_status, &NewConnectionStatus::Banned) {
             let exemption = self.trust_basis(peer_id);
-            if let Some(peer) = self.peers.get_mut(peer_id) {
+            if let Some(peer) = self.peers.get_mut(&id) {
                 peer.ensure_banned(peer_id, exemption);
             } else {
                 // unreachable
@@ -194,7 +248,7 @@ impl AllPeers {
         }
 
         self.peers
-            .get(peer_id)
+            .get(&id)
             .map(|peer| *peer.connection_status())
             .unwrap_or(ConnectionStatus::Unknown)
     }
@@ -208,13 +262,13 @@ impl AllPeers {
     /// `ConnectionStatus::Disconnected`. It's important these peers are disconnected because
     /// dialing peers are counted towards the limit on inbound connections.
     pub(super) fn heartbeat_maintenance(&mut self) -> Vec<(PeerId, PeerAction)> {
-        let peers_to_disconnect: Vec<_> = self
+        let peers_to_disconnect: Vec<PeerId> = self
             .peers
             .iter()
-            .filter_map(|(peer_id, info)| {
+            .filter_map(|(id, info)| {
                 if let ConnectionStatus::Dialing { instant } = info.connection_status() {
                     if (*instant) + self.dial_timeout < Instant::now() {
-                        return Some(*peer_id);
+                        return Self::peer_id_for(id, info);
                     }
                 }
                 None
@@ -245,7 +299,7 @@ impl AllPeers {
             let update = peer.heartbeat(exemption);
             match update {
                 ReputationUpdate::Unbanned => {
-                    Some(*id)
+                    Self::peer_id_for(id, peer)
                 },
                 // filter other results and log error
                 ReputationUpdate::Banned | ReputationUpdate::Disconnect => {
@@ -367,7 +421,8 @@ impl AllPeers {
         multiaddr: Multiaddr,
         direction: ConnectionDirection,
     ) -> PeerAction {
-        if let Some(peer) = self.peers.get_mut(peer_id) {
+        let id = self.identity_for(peer_id);
+        if let Some(peer) = self.peers.get_mut(&id) {
             // update counters based on previous state
             match current_status {
                 ConnectionStatus::Disconnected { .. } => {
@@ -401,7 +456,8 @@ impl AllPeers {
         peer_id: &PeerId,
         current_status: ConnectionStatus,
     ) -> PeerAction {
-        if let Some(peer) = self.peers.get_mut(peer_id) {
+        let id = self.identity_for(peer_id);
+        if let Some(peer) = self.peers.get_mut(&id) {
             match current_status {
                 ConnectionStatus::Banned { .. } => {
                     warn!(target: "peer-manager", ?peer_id, "dialing a banned peer");
@@ -449,7 +505,8 @@ impl AllPeers {
             | ConnectionStatus::Connected { .. }
             | ConnectionStatus::Dialing { .. } => {
                 self.disconnected_peers += 1;
-                if let Some(peer) = self.peers.get_mut(peer_id) {
+                let id = self.identity_for(peer_id);
+                if let Some(peer) = self.peers.get_mut(&id) {
                     peer.set_connection_status(ConnectionStatus::Disconnected {
                         instant: Instant::now(),
                     });
@@ -474,7 +531,8 @@ impl AllPeers {
         debug!(target: "peer-manager", ?already_banned_ips, "handle disconnected and banned");
 
         // update peer's status
-        if let Some(peer) = self.peers.get_mut(peer_id) {
+        let id = self.identity_for(peer_id);
+        if let Some(peer) = self.peers.get_mut(&id) {
             peer.set_connection_status(ConnectionStatus::Banned { instant: Instant::now() });
             self.banned_peers.add_banned_peer(peer);
             let banned_ips = peer
@@ -492,7 +550,8 @@ impl AllPeers {
     /// Handle disconnected state for a peer that was disconnected without being banned.
     fn handle_disconnected_normal(&mut self, peer_id: &PeerId) -> PeerAction {
         self.disconnected_peers += 1;
-        if let Some(peer) = self.peers.get_mut(peer_id) {
+        let id = self.identity_for(peer_id);
+        if let Some(peer) = self.peers.get_mut(&id) {
             peer.set_connection_status(ConnectionStatus::Disconnected { instant: Instant::now() });
         }
 
@@ -507,7 +566,8 @@ impl AllPeers {
         banned: bool,
     ) -> PeerAction {
         // set the peer to disconnecting state
-        if let Some(peer) = self.peers.get_mut(peer_id) {
+        let id = self.identity_for(peer_id);
+        if let Some(peer) = self.peers.get_mut(&id) {
             peer.set_connection_status(ConnectionStatus::Disconnecting { banned });
         }
 
@@ -539,7 +599,8 @@ impl AllPeers {
         peer_id: &PeerId,
         current_state: ConnectionStatus,
     ) -> PeerAction {
-        if let Some(peer) = self.peers.get_mut(peer_id) {
+        let id = self.identity_for(peer_id);
+        if let Some(peer) = self.peers.get_mut(&id) {
             match current_state {
                 ConnectionStatus::Disconnected { .. } => {
                     self.banned_peers.add_banned_peer(peer);
@@ -592,7 +653,8 @@ impl AllPeers {
         peer_id: &PeerId,
         current_state: ConnectionStatus,
     ) -> PeerAction {
-        if let Some(peer) = self.peers.get_mut(peer_id) {
+        let id = self.identity_for(peer_id);
+        if let Some(peer) = self.peers.get_mut(&id) {
             if matches!(peer.reputation(), Reputation::Banned) {
                 error!(target: "peer-manager", ?peer_id, "unbanning a banned peer");
             }
@@ -637,7 +699,7 @@ impl AllPeers {
 
     /// Return the [Peer] by [PeerId] if it is known.
     pub(super) fn get_peer(&self, peer_id: &PeerId) -> Option<&Peer> {
-        self.peers.get(peer_id)
+        self.peers.get(&self.identity_for(peer_id))
     }
 
     /// Boolean indicating if this peer is a validator.
@@ -648,7 +710,12 @@ impl AllPeers {
 
     /// Boolean indicating if this peer is in the current committee of voting validators.
     fn is_peer_cvv(&self, peer_id: &PeerId) -> bool {
-        self.current_committee.contains(peer_id)
+        match self.identity_for(peer_id) {
+            PeerIdentity::Confirmed(bls_public_key) => {
+                self.current_committee.contains(&bls_public_key)
+            }
+            PeerIdentity::Unidentified(_) => false,
+        }
     }
 
     /// The [TrustBasis] exempting `peer` from the score model this epoch, if any.
@@ -657,8 +724,13 @@ impl AllPeers {
     /// cannot drift out of sync with rotation); operator allowlisting is read from the peer.
     /// Validator takes precedence in the reported basis as it is the operationally significant
     /// signal when a penalty is suppressed.
-    fn exemption(peer_id: &PeerId, peer: &Peer, committee: &HashSet<PeerId>) -> Option<TrustBasis> {
-        if committee.contains(peer_id) {
+    fn exemption(
+        id: &PeerIdentity,
+        peer: &Peer,
+        committee: &HashSet<BlsPublicKey>,
+    ) -> Option<TrustBasis> {
+        if matches!(id, PeerIdentity::Confirmed(bls_public_key) if committee.contains(bls_public_key))
+        {
             Some(TrustBasis::Validator)
         } else if peer.is_operator_allowlisted() {
             Some(TrustBasis::Operator)
@@ -671,9 +743,8 @@ impl AllPeers {
     ///
     /// `None` means the peer is subject to the normal score model.
     fn trust_basis(&self, peer_id: &PeerId) -> Option<TrustBasis> {
-        self.peers
-            .get(peer_id)
-            .and_then(|peer| Self::exemption(peer_id, peer, &self.current_committee))
+        let id = self.identity_for(peer_id);
+        self.peers.get(&id).and_then(|peer| Self::exemption(&id, peer, &self.current_committee))
     }
 
     /// Boolean indicating if the ip address is associated with a banned peer.
@@ -685,15 +756,18 @@ impl AllPeers {
     /// NOTE: the peer can still be in a connected status but pending a ban, so the connection
     /// status is not used.
     pub(super) fn peer_banned(&self, peer_id: &PeerId) -> bool {
-        self.peers.get(peer_id).is_some_and(|peer| {
+        self.get_peer(peer_id).is_some_and(|peer| {
             peer.reputation().banned() || peer.known_ip_addresses().any(|ip| self.ip_banned(&ip))
         })
     }
 
     /// Gives the ids of all known connected peers.
-    pub(super) fn connected_peer_ids(&self) -> impl Iterator<Item = &PeerId> {
-        self.peers.iter().filter_map(|(peer_id, peer)| {
-            peer.connection_status().is_connected().then_some(peer_id)
+    pub(super) fn connected_peer_ids(&self) -> impl Iterator<Item = PeerId> + '_ {
+        self.peers.iter().filter_map(|(id, peer)| {
+            peer.connection_status()
+                .is_connected()
+                .then_some(())
+                .and_then(|()| Self::peer_id_for(id, peer))
         })
     }
 
@@ -701,11 +775,12 @@ impl AllPeers {
     pub(super) fn connected_or_dialing_peers(&self) -> Vec<PeerId> {
         self.peers
             .iter()
-            .filter(|(_, peer)| {
+            .filter_map(|(id, peer)| {
                 let status = peer.connection_status();
-                status.is_connected() || status.is_dialing()
+                (status.is_connected() || status.is_dialing())
+                    .then_some(())
+                    .and_then(|()| Self::peer_id_for(id, peer))
             })
-            .map(|(peer_id, _)| *peer_id)
             .collect()
     }
 
@@ -713,7 +788,7 @@ impl AllPeers {
     ///
     /// Used when handling connection closed events from the swarm.
     pub(super) fn is_peer_connected_or_disconnecting(&self, peer_id: &PeerId) -> bool {
-        self.peers.get(peer_id).is_some_and(|peer| {
+        self.get_peer(peer_id).is_some_and(|peer| {
             matches!(
                 peer.connection_status(),
                 ConnectionStatus::Connected { .. } | ConnectionStatus::Disconnecting { .. }
@@ -740,9 +815,13 @@ impl AllPeers {
     ///
     /// The shuffle ensures peers with equal scores are sorted in a random order. Peers with the
     /// lowest score and are not part of the kademlia table are prioritized.
-    pub(super) fn connected_peers_by_score_and_routability(&self) -> Vec<(&PeerId, &Peer)> {
-        let mut connected_peers: Vec<_> =
-            self.peers.iter().filter(|(_, peer)| peer.connection_status().is_connected()).collect();
+    pub(super) fn connected_peers_by_score_and_routability(&self) -> Vec<(PeerId, &Peer)> {
+        let mut connected_peers: Vec<(PeerId, &Peer)> = self
+            .peers
+            .iter()
+            .filter(|(_, peer)| peer.connection_status().is_connected())
+            .filter_map(|(id, peer)| Self::peer_id_for(id, peer).map(|peer_id| (peer_id, peer)))
+            .collect();
 
         // shuffle here for unbiased tie-breakers
         connected_peers.shuffle(&mut rand::rng());
@@ -775,18 +854,17 @@ impl AllPeers {
         &self,
         excess: usize,
         filter: F,
-    ) -> BinaryHeap<(Reverse<Instant>, PeerId, Vec<IpAddr>)>
+    ) -> BinaryHeap<(Reverse<Instant>, PeerIdentity, Vec<IpAddr>)>
     where
         F: Fn(&ConnectionStatus) -> Option<Instant>,
     {
         // collection of peers to prune
         let mut excess_peers = BinaryHeap::with_capacity(excess);
 
-        for (peer_id, peer) in &self.peers {
+        for (id, peer) in &self.peers {
             if let Some(instant) = filter(peer.connection_status()) {
                 // min-heap sorted by instant (oldest first)
-                let entry =
-                    (Reverse(instant), *peer_id, peer.known_ip_addresses().collect::<Vec<_>>());
+                let entry = (Reverse(instant), *id, peer.known_ip_addresses().collect::<Vec<_>>());
 
                 if excess_peers.len() < excess {
                     // fill the heap until `excess` elements
@@ -819,10 +897,12 @@ impl AllPeers {
                 }
             });
 
-            for (_, peer_id, ip_addrs) in excess_peers {
-                self.peers.remove(&peer_id);
+            for (_, id, ip_addrs) in excess_peers {
+                let peer_id = self.evict(&id).and_then(|peer| Self::peer_id_for(&id, &peer));
                 let ips = self.banned_peers.remove_banned_peer(ip_addrs.clone().into_iter());
-                unbanned.push((peer_id, ips));
+                if let Some(peer_id) = peer_id {
+                    unbanned.push((peer_id, ips));
+                }
             }
         }
 
@@ -843,8 +923,8 @@ impl AllPeers {
             });
 
             // remove peer
-            for (_, peer_id, _) in excess_peers {
-                self.peers.remove(&peer_id);
+            for (_, id, _) in excess_peers {
+                self.evict(&id);
                 self.disconnected_peers = self.disconnected_peers.saturating_sub(1);
             }
         }
@@ -865,16 +945,15 @@ impl AllPeers {
     ) -> Vec<(PeerId, PeerAction)> {
         // update current committee
         self.current_committee.clear();
-        self.current_committee_keys.clear();
 
         let mut actions = Vec::with_capacity(committee.len());
         for (bls_key, NetworkInfo { pubkey, multiaddrs: addr, .. }) in committee {
             let peer_id: PeerId = pubkey.clone().into();
-            self.current_committee.insert(peer_id);
-            self.current_committee_keys.insert(bls_key, Some(peer_id));
+            self.current_committee.insert(bls_key);
             // the NewConnectionStatus doesn't affect this call
             let status = self.ensure_peer_exists(&peer_id, &NewConnectionStatus::Unbanned);
-            // We have all our network settings so go ahead and make sure they are set.
+            // We have all our network settings so go ahead and make sure they are set. This also
+            // re-keys a peer first seen as `Unidentified` onto its `Confirmed` identity.
             self.upsert_peer(bls_key, pubkey, addr.clone());
 
             match status {
@@ -899,8 +978,9 @@ impl AllPeers {
                 | ConnectionStatus::Connected { .. } => { /* nothing to do */ }
             }
 
-            // already ensured peer exists
-            if let Some(peer) = self.peers.get_mut(&peer_id) {
+            // already ensured peer exists (and re-keyed onto its confirmed identity)
+            let id = self.identity_for(&peer_id);
+            if let Some(peer) = self.peers.get_mut(&id) {
                 // update peer regardless of connection status; validator trust is derived from
                 // `current_committee`, so we only prime the score (no trust flag is stored)
                 peer.reset_score_to_max();
@@ -919,13 +999,27 @@ impl AllPeers {
     /// of being banned (connected/disconnecting).
     pub(super) fn can_dial(&self, peer_id: &PeerId) -> bool {
         // unknown peers are eligible for dial attempts
-        self.peers.get(peer_id).map(|peer| peer.can_dial()).unwrap_or(true)
+        self.get_peer(peer_id).map(|peer| peer.can_dial()).unwrap_or(true)
     }
 
     /// Update a peer's status in the routing table.
     pub(super) fn update_routing_for_peer(&mut self, peer_id: &PeerId, routable: bool) {
-        if let Some(peer) = self.peers.get_mut(peer_id) {
+        let id = self.identity_for(peer_id);
+        if let Some(peer) = self.peers.get_mut(&id) {
             peer.update_routability(routable)
         }
+    }
+
+    /// Test-only: mutable access to a peer resolved by its libp2p [PeerId].
+    #[cfg(test)]
+    pub(super) fn get_peer_mut(&mut self, peer_id: &PeerId) -> Option<&mut Peer> {
+        let id = self.identity_for(peer_id);
+        self.peers.get_mut(&id)
+    }
+
+    /// Test-only: insert a peer keyed by its libp2p [PeerId] (an `Unidentified` peer).
+    #[cfg(test)]
+    pub(super) fn insert_unidentified(&mut self, peer_id: PeerId, peer: Peer) {
+        self.peers.insert(PeerIdentity::Unidentified(peer_id), peer);
     }
 }

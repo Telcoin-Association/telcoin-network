@@ -297,12 +297,9 @@ where
                         self.consensus_certs.lock().insert(consensus_result_hash, 1);
                     }
                 } else {
-                    let latest_missing = *self.consensus_bus.requested_missing_epoch().borrow();
-                    if epoch > latest_missing {
-                        // Not sure we can sanity check this epoch.  However if it is bogus the code
-                        // to handle it should be fine, it stops when out of epochs.
-                        self.consensus_bus.requested_missing_epoch().send_replace(epoch);
-                    }
+                    // Not sure we can sanity check this epoch.  However if it is bogus the code
+                    // to handle it should be fine, it stops when out of epochs.
+                    self.consensus_bus.set_request_missing_epoch_if_newer(epoch);
                 }
             }
             PrimaryGossip::EpochVote(vote) => {
@@ -851,10 +848,19 @@ where
         hash: BlockHash,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
         let mut my_number = self.consensus_chain.latest_consensus_number();
-        // If we are one behind then wait to catch up.
-        while my_number + 1 == number {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            my_number = self.consensus_chain.latest_consensus_number();
+        // If we are behind then wait up to two seconds to catch up.
+        let mut count = 0;
+        if number.saturating_sub(my_number) < 4 {
+            // Only wait if we are close.
+            while my_number < number {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                my_number = self.consensus_chain.latest_consensus_number();
+                if count >= 20 {
+                    // Don't wait more than 2 seconds for this to show up.
+                    return Err(PrimaryNetworkError::UnknownConsensusHeaderDigest(hash));
+                }
+                count += 1;
+            }
         }
         let header = self.get_header_by_hash(number, hash).await?;
         Ok(PrimaryResponse::ConsensusHeader(Arc::new(header)))

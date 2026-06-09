@@ -26,7 +26,7 @@ use tokio::{
         oneshot,
     },
 };
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::{
     consensus_pack::{ConsensusPack, PackError, DATA_NAME},
@@ -488,17 +488,31 @@ impl ConsensusChain {
         &self,
         consensus: ConsensusOutput,
     ) -> Result<(), ConsensusChainError> {
-        if let Some(pack) = &self.current_pack() {
-            if consensus.number() > self.latest_consensus.number() {
-                let epoch = consensus.sub_dag().leader_epoch();
-                let number = consensus.number();
+        let number = consensus.number();
+        if number > self.latest_consensus.number() {
+            let epoch = consensus.sub_dag().leader_epoch();
+            if let Some(pack) = &self.current_pack() {
                 pack.save_consensus_output(consensus).await?;
                 self.latest_consensus.update(epoch, number).await;
+            } else if let Ok(pack) = self.get_static(epoch).await {
+                // We may be replaying consensus from old epochs and not have a current pack to save
+                // too.
+                if pack.contains_consensus_header_number(number).await.unwrap_or_default() {
+                    // We should have this saved already if no current_pack but let's confirm before
+                    // we save the latest.
+                    self.latest_consensus.update(epoch, number).await;
+                } else {
+                    // Note this should not happen but don't want to kill node on an error since it
+                    // will hopefully self correct soon.
+                    warn!(target: "consensus-chain", epoch, number, "Failed to update latest consensus, data not in expected pack file.");
+                }
+            } else {
+                // Note this should not happen but don't want to kill node on an error since it will
+                // hopefully self correct soon.
+                warn!(target: "consensus-chain", epoch, number, "Failed to update latest consensus, pack file that should contain data is missing.");
             }
-            Ok(())
-        } else {
-            Ok(()) // If no current then this is a no-op.
         }
+        Ok(())
     }
 
     /// Load and return the consensus output from the current epoch.
@@ -625,7 +639,7 @@ impl ConsensusChain {
     pub async fn read_latest_commit_with_final_reputation_scores(
         &self,
         epoch: Epoch,
-    ) -> Option<Arc<CommittedSubDag>> {
+    ) -> Option<CommittedSubDag> {
         if let Some(pack) = &self.current_pack() {
             if pack.epoch() == epoch {
                 return pack.read_latest_commit_with_final_reputation_scores().await;
@@ -642,7 +656,7 @@ impl ConsensusChain {
     /// This uses garbage parent hash and number and is ONLY for testing.
     /// As a test only function this will panic if unable to write the sub dag
     /// to the consensus chain
-    pub async fn write_subdag_for_test(&self, number: u64, sub_dag: Arc<CommittedSubDag>) {
+    pub async fn write_subdag_for_test(&self, number: u64, sub_dag: CommittedSubDag) {
         let output = ConsensusOutput::new(
             sub_dag,
             BlockHash::default(),
@@ -768,7 +782,7 @@ impl ConsensusChainReader for ConsensusChain {
     async fn read_latest_commit_with_final_reputation_scores(
         &self,
         epoch: Epoch,
-    ) -> Option<Arc<CommittedSubDag>> {
+    ) -> Option<CommittedSubDag> {
         ConsensusChain::read_latest_commit_with_final_reputation_scores(self, epoch).await
     }
 

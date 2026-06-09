@@ -1,7 +1,7 @@
 //! Leader schedule tests
 
 use crate::consensus::{Dag, LeaderSchedule, LeaderSwapTable};
-use std::{collections::BTreeSet, num::NonZeroUsize, sync::Arc};
+use std::{collections::BTreeSet, num::NonZeroUsize};
 use tempfile::TempDir;
 use tn_primary::test_utils::mock_certificate;
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
@@ -432,7 +432,7 @@ async fn test_leader_schedule_from_store() {
     }
 
     let cert = Certificate::default();
-    let sub_dag = Arc::new(CommittedSubDag::new(vec![cert.clone()], cert, 0, scores, None));
+    let sub_dag = CommittedSubDag::new(vec![cert.clone()], cert, 0, scores, None);
 
     consensus_chain.write_subdag_for_test(1, sub_dag).await;
 

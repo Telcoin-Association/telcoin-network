@@ -99,7 +99,7 @@ enum PackMessage {
     GetConsensusOutput(u64, oneshot::Sender<Result<ConsensusOutput, PackError>>),
     Persist(oneshot::Sender<Result<(), PackError>>),
     ReadLastCommitted(oneshot::Sender<HashMap<AuthorityIdentifier, Round>>),
-    ReadLatestFinalRep(oneshot::Sender<Option<Arc<CommittedSubDag>>>),
+    ReadLatestFinalRep(oneshot::Sender<Option<CommittedSubDag>>),
     ContainsBatch(B256, oneshot::Sender<bool>),
     Batch(B256, oneshot::Sender<Option<Batch>>),
     CountLeaders(Round, RewardsCounter, oneshot::Sender<Result<(), PackError>>),
@@ -377,9 +377,7 @@ impl ConsensusPack {
     /// Reads from storage the latest commit sub dag from the epoch where its
     /// ReputationScores are marked as "final". If none exists then this
     /// method returns `None`.
-    pub async fn read_latest_commit_with_final_reputation_scores(
-        &self,
-    ) -> Option<Arc<CommittedSubDag>> {
+    pub async fn read_latest_commit_with_final_reputation_scores(&self) -> Option<CommittedSubDag> {
         let (tx, rx) = oneshot::channel();
         let _ = self.tx.send(PackMessage::ReadLatestFinalRep(tx)).await;
         rx.await.unwrap_or_default()
@@ -830,7 +828,7 @@ impl Inner {
                     if consensus_header.parent_hash != parent_digest {
                         return Err(PackError::InvalidConsensusChain);
                     }
-                    for header in &consensus_header.sub_dag.headers {
+                    for header in consensus_header.sub_dag.headers() {
                         for (digest, _) in header.payload().iter() {
                             if !batches.contains(digest) {
                                 return Err(PackError::MissingBatches);
@@ -971,7 +969,7 @@ impl Inner {
 
         // map all fetched batches to their respective certificates for applying block rewards
         let mut batches = Vec::with_capacity(num_certs);
-        for header in &sub_dag.headers {
+        for header in sub_dag.headers() {
             // create collection of batches to execute for this certificate
             let mut cert_batches = Vec::with_capacity(header.payload().len());
 
@@ -1096,7 +1094,7 @@ impl Inner {
         res
     }
 
-    fn read_latest_commit_with_final_reputation_scores(&mut self) -> Option<Arc<CommittedSubDag>> {
+    fn read_latest_commit_with_final_reputation_scores(&mut self) -> Option<CommittedSubDag> {
         if let Ok(iter) = self.consensus_idx.rev_iter(1000) {
             for commit in iter.filter_map(|pos| {
                 let block = self.data.fetch(pos);
@@ -1107,10 +1105,10 @@ impl Inner {
                 }
             }) {
                 // found a final of schedule score, so we'll return that
-                if commit.reputation_score.final_of_schedule {
+                if commit.reputation_scores().final_of_schedule {
                     debug!(
                         "Found latest final reputation scores: {:?} from commit",
-                        commit.reputation_score,
+                        commit.reputation_scores(),
                     );
                     return Some(commit);
                 }
@@ -1330,13 +1328,13 @@ pub(crate) mod test {
         let reputation_scores = ReputationScores::default();
         let previous_sub_dag = None;
         let batch_digests_1: VecDeque<BlockHash> = batches_1.iter().map(|b| b.digest()).collect();
-        let subdag_1 = Arc::new(CommittedSubDag::new(
+        let subdag_1 = CommittedSubDag::new(
             vec![leader_1.clone()],
             leader_1,
             sub_dag_index_1,
             reputation_scores,
             previous_sub_dag,
-        ));
+        );
         ConsensusOutput::new(
             subdag_1.clone(),
             parent,

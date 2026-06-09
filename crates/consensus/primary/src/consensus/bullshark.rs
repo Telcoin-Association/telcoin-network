@@ -3,7 +3,7 @@
 use crate::consensus::{
     utils, ConsensusError, ConsensusState, Dag, LeaderSchedule, LeaderSwapTable, Outcome,
 };
-use std::{collections::VecDeque, sync::Arc};
+use std::collections::VecDeque;
 use tn_types::{
     Certificate, CommittedSubDag, Committee, Hash as _, ReputationScores, Round, VotingPower,
 };
@@ -71,7 +71,7 @@ impl Bullshark {
             if (sub_dag_index / 2).is_multiple_of(self.num_sub_dags_per_schedule as u64) {
                 ReputationScores::new(&self.committee)
             } else if let Some(last) = state.last_committed_sub_dag.as_ref() {
-                last.reputation_score.clone()
+                last.reputation_scores().clone()
             } else {
                 ReputationScores::new(&self.committee)
             };
@@ -108,7 +108,7 @@ impl Bullshark {
         &mut self,
         state: &mut ConsensusState,
         certificate: Certificate,
-    ) -> Result<(Outcome, Vec<Arc<CommittedSubDag>>), ConsensusError> {
+    ) -> Result<(Outcome, Vec<CommittedSubDag>), ConsensusError> {
         debug!("Processing {:?}", certificate);
         let round = certificate.round();
 
@@ -180,7 +180,7 @@ impl Bullshark {
         &mut self,
         leader_round: Round,
         state: &mut ConsensusState,
-    ) -> Result<(Outcome, Vec<Arc<CommittedSubDag>>), ConsensusError> {
+    ) -> Result<(Outcome, Vec<CommittedSubDag>), ConsensusError> {
         let leader = match self.leader_schedule.leader_certificate(leader_round, &state.dag) {
             (_leader_authority, Some(certificate)) => certificate,
             (_leader_authority, None) => {
@@ -237,14 +237,13 @@ impl Bullshark {
             // We resolve the reputation score that should be stored alongside with this sub dag.
             let reputation_score = self.resolve_reputation_score(state, &sequence, sub_dag_index);
 
-            let sub_dag: Arc<CommittedSubDag> = CommittedSubDag::new(
+            let sub_dag: CommittedSubDag = CommittedSubDag::new(
                 sequence,
                 leader.clone(),
                 sub_dag_index,
                 reputation_score.clone(),
                 state.last_committed_sub_dag.clone(),
-            )
-            .into();
+            );
 
             // Metric: subdag_committed - tracks subdag commits with key metrics
             info!(

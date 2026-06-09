@@ -31,8 +31,8 @@ fn test_add_trusted_peer() {
     let peer_id: PeerId = net.clone().into();
     all_peers.add_trusted_peer(bls, net, vec![addr.clone()]);
 
-    assert!(all_peers.peers.contains_key(&peer_id));
-    let peer = all_peers.peers.get_mut(&peer_id).unwrap();
+    assert!(all_peers.get_peer(&peer_id).is_some());
+    let peer = all_peers.get_peer_mut(&peer_id).unwrap();
     assert_eq!(peer.reputation(), Reputation::Trusted);
     assert_eq!(peer.score().aggregate_score(), config.max_score);
 
@@ -53,7 +53,7 @@ fn test_process_penalty() {
     // add connected peer first and set as this node dialed
     let mut peer = Peer::default_for_test();
     peer.set_connection_status(ConnectionStatus::Connected { num_in: 0, num_out: 1 });
-    all_peers.peers.insert(peer_id, peer);
+    all_peers.insert_unidentified(peer_id, peer);
 
     // test penalty that doesn't change reputation
     let action = all_peers.process_penalty(&peer_id, Penalty::Mild);
@@ -92,7 +92,7 @@ fn test_ensure_peer_exists() {
     // Unknown peer, valid initial state
     let status = all_peers.ensure_peer_exists(&peer_id, &NewConnectionStatus::Dialing);
     assert!(matches!(status, ConnectionStatus::Unknown));
-    assert!(all_peers.peers.contains_key(&peer_id));
+    assert!(all_peers.get_peer(&peer_id).is_some());
 
     // now peer exists with default status
     all_peers.peers.clear();
@@ -100,7 +100,7 @@ fn test_ensure_peer_exists() {
     assert!(matches!(status, ConnectionStatus::Unknown));
 
     // Check that peer is banned when new status is Banned
-    let peer = all_peers.peers.get(&peer_id).unwrap();
+    let peer = all_peers.get_peer(&peer_id).unwrap();
     assert_eq!(peer.reputation(), Reputation::Banned);
 }
 
@@ -184,7 +184,7 @@ fn test_heartbeat_maintenance() {
     all_peers.update_connection_status(&peer_id, NewConnectionStatus::Dialing);
 
     // Manually set the dialing time to be older than the timeout
-    if let Some(peer) = all_peers.peers.get_mut(&peer_id) {
+    if let Some(peer) = all_peers.get_peer_mut(&peer_id) {
         if peer.connection_status().is_dialing() {
             peer.set_connection_status(ConnectionStatus::Dialing {
                 instant: Instant::now() - Duration::from_secs(10),
@@ -196,7 +196,7 @@ fn test_heartbeat_maintenance() {
     let _ = all_peers.heartbeat_maintenance();
 
     // The peer should now be disconnected
-    let peer = all_peers.peers.get(&peer_id).unwrap();
+    let peer = all_peers.get_peer(&peer_id).unwrap();
     assert!(matches!(peer.connection_status(), ConnectionStatus::Disconnected { .. }));
     assert_eq!(all_peers.disconnected_peers, 1);
 }
@@ -214,7 +214,7 @@ fn test_pruning_logic() {
         all_peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
 
         // Manually set disconnection time to be older for first peers
-        if let Some(peer) = all_peers.peers.get_mut(&peer_id) {
+        if let Some(peer) = all_peers.get_peer_mut(&peer_id) {
             let disconnected =
                 matches!(peer.connection_status(), ConnectionStatus::Disconnected { .. });
             if disconnected {
@@ -251,7 +251,7 @@ fn test_pruning_logic() {
         all_peers.update_connection_status(&peer_id, NewConnectionStatus::Banned);
 
         // Manually set banned time to be older for first peers
-        if let Some(peer) = all_peers.peers.get_mut(&peer_id) {
+        if let Some(peer) = all_peers.get_peer_mut(&peer_id) {
             let banned = matches!(peer.connection_status(), ConnectionStatus::Banned { .. });
             if banned {
                 // set a deterministic order - earlier IDs are older
@@ -276,9 +276,16 @@ fn test_pruning_logic() {
 #[test]
 fn test_is_validator() {
     ensure_score_config(None);
-    let validator_id = PeerId::random();
     let mut all_peers = AllPeers::new(Duration::from_secs(5), 10, 10);
-    all_peers.current_committee.insert(validator_id);
+
+    // a committee member is a confirmed peer (bls known) whose libp2p id resolves to its bls
+    let mut rng = StdRng::from_seed([0; 32]);
+    let bls = *BlsKeypair::generate(&mut rng).public();
+    let net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let validator_id: PeerId = net.clone().into();
+    all_peers.upsert_peer(bls, net, vec![]);
+    all_peers.current_committee.insert(bls);
+
     assert!(all_peers.is_peer_validator(&validator_id));
     assert!(!all_peers.is_peer_validator(&PeerId::random()));
 }
@@ -297,7 +304,7 @@ fn test_committee_rotation_revokes_validator_exemption() {
     let net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
     let peer_id: PeerId = net.clone().into();
     all_peers.upsert_peer(bls, net, vec![]);
-    all_peers.current_committee.insert(peer_id);
+    all_peers.current_committee.insert(bls);
 
     // while in the committee the peer is exempt: a fatal penalty is suppressed and its
     // reputation is unaffected
@@ -391,7 +398,7 @@ fn test_connected_peer_methods() {
     // Test connected_peer_ids
     let connected_ids: Vec<_> = all_peers.connected_peer_ids().collect();
     assert_eq!(connected_ids.len(), 1);
-    assert!(connected_ids.contains(&&connected_peer_id));
+    assert!(connected_ids.contains(&connected_peer_id));
 
     // Test connected_or_dialing_peers
     let connected_or_dialing: Vec<_> = all_peers.connected_or_dialing_peers();

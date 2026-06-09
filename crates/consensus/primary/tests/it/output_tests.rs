@@ -1,5 +1,5 @@
 use indexmap::IndexMap;
-use std::{collections::BTreeSet, num::NonZeroUsize, sync::Arc};
+use std::{collections::BTreeSet, num::NonZeroUsize};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
@@ -58,14 +58,13 @@ fn test_monotonically_incremented_commit_timestamps() {
     let certificate = Certificate::new_unsigned_for_test(&committee, header, Vec::new()).unwrap();
 
     // AND
-    let sub_dag_round_2: Arc<CommittedSubDag> = CommittedSubDag::new(
+    let sub_dag_round_2 = CommittedSubDag::new(
         vec![certificate.clone()],
         certificate,
         1,
         ReputationScores::default(),
         None,
-    )
-    .into();
+    );
 
     // AND commit timestamp is the leader's timestamp
     assert_eq!(sub_dag_round_2.commit_timestamp(), newer_timestamp);
