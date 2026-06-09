@@ -1,25 +1,25 @@
 //! Module with kademlia specific extensions, like a persistant store.
 
-use std::{
-    borrow::Cow,
-    fmt, iter,
-    time::{Instant, SystemTime},
-};
-
+use crate::types::NetworkType;
 use libp2p::{
     kad::{
         store::{Error, MemoryStoreConfig, RecordStore},
         ProviderRecord, Record, RecordKey,
     },
-    Multiaddr, PeerId, StreamProtocol,
+    Multiaddr, PeerId,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::{serde_as, DeserializeAs, SerializeAs};
+use std::{
+    borrow::Cow,
+    fmt, iter,
+    time::{Instant, SystemTime},
+};
 use tn_config::KeyConfig;
 use tn_storage::tables::{
     KadProviderRecords, KadRecords, KadWorkerProviderRecords, KadWorkerRecords,
 };
-use tn_types::{decode, encode, BlockHash, Database, DefaultHashFunction, WorkerId};
+use tn_types::{decode, encode, BlockHash, Database, DefaultHashFunction};
 
 /// A record stored in the DHT.
 /// This is a "shadow" struct for a kad Record so we can serialize/deserialize
@@ -156,42 +156,6 @@ fn instant_to_system(expires: &Option<Instant>) -> Option<SystemTime> {
         }
     } else {
         None
-    }
-}
-
-/// The role of a consensus network instance — primary or worker.
-///
-/// A node runs both as fully isolated libp2p swarms in one process. This is the
-/// one source of truth for everything that must differ: the kad store's backing
-/// tables and the wire protocol names that keep the two from ever negotiating a
-/// connection with one another.
-#[derive(Copy, Clone, Debug)]
-pub enum NetworkType {
-    /// Primary network.
-    Primary,
-    /// Worker network.
-    Worker(WorkerId),
-}
-
-impl NetworkType {
-    /// Request-response wire protocol, isolated per role (and per worker).
-    pub(crate) fn req_res_protocol(&self) -> StreamProtocol {
-        match self {
-            Self::Primary => StreamProtocol::new("/tn-primary/0.0.1"),
-            Self::Worker(id) => StreamProtocol::try_from_owned(format!("/tn-worker-{id}/0.0.1"))
-                .expect("worker req-res protocol name starts with '/'"),
-        }
-    }
-
-    /// Kademlia wire protocol, isolated per role (and per worker).
-    pub(crate) fn kad_protocol(&self) -> StreamProtocol {
-        match self {
-            Self::Primary => StreamProtocol::new("/tn-primary-kad/1.0.0"),
-            Self::Worker(id) => {
-                StreamProtocol::try_from_owned(format!("/tn-worker-{id}-kad/1.0.0"))
-                    .expect("worker kad protocol name starts with '/'")
-            }
-        }
     }
 }
 

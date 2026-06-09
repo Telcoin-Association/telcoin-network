@@ -5,13 +5,13 @@
 use crate::{
     codec::{TNCodec, TNMessage},
     error::NetworkError,
-    kad::{KadStore, NetworkType},
+    kad::KadStore,
     peers::{self, PeerEvent, PeerManager, Penalty},
     send_or_log_error,
     stream::{StreamBehavior, StreamEvent},
     types::{
         KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo, NetworkResponseMessage,
-        NetworkResponseSender, NetworkResult, NodeRecord,
+        NetworkResponseSender, NetworkResult, NetworkType, NodeRecord,
     },
     PeerExchangeMap,
 };
