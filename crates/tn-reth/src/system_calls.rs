@@ -158,9 +158,12 @@ sol!(
         function getCurrentEpochInfo() external view returns (EpochInfo memory currentEpochInfo);
         /// Return committee epoch info for a specific epoch.
         function getEpochInfo(uint32 epoch) public view returns (EpochInfo memory epochInfo);
-        /// Return the validators by status. Pass `Any` (6) for status to return all
-        /// validators. `Undefined` (0) reverts on-chain.
-        function getValidators(uint8 status) public view returns (ValidatorInfo[] memory);
+        /// Return the validator addresses for exactly the given status's set. Reverts on `Undefined`
+        /// (0) and `Any` (6); neither folds statuses. The committee-eligible pool is the off-chain
+        /// union of `Active`, `PendingActivation`, and `PendingExit`.
+        function getValidators(uint8 status) public view returns (address[] memory);
+        /// Like `getValidators`, but returns the full `ValidatorInfo` structs for the status's set.
+        function getValidatorsInfo(uint8 status) public view returns (ValidatorInfo[] memory);
         /// Fetch the committee for a given epoch.
         function getCommitteeValidators(uint32 epoch) external view returns (ValidatorInfo[] memory);
         /// Fetch the BLS pubkey for a given validator address.
