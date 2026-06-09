@@ -19,7 +19,7 @@ use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode, QueCh
 use tn_reth::{system_calls::EpochState, RethDb, RethEnv};
 use tn_storage::{consensus::ConsensusChain, open_db, DatabaseType};
 use tn_types::{
-    deconstruct_nonce, gas_accumulator::GasAccumulator, BlockNumHash, BlsPublicKey,
+    deconstruct_nonce, gas_accumulator::GasAccumulator, BlockHash, BlockNumHash, BlsPublicKey,
     BootstrapServer, Committee, ConsensusHeader, ConsensusOutput, Database as TNDatabase,
     EngineUpdate, Epoch, Notifier, TaskError, TaskManager, TaskSpawner, TimestampSec,
     MIN_PROTOCOL_BASE_FEE,
@@ -69,6 +69,16 @@ pub(crate) struct EpochManager<P, DB> {
 
     /// The last consenses header for a closing epoch.
     last_consensus_header: Option<ConsensusHeader>,
+
+    /// The execution block that closed the current epoch.
+    ///
+    /// Set by [`EpochManager::close_epoch`] to the block verified by its `parent_beacon_block_root`
+    /// (the closing consensus header hash) and its non-empty `extra_data` (the closing-epoch
+    /// randomness `keccak256(leader_bls_sig)`). This is the single source of truth for reading
+    /// on-chain state when configuring the next epoch: all next-epoch EVM state reads should pin to
+    /// this hash to avoid canonical-tip races, since the engine has no gate preventing it from
+    /// executing past the epoch-closing block. `None` until the first epoch boundary is closed.
+    closing_epoch_state_blockhash: Option<BlockHash>,
 
     /// Track the last consensus number that was actually forwarded to the execution engine.
     /// This prevents waiting on consensus that was saved to the DB but never sent to the engine.
@@ -213,6 +223,7 @@ where
             consensus_bus,
             worker_event_stream,
             last_consensus_header: None,
+            closing_epoch_state_blockhash: None,
             last_forwarded_consensus_number: 0,
             consensus_chain,
             bootstrap_servers,

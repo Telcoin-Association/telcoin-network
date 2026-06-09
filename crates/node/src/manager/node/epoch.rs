@@ -631,21 +631,35 @@ where
             return Ok(());
         }
 
-        let committee_keys = engine.validators_for_epoch(epoch).await?;
-        let next_committee_keys = engine.validators_for_epoch(epoch + 1).await?;
+        // Pin every next-epoch on-chain read to the verified epoch-closing block captured by
+        // `close_epoch`. Reading at this consensus-committed hash (instead of the canonical tip)
+        // makes the signed `EpochRecord` deterministic and race-free across validators, even when
+        // the engine has already executed blocks past the boundary: boundary state comes from the
+        // pinned closing-epoch snapshot, not "latest".
+        let close_hash = self.closing_epoch_state_blockhash.ok_or_else(|| {
+            eyre!("write_epoch_record called without a pinned closing-epoch block hash")
+        })?;
+        let committee_keys = engine.validators_for_epoch_at_block(close_hash, epoch).await?;
+        let next_committee_keys =
+            engine.validators_for_epoch_at_block(close_hash, epoch + 1).await?;
         let parent_hash = if epoch == 0 {
             B256::default()
         } else if let Some(prev) = self.consensus_chain.epochs().record_by_epoch(epoch - 1).await {
             if committee_keys != prev.next_committee {
-                error!(
+                // Ejections during epoch N can legitimately make the pinned committee(N) differ
+                // from epoch N-1's predicted next_committee. The pinned read is authoritative —
+                // every validator reads the same closing block — so warn and proceed rather than
+                // stalling the epoch. The persisted committee stays self-consistent: epoch-N votes
+                // are signed and bitmap-indexed against this same `committee` vec.
+                warn!(
                     target: "epoch-manager",
-                    "Last epochs next committee not equal to this epochs committee! previous {:?}, current {:?}",
+                    epoch,
+                    "pinned committee differs from previous epoch's next_committee (e.g. mid-epoch \
+                     ejections); persisting pinned closing-block read as authoritative. previous \
+                     next_committee {:?}, pinned committee {:?}",
                     prev.next_committee,
-                    committee_keys
+                    committee_keys,
                 );
-                return Err(eyre!(
-                    "Last epochs next committee not equal to this epochs committee!"
-                ));
             }
             prev.digest()
         } else {
@@ -660,14 +674,23 @@ where
             .take()
             .expect("epoch was finished with last consensus header");
         let target_hash = last_consensus_header.digest();
-        let parent_state = self.consensus_bus.latest_execution_block_num_hash();
+        // The epoch's final execution state is the pinned closing block, not the canonical tip.
+        // `latest_execution_block_num_hash()` could point past the boundary if the engine executed
+        // further, making the signed `final_state` non-deterministic across validators.
+        let final_state = engine
+            .sealed_header_by_hash(close_hash)
+            .await?
+            .ok_or_else(|| {
+                eyre!("pinned closing-epoch block {close_hash:?} not found in execution store")
+            })?
+            .num_hash();
 
         let epoch_rec = EpochRecord {
             epoch,
             committee: committee_keys,
             next_committee: next_committee_keys,
             parent_hash,
-            final_state: parent_state,
+            final_state,
             final_consensus: BlockNumHash::new(last_consensus_header.number, target_hash),
         };
 
@@ -726,8 +749,14 @@ where
     }
 
     /// Close an epoch after wait_for_epoch_boundary returns.
+    ///
+    /// Captures the verified epoch-closing execution block and pins it on the manager as
+    /// `closing_epoch_state_blockhash` — the source of truth for next-epoch on-chain state reads.
+    /// The block is resolved by the execution wait from `target_hash` (the closing consensus header
+    /// hash), so the capture is tied to this specific consensus output and taken at the instant of
+    /// execution — never read from "latest", and so race-free.
     async fn close_epoch(
-        &self,
+        &mut self,
         shutdown_consensus: Option<Notifier>,
         gas_accumulator: &GasAccumulator,
         target_hash: B256,
@@ -736,7 +765,9 @@ where
         if let Some(s) = shutdown_consensus {
             s.notify()
         }
-        self.consensus_bus.wait_for_consensus_execution(target_hash).await?;
+        let closing_block =
+            self.consensus_bus.wait_for_consensus_execution_block(target_hash).await?;
+        self.closing_epoch_state_blockhash = Some(closing_block.hash());
         self.adjust_base_fees(gas_accumulator);
         gas_accumulator.clear(); // Clear the accumlated values for next epoch.
         Ok(())

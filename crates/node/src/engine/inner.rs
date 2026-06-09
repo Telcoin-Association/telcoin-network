@@ -18,7 +18,7 @@ use tn_reth::{
 use tn_rpc::{EngineToPrimary, TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator},
-    Address, BatchSender, BatchValidation, BlockHeader, BlsPublicKey, ConsensusOutput,
+    Address, BatchSender, BatchValidation, BlockHeader, BlsPublicKey, Bytes, ConsensusOutput,
     EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId, B256,
     MIN_PROTOCOL_BASE_FEE,
 };
@@ -343,13 +343,43 @@ impl ExecutionNodeInner {
         self.reth_env.epoch_state_from_canonical_tip()
     }
 
-    /// Read committee validator keys for epoch.
+    /// Decode raw on-chain BLS pubkey bytes into [`BlsPublicKey`]s, hard-failing on any
+    /// undecodable key.
+    ///
+    /// A malformed registered key is a real error, not something to silently skip. This keeps
+    /// decode behavior consistent with [`RethEnv::epoch_state_from_canonical_tip`] and removes the
+    /// silent-drop asymmetry (`filter_map(..ok())`) that could let the closing-epoch committee
+    /// diverge from the canonical-tip read and stall the epoch boundary cross-check.
+    fn decode_bls_keys(raw: Vec<Bytes>) -> eyre::Result<Vec<BlsPublicKey>> {
+        raw.iter()
+            .map(|bls| BlsPublicKey::from_literal_bytes(bls.as_ref()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| eyre::eyre!("failed to create bls key from on-chain bytes: {err:?}"))
+    }
+
+    /// Read committee validator keys for epoch from the canonical tip.
     pub(super) fn validators_for_epoch(&self, epoch: u32) -> eyre::Result<Vec<BlsPublicKey>> {
-        Ok(self
-            .reth_env
-            .bls_pubkeys_for_epoch(epoch)?
-            .iter()
-            .filter_map(|bls| BlsPublicKey::from_literal_bytes(bls.as_ref()).ok())
-            .collect())
+        Self::decode_bls_keys(self.reth_env.bls_pubkeys_for_epoch(epoch)?)
+    }
+
+    /// Read committee validator keys for epoch, pinned to the execution block `block_hash`.
+    ///
+    /// Used at epoch boundaries to read committee state from the verified epoch-closing block
+    /// rather than the canonical tip, so every validator reads identical state regardless of how
+    /// far the engine has executed past the boundary.
+    pub(super) fn validators_for_epoch_at_block(
+        &self,
+        block_hash: B256,
+        epoch: u32,
+    ) -> eyre::Result<Vec<BlsPublicKey>> {
+        Self::decode_bls_keys(self.reth_env.bls_pubkeys_for_epoch_at_block(block_hash, epoch)?)
+    }
+
+    /// Look up the sealed header for `block_hash` (e.g. to read the epoch-closing block number).
+    pub(super) fn sealed_header_by_hash(
+        &self,
+        block_hash: B256,
+    ) -> eyre::Result<Option<SealedHeader>> {
+        Ok(self.reth_env.sealed_header_by_hash(block_hash)?)
     }
 }

@@ -217,4 +217,26 @@ impl ExecutionNode {
         let guard = self.internal.read().await;
         guard.validators_for_epoch(epoch)
     }
+
+    /// Read committee validator keys for epoch, pinned to the execution block `block_hash`.
+    ///
+    /// Reads committee state from a specific (e.g. epoch-closing) block rather than the canonical
+    /// tip, so every validator derives identical committee state at the epoch boundary.
+    pub async fn validators_for_epoch_at_block(
+        &self,
+        block_hash: B256,
+        epoch: u32,
+    ) -> eyre::Result<Vec<BlsPublicKey>> {
+        let guard = self.internal.read().await;
+        guard.validators_for_epoch_at_block(block_hash, epoch)
+    }
+
+    /// Look up the sealed header for `block_hash`.
+    pub async fn sealed_header_by_hash(
+        &self,
+        block_hash: B256,
+    ) -> eyre::Result<Option<SealedHeader>> {
+        let guard = self.internal.read().await;
+        guard.sealed_header_by_hash(block_hash)
+    }
 }

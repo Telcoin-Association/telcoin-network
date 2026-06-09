@@ -101,6 +101,26 @@ impl RecentBlocks {
         false
     }
 
+    /// Return the epoch-closing execution block for the consensus output `hash`, if we have it.
+    ///
+    /// A single consensus output produces several execution blocks that all share
+    /// `parent_beacon_block_root == hash` (the consensus header hash). Only the *last* of these is
+    /// the epoch-closing block, distinguished by a non-empty `extra_data` carrying the closing
+    /// randomness `keccak256(leader_bls_sig)`. This mirrors the empty-vs-non-empty `extra_data`
+    /// convention read in `crates/tn-reth/src/evm/config.rs` (`context_for_block`): empty
+    /// `extra_data` ⇒ not closing.
+    ///
+    /// Iterates newest-first so the matched block is the most recent closing block for `hash`.
+    pub fn execution_block_for_consensus(&self, hash: BlockHash) -> Option<SealedHeader> {
+        self.executed_blocks
+            .iter()
+            .rev()
+            .find(|block| {
+                block.parent_beacon_block_root == Some(hash) && !block.extra_data.is_empty()
+            })
+            .cloned()
+    }
+
     /// Return the number/hash of the latest processed consensus output.
     pub fn latest_consensus_block_num_hash(&self) -> BlockNumHash {
         self.recent_consensus_num_hashes.back().copied().unwrap_or_else(Default::default)
@@ -115,7 +135,23 @@ impl RecentBlocks {
 #[cfg(test)]
 mod tests {
     use super::RecentBlocks;
-    use tn_types::{BlockHash, BlockNumHash, ExecHeader, SealedHeader};
+    use tn_types::{BlockHash, BlockNumHash, Bytes, ExecHeader, SealedHeader};
+
+    /// Build a sealed header at `number` whose `parent_beacon_block_root` is `consensus_hash` and
+    /// whose `extra_data` is `extra_data` (empty ⇒ non-closing sibling, non-empty ⇒ closing block).
+    fn block_for_consensus(
+        number: u64,
+        consensus_hash: BlockHash,
+        extra_data: Bytes,
+    ) -> SealedHeader {
+        let header = ExecHeader {
+            number,
+            parent_beacon_block_root: Some(consensus_hash),
+            extra_data,
+            ..Default::default()
+        };
+        SealedHeader::seal_slow(header)
+    }
 
     #[test]
     fn tracks_latest_consensus_num_hash_for_skipped_rounds() {
@@ -142,5 +178,42 @@ mod tests {
         assert_eq!(recent.latest_consensus_block_num_hash(), consensus_num_hash);
         assert_eq!(recent.latest_execution_block_num_hash(), executed.num_hash());
         assert!(recent.contains_execution_hash(executed.hash()));
+    }
+
+    #[test]
+    fn execution_block_for_consensus_returns_closing_block() {
+        let mut recent = RecentBlocks::new(4);
+        let consensus_hash = BlockHash::from([9u8; 32]);
+
+        // A sibling block from the same consensus output: shares `parent_beacon_block_root` but
+        // has empty `extra_data`, so it is NOT the epoch-closing block.
+        let sibling = block_for_consensus(20, consensus_hash, Bytes::default());
+        // The epoch-closing block: same `parent_beacon_block_root`, non-empty `extra_data`
+        // carrying the closing randomness.
+        let closing = block_for_consensus(21, consensus_hash, Bytes::from(vec![1u8; 32]));
+
+        recent.push_latest(1, BlockNumHash::new(20, consensus_hash), Some(sibling.clone()));
+        recent.push_latest(1, BlockNumHash::new(21, consensus_hash), Some(closing.clone()));
+
+        // Only the closing block (non-empty extra_data) is returned, never the sibling.
+        let found = recent.execution_block_for_consensus(consensus_hash);
+        assert_eq!(found, Some(closing));
+        assert_ne!(found.map(|b| b.hash()), Some(sibling.hash()));
+
+        // A consensus hash we never executed returns None.
+        assert_eq!(recent.execution_block_for_consensus(BlockHash::from([7u8; 32])), None);
+    }
+
+    #[test]
+    fn execution_block_for_consensus_rejects_empty_extra_data_sibling() {
+        let mut recent = RecentBlocks::new(4);
+        let consensus_hash = BlockHash::from([3u8; 32]);
+
+        // Only a sibling with empty extra_data exists for this consensus output.
+        let sibling = block_for_consensus(5, consensus_hash, Bytes::default());
+        recent.push_latest(1, BlockNumHash::new(5, consensus_hash), Some(sibling));
+
+        // No epoch-closing block ⇒ None even though `parent_beacon_block_root` matches.
+        assert_eq!(recent.execution_block_for_consensus(consensus_hash), None);
     }
 }

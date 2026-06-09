@@ -19,8 +19,8 @@ use tn_network_libp2p::types::NetworkEvent;
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{
     deconstruct_nonce, BlockHash, BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader,
-    ConsensusOutput, Epoch, EpochRecord, EpochVote, Header, Round, TnReceiver, TnSender, B256,
-    CHANNEL_CAPACITY,
+    ConsensusOutput, Epoch, EpochRecord, EpochVote, Header, Round, SealedHeader, TnReceiver,
+    TnSender, B256, CHANNEL_CAPACITY,
 };
 use tokio::{
     sync::{
@@ -564,6 +564,35 @@ impl ConsensusBusApp {
         Err(WaitForExecutionElapsed())
     }
 
+    /// Will resolve once we have executed the epoch-closing block for the consensus output `hash`,
+    /// returning that verified [`SealedHeader`].
+    ///
+    /// The returned block is the epoch-closing block: its `parent_beacon_block_root` is `hash` and
+    /// its `extra_data` carries the closing randomness (see
+    /// [`RecentBlocks::execution_block_for_consensus`]). Capturing the block this way ties it to
+    /// the specific consensus output (never "latest"), so epoch-boundary state can be pinned
+    /// race-free at the instant of execution.
+    ///
+    /// Note if the chain is not advancing this may never return.
+    pub async fn wait_for_consensus_execution_block(
+        &self,
+        hash: BlockHash,
+    ) -> Result<SealedHeader, WaitForExecutionElapsed> {
+        let mut watch_execution_result = self.recent_blocks().subscribe();
+        // Bind to a local so the watch `Ref` is dropped before the `.await` below.
+        let found = self.recent_blocks().borrow().execution_block_for_consensus(hash);
+        if let Some(header) = found {
+            return Ok(header);
+        }
+        while watch_execution_result.changed().await.is_ok() {
+            let found = self.recent_blocks().borrow().execution_block_for_consensus(hash);
+            if let Some(header) = found {
+                return Ok(header);
+            }
+        }
+        Err(WaitForExecutionElapsed())
+    }
+
     /// Returns the ConsensusHeader that created the last executed block if it can be found.
     /// If we are not starting at genesis or a new epoch, then not finding this indicates a database
     /// issue.
@@ -925,5 +954,45 @@ impl Error for WaitForExecutionElapsed {}
 impl std::fmt::Display for WaitForExecutionElapsed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{self:?}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConsensusBusApp;
+    use tn_types::{BlockHash, BlockNumHash, Bytes, ExecHeader, SealedHeader};
+
+    #[tokio::test]
+    async fn wait_for_consensus_execution_block_returns_closing_block() {
+        let cb = ConsensusBusApp::new();
+        let consensus_hash = BlockHash::from([5u8; 32]);
+
+        // The epoch-closing block for this consensus output: `parent_beacon_block_root == hash`
+        // and non-empty `extra_data` (the closing randomness).
+        let closing = SealedHeader::seal_slow(ExecHeader {
+            number: 42,
+            parent_beacon_block_root: Some(consensus_hash),
+            extra_data: Bytes::from(vec![7u8; 32]),
+            ..Default::default()
+        });
+
+        // A sibling from the same consensus output that is NOT the closing block (empty
+        // `extra_data`) — present in recent blocks but must never be the resolved header.
+        let sibling = SealedHeader::seal_slow(ExecHeader {
+            number: 41,
+            parent_beacon_block_root: Some(consensus_hash),
+            ..Default::default()
+        });
+
+        cb.recent_blocks().send_modify(|rb| {
+            rb.push_latest(1, BlockNumHash::new(41, consensus_hash), Some(sibling));
+            rb.push_latest(1, BlockNumHash::new(42, consensus_hash), Some(closing.clone()));
+        });
+
+        let header = cb
+            .wait_for_consensus_execution_block(consensus_hash)
+            .await
+            .expect("epoch-closing block resolves");
+        assert_eq!(header, closing);
     }
 }

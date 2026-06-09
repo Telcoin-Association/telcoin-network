@@ -1422,18 +1422,44 @@ impl RethEnv {
     }
 
     /// Read the BLS pubkeys for the committee of the provided epoch from the [ConsensusRegistry]
-    /// on-chain.
+    /// on-chain at the canonical tip.
     pub fn bls_pubkeys_for_epoch(&self, epoch: u32) -> eyre::Result<Vec<alloy::primitives::Bytes>> {
         let canonical_tip = self.canonical_tip();
-        let state_provider =
-            self.inner.blockchain_provider.state_by_block_hash(canonical_tip.hash())?;
+        self.bls_pubkeys_for_epoch_inner(&canonical_tip, epoch)
+    }
+
+    /// Read the BLS pubkeys for the committee of the provided epoch from the [ConsensusRegistry]
+    /// on-chain at the block identified by `block_hash`.
+    ///
+    /// Pins the read to a specific execution block (e.g. the epoch-closing block) so every
+    /// validator reads identical, consensus-committed state regardless of how far the engine has
+    /// executed past the epoch boundary. Mirrors [`Self::get_worker_fee_configs_at_block`].
+    pub fn bls_pubkeys_for_epoch_at_block(
+        &self,
+        block_hash: B256,
+        epoch: u32,
+    ) -> eyre::Result<Vec<alloy::primitives::Bytes>> {
+        let header = self
+            .sealed_header_by_hash(block_hash)?
+            .ok_or_else(|| eyre::eyre!("sealed header not found for block hash {block_hash:?}"))?;
+        self.bls_pubkeys_for_epoch_inner(&header, epoch)
+    }
+
+    /// Build an EVM against `header`'s state and read the committee BLS pubkeys for `epoch` from
+    /// the [ConsensusRegistry] on-chain. Shared by the canonical-tip and block-pinned wrappers.
+    fn bls_pubkeys_for_epoch_inner(
+        &self,
+        header: &SealedHeader,
+        epoch: u32,
+    ) -> eyre::Result<Vec<alloy::primitives::Bytes>> {
+        let state_provider = self.inner.blockchain_provider.state_by_block_hash(header.hash())?;
         let state = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder().with_database(state).with_bundle_update().build();
         let mut tn_evm = self
             .inner
             .evm_config
             .evm_factory()
-            .create_evm(&mut db, self.inner.evm_config.evm_env(&canonical_tip)?);
+            .create_evm(&mut db, self.inner.evm_config.evm_env(header)?);
 
         self.get_committee_bls_pubkeys_by_epoch(epoch, &mut tn_evm)
     }
