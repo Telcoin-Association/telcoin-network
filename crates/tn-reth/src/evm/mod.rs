@@ -18,10 +18,13 @@ use reth_revm::{
 use std::ops::{Deref, DerefMut};
 use tn_types::{Address, Bytes, TxKind, U256};
 mod block;
+mod bls_precompile;
 mod config;
 mod context;
 mod factory;
 mod handler;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod precompile_test_utils;
 mod tel_precompile;
 mod utils;
 use crate::evm::handler::TNEvmHandler;
@@ -29,8 +32,6 @@ pub(crate) use block::*;
 pub(crate) use config::*;
 pub(crate) use context::*;
 pub(crate) use factory::*;
-#[cfg(any(test, feature = "test-utils"))]
-pub use tel_precompile::test_utils as precompile_test_utils;
 #[cfg(not(feature = "faucet"))]
 pub use tel_precompile::TIMELOCK_DURATION;
 pub use tel_precompile::{

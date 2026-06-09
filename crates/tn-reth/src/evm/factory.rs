@@ -1,8 +1,9 @@
 //! The factory to create EVM environments.
 
 use super::{
-    tel_precompile::add_telcoin_precompile, TNBlockExecutionCtx, TNBlockExecutor, TNContext as _,
-    TNContextBuilder as _, TNEvm, TNEvmContext,
+    bls_precompile::add_bls_precompile, tel_precompile::add_telcoin_precompile,
+    TNBlockExecutionCtx, TNBlockExecutor, TNContext as _, TNContextBuilder as _, TNEvm,
+    TNEvmContext,
 };
 use alloy_evm::Database;
 use reth_evm::{
@@ -55,6 +56,7 @@ impl EvmFactory for TNEvmFactory {
                         PrecompileSpecId::from_spec_id(spec_id),
                     ));
                     add_telcoin_precompile(&mut map);
+                    add_bls_precompile(&mut map);
                     map
                 }),
             inspect: false,
@@ -79,6 +81,7 @@ impl EvmFactory for TNEvmFactory {
                         PrecompileSpecId::from_spec_id(spec_id),
                     ));
                     add_telcoin_precompile(&mut map);
+                    add_bls_precompile(&mut map);
                     map
                 }),
             inspect: true,
