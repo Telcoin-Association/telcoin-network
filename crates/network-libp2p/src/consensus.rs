@@ -5,13 +5,13 @@
 use crate::{
     codec::{TNCodec, TNMessage},
     error::NetworkError,
-    kad::{KadStore, KadStoreType, DEFAULT_KAD_PROTO_NAME},
+    kad::KadStore,
     peers::{self, PeerEvent, PeerManager, Penalty},
     send_or_log_error,
     stream::{StreamBehavior, StreamEvent},
     types::{
         KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo, NetworkResponseMessage,
-        NetworkResponseSender, NetworkResult, NodeRecord,
+        NetworkResponseSender, NetworkResult, NetworkType, NodeRecord,
     },
     PeerExchangeMap,
 };
@@ -25,6 +25,7 @@ use libp2p::{
     request_response::{
         self, Codec, Event as ReqResEvent, InboundFailure as ReqResInboundFailure,
         InboundRequestId, OutboundFailure as ReqResOutboundFailure, OutboundRequestId,
+        ProtocolSupport,
     },
     swarm::{NetworkBehaviour, SwarmEvent},
     Multiaddr, PeerId, Swarm, SwarmBuilder,
@@ -37,7 +38,7 @@ use std::{
 use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig};
 use tn_types::{
     decode, encode, now, try_decode, BlsPublicKey, BlsSigner, Database, NetworkKeypair,
-    NetworkPublicKey, TaskSpawner, TnSender,
+    NetworkPublicKey, TaskSpawner, TnSender, WorkerId,
 };
 use tokio::sync::{
     mpsc::{Receiver, Sender},
@@ -201,13 +202,14 @@ where
             network_key,
             db,
             task_manager,
-            KadStoreType::Primary,
+            NetworkType::Primary,
             external_addr,
         )
     }
 
     /// Convenience method for spawning a worker network instance.
     pub fn new_for_worker(
+        worker_id: WorkerId,
         network_config: &NetworkConfig,
         event_stream: Events,
         key_config: KeyConfig,
@@ -223,7 +225,7 @@ where
             network_key,
             db,
             task_manager,
-            KadStoreType::Worker,
+            NetworkType::Worker(worker_id),
             external_addr,
         )
     }
@@ -237,7 +239,7 @@ where
         keypair: NetworkKeypair,
         db: DB,
         task_spawner: TaskSpawner,
-        kad_type: KadStoreType,
+        network_type: NetworkType,
         external_addr: Multiaddr,
     ) -> NetworkResult<Self> {
         let gossipsub_config = gossipsub::ConfigBuilder::default()
@@ -259,11 +261,11 @@ where
 
         let req_res = request_response::Behaviour::with_codec(
             tn_codec,
-            network_config.libp2p_config().supported_req_res_protocols.clone(),
+            vec![(network_type.req_res_protocol(), ProtocolSupport::Full)],
             request_response::Config::default(),
         );
         let peer_id: PeerId = keypair.public().into();
-        let mut kad_config = libp2p::kad::Config::new(DEFAULT_KAD_PROTO_NAME);
+        let mut kad_config = libp2p::kad::Config::new(network_type.kad_protocol());
         // manually add peers
         kad_config.set_kbucket_inserts(kad::BucketInserts::Manual);
         let libp2p = network_config.libp2p_config();
@@ -274,7 +276,7 @@ where
             .set_publication_interval(Some(libp2p.kad_publication_interval))
             .set_query_timeout(Duration::from_secs(60))
             .set_provider_record_ttl(Some(libp2p.kad_record_ttl));
-        let kad_store = KadStore::new(db.clone(), &key_config, kad_type);
+        let kad_store = KadStore::new(db.clone(), &key_config, network_type);
         let kademlia = kad::Behaviour::with_config(peer_id, kad_store.clone(), kad_config);
 
         // create custom behavior
@@ -704,21 +706,23 @@ where
                 let peers = self.swarm.behaviour_mut().peer_manager.peers_for_exchange();
                 send_or_log_error!(reply, peers, "PeersForExchange");
             }
-            NetworkCommand::NewEpoch { committee } => {
-                // at the start of a new epoch, each node needs to know:
-                // - the current committee
-                // - all staked nodes who will vote at the end of the epoch
-                //      - only synced nodes can vote
+            NetworkCommand::UpdateCommittees { previous, current, next } => {
+                // The network mirrors three of the on-chain registry's committees: previous,
+                // current, and next. Peers in any of the three count as validators so the
+                // just-completed committee is not pruned while late gossip may still arrive and
+                // next-epoch peers are protected before they begin voting. (NVV support and
+                // late-gossip acceptance remain future work.)
                 //
-                // once a node stakes and tries to sync, it would be nice
-                // if it could receive priority on the network for syncing
-                // state
-                //
-                // for now, this only supports the current committee for the epoch
-
-                info!(target: "network", this_node=?self.swarm.local_peer_id(), "network update for next committee - ensuring no committee members are banned");
-                // ensure that the next committee isn't banned
-                self.swarm.behaviour_mut().peer_manager.new_epoch(committee);
+                // All three slots are set directly from authoritative state every epoch (no
+                // positional rotation), so current/previous self-correct against on-chain state and
+                // any peer that exits the three-slot window is demoted.
+                info!(target: "network", this_node=?self.swarm.local_peer_id(), "updating previous/current/next committees");
+                self.swarm.behaviour_mut().peer_manager.update_committees(previous, current, next);
+            }
+            NetworkCommand::PrepareCommitteeDial { committee } => {
+                // Deadlock-breaker pre-dial: forgive bans so the committee can be dialed without
+                // mutating the committee slots (the real slot update follows shortly after).
+                self.swarm.behaviour_mut().peer_manager.prepare_committee_dial(committee);
             }
             NetworkCommand::FindAuthorities { bls_keys } => {
                 // this will trigger a PeerEvent to fetch records through kad if not in the peer map

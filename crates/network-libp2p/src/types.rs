@@ -8,11 +8,13 @@ use libp2p::{
     core::transport::ListenerId,
     gossipsub::{PublishError, SubscriptionError, TopicHash},
     request_response::ResponseChannel,
-    Multiaddr, PeerId, Stream, TransportError,
+    Multiaddr, PeerId, Stream, StreamProtocol, TransportError,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use tn_types::{encode, now, BlsPublicKey, BlsSignature, NetworkPublicKey, P2pNode, TimestampSec};
+use tn_types::{
+    encode, now, BlsPublicKey, BlsSignature, NetworkPublicKey, P2pNode, TimestampSec, WorkerId,
+};
 use tokio::sync::{mpsc, oneshot};
 
 #[cfg(test)]
@@ -52,6 +54,42 @@ pub const WORKER_BATCH_TOPIC: &str = "tn_batches";
 pub const PRIMARY_CERT_TOPIC: &str = "tn_certificates";
 /// The topic for NVVs to subscribe to for published consensus chain.
 pub const CONSENSUS_HEADER_TOPIC: &str = "tn_consensus_headers";
+
+/// The role of a consensus network instance: primary or worker.
+///
+/// A node runs both as fully isolated libp2p swarms in one process. This is the
+/// one source of truth for everything that must differ: the kad store's backing
+/// tables and the wire protocol names that keep the two from ever negotiating a
+/// connection with one another.
+#[derive(Copy, Clone, Debug)]
+pub enum NetworkType {
+    /// Primary network.
+    Primary,
+    /// Worker network.
+    Worker(WorkerId),
+}
+
+impl NetworkType {
+    /// Request-response wire protocol, isolated per role (and per worker).
+    pub(crate) fn req_res_protocol(&self) -> StreamProtocol {
+        match self {
+            Self::Primary => StreamProtocol::new("/tn-primary/0.0.1"),
+            Self::Worker(id) => StreamProtocol::try_from_owned(format!("/tn-worker-{id}/0.0.1"))
+                .expect("worker req-res protocol name starts with '/'"),
+        }
+    }
+
+    /// Kademlia wire protocol, isolated per role (and per worker).
+    pub(crate) fn kad_protocol(&self) -> StreamProtocol {
+        match self {
+            Self::Primary => StreamProtocol::new("/tn-primary-kad/0.0.1"),
+            Self::Worker(id) => {
+                StreamProtocol::try_from_owned(format!("/tn-worker-{id}-kad/0.0.1"))
+                    .expect("worker kad protocol name starts with '/'")
+            }
+        }
+    }
+}
 
 /// Events created from network activity.
 #[derive(Debug)]
@@ -279,9 +317,19 @@ where
         /// The reply to caller.
         reply: oneshot::Sender<PeerExchangeMap>,
     },
-    /// Start a new epoch.
-    NewEpoch {
-        /// The epoch committee.
+    /// Set the previous/current/next committees directly from authoritative state, every epoch.
+    UpdateCommittees {
+        /// The previous epoch committee.
+        previous: HashSet<BlsPublicKey>,
+        /// The current epoch committee.
+        current: HashSet<BlsPublicKey>,
+        /// The next epoch committee.
+        next: HashSet<BlsPublicKey>,
+    },
+    /// Pre-dial recovery: forgive bans for a committee so it can be dialed, without mutating the
+    /// committee slots.
+    PrepareCommitteeDial {
+        /// The committee whose peers should be unbanned for dialing.
         committee: HashSet<BlsPublicKey>,
     },
     /// Find authorities for a future committee by bls key and return to sender.
@@ -536,9 +584,26 @@ where
         res.await.map_err(Into::into)
     }
 
-    /// Create a [PeerExchangeMap] for exchanging peers.
-    pub async fn new_epoch(&self, committee: HashSet<BlsPublicKey>) -> NetworkResult<()> {
-        self.sender.send(NetworkCommand::NewEpoch { committee }).await?;
+    /// Set the previous/current/next committees directly from authoritative state, every epoch.
+    pub async fn update_committees(
+        &self,
+        previous: HashSet<BlsPublicKey>,
+        current: HashSet<BlsPublicKey>,
+        next: HashSet<BlsPublicKey>,
+    ) -> NetworkResult<()> {
+        self.sender.send(NetworkCommand::UpdateCommittees { previous, current, next }).await?;
+        Ok(())
+    }
+
+    /// Forgive bans for a committee so it can be dialed, without mutating the committee slots.
+    ///
+    /// Used by the deadlock-breaker pre-dial path; the real slot update follows via
+    /// [`Self::update_committees`].
+    pub async fn prepare_committee_dial(
+        &self,
+        committee: HashSet<BlsPublicKey>,
+    ) -> NetworkResult<()> {
+        self.sender.send(NetworkCommand::PrepareCommitteeDial { committee }).await?;
         Ok(())
     }
 

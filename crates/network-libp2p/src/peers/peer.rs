@@ -34,8 +34,6 @@ pub(super) struct Peer {
     ///
     /// These are used to manage the banning process and are exchanged with peers.
     multiaddrs: HashSet<Multiaddr>,
-    /// The listening multiaddrs advertised by this peer.
-    listening_addrs: Vec<Multiaddr>,
     /// Connection status of the peer.
     connection_status: ConnectionStatus,
     /// Trusted peers are specifically included by node operators.
@@ -54,15 +52,10 @@ pub(super) struct Peer {
 
 impl Peer {
     /// Create a new trusted peer.
-    pub(super) fn new_trusted(
-        bls_public_key: BlsPublicKey,
-        network_key: NetworkPublicKey,
-        listening_addrs: Vec<Multiaddr>,
-    ) -> Peer {
+    pub(super) fn new_trusted(bls_public_key: BlsPublicKey, network_key: NetworkPublicKey) -> Peer {
         Self {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
-            listening_addrs,
             score: Score::new_max(),
             is_trusted: true,
             config: Default::default(),
@@ -73,20 +66,19 @@ impl Peer {
         }
     }
 
-    /// Create a new trusted peer.
+    /// Create a new peer with its known multiaddrs.
     pub(super) fn new(
         bls_public_key: BlsPublicKey,
         network_key: NetworkPublicKey,
-        listening_addrs: Vec<Multiaddr>,
+        addrs: Vec<Multiaddr>,
     ) -> Peer {
         Self {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
-            listening_addrs,
             score: Score::default(),
             is_trusted: false,
             config: Default::default(),
-            multiaddrs: Default::default(),
+            multiaddrs: addrs.into_iter().collect(),
             connection_status: Default::default(),
             connection_direction: Default::default(),
             routable: false,
@@ -100,11 +92,9 @@ impl Peer {
         let mut rng = StdRng::from_seed([0; 32]);
         let bls_public_key = *BlsKeypair::generate(&mut rng).public();
         let network_key: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
-        let listening_addrs = vec![Multiaddr::empty()];
         Self {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
-            listening_addrs,
             score: Score::new_max(),
             is_trusted: false,
             config: Default::default(),
@@ -342,18 +332,17 @@ impl Peer {
         }
     }
 
-    /// Update multiaddrs for the peer.
+    /// Revoke a peer's trusted status, returning it to the normal score model.
     ///
-    /// Returns a boolean indicating if the multiaddr was newly recorded.
-    pub(super) fn update_listening_addrs(&mut self, multiaddrs: Vec<Multiaddr>) -> bool {
-        let mut res = false;
-        for multiaddr in multiaddrs {
-            if !self.listening_addrs.contains(&multiaddr) {
-                self.listening_addrs.push(multiaddr);
-                res = true;
-            }
-        }
-        res
+    /// Called when a peer rotates out of all three committee slots. Only the flag is cleared;
+    /// the score is left as-is so the demoted peer gets a soft landing (heartbeat decay and
+    /// penalties resume immediately now that `is_trusted` is false).
+    ///
+    /// NOTE: `is_trusted` currently conflates committee-derived trust with operator-allowlist
+    /// trust (`new_trusted`/`add_trusted_peer`); demoting clears both for a peer that was in a
+    /// committee.
+    pub(super) fn make_untrusted(&mut self) {
+        self.is_trusted = false;
     }
 
     /// Update peer record to indicate participation in kad as a routable peer.
