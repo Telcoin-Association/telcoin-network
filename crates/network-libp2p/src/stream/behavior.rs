@@ -17,7 +17,7 @@ use crate::{
 };
 
 /// The protocol identifier for streaming data.
-pub(crate) const TN_STREAM_PROTOCOL: StreamProtocol = StreamProtocol::new("/tn-stream/1.0.0");
+pub(crate) const TN_STREAM_PROTOCOL: StreamProtocol = StreamProtocol::new("/tn-stream/0.0.1");
 
 /// Events emitted by the stream behavior to the swarm/application layer.
 #[derive(Debug)]
