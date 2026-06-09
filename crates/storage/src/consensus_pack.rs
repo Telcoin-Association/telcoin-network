@@ -18,8 +18,8 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tn_types::{
     gas_accumulator::RewardsCounter, AuthorityIdentifier, Batch, BlockHash, BlockNumHash,
-    BlsPublicKey, CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput,
-    Epoch, EpochRecord, Round, B256,
+    BlsPublicKey, CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader,
+    ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch, EpochRecord, Round, B256,
 };
 use tokio::{
     io::AsyncRead,
@@ -55,7 +55,7 @@ pub struct EpochMeta {
     pub genesis_exec_state: BlockNumHash,
     /// The hash of the last ['ConsensusHeader'] of the previous epoch.
     /// This is the "genesis" consensus ofder  this epoch.
-    pub genesis_consensus: BlockNumHash,
+    pub genesis_consensus: ConsensusNumHash,
 }
 
 /// Descriminant type for records in a Consensus Pack file.
@@ -93,8 +93,8 @@ impl PackRecord {
 enum PackMessage {
     ConsensusOutput(ConsensusOutput),
     ContainsConsensusHeaderNumber(u64, oneshot::Sender<bool>),
-    ContainsConsensusHeader(B256, oneshot::Sender<bool>),
-    ConsensusHeader(B256, oneshot::Sender<Option<ConsensusHeader>>),
+    ContainsConsensusHeader(ConsensusHeaderDigest, oneshot::Sender<bool>),
+    ConsensusHeader(ConsensusHeaderDigest, oneshot::Sender<Option<ConsensusHeader>>),
     ConsensusHeaderNumber(u64, oneshot::Sender<Result<ConsensusHeader, PackError>>),
     GetConsensusOutput(u64, oneshot::Sender<Result<ConsensusOutput, PackError>>),
     Persist(oneshot::Sender<Result<(), PackError>>),
@@ -325,7 +325,7 @@ impl ConsensusPack {
     }
 
     /// True if consensus header by digest is found by digest.
-    pub async fn contains_consensus_header(&self, digest: B256) -> bool {
+    pub async fn contains_consensus_header(&self, digest: ConsensusHeaderDigest) -> bool {
         let (tx, rx) = oneshot::channel();
         if self.tx.send(PackMessage::ContainsConsensusHeader(digest, tx)).await.is_ok() {
             rx.await.unwrap_or(false)
@@ -335,7 +335,10 @@ impl ConsensusPack {
     }
 
     /// Retrieve a consensus header by digest.
-    pub async fn consensus_header_by_digest(&self, digest: B256) -> Option<ConsensusHeader> {
+    pub async fn consensus_header_by_digest(
+        &self,
+        digest: ConsensusHeaderDigest,
+    ) -> Option<ConsensusHeader> {
         let (tx, rx) = oneshot::channel();
         if self.tx.send(PackMessage::ConsensusHeader(digest, tx)).await.is_ok() {
             rx.await.unwrap_or(None)
@@ -859,7 +862,7 @@ impl Inner {
                         .append(&PackRecord::Consensus(consensus_header))
                         .map_err(|e| PackError::Append(e.to_string()))?;
                     consensus_digests
-                        .save(consensus_digest, position)
+                        .save(consensus_digest.into(), position)
                         .map_err(|e| PackError::IndexAppend(format!("consensus digest {e}")))?;
                     let consensus_idx_pos =
                         consensus_number.saturating_sub(epoch_meta.start_consensus_number);
@@ -923,7 +926,7 @@ impl Inner {
             .append(&PackRecord::Consensus(Box::new(consensus.consensus_header())))
             .map_err(|e| PackError::Append(e.to_string()))?;
         self.consensus_digests
-            .save(consensus_digest, position)
+            .save(consensus_digest.into(), position)
             .map_err(|e| PackError::IndexAppend(format!("consensus {e}")))?;
         self.consensus_idx
             .save(consensus_idx, position)
@@ -1006,11 +1009,11 @@ impl Inner {
     }
 
     /// True if consensus header is found by digest.
-    fn contains_consensus_header(&mut self, digest: B256) -> bool {
+    fn contains_consensus_header(&mut self, digest: ConsensusHeaderDigest) -> bool {
         // This is a bit more complicated (the pos file_len check) because in a very rare
         // case of repairing a damaged pack we might have something in the index not in the
         // pack file (yet).
-        if let Ok(pos) = self.consensus_digests.load(digest) {
+        if let Ok(pos) = self.consensus_digests.load(digest.into()) {
             pos < self.data.file_len()
         } else {
             false
@@ -1018,8 +1021,11 @@ impl Inner {
     }
 
     /// Retrieve a consensus header by digest.
-    fn consensus_header_by_digest(&mut self, digest: B256) -> Option<ConsensusHeader> {
-        let pos = self.consensus_digests.load(digest).ok()?;
+    fn consensus_header_by_digest(
+        &mut self,
+        digest: ConsensusHeaderDigest,
+    ) -> Option<ConsensusHeader> {
+        let pos = self.consensus_digests.load(digest.into()).ok()?;
         // This is not strickly needed, the fetch below will fail if
         // we try to read past the end of the file but this potentially
         // short circuits a lot of checks for a small cost.
@@ -1287,7 +1293,8 @@ pub(crate) mod test {
     use tn_test_utils::CommitteeFixture;
     use tn_types::{
         test_genesis, BlockHash, Certificate, CertifiedBatch, CommittedSubDag, Committee,
-        ConsensusHeader, ConsensusOutput, EpochRecord, Hash, HeaderBuilder, ReputationScores,
+        ConsensusHeader, ConsensusHeaderDigest, ConsensusOutput, EpochRecord, Hash, HeaderBuilder,
+        ReputationScores,
     };
 
     use crate::{
@@ -1300,7 +1307,7 @@ pub(crate) mod test {
         authority_index: usize,
         chain: Arc<RethChainSpec>,
         number: u64,
-        parent: BlockHash,
+        parent: ConsensusHeaderDigest,
     ) -> ConsensusOutput {
         let batches_1 = tn_reth::test_utils::batches(chain, 4); // create 4 batches
         let authority_1 = committee

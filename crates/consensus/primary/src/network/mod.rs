@@ -34,9 +34,9 @@ use tn_storage::{
     PayloadStore,
 };
 use tn_types::{
-    encode, BlockHash, BlsPublicKey, BlsSignature, Certificate, ConsensusHeader, Database, Epoch,
-    EpochCertificate, EpochRecord, EpochVote, Header, HeaderDigest, Round, TaskError, TaskSpawner,
-    TnReceiver, TnSender, Vote, B256,
+    encode, BlsPublicKey, BlsSignature, Certificate, ConsensusHeader, ConsensusHeaderDigest,
+    Database, Epoch, EpochCertificate, EpochDigest, EpochRecord, EpochVote, Header, HeaderDigest,
+    Round, TaskError, TaskSpawner, TnReceiver, TnSender, Vote, B256,
 };
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
@@ -147,7 +147,7 @@ impl PrimaryNetworkHandle {
         epoch: Epoch,
         round: Round,
         consensus_block_num: u64,
-        consensus_header_hash: BlockHash,
+        consensus_header_hash: ConsensusHeaderDigest,
         key: BlsPublicKey,
         signature: BlsSignature,
     ) -> NetworkResult<()> {
@@ -240,7 +240,7 @@ impl PrimaryNetworkHandle {
         &self,
         peer: BlsPublicKey,
         number: u64,
-        hash: BlockHash,
+        hash: ConsensusHeaderDigest,
     ) -> NetworkResult<ConsensusHeader> {
         let request = PrimaryRequest::ConsensusHeader { number, hash };
         let res = self.handle.send_request(request, peer).await?;
@@ -269,7 +269,7 @@ impl PrimaryNetworkHandle {
     pub async fn request_consensus(
         &self,
         number: u64,
-        hash: BlockHash,
+        hash: ConsensusHeaderDigest,
     ) -> NetworkResult<ConsensusHeader> {
         const TIMEOUT: Duration = Duration::from_secs(10);
         let request = PrimaryRequest::ConsensusHeader { number, hash };
@@ -309,7 +309,7 @@ impl PrimaryNetworkHandle {
     pub async fn request_epoch_cert(
         &self,
         epoch: Option<Epoch>,
-        hash: Option<BlockHash>,
+        hash: Option<EpochDigest>,
     ) -> NetworkResult<(EpochRecord, EpochCertificate)> {
         let request = PrimaryRequest::EpochRecord { epoch, hash };
         // Try up to three times (from three peers) to get consensus.
@@ -699,7 +699,7 @@ where
         &self,
         peer: BlsPublicKey,
         number: u64,
-        hash: BlockHash,
+        hash: ConsensusHeaderDigest,
         channel: ResponseChannel<PrimaryResponse>,
         cancel: oneshot::Receiver<()>,
     ) {
@@ -742,7 +742,7 @@ where
         &self,
         peer: BlsPublicKey,
         epoch: Option<Epoch>,
-        hash: Option<BlockHash>,
+        hash: Option<EpochDigest>,
         channel: ResponseChannel<PrimaryResponse>,
         cancel: oneshot::Receiver<()>,
     ) {

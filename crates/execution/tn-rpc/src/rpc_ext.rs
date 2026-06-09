@@ -7,7 +7,7 @@ use crate::{
 use async_trait::async_trait;
 use jsonrpsee::proc_macros::rpc;
 use tn_reth::RethEnv;
-use tn_types::{BlockHash, ConsensusHeader, Epoch, EpochCertificate, EpochRecord, Genesis};
+use tn_types::{ConsensusHeader, Epoch, EpochCertificate, EpochDigest, EpochRecord, Genesis};
 
 /// Telcoin Network RPC namespace.
 ///
@@ -40,7 +40,7 @@ pub trait TelcoinNetworkRpcExtApi {
     #[method(name = "epochRecordByHash")]
     async fn epoch_record_by_hash(
         &self,
-        hash: BlockHash,
+        hash: EpochDigest,
     ) -> TelcoinNetworkRpcResult<(EpochRecord, EpochCertificate)>;
 }
 
@@ -84,7 +84,7 @@ where
 
     async fn epoch_record_by_hash(
         &self,
-        hash: BlockHash,
+        hash: EpochDigest,
     ) -> TelcoinNetworkRpcResult<(EpochRecord, EpochCertificate)> {
         self.inner_node_network.epoch(None, Some(hash)).await.ok_or(TNRpcError::NotFound)
     }

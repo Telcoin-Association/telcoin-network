@@ -3,8 +3,9 @@
 
 use super::ConsensusHeader;
 use crate::{
-    crypto, encode, Address, Batch, BlockHash, BlockNumHash, BlsSignature, Certificate, Digest,
-    Epoch, Hash, Header, ReputationScores, Round, SealedHeader, TimestampSec, B256,
+    crypto, encode, Address, Batch, BlockHash, BlsSignature, Certificate, ConsensusHeaderDigest,
+    ConsensusNumHash, Digest, Epoch, Hash, Header, ReputationScores, Round, SealedHeader,
+    TimestampSec, B256,
 };
 use alloy::primitives::keccak256;
 use serde::{Deserialize, Serialize};
@@ -25,7 +26,7 @@ pub type SequenceNumber = u64;
 /// - leader round from consensus
 /// - consensus block number/hash
 /// - latest canonical tip when execution produced a block (`None` when execution was skipped)
-pub type EngineUpdate = (Round, BlockNumHash, Option<SealedHeader>);
+pub type EngineUpdate = (Round, ConsensusNumHash, Option<SealedHeader>);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// Struct that contains all necessary information for executing a batch post-consensus.
@@ -53,7 +54,7 @@ struct ConsensusOutputInner {
     batch_digests: VecDeque<BlockHash>,
     // These fields are used to construct the ConsensusHeader.
     /// The hash of the previous ConsesusHeader in the chain.
-    parent_hash: B256,
+    parent_hash: ConsensusHeaderDigest,
     /// A scalar value equal to the number of ancestor blocks. The genesis block has a number of
     /// zero.
     number: u64,
@@ -72,7 +73,7 @@ pub struct ConsensusOutput {
     /// The engine should make a system call to consensus registry contract to close the epoch.
     close_epoch: bool,
     /// Cached digest of the consensus header for this output.
-    consensus_header_hash_cache: B256,
+    consensus_header_hash_cache: ConsensusHeaderDigest,
 }
 
 // NOTE: only [Self::inner] is serialized. `close_epoch` is intentionally NOT part of the
@@ -106,7 +107,7 @@ impl ConsensusOutput {
     /// Create a
     pub fn new(
         sub_dag: CommittedSubDag,
-        parent_hash: BlockHash,
+        parent_hash: ConsensusHeaderDigest,
         number: u64,
         close_epoch: bool,
         batch_digests: VecDeque<BlockHash>,
@@ -124,12 +125,16 @@ impl ConsensusOutput {
             ConsensusHeader::digest_from_parts(inner.parent_hash, &inner.sub_dag, inner.number);
         ConsensusOutput { inner, close_epoch, consensus_header_hash_cache }
     }
-    pub fn new_with_subdag(sub_dag: CommittedSubDag, parent_hash: BlockHash, number: u64) -> Self {
+    pub fn new_with_subdag(
+        sub_dag: CommittedSubDag,
+        parent_hash: ConsensusHeaderDigest,
+        number: u64,
+    ) -> Self {
         Self::new(sub_dag, parent_hash, number, false, VecDeque::new(), Vec::new())
     }
     pub fn new_closed_with_subdag(
         sub_dag: CommittedSubDag,
-        parent_hash: BlockHash,
+        parent_hash: ConsensusHeaderDigest,
         number: u64,
     ) -> Self {
         Self::new(sub_dag, parent_hash, number, true, VecDeque::new(), Vec::new())
@@ -218,13 +223,13 @@ impl ConsensusOutput {
     }
 
     /// Return the hash of the consensus header that matches this output.
-    pub fn consensus_header_hash(&self) -> B256 {
+    pub fn consensus_header_hash(&self) -> ConsensusHeaderDigest {
         self.consensus_header_hash_cache
     }
 
     /// Return number/hash tuple for this consensus output.
-    pub fn num_hash(&self) -> BlockNumHash {
-        BlockNumHash::new(self.inner.number, self.consensus_header_hash())
+    pub fn num_hash(&self) -> ConsensusNumHash {
+        ConsensusNumHash::new(self.inner.number, self.consensus_header_hash())
     }
 
     /// Return a `bool` if this is the last batch (by index) of the last output for the epoch.
@@ -260,17 +265,17 @@ impl ConsensusOutput {
     }
 
     /// The parent hash for this output.
-    pub fn parent_hash(&self) -> BlockHash {
+    pub fn parent_hash(&self) -> ConsensusHeaderDigest {
         self.inner.parent_hash
     }
 }
 
 impl Hash<{ crypto::DIGEST_LENGTH }> for ConsensusOutput {
-    type TypedDigest = ConsensusDigest;
+    type TypedDigest = ConsensusHeaderDigest;
 
     /// The digest of the corresponding [ConsensusHeader] that produced this output.
-    fn digest(&self) -> ConsensusDigest {
-        ConsensusDigest(Digest { digest: self.consensus_header_hash().into() })
+    fn digest(&self) -> ConsensusHeaderDigest {
+        self.consensus_header_hash()
     }
 }
 
@@ -466,45 +471,12 @@ impl Hash<{ crypto::DIGEST_LENGTH }> for CommittedSubDag {
     }
 }
 
-// Convenience function for casting `ConsensusDigest` into EL B256.
-// note: these are both 32-bytes
-impl From<ConsensusDigest> for B256 {
-    fn from(value: ConsensusDigest) -> Self {
-        B256::from_slice(value.as_ref())
-    }
-}
-
 /// Shutdown token dropped when a task is properly shut down.
 pub type ShutdownToken = mpsc::Sender<()>;
 
-// Digest of ConsususOutput and CommittedSubDag
-#[derive(
-    Clone, Copy, Default, PartialEq, Eq, std::hash::Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
-pub struct ConsensusDigest(Digest<{ crypto::DIGEST_LENGTH }>);
-
-impl AsRef<[u8]> for ConsensusDigest {
-    fn as_ref(&self) -> &[u8] {
-        &self.0.digest
-    }
-}
-
-impl From<ConsensusDigest> for Digest<{ crypto::DIGEST_LENGTH }> {
-    fn from(d: ConsensusDigest) -> Self {
-        d.0
-    }
-}
-
-impl fmt::Debug for ConsensusDigest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl fmt::Display for ConsensusDigest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(f, "{}", self.0.to_string().get(0..16).ok_or(fmt::Error)?)
-    }
+crate::crypto::digest_newtype! {
+    /// Digest of a [`ConsensusOutput`]/[`CommittedSubDag`].
+    pub struct ConsensusDigest;
 }
 
 // See test_utils output_tests.rs for this modules tests.

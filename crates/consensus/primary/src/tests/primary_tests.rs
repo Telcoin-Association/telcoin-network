@@ -19,8 +19,9 @@ use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, CertificateStore, PayloadStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    error::HeaderError, now, AuthorityIdentifier, BlockNumHash, Certificate, Committee, ExecHeader,
-    Hash as _, SealedHeader, SignatureVerificationState, TaskManager, B256,
+    error::HeaderError, now, AuthorityIdentifier, BlockNumHash, Certificate, Committee,
+    ConsensusHeaderDigest, ConsensusNumHash, ExecHeader, Hash as _, SealedHeader,
+    SignatureVerificationState, TaskManager,
 };
 use tokio::time::timeout;
 
@@ -45,7 +46,11 @@ async fn test_request_vote_too_new() {
     // Need a dummy parent so we can request a vote.
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
     let task_manager = TaskManager::default();
     let synchronizer =
@@ -112,7 +117,11 @@ async fn test_request_vote_has_missing_execution_block() {
     // Need a dummy parent so we can request a vote.
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
     let task_manager = TaskManager::default();
     let synchronizer =
@@ -189,14 +198,18 @@ async fn test_request_vote_older_execution_block() {
     let dummy_hash = dummy_parent.hash();
     // This will be an "older" execution block, test this still works.
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
     let mut dummy = ExecHeader { nonce: 110_u64.into(), ..Default::default() };
     dummy.nonce = 110_u64.into();
     cb.app().recent_blocks().send_modify(|blocks| {
         blocks.push_latest(
             0,
-            BlockNumHash::new(0, B256::default()),
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
             Some(SealedHeader::seal_slow(dummy)),
         )
     });
@@ -204,7 +217,7 @@ async fn test_request_vote_older_execution_block() {
     cb.app().recent_blocks().send_modify(|blocks| {
         blocks.push_latest(
             0,
-            BlockNumHash::new(0, B256::default()),
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
             Some(SealedHeader::seal_slow(dummy)),
         )
     });
@@ -283,7 +296,11 @@ async fn test_request_vote_has_missing_parents() {
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
     let task_manager = TaskManager::default();
     let synchronizer =
@@ -397,7 +414,11 @@ async fn test_request_vote_accept_missing_parents() {
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
     let task_manager = TaskManager::default();
     let synchronizer =
@@ -501,7 +522,11 @@ async fn test_request_vote_missing_batches() {
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
     let task_manager = TaskManager::default();
     let synchronizer =
@@ -577,7 +602,11 @@ async fn test_request_vote_already_voted() {
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
     let task_manager = TaskManager::default();
     let synchronizer =
@@ -824,7 +853,11 @@ async fn test_request_vote_created_at_in_future() {
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
     let task_manager = TaskManager::default();
     let synchronizer =

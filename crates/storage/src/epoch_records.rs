@@ -17,7 +17,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use tn_types::{BlsPublicKey, Epoch, EpochCertificate, EpochRecord, B256};
+use tn_types::{BlsPublicKey, Epoch, EpochCertificate, EpochDigest, EpochRecord};
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     oneshot, watch,
@@ -42,17 +42,17 @@ enum EpochDbMessage {
     /// If the record is already stored, only the certificate is saved.
     Save(EpochRecord, EpochCertificate),
     /// Save an [`EpochCertificate`] keyed by its record digest.
-    SaveCertificate(B256, EpochCertificate),
+    SaveCertificate(EpochDigest, EpochCertificate),
     /// Retrieve an [`EpochRecord`] by epoch number.
     RecordByEpoch(Epoch, oneshot::Sender<Option<EpochRecord>>),
     /// Retrieve an [`EpochRecord`] by its digest.
-    RecordByDigest(B256, oneshot::Sender<Option<EpochRecord>>),
+    RecordByDigest(EpochDigest, oneshot::Sender<Option<EpochRecord>>),
     /// Retrieve an [`EpochCertificate`] by its epoch_hash digest.
-    CertByDigest(B256, oneshot::Sender<Option<EpochCertificate>>),
+    CertByDigest(EpochDigest, oneshot::Sender<Option<EpochCertificate>>),
     /// True if the database contains a record for the given epoch number.
     ContainsEpoch(Epoch, oneshot::Sender<bool>),
     /// True if the database contains a record with the given digest.
-    ContainsRecordDigest(B256, oneshot::Sender<bool>),
+    ContainsRecordDigest(EpochDigest, oneshot::Sender<bool>),
     /// Return the latest (highest epoch) [`EpochRecord`] stored, if any.
     LatestRecord(oneshot::Sender<Option<EpochRecord>>),
     /// Flush all pending writes to disk.
@@ -242,7 +242,7 @@ impl EpochRecordDb {
     /// Idempotent: returns `Ok(())` if a certificate for this digest is already stored.
     pub async fn save_certificate(
         &self,
-        digest: B256,
+        digest: EpochDigest,
         cert: EpochCertificate,
     ) -> Result<(), EpochDbError> {
         self.get_error()?;
@@ -284,7 +284,7 @@ impl EpochRecordDb {
     }
 
     /// Retrieve an [`EpochRecord`] by its digest.
-    pub async fn record_by_digest(&self, digest: B256) -> Option<EpochRecord> {
+    pub async fn record_by_digest(&self, digest: EpochDigest) -> Option<EpochRecord> {
         let (tx, rx) = oneshot::channel();
         if self.tx.send(EpochDbMessage::RecordByDigest(digest, tx)).await.is_ok() {
             rx.await.unwrap_or(None)
@@ -294,7 +294,7 @@ impl EpochRecordDb {
     }
 
     /// Retrieve an [`EpochCertificate`] by its `epoch_hash` digest.
-    pub async fn cert_by_digest(&self, digest: B256) -> Option<EpochCertificate> {
+    pub async fn cert_by_digest(&self, digest: EpochDigest) -> Option<EpochCertificate> {
         let (tx, rx) = oneshot::channel();
         if self.tx.send(EpochDbMessage::CertByDigest(digest, tx)).await.is_ok() {
             rx.await.unwrap_or(None)
@@ -314,7 +314,7 @@ impl EpochRecordDb {
     }
 
     /// True if the database contains a record with the given digest.
-    pub async fn contains_record_digest(&self, digest: B256) -> bool {
+    pub async fn contains_record_digest(&self, digest: EpochDigest) -> bool {
         let (tx, rx) = oneshot::channel();
         if self.tx.send(EpochDbMessage::ContainsRecordDigest(digest, tx)).await.is_ok() {
             rx.await.unwrap_or(false)
@@ -375,7 +375,7 @@ impl EpochRecordDb {
     /// Retrieve the epoch record and certificate (if available) by record digest.
     pub async fn get_epoch_by_hash(
         &self,
-        hash: B256,
+        hash: EpochDigest,
     ) -> Option<(EpochRecord, Option<EpochCertificate>)> {
         let record = self.record_by_digest(hash).await?;
         let cert = self.cert_by_digest(record.digest()).await;
@@ -578,7 +578,7 @@ impl Inner {
         let record_pos =
             self.records.append(&record).map_err(|e| EpochDbError::Append(e.to_string()))?;
         self.record_digests
-            .save(record_digest, record_pos)
+            .save(record_digest.into(), record_pos)
             .map_err(|e| EpochDbError::IndexAppend(format!("record digest: {e}")))?;
         self.epoch_idx
             .save(idx, record_pos)
@@ -597,13 +597,13 @@ impl Inner {
         self.save_record(record)?;
 
         // Skip if the cert is already stored.
-        if self.cert_digests.load(record_digest).is_ok() {
+        if self.cert_digests.load(record_digest.into()).is_ok() {
             return Ok(());
         }
 
         let cert_pos = self.certs.append(&cert).map_err(|e| EpochDbError::Append(e.to_string()))?;
         self.cert_digests
-            .save(record_digest, cert_pos)
+            .save(record_digest.into(), cert_pos)
             .map_err(|e| EpochDbError::IndexAppend(format!("cert digest: {e}")))?;
         self.cert_digests.set_data_file_length(self.certs.file_len());
         Ok(())
@@ -612,15 +612,15 @@ impl Inner {
     /// Save an [`EpochCertificate`] keyed by `digest`. Idempotent.
     fn save_certificate(
         &mut self,
-        digest: B256,
+        digest: EpochDigest,
         cert: EpochCertificate,
     ) -> Result<(), EpochDbError> {
-        if self.cert_digests.load(digest).is_ok() {
+        if self.cert_digests.load(digest.into()).is_ok() {
             return Ok(());
         }
         let cert_pos = self.certs.append(&cert).map_err(|e| EpochDbError::Append(e.to_string()))?;
         self.cert_digests
-            .save(digest, cert_pos)
+            .save(digest.into(), cert_pos)
             .map_err(|e| EpochDbError::IndexAppend(format!("cert digest: {e}")))?;
         self.cert_digests.set_data_file_length(self.certs.file_len());
         Ok(())
@@ -638,13 +638,13 @@ impl Inner {
         }
     }
 
-    fn record_by_digest(&mut self, digest: B256) -> Option<EpochRecord> {
-        let pos = self.record_digests.load(digest).ok()?;
+    fn record_by_digest(&mut self, digest: EpochDigest) -> Option<EpochRecord> {
+        let pos = self.record_digests.load(digest.into()).ok()?;
         self.records.fetch(pos).ok()
     }
 
-    fn cert_by_digest(&mut self, digest: B256) -> Option<EpochCertificate> {
-        let pos = self.cert_digests.load(digest).ok()?;
+    fn cert_by_digest(&mut self, digest: EpochDigest) -> Option<EpochCertificate> {
+        let pos = self.cert_digests.load(digest.into()).ok()?;
         self.certs.fetch(pos).ok()
     }
 
@@ -659,8 +659,8 @@ impl Inner {
         }
     }
 
-    fn contains_record_digest(&mut self, digest: B256) -> bool {
-        if let Ok(pos) = self.record_digests.load(digest) {
+    fn contains_record_digest(&mut self, digest: EpochDigest) -> bool {
+        if let Ok(pos) = self.record_digests.load(digest.into()) {
             pos < self.records.file_len()
         } else {
             false
@@ -755,8 +755,9 @@ mod test {
     use roaring::RoaringBitmap;
     use tempfile::TempDir;
     use tn_types::{
-        BlockNumHash, BlsAggregateSignature, BlsKeypair, BlsPublicKey, BlsSignature, BlsSigner,
-        Epoch, EpochCertificate, EpochRecord, Signer as _, B256,
+        BlsAggregateSignature, BlsKeypair, BlsPublicKey, BlsSignature, BlsSigner,
+        ConsensusHeaderDigest, ConsensusNumHash, Epoch, EpochCertificate, EpochDigest, EpochRecord,
+        Signer as _,
     };
 
     use crate::epoch_records::{EpochRecordDb, RECORDS_NAME};
@@ -785,7 +786,7 @@ mod test {
     fn make_test_pair(
         epoch: Epoch,
         signers: &[TestSigner],
-        parent_hash: B256,
+        parent_hash: EpochDigest,
     ) -> (EpochRecord, EpochCertificate) {
         let committee: Vec<BlsPublicKey> = signers.iter().map(|s| s.public_key()).collect();
         let record = EpochRecord {
@@ -793,7 +794,10 @@ mod test {
             committee: committee.clone(),
             next_committee: committee,
             parent_hash,
-            final_consensus: BlockNumHash::new((epoch as u64 + 1) * 10, B256::default()),
+            final_consensus: ConsensusNumHash::new(
+                (epoch as u64 + 1) * 10,
+                ConsensusHeaderDigest::default(),
+            ),
             ..Default::default()
         };
 
@@ -821,7 +825,7 @@ mod test {
 
         let num_records: u32 = 20;
         let mut pairs = Vec::new();
-        let mut parent = B256::default();
+        let mut parent = EpochDigest::default();
         for epoch in 0..num_records {
             let (record, cert) = make_test_pair(epoch, &signers, parent);
             parent = record.digest();

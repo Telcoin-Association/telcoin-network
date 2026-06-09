@@ -118,9 +118,10 @@ use tn_config::{
 use tn_types::{
     deconstruct_nonce,
     gas_accumulator::{RewardsCounter, WorkerFeeConfig},
-    Address, BlockBody, BlockHashOrNumber, BlockNumHash, BlockNumber, EngineUpdate, Epoch,
-    ExecHeader, Genesis, GenesisAccount, RecoveredBlock, Round, SealedBlock, SealedHeader,
-    TaskManager, TaskSpawner, TransactionSigned, B256, ETHEREUM_BLOCK_GAS_LIMIT_30M, U256,
+    Address, BlockBody, BlockHashOrNumber, BlockNumHash, BlockNumber, ConsensusNumHash,
+    EngineUpdate, Epoch, ExecHeader, Genesis, GenesisAccount, RecoveredBlock, Round, SealedBlock,
+    SealedHeader, TaskManager, TaskSpawner, TransactionSigned, B256, ETHEREUM_BLOCK_GAS_LIMIT_30M,
+    U256,
 };
 use tracing::{debug, error, info, warn};
 use traits::{TNPrimitives, TelcoinNode};
@@ -805,7 +806,7 @@ impl RethEnv {
     pub fn finish_executing_output(
         &self,
         blocks: Vec<ExecutedBlock>,
-        engine_update: Option<(Round, BlockNumHash, tokio::sync::mpsc::Sender<EngineUpdate>)>,
+        engine_update: Option<(Round, ConsensusNumHash, tokio::sync::mpsc::Sender<EngineUpdate>)>,
     ) -> TnRethResult<()> {
         // NOTE: this makes all blocks canonical, commits them to the database,
         // and broadcasts new chain on `canon_state_notification_sender`
