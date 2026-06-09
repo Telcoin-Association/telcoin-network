@@ -734,20 +734,6 @@ impl AllPeers {
         }
     }
 
-    /// Boolean indicating if this peer is in the current committee of voting validators.
-    ///
-    /// This is the narrow current-only check; [`Self::is_peer_validator`] widens membership to the
-    /// previous and next committees as well. Kept as the building block for future NVV support.
-    #[allow(dead_code)]
-    fn is_peer_cvv(&self, peer_id: &PeerId) -> bool {
-        match self.identity_for(peer_id) {
-            PeerIdentity::Confirmed(bls_public_key) => {
-                self.current_committee.contains(&bls_public_key)
-            }
-            PeerIdentity::Unidentified(_) => false,
-        }
-    }
-
     /// Boolean indicating if the ip address is associated with a banned peer.
     pub(super) fn ip_banned(&self, ip: &IpAddr) -> bool {
         self.banned_peers.ip_banned(ip)
