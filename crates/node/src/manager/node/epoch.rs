@@ -194,6 +194,16 @@ where
         // This needs to be created early so required machinery for other tasks exists when needed.
         let mut worker = worker_node.new_worker().await?;
         let current_epoch = primary.current_committee().await.epoch();
+        let (current_consensus_epoch, _, _) = self.consensus_bus.published_consensus_num_hash();
+        if current_epoch < current_consensus_epoch {
+            // If we are starting an epoch behind consensus then make sure we have requested this
+            // pack file. The request will not do anything if we have the pack or it's
+            // inprocess already. This should not be needed but should be harmless and
+            // adds a small safety net.
+            self.consensus_bus
+                .request_epoch_pack_file_by_epoch(current_epoch, &self.consensus_chain)
+                .await;
+        }
 
         gas_accumulator.rewards_counter().set_committee(primary.current_committee().await);
         let certificate_pack = if consensus_bus.is_active_cvv() {

@@ -518,11 +518,6 @@ where
     /// Process commands for the network.
     fn process_command(&mut self, command: NetworkCommand<Req, Res>) -> NetworkResult<()> {
         match command {
-            NetworkCommand::UpdateAuthorizedPublishers { authorities, reply } => {
-                // this value should be updated at the start of each epoch
-                self.authorized_publishers = authorities;
-                send_or_log_error!(reply, Ok(()), "UpdateAuthorizedPublishers");
-            }
             NetworkCommand::StartListening { multiaddr, reply } => {
                 let res = self.swarm.listen_on(multiaddr);
                 send_or_log_error!(reply, res, "StartListening");

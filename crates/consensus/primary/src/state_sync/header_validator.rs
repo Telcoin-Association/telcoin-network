@@ -180,7 +180,7 @@ where
                     committed_round = *rx_committed_round_updates.borrow_and_update();
                     debug!(target: "primary::header_validator", ?committed_round, "committed round update");
 
-                    if header.round < committed_round.saturating_sub(max_age) {
+                    if header.round() < committed_round.saturating_sub(max_age) {
                         return Err(HeaderError::TooOld{
                             digest: header.digest(),
                             header_round: header.round(),

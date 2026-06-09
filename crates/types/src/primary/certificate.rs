@@ -12,15 +12,14 @@ use crate::{
     ensure,
     error::{CertificateError, CertificateResult, DagError, DagResult, HeaderError},
     serde::RoaringBitmapSerde,
-    Authority, AuthorityIdentifier, Committee, Epoch, Hash, Header, HeaderDigest, Round,
-    TimestampSec, VotingPower,
+    Authority, AuthorityIdentifier, Committee, Epoch, Hash, Header, HeaderBuilder, HeaderDigest,
+    Round, TimestampSec, VotingPower,
 };
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    sync::Arc,
 };
 
 /// Certificates are the output of consensus.
@@ -29,28 +28,31 @@ use std::{
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct Certificate {
     /// Certificate's header.
-    /// Wrapped in an Arc to make cloning cheaper and to discourage changing the header and
-    /// invalidating the cert.
-    pub header: Arc<Header>,
+    /// Header uses an inner Arc and is immutable (so cert can't be invalidated trivially).
+    header: Header,
     /// Container for [BlsAggregateSignatureBytes].
-    pub signature_verification_state: SignatureVerificationState,
+    signature_verification_state: SignatureVerificationState,
     /// Bitmap that indicates which authorities from committee signed this certificate.
     #[serde_as(as = "RoaringBitmapSerde")]
     signed_authorities: roaring::RoaringBitmap,
 }
 
 impl Certificate {
+    /// Consume the cert and return the contained Header.
+    pub fn into_header(self) -> Header {
+        self.header
+    }
+
     /// Create a genesis certificate with empty payload.
     pub fn genesis(committee: &Committee) -> Vec<Self> {
         committee
             .authorities()
             .iter()
             .map(|authority| Self {
-                header: Arc::new(Header {
-                    author: authority.id(),
-                    epoch: committee.epoch(),
-                    ..Default::default()
-                }),
+                header: HeaderBuilder::default()
+                    .author(authority.id())
+                    .epoch(committee.epoch())
+                    .build(),
                 ..Self::default()
             })
             .collect()
@@ -158,11 +160,7 @@ impl Certificate {
             SignatureVerificationState::Unverified(bls_signature)
         };
 
-        Ok(Certificate {
-            header: Arc::new(header),
-            signature_verification_state,
-            signed_authorities,
-        })
+        Ok(Certificate { header, signature_verification_state, signed_authorities })
     }
 
     /// Return the group of authorities that signed this certificate.
@@ -371,35 +369,31 @@ impl Certificate {
     ///
     /// Only Used for testing.
     pub fn update_header_for_test(&mut self, header: Header) {
-        self.header = Arc::new(header);
+        self.header = header;
     }
 
     /// Update the headers author for a test- not for production code.
     pub fn update_header_author_for_test(&mut self, author: AuthorityIdentifier) {
-        let mut header = (*self.header).clone();
-        header.author = author;
-        self.header = Arc::new(header);
+        let header_builder = HeaderBuilder::from_header(&self.header);
+        self.header = header_builder.author(author).build();
     }
 
     /// Update the headers round for a test- not for production code.
     pub fn update_header_round_for_test(&mut self, round: Round) {
-        let mut header = (*self.header).clone();
-        header.round = round;
-        self.header = Arc::new(header);
+        let header_builder = HeaderBuilder::from_header(&self.header);
+        self.header = header_builder.round(round).build();
     }
 
     /// Update the headers epoch for a test- not for production code.
     pub fn update_header_epoch_for_test(&mut self, epoch: Epoch) {
-        let mut header = (*self.header).clone();
-        header.epoch = epoch;
-        self.header = Arc::new(header);
+        let header_builder = HeaderBuilder::from_header(&self.header);
+        self.header = header_builder.epoch(epoch).build();
     }
 
     /// Update the headers created_at for a test- not for production code.
     pub fn update_header_created_at_for_test(&mut self, created_at: TimestampSec) {
-        let mut header = (*self.header).clone();
-        header.created_at = created_at;
-        self.header = Arc::new(header);
+        let header_builder = HeaderBuilder::from_header(&self.header);
+        self.header = header_builder.created_at(created_at).build();
     }
 }
 

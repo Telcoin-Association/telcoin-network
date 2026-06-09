@@ -17,7 +17,7 @@ use tn_network_libp2p::{
 use tn_storage::{mem_db::MemDatabase, CertificateStore, PayloadStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    test_utils::init_test_tracing, BlsSignature, Certificate, Hash as _, Header,
+    test_utils::init_test_tracing, BlsSignature, Certificate, Hash as _, Header, HeaderBuilder,
     SignatureVerificationState, TaskManager, TnSender as _,
 };
 use tokio::{
@@ -320,9 +320,8 @@ async fn test_fetch_certificates_basic() {
                     let mut certs = Vec::new();
                     // Add cert missing parent info.
                     let mut cert = certificates[num_written].clone();
-                    let mut ch = cert.header().clone();
-                    ch.clear_parents_for_test();
-                    cert.update_header_for_test(ch);
+                    let ch_builder = HeaderBuilder::from_header(cert.header());
+                    cert.update_header_for_test(ch_builder.parents(BTreeSet::default()).build());
                     certs.push(cert);
                     // Add cert with incorrect digest.
                     let mut cert = certificates[num_written].clone();
@@ -353,7 +352,7 @@ async fn test_fetch_certificates_basic() {
     verify_certificates_not_in_store(&certificate_store, &certificates[num_written..target_index]);
 
     assert!(!synchronizer
-        .identify_unkown_parents(&certificates[target_index].header)
+        .identify_unkown_parents(certificates[target_index].header())
         .await
         .unwrap()
         .is_empty());
@@ -398,7 +397,7 @@ async fn test_fetch_certificates_basic() {
     verify_certificates_not_in_store(&certificate_store, &certificates[num_written..target_index]);
 
     assert!(!synchronizer
-        .identify_unkown_parents(&certificates[target_index].header)
+        .identify_unkown_parents(certificates[target_index].header())
         .await
         .unwrap()
         .is_empty());

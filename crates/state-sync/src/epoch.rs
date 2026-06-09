@@ -8,7 +8,7 @@ use std::{collections::BTreeSet, time::Duration};
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{BlsPublicKey, Epoch, EpochRecord, Noticer, TaskSpawner, B256};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 /// How long to wait before retrying a failed epoch record collection.
 const EPOCH_COLLECT_RETRY_SECS: u64 = 5;
@@ -61,17 +61,13 @@ async fn collect_epoch_records(
             // allowing last_epoch to advance past already-complete epochs on future calls.
             result_epoch = epoch;
 
-            let (_old_epoch, old_number, _) = consensus_bus.published_consensus_num_hash();
             let number = rec.final_consensus.number;
             let hash = rec.final_consensus.hash;
-            if number > old_number {
-                info!(
+            if consensus_bus.publish_consensus_num_hash_if_newer(epoch, number, hash) {
+                debug!(
                     target: "epoch-manager",
-                    "epoch sync downloaded up to epoch {result_epoch}, final consensus at block {number} ({hash}) - notifying state sync",
+                    "epoch record sync downloaded up to epoch {result_epoch}, final consensus at block {number} ({hash}) - notifying state sync",
                 );
-                consensus_bus
-                    .last_published_consensus_num_hash()
-                    .send_replace((epoch, number, hash));
             }
 
             continue;
@@ -162,13 +158,11 @@ async fn collect_epoch_records(
     // gap (e.g. gossip arrived before the epoch record was available). We do this once
     // at the end rather than per-epoch to avoid flooding peers with concurrent requests.
     if let Some((epoch, number, hash)) = best_final_consensus {
-        let (_old_epoch, old_number, _) = consensus_bus.published_consensus_num_hash();
-        if number > old_number {
+        if consensus_bus.publish_consensus_num_hash_if_newer(epoch, number, hash) {
             info!(
                 target: "epoch-manager",
-                "epoch sync downloaded up to epoch {result_epoch}, final consensus at block {number} ({hash}) - notifying state sync",
+                "updating last published consensus num hash up to epoch {result_epoch}, final consensus at block {number} ({hash}) - notifying state sync",
             );
-            consensus_bus.last_published_consensus_num_hash().send_replace((epoch, number, hash));
         }
     }
     result_epoch

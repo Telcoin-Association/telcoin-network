@@ -807,6 +807,7 @@ impl Inner {
             previous_epoch.final_consensus.hash
         };
         let mut batches = HashSet::new();
+        let mut referenced_batches = HashSet::new();
         while let Some(record) = next(&mut stream_iter, timeout).await? {
             match record {
                 PackRecord::EpochMeta(_epoch_meta) => {
@@ -831,14 +832,22 @@ impl Inner {
                     }
                     for header in &consensus_header.sub_dag.headers {
                         for (digest, _) in header.payload().iter() {
-                            if !batches.remove(digest) {
+                            if !batches.contains(digest) {
                                 return Err(PackError::MissingBatches);
                             }
+                            referenced_batches.insert(*digest);
                         }
                     }
-                    if !batches.is_empty() {
+                    // batches.len() will generally equal referenced_batches.len() but if it is
+                    // greater than we had batches that were not accounted for.
+                    // It is possible (at time of writing) for a batch to
+                    // be in more than one subdag.  This is also why we don't just
+                    // remove batches as we check above.
+                    if batches.len() > referenced_batches.len() {
                         return Err(PackError::ExtraBatches);
                     }
+                    batches.clear();
+                    referenced_batches.clear();
                     let consensus_digest = consensus_header.digest();
                     parent_digest = consensus_digest;
                     let consensus_number = consensus_header.number;
@@ -1280,7 +1289,7 @@ pub(crate) mod test {
     use tn_test_utils::CommitteeFixture;
     use tn_types::{
         test_genesis, BlockHash, Certificate, CertifiedBatch, CommittedSubDag, Committee,
-        ConsensusHeader, ConsensusOutput, EpochRecord, Hash, ReputationScores,
+        ConsensusHeader, ConsensusOutput, EpochRecord, Hash, HeaderBuilder, ReputationScores,
     };
 
     use crate::{
@@ -1311,9 +1320,9 @@ pub(crate) mod test {
         // update cert
         leader_1.update_header_author_for_test(authority_1);
         for batch in &batches_1 {
-            let mut ch = leader_1.header().clone();
-            ch.payload.insert(batch.digest(), 0_u16);
-            leader_1.update_header_for_test(ch);
+            let mut builder = HeaderBuilder::from_header(leader_1.header());
+            builder = builder.with_payload_batch(&batch, 0_u16);
+            leader_1.update_header_for_test(builder.build());
         }
         let sub_dag_index_1 = 1;
         leader_1.update_header_round_for_test(sub_dag_index_1 as u32);

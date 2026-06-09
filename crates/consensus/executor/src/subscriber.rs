@@ -4,7 +4,7 @@ use crate::{errors::SubscriberResult, SubscriberError};
 use futures::{stream::FuturesOrdered, StreamExt};
 use state_sync::{last_consensus_parent, save_consensus, spawn_state_sync};
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -267,6 +267,55 @@ impl<DB: Database> Subscriber<DB> {
         Ok(result)
     }
 
+    /// Save consensus output and publish or signature once we have all the batches (complete
+    /// ConsensusOutput).
+    async fn handle_consensus_output(
+        &self,
+        consensus_chain: &mut ConsensusChain,
+        output: ConsensusOutput,
+    ) -> SubscriberResult<()> {
+        debug!(target: "subscriber", output=?output.digest(), "saving next output");
+        save_consensus(output.clone(), consensus_chain).await?;
+        debug!(target: "subscriber", "broadcasting output...");
+        // Publish the consensus result now that we are totally finished.
+        let number = output.number();
+        let this_digest = output.consensus_header_hash();
+
+        // Record the latest ConsensusHeader, we probably don't need this in this mode but keep it
+        // up to date anyway. Note we don't bother sending this to the consensus header
+        // channel since not needed when an active CVV.
+        self.consensus_bus.last_consensus_header().send_replace(Some(output.consensus_header()));
+        let epoch = output.sub_dag().leader_epoch();
+        let round = output.sub_dag().leader_round();
+        let consensus_result_hash = ConsensusResult::digest_data(epoch, round, number, this_digest);
+        let sig = self
+            .config
+            .key_config()
+            .request_signature_direct(&encode(&to_intent_message(consensus_result_hash)));
+        if let Err(e) = self
+            .network_handle
+            .publish_consensus(
+                epoch,
+                round,
+                number,
+                this_digest,
+                self.config.key_config().public_key(),
+                sig,
+            )
+            .await
+        {
+            error!(target: "subscriber", "error publishing latest consensus to network {:?}: {}", self.inner.authority_id, e);
+        }
+        if let Err(e) = self.consensus_bus.consensus_output().send(output).await {
+            error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self.inner.authority_id, e);
+            return Err(SubscriberError::ClosedChannel(
+                "failed to broadcast consensus output".to_string(),
+            ));
+        }
+        debug!(target: "subscriber", "output broadcast successfully");
+        Ok(())
+    }
+
     /// Main loop connecting to the consensus to listen to sequence messages.
     #[instrument(level = "info", skip_all, fields(authority = ?self.inner.authority_id))]
     async fn run(
@@ -305,20 +354,8 @@ impl<DB: Database> Subscriber<DB> {
                     // then MAX_PENDING_PAYLOADS is pending
                     let parent_hash = last_parent;
                     let number = last_number + 1;
-                    last_parent = ConsensusHeader::digest_from_parts(parent_hash, &sub_dag, number);
-
-                    // Record the latest ConsensusHeader, we probably don't need this in this mode but keep it up to date anyway.
-                    // Note we don't bother sending this to the consensus header channel since not needed when an active CVV.
-                    self.consensus_bus.last_consensus_header().send_replace(Some(ConsensusHeader { parent_hash, sub_dag: sub_dag.clone(), number, extra: B256::default() }));
-                    let epoch = sub_dag.leader_epoch();
-                    let round = sub_dag.leader_round();
-                    let consensus_result_hash = ConsensusResult::digest_data(epoch, round, number, last_parent);
-                    let sig =
-                        self.config.key_config().request_signature_direct(&encode(&to_intent_message(consensus_result_hash)));
-                    if let Err(e) = self.network_handle.publish_consensus(epoch, round, number, last_parent, self.config.key_config().public_key(), sig).await {
-                        error!(target: "subscriber", "error publishing latest consensus to network {:?}: {}", self.inner.authority_id, e);
-                    }
                     last_number += 1;
+                    last_parent = ConsensusHeader::digest_from_parts(parent_hash, &sub_dag, number);
                     waiting.push_back(self.fetch_batches(sub_dag, parent_hash, number));
                 },
 
@@ -328,16 +365,7 @@ impl<DB: Database> Subscriber<DB> {
                 // NOTE: this broadcasts to all subscribers, but lagging receivers will lose messages
                 Some(output) = waiting.next() => {
                     match output {
-                        Ok(output) => {
-                            debug!(target: "subscriber", output=?output.digest(), "saving next output");
-                            save_consensus(output.clone(), &mut consensus_chain).await?;
-                            debug!(target: "subscriber", "broadcasting output...");
-                            if let Err(e) = self.consensus_bus.consensus_output().send(output).await {
-                                error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self.inner.authority_id, e);
-                                return Err(SubscriberError::ClosedChannel("failed to broadcast consensus output".to_string()));
-                            }
-                            debug!(target: "subscriber", "output broadcast successfully");
-                        }
+                        Ok(output) => self.handle_consensus_output(&mut consensus_chain, output).await?,
                         Err(e) => {
                             error!(target: "subscriber", "error fetching batches: {e}");
                             // Failure to fetch batches is a fatal condition, return an error which will trigger node shutdown.
@@ -430,6 +458,7 @@ impl<DB: Database> Subscriber<DB> {
         // SAFETY: 10-node committees * 6-round commit max * 5 batch max = 300 max batch digests
         // possible 32bytes * 300 = 9.6 kb => well within 1MB max message size
         let mut fetched_batches = self.fetch_batches_from_peers(batch_set).await?;
+        let fetched_digests: HashSet<BlockHash> = fetched_batches.keys().copied().collect();
 
         let mut batches = Vec::with_capacity(num_certs);
         // map all fetched batches to their respective certificates for applying block rewards
@@ -439,16 +468,29 @@ impl<DB: Database> Subscriber<DB> {
 
             // retrieve fetched batch by digest
             for digest in header.payload().keys() {
-                let batch = fetched_batches.remove(digest).ok_or(SubscriberError::MissingFetchedBatch(*digest)).inspect_err(|_| {
-                    error!(target: "subscriber", "[Protocol violation] Batch not found in fetched batches from workers of certificate signers");
-                })?;
-
                 debug!(
                     target: "subscriber",
-                    "Adding fetched batch {digest} from certificate {} to consensus output",
-                    header.digest()
+                    ?digest,
+                    "fetching batch",
                 );
-                cert_batches.push(batch);
+
+                let batch = fetched_batches.remove(digest);
+                if let Some(batch) = batch {
+                    debug!(
+                        target: "subscriber",
+                        "Adding fetched batch {digest} from certificate {} to consensus output",
+                        header.digest()
+                    );
+
+                    cert_batches.push(batch);
+                } else {
+                    // if the batch is a duplicate, the engine will ignore
+                    warn!(target: "subscriber", ?digest, ?batch_digests, "failed to remove fetched batch - possible duplicate");
+                    if !fetched_digests.contains(digest) {
+                        error!(target: "subscriber", ?digest, "[Protocol violation] Batch not found in fetched batches from workers of certificate signers");
+                        return Err(SubscriberError::MissingFetchedBatch(*digest));
+                    }
+                }
             }
 
             // main collection for execution

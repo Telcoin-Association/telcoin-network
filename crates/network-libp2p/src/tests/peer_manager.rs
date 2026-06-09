@@ -638,6 +638,39 @@ async fn test_prepare_committee_dial_unbans_without_touching_slots() {
 }
 
 #[tokio::test]
+async fn test_add_known_peer_closes_validator_gap_on_discovery() {
+    // GAP FIX (full): a committee member set by bls before its network identity is known is tracked
+    // in the slot but does not yet resolve to a validator by its libp2p id. The moment kad discovery
+    // confirms the identity via `add_known_peer`, the lazy-trust hook makes it a validator and marks
+    // it important -- without waiting for the next epoch's `update_committees`.
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // a committee member whose network identity is not yet known to this node
+    let mut rng = StdRng::from_seed([7; 32]);
+    let bls = *BlsKeypair::generate(&mut rng).public();
+    let netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let peer_id: PeerId = netkey.clone().into();
+    let info =
+        NetworkInfo { pubkey: netkey, multiaddrs: vec![create_multiaddr(None)], timestamp: now() };
+
+    // set the current committee with the member present by bls, BEFORE discovering its peer id
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+
+    // GAP: the member is tracked by bls, but its libp2p id does not resolve to a validator yet
+    assert!(!peer_manager.is_peer_validator(&peer_id), "unknown peer id must not resolve yet");
+
+    // kad discovery confirms the network identity, which applies committee trust immediately
+    peer_manager.add_known_peer(bls, info);
+
+    // gap closed the instant discovery completed: validator + important (trusted)
+    assert!(peer_manager.is_peer_validator(&peer_id), "discovered member must now be a validator");
+    assert!(
+        peer_manager.peer_is_important(&peer_id),
+        "discovered member must be trusted/important"
+    );
+}
+
+#[tokio::test]
 async fn test_register_outgoing_connection() {
     let mut peer_manager = create_test_peer_manager(None);
     let peer_id = PeerId::random();

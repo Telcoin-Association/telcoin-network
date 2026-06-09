@@ -27,7 +27,7 @@ async fn test_sync_batches_drops_old_rounds() -> eyre::Result<()> {
         .map(|a| {
             let header = a
                 .header_builder(&committee)
-                .with_payload_batch(fixture_batch_with_transactions(10), 0)
+                .with_payload_batch(&fixture_batch_with_transactions(10), 0)
                 .build();
             let cert = fixture.certificate(&header);
             let digest = cert.digest();
@@ -44,7 +44,7 @@ async fn test_sync_batches_drops_old_rounds() -> eyre::Result<()> {
         .header_builder(&fixture.committee())
         .round(2)
         .parents(certs.keys().cloned().collect())
-        .with_payload_batch(fixture_batch_with_transactions(10), 0)
+        .with_payload_batch(&fixture_batch_with_transactions(10), 0)
         .build();
 
     // update round

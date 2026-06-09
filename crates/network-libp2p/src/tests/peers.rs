@@ -5,7 +5,7 @@ use crate::common::{create_multiaddr, ensure_score_config, random_ip_addr};
 use libp2p::PeerId;
 use rand::{rngs::StdRng, Rng as _, SeedableRng as _};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     net::IpAddr,
     time::{Duration, Instant},
 };
@@ -30,10 +30,10 @@ fn test_add_trusted_peer() {
     let bls = *BlsKeypair::generate(&mut rng).public();
     let net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
     let peer_id: PeerId = net.clone().into();
-    all_peers.add_trusted_peer(bls, net, vec![addr.clone()]);
+    all_peers.add_trusted_peer(bls, net);
 
-    assert!(all_peers.peers.contains_key(&peer_id));
-    let peer = all_peers.peers.get_mut(&peer_id).unwrap();
+    assert!(all_peers.get_peer(&peer_id).is_some());
+    let peer = all_peers.get_peer_mut(&peer_id).unwrap();
     assert_eq!(peer.reputation(), Reputation::Trusted);
     assert_eq!(peer.score().aggregate_score(), config.max_score);
 
@@ -54,7 +54,7 @@ fn test_process_penalty() {
     // add connected peer first and set as this node dialed
     let mut peer = Peer::default_for_test();
     peer.set_connection_status(ConnectionStatus::Connected { num_in: 0, num_out: 1 });
-    all_peers.peers.insert(peer_id, peer);
+    all_peers.insert_unidentified(peer_id, peer);
 
     // test penalty that doesn't change reputation
     let action = all_peers.process_penalty(&peer_id, Penalty::Mild);
@@ -93,7 +93,7 @@ fn test_ensure_peer_exists() {
     // Unknown peer, valid initial state
     let status = all_peers.ensure_peer_exists(&peer_id, &NewConnectionStatus::Dialing);
     assert!(matches!(status, ConnectionStatus::Unknown));
-    assert!(all_peers.peers.contains_key(&peer_id));
+    assert!(all_peers.get_peer(&peer_id).is_some());
 
     // now peer exists with default status
     all_peers.peers.clear();
@@ -101,7 +101,7 @@ fn test_ensure_peer_exists() {
     assert!(matches!(status, ConnectionStatus::Unknown));
 
     // Check that peer is banned when new status is Banned
-    let peer = all_peers.peers.get(&peer_id).unwrap();
+    let peer = all_peers.get_peer(&peer_id).unwrap();
     assert_eq!(peer.reputation(), Reputation::Banned);
 }
 
@@ -185,7 +185,7 @@ fn test_heartbeat_maintenance() {
     all_peers.update_connection_status(&peer_id, NewConnectionStatus::Dialing);
 
     // Manually set the dialing time to be older than the timeout
-    if let Some(peer) = all_peers.peers.get_mut(&peer_id) {
+    if let Some(peer) = all_peers.get_peer_mut(&peer_id) {
         if peer.connection_status().is_dialing() {
             peer.set_connection_status(ConnectionStatus::Dialing {
                 instant: Instant::now() - Duration::from_secs(10),
@@ -197,7 +197,7 @@ fn test_heartbeat_maintenance() {
     let _ = all_peers.heartbeat_maintenance();
 
     // The peer should now be disconnected
-    let peer = all_peers.peers.get(&peer_id).unwrap();
+    let peer = all_peers.get_peer(&peer_id).unwrap();
     assert!(matches!(peer.connection_status(), ConnectionStatus::Disconnected { .. }));
     assert_eq!(all_peers.disconnected_peers, 1);
 }
@@ -215,7 +215,7 @@ fn test_pruning_logic() {
         all_peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
 
         // Manually set disconnection time to be older for first peers
-        if let Some(peer) = all_peers.peers.get_mut(&peer_id) {
+        if let Some(peer) = all_peers.get_peer_mut(&peer_id) {
             let disconnected =
                 matches!(peer.connection_status(), ConnectionStatus::Disconnected { .. });
             if disconnected {
@@ -252,7 +252,7 @@ fn test_pruning_logic() {
         all_peers.update_connection_status(&peer_id, NewConnectionStatus::Banned);
 
         // Manually set banned time to be older for first peers
-        if let Some(peer) = all_peers.peers.get_mut(&peer_id) {
+        if let Some(peer) = all_peers.get_peer_mut(&peer_id) {
             let banned = matches!(peer.connection_status(), ConnectionStatus::Banned { .. });
             if banned {
                 // set a deterministic order - earlier IDs are older
@@ -277,9 +277,16 @@ fn test_pruning_logic() {
 #[test]
 fn test_is_validator() {
     ensure_score_config(None);
-    let validator_id = PeerId::random();
     let mut all_peers = AllPeers::new(Duration::from_secs(5), 10, 10);
-    all_peers.current_committee.insert(validator_id);
+
+    // a committee member is a confirmed peer (bls known) whose libp2p id resolves to its bls
+    let mut rng = StdRng::from_seed([0; 32]);
+    let bls = *BlsKeypair::generate(&mut rng).public();
+    let net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let validator_id: PeerId = net.clone().into();
+    all_peers.upsert_peer(bls, net, vec![]);
+    all_peers.current_committee.insert(bls);
+
     assert!(all_peers.is_peer_validator(&validator_id));
     assert!(!all_peers.is_peer_validator(&PeerId::random()));
 }
@@ -362,7 +369,7 @@ fn test_connected_peer_methods() {
     // Test connected_peer_ids
     let connected_ids: Vec<_> = all_peers.connected_peer_ids().collect();
     assert_eq!(connected_ids.len(), 1);
-    assert!(connected_ids.contains(&&connected_peer_id));
+    assert!(connected_ids.contains(&connected_peer_id));
 
     // Test connected_or_dialing_peers
     let connected_or_dialing: Vec<_> = all_peers.connected_or_dialing_peers();
@@ -629,25 +636,36 @@ fn test_ban_action_returns_only_unbanned_ips() {
     }
 }
 
-/// Build a distinct committee member: (bls key, network info, derived peer id).
-fn committee_member(rng: &mut StdRng) -> (BlsPublicKey, NetworkInfo, PeerId) {
+/// Build a distinct committee member: (bls key, network key, derived peer id).
+fn committee_member(rng: &mut StdRng) -> (BlsPublicKey, NetworkPublicKey, PeerId) {
     let bls = *BlsKeypair::generate(rng).public();
     let net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
     let peer_id: PeerId = net.clone().into();
-    let info = NetworkInfo { pubkey: net, multiaddrs: vec![create_multiaddr(None)], timestamp: 0 };
-    (bls, info, peer_id)
+    (bls, net, peer_id)
 }
 
-/// Build a committee of `size` distinct members plus the set of their derived peer ids.
+/// Simulate kad discovery of a member: record its network identity so its libp2p id resolves to its
+/// bls key and a `Confirmed` peer record exists (the precondition for trust/validator-by-peer-id).
+fn discover(all_peers: &mut AllPeers, bls: BlsPublicKey, net: &NetworkPublicKey) {
+    all_peers.upsert_peer(bls, net.clone(), vec![create_multiaddr(None)]);
+}
+
+/// Build `size` distinct, already-discovered members and return them keyed by bls in a slot set,
+/// alongside the set of their derived peer ids.
 fn random_committee(
+    all_peers: &mut AllPeers,
     rng: &mut StdRng,
     size: usize,
-) -> (HashMap<PeerId, (BlsPublicKey, NetworkInfo)>, HashSet<PeerId>) {
-    let members: Vec<(BlsPublicKey, NetworkInfo, PeerId)> =
-        (0..size).map(|_| committee_member(rng)).collect();
-    let ids: HashSet<PeerId> = members.iter().map(|(_, _, id)| *id).collect();
-    let committee = members.into_iter().map(|(b, i, id)| (id, (b, i))).collect();
-    (committee, ids)
+) -> (HashSet<BlsPublicKey>, HashSet<PeerId>) {
+    let mut bls_set = HashSet::new();
+    let mut ids = HashSet::new();
+    for _ in 0..size {
+        let (bls, net, id) = committee_member(rng);
+        discover(all_peers, bls, &net);
+        bls_set.insert(bls);
+        ids.insert(id);
+    }
+    (bls_set, ids)
 }
 
 #[test]
@@ -655,19 +673,26 @@ fn test_update_committees_sets_all_three_slots() {
     let mut rng = StdRng::from_seed([10; 32]);
     let mut all_peers = create_all_peers(None);
 
-    let (p_bls, p_info, p_peer_id) = committee_member(&mut rng);
-    let (c_bls, c_info, c_peer_id) = committee_member(&mut rng);
-    let (n_bls, n_info, n_peer_id) = committee_member(&mut rng);
+    let (p_bls, p_net, p_peer_id) = committee_member(&mut rng);
+    let (c_bls, c_net, c_peer_id) = committee_member(&mut rng);
+    let (n_bls, n_net, n_peer_id) = committee_member(&mut rng);
+
+    // discover each member so its peer id resolves to its bls
+    discover(&mut all_peers, p_bls, &p_net);
+    discover(&mut all_peers, c_bls, &c_net);
+    discover(&mut all_peers, n_bls, &n_net);
 
     all_peers.update_committees(
-        HashMap::from([(p_peer_id, (p_bls, p_info))]),
-        HashMap::from([(c_peer_id, (c_bls, c_info))]),
-        HashMap::from([(n_peer_id, (n_bls, n_info))]),
+        HashSet::from([p_bls]),
+        HashSet::from([c_bls]),
+        HashSet::from([n_bls]),
     );
 
-    assert!(all_peers.previous_committee.contains(&p_peer_id));
-    assert!(all_peers.current_committee.contains(&c_peer_id));
-    assert!(all_peers.next_committee.contains(&n_peer_id));
+    // slots hold the bls keys directly
+    assert!(all_peers.previous_committee.contains(&p_bls));
+    assert!(all_peers.current_committee.contains(&c_bls));
+    assert!(all_peers.next_committee.contains(&n_bls));
+    // discovered members resolve to validators by their peer id
     assert!(all_peers.is_peer_validator(&p_peer_id));
     assert!(all_peers.is_peer_validator(&c_peer_id));
     assert!(all_peers.is_peer_validator(&n_peer_id));
@@ -679,33 +704,34 @@ fn test_update_committees_overwrites_slots_directly() {
     let mut rng = StdRng::from_seed([11; 32]);
     let mut all_peers = create_all_peers(None);
 
-    let (a_bls, a_info, a_id) = committee_member(&mut rng);
-    let (b_bls, b_info, b_id) = committee_member(&mut rng);
-    let (c_bls, c_info, c_id) = committee_member(&mut rng);
-    let (d_bls, d_info, d_id) = committee_member(&mut rng);
-    let (e_bls, e_info, e_id) = committee_member(&mut rng);
-    let (f_bls, f_info, f_id) = committee_member(&mut rng);
+    let (a_bls, ..) = committee_member(&mut rng);
+    let (b_bls, ..) = committee_member(&mut rng);
+    let (c_bls, ..) = committee_member(&mut rng);
+    let (d_bls, ..) = committee_member(&mut rng);
+    let (e_bls, ..) = committee_member(&mut rng);
+    let (f_bls, ..) = committee_member(&mut rng);
 
-    // first update: previous={A}, current={B}, next={C}
+    // first update: previous={A}, current={B}, next={C}. The complete sets are stored directly, so
+    // no discovery is required for slot-content assertions.
     all_peers.update_committees(
-        HashMap::from([(a_id, (a_bls, a_info))]),
-        HashMap::from([(b_id, (b_bls, b_info))]),
-        HashMap::from([(c_id, (c_bls, c_info))]),
+        HashSet::from([a_bls]),
+        HashSet::from([b_bls]),
+        HashSet::from([c_bls]),
     );
-    assert_eq!(all_peers.previous_committee, HashSet::from([a_id]));
-    assert_eq!(all_peers.current_committee, HashSet::from([b_id]));
-    assert_eq!(all_peers.next_committee, HashSet::from([c_id]));
+    assert_eq!(all_peers.previous_committee, HashSet::from([a_bls]));
+    assert_eq!(all_peers.current_committee, HashSet::from([b_bls]));
+    assert_eq!(all_peers.next_committee, HashSet::from([c_bls]));
 
     // second update: each slot is set directly from its arg, NOT positionally shifted from the
     // prior round (otherwise current would be the prior next, {C}).
     all_peers.update_committees(
-        HashMap::from([(d_id, (d_bls, d_info))]),
-        HashMap::from([(e_id, (e_bls, e_info))]),
-        HashMap::from([(f_id, (f_bls, f_info))]),
+        HashSet::from([d_bls]),
+        HashSet::from([e_bls]),
+        HashSet::from([f_bls]),
     );
-    assert_eq!(all_peers.previous_committee, HashSet::from([d_id]));
-    assert_eq!(all_peers.current_committee, HashSet::from([e_id]));
-    assert_eq!(all_peers.next_committee, HashSet::from([f_id]));
+    assert_eq!(all_peers.previous_committee, HashSet::from([d_bls]));
+    assert_eq!(all_peers.current_committee, HashSet::from([e_bls]));
+    assert_eq!(all_peers.next_committee, HashSet::from([f_bls]));
 }
 
 #[test]
@@ -713,26 +739,19 @@ fn test_update_committees_no_change() {
     let mut rng = StdRng::from_seed([13; 32]);
     let mut all_peers = create_all_peers(None);
 
-    let (x_bls, x_info, x_id) = committee_member(&mut rng);
+    let (x_bls, x_net, x_id) = committee_member(&mut rng);
+    discover(&mut all_peers, x_bls, &x_net);
 
     // X is in both current and next
-    all_peers.update_committees(
-        HashMap::new(),
-        HashMap::from([(x_id, (x_bls, x_info.clone()))]),
-        HashMap::from([(x_id, (x_bls, x_info.clone()))]),
-    );
+    all_peers.update_committees(HashSet::new(), HashSet::from([x_bls]), HashSet::from([x_bls]));
 
     // repeat the same membership next epoch
-    all_peers.update_committees(
-        HashMap::new(),
-        HashMap::from([(x_id, (x_bls, x_info.clone()))]),
-        HashMap::from([(x_id, (x_bls, x_info.clone()))]),
-    );
+    all_peers.update_committees(HashSet::new(), HashSet::from([x_bls]), HashSet::from([x_bls]));
 
     // full overlap keeps X a validator, present in both current and next, never demoted
     assert!(all_peers.is_peer_validator(&x_id));
-    assert!(all_peers.current_committee.contains(&x_id));
-    assert!(all_peers.next_committee.contains(&x_id));
+    assert!(all_peers.current_committee.contains(&x_bls));
+    assert!(all_peers.next_committee.contains(&x_bls));
     assert!(all_peers.get_peer(&x_id).unwrap().is_trusted());
 }
 
@@ -741,29 +760,35 @@ fn test_update_committees_full_turnover() {
     let mut rng = StdRng::from_seed([14; 32]);
     let mut all_peers = create_all_peers(None);
 
-    let (a_bls, a_info, a_id) = committee_member(&mut rng);
-    let (b_bls, b_info, b_id) = committee_member(&mut rng);
-    let (c_bls, c_info, c_id) = committee_member(&mut rng);
+    let (a_bls, a_net, a_id) = committee_member(&mut rng);
+    let (b_bls, b_net, b_id) = committee_member(&mut rng);
+    let (c_bls, c_net, c_id) = committee_member(&mut rng);
+    discover(&mut all_peers, a_bls, &a_net);
+    discover(&mut all_peers, b_bls, &b_net);
+    discover(&mut all_peers, c_bls, &c_net);
 
     // initialize with previous={A}, current={B}, next={C}
     all_peers.update_committees(
-        HashMap::from([(a_id, (a_bls, a_info))]),
-        HashMap::from([(b_id, (b_bls, b_info))]),
-        HashMap::from([(c_id, (c_bls, c_info))]),
+        HashSet::from([a_bls]),
+        HashSet::from([b_bls]),
+        HashSet::from([c_bls]),
     );
 
     // a fully disjoint set replaces every slot directly
-    let (d_bls, d_info, d_id) = committee_member(&mut rng);
-    let (e_bls, e_info, e_id) = committee_member(&mut rng);
-    let (f_bls, f_info, f_id) = committee_member(&mut rng);
+    let (d_bls, d_net, _d_id) = committee_member(&mut rng);
+    let (e_bls, e_net, _e_id) = committee_member(&mut rng);
+    let (f_bls, f_net, _f_id) = committee_member(&mut rng);
+    discover(&mut all_peers, d_bls, &d_net);
+    discover(&mut all_peers, e_bls, &e_net);
+    discover(&mut all_peers, f_bls, &f_net);
     all_peers.update_committees(
-        HashMap::from([(d_id, (d_bls, d_info))]),
-        HashMap::from([(e_id, (e_bls, e_info))]),
-        HashMap::from([(f_id, (f_bls, f_info))]),
+        HashSet::from([d_bls]),
+        HashSet::from([e_bls]),
+        HashSet::from([f_bls]),
     );
-    assert_eq!(all_peers.previous_committee, HashSet::from([d_id]));
-    assert_eq!(all_peers.current_committee, HashSet::from([e_id]));
-    assert_eq!(all_peers.next_committee, HashSet::from([f_id]));
+    assert_eq!(all_peers.previous_committee, HashSet::from([d_bls]));
+    assert_eq!(all_peers.current_committee, HashSet::from([e_bls]));
+    assert_eq!(all_peers.next_committee, HashSet::from([f_bls]));
 
     // every member of the fully-replaced window is gone
     assert!(!all_peers.is_peer_validator(&a_id));
@@ -773,20 +798,116 @@ fn test_update_committees_full_turnover() {
 
 #[test]
 fn test_is_peer_validator_returns_true_for_all_three_slots() {
+    let mut rng = StdRng::from_seed([17; 32]);
     let mut all_peers = create_all_peers(None);
 
-    let prev_id = PeerId::random();
-    let curr_id = PeerId::random();
-    let next_id = PeerId::random();
+    let (prev_bls, prev_net, prev_id) = committee_member(&mut rng);
+    let (curr_bls, curr_net, curr_id) = committee_member(&mut rng);
+    let (next_bls, next_net, next_id) = committee_member(&mut rng);
 
-    all_peers.previous_committee.insert(prev_id);
-    all_peers.current_committee.insert(curr_id);
-    all_peers.next_committee.insert(next_id);
+    // discover each member so its peer id resolves to its bls
+    discover(&mut all_peers, prev_bls, &prev_net);
+    discover(&mut all_peers, curr_bls, &curr_net);
+    discover(&mut all_peers, next_bls, &next_net);
 
+    all_peers.previous_committee.insert(prev_bls);
+    all_peers.current_committee.insert(curr_bls);
+    all_peers.next_committee.insert(next_bls);
+
+    // membership in ANY of the three slots makes a discovered peer a validator
     assert!(all_peers.is_peer_validator(&prev_id));
     assert!(all_peers.is_peer_validator(&curr_id));
     assert!(all_peers.is_peer_validator(&next_id));
     assert!(!all_peers.is_peer_validator(&PeerId::random()));
+}
+
+#[test]
+fn test_update_committees_tracks_undiscovered_member_then_trusts_on_discovery() {
+    // GAP FIX: a committee member whose network identity is not yet known is still tracked in the
+    // slot (membership is a bls-domain fact that is always known), but `is_peer_validator` by peer
+    // id is false until the libp2p id is learned. The moment discovery confirms the network
+    // identity, the lazy-trust hook (`apply_membership_if_committee`, driven by `add_known_peer`)
+    // makes it a validator and trusts it -- without waiting for the next epoch's update.
+    let mut rng = StdRng::from_seed([99; 32]);
+    let mut all_peers = create_all_peers(None);
+
+    let (bls, net, peer_id) = committee_member(&mut rng);
+
+    // set committees with the member present by bls, but DO NOT discover its peer id yet
+    all_peers.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+
+    // the slot retains the complete set (the bls is tracked)...
+    assert!(all_peers.current_committee.contains(&bls));
+    // ...but with no peer record the libp2p id does not yet resolve to a validator
+    assert!(all_peers.get_peer(&peer_id).is_none());
+    assert!(!all_peers.is_peer_validator(&peer_id));
+
+    // discovery confirms the network identity (as `add_known_peer` would) ...
+    all_peers.upsert_peer(bls, net, vec![create_multiaddr(None)]);
+    // ... and the lazy-trust hook applies committee membership immediately
+    let actions = all_peers.apply_membership_if_committee(bls);
+
+    // now the member resolves: validator + trusted, the moment discovery completed
+    assert!(all_peers.is_peer_validator(&peer_id));
+    assert!(all_peers.get_peer(&peer_id).unwrap().is_trusted());
+    // a freshly discovered, never-banned peer needs no unban action
+    assert!(actions.is_empty());
+}
+
+#[test]
+fn test_undiscovered_committee_member_banned_then_unbanned_on_discovery() {
+    // Race-window scenario: a committee member is tracked by bls before its peer id is known, then
+    // connects anonymously (`Unidentified`) and is banned during that window. When kad later
+    // resolves its bls, `upsert_peer` re-keys the existing record onto its `Confirmed` identity
+    // (retaining it) and the lazy-trust hook unbans + trusts it. No panic; the member is retained.
+    let mut rng = StdRng::from_seed([55; 32]);
+    let mut all_peers = create_all_peers(None);
+
+    let (bls, net, peer_id) = committee_member(&mut rng);
+
+    // committee set with the member present by bls, peer id still unknown
+    all_peers.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+    assert!(!all_peers.is_peer_validator(&peer_id), "unidentified peer is not yet a validator");
+
+    // the member connects anonymously and is banned during the window (Unidentified record)
+    all_peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
+    let ban = all_peers.update_connection_status(&peer_id, NewConnectionStatus::Banned);
+    assert!(matches!(ban, PeerAction::Ban(_)));
+    assert!(all_peers.peer_banned(&peer_id), "member should be banned during the window");
+    assert!(!all_peers.is_peer_validator(&peer_id), "still unidentified, still not a validator");
+
+    // kad resolves the bls: re-key the Unidentified record onto Confirmed, then apply committee trust
+    all_peers.upsert_peer(bls, net, vec![create_multiaddr(None)]);
+    let actions = all_peers.apply_membership_if_committee(bls);
+
+    // the member is retained, now resolves as a validator, is unbanned, and is trusted
+    assert!(all_peers.get_peer(&peer_id).is_some(), "member record must be retained");
+    assert!(all_peers.is_peer_validator(&peer_id), "discovered member is now a validator");
+    assert!(!all_peers.peer_banned(&peer_id), "discovered committee member must be unbanned");
+    assert!(
+        all_peers.get_peer(&peer_id).unwrap().is_trusted(),
+        "discovered member must be trusted"
+    );
+    assert!(
+        actions.iter().any(|(id, action)| id == &peer_id && matches!(action, PeerAction::Unban(_))),
+        "discovery must emit an unban action for the previously-banned member"
+    );
+}
+
+#[test]
+fn test_apply_membership_if_committee_is_noop_for_non_member() {
+    // the lazy-trust hook must not trust an arbitrary discovered peer that is not in any committee.
+    let mut rng = StdRng::from_seed([100; 32]);
+    let mut all_peers = create_all_peers(None);
+
+    let (bls, net, peer_id) = committee_member(&mut rng);
+    all_peers.upsert_peer(bls, net, vec![create_multiaddr(None)]);
+
+    let actions = all_peers.apply_membership_if_committee(bls);
+
+    assert!(actions.is_empty());
+    assert!(!all_peers.is_peer_validator(&peer_id));
+    assert!(!all_peers.get_peer(&peer_id).unwrap().is_trusted());
 }
 
 #[test]
@@ -795,25 +916,19 @@ fn test_update_committees_in_window_peer_stays_trusted() {
     let mut all_peers = create_all_peers(None);
 
     // M starts in the current committee and is made trusted by update_committees
-    let (m_bls, m_info, m_id) = committee_member(&mut rng);
-    all_peers.update_committees(
-        HashMap::new(),
-        HashMap::from([(m_id, (m_bls, m_info.clone()))]),
-        HashMap::new(),
-    );
+    let (m_bls, m_net, m_id) = committee_member(&mut rng);
+    discover(&mut all_peers, m_bls, &m_net);
+    all_peers.update_committees(HashSet::new(), HashSet::from([m_bls]), HashSet::new());
     assert!(all_peers.get_peer(&m_id).unwrap().is_trusted());
 
     // next epoch: M moves to the previous slot (still in-window) alongside a disjoint current
-    let (other_bls, other_info, other_id) = committee_member(&mut rng);
-    all_peers.update_committees(
-        HashMap::from([(m_id, (m_bls, m_info))]),
-        HashMap::from([(other_id, (other_bls, other_info))]),
-        HashMap::new(),
-    );
+    let (other_bls, other_net, _other_id) = committee_member(&mut rng);
+    discover(&mut all_peers, other_bls, &other_net);
+    all_peers.update_committees(HashSet::from([m_bls]), HashSet::from([other_bls]), HashSet::new());
 
     // M is still inside the three-slot window (now in previous), so it stays trusted -- not via a
     // one-way ratchet, but because it is still a tracked committee member.
-    assert!(all_peers.previous_committee.contains(&m_id));
+    assert!(all_peers.previous_committee.contains(&m_bls));
     assert!(all_peers.is_peer_validator(&m_id));
     assert!(all_peers.get_peer(&m_id).unwrap().is_trusted());
 }
@@ -824,22 +939,16 @@ fn test_update_committees_demotes_peer_that_exits_window() {
     let mut all_peers = create_all_peers(None);
 
     // E starts trusted as a current-committee member
-    let (e_bls, e_info, e_id) = committee_member(&mut rng);
-    all_peers.update_committees(
-        HashMap::new(),
-        HashMap::from([(e_id, (e_bls, e_info))]),
-        HashMap::new(),
-    );
+    let (e_bls, e_net, e_id) = committee_member(&mut rng);
+    discover(&mut all_peers, e_bls, &e_net);
+    all_peers.update_committees(HashSet::new(), HashSet::from([e_bls]), HashSet::new());
     assert!(all_peers.get_peer(&e_id).unwrap().is_trusted());
     assert!(all_peers.is_peer_validator(&e_id));
 
     // next epoch's three slots do not include E at all
-    let (f_bls, f_info, f_id) = committee_member(&mut rng);
-    all_peers.update_committees(
-        HashMap::new(),
-        HashMap::from([(f_id, (f_bls, f_info))]),
-        HashMap::new(),
-    );
+    let (f_bls, f_net, _f_id) = committee_member(&mut rng);
+    discover(&mut all_peers, f_bls, &f_net);
+    all_peers.update_committees(HashSet::new(), HashSet::from([f_bls]), HashSet::new());
 
     // E fell out of the window: demoted to untrusted and no longer counts as a validator
     assert!(!all_peers.get_peer(&e_id).unwrap().is_trusted());
@@ -855,16 +964,13 @@ fn test_update_committees_does_not_demote_operator_trusted_peer_never_in_committ
     let op_bls = *BlsKeypair::generate(&mut rng).public();
     let op_net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
     let op_id: PeerId = op_net.clone().into();
-    all_peers.add_trusted_peer(op_bls, op_net, vec![create_multiaddr(None)]);
+    all_peers.add_trusted_peer(op_bls, op_net);
     assert!(all_peers.get_peer(&op_id).unwrap().is_trusted());
 
     // a committee update that does not involve the operator peer
-    let (c_bls, c_info, c_id) = committee_member(&mut rng);
-    all_peers.update_committees(
-        HashMap::new(),
-        HashMap::from([(c_id, (c_bls, c_info))]),
-        HashMap::new(),
-    );
+    let (c_bls, c_net, _c_id) = committee_member(&mut rng);
+    discover(&mut all_peers, c_bls, &c_net);
+    all_peers.update_committees(HashSet::new(), HashSet::from([c_bls]), HashSet::new());
 
     // the operator peer was never tracked in a committee slot, so demotion does not touch it
     assert!(all_peers.get_peer(&op_id).unwrap().is_trusted());
@@ -878,27 +984,19 @@ fn test_update_committees_current_is_authoritative() {
     let mut rng = StdRng::from_seed([20; 32]);
     let mut all_peers = create_all_peers(None);
 
-    let (predicted_bls, predicted_info, predicted_id) = committee_member(&mut rng);
-    let (actual_bls, actual_info, actual_id) = committee_member(&mut rng);
+    let (predicted_bls, ..) = committee_member(&mut rng);
+    let (actual_bls, ..) = committee_member(&mut rng);
 
     // epoch N predicts next = {predicted}
-    all_peers.update_committees(
-        HashMap::new(),
-        HashMap::new(),
-        HashMap::from([(predicted_id, (predicted_bls, predicted_info))]),
-    );
-    assert_eq!(all_peers.next_committee, HashSet::from([predicted_id]));
+    all_peers.update_committees(HashSet::new(), HashSet::new(), HashSet::from([predicted_bls]));
+    assert_eq!(all_peers.next_committee, HashSet::from([predicted_bls]));
 
     // epoch N+1's authoritative current is {actual}, which differs from the prediction
-    all_peers.update_committees(
-        HashMap::new(),
-        HashMap::from([(actual_id, (actual_bls, actual_info))]),
-        HashMap::new(),
-    );
+    all_peers.update_committees(HashSet::new(), HashSet::from([actual_bls]), HashSet::new());
 
     // current matches the authoritative arg, not the stale prediction
-    assert_eq!(all_peers.current_committee, HashSet::from([actual_id]));
-    assert!(!all_peers.current_committee.contains(&predicted_id));
+    assert_eq!(all_peers.current_committee, HashSet::from([actual_bls]));
+    assert!(!all_peers.current_committee.contains(&predicted_bls));
 }
 
 #[test]
@@ -909,16 +1007,14 @@ fn test_update_committees_populates_previous() {
     let mut rng = StdRng::from_seed([21; 32]);
     let mut all_peers = create_all_peers(None);
 
-    let (p_bls, p_info, p_id) = committee_member(&mut rng);
-    let (c_bls, c_info, c_id) = committee_member(&mut rng);
+    let (p_bls, p_net, p_id) = committee_member(&mut rng);
+    let (c_bls, c_net, _c_id) = committee_member(&mut rng);
+    discover(&mut all_peers, p_bls, &p_net);
+    discover(&mut all_peers, c_bls, &c_net);
 
-    all_peers.update_committees(
-        HashMap::from([(p_id, (p_bls, p_info))]),
-        HashMap::from([(c_id, (c_bls, c_info))]),
-        HashMap::new(),
-    );
+    all_peers.update_committees(HashSet::from([p_bls]), HashSet::from([c_bls]), HashSet::new());
 
-    assert_eq!(all_peers.previous_committee, HashSet::from([p_id]));
+    assert_eq!(all_peers.previous_committee, HashSet::from([p_bls]));
     assert!(all_peers.is_peer_validator(&p_id));
     assert!(all_peers.get_peer(&p_id).unwrap().is_trusted());
 }
@@ -926,9 +1022,9 @@ fn test_update_committees_populates_previous() {
 #[test]
 fn test_update_committees_invariants_under_random_committees() {
     // Property-style coverage without a proptest dependency: across many epochs with random
-    // committees in each slot, every slot must equal exactly the set it was given, every union
-    // member is trusted, and every peer tracked last round but absent this round is demoted to
-    // untrusted.
+    // committees in each slot, every slot must equal exactly the (bls) set it was given, every
+    // discovered union member is trusted, and every peer tracked last round but absent this round
+    // is demoted to untrusted.
     let mut rng = StdRng::from_seed([42; 32]);
     let mut all_peers = create_all_peers(None);
 
@@ -936,20 +1032,20 @@ fn test_update_committees_invariants_under_random_committees() {
 
     for round in 0..32u64 {
         let prev_size = rng.random_range(0..=4usize);
-        let (previous, prev_ids) = random_committee(&mut rng, prev_size);
+        let (prev_bls, prev_ids) = random_committee(&mut all_peers, &mut rng, prev_size);
         let curr_size = rng.random_range(0..=4usize);
-        let (current, curr_ids) = random_committee(&mut rng, curr_size);
+        let (curr_bls, curr_ids) = random_committee(&mut all_peers, &mut rng, curr_size);
         let next_size = rng.random_range(0..=4usize);
-        let (next, next_ids) = random_committee(&mut rng, next_size);
+        let (next_bls, next_ids) = random_committee(&mut all_peers, &mut rng, next_size);
 
-        all_peers.update_committees(previous, current, next);
+        all_peers.update_committees(prev_bls.clone(), curr_bls.clone(), next_bls.clone());
 
         // each slot equals exactly its input set (direct set, no positional shift)
-        assert_eq!(all_peers.previous_committee, prev_ids, "previous slot after round {round}");
-        assert_eq!(all_peers.current_committee, curr_ids, "current slot after round {round}");
-        assert_eq!(all_peers.next_committee, next_ids, "next slot after round {round}");
+        assert_eq!(all_peers.previous_committee, prev_bls, "previous slot after round {round}");
+        assert_eq!(all_peers.current_committee, curr_bls, "current slot after round {round}");
+        assert_eq!(all_peers.next_committee, next_bls, "next slot after round {round}");
 
-        // every member of the new window is trusted
+        // every discovered member of the new window is trusted
         let union: HashSet<PeerId> =
             prev_ids.iter().chain(curr_ids.iter()).chain(next_ids.iter()).copied().collect();
         for id in &union {

@@ -135,6 +135,6 @@ pub enum SubscriberError {
     /// This is a protocol violation that occurs when consensus references a batch
     /// but it's not present in the fetched results. This should not happen if workers
     /// are behaving correctly and may indicate either a worker bug or data corruption.
-    #[error("A fetched batch is missing from the collection.")]
+    #[error("A fetched batch is missing from the collection: {0}")]
     MissingFetchedBatch(BlockHash),
 }

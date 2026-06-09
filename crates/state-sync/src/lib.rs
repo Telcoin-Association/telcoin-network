@@ -285,15 +285,6 @@ async fn catch_up_consensus_from_to<DB: Database>(
     let last_consensus_height = from.number;
     let max_consensus_height = max_consensus.number;
     let catchup_distance = max_consensus_height.saturating_sub(last_consensus_height);
-    if catchup_distance > 0 {
-        info!(
-            target: "tn::observer",
-            last_consensus_height,
-            max_consensus_height,
-            catchup_distance,
-            "catching up consensus blocks"
-        );
-    }
     if last_consensus_height >= max_consensus_height {
         return Ok(from);
     }
@@ -303,22 +294,31 @@ async fn catch_up_consensus_from_to<DB: Database>(
         let mut remove_cache = false;
         // Check if we already have this consensus output in our local DB.
         // We will be verifying and loading these records elsewhere.
-        let consensus_header = if number == max_consensus_height {
-            max_consensus.clone()
-        } else if let Ok(Some(header)) = db.get::<ConsensusHeaderCache>(&number) {
+        let consensus_header = if let Ok(Some(header)) = db.get::<ConsensusHeaderCache>(&number) {
+            // Always check the cache first, even if on max_consesus_height so we evict this record
+            // if cached.
+            // Note that the consensus header at number must be consenstent (consensus was reached)
+            // so this is fine. In other words it would be a protocol violation to have
+            // different ConsensusHeaders at the same number.
             remove_cache = true;
             header
+        } else if number == max_consensus_height {
+            max_consensus.clone()
         } else if let Ok(Some(header)) = consensus_chain.consensus_header_by_number(number).await {
             // Block already in local ConsensusChain DB (e.g., processed before a restart).
             // Use it to advance the parent-chain verification; execution will be skipped below
             // since number <= consensus_chain.latest_consensus_number().
             header
         } else {
-            warn!(
-                target: "tn::observer",
-                block_number = number,
-                "Could not find header"
-            );
+            if number > last_consensus_height + 1 {
+                // Only log the warning after we start and hit a missing header.
+                // I.e. We don't want a ton of warnings when we are starting to catch up.
+                warn!(
+                    target: "tn::observer",
+                    block_number = number,
+                    "Could not find header (We may be catching up)"
+                );
+            }
             // We should have all the required headers in local storage by now...
             return Ok(result_header);
         };
@@ -328,6 +328,16 @@ async fn catch_up_consensus_from_to<DB: Database>(
         }
         if remove_cache {
             let _ = db.remove::<ConsensusHeaderCache>(&number); // Should be done with this now.
+        }
+        if number == last_consensus_height + 1 {
+            // We only want to log this once and only when we are doing something.
+            info!(
+                target: "tn::observer",
+                last_consensus_height,
+                max_consensus_height,
+                catchup_distance,
+                "catching up consensus blocks"
+            );
         }
         let parent_hash = last_parent;
         last_parent =
@@ -346,7 +356,7 @@ async fn catch_up_consensus_from_to<DB: Database>(
             continue;
         }
 
-        let base_execution_block = consensus_header.sub_dag.leader().latest_execution_block;
+        let base_execution_block = consensus_header.sub_dag.leader().latest_execution_block();
         // We need to make sure execution has caught up so we can verify we have not
         // forked. This will force the follow function to not outrun
         // execution...  this is probably fine. Also once we can

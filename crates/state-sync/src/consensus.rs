@@ -15,12 +15,17 @@ use tn_types::{
     Database as TNDatabase, Epoch, EpochRecord, Noticer, TaskSpawner, TnReceiver, TnSender as _,
     B256,
 };
-use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::{debug, error, info, warn};
 
 /// How long to wait before retrying a failed pack file download.
 const PACK_DOWNLOAD_RETRY_SECS: u64 = 5;
 const PACK_RECORD_TIMEOUT_SECS: u64 = 10;
+
+enum ConsensusHeaderResult {
+    Done,
+    Continue(u64, B256),
+    Retry,
+}
 
 /// Retrieve a consensus header from a peer.
 /// If we are requesting a hash then that hash should
@@ -33,24 +38,18 @@ async fn get_consensus_header<DB: TNDatabase>(
     consensus_bus: &ConsensusBusApp,
     network: &PrimaryNetworkHandle,
     consensus_chain: &ConsensusChain,
-) -> Option<(Epoch, u64, B256)> {
-    // Use the persisted ConsensusChain DB number as the cutoff, not the in-memory
-    // recent_blocks tracker. The in-memory tracker can advance during a brief CvvActive
-    // phase (local Bullshark commits) before the node transitions to CvvInactive, causing
-    // the backward traversal to incorrectly skip blocks that haven't been fetched from
-    // peers and stored in ConsensusHeaderCache yet.
-    if number <= consensus_chain.latest_consensus_number() {
-        return None;
+) -> ConsensusHeaderResult {
+    // Use the ConsensusChain, once we have a record in a pack file we are done.
+    let chain_contains_header =
+        consensus_chain.consensus_header_by_number(number).await.ok().flatten().is_some();
+    if chain_contains_header {
+        return ConsensusHeaderResult::Done;
     }
     if let Ok(Some(block)) = db.get::<ConsensusHeaderCache>(&number) {
         return if block.number > 0 {
-            Some((
-                consensus_chain.epochs().number_to_epoch(block.number - 1),
-                block.number - 1,
-                block.parent_hash,
-            ))
+            ConsensusHeaderResult::Continue(block.number - 1, block.parent_hash)
         } else {
-            None
+            ConsensusHeaderResult::Done
         };
     }
     // request consensus from any peer
@@ -61,19 +60,13 @@ async fn get_consensus_header<DB: TNDatabase>(
             }
             // The header we got will match hash (request_consensus() contract).
             let parent = header.parent_hash;
-            let parent_number = header.number - 1;
-            let last_seen_header_number = consensus_bus
-                .last_consensus_header()
-                .borrow()
-                .as_ref()
-                .map(|h| h.number)
-                .unwrap_or_default();
-            if header.number > last_seen_header_number {
-                // Update our last seen valid consensus header if it is newer.
-                consensus_bus.last_consensus_header().send_replace(Some(header));
+            let parent_number = header.number.saturating_sub(1);
+            consensus_bus.send_last_consensus_header_if_newer(header);
+            if number > 0 {
+                ConsensusHeaderResult::Continue(parent_number, parent)
+            } else {
+                ConsensusHeaderResult::Done
             }
-            let epoch = consensus_chain.epochs().number_to_epoch(parent_number);
-            Some((epoch, parent_number, parent))
         }
         Err(e) => {
             warn!(
@@ -83,11 +76,7 @@ async fn get_consensus_header<DB: TNDatabase>(
                 ?number,
                 "failed to fetch consensus header from peer"
             );
-            // Return the failed data so we try again.
-            // We will not be able to progress without this info so pause and keep trying...
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            let epoch = consensus_chain.epochs().number_to_epoch(number);
-            Some((epoch, number, hash))
+            ConsensusHeaderResult::Retry
         }
     }
 }
@@ -98,7 +87,6 @@ async fn request_epochs(
     current_fetch_epoch: &mut Epoch,
     consensus_chain: &ConsensusChain,
     consensus_bus: &ConsensusBusApp,
-    last_gossipped_epoch: Option<Epoch>,
 ) {
     // If we still have epochs to fetch then add to the queue until we are out of epoch records.
     // For epoch 0: `saturating_sub(1)` yields 0, so record_by_epoch(0) would return the
@@ -117,20 +105,16 @@ async fn request_epochs(
             consensus_chain.epochs().record_by_epoch(*current_fetch_epoch).await
         {
             *current_fetch_epoch += 1;
-            if epoch_record.epoch < last_gossipped_epoch.unwrap_or(u32::MAX) {
-                let contains_final_header = consensus_chain.is_epoch_complete(&epoch_record).await;
-                // If the pack file is missing or incomplete request it.
-                // Note since we have an epoch record this is a past epoch
-                // not the current epoch.
-                if !contains_final_header {
-                    consensus_bus
-                        .request_epoch_pack_file(previous_epoch_record, epoch_record.clone())
-                        .await;
-                }
-                previous_epoch_record = epoch_record;
-            } else {
-                break;
+            let contains_final_header = consensus_chain.is_epoch_complete(&epoch_record).await;
+            // If the pack file is missing or incomplete request it.
+            // Note since we have an epoch record this is a past epoch
+            // not the current epoch.
+            if !contains_final_header {
+                consensus_bus
+                    .request_epoch_pack_file(previous_epoch_record, epoch_record.clone())
+                    .await;
             }
+            previous_epoch_record = epoch_record;
         }
     }
 }
@@ -177,24 +161,17 @@ pub async fn spawn_fetch_consensus(
     task_index: u32, // Task index for logging.
     consensus_chain: ConsensusChain,
 ) {
-    async fn next_epoch<'s>(
-        consensus_bus: &ConsensusBusApp,
-        next_sem: &'s Arc<Semaphore>,
-    ) -> Option<(SemaphorePermit<'s>, EpochRecord, EpochRecord)> {
-        let permit = next_sem.acquire().await.ok()?;
-        consensus_bus.get_next_epoch_pack_file_request().await.map(|(pe, e)| (permit, pe, e))
-    }
-    // When can we accept more work (a new epoch).
-    let next_sem = Arc::new(Semaphore::new(1));
     // Get the epoch of our last executed consensus.
     loop {
         tokio::select! {
-            Some((_permit, previous_epoch_record, mut epoch_record)) = next_epoch(&consensus_bus, &next_sem) => {
+            Some((previous_epoch_record, mut epoch_record)) = consensus_bus.get_next_epoch_pack_file_request() => {
                 let epoch = epoch_record.epoch;
-                if consensus_chain.already_streaming_epoch(epoch) || consensus_chain.is_epoch_complete(&epoch_record).await {
+                let already_streaming = consensus_chain.already_streaming_epoch(epoch);
+                if already_streaming || consensus_chain.is_epoch_complete(&epoch_record).await {
                     // If we have already streamed this epoch or are in process of streaming then continue.
                     // Note, it is a lot less complex to do this check here than to make sure we don't request
                     // the same pack more than once so do it this way.
+                    info!(target: "state-sync", "epoch consensus fetcher {task_index} skipping epoch {epoch} we are streaming {already_streaming} or already have");
                     continue;
                 }
                 info!(target: "state-sync", "epoch consensus fetcher {task_index} retrieving epoch {epoch}");
@@ -211,19 +188,14 @@ pub async fn spawn_fetch_consensus(
                                         .consensus_header_by_number(epoch_record.final_consensus.number)
                                         .await {
                                         Ok(Some(final_header)) => {
-                                            let current_last = consensus_bus
-                                                .last_consensus_header()
-                                                .borrow()
-                                                .as_ref()
-                                                .map(|h| h.number)
-                                                .unwrap_or_default();
-                                            if final_header.number > current_last {
+                                            let number = final_header.number;
+                                            if consensus_bus.send_last_consensus_header_if_newer(final_header) {
                                                 info!(target: "state-sync",
                                                     epoch = epoch_record.epoch,
-                                                    final_header_number = final_header.number,
+                                                    final_header_number = number,
                                                     "epoch pack downloaded, signaling stream to process locally available blocks");
-                                                consensus_bus.last_consensus_header().send_replace(Some(final_header));
                                             }
+                                            break;
                                         }
                                         Ok(None) => error!(target: "state-sync",
                                             epoch = epoch_record.epoch,
@@ -233,33 +205,9 @@ pub async fn spawn_fetch_consensus(
                                             ?e,
                                             "Unable to find header by number for new pack file"),
                                     }
-                                    break;
                                 }
-                                Err(e) => {
-                                    error!(target: "state-sync",
-                                        "failed to request epoch pack for epoch {epoch}, attempt {attempts}: {e}");
-                                    // The epoch record may have been a dummy (final_consensus.number=0)
-                                    // when first queued at startup. Refresh from DB so subsequent
-                                    // retries use the real signed cert if it has since arrived.
-                                    if let Some(fresh) = consensus_chain.epochs().record_by_epoch(epoch).await {
-                                        if fresh.final_consensus.number > epoch_record.final_consensus.number {
-                                            info!(target: "state-sync",
-                                                "refreshed epoch {epoch} record for retry: final_consensus {} -> {}",
-                                                epoch_record.final_consensus.number, fresh.final_consensus.number);
-                                            epoch_record = fresh;
-                                        }
-                                    }
-                                    // Wait a beat before we try again, may have a network issue.
-                                    // Wait time will increase as attempts grow.
-                                    tokio::select! {
-                                        _ = &rx_shutdown => {
-                                            info!(target: "state-sync",
-                                                "epoch consensus fetcher {task_index} shutting down during pack fetch");
-                                            return;
-                                        },
-                                        _ = tokio::time::sleep(Duration::from_secs(((attempts / 10) + 1) * PACK_DOWNLOAD_RETRY_SECS)) => { }
-                                    }
-                                }
+                                Err(e) => error!(target: "state-sync",
+                                        "failed to request epoch pack for epoch {epoch}, attempt {attempts}: {e}"),
                             }
                         }
                         _ = &rx_shutdown => {
@@ -277,6 +225,27 @@ pub async fn spawn_fetch_consensus(
                         consensus_bus.request_epoch_pack_file(previous_epoch_record, epoch_record).await;
                         break;
                     }
+                    // The epoch record may have been a dummy (final_consensus.number=0)
+                    // when first queued at startup. Refresh from DB so subsequent
+                    // retries use the real signed cert if it has since arrived.
+                    if let Some(fresh) = consensus_chain.epochs().record_by_epoch(epoch).await {
+                        if fresh.final_consensus.number > epoch_record.final_consensus.number {
+                            info!(target: "state-sync",
+                                "refreshed epoch {epoch} record for retry: final_consensus {} -> {}",
+                                epoch_record.final_consensus.number, fresh.final_consensus.number);
+                            epoch_record = fresh;
+                        }
+                    }
+                    // Wait a beat before we try again, may have a network issue.
+                    // Wait time will increase as attempts grow.
+                    tokio::select! {
+                        _ = &rx_shutdown => {
+                            info!(target: "state-sync",
+                                "epoch consensus fetcher {task_index} shutting down during pack fetch");
+                            return;
+                        },
+                        _ = tokio::time::sleep(Duration::from_secs(((attempts / 10) + 1) * PACK_DOWNLOAD_RETRY_SECS)) => { }
+                    }
                     attempts += 1;
                 }
             }
@@ -289,7 +258,6 @@ pub async fn spawn_fetch_consensus(
 
 /// Retrieve a consensus headers from a peer.
 /// Start at number/hash and work backwards to end number.
-#[allow(clippy::too_many_arguments)]
 async fn get_consensus_header_range<DB: TNDatabase>(
     number: u64,
     hash: B256,
@@ -297,32 +265,39 @@ async fn get_consensus_header_range<DB: TNDatabase>(
     consensus_bus: &ConsensusBusApp,
     network: &PrimaryNetworkHandle,
     consensus_chain: &ConsensusChain,
-    fetch_epoch: Epoch,
     end_number: u64,
 ) {
     if number < end_number {
         return;
     }
-    info!(target: "state-sync", ?number, ?hash, ?end_number, ?fetch_epoch, "fetching consensus from peer");
+    info!(target: "state-sync", ?number, ?hash, ?end_number, "fetching consensus from peer");
     let mut number = number;
     let mut hash = hash;
     let mut count = 1;
-    while let Some((epoch, next_number, next_hash)) =
-        get_consensus_header(number, hash, db, consensus_bus, network, consensus_chain).await
-    {
-        number = next_number;
-        hash = next_hash;
-        if number < end_number || epoch < fetch_epoch {
-            break;
+    let mut retries = 0;
+    loop {
+        match get_consensus_header(number, hash, db, consensus_bus, network, consensus_chain).await
+        {
+            ConsensusHeaderResult::Continue(next_number, next_hash) => {
+                number = next_number;
+                hash = next_hash;
+                if number < end_number {
+                    break;
+                }
+                if count % 10 == 0 {
+                    info!(target: "state-sync", ?number, ?hash, ?end_number, "fetching consensus from peer");
+                }
+                count += 1;
+                retries = 0;
+            }
+            ConsensusHeaderResult::Done => break,
+            ConsensusHeaderResult::Retry => {
+                if retries < 5 {
+                    retries += 1;
+                }
+                tokio::time::sleep(Duration::from_secs(retries)).await;
+            }
         }
-        if consensus_chain.consensus_header_by_number(number).await.unwrap_or_default().is_some() {
-            // The next number showed up in a pack file.  We don't need to continue this download...
-            break;
-        }
-        if count % 10 == 0 {
-            info!(target: "state-sync", ?number, ?hash, ?end_number, ?fetch_epoch, "fetching consensus from peer");
-        }
-        count += 1;
     }
 }
 
@@ -350,12 +325,19 @@ async fn manage_new_consensus<DB: TNDatabase>(
     let consensus_chain_clone = consensus_chain.clone();
     if first_gossipped_epoch.is_none() {
         *first_gossipped_epoch = Some(epoch);
+    }
+    // Note that the way tasks is used is open to "races" but this is a simple throttle for not
+    // firing too many fetch tasks so not worth the overhead of using a full lock here.  I.e.
+    // one more or less task won't matter.
+    let task_num = tasks.load(Ordering::Relaxed);
+    // Skip for now, this number will be subsumed by gossip once enough tasks end.
+    if task_num < 6 {
+        let end_number = last_number.unwrap_or_default();
         *last_number = Some(number + 1);
         let tasks_clone = tasks.clone();
-        // Start one backtracking fetch at the first consensus we get.
-        tasks.store(1, Ordering::Relaxed);
+        tasks.fetch_add(1, Ordering::Relaxed);
         task_spawner.spawn_task(
-            format!("backfilling epoch {epoch} consensus from {number}/{hash}"),
+            format!("backfilling epoch {epoch} consensus from {number}/{hash} to {end_number}"),
             async move {
                 get_consensus_header_range(
                     number,
@@ -364,51 +346,19 @@ async fn manage_new_consensus<DB: TNDatabase>(
                     &consensus_bus_clone,
                     &network_clone,
                     &consensus_chain_clone,
-                    epoch,
-                    0,
+                    end_number,
                 )
                 .await;
                 tasks_clone.fetch_sub(1, Ordering::Relaxed);
                 Ok(())
             },
         );
-    } else {
-        // Note that the way tasks is used is open to "races" but this is a simple throttle for not
-        // firing too many fetch tasks so not worth the overhead of using a full lock here.  I.e.
-        // one more or less task won't matter.
-        let task_num = tasks.load(Ordering::Relaxed);
-        // Skip for now, this number will be subsumed by gossip once enough tasks end.
-        if task_num < 6 {
-            let end_number = last_number.unwrap_or_default();
-            *last_number = Some(number + 1);
-            let min_epoch = first_gossipped_epoch.unwrap_or_default();
-            let tasks_clone = tasks.clone();
-            tasks.fetch_add(1, Ordering::Relaxed);
-            task_spawner.spawn_task(
-                format!("backfilling epoch {epoch} consensus from {number}/{hash} to {end_number}"),
-                async move {
-                    get_consensus_header_range(
-                        number,
-                        hash,
-                        &db_clone,
-                        &consensus_bus_clone,
-                        &network_clone,
-                        &consensus_chain_clone,
-                        min_epoch,
-                        end_number,
-                    )
-                    .await;
-                    tasks_clone.fetch_sub(1, Ordering::Relaxed);
-                    Ok(())
-                },
-            );
-        }
     }
 
     if *current_fetch_epoch < epoch {
-        // Use Some(epoch) instead of start_gossipped_epoch- switch to pack download if we change
+        // This will switch to pack download if we change
         // epochs. This will almost certainly be faster and more reliable...
-        request_epochs(current_fetch_epoch, consensus_chain, consensus_bus, Some(epoch)).await
+        request_epochs(current_fetch_epoch, consensus_chain, consensus_bus).await
     }
 }
 
@@ -423,6 +373,14 @@ pub async fn spawn_fetch_recent_consensus<DB: TNDatabase>(
     task_spawner: TaskSpawner,
     mut rx_consensus_request: impl TnReceiver<(Epoch, u64, B256)>,
 ) {
+    // Attempt to clear the consensus header cache on startup.
+    // This should not really be needed (records are evicted as they are processed) but
+    // should not hurt and can clear up an issue if something interferes with eviction.
+    // Note, on longer shutdowns this will have no real effect but could lead to churn
+    // if a node is being restarted relatively quickly.
+    if let Err(e) = db.clear_table::<ConsensusHeaderCache>() {
+        error!(target: "state-sync", ?e, "Error clearing consensus header cache, ignoring...");
+    }
     // Get the epoch of our last executed consensus.
     let mut current_fetch_epoch = consensus_chain.latest_consensus_epoch();
     let mut first_gossipped_epoch = None; // Track the first epoch we see via gossip.
@@ -462,25 +420,13 @@ pub async fn spawn_fetch_recent_consensus<DB: TNDatabase>(
 /// Send a request to stream any pack files that are missing or incomplete for any epoch records we
 /// have. This should not be strictly needed but it can help with some wonky states to get synced
 /// (was added in response to an early testnet freeze).
+/// Note this just trigers a test and resync for any epoch pack files that are incomplete from our
+/// current epoch.
 pub async fn request_missing_packs(
     consensus_bus: &ConsensusBusApp,
     consensus_chain: &ConsensusChain,
 ) {
-    // If we have any epoch records with missing or incomplete pack files then request the pack
-    // files.
-    let mut epoch_rec = consensus_chain.epochs().latest_record().await;
-    let mut first_missing = None;
-    while let Some(rec) = epoch_rec {
-        let has_final = consensus_chain.is_epoch_complete(&rec).await;
-        epoch_rec = if !has_final {
-            first_missing = Some(rec.epoch);
-            consensus_chain.epochs().get_epoch_by_hash(rec.parent_hash).await.map(|r| r.0)
-        } else {
-            None
-        };
-    }
     // Get the epoch of our last executed consensus.
-    if let Some(mut first_missing) = first_missing {
-        request_epochs(&mut first_missing, consensus_chain, consensus_bus, None).await
-    }
+    let mut current_fetch_epoch = consensus_chain.latest_consensus_epoch();
+    request_epochs(&mut current_fetch_epoch, consensus_chain, consensus_bus).await
 }

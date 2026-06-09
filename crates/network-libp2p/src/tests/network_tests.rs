@@ -737,7 +737,7 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
     }
 
     // remove cvv from whitelist and try to publish again
-    nvv.update_authorized_publishers(HashMap::new()).await?;
+    nvv.subscribe_with_publishers(TEST_TOPIC.into(), HashSet::new()).await?;
 
     let random_block = fixture_batch_with_transactions(10);
     let sealed_block = random_block.seal_slow();

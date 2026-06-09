@@ -75,7 +75,7 @@ async fn test_request_vote_too_new() {
         .round(100) // Need to be bigger than the gc window
         .latest_execution_block(BlockNumHash::default()) // dummy_hash would be correct here but this is the test...
         .parents(round_2_certs.iter().map(|c| c.digest()).collect())
-        .with_payload_batch(fixture_batch_with_transactions(10), 0)
+        .with_payload_batch(&fixture_batch_with_transactions(10), 0)
         .build();
 
     // Trying to build on off of a missing execution block, will be an error.
@@ -143,7 +143,7 @@ async fn test_request_vote_has_missing_execution_block() {
         .round(3)
         .latest_execution_block(BlockNumHash::default()) // dummy_hash would be correct here but this is the test...
         .parents(round_2_certs.iter().map(|c| c.digest()).collect())
-        .with_payload_batch(fixture_batch_with_transactions(10), 0)
+        .with_payload_batch(&fixture_batch_with_transactions(10), 0)
         .build();
 
     // Write some certificates from round 2 into the store, and leave out the rest to test
@@ -237,7 +237,7 @@ async fn test_request_vote_older_execution_block() {
         .round(3)
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
         .parents(round_2_certs.iter().map(|c| c.digest()).collect())
-        .with_payload_batch(fixture_batch_with_transactions(10), 0)
+        .with_payload_batch(&fixture_batch_with_transactions(10), 0)
         .build();
 
     // Write some certificates from round 2 into the store, and leave out the rest to test
@@ -315,7 +315,7 @@ async fn test_request_vote_has_missing_parents() {
         .round(2)
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
         .parents(round_2_certs.iter().map(|c| c.digest()).collect())
-        .with_payload_batch(fixture_batch_with_transactions(10), 0)
+        .with_payload_batch(&fixture_batch_with_transactions(10), 0)
         .build();
 
     // Write some certificates from round 2 into the store, and leave out the rest to test
@@ -431,7 +431,7 @@ async fn test_request_vote_accept_missing_parents() {
         .round(3)
         .parents(round_2_certs.iter().map(|c| c.digest()).collect())
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
-        .with_payload_batch(fixture_batch_with_transactions(10), 0)
+        .with_payload_batch(&fixture_batch_with_transactions(10), 0)
         .build();
 
     // Populate all round 1 certificates and some round 2 certificates into the storage.
@@ -519,7 +519,7 @@ async fn test_request_vote_missing_batches() {
     for primary in fixture.authorities().filter(|a| a.id() != authority_id) {
         let header = primary
             .header_builder(&fixture.committee())
-            .with_payload_batch(fixture_batch_with_transactions(10), 0)
+            .with_payload_batch(&fixture_batch_with_transactions(10), 0)
             .build();
 
         let certificate = fixture.certificate(&header);
@@ -536,7 +536,7 @@ async fn test_request_vote_missing_batches() {
         .round(2)
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
         .parents(certificates.keys().cloned().collect())
-        .with_payload_batch(fixture_batch_with_transactions(10), 0)
+        .with_payload_batch(&fixture_batch_with_transactions(10), 0)
         .build();
 
     // Set up mock worker.
@@ -595,7 +595,7 @@ async fn test_request_vote_already_voted() {
     for primary in fixture.authorities().filter(|a| a.id() != id) {
         let header = primary
             .header_builder(&fixture.committee())
-            .with_payload_batch(fixture_batch_with_transactions(10), 0)
+            .with_payload_batch(&fixture_batch_with_transactions(10), 0)
             .build();
 
         let certificate = fixture.certificate(&header);
@@ -619,7 +619,7 @@ async fn test_request_vote_already_voted() {
         .round(2)
         .parents(certificates.keys().cloned().collect())
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
-        .with_payload_batch(fixture_batch_with_transactions(10), 0)
+        .with_payload_batch(&fixture_batch_with_transactions(10), 0)
         .build();
 
     cb.app().committed_round_updates().send_replace(1);
@@ -652,7 +652,7 @@ async fn test_request_vote_already_voted() {
         .round(2)
         .parents(certificates.keys().cloned().collect())
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
-        .with_payload_batch(fixture_batch_with_transactions(10), 0)
+        .with_payload_batch(&fixture_batch_with_transactions(10), 0)
         .build();
 
     let response = handler.vote(author_peer, test_header, Vec::new()).await;
@@ -842,7 +842,7 @@ async fn test_request_vote_created_at_in_future() {
     for primary in fixture.authorities().filter(|a| a.id() != id) {
         let header = primary
             .header_builder(&fixture.committee())
-            .with_payload_batch(fixture_batch_with_transactions(10), 0)
+            .with_payload_batch(&fixture_batch_with_transactions(10), 0)
             .build();
 
         let certificate = fixture.certificate(&header);
@@ -870,7 +870,7 @@ async fn test_request_vote_created_at_in_future() {
         .round(2)
         .parents(certificates.keys().cloned().collect())
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
-        .with_payload_batch(fixture_batch_with_transactions(10), 0)
+        .with_payload_batch(&fixture_batch_with_transactions(10), 0)
         .created_at(created_at)
         .build();
 
@@ -886,7 +886,7 @@ async fn test_request_vote_created_at_in_future() {
         let header = primary
             .header_builder(&fixture.committee())
             .round(2)
-            .with_payload_batch(fixture_batch_with_transactions(10), 0)
+            .with_payload_batch(&fixture_batch_with_transactions(10), 0)
             .build();
 
         let certificate = fixture.certificate(&header);
@@ -907,7 +907,7 @@ async fn test_request_vote_created_at_in_future() {
         .round(3)
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
         .parents(certificates.keys().cloned().collect())
-        .with_payload_batch(fixture_batch_with_transactions(10), 0)
+        .with_payload_batch(&fixture_batch_with_transactions(10), 0)
         .created_at(created_at)
         .build();
 

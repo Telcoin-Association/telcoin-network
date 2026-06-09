@@ -325,6 +325,21 @@ impl ConsensusBusApp {
         &self.inner.tx_requested_missing_epoch
     }
 
+    /// Update requested missing epoch if epoch is newer than the current value.
+    /// Return true if it updates.
+    pub fn set_request_missing_epoch_if_newer(&self, epoch: Epoch) -> bool {
+        self.requested_missing_epoch().send_if_modified(|state| {
+            if epoch > *state {
+                // Not sure we can sanity check this epoch.  However if it is bogus the code
+                // to handle it should be fine, it stops when out of epochs.
+                *state = epoch;
+                true
+            } else {
+                false
+            }
+        })
+    }
+
     /// Signals a new round
     pub fn primary_round_updates(&self) -> &watch::Sender<Round> {
         &self.inner.tx_primary_round_updates
@@ -361,11 +376,45 @@ impl ConsensusBusApp {
         &self.inner.tx_last_consensus_header
     }
 
+    /// Update last consensus header if header is newer than the current value.
+    /// Return true if it was updated.
+    pub fn send_last_consensus_header_if_newer(&self, header: ConsensusHeader) -> bool {
+        self.last_consensus_header().send_if_modified(|state| {
+            if header.number > state.as_ref().map(|h| h.number).unwrap_or_default() {
+                // Update our last seen valid consensus header if it is newer.
+                *state = Some(header);
+                true
+            } else {
+                false
+            }
+        })
+    }
+
     /// Track the latest published consensus header block number and hash seen on the gossip
     /// network. This value will have been verified and can be trusted to be the correct hash
     /// for block number.  DO NOT send unverified values to this watch.
     pub fn last_published_consensus_num_hash(&self) -> &watch::Sender<(Epoch, u64, BlockHash)> {
         &self.inner.tx_last_published_consensus_num_hash
+    }
+
+    /// Update the last published consensus epoch, number and hash if number is greater than current
+    /// value. Return true if it was updated.
+    pub fn publish_consensus_num_hash_if_newer(
+        &self,
+        epoch: Epoch,
+        number: u64,
+        hash: B256,
+    ) -> bool {
+        self.last_published_consensus_num_hash().send_if_modified(|state| {
+            if number > state.1 {
+                state.0 = epoch;
+                state.1 = number;
+                state.2 = hash;
+                true
+            } else {
+                false
+            }
+        })
     }
 
     /// Returns the latest verified consensus block number and hash from gossip.
@@ -558,6 +607,41 @@ impl ConsensusBusApp {
         epoch_record: EpochRecord,
     ) {
         let _ = self.inner.epoch_request_queue_tx.send((previous_epoch_record, epoch_record)).await;
+    }
+
+    /// Send a request to download the epoch pack file for the provided Epoch.
+    /// Use this when you only have the epoch vs the EpochRecords.
+    pub async fn request_epoch_pack_file_by_epoch(
+        &self,
+        current_epoch: Epoch,
+        consensus_chain: &ConsensusChain,
+    ) {
+        // We are starting a new epoch behind consensus so make sure we have the pack file.
+        // If we still have epochs to fetch then add to the queue until we are out of epoch records.
+        // For epoch 0: `saturating_sub(1)` yields 0, so record_by_epoch(0) would return the
+        // *real* epoch-0 record- use a synthetic epoch record instead.
+        let maybe_previous = if current_epoch == 0 {
+            consensus_chain.epochs().record_by_epoch(0).await.map(|r| EpochRecord {
+                committee: r.committee.clone(),
+                next_committee: r.committee.clone(),
+                ..EpochRecord::default()
+            })
+        } else {
+            consensus_chain.epochs().record_by_epoch(current_epoch.saturating_sub(1)).await
+        };
+        if let Some(previous_epoch_record) = maybe_previous {
+            if let Some(epoch_record) =
+                consensus_chain.epochs().record_by_epoch(current_epoch).await
+            {
+                let contains_final_header = consensus_chain.is_epoch_complete(&epoch_record).await;
+                // If the pack file is missing or incomplete request it.
+                // Note since we have an epoch record this is a past epoch
+                // not the current epoch.
+                if !contains_final_header {
+                    self.request_epoch_pack_file(previous_epoch_record, epoch_record.clone()).await;
+                }
+            }
+        }
     }
 
     /// Retrieve the next request to down load an epoch pack file.
