@@ -8,7 +8,6 @@ use std::{
     cmp::{max, Ordering},
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Debug,
-    sync::Arc,
 };
 use tn_config::ConsensusConfig;
 use tn_storage::{
@@ -41,7 +40,7 @@ pub struct ConsensusState {
     pub last_committed: HashMap<AuthorityIdentifier, Round>,
     /// The last committed sub dag. If value is None, it means that we haven't committed any sub
     /// dag yet.
-    pub last_committed_sub_dag: Option<Arc<CommittedSubDag>>,
+    pub last_committed_sub_dag: Option<CommittedSubDag>,
     /// Keeps the latest committed certificate (and its parents) for every authority. Anything
     /// older must be regularly cleaned up through the function `update`.
     pub dag: Dag,
@@ -63,7 +62,7 @@ impl ConsensusState {
         last_committed_round: Round,
         gc_depth: Round,
         recovered_last_committed: HashMap<AuthorityIdentifier, Round>,
-        latest_sub_dag: Option<Arc<CommittedSubDag>>,
+        latest_sub_dag: Option<CommittedSubDag>,
         cert_store: DB,
     ) -> Self {
         let last_round = ConsensusRound::new_with_gc_depth(last_committed_round, gc_depth);
@@ -436,7 +435,7 @@ impl<DB: Database> Consensus<DB> {
 
                 tracing::debug!(target: "telcoin::consensus_state", "Commit in Sequence {:?}", committed_sub_dag.leader().nonce());
 
-                for header in &committed_sub_dag.headers {
+                for header in committed_sub_dag.headers() {
                     has_headers = true;
                     leader_commit_round = leader_commit_round.max(header.round());
                     // Now we are going to signal which of our own batches have been committed.

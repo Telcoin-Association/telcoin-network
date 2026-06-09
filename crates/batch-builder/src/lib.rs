@@ -643,9 +643,10 @@ mod tests {
         // specify leader for consensus output
         let mut leader_cert = Certificate::default();
         leader_cert.update_header_author_for_test(leader);
-        let mut subdag = CommittedSubDag::default();
-        subdag.headers.push(leader_cert.header().clone());
-        let output = ConsensusOutput::new_with_subdag(Arc::new(subdag), BlockHash::default(), 0);
+        let mut headers = Vec::new();
+        headers.push(leader_cert.header().clone());
+        let subdag = CommittedSubDag::new_with_headers_for_test(headers);
+        let output = ConsensusOutput::new_with_subdag(subdag, BlockHash::default(), 0);
 
         // receive new blocks and return non-fatal errors
         // non-fatal errors cause the loop to break and wait for txpool updates

@@ -17,7 +17,7 @@
 //! Error handling follows the [`Database`] trait convention of `eyre::Result`,
 //! so these interfaces compose cleanly with the rest of the workspace.
 
-use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
+use std::{collections::HashMap, future::Future, time::Duration};
 
 use tokio::io::{AsyncRead, AsyncSeek};
 
@@ -87,7 +87,7 @@ pub trait ConsensusChainReader: Send + Sync + Clone + 'static {
     fn read_latest_commit_with_final_reputation_scores(
         &self,
         epoch: Epoch,
-    ) -> impl Future<Output = Option<Arc<CommittedSubDag>>> + Send;
+    ) -> impl Future<Output = Option<CommittedSubDag>> + Send;
 
     /// Load a consensus output from the current epoch by number.
     fn get_consensus_output_current(

@@ -30,7 +30,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "macros", "signal"] }
 tracing = { workspace = true }
 eyre = { workspace = true }
-once_cell = { workspace = true }
 parking_lot = { workspace = true }
 secp256k1 = { workspace = true }
 libp2p = { workspace = true, features = ["serde"] }

@@ -529,7 +529,7 @@ where
         let last_forwarded_consensus_number = output.number();
         if output.committed_at() >= self.epoch_boundary {
             // update output so engine closes epoch
-            output.close_epoch = true;
+            output.set_epoch_close();
         }
         // Now that this output has made it to execution (or almost) clear any of
         // batches from our batches cache.
@@ -697,7 +697,7 @@ where
                     "epoch boundary detected",
                 );
                 // update output so engine closes epoch
-                output.close_epoch = true;
+                output.set_epoch_close();
 
                 // obtain hash to monitor execution progress
                 let target_hash = output.consensus_header_hash();

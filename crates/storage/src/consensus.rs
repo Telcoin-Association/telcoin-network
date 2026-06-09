@@ -639,7 +639,7 @@ impl ConsensusChain {
     pub async fn read_latest_commit_with_final_reputation_scores(
         &self,
         epoch: Epoch,
-    ) -> Option<Arc<CommittedSubDag>> {
+    ) -> Option<CommittedSubDag> {
         if let Some(pack) = &self.current_pack() {
             if pack.epoch() == epoch {
                 return pack.read_latest_commit_with_final_reputation_scores().await;
@@ -656,7 +656,7 @@ impl ConsensusChain {
     /// This uses garbage parent hash and number and is ONLY for testing.
     /// As a test only function this will panic if unable to write the sub dag
     /// to the consensus chain
-    pub async fn write_subdag_for_test(&self, number: u64, sub_dag: Arc<CommittedSubDag>) {
+    pub async fn write_subdag_for_test(&self, number: u64, sub_dag: CommittedSubDag) {
         let output = ConsensusOutput::new(
             sub_dag,
             BlockHash::default(),
@@ -782,7 +782,7 @@ impl ConsensusChainReader for ConsensusChain {
     async fn read_latest_commit_with_final_reputation_scores(
         &self,
         epoch: Epoch,
-    ) -> Option<Arc<CommittedSubDag>> {
+    ) -> Option<CommittedSubDag> {
         ConsensusChain::read_latest_commit_with_final_reputation_scores(self, epoch).await
     }
 

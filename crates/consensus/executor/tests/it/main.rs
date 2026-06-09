@@ -113,7 +113,7 @@ async fn test_output_to_header() -> eyre::Result<()> {
     let mut consensus_headers_seen: Vec<_> = Vec::with_capacity(expected_num);
     while let Some(output) = consensus_output.recv().await {
         // assert epoch boundary not reached
-        assert!(!output.close_epoch);
+        assert!(!output.close_epoch());
 
         let num = output.number();
         let consensus_header = output.consensus_header();

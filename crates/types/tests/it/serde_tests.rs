@@ -83,9 +83,9 @@ fn test_committed_subdag_serde_roundtrip() {
 
     // Compare leader and certificates
     assert_eq!(original_subdag.leader().digest(), recovered_subdag.leader().digest());
-    assert_eq!(original_subdag.headers.len(), recovered_subdag.headers.len());
+    assert_eq!(original_subdag.headers().len(), recovered_subdag.headers().len());
 
-    for (orig, recov) in original_subdag.headers.iter().zip(recovered_subdag.headers.iter()) {
+    for (orig, recov) in original_subdag.headers().iter().zip(recovered_subdag.headers().iter()) {
         assert_eq!(orig.digest(), recov.digest());
     }
 }
