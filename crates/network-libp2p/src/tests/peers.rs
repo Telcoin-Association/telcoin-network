@@ -139,6 +139,30 @@ fn test_peer_exchange() {
 }
 
 #[test]
+fn test_upsert_peer_seeds_multiaddrs_for_new_peer() {
+    let mut all_peers = create_all_peers(None);
+
+    // upsert a previously-unknown peer with a known addr but no connection
+    let network_key: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let peer_id: PeerId = network_key.clone().into();
+    let addr = create_multiaddr(None);
+    let mut rng = StdRng::from_seed([7; 32]);
+    let bls = *BlsKeypair::generate(&mut rng).public();
+    all_peers.upsert_peer(bls, network_key, vec![addr.clone()]);
+
+    // the fresh record carries the addr through to peer exchange and ip-ban association,
+    // even though the peer has never connected
+    let peer = all_peers.get_peer(&peer_id).expect("peer exists after upsert");
+    assert!(peer.exchange_info().unwrap().1.iter().any(|a| a == &addr));
+    let expected_ip = addr.iter().find_map(|p| match p {
+        libp2p::multiaddr::Protocol::Ip4(ip) => Some(IpAddr::from(ip)),
+        libp2p::multiaddr::Protocol::Ip6(ip) => Some(IpAddr::from(ip)),
+        _ => None,
+    });
+    assert!(peer.known_ip_addresses().any(|ip| Some(ip) == expected_ip));
+}
+
+#[test]
 fn test_connected_peers_by_score() {
     let mut all_peers = create_all_peers(None);
 

@@ -66,15 +66,19 @@ impl Peer {
         }
     }
 
-    /// Create a new trusted peer.
-    pub(super) fn new(bls_public_key: BlsPublicKey, network_key: NetworkPublicKey) -> Peer {
+    /// Create a new peer with its known multiaddrs.
+    pub(super) fn new(
+        bls_public_key: BlsPublicKey,
+        network_key: NetworkPublicKey,
+        addrs: Vec<Multiaddr>,
+    ) -> Peer {
         Self {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
             score: Score::default(),
             is_trusted: false,
             config: Default::default(),
-            multiaddrs: Default::default(),
+            multiaddrs: addrs.into_iter().collect(),
             connection_status: Default::default(),
             connection_direction: Default::default(),
             routable: false,

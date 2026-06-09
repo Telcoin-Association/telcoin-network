@@ -167,7 +167,7 @@ impl AllPeers {
                 peer.update_net(bls_public_key, network_key, addrs);
                 peer
             }
-            None => Peer::new(bls_public_key, network_key),
+            None => Peer::new(bls_public_key, network_key, addrs),
         };
         self.bls_by_peer_id.insert(peer_id, bls_public_key);
         self.peers.insert(PeerIdentity::Confirmed(bls_public_key), peer);
