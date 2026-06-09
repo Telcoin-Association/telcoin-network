@@ -904,11 +904,11 @@ mod test {
     #[test]
     fn test_network_type_protocol_names() {
         assert_eq!(NetworkType::Primary.req_res_protocol().as_ref(), "/tn-primary/0.0.1");
-        assert_eq!(NetworkType::Primary.kad_protocol().as_ref(), "/tn-primary-kad/1.0.0");
+        assert_eq!(NetworkType::Primary.kad_protocol().as_ref(), "/tn-primary-kad/0.0.1");
         assert_eq!(NetworkType::Worker(0).req_res_protocol().as_ref(), "/tn-worker-0/0.0.1");
-        assert_eq!(NetworkType::Worker(0).kad_protocol().as_ref(), "/tn-worker-0-kad/1.0.0");
+        assert_eq!(NetworkType::Worker(0).kad_protocol().as_ref(), "/tn-worker-0-kad/0.0.1");
         // worker id is interpolated, not literal
         assert_eq!(NetworkType::Worker(3).req_res_protocol().as_ref(), "/tn-worker-3/0.0.1");
-        assert_eq!(NetworkType::Worker(3).kad_protocol().as_ref(), "/tn-worker-3-kad/1.0.0");
+        assert_eq!(NetworkType::Worker(3).kad_protocol().as_ref(), "/tn-worker-3-kad/0.0.1");
     }
 }
