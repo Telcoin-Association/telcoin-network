@@ -6,7 +6,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use jsonrpsee::proc_macros::rpc;
-use tn_reth::ChainSpec;
+use tn_reth::RethEnv;
 use tn_types::{BlockHash, ConsensusHeader, Epoch, EpochCertificate, EpochRecord, Genesis};
 
 /// Telcoin Network RPC namespace.
@@ -47,8 +47,8 @@ pub trait TelcoinNetworkRpcExtApi {
 /// The type that implements `tn` namespace trait.
 #[derive(Debug)]
 pub struct TelcoinNetworkRpcExt<N: EngineToPrimary> {
-    /// The chain id for this node.
-    chain: ChainSpec,
+    /// Type to interact with EVM state.
+    evm_state: RethEnv,
     /// The inner-node network.
     ///
     /// The interface that handles primary <-> engine network communication.
@@ -72,7 +72,7 @@ where
     }
 
     async fn genesis(&self) -> TelcoinNetworkRpcResult<Genesis> {
-        Ok(self.chain.genesis().clone())
+        Ok(self.evm_state.chainspec().genesis().clone())
     }
 
     async fn epoch_record(
@@ -92,7 +92,7 @@ where
 
 impl<N: EngineToPrimary> TelcoinNetworkRpcExt<N> {
     /// Create new instance of the Telcoin Network RPC extension.
-    pub fn new(chain: ChainSpec, inner_node_network: N) -> Self {
-        Self { chain, inner_node_network }
+    pub fn new(evm_state: RethEnv, inner_node_network: N) -> Self {
+        Self { evm_state, inner_node_network }
     }
 }

@@ -153,7 +153,7 @@ impl ExecutionNodeInner {
         transaction_pool.set_block_info(tx_pool_latest);
 
         // extend TN namespace
-        let tn_ext = TelcoinNetworkRpcExt::new(self.reth_env.chainspec(), engine_to_primary);
+        let tn_ext = TelcoinNetworkRpcExt::new(self.reth_env.clone(), engine_to_primary);
         let server = self.reth_env.get_rpc_server(
             transaction_pool.clone(),
             network.clone(),
