@@ -132,6 +132,15 @@ impl Peer {
         self.bls_public_key
     }
 
+    /// This peer's libp2p [PeerId], derived from its network public key.
+    ///
+    /// Returns `None` if the network key is not yet known. The derivation is a pure,
+    /// total function of the network key, so any peer with a recorded bls key (which is
+    /// always set alongside the network key) also has a recoverable [PeerId].
+    pub(super) fn peer_id(&self) -> Option<PeerId> {
+        self.network_key.as_ref().map(|network_key| network_key.clone().into())
+    }
+
     /// Return a peer's reputation based on the aggregate score.
     pub(super) fn reputation(&self) -> Reputation {
         match self.score.aggregate_score() {
