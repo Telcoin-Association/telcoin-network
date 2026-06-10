@@ -158,8 +158,10 @@ sol!(
         function getCurrentEpochInfo() external view returns (EpochInfo memory currentEpochInfo);
         /// Return committee epoch info for a specific epoch.
         function getEpochInfo(uint32 epoch) public view returns (EpochInfo memory epochInfo);
-        /// Return the validators by status. Pass `0` for status to return all validators.
-        function getValidators(uint8 status) public view returns (ValidatorInfo[] memory);
+        /// Return the validator addresses by status. Pass `0` for status to return all validators.
+        function getValidators(uint8 status) public view returns (address[] memory);
+        /// Return the full `ValidatorInfo` structs by status. Pass `0` to return all validators.
+        function getValidatorsInfo(uint8 status) public view returns (ValidatorInfo[] memory);
         /// Fetch the committee for a given epoch.
         function getCommitteeValidators(uint32 epoch) external view returns (ValidatorInfo[] memory);
         /// Fetch the BLS pubkey for a given validator address.
