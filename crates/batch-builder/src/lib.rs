@@ -355,8 +355,8 @@ mod tests {
     };
     use tn_storage::{open_db, tables::NodeBatchesCache};
     use tn_types::{
-        gas_accumulator::GasAccumulator, test_genesis, BlockHash, Bytes, Certificate,
-        CommittedSubDag, ConsensusOutput, Database, GenesisAccount, TaskManager,
+        gas_accumulator::GasAccumulator, test_genesis, Bytes, Certificate, CommittedSubDag,
+        ConsensusHeaderDigest, ConsensusOutput, Database, GenesisAccount, TaskManager,
         MIN_PROTOCOL_BASE_FEE, U160, U256,
     };
     use tn_worker::{test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle};
@@ -643,9 +643,10 @@ mod tests {
         // specify leader for consensus output
         let mut leader_cert = Certificate::default();
         leader_cert.update_header_author_for_test(leader);
-        let mut subdag = CommittedSubDag::default();
-        subdag.headers.push(leader_cert.header().clone());
-        let output = ConsensusOutput::new_with_subdag(Arc::new(subdag), BlockHash::default(), 0);
+        let mut headers = Vec::new();
+        headers.push(leader_cert.header().clone());
+        let subdag = CommittedSubDag::new_with_headers_for_test(headers);
+        let output = ConsensusOutput::new_with_subdag(subdag, ConsensusHeaderDigest::default(), 0);
 
         // receive new blocks and return non-fatal errors
         // non-fatal errors cause the loop to break and wait for txpool updates

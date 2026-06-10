@@ -199,7 +199,7 @@ async fn test_bullshark_schedule_change_reputation() {
         match outcome {
             Outcome::Commit => {
                 for subdag in &committed {
-                    if subdag.reputation_score.final_of_schedule {
+                    if subdag.reputation_scores().final_of_schedule {
                         schedule_change_count += 1;
                     }
                 }

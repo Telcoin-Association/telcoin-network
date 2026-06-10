@@ -3,11 +3,11 @@
 
 use super::ConsensusHeader;
 use crate::{
-    crypto, encode, Address, Batch, BlockHash, BlockNumHash, BlsSignature, Certificate, Digest,
-    Epoch, Hash, Header, ReputationScores, Round, SealedHeader, TimestampSec, B256,
+    crypto, encode, Address, Batch, BlockHash, BlsSignature, Certificate, ConsensusHeaderDigest,
+    ConsensusNumHash, Digest, Epoch, Hash, Header, ReputationScores, Round, SealedHeader,
+    TimestampSec, B256,
 };
 use alloy::primitives::keccak256;
-use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
@@ -26,9 +26,9 @@ pub type SequenceNumber = u64;
 /// - leader round from consensus
 /// - consensus block number/hash
 /// - latest canonical tip when execution produced a block (`None` when execution was skipped)
-pub type EngineUpdate = (Round, BlockNumHash, Option<SealedHeader>);
+pub type EngineUpdate = (Round, ConsensusNumHash, Option<SealedHeader>);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 /// Struct that contains all necessary information for executing a batch post-consensus.
 pub struct CertifiedBatch {
     /// The ECDSA address of the authority that produced the batch. This address is used as the
@@ -39,10 +39,10 @@ pub struct CertifiedBatch {
     pub batches: Vec<Batch>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct ConsensusOutputInner {
     /// The committed subdag that triggered this output.
-    sub_dag: Arc<CommittedSubDag>,
+    sub_dag: CommittedSubDag,
     /// Matches certificates in the `sub_dag` one-to-one.
     ///
     /// This field is not included in [Self] digest. To validate,
@@ -54,7 +54,7 @@ struct ConsensusOutputInner {
     batch_digests: VecDeque<BlockHash>,
     // These fields are used to construct the ConsensusHeader.
     /// The hash of the previous ConsesusHeader in the chain.
-    parent_hash: B256,
+    parent_hash: ConsensusHeaderDigest,
     /// A scalar value equal to the number of ancestor blocks. The genesis block has a number of
     /// zero.
     number: u64,
@@ -65,50 +65,76 @@ struct ConsensusOutputInner {
 
 /// The output of Consensus, which includes all the blocks for each certificate in the sub dag
 /// It is sent to the the ExecutionState handle_consensus_transaction
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ConsensusOutput {
     inner: Arc<ConsensusOutputInner>,
     /// Boolean indicating if this is the last output for the epoch.
     ///
     /// The engine should make a system call to consensus registry contract to close the epoch.
-    pub close_epoch: bool,
+    close_epoch: bool,
     /// Cached digest of the consensus header for this output.
-    pub consensus_header_hash_cache: OnceCell<B256>,
+    consensus_header_hash_cache: ConsensusHeaderDigest,
+}
+
+// NOTE: only [Self::inner] is serialized. `close_epoch` is intentionally NOT part of the
+// serialized form: it is a transient, locally-derived flag (not part of the consensus header
+// digest) and is always recomputed from `committed_at() >= epoch_boundary`. Any consumer that
+// deserializes a [ConsensusOutput] MUST recompute it via `EpochManager::process_output` before
+// trusting [ConsensusOutput::close_epoch] — a deserialized output always reports `false`.
+impl Serialize for ConsensusOutput {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let ok = self.inner.serialize(serializer)?;
+        Ok(ok)
+    }
+}
+
+impl<'de> Deserialize<'de> for ConsensusOutput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let inner = ConsensusOutputInner::deserialize(deserializer)?;
+        let consensus_header_hash_cache =
+            ConsensusHeader::digest_from_parts(inner.parent_hash, &inner.sub_dag, inner.number);
+        Ok(Self { inner: Arc::new(inner), close_epoch: false, consensus_header_hash_cache })
+    }
 }
 
 impl ConsensusOutput {
     /// Create a
     pub fn new(
-        sub_dag: Arc<CommittedSubDag>,
-        parent_hash: BlockHash,
+        sub_dag: CommittedSubDag,
+        parent_hash: ConsensusHeaderDigest,
         number: u64,
         close_epoch: bool,
         batch_digests: VecDeque<BlockHash>,
         batches: Vec<CertifiedBatch>,
     ) -> Self {
-        ConsensusOutput {
-            inner: Arc::new(ConsensusOutputInner {
-                sub_dag: sub_dag.clone(),
-                parent_hash,
-                number,
-                batch_digests,
-                batches,
-                ..Default::default()
-            }),
-            close_epoch,
-            consensus_header_hash_cache: OnceCell::default(),
-        }
+        let inner = Arc::new(ConsensusOutputInner {
+            sub_dag: sub_dag.clone(),
+            parent_hash,
+            number,
+            batch_digests,
+            batches,
+            ..Default::default()
+        });
+        let consensus_header_hash_cache =
+            ConsensusHeader::digest_from_parts(inner.parent_hash, &inner.sub_dag, inner.number);
+        ConsensusOutput { inner, close_epoch, consensus_header_hash_cache }
     }
     pub fn new_with_subdag(
-        sub_dag: Arc<CommittedSubDag>,
-        parent_hash: BlockHash,
+        sub_dag: CommittedSubDag,
+        parent_hash: ConsensusHeaderDigest,
         number: u64,
     ) -> Self {
         Self::new(sub_dag, parent_hash, number, false, VecDeque::new(), Vec::new())
     }
     pub fn new_closed_with_subdag(
-        sub_dag: Arc<CommittedSubDag>,
-        parent_hash: BlockHash,
+        sub_dag: CommittedSubDag,
+        parent_hash: ConsensusHeaderDigest,
         number: u64,
     ) -> Self {
         Self::new(sub_dag, parent_hash, number, true, VecDeque::new(), Vec::new())
@@ -197,19 +223,13 @@ impl ConsensusOutput {
     }
 
     /// Return the hash of the consensus header that matches this output.
-    pub fn consensus_header_hash(&self) -> B256 {
-        *self.consensus_header_hash_cache.get_or_init(|| {
-            ConsensusHeader::digest_from_parts(
-                self.inner.parent_hash,
-                &self.inner.sub_dag,
-                self.inner.number,
-            )
-        })
+    pub fn consensus_header_hash(&self) -> ConsensusHeaderDigest {
+        self.consensus_header_hash_cache
     }
 
     /// Return number/hash tuple for this consensus output.
-    pub fn num_hash(&self) -> BlockNumHash {
-        BlockNumHash::new(self.inner.number, self.consensus_header_hash())
+    pub fn num_hash(&self) -> ConsensusNumHash {
+        ConsensusNumHash::new(self.inner.number, self.consensus_header_hash())
     }
 
     /// Return a `bool` if this is the last batch (by index) of the last output for the epoch.
@@ -223,27 +243,39 @@ impl ConsensusOutput {
         )
     }
 
+    /// Set the close epoch field, this is the last consensus output for an epoch.
+    pub fn set_epoch_close(&mut self) {
+        self.close_epoch = true;
+    }
+
+    /// Boolean indicating if this is the last output for the epoch.
+    ///
+    /// The engine should make a system call to consensus registry contract to close the epoch.
+    pub fn close_epoch(&self) -> bool {
+        self.close_epoch
+    }
+
     /// Generate the source of randomness to shuffle future committees at the epoch boundary. The
     /// source of randomness comes from the keccak hash of the leader's aggregate signature.
     ///
     /// NOTE: this cannot fail - uses [BlsSignature::default] and is considered acceptable with
     /// permissioned validator set, but should never happen.
     pub fn keccak_leader_sigs(&self) -> B256 {
-        self.inner.sub_dag.randomness
+        self.inner.sub_dag.inner.randomness
     }
 
     /// The parent hash for this output.
-    pub fn parent_hash(&self) -> BlockHash {
+    pub fn parent_hash(&self) -> ConsensusHeaderDigest {
         self.inner.parent_hash
     }
 }
 
 impl Hash<{ crypto::DIGEST_LENGTH }> for ConsensusOutput {
-    type TypedDigest = ConsensusDigest;
+    type TypedDigest = ConsensusHeaderDigest;
 
     /// The digest of the corresponding [ConsensusHeader] that produced this output.
-    fn digest(&self) -> ConsensusDigest {
-        ConsensusDigest(Digest { digest: self.consensus_header_hash().into() })
+    fn digest(&self) -> ConsensusHeaderDigest {
+        self.consensus_header_hash()
     }
 }
 
@@ -260,17 +292,13 @@ impl Display for ConsensusOutput {
     }
 }
 
-/// Contains the committed output from Bullshark consensus.
-/// Note it stores Headers without certificates, all validation
-/// should be complete.  Future validation can be done by verifying
-/// the consensus chain against signed checkpoints (like epoch records).
 #[derive(PartialEq, Serialize, Deserialize, Debug)]
-pub struct CommittedSubDag {
+struct CommittedSubDagInner {
     /// The sequence of committed certificates.
     /// Note the last element MUST be the leader.
-    pub headers: Vec<Header>,
+    headers: Vec<Header>,
     /// The so far calculated reputation score for nodes
-    pub reputation_score: ReputationScores,
+    reputation_scores: ReputationScores,
     /// The timestamp that should identify this commit. This is guaranteed to be monotonically
     /// incremented. This is not necessarily the leader's timestamp. We compare the leader's
     /// timestamp with the previously committed sub dag timestamp and we always keep the max.
@@ -281,16 +309,46 @@ pub struct CommittedSubDag {
     randomness: B256,
 }
 
+/// Contains the committed output from Bullshark consensus.
+/// Note it stores Headers without certificates, all validation
+/// should be complete.  Future validation can be done by verifying
+/// the consensus chain against signed checkpoints (like epoch records).
+#[derive(Clone, PartialEq, Debug)]
+pub struct CommittedSubDag {
+    inner: Arc<CommittedSubDagInner>,
+}
+
+impl Serialize for CommittedSubDag {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let ok = self.inner.serialize(serializer)?;
+        Ok(ok)
+    }
+}
+
+impl<'de> Deserialize<'de> for CommittedSubDag {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let inner = CommittedSubDagInner::deserialize(deserializer)?;
+        Ok(Self { inner: Arc::new(inner) })
+    }
+}
+
 impl Default for CommittedSubDag {
     fn default() -> Self {
         // Override default so we have one default header (the leader)
         // so a default value won't panic when used.
-        Self {
+        let inner = Arc::new(CommittedSubDagInner {
             headers: vec![Header::default()],
-            reputation_score: Default::default(),
+            reputation_scores: Default::default(),
             commit_timestamp: Default::default(),
             randomness: Default::default(),
-        }
+        });
+        Self { inner }
     }
 }
 
@@ -301,12 +359,13 @@ impl CommittedSubDag {
         certificates: Vec<Certificate>,
         leader: Certificate,
         sub_dag_index: SequenceNumber,
-        reputation_score: ReputationScores,
-        previous_sub_dag: Option<Arc<CommittedSubDag>>,
+        reputation_scores: ReputationScores,
+        previous_sub_dag: Option<CommittedSubDag>,
     ) -> Self {
         // Narwhal enforces some invariants on the header.created_at, so we can use it as a
         // timestamp.
-        let previous_sub_dag_ts = previous_sub_dag.map(|s| s.commit_timestamp).unwrap_or_default();
+        let previous_sub_dag_ts =
+            previous_sub_dag.map(|s| s.inner.commit_timestamp).unwrap_or_default();
         let commit_timestamp = previous_sub_dag_ts.max(*leader.header().created_at());
 
         if previous_sub_dag_ts > *leader.header().created_at() {
@@ -322,12 +381,31 @@ impl CommittedSubDag {
             });
         let randomness = keccak256(randomness.to_bytes());
         let headers = certificates.into_iter().map(|c| c.into_header()).collect();
-        Self { headers, reputation_score, commit_timestamp, randomness }
+        let inner = Arc::new(CommittedSubDagInner {
+            headers,
+            reputation_scores,
+            commit_timestamp,
+            randomness,
+        });
+        Self { inner }
+    }
+
+    /// Make a default with just headers for testing.
+    pub fn new_with_headers_for_test(headers: Vec<Header>) -> Self {
+        // Override default so we have one default header (the leader)
+        // so a default value won't panic when used.
+        let inner = Arc::new(CommittedSubDagInner {
+            headers,
+            reputation_scores: Default::default(),
+            commit_timestamp: Default::default(),
+            randomness: Default::default(),
+        });
+        Self { inner }
     }
 
     /// How many consensus headers are in this sub dag (including the leader).
     pub fn len(&self) -> usize {
-        self.headers.len()
+        self.inner.headers.len()
     }
 
     /// Is this empty (i.e. contains no headers).
@@ -337,12 +415,12 @@ impl CommittedSubDag {
 
     /// Number of batches contained in the sub dag.
     pub fn num_primary_batches(&self) -> usize {
-        self.headers.iter().map(|x| x.payload().len()).sum()
+        self.inner.headers.iter().map(|x| x.payload().len()).sum()
     }
 
     /// The leader header responsible for committing this sub-dag.
     pub fn leader(&self) -> &Header {
-        self.headers.last().expect("sub dag MUST have a leader")
+        self.inner.headers.last().expect("sub dag MUST have a leader")
     }
 
     /// The Certificate's round.
@@ -360,15 +438,19 @@ impl CommittedSubDag {
         // If commit_timestamp is zero, then safely assume that this is an upgraded node that is
         // replaying this commit and field is never initialised. It's safe to fallback on leader's
         // timestamp.
-        if self.commit_timestamp == 0 {
+        if self.inner.commit_timestamp == 0 {
             return *self.leader().created_at();
         }
-        self.commit_timestamp
+        self.inner.commit_timestamp
     }
 
     /// Return the Certificates for this SubDag.
     pub fn headers(&self) -> &[Header] {
-        &self.headers
+        &self.inner.headers
+    }
+
+    pub fn reputation_scores(&self) -> &ReputationScores {
+        &self.inner.reputation_scores
     }
 }
 
@@ -379,55 +461,22 @@ impl Hash<{ crypto::DIGEST_LENGTH }> for CommittedSubDag {
         let mut hasher = crypto::DefaultHashFunction::new();
         // Instead of hashing serialized CommittedSubDag, hash the certificate digests instead.
         // Signatures in the certificates are not part of the commitment.
-        for cert in &self.headers {
+        for cert in &self.inner.headers {
             hasher.update(cert.digest().as_ref());
         }
-        hasher.update(encode(&self.reputation_score).as_ref());
-        hasher.update(encode(&self.commit_timestamp).as_ref());
-        hasher.update(self.randomness.as_ref());
+        hasher.update(encode(&self.inner.reputation_scores).as_ref());
+        hasher.update(encode(&self.inner.commit_timestamp).as_ref());
+        hasher.update(self.inner.randomness.as_ref());
         ConsensusDigest(Digest { digest: hasher.finalize().into() })
-    }
-}
-
-// Convenience function for casting `ConsensusDigest` into EL B256.
-// note: these are both 32-bytes
-impl From<ConsensusDigest> for B256 {
-    fn from(value: ConsensusDigest) -> Self {
-        B256::from_slice(value.as_ref())
     }
 }
 
 /// Shutdown token dropped when a task is properly shut down.
 pub type ShutdownToken = mpsc::Sender<()>;
 
-// Digest of ConsususOutput and CommittedSubDag
-#[derive(
-    Clone, Copy, Default, PartialEq, Eq, std::hash::Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
-pub struct ConsensusDigest(Digest<{ crypto::DIGEST_LENGTH }>);
-
-impl AsRef<[u8]> for ConsensusDigest {
-    fn as_ref(&self) -> &[u8] {
-        &self.0.digest
-    }
-}
-
-impl From<ConsensusDigest> for Digest<{ crypto::DIGEST_LENGTH }> {
-    fn from(d: ConsensusDigest) -> Self {
-        d.0
-    }
-}
-
-impl fmt::Debug for ConsensusDigest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl fmt::Display for ConsensusDigest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(f, "{}", self.0.to_string().get(0..16).ok_or(fmt::Error)?)
-    }
+crate::crypto::digest_newtype! {
+    /// Digest of a [`ConsensusOutput`]/[`CommittedSubDag`].
+    pub struct ConsensusDigest;
 }
 
 // See test_utils output_tests.rs for this modules tests.

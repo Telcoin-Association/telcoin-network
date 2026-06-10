@@ -397,13 +397,13 @@ fn consensus_output_for_test(
     leader.update_header_epoch_for_test(epoch);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
-    let sub_dag = Arc::new(CommittedSubDag::new(
+    let sub_dag = CommittedSubDag::new(
         vec![Certificate::default(), leader.clone()],
         leader,
         subdag_index,
         reputation_scores,
         previous_sub_dag,
-    ));
+    );
     ConsensusOutput::new(
         sub_dag,
         ConsensusHeader::default().digest(),

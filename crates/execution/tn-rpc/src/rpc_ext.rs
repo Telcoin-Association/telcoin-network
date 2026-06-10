@@ -8,9 +8,9 @@ use async_trait::async_trait;
 use jsonrpsee::proc_macros::rpc;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tn_reth::{error::RegistryReadError, system_calls::ConsensusRegistry, ChainSpec, RethEnv};
+use tn_reth::{error::RegistryReadError, system_calls::ConsensusRegistry, RethEnv};
 use tn_types::{
-    Address, BlockHash, Bytes, ConsensusHeader, Epoch, EpochCertificate, EpochRecord, Genesis,
+    Address, Bytes, ConsensusHeader, Epoch, EpochCertificate, EpochDigest, EpochRecord, Genesis,
     SolCall, SolType, SolValue, B256, U256,
 };
 use tokio::sync::{oneshot, Semaphore};
@@ -60,7 +60,7 @@ pub trait TelcoinNetworkRpcExtApi {
     #[method(name = "epochRecordByHash")]
     async fn epoch_record_by_hash(
         &self,
-        hash: BlockHash,
+        hash: EpochDigest,
     ) -> TelcoinNetworkRpcResult<(EpochRecord, EpochCertificate)>;
     /// Return the current epoch number from the on-chain [`ConsensusRegistry`].
     #[method(name = "getCurrentEpoch")]
@@ -172,9 +172,7 @@ const MAX_CONCURRENT_REGISTRY_READS: usize = 64;
 /// The type that implements `tn` namespace trait.
 #[derive(Debug)]
 pub struct TelcoinNetworkRpcExt<N: EngineToPrimary> {
-    /// The chain id for this node.
-    chain: ChainSpec,
-    /// The execution environment for reading on-chain [`ConsensusRegistry`] state.
+    /// Type to interact with EVM state.
     evm_state: RethEnv,
     /// The inner-node network.
     ///
@@ -203,7 +201,7 @@ where
     }
 
     async fn genesis(&self) -> TelcoinNetworkRpcResult<Genesis> {
-        Ok(self.chain.genesis().clone())
+        Ok(self.evm_state.chainspec().genesis().clone())
     }
 
     async fn epoch_record(
@@ -215,7 +213,7 @@ where
 
     async fn epoch_record_by_hash(
         &self,
-        hash: BlockHash,
+        hash: EpochDigest,
     ) -> TelcoinNetworkRpcResult<(EpochRecord, EpochCertificate)> {
         self.inner_node_network.epoch(None, Some(hash)).await.ok_or(TNRpcError::NotFound)
     }
@@ -371,9 +369,8 @@ where
 impl<N: EngineToPrimary> TelcoinNetworkRpcExt<N> {
     /// Create new instance of the Telcoin Network RPC extension.
     pub fn new(evm_state: RethEnv, inner_node_network: N) -> Self {
-        let chain = evm_state.chainspec();
         let blocking_io_guard = Arc::new(Semaphore::new(MAX_CONCURRENT_REGISTRY_READS));
-        Self { chain, evm_state, inner_node_network, blocking_io_guard }
+        Self { evm_state, inner_node_network, blocking_io_guard }
     }
 
     /// Execute a read-only [`ConsensusRegistry`] call at the canonical tip and decode the result.

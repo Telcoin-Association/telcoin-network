@@ -7,8 +7,8 @@ mod rpc_ext;
 pub use rpc_ext::{TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use serde::Serialize;
 use tn_types::{
-    Address, AuthorityIdentifier, BlockHash, BlsPublicKey, ConsensusHeader, Epoch,
-    EpochCertificate, EpochRecord, Multiaddr, NetworkPublicKey,
+    Address, AuthorityIdentifier, BlsPublicKey, ConsensusHeader, Epoch, EpochCertificate,
+    EpochDigest, EpochRecord, Multiaddr, NetworkPublicKey,
 };
 
 /// Contain the node's identifying info to provide over RPC.
@@ -48,7 +48,7 @@ pub trait EngineToPrimary {
     fn epoch(
         &self,
         epoch: Option<Epoch>,
-        hash: Option<BlockHash>,
+        hash: Option<EpochDigest>,
     ) -> impl std::future::Future<Output = Option<(EpochRecord, EpochCertificate)>> + Send;
     /// Return the node's static information.
     fn node_info(&self) -> &RpcNodeInfo;

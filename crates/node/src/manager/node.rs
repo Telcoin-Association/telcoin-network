@@ -19,10 +19,10 @@ use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode, QueCh
 use tn_reth::{system_calls::EpochState, RethDb, RethEnv};
 use tn_storage::{consensus::ConsensusChain, open_db, DatabaseType};
 use tn_types::{
-    deconstruct_nonce, gas_accumulator::GasAccumulator, BlockNumHash, BlsPublicKey,
-    BootstrapServer, Committee, ConsensusHeader, ConsensusOutput, Database as TNDatabase,
-    EngineUpdate, Epoch, Notifier, TaskError, TaskManager, TaskSpawner, TimestampSec,
-    MIN_PROTOCOL_BASE_FEE,
+    deconstruct_nonce, gas_accumulator::GasAccumulator, BlsPublicKey, BootstrapServer, Committee,
+    ConsensusHeader, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput,
+    Database as TNDatabase, EngineUpdate, Epoch, Notifier, TaskError, TaskManager, TaskSpawner,
+    TimestampSec, DEFAULT_WORKER_ID, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::mpsc;
@@ -58,6 +58,19 @@ pub(crate) struct EpochManager<P, DB> {
     /// If the timestamp of the leader is >= the epoch_boundary then the
     /// manager closes the epoch after the engine executes all data.
     epoch_boundary: TimestampSec,
+    /// Whether the long-running p2p networks have completed their one-time, per-process setup
+    /// (start listening, register bootstrap peers).
+    ///
+    /// This setup normally runs on the `Initial` epoch, but the `Initial` iteration can return
+    /// early from [`EpochManager::replay_missed_consensus`] - when a restart must replay-and-close
+    /// an epoch boundary - *before* `create_consensus` runs the setup. In that case the setup runs
+    /// on the first following `NewEpoch` iteration instead. Gating on this flag, rather than on
+    /// [`RunEpochMode::Initial`], guarantees the networks are set up exactly once even on that
+    /// restart path (mirrors the `are_workers_initialized` guard used for worker components).
+    ///
+    /// Committee slots are NOT gated on this flag. They are set every epoch from authoritative
+    /// state via `update_committees`.
+    network_initialized: bool,
     /// Reth DB, keep for entire execution.
     reth_db: RethDb,
     /// Consensus DB, keep for entire execution.
@@ -208,6 +221,7 @@ where
             key_config,
             node_shutdown,
             epoch_boundary: Default::default(),
+            network_initialized: false,
             reth_db,
             consensus_db,
             consensus_bus,
@@ -421,6 +435,7 @@ where
 
         // create long-running network task for worker
         let worker_network = ConsensusNetwork::new_for_worker(
+            DEFAULT_WORKER_ID,
             network_config,
             self.worker_event_stream.clone(),
             self.key_config.clone(),
@@ -524,7 +539,8 @@ where
             // On restore, use the block's consensus hash from parent_beacon_block_root.
             // Round is set to 0 since we don't persist it; consensus number/hash still allows
             // wait_for_consensus_execution to resolve hash lookups.
-            let consensus_hash = recent_block.parent_beacon_block_root.unwrap_or_default();
+            let consensus_hash: ConsensusHeaderDigest =
+                recent_block.parent_beacon_block_root.unwrap_or_default().into();
             let (epoch, round) = deconstruct_nonce(recent_block.nonce.into());
             let consensus_number = self
                 .consensus_chain
@@ -532,7 +548,7 @@ where
                 .await?
                 .map(|h| h.number)
                 .unwrap_or_default();
-            let consensus_num_hash = BlockNumHash::new(consensus_number, consensus_hash);
+            let consensus_num_hash = ConsensusNumHash::new(consensus_number, consensus_hash);
             self.consensus_bus.recent_blocks().send_modify(|blocks| {
                 blocks.push_latest(round, consensus_num_hash, Some(recent_block))
             });

@@ -24,8 +24,9 @@ use tn_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
     now, to_intent_message, try_decode, AuthorityIdentifier, BlockHash, BlsPublicKey, Certificate,
-    ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord, Hash as _, Header,
-    HeaderDigest, ProtocolSignature, Round, SignatureVerificationState, TnSender as _, Vote, B256,
+    ConsensusHeader, ConsensusHeaderDigest, Database, Epoch, EpochCertificate, EpochDigest,
+    EpochRecord, Hash as _, Header, HeaderDigest, ProtocolSignature, Round,
+    SignatureVerificationState, TnSender as _, Vote, B256,
 };
 use tokio::{io::AsyncReadExt, sync::Mutex as TokioMutex, time::timeout};
 use tracing::{debug, error, info, warn};
@@ -297,12 +298,9 @@ where
                         self.consensus_certs.lock().insert(consensus_result_hash, 1);
                     }
                 } else {
-                    let latest_missing = *self.consensus_bus.requested_missing_epoch().borrow();
-                    if epoch > latest_missing {
-                        // Not sure we can sanity check this epoch.  However if it is bogus the code
-                        // to handle it should be fine, it stops when out of epochs.
-                        self.consensus_bus.requested_missing_epoch().send_replace(epoch);
-                    }
+                    // Not sure we can sanity check this epoch.  However if it is bogus the code
+                    // to handle it should be fine, it stops when out of epochs.
+                    self.consensus_bus.set_request_missing_epoch_if_newer(epoch);
                 }
             }
             PrimaryGossip::EpochVote(vote) => {
@@ -848,13 +846,22 @@ where
     pub(super) async fn retrieve_consensus_header(
         &self,
         number: u64,
-        hash: BlockHash,
+        hash: ConsensusHeaderDigest,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
         let mut my_number = self.consensus_chain.latest_consensus_number();
-        // If we are one behind then wait to catch up.
-        while my_number + 1 == number {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            my_number = self.consensus_chain.latest_consensus_number();
+        // If we are behind then wait up to two seconds to catch up.
+        let mut count = 0;
+        if number.saturating_sub(my_number) < 4 {
+            // Only wait if we are close.
+            while my_number < number {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                my_number = self.consensus_chain.latest_consensus_number();
+                if count >= 20 {
+                    // Don't wait more than 2 seconds for this to show up.
+                    return Err(PrimaryNetworkError::UnknownConsensusHeaderDigest(hash));
+                }
+                count += 1;
+            }
         }
         let header = self.get_header_by_hash(number, hash).await?;
         Ok(PrimaryResponse::ConsensusHeader(Arc::new(header)))
@@ -864,7 +871,7 @@ where
     pub(super) async fn retrieve_epoch_record(
         &self,
         epoch: Option<Epoch>,
-        hash: Option<BlockHash>,
+        hash: Option<EpochDigest>,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
         let (record, certificate) = match (epoch, hash) {
             (_, Some(hash)) => self.get_epoch_by_hash(hash).await?,
@@ -879,7 +886,7 @@ where
     async fn get_header_by_hash(
         &self,
         number: u64,
-        hash: BlockHash,
+        hash: ConsensusHeaderDigest,
     ) -> PrimaryNetworkResult<ConsensusHeader> {
         let epoch = self.consensus_chain.epochs().number_to_epoch(number);
         match self.consensus_chain.consensus_header_by_digest(epoch, hash).await {
@@ -914,7 +921,7 @@ where
     /// Retrieve the consensus header by hash
     async fn get_epoch_by_hash(
         &self,
-        hash: BlockHash,
+        hash: EpochDigest,
     ) -> PrimaryNetworkResult<(EpochRecord, EpochCertificate)> {
         match self.consensus_chain.epochs().get_epoch_by_hash(hash).await {
             Some((record, Some(cert))) => Ok((record, cert)),

@@ -18,9 +18,9 @@ use tn_primary::{
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
 use tn_test_utils::{create_signed_certificates_for_rounds, CommitteeFixture};
 use tn_types::{
-    now, test_chain_spec_arc, Batch, BlockHash, BlockNumHash, ExecHeader, Hash as _, HeaderBuilder,
-    HeaderDigest, SealedHeader, TaskManager, TnReceiver as _, TnSender as _, WorkerId, B256,
-    DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    now, test_chain_spec_arc, Batch, BlockHash, ConsensusHeaderDigest, ConsensusNumHash,
+    ExecHeader, Hash as _, HeaderBuilder, HeaderDigest, SealedHeader, TaskManager, TnReceiver as _,
+    TnSender as _, WorkerId, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::sync::mpsc;
 
@@ -91,7 +91,11 @@ async fn test_output_to_header() -> eyre::Result<()> {
 
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     consensus_bus.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
     let task_manager = TaskManager::default();
     Consensus::spawn(
@@ -113,7 +117,7 @@ async fn test_output_to_header() -> eyre::Result<()> {
     let mut consensus_headers_seen: Vec<_> = Vec::with_capacity(expected_num);
     while let Some(output) = consensus_output.recv().await {
         // assert epoch boundary not reached
-        assert!(!output.close_epoch);
+        assert!(!output.close_epoch());
 
         let num = output.number();
         let consensus_header = output.consensus_header();
@@ -200,7 +204,11 @@ async fn test_executor_output_ordering() -> eyre::Result<()> {
 
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     consensus_bus.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
     let task_manager2 = TaskManager::default();
     Consensus::spawn(
@@ -300,7 +308,11 @@ async fn test_executor_batch_fetching() -> eyre::Result<()> {
 
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     consensus_bus.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
     let task_manager2 = TaskManager::default();
     Consensus::spawn(
@@ -488,7 +500,11 @@ async fn test_duplicate_batch_digest() -> eyre::Result<()> {
 
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     consensus_bus.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
     let task_manager2 = TaskManager::default();
     Consensus::spawn(

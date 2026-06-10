@@ -1,7 +1,7 @@
 //! Configuration for network variables.
 
 use crate::{ConfigFmt, ConfigTrait, TelcoinDirs};
-use libp2p::{kad::K_VALUE, request_response::ProtocolSupport, StreamProtocol};
+use libp2p::kad::K_VALUE;
 use serde::{Deserialize, Serialize};
 use std::{num::NonZeroUsize, time::Duration};
 use tn_types::Round;
@@ -81,10 +81,6 @@ impl NetworkConfig {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(default)]
 pub struct LibP2pConfig {
-    /// The supported inbound/outbound protocols for request/response behavior.
-    /// - ex) "/telcoin-network/mainnet/0.0.1"
-    #[serde(with = "protocol_vec")]
-    pub supported_req_res_protocols: Vec<(StreamProtocol, ProtocolSupport)>,
     /// Maximum message size between request/response network messages in bytes.
     pub max_rpc_message_size: usize,
     /// Maximum message size for gossipped network messages in bytes.
@@ -151,27 +147,13 @@ impl LibP2pConfig {
     pub fn worker_txn_topic() -> String {
         String::from("tn-txn")
     }
-
-    /// Protocol for identify behavior.
-    pub fn identify_protocol(&self) -> &'static str {
-        Self::protocol()
-    }
-
-    /// Return the protocol string.
-    pub fn protocol() -> &'static str {
-        "/telcoin-network/0.0.0"
-    }
 }
 
 impl Default for LibP2pConfig {
     fn default() -> Self {
         Self {
-            supported_req_res_protocols: vec![(
-                StreamProtocol::new(Self::protocol()),
-                ProtocolSupport::Full,
-            )],
-            max_rpc_message_size: 1024 * 1024, // 1 MiB
-            max_gossip_message_size: 12_000,   // 12kb
+            max_rpc_message_size: 1024 * 1024,                    // 1 MiB
+            max_gossip_message_size: 12_000,                      // 12kb
             max_idle_connection_timeout: Duration::from_secs(65), // same as quic handshake
             max_px_disconnects: 10,
             px_disconnect_timeout: Duration::from_secs(3),
@@ -465,68 +447,6 @@ impl ScoreConfig {
     }
 }
 
-// Serialize and deserialize for tuples of protocols
-mod protocol_vec {
-    use super::*;
-    use serde::{de::Error, Deserialize, Deserializer, Serialize, Serializer};
-
-    pub(crate) fn serialize<S>(
-        protocols: &[(StreamProtocol, ProtocolSupport)],
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        // Simply convert to a Vec of string tuples
-        let string_tuples: Vec<(String, String)> = protocols
-            .iter()
-            .map(|(protocol, support)| {
-                let support_str = match support {
-                    ProtocolSupport::Inbound => "inbound".to_string(),
-                    ProtocolSupport::Outbound => "outbound".to_string(),
-                    ProtocolSupport::Full => "full".to_string(),
-                };
-                (protocol.as_ref().to_string(), support_str)
-            })
-            .collect();
-
-        string_tuples.serialize(serializer)
-    }
-
-    pub(crate) fn deserialize<'de, D>(
-        deserializer: D,
-    ) -> Result<Vec<(StreamProtocol, ProtocolSupport)>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let string_tuples: Vec<(String, String)> = Vec::deserialize(deserializer)?;
-
-        string_tuples
-            .into_iter()
-            .map(|(protocol_str, support_str)| {
-                // Convert the protocol string to StreamProtocol
-                let protocol = StreamProtocol::try_from_owned(protocol_str).map_err(|_| {
-                    D::Error::custom("Invalid protocol: must start with a forward slash")
-                })?;
-
-                // Convert the support string to ProtocolSupport
-                let support = match support_str.as_str() {
-                    "inbound" => ProtocolSupport::Inbound,
-                    "outbound" => ProtocolSupport::Outbound,
-                    "full" => ProtocolSupport::Full,
-                    _ => {
-                        return Err(D::Error::custom(format!(
-                            "Invalid protocol support: {support_str}, expected inbound, outbound, or full"
-                        )))
-                    }
-                };
-
-                Ok((protocol, support))
-            })
-            .collect()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,9 +476,6 @@ mod tests {
         // fields (and others) are absent and must fall back to defaults.
         let yaml = r#"
 libp2p_config:
-  supported_req_res_protocols:
-    - - /telcoin-network/0.0.0
-      - full
   max_rpc_message_size: 2097152
   max_gossip_message_size: 12000
   max_idle_connection_timeout:

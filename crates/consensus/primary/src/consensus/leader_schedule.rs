@@ -262,7 +262,7 @@ impl LeaderSchedule {
             LeaderSwapTable::new(
                 &committee,
                 subdag.leader_round(),
-                &subdag.reputation_score,
+                subdag.reputation_scores(),
                 bad_nodes_percent_threshold,
             )
         });
