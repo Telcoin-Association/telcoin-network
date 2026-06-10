@@ -8,9 +8,7 @@ use std::{
 use tn_types::get_available_tcp_port;
 use tracing::info;
 
-use crate::common::{
-    network_advancing, start_validator, start_validator_with_args, ProcessGuard,
-};
+use crate::common::{network_advancing, start_validator, start_validator_with_args, ProcessGuard};
 
 /// Scrape the metrics endpoint with a raw HTTP GET (no client deps).
 fn scrape_metrics(addr: &str) -> eyre::Result<String> {
@@ -58,8 +56,7 @@ fn test_metrics_endpoint_serves_tn_and_reth_metrics() -> eyre::Result<()> {
 
     let bin = e2e_tests::get_telcoin_network_binary();
 
-    let metrics_port =
-        get_available_tcp_port("127.0.0.1").expect("metrics port assigned by host");
+    let metrics_port = get_available_tcp_port("127.0.0.1").expect("metrics port assigned by host");
     let metrics_addr = format!("127.0.0.1:{metrics_port}");
 
     // start 4 validators; the first one exposes the metrics endpoint
