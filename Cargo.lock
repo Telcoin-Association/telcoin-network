@@ -11693,7 +11693,10 @@ version = "0.1.0"
 dependencies = [
  "eyre",
  "jsonrpsee",
+ "metrics",
+ "metrics-util",
  "rand 0.9.2",
+ "reth-metrics",
  "roaring 0.10.12",
  "state-sync",
  "tempfile",

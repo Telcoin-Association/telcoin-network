@@ -33,8 +33,11 @@ tn-batch-builder = { workspace = true }
 tn-batch-validator = { workspace = true }
 jsonrpsee = { workspace = true }
 roaring = { workspace = true }
+metrics = { workspace = true }
+reth-metrics = { workspace = true }
 
 [dev-dependencies]
+metrics-util = { workspace = true }
 rand = { workspace = true }
 tn-primary = { workspace = true, features = ["test-utils"] }
 tn-types = { workspace = true, features = ["test-utils"] }

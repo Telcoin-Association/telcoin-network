@@ -100,6 +100,8 @@ where
         gas_accumulator: GasAccumulator,
     ) -> eyre::Result<RunEpochMode> {
         info!(target: "epoch-manager", "Starting epoch");
+        // counts epoch transitions AND mid-epoch restarts (recovery/flapping signal)
+        self.metrics.record_epoch_run(&epoch_mode);
 
         // Create a new bus wrapping the application channels and adding the epoch specific
         // channels.
@@ -110,6 +112,8 @@ where
         let (committee, epoch_info, epoch_start) =
             self.get_committee_with_epoch_start_info(engine).await?;
         self.epoch_boundary = epoch_start + epoch_info.epochDuration as u64;
+        self.metrics.current.set(committee.epoch() as f64);
+        self.metrics.boundary_timestamp_seconds.set(self.epoch_boundary as f64);
         // Produce a "dummy" epoch 0 EpochRecord if missing.
         // This will let us use simple code to find any epoch including 0 at startup.
         if !self.consensus_chain.epochs().contains_epoch(0).await {
@@ -425,6 +429,7 @@ where
                 error!(target: "epoch-manager", "error sending consensus output to engine: {}", e);
                 return Err(e);
             }
+            self.metrics.replayed_outputs_total.increment(1);
             last_replayed_hash = Some(output_hash);
             if is_epoch_close {
                 return Ok(ReplayResult {

@@ -10,6 +10,7 @@ use crate::{
     engine::{ExecutionNode, TnBuilder},
     health::HealthcheckServer,
     manager::spawn_epoch_vote_collector,
+    metrics::EpochMetrics,
 };
 use eyre::eyre;
 use state_sync::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_recent_consensus};
@@ -29,7 +30,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 mod epoch;
-use epoch::RunEpochMode;
+pub(crate) use epoch::RunEpochMode;
 
 /// The long-running task manager name.
 const NODE_TASK_MANAGER: &str = "Node Task Manager";
@@ -95,6 +96,9 @@ pub(crate) struct EpochManager<P, DB> {
 
     /// The version string for the running node.
     version_str: &'static str,
+
+    /// Prometheus metrics for the epoch lifecycle.
+    metrics: EpochMetrics,
 }
 
 /// Restore the [`GasAccumulator`] state after a mid-epoch restart.
@@ -231,6 +235,7 @@ where
             consensus_chain,
             bootstrap_servers,
             version_str,
+            metrics: EpochMetrics::default(),
         }
     }
 

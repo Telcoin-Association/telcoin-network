@@ -1,6 +1,6 @@
 //! Prometheus metrics for the primary (consensus layer).
 
-use crate::ConsensusBusApp;
+use crate::{ConsensusBusApp, NodeMode};
 use reth_metrics::{
     metrics::{Counter, Gauge, Histogram},
     Metrics,
@@ -68,10 +68,12 @@ pub fn spawn_bus_metrics_mirror(
     let metrics = bus.metrics().clone();
     let mut rx_round = bus.primary_round_updates().subscribe();
     let mut rx_committed = bus.committed_round_updates().subscribe();
+    let mut rx_mode = bus.node_mode().subscribe();
 
     // prime gauges with current values
     metrics.round.set(*rx_round.borrow_and_update() as f64);
     metrics.committed_round.set(*rx_committed.borrow_and_update() as f64);
+    set_node_mode_gauges(&rx_mode.borrow_and_update());
 
     task_spawner.spawn_task("bus-metrics-mirror", async move {
         loop {
@@ -89,11 +91,33 @@ pub fn spawn_bus_metrics_mirror(
                     }
                     metrics.committed_round.set(*rx_committed.borrow_and_update() as f64);
                 }
+                res = rx_mode.changed() => {
+                    if res.is_err() {
+                        break;
+                    }
+                    let mode = *rx_mode.borrow_and_update();
+                    set_node_mode_gauges(&mode);
+                }
             }
         }
         debug!(target: "primary::metrics", "bus metrics mirror shutting down");
         Ok(())
     });
+}
+
+/// One-hot `tn_node_mode{mode=...}` gauges: exactly one of the three series is 1.
+///
+/// Grafana renders this as a state timeline; one-hot avoids encoding the enum as
+/// magic numbers.
+fn set_node_mode_gauges(mode: &NodeMode) {
+    let states = [
+        ("cvv_active", mode.is_active_cvv()),
+        ("cvv_inactive", mode.is_cvv_inactive()),
+        ("observer", mode.is_observer()),
+    ];
+    for (label, active) in states {
+        metrics::gauge!("tn_node.mode", "mode" => label).set(if active { 1.0 } else { 0.0 });
+    }
 }
 
 #[cfg(test)]
