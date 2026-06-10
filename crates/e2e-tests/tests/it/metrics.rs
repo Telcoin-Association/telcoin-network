@@ -97,7 +97,21 @@ fn test_metrics_endpoint_serves_tn_and_reth_metrics() -> eyre::Result<()> {
     // pre-scrape hook), and process metrics
     let body = scrape_until_contains(
         &metrics_addr,
-        &["tn_info{", "reth_db_table_size", "reth_process_cpu_seconds_total"],
+        &[
+            // server + recorder infrastructure
+            "tn_info{",
+            "reth_db_table_size",
+            "reth_process_cpu_seconds_total",
+            // per-crate instrumentation registered on a running validator
+            "tn_primary_round",
+            "tn_epoch_current",
+            "tn_node_mode{",
+            "tn_engine_queued_outputs",
+            "tn_worker_batches_sealed_total",
+            "tn_batch_builder_base_fee",
+            "tn_executor_outputs_ready_total",
+            "tn_network_connected_peers",
+        ],
         45,
     )?;
 
