@@ -23,7 +23,7 @@ use std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tn_reth::{CanonStateNotificationStream, ChangedAccount, RethEnv, TxPool as _, WorkerTxPool};
 use tn_types::{
@@ -35,8 +35,11 @@ use tracing::{debug, error, field, info_span, Instrument};
 
 mod batch;
 mod error;
+mod metrics;
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
+
+use crate::metrics::BatchBuilderMetrics;
 
 /// The result of a successful batch build containing data needed to update the pool.
 #[derive(Debug)]
@@ -92,6 +95,8 @@ pub struct BatchBuilder {
     base_fee: u64,
     /// The epoch we are building batches for.
     epoch: Epoch,
+    /// Prometheus metrics for this worker's batch builder.
+    metrics: BatchBuilderMetrics,
 }
 
 impl BatchBuilder {
@@ -111,6 +116,9 @@ impl BatchBuilder {
         let max_delay_interval = tokio::time::interval(max_delay);
         let state_changed = reth_env.canonical_block_stream();
         let last_canonical_update = Self::latest_canon_block(reth_env);
+        let metrics = BatchBuilderMetrics::new_for_worker(worker_id);
+        // constant per epoch
+        metrics.base_fee.set(base_fee as f64);
         Self {
             pending_task: None,
             pool,
@@ -123,6 +131,7 @@ impl BatchBuilder {
             worker_id,
             base_fee,
             epoch,
+            metrics,
         }
     }
 
@@ -147,11 +156,13 @@ impl BatchBuilder {
         let (result, done) = oneshot::channel();
         let worker_id = self.worker_id;
         let base_fee = self.base_fee;
+        let metrics = self.metrics.clone();
 
         let span = info_span!(target: "telcoin", "propose-batch", batch = field::Empty, worker_id, base_fee, epoch = self.epoch);
         let span_clone = span.clone();
         // spawn block building task and forward to worker
         self.task_spawner.spawn_task("next-batch", async move {
+            let seal_start = Instant::now();
             // ack once worker reaches quorum
             let (ack, rx) = oneshot::channel();
 
@@ -171,9 +182,12 @@ impl BatchBuilder {
             // wait for worker to ack quorum reached then update pool with mined transactions
             match rx.await {
                 Ok(res) => {
+                    // measures build + broadcast + quorum, regardless of outcome
+                    metrics.seal_duration_seconds.record(seal_start.elapsed());
                     match res {
                         Ok(_) => {
                             debug!(target: "worker::batch-builder", ?res, "received ack");
+                            metrics.batches_sealed_total.increment(1);
                             // signal to Self that this task is complete
                             if let Err(e) = result.send(Ok(MinedBatchResult { mined_transactions, changed_accounts })) {
                                 error!(target: "worker::batch_builder", ?e, "failed to send block builder result to block builder task");
@@ -181,6 +195,7 @@ impl BatchBuilder {
                         }
                         Err(error) => {
                             error!(target: "worker::batch_builder", ?error, "error while sealing batch");
+                            metrics.record_seal_failure(worker_id, &error);
                             let converted = match error {
                                 BlockSealError::FatalDBFailure => {
                                     // fatal - return error
@@ -258,6 +273,7 @@ impl Future for BatchBuilder {
             // only propose one block at a time
             if this.pending_task.is_none() {
                 // check for pending transactions
+                this.metrics.pending_pool_transactions.set(this.pool.pool_size().pending as f64);
                 if this.pool.pending_transactions().is_empty() {
                     // reset interval to wake up after some time
                     //
