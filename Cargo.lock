@@ -11300,6 +11300,7 @@ dependencies = [
  "tn-config",
  "tn-node",
  "tn-reth",
+ "tn-storage",
  "tn-types",
  "tokio",
  "tracing",

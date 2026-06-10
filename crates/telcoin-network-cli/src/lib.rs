@@ -13,6 +13,7 @@
 
 pub mod args;
 pub mod cli;
+pub mod db;
 pub mod genesis;
 pub mod keytool;
 pub mod node;

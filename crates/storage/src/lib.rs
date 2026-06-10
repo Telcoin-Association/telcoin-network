@@ -25,6 +25,7 @@ pub mod layered_db;
 #[cfg(feature = "reth-libmdbx")]
 pub mod mdbx;
 pub mod mem_db;
+pub mod pack_validate;
 pub mod redb;
 
 pub use tn_types::error::StoreError;
