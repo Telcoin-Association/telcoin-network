@@ -4,10 +4,14 @@
 //! been certified.
 
 use crate::{
+    metrics::WorkerMetrics,
     network::{error::WorkerNetworkResult, WorkerNetworkHandle},
     WorkerNetworkError,
 };
-use std::collections::{BTreeSet, HashMap};
+use std::{
+    collections::{BTreeSet, HashMap},
+    time::Instant,
+};
 use tn_storage::{consensus::ConsensusChain, tables::NodeBatchesCache};
 use tn_types::{now, Batch, BlockHash, Database, DbTxMut, Epoch, B256};
 use tracing::{debug, error, instrument};
@@ -21,6 +25,8 @@ pub(crate) struct BatchFetcher<DB> {
     batch_store: DB,
     /// The consensus chain.
     consensus_chain: ConsensusChain,
+    /// Prometheus metrics for fetch operations.
+    metrics: WorkerMetrics,
 }
 
 /// Retrieve a batch from local storage for batch_digest.
@@ -110,8 +116,9 @@ impl<DB: Database> BatchFetcher<DB> {
         network: WorkerNetworkHandle,
         batch_store: DB,
         consensus_chain: ConsensusChain,
+        metrics: WorkerMetrics,
     ) -> Self {
-        Self { network, batch_store, consensus_chain }
+        Self { network, batch_store, consensus_chain, metrics }
     }
 
     /// Bulk fetches payload from local storage and remote workers.
@@ -125,6 +132,17 @@ impl<DB: Database> BatchFetcher<DB> {
     /// possible 32bytes * 300 = 9.6 kb => well within 1MB max message size
     #[instrument(level = "debug", skip_all, fields(num_digests = missing_digests.len()))]
     pub(crate) async fn fetch_for_primary(
+        &self,
+        missing_digests: BTreeSet<BlockHash>,
+    ) -> WorkerNetworkResult<HashMap<BlockHash, Batch>> {
+        let fetch_start = Instant::now();
+        let result = self.fetch_for_primary_inner(missing_digests).await;
+        self.metrics.record_batch_fetch_duration(fetch_start.elapsed());
+        result
+    }
+
+    /// Inner fetch loop for [`Self::fetch_for_primary`] (split out so the wrapper can time it).
+    async fn fetch_for_primary_inner(
         &self,
         mut missing_digests: BTreeSet<BlockHash>,
     ) -> WorkerNetworkResult<HashMap<BlockHash, Batch>> {
@@ -141,7 +159,9 @@ impl<DB: Database> BatchFetcher<DB> {
             }
 
             // 1) fetch from local storage
+            let local_before = fetched_batches.len();
             self.fetch_local(&mut missing_digests, &mut fetched_batches).await?;
+            self.metrics.record_batches_fetched("local", fetched_batches.len() - local_before);
 
             // return if all batches recovered
             if missing_digests.is_empty() {
@@ -156,6 +176,7 @@ impl<DB: Database> BatchFetcher<DB> {
             // re-check local storage and try peers again.
             if let Ok(mut new_batches) = self.request_batches_from_peers(&mut missing_digests).await
             {
+                self.metrics.record_batches_fetched("remote", new_batches.len());
                 // set received_at timestamp for remote batches
                 let mut updated_new_batches = HashMap::new();
                 let mut txn = self.batch_store.write_txn().map_err(|e| {
@@ -430,6 +451,7 @@ mod tests {
             handle,
             db,
             ConsensusChain::new(temp_dir.path().to_path_buf()).expect("consensus chain"),
+            crate::metrics::WorkerMetrics::new_for_worker(0),
         );
 
         let result = fetcher.fetch_for_primary(digests.clone()).await.expect("fetch local batches");
@@ -452,6 +474,7 @@ mod tests {
             handle,
             db,
             ConsensusChain::new(temp_dir.path().to_path_buf()).expect("consensus chain"),
+            crate::metrics::WorkerMetrics::new_for_worker(0),
         );
 
         let result = fetcher.fetch_for_primary(digests.clone()).await.expect("fetch local batches");
@@ -487,6 +510,7 @@ mod tests {
             handle.clone(),
             db,
             ConsensusChain::new(temp_dir.path().to_path_buf()).expect("consensus chain"),
+            crate::metrics::WorkerMetrics::new_for_worker(0),
         );
 
         // step 1: fetch_local finds 1 batch, leaves 4 missing

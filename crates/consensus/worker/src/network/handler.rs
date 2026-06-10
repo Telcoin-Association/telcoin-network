@@ -6,6 +6,7 @@ use super::{
 };
 use crate::{
     batch_fetcher::get_batch_local_cache,
+    metrics::WorkerMetrics,
     network::{stream_codec, PendingBatchStream},
 };
 use futures::AsyncWriteExt as _;
@@ -37,6 +38,8 @@ pub struct RequestHandler<DB> {
     consensus_config: ConsensusConfig<DB>,
     /// Network handle- so we can respond to gossip.
     network_handle: WorkerNetworkHandle,
+    /// Prometheus metrics for peer batch handling.
+    metrics: WorkerMetrics,
 }
 
 impl<DB> RequestHandler<DB>
@@ -50,7 +53,8 @@ where
         consensus_config: ConsensusConfig<DB>,
         network_handle: WorkerNetworkHandle,
     ) -> Self {
-        Self { id, validator, consensus_config, network_handle }
+        let metrics = WorkerMetrics::new_for_worker(id);
+        Self { id, validator, consensus_config, network_handle, metrics }
     }
 
     /// Process gossip from the committee.
@@ -157,7 +161,9 @@ where
         let client = self.consensus_config.local_network().clone();
         let store = self.consensus_config.node_storage().clone();
         // validate batch - log error if invalid
-        self.validator.validate_batch(sealed_batch.clone())?;
+        self.validator
+            .validate_batch(sealed_batch.clone())
+            .inspect_err(|_| self.metrics.record_batch_validation_failure())?;
 
         let (mut batch, digest) = sealed_batch.split();
 
