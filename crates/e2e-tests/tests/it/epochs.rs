@@ -242,6 +242,14 @@ async fn assert_tn_registry_endpoints<P: Provider>(provider: &P) -> eyre::Result
         provider.raw_request("tn_getValidator".into(), (known_validator,)).await?;
     assert_eq!(from_tn, from_contract, "tn_getValidator mismatch for {known_validator}");
 
+    // concurrent-burst smoke test: fire 3x the 64-permit semaphore bound at once.
+    // the RPC-layer guard must queue excess reads (not reject), so every request resolves Ok.
+    // catches deadlock or spurious rejection in the acquire-before-spawn path.
+    let burst = (0..192).map(|_| provider.raw_request::<_, u32>("tn_getCurrentEpoch".into(), ()));
+    for res in futures::future::join_all(burst).await {
+        res.expect("tn_getCurrentEpoch must succeed under concurrent load");
+    }
+
     Ok(())
 }
 

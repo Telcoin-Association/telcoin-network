@@ -7,11 +7,13 @@ use crate::{
 use async_trait::async_trait;
 use jsonrpsee::proc_macros::rpc;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tn_reth::{error::RegistryReadError, system_calls::ConsensusRegistry, ChainSpec, RethEnv};
 use tn_types::{
     Address, BlockHash, Bytes, ConsensusHeader, Epoch, EpochCertificate, EpochRecord, Genesis,
     SolCall, SolType, SolValue, B256, U256,
 };
+use tokio::sync::{oneshot, Semaphore};
 
 /// Response for `tn_getBalanceBreakdown`.
 ///
@@ -153,6 +155,20 @@ pub trait TelcoinNetworkRpcExtApi {
     async fn undistributed_issuance(&self) -> TelcoinNetworkRpcResult<U256>;
 }
 
+/// Maximum number of concurrent blocking [`ConsensusRegistry`] reads served by the `tn`
+/// namespace.
+///
+/// Each public read builds a fresh EVM and state snapshot at the canonical tip - synchronous
+/// database/CPU work on a blocking thread. A semaphore permit is held for the full lifetime of
+/// the blocking work, so this bounds true blocking-pool occupancy, not just in-flight requests.
+///
+/// Mirrors reth's `eth_call` guard (`DEFAULT_MAX_BLOCKING_IO_REQUEST` = 256): tokio's blocking
+/// pool defaults to 512 threads and grows unbounded under request load without a bound. Set
+/// below reth's 256 because reth's own eth namespace shares the same pool; 64 keeps headroom
+/// for BLS signing and engine blocking tasks. Lives at the RPC layer only, so consensus-critical
+/// reads (`epoch_state_from_canonical_tip`) are never throttled by RPC traffic.
+const MAX_CONCURRENT_REGISTRY_READS: usize = 64;
+
 /// The type that implements `tn` namespace trait.
 #[derive(Debug)]
 pub struct TelcoinNetworkRpcExt<N: EngineToPrimary> {
@@ -164,6 +180,10 @@ pub struct TelcoinNetworkRpcExt<N: EngineToPrimary> {
     ///
     /// The interface that handles primary <-> engine network communication.
     inner_node_network: N,
+    /// Bounds concurrent blocking [`ConsensusRegistry`] reads (see
+    /// [`MAX_CONCURRENT_REGISTRY_READS`]). Acquired before spawning the blocking read and held
+    /// until it completes, capping blocking-pool occupancy from RPC load.
+    blocking_io_guard: Arc<Semaphore>,
 }
 
 #[async_trait]
@@ -352,26 +372,49 @@ impl<N: EngineToPrimary> TelcoinNetworkRpcExt<N> {
     /// Create new instance of the Telcoin Network RPC extension.
     pub fn new(evm_state: RethEnv, inner_node_network: N) -> Self {
         let chain = evm_state.chainspec();
-        Self { chain, evm_state, inner_node_network }
+        let blocking_io_guard = Arc::new(Semaphore::new(MAX_CONCURRENT_REGISTRY_READS));
+        Self { chain, evm_state, inner_node_network, blocking_io_guard }
     }
 
     /// Execute a read-only [`ConsensusRegistry`] call at the canonical tip and decode the result.
     ///
-    /// EVM reads are synchronous database/CPU work, so they run on a blocking task to avoid
-    /// stalling the async runtime on a public endpoint.
+    /// EVM reads are synchronous database/CPU work, so they run on the protocol [`TaskSpawner`]'s
+    /// blocking pool to avoid stalling the async runtime on a public endpoint. A
+    /// [`MAX_CONCURRENT_REGISTRY_READS`] permit is acquired before spawning and moved into the
+    /// blocking task, so it is released only when the work finishes — bounding blocking-pool
+    /// occupancy even if a client disconnects mid-read.
     ///
     /// On-chain reverts surface to the client eth_call-style (code 3 with revert bytes in
     /// `data`); internal failures are logged server-side and return a generic error.
+    ///
+    /// [`TaskSpawner`]: tn_types::TaskSpawner
     async fn registry_read<T>(&self, calldata: Bytes) -> TelcoinNetworkRpcResult<T>
     where
         T: SolValue + Send + 'static,
         T: From<<<T as SolValue>::SolType as SolType>::RustType>,
     {
+        // bound concurrent blocking reads; queues (does not reject) at capacity, mirroring
+        // reth's eth_call guard. acquire only fails if the semaphore is closed, which never
+        // happens because it lives as long as the RPC server.
+        let permit = self.blocking_io_guard.clone().acquire_owned().await.map_err(|e| {
+            tracing::warn!(target: "tn::rpc", error = %e, "registry read semaphore closed");
+            TNRpcError::Internal
+        })?;
+
         let evm = self.evm_state.clone();
-        tokio::task::spawn_blocking(move || evm.read_consensus_registry::<T>(calldata))
-            .await
+        let (tx, rx) = oneshot::channel();
+        self.evm_state.get_task_spawner().spawn_blocking_task("tn-rpc-registry-read", move || {
+            // hold the permit until the blocking read completes
+            let _permit = permit;
+            if tx.send(evm.read_consensus_registry::<T>(calldata)).is_err() {
+                tracing::debug!(target: "tn::rpc", "registry read receiver dropped before result");
+            }
+            Ok(())
+        });
+
+        rx.await
             .map_err(|e| {
-                tracing::warn!(target: "tn::rpc", error = %e, "registry read task join error");
+                tracing::warn!(target: "tn::rpc", error = %e, "registry read result channel closed");
                 TNRpcError::Internal
             })?
             .map_err(|report| match report.downcast_ref::<RegistryReadError>() {
