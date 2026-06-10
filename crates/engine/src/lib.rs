@@ -7,7 +7,9 @@
 #![allow(unused_crate_dependencies)]
 
 mod error;
+mod metrics;
 mod payload_builder;
+use crate::metrics::ENGINE_METRICS;
 use error::EngineResult;
 pub use error::TnEngineError;
 use futures::{Future, StreamExt};
@@ -125,6 +127,7 @@ impl ExecutorEngine {
             let engine_update_tx = self.engine_update_tx.clone();
             // spawn blocking task and return future
             self.task_spawner.spawn_blocking_task(task_name, move || {
+                let execution_start = std::time::Instant::now();
                 // this is safe to call on blocking thread without a semaphore bc it's held in
                 // Self::pending_tesk as a single `Option`
                 let result =
@@ -132,6 +135,7 @@ impl ExecutorEngine {
                         .inspect_err(|e| {
                             error!(target: "engine", ?e, "error executing consensus output");
                         });
+                ENGINE_METRICS.execution_duration_seconds.record(execution_start.elapsed());
                 if let Err(e) = tx.send(result) {
                     warn!(target: "engine", ?e, "error sending result from execute_consensus_output")
                 }
@@ -208,7 +212,9 @@ impl Future for ExecutorEngine {
             match this.consensus_output_stream.poll_next_unpin(cx) {
                 Poll::Ready(Some(output)) => {
                     // queue the output for local execution
-                    this.queued.push_back(output)
+                    this.queued.push_back(output);
+                    // backlog growth means execution is falling behind consensus
+                    ENGINE_METRICS.queued_outputs.set(this.queued.len() as f64);
                 }
                 Poll::Ready(None) => {
                     // the stream has ended
@@ -247,6 +253,9 @@ impl Future for ExecutorEngine {
                         let finalized_header = res.map_err(Into::into).and_then(|res| res)?;
                         // store last executed header in memory
                         this.parent_header = finalized_header;
+                        ENGINE_METRICS.outputs_executed_total.increment(1);
+                        ENGINE_METRICS.canonical_height.set(this.parent_header.number as f64);
+                        ENGINE_METRICS.queued_outputs.set(this.queued.len() as f64);
 
                         // check max_round to auto shutdown
                         #[cfg(any(test, feature = "test-utils"))]
