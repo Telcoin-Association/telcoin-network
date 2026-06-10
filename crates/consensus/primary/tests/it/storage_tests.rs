@@ -4,7 +4,6 @@
 use futures::future::join_all;
 use std::{
     collections::{BTreeSet, HashSet},
-    sync::Arc,
     time::Instant,
 };
 use tempfile::TempDir;
@@ -19,8 +18,8 @@ use tn_storage::{
 };
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Database, EpochRecord,
-    Hash as _, Header, HeaderBuilder, ReputationScores, Round,
+    AuthorityIdentifier, Certificate, CommittedSubDag, Database, EpochRecord, Hash as _, Header,
+    HeaderBuilder, HeaderDigest, ReputationScores, Round,
 };
 
 fn create_header_for_round(round: Round) -> Header {
@@ -32,8 +31,8 @@ fn create_header_for_round(round: Round) -> Header {
         .author(id)
         .round(round)
         .epoch(fixture.committee().epoch())
-        .parents([CertificateDigest::default()].iter().cloned().collect())
-        .with_payload_batch(fixture_batch_with_transactions(10), 0)
+        .parents([HeaderDigest::default()].iter().cloned().collect())
+        .with_payload_batch(&fixture_batch_with_transactions(10), 0)
         .build()
 }
 
@@ -118,13 +117,14 @@ async fn test_consensus_store_read_latest_final_reputation_scores() {
 
     // AND we add some commits without any final scores
     for sequence_number in 0..10 {
-        let sub_dag = Arc::new(CommittedSubDag::new(
-            vec![],
-            Certificate::default(),
+        let cert = Certificate::default();
+        let sub_dag = CommittedSubDag::new(
+            vec![cert.clone()],
+            cert,
             sequence_number,
             ReputationScores::new(&committee),
             None,
-        ));
+        );
 
         consensus_chain.write_subdag_for_test(sequence_number, sub_dag).await;
     }
@@ -145,13 +145,8 @@ async fn test_consensus_store_read_latest_final_reputation_scores() {
             scores.final_of_schedule = true;
         }
 
-        let sub_dag = Arc::new(CommittedSubDag::new(
-            vec![],
-            Certificate::default(),
-            sequence_number,
-            scores,
-            None,
-        ));
+        let cert = Certificate::default();
+        let sub_dag = CommittedSubDag::new(vec![cert.clone()], cert, sequence_number, scores, None);
 
         consensus_chain.write_subdag_for_test(sequence_number, sub_dag).await;
     }
@@ -162,7 +157,7 @@ async fn test_consensus_store_read_latest_final_reputation_scores() {
         .await
         .unwrap();
 
-    assert!(commit.reputation_score.final_of_schedule);
+    assert!(commit.reputation_scores().final_of_schedule);
 }
 
 #[tokio::test]
@@ -219,7 +214,7 @@ async fn test_write_all_and_read_all_by_store_type<DB: CertificateStore>(store: 
     // GIVEN
     // create certificates for 10 rounds
     let certs = certificates(10);
-    let ids = certs.iter().map(|c| c.digest()).collect::<Vec<CertificateDigest>>();
+    let ids = certs.iter().map(|c| c.digest()).collect::<Vec<HeaderDigest>>();
 
     // store them in both main and secondary index
     store.write_all(certs.iter()).unwrap();
@@ -250,7 +245,7 @@ async fn test_certificate_store_next_round_number() {
     let mut certs = Vec::new();
     for r in &rounds {
         let mut c = cert.clone();
-        c.header_mut_for_test().update_round_for_test(*r);
+        c.update_header_round_for_test(*r);
         certs.push(c);
     }
 
@@ -393,7 +388,7 @@ async fn test_certificate_store_notify_read() {
     // run the tests a few times
     for _ in 0..10 {
         let mut certs = certificates(3);
-        let mut ids = certs.iter().map(|c| c.digest()).collect::<Vec<CertificateDigest>>();
+        let mut ids = certs.iter().map(|c| c.digest()).collect::<Vec<HeaderDigest>>();
 
         let cloned_store = store.clone();
 

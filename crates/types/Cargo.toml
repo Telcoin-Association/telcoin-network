@@ -18,7 +18,6 @@ bincode = { workspace = true }
 reth-primitives = { workspace = true }
 reth-chainspec = { workspace = true }
 reth-tasks = { workspace = true }
-derive_builder = { workspace = true }
 futures = { workspace = true }
 indexmap = { workspace = true }
 rand = { workspace = true }
@@ -32,7 +31,6 @@ url = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "macros", "signal"] }
 tracing = { workspace = true }
 eyre = { workspace = true }
-once_cell = { workspace = true }
 parking_lot = { workspace = true }
 secp256k1 = { workspace = true }
 libp2p = { workspace = true, features = ["serde"] }

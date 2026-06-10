@@ -13,7 +13,7 @@ use libp2p::{
 use std::{collections::HashSet, net::IpAddr, time::Instant};
 use tn_config::PeerConfig;
 use tn_types::{BlsPublicKey, NetworkPublicKey};
-use tracing::error;
+use tracing::{error, warn};
 
 /// Information about a given connected peer.
 /// Note that bls_public_key and network_key are Optional.
@@ -34,8 +34,6 @@ pub(super) struct Peer {
     ///
     /// These are used to manage the banning process and are exchanged with peers.
     multiaddrs: HashSet<Multiaddr>,
-    /// The listening multiaddrs advertised by this peer.
-    listening_addrs: Vec<Multiaddr>,
     /// Connection status of the peer.
     connection_status: ConnectionStatus,
     /// Trusted peers are specifically included by node operators.
@@ -54,15 +52,10 @@ pub(super) struct Peer {
 
 impl Peer {
     /// Create a new trusted peer.
-    pub(super) fn new_trusted(
-        bls_public_key: BlsPublicKey,
-        network_key: NetworkPublicKey,
-        listening_addrs: Vec<Multiaddr>,
-    ) -> Peer {
+    pub(super) fn new_trusted(bls_public_key: BlsPublicKey, network_key: NetworkPublicKey) -> Peer {
         Self {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
-            listening_addrs,
             score: Score::new_max(),
             is_trusted: true,
             config: Default::default(),
@@ -73,20 +66,19 @@ impl Peer {
         }
     }
 
-    /// Create a new trusted peer.
+    /// Create a new peer with its known multiaddrs.
     pub(super) fn new(
         bls_public_key: BlsPublicKey,
         network_key: NetworkPublicKey,
-        listening_addrs: Vec<Multiaddr>,
+        addrs: Vec<Multiaddr>,
     ) -> Peer {
         Self {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
-            listening_addrs,
             score: Score::default(),
             is_trusted: false,
             config: Default::default(),
-            multiaddrs: Default::default(),
+            multiaddrs: addrs.into_iter().collect(),
             connection_status: Default::default(),
             connection_direction: Default::default(),
             routable: false,
@@ -100,11 +92,9 @@ impl Peer {
         let mut rng = StdRng::from_seed([0; 32]);
         let bls_public_key = *BlsKeypair::generate(&mut rng).public();
         let network_key: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
-        let listening_addrs = vec![Multiaddr::empty()];
         Self {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
-            listening_addrs,
             score: Score::new_max(),
             is_trusted: false,
             config: Default::default(),
@@ -132,6 +122,15 @@ impl Peer {
         self.bls_public_key
     }
 
+    /// This peer's libp2p [PeerId], derived from its network public key.
+    ///
+    /// Returns `None` if the network key is not yet known. The derivation is a pure,
+    /// total function of the network key, so any peer with a recorded bls key (which is
+    /// always set alongside the network key) also has a recoverable [PeerId].
+    pub(super) fn peer_id(&self) -> Option<PeerId> {
+        self.network_key.as_ref().map(|network_key| network_key.clone().into())
+    }
+
     /// Return a peer's reputation based on the aggregate score.
     pub(super) fn reputation(&self) -> Reputation {
         match self.score.aggregate_score() {
@@ -156,7 +155,20 @@ impl Peer {
 
     /// Apply a penalty to the peer's score.
     pub(super) fn apply_penalty(&mut self, penalty: Penalty) -> Reputation {
-        if !self.is_trusted {
+        if self.is_trusted {
+            // Trusted peers (current-epoch committee, configured allowlist) bypass
+            // the score model entirely. Severe/Fatal suppressions are operationally
+            // significant: they hint that a committee member is misbehaving in ways
+            // that would normally ban an untrusted peer. Surface as a warn! so ops
+            // can correlate downstream issues with the original signal.
+            if matches!(penalty, Penalty::Severe | Penalty::Fatal) {
+                warn!(
+                    target: "peer-manager",
+                    ?penalty,
+                    "skipping severe/fatal penalty for trusted peer"
+                );
+            }
+        } else {
             self.score.apply_penalty(penalty);
         }
 
@@ -320,18 +332,17 @@ impl Peer {
         }
     }
 
-    /// Update multiaddrs for the peer.
+    /// Revoke a peer's trusted status, returning it to the normal score model.
     ///
-    /// Returns a boolean indicating if the multiaddr was newly recorded.
-    pub(super) fn update_listening_addrs(&mut self, multiaddrs: Vec<Multiaddr>) -> bool {
-        let mut res = false;
-        for multiaddr in multiaddrs {
-            if !self.listening_addrs.contains(&multiaddr) {
-                self.listening_addrs.push(multiaddr);
-                res = true;
-            }
-        }
-        res
+    /// Called when a peer rotates out of all three committee slots. Only the flag is cleared;
+    /// the score is left as-is so the demoted peer gets a soft landing (heartbeat decay and
+    /// penalties resume immediately now that `is_trusted` is false).
+    ///
+    /// NOTE: `is_trusted` currently conflates committee-derived trust with operator-allowlist
+    /// trust (`new_trusted`/`add_trusted_peer`); demoting clears both for a peer that was in a
+    /// committee.
+    pub(super) fn make_untrusted(&mut self) {
+        self.is_trusted = false;
     }
 
     /// Update peer record to indicate participation in kad as a routable peer.

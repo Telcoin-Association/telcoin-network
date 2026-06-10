@@ -197,11 +197,12 @@ impl<'de> Deserialize<'de> for Authority {
 }
 
 /// The committee lists all validators that participate in consensus.
-#[derive(Serialize, Deserialize, Debug, Eq, PartialEq, Default)]
+#[derive(Serialize, Deserialize, Debug, Eq, Default)]
 struct CommitteeInner {
     /// The authorities of epoch.
     authorities: BTreeMap<BlsPublicKey, Authority>,
     /// Keeps and index of the Authorities by their respective identifier
+    /// This is a helper struct, not included in serde or equality.
     #[serde(skip)]
     authorities_by_id: BTreeMap<AuthorityIdentifier, Authority>,
     /// The epoch number of this committee
@@ -213,7 +214,17 @@ struct CommitteeInner {
     #[serde(skip)]
     validity_threshold: VotingPower,
     /// The bootstrap servers to initially join a network (probably the initial committee).
+    /// Note, not included in partial eq since they are not relevand to overall committee equality.
     bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapServer>,
+}
+
+impl PartialEq for CommitteeInner {
+    fn eq(&self, other: &Self) -> bool {
+        self.epoch == other.epoch
+            && self.quorum_threshold == other.quorum_threshold
+            && self.validity_threshold == other.validity_threshold
+            && self.authorities.eq(&other.authorities)
+    }
 }
 
 impl CommitteeInner {

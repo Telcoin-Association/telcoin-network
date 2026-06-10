@@ -3,27 +3,29 @@
 use crate::{
     error::PrimaryNetworkError,
     network::{
-        message::{ConsensusResult, PrimaryGossip},
-        MissingCertificatesRequest, RequestHandler,
+        message::{ConsensusResult, PrimaryGossip, PrimaryResponse},
+        MissingCertificatesRequest, PendingEpochStream, RequestHandler,
+        MAX_CONCURRENT_EPOCH_STREAMS, PENDING_REQUEST_TIMEOUT,
     },
     state_sync::StateSynchronizer,
     ConsensusBus, ConsensusBusApp, NodeMode, RecentBlocks,
 };
 use assert_matches::assert_matches;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
-    time::Duration,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 use tempfile::TempDir;
 use tn_config::Parameters;
 use tn_network_libp2p::{GossipMessage, TopicHash};
-use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
+use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, tables::Votes};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     error::HeaderError, now, AuthorityIdentifier, BlockHash, BlockHeader, BlockNumHash,
-    BlsPublicKey, Certificate, CertificateDigest, EpochVote, ExecHeader, Hash as _, SealedHeader,
-    TaskManager, B256,
+    BlsPublicKey, Certificate, ConsensusHeaderDigest, ConsensusNumHash, Database, Epoch, EpochVote,
+    ExecHeader, Hash as _, HeaderDigest, SealedHeader, TaskManager, VoteDigest, VoteInfo, B256,
 };
 use tracing::debug;
 
@@ -94,7 +96,11 @@ async fn create_test_types_with_params(path: &Path, params: Option<Parameters>) 
 
     // set the latest execution result to genesis - test headers are proposed for round 1
     let mut recent = RecentBlocks::new(1);
-    recent.push_latest(0, BlockNumHash::new(0, B256::default()), Some(parent.clone()));
+    recent.push_latest(
+        0,
+        ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+        Some(parent.clone()),
+    );
     cb.app().recent_blocks().send_replace(recent);
 
     let consensus_chain =
@@ -109,6 +115,43 @@ async fn create_test_types_with_params(path: &Path, params: Option<Parameters>) 
 /// committee.
 async fn create_test_types(path: &Path) -> TestTypes {
     create_test_types_with_params(path, None).await
+}
+
+/// Helper function to create an instance of [RequestHandler] for the first authority of a
+/// committee at the supplied epoch. Mirrors [`create_test_types_with_params`] but threads the
+/// epoch through the [`CommitteeFixture`] builder so that the handler's view of the committee
+/// reports `epoch` rather than the default `0`.
+async fn create_test_types_at_epoch(path: &Path, epoch: Epoch) -> TestTypes {
+    let committee =
+        CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).epoch(epoch).build();
+    let authority = committee.first_authority();
+    let config = authority.consensus_config();
+    let cb = ConsensusBus::new();
+
+    // spawn the synchronizer
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(config.clone(), cb.clone(), task_manager.get_spawner());
+    synchronizer.spawn(&task_manager);
+
+    // last execution result
+    let parent = SealedHeader::seal_slow(ExecHeader::default());
+
+    // set the latest execution result to genesis - test headers are proposed for round 1
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(
+        0,
+        ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+        Some(parent.clone()),
+    );
+    cb.app().recent_blocks().send_replace(recent);
+
+    let consensus_chain =
+        ConsensusChain::new_for_test(path.to_owned(), committee.committee()).await.unwrap();
+    let consensus_bus = cb.app().clone();
+    let handler =
+        RequestHandler::new(config.clone(), cb.app().clone(), synchronizer, consensus_chain);
+    TestTypes { committee, handler, parent, consensus_bus, task_manager }
 }
 
 #[tokio::test]
@@ -132,6 +175,49 @@ async fn test_vote_succeeds() -> eyre::Result<()> {
     let res = handler.vote(peer, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
     assert!(res.is_ok());
+    Ok(())
+}
+
+/// Regression test: a stale `VoteInfo` from a prior epoch left over in the `Votes` table must
+/// not block a vote on a header from the current epoch. Without the explicit
+/// `header.epoch() > vote_info.epoch()` branch in the vote handler, an older entry's `round`
+/// would short-circuit the equivocation check and reject the new header as a duplicate vote.
+#[tokio::test]
+async fn test_vote_succeeds_with_stale_prior_epoch_vote_info() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types_at_epoch(temp_dir.path(), 1).await;
+
+    // Seed the Votes table with a stale entry from epoch 0 keyed under the authority that
+    // will submit the current-epoch header. F3 should clear this row on epoch close, so the
+    // scenario is theoretically impossible — but the new branch defends against the row
+    // leaking, and the regression test pins that defence in place.
+    let author_id = committee.last_authority().id();
+    let stale = VoteInfo { epoch: 0, round: 5, vote_digest: VoteDigest::default() };
+    committee
+        .first_authority()
+        .consensus_config()
+        .node_storage()
+        .insert::<Votes>(&author_id, &stale)?;
+
+    // current-epoch (epoch=1) header from the same author at round 1
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1) // parent is 0
+        .build();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    let res = handler.vote(peer, header, vec![]).await?;
+    assert_matches!(res, PrimaryResponse::Vote(_));
+
+    // The stale row must have been overwritten with a current-epoch entry.
+    let stored: Option<VoteInfo> =
+        committee.first_authority().consensus_config().node_storage().get::<Votes>(&author_id)?;
+    let stored = stored.expect("vote info written");
+    assert_eq!(stored.epoch, committee.committee().epoch());
+    assert_eq!(stored.round, 1);
+
     Ok(())
 }
 
@@ -197,7 +283,7 @@ async fn test_vote_fails_invalid_genesis_parent() -> eyre::Result<()> {
     // start with the expected parents in genesis
     let mut expected_parents: Vec<_> =
         Certificate::genesis(&committee.committee()).iter().map(|x| x.digest()).collect();
-    let extra_parent = CertificateDigest::new(BlockHash::random().0);
+    let extra_parent = HeaderDigest::new(BlockHash::random().0);
     expected_parents.pop();
     expected_parents.push(extra_parent);
     let wrong_genesis: BTreeSet<_> = expected_parents.into_iter().collect();
@@ -234,27 +320,6 @@ async fn test_vote_fails_unknown_execution_result() -> eyre::Result<()> {
     let res = handler.vote(peer, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
     assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::UnknownExecutionResult(wrong_hash))) if wrong_hash.hash == BlockHash::ZERO);
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_vote_fails_invalid_header_digest() -> eyre::Result<()> {
-    // common types
-    let temp_dir = TempDir::new().unwrap();
-    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
-        create_test_types(temp_dir.path()).await;
-
-    let parents = Vec::new();
-
-    // create header proposed by last peer in the committee for round 1
-    let mut header = committee.header_from_last_authority();
-    // change values so digest doesn't match
-    header.latest_execution_block = BlockNumHash::new(0, BlockHash::random());
-    let peer = *committee.last_authority().authority().protocol_key();
-
-    // process vote
-    let res = handler.vote(peer, header, parents).await;
-    assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidHeaderDigest)));
     Ok(())
 }
 
@@ -668,7 +733,7 @@ async fn test_behind_consensus_committed_round_prevents_false_positive() {
     // Without the fix: effective_exec_round = 18, 18 + 40 = 58 < 59 → false positive!
     // With the fix: effective_exec_round = max(0, 18, 59) = 59, 59 + 40 = 99 > 59 → correct.
     let mut recent = RecentBlocks::new(1);
-    recent.push_latest(18, BlockNumHash::new(0, B256::default()), None);
+    recent.push_latest(18, ConsensusNumHash::new(0, ConsensusHeaderDigest::default()), None);
     consensus_bus.recent_blocks().send_replace(recent);
 
     // Set committed round to 59 (as Bullshark would)
@@ -689,10 +754,67 @@ async fn test_behind_consensus_genuinely_behind() {
     // Incoming gossip is at round 60 in the same epoch.
     // effective_exec_round = max(0, 5, 5) = 5, gc_depth = 40, 5 + 40 = 45 < 60 → behind.
     let mut recent = RecentBlocks::new(1);
-    recent.push_latest(5, BlockNumHash::new(0, B256::default()), None);
+    recent.push_latest(5, ConsensusNumHash::new(0, ConsensusHeaderDigest::default()), None);
     consensus_bus.recent_blocks().send_replace(recent);
     consensus_bus.committed_round_updates().send_replace(5);
 
     let result = handler.behind_consensus(0, 60, None).await;
     assert!(result, "genuinely behind node should be detected");
+}
+
+/// A peer that re-requests the same epoch while an entry is already pending must not be
+/// able to reset the cleanup timer. If the replacement path rearmed `created_at`, a peer
+/// could re-request every 20s and hold a slot forever. This test exercises the
+/// preservation logic used by `process_epoch_stream` and verifies the entry is evicted on
+/// schedule relative to the *original* insertion time.
+#[tokio::test]
+async fn test_pending_epoch_stream_replacement_preserves_created_at() {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_EPOCH_STREAMS));
+    let mut pending_map: HashMap<(BlsPublicKey, B256), PendingEpochStream> = HashMap::new();
+
+    let peer = BlsPublicKey::default();
+    let digest = B256::random();
+    let key = (peer, digest);
+    let epoch: u32 = 7;
+
+    // initial insertion at T0, where T0 is just past the cleanup horizon so we can
+    // assert eviction without waiting on wall-clock time
+    let t0 = Instant::now() - PENDING_REQUEST_TIMEOUT - Duration::from_secs(1);
+    let permit = semaphore.clone().try_acquire_owned().expect("permit available");
+    pending_map.insert(key, PendingEpochStream::new_with_created_at(epoch, permit, t0));
+
+    // simulate a re-request: production code looks up the existing entry's
+    // `created_at` and reuses it when building the replacement
+    let new_permit = semaphore.clone().try_acquire_owned().expect("permit available");
+    let preserved_created_at =
+        pending_map.get(&key).map(|p| p.created_at).unwrap_or_else(Instant::now);
+    let replacement =
+        PendingEpochStream { epoch, created_at: preserved_created_at, _permit: new_permit };
+    assert!(pending_map.insert(key, replacement).is_some(), "expected replacement");
+
+    // the replacement must carry the original `created_at`, not a fresh one
+    let after = pending_map.get(&key).expect("entry present after replacement");
+    assert_eq!(
+        after.created_at, t0,
+        "replacement must preserve original created_at to prevent cleanup-timer reset"
+    );
+
+    // cleanup mirrors `PrimaryNetwork::cleanup_stale_pending_requests`: entries whose
+    // age >= PENDING_REQUEST_TIMEOUT must be evicted. Since created_at is t0 (stale),
+    // the entry must drop.
+    let now = Instant::now();
+    pending_map
+        .retain(|_, pending| now.duration_since(pending.created_at) < PENDING_REQUEST_TIMEOUT);
+
+    assert!(
+        pending_map.is_empty(),
+        "stale entry must be evicted by cleanup even though it was 'replaced' moments ago"
+    );
+
+    // and the permit must have returned to the semaphore
+    assert_eq!(
+        semaphore.available_permits(),
+        MAX_CONCURRENT_EPOCH_STREAMS,
+        "dropping the evicted pending entry must release its semaphore permit"
+    );
 }

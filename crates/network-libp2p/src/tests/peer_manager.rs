@@ -3,7 +3,10 @@
 use super::*;
 use crate::common::{create_multiaddr, random_ip_addr};
 use assert_matches::assert_matches;
-use libp2p::swarm::{ConnectionId, NetworkBehaviour as _};
+use libp2p::{
+    core::Endpoint,
+    swarm::{ConnectionId, NetworkBehaviour as _},
+};
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::{
     collections::{HashMap, HashSet},
@@ -551,6 +554,7 @@ async fn test_is_validator() {
     let config = authority_1.consensus_config();
     let mut peer_manager = PeerManager::new(config.network_config().peer_config());
     let validator = *authority_1.authority().protocol_key();
+    let validator_peer_id: PeerId = config.key_config().primary_network_public_key().into();
     let random_peer_id = PeerId::random();
 
     let info = NetworkInfo {
@@ -561,12 +565,124 @@ async fn test_is_validator() {
     };
     peer_manager.add_known_peer(validator, info);
 
-    // update epoch with random multiaddr
+    // set the current committee (no previous/next committee for this test)
     let committee = config.committee_pub_keys();
-    peer_manager.new_epoch(committee);
+    peer_manager.update_committees(HashSet::new(), committee, HashSet::new());
+
+    // Verify the registered committee member is a validator
+    assert!(peer_manager.is_peer_validator(&validator_peer_id));
 
     // Verify random peer is not a validator
     assert!(!peer_manager.is_peer_validator(&random_peer_id));
+}
+
+#[tokio::test]
+async fn test_update_committees_triggers_missing_authorities_for_unknown_next_keys() {
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // generate a bls key that was never registered via add_known_peer
+    let unknown_bls = *BlsKeypair::generate(&mut StdRng::from_seed([9; 32])).public();
+
+    // update with a next committee that contains the unknown key
+    peer_manager.update_committees(HashSet::new(), HashSet::new(), HashSet::from([unknown_bls]));
+
+    // exactly one MissingAuthorities event referencing the unknown key should be emitted
+    let events = collect_all_events(&mut peer_manager);
+    let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
+    assert!(missing_events.len() == 1, "Expect one missing authorities event");
+    assert_matches!(
+        missing_events.first().unwrap(),
+        PeerEvent::MissingAuthorities(missing) if missing.contains(&unknown_bls)
+    );
+}
+
+#[tokio::test]
+async fn test_update_committees_does_not_trigger_for_unknown_previous() {
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // generate a bls key that was never registered via add_known_peer
+    let unknown_bls = *BlsKeypair::generate(&mut StdRng::from_seed([9; 32])).public();
+
+    // the unknown key appears ONLY in the previous committee (peers rotating out are not chased)
+    peer_manager.update_committees(HashSet::from([unknown_bls]), HashSet::new(), HashSet::new());
+
+    // no MissingAuthorities event should be emitted for a previous-only unknown key
+    let events = collect_all_events(&mut peer_manager);
+    let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
+    assert!(
+        missing_events.is_empty(),
+        "previous-committee-only unknown keys must not trigger MissingAuthorities"
+    );
+}
+
+#[tokio::test]
+async fn test_prepare_committee_dial_unbans_without_touching_slots() {
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // build a known committee member
+    let mut rng = StdRng::from_seed([3; 32]);
+    let bls = *BlsKeypair::generate(&mut rng).public();
+    let netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let peer_id: PeerId = netkey.clone().into();
+    let info = NetworkInfo {
+        pubkey: netkey,
+        multiaddrs: vec![create_multiaddr(None)],
+        timestamp: now(),
+        rpc: None,
+    };
+    peer_manager.add_known_peer(bls, info);
+
+    // manually temp-ban the peer
+    peer_manager.temporarily_banned.insert(peer_id);
+    assert!(peer_manager.peer_banned(&peer_id));
+
+    // prepare the committee for dialing
+    peer_manager.prepare_committee_dial(HashSet::from([bls]));
+
+    // the peer is unbanned but the committee slots remain untouched
+    assert!(!peer_manager.peer_banned(&peer_id), "prepare_committee_dial should unban the peer");
+    assert!(
+        !peer_manager.is_peer_validator(&peer_id),
+        "prepare_committee_dial must not populate committee slots"
+    );
+}
+
+#[tokio::test]
+async fn test_add_known_peer_closes_validator_gap_on_discovery() {
+    // GAP FIX (full): a committee member set by bls before its network identity is known is tracked
+    // in the slot but does not yet resolve to a validator by its libp2p id. The moment kad
+    // discovery confirms the identity via `add_known_peer`, the lazy-trust hook makes it a
+    // validator and marks it important -- without waiting for the next epoch's
+    // `update_committees`.
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // a committee member whose network identity is not yet known to this node
+    let mut rng = StdRng::from_seed([7; 32]);
+    let bls = *BlsKeypair::generate(&mut rng).public();
+    let netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let peer_id: PeerId = netkey.clone().into();
+    let info = NetworkInfo {
+        pubkey: netkey,
+        multiaddrs: vec![create_multiaddr(None)],
+        timestamp: now(),
+        rpc: None,
+    };
+
+    // set the current committee with the member present by bls, BEFORE discovering its peer id
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+
+    // GAP: the member is tracked by bls, but its libp2p id does not resolve to a validator yet
+    assert!(!peer_manager.is_peer_validator(&peer_id), "unknown peer id must not resolve yet");
+
+    // kad discovery confirms the network identity, which applies committee trust immediately
+    peer_manager.add_known_peer(bls, info);
+
+    // gap closed the instant discovery completed: validator + important (trusted)
+    assert!(peer_manager.is_peer_validator(&peer_id), "discovered member must now be a validator");
+    assert!(
+        peer_manager.peer_is_important(&peer_id),
+        "discovered member must be trusted/important"
+    );
 }
 
 #[tokio::test]
@@ -718,6 +834,93 @@ async fn test_banned_peer_dial_fails_and_ip_ban() {
     let dial_attempt =
         peer_manager.handle_pending_inbound_connection(connection_id, &local, &multiaddr);
     assert!(dial_attempt.is_err());
+}
+
+// Regression: a peer whose reputation is Banned but whose ConnectionStatus
+// has been flipped back to Disconnected (via the Unbanned transition) must
+// NOT be dialable. Pre-fix `can_dial` only consulted status + the
+// temporarily_banned LRU, so it returned `true` here and `kad` was free to
+// re-dial the banned peer.
+#[tokio::test]
+async fn test_can_dial_rejects_reputation_banned_disconnected_peer() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let peer_id = register_peer(&mut peer_manager, None);
+
+    // drive peer to reputation=Banned, ConnectionStatus=Banned
+    peer_manager.process_penalty(peer_id, Penalty::Fatal);
+    peer_manager.register_disconnected(&peer_id);
+    assert!(peer_manager.peer_banned(&peer_id));
+
+    // flip ConnectionStatus Banned -> Disconnected without touching reputation
+    let _ = peer_manager.peers.update_connection_status(&peer_id, NewConnectionStatus::Unbanned);
+
+    // clear temporarily_banned to isolate the rep-based ban check
+    peer_manager.temporarily_banned.remove(&peer_id);
+
+    // sanity: state is rep-banned + Disconnected + not temp-banned
+    assert!(!peer_manager.temporarily_banned.contains(&peer_id));
+    assert!(peer_manager.peer_banned(&peer_id), "rep+IP ban predicate still flags peer");
+    assert!(
+        peer_manager.peers.can_dial(&peer_id),
+        "low-level can_dial returns true for Disconnected status"
+    );
+
+    // The unified can_dial must reject the dial because reputation is Banned.
+    assert!(
+        !peer_manager.can_dial(&peer_id),
+        "can_dial must reject reputation-banned peer in Disconnected status"
+    );
+}
+
+// Regression: `PeerAction::Ban` must arm `temporarily_banned`, matching the
+// behavior of `Disconnect`/`DisconnectWithPX`. Without this, a peer that
+// transitions directly into the banned state via `process_ban` would slip
+// through the temp-ban LRU veto.
+#[tokio::test]
+async fn test_peer_action_ban_arms_temporarily_banned() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let peer_id = register_peer(&mut peer_manager, None);
+
+    assert!(!peer_manager.temporarily_banned.contains(&peer_id));
+
+    peer_manager.apply_peer_action(peer_id, PeerAction::Ban(Vec::new()));
+
+    assert!(
+        peer_manager.temporarily_banned.contains(&peer_id),
+        "PeerAction::Ban must arm temporarily_banned"
+    );
+}
+
+// Regression: an in-flight dial whose peer became banned mid-dial must be
+// rejected at `handle_pending_outbound_connection`. Pre-fix, the
+// `dial_attempt_already_registered` short-circuit returned `Ok(vec![])` with
+// no ban check, leaving the dial to fail later at the established stage and
+// triggering a tight retry loop.
+#[tokio::test]
+async fn test_pending_outbound_rejected_when_dialing_state_and_banned() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let peer_id = PeerId::random();
+
+    // put peer into Dialing state so `dial_attempt_already_registered` returns true
+    peer_manager.register_dial_attempt(peer_id, None);
+    assert!(peer_manager.dial_attempt_already_registered(&peer_id));
+
+    // ban the peer mid-dial via temp-ban LRU
+    peer_manager.temporarily_banned.insert(peer_id);
+    assert!(peer_manager.peer_banned(&peer_id));
+
+    let connection_id = ConnectionId::new_unchecked(0);
+    let result = peer_manager.handle_pending_outbound_connection(
+        connection_id,
+        Some(peer_id),
+        &[],
+        Endpoint::Dialer,
+    );
+
+    assert!(
+        result.is_err(),
+        "pending outbound connection must be denied for banned peer in Dialing state"
+    );
 }
 
 #[test]

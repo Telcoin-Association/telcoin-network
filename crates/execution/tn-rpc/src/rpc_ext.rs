@@ -2,18 +2,23 @@
 
 use crate::{
     error::{TNRpcError, TelcoinNetworkRpcResult},
-    EngineToPrimary,
+    EngineToPrimary, RpcNodeInfo,
 };
 use async_trait::async_trait;
 use jsonrpsee::proc_macros::rpc;
-use tn_reth::ChainSpec;
-use tn_types::{BlockHash, ConsensusHeader, Epoch, EpochCertificate, EpochRecord, Genesis};
+use tn_reth::RethEnv;
+use tn_types::{ConsensusHeader, Epoch, EpochCertificate, EpochDigest, EpochRecord, Genesis};
 
 /// Telcoin Network RPC namespace.
 ///
 /// TN-specific RPC endpoints.
 #[rpc(server, namespace = "tn")]
 pub trait TelcoinNetworkRpcExtApi {
+    /// Return the node's information.
+    /// To include, names, ids, public keys, network addressed etc.
+    /// This should be all the publicly available information to identify and connect to this node.
+    #[method(name = "info")]
+    async fn info(&self) -> TelcoinNetworkRpcResult<RpcNodeInfo>;
     /// Return the latest consensus header.
     #[method(name = "latestConsensusHeader")]
     async fn latest_consensus_header(&self) -> TelcoinNetworkRpcResult<ConsensusHeader>;
@@ -35,15 +40,15 @@ pub trait TelcoinNetworkRpcExtApi {
     #[method(name = "epochRecordByHash")]
     async fn epoch_record_by_hash(
         &self,
-        hash: BlockHash,
+        hash: EpochDigest,
     ) -> TelcoinNetworkRpcResult<(EpochRecord, EpochCertificate)>;
 }
 
 /// The type that implements `tn` namespace trait.
 #[derive(Debug)]
 pub struct TelcoinNetworkRpcExt<N: EngineToPrimary> {
-    /// The chain id for this node.
-    chain: ChainSpec,
+    /// Type to interact with EVM state.
+    evm_state: RethEnv,
     /// The inner-node network.
     ///
     /// The interface that handles primary <-> engine network communication.
@@ -55,6 +60,9 @@ impl<N: EngineToPrimary> TelcoinNetworkRpcExtApiServer for TelcoinNetworkRpcExt<
 where
     N: Send + Sync + 'static,
 {
+    async fn info(&self) -> TelcoinNetworkRpcResult<RpcNodeInfo> {
+        Ok(self.inner_node_network.node_info().clone())
+    }
     async fn latest_consensus_header(&self) -> TelcoinNetworkRpcResult<ConsensusHeader> {
         Ok(self.inner_node_network.get_latest_consensus_block())
     }
@@ -64,7 +72,7 @@ where
     }
 
     async fn genesis(&self) -> TelcoinNetworkRpcResult<Genesis> {
-        Ok(self.chain.genesis().clone())
+        Ok(self.evm_state.chainspec().genesis().clone())
     }
 
     async fn epoch_record(
@@ -76,7 +84,7 @@ where
 
     async fn epoch_record_by_hash(
         &self,
-        hash: BlockHash,
+        hash: EpochDigest,
     ) -> TelcoinNetworkRpcResult<(EpochRecord, EpochCertificate)> {
         self.inner_node_network.epoch(None, Some(hash)).await.ok_or(TNRpcError::NotFound)
     }
@@ -84,7 +92,7 @@ where
 
 impl<N: EngineToPrimary> TelcoinNetworkRpcExt<N> {
     /// Create new instance of the Telcoin Network RPC extension.
-    pub fn new(chain: ChainSpec, inner_node_network: N) -> Self {
-        Self { chain, inner_node_network }
+    pub fn new(evm_state: RethEnv, inner_node_network: N) -> Self {
+        Self { evm_state, inner_node_network }
     }
 }

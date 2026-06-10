@@ -11,10 +11,9 @@ use crate::{
     },
     ensure,
     error::{CertificateError, CertificateResult, DagError, DagResult, HeaderError},
-    now,
     serde::RoaringBitmapSerde,
-    Authority, AuthorityIdentifier, BlockHash, Committee, Digest, Epoch, Hash, Header, Round,
-    TimestampSec, VotingPower,
+    Authority, AuthorityIdentifier, Committee, Epoch, Hash, Header, HeaderBuilder, HeaderDigest,
+    Round, TimestampSec, VotingPower,
 };
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
@@ -29,30 +28,31 @@ use std::{
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct Certificate {
     /// Certificate's header.
-    pub header: Header,
+    /// Header uses an inner Arc and is immutable (so cert can't be invalidated trivially).
+    header: Header,
     /// Container for [BlsAggregateSignatureBytes].
-    pub signature_verification_state: SignatureVerificationState,
+    signature_verification_state: SignatureVerificationState,
     /// Bitmap that indicates which authorities from committee signed this certificate.
     #[serde_as(as = "RoaringBitmapSerde")]
     signed_authorities: roaring::RoaringBitmap,
-    /// Timestamp for certificate creation.
-    ///
-    /// This is only used for performance metrics. Consensus relies on the header's timestamp.
-    created_at: TimestampSec,
 }
 
 impl Certificate {
+    /// Consume the cert and return the contained Header.
+    pub fn into_header(self) -> Header {
+        self.header
+    }
+
     /// Create a genesis certificate with empty payload.
     pub fn genesis(committee: &Committee) -> Vec<Self> {
         committee
             .authorities()
             .iter()
             .map(|authority| Self {
-                header: Header {
-                    author: authority.id(),
-                    epoch: committee.epoch(),
-                    ..Default::default()
-                },
+                header: HeaderBuilder::default()
+                    .author(authority.id())
+                    .epoch(committee.epoch())
+                    .build(),
                 ..Self::default()
             })
             .collect()
@@ -160,12 +160,7 @@ impl Certificate {
             SignatureVerificationState::Unverified(bls_signature)
         };
 
-        Ok(Certificate {
-            header,
-            signature_verification_state,
-            signed_authorities,
-            created_at: now(),
-        })
+        Ok(Certificate { header, signature_verification_state, signed_authorities })
     }
 
     /// Return the group of authorities that signed this certificate.
@@ -346,13 +341,6 @@ impl Certificate {
         &self.signature_verification_state
     }
 
-    /// The time (sec) when the certificate was created.
-    ///
-    /// This is only used for performance metrics. Consensus relies on the header's timestamp.
-    pub fn created_at(&self) -> &TimestampSec {
-        &self.created_at
-    }
-
     /// Set the state of the Signature verification.
     pub fn set_signature_verification_state(&mut self, state: SignatureVerificationState) {
         self.signature_verification_state = state;
@@ -384,18 +372,28 @@ impl Certificate {
         self.header = header;
     }
 
-    /// Return a mutable reference to the header.
-    ///
-    /// Only Used for testing.
-    pub fn header_mut_for_test(&mut self) -> &mut Header {
-        &mut self.header
+    /// Update the headers author for a test- not for production code.
+    pub fn update_header_author_for_test(&mut self, author: AuthorityIdentifier) {
+        let header_builder = HeaderBuilder::from_header(&self.header);
+        self.header = header_builder.author(author).build();
     }
 
-    /// Change the certificate's created_at timestamp.
-    ///
-    /// Only Used for testing.
-    pub fn update_created_at_for_test(&mut self, timestamp: TimestampSec) {
-        self.created_at = timestamp;
+    /// Update the headers round for a test- not for production code.
+    pub fn update_header_round_for_test(&mut self, round: Round) {
+        let header_builder = HeaderBuilder::from_header(&self.header);
+        self.header = header_builder.round(round).build();
+    }
+
+    /// Update the headers epoch for a test- not for production code.
+    pub fn update_header_epoch_for_test(&mut self, epoch: Epoch) {
+        let header_builder = HeaderBuilder::from_header(&self.header);
+        self.header = header_builder.epoch(epoch).build();
+    }
+
+    /// Update the headers created_at for a test- not for production code.
+    pub fn update_header_created_at_for_test(&mut self, created_at: TimestampSec) {
+        let header_builder = HeaderBuilder::from_header(&self.header);
+        self.header = header_builder.created_at(created_at).build();
     }
 }
 
@@ -472,54 +470,11 @@ pub fn validate_fetched_certificate(
     Ok(certificate)
 }
 
-/// Certificate digest.
-#[derive(
-    Clone, Copy, Default, PartialEq, Eq, std::hash::Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
-pub struct CertificateDigest(Digest<{ crypto::DIGEST_LENGTH }>);
-
-impl CertificateDigest {
-    /// Create a new instance of CertificateDigest.
-    pub fn new(digest: [u8; crypto::DIGEST_LENGTH]) -> Self {
-        CertificateDigest(Digest { digest })
-    }
-}
-
-impl AsRef<[u8]> for CertificateDigest {
-    fn as_ref(&self) -> &[u8] {
-        &self.0.digest
-    }
-}
-
-impl From<CertificateDigest> for Digest<{ crypto::DIGEST_LENGTH }> {
-    fn from(hd: CertificateDigest) -> Self {
-        hd.0
-    }
-}
-
-impl fmt::Debug for CertificateDigest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl fmt::Display for CertificateDigest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(f, "{}", self.0.to_string().get(0..16).ok_or(fmt::Error)?)
-    }
-}
-
 impl Hash<{ crypto::DIGEST_LENGTH }> for Certificate {
-    type TypedDigest = CertificateDigest;
+    type TypedDigest = HeaderDigest;
 
-    fn digest(&self) -> CertificateDigest {
-        CertificateDigest(Digest { digest: self.header.digest().into() })
-    }
-}
-
-impl From<CertificateDigest> for BlockHash {
-    fn from(value: CertificateDigest) -> Self {
-        Self::from(value.0.digest)
+    fn digest(&self) -> HeaderDigest {
+        self.header.digest()
     }
 }
 

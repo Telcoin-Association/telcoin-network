@@ -210,7 +210,7 @@ impl<DB: Database> Proposer<DB> {
             current_round,
             current_epoch,
             digests.iter().map(|m| (m.digest, m.worker_id)).collect(),
-            parents.iter().map(|x| x.digest()).collect(),
+            parents.iter().map(|x| x.header().digest()).collect(),
             consensus_bus.app().latest_execution_block_num_hash(),
         );
 
@@ -295,21 +295,15 @@ impl<DB: Database> Proposer<DB> {
     /// The min delay is reduced when this authority expects to become the leader of the next round.
     /// Reducing the min delay increases the chances of successfully committing a leader.
     ///
-    /// NOTE: If the next round is even, the leader schedule is used to identify the next leader. If
-    /// the next round is odd, the whole committee is used in order to keep the proposal rate as
-    /// high as possible (which leads to a higher round rates). Using the entire committee here also
-    /// helps boost scores for weaker nodes that may be trying to resync.
+    /// Leaders are only elected on even rounds. For even rounds, zero delay when this node is the
+    /// anticipated leader increases commit chance. For odd rounds, use min_header_delay so the
+    /// certifier has time to certify the previous (possibly batch-bearing) even round header
+    /// before it gets canceled by the next proposal.
     fn calc_min_delay(&self) -> Duration {
-        // check next round
         let next_round = self.round + 1;
 
-        // compare:
-        // - leader schedule for even rounds
-        // - entire committee for odd rounds
-        //
-        // NOTE: committee size is asserted >1 during Committee::load()
-        if !(next_round.is_multiple_of(2)
-            && self.leader_schedule.leader(next_round).id() != self.authority_id)
+        if next_round.is_multiple_of(2)
+            && self.leader_schedule.leader(next_round).id() == self.authority_id
         {
             Duration::ZERO
         } else {
@@ -586,6 +580,7 @@ impl<DB: Database> Proposer<DB> {
                     let res =
                         Proposer::repropose_header(header, proposer_store, &consensus_bus).await;
                     let _ = tx.send(res);
+                    Ok(())
                 });
             }
             // create new header
@@ -611,6 +606,7 @@ impl<DB: Database> Proposer<DB> {
                     .await;
 
                     let _ = tx.send(proposal);
+                    Ok(())
                 });
             }
         }
@@ -650,7 +646,7 @@ impl<DB: Database> Proposer<DB> {
             let rx_committed_own_headers = self.consensus_bus.subscribe_committed_own_headers();
             task_manager.spawn_critical_task("proposer task", async move {
                 info!(target: "primary::proposer", "Starting proposer");
-                self.run(rx_our_digests, rx_parents, rx_committed_own_headers).await
+                Ok(self.run(rx_our_digests, rx_parents, rx_committed_own_headers).await?)
             });
         }
         // If not an active CVV then don't propose anything.
@@ -810,6 +806,7 @@ impl<DB: Database> Proposer<DB> {
                         )
                         .await;
                         let _ = tx.send(res);
+                        Ok(())
                     });
                     max_delay_timed_out = false;
                     min_delay_timed_out = false;

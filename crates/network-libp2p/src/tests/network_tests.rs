@@ -49,7 +49,7 @@ fn create_test_peers<Req: TNMessage, Res: TNMessage>(
                 network_key,
                 db,
                 task_manager.get_spawner(),
-                KadStoreType::Primary,
+                NetworkType::Primary,
                 config.primary_address(),
                 None,
             )
@@ -71,6 +71,10 @@ fn create_test_peers<Req: TNMessage, Res: TNMessage>(
     (target, peers, task_manager)
 }
 
+/// ConsensusNetwork backed by in-memory kad store.
+type ConsensusNetworkMemoryDB<Req, Res> =
+    ConsensusNetwork<Req, Res, MemDatabase, mpsc::Sender<NetworkEvent<Req, Res>>>;
+
 /// A peer on TN
 struct TestPeer<Req, Res, DB = MemDatabase>
 where
@@ -84,8 +88,7 @@ where
     /// Network handle to send commands.
     network_handle: NetworkHandle<Req, Res>,
     /// The network task.
-    #[allow(clippy::type_complexity)]
-    network: Option<ConsensusNetwork<Req, Res, MemDatabase, mpsc::Sender<NetworkEvent<Req, Res>>>>,
+    network: Option<ConsensusNetworkMemoryDB<Req, Res>>,
 }
 /// A peer on TN
 struct NetworkPeer<Req, Res, DB = MemDatabase>
@@ -124,8 +127,21 @@ where
     Req: TNMessage,
     Res: TNMessage,
 {
+    create_test_types_with_config::<Req, Res>(NetworkConfig::default())
+}
+
+/// Variant of [`create_test_types`] that lets a caller customize [`NetworkConfig`]
+/// (e.g. shrink `kad_record_ttl` for a regression test).
+///
+/// The heartbeat-interval override applied by `create_test_types` is preserved here
+/// so callers can opt into a custom kad TTL without having to also remember the
+/// short heartbeat the peer manager needs in tests.
+fn create_test_types_with_config<Req, Res>(mut network_config: NetworkConfig) -> TestTypes<Req, Res>
+where
+    Req: TNMessage,
+    Res: TNMessage,
+{
     // custom network config with short heartbeat interval for peer manager
-    let mut network_config = NetworkConfig::default();
     network_config.peer_config_mut().heartbeat_interval = TEST_HEARTBEAT_INTERVAL;
 
     let all_nodes =
@@ -149,7 +165,7 @@ where
             network_key_1,
             MemDatabase::default(),
             task_manager.get_spawner(),
-            KadStoreType::Primary,
+            NetworkType::Primary,
             config_1.primary_address(),
             None,
         )
@@ -172,7 +188,7 @@ where
             network_key_2,
             MemDatabase::default(),
             task_manager.get_spawner(),
-            KadStoreType::Primary,
+            NetworkType::Primary,
             config_2.primary_address(),
             None,
         )
@@ -273,7 +289,8 @@ async fn test_valid_req_restt() -> eyre::Result<()> {
     }
 
     // expect response
-    let response = timeout(max_time, response_from_peer).await?.expect("outbound id recv")?;
+    let NetworkResponseMessage { peer: _, result: response } =
+        timeout(max_time, response_from_peer).await?.expect("outbound id recv")?;
     assert_eq!(response, batch_res);
 
     Ok(())
@@ -457,7 +474,6 @@ async fn test_outbound_failure_malicious_request() -> eyre::Result<()> {
     malicious_peer.start_listening(config_1.primary_address()).await?;
     honest_peer.start_listening(config_2.primary_address()).await?;
 
-    let malicious_peer_id = malicious_peer.local_peer_id().await?;
     let honest_peer_id = honest_peer.local_peer_id().await?;
     let honest_peer_addr = config_2.primary_address();
     let honest_peer_net = config_2.primary_networkkey();
@@ -484,7 +500,20 @@ async fn test_outbound_failure_malicious_request() -> eyre::Result<()> {
     // sleep for heartbeat
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
 
-    let peer_score_before_msg = honest_peer.peer_score(malicious_peer_id).await?.unwrap();
+    // Capture the malicious peer's view of the honest responder before the request.
+    //
+    // The contract under test: when a malformed *request* arrives at the responder,
+    // libp2p's `read_request` fails inside the codec and the responder drops the
+    // substream WITHOUT emitting `InboundFailure::Io` (see libp2p request-response
+    // 0.29 `lib.rs:1011-1014`). From the requester's side the failure surfaces as
+    // either `OutboundFailure::ConnectionClosed` or `OutboundFailure::Io` with a
+    // transport-flap `ErrorKind` (e.g. `UnexpectedEof`) — both are no-penalty
+    // under the new policy.
+    //
+    // The `Penalty::Medium` codec-violation path requires the malformed bytes to
+    // be a *response* (read_response on the requester returns `io::Error::other`).
+    // That is exercised separately by `test_outbound_failure_malicious_response`.
+    let malicious_view_before = malicious_peer.peer_score(honest_peer_id).await?.unwrap();
 
     // honest peer returns `OutboundFailure` error
     let response_from_peer = malicious_peer.send_request(malicious_msg, honest_bls).await?;
@@ -494,15 +523,23 @@ async fn test_outbound_failure_malicious_request() -> eyre::Result<()> {
 
     assert_matches!(res, Err(NetworkError::Outbound(_)));
 
-    // Allow time for penalty to be applied
+    // Allow time for any penalty propagation
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // TODO: the honest peer penalize the malicious requestor. see Issue #250
-    //
-    // assert honest peer's score is lower - penalties are applied immediately
-    // however, it should be the case that honest peer penalizes the malicious peer
-    let peer_score_after_msg = malicious_peer.peer_score(honest_peer_id).await?.unwrap();
-    assert!(peer_score_before_msg > peer_score_after_msg);
+    // Responder's score (from the requester's view) is unchanged: a transport-level
+    // OutboundFailure for a malformed-request scenario must not penalize the
+    // responder. Otherwise a peer who cannot satisfy a request would be banned by
+    // every requester — the ban-cascade that breaks observer joins on WAN.
+    let malicious_view_after = malicious_peer.peer_score(honest_peer_id).await?.unwrap();
+    assert_eq!(
+        malicious_view_before, malicious_view_after,
+        "requester must not penalize responder on transport-level OutboundFailure (before={malicious_view_before}, after={malicious_view_after})"
+    );
+
+    // Note: honest peer's penalty of the malicious requester via InboundFailure is
+    // NOT exercised here. libp2p request-response 0.29 does not emit
+    // InboundFailure::Io when read_request fails — see lib.rs:1011-1014.
+    // Dispatch-layer coverage for that path is tracked in Issue #250.
 
     Ok(())
 }
@@ -578,6 +615,140 @@ async fn test_outbound_failure_malicious_response() -> eyre::Result<()> {
     // OutboundFailure::Io(Custom { kind: Other, error: Custom("Invalid value was given to the
     // function") })
     assert_matches!(res, Err(NetworkError::Outbound(_)));
+
+    Ok(())
+}
+
+/// Regression test for cross-role network isolation.
+///
+/// A single node runs a primary and a worker `ConsensusNetwork` in the same
+/// process; they must never negotiate a working session with one another. Before
+/// role-derived protocol names, both spoke `/telcoin-network/0.0.0` (req/res) and
+/// `/tn-kad/1.0.0` (kad). Because kad records are keyed on the validator's BLS
+/// pubkey — identical for that validator's worker and primary — a primary could
+/// ingest a *worker's* `NodeRecord` and then dial/RPC it with primary protocols,
+/// penalizing and banning otherwise-healthy peers.
+///
+/// With `NetworkType::Primary` → `/tn-primary/*` and `NetworkType::Worker(0)` →
+/// `/tn-worker-0/*`, the cross-role substreams never negotiate: kad never exchanges
+/// records (so the worker's pushed record never resolves on the primary) and a
+/// req/res request surfaces an `OutboundFailure`. Both networks use IDENTICAL
+/// req/res message types here, so the only thing that can differ is the
+/// role-derived protocol name.
+#[tokio::test]
+async fn test_primary_worker_protocol_isolation() -> eyre::Result<()> {
+    // build two networks from the same committee
+    let mut network_config = NetworkConfig::default();
+    network_config.peer_config_mut().heartbeat_interval = TEST_HEARTBEAT_INTERVAL;
+
+    let all_nodes =
+        CommitteeFixture::builder(MemDatabase::default).with_network_config(network_config).build();
+    let mut authorities = all_nodes.authorities();
+    let config_1 = authorities.next().expect("first authority").consensus_config();
+    let config_2 = authorities.next().expect("second authority").consensus_config();
+    let (tx1, _events_1) = mpsc::channel(10);
+    let (tx2, _events_2) = mpsc::channel(10);
+    let task_manager = TaskManager::default();
+
+    // peer1: PRIMARY role
+    let primary_network = ConsensusNetwork::<
+        TestWorkerRequest,
+        TestWorkerResponse,
+        MemDatabase,
+        mpsc::Sender<NetworkEvent<TestWorkerRequest, TestWorkerResponse>>,
+    >::new(
+        config_1.network_config(),
+        tx1,
+        config_1.key_config().clone(),
+        config_1.key_config().primary_network_keypair().clone(),
+        MemDatabase::default(),
+        task_manager.get_spawner(),
+        NetworkType::Primary,
+        config_1.primary_address(),
+        None,
+    )
+    .expect("primary network created");
+    let primary = primary_network.network_handle();
+    tokio::spawn(async move {
+        primary_network.run().await.expect("primary network run failed!");
+    });
+
+    // peer2: WORKER role
+    let worker_network = ConsensusNetwork::<
+        TestWorkerRequest,
+        TestWorkerResponse,
+        MemDatabase,
+        mpsc::Sender<NetworkEvent<TestWorkerRequest, TestWorkerResponse>>,
+    >::new(
+        config_2.network_config(),
+        tx2,
+        config_2.key_config().clone(),
+        config_2.key_config().worker_network_keypair().clone(),
+        MemDatabase::default(),
+        task_manager.get_spawner(),
+        NetworkType::Worker(0),
+        config_2.worker_address(),
+        None,
+    )
+    .expect("worker network created");
+    let worker = worker_network.network_handle();
+    tokio::spawn(async move {
+        worker_network.run().await.expect("worker network run failed!");
+    });
+
+    // start listening
+    primary.start_listening(config_1.primary_address()).await?;
+    worker.start_listening(config_2.worker_address()).await?;
+    let worker_addr = worker.listeners().await?.first().expect("worker listen addr").clone();
+    let primary_peer_id = primary.local_peer_id().await?;
+
+    // the BLS key is identical for both of the validator's networks — exactly the
+    // shared key that previously let a worker's record contaminate a primary store.
+    let primary_bls = config_1.key_config().primary_public_key();
+    let worker_bls = config_2.key_config().primary_public_key();
+
+    // primary dials the worker across roles
+    primary
+        .add_explicit_peer(
+            worker_bls,
+            config_2.key_config().worker_network_public_key(),
+            worker_addr,
+        )
+        .await?;
+    primary.dial_by_bls(worker_bls).await?;
+
+    // allow the QUIC transport to connect and the kad/req-res substreams to (fail
+    // to) negotiate
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // positive control: the transport connection IS established across roles — the
+    // worker sees the primary's peer id — so the isolation below is protocol-level,
+    // not a failed dial.
+    assert!(
+        worker.connected_peer_ids().await?.contains(&primary_peer_id),
+        "transport connection across roles should establish"
+    );
+
+    // kad isolation: the primary pushes its record to the worker on connect, but
+    // the worker speaks a different kad protocol and never ingests it, so the
+    // worker never resolves the primary's BLS key. (The worker did NOT add the
+    // primary as an explicit peer, so a resolved BLS key could only come from kad.)
+    assert!(
+        !worker.connected_peers().await?.contains(&primary_bls),
+        "worker resolved primary's BLS key — kad records crossed roles"
+    );
+
+    // req/res isolation: a request to the worker cannot negotiate a protocol —
+    // the worker speaks `/tn-worker-0/*`, not the primary's `/tn-primary/*`. With
+    // identical message types, this can ONLY be a protocol-name mismatch.
+    let req = TestWorkerRequest::MissingBatches(vec![]);
+    let reply = primary.send_request(req, worker_bls).await?;
+    let res = timeout(Duration::from_secs(5), reply).await?.expect("reply channel");
+    assert_matches!(
+        res,
+        Err(NetworkError::Outbound(_)),
+        "cross-role req/res must fail to negotiate a protocol"
+    );
 
     Ok(())
 }
@@ -703,7 +874,7 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
     }
 
     // remove cvv from whitelist and try to publish again
-    nvv.update_authorized_publishers(HashMap::new()).await?;
+    nvv.subscribe_with_publishers(TEST_TOPIC.into(), HashSet::new()).await?;
 
     let random_block = fixture_batch_with_transactions(10);
     let sealed_block = random_block.seal_slow();
@@ -1306,10 +1477,13 @@ async fn test_new_epoch_unbans_committee_members() -> eyre::Result<()> {
         .into_iter()
         .collect();
 
-    // Send NewEpoch command to peer1
+    // Seed peer1's committee with peer2
     let handle = peer1.clone();
     tokio::spawn(async move {
-        handle.new_epoch(committee).await.expect("Failed to send NewEpoch command");
+        handle
+            .update_committees(Default::default(), committee, Default::default())
+            .await
+            .expect("Failed to send UpdateCommittees command");
     })
     .await?;
 
@@ -1380,7 +1554,6 @@ async fn test_new_epoch_unbans_committee_member_ip() -> eyre::Result<()> {
 
     // For peer2, multiaddr has the same IP as peer1 (127.0.0.1)
     let peer2_addr = peer2.config.primary_address();
-    let peer2_id = peer2.network_handle.local_peer_id().await?;
     // join network so kad record is available
     peer2.network_handle.start_listening(peer2_addr.clone()).await?;
     peer2.network_handle.dial(peer1_id, peer1_addr.clone()).await?;
@@ -1395,6 +1568,15 @@ async fn test_new_epoch_unbans_committee_member_ip() -> eyre::Result<()> {
         )
         .await?;
     target_peer.network_handle.dial_by_bls(peer1.config.key_config().primary_public_key()).await?;
+    // Explicitly add peer2 as well- we want to track it's score at the end.
+    target_peer
+        .network_handle
+        .add_explicit_peer(
+            peer2.config.key_config().primary_public_key(),
+            peer2.config.primary_networkkey(),
+            peer2.config.primary_address(),
+        )
+        .await?;
 
     // Wait for connection to establish
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1423,16 +1605,23 @@ async fn test_new_epoch_unbans_committee_member_ip() -> eyre::Result<()> {
         .into_iter()
         .collect();
 
-    target_peer.network_handle.new_epoch(committee).await?;
+    target_peer
+        .network_handle
+        .update_committees(Default::default(), committee, Default::default())
+        .await?;
 
     // wait for connection to establish
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
 
     // verify connection established with peer2
-    let connected_peers_after = target_peer.network_handle.connected_peer_ids().await?;
-    assert!(
-        connected_peers_after.contains(&peer2_id),
-        "Peer2 should be connected despite sharing IP with banned peer1"
+    let peer2_score = target_peer
+        .network_handle
+        .peer_score(peer2.network_handle.local_peer_id().await.unwrap())
+        .await?
+        .unwrap();
+    assert_eq!(
+        peer2_score, 100.0,
+        "Peer2 should have a high score despite sharing IP with banned peer1"
     );
 
     Ok(())
@@ -1495,10 +1684,13 @@ async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> 
         .into_iter()
         .collect();
 
-    // Send NewEpoch command to peer1
+    // Seed peer1's committee with peer2
     let handle = peer1.clone();
     tokio::spawn(async move {
-        handle.new_epoch(committee).await.expect("Failed to send NewEpoch command");
+        handle
+            .update_committees(Default::default(), committee, Default::default())
+            .await
+            .expect("Failed to send UpdateCommittees command");
     })
     .await?;
 
@@ -1521,6 +1713,168 @@ async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> 
     // Verify connection is established
     let connected_peers_after = peer1.connected_peer_ids().await?;
     assert!(connected_peers_after.contains(&peer2_id), "Peer2 should be connected after new epoch");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rotate_does_not_disconnect_previous_committee() -> eyre::Result<()> {
+    // Start with two peers
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let NetworkPeer { config: config_1, network_handle: peer1, network, .. } = peer1;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+
+    let NetworkPeer { config: config_2, network_handle: peer2, network, .. } = peer2;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+
+    peer1.start_listening(config_1.primary_address()).await?;
+    peer2.start_listening(config_2.primary_address()).await?;
+
+    let peer2_id = peer2.local_peer_id().await?;
+    let peer2_bls = config_2.key_config().primary_public_key();
+
+    // Connect peer1 -> peer2
+    peer1
+        .add_explicit_peer(
+            peer2_bls,
+            config_2.key_config().primary_network_public_key(),
+            config_2.primary_address(),
+        )
+        .await?;
+    peer1.dial_by_bls(peer2_bls).await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        peer1.connected_peer_ids().await?.contains(&peer2_id),
+        "peer2 should be connected before rotation"
+    );
+
+    // peer2 is in the CURRENT committee for this epoch
+    peer1
+        .update_committees(
+            Default::default(),
+            vec![peer2_bls].into_iter().collect(),
+            Default::default(),
+        )
+        .await?;
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+
+    // Update to the next epoch where peer2 has rotated out of `current` into `previous`: it is
+    // placed explicitly in the previous slot and absent from current/next. peer2 must NOT be
+    // disconnected, since it still counts as a validator (is_peer_validator spans the previous
+    // committee).
+    peer1
+        .update_committees(
+            vec![peer2_bls].into_iter().collect(),
+            Default::default(),
+            Default::default(),
+        )
+        .await?;
+
+    // Let several heartbeats run so any pruning of non-validator peers would take effect.
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 3)).await;
+
+    assert!(
+        peer1.connected_peer_ids().await?.contains(&peer2_id),
+        "peer2 must stay connected after rotating into the previous committee"
+    );
+    // peer2 stays trusted because it is still inside the three-slot window (now in `previous`), so
+    // it keeps the validator (max) score it was given on entering the committee.
+    let peer2_score = peer1.peer_score(peer2_id).await?.expect("peer2 score");
+    assert_eq!(
+        peer2_score,
+        config_1.network_config().peer_config().score_config.max_score,
+        "previous-committee peer should retain validator (max) score"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_gossip_explicit_peer_includes_next_committee() -> eyre::Result<()> {
+    // peer1 publishes; peer2 only ever appears in peer1's `next` committee and receives gossip.
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let NetworkPeer { config: config_1, network_handle: publisher, network, .. } = peer1;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+
+    let NetworkPeer {
+        config: config_2,
+        network_handle: next_peer,
+        network_events: mut next_peer_events,
+        network,
+    } = peer2;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+
+    publisher.start_listening(config_1.primary_address()).await?;
+    next_peer.start_listening(config_2.primary_address()).await?;
+    let publisher_addr =
+        publisher.listeners().await?.first().expect("publisher listen addr").clone();
+
+    let next_bls = config_2.key_config().primary_public_key();
+    let next_id = next_peer.local_peer_id().await?;
+
+    // Register peer2's network info with peer1, then place peer2 ONLY in peer1's `next` committee
+    // (peer1 never had peer2 in `current`). When peer2 connects, peer1's PeerConnected handler must
+    // treat it as important (is_peer_validator now spans `next`) and add it as a gossipsub explicit
+    // peer, so gossip reaches it.
+    publisher
+        .add_explicit_peer(
+            next_bls,
+            config_2.key_config().primary_network_public_key(),
+            config_2.primary_address(),
+        )
+        .await?;
+    publisher
+        .update_committees(
+            Default::default(),
+            Default::default(),
+            vec![next_bls].into_iter().collect(),
+        )
+        .await?;
+
+    // peer2 subscribes with peer1 as the authorized publisher and dials peer1.
+    next_peer
+        .subscribe_with_publishers(
+            TEST_TOPIC.into(),
+            vec![config_1.key_config().primary_public_key()].into_iter().collect(),
+        )
+        .await?;
+    next_peer
+        .add_trusted_peer_and_dial(
+            config_1.key_config().primary_public_key(),
+            config_1.key_config().primary_network_public_key(),
+            publisher_addr,
+        )
+        .await?;
+
+    // Allow the connection to establish and gossipsub to graft.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert!(
+        publisher.connected_peer_ids().await?.contains(&next_id),
+        "next-committee peer should be connected to the publisher"
+    );
+
+    // Publish and confirm the next-committee peer receives the gossip.
+    let block = fixture_batch_with_transactions(10).seal_slow();
+    let expected = Vec::from(&block);
+    publisher.publish(TEST_TOPIC.into(), expected.clone()).await?;
+    let event =
+        timeout(Duration::from_secs(2), next_peer_events.recv()).await?.expect("gossip received");
+    if let NetworkEvent::Gossip(msg, _) = event {
+        assert_eq!(msg.data, expected);
+    } else {
+        panic!("unexpected network event received");
+    }
 
     Ok(())
 }
@@ -1693,6 +2047,104 @@ async fn test_node_record_validation() {
 }
 
 #[tokio::test]
+async fn test_local_record_has_no_expiry() {
+    let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let record = peer1.network.get_peer_record();
+    // Must be `None`. libp2p's PutRecordJob::poll only refreshes `expires` via
+    // `.or_else(...)`, so a `Some(_)` value here causes the local RecordIter to
+    // filter our row after `kad_record_ttl` and the node goes invisible. See
+    // get_peer_record() for the full reasoning.
+    assert!(
+        record.expires.is_none(),
+        "local record must have expires: None (see nemesis-1 in security-eval-kad-table-bug.md)"
+    );
+}
+
+/// End-to-end check on the nemesis-1 fix: peer 1's *own* record must survive
+/// past `kad_record_ttl` (because `get_peer_record` sets `expires: None` and
+/// libp2p's `PutRecordJob` keeps refreshing it), while peer 1's *copy of peer
+/// 2's* record must drop off the read path once `expires: Some(_)` (filled in
+/// by peer 2's libp2p before sending) lapses with no further republishes.
+#[tokio::test]
+async fn test_killed_peer_record_expires_local_record_survives() -> eyre::Result<()> {
+    // Short TTL keeps the test fast. Publication interval is the libp2p check
+    // cadence for record refresh — must be < TTL.
+    let short_ttl = Duration::from_secs(2);
+    let mut network_config = NetworkConfig::default();
+    network_config.libp2p_config_mut().kad_record_ttl = short_ttl;
+    network_config.libp2p_config_mut().kad_publication_interval = Duration::from_millis(500);
+
+    let TestTypes { peer1, peer2, _task_manager } =
+        create_test_types_with_config::<TestWorkerRequest, TestWorkerResponse>(network_config);
+
+    let NetworkPeer {
+        config: config_1, network_handle: peer1_handle, network: peer1_network, ..
+    } = peer1;
+    let NetworkPeer {
+        config: config_2, network_handle: peer2_handle, network: peer2_network, ..
+    } = peer2;
+
+    let peer1_bls = config_1.key_config().primary_public_key();
+    let peer2_bls = config_2.key_config().primary_public_key();
+    let peer2_net = config_2.primary_networkkey();
+    let peer2_addr = config_2.primary_address();
+
+    let peer1_task = tokio::spawn(async move { peer1_network.run().await });
+    let peer2_task = tokio::spawn(async move { peer2_network.run().await });
+
+    peer1_handle.start_listening(config_1.primary_address()).await?;
+    peer2_handle.start_listening(peer2_addr.clone()).await?;
+
+    // Wire peer1 -> peer2 and wait for kad cross-publication.
+    peer1_handle.add_trusted_peer_and_dial(peer2_bls, peer2_net, peer2_addr).await?;
+    wait_for_peer_discovery(&peer1_handle, peer2_bls, Duration::from_secs(5)).await?;
+
+    // Poll until peer1 has stored peer2's record. `publish_our_data_to_peer`
+    // fires on PeerConnected, but the actual record-store write only lands
+    // after a round trip.
+    let kad_recv_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if peer1_handle.kad_store_get(peer2_bls).await?.is_some() {
+            break;
+        }
+        if tokio::time::Instant::now() >= kad_recv_deadline {
+            return Err(eyre!("timed out waiting for peer1 to receive peer2's kad record"));
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Sanity: peer1's own record also present before peer2 dies.
+    assert!(
+        peer1_handle.kad_store_get(peer1_bls).await?.is_some(),
+        "own record present after startup"
+    );
+
+    // Kill peer2 — no more republishes can refresh peer1's stored copy.
+    peer2_task.abort();
+    let _ = peer2_task.await;
+
+    // Wait past kad_record_ttl. Buffer covers SystemTime/Instant rounding.
+    tokio::time::sleep(short_ttl + Duration::from_secs(1)).await;
+
+    // Invariant 1: peer1's own record (expires: None) is still readable.
+    assert!(
+        peer1_handle.kad_store_get(peer1_bls).await?.is_some(),
+        "local record must survive past kad_record_ttl (regression on nemesis-1 fix)"
+    );
+
+    // Invariant 2: peer1's copy of peer2's record (expires: Some(_)) is filtered on read.
+    assert!(
+        peer1_handle.kad_store_get(peer2_bls).await?.is_none(),
+        "expired peer record must not be returned from kad store"
+    );
+
+    peer1_task.abort();
+    let _ = peer1_task.await;
+    drop(_task_manager);
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_newer_kad_record_replaced() -> eyre::Result<()> {
     let TestTypes { peer1, mut peer2, .. } =
         create_test_types::<TestWorkerRequest, TestWorkerResponse>();
@@ -1721,7 +2173,11 @@ async fn test_newer_kad_record_replaced() -> eyre::Result<()> {
         .store_mut()
         .get(&peer2_new_record.key)
         .expect("peer2 record in local kad store");
-    assert_eq!(old_kad_record, *store_record);
+    // Records carry an `Instant` `expires`, which loses precision across the
+    // SystemTime <-> Instant round-trip in `KadRecord`. Compare the stable fields.
+    assert_eq!(old_kad_record.key, store_record.key);
+    assert_eq!(old_kad_record.value, store_record.value);
+    assert_eq!(old_kad_record.publisher, store_record.publisher);
 
     // process new put request with newer record
     network
@@ -1734,7 +2190,9 @@ async fn test_newer_kad_record_replaced() -> eyre::Result<()> {
         .store_mut()
         .get(&peer2_new_record.key)
         .expect("peer2 record in local kad store");
-    assert_eq!(*store_record, peer2_new_record);
+    assert_eq!(store_record.key, peer2_new_record.key);
+    assert_eq!(store_record.value, peer2_new_record.value);
+    assert_eq!(store_record.publisher, peer2_new_record.publisher);
 
     Ok(())
 }
@@ -2015,7 +2473,7 @@ async fn test_startup_tolerates_legacy_and_corrupt_kad_records() -> eyre::Result
     // seed the DB before the network starts, simulating records that survived
     // a node restart from before the upgrade
     {
-        let mut kad_store = KadStore::new(db.clone(), config_1.key_config(), KadStoreType::Primary);
+        let mut kad_store = KadStore::new(db.clone(), config_1.key_config(), NetworkType::Primary);
 
         // valid pre-upgrade record signed by authority 2 over the legacy encoding
         let old_info = OldNetworkInfo {
@@ -2057,7 +2515,7 @@ async fn test_startup_tolerates_legacy_and_corrupt_kad_records() -> eyre::Result
         network_key,
         db.clone(),
         task_manager.get_spawner(),
-        KadStoreType::Primary,
+        NetworkType::Primary,
         config_1.primary_address(),
         None,
     )
@@ -2075,7 +2533,7 @@ async fn test_startup_tolerates_legacy_and_corrupt_kad_records() -> eyre::Result
 
     // the corrupt record was purged from the persistent store; the legacy
     // record's original signed bytes were preserved
-    let store = KadStore::new(db, config_1.key_config(), KadStoreType::Primary);
+    let store = KadStore::new(db, config_1.key_config(), NetworkType::Primary);
     assert!(store.get(&kad::RecordKey::new(&garbage_bls)).is_none(), "corrupt record purged");
     assert!(store.get(&kad::RecordKey::new(&owner_bls)).is_some(), "legacy record preserved");
 

@@ -27,8 +27,8 @@ use tn_test_utils::{
     create_signed_certificates_for_rounds, default_test_execution_node, CommitteeFixture,
 };
 use tn_types::{
-    adiri_genesis, gas_accumulator::GasAccumulator, Batch, BlockNumHash, ExecHeader, Notifier,
-    SealedHeader, TaskManager, TnReceiver as _, TnSender as _, B256,
+    adiri_genesis, gas_accumulator::GasAccumulator, Batch, ConsensusHeaderDigest, ConsensusNumHash,
+    ExecHeader, Notifier, SealedHeader, TaskManager, TnReceiver as _, TnSender as _, B256,
     DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::{
@@ -97,6 +97,7 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
         let res = engine.await;
         debug!(target: "gas-test", ?res, "res:");
         let _ = tx.send(res);
+        Ok(())
     });
 
     // subscribe to output early
@@ -126,7 +127,7 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
             // forward output from consensus to engine
             Some(output) = consensus_output.recv() => {
                 debug!(target: "gas-test", output=?output.leader(), round=output.leader().round(), "received output");
-                let leader = output.leader().origin().clone();
+                let leader = output.leader().author().clone();
                 // manually track values as well
                 rewards.entry(leader).and_modify(|count| *count += 1).or_insert(1);
                 to_engine.send(output).await?;
@@ -228,6 +229,7 @@ async fn test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
         let res = engine.await;
         debug!(target: "gas-test", ?res, "res:");
         let _ = tx.send(res);
+        Ok(())
     });
 
     let mut consensus_output = consensus_bus.app().subscribe_consensus_output();
@@ -276,7 +278,7 @@ async fn test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
     let mut rewards = HashMap::new();
     let mut empty_outputs_seen = 0u32;
     for (i, output) in real_outputs.into_iter().enumerate() {
-        let leader = output.leader().origin().clone();
+        let leader = output.leader().author().clone();
         rewards.entry(leader.clone()).and_modify(|count| *count += 1).or_insert(1);
         to_engine.send(output.clone()).await?;
 
@@ -285,18 +287,18 @@ async fn test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
         if i > 0 && i % 3 == 0 {
             use tn_types::{Certificate, CommittedSubDag, ConsensusOutput, ReputationScores};
             let mut empty_leader = Certificate::default();
-            empty_leader.header.round = output.leader().round();
-            empty_leader.header.epoch = output.leader().epoch();
-            empty_leader.header.created_at = tn_types::now();
-            empty_leader.header_mut_for_test().author = leader.clone();
+            empty_leader.update_header_round_for_test(output.leader().round());
+            empty_leader.update_header_epoch_for_test(output.leader().epoch());
+            empty_leader.update_header_created_at_for_test(tn_types::now());
+            empty_leader.update_header_author_for_test(leader.clone());
 
-            let empty_subdag = Arc::new(CommittedSubDag::new(
+            let empty_subdag = CommittedSubDag::new(
                 vec![empty_leader.clone()],
                 empty_leader,
                 synthetic_number,
                 ReputationScores::default(),
                 None,
-            ));
+            );
             let empty_output = ConsensusOutput::new(
                 empty_subdag.clone(),
                 output.parent_hash(),
@@ -395,6 +397,7 @@ async fn test_catchup_accumulator_partial_execution() -> eyre::Result<()> {
         let res = engine.await;
         debug!(target: "gas-test", ?res, "partial res:");
         let _ = tx.send(res);
+        Ok(())
     });
 
     let mut consensus_output = consensus_bus.app().subscribe_consensus_output();
@@ -417,7 +420,7 @@ async fn test_catchup_accumulator_partial_execution() -> eyre::Result<()> {
     loop {
         tokio::select! {
             Some(output) = consensus_output.recv() => {
-                let leader = output.leader().origin().clone();
+                let leader = output.leader().author().clone();
                 let round = output.leader().round();
                 if round <= engine_stop_round as u32 {
                     executed_rewards.entry(leader).and_modify(|c| *c += 1).or_insert(1u32);
@@ -505,7 +508,11 @@ async fn spawn_consensus(
     // spawn consensus to await certificates
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     consensus_bus.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
-    Consensus::spawn(config, consensus_bus, bullshark, task_manager, consensus_chain).await;
+    Consensus::spawn(config, consensus_bus, bullshark, task_manager, consensus_chain, None).await;
 }

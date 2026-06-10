@@ -20,7 +20,7 @@ use tn_primary::test_utils::mock_certificate_with_rand;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    Authority, AuthorityIdentifier, Certificate, CertificateDigest, Committee, Hash as _, Round,
+    Authority, AuthorityIdentifier, Certificate, Committee, Hash as _, HeaderDigest, Round,
     VotingPower,
 };
 use tokio::sync::mpsc::channel;
@@ -310,7 +310,7 @@ fn make_certificates_with_parameters(
     let mut certificates = VecDeque::new();
     let mut parents = initial_parents;
     let mut next_parents = Vec::new();
-    let mut certificate_digests: HashSet<CertificateDigest> =
+    let mut certificate_digests: HashSet<HeaderDigest> =
         parents.iter().map(|c| c.digest()).collect();
 
     for round in range {
@@ -347,7 +347,7 @@ fn make_certificates_with_parameters(
                 .map(|(a, inclusion_probability)| (a.id(), *inclusion_probability))
                 .collect();
 
-            let mut parent_digests: BTreeSet<CertificateDigest> = this_cert_parents_with_slow_nodes(
+            let mut parent_digests: BTreeSet<HeaderDigest> = this_cert_parents_with_slow_nodes(
                 &authority.id(),
                 current_parents.clone(),
                 ids.as_slice(),
@@ -366,7 +366,7 @@ fn make_certificates_with_parameters(
                 None
             };
 
-            let mut parent_digests: Vec<CertificateDigest> = parent_digests.into_iter().collect();
+            let mut parent_digests: Vec<HeaderDigest> = parent_digests.into_iter().collect();
 
             // Step 4 -- references to previous round
             // Now from the rest of current_parents, pick a random number - uniform - to how many
@@ -378,7 +378,7 @@ fn make_certificates_with_parameters(
             parent_digests.shuffle(&mut rand);
 
             // now keep only the num_of_parents_to_pick
-            let mut parents_digests: Vec<CertificateDigest> =
+            let mut parents_digests: Vec<HeaderDigest> =
                 parent_digests.into_iter().take(num_of_parents_to_pick as usize).collect();
 
             // Now swap one if necessary with our own
@@ -395,8 +395,7 @@ fn make_certificates_with_parameters(
                 "Failed on seed {seed}. At least 2f+1 parents are needed."
             );
 
-            let parents_digests: BTreeSet<CertificateDigest> =
-                parents_digests.into_iter().collect();
+            let parents_digests: BTreeSet<HeaderDigest> = parents_digests.into_iter().collect();
 
             // Now create the certificate with the provided parents
             let (_, certificate) = mock_certificate_with_rand(
@@ -493,7 +492,7 @@ fn generate_and_run_execution_plans(
             let (_outcome, committed_sub_dags) =
                 bullshark.process_certificate(&mut state, c).unwrap();
             for sub_dag in committed_sub_dags {
-                plan_committed_certificates.extend(sub_dag.certificates().iter().cloned());
+                plan_committed_certificates.extend(sub_dag.headers().iter().cloned());
             }
         }
 
@@ -534,7 +533,7 @@ fn create_execution_plan(
     let mut rand = rand::rngs::StdRng::seed_from_u64(seed);
 
     // Create a map of digest -> certificate
-    let digest_to_certificate: HashMap<CertificateDigest, Certificate> =
+    let digest_to_certificate: HashMap<HeaderDigest, Certificate> =
         certificates.clone().into_iter().map(|c| (c.digest(), c)).collect();
 
     // To model the DAG in form of edges and vertexes build an adjacency matrix.
@@ -542,8 +541,7 @@ fn create_execution_plan(
     // certificates. This is important because the algorithm ensures that no children will be
     // added to the final list unless all their dependencies (parent certificates) have first
     // been added earlier - so we respect the causal order.
-    let mut adjacency_parent_to_children: HashMap<CertificateDigest, Vec<CertificateDigest>> =
-        HashMap::new();
+    let mut adjacency_parent_to_children: HashMap<HeaderDigest, Vec<HeaderDigest>> = HashMap::new();
 
     // The nodes that have no incoming edges/dependencies (parent certificates) - initially are the
     // certificates of round 1 (we have no parents)

@@ -8,13 +8,16 @@ use std::{
     cmp::{max, Ordering},
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Debug,
-    sync::Arc,
 };
 use tn_config::ConsensusConfig;
-use tn_storage::{consensus::ConsensusChain, CertificateStore};
+use tn_storage::{
+    certificate_pack::{CertificatePack, PackError},
+    consensus::ConsensusChain,
+    CertificateStore,
+};
 use tn_types::{
-    AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Committee, Database,
-    Hash as _, Noticer, Round, TaskManager, Timestamp, TnReceiver, TnSender,
+    AuthorityIdentifier, Certificate, CommittedSubDag, Committee, Database, Hash as _,
+    HeaderDigest, Noticer, Round, TaskManager, TnReceiver, TnSender,
 };
 use tracing::{debug, error, info, instrument};
 
@@ -23,7 +26,7 @@ use tracing::{debug, error, info, instrument};
 mod consensus_tests;
 
 /// The representation of the DAG in memory.
-pub type Dag = BTreeMap<Round, HashMap<AuthorityIdentifier, (CertificateDigest, Certificate)>>;
+pub type Dag = BTreeMap<Round, HashMap<AuthorityIdentifier, (HeaderDigest, Certificate)>>;
 
 /// The state that needs to be persisted for crash-recovery.
 #[derive(Debug)]
@@ -37,7 +40,7 @@ pub struct ConsensusState {
     pub last_committed: HashMap<AuthorityIdentifier, Round>,
     /// The last committed sub dag. If value is None, it means that we haven't committed any sub
     /// dag yet.
-    pub last_committed_sub_dag: Option<Arc<CommittedSubDag>>,
+    pub last_committed_sub_dag: Option<CommittedSubDag>,
     /// Keeps the latest committed certificate (and its parents) for every authority. Anything
     /// older must be regularly cleaned up through the function `update`.
     pub dag: Dag,
@@ -59,7 +62,7 @@ impl ConsensusState {
         last_committed_round: Round,
         gc_depth: Round,
         recovered_last_committed: HashMap<AuthorityIdentifier, Round>,
-        latest_sub_dag: Option<Arc<CommittedSubDag>>,
+        latest_sub_dag: Option<CommittedSubDag>,
         cert_store: DB,
     ) -> Self {
         let last_round = ConsensusRound::new_with_gc_depth(last_committed_round, gc_depth);
@@ -166,12 +169,9 @@ impl ConsensusState {
             .or_insert_with(|| certificate.round());
         self.last_round = self.last_round.update(certificate.round(), self.gc_depth);
 
-        let commit_latency_ms = certificate.created_at().elapsed().as_millis() as u64;
-
         // Metric: certificate_commit_latency_ms - time from certificate creation to commit
         info!(
             target: "consensus::metrics",
-            certificate_commit_latency_ms = commit_latency_ms,
             round = certificate.round(),
             origin = ?certificate.origin(),
             digest = ?certificate.digest(),
@@ -197,7 +197,7 @@ impl ConsensusState {
             return Ok(());
         }
         if let Some(round_table) = dag.get(&(round - 1)) {
-            let store_parents: BTreeSet<&CertificateDigest> =
+            let store_parents: BTreeSet<&HeaderDigest> =
                 round_table.iter().map(|(_, (digest, _))| digest).collect();
             for parent_digest in certificate.header().parents() {
                 if !store_parents.contains(parent_digest) {
@@ -270,6 +270,10 @@ pub struct Consensus<DB> {
     /// Are we an active CVV?
     /// An active CVV is participating in consensus (not catching up or following as an NVV).
     active: bool,
+
+    /// Optional pack that is available we want to save all our certificates into
+    /// before sending to bullshark.
+    certificate_pack: Option<CertificatePack>,
 }
 
 impl<DB: Database> Consensus<DB> {
@@ -279,6 +283,7 @@ impl<DB: Database> Consensus<DB> {
         protocol: Bullshark,
         task_manager: &TaskManager,
         consensus_chain: ConsensusChain,
+        certificate_pack: Option<CertificatePack>,
     ) {
         let rx_shutdown = consensus_config.shutdown().subscribe();
         // The consensus state (everything else is immutable).
@@ -332,6 +337,7 @@ impl<DB: Database> Consensus<DB> {
             protocol,
             state,
             active: false,
+            certificate_pack,
         };
 
         // Only run the consensus task if we are an active CVV.
@@ -339,7 +345,9 @@ impl<DB: Database> Consensus<DB> {
         if consensus_bus.is_active_cvv() {
             // Subscribe before spawning so the channel is active before any messages are sent.
             let rx_new_certificates = consensus_bus.subscribe_new_certificates();
-            task_manager.spawn_critical_task("consensus task", s.run(rx_new_certificates));
+            task_manager.spawn_critical_task("consensus task", async move {
+                Ok(s.run(rx_new_certificates).await?)
+            });
         }
     }
 
@@ -353,6 +361,11 @@ impl<DB: Database> Consensus<DB> {
         loop {
             tokio::select! {
                 _ = &self.rx_shutdown => {
+                    if let Some(pack) = self.certificate_pack {
+                        if let Err(e) = pack.shutdown().await {
+                            error!(target: "epoch-manager", ?e, "error shutting down certificate pack");
+                        }
+                    }
                     return Ok(())
                 }
 
@@ -377,14 +390,26 @@ impl<DB: Database> Consensus<DB> {
                 return Ok(());
             }
         }
+        if let Some(certificate_pack) = &self.certificate_pack {
+            if let Err(e) = certificate_pack.try_save(certificate.clone()) {
+                tracing::error!(target: "telcoin::consensus_state", ?e, "Failed to save certificate to cert pack file");
+                // The certificate pack is in a failed state so stop using it.
+                // This is not a critical path so not stopping but if the DB gets in a failed
+                // state the node is probably not long for world...
+                // If the sender is overflowed then can try again later.
+                if let PackError::SendFailed = e {
+                    self.certificate_pack = None;
+                }
+            }
+        }
         // Process the certificate using the selected consensus protocol.
         let (outcome, committed_sub_dags) =
             self.protocol.process_certificate(&mut self.state, certificate)?;
         if self.active {
-            // We extract a list of headers from this specific validator that
-            // have been agreed upon, and signal this back to the narwhal sub-system
-            // to be used to re-send batches that have not made it to a commit.
-            let mut committed_certificates = Vec::new();
+            let mut own_rounds_committed = Vec::new();
+            let mut leader_commit_round = 0;
+            let mut has_headers = false;
+            let authority_id = self.consensus_config.authority_id();
 
             // Output the sequence in the right order.
             let csd_len = committed_sub_dags.len();
@@ -393,7 +418,7 @@ impl<DB: Database> Consensus<DB> {
                 // This will force the follow function to not outrun execution...  this is probably
                 // fine. Also once we can follow gossiped consensus output this will not really be
                 // an issue (except during initial catch up).
-                let base_execution_block = committed_sub_dag.leader.header.latest_execution_block;
+                let base_execution_block = committed_sub_dag.leader().latest_execution_block();
                 if self.consensus_bus.app().wait_for_execution(base_execution_block).await.is_err()
                 {
                     // This seems to be a bogus sub dag, we are out of sync...
@@ -408,10 +433,15 @@ impl<DB: Database> Consensus<DB> {
                     return Ok(());
                 }
 
-                tracing::debug!(target: "telcoin::consensus_state", "Commit in Sequence {:?}", committed_sub_dag.leader.nonce());
+                tracing::debug!(target: "telcoin::consensus_state", "Commit in Sequence {:?}", committed_sub_dag.leader().nonce());
 
-                for certificate in &committed_sub_dag.certificates {
-                    committed_certificates.push(certificate.clone());
+                for header in committed_sub_dag.headers() {
+                    has_headers = true;
+                    leader_commit_round = leader_commit_round.max(header.round());
+                    // Now we are going to signal which of our own batches have been committed.
+                    if Some(header.author()) == authority_id.as_ref() {
+                        own_rounds_committed.push(header.round())
+                    }
                 }
 
                 // NOTE: The size of the sub-dag can be arbitrarily large (depending on the network
@@ -423,18 +453,10 @@ impl<DB: Database> Consensus<DB> {
                     .map_err(|_| ConsensusError::ShuttingDown)?;
             }
 
-            if !committed_certificates.is_empty() {
-                // Highest committed certificate round is the leader round / commit round
-                // expected by primary.
-                let leader_commit_round = committed_certificates
-                    .iter()
-                    .map(|c| c.round())
-                    .max()
-                    .expect("committed_certificates isn't empty");
-
+            if has_headers {
                 self.consensus_bus
-                    .committed_certificates()
-                    .send((leader_commit_round, committed_certificates))
+                    .committed_own_headers()
+                    .send((leader_commit_round, own_rounds_committed))
                     .await
                     .map_err(|_| ConsensusError::ShuttingDown)?;
 

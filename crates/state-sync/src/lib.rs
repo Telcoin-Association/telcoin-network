@@ -12,14 +12,11 @@ use tn_test_utils_committee as _;
 
 use std::time::Duration;
 use tn_config::ConsensusConfig;
-use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode};
-use tn_storage::{
-    consensus::ConsensusChain,
-    tables::{ConsensusHeaderCache, NodeBatchesCache},
-};
+use tn_primary::{ConsensusBusApp, NodeMode};
+use tn_storage::{consensus::ConsensusChain, tables::ConsensusHeaderCache};
 use tn_types::{
-    AuthorityIdentifier, BlockHash, ConsensusHeader, ConsensusOutput, Database, Epoch, TaskSpawner,
-    TnSender,
+    ConsensusHeader, ConsensusHeaderDigest, ConsensusOutput, Database, Epoch, TaskError,
+    TaskSpawner, TnSender,
 };
 use tracing::{debug, error, info, warn};
 
@@ -27,6 +24,7 @@ mod epoch;
 pub use epoch::spawn_epoch_record_collector;
 mod consensus;
 use consensus::spawn_track_recent_consensus;
+pub use consensus::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_recent_consensus};
 
 /// Sets some bus defaults.
 /// Call this somewhere when starting an epoch.
@@ -61,7 +59,6 @@ pub async fn prime_consensus<DB: Database>(
 pub fn spawn_state_sync<DB: Database>(
     config: ConsensusConfig<DB>,
     consensus_bus: ConsensusBusApp,
-    network: PrimaryNetworkHandle,
     task_spawner: TaskSpawner,
     consensus_chain: ConsensusChain,
 ) {
@@ -72,23 +69,15 @@ pub fn spawn_state_sync<DB: Database>(
         NodeMode::CvvInactive | NodeMode::Observer => {
             // If we are not an active CVV then follow latest consensus from peers.
             let (config_clone, consensus_bus_clone) = (config.clone(), consensus_bus.clone());
-            let task_spawner_clone = task_spawner.clone();
-            let consensus_chain_clone = consensus_chain.clone();
             task_spawner.spawn_task(
                 "state sync: track latest consensus header from peers",
                 async move {
                     info!(target: "state-sync", "Starting state sync: track latest consensus header from peers");
-                    if let Err(e) = spawn_track_recent_consensus(
+                    spawn_track_recent_consensus(
                         config_clone,
                         consensus_bus_clone,
-                        network,
-                        task_spawner_clone,
-                        consensus_chain_clone,
-                    )
-                    .await
-                    {
-                        error!(target: "state-sync", "Error tracking latest consensus headers: {e}");
-                    }
+                    ).await;
+                    Ok(())
                 },
             );
             task_spawner.spawn_task(
@@ -97,6 +86,9 @@ pub fn spawn_state_sync<DB: Database>(
                     info!(target: "state-sync", "Starting state sync: stream consensus header from peers");
                     if let Err(e) = spawn_stream_consensus_headers(config, consensus_bus, consensus_chain).await {
                         error!(target: "state-sync", "Error streaming consensus headers: {e}");
+                        Err(TaskError::from_message(e))
+                    } else {
+                        Ok(())
                     }
                 },
             );
@@ -104,30 +96,17 @@ pub fn spawn_state_sync<DB: Database>(
     }
 }
 
-/// Write the consensus header and it's component transaction batches to the consensus DB.
+/// Write the consensus header and it's component transaction batches to the consensus chain.
 ///
 /// An error here indicates a critical node failure.
 /// Note, if this returns an error then the DB could not be written to- this is probably fatal.
-pub async fn save_consensus<DB: Database>(
-    db: &DB,
+pub async fn save_consensus(
     consensus_output: ConsensusOutput,
-    authority_id: &Option<AuthorityIdentifier>,
     consensus_chain: &mut ConsensusChain,
 ) -> eyre::Result<()> {
-    let sub_dag = consensus_output.sub_dag().clone();
     consensus_chain.save_consensus_output(consensus_output).await?;
-    if let Some(authority_id) = authority_id {
-        // If we are a validator we need to clear any of our batches from our cache that are
-        // now part of consensus.
-        for cert in &sub_dag.certificates {
-            if cert.header().author() == authority_id {
-                for batch_hash in cert.header().payload().keys() {
-                    let _ = db.remove::<NodeBatchesCache>(batch_hash);
-                }
-            }
-        }
-    }
-    // Make sure we have persisted the consensus output before we execute.
+    // Note it is ok to leave batches in NodeBatchesCache until the epoch ends (when the table is
+    // cleared). Make sure we have persisted the consensus output before we execute.
     consensus_chain.persist_current().await?;
     Ok(())
 }
@@ -150,7 +129,7 @@ pub async fn last_executed_consensus_block(
 pub async fn last_consensus_parent(
     consensus_bus: &ConsensusBusApp,
     consensus_chain: &ConsensusChain,
-) -> (BlockHash, u64) {
+) -> (ConsensusHeaderDigest, u64) {
     let last_executed =
         last_executed_consensus_block(consensus_bus, consensus_chain).await.unwrap_or_default();
     let last_db = consensus_chain
@@ -216,63 +195,72 @@ async fn spawn_stream_consensus_headers<DB: Database>(
     let mut last_consensus_height = last_consensus_header.number;
     let epoch = config.committee().epoch();
 
+    // Read and consume the current watch value immediately. This handles a race where a pack
+    // file was downloaded and last_consensus_header() was updated before this task subscribed
+    // (e.g., epoch N's pack arrives before epoch N's spawn_stream_consensus_headers starts).
+    // borrow_and_update() marks the value as seen so that changed() fires correctly for
+    // subsequent sends — without it, changed() could fire spuriously for the stale value.
+    let mut pending_header =
+        rx_last_consensus_header.borrow_and_update().clone().unwrap_or_default();
+
     // infinite loop over consensus output
     loop {
+        if pending_header.number > last_consensus_height {
+            debug!(target: "state-sync", rx_last_consensus_header=?pending_header.number, ?last_consensus_height, "streaming consensus headers detected change");
+            // Retry loop: the concurrent backward traversal in
+            // spawn_track_recent_consensus fills ConsensusHeaderCache asynchronously.
+            // catch_up_consensus_from_to may return early on a cache miss before the
+            // backward traversal has fetched an intermediate block. Retry with a short
+            // delay to let the traversal finish rather than waiting for the next gossip
+            // update (which may never come for an older epoch's blocks).
+            let mut no_progress_count = 0u32;
+            const MAX_NO_PROGRESS: u32 = 600; // 600 * 100ms = 60 seconds max wait
+            loop {
+                let prev_height = last_consensus_height;
+                last_consensus_header = catch_up_consensus_from_to(
+                    &consensus_bus,
+                    last_consensus_header,
+                    pending_header.clone(),
+                    config.node_storage(),
+                    &consensus_chain,
+                    epoch,
+                )
+                .await?;
+                if last_consensus_header.sub_dag.leader_epoch() > epoch {
+                    return Ok(());
+                }
+                last_consensus_height = last_consensus_header.number;
+
+                if last_consensus_height >= pending_header.number {
+                    break; // Fully caught up to the target.
+                }
+                if last_consensus_height == prev_height {
+                    // No progress: the backward traversal hasn't yet cached this block.
+                    no_progress_count += 1;
+                    if no_progress_count >= MAX_NO_PROGRESS {
+                        warn!(target: "state-sync", ?epoch, last_consensus_height, target=pending_header.number,
+                            "could not catch up to consensus target after retries, waiting for next gossip update");
+                        break;
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                        _ = &rx_shutdown => return Ok(()),
+                    }
+                } else {
+                    if no_progress_count > 0 {
+                        info!(target: "state-sync", ?epoch, last_consensus_height, no_progress_count,
+                            "catch-up made progress after retries");
+                    }
+                    no_progress_count = 0; // Progress was made, reset counter.
+                }
+            }
+        }
+
         tokio::select! {
             _ = rx_last_consensus_header.changed() => {
-                // If this changes it should not be None...
                 // Use borrow_and_update so the change is marked consumed; any subsequent
-                // updates during the retry loop below will re-arm changed() correctly.
-                let header = rx_last_consensus_header.borrow_and_update().clone().unwrap_or_default();
-                debug!(target: "state-sync", rx_last_consensus_header=?header.number, ?last_consensus_height, "streaming consensus headers detected change");
-
-                if header.number > last_consensus_height {
-                    // Retry loop: the concurrent backward traversal in
-                    // spawn_track_recent_consensus fills ConsensusHeaderCache asynchronously.
-                    // catch_up_consensus_from_to may return early on a cache miss before the
-                    // backward traversal has fetched an intermediate block. Retry with a short
-                    // delay to let the traversal finish rather than waiting for the next gossip
-                    // update (which may never come for an older epoch's blocks).
-                    let mut no_progress_count = 0u32;
-                    const MAX_NO_PROGRESS: u32 = 600; // 600 * 100ms = 60 seconds max wait
-                    loop {
-                        let prev_height = last_consensus_height;
-                        last_consensus_header = catch_up_consensus_from_to(
-                            &consensus_bus,
-                            last_consensus_header,
-                            header.clone(),
-                            config.node_storage(),
-                            &consensus_chain,
-                            epoch,
-                        )
-                        .await?;
-                        if last_consensus_header.sub_dag.leader_epoch() > epoch { return Ok(()); }
-                        last_consensus_height = last_consensus_header.number;
-
-                        if last_consensus_height >= header.number {
-                            break; // Fully caught up to the target.
-                        }
-                        if last_consensus_height == prev_height {
-                            // No progress: the backward traversal hasn't yet cached this block.
-                            no_progress_count += 1;
-                            if no_progress_count >= MAX_NO_PROGRESS {
-                                warn!(target: "state-sync", ?epoch, last_consensus_height, target=header.number,
-                                    "could not catch up to consensus target after retries, waiting for next gossip update");
-                                break;
-                            }
-                            tokio::select! {
-                                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
-                                _ = &rx_shutdown => return Ok(()),
-                            }
-                        } else {
-                            if no_progress_count > 0 {
-                                info!(target: "state-sync", ?epoch, last_consensus_height, no_progress_count,
-                                    "catch-up made progress after retries");
-                            }
-                            no_progress_count = 0; // Progress was made, reset counter.
-                        }
-                    }
-                }
+                // updates during the retry loop above will re-arm changed() correctly.
+                pending_header = rx_last_consensus_header.borrow_and_update().clone().unwrap_or_default();
             }
             _ = &rx_shutdown => {
                 return Ok(())
@@ -298,15 +286,6 @@ async fn catch_up_consensus_from_to<DB: Database>(
     let last_consensus_height = from.number;
     let max_consensus_height = max_consensus.number;
     let catchup_distance = max_consensus_height.saturating_sub(last_consensus_height);
-    if catchup_distance > 0 {
-        info!(
-            target: "tn::observer",
-            last_consensus_height,
-            max_consensus_height,
-            catchup_distance,
-            "catching up consensus blocks"
-        );
-    }
     if last_consensus_height >= max_consensus_height {
         return Ok(from);
     }
@@ -316,22 +295,31 @@ async fn catch_up_consensus_from_to<DB: Database>(
         let mut remove_cache = false;
         // Check if we already have this consensus output in our local DB.
         // We will be verifying and loading these records elsewhere.
-        let consensus_header = if number == max_consensus_height {
-            max_consensus.clone()
-        } else if let Ok(Some(header)) = db.get::<ConsensusHeaderCache>(&number) {
+        let consensus_header = if let Ok(Some(header)) = db.get::<ConsensusHeaderCache>(&number) {
+            // Always check the cache first, even if on max_consesus_height so we evict this record
+            // if cached.
+            // Note that the consensus header at number must be consenstent (consensus was reached)
+            // so this is fine. In other words it would be a protocol violation to have
+            // different ConsensusHeaders at the same number.
             remove_cache = true;
             header
+        } else if number == max_consensus_height {
+            max_consensus.clone()
         } else if let Ok(Some(header)) = consensus_chain.consensus_header_by_number(number).await {
             // Block already in local ConsensusChain DB (e.g., processed before a restart).
             // Use it to advance the parent-chain verification; execution will be skipped below
             // since number <= consensus_chain.latest_consensus_number().
             header
         } else {
-            error!(
-                target: "tn::observer",
-                block_number = number,
-                "Could not find header"
-            );
+            if number > last_consensus_height + 1 {
+                // Only log the warning after we start and hit a missing header.
+                // I.e. We don't want a ton of warnings when we are starting to catch up.
+                warn!(
+                    target: "tn::observer",
+                    block_number = number,
+                    "Could not find header (We may be catching up)"
+                );
+            }
             // We should have all the required headers in local storage by now...
             return Ok(result_header);
         };
@@ -341,6 +329,16 @@ async fn catch_up_consensus_from_to<DB: Database>(
         }
         if remove_cache {
             let _ = db.remove::<ConsensusHeaderCache>(&number); // Should be done with this now.
+        }
+        if number == last_consensus_height + 1 {
+            // We only want to log this once and only when we are doing something.
+            info!(
+                target: "tn::observer",
+                last_consensus_height,
+                max_consensus_height,
+                catchup_distance,
+                "catching up consensus blocks"
+            );
         }
         let parent_hash = last_parent;
         last_parent =
@@ -359,7 +357,7 @@ async fn catch_up_consensus_from_to<DB: Database>(
             continue;
         }
 
-        let base_execution_block = consensus_header.sub_dag.leader.header().latest_execution_block;
+        let base_execution_block = consensus_header.sub_dag.leader().latest_execution_block();
         // We need to make sure execution has caught up so we can verify we have not
         // forked. This will force the follow function to not outrun
         // execution...  this is probably fine. Also once we can

@@ -12,8 +12,9 @@ use tempfile::TempDir;
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, CertificateStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    BlockNumHash, Certificate, CertificateDigest, ExecHeader, Hash as _, ReputationScores,
-    SealedHeader, TaskManager, TnReceiver, TnSender, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    Certificate, ConsensusHeaderDigest, ConsensusNumHash, ExecHeader, Hash as _, Header,
+    HeaderDigest, ReputationScores, SealedHeader, TaskManager, TnReceiver, TnSender, B256,
+    DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::fs::create_dir_all;
 
@@ -66,11 +67,16 @@ async fn test_consensus_recovery_with_bullshark() {
     let cb = ConsensusBus::new();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
-    Consensus::spawn(config.clone(), &cb, bullshark, &task_manager, consensus_chain.clone()).await;
+    Consensus::spawn(config.clone(), &cb, bullshark, &task_manager, consensus_chain.clone(), None)
+        .await;
 
     // WHEN we feed all certificates to the consensus.
     for certificate in certificates.iter() {
@@ -94,16 +100,16 @@ async fn test_consensus_recovery_with_bullshark() {
 
     // hold all the certificates that get committed when consensus runs
     // without any crash.
-    let mut committed_output_no_crash: Vec<Certificate> = Vec::new();
+    let mut committed_output_no_crash: Vec<Header> = Vec::new();
     let mut score_no_crash: ReputationScores = ReputationScores::default();
 
     let mut idx = 1;
     'main: while let Some(sub_dag) = rx_output.recv().await {
-        score_no_crash = sub_dag.reputation_score.clone();
-        assert_eq!(sub_dag.leader.round(), consensus_index_counter);
+        score_no_crash = sub_dag.reputation_scores().clone();
+        assert_eq!(sub_dag.leader().round(), consensus_index_counter);
         consensus_chain.write_subdag_for_test(idx, sub_dag.clone()).await;
         idx += 1;
-        for output in sub_dag.certificates() {
+        for output in sub_dag.headers() {
             assert!(output.round() <= 6);
 
             committed_output_no_crash.push(output.clone());
@@ -158,11 +164,16 @@ async fn test_consensus_recovery_with_bullshark() {
     let cb = ConsensusBus::new();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
-    Consensus::spawn(config.clone(), &cb, bullshark, &task_manager, consensus_chain.clone()).await;
+    Consensus::spawn(config.clone(), &cb, bullshark, &task_manager, consensus_chain.clone(), None)
+        .await;
 
     // WHEN we send same certificates but up to round 3 (inclusive)
     // Then we store all the certificates up to round 6 so we can let the recovery algorithm
@@ -184,13 +195,13 @@ async fn test_consensus_recovery_with_bullshark() {
     // * 1 certificate of round 2 (the leader)
     let mut consensus_index_counter = 2;
     let mut pack_number = 1u64;
-    let mut committed_output_before_crash: Vec<Certificate> = Vec::new();
+    let mut committed_output_before_crash: Vec<Header> = Vec::new();
 
     'main: while let Some(sub_dag) = rx_output.recv().await {
-        assert_eq!(sub_dag.leader.round(), consensus_index_counter);
+        assert_eq!(sub_dag.leader().round(), consensus_index_counter);
         consensus_chain.write_subdag_for_test(pack_number, sub_dag.clone()).await;
         pack_number += 1;
-        for output in sub_dag.certificates() {
+        for output in sub_dag.headers() {
             assert!(output.round() <= 2);
 
             committed_output_before_crash.push(output.clone());
@@ -219,11 +230,15 @@ async fn test_consensus_recovery_with_bullshark() {
     let cb = ConsensusBus::new();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
-    Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain.clone()).await;
+    Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain.clone(), None).await;
 
     // WHEN send the certificates of round >= 5 to trigger a leader election for round 4
     // and start committing.
@@ -234,16 +249,16 @@ async fn test_consensus_recovery_with_bullshark() {
     }
 
     // AND capture the committed output
-    let mut committed_output_after_crash: Vec<Certificate> = Vec::new();
+    let mut committed_output_after_crash: Vec<Header> = Vec::new();
     let mut score_with_crash: ReputationScores = ReputationScores::default();
 
     'main: while let Some(sub_dag) = rx_output.recv().await {
-        score_with_crash = sub_dag.reputation_score.clone();
+        score_with_crash = sub_dag.reputation_scores().clone();
         assert_eq!(score_with_crash.total_authorities(), 4);
         consensus_chain.write_subdag_for_test(pack_number, sub_dag.clone()).await;
         pack_number += 1;
 
-        for output in sub_dag.certificates() {
+        for output in sub_dag.headers() {
             assert!(output.round() >= 2);
 
             committed_output_after_crash.push(output.clone());
@@ -290,7 +305,7 @@ async fn test_dag_rejects_certificate_with_missing_parents() {
     let mut state = ConsensusState::new(gc_depth);
 
     // Get genesis digests
-    let genesis: BTreeSet<CertificateDigest> =
+    let genesis: BTreeSet<HeaderDigest> =
         Certificate::genesis(&committee).iter().map(|x| x.digest()).collect();
 
     // Create round 1 certificates with valid genesis parents
@@ -305,7 +320,7 @@ async fn test_dag_rejects_certificate_with_missing_parents() {
     // Create a fake parent digest that doesn't exist
     let mut fake_parent_bytes = [0u8; 32];
     fake_parent_bytes[31] = 0xFF;
-    let fake_parent = CertificateDigest::new(fake_parent_bytes);
+    let fake_parent = HeaderDigest::new(fake_parent_bytes);
 
     // Create certificate with fake parent (that doesn't exist in DAG)
     let mut fake_parents = round1_digests.clone();
@@ -337,7 +352,7 @@ async fn test_dag_rejects_certificate_at_gc_boundary() {
     let gc_depth = 5;
     let mut state = ConsensusState::new(gc_depth);
 
-    let genesis: BTreeSet<CertificateDigest> =
+    let genesis: BTreeSet<HeaderDigest> =
         Certificate::genesis(&committee).iter().map(|x| x.digest()).collect();
 
     // Build DAG from round 1 to 10
@@ -382,7 +397,7 @@ async fn test_dag_detects_equivocation_same_round_different_cert() {
     let gc_depth = 10;
     let mut state = ConsensusState::new(gc_depth);
 
-    let genesis: BTreeSet<CertificateDigest> =
+    let genesis: BTreeSet<HeaderDigest> =
         Certificate::genesis(&committee).iter().map(|x| x.digest()).collect();
 
     // Create first certificate from authority 0 at round 1
@@ -430,7 +445,7 @@ async fn test_dag_accepts_duplicate_certificate_insertion() {
     let gc_depth = 10;
     let mut state = ConsensusState::new(gc_depth);
 
-    let genesis: BTreeSet<CertificateDigest> =
+    let genesis: BTreeSet<HeaderDigest> =
         Certificate::genesis(&committee).iter().map(|x| x.digest()).collect();
 
     let (_, cert) = mock_certificate(&committee, ids[0].clone(), 1, genesis);
@@ -457,7 +472,7 @@ async fn test_dag_rejects_certificate_with_missing_parent_round() {
     let gc_depth = 10;
     let mut state = ConsensusState::new(gc_depth);
 
-    let genesis: BTreeSet<CertificateDigest> =
+    let genesis: BTreeSet<HeaderDigest> =
         Certificate::genesis(&committee).iter().map(|x| x.digest()).collect();
 
     // Create round 1 certificates

@@ -5,14 +5,17 @@
 
 use crate::{
     batch_fetcher::BatchFetcher,
-    network::PrimaryReceiverHandler,
+    network::primary::PrimaryReceiverHandler,
     quorum_waiter::{QuorumWaiter, QuorumWaiterTrait},
     WorkerNetworkHandle,
 };
 use std::{sync::Arc, time::Duration};
 use tn_config::ConsensusConfig;
 use tn_network_types::{local::LocalNetwork, WorkerOwnBatchMessage, WorkerToPrimaryClient};
-use tn_storage::tables::NodeBatchesCache;
+use tn_storage::{
+    consensus::ConsensusChain,
+    tables::{NodeBatchesCache, OurNodeBatchesCache},
+};
 use tn_types::{
     error::BlockSealError, BatchReceiver, BatchSender, BatchValidation, Database, SealedBatch,
     TaskManager, WorkerId,
@@ -30,17 +33,20 @@ pub fn new_worker<DB: Database>(
     validator: Arc<dyn BatchValidation>,
     consensus_config: ConsensusConfig<DB>,
     network_handle: WorkerNetworkHandle,
+    consensus_chain: ConsensusChain,
 ) -> Worker<DB, QuorumWaiter> {
     info!(target: "worker::worker", "Boot worker node with id {} key {:?}", id, consensus_config.key_config().primary_public_key());
 
-    let batch_fetcher =
-        BatchFetcher::new(network_handle.clone(), consensus_config.node_storage().clone());
+    let batch_fetcher = BatchFetcher::new(
+        network_handle.clone(),
+        consensus_config.node_storage().clone(),
+        consensus_chain,
+    );
     consensus_config.local_network().set_primary_to_worker_local_handler(Arc::new(
         PrimaryReceiverHandler {
             store: consensus_config.node_storage().clone(),
-            request_batches_timeout: consensus_config.parameters().sync_retry_delay,
             network: Some(network_handle.clone()),
-            batch_fetcher: Some(batch_fetcher),
+            batch_fetcher,
             validator,
         },
     ));
@@ -108,7 +114,7 @@ pub struct Worker<DB, QW> {
     network_handle: WorkerNetworkHandle,
 }
 
-// Need to imlement clone directly because of the rx_batches field.
+// Need to implement clone directly because of the rx_batches field.
 // This field is a use once field when spawning the batch manager so this is fine.
 // Code will panic quickly if this is messed up.
 impl<DB: Clone, QW: Clone> Clone for Worker<DB, QW> {
@@ -160,13 +166,14 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
     pub fn spawn_batch_builder(&mut self, prefix: &str, task_manager: &TaskManager) {
         let this_clone = self.clone();
         let mut rx_batches = self.rx_batches.take().expect("have batch receive");
-        task_manager.spawn_critical_task(&format!("{prefix} batch-builder"), async move {
+        task_manager.spawn_critical_task(format!("{prefix} batch-builder"), async move {
             while let Some((batch, tx)) = rx_batches.recv().await {
                 let res = this_clone.seal(batch).await;
                 if tx.send(res).is_err() {
                     error!(target: "worker::batch_provider", "Error sending result to channel caller!  Channel closed.");
                 }
             }
+            Ok(())
         });
     }
 
@@ -211,7 +218,7 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         );
 
         let (batch, digest) = sealed_batch.split();
-        if let Err(e) = self.store.insert::<NodeBatchesCache>(&digest, &batch) {
+        if let Err(e) = self.store.insert::<OurNodeBatchesCache>(&digest, &batch) {
             // Cache the batch early, avoid race conditions.
             // Note the cache should be cleared every epoch after processing.
             error!(target: "worker::batch_provider", "Store failed (batch cache) with error: {:?}", e);
@@ -239,6 +246,10 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
                         let _ = self.network_handle.publish_batch(digest).await;
                     }
                     Err(e) => {
+                        // On error the batch builder should leave the transactions in the pool for
+                        // a future batch. So go ahead and remove so we
+                        // don't try to re-inject them later.
+                        let _ = self.store.remove::<OurNodeBatchesCache>(&digest);
                         return Err(match e {
                             crate::quorum_waiter::QuorumWaiterError::QuorumRejected => {
                                 BlockSealError::QuorumRejected
@@ -260,27 +271,29 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
             }
             Err(e) => {
                 error!(target: "worker::batch_provider", "Join error attempting batch quorum! {e}");
+                // See remove comment above.
+                let _ = self.store.remove::<OurNodeBatchesCache>(&digest);
                 return Err(BlockSealError::FailedQuorum);
             }
         }
 
-        // Now save it to permenant storage
+        // Save to live batch storage so other nodes can fetch it.
+        // Keep OurNodeBatchesCache entry intact: if the epoch ends before this batch's cert is
+        // committed, orphan_batches() will re-inject the transactions at the next epoch start.
+        // Already-executed transactions are rejected by the pool (nonce too low), so re-injection
+        // is always safe.
         if let Err(e) = self.store.insert::<NodeBatchesCache>(&digest, &batch) {
             error!(target: "worker::batch_provider", "Store failed with error: {:?}", e);
             return Err(BlockSealError::FatalDBFailure);
         }
-        // Make sure we have persisted the batch before we report it to other nodes.
-        self.store.persist::<NodeBatchesCache>().await;
 
         // Send the batch to the primary.
         let message = WorkerOwnBatchMessage { worker_id: self.id, digest };
         if let Err(err) = self.client.report_own_batch(message).await {
             error!(target: "worker::batch_provider", "Failed to report our batch: {err:?}");
-            // Should we return an error here?  Doing so complicates some tests but also the batch
-            // is sealed, etc. If we can not report our own batch is this a
-            // showstopper?
+            Err(BlockSealError::FailedToReport)
+        } else {
+            Ok(())
         }
-
-        Ok(())
     }
 }

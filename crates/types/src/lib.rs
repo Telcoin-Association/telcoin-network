@@ -12,6 +12,7 @@ use tn_test_utils_committee as _;
 mod codec;
 #[allow(clippy::mutable_key_type)]
 mod committee;
+pub mod consensus_chain_traits;
 mod crypto;
 pub mod database_traits;
 pub mod gas_accumulator;
@@ -28,6 +29,7 @@ pub mod error;
 
 pub use codec::*;
 pub use committee::*;
+pub use consensus_chain_traits::*;
 pub use crypto::*;
 pub use database_traits::*;
 pub use genesis::*;

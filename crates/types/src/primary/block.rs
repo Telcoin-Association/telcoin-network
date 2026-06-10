@@ -7,9 +7,8 @@
 //! if not directly participating in consesus.
 
 use super::{CommittedSubDag, ConsensusOutput};
-use crate::{crypto, BlockHash, Certificate, Hash, B256};
+use crate::{crypto, Certificate, Digest, Hash, B256};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
 /// Header for the consensus chain.
 ///
@@ -18,10 +17,10 @@ use std::sync::Arc;
 #[derive(PartialEq, Serialize, Deserialize, Clone, Debug)]
 pub struct ConsensusHeader {
     /// The hash of the previous ConsesusHeader in the chain.
-    pub parent_hash: B256,
+    pub parent_hash: ConsensusHeaderDigest,
 
     /// This is the committed sub dag used to extend the execution chain.
-    pub sub_dag: Arc<CommittedSubDag>,
+    pub sub_dag: CommittedSubDag,
 
     /// A scalar value equal to the number of ancestor blocks. The genesis block has a number of
     /// zero.
@@ -34,35 +33,44 @@ pub struct ConsensusHeader {
 
 impl ConsensusHeader {
     /// Return the digest for this ConsensusHeader.
-    pub fn digest(&self) -> BlockHash {
+    pub fn digest(&self) -> ConsensusHeaderDigest {
         Self::digest_from_parts(self.parent_hash, &self.sub_dag, self.number)
     }
 
     /// Produce the digest that result from a ConsensusHeader with this data.
     /// This allows digesting in some cases with out cloning a CommittedSubDag.
     pub fn digest_from_parts(
-        parent_hash: B256,
+        parent_hash: ConsensusHeaderDigest,
         sub_dag: &CommittedSubDag,
         number: u64,
-    ) -> BlockHash {
+    ) -> ConsensusHeaderDigest {
         let mut hasher = crypto::DefaultHashFunction::new();
-        hasher.update(parent_hash.as_slice());
+        hasher.update(parent_hash.as_ref());
         hasher.update(sub_dag.digest().as_ref());
         hasher.update(number.to_le_bytes().as_ref());
-        BlockHash::from_slice(hasher.finalize().as_bytes())
+        // Include the extra field.
+        // Not using this yet but include the default in the hash in prep when we do.
+        hasher.update(B256::default().as_slice());
+        ConsensusHeaderDigest(Digest { digest: hasher.finalize().into() })
     }
 }
 
 impl Default for ConsensusHeader {
     fn default() -> Self {
-        let sub_dag = Arc::new(CommittedSubDag::new(
-            vec![],
-            Certificate::default(),
+        let cert = Certificate::default();
+        let sub_dag = CommittedSubDag::new(
+            vec![cert.clone()],
+            cert,
             0,
             crate::ReputationScores::default(),
             None,
-        ));
-        Self { parent_hash: B256::default(), sub_dag, number: 0, extra: B256::default() }
+        );
+        Self {
+            parent_hash: ConsensusHeaderDigest::default(),
+            sub_dag,
+            number: 0,
+            extra: B256::default(),
+        }
     }
 }
 
@@ -81,5 +89,64 @@ impl From<&[u8]> for ConsensusHeader {
 impl From<&ConsensusHeader> for Vec<u8> {
     fn from(value: &ConsensusHeader) -> Self {
         crate::encode(value)
+    }
+}
+
+crate::crypto::digest_newtype! {
+    /// Digest of a [`ConsensusHeader`].
+    pub struct ConsensusHeaderDigest;
+}
+
+/// A consensus header number and a hash.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, std::hash::Hash, Serialize, Deserialize)]
+pub struct ConsensusNumHash {
+    /// The number
+    pub number: u64,
+    /// The hash.
+    pub hash: ConsensusHeaderDigest,
+}
+
+impl ConsensusNumHash {
+    /// Creates a new `NumHash` from a number and hash.
+    pub const fn new(number: u64, hash: ConsensusHeaderDigest) -> Self {
+        Self { number, hash }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use alloy::{eips::NumHash, primitives::B256};
+
+    use crate::{crypto, decode, encode, ConsensusHeaderDigest, ConsensusNumHash};
+
+    /// Verify that ConsensusHeaderDigest encodes/decodes to the same bytes as a B256/BlockHash.
+    #[test]
+    fn test_consensus_digest_serde() {
+        let mut hasher = crypto::DefaultHashFunction::new();
+        hasher.update(b"test_consensus_digest_serde");
+        let init_bytes = B256::from_slice(hasher.finalize().as_bytes());
+        let cdigest: ConsensusHeaderDigest = init_bytes.into();
+        let enc = encode(&cdigest);
+        let b256: B256 = decode(&enc);
+        assert_eq!(init_bytes, b256);
+        let enc = encode(&b256);
+        let cdigest2: ConsensusHeaderDigest = decode(&enc);
+        assert_eq!(cdigest, cdigest2);
+    }
+
+    /// Verify that ConsensusNumHash encodes/decodes to the same bytes as a NumHash.
+    #[test]
+    fn test_consensus_numhash_serde() {
+        let mut hasher = crypto::DefaultHashFunction::new();
+        hasher.update(b"test_consensus_digest_serde");
+        let init_bytes = B256::from_slice(hasher.finalize().as_bytes());
+        let num_hash = NumHash { number: 3, hash: init_bytes };
+        let consensus_num_hash = ConsensusNumHash { number: 3, hash: init_bytes.into() };
+        let enc = encode(&consensus_num_hash);
+        let num_hash2: NumHash = decode(&enc);
+        assert_eq!(num_hash, num_hash2);
+        let enc = encode(&num_hash2);
+        let cnum_hash: ConsensusNumHash = decode(&enc);
+        assert_eq!(consensus_num_hash, cnum_hash);
     }
 }

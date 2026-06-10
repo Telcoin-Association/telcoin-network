@@ -43,8 +43,6 @@ sol!(
         /// The validator's information.
         #[derive(Debug)]
         struct ValidatorInfo {
-            /// The BLS12-381 public key.
-            bytes blsPubkey;
             /// The address based on ECDSA public key.
             address validatorAddress;
             /// The epoch which the validator's status
@@ -57,12 +55,13 @@ sol!(
             ValidatorStatus currentStatus;
             /// The validator is permanently disqualified from consensus.
             bool isRetired;
-            /// The validator received stake through delegation.
-            bool isDelegated;
             /// The configuration for validators stake.
             ///
             /// This supports updating stake amount.
             uint8 stakeVersion;
+            /// GSMA region identifier for geographic diversity.
+            /// 0 = unspecified, 1-8 = assigned regions.
+            uint8 region;
         }
 
         /// The epoch info stored on-chain.
@@ -139,6 +138,8 @@ sol!(
             StakeConfig memory genesisConfig_,
             /// The initial validators with stake.
             ValidatorInfo[] memory initialValidators_,
+            /// The initial validators' BLS12-381 public keys.
+            bytes[] memory blsPubkeys_,
             /// The initial validators' uncompressed proofs of possession
             ProofOfPossession[] memory proofsOfPossession,
             /// The address of the owner.
@@ -161,6 +162,10 @@ sol!(
         function getValidators(uint8 status) public view returns (ValidatorInfo[] memory);
         /// Fetch the committee for a given epoch.
         function getCommitteeValidators(uint32 epoch) external view returns (ValidatorInfo[] memory);
+        /// Fetch the BLS pubkey for a given validator address.
+        function getBlsPubkey(address validatorAddress) external view returns (bytes memory);
+        /// Fetch the BLS pubkeys for the committee of a given epoch.
+        function getCommitteeBlsPubkeys(uint32 epoch) external view returns (bytes[] memory);
         /// Fetch the `ValidatorInfo` for a give address.
         function getValidator(address validatorAddress) external view returns (ValidatorInfo memory);
         /// Returns the BLS12-381 proof of possession message: `blsPubkey || validatorAddress`
@@ -181,7 +186,41 @@ sol!(
         function getRewards(address validatorAddress) public view virtual returns (uint256);
         /// Returns the next committee size
         function getNextCommitteeSize() external view returns (uint16);
+        /// Sets the GSMA region identifier for a validator (0=unspecified, 1-255=assigned regions).
+        /// Only callable by governance (owner).
+        function setValidatorRegion(address validatorAddress, uint8 region) external;
+    }
 
+    /// Worker fee configs for base fee adjustment.
+    #[sol(rpc)]
+    contract WorkerConfigs {
+        /// Initialize with per-worker configs and owner.
+        constructor(
+            uint8[] memory strategies,
+            uint64[] memory values,
+            uint128[] memory datas,
+            address owner_,
+        );
+        /// Get the stored fee config for a worker.
+        function getWorkerConfig(uint16 workerId)
+            external view
+            returns (uint8 strategy, uint64 value, uint128 data);
+        /// Get every worker's config in a single call.
+        function getAllWorkerConfigs()
+            external view
+            returns (
+                uint16 count,
+                uint8[] memory strategies,
+                uint64[] memory values,
+                uint128[] memory datas,
+            );
+        /// Set the number of workers for the next epoch.
+        function setNumWorkers(uint16 numWorkers_) external;
+        /// Set the config for a worker by worker id.
+        /// NOTE: this must be called before calling `setNumWorkers`.
+        function setWorkerConfig(uint16 workerId, uint8 strategy, uint64 value, uint128 data) external;
+        /// Retrieve the number of workers for the protocol.
+        function numWorkers() external view returns (uint16);
     }
 );
 
@@ -194,6 +233,8 @@ pub struct EpochState {
     pub epoch_info: ConsensusRegistry::EpochInfo,
     /// The collection of validator info.
     pub validators: Vec<ConsensusRegistry::ValidatorInfo>,
+    /// The BLS12-381 public keys for the committee validators.
+    pub bls_pubkeys: Vec<tn_types::Bytes>,
     /// The timestamp for when the previous epoch closed.
     ///
     /// This time plus the `EpochInfo::epochDuration` creates the timestamp for the next epoch

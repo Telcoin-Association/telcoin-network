@@ -8,12 +8,13 @@ use libp2p::{
     core::transport::ListenerId,
     gossipsub::{PublishError, SubscriptionError, TopicHash},
     request_response::ResponseChannel,
-    Multiaddr, PeerId, Stream, TransportError,
+    Multiaddr, PeerId, Stream, StreamProtocol, TransportError,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use tn_types::{
     encode, now, try_decode, BlsPublicKey, BlsSignature, NetworkPublicKey, P2pNode, TimestampSec,
+    WorkerId,
 };
 // Re-export the shared RPC endpoint type so callers can keep referring to
 // `network_libp2p::types::RpcInfo`. The canonical definition lives in `tn_types`.
@@ -58,6 +59,42 @@ pub const PRIMARY_CERT_TOPIC: &str = "tn_certificates";
 /// The topic for NVVs to subscribe to for published consensus chain.
 pub const CONSENSUS_HEADER_TOPIC: &str = "tn_consensus_headers";
 
+/// The role of a consensus network instance: primary or worker.
+///
+/// A node runs both as fully isolated libp2p swarms in one process. This is the
+/// one source of truth for everything that must differ: the kad store's backing
+/// tables and the wire protocol names that keep the two from ever negotiating a
+/// connection with one another.
+#[derive(Copy, Clone, Debug)]
+pub enum NetworkType {
+    /// Primary network.
+    Primary,
+    /// Worker network.
+    Worker(WorkerId),
+}
+
+impl NetworkType {
+    /// Request-response wire protocol, isolated per role (and per worker).
+    pub(crate) fn req_res_protocol(&self) -> StreamProtocol {
+        match self {
+            Self::Primary => StreamProtocol::new("/tn-primary/0.0.1"),
+            Self::Worker(id) => StreamProtocol::try_from_owned(format!("/tn-worker-{id}/0.0.1"))
+                .expect("worker req-res protocol name starts with '/'"),
+        }
+    }
+
+    /// Kademlia wire protocol, isolated per role (and per worker).
+    pub(crate) fn kad_protocol(&self) -> StreamProtocol {
+        match self {
+            Self::Primary => StreamProtocol::new("/tn-primary-kad/0.0.1"),
+            Self::Worker(id) => {
+                StreamProtocol::try_from_owned(format!("/tn-worker-{id}-kad/0.0.1"))
+                    .expect("worker kad protocol name starts with '/'")
+            }
+        }
+    }
+}
+
 /// Events created from network activity.
 #[derive(Debug)]
 pub enum NetworkEvent<Req, Res> {
@@ -99,16 +136,6 @@ where
     Req: TNMessage,
     Res: TNMessage,
 {
-    /// Update the list of authorized publishers.
-    ///
-    /// This list is used to verify messages came from an authorized source.
-    /// Only valid for Subscriber implementations.
-    UpdateAuthorizedPublishers {
-        /// The unique set of authorized peers by topic.
-        authorities: HashMap<String, Option<HashSet<BlsPublicKey>>>,
-        /// The acknowledgement that the set was updated.
-        reply: oneshot::Sender<NetworkResult<()>>,
-    },
     /// Start listening on the provided multiaddr.
     ///
     /// Return the result to caller.
@@ -187,7 +214,7 @@ where
         /// The request to send.
         request: Req,
         /// Channel for forwarding any responses.
-        reply: oneshot::Sender<NetworkResult<Res>>,
+        reply: NetworkResponseSender<Res>,
     },
     /// Send a request to a peer by PeerId.
     ///
@@ -200,7 +227,7 @@ where
         /// The request to send.
         request: Req,
         /// Channel for forwarding any responses.
-        reply: oneshot::Sender<NetworkResult<Res>>,
+        reply: NetworkResponseSender<Res>,
     },
     /// Send a request to any connected peer.
     ///
@@ -211,7 +238,7 @@ where
         /// The request to send.
         request: Req,
         /// Channel for forwarding any responses.
-        reply: oneshot::Sender<NetworkResult<Res>>,
+        reply: NetworkResponseSender<Res>,
     },
     /// Send response to a peer's request.
     SendResponse {
@@ -294,9 +321,19 @@ where
         /// The reply to caller.
         reply: oneshot::Sender<PeerExchangeMap>,
     },
-    /// Start a new epoch.
-    NewEpoch {
-        /// The epoch committee.
+    /// Set the previous/current/next committees directly from authoritative state, every epoch.
+    UpdateCommittees {
+        /// The previous epoch committee.
+        previous: HashSet<BlsPublicKey>,
+        /// The current epoch committee.
+        current: HashSet<BlsPublicKey>,
+        /// The next epoch committee.
+        next: HashSet<BlsPublicKey>,
+    },
+    /// Pre-dial recovery: forgive bans for a committee so it can be dialed, without mutating the
+    /// committee slots.
+    PrepareCommitteeDial {
+        /// The committee whose peers should be unbanned for dialing.
         committee: HashSet<BlsPublicKey>,
     },
     /// Find authorities for a future committee by bls key and return to sender.
@@ -326,7 +363,31 @@ where
         /// The reply to caller.
         reply: oneshot::Sender<Vec<(BlsPublicKey, RpcInfo)>>,
     },
+    /// Read a single record from the local kad store by BLS key.
+    ///
+    /// Test-only observation hook used to assert local-store eviction
+    /// behavior from a spawned-network test. See `kad_store_get`.
+    #[cfg(test)]
+    KadStoreGet {
+        /// The BLS public key the record is stored under.
+        key: BlsPublicKey,
+        /// Reply with the record if one exists in the local store.
+        reply: oneshot::Sender<Option<libp2p::kad::Record>>,
+    },
 }
+
+/// Wrap a network response.
+/// Adds the Bls key of the peer that sent the response.
+#[derive(Clone, Debug)]
+pub struct NetworkResponseMessage<Res: TNMessage> {
+    /// The BLS public key of the node that sent this response.
+    pub peer: BlsPublicKey,
+    /// The actual response.
+    pub result: Res,
+}
+
+/// Type for the result channel for a network request.
+pub type NetworkResponseSender<Res> = oneshot::Sender<NetworkResult<NetworkResponseMessage<Res>>>;
 
 /// Network handle.
 ///
@@ -355,16 +416,6 @@ where
     pub fn new_for_test() -> Self {
         let (sender, _) = mpsc::channel(100);
         Self { sender }
-    }
-
-    /// Update the list of authorized publishers.
-    pub async fn update_authorized_publishers(
-        &self,
-        authorities: HashMap<String, Option<HashSet<BlsPublicKey>>>,
-    ) -> NetworkResult<()> {
-        let (reply, ack) = oneshot::channel();
-        self.sender.send(NetworkCommand::UpdateAuthorizedPublishers { authorities, reply }).await?;
-        ack.await?
     }
 
     /// Start swarm listening on the given address. Returns an error if the address is not
@@ -489,7 +540,7 @@ where
         &self,
         request: Req,
         peer: BlsPublicKey,
-    ) -> NetworkResult<oneshot::Receiver<NetworkResult<Res>>> {
+    ) -> NetworkResult<oneshot::Receiver<NetworkResult<NetworkResponseMessage<Res>>>> {
         let (reply, to_caller) = oneshot::channel();
         self.sender.send(NetworkCommand::SendRequest { peer, request, reply }).await?;
         Ok(to_caller)
@@ -501,7 +552,7 @@ where
     pub async fn send_request_any(
         &self,
         request: Req,
-    ) -> NetworkResult<oneshot::Receiver<NetworkResult<Res>>> {
+    ) -> NetworkResult<oneshot::Receiver<NetworkResult<NetworkResponseMessage<Res>>>> {
         let (reply, to_caller) = oneshot::channel();
         self.sender.send(NetworkCommand::SendRequestAny { request, reply }).await?;
         Ok(to_caller)
@@ -549,9 +600,26 @@ where
         res.await.map_err(Into::into)
     }
 
-    /// Create a [PeerExchangeMap] for exchanging peers.
-    pub async fn new_epoch(&self, committee: HashSet<BlsPublicKey>) -> NetworkResult<()> {
-        self.sender.send(NetworkCommand::NewEpoch { committee }).await?;
+    /// Set the previous/current/next committees directly from authoritative state, every epoch.
+    pub async fn update_committees(
+        &self,
+        previous: HashSet<BlsPublicKey>,
+        current: HashSet<BlsPublicKey>,
+        next: HashSet<BlsPublicKey>,
+    ) -> NetworkResult<()> {
+        self.sender.send(NetworkCommand::UpdateCommittees { previous, current, next }).await?;
+        Ok(())
+    }
+
+    /// Forgive bans for a committee so it can be dialed, without mutating the committee slots.
+    ///
+    /// Used by the deadlock-breaker pre-dial path; the real slot update follows via
+    /// [`Self::update_committees`].
+    pub async fn prepare_committee_dial(
+        &self,
+        committee: HashSet<BlsPublicKey>,
+    ) -> NetworkResult<()> {
+        self.sender.send(NetworkCommand::PrepareCommitteeDial { committee }).await?;
         Ok(())
     }
 
@@ -849,9 +917,24 @@ where
         &self,
         request: Req,
         peer: PeerId,
-    ) -> NetworkResult<oneshot::Receiver<NetworkResult<Res>>> {
+    ) -> NetworkResult<oneshot::Receiver<NetworkResult<NetworkResponseMessage<Res>>>> {
         let (reply, to_caller) = oneshot::channel();
         self.sender.send(NetworkCommand::SendRequestDirect { peer, request, reply }).await?;
         Ok(to_caller)
+    }
+
+    /// Read a single record from the local kad store by BLS key.
+    ///
+    /// Test-only observation hook so a spawned-network test can assert on
+    /// kad store contents that are otherwise unreachable once the network is
+    /// running on its own task.
+    #[cfg(test)]
+    pub(crate) async fn kad_store_get(
+        &self,
+        key: BlsPublicKey,
+    ) -> NetworkResult<Option<libp2p::kad::Record>> {
+        let (reply, rx) = oneshot::channel();
+        self.sender.send(NetworkCommand::KadStoreGet { key, reply }).await?;
+        rx.await.map_err(Into::into)
     }
 }

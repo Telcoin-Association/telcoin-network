@@ -4,7 +4,6 @@
 
 mod certificate_tests;
 mod committee_props;
-mod output_tests;
 mod serde_tests;
 
 fn main() {}

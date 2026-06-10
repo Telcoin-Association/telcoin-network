@@ -1,5 +1,6 @@
+//! Worker's network-related errors.
 use tn_network_libp2p::{error::NetworkError, Penalty};
-use tn_types::{BatchValidationError, BcsError};
+use tn_types::{BatchValidationError, BcsError, BlockHash, Epoch};
 use tokio::time::error::Elapsed;
 
 /// Result alias for results that possibly return [`WorkerNetworkError`].
@@ -8,9 +9,9 @@ pub(crate) type WorkerNetworkResult<T> = Result<T, WorkerNetworkError>;
 /// Core error variants when executing the output from consensus and extending the canonical block.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerNetworkError {
-    /// Error decoding with bcs.
-    #[error("Failed to decode gossip message: {0}")]
-    Decode(#[from] BcsError),
+    /// Serialization error from BCS.
+    #[error("BCS error: {0}")]
+    Bcs(#[from] BcsError),
     /// Batch validation error occured.
     #[error("Failed batch validation: {0}")]
     BatchValidation(#[from] BatchValidationError),
@@ -32,14 +33,53 @@ pub enum WorkerNetworkError {
     /// Invalid topic- something was published to the wrong topic.
     #[error("Gossip was published to the wrong topic")]
     InvalidTopic,
+    /// Peer sent more batches than expected.
+    #[error("Peer sent too many batches: expected {expected}, received {received}")]
+    TooManyBatches {
+        /// The expected number of batches.
+        expected: usize,
+        /// The number of batches received.
+        received: usize,
+    },
+    /// Peer sent a batch we didn't request.
+    #[error("Received unexpected batch with digest {0}")]
+    UnexpectedBatch(BlockHash),
+    /// Peer sent duplicate batch.
+    #[error("Received duplicate batch with digest {0}")]
+    DuplicateBatch(BlockHash),
+    /// Stream was closed unexpectedly.
+    #[error("Stream closed unexpectedly")]
+    StreamClosed,
+    /// No matching pending request for inbound stream.
+    #[error("No pending request matches stream hash")]
+    UnknownStreamRequest(BlockHash),
+    /// Request hash mismatch between negotiation and stream.
+    #[error("Request hash mismatch")]
+    RequestHashMismatch,
+    /// Error conversion from [std::io::Error]
+    #[error(transparent)]
+    StdIo(#[from] std::io::Error),
+    /// Error while inserting into the DB.
+    #[error("DB Insert Error {0}")]
+    DBInsert(String),
+    /// Error committing to DB.
+    #[error("DB Commit Error {0}")]
+    DBCommit(String),
+    /// Error reading from DB.
+    #[error("DB read Error {0}")]
+    DBRead(String),
+    /// Invalid batch epoch.
+    #[error("Got batch from epoch {0} expected {1}")]
+    BatchEpochMismatch(Epoch, Epoch),
 }
 
-impl From<WorkerNetworkError> for Option<Penalty> {
-    fn from(val: WorkerNetworkError) -> Self {
+impl WorkerNetworkError {
+    /// Return the penalty for this error if it causes one (None if no penalty).
+    pub fn penalty(&self) -> Option<Penalty> {
         //
         // explicitly match every error type to ensure penalties are updated with changes
         //
-        match val {
+        match self {
             WorkerNetworkError::BatchValidation(batch_validation_error) => {
                 match batch_validation_error {
                     // mild
@@ -62,17 +102,43 @@ impl From<WorkerNetworkError> for Option<Penalty> {
                     }
                 }
             }
-            WorkerNetworkError::InvalidRequest(_) => Some(Penalty::Mild),
+            WorkerNetworkError::InvalidRequest(_) | WorkerNetworkError::UnknownStreamRequest(_) => {
+                Some(Penalty::Mild)
+            }
+            WorkerNetworkError::StdIo(ref io_err) => {
+                // separate legitimate failures like connection resets from suspicious behavior
+                match io_err.kind() {
+                    std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::Interrupted => Some(Penalty::Mild),
+                    _ => Some(Penalty::Medium),
+                }
+            }
             // may occur at epoch boundaries
             WorkerNetworkError::NonCommitteeBatch => Some(Penalty::Medium),
-            // fatal
-            WorkerNetworkError::InvalidTopic | WorkerNetworkError::Decode(_) => {
-                Some(Penalty::Fatal)
-            }
+            // protocol violations - fatal penalty
+            WorkerNetworkError::InvalidTopic
+            | WorkerNetworkError::Bcs(_)
+            | WorkerNetworkError::TooManyBatches { .. }
+            | WorkerNetworkError::UnexpectedBatch(_)
+            | WorkerNetworkError::DuplicateBatch(_)
+            | WorkerNetworkError::RequestHashMismatch => Some(Penalty::Fatal),
             // ignore
             WorkerNetworkError::Timeout(_)
+            | WorkerNetworkError::DBInsert(_)
+            | WorkerNetworkError::DBCommit(_)
+            | WorkerNetworkError::DBRead(_)
+            | WorkerNetworkError::StreamClosed
             | WorkerNetworkError::Network(_)
+            | WorkerNetworkError::BatchEpochMismatch(_, _)
             | WorkerNetworkError::Internal(_) => None,
         }
+    }
+}
+
+impl From<WorkerNetworkError> for Option<Penalty> {
+    fn from(val: WorkerNetworkError) -> Self {
+        val.penalty()
     }
 }

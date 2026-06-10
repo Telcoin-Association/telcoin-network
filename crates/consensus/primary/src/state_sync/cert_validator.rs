@@ -12,7 +12,7 @@ use std::{collections::HashSet, sync::Arc};
 use tn_config::ConsensusConfig;
 use tn_storage::CertificateStore;
 use tn_types::{
-    error::CertificateError, Certificate, CertificateDigest, Database, Hash as _, Round,
+    error::CertificateError, Certificate, Database, Hash as _, HeaderDigest, Round,
     SignatureVerificationState, TaskSpawner, TnSender as _,
 };
 use tokio::sync::oneshot;
@@ -88,25 +88,6 @@ where
         certificate: &mut Certificate,
         external: bool,
     ) -> CertManagerResult<()> {
-        // validate certificate standalone and forward to CertificateManager
-        // - try_accept_certificate
-        // - accept_own_certificate
-        //
-        // synchronizer::process_certificate_internal
-        // - check node storage for certificate already exists
-        //      - make this a separate method so vote can call it too
-        //          - synchronizer::get_unknown_parent_digests
-        //      - return missing
-        // + ignore pending state -> let next step do this
-        // - sanitize certificate
-        // - ignore sync batches request (L1140) - duplicate from PrimaryNetwork
-        //      - confirm this is duplicate and remove from PrimaryNetwork handler
-        //      - NOTE: this is never subscribed????
-        // - sync ancestors if too new? Or let pending do this?
-        //      - confirm certificate fetcher command is redundant here
-        // - forward to certificate manager to check for pending
-        //      - return/await oneshot reply
-
         // see if certificate already processed
         let digest = certificate.digest();
         if self.config.node_storage().contains(&digest)? {
@@ -202,10 +183,8 @@ where
             // NOTE: this should be okay bc header is already certified by quorum of signatures
             self.task_spawner.spawn_task("sync header batches", async move {
                 let sync_header = HeaderValidator::new(config, bus);
-                let res = sync_header.sync_header_batches(&header, true, max_age).await;
-                if let Err(e) = res {
-                    error!(target: "primary::cert_validator", ?e, ?header, ?max_age, "error syncing batches for certified header");
-                }
+                Ok(sync_header.sync_header_batches(&header, true, max_age).await
+                    .inspect_err(|e| error!(target: "primary::cert_validator", ?e, ?header, ?max_age, "error syncing batches for certified header"))?)
             });
 
             // trigger certificate fetching if cert is too far ahead of this node
@@ -322,7 +301,7 @@ where
     fn requires_direct_verification(
         &self,
         cert: &Certificate,
-        all_parents: &HashSet<CertificateDigest>,
+        all_parents: &HashSet<HeaderDigest>,
     ) -> bool {
         !all_parents.contains(&cert.digest())
             || cert.header().round().is_multiple_of(

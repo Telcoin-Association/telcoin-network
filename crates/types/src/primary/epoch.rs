@@ -7,9 +7,9 @@
 //! execute with known correct consensus outputs.
 
 use crate::{
-    crypto, encode, serde::RoaringBitmapSerde, BlockHash, BlsAggregateSignature, BlsPublicKey,
-    BlsSignature, BlsSigner, Epoch, Intent, IntentMessage, IntentScope,
-    ValidatorAggregateSignature as _, B256,
+    crypto, encode, serde::RoaringBitmapSerde, BlsAggregateSignature, BlsPublicKey, BlsSignature,
+    BlsSigner, ConsensusNumHash, Epoch, Intent, IntentMessage, IntentScope,
+    ValidatorAggregateSignature as _,
 };
 use alloy::eips::BlockNumHash;
 use serde::{Deserialize, Serialize};
@@ -27,22 +27,22 @@ pub struct EpochRecord {
     /// This can be used for trustless syncing.
     pub next_committee: Vec<BlsPublicKey>,
     /// Hash of the previous EpochRecord.
-    pub parent_hash: B256,
+    pub parent_hash: EpochDigest,
     /// The block number and hash of the last execution state of this epoch.
     /// Basically the execution genesis for the next epoch after this one.
     /// Also a signed checkpoint of execution state (with the certificate).
     pub final_state: BlockNumHash,
     /// The hash and consensus block number of the last ['ConsensusHeader'] of this epoch.
     /// Can be used as a signed checkpoint for consensus (with the certificate).
-    pub final_consensus: BlockNumHash,
+    pub final_consensus: ConsensusNumHash,
 }
 
 impl EpochRecord {
     /// Return the digest for this ConsensusHeader.
-    pub fn digest(&self) -> B256 {
+    pub fn digest(&self) -> EpochDigest {
         let mut hasher = crypto::DefaultHashFunction::new();
         hasher.update(&encode(self));
-        BlockHash::from_slice(hasher.finalize().as_bytes())
+        (*hasher.finalize().as_bytes()).into()
     }
 
     /// Use signer to generate an [`EpochVote`] for this EpochRecord.
@@ -107,7 +107,7 @@ pub struct EpochVote {
     /// The hash of the ['EpochRecord'].
     /// Store the hash not the record to keep gossip size down.
     /// Other nodes can request the record once vs recieving it many times.
-    pub epoch_hash: B256,
+    pub epoch_hash: EpochDigest,
     /// Public key of the committee member that signed this.
     /// This needs to be verified to be a committee member.
     pub public_key: BlsPublicKey,
@@ -136,7 +136,7 @@ pub struct EpochCertificate {
     /// The hash of the ['EpochRecord'].
     /// Store the hash not the record to keep gossip size down.
     /// Other nodes can request the record once vs recieving it many times.
-    pub epoch_hash: B256,
+    pub epoch_hash: EpochDigest,
     /// Signatures of a quorum of committee member for the epoch.
     pub signature: BlsSignature,
     /// Bitmap defining which committee members signed this certificate.
@@ -154,6 +154,11 @@ impl EpochCertificate {
     }
 }
 
+crate::crypto::digest_newtype! {
+    /// Digest of a [`EpochRecord`].
+    pub struct EpochDigest;
+}
+
 #[cfg(test)]
 mod test {
     use std::sync::Arc;
@@ -161,7 +166,8 @@ mod test {
     use rand::{rngs::StdRng, CryptoRng, RngCore, SeedableRng as _};
     use roaring::RoaringBitmap;
 
-    use crate::{BlsKeypair, Signer as _};
+    use crate::{crypto, decode, encode, BlsKeypair, ConsensusNumHash, Signer as _};
+    use alloy::primitives::B256;
 
     use super::*;
 
@@ -194,9 +200,9 @@ mod test {
             epoch: 0,
             committee: vec![com1.public_key(), com2.public_key(), com3.public_key()],
             next_committee: vec![com1.public_key(), com2.public_key(), com3.public_key()],
-            parent_hash: B256::default(),
+            parent_hash: EpochDigest::default(),
             final_state: BlockNumHash::default(),
-            final_consensus: BlockNumHash::default(),
+            final_consensus: ConsensusNumHash::default(),
         };
         let vote1 = record.sign_vote(&com1);
         let vote2 = record.sign_vote(&com2);
@@ -230,5 +236,20 @@ mod test {
                 panic!("failed to aggregate epoch record signatures",);
             }
         }
+    }
+
+    /// Verify that EpochDigest encodes/decodes to the same bytes as a B256/BlockHash.
+    #[test]
+    fn test_epoch_digest_serde() {
+        let mut hasher = crypto::DefaultHashFunction::new();
+        hasher.update(b"test_epoch_digest_serde");
+        let init_bytes = B256::from_slice(hasher.finalize().as_bytes());
+        let edigest: EpochDigest = init_bytes.into();
+        let enc = encode(&edigest);
+        let b256: B256 = decode(&enc);
+        assert_eq!(init_bytes, b256);
+        let enc = encode(&b256);
+        let edigest2: EpochDigest = decode(&enc);
+        assert_eq!(edigest, edigest2);
     }
 }

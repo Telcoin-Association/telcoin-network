@@ -7,9 +7,9 @@ use engine::TnBuilder;
 use manager::EpochManager;
 use tn_config::{KeyConfig, TelcoinDirs};
 use tn_primary::ConsensusBusApp;
-use tn_rpc::EngineToPrimary;
+use tn_rpc::{EngineToPrimary, RpcNodeInfo};
 use tn_storage::consensus::ConsensusChain;
-use tn_types::{BlockHash, ConsensusHeader, Epoch, EpochCertificate, EpochRecord};
+use tn_types::{ConsensusHeader, Epoch, EpochCertificate, EpochDigest, EpochRecord};
 use tokio::task::JoinHandle;
 
 pub mod engine;
@@ -27,12 +27,13 @@ use tempfile as _;
 ///
 /// Worker, Primary, and Execution.
 /// This will possibly "loop" to launch multiple times in response to
-/// a nodes mode changes.  This ensures a clean state and fresh tasks
+/// a node's mode changes.  This ensures a clean state and fresh tasks
 /// when switching modes.
 pub fn launch_node<P>(
     builder: TnBuilder,
     tn_datadir: P,
     key_config: KeyConfig,
+    version: &'static str,
 ) -> JoinHandle<eyre::Result<()>>
 where
     P: TelcoinDirs + Clone + 'static,
@@ -45,7 +46,7 @@ where
     tokio::spawn(async move {
         // create the epoch manager
         let mut epoch_manager =
-            EpochManager::new(builder, tn_datadir, consensus_db, key_config).await;
+            EpochManager::new(builder, tn_datadir, consensus_db, key_config, version).await;
         let result = epoch_manager.run().await;
         if let Err(err) = &result {
             tracing::error!("Error running node: {err}");
@@ -60,11 +61,17 @@ pub struct EngineToPrimaryRpc {
     consensus_bus: ConsensusBusApp,
     /// Consensus Chain DB
     consensus_chain: ConsensusChain,
+    /// Static node info to provide clients.
+    node_info: RpcNodeInfo,
 }
 
 impl EngineToPrimaryRpc {
-    pub fn new(consensus_bus: ConsensusBusApp, consensus_chain: ConsensusChain) -> Self {
-        Self { consensus_bus, consensus_chain }
+    pub fn new(
+        consensus_bus: ConsensusBusApp,
+        consensus_chain: ConsensusChain,
+        node_info: RpcNodeInfo,
+    ) -> Self {
+        Self { consensus_bus, consensus_chain, node_info }
     }
 
     /// Retrieve the consensus header by number.
@@ -77,7 +84,10 @@ impl EngineToPrimaryRpc {
     }
 
     /// Retrieve the consensus header by hash
-    async fn get_epoch_by_hash(&self, hash: BlockHash) -> Option<(EpochRecord, EpochCertificate)> {
+    async fn get_epoch_by_hash(
+        &self,
+        hash: EpochDigest,
+    ) -> Option<(EpochRecord, EpochCertificate)> {
         if let Some((r, Some(c))) = self.consensus_chain.epochs().get_epoch_by_hash(hash).await {
             Some((r, c))
         } else {
@@ -94,13 +104,17 @@ impl EngineToPrimary for EngineToPrimaryRpc {
     async fn epoch(
         &self,
         epoch: Option<Epoch>,
-        hash: Option<BlockHash>,
+        hash: Option<EpochDigest>,
     ) -> Option<(EpochRecord, EpochCertificate)> {
         match (epoch, hash) {
             (_, Some(hash)) => self.get_epoch_by_hash(hash).await,
             (Some(epoch), _) => self.get_epoch_by_number(epoch).await,
             (None, None) => None,
         }
+    }
+
+    fn node_info(&self) -> &tn_rpc::RpcNodeInfo {
+        &self.node_info
     }
 }
 

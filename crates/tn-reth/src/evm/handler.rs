@@ -140,6 +140,11 @@ where
         exec_result: &mut FrameResult,
     ) -> Result<(), Self::Error> {
         let context = evm.ctx();
+        // skip for system calls — gas_price and basefee are both 0, so all amounts are 0.
+        // this prevents the beneficiary and basefee_address from being spuriously touched.
+        if context.tx().caller() == SYSTEM_ADDRESS {
+            return Ok(());
+        }
         let beneficiary = context.block().beneficiary();
         let basefee = context.block().basefee() as u128;
         let effective_gas_price = context.tx().effective_gas_price(basefee);

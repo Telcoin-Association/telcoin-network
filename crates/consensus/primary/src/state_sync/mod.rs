@@ -5,7 +5,7 @@ use cert_validator::CertificateValidator;
 use header_validator::HeaderValidator;
 use tn_config::ConsensusConfig;
 use tn_types::{
-    error::HeaderResult, Certificate, CertificateDigest, Database, Header, Round, TaskManager,
+    error::HeaderResult, Certificate, Database, Header, HeaderDigest, Round, TaskManager,
     TaskSpawner,
 };
 mod cert_collector;
@@ -53,7 +53,9 @@ where
         let certificate_manager = self.certificate_validator.new_cert_manager();
         // Subscribe before spawning so the channel is active before any messages are sent.
         let rx = self.certificate_validator.consensus_bus().subscribe_certificate_manager();
-        task_manager.spawn_critical_task("certificate-manager", certificate_manager.run(rx));
+        task_manager.spawn_critical_task("certificate-manager", async move {
+            Ok(certificate_manager.run(rx).await?)
+        });
     }
 
     //
@@ -114,7 +116,7 @@ where
     pub(crate) async fn identify_unkown_parents(
         &self,
         header: &Header,
-    ) -> HeaderResult<Vec<CertificateDigest>> {
+    ) -> HeaderResult<Vec<HeaderDigest>> {
         self.header_validator.identify_unkown_parents(header).await
     }
 }

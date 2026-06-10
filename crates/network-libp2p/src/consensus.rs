@@ -5,13 +5,13 @@
 use crate::{
     codec::{TNCodec, TNMessage},
     error::NetworkError,
-    kad::{KadStore, KadStoreType, DEFAULT_KAD_PROTO_NAME},
+    kad::KadStore,
     peers::{self, PeerEvent, PeerManager, Penalty},
     send_or_log_error,
     stream::{StreamBehavior, StreamEvent},
     types::{
-        KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo, NetworkResult,
-        NodeRecord, RpcInfo,
+        KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo, NetworkResponseMessage,
+        NetworkResponseSender, NetworkResult, NetworkType, NodeRecord, RpcInfo,
     },
     PeerExchangeMap,
 };
@@ -24,19 +24,21 @@ use libp2p::{
     kad::{self, store::RecordStore, Mode, QueryId},
     request_response::{
         self, Codec, Event as ReqResEvent, InboundFailure as ReqResInboundFailure,
-        InboundRequestId, OutboundRequestId,
+        InboundRequestId, OutboundFailure as ReqResOutboundFailure, OutboundRequestId,
+        ProtocolSupport,
     },
     swarm::{NetworkBehaviour, SwarmEvent},
     Multiaddr, PeerId, Swarm, SwarmBuilder,
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    io::ErrorKind,
     time::Duration,
 };
 use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig};
 use tn_types::{
     encode, now, BlsPublicKey, BlsSigner, Database, NetworkKeypair, NetworkPublicKey, TaskSpawner,
-    TnSender,
+    TnSender, WorkerId,
 };
 use tokio::sync::{
     mpsc::{Receiver, Sender},
@@ -136,7 +138,7 @@ where
     /// Callers include a oneshot channel for the network to return response. The caller is
     /// responsible for decoding message bytes and reporting peers who return bad data. Peers that
     /// send messages that fail to decode must receive an application score penalty.
-    outbound_requests: HashMap<(PeerId, OutboundRequestId), oneshot::Sender<NetworkResult<Res>>>,
+    outbound_requests: HashMap<(PeerId, OutboundRequestId), NetworkResponseSender<Res>>,
     /// The collection of pending inbound requests.
     ///
     /// Callers include a oneshot channel for the network to return a cancellation notice. The
@@ -166,6 +168,14 @@ where
     ///
     /// The external address is self-reported and unconfirmed.
     node_record: NodeRecord,
+    /// Peers we have already pushed our [NodeRecord] to.
+    ///
+    /// A peer connecting for the first time needs our record before it can resolve
+    /// our BLS key, so we push it on `PeerConnected`. A peer that reconnects (or that
+    /// flaps repeatedly, as observed with banned peers in adiri testnet) should already have
+    /// the record in their persistent kad store. This list is per-process-lifetime in case nodes
+    /// restart.
+    published_to_peers: HashSet<PeerId>,
 }
 
 impl<Req, Res, DB, Events> ConsensusNetwork<Req, Res, DB, Events>
@@ -192,14 +202,16 @@ where
             network_key,
             db,
             task_manager,
-            KadStoreType::Primary,
+            NetworkType::Primary,
             external_addr,
             None,
         )
     }
 
     /// Convenience method for spawning a worker network instance.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_for_worker(
+        worker_id: WorkerId,
         network_config: &NetworkConfig,
         event_stream: Events,
         key_config: KeyConfig,
@@ -216,7 +228,7 @@ where
             network_key,
             db,
             task_manager,
-            KadStoreType::Worker,
+            NetworkType::Worker(worker_id),
             external_addr,
             rpc,
         )
@@ -231,7 +243,7 @@ where
         keypair: NetworkKeypair,
         db: DB,
         task_spawner: TaskSpawner,
-        kad_type: KadStoreType,
+        network_type: NetworkType,
         external_addr: Multiaddr,
         rpc: Option<RpcInfo>,
     ) -> NetworkResult<Self> {
@@ -254,23 +266,22 @@ where
 
         let req_res = request_response::Behaviour::with_codec(
             tn_codec,
-            network_config.libp2p_config().supported_req_res_protocols.clone(),
+            vec![(network_type.req_res_protocol(), ProtocolSupport::Full)],
             request_response::Config::default(),
         );
         let peer_id: PeerId = keypair.public().into();
-        let mut kad_config = libp2p::kad::Config::new(DEFAULT_KAD_PROTO_NAME);
+        let mut kad_config = libp2p::kad::Config::new(network_type.kad_protocol());
         // manually add peers
         kad_config.set_kbucket_inserts(kad::BucketInserts::Manual);
-        kad_config.set_kbucket_size(network_config.libp2p_config().k_bucket_size);
-        let two_days = Some(Duration::from_secs(48 * 60 * 60));
-        let twelve_hours = Some(Duration::from_secs(12 * 60 * 60));
+        let libp2p = network_config.libp2p_config();
+        kad_config.set_kbucket_size(libp2p.k_bucket_size);
         kad_config
-            .set_record_ttl(two_days)
+            .set_record_ttl(Some(libp2p.kad_record_ttl))
             .set_record_filtering(kad::StoreInserts::FilterBoth)
-            .set_publication_interval(twelve_hours)
+            .set_publication_interval(Some(libp2p.kad_publication_interval))
             .set_query_timeout(Duration::from_secs(60))
-            .set_provider_record_ttl(two_days);
-        let mut kad_store = KadStore::new(db.clone(), &key_config, kad_type);
+            .set_provider_record_ttl(Some(libp2p.kad_record_ttl));
+        let mut kad_store = KadStore::new(db.clone(), &key_config, network_type);
 
         // Load the Kad records from DB for the local peer cache, decoding with a legacy
         // fallback so records persisted by pre-upgrade software still load. Collect
@@ -356,6 +367,7 @@ where
             key_config,
             task_spawner,
             node_record,
+            published_to_peers: HashSet::new(),
         })
     }
 
@@ -380,11 +392,15 @@ where
     /// Return None if we don't have any confirmed external addresses yet.
     fn get_peer_record(&self) -> kad::Record {
         let key = kad::RecordKey::new(&self.key_config.primary_public_key());
+        // Leave `expires: None` for our OWN record so libp2p's PutRecordJob
+        // recomputes a fresh `now + kad_record_ttl` on every replication snapshot
+        // (see libp2p-kad jobs.rs:217-221). The configured `kad_record_ttl` still
+        // drives the wire-level expiry that remote peers store.
         kad::Record {
             key: key.clone(),
             value: encode(&self.node_record),
             publisher: Some(*self.swarm.local_peer_id()),
-            expires: None, // never expire
+            expires: None,
         }
     }
 
@@ -431,22 +447,19 @@ where
         }
     }
 
-    /// Publish our network addresses and peer id AND to the network under our BLS public key for
-    /// discovery.
+    /// Push our [NodeRecord] directly to a newly-connected peer.
+    ///
+    /// Used on first-time connections so the remote peer can resolve our BLS key
+    /// without waiting for the kad publication interval (12h). Callers must
+    /// short-circuit on reconnects - see [`Self::published_to_peers`]
     fn publish_our_data_to_peer(&mut self, peer: PeerId) {
         let record = self.get_peer_record();
-        info!(target: "network-kad", "Publishing our record to kademlia");
-        // Publish to the specified peer.
+        info!(target: "network-kad", "Publishing our record to peer {peer:?}");
         let _ = self.swarm.behaviour_mut().kademlia.put_record_to(
-            record.clone(),
+            record,
             vec![peer].into_iter(),
             kad::Quorum::One,
         );
-
-        // Also publish our record locally and to the network.
-        if let Err(err) = self.swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One) {
-            error!(target: "network-kad", "Failed to publish record: {err}");
-        }
     }
 
     /// Run the network loop to process incoming gossip.
@@ -457,13 +470,17 @@ where
 
         loop {
             tokio::select! {
-                event = self.swarm.select_next_some() => self.process_event(event).await.inspect_err(|e| {
-                    error!(target: "network", ?e, "network event error")
-                })?,
+                event = self.swarm.select_next_some() => if let Err(e) = self.process_event(event).await {
+                    error!(target: "network", ?e, "network event error");
+                    if let NetworkError::AllListenersClosed = e {
+                        // In this case go ahead and kill the node.
+                        return Err(e);
+                    }
+                },
                 command = self.commands.recv() => match command {
-                    Some(c) => self.process_command(c).inspect_err(|e| {
+                    Some(c) => if let Err(e) = self.process_command(c) {
                         error!(target: "network", ?e, "network command error")
-                    })?,
+                    },
                     None => {
                         info!(target: "network", "network shutting down...");
                         return Ok(())
@@ -487,9 +504,13 @@ where
                 TNBehaviorEvent::Kademlia(event) => self.process_kad_event(event)?,
                 TNBehaviorEvent::Stream(event) => self.process_stream_event(event)?,
             },
-            SwarmEvent::ExternalAddrConfirmed { address: _ } => {
-                // New confirmed address so lets publish/update or kademlia address rocord.
-                self.provide_our_data();
+            SwarmEvent::ExternalAddrConfirmed { address } => {
+                // protocol expects static IP address
+                // emit warning if peers report different external address
+                let expected = &self.node_record.info().multiaddrs;
+                if !expected.contains(&address) {
+                    warn!(target: "network", ?expected, reported=?address, "peer reporting different external addr:")
+                }
             }
             SwarmEvent::ExpiredListenAddr { address, .. } => {
                 debug!(
@@ -528,11 +549,6 @@ where
     /// Process commands for the network.
     fn process_command(&mut self, command: NetworkCommand<Req, Res>) -> NetworkResult<()> {
         match command {
-            NetworkCommand::UpdateAuthorizedPublishers { authorities, reply } => {
-                // this value should be updated at the start of each epoch
-                self.authorized_publishers = authorities;
-                send_or_log_error!(reply, Ok(()), "UpdateAuthorizedPublishers");
-            }
             NetworkCommand::StartListening { multiaddr, reply } => {
                 let res = self.swarm.listen_on(multiaddr);
                 send_or_log_error!(reply, res, "StartListening");
@@ -722,21 +738,23 @@ where
                 let peers = self.swarm.behaviour_mut().peer_manager.peers_for_exchange();
                 send_or_log_error!(reply, peers, "PeersForExchange");
             }
-            NetworkCommand::NewEpoch { committee } => {
-                // at the start of a new epoch, each node needs to know:
-                // - the current committee
-                // - all staked nodes who will vote at the end of the epoch
-                //      - only synced nodes can vote
+            NetworkCommand::UpdateCommittees { previous, current, next } => {
+                // The network mirrors three of the on-chain registry's committees: previous,
+                // current, and next. Peers in any of the three count as validators so the
+                // just-completed committee is not pruned while late gossip may still arrive and
+                // next-epoch peers are protected before they begin voting. (NVV support and
+                // late-gossip acceptance remain future work.)
                 //
-                // once a node stakes and tries to sync, it would be nice
-                // if it could receive priority on the network for syncing
-                // state
-                //
-                // for now, this only supports the current committee for the epoch
-
-                info!(target: "network", this_node=?self.swarm.local_peer_id(), "network update for next committee - ensuring no committee members are banned");
-                // ensure that the next committee isn't banned
-                self.swarm.behaviour_mut().peer_manager.new_epoch(committee);
+                // All three slots are set directly from authoritative state every epoch (no
+                // positional rotation), so current/previous self-correct against on-chain state and
+                // any peer that exits the three-slot window is demoted.
+                info!(target: "network", this_node=?self.swarm.local_peer_id(), "updating previous/current/next committees");
+                self.swarm.behaviour_mut().peer_manager.update_committees(previous, current, next);
+            }
+            NetworkCommand::PrepareCommitteeDial { committee } => {
+                // Deadlock-breaker pre-dial: forgive bans so the committee can be dialed without
+                // mutating the committee slots (the real slot update follows shortly after).
+                self.swarm.behaviour_mut().peer_manager.prepare_committee_dial(committee);
             }
             NetworkCommand::FindAuthorities { bls_keys } => {
                 // this will trigger a PeerEvent to fetch records through kad if not in the peer map
@@ -775,6 +793,18 @@ where
                 // The stream (or error) will be returned to the caller via oneshot
                 // without any intermediate tracking.
                 self.swarm.behaviour_mut().stream.open_stream(peer_id, reply);
+            }
+            #[cfg(test)]
+            NetworkCommand::KadStoreGet { key, reply } => {
+                let record_key = kad::RecordKey::new(&key);
+                let record = self
+                    .swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .store_mut()
+                    .get(&record_key)
+                    .map(|cow| cow.into_owned());
+                let _ = reply.send(record);
             }
         }
 
@@ -920,10 +950,18 @@ where
                         }
 
                         // try to forward response to original caller
-                        let _ = self
-                            .outbound_requests
-                            .remove(&(peer, request_id))
-                            .map(|ack| ack.send(Ok(response)));
+                        let _ = self.outbound_requests.remove(&(peer, request_id)).map(|ack| {
+                            if let Some(key) =
+                                self.swarm.behaviour().peer_manager.peer_to_bls(&peer)
+                            {
+                                let _ = ack.send(Ok(NetworkResponseMessage {
+                                    peer: key,
+                                    result: response,
+                                }));
+                            } else {
+                                let _ = ack.send(Err(NetworkError::PeerMissing));
+                            }
+                        });
                     }
                 }
             }
@@ -938,42 +976,102 @@ where
                     return Ok(());
                 }
 
-                // apply penalty
-                self.swarm.behaviour_mut().peer_manager.process_penalty(peer, Penalty::Medium);
-
-                // try to forward error to original caller
-                let _ = self
-                    .outbound_requests
-                    .remove(&(peer, request_id))
-                    .map(|ack| ack.send(Err(error.into())));
-            }
-            ReqResEvent::InboundFailure { peer, request_id, error, connection_id: _ } => {
-                debug!(target: "network", ?peer, ?error, pending=?self.inbound_requests, "Inbound failure for req/res");
-                debug!(target: "network", my_id=?self.swarm.local_peer_id(), "this node");
-                match error {
-                    ReqResInboundFailure::Io(e) => {
-                        // penalize peer since this is an attack surface
-                        warn!(target: "network", ?e, ?peer, ?request_id, "inbound IO failure");
-                        self.swarm
-                            .behaviour_mut()
-                            .peer_manager
-                            .process_penalty(peer, Penalty::Medium);
+                // Differentiate transport-level failures (peer disconnect, dial fail) from
+                // protocol-level violations. Transport failures are common on WAN and should
+                // not contribute to ban score; otherwise N in-flight requests at disconnect
+                // time cause N * Medium = instant ban.
+                match &error {
+                    ReqResOutboundFailure::DialFailure
+                    | ReqResOutboundFailure::ConnectionClosed => {
+                        // transport-level: no penalty
                     }
-                    ReqResInboundFailure::UnsupportedProtocols => {
-                        warn!(target: "network", ?peer, ?request_id, ?error, "inbound failure: unsupported protocol");
-
-                        // the local peer supports none of the protocols requested by the remote
-                        self.swarm
-                            .behaviour_mut()
-                            .peer_manager
-                            .process_penalty(peer, Penalty::Fatal);
-                    }
-                    ReqResInboundFailure::Timeout | ReqResInboundFailure::ConnectionClosed => {
-                        // penalty for potentially malicious request
+                    ReqResOutboundFailure::Io(e) => match e.kind() {
+                        ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::TimedOut
+                        | ErrorKind::UnexpectedEof
+                        | ErrorKind::BrokenPipe
+                        | ErrorKind::Interrupted => {
+                            // transport flap on WAN — no penalty
+                        }
+                        _ => {
+                            warn!(
+                                target: "network",
+                                ?e, ?peer, ?request_id,
+                                "outbound IO failure (likely codec violation)"
+                            );
+                            self.swarm
+                                .behaviour_mut()
+                                .peer_manager
+                                .process_penalty(peer, Penalty::Medium);
+                        }
+                    },
+                    ReqResOutboundFailure::Timeout => {
                         self.swarm
                             .behaviour_mut()
                             .peer_manager
                             .process_penalty(peer, Penalty::Mild);
+                    }
+                    // Severe = 5 strikes covers the typical rolling-upgrade window where
+                    // a peer sees <=5 req-res handshakes per halflife. Demote to Medium
+                    // if telemetry shows version-skewed peers banned during normal
+                    // upgrades.
+                    ReqResOutboundFailure::UnsupportedProtocols => {
+                        warn!(target: "network", ?peer, ?request_id, "outbound failure: unsupported protocol");
+                        self.swarm
+                            .behaviour_mut()
+                            .peer_manager
+                            .process_penalty(peer, Penalty::Severe);
+                    }
+                }
+
+                // try to forward error to original caller
+                let _ = self.outbound_requests.remove(&(peer, request_id)).map(|ack| {
+                    let _ = ack.send(Err(error.into()));
+                });
+            }
+            ReqResEvent::InboundFailure { peer, request_id, error, connection_id: _ } => {
+                debug!(target: "network", ?peer, ?error, pending=?self.inbound_requests, "Inbound failure for req/res");
+                debug!(target: "network", my_id=?self.swarm.local_peer_id(), "this node");
+                match &error {
+                    ReqResInboundFailure::Io(e) => match e.kind() {
+                        ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::TimedOut
+                        | ErrorKind::UnexpectedEof
+                        | ErrorKind::BrokenPipe
+                        | ErrorKind::Interrupted => {
+                            // transport flap on WAN — no penalty
+                        }
+                        _ => {
+                            warn!(
+                                target: "network",
+                                ?e, ?peer, ?request_id,
+                                "inbound IO failure (likely codec violation)"
+                            );
+                            self.swarm
+                                .behaviour_mut()
+                                .peer_manager
+                                .process_penalty(peer, Penalty::Medium);
+                        }
+                    },
+                    // Severe = 5 strikes covers the typical rolling-upgrade window where
+                    // a peer sees <=5 req-res handshakes per halflife. Demote to Medium
+                    // if telemetry shows version-skewed peers banned during normal
+                    // upgrades.
+                    ReqResInboundFailure::UnsupportedProtocols => {
+                        warn!(target: "network", ?peer, ?request_id, ?error, "inbound failure: unsupported protocol");
+
+                        // the local peer supports none of the protocols requested by the remote
+                        // Severe (not Fatal) so version skew during rolling upgrades does not
+                        // instantly ban a peer that is otherwise well-behaved.
+                        self.swarm
+                            .behaviour_mut()
+                            .peer_manager
+                            .process_penalty(peer, Penalty::Severe);
+                    }
+                    ReqResInboundFailure::Timeout | ReqResInboundFailure::ConnectionClosed => {
+                        // peer dropped or stalled mid-request — expected on WAN, no penalty
                     }
                     ReqResInboundFailure::ResponseOmission => { /* ignore local error */ }
                 }
@@ -1064,10 +1162,9 @@ where
 
                 // remove from outbound_requests and send error
                 for k in keys {
-                    let _ = self
-                        .outbound_requests
-                        .remove(&k)
-                        .map(|ack| ack.send(Err(NetworkError::Disconnected)));
+                    let _ = self.outbound_requests.remove(&k).map(|ack| {
+                        let _ = ack.send(Err(NetworkError::Disconnected));
+                    });
                 }
             }
             PeerEvent::DisconnectPeerX(peer_id, peer_exchange) => {
@@ -1095,6 +1192,7 @@ where
                         // ignore errors and disconnect after px attempt
                         let _res = tokio::time::timeout(timeout, done).await;
                         let _ = handle.disconnect_peer(peer_id).await;
+                        Ok(())
                     });
 
                     // insert to pending px disconnects
@@ -1111,12 +1209,32 @@ where
                 self.connected_peers.retain(|peer| *peer != peer_id);
             }
             PeerEvent::PeerConnected(peer_id, addr) => {
+                // Defense in depth: even if the peer-manager `handle_established_*_connection`
+                // path lets a banned peer reach this event (observed in adiri testnet logs),
+                // refuse to register the connection with kademlia/gossipsub. Otherwise the
+                // banned peer ends up in the kad routing table and triggers a redial loop.
+                if self.swarm.behaviour().peer_manager.peer_banned(&peer_id) {
+                    debug!(
+                        target: "network",
+                        ?peer_id,
+                        "PeerConnected for banned peer — refusing to register"
+                    );
+                    let _ = self.swarm.disconnect_peer_id(peer_id);
+                    return Ok(());
+                }
+
                 // register peer for request-response behaviour
                 // NOTE: gossipsub handles `FromSwarm::ConnectionEstablished`
                 self.swarm.add_peer_address(peer_id, addr.clone());
                 // add as a kademlia peer
                 self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
-                self.publish_our_data_to_peer(peer_id);
+
+                // First-time connections need a direct record push so the peer can resolve
+                // our BLS key without waiting for the next kad publication interval. Skip
+                // on reconnects to avoid amplifying the local kad store on flapping peers
+                if self.published_to_peers.insert(peer_id) {
+                    self.publish_our_data_to_peer(peer_id);
+                }
 
                 // manage connected peers for
                 self.connected_peers.push_back(peer_id);
@@ -1259,9 +1377,6 @@ where
                     kad::QueryResult::GetRecord(Ok(
                         kad::GetRecordOk::FinishedWithNoAdditionalRecord { cache_candidates },
                     )) => {
-                        // TODO: configure caching and see issue #301
-                        // self.swarm.behaviour_mut().kademlia.put_record_to(record, peers, quorum);
-
                         debug!(target: "network-kad", ?cache_candidates, "FinishedWithNoAdditionalRecord - failed to find record");
                         self.close_kad_query(&query_id);
                     }
@@ -1282,7 +1397,7 @@ where
                         );
                     }
                     kad::QueryResult::PutRecord(Err(err)) => {
-                        error!(target: "network-kad", "Failed to put record: {err:?}");
+                        debug!(target: "network-kad", "Failed to put record: {err:?}");
                     }
                     kad::QueryResult::StartProviding(Ok(kad::AddProviderOk { key })) => {
                         debug!(
@@ -1387,9 +1502,10 @@ where
                 trace!(target: "network-kad", "Got record {key} {value:?}");
                 self.swarm.behaviour_mut().peer_manager.add_known_peer(key, value.info);
             } else {
-                // mild punishment for old record
-                trace!(target: "network-kad", ?source, "processing mild penalty for old record");
-                self.swarm.behaviour_mut().peer_manager.process_penalty(source, Penalty::Mild);
+                // A peer republishing a slightly stale (but signature-valid) record is
+                // expected after restarts and benign — the local store keeps the newer
+                // version. Log only; no penalty.
+                trace!(target: "network-kad", ?source, "ignoring stale but valid kad record");
             }
         } else {
             warn!(target: "network-kad", "Received invalid peer record!");

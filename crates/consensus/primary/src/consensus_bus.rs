@@ -18,9 +18,9 @@ use tn_config::Parameters;
 use tn_network_libp2p::types::NetworkEvent;
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{
-    deconstruct_nonce, BlockHash, BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader,
-    ConsensusOutput, Epoch, EpochRecord, EpochVote, Header, Round, TnReceiver, TnSender,
-    CHANNEL_CAPACITY,
+    deconstruct_nonce, BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader,
+    ConsensusHeaderDigest, ConsensusOutput, Epoch, EpochRecord, EpochVote, Header, Round,
+    TnReceiver, TnSender, CHANNEL_CAPACITY,
 };
 use tokio::{
     sync::{
@@ -215,7 +215,7 @@ pub struct ConsensusBusAppInner {
     /// Watch tracking most recently seen consensus header.
     tx_last_consensus_header: watch::Sender<Option<ConsensusHeader>>,
     /// Watch tracking the last gossipped consensus block number and hash.
-    tx_last_published_consensus_num_hash: watch::Sender<(u64, BlockHash)>,
+    tx_last_published_consensus_num_hash: watch::Sender<(Epoch, u64, ConsensusHeaderDigest)>,
 
     /// Consensus header.  Note this can be used to create consensus output to execute for non
     /// validators.
@@ -232,6 +232,13 @@ pub struct ConsensusBusAppInner {
     tx_epoch_record: watch::Sender<Option<EpochRecord>>,
     /// The que channel for primary network events.
     primary_network_events: QueChannel<NetworkEvent<crate::network::Req, crate::network::Res>>,
+    /// Sender for epoch records that need to have a pack file downloaded.
+    epoch_request_queue_tx: tokio::sync::mpsc::Sender<(EpochRecord, EpochRecord)>,
+    /// Reciever for epoch records to download pack files for.
+    epoch_request_queue_rx:
+        Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(EpochRecord, EpochRecord)>>>,
+    /// Channel to request consensus headers to cache.
+    consensus_request_queue: QueChannel<(Epoch, u64, ConsensusHeaderDigest)>,
 }
 
 /// The thread-safe inner type that holds all the channels for inner-consensus
@@ -261,7 +268,8 @@ impl ConsensusBusApp {
 
         let (tx_primary_round_updates, _) = watch::channel(0u32);
         let (tx_last_consensus_header, _) = watch::channel(None);
-        let (tx_last_published_consensus_num_hash, _) = watch::channel((0, BlockHash::default()));
+        let (tx_last_published_consensus_num_hash, _) =
+            watch::channel((0, 0, ConsensusHeaderDigest::default()));
 
         let (tx_recent_blocks, _) = watch::channel(RecentBlocks::new(recent_blocks as usize));
         let (tx_sync_status, _) = watch::channel(NodeMode::default());
@@ -271,6 +279,8 @@ impl ConsensusBusApp {
 
         let (tx_epoch_record, _) = watch::channel(None);
 
+        let (epoch_request_queue_tx, epochs_rx) = tokio::sync::mpsc::channel(1024);
+        let epoch_request_queue_rx = Arc::new(tokio::sync::Mutex::new(epochs_rx));
         Self {
             inner: Arc::new(ConsensusBusAppInner {
                 tx_committed_round_updates,
@@ -286,6 +296,9 @@ impl ConsensusBusApp {
                 new_epoch_votes: QueChannel::new(),
                 tx_epoch_record,
                 primary_network_events: QueChannel::new_always_subscribed(),
+                epoch_request_queue_tx,
+                epoch_request_queue_rx,
+                consensus_request_queue: QueChannel::new(),
             }),
         }
     }
@@ -310,6 +323,21 @@ impl ConsensusBusApp {
     /// Contains the last requested epoch to retrieve a record.
     pub fn requested_missing_epoch(&self) -> &watch::Sender<Epoch> {
         &self.inner.tx_requested_missing_epoch
+    }
+
+    /// Update requested missing epoch if epoch is newer than the current value.
+    /// Return true if it updates.
+    pub fn set_request_missing_epoch_if_newer(&self, epoch: Epoch) -> bool {
+        self.requested_missing_epoch().send_if_modified(|state| {
+            if epoch > *state {
+                // Not sure we can sanity check this epoch.  However if it is bogus the code
+                // to handle it should be fine, it stops when out of epochs.
+                *state = epoch;
+                true
+            } else {
+                false
+            }
+        })
     }
 
     /// Signals a new round
@@ -348,15 +376,51 @@ impl ConsensusBusApp {
         &self.inner.tx_last_consensus_header
     }
 
+    /// Update last consensus header if header is newer than the current value.
+    /// Return true if it was updated.
+    pub fn send_last_consensus_header_if_newer(&self, header: ConsensusHeader) -> bool {
+        self.last_consensus_header().send_if_modified(|state| {
+            if header.number > state.as_ref().map(|h| h.number).unwrap_or_default() {
+                // Update our last seen valid consensus header if it is newer.
+                *state = Some(header);
+                true
+            } else {
+                false
+            }
+        })
+    }
+
     /// Track the latest published consensus header block number and hash seen on the gossip
     /// network. This value will have been verified and can be trusted to be the correct hash
     /// for block number.  DO NOT send unverified values to this watch.
-    pub fn last_published_consensus_num_hash(&self) -> &watch::Sender<(u64, BlockHash)> {
+    pub fn last_published_consensus_num_hash(
+        &self,
+    ) -> &watch::Sender<(Epoch, u64, ConsensusHeaderDigest)> {
         &self.inner.tx_last_published_consensus_num_hash
     }
 
+    /// Update the last published consensus epoch, number and hash if number is greater than current
+    /// value. Return true if it was updated.
+    pub fn publish_consensus_num_hash_if_newer(
+        &self,
+        epoch: Epoch,
+        number: u64,
+        hash: ConsensusHeaderDigest,
+    ) -> bool {
+        self.last_published_consensus_num_hash().send_if_modified(|state| {
+            if number > state.1 {
+                state.0 = epoch;
+                state.1 = number;
+                state.2 = hash;
+                true
+            } else {
+                false
+            }
+        })
+    }
+
     /// Returns the latest verified consensus block number and hash from gossip.
-    pub fn published_consensus_num_hash(&self) -> (u64, BlockHash) {
+    pub fn published_consensus_num_hash(&self) -> (Epoch, u64, ConsensusHeaderDigest) {
         *self.inner.tx_last_published_consensus_num_hash.borrow()
     }
 
@@ -488,7 +552,7 @@ impl ConsensusBusApp {
     /// Note if the chain is not advancing this may never return.
     pub async fn wait_for_consensus_execution(
         &self,
-        hash: BlockHash,
+        hash: ConsensusHeaderDigest,
     ) -> Result<(), WaitForExecutionElapsed> {
         let mut watch_execution_result = self.recent_blocks().subscribe();
         if self.recent_blocks().borrow().contains_consensus(hash) {
@@ -515,7 +579,7 @@ impl ConsensusBusApp {
         let parent_beacon_block_root = header.parent_beacon_block_root;
         if let Some(consensus_hash) = parent_beacon_block_root {
             consensus_chain
-                .consensus_header_by_digest(epoch, consensus_hash)
+                .consensus_header_by_digest(epoch, consensus_hash.into())
                 .await
                 .unwrap_or_default()
         } else {
@@ -537,6 +601,69 @@ impl ConsensusBusApp {
             .await
             .unwrap_or_default()
     }
+
+    /// Send a request to download the epoch pack file for the provided EpochRecord.
+    pub async fn request_epoch_pack_file(
+        &self,
+        previous_epoch_record: EpochRecord,
+        epoch_record: EpochRecord,
+    ) {
+        let _ = self.inner.epoch_request_queue_tx.send((previous_epoch_record, epoch_record)).await;
+    }
+
+    /// Send a request to download the epoch pack file for the provided Epoch.
+    /// Use this when you only have the epoch vs the EpochRecords.
+    pub async fn request_epoch_pack_file_by_epoch(
+        &self,
+        current_epoch: Epoch,
+        consensus_chain: &ConsensusChain,
+    ) {
+        // We are starting a new epoch behind consensus so make sure we have the pack file.
+        // If we still have epochs to fetch then add to the queue until we are out of epoch records.
+        // For epoch 0: `saturating_sub(1)` yields 0, so record_by_epoch(0) would return the
+        // *real* epoch-0 record- use a synthetic epoch record instead.
+        let maybe_previous = if current_epoch == 0 {
+            consensus_chain.epochs().record_by_epoch(0).await.map(|r| EpochRecord {
+                committee: r.committee.clone(),
+                next_committee: r.committee.clone(),
+                ..EpochRecord::default()
+            })
+        } else {
+            consensus_chain.epochs().record_by_epoch(current_epoch.saturating_sub(1)).await
+        };
+        if let Some(previous_epoch_record) = maybe_previous {
+            if let Some(epoch_record) =
+                consensus_chain.epochs().record_by_epoch(current_epoch).await
+            {
+                let contains_final_header = consensus_chain.is_epoch_complete(&epoch_record).await;
+                // If the pack file is missing or incomplete request it.
+                // Note since we have an epoch record this is a past epoch
+                // not the current epoch.
+                if !contains_final_header {
+                    self.request_epoch_pack_file(previous_epoch_record, epoch_record.clone()).await;
+                }
+            }
+        }
+    }
+
+    /// Retrieve the next request to down load an epoch pack file.
+    /// Will not resolve until a request is ready and will only ever
+    /// provide each request once.  Returns None when the underlying channel closes.
+    pub async fn get_next_epoch_pack_file_request(&self) -> Option<(EpochRecord, EpochRecord)> {
+        self.inner.epoch_request_queue_rx.lock().await.recv().await
+    }
+
+    /// Channel to request consensus headers to be fetched and cached.
+    pub fn consensus_request_queue(&self) -> &impl TnSender<(Epoch, u64, ConsensusHeaderDigest)> {
+        &self.inner.consensus_request_queue
+    }
+
+    /// Subscribe to consensus header fetch queue.
+    pub fn subscribe_consensus_request_queue(
+        &self,
+    ) -> impl TnReceiver<(Epoch, u64, ConsensusHeaderDigest)> {
+        self.inner.consensus_request_queue.subscribe()
+    }
 }
 
 impl Default for ConsensusBusApp {
@@ -553,9 +680,6 @@ struct ConsensusBusEpochInner {
     /// New certificates from the primary. The primary should send us new certificates
     /// only if it already sent us its whole history.
     new_certificates: QueChannel<Certificate>,
-    /// Outputs the sequence of ordered certificates to the primary (for cleanup and feedback).
-    committed_certificates: QueChannel<(Round, Vec<Certificate>)>,
-
     /// Sends missing certificates to the `CertificateFetcher`.
     /// Receives certificates with missing parents from the `Synchronizer`.
     certificate_fetcher: QueChannel<CertificateFetcherCommand>,
@@ -573,7 +697,7 @@ struct ConsensusBusEpochInner {
     committed_own_headers: QueChannel<(Round, Vec<Round>)>,
 
     /// Outputs the sequence of ordered certificates to the application layer.
-    sequence: QueChannel<Arc<CommittedSubDag>>,
+    sequence: QueChannel<CommittedSubDag>,
 
     /// Messages to the Certificate Manager.
     certificate_manager: QueChannel<CertificateManagerCommand>,
@@ -583,7 +707,6 @@ impl ConsensusBusEpochInner {
     fn new() -> Self {
         Self {
             new_certificates: QueChannel::new(),
-            committed_certificates: QueChannel::new(),
             certificate_fetcher: QueChannel::new(),
             parents: QueChannel::new(),
             our_digests: QueChannel::new(),
@@ -658,12 +781,6 @@ impl ConsensusBus {
         &self.inner_epoch.new_certificates
     }
 
-    /// Outputs the sequence of ordered certificates to the primary (for cleanup and feedback).
-    /// Can only be subscribed to once.
-    pub fn committed_certificates(&self) -> &impl TnSender<(Round, Vec<Certificate>)> {
-        &self.inner_epoch.committed_certificates
-    }
-
     /// Missing certificates.
     ///
     /// Sends missing certificates to the `CertificateFetcher`.
@@ -705,7 +822,7 @@ impl ConsensusBus {
 
     /// Outputs the sequence of ordered certificates from consensus.
     /// Can only be subscribed to once.
-    pub fn sequence(&self) -> &impl TnSender<Arc<CommittedSubDag>> {
+    pub fn sequence(&self) -> &impl TnSender<CommittedSubDag> {
         &self.inner_epoch.sequence
     }
 
@@ -753,11 +870,6 @@ impl ConsensusBus {
         self.inner_epoch.new_certificates.subscribe()
     }
 
-    /// Subscribe to the sequence of ordered certificates to the primary (for cleanup and feedback).
-    pub fn subscribe_committed_certificates(&self) -> impl TnReceiver<(Round, Vec<Certificate>)> {
-        self.inner_epoch.committed_certificates.subscribe()
-    }
-
     /// Subscribe to certificates with missing parents from the `Synchronizer`.
     pub fn subscribe_certificate_fetcher(&self) -> impl TnReceiver<CertificateFetcherCommand> {
         self.inner_epoch.certificate_fetcher.subscribe()
@@ -785,7 +897,7 @@ impl ConsensusBus {
     }
 
     /// Subscribe to sequence of ordered certificates to the application layer.
-    pub fn subscribe_sequence(&self) -> impl TnReceiver<Arc<CommittedSubDag>> {
+    pub fn subscribe_sequence(&self) -> impl TnReceiver<CommittedSubDag> {
         self.inner_epoch.sequence.subscribe()
     }
 

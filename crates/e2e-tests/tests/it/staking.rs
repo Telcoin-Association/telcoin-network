@@ -129,7 +129,7 @@ async fn test_cli_keygen_to_stake() -> eyre::Result<()> {
         epochIssuance: U256::from(parse_ether("20_000_000").unwrap())
             .checked_div(U256::from(28))
             .expect("u256 div"),
-        epochDuration: 86400,
+        epochDuration: 28800,
     };
 
     let genesis = tn_types::test_genesis().extend_accounts([
@@ -148,6 +148,7 @@ async fn test_cli_keygen_to_stake() -> eyre::Result<()> {
         genesis,
         initial_stake_config.clone(),
         governance,
+        vec![(0u8, 30_000_000u64)],
     )?;
 
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
@@ -224,8 +225,9 @@ async fn test_cli_keygen_to_stake() -> eyre::Result<()> {
         "validator should be PendingActivation after stake + activate"
     );
     assert!(!on_chain.isRetired, "validator should not be retired");
+    let on_chain_bls = reth_env.get_bls_pubkey(h1.hash(), new_validator_addr)?;
     assert_eq!(
-        on_chain.blsPubkey.as_ref(),
+        on_chain_bls.as_ref(),
         node_info.bls_public_key.to_bytes(),
         "on-chain BLS pubkey should match CLI-generated key"
     );

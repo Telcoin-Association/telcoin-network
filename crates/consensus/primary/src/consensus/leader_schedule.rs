@@ -248,7 +248,7 @@ impl LeaderSchedule {
     }
 
     /// Restores the LeaderSchedule by using the storage. It will attempt to retrieve the last
-    /// committed "final" ReputationScores and use them to create build a LeaderSwapTable to use
+    /// committed "final" ReputationScores and use them to build a LeaderSwapTable to use
     /// for the LeaderSchedule.
     pub async fn from_store(
         committee: Committee,
@@ -262,7 +262,7 @@ impl LeaderSchedule {
             LeaderSwapTable::new(
                 &committee,
                 subdag.leader_round(),
-                &subdag.reputation_score,
+                subdag.reputation_scores(),
                 bad_nodes_percent_threshold,
             )
         });

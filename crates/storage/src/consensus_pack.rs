@@ -3,7 +3,7 @@
 
 use std::{
     cmp::max,
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     error::Error,
     fmt::Display,
     hash::BuildHasherDefault,
@@ -11,17 +11,18 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
     thread::JoinHandle,
+    time::Duration,
 };
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tn_types::{
     gas_accumulator::RewardsCounter, AuthorityIdentifier, Batch, BlockHash, BlockNumHash,
-    CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput, Epoch,
-    EpochRecord, Round, B256,
+    BlsPublicKey, CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader,
+    ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch, EpochRecord, Round, B256,
 };
 use tokio::{
-    io::{AsyncRead, AsyncSeek},
+    io::AsyncRead,
     sync::{
         mpsc::{self, Receiver, Sender},
         oneshot, watch,
@@ -34,7 +35,7 @@ use crate::archive::{
     error::{fetch::FetchError, open::OpenError},
     fxhasher::FxHasher,
     index::Index as _,
-    pack::{Pack, DATA_HEADER_BYTES},
+    pack::{Pack, PackCompression, DATA_HEADER_BYTES},
     pack_iter::AsyncPackIter,
     position_index::index::PositionIndex,
 };
@@ -54,7 +55,7 @@ pub struct EpochMeta {
     pub genesis_exec_state: BlockNumHash,
     /// The hash of the last ['ConsensusHeader'] of the previous epoch.
     /// This is the "genesis" consensus ofder  this epoch.
-    pub genesis_consensus: BlockNumHash,
+    pub genesis_consensus: ConsensusNumHash,
 }
 
 /// Descriminant type for records in a Consensus Pack file.
@@ -92,13 +93,13 @@ impl PackRecord {
 enum PackMessage {
     ConsensusOutput(ConsensusOutput),
     ContainsConsensusHeaderNumber(u64, oneshot::Sender<bool>),
-    ContainsConsensusHeader(B256, oneshot::Sender<bool>),
-    ConsensusHeader(B256, oneshot::Sender<Option<ConsensusHeader>>),
+    ContainsConsensusHeader(ConsensusHeaderDigest, oneshot::Sender<bool>),
+    ConsensusHeader(ConsensusHeaderDigest, oneshot::Sender<Option<ConsensusHeader>>),
     ConsensusHeaderNumber(u64, oneshot::Sender<Result<ConsensusHeader, PackError>>),
     GetConsensusOutput(u64, oneshot::Sender<Result<ConsensusOutput, PackError>>),
     Persist(oneshot::Sender<Result<(), PackError>>),
     ReadLastCommitted(oneshot::Sender<HashMap<AuthorityIdentifier, Round>>),
-    ReadLatestFinalRep(oneshot::Sender<Option<Arc<CommittedSubDag>>>),
+    ReadLatestFinalRep(oneshot::Sender<Option<CommittedSubDag>>),
     ContainsBatch(B256, oneshot::Sender<bool>),
     Batch(B256, oneshot::Sender<Option<Batch>>),
     CountLeaders(Round, RewardsCounter, oneshot::Sender<Result<(), PackError>>),
@@ -183,7 +184,7 @@ fn run_pack_loop(
 impl Drop for ConsensusPack {
     fn drop(&mut self) {
         if Arc::strong_count(&self.handle) == 1 {
-            // If we are the last ConsensusPack then shutdown thread and wait for it persist and
+            // If we are the last ConsensusPack then shutdown thread and wait for it to persist and
             // exit.
             if let Some(handle) = self.handle.lock().take() {
                 if self.tx.try_send(PackMessage::Shutdown).is_ok() {
@@ -250,16 +251,26 @@ impl ConsensusPack {
     }
 
     /// Create a new set of epoch static files to write consensus output into.
-    pub async fn stream_import<P: Into<PathBuf>, R: AsyncRead + AsyncSeek + Unpin>(
+    pub async fn stream_import<P: Into<PathBuf>, R: AsyncRead + Unpin>(
         path: P,
         stream: R,
         epoch: Epoch,
-        previous_epoch: EpochRecord,
+        previous_epoch: &EpochRecord,
+        final_consensus_number: u64,
+        timeout: Duration,
     ) -> Result<ConsensusPack, PackError> {
         let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
         let (tx_error, error) = watch::channel(None);
-        let inner = Inner::stream_import(path, stream, epoch, &previous_epoch).await?;
+        let inner = Inner::stream_import(
+            path,
+            stream,
+            epoch,
+            previous_epoch,
+            final_consensus_number,
+            timeout,
+        )
+        .await?;
         let handle = std::thread::spawn(move || {
             run_pack_loop(inner, rx, tx_error);
         });
@@ -314,7 +325,7 @@ impl ConsensusPack {
     }
 
     /// True if consensus header by digest is found by digest.
-    pub async fn contains_consensus_header(&self, digest: B256) -> bool {
+    pub async fn contains_consensus_header(&self, digest: ConsensusHeaderDigest) -> bool {
         let (tx, rx) = oneshot::channel();
         if self.tx.send(PackMessage::ContainsConsensusHeader(digest, tx)).await.is_ok() {
             rx.await.unwrap_or(false)
@@ -324,7 +335,10 @@ impl ConsensusPack {
     }
 
     /// Retrieve a consensus header by digest.
-    pub async fn consensus_header_by_digest(&self, digest: B256) -> Option<ConsensusHeader> {
+    pub async fn consensus_header_by_digest(
+        &self,
+        digest: ConsensusHeaderDigest,
+    ) -> Option<ConsensusHeader> {
         let (tx, rx) = oneshot::channel();
         if self.tx.send(PackMessage::ConsensusHeader(digest, tx)).await.is_ok() {
             rx.await.unwrap_or(None)
@@ -366,9 +380,7 @@ impl ConsensusPack {
     /// Reads from storage the latest commit sub dag from the epoch where its
     /// ReputationScores are marked as "final". If none exists then this
     /// method returns `None`.
-    pub async fn read_latest_commit_with_final_reputation_scores(
-        &self,
-    ) -> Option<Arc<CommittedSubDag>> {
+    pub async fn read_latest_commit_with_final_reputation_scores(&self) -> Option<CommittedSubDag> {
         let (tx, rx) = oneshot::channel();
         let _ = self.tx.send(PackMessage::ReadLatestFinalRep(tx)).await;
         rx.await.unwrap_or_default()
@@ -536,7 +548,8 @@ impl Inner {
         let _ = std::fs::create_dir_all(&base_dir);
         let pack_file = base_dir.join(Self::DATA_NAME);
         let have_pack = std::fs::exists(&pack_file).unwrap_or_default();
-        let mut data: Pack<PackRecord> = Pack::open(&pack_file, epoch as u64, false)?;
+        let mut data: Pack<PackRecord> =
+            Pack::open(&pack_file, epoch as u64, false, PackCompression::ZStd)?;
         let start_consensus_number =
             if epoch == 0 { 1 } else { previous_epoch.final_consensus.number + 1 };
         let epoch_meta = EpochMeta {
@@ -550,7 +563,10 @@ impl Inner {
         if let Ok(meta) = data.fetch(DATA_HEADER_BYTES as u64) {
             let meta = meta.into_epoch()?;
             if epoch_meta != meta {
-                return Err(PackError::InvalidEpoch);
+                return Err(PackError::InvalidEpoch(
+                    epoch,
+                    format!("open append has unexpected meta data, expected {epoch_meta:?} got {meta:?}"),
+                ));
             }
         } else {
             data.append(&PackRecord::EpochMeta(epoch_meta.clone()))
@@ -593,8 +609,12 @@ impl Inner {
     fn open_append_exists<P: AsRef<Path>>(path: P, epoch: Epoch) -> Result<Self, PackError> {
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
 
-        let mut data =
-            Pack::<PackRecord>::open(base_dir.join(Self::DATA_NAME), epoch as u64, false)?;
+        let mut data = Pack::<PackRecord>::open(
+            base_dir.join(Self::DATA_NAME),
+            epoch as u64,
+            false,
+            PackCompression::ZStd,
+        )?;
         let epoch_meta = data
             .fetch(DATA_HEADER_BYTES as u64)
             .map_err(|e| PackError::EpochLoad(e.to_string()))?
@@ -631,8 +651,12 @@ impl Inner {
     fn open_static<P: AsRef<Path>>(path: P, epoch: Epoch) -> Result<Self, PackError> {
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
 
-        let mut data =
-            Pack::<PackRecord>::open(base_dir.join(Self::DATA_NAME), epoch as u64, true)?;
+        let mut data = Pack::<PackRecord>::open(
+            base_dir.join(Self::DATA_NAME),
+            epoch as u64,
+            true,
+            PackCompression::ZStd,
+        )?;
         let epoch_meta = data
             .fetch(DATA_HEADER_BYTES as u64)
             .map_err(|e| PackError::EpochLoad(e.to_string()))?
@@ -667,27 +691,93 @@ impl Inner {
         Ok(Self { data, consensus_idx, consensus_digests, batch_digests, epoch_meta })
     }
 
+    /// Verify a streamed EpochMeta record is valid.
+    fn verify_epoch_meta(
+        epoch: Epoch,
+        previous_epoch: &EpochRecord,
+        epoch_meta: &EpochMeta,
+    ) -> Result<(), PackError> {
+        if epoch != epoch_meta.epoch {
+            return Err(PackError::InvalidEpoch(
+                epoch,
+                format!("meta data epoch is {}", epoch_meta.epoch),
+            ));
+        }
+        let start_consensus_number =
+            if epoch == 0 { 1 } else { previous_epoch.final_consensus.number + 1 };
+        if start_consensus_number != epoch_meta.start_consensus_number {
+            return Err(PackError::InvalidEpoch(
+                epoch,
+                format!(
+                    "expected start consensus number {start_consensus_number}, got {}",
+                    epoch_meta.start_consensus_number
+                ),
+            ));
+        }
+        if previous_epoch.final_state != epoch_meta.genesis_exec_state {
+            return Err(PackError::InvalidEpoch(
+                epoch,
+                format!(
+                    "expected final state {:?} meta final state {:?}",
+                    previous_epoch.final_state, epoch_meta.genesis_exec_state
+                ),
+            ));
+        }
+        if previous_epoch.final_consensus != epoch_meta.genesis_consensus {
+            return Err(PackError::InvalidEpoch(
+                epoch,
+                format!(
+                    "expected final consensus {:?} meta final consensus {:?}",
+                    previous_epoch.final_consensus, epoch_meta.genesis_consensus
+                ),
+            ));
+        }
+        let committee: BTreeSet<BlsPublicKey> =
+            previous_epoch.next_committee.iter().copied().collect();
+        if epoch_meta.committee.bls_keys() != committee {
+            return Err(PackError::InvalidEpoch(
+                epoch,
+                "epoch meta has unexpected committee".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Create a new set of epoch static files to write consensus output into.
-    async fn stream_import<P: AsRef<Path>, R: AsyncRead + AsyncSeek + Unpin>(
+    async fn stream_import<P: AsRef<Path>, R: AsyncRead + Unpin>(
         path: P,
         stream: R,
         epoch: Epoch,
         previous_epoch: &EpochRecord,
+        final_consensus_number: u64,
+        timeout: Duration,
     ) -> Result<Self, PackError> {
+        /// Private helper to read the next record from a pack iterator or timeout if it takes
+        /// longer than timeout.
+        async fn next<R: AsyncRead + Unpin>(
+            iter: &mut AsyncPackIter<PackRecord, R>,
+            timeout: Duration,
+        ) -> Result<Option<PackRecord>, PackError> {
+            match tokio::time::timeout(timeout, iter.next()).await {
+                Ok(Some(Ok(rec))) => Ok(Some(rec)),
+                Ok(Some(Err(e))) => Err(PackError::ReadError(e.to_string())),
+                Ok(None) => Ok(None),
+                Err(_) => Err(PackError::ReadError("timeout".to_string())),
+            }
+        }
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
         let _ = std::fs::create_dir_all(&base_dir);
         let mut stream_iter = AsyncPackIter::<PackRecord, R>::open(stream, epoch as u64)
             .await
             .map_err(|e| PackError::ReadError(e.to_string()))?;
-        let mut data = Pack::open(base_dir.join(Self::DATA_NAME), epoch as u64, false)?;
-        let epoch_meta = if let Some(Ok(meta)) = stream_iter.next().await {
+        let mut data =
+            Pack::open(base_dir.join(Self::DATA_NAME), epoch as u64, false, PackCompression::ZStd)?;
+        let epoch_meta = if let Some(meta) = next(&mut stream_iter, timeout).await? {
             meta.into_epoch()?
         } else {
             return Err(PackError::NotEpoch);
         };
-        if epoch != epoch_meta.epoch {
-            return Err(PackError::InvalidEpoch);
-        }
+        Self::verify_epoch_meta(epoch, previous_epoch, &epoch_meta)?;
         data.append(&PackRecord::EpochMeta(epoch_meta.clone()))
             .map_err(|e| PackError::Append(e.to_string()))?;
         let mut consensus_idx = PositionIndex::open_pdx_file(
@@ -712,10 +802,14 @@ impl Inner {
             false,
         )
         .map_err(OpenError::IndexFileOpen)?;
-        let mut parent_digest = previous_epoch.final_consensus.hash;
+        let mut parent_digest = if epoch == 0 {
+            ConsensusHeader::default().digest()
+        } else {
+            previous_epoch.final_consensus.hash
+        };
         let mut batches = HashSet::new();
-        while let Some(record) = stream_iter.next().await {
-            let record = record.map_err(|e| PackError::ReadError(e.to_string()))?;
+        let mut referenced_batches = HashSet::new();
+        while let Some(record) = next(&mut stream_iter, timeout).await? {
             match record {
                 PackRecord::EpochMeta(_epoch_meta) => {
                     return Err(PackError::EpochLoad("epoch meta data found twice".to_string()))
@@ -737,24 +831,38 @@ impl Inner {
                     if consensus_header.parent_hash != parent_digest {
                         return Err(PackError::InvalidConsensusChain);
                     }
-                    for cert in &consensus_header.sub_dag.certificates {
-                        for (digest, _) in cert.header().payload().iter() {
-                            if !batches.remove(digest) {
+                    for header in consensus_header.sub_dag.headers() {
+                        for (digest, _) in header.payload().iter() {
+                            if !batches.contains(digest) {
                                 return Err(PackError::MissingBatches);
                             }
+                            referenced_batches.insert(*digest);
                         }
                     }
-                    if !batches.is_empty() {
+                    // batches.len() will generally equal referenced_batches.len() but if it is
+                    // greater than we had batches that were not accounted for.
+                    // It is possible (at time of writing) for a batch to
+                    // be in more than one subdag.  This is also why we don't just
+                    // remove batches as we check above.
+                    if batches.len() > referenced_batches.len() {
                         return Err(PackError::ExtraBatches);
                     }
+                    batches.clear();
+                    referenced_batches.clear();
                     let consensus_digest = consensus_header.digest();
                     parent_digest = consensus_digest;
                     let consensus_number = consensus_header.number;
+                    if consensus_number > final_consensus_number {
+                        return Err(PackError::InvalidConsensusNumber(
+                            consensus_number,
+                            final_consensus_number,
+                        ));
+                    }
                     let position = data
                         .append(&PackRecord::Consensus(consensus_header))
                         .map_err(|e| PackError::Append(e.to_string()))?;
                     consensus_digests
-                        .save(consensus_digest, position)
+                        .save(consensus_digest.into(), position)
                         .map_err(|e| PackError::IndexAppend(format!("consensus digest {e}")))?;
                     let consensus_idx_pos =
                         consensus_number.saturating_sub(epoch_meta.start_consensus_number);
@@ -818,7 +926,7 @@ impl Inner {
             .append(&PackRecord::Consensus(Box::new(consensus.consensus_header())))
             .map_err(|e| PackError::Append(e.to_string()))?;
         self.consensus_digests
-            .save(consensus_digest, position)
+            .save(consensus_digest.into(), position)
             .map_err(|e| PackError::IndexAppend(format!("consensus {e}")))?;
         self.consensus_idx
             .save(consensus_idx, position)
@@ -844,7 +952,7 @@ impl Inner {
             .into_consensus()?;
         let parent_hash = header.parent_hash;
         let deliver = header.sub_dag;
-        let num_blocks = deliver.num_primary_blocks();
+        let num_blocks = deliver.num_primary_batches();
         let num_certs = deliver.len();
 
         let sub_dag = deliver;
@@ -855,8 +963,8 @@ impl Inner {
         let mut batch_set: HashSet<BlockHash> = HashSet::new();
 
         let mut batch_digests = VecDeque::with_capacity(num_certs);
-        for cert in sub_dag.certificates() {
-            for (digest, _) in cert.header().payload().iter() {
+        for header in sub_dag.headers() {
+            for (digest, _) in header.payload().iter() {
                 batch_set.insert(*digest);
                 batch_digests.push_back(*digest);
             }
@@ -864,12 +972,12 @@ impl Inner {
 
         // map all fetched batches to their respective certificates for applying block rewards
         let mut batches = Vec::with_capacity(num_certs);
-        for cert in &sub_dag.certificates {
+        for header in sub_dag.headers() {
             // create collection of batches to execute for this certificate
-            let mut cert_batches = Vec::with_capacity(cert.header().payload().len());
+            let mut cert_batches = Vec::with_capacity(header.payload().len());
 
             // retrieve fetched batch by digest
-            for digest in cert.header().payload().keys() {
+            for digest in header.payload().keys() {
                 let position = self
                     .batch_digests
                     .load(*digest)
@@ -883,7 +991,7 @@ impl Inner {
             }
 
             let address =
-                self.epoch_meta.committee.authority(cert.origin()).map(|a| a.execution_address());
+                self.epoch_meta.committee.authority(header.author()).map(|a| a.execution_address());
             if let Some(address) = address {
                 // main collection for execution
                 batches.push(CertifiedBatch { address, batches: cert_batches });
@@ -901,11 +1009,11 @@ impl Inner {
     }
 
     /// True if consensus header is found by digest.
-    fn contains_consensus_header(&mut self, digest: B256) -> bool {
+    fn contains_consensus_header(&mut self, digest: ConsensusHeaderDigest) -> bool {
         // This is a bit more complicated (the pos file_len check) because in a very rare
         // case of repairing a damaged pack we might have something in the index not in the
         // pack file (yet).
-        if let Ok(pos) = self.consensus_digests.load(digest) {
+        if let Ok(pos) = self.consensus_digests.load(digest.into()) {
             pos < self.data.file_len()
         } else {
             false
@@ -913,10 +1021,26 @@ impl Inner {
     }
 
     /// Retrieve a consensus header by digest.
-    fn consensus_header_by_digest(&mut self, digest: B256) -> Option<ConsensusHeader> {
-        let pos = self.consensus_digests.load(digest).ok()?;
-        let rec = self.data.fetch(pos).ok()?;
-        rec.into_consensus().ok()
+    fn consensus_header_by_digest(
+        &mut self,
+        digest: ConsensusHeaderDigest,
+    ) -> Option<ConsensusHeader> {
+        let pos = self.consensus_digests.load(digest.into()).ok()?;
+        // This is not strickly needed, the fetch below will fail if
+        // we try to read past the end of the file but this potentially
+        // short circuits a lot of checks for a small cost.
+        // Note, this could happen if a file is damaged and repaired.
+        if pos >= self.data.file_len() {
+            return None;
+        }
+        let header = self.data.fetch(pos).ok()?.into_consensus().ok()?;
+        // Verify the digest.  There is an extremely unlikely edge case where
+        // a repaired DB could write a new header to the same location as an
+        // old header.  This makes sure the contract is always intact.
+        if header.digest() != digest {
+            return None;
+        }
+        Some(header)
     }
 
     /// Retrieve a consensus header by number.
@@ -962,21 +1086,21 @@ impl Inner {
                 let block = self.data.fetch(pos);
                 block.ok().map(|b| b.into_consensus().ok()).unwrap_or_default()
             }) {
-                let id = block.sub_dag.leader.origin().clone();
+                let id = block.sub_dag.leader().author().clone();
                 let round = block.sub_dag.leader_round();
-                let certs = block.sub_dag.certificates();
+                let headers = block.sub_dag.headers();
                 res.entry(id).and_modify(|r| *r = max(*r, round)).or_insert_with(|| round);
-                for c in certs {
-                    res.entry(c.origin().clone())
-                        .and_modify(|r| *r = max(*r, c.round()))
-                        .or_insert_with(|| c.round());
+                for h in headers {
+                    res.entry(h.author().clone())
+                        .and_modify(|r| *r = max(*r, h.round()))
+                        .or_insert_with(|| h.round());
                 }
             }
         }
         res
     }
 
-    fn read_latest_commit_with_final_reputation_scores(&mut self) -> Option<Arc<CommittedSubDag>> {
+    fn read_latest_commit_with_final_reputation_scores(&mut self) -> Option<CommittedSubDag> {
         if let Ok(iter) = self.consensus_idx.rev_iter(1000) {
             for commit in iter.filter_map(|pos| {
                 let block = self.data.fetch(pos);
@@ -987,10 +1111,10 @@ impl Inner {
                 }
             }) {
                 // found a final of schedule score, so we'll return that
-                if commit.reputation_score.final_of_schedule {
+                if commit.reputation_scores().final_of_schedule {
                     debug!(
                         "Found latest final reputation scores: {:?} from commit",
-                        commit.reputation_score,
+                        commit.reputation_scores(),
                     );
                     return Some(commit);
                 }
@@ -1002,19 +1126,34 @@ impl Inner {
 
     /// True if the pack contains the batch for digest.
     fn contains_batch(&mut self, digest: BlockHash) -> bool {
-        self.batch_digests.load(digest).is_ok()
+        // This is a bit more complicated (the pos file_len check) because in a very rare
+        // case of repairing a damaged pack we might have something in the index not in the
+        // pack file (yet).
+        if let Ok(pos) = self.batch_digests.load(digest) {
+            pos < self.data.file_len()
+        } else {
+            false
+        }
     }
 
     /// Return the Batch for digest if found.
     fn batch(&mut self, digest: BlockHash) -> Option<Batch> {
-        if let Ok(pos) = self.batch_digests.load(digest) {
-            if let Ok(batch) = self.data.fetch(pos) {
-                if let Ok(batch) = batch.into_batch() {
-                    return Some(batch);
-                }
-            }
+        let pos = self.batch_digests.load(digest).ok()?;
+        // This is not strickly needed, the fetch below will fail if
+        // we try to read past the end of the file but this potentially
+        // short circuits a lot of checks for a small cost.
+        // Note, this could happen if a file is damaged and repaired.
+        if pos >= self.data.file_len() {
+            return None;
         }
-        None
+        let batch = self.data.fetch(pos).ok()?.into_batch().ok()?;
+        // Verify the digest.  There is an extremely unlikely edge case where
+        // a repaired DB could write a new batch to the same location as an
+        // old batch.  This makes sure the contract is always intact.
+        if batch.digest() != digest {
+            return None;
+        }
+        Some(batch)
     }
 
     /// Count leaders in this pack (in rewards_counter) lower than last_executed_round.
@@ -1040,7 +1179,7 @@ impl Inner {
                 continue;
             }
 
-            rewards_counter.inc_leader_count(header.sub_dag.leader.origin());
+            rewards_counter.inc_leader_count(header.sub_dag.leader().author());
         }
         Ok(())
     }
@@ -1065,7 +1204,7 @@ pub enum PackError {
     InvalidConsensusChain,
     ExtraBatches,
     MissingBatches,
-    InvalidEpoch,
+    InvalidEpoch(Epoch, String),
     SendFailed,
     ReceiveFailed,
     PersistError(String),
@@ -1097,7 +1236,9 @@ impl Display for PackError {
             PackError::InvalidConsensusChain => write!(f, "Broken consensus record chain"),
             PackError::ExtraBatches => write!(f, "Extra batches in pack file"),
             PackError::MissingBatches => write!(f, "Missing batches in pack file"),
-            PackError::InvalidEpoch => write!(f, "Epoch meta data incorrect"),
+            PackError::InvalidEpoch(epoch, msg) => {
+                write!(f, "Epoch meta data incorrect, epoch {epoch}: {msg}")
+            }
             PackError::SendFailed => write!(f, "Internal channel send failed"),
             PackError::ReceiveFailed => write!(f, "Internal channel receive failed"),
             PackError::PersistError(e) => write!(f, "Failed to persist: {e}"),
@@ -1151,8 +1292,9 @@ pub(crate) mod test {
     use tn_reth::RethChainSpec;
     use tn_test_utils::CommitteeFixture;
     use tn_types::{
-        now, test_genesis, BlockHash, Certificate, CertifiedBatch, CommittedSubDag, Committee,
-        ConsensusOutput, EpochRecord, Hash, ReputationScores,
+        test_genesis, BlockHash, Certificate, CertifiedBatch, CommittedSubDag, Committee,
+        ConsensusHeader, ConsensusHeaderDigest, ConsensusOutput, EpochRecord, Hash, HeaderBuilder,
+        ReputationScores,
     };
 
     use crate::{
@@ -1165,7 +1307,7 @@ pub(crate) mod test {
         authority_index: usize,
         chain: Arc<RethChainSpec>,
         number: u64,
-        parent: BlockHash,
+        parent: ConsensusHeaderDigest,
     ) -> ConsensusOutput {
         let batches_1 = tn_reth::test_utils::batches(chain, 4); // create 4 batches
         let authority_1 = committee
@@ -1179,27 +1321,27 @@ pub(crate) mod test {
             .expect("authority in committee")
             .execution_address();
 
-        let timestamp = now();
         let mut leader_1 = Certificate::default();
         // update cert
-        leader_1.update_created_at_for_test(timestamp);
-        leader_1.header_mut_for_test().author = authority_1;
+        leader_1.update_header_author_for_test(authority_1);
         for batch in &batches_1 {
-            leader_1.header.payload.insert(batch.digest(), 0_u16);
+            let mut builder = HeaderBuilder::from_header(leader_1.header());
+            builder = builder.with_payload_batch(&batch, 0_u16);
+            leader_1.update_header_for_test(builder.build());
         }
         let sub_dag_index_1 = 1;
-        leader_1.header.round = sub_dag_index_1 as u32;
-        leader_1.header.epoch = committee.epoch();
+        leader_1.update_header_round_for_test(sub_dag_index_1 as u32);
+        leader_1.update_header_epoch_for_test(committee.epoch());
         let reputation_scores = ReputationScores::default();
         let previous_sub_dag = None;
         let batch_digests_1: VecDeque<BlockHash> = batches_1.iter().map(|b| b.digest()).collect();
-        let subdag_1 = Arc::new(CommittedSubDag::new(
+        let subdag_1 = CommittedSubDag::new(
             vec![leader_1.clone()],
             leader_1,
             sub_dag_index_1,
             reputation_scores,
             previous_sub_dag,
-        ));
+        );
         ConsensusOutput::new(
             subdag_1.clone(),
             parent,
@@ -1260,7 +1402,7 @@ pub(crate) mod test {
 
         let num_outputs = 1000;
         let mut outputs = Vec::new();
-        let mut parent = BlockHash::default();
+        let mut parent = ConsensusHeader::default().digest();
         for i in 0..num_outputs {
             let consensus_output =
                 make_test_output(&committee, i % 4, chain.clone(), (i as u64) + 1, parent);
@@ -1321,10 +1463,16 @@ pub(crate) mod test {
                 tokio::fs::File::open(temp_dir.path().join("epoch-0").join(Inner::DATA_NAME))
                     .await
                     .expect("log file");
-            let pack =
-                ConsensusPack::stream_import(temp_dir2.path(), stream, 0, previous_epoch.clone())
-                    .await
-                    .expect("open pack");
+            let pack = ConsensusPack::stream_import(
+                temp_dir2.path(),
+                stream,
+                0,
+                &previous_epoch,
+                num_outputs as u64 * 2,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("open pack");
             tokio::time::sleep(Duration::from_secs(2)).await;
             for i in 0..num_outputs {
                 let output_db = pack.get_consensus_output(i as u64 + 1).await.unwrap();

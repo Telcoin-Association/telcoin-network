@@ -28,8 +28,8 @@ use tn_test_utils::default_test_execution_node;
 use tn_types::{
     gas_accumulator::GasAccumulator, max_batch_gas, now, test_chain_spec_arc, test_genesis,
     Address, Batch, BlockHash, Bloom, Bytes, Certificate, CertifiedBatch, CommittedSubDag,
-    ConsensusOutput, Encodable2718, GenesisAccount, Hash as _, Notifier, ReputationScores,
-    SealedBlock, TaskManager, TransactionTrait as _, B256, EMPTY_WITHDRAWALS,
+    ConsensusHeaderDigest, ConsensusOutput, Encodable2718, GenesisAccount, Hash as _, Notifier,
+    ReputationScores, SealedBlock, TaskManager, TransactionTrait as _, B256, EMPTY_WITHDRAWALS,
     MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tokio::{sync::oneshot, time::timeout};
@@ -64,7 +64,7 @@ fn calc_priority_fees(basefee: u64) -> u64 {
 fn assert_eip4788(
     reth_env: &RethEnv,
     block: &SealedBlock,
-    consensus_hash: B256,
+    consensus_hash: ConsensusHeaderDigest,
 ) -> eyre::Result<()> {
     // for EIP-4788, the storage slot is derived from the timestamp:
     //  - timestamp_slot = to_uint256_be(evm.timestamp) % HISTORY_BUFFER_LENGTH
@@ -83,7 +83,8 @@ fn assert_eip4788(
 
     // assert the block hash was correctly written to the contract
     let root_storage_slot = timestamp_storage_slot + U256::from(HISTORY_BUFFER_LENGTH);
-    let expected_blockhash = U256::from_be_bytes(consensus_hash.0);
+    let expected_blockhash: B256 = consensus_hash.into();
+    let expected_blockhash = U256::from_be_bytes(expected_blockhash.0);
     let stored_value =
         state_provider.storage(BEACON_ROOTS_ADDRESS, root_storage_slot.into())?.unwrap_or_default();
     assert_eq!(
@@ -137,22 +138,22 @@ async fn test_empty_output_skips_execution() -> eyre::Result<()> {
     let timestamp = now();
     let mut leader = Certificate::default();
     let sub_dag_index = 0;
-    leader.header.round = sub_dag_index as u32;
+    leader.update_header_round_for_test(sub_dag_index as u32);
     // update timestamp so it's not default 0
-    leader.header.created_at = timestamp;
+    leader.update_header_created_at_for_test(timestamp);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
-    leader.header_mut_for_test().author = leader_id;
+    leader.update_header_author_for_test(leader_id);
 
-    let sub_dag: Arc<CommittedSubDag> = CommittedSubDag::new(
+    let sub_dag: CommittedSubDag = CommittedSubDag::new(
         vec![leader.clone()],
         leader,
         sub_dag_index,
         reputation_scores,
         previous_sub_dag,
-    )
-    .into();
-    let consensus_output = ConsensusOutput::new_with_subdag(sub_dag, BlockHash::default(), 0);
+    );
+    let consensus_output =
+        ConsensusOutput::new_with_subdag(sub_dag, ConsensusHeaderDigest::default(), 0);
 
     let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
     let reth_env = execution_node.get_reth_env().await;
@@ -188,6 +189,7 @@ async fn test_empty_output_skips_execution() -> eyre::Result<()> {
     task_manager.spawn_task("Test task eng", async move {
         let res = engine.await;
         let _ = tx.send(res);
+        Ok(())
     });
 
     let engine_task = timeout(Duration::from_secs(10), rx).await??;
@@ -242,22 +244,28 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
     let timestamp = now();
     let mut leader = Certificate::default();
     let sub_dag_index = 0;
-    leader.header.round = sub_dag_index as u32;
+    leader.update_header_round_for_test(sub_dag_index as u32);
     // update timestamp so it's not default 0
-    leader.header.created_at = timestamp;
+    leader.update_header_created_at_for_test(timestamp);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
-    leader.header_mut_for_test().author = leader_id;
+    leader.update_header_author_for_test(leader_id);
 
-    let subdag = Arc::new(CommittedSubDag::new(
+    let subdag = CommittedSubDag::new(
         vec![leader.clone()],
         leader,
         sub_dag_index,
         reputation_scores,
         previous_sub_dag,
-    ));
-    let consensus_output =
-        ConsensusOutput::new(subdag, BlockHash::default(), 0, true, VecDeque::new(), vec![]);
+    );
+    let consensus_output = ConsensusOutput::new(
+        subdag,
+        ConsensusHeaderDigest::default(),
+        0,
+        true,
+        VecDeque::new(),
+        vec![],
+    );
     let consensus_output_hash = consensus_output.consensus_header_hash();
 
     let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
@@ -294,6 +302,7 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
     task_manager.spawn_task("Test task eng", async move {
         let res = engine.await;
         let _ = tx.send(res);
+        Ok(())
     });
 
     let engine_task = timeout(Duration::from_secs(10), rx).await??;
@@ -352,10 +361,9 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
     // timestamp
     assert_eq!(expected_block.timestamp, consensus_output.committed_at());
     // parent beacon block root is output digest
-    assert_eq!(
-        expected_block.parent_beacon_block_root,
-        Some(consensus_output.consensus_header_hash())
-    );
+    let parent_beacon_block_root: Option<ConsensusHeaderDigest> =
+        expected_block.parent_beacon_block_root.map(|d| d.into());
+    assert_eq!(parent_beacon_block_root, Some(consensus_output.consensus_header_hash()));
     // first block's parent is expected to be genesis
     assert_eq!(expected_block.parent_hash, chain.genesis_hash());
     // expect state roots are different after writing parent hash to BEACON_ROOT_CONTRACT
@@ -417,21 +425,27 @@ async fn test_empty_output_increments_leader_count() -> eyre::Result<()> {
     let timestamp = now();
     let mut leader = Certificate::default();
     let sub_dag_index = 0;
-    leader.header.round = sub_dag_index as u32;
-    leader.header.created_at = timestamp;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    leader.update_header_created_at_for_test(timestamp);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
-    leader.header_mut_for_test().author = leader_id;
+    leader.update_header_author_for_test(leader_id);
 
-    let subdag = Arc::new(CommittedSubDag::new(
+    let subdag = CommittedSubDag::new(
         vec![leader.clone()],
         leader,
         sub_dag_index,
         reputation_scores,
         previous_sub_dag,
-    ));
-    let consensus_output =
-        ConsensusOutput::new(subdag, BlockHash::default(), 0, false, VecDeque::new(), vec![]);
+    );
+    let consensus_output = ConsensusOutput::new(
+        subdag,
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        VecDeque::new(),
+        vec![],
+    );
 
     // verify leader counts start at zero
     let address_counts = gas_accumulator.rewards_counter().get_address_counts();
@@ -468,6 +482,7 @@ async fn test_empty_output_increments_leader_count() -> eyre::Result<()> {
     task_manager.spawn_task("Test task eng", async move {
         let res = engine.await;
         let _ = tx.send(res);
+        Ok(())
     });
 
     let engine_task = timeout(Duration::from_secs(10), rx).await??;
@@ -697,26 +712,24 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     // are randomly generated
     //
     // for each tx, seed address with funds in genesis
-    let timestamp = now();
     let mut leader_1 = Certificate::default();
     // update cert
-    leader_1.update_created_at_for_test(timestamp);
-    leader_1.header_mut_for_test().author = authority_1;
+    leader_1.update_header_author_for_test(authority_1);
     let sub_dag_index_1 = 1;
-    leader_1.header.round = sub_dag_index_1 as u32;
+    leader_1.update_header_round_for_test(sub_dag_index_1 as u32);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
     let mut batch_digests_1: VecDeque<BlockHash> = batches_1.iter().map(|b| b.digest()).collect();
-    let subdag_1 = Arc::new(CommittedSubDag::new(
-        vec![leader_1.clone(), Certificate::default()],
+    let subdag_1 = CommittedSubDag::new(
+        vec![Certificate::default(), leader_1.clone()],
         leader_1,
         sub_dag_index_1,
         reputation_scores,
         previous_sub_dag,
-    ));
+    );
     let consensus_output_1 = ConsensusOutput::new(
         subdag_1.clone(),
-        BlockHash::default(),
+        ConsensusHeaderDigest::default(),
         0,
         false,
         batch_digests_1.clone(),
@@ -727,15 +740,14 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     let mut leader_2 = Certificate::default();
     let leader_2_epoch = leader_2.epoch();
     // update cert
-    leader_2.update_created_at_for_test(timestamp + 2);
-    leader_2.header_mut_for_test().author = authority_2;
+    leader_2.update_header_author_for_test(authority_2);
     let sub_dag_index_2 = 2;
-    leader_2.header.round = sub_dag_index_2 as u32;
+    leader_2.update_header_round_for_test(sub_dag_index_2 as u32);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = Some(subdag_1.clone());
     let batch_digests_2: VecDeque<BlockHash> = batches_2.iter().map(|b| b.digest()).collect();
     let subdag_2 = CommittedSubDag::new(
-        vec![leader_2.clone(), Certificate::default()],
+        vec![Certificate::default(), leader_2.clone()],
         leader_2,
         sub_dag_index_2,
         reputation_scores,
@@ -806,6 +818,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     task_manager.spawn_task("test task eng", async move {
         let res = engine.await;
         let _ = tx.send(res);
+        Ok(())
     });
 
     let engine_task = timeout(Duration::from_secs(10), rx).await??;
@@ -928,7 +941,9 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         // timestamp
         assert_eq!(block.timestamp, expected_output.committed_at());
         // parent beacon block root is output digest
-        assert_eq!(block.parent_beacon_block_root, Some(expected_parent_beacon_block_root));
+        let parent_beacon_block_root: Option<ConsensusHeaderDigest> =
+            block.parent_beacon_block_root.map(|d| d.into());
+        assert_eq!(parent_beacon_block_root, Some(expected_parent_beacon_block_root));
 
         if idx == 0 {
             // first block's parent is expected to be genesis
@@ -1208,28 +1223,26 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     // are randomly generated
     //
     // for each tx, seed address with funds in genesis
-    let timestamp = now();
     let mut leader_1 = Certificate::default();
     // update timestamp
-    leader_1.update_created_at_for_test(timestamp);
-    leader_1.header_mut_for_test().author = authority_1;
+    leader_1.update_header_author_for_test(authority_1);
     let sub_dag_index_1: u64 = 1;
-    leader_1.header.round = sub_dag_index_1 as u32;
+    leader_1.update_header_round_for_test(sub_dag_index_1 as u32);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
     let mut batch_digests_1: VecDeque<BlockHash> = batches_1.iter().map(|b| b.digest()).collect();
     let mut cert_1 = Certificate::default();
-    cert_1.header.round = 1;
-    let subdag_1 = Arc::new(CommittedSubDag::new(
-        vec![cert_1],
+    cert_1.update_header_round_for_test(1);
+    let subdag_1 = CommittedSubDag::new(
+        vec![leader_1.clone()],
         leader_1,
         sub_dag_index_1,
         reputation_scores,
         previous_sub_dag,
-    ));
+    );
     let consensus_output_1 = ConsensusOutput::new(
         subdag_1.clone(),
-        BlockHash::default(),
+        ConsensusHeaderDigest::default(),
         0,
         false,
         batch_digests_1.clone(),
@@ -1240,23 +1253,21 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     let mut leader_2 = Certificate::default();
     let leader_2_epoch = leader_2.epoch();
     // update timestamp
-    leader_2.update_created_at_for_test(timestamp + 2);
-    leader_2.header_mut_for_test().author = authority_2;
+    leader_2.update_header_author_for_test(authority_2);
     let sub_dag_index_2 = 2;
-    leader_2.header.round = sub_dag_index_2 as u32;
+    leader_2.update_header_round_for_test(sub_dag_index_2 as u32);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = Some(subdag_1.clone());
     let batch_digests_2: VecDeque<BlockHash> = batches_2.iter().map(|b| b.digest()).collect();
     let mut cert_2 = Certificate::default();
-    cert_2.header.round = 2;
-    let subdag_2: Arc<CommittedSubDag> = CommittedSubDag::new(
-        vec![cert_2],
+    cert_2.update_header_round_for_test(2);
+    let subdag_2 = CommittedSubDag::new(
+        vec![leader_2.clone()],
         leader_2,
         sub_dag_index_2,
         reputation_scores,
         previous_sub_dag,
-    )
-    .into();
+    );
     let consensus_output_2 = ConsensusOutput::new(
         subdag_2.clone(),
         consensus_output_1.consensus_header_hash(),
@@ -1316,6 +1327,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     task_manager.spawn_task("test task eng", async move {
         let res = engine.await;
         let _ = tx.send(res);
+        Ok(())
     });
 
     let engine_task = timeout(Duration::from_secs(10), rx).await??;
@@ -1473,7 +1485,9 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         // timestamp
         assert_eq!(block.timestamp, expected_output.committed_at());
         // parent beacon block root is output digest
-        assert_eq!(block.parent_beacon_block_root, Some(expected_parent_beacon_block_root));
+        let parent_beacon_block_root: Option<ConsensusHeaderDigest> =
+            block.parent_beacon_block_root.map(|d| d.into());
+        assert_eq!(parent_beacon_block_root, Some(expected_parent_beacon_block_root));
 
         if idx == 0 {
             // first block's parent is expected to be genesis
@@ -1594,25 +1608,23 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     // are randomly generated
     //
     // for each tx, seed address with funds in genesis
-    let timestamp = now();
     let mut leader_1 = Certificate::default();
     // update timestamp
-    leader_1.update_created_at_for_test(timestamp);
     let sub_dag_index_1 = 1;
-    leader_1.header.round = sub_dag_index_1 as u32;
+    leader_1.update_header_round_for_test(sub_dag_index_1 as u32);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
     let batch_digests_1: VecDeque<BlockHash> = batches_1.iter().map(|b| b.digest()).collect();
-    let subdag_1 = Arc::new(CommittedSubDag::new(
-        vec![Certificate::default()],
+    let subdag_1 = CommittedSubDag::new(
+        vec![leader_1.clone()],
         leader_1,
         sub_dag_index_1,
         reputation_scores,
         previous_sub_dag,
-    ));
+    );
     let consensus_output_1 = ConsensusOutput::new(
         subdag_1.clone(),
-        BlockHash::default(),
+        ConsensusHeaderDigest::default(),
         0,
         false,
         batch_digests_1,
@@ -1623,20 +1635,18 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     // create second output
     let mut leader_2 = Certificate::default();
     // update timestamp
-    leader_2.update_created_at_for_test(timestamp + 2);
     let sub_dag_index_2 = 2;
-    leader_2.header.round = sub_dag_index_2 as u32;
+    leader_2.update_header_round_for_test(sub_dag_index_2 as u32);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = Some(subdag_1.clone());
     let batch_digests_2: VecDeque<BlockHash> = batches_2.iter().map(|b| b.digest()).collect();
-    let subdag_2: Arc<CommittedSubDag> = CommittedSubDag::new(
-        vec![Certificate::default()],
+    let subdag_2 = CommittedSubDag::new(
+        vec![Certificate::default(), leader_2.clone()],
         leader_2,
         sub_dag_index_2,
         reputation_scores,
         previous_sub_dag,
-    )
-    .into();
+    );
     let consensus_output_2 = ConsensusOutput::new(
         subdag_2,
         consensus_output_1.consensus_header_hash(),
@@ -1684,6 +1694,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     task_manager.spawn_task("test task eng", async move {
         let res = engine.await;
         let _ = tx.send(res);
+        Ok(())
     });
 
     let engine_task = timeout(Duration::from_secs(10), rx).await??;
@@ -1830,27 +1841,25 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
     // are randomly generated
     //
     // for each tx, seed address with funds in genesis
-    let timestamp = now();
     let mut leader = Certificate::default();
     // update cert
-    leader.update_created_at_for_test(timestamp);
-    leader.header_mut_for_test().author = authority_1;
+    leader.update_header_author_for_test(authority_1);
     let sub_dag_index = 1;
-    leader.header.round = sub_dag_index as u32;
+    leader.update_header_round_for_test(sub_dag_index as u32);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
     let batch_digest = batch.digest();
     let batch_digests = VecDeque::from([batch_digest]);
-    let subdag = Arc::new(CommittedSubDag::new(
-        vec![leader.clone(), Certificate::default()],
+    let subdag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
         leader,
         sub_dag_index,
         reputation_scores,
         previous_sub_dag,
-    ));
+    );
     let consensus_output = ConsensusOutput::new(
         subdag.clone(),
-        BlockHash::default(),
+        ConsensusHeaderDigest::default(),
         0,
         false,
         batch_digests.clone(),
@@ -1903,6 +1912,7 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
     task_manager.spawn_task("test task eng", async move {
         let res = engine.await;
         let _ = tx.send(res);
+        Ok(())
     });
 
     let engine_task = timeout(Duration::from_secs(5), rx).await??;
@@ -1994,7 +2004,9 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
         // timestamp
         assert_eq!(block.timestamp, consensus_output.committed_at());
         // parent beacon block root is output digest
-        assert_eq!(block.parent_beacon_block_root, Some(consensus_output_hash));
+        let parent_beacon_block_root: Option<ConsensusHeaderDigest> =
+            block.parent_beacon_block_root.map(|d| d.into());
+        assert_eq!(parent_beacon_block_root, Some(consensus_output_hash));
 
         if idx == 0 {
             // first block's parent is expected to be genesis
@@ -2010,7 +2022,8 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
         }
 
         // mix hash is xor batch's hash and consensus output digest
-        let expected_mix_hash = consensus_output_hash ^ batch_digest;
+        let consensus_output_hash_bytes: B256 = consensus_output_hash.into();
+        let expected_mix_hash = consensus_output_hash_bytes ^ batch_digest;
         assert_eq!(block.mix_hash, expected_mix_hash);
         // bloom expected to be the same bc all proposed transactions should be good
         // ie) no duplicates, etc.
@@ -2137,26 +2150,24 @@ async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
     execute_test_batch(&mut batch);
 
     // consensus output
-    let timestamp = now();
     let mut leader = Certificate::default();
-    leader.update_created_at_for_test(timestamp);
-    leader.header_mut_for_test().author = authority_1;
+    leader.update_header_author_for_test(authority_1);
     let sub_dag_index = 1;
-    leader.header.round = sub_dag_index as u32;
+    leader.update_header_round_for_test(sub_dag_index as u32);
     let reputation_scores = ReputationScores::default();
     let previous_sub_dag = None;
     let batch_digest = batch.digest();
     let batch_digests = VecDeque::from([batch_digest]);
-    let subdag = Arc::new(CommittedSubDag::new(
-        vec![leader.clone(), Certificate::default()],
+    let subdag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
         leader,
         sub_dag_index,
         reputation_scores,
         previous_sub_dag,
-    ));
+    );
     let consensus_output = ConsensusOutput::new(
         subdag.clone(),
-        BlockHash::default(),
+        ConsensusHeaderDigest::default(),
         0,
         false,
         batch_digests.clone(),
@@ -2193,6 +2204,7 @@ async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
     task_manager.spawn_task("test task eng", async move {
         let res = engine.await;
         let _ = tx.send(res);
+        Ok(())
     });
 
     let engine_task = timeout(Duration::from_secs(5), rx).await??;

@@ -5,34 +5,33 @@ use std::{
     error::Error,
     fmt::Display,
     fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Arc,
     thread::JoinHandle,
+    time::Duration,
 };
 
 use parking_lot::Mutex;
 use tn_types::{
-    gas_accumulator::RewardsCounter, AuthorityIdentifier, BlockHash, BlockNumHash, CommittedSubDag,
-    Committee, ConsensusHeader, ConsensusOutput, Epoch, EpochRecord, Round, B256,
+    gas_accumulator::RewardsCounter, AuthorityIdentifier, Batch, BlockHash, CommittedSubDag,
+    Committee, ConsensusChainReader, ConsensusChainWriter, ConsensusHeader, ConsensusHeaderDigest,
+    ConsensusNumHash, ConsensusOutput, Epoch, EpochRecord, ReadStream, Round,
 };
 use tokio::{
     fs::File as AsyncFile,
-    io::{AsyncRead, AsyncSeek},
+    io::AsyncRead,
     sync::{
         mpsc::{self, Sender},
         oneshot,
     },
 };
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::{
     consensus_pack::{ConsensusPack, PackError, DATA_NAME},
     epoch_records::{EpochDbError, EpochRecordDb},
 };
-
-pub trait ReadStream: AsyncRead + AsyncSeek + Unpin {}
-impl ReadStream for AsyncFile {}
 
 /// Simple enum for which of two saved consensus states we are using.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -311,7 +310,7 @@ impl ConsensusChain {
             epoch: 0,
             committee: committee.bls_keys().iter().copied().collect(),
             next_committee: committee.bls_keys().iter().copied().collect(),
-            final_consensus: BlockNumHash::new(1000, BlockHash::default()),
+            final_consensus: ConsensusNumHash::new(1000, ConsensusHeaderDigest::default()),
             ..Default::default()
         };
         me.new_epoch(rec.clone(), committee).await?;
@@ -351,27 +350,138 @@ impl ConsensusChain {
         &self.epochs
     }
 
+    /// Return true if this process is already streaming this epoch.
+    pub fn already_streaming_epoch(&self, epoch: Epoch) -> bool {
+        ImportPath::is_streaming(&self.base_path, epoch)
+    }
+
     /// Populate an epoch pack from a stream.
     /// This will resolve once the stream has been written.
-    pub async fn stream_import<R: AsyncRead + AsyncSeek + Unpin>(
+    /// Note, if called on an epoch while streaming that epoch will just return Ok(()).
+    pub async fn stream_import<R: AsyncRead + Unpin>(
         &self,
         stream: R,
-        epoch: Epoch,
-        previous_epoch: EpochRecord,
+        epoch_record: &EpochRecord,
+        previous_epoch: &EpochRecord,
+        timeout: Duration,
     ) -> Result<(), ConsensusChainError> {
-        let pack =
-            ConsensusPack::stream_import(&self.base_path, stream, epoch, previous_epoch).await?;
-        Ok(pack.persist().await?)
+        let epoch = epoch_record.epoch;
+        let epoch_final_hash = epoch_record.final_consensus.hash;
+        if let Ok(pack) = self.get_static(epoch).await {
+            if let Some(last_header) = pack.latest_consensus_header().await {
+                if epoch_record.final_consensus.number == last_header.number
+                    && epoch_final_hash == last_header.digest()
+                {
+                    // If we already have a complete pack file then we are done, no need to
+                    // stream...
+                    return Ok(());
+                }
+            }
+        }
+        // Import path will use RAII to remove the import dir when we are done.
+        let Some(import_path) = ImportPath::new(&self.base_path, epoch)? else {
+            // If this returns None then we are already importing this epoch.
+            return Ok(());
+        };
+        // Store our files out of the way while we import so we don't use them until ready.
+        let path = import_path.path();
+        let res_pack = ConsensusPack::stream_import(
+            path,
+            stream,
+            epoch,
+            previous_epoch,
+            epoch_record.final_consensus.number,
+            timeout,
+        )
+        .await;
+        match res_pack {
+            Ok(pack) => {
+                let base_dir = self.base_path.join(format!("epoch-{epoch}"));
+                let path_base_dir = path.join(format!("epoch-{epoch}"));
+                pack.persist().await?;
+                match pack.latest_consensus_header().await {
+                    Some(last_header) => {
+                        // The chain was verified as it was streamed.  So if the final block matches
+                        // the expected final_consensus then the entire pack
+                        // file should be valid.
+                        if epoch_record.final_consensus.number != last_header.number
+                            || epoch_final_hash != last_header.digest()
+                        {
+                            // Invalid final consensus header...
+                            return Err(ConsensusChainError::InvalidImport);
+                        }
+                    }
+                    None => {
+                        // Missing a final consensus header...
+                        return Err(ConsensusChainError::EmptyImport);
+                    }
+                }
+                let mut current_pack = self.current_pack.lock();
+                let replace_current = if let Some(current_pack) = &*current_pack {
+                    current_pack.epoch() == epoch
+                } else {
+                    false
+                };
+                if replace_current {
+                    *current_pack = None;
+                }
+                drop(pack);
+                drop(current_pack);
+                // Make sure we don't have any cruft in the final dir.
+                if std::fs::exists(&base_dir).unwrap_or_default() {
+                    // If this exists it is incomplete (see check at start of function).
+                    // This remove will leave a tiny window before the rename where it is
+                    // not available.  This may produce errors that should be handled correctly if
+                    // so.
+                    let _ = std::fs::remove_dir_all(&base_dir);
+                }
+                let rename_err = std::fs::rename(&path_base_dir, &base_dir);
+                // Invalidate the cache AFTER the rename so a concurrent get_static that
+                // missed the cache and opened FDs on the old (now-unlinked) inode cannot
+                // leave a stale entry behind for other callers — any entry cached during
+                // the race is purged here. Readers after this point fall through and
+                // see the new on-disk pack.
+                self.recent_packs.lock().retain(|p| p.epoch() != epoch);
+                rename_err?;
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Return a stream reader for the log file of epoch.
+    /// Verifies the epoch pack is complete or will return an error.
     pub async fn get_epoch_stream(
         &self,
         epoch: Epoch,
     ) -> Result<Box<dyn ReadStream>, ConsensusChainError> {
-        let base_dir = self.base_path.join(format!("epoch-{epoch}"));
-        let stream = AsyncFile::open(base_dir.join(DATA_NAME)).await?;
-        Ok(Box::new(stream))
+        if let Ok(pack) = self.get_static(epoch).await {
+            if let Some((epoch_record, _)) = self.epochs().get_epoch_by_number(epoch).await {
+                match pack.latest_consensus_header().await {
+                    Some(last_header) => {
+                        let epoch_final_hash = epoch_record.final_consensus.hash;
+                        if epoch_record.final_consensus.number == last_header.number
+                            && epoch_final_hash == last_header.digest()
+                        {
+                            drop(pack);
+                            // Remove the other open file.
+                            // Should not matter a "complete" pack file should not be changed or
+                            // moved again.
+                            let base_dir = self.base_path.join(format!("epoch-{epoch}"));
+                            let stream = AsyncFile::open(base_dir.join(DATA_NAME)).await?;
+                            Ok(Box::new(stream))
+                        } else {
+                            Err(ConsensusChainError::StreamUnavailable)
+                        }
+                    }
+                    None => Err(ConsensusChainError::StreamUnavailable),
+                }
+            } else {
+                Err(ConsensusChainError::StreamUnavailable)
+            }
+        } else {
+            Err(ConsensusChainError::StreamUnavailable)
+        }
     }
 
     /// Save all the batches and consensus header from the ConsensusOutput the pack file for the
@@ -380,17 +490,31 @@ impl ConsensusChain {
         &self,
         consensus: ConsensusOutput,
     ) -> Result<(), ConsensusChainError> {
-        if let Some(pack) = &self.current_pack() {
-            if consensus.number() > self.latest_consensus.number() {
-                let epoch = consensus.sub_dag().leader_epoch();
-                let number = consensus.number();
+        let number = consensus.number();
+        if number > self.latest_consensus.number() {
+            let epoch = consensus.sub_dag().leader_epoch();
+            if let Some(pack) = &self.current_pack() {
                 pack.save_consensus_output(consensus).await?;
                 self.latest_consensus.update(epoch, number).await;
+            } else if let Ok(pack) = self.get_static(epoch).await {
+                // We may be replaying consensus from old epochs and not have a current pack to save
+                // too.
+                if pack.contains_consensus_header_number(number).await.unwrap_or_default() {
+                    // We should have this saved already if no current_pack but let's confirm before
+                    // we save the latest.
+                    self.latest_consensus.update(epoch, number).await;
+                } else {
+                    // Note this should not happen but don't want to kill node on an error since it
+                    // will hopefully self correct soon.
+                    warn!(target: "consensus-chain", epoch, number, "Failed to update latest consensus, data not in expected pack file.");
+                }
+            } else {
+                // Note this should not happen but don't want to kill node on an error since it will
+                // hopefully self correct soon.
+                warn!(target: "consensus-chain", epoch, number, "Failed to update latest consensus, pack file that should contain data is missing.");
             }
-            Ok(())
-        } else {
-            Err(ConsensusChainError::NoCurrentEpoch)
         }
+        Ok(())
     }
 
     /// Load and return the consensus output from the current epoch.
@@ -409,7 +533,7 @@ impl ConsensusChain {
     pub async fn consensus_header_by_digest(
         &self,
         epoch: Epoch,
-        digest: B256,
+        digest: ConsensusHeaderDigest,
     ) -> Result<Option<ConsensusHeader>, ConsensusChainError> {
         if let Some(pack) = &self.current_pack() {
             if epoch == pack.epoch() {
@@ -440,6 +564,17 @@ impl ConsensusChain {
         } else {
             // Don't have this epoch data.
             Ok(None)
+        }
+    }
+
+    /// Return true if we have a complete pack file for epoch_record.
+    pub async fn is_epoch_complete(&self, epoch_record: &EpochRecord) -> bool {
+        match self.consensus_header_by_number(epoch_record.final_consensus.number).await {
+            Ok(result) => result.is_some(),
+            Err(e) => {
+                error!(target: "consensus-chain", epoch=?epoch_record.epoch, "DB error checking epoch completeness: {e}");
+                false
+            }
         }
     }
 
@@ -506,7 +641,7 @@ impl ConsensusChain {
     pub async fn read_latest_commit_with_final_reputation_scores(
         &self,
         epoch: Epoch,
-    ) -> Option<Arc<CommittedSubDag>> {
+    ) -> Option<CommittedSubDag> {
         if let Some(pack) = &self.current_pack() {
             if pack.epoch() == epoch {
                 return pack.read_latest_commit_with_final_reputation_scores().await;
@@ -523,10 +658,10 @@ impl ConsensusChain {
     /// This uses garbage parent hash and number and is ONLY for testing.
     /// As a test only function this will panic if unable to write the sub dag
     /// to the consensus chain
-    pub async fn write_subdag_for_test(&self, number: u64, sub_dag: Arc<CommittedSubDag>) {
+    pub async fn write_subdag_for_test(&self, number: u64, sub_dag: CommittedSubDag) {
         let output = ConsensusOutput::new(
             sub_dag,
-            BlockHash::default(),
+            ConsensusHeaderDigest::default(),
             number,
             false,
             VecDeque::new(),
@@ -544,6 +679,23 @@ impl ConsensusChain {
         } else {
             false
         }
+    }
+
+    /// Return a vector of batches matching the provided digests (if found).
+    pub async fn get_batches(
+        &self,
+        epoch: Epoch,
+        digests: impl Iterator<Item = &BlockHash>,
+    ) -> Vec<Batch> {
+        let mut result = Vec::new();
+        if let Ok(pack) = self.get_static(epoch).await {
+            for digest in digests {
+                if let Some(batch) = pack.batch(*digest).await {
+                    result.push(batch);
+                }
+            }
+        }
+        result
     }
 
     /// Count leaders in this pack (in rewards_counter) lower than last_executed_round.
@@ -590,6 +742,121 @@ impl ConsensusChain {
     }
 }
 
+impl ConsensusChainReader for ConsensusChain {
+    async fn consensus_header_by_digest(
+        &self,
+        epoch: Epoch,
+        digest: ConsensusHeaderDigest,
+    ) -> eyre::Result<Option<ConsensusHeader>> {
+        ConsensusChain::consensus_header_by_digest(self, epoch, digest).await.map_err(Into::into)
+    }
+
+    async fn consensus_header_by_number(
+        &self,
+        number: u64,
+    ) -> eyre::Result<Option<ConsensusHeader>> {
+        ConsensusChain::consensus_header_by_number(self, number).await.map_err(Into::into)
+    }
+
+    async fn consensus_header_latest(&self) -> eyre::Result<Option<ConsensusHeader>> {
+        ConsensusChain::consensus_header_latest(self).await.map_err(Into::into)
+    }
+
+    async fn latest_consensus_header_from_pack(
+        &self,
+        epoch: Epoch,
+    ) -> eyre::Result<Option<ConsensusHeader>> {
+        ConsensusChain::latest_consensus_header_from_pack(self, epoch).await.map_err(Into::into)
+    }
+
+    fn latest_consensus_number(&self) -> u64 {
+        ConsensusChain::latest_consensus_number(self)
+    }
+
+    fn latest_consensus_epoch(&self) -> Epoch {
+        ConsensusChain::latest_consensus_epoch(self)
+    }
+
+    async fn read_last_committed(&self, epoch: Epoch) -> HashMap<AuthorityIdentifier, Round> {
+        ConsensusChain::read_last_committed(self, epoch).await
+    }
+
+    async fn read_latest_commit_with_final_reputation_scores(
+        &self,
+        epoch: Epoch,
+    ) -> Option<CommittedSubDag> {
+        ConsensusChain::read_latest_commit_with_final_reputation_scores(self, epoch).await
+    }
+
+    async fn get_consensus_output_current(&self, number: u64) -> eyre::Result<ConsensusOutput> {
+        ConsensusChain::get_consensus_output_current(self, number).await.map_err(Into::into)
+    }
+
+    async fn is_epoch_complete(&self, epoch_record: &EpochRecord) -> bool {
+        ConsensusChain::is_epoch_complete(self, epoch_record).await
+    }
+
+    async fn contains_current_batch(&self, digest: BlockHash) -> bool {
+        ConsensusChain::contains_current_batch(self, digest).await
+    }
+
+    async fn get_batches<'a>(
+        &'a self,
+        epoch: Epoch,
+        digests: impl Iterator<Item = &'a BlockHash> + Send + 'a,
+    ) -> Vec<Batch> {
+        ConsensusChain::get_batches(self, epoch, digests).await
+    }
+
+    async fn count_leaders(
+        &self,
+        last_executed_round: Round,
+        rewards_counter: RewardsCounter,
+    ) -> eyre::Result<()> {
+        ConsensusChain::count_leaders(self, last_executed_round, rewards_counter)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn get_epoch_stream(&self, epoch: Epoch) -> eyre::Result<Box<dyn ReadStream>> {
+        ConsensusChain::get_epoch_stream(self, epoch).await.map_err(Into::into)
+    }
+
+    fn already_streaming_epoch(&self, epoch: Epoch) -> bool {
+        ConsensusChain::already_streaming_epoch(self, epoch)
+    }
+}
+
+impl ConsensusChainWriter for ConsensusChain {
+    async fn save_consensus_output(&self, consensus: ConsensusOutput) -> eyre::Result<()> {
+        ConsensusChain::save_consensus_output(self, consensus).await.map_err(Into::into)
+    }
+
+    async fn new_epoch(
+        &self,
+        previous_epoch: EpochRecord,
+        committee: Committee,
+    ) -> eyre::Result<()> {
+        ConsensusChain::new_epoch(self, previous_epoch, committee).await.map_err(Into::into)
+    }
+
+    async fn stream_import<R: AsyncRead + Unpin + Send>(
+        &self,
+        stream: R,
+        epoch_record: &EpochRecord,
+        previous_epoch: &EpochRecord,
+        timeout: Duration,
+    ) -> eyre::Result<()> {
+        ConsensusChain::stream_import(self, stream, epoch_record, previous_epoch, timeout)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn persist_current(&self) -> eyre::Result<()> {
+        ConsensusChain::persist_current(self).await.map_err(Into::into)
+    }
+}
+
 #[derive(Debug)]
 pub enum ConsensusChainError {
     PackError(PackError),
@@ -599,6 +866,9 @@ pub enum ConsensusChainError {
     PrevCommitteeEpochMismatch,
     CrcError,
     EpochDbError(EpochDbError),
+    EmptyImport,
+    InvalidImport,
+    StreamUnavailable,
 }
 
 impl Error for ConsensusChainError {}
@@ -616,6 +886,13 @@ impl Display for ConsensusChainError {
             }
             ConsensusChainError::CrcError => write!(f, "Crc error"),
             ConsensusChainError::EpochDbError(e) => write!(f, "Epoch DB Error: {e}"),
+            ConsensusChainError::EmptyImport => write!(f, "No consensus in imported pack file"),
+            ConsensusChainError::InvalidImport => {
+                write!(f, "Bad final consensus in imported pack file")
+            }
+            ConsensusChainError::StreamUnavailable => {
+                write!(f, "Incomplete data to stream a pack file")
+            }
         }
     }
 }
@@ -638,14 +915,68 @@ impl From<EpochDbError> for ConsensusChainError {
     }
 }
 
+/// Lock to prevent races when creating ImportPath's.
+static IMPORT_PATH_LOCK: Mutex<()> = Mutex::new(());
+
+/// Helper to create the stream import dir and remove on Drop.
+struct ImportPath {
+    path: PathBuf,
+}
+
+impl ImportPath {
+    /// New ImportPath rooted at base_path.
+    /// Returns None if this process is already importing for this epoch.
+    fn new(base_path: &Path, epoch: Epoch) -> io::Result<Option<Self>> {
+        // Store our files out of the way while we import so we don't use them until ready.
+        let path = base_path.join(format!("import-{epoch}"));
+        let pid = std::process::id();
+        let proc_path = path.join(format!("{pid}.inproc"));
+        // Grab the single lock so we can avoid races on the off chance we try to
+        // import the same epoch twice at the same time.
+        let _guard = IMPORT_PATH_LOCK.lock();
+        if proc_path.exists() {
+            // This process is already streaming this pack file so just return.
+            return Ok(None);
+        }
+        // We need to start with a clean import dir since we do not restart.
+        // Note, this should not exist but just in case...
+        let _ = std::fs::remove_dir_all(&path);
+        // Create a sentinel for this process to avoid double streams.
+        let _ = std::fs::create_dir_all(&path);
+        File::create(proc_path)?;
+        Ok(Some(Self { path }))
+    }
+
+    /// True if this epoch is already being streamed.
+    fn is_streaming(base_path: &Path, epoch: Epoch) -> bool {
+        let pid = std::process::id();
+        let path = base_path.join(format!("import-{epoch}")).join(format!("{pid}.inproc"));
+        path.exists()
+    }
+
+    /// Return the contained path.
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ImportPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 #[cfg(test)]
 mod test {
     use tempfile::TempDir;
 
     use crate::consensus::{ConsensusSlot, LatestConsensus};
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
-    use tn_types::{test_genesis, BlockHash, BlockNumHash, Epoch, EpochRecord, Hash as _, B256};
+    use tn_types::{
+        test_genesis, ConsensusHeader, ConsensusHeaderDigest, ConsensusNumHash, Epoch, EpochRecord,
+        Hash as _,
+    };
 
     use crate::{
         consensus::ConsensusChain,
@@ -685,8 +1016,6 @@ mod test {
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         let committee = fixture.committee();
         let previous_epoch = EpochRecord {
-            // If we can't find the recort then this we should be starting at epoch 0- use this
-            // filler.
             epoch: 0,
             committee: committee.bls_keys().iter().copied().collect(),
             next_committee: committee.bls_keys().iter().copied().collect(),
@@ -698,7 +1027,7 @@ mod test {
 
         let num_outputs = 1000;
         let mut outputs = Vec::new();
-        let mut parent = BlockHash::default();
+        let mut parent = ConsensusHeader::default().digest();
         for i in 0..num_outputs {
             let consensus_output =
                 make_test_output(&committee, i % 4, chain.clone(), (i as u64) + 1, parent);
@@ -706,6 +1035,9 @@ mod test {
             outputs.push(consensus_output.clone());
             consensus_chain.save_consensus_output(consensus_output).await.unwrap();
         }
+        let last = outputs.last().unwrap();
+        let mut epoch_record = previous_epoch.clone();
+        epoch_record.final_consensus = ConsensusNumHash::new(last.number(), last.digest());
         for i in 0..num_outputs {
             let output_db =
                 consensus_chain.get_consensus_output_current(i as u64 + 1).await.unwrap();
@@ -718,8 +1050,12 @@ mod test {
 
         let temp_dir2 = TempDir::with_prefix("test_consensus_pack2").expect("temp dir");
         let consensus_chain2 = ConsensusChain::new(temp_dir2.path().to_owned()).unwrap();
+        consensus_chain.epochs().save_record(epoch_record.clone()).await.expect("save epoch");
         let stream = consensus_chain.get_epoch_stream(0).await.unwrap();
-        consensus_chain2.stream_import(stream, 0, previous_epoch.clone()).await.unwrap();
+        consensus_chain2
+            .stream_import(stream, &epoch_record, &previous_epoch, Duration::from_secs(5))
+            .await
+            .unwrap();
         consensus_chain2.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
         for i in 0..num_outputs {
             let output_db =
@@ -747,7 +1083,7 @@ mod test {
 
         let num_outputs = 100;
         let mut outputs = Vec::new();
-        let mut parent = BlockHash::default();
+        let mut parent = ConsensusHeaderDigest::default();
         for i in 0..num_outputs {
             let consensus_output =
                 make_test_output(&committee, i % 4, chain.clone(), (i as u64) + 1, parent);
@@ -766,7 +1102,10 @@ mod test {
             committee: committee.bls_keys().iter().copied().collect(),
             next_committee: committee.bls_keys().iter().copied().collect(),
             parent_hash: previous_epoch.digest(),
-            final_consensus: BlockNumHash { number: 100, hash: BlockHash::default() },
+            final_consensus: ConsensusNumHash {
+                number: 100,
+                hash: ConsensusHeaderDigest::default(),
+            },
             ..Default::default()
         };
         let committee = committee.advance_epoch_for_test(1);
@@ -796,7 +1135,10 @@ mod test {
             committee: committee.bls_keys().iter().copied().collect(),
             next_committee: committee.bls_keys().iter().copied().collect(),
             parent_hash: previous_epoch.digest(),
-            final_consensus: BlockNumHash { number: 200, hash: BlockHash::default() },
+            final_consensus: ConsensusNumHash {
+                number: 200,
+                hash: ConsensusHeaderDigest::default(),
+            },
             ..Default::default()
         };
         let committee = committee.advance_epoch_for_test(2);
@@ -850,7 +1192,7 @@ mod test {
         // Now by digest
         for i in 0..(num_outputs * 3) {
             let epoch = (i / num_outputs) as Epoch;
-            let digest: B256 = outputs[i].digest().into();
+            let digest = outputs[i].digest();
             let header_db =
                 consensus_chain.consensus_header_by_digest(epoch, digest).await.unwrap().unwrap();
             assert_eq!(digest, header_db.digest(), "consensus headers mismatch (by digest) {i}");
@@ -869,7 +1211,7 @@ mod test {
         }
         for i in 0..(num_outputs * 3) {
             let epoch = i / num_outputs;
-            let digest: B256 = outputs[i].digest().into();
+            let digest = outputs[i].digest();
             let header_db = consensus_chain
                 .consensus_header_by_digest(epoch as u32, digest)
                 .await

@@ -1,7 +1,7 @@
 //! Configuration for network variables.
 
 use crate::{ConfigFmt, ConfigTrait, TelcoinDirs};
-use libp2p::{kad::K_VALUE, request_response::ProtocolSupport, StreamProtocol};
+use libp2p::kad::K_VALUE;
 use serde::{Deserialize, Serialize};
 use std::{num::NonZeroUsize, time::Duration};
 use tn_types::Round;
@@ -10,6 +10,7 @@ impl ConfigTrait for NetworkConfig {}
 
 /// The container for all network configurations.
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
+#[serde(default)]
 pub struct NetworkConfig {
     /// The configurations for libp2p library.
     ///
@@ -78,11 +79,8 @@ impl NetworkConfig {
 
 /// Configurations for libp2p library.
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(default)]
 pub struct LibP2pConfig {
-    /// The supported inbound/outbound protocols for request/response behavior.
-    /// - ex) "/telcoin-network/mainnet/0.0.1"
-    #[serde(with = "protocol_vec")]
-    pub supported_req_res_protocols: Vec<(StreamProtocol, ProtocolSupport)>,
     /// Maximum message size between request/response network messages in bytes.
     pub max_rpc_message_size: usize,
     /// Maximum message size for gossipped network messages in bytes.
@@ -113,6 +111,15 @@ pub struct LibP2pConfig {
     pub px_disconnect_timeout: Duration,
     /// The k-bucket size for kademlia.
     pub k_bucket_size: NonZeroUsize,
+    /// The TTL applied to kademlia records — both the libp2p record TTL and the
+    /// local store's `expires` timestamp. Drives eviction of records that are
+    /// never refreshed. Also used for provider record TTL.
+    pub kad_record_ttl: Duration,
+    /// How often this node republishes its own kademlia records.
+    ///
+    /// Must be < `kad_record_ttl`, otherwise records expire before they are
+    /// refreshed.
+    pub kad_publication_interval: Duration,
 }
 
 impl LibP2pConfig {
@@ -140,37 +147,26 @@ impl LibP2pConfig {
     pub fn worker_txn_topic() -> String {
         String::from("tn-txn")
     }
-
-    /// Protocol for identify behavior.
-    pub fn identify_protocol(&self) -> &'static str {
-        Self::protocol()
-    }
-
-    /// Return the protocol string.
-    pub fn protocol() -> &'static str {
-        "/telcoin-network/0.0.0"
-    }
 }
 
 impl Default for LibP2pConfig {
     fn default() -> Self {
         Self {
-            supported_req_res_protocols: vec![(
-                StreamProtocol::new(Self::protocol()),
-                ProtocolSupport::Full,
-            )],
-            max_rpc_message_size: 1024 * 1024, // 1 MiB
-            max_gossip_message_size: 12_000,   // 12kb
+            max_rpc_message_size: 1024 * 1024,                    // 1 MiB
+            max_gossip_message_size: 12_000,                      // 12kb
             max_idle_connection_timeout: Duration::from_secs(65), // same as quic handshake
             max_px_disconnects: 10,
             px_disconnect_timeout: Duration::from_secs(3),
             k_bucket_size: K_VALUE,
+            kad_record_ttl: Duration::from_secs(48 * 60 * 60),
+            kad_publication_interval: Duration::from_secs(12 * 60 * 60),
         }
     }
 }
 
 /// Configuration for state syncing operations.
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(default)]
 pub struct SyncConfig {
     /// Maximum number of rounds that can be skipped for a single authority when requesting missing
     /// certificates.
@@ -242,6 +238,7 @@ impl Default for SyncConfig {
 
 /// Configure the quic transport for libp2p.
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(default)]
 pub struct QuicConfig {
     /// Timeout for the initial handshake when establishing a connection.
     /// The actual timeout is the minimum of this and the [`Config::max_idle_timeout`].
@@ -283,6 +280,7 @@ impl Default for QuicConfig {
 
 /// Configurations for network peers.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+#[serde(default)]
 pub struct PeerConfig {
     /// The interval (secs) for updating peer status.
     pub heartbeat_interval: u64,
@@ -393,6 +391,7 @@ impl PeerConfig {
 
 /// Configuration for peer scoring parameters
 #[derive(Serialize, Deserialize, Clone, Debug, Copy)]
+#[serde(default)]
 pub struct ScoreConfig {
     /// The default score for new peers.
     pub default_score: f64,
@@ -420,8 +419,15 @@ impl Default for ScoreConfig {
             min_application_score_before_ban: -60.0,
             max_score: 100.0,
             min_score: -100.0,
-            score_halflife: 600.0,
-            banned_before_decay_secs: 12 * 3600, // 12 hours
+            // 5-minute halflife: transient WAN penalties (peer flap, slow request) decay
+            // out within a couple of half-lives so they do not accumulate across the
+            // observer-join window.
+            score_halflife: 300.0,
+            // Short lockout so a peer that crosses the ban threshold can recover within
+            // one operator-attention window. DoS protection comes from the ban threshold
+            // itself, not from the lockout duration — a peer that keeps misbehaving will
+            // simply hit the threshold again.
+            banned_before_decay_secs: 30 * 60, // 30 minutes
             min_score_before_disconnect: -20.0,
             min_score_before_ban: -50.0,
         }
@@ -441,64 +447,90 @@ impl ScoreConfig {
     }
 }
 
-// Serialize and deserialize for tuples of protocols
-mod protocol_vec {
+#[cfg(test)]
+mod tests {
     use super::*;
-    use serde::{de::Error, Deserialize, Deserializer, Serialize, Serializer};
 
-    pub(crate) fn serialize<S>(
-        protocols: &[(StreamProtocol, ProtocolSupport)],
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        // Simply convert to a Vec of string tuples
-        let string_tuples: Vec<(String, String)> = protocols
-            .iter()
-            .map(|(protocol, support)| {
-                let support_str = match support {
-                    ProtocolSupport::Inbound => "inbound".to_string(),
-                    ProtocolSupport::Outbound => "outbound".to_string(),
-                    ProtocolSupport::Full => "full".to_string(),
-                };
-                (protocol.as_ref().to_string(), support_str)
-            })
-            .collect();
+    #[test]
+    fn empty_yaml_deserializes_to_default() {
+        let parsed: NetworkConfig = serde_yaml::from_str("{}").expect("empty mapping deserializes");
+        let default = NetworkConfig::default();
 
-        string_tuples.serialize(serializer)
+        assert_eq!(parsed.hostname, default.hostname);
+        assert_eq!(parsed.libp2p_config.kad_record_ttl, default.libp2p_config.kad_record_ttl);
+        assert_eq!(
+            parsed.libp2p_config.kad_publication_interval,
+            default.libp2p_config.kad_publication_interval
+        );
+        assert_eq!(parsed.peer_config.target_num_peers, default.peer_config.target_num_peers);
+        assert_eq!(
+            parsed.sync_config.max_skip_rounds_for_missing_certs,
+            default.sync_config.max_skip_rounds_for_missing_certs
+        );
+        assert_eq!(parsed.quic_config.max_idle_timeout, default.quic_config.max_idle_timeout);
     }
 
-    pub(crate) fn deserialize<'de, D>(
-        deserializer: D,
-    ) -> Result<Vec<(StreamProtocol, ProtocolSupport)>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let string_tuples: Vec<(String, String)> = Vec::deserialize(deserializer)?;
+    #[test]
+    fn partial_yaml_uses_defaults_for_missing_fields() {
+        // libp2p_config provided with only a subset of fields; the two new kad
+        // fields (and others) are absent and must fall back to defaults.
+        let yaml = r#"
+libp2p_config:
+  max_rpc_message_size: 2097152
+  max_gossip_message_size: 12000
+  max_idle_connection_timeout:
+    secs: 65
+    nanos: 0
+  max_px_disconnects: 10
+  px_disconnect_timeout:
+    secs: 3
+    nanos: 0
+  k_bucket_size: 20
+hostname: "my-validator"
+"#;
+        let parsed: NetworkConfig =
+            serde_yaml::from_str(yaml).expect("partial config deserializes");
+        let default = LibP2pConfig::default();
 
-        string_tuples
-            .into_iter()
-            .map(|(protocol_str, support_str)| {
-                // Convert the protocol string to StreamProtocol
-                let protocol = StreamProtocol::try_from_owned(protocol_str).map_err(|_| {
-                    D::Error::custom("Invalid protocol: must start with a forward slash")
-                })?;
+        // explicitly-set field is preserved
+        assert_eq!(parsed.libp2p_config.max_rpc_message_size, 2 * 1024 * 1024);
+        assert_eq!(parsed.hostname, "my-validator");
 
-                // Convert the support string to ProtocolSupport
-                let support = match support_str.as_str() {
-                    "inbound" => ProtocolSupport::Inbound,
-                    "outbound" => ProtocolSupport::Outbound,
-                    "full" => ProtocolSupport::Full,
-                    _ => {
-                        return Err(D::Error::custom(format!(
-                            "Invalid protocol support: {support_str}, expected inbound, outbound, or full"
-                        )))
-                    }
-                };
+        // missing new fields fall back to defaults
+        assert_eq!(parsed.libp2p_config.kad_record_ttl, default.kad_record_ttl);
+        assert_eq!(parsed.libp2p_config.kad_publication_interval, default.kad_publication_interval);
 
-                Ok((protocol, support))
-            })
-            .collect()
+        // entirely-missing sub-sections also default
+        assert_eq!(parsed.peer_config.target_num_peers, PeerConfig::default().target_num_peers);
+    }
+
+    #[test]
+    fn legacy_libp2p_config_without_kad_fields_deserializes() {
+        let default = LibP2pConfig::default();
+        let serialized = serde_yaml::to_string(&default).expect("serialize default");
+
+        // Round-trip through serde_yaml::Value so we can drop the two new
+        // kad fields cleanly without depending on their serialized layout
+        // (Duration serializes as a multi-line mapping).
+        let mut value: serde_yaml::Value =
+            serde_yaml::from_str(&serialized).expect("serialized default re-parses");
+        let mapping = value.as_mapping_mut().expect("libp2p config is a mapping");
+        assert!(
+            mapping.remove(&serde_yaml::Value::String("kad_record_ttl".into())).is_some(),
+            "kad_record_ttl must be present in the default serialization"
+        );
+        assert!(
+            mapping.remove(&serde_yaml::Value::String("kad_publication_interval".into())).is_some(),
+            "kad_publication_interval must be present in the default serialization"
+        );
+        let legacy = serde_yaml::to_string(&value).expect("serialize stripped value");
+
+        let parsed: LibP2pConfig =
+            serde_yaml::from_str(&legacy).expect("legacy yaml without kad fields parses");
+
+        assert_eq!(parsed.kad_record_ttl, default.kad_record_ttl);
+        assert_eq!(parsed.kad_publication_interval, default.kad_publication_interval);
+        assert_eq!(parsed.max_rpc_message_size, default.max_rpc_message_size);
+        assert_eq!(parsed.k_bucket_size, default.k_bucket_size);
     }
 }

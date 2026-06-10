@@ -18,8 +18,8 @@ use tn_reth::{
 use tn_rpc::{EngineToPrimary, TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator},
-    Address, BatchSender, BatchValidation, BlockHeader, BlsPublicKey, ConsensusOutput,
-    EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId, B256,
+    Address, BatchSender, BatchValidation, BlockHeader, BlsPublicKey, ConsensusHeaderDigest,
+    ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId,
     MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::WorkerNetworkHandle;
@@ -76,10 +76,15 @@ impl ExecutionNodeInner {
         self.reth_env.get_task_spawner().spawn_critical_task("consensus engine", async move {
             info!("Engine stated from block {block_num}/{block_hash}, consensus output {consensus_header:?}");
             let res = tn_engine.await;
-            match res {
-                Ok(_) => info!(target: "engine", "TN Engine exited gracefully"),
-                Err(e) => error!(target: "engine", ?e, "TN Engine error"),
+            match &res {
+                Ok(_) => {
+                    info!(target: "engine", "TN Engine exited gracefully");
+                }
+                Err(e) => {
+                    error!(target: "engine", ?e, "TN Engine error");
+                }
             }
+            Ok(res?)
         });
 
         Ok(())
@@ -118,6 +123,7 @@ impl ExecutionNodeInner {
         epoch_task_spawner.spawn_critical_task("batch builder", async move {
             let res = batch_builder.await;
             info!(target: "tn::execution", ?res, "batch builder task exited");
+            Ok(res?)
         });
 
         Ok(())
@@ -147,7 +153,7 @@ impl ExecutionNodeInner {
         transaction_pool.set_block_info(tx_pool_latest);
 
         // extend TN namespace
-        let tn_ext = TelcoinNetworkRpcExt::new(self.reth_env.chainspec(), engine_to_primary);
+        let tn_ext = TelcoinNetworkRpcExt::new(self.reth_env.clone(), engine_to_primary);
         let server = self.reth_env.get_rpc_server(
             transaction_pool.clone(),
             network.clone(),
@@ -200,7 +206,7 @@ impl ExecutionNodeInner {
     ///
     /// This returns the hash of the last executed ConsensusHeader on the consensus chain.
     /// since the execution layer is confirming the last executing block.
-    pub(super) fn last_executed_output(&self) -> eyre::Result<B256> {
+    pub(super) fn last_executed_output(&self) -> eyre::Result<ConsensusHeaderDigest> {
         // NOTE: The payload_builder only extends canonical tip and sets finalized after
         // entire output is successfully executed. This ensures consistent recovery state.
         //
@@ -217,7 +223,7 @@ impl ExecutionNodeInner {
             .map(|opt| opt.parent_beacon_block_root.unwrap_or_default())
             .unwrap_or_else(Default::default);
 
-        Ok(last_round_of_consensus)
+        Ok(last_round_of_consensus.into())
     }
 
     /// Return a vector of the last 'number' executed block headers.
@@ -341,9 +347,9 @@ impl ExecutionNodeInner {
     pub(super) fn validators_for_epoch(&self, epoch: u32) -> eyre::Result<Vec<BlsPublicKey>> {
         Ok(self
             .reth_env
-            .validators_for_epoch(epoch)?
+            .bls_pubkeys_for_epoch(epoch)?
             .iter()
-            .filter_map(|v| BlsPublicKey::from_literal_bytes(v.blsPubkey.as_ref()).ok())
+            .filter_map(|bls| BlsPublicKey::from_literal_bytes(bls.as_ref()).ok())
             .collect())
     }
 }

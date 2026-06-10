@@ -5,7 +5,7 @@ use tn_network_libp2p::Penalty;
 use tn_storage::StoreError;
 use tn_types::{
     error::{CertificateError, HeaderError},
-    BcsError, BlockHash, BlsPublicKey, Epoch,
+    BcsError, BlockHash, BlsPublicKey, ConsensusHeaderDigest, Epoch, EpochDigest,
 };
 
 /// Result alias for results that possibly return [`PrimaryNetworkError`].
@@ -37,10 +37,10 @@ pub(crate) enum PrimaryNetworkError {
     Internal(String),
     /// Unknown consensus header.
     #[error("Unknown consensus header: {0}")]
-    UnknownConsensusHeaderDigest(BlockHash),
+    UnknownConsensusHeaderDigest(ConsensusHeaderDigest),
     /// Unknown consensus header certificate.
     #[error("Unknown consensus header certificate for: {0}")]
-    UnknownConsensusHeaderCert(BlockHash),
+    UnknownConsensusHeaderCert(ConsensusHeaderDigest),
     /// Peer that is not committee published invalid gosip.
     /// Temparily disabled, will be back soon.
     #[error("Peer {0} is not in the committee!")]
@@ -50,7 +50,7 @@ pub(crate) enum PrimaryNetworkError {
     UnavailableEpoch(Epoch),
     /// Unavaliable epoch hash (either it is invalid or this node does not have it).
     #[error("Unknown epoch record digest: {0}")]
-    UnavailableEpochDigest(BlockHash),
+    UnavailableEpochDigest(EpochDigest),
     /// Invalid epoch request.
     #[error("Must suply an epoch or hash when requesting an epoch record")]
     InvalidEpochRequest,
@@ -59,6 +59,12 @@ pub(crate) enum PrimaryNetworkError {
     InvalidTopic,
     #[error(transparent)]
     Timeout(#[from] tokio::time::error::Elapsed),
+    /// No matching pending request for inbound stream.
+    #[error("No pending request matches stream hash")]
+    UnknownStreamRequest(BlockHash),
+    /// A requested pack file stream is not available.
+    #[error("Pack file is not available to stream for epoch {0}")]
+    StreamUnavailable(Epoch),
 }
 
 impl From<&PrimaryNetworkError> for Option<Penalty> {
@@ -106,8 +112,11 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
                 | CertManagerError::ChannelClosed
                 | CertManagerError::TNSend(_) => None,
             },
-            | PrimaryNetworkError::InvalidRequest(_)
-            | PrimaryNetworkError::UnknownConsensusHeaderDigest(_)
+            // Benign "miss": observers legitimately request not-yet-served headers.
+            // No penalty so honest sync flows are not banned during catch-up.
+            PrimaryNetworkError::UnknownConsensusHeaderDigest(_) => None,
+            PrimaryNetworkError::InvalidRequest(_)
+            | PrimaryNetworkError::UnknownStreamRequest(_)
             | PrimaryNetworkError::UnknownConsensusHeaderCert(_) => Some(Penalty::Mild),
             PrimaryNetworkError::InvalidEpochRequest
             | PrimaryNetworkError::StdIo(_) => Some(Penalty::Medium),
@@ -118,6 +127,7 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
             | PrimaryNetworkError::PeerNotInCommittee(_)
             | PrimaryNetworkError::Storage(_)
             | PrimaryNetworkError::Timeout(_)
+            | PrimaryNetworkError::StreamUnavailable(_)
             | PrimaryNetworkError::Internal(_) => None,
         }
     }
@@ -152,7 +162,6 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         | HeaderError::ParentMissingSignature
         | HeaderError::InvalidParentTimestamp { .. }
         | HeaderError::UnkownWorkerId
-        | HeaderError::InvalidHeaderDigest
         | HeaderError::UnknownAuthority(_) => Some(Penalty::Fatal),
         // ignore
         HeaderError::PendingCertificateOneshot

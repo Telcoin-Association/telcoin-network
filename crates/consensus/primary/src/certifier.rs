@@ -6,16 +6,17 @@ use crate::{
     state_sync::StateSynchronizer,
     ConsensusBus,
 };
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tn_config::{ConsensusConfig, KeyConfig};
 use tn_network_libp2p::error::NetworkError;
-use tn_storage::CertificateStore;
+use tn_storage::{tables::ProposedCertificates, CertificateStore};
 use tn_types::{
     ensure,
     error::{DagError, DagResult},
-    AuthorityIdentifier, BlsPublicKey, Certificate, CertificateDigest, Committee, Database, Header,
-    Noticer, Notifier, TaskManager, TaskSpawner, TnReceiver, Vote,
+    AuthorityIdentifier, BlsPublicKey, Certificate, Committee, Database, Header, HeaderDigest,
+    Noticer, Notifier, TaskError, TaskManager, TaskResult, TaskSpawner, TnReceiver, Vote,
 };
+use tokio::sync::Mutex;
 use tracing::{debug, enabled, error, info, instrument};
 
 #[cfg(test)]
@@ -47,6 +48,10 @@ pub(crate) struct Certifier<DB> {
     task_spawner: TaskSpawner,
     /// Notifier to cancel pending proposals and vote requests if new header is received.
     new_proposal: Notifier,
+    /// Lock to make sure we are only in one header proposal at a time.
+    /// Should not generally happen but can lead to leader cert equivocation
+    /// if it does so be really sure.
+    proposal_lock: Arc<Mutex<()>>,
 }
 
 impl<DB: Database> Certifier<DB> {
@@ -90,7 +95,7 @@ impl<DB: Database> Certifier<DB> {
 
             info!(target: "primary::certifier", "Certifier on node {:?} has started successfully.", authority_id);
 
-            Self {
+            let res = Self {
                 authority_id: authority_id.clone(),
                 committee: config.committee().clone(),
                 certificate_store: config.node_storage().clone(),
@@ -100,10 +105,12 @@ impl<DB: Database> Certifier<DB> {
                 network: primary_network,
                 task_spawner,
                 new_proposal: Notifier::new(),
+                proposal_lock: Arc::new(Mutex::new(())),
             }
             .run(rx_headers)
             .await;
             info!(target: "primary::certifier", "Certifier on node {} has shutdown.", authority_id);
+            res
         });
     }
 
@@ -119,7 +126,7 @@ impl<DB: Database> Certifier<DB> {
         committee: Committee,
         cancel_proposal: Noticer,
     ) -> DagResult<Vote> {
-        let mut missing_parents: Option<Vec<CertificateDigest>> = None;
+        let mut missing_parents: Option<Vec<HeaderDigest>> = None;
         let mut attempt: u32 = 0;
         debug!(target: "primary::certifier", ?authority, ?header, "requesting vote for header...");
 
@@ -282,7 +289,7 @@ impl<DB: Database> Certifier<DB> {
             let task_name = format!("vote-{header:?}-{name}");
             self.task_spawner.spawn_task(task_name, async move {
                 // process request for vote
-                tx_votes.send(
+                let _ = tx_votes.send(
                     // this will exit early on cancel_proposal
                     Self::request_vote(
                         name,
@@ -294,7 +301,8 @@ impl<DB: Database> Certifier<DB> {
                         cancel_proposal,
                     )
                     .await,
-                )
+                );
+                Ok(())
             });
         }
 
@@ -388,39 +396,66 @@ impl<DB: Database> Certifier<DB> {
     /// This listens for new proposal notifications to exit early.
     /// The method returns once enough votes are processed to certify the proposal,
     /// or if a new proposal arrives.
-    async fn spawn_header_proposal(self, header: Header) {
+    async fn spawn_header_proposal(self, header: Header) -> TaskResult {
+        // Grab this before the lock so quick exit after the lock if need to.
+        let new_proposal_noticer = self.new_proposal.subscribe();
+        // Make sure other proposal's are shutdown and done before we check if
+        // this header is already certified.  Any existing proposals should have been cancelled
+        // before this call.
+        let _guard = self.proposal_lock.lock().await;
+        let header_digest = header.digest();
+        if let Ok(Some(cert)) =
+            self.config.node_storage().get::<ProposedCertificates>(&header_digest)
+        {
+            info!(target: "primary::certifier", "asked to propose a header that is already certified {header_digest}, skipping proposal and re-publishing");
+            // We have already processed this certificate, doing so again could produce signature
+            // equivocation and destroy deterministic randomness (based on the leader
+            // signature). Since we got here try to re-publish the certificate on gossip
+            // network
+            if let Err(e) = self.network.publish_certificate(cert).await {
+                error!(target: "primary::certifier", ?e, "failed to re-gossip certificate");
+            }
+            return Ok(());
+        }
         tokio::select! {
             // listen for new_proposal notification to exit
             // NOTE: sub here is okay bc no loop
-            _ = self.new_proposal.subscribe() => {
+            _ = new_proposal_noticer => {
                 debug!(target: "primary::certifier", "new proposal notification received");
+                Ok(())
             },
 
             // receive enough votes for certification (or exit early)
             proposal_result = self.propose_header(header) => {
                 match proposal_result {
                     Ok(mut certificate) => {
+                        if let Err(e) = self.config.node_storage().insert::<ProposedCertificates>(&header_digest, &certificate) {
+                            error!(target: "primary::certifier", "error accepting own certificate, unable to save the certificate: {e}");
+                            return Err(TaskError::from_message(e.to_string()));
+                        }
                         // pass to state_sync for internal processing
                         if let Err(e) = self.state_sync.process_own_certificate(&mut certificate).await {
                             error!(target: "primary::certifier", "error accepting own certificate: {e}");
-                            return;
+                            return Err(e.into());
                         }
 
                         // try to publish the certificate on gossip network
                         if let Err(e) = self.network.publish_certificate(certificate).await {
                             error!(target: "primary::certifier", ?e, "failed to gossip certificate");
                         }
+                        Ok(())
                     }
 
                     Err(e) => {
                         match e {
-                            // ignore cancelled proposal errors
+                            // ignore cancelled proposal errors - expected when new proposal arrives
                             DagError::Canceled => {
                                 debug!(
                                     target: "primary::certifier",
                                     auth=?self.authority_id,
                                     "certifier cancelled proposed header task"
                                 );
+                                Ok(())
                             }
                             // log other errors loudly
                             e =>  {
@@ -429,6 +464,7 @@ impl<DB: Database> Certifier<DB> {
                                     auth=?self.authority_id,
                                     "Certifier error on proposed header task: {e}"
                                 );
+                                Err(e.into())
                             }
                         }
                     }
@@ -440,7 +476,7 @@ impl<DB: Database> Certifier<DB> {
     /// Execute the main certification task.  Will run until shutdown is signalled.
     /// If this exits outside of shutdown it will log an error and this will trigger a node
     /// shutdown.
-    async fn run(self, mut rx_headers: impl TnReceiver<Header>) {
+    async fn run(self, mut rx_headers: impl TnReceiver<Header>) -> TaskResult {
         info!(target: "primary::certifier", "Certifier on node {} has started successfully.", &self.authority_id);
         let shutdown = &self.config.shutdown().subscribe();
         loop {
@@ -466,7 +502,7 @@ impl<DB: Database> Certifier<DB> {
                     // cancel any outstanding proposals and vote requests
                     // NOTE: this isn't strictly necessary but may help shutdown
                     self.new_proposal.notify();
-                    break;
+                    break Ok(());
                 }
             }
         }

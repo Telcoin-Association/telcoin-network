@@ -9,7 +9,7 @@ use tn_network_types::{PrimaryToWorkerClient as _, WorkerSynchronizeMessage};
 use tn_storage::{CertificateStore, PayloadStore};
 use tn_types::{
     error::{DagError, HeaderError, HeaderResult},
-    Certificate, CertificateDigest, Database, Header, Round, TnSender as _,
+    Certificate, Database, Header, HeaderDigest, Round, TnSender as _,
 };
 use tokio::sync::oneshot;
 use tracing::debug;
@@ -180,7 +180,7 @@ where
                     committed_round = *rx_committed_round_updates.borrow_and_update();
                     debug!(target: "primary::header_validator", ?committed_round, "committed round update");
 
-                    if header.round < committed_round.saturating_sub(max_age) {
+                    if header.round() < committed_round.saturating_sub(max_age) {
                         return Err(HeaderError::TooOld{
                             digest: header.digest(),
                             header_round: header.round(),
@@ -198,7 +198,7 @@ where
     pub(super) async fn identify_unkown_parents(
         &self,
         header: &Header,
-    ) -> HeaderResult<Vec<CertificateDigest>> {
+    ) -> HeaderResult<Vec<HeaderDigest>> {
         // handle genesis
         if header.round() == 1 {
             for digest in header.parents() {

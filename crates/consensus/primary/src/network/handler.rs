@@ -6,10 +6,11 @@ use super::{
 };
 use crate::{
     error::{CertManagerError, PrimaryNetworkError, PrimaryNetworkResult},
-    network::message::PrimaryGossip,
+    network::{message::PrimaryGossip, PendingEpochStream},
     state_sync::{CertificateCollector, StateSynchronizer},
     ConsensusBusApp, NodeMode,
 };
+use futures::{AsyncWrite, AsyncWriteExt as _};
 use parking_lot::Mutex;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -17,18 +18,23 @@ use std::{
     time::Duration,
 };
 use tn_config::ConsensusConfig;
-use tn_network_libp2p::GossipMessage;
+use tn_network_libp2p::{GossipMessage, Stream};
 use tn_storage::{consensus::ConsensusChain, CertificateStore, VoteDigestStore};
 use tn_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
     now, to_intent_message, try_decode, AuthorityIdentifier, BlockHash, BlsPublicKey, Certificate,
-    CertificateDigest, ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord, Hash as _,
-    Header, HeaderDigest, ProtocolSignature, Round, SignatureVerificationState, TnSender as _,
-    Vote,
+    ConsensusHeader, ConsensusHeaderDigest, Database, Epoch, EpochCertificate, EpochDigest,
+    EpochRecord, Hash as _, Header, HeaderDigest, ProtocolSignature, Round,
+    SignatureVerificationState, TnSender as _, Vote, B256,
 };
-use tokio::sync::Mutex as TokioMutex;
+use tokio::{io::AsyncReadExt, sync::Mutex as TokioMutex, time::timeout};
 use tracing::{debug, error, info, warn};
+
+/// Total timeout for sending a 16kb buffer of pack file data.
+/// Prevents slow-reader attacks where a peer accepts a stream but never reads.
+/// Set to an arbitrary 10 seconds to read 16kb buffer.
+const SEND_STREAM_BUFFER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Map to hold vote info to detect invalid votes, equivocation and cache responses in case of
 /// rerequests.
@@ -52,7 +58,7 @@ pub(crate) struct RequestHandler<DB> {
     /// for missing parents. The values are associated with the first authority that proposed a
     /// header with these parents. The node keeps track of requested Certificates to prevent
     /// unsolicited certificate attacks.
-    requested_parents: Arc<Mutex<BTreeMap<(Round, CertificateDigest), AuthorityIdentifier>>>,
+    requested_parents: Arc<Mutex<BTreeMap<(Round, HeaderDigest), AuthorityIdentifier>>>,
     /// Map of the last epoch and round each authority requested a vote for.
     /// Used to stop validator equivocation early.
     auth_last_vote: Arc<AuthEquivocationMap>,
@@ -120,7 +126,8 @@ where
         // lags behind a burst of empty consensus rounds.
         let committed_round = self.consensus_bus.committed_round();
         let effective_exec_round = exec_round.max(processed_consensus_round).max(committed_round);
-        let (last_consensus_number, _) = self.consensus_bus.published_consensus_num_hash();
+        let (_last_consensus_epoch, last_consensus_number, _) =
+            self.consensus_bus.published_consensus_num_hash();
         // Use GC depth to estimate how many rounds we can be behind.
         // Subtract ten here so if we are right on the GC depth we will still go inactive (small
         // safety buffer).  Ten is arbitrary but should make sure we are comfortably within
@@ -173,6 +180,8 @@ where
     async fn get_committee(&self, epoch: Epoch) -> Option<BTreeSet<BlsPublicKey>> {
         if epoch == self.consensus_config.committee().epoch() {
             Some(self.consensus_config.committee().bls_keys())
+        } else if epoch == self.consensus_config.committee().epoch() + 1 {
+            Some(self.consensus_config.next_committee_keys().iter().copied().collect())
         } else {
             self.consensus_chain.epochs().get_committee_keys(epoch).await
         }
@@ -180,7 +189,7 @@ where
 
     /// Process gossip from the committee.
     ///
-    /// Peers gossip the CertificateDigest so peers can request the Certificate. This waits until
+    /// Peers gossip the HeaderDigest so peers can request the Certificate. This waits until
     /// the certificate can be retrieved and timesout after some time. It's important to give up
     /// after enough time to limit the DoS attack surface. Peers who timeout must lose reputation.
     pub(super) async fn process_gossip(&self, msg: &GossipMessage) -> PrimaryNetworkResult<()> {
@@ -199,18 +208,26 @@ where
                 // process certificate
                 cert.validate_received().map_err(CertManagerError::from)?;
 
-                let epoch = cert.header().epoch;
+                let epoch = cert.header().epoch();
                 // Early verify so we can detect we are behind.
                 // The verification is cached in the cert so this should not be too expensive.
                 if let Some(committee) = self.get_committee(epoch).await {
                     match cert.verify_cert(&committee) {
                         Ok(()) => {
                             if self.consensus_bus.is_cvv() {
-                                if self.behind_consensus(epoch, cert.header().round, None).await {
+                                if self.behind_consensus(epoch, cert.header().round(), None).await {
                                     warn!(target: "primary", "certificate indicates we are behind, go to catchup mode!");
                                     return Ok(());
                                 }
                                 self.state_sync.process_peer_certificate(&mut cert).await?;
+                            }
+                            if self.consensus_bus.is_cvv_inactive()
+                                && self.consensus_config.committee().epoch() == cert.epoch()
+                            {
+                                // If we are catching up and this is for our current epoch save in
+                                // cache so we will be able
+                                // to rejoin consensus later when caught up.
+                                let _ = self.consensus_config.node_storage().write((*cert).clone());
                             }
                         }
                         Err(e) => warn!(target: "primary", "Recieved invalid cert {e}"),
@@ -234,7 +251,8 @@ where
                 let consensus_result_hash = result.digest();
                 let ConsensusResult { epoch, round, number, hash, validator: key, signature } =
                     *result;
-                let (old_number, old_hash) = self.consensus_bus.published_consensus_num_hash();
+                let (_old_epoch, old_number, old_hash) =
+                    self.consensus_bus.published_consensus_num_hash();
                 if hash == old_hash || old_number >= number {
                     // We have already dealt with this hash or we are past this output.
                     return Ok(());
@@ -271,7 +289,7 @@ where
                             info!(target: "primary", "got new consensus {number}/{hash}");
                             self.consensus_bus
                                 .last_published_consensus_num_hash()
-                                .send_replace((number, hash));
+                                .send_replace((epoch, number, hash));
                             self.consensus_certs.lock().clear();
                         } else {
                             self.consensus_certs.lock().insert(consensus_result_hash, sigs + 1);
@@ -280,12 +298,9 @@ where
                         self.consensus_certs.lock().insert(consensus_result_hash, 1);
                     }
                 } else {
-                    let latest_missing = *self.consensus_bus.requested_missing_epoch().borrow();
-                    if epoch > latest_missing {
-                        // Not sure we can sanity check this epoch.  However if it is bogus the code
-                        // to handle it should be fine, it stops when out of epochs.
-                        self.consensus_bus.requested_missing_epoch().send_replace(epoch);
-                    }
+                    // Not sure we can sanity check this epoch.  However if it is bogus the code
+                    // to handle it should be fine, it stops when out of epochs.
+                    self.consensus_bus.set_request_missing_epoch_if_newer(epoch);
                 }
             }
             PrimaryGossip::EpochVote(vote) => {
@@ -329,7 +344,7 @@ where
         // This should keep a malicious validator from corrupting another
         // nodes vote cache.
         // This relies on libp2p to manage peer ids that are used to get the bls key.
-        let committee_peer = header.author.clone();
+        let committee_peer = header.author().clone();
         let auth_id: AuthorityIdentifier = peer.into();
         if let Some(auth) = self.consensus_config.committee().authority(&committee_peer) {
             // We err on the side of caution here, if auths peer id is not known fail but we
@@ -364,6 +379,21 @@ where
                     match last_response {
                         None | Some(PrimaryResponse::RecoverableError(_)) => {}
                         Some(PrimaryResponse::MissingParents(missing)) => {
+                            if parents.is_empty() {
+                                // Proposer retried with a fresh request (no parents provided).
+                                // Re-issue the missing parents request so the proposer knows
+                                // what to provide on the next attempt. This avoids a deadlock
+                                // where the proposer's certifier restarts (losing the missing
+                                // parent hint) and the cached state here causes a fatal
+                                // WrongNumberOfParents error on every subsequent attempt.
+                                *auth_last_vote = Some((
+                                    last_epoch,
+                                    last_round,
+                                    last_digest,
+                                    Some(PrimaryResponse::MissingParents(missing.clone())),
+                                ));
+                                return Ok(PrimaryResponse::MissingParents(missing));
+                            }
                             // A proper response to missing parents will include exactly the missing
                             // parents.
                             if parents.len() == missing.len() {
@@ -465,14 +495,14 @@ where
         // if peer is ahead, wait for execution to catch up
         // NOTE: this doesn't hurt since this node shouldn't vote until execution is caught up
         // ensure execution results match if this succeeds.
-        if self.consensus_bus.wait_for_execution(header.latest_execution_block).await.is_err() {
+        if self.consensus_bus.wait_for_execution(header.latest_execution_block()).await.is_err() {
             error!(
                 target: "primary",
-                peer_hash = ?header.latest_execution_block,
+                peer_hash = ?header.latest_execution_block(),
                 expected = ?self.consensus_bus.latest_execution_block_num_hash(),
                 "unexpected execution result received"
             );
-            return Err(HeaderError::UnknownExecutionResult(header.latest_execution_block).into());
+            return Err(HeaderError::UnknownExecutionResult(header.latest_execution_block()).into());
         }
         debug!(target: "primary", ?header, round = header.round(), "Processing vote request from peer");
 
@@ -543,7 +573,7 @@ where
                 header.created_at() >= parent.header().created_at(),
                 HeaderError::InvalidParentTimestamp {
                     header: *header.created_at(),
-                    parent: *parent.header.created_at()
+                    parent: *parent.header().created_at()
                 }
                 .into()
             );
@@ -617,60 +647,66 @@ where
             .map_err(HeaderError::Storage)?;
         if let Some(vote_info) = previous_vote {
             ensure!(
-                header.epoch() == vote_info.epoch(),
+                header.epoch() >= vote_info.epoch(),
                 HeaderError::InvalidEpoch { theirs: header.epoch(), ours: vote_info.epoch() }
                     .into()
             );
-            ensure!(
-                header.round() >= vote_info.round(),
-                HeaderError::AlreadyVotedForLaterRound {
-                    theirs: header.round(),
-                    ours: vote_info.round()
-                }
-                .into()
-            );
-            if header.round() == vote_info.round() {
-                // Make sure we don't vote twice for the same authority in the same epoch/round.
-                let vote = Vote::new(
-                    &header,
-                    self.consensus_config.authority_id().expect("only validators can vote"),
-                    self.consensus_config.key_config(),
-                );
-                if vote.digest() != vote_info.vote_digest() {
-                    // Check if a certificate was already formed for this header author at this
-                    // round. If one exists, the old vote contributed to a real certificate, so
-                    // voting for a different header at the same round would be equivocation.
-                    // If no certificate exists, the old vote was never aggregated (e.g. the
-                    // proposer was killed before collecting enough votes, then restarted and
-                    // created a new header at the same round). In that case it is safe to
-                    // re-vote for the new header.
-                    let cert_exists = self
-                        .consensus_config
-                        .node_storage()
-                        .read_by_index(header.author(), header.round())
-                        .unwrap_or(None)
-                        .is_some();
-                    if cert_exists {
-                        warn!(
-                            "Authority {} submitted different header {:?} for voting",
-                            header.author(),
-                            header,
-                        );
-                        return Err(
-                            HeaderError::AlreadyVoted(header.digest(), header.round()).into()
-                        );
+            if header.epoch() == vote_info.epoch() {
+                ensure!(
+                    header.round() >= vote_info.round(),
+                    HeaderError::AlreadyVotedForLaterRound {
+                        theirs: header.round(),
+                        ours: vote_info.round()
                     }
-                    // No certificate was formed for the old vote — allow re-voting.
-                    warn!(
-                        "Authority {} re-proposing at round {} with a different header; \
-                         previous vote was for an uncertified header — allowing re-vote",
-                        header.author(),
-                        header.round(),
+                    .into()
+                );
+                if header.round() == vote_info.round() {
+                    // Make sure we don't vote twice for the same authority in the same epoch/round.
+                    let vote = Vote::new(
+                        &header,
+                        self.consensus_config.authority_id().expect("only validators can vote"),
+                        self.consensus_config.key_config(),
                     );
-                    // Fall through to create and store the new vote below.
-                } else {
-                    debug!("Resending vote {vote:?} for {} at round {}", header, header.round());
-                    return Ok(PrimaryResponse::Vote(vote));
+                    if vote.digest() != vote_info.vote_digest() {
+                        // Check if a certificate was already formed for this header author at this
+                        // round. If one exists, the old vote contributed to a real certificate, so
+                        // voting for a different header at the same round would be equivocation.
+                        // If no certificate exists, the old vote was never aggregated (e.g. the
+                        // proposer was killed before collecting enough votes, then restarted and
+                        // created a new header at the same round). In that case it is safe to
+                        // re-vote for the new header.
+                        let cert_exists = self
+                            .consensus_config
+                            .node_storage()
+                            .read_by_index(header.author(), header.round())
+                            .unwrap_or(None)
+                            .is_some();
+                        if cert_exists {
+                            warn!(
+                                "Authority {} submitted different header {:?} for voting",
+                                header.author(),
+                                header,
+                            );
+                            return Err(
+                                HeaderError::AlreadyVoted(header.digest(), header.round()).into()
+                            );
+                        }
+                        // No certificate was formed for the old vote — allow re-voting.
+                        warn!(
+                            "Authority {} re-proposing at round {} with a different header; \
+                         previous vote was for an uncertified header — allowing re-vote",
+                            header.author(),
+                            header.round(),
+                        );
+                        // Fall through to create and store the new vote below.
+                    } else {
+                        debug!(
+                            "Resending vote {vote:?} for {} at round {}",
+                            header,
+                            header.round()
+                        );
+                        return Ok(PrimaryResponse::Vote(vote));
+                    }
                 }
             }
         }
@@ -694,10 +730,7 @@ where
     ///
     /// Certificates are considered "known" if they are in local storage, pending, or already
     /// requested from a peer.
-    async fn check_for_missing_parents(
-        &self,
-        header: &Header,
-    ) -> HeaderResult<Vec<CertificateDigest>> {
+    async fn check_for_missing_parents(&self, header: &Header) -> HeaderResult<Vec<HeaderDigest>> {
         // identify parents that are neither in storage nor pending
         let mut unknown_certs = self.state_sync.identify_unkown_parents(header).await?;
 
@@ -813,13 +846,22 @@ where
     pub(super) async fn retrieve_consensus_header(
         &self,
         number: u64,
-        hash: BlockHash,
+        hash: ConsensusHeaderDigest,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
         let mut my_number = self.consensus_chain.latest_consensus_number();
-        // If we are one behind then wait to catch up.
-        while my_number + 1 == number {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            my_number = self.consensus_chain.latest_consensus_number();
+        // If we are behind then wait up to two seconds to catch up.
+        let mut count = 0;
+        if number.saturating_sub(my_number) < 4 {
+            // Only wait if we are close.
+            while my_number < number {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                my_number = self.consensus_chain.latest_consensus_number();
+                if count >= 20 {
+                    // Don't wait more than 2 seconds for this to show up.
+                    return Err(PrimaryNetworkError::UnknownConsensusHeaderDigest(hash));
+                }
+                count += 1;
+            }
         }
         let header = self.get_header_by_hash(number, hash).await?;
         Ok(PrimaryResponse::ConsensusHeader(Arc::new(header)))
@@ -829,7 +871,7 @@ where
     pub(super) async fn retrieve_epoch_record(
         &self,
         epoch: Option<Epoch>,
-        hash: Option<BlockHash>,
+        hash: Option<EpochDigest>,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
         let (record, certificate) = match (epoch, hash) {
             (_, Some(hash)) => self.get_epoch_by_hash(hash).await?,
@@ -844,7 +886,7 @@ where
     async fn get_header_by_hash(
         &self,
         number: u64,
-        hash: BlockHash,
+        hash: ConsensusHeaderDigest,
     ) -> PrimaryNetworkResult<ConsensusHeader> {
         let epoch = self.consensus_chain.epochs().number_to_epoch(number);
         match self.consensus_chain.consensus_header_by_digest(epoch, hash).await {
@@ -879,7 +921,7 @@ where
     /// Retrieve the consensus header by hash
     async fn get_epoch_by_hash(
         &self,
-        hash: BlockHash,
+        hash: EpochDigest,
     ) -> PrimaryNetworkResult<(EpochRecord, EpochCertificate)> {
         match self.consensus_chain.epochs().get_epoch_by_hash(hash).await {
             Some((record, Some(cert))) => Ok((record, cert)),
@@ -897,5 +939,86 @@ where
             }
             None => Err(PrimaryNetworkError::UnavailableEpochDigest(hash)),
         }
+    }
+
+    /// Return a reference to the `ConsensusChain`.
+    pub(super) fn consensus_chain(&self) -> &ConsensusChain {
+        &self.consensus_chain
+    }
+
+    /// Send epoch pack file over stream.
+    async fn send_epoch_over_stream<S>(
+        mut stream: S,
+        consensus_chain: &ConsensusChain,
+        epoch: Epoch,
+        buffer_timeout: Duration,
+        peer: BlsPublicKey,
+    ) -> PrimaryNetworkResult<()>
+    where
+        S: AsyncWrite + Unpin + Send,
+    {
+        let mut bytes = vec![0_u8; 16 * 1024]; // Use a 16kb read buffer.
+        let mut epoch_stream = consensus_chain
+            .get_epoch_stream(epoch)
+            .await
+            .map_err(|_| PrimaryNetworkError::StreamUnavailable(epoch))?;
+        loop {
+            let n = epoch_stream.read(&mut bytes[..]).await?;
+            if n == 0 {
+                break;
+            }
+            timeout(buffer_timeout, stream.write_all(&bytes[..n])).await??;
+        }
+
+        // attempt to close the stream gracefully
+        if let Err(e) = stream.close().await {
+            tracing::warn!(target: "primary::network", %peer, %epoch, ?e, "stream close failed");
+        }
+
+        Ok(())
+    }
+
+    /// Process request to open stream for an epoch pack.
+    pub(super) async fn process_request_epoch_stream(
+        &self,
+        peer: BlsPublicKey,
+        pending_request: Option<PendingEpochStream>,
+        stream: Stream,
+        request_digest: B256,
+        consensus_chain: &ConsensusChain,
+    ) -> PrimaryNetworkResult<()> {
+        // `None` indicates unexpected request
+        let Some(request) = pending_request else {
+            // this is a protocol violation - return error for penalty
+            warn!(
+                target: "primary::network",
+                %peer,
+                ?request_digest,
+                "inbound stream has no matching pending request"
+            );
+            return Err(PrimaryNetworkError::UnknownStreamRequest(request_digest));
+        };
+
+        // process request to send batches through stream
+        debug!(
+            target: "primary::network",
+            %peer,
+            ?request_digest,
+            epoch = request.epoch,
+            "processing inbound epoch stream"
+        );
+
+        // set timeout to prevent slow-read attack
+        Self::send_epoch_over_stream(
+            stream,
+            consensus_chain,
+            request.epoch,
+            SEND_STREAM_BUFFER_TIMEOUT,
+            peer,
+        )
+        .await
+        .inspect_err(
+            |e| warn!(target: "primary::network", %peer, ?e, "failed to send epoch over stream"),
+        )
     }
 }

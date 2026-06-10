@@ -12,12 +12,12 @@ use std::{collections::BTreeSet, future::Future as _, time::Duration};
 use tn_config::Parameters;
 use tn_network_libp2p::{
     error::NetworkError,
-    types::{NetworkCommand, NetworkHandle},
+    types::{NetworkCommand, NetworkHandle, NetworkResponseMessage},
 };
 use tn_storage::{mem_db::MemDatabase, CertificateStore, PayloadStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    test_utils::init_test_tracing, BlsSignature, Certificate, Hash as _, Header,
+    test_utils::init_test_tracing, BlsSignature, Certificate, Hash as _, Header, HeaderBuilder,
     SignatureVerificationState, TaskManager, TnSender as _,
 };
 use tokio::{
@@ -164,7 +164,7 @@ async fn test_fetch_certificates_basic() {
     let mut first_batch_len = 0;
     let mut first_batch_resp = vec![];
     if let Some(NetworkCommand::SendRequest {
-        peer: _,
+        peer,
         request: PrimaryRequest::MissingCertificates { inner },
         reply,
     }) = fake_receiver.recv().await
@@ -184,7 +184,12 @@ async fn test_fetch_certificates_basic() {
             .take(first_batch_len)
             .cloned()
             .collect::<Vec<_>>();
-        reply.send(Ok(PrimaryResponse::RequestedCertificates(first_batch_resp.clone()))).unwrap();
+        reply
+            .send(Ok(NetworkResponseMessage {
+                peer,
+                result: PrimaryResponse::RequestedCertificates(first_batch_resp.clone()),
+            }))
+            .unwrap();
     }
 
     // The certificates up to index 66 (4 + 62) should be written to store eventually by core.
@@ -203,7 +208,7 @@ async fn test_fetch_certificates_basic() {
     loop {
         match fake_receiver.recv().await {
             Some(NetworkCommand::SendRequest {
-                peer: _,
+                peer,
                 request: PrimaryRequest::MissingCertificates { inner },
                 reply,
             }) => {
@@ -212,7 +217,12 @@ async fn test_fetch_certificates_basic() {
                     // Drain the fetch requests sent out before the last reply, when only 1 round in
                     // skip_rounds.
                     reply
-                        .send(Ok(PrimaryResponse::RequestedCertificates(first_batch_resp.clone())))
+                        .send(Ok(NetworkResponseMessage {
+                            peer,
+                            result: PrimaryResponse::RequestedCertificates(
+                                first_batch_resp.clone(),
+                            ),
+                        }))
                         .unwrap();
                     continue;
                 }
@@ -235,7 +245,10 @@ async fn test_fetch_certificates_basic() {
                     .cloned()
                     .collect::<Vec<_>>();
                 reply
-                    .send(Ok(PrimaryResponse::RequestedCertificates(second_batch_resp.clone())))
+                    .send(Ok(NetworkResponseMessage {
+                        peer,
+                        result: PrimaryResponse::RequestedCertificates(second_batch_resp.clone()),
+                    }))
                     .unwrap();
                 break;
             }
@@ -259,7 +272,7 @@ async fn test_fetch_certificates_basic() {
     loop {
         match fake_receiver.try_recv() {
             Ok(NetworkCommand::SendRequest {
-                peer: _,
+                peer,
                 request: PrimaryRequest::MissingCertificates { inner },
                 reply,
             }) => {
@@ -268,7 +281,12 @@ async fn test_fetch_certificates_basic() {
                 if first_num_skip_rounds == 16 || first_num_skip_rounds == 17 {
                     // Drain the fetch requests sent out before the last reply.
                     reply
-                        .send(Ok(PrimaryResponse::RequestedCertificates(second_batch_resp.clone())))
+                        .send(Ok(NetworkResponseMessage {
+                            peer,
+                            result: PrimaryResponse::RequestedCertificates(
+                                second_batch_resp.clone(),
+                            ),
+                        }))
                         .unwrap();
                     continue;
                 }
@@ -289,7 +307,7 @@ async fn test_fetch_certificates_basic() {
     // Verify the fetch request.
     if let Some(req) = fake_receiver.recv().await {
         match req {
-            NetworkCommand::SendRequest { peer: _, request, reply } => match request {
+            NetworkCommand::SendRequest { peer, request, reply } => match request {
                 PrimaryRequest::MissingCertificates { inner } => {
                     let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
                     assert_eq!(lower_bound, 0);
@@ -302,7 +320,8 @@ async fn test_fetch_certificates_basic() {
                     let mut certs = Vec::new();
                     // Add cert missing parent info.
                     let mut cert = certificates[num_written].clone();
-                    cert.header_mut_for_test().clear_parents_for_test();
+                    let ch_builder = HeaderBuilder::from_header(cert.header());
+                    cert.update_header_for_test(ch_builder.parents(BTreeSet::default()).build());
                     certs.push(cert);
                     // Add cert with incorrect digest.
                     let mut cert = certificates[num_written].clone();
@@ -313,7 +332,12 @@ async fn test_fetch_certificates_basic() {
                     certs.push(cert);
                     // Add cert without all parents in storage.
                     certs.push(certificates[num_written + 1].clone());
-                    reply.send(Ok(PrimaryResponse::RequestedCertificates(certs))).unwrap();
+                    reply
+                        .send(Ok(NetworkResponseMessage {
+                            peer,
+                            result: PrimaryResponse::RequestedCertificates(certs),
+                        }))
+                        .unwrap();
                 }
                 _ => panic!("not missing certs!"),
             },
@@ -328,7 +352,7 @@ async fn test_fetch_certificates_basic() {
     verify_certificates_not_in_store(&certificate_store, &certificates[num_written..target_index]);
 
     assert!(!synchronizer
-        .identify_unkown_parents(&certificates[target_index].header)
+        .identify_unkown_parents(certificates[target_index].header())
         .await
         .unwrap()
         .is_empty());
@@ -336,7 +360,7 @@ async fn test_fetch_certificates_basic() {
     // Verify the fetch request.
     if let Some(req) = fake_receiver.recv().await {
         match req {
-            NetworkCommand::SendRequest { peer: _, request, reply } => match request {
+            NetworkCommand::SendRequest { peer, request, reply } => match request {
                 PrimaryRequest::MissingCertificates { inner } => {
                     let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
                     assert_eq!(lower_bound, 0);
@@ -354,7 +378,12 @@ async fn test_fetch_certificates_basic() {
                         );
                         certs.push(cert);
                     }
-                    reply.send(Ok(PrimaryResponse::RequestedCertificates(certs))).unwrap();
+                    reply
+                        .send(Ok(NetworkResponseMessage {
+                            peer,
+                            result: PrimaryResponse::RequestedCertificates(certs),
+                        }))
+                        .unwrap();
                 }
                 _ => panic!("not missing certs!"),
             },
@@ -368,7 +397,7 @@ async fn test_fetch_certificates_basic() {
     verify_certificates_not_in_store(&certificate_store, &certificates[num_written..target_index]);
 
     assert!(!synchronizer
-        .identify_unkown_parents(&certificates[target_index].header)
+        .identify_unkown_parents(certificates[target_index].header())
         .await
         .unwrap()
         .is_empty());
@@ -376,7 +405,7 @@ async fn test_fetch_certificates_basic() {
     // Verify the fetch request.
     if let Some(req) = fake_receiver.recv().await {
         match req {
-            NetworkCommand::SendRequest { peer: _, request, reply } => match request {
+            NetworkCommand::SendRequest { peer, request, reply } => match request {
                 PrimaryRequest::MissingCertificates { inner } => {
                     let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
                     assert_eq!(lower_bound, 0);
@@ -392,7 +421,12 @@ async fn test_fetch_certificates_basic() {
                     for cert in certificates.iter().skip(num_written).take(204) {
                         certs.push(cert.clone());
                     }
-                    reply.send(Ok(PrimaryResponse::RequestedCertificates(certs))).unwrap();
+                    reply
+                        .send(Ok(NetworkResponseMessage {
+                            peer,
+                            result: PrimaryResponse::RequestedCertificates(certs),
+                        }))
+                        .unwrap();
                 }
                 _ => panic!("not missing certs!"),
             },
@@ -477,7 +511,7 @@ async fn test_fetch_cancellation_on_success() {
 
     // expecxt a fetch request for the missing certificates
     if let Some(NetworkCommand::SendRequest {
-        peer: _,
+        peer,
         request: PrimaryRequest::MissingCertificates { .. },
         reply,
     }) = timeout(Duration::from_secs(2), fake_receiver.recv())
@@ -485,7 +519,12 @@ async fn test_fetch_cancellation_on_success() {
         .expect("Should get fetch request")
     {
         // first peer responds immediately with all missing certificates
-        reply.send(Ok(PrimaryResponse::RequestedCertificates(all_certificates.clone()))).unwrap();
+        reply
+            .send(Ok(NetworkResponseMessage {
+                peer,
+                result: PrimaryResponse::RequestedCertificates(all_certificates.clone()),
+            }))
+            .unwrap();
     } else {
         panic!("Expected a fetch request for missing certificates");
     }
@@ -702,7 +741,7 @@ async fn test_gc_round_update_during_fetch() {
     loop {
         match timeout(Duration::from_secs(2), fake_receiver.recv()).await {
             Ok(Some(NetworkCommand::SendRequest {
-                peer: _,
+                peer,
                 request: PrimaryRequest::MissingCertificates { inner },
                 reply,
             })) => {
@@ -713,13 +752,16 @@ async fn test_gc_round_update_during_fetch() {
                 }
 
                 reply
-                    .send(Ok(PrimaryResponse::RequestedCertificates(
-                        all_certificates
-                            .iter()
-                            .filter(|c| c.header().round() > 5)
-                            .cloned()
-                            .collect(),
-                    )))
+                    .send(Ok(NetworkResponseMessage {
+                        peer,
+                        result: PrimaryResponse::RequestedCertificates(
+                            all_certificates
+                                .iter()
+                                .filter(|c| c.header().round() > 5)
+                                .cloned()
+                                .collect(),
+                        ),
+                    }))
                     .unwrap();
 
                 // break here to prevent timeout
@@ -875,7 +917,7 @@ async fn test_partial_response_handling_rejects_invalid_cert() {
     let mut bad_cert = all_certificates[target_index - 1].clone();
 
     // first peer returns partial response with some invalid certificates
-    if let Some(NetworkCommand::SendRequest { reply, .. }) = fake_receiver.recv().await {
+    if let Some(NetworkCommand::SendRequest { reply, peer, .. }) = fake_receiver.recv().await {
         let mut response = vec![];
 
         // add some valid certificates
@@ -892,7 +934,12 @@ async fn test_partial_response_handling_rejects_invalid_cert() {
         response.extend(all_certificates.iter().skip(6).take(4).cloned());
 
         // send malicious payload
-        reply.send(Ok(PrimaryResponse::RequestedCertificates(response))).unwrap();
+        reply
+            .send(Ok(NetworkResponseMessage {
+                peer,
+                result: PrimaryResponse::RequestedCertificates(response),
+            }))
+            .unwrap();
     }
 
     // allow time for writes to db
@@ -955,7 +1002,7 @@ async fn test_bad_cert_in_fetch_rejects_all() {
     let mut bad_cert = all_certificates[5].clone();
 
     // first peer returns partial response with some invalid certificates
-    if let Some(NetworkCommand::SendRequest { reply, .. }) = fake_receiver.recv().await {
+    if let Some(NetworkCommand::SendRequest { reply, peer, .. }) = fake_receiver.recv().await {
         let mut response = vec![];
 
         // add some valid certificates
@@ -970,7 +1017,12 @@ async fn test_bad_cert_in_fetch_rejects_all() {
         response.extend(all_certificates.iter().skip(6).take(4).cloned());
 
         // send malicious payload
-        reply.send(Ok(PrimaryResponse::RequestedCertificates(response))).unwrap();
+        reply
+            .send(Ok(NetworkResponseMessage {
+                peer,
+                result: PrimaryResponse::RequestedCertificates(response),
+            }))
+            .unwrap();
     }
 
     // allow time for writes to db

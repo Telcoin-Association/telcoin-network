@@ -19,8 +19,9 @@ use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, CertificateStore, PayloadStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    error::HeaderError, now, AuthorityIdentifier, BlockNumHash, Certificate, Committee, ExecHeader,
-    Hash as _, SealedHeader, SignatureVerificationState, TaskManager, B256,
+    error::HeaderError, now, AuthorityIdentifier, BlockNumHash, Certificate, Committee,
+    ConsensusHeaderDigest, ConsensusNumHash, ExecHeader, Hash as _, SealedHeader,
+    SignatureVerificationState, TaskManager,
 };
 use tokio::time::timeout;
 
@@ -45,7 +46,11 @@ async fn test_request_vote_too_new() {
     // Need a dummy parent so we can request a vote.
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
     let task_manager = TaskManager::default();
     let synchronizer =
@@ -75,7 +80,7 @@ async fn test_request_vote_too_new() {
         .round(100) // Need to be bigger than the gc window
         .latest_execution_block(BlockNumHash::default()) // dummy_hash would be correct here but this is the test...
         .parents(round_2_certs.iter().map(|c| c.digest()).collect())
-        .with_payload_batch(fixture_batch_with_transactions(10), 0)
+        .with_payload_batch(&fixture_batch_with_transactions(10), 0)
         .build();
 
     // Trying to build on off of a missing execution block, will be an error.
@@ -112,7 +117,11 @@ async fn test_request_vote_has_missing_execution_block() {
     // Need a dummy parent so we can request a vote.
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
     let task_manager = TaskManager::default();
     let synchronizer =
@@ -143,7 +152,7 @@ async fn test_request_vote_has_missing_execution_block() {
         .round(3)
         .latest_execution_block(BlockNumHash::default()) // dummy_hash would be correct here but this is the test...
         .parents(round_2_certs.iter().map(|c| c.digest()).collect())
-        .with_payload_batch(fixture_batch_with_transactions(10), 0)
+        .with_payload_batch(&fixture_batch_with_transactions(10), 0)
         .build();
 
     // Write some certificates from round 2 into the store, and leave out the rest to test
@@ -189,14 +198,18 @@ async fn test_request_vote_older_execution_block() {
     let dummy_hash = dummy_parent.hash();
     // This will be an "older" execution block, test this still works.
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
     let mut dummy = ExecHeader { nonce: 110_u64.into(), ..Default::default() };
     dummy.nonce = 110_u64.into();
     cb.app().recent_blocks().send_modify(|blocks| {
         blocks.push_latest(
             0,
-            BlockNumHash::new(0, B256::default()),
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
             Some(SealedHeader::seal_slow(dummy)),
         )
     });
@@ -204,7 +217,7 @@ async fn test_request_vote_older_execution_block() {
     cb.app().recent_blocks().send_modify(|blocks| {
         blocks.push_latest(
             0,
-            BlockNumHash::new(0, B256::default()),
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
             Some(SealedHeader::seal_slow(dummy)),
         )
     });
@@ -237,7 +250,7 @@ async fn test_request_vote_older_execution_block() {
         .round(3)
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
         .parents(round_2_certs.iter().map(|c| c.digest()).collect())
-        .with_payload_batch(fixture_batch_with_transactions(10), 0)
+        .with_payload_batch(&fixture_batch_with_transactions(10), 0)
         .build();
 
     // Write some certificates from round 2 into the store, and leave out the rest to test
@@ -283,7 +296,11 @@ async fn test_request_vote_has_missing_parents() {
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
     let task_manager = TaskManager::default();
     let synchronizer =
@@ -315,7 +332,7 @@ async fn test_request_vote_has_missing_parents() {
         .round(2)
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
         .parents(round_2_certs.iter().map(|c| c.digest()).collect())
-        .with_payload_batch(fixture_batch_with_transactions(10), 0)
+        .with_payload_batch(&fixture_batch_with_transactions(10), 0)
         .build();
 
     // Write some certificates from round 2 into the store, and leave out the rest to test
@@ -342,28 +359,34 @@ async fn test_request_vote_has_missing_parents() {
     let received_missing: HashSet<_> = missing.into_iter().collect();
     assert_eq!(expected_missing, received_missing);
 
-    // TEST PHASE 2: Handler should not return additional unknown digests.
-    // No additional missing parents will be requested.
+    // TEST PHASE 2: Handler should re-issue the same MissingParents when proposer retries with
+    // empty parents (fresh request). This avoids a deadlock where the proposer's certifier
+    // restarts and the cached state causes a fatal WrongNumberOfParents error.
     let result =
         timeout(Duration::from_secs(5), handler.vote(author_peer, test_header.clone(), Vec::new()))
             .await;
-    assert!(
-        matches!(
-            result,
-            Ok(Err(PrimaryNetworkError::InvalidHeader(HeaderError::WrongNumberOfParents(5, 0))))
-        ),
-        "{result:?}"
-    );
+    let missing2 = if let Ok(Ok(PrimaryResponse::MissingParents(missing))) = result {
+        missing
+    } else {
+        panic!("Expected MissingParents response on retry, got: {result:?}");
+    };
+    // Should re-issue the same missing parents as before.
+    let received_missing2: HashSet<_> = missing2.into_iter().collect();
+    assert_eq!(expected_missing, received_missing2);
 
-    // TEST PHASE 3: Handler should return error if header is too old.
-    // Increase round threshold.
+    // TEST PHASE 3: With the MissingParents state still cached, a fresh empty-parents request
+    // continues to re-issue MissingParents (proposer is expected to provide them).
+    // Increase round threshold to simulate header becoming old, but the cached MissingParents
+    // state means the handler still re-issues the same request before TooOld is checked.
     cb.app().primary_round_updates().send_replace(100);
-    // Because round 1 certificates are not in store, the missing parents will not be accepted yet.
     let result =
         timeout(Duration::from_secs(5), handler.vote(author_peer, test_header, Vec::new()))
             .await
             .unwrap();
-    assert!(result.is_err(), "{result:?}");
+    assert!(
+        matches!(result, Ok(PrimaryResponse::MissingParents(_))),
+        "Expected MissingParents on retry, got: {result:?}"
+    );
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -391,7 +414,11 @@ async fn test_request_vote_accept_missing_parents() {
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
     let task_manager = TaskManager::default();
     let synchronizer =
@@ -425,7 +452,7 @@ async fn test_request_vote_accept_missing_parents() {
         .round(3)
         .parents(round_2_certs.iter().map(|c| c.digest()).collect())
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
-        .with_payload_batch(fixture_batch_with_transactions(10), 0)
+        .with_payload_batch(&fixture_batch_with_transactions(10), 0)
         .build();
 
     // Populate all round 1 certificates and some round 2 certificates into the storage.
@@ -495,7 +522,11 @@ async fn test_request_vote_missing_batches() {
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
     let task_manager = TaskManager::default();
     let synchronizer =
@@ -513,7 +544,7 @@ async fn test_request_vote_missing_batches() {
     for primary in fixture.authorities().filter(|a| a.id() != authority_id) {
         let header = primary
             .header_builder(&fixture.committee())
-            .with_payload_batch(fixture_batch_with_transactions(10), 0)
+            .with_payload_batch(&fixture_batch_with_transactions(10), 0)
             .build();
 
         let certificate = fixture.certificate(&header);
@@ -530,7 +561,7 @@ async fn test_request_vote_missing_batches() {
         .round(2)
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
         .parents(certificates.keys().cloned().collect())
-        .with_payload_batch(fixture_batch_with_transactions(10), 0)
+        .with_payload_batch(&fixture_batch_with_transactions(10), 0)
         .build();
 
     // Set up mock worker.
@@ -571,7 +602,11 @@ async fn test_request_vote_already_voted() {
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
     let task_manager = TaskManager::default();
     let synchronizer =
@@ -589,7 +624,7 @@ async fn test_request_vote_already_voted() {
     for primary in fixture.authorities().filter(|a| a.id() != id) {
         let header = primary
             .header_builder(&fixture.committee())
-            .with_payload_batch(fixture_batch_with_transactions(10), 0)
+            .with_payload_batch(&fixture_batch_with_transactions(10), 0)
             .build();
 
         let certificate = fixture.certificate(&header);
@@ -613,7 +648,7 @@ async fn test_request_vote_already_voted() {
         .round(2)
         .parents(certificates.keys().cloned().collect())
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
-        .with_payload_batch(fixture_batch_with_transactions(10), 0)
+        .with_payload_batch(&fixture_batch_with_transactions(10), 0)
         .build();
 
     cb.app().committed_round_updates().send_replace(1);
@@ -646,7 +681,7 @@ async fn test_request_vote_already_voted() {
         .round(2)
         .parents(certificates.keys().cloned().collect())
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
-        .with_payload_batch(fixture_batch_with_transactions(10), 0)
+        .with_payload_batch(&fixture_batch_with_transactions(10), 0)
         .build();
 
     let response = handler.vote(author_peer, test_header, Vec::new()).await;
@@ -818,7 +853,11 @@ async fn test_request_vote_created_at_in_future() {
     let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
     let dummy_hash = dummy_parent.hash();
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
     let task_manager = TaskManager::default();
     let synchronizer =
@@ -836,7 +875,7 @@ async fn test_request_vote_created_at_in_future() {
     for primary in fixture.authorities().filter(|a| a.id() != id) {
         let header = primary
             .header_builder(&fixture.committee())
-            .with_payload_batch(fixture_batch_with_transactions(10), 0)
+            .with_payload_batch(&fixture_batch_with_transactions(10), 0)
             .build();
 
         let certificate = fixture.certificate(&header);
@@ -864,7 +903,7 @@ async fn test_request_vote_created_at_in_future() {
         .round(2)
         .parents(certificates.keys().cloned().collect())
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
-        .with_payload_batch(fixture_batch_with_transactions(10), 0)
+        .with_payload_batch(&fixture_batch_with_transactions(10), 0)
         .created_at(created_at)
         .build();
 
@@ -880,7 +919,7 @@ async fn test_request_vote_created_at_in_future() {
         let header = primary
             .header_builder(&fixture.committee())
             .round(2)
-            .with_payload_batch(fixture_batch_with_transactions(10), 0)
+            .with_payload_batch(&fixture_batch_with_transactions(10), 0)
             .build();
 
         let certificate = fixture.certificate(&header);
@@ -901,7 +940,7 @@ async fn test_request_vote_created_at_in_future() {
         .round(3)
         .latest_execution_block(BlockNumHash::new(0, dummy_hash))
         .parents(certificates.keys().cloned().collect())
-        .with_payload_batch(fixture_batch_with_transactions(10), 0)
+        .with_payload_batch(&fixture_batch_with_transactions(10), 0)
         .created_at(created_at)
         .build();
 

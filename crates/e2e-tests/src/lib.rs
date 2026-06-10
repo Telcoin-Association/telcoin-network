@@ -67,6 +67,18 @@ pub fn config_local_testnet(
     passphrase: Option<String>,
     accounts: Option<Vec<(Address, GenesisAccount)>>,
 ) -> eyre::Result<()> {
+    config_local_testnet_with_epoch_duration(temp_path, passphrase, accounts, None)
+}
+
+/// Like [`config_local_testnet`], but lets the caller override the epoch duration in seconds.
+/// Pass `None` to use the genesis CLI default (8 hours). Useful for tests that need to
+/// observe an epoch boundary within the test budget.
+pub fn config_local_testnet_with_epoch_duration(
+    temp_path: &Path,
+    passphrase: Option<String>,
+    accounts: Option<Vec<(Address, GenesisAccount)>>,
+    epoch_duration_secs: Option<u32>,
+) -> eyre::Result<()> {
     let validators = [
         ("validator-1", "0x1111111111111111111111111111111111111111"),
         ("validator-2", "0x2222222222222222222222222222222222222222"),
@@ -94,19 +106,24 @@ pub fn config_local_testnet(
     create_observer_info(dir, passphrase.clone())?;
 
     // create committee from shared genesis dir
-    let create_committee_command = CommandParser::<GenesisArgs>::parse_from([
-        "tn",
-        "--basefee-address",
-        "0x9999999999999999999999999999999999999999",
-        "--consensus-registry-owner",
-        "0x00000000000000000000000000000000000007a0",
-        "--dev-funded-account",
-        "test-source",
-        "--max-header-delay-ms",
-        "1000",
-        "--min-header-delay-ms",
-        "500",
-    ]);
+    let mut genesis_args: Vec<String> = vec![
+        "tn".into(),
+        "--basefee-address".into(),
+        "0x9999999999999999999999999999999999999999".into(),
+        "--consensus-registry-owner".into(),
+        "0x00000000000000000000000000000000000007a0".into(),
+        "--dev-funded-account".into(),
+        "test-source".into(),
+        "--max-header-delay-ms".into(),
+        "1000".into(),
+        "--min-header-delay-ms".into(),
+        "500".into(),
+    ];
+    if let Some(duration) = epoch_duration_secs {
+        genesis_args.push("--epoch-duration-in-secs".into());
+        genesis_args.push(duration.to_string());
+    }
+    let create_committee_command = CommandParser::<GenesisArgs>::parse_from(genesis_args);
     create_committee_command.args.execute(shared_genesis_dir.clone())?;
     // If provided optional accounts then hack them into genesis now...
     if let Some(accounts) = accounts {
@@ -203,8 +220,8 @@ pub fn spawn_local_testnet(
                 match command.execute(
                     dir,
                     key_config,
-                    |builder, _: NoArgs, tn_datadir, passphrase| {
-                        launch_node(builder, tn_datadir, passphrase)
+                    |builder, _: NoArgs, tn_datadir, passphrase, version| {
+                        launch_node(builder, tn_datadir, passphrase, version)
                     },
                 ) {
                     Ok(handle) => {

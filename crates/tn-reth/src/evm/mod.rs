@@ -34,10 +34,8 @@ pub use tel_precompile::test_utils as precompile_test_utils;
 #[cfg(not(feature = "faucet"))]
 pub use tel_precompile::TIMELOCK_DURATION;
 pub use tel_precompile::{
-    add_telcoin_precompile, allowanceCall, approveCall, balanceOfCall, burnCall, claimCall,
-    decimalsCall, grantMintRoleCall, hasMintRoleCall, mintCall, nameCall, noncesCall, permitCall,
-    revokeMintRoleCall, symbolCall, totalSupplyCall, transferCall, transferFromCall,
-    DOMAIN_SEPARATORCall, TELCOIN_PRECOMPILE_ADDRESS,
+    add_telcoin_precompile, burnCall, claimCall, grantMintRoleCall, hasMintRoleCall, mintCall,
+    revokeMintRoleCall, totalSupplyCall, TELCOIN_PRECOMPILE_ADDRESS,
 };
 pub use utils::calculate_gas_penalty;
 
@@ -212,7 +210,9 @@ where
         // NOTE: revm currently marks the caller and block beneficiary accounts as "touched"
         // after the above transact calls, and includes them in the result.
         //
-        // System calls are used by TN protocol to update more than just the contract.
+        // Callers are responsible for removing SYSTEM_ADDRESS from the result state
+        // before committing. The reward_beneficiary handler skips system calls to
+        // prevent the beneficiary and basefee address from being spuriously touched.
         res
     }
 

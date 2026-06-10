@@ -3,7 +3,7 @@
 
 use serde::{de::DeserializeOwned, Serialize};
 use tn_types::{encode_into_buffer, try_decode};
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncSeek, AsyncSeekExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _};
 
 use crate::archive::{
     error::{
@@ -11,7 +11,7 @@ use crate::archive::{
         load_header::LoadHeaderError, open::OpenError, rename::RenameError,
     },
     fxhasher::FxHasher,
-    pack_iter::PackIter,
+    pack_iter::{PackIter, MAX_RECORD_SIZE},
 };
 
 use super::{crc::add_crc32, data_file::DataFile};
@@ -39,8 +39,13 @@ where
     V: Debug + Serialize + DeserializeOwned,
 {
     /// Open a new or reopen an existing database.
-    pub fn open<P: AsRef<Path>>(path: P, uid_idx: u64, read_only: bool) -> Result<Self, OpenError> {
-        Ok(Self { inner: PackInner::open(path, uid_idx, read_only)? })
+    pub fn open<P: AsRef<Path>>(
+        path: P,
+        uid_idx: u64,
+        read_only: bool,
+        compression: PackCompression,
+    ) -> Result<Self, OpenError> {
+        Ok(Self { inner: PackInner::open(path, uid_idx, read_only, compression)? })
     }
 
     /// Length of the Pack file.
@@ -85,7 +90,7 @@ where
     }
 
     /// Return the DB application number (set at creation).
-    pub fn appnum(&self) -> u64 {
+    pub fn appnum(&self) -> u32 {
         self.inner.appnum()
     }
 
@@ -149,6 +154,8 @@ where
     header: DataHeader,
     data_file: DataFile,
     value_buffer: Vec<u8>,
+    /// Used as a second buffer for compress and decompress operations on records.
+    compression_buffer: Vec<u8>,
     failed: bool,
     read_only: bool,
     uid_idx: u64, // Store for opening an iterator.
@@ -171,13 +178,19 @@ where
     V: Debug + Serialize + DeserializeOwned,
 {
     /// Open a new or reopen an existing database.
-    fn open<P: AsRef<Path>>(path: P, uid_idx: u64, read_only: bool) -> Result<Self, OpenError> {
-        let (data_file, header) =
-            Self::open_data_file(path, uid_idx, read_only).map_err(OpenError::DataFileOpen)?;
+    fn open<P: AsRef<Path>>(
+        path: P,
+        uid_idx: u64,
+        read_only: bool,
+        compression: PackCompression,
+    ) -> Result<Self, OpenError> {
+        let (data_file, header) = Self::open_data_file(path, uid_idx, read_only, compression)
+            .map_err(OpenError::DataFileOpen)?;
         Ok(Self {
             header,
             data_file,
             value_buffer: Vec::new(),
+            compression_buffer: Vec::new(),
             failed: false,
             read_only,
             uid_idx,
@@ -201,16 +214,27 @@ where
         self.value_buffer.clear();
         encode_into_buffer(&mut self.value_buffer, value)
             .map_err(|e| AppendError::SerializeValue(e.to_string()))?;
+        let buffer = match self.header.compression {
+            PackCompression::None => &self.value_buffer,
+            PackCompression::ZStd => {
+                self.compression_buffer.clear();
+                let mut compressor =
+                    zstd::stream::write::Encoder::new(&mut self.compression_buffer, 0)?;
+                compressor.write_all(&self.value_buffer)?;
+                compressor.finish()?;
+                &self.compression_buffer
+            }
+        };
 
         let mut crc32_hasher = crc32fast::Hasher::new();
         // Once we have written to write_buffer, it needs to be rolled back before returning an
         // error. Space for the value length.
-        let value_size = (self.value_buffer.len() as u32).to_le_bytes();
+        let value_size = (buffer.len() as u32).to_le_bytes();
         self.data_file.write_all(&value_size)?;
         crc32_hasher.update(&value_size);
 
-        self.data_file.write_all(&self.value_buffer)?;
-        crc32_hasher.update(&self.value_buffer);
+        self.data_file.write_all(buffer)?;
+        crc32_hasher.update(buffer);
         let crc32 = crc32_hasher.finalize();
         self.data_file.write_all(&crc32.to_le_bytes())?;
 
@@ -253,7 +277,7 @@ where
     }
 
     /// Return the DB application number (set at creation).
-    fn appnum(&self) -> u64 {
+    fn appnum(&self) -> u32 {
         self.header.appnum()
     }
 
@@ -285,12 +309,13 @@ where
         path: P,
         uid_idx: u64,
         ro: bool,
+        compression: PackCompression,
     ) -> Result<(DataFile, DataHeader), LoadHeaderError> {
         let mut data_file = DataFile::open(path, ro)?;
         let file_end = data_file.data_file_end();
 
         let header = if file_end == 0 {
-            let header = DataHeader::new(uid_idx);
+            let header = DataHeader::new(uid_idx, compression);
             header.write_header(&mut data_file)?;
             header
         } else {
@@ -317,6 +342,9 @@ where
         self.data_file.read_exact(&mut val_size_buf)?;
         crc32_hasher.update(&val_size_buf);
         let val_size = u32::from_le_bytes(val_size_buf);
+        if val_size > MAX_RECORD_SIZE {
+            return Err(FetchError::RequestedSizeTooLarge(val_size, MAX_RECORD_SIZE));
+        }
         self.value_buffer.resize(val_size as usize, 0);
         self.data_file.read_exact(&mut self.value_buffer[..])?;
         crc32_hasher.update(&self.value_buffer);
@@ -327,8 +355,23 @@ where
         if calc_crc32 != read_crc32 {
             return Err(FetchError::CrcFailed);
         }
-        let val = try_decode::<V>(&self.value_buffer[..])
-            .map_err(|e| FetchError::DeserializeValue(e.to_string()))?;
+        let buffer = match self.header.compression {
+            PackCompression::None => &self.value_buffer,
+            PackCompression::ZStd => {
+                let mut decoder = zstd::stream::read::Decoder::new(&self.value_buffer[..])?;
+                decoder.window_log_max(24)?;
+                self.compression_buffer.clear();
+                // +1 lets us detect overflow vs. natural EOF
+                let mut limited = decoder.take(MAX_RECORD_SIZE as u64 + 1);
+                limited.read_to_end(&mut self.compression_buffer)?;
+                if self.compression_buffer.len() as u64 > MAX_RECORD_SIZE as u64 {
+                    return Err(FetchError::RequestedDecompressSizeTooLarge(MAX_RECORD_SIZE));
+                }
+                &self.compression_buffer
+            }
+        };
+        let val =
+            try_decode::<V>(buffer).map_err(|e| FetchError::DeserializeValue(e.to_string()))?;
         Ok(val)
     }
 
@@ -341,6 +384,9 @@ where
         self.data_file.read_exact(&mut val_size_buf)?;
         crc32_hasher.update(&val_size_buf);
         let val_size = u32::from_le_bytes(val_size_buf);
+        if val_size > MAX_RECORD_SIZE {
+            return Err(FetchError::RequestedSizeTooLarge(val_size, MAX_RECORD_SIZE));
+        }
         self.value_buffer.resize(val_size as usize, 0);
         self.data_file.read_exact(&mut self.value_buffer[..])?;
         crc32_hasher.update(&self.value_buffer);
@@ -389,18 +435,23 @@ pub const DATA_HEADER_BYTES: usize = 28;
 /// truncated to maintain consistency.
 /// This data in the file will be followed by a CRC32 checksum value to verify it.
 #[derive(Debug, Copy, Clone)]
-#[repr(C)]
 pub struct DataHeader {
-    type_id: [u8; 6], // The characters "telnet"
-    version: u16,     // Holds the version number
-    uid: u64,         // Unique ID generated on creation
-    appnum: u64,      // Application defined constant
+    /// The characters "telnet"
+    type_id: [u8; 6],
+    /// Holds the version number
+    version: u16,
+    /// Unique ID generated on creation
+    uid: u64,
+    /// Application defined constant
+    appnum: u32,
+    /// Define compression used.
+    compression: PackCompression,
 }
 
 impl DataHeader {
-    pub(crate) fn new(uid_idx: u64) -> Self {
+    pub(crate) fn new(uid_idx: u64, compression: PackCompression) -> Self {
         let uid = Self::gen_uid(uid_idx);
-        Self { type_id: *b"telnet", version: 0, uid, appnum: 1 }
+        Self { type_id: *b"telnet", version: 0, uid, appnum: 1, compression }
     }
 
     /// Load a DataHeader from source.
@@ -415,11 +466,11 @@ impl DataHeader {
     }
 
     /// Load a DataHeader from source.
-    pub(crate) async fn load_header_async<R: AsyncRead + AsyncSeek + Unpin>(
+    /// Note the read position must be at the header (this does not seek first).
+    pub(crate) async fn load_header_async<R: AsyncRead + Unpin>(
         source: &mut R,
         uid_idx: u64,
     ) -> Result<Self, LoadHeaderError> {
-        source.rewind().await?;
         let mut buffer = [0_u8; DATA_HEADER_BYTES];
         source.read_exact(&mut buffer[..]).await?;
         Self::load_header_from_buffer(buffer, uid_idx)
@@ -457,9 +508,13 @@ impl DataHeader {
             return Err(LoadHeaderError::InvalidDataUID);
         }
         pos += 8;
-        buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
-        let appnum = u64::from_le_bytes(buf64);
-        let header = Self { type_id, version, uid, appnum };
+        buf32.copy_from_slice(&buffer[pos..(pos + 4)]);
+        let appconst = u32::from_le_bytes(buf32);
+        pos += 4;
+        buf32.copy_from_slice(&buffer[pos..(pos + 4)]);
+        let compression = u32::from_le_bytes(buf32);
+        let compression = PackCompression::from_u32(compression)?;
+        let header = Self { type_id, version, uid, appnum: appconst, compression };
         Ok(header)
     }
 
@@ -484,8 +539,10 @@ impl DataHeader {
         pos += 2;
         buffer[pos..(pos + 8)].copy_from_slice(&self.uid.to_le_bytes());
         pos += 8;
-        buffer[pos..(pos + 8)].copy_from_slice(&self.appnum.to_le_bytes());
-        pos += 8;
+        buffer[pos..(pos + 4)].copy_from_slice(&self.appnum.to_le_bytes());
+        pos += 4;
+        buffer[pos..(pos + 4)].copy_from_slice(&self.compression.to_u32().to_le_bytes());
+        pos += 4;
         add_crc32(&mut buffer);
         pos += 4;
         assert_eq!(pos, DATA_HEADER_BYTES);
@@ -504,8 +561,41 @@ impl DataHeader {
     }
 
     /// User defined appnum.
-    pub(crate) fn appnum(&self) -> u64 {
+    pub(crate) fn appnum(&self) -> u32 {
         self.appnum
+    }
+
+    /// Compression for records.
+    pub(crate) fn compression(&self) -> PackCompression {
+        self.compression
+    }
+}
+
+/// Set the pack file record level compression.
+#[derive(Debug, Copy, Clone)]
+pub enum PackCompression {
+    /// No compression
+    None,
+    /// ZStd compression
+    ZStd,
+}
+
+impl PackCompression {
+    /// Create a PackCompression enum from a u32.
+    pub fn from_u32(v: u32) -> Result<Self, LoadHeaderError> {
+        match v {
+            0 => Ok(Self::None),
+            1 => Ok(Self::ZStd),
+            _ => Err(LoadHeaderError::InvalidCompression),
+        }
+    }
+
+    /// Convert a PackCompression enum into a u32.
+    pub fn to_u32(&self) -> u32 {
+        match self {
+            PackCompression::None => 0,
+            PackCompression::ZStd => 1,
+        }
     }
 }
 
@@ -525,11 +615,11 @@ mod tests {
     }
     type TestPack = Pack<TestRec>;
 
-    #[test]
-    fn test_archive_pack_one() {
+    fn archive_pack_(compression: PackCompression) {
         let tmp_path = TempDir::with_prefix("test_archive_pack_one").expect("temp dir");
         let mut db: TestPack =
-            Pack::open(tmp_path.path().join("pack_test_one"), 0, false).expect("open pack");
+            Pack::open(tmp_path.path().join("pack_test_one"), 0, false, compression)
+                .expect("open pack");
         let pos_1 = db.append(&TestRec { idx: 1, name: "Value One".to_string() }).expect("append");
         let pos_2 = db.append(&TestRec { idx: 2, name: "Value Two".to_string() }).expect("append");
         let pos_3 =
@@ -576,7 +666,8 @@ mod tests {
         drop(db);
 
         let mut db: TestPack =
-            Pack::open(tmp_path.path().join("pack_test_one"), 0, false).expect("open pack");
+            Pack::open(tmp_path.path().join("pack_test_one"), 0, false, compression)
+                .expect("open pack");
         let pos_1_2 =
             db.append(&TestRec { idx: 6, name: "Value One2".to_string() }).expect("append");
         let pos_2_2 =
@@ -596,7 +687,8 @@ mod tests {
         drop(db);
 
         let mut db: TestPack =
-            Pack::open(tmp_path.path().join("pack_test_one"), 0, true).expect("open pack");
+            Pack::open(tmp_path.path().join("pack_test_one"), 0, true, compression)
+                .expect("open pack");
         let v = db.fetch(pos_1_2).unwrap();
         assert_eq!(v.idx, 6);
         assert_eq!(v.name, "Value One2");
@@ -641,8 +733,8 @@ mod tests {
         assert_eq!(v.name, "Value Three2");
         assert!(iter.next().is_none());
 
-        let db: TestPack =
-            Pack::open(tmp_path.path().join("pack_test_one"), 0, true).expect("open pack");
+        let db: TestPack = Pack::open(tmp_path.path().join("pack_test_one"), 0, true, compression)
+            .expect("open pack");
         let mut iter = db.raw_iter().unwrap().map(|r| r.unwrap());
         let v: TestRec = iter.next().unwrap();
         assert_eq!(v.idx, 1);
@@ -669,5 +761,199 @@ mod tests {
         assert_eq!(v.idx, 8);
         assert_eq!(v.name, "Value Three2");
         assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_archive_pack_zstd() {
+        archive_pack_(PackCompression::ZStd);
+    }
+
+    #[test]
+    fn test_archive_pack_none() {
+        archive_pack_(PackCompression::None);
+    }
+
+    /// Builds a zstd pack file containing a single hand-crafted record whose compressed
+    /// payload is small (so val_size <= MAX_RECORD_SIZE) but decompresses to
+    /// MAX_RECORD_SIZE + 1 bytes. The outer CRC32 is computed over the same bytes the
+    /// production read path hashes, so the record reaches the zstd decoder with the
+    /// integrity check passing — exercising the in-memory cap added at pack.rs:362-368.
+    ///
+    /// Returns the temp dir handle (drop = cleanup) and the byte position at which the
+    /// crafted record starts, suitable for `Pack::fetch` or as the iterator's first
+    /// post-header read.
+    fn build_pack_with_decompression_bomb() -> (TempDir, u64) {
+        let tmp_path = TempDir::with_prefix("test_zstd_bomb").expect("temp dir");
+        let path = tmp_path.path().join("pack_bomb");
+        {
+            let _pack: TestPack =
+                Pack::open(&path, 0, false, PackCompression::ZStd).expect("open pack");
+        }
+        let pos = fs::metadata(&path).expect("metadata").len();
+
+        let payload = vec![0u8; (MAX_RECORD_SIZE as usize) + 1];
+        let mut compressed = Vec::new();
+        {
+            let mut encoder =
+                zstd::stream::write::Encoder::new(&mut compressed, 0).expect("zstd encoder");
+            encoder.write_all(&payload).expect("zstd write");
+            encoder.finish().expect("zstd finish");
+        }
+
+        let val_size = compressed.len() as u32;
+        let val_size_bytes = val_size.to_le_bytes();
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&val_size_bytes);
+        hasher.update(&compressed);
+        let crc = hasher.finalize();
+
+        let mut file = OpenOptions::new().append(true).open(&path).expect("open for append");
+        file.write_all(&val_size_bytes).expect("write val_size");
+        file.write_all(&compressed).expect("write compressed");
+        file.write_all(&crc.to_le_bytes()).expect("write crc");
+        file.flush().expect("flush");
+
+        (tmp_path, pos)
+    }
+
+    /// Builds a zstd pack file containing one valid record and then mutates a byte deep
+    /// in the zstd frame body, recomputing the outer CRC32 so the corruption survives
+    /// the integrity check. The decoder must surface an io-error or a deserialization
+    /// failure rather than silently returning bad bytes.
+    ///
+    /// Returns the temp dir and the byte position of the corrupted record.
+    fn build_pack_with_corrupt_zstd_frame() -> (TempDir, u64) {
+        let tmp_path = TempDir::with_prefix("test_zstd_corrupt").expect("temp dir");
+        let path = tmp_path.path().join("pack_corrupt");
+        let pos = {
+            let mut pack: TestPack =
+                Pack::open(&path, 0, false, PackCompression::ZStd).expect("open pack");
+            pack.append(&TestRec { idx: 1, name: "f4 fixture".to_string() }).expect("append")
+        };
+
+        let mut file = OpenOptions::new().read(true).write(true).open(&path).expect("open for rw");
+
+        file.seek(SeekFrom::Start(pos)).expect("seek val_size");
+        let mut val_size_bytes = [0_u8; 4];
+        file.read_exact(&mut val_size_bytes).expect("read val_size");
+        let val_size = u32::from_le_bytes(val_size_bytes);
+
+        let mut compressed = vec![0u8; val_size as usize];
+        file.read_exact(&mut compressed).expect("read compressed");
+
+        // Flip every byte past the 4-byte zstd magic. A single-byte corruption is too narrow:
+        // for small payloads zstd may emit a Raw_Block where a one-byte flip is silently
+        // absorbed into the output, and bincode is permissive enough to decode the resulting
+        // bytes as a valid-but-wrong record. Corrupting the entire post-magic span makes the
+        // decoder either reject the frame structurally (frame header / block header parse
+        // failure) or produce enough garbage that bincode fails to deserialize.
+        let corruption_start = 4_usize.min(compressed.len());
+        for byte in compressed[corruption_start..].iter_mut() {
+            *byte ^= 0xFF;
+        }
+
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&val_size_bytes);
+        hasher.update(&compressed);
+        let new_crc = hasher.finalize();
+
+        file.seek(SeekFrom::Start(pos + 4)).expect("seek body");
+        file.write_all(&compressed).expect("write corrupted");
+        file.seek(SeekFrom::Start(pos + 4 + val_size as u64)).expect("seek crc");
+        file.write_all(&new_crc.to_le_bytes()).expect("write crc");
+        file.flush().expect("flush");
+
+        (tmp_path, pos)
+    }
+
+    // F3: the in-memory MAX_RECORD_SIZE cap on decompressed output must fire at every
+    // decompression site (sync fetch, sync iterator, async iterator). Parity tests across
+    // the three sites guard against drift if one site is refactored without the others.
+
+    #[test]
+    fn test_zstd_decompression_bomb_fetch() {
+        let (tmp_dir, pos) = build_pack_with_decompression_bomb();
+        let path = tmp_dir.path().join("pack_bomb");
+        let mut pack: TestPack =
+            Pack::open(&path, 0, true, PackCompression::ZStd).expect("open pack");
+        match pack.fetch(pos) {
+            Err(FetchError::RequestedDecompressSizeTooLarge(max)) => {
+                assert_eq!(max, MAX_RECORD_SIZE);
+            }
+            other => panic!("expected RequestedSizeTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_zstd_decompression_bomb_pack_iter() {
+        let (tmp_dir, _pos) = build_pack_with_decompression_bomb();
+        let path = tmp_dir.path().join("pack_bomb");
+        let file = File::open(&path).expect("open file");
+        let mut iter = PackIter::<TestRec, _>::open(file, 0).expect("iter open");
+        match iter.next() {
+            Some(Err(FetchError::RequestedDecompressSizeTooLarge(max))) => {
+                assert_eq!(max, MAX_RECORD_SIZE);
+            }
+            other => panic!("expected RequestedSizeTooLarge, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_zstd_decompression_bomb_async_pack_iter() {
+        use crate::archive::pack_iter::AsyncPackIter;
+
+        let (tmp_dir, _pos) = build_pack_with_decompression_bomb();
+        let path = tmp_dir.path().join("pack_bomb");
+        let file = tokio::fs::File::open(&path).await.expect("open file");
+        let mut iter = AsyncPackIter::<TestRec, _>::open(file, 0).await.expect("iter open");
+        match iter.next().await {
+            Some(Err(FetchError::RequestedDecompressSizeTooLarge(max))) => {
+                assert_eq!(max, MAX_RECORD_SIZE);
+            }
+            other => panic!("expected RequestedSizeTooLarge, got {other:?}"),
+        }
+    }
+
+    // F4: a CRC-valid but internally corrupt zstd frame must surface as an error rather
+    // than silently passing through. Either FetchError::IO (zstd decode error) or
+    // FetchError::DeserializeValue (zstd produced different bytes that bincode rejects)
+    // is acceptable — both signal that the frame did not round-trip cleanly.
+
+    #[test]
+    fn test_zstd_corrupt_frame_fetch() {
+        let (tmp_dir, pos) = build_pack_with_corrupt_zstd_frame();
+        let path = tmp_dir.path().join("pack_corrupt");
+        let mut pack: TestPack =
+            Pack::open(&path, 0, true, PackCompression::ZStd).expect("open pack");
+        match pack.fetch(pos) {
+            Err(FetchError::IO(_)) | Err(FetchError::DeserializeValue(_)) => {}
+            other => panic!("expected IO or DeserializeValue error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_zstd_corrupt_frame_pack_iter() {
+        let (tmp_dir, _pos) = build_pack_with_corrupt_zstd_frame();
+        let path = tmp_dir.path().join("pack_corrupt");
+        let file = File::open(&path).expect("open file");
+        let mut iter = PackIter::<TestRec, _>::open(file, 0).expect("iter open");
+        match iter.next() {
+            Some(Err(FetchError::IO(_))) | Some(Err(FetchError::DeserializeValue(_))) => {}
+            other => panic!("expected IO or DeserializeValue error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_zstd_corrupt_frame_async_pack_iter() {
+        use crate::archive::pack_iter::AsyncPackIter;
+
+        let (tmp_dir, _pos) = build_pack_with_corrupt_zstd_frame();
+        let path = tmp_dir.path().join("pack_corrupt");
+        let file = tokio::fs::File::open(&path).await.expect("open file");
+        let mut iter = AsyncPackIter::<TestRec, _>::open(file, 0).await.expect("iter open");
+        match iter.next().await {
+            Some(Err(FetchError::IO(_))) | Some(Err(FetchError::DeserializeValue(_))) => {}
+            other => panic!("expected IO or DeserializeValue error, got {other:?}"),
+        }
     }
 }

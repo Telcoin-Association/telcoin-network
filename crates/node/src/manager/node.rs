@@ -4,21 +4,25 @@
 //! tasks run for one epoch. Other resources are shared across epochs.
 //! This file defines the struct and the node/application scoped code.
 
+use std::collections::BTreeMap;
+
 use crate::{
     engine::{ExecutionNode, TnBuilder},
     health::HealthcheckServer,
     manager::spawn_epoch_vote_collector,
 };
 use eyre::{eyre, WrapErr as _};
-use tn_config::{KeyConfig, NetworkConfig, TelcoinDirs};
+use state_sync::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_recent_consensus};
+use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, TelcoinDirs};
 use tn_network_libp2p::{types::NetworkEvent, ConsensusNetwork};
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode, QueChannel};
 use tn_reth::{system_calls::EpochState, RethDb, RethEnv};
 use tn_storage::{consensus::ConsensusChain, open_db, DatabaseType};
 use tn_types::{
-    deconstruct_nonce, gas_accumulator::GasAccumulator, BlockNumHash, ConsensusHeader,
-    ConsensusOutput, Database as TNDatabase, EngineUpdate, Notifier, TaskManager, TaskSpawner,
-    TimestampSec, MIN_PROTOCOL_BASE_FEE,
+    deconstruct_nonce, gas_accumulator::GasAccumulator, BlsPublicKey, BootstrapServer, Committee,
+    ConsensusHeader, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput,
+    Database as TNDatabase, EngineUpdate, Epoch, Notifier, TaskError, TaskManager, TaskSpawner,
+    TimestampSec, DEFAULT_WORKER_ID, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::mpsc;
@@ -54,6 +58,19 @@ pub(crate) struct EpochManager<P, DB> {
     /// If the timestamp of the leader is >= the epoch_boundary then the
     /// manager closes the epoch after the engine executes all data.
     epoch_boundary: TimestampSec,
+    /// Whether the long-running p2p networks have completed their one-time, per-process setup
+    /// (start listening, register bootstrap peers).
+    ///
+    /// This setup normally runs on the `Initial` epoch, but the `Initial` iteration can return
+    /// early from [`EpochManager::replay_missed_consensus`] - when a restart must replay-and-close
+    /// an epoch boundary - *before* `create_consensus` runs the setup. In that case the setup runs
+    /// on the first following `NewEpoch` iteration instead. Gating on this flag, rather than on
+    /// [`RunEpochMode::Initial`], guarantees the networks are set up exactly once even on that
+    /// restart path (mirrors the `are_workers_initialized` guard used for worker components).
+    ///
+    /// Committee slots are NOT gated on this flag. They are set every epoch from authoritative
+    /// state via `update_committees`.
+    network_initialized: bool,
     /// Reth DB, keep for entire execution.
     reth_db: RethDb,
     /// Consensus DB, keep for entire execution.
@@ -72,6 +89,12 @@ pub(crate) struct EpochManager<P, DB> {
 
     /// Access to the epoch pack files storing consensus data.
     consensus_chain: ConsensusChain,
+
+    /// The nodes bootstrap servers.
+    bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapServer>,
+
+    /// The version string for the running node.
+    version_str: &'static str,
 }
 
 /// Restore the [`GasAccumulator`] state after a mid-epoch restart.
@@ -160,6 +183,7 @@ where
         tn_datadir: P,
         consensus_db: DB,
         key_config: KeyConfig,
+        version_str: &'static str,
     ) -> Self {
         // Note this can only fail if the consensus DB is very broken (bad path for instance).
         // So we will panic for now, this will kill the node on startup for a critical error.
@@ -178,6 +202,16 @@ where
             consensus_bus.node_mode().send_replace(NodeMode::Observer);
         }
         let worker_event_stream = QueChannel::new();
+        let bootstrap_servers = if let Ok(committee_zero) =
+            Config::load_from_path_or_default::<Committee>(
+                tn_datadir.committee_path(),
+                ConfigFmt::YAML,
+            ) {
+            committee_zero.bootstrap_servers()
+        } else {
+            error!(target: "epoch-manager", "Unable to load bootstrap servers from the genesis committee!");
+            BTreeMap::new()
+        };
 
         Self {
             builder,
@@ -187,6 +221,7 @@ where
             key_config,
             node_shutdown,
             epoch_boundary: Default::default(),
+            network_initialized: false,
             reth_db,
             consensus_db,
             consensus_bus,
@@ -194,6 +229,8 @@ where
             last_consensus_header: None,
             last_forwarded_consensus_number: 0,
             consensus_chain,
+            bootstrap_servers,
+            version_str,
         }
     }
 
@@ -205,6 +242,10 @@ where
         // Long-running tasks for the lifetime of the node.
         let mut node_task_manager = TaskManager::new(NODE_TASK_MANAGER);
         let node_task_spawner = node_task_manager.get_spawner();
+        // Prime the last forwarded consensus number at startup.
+        // Normally this is not needed but is a layer of safety in case
+        // run_epoch() does not process any output for some reason.
+        self.last_forwarded_consensus_number = self.consensus_chain.latest_consensus_number();
 
         info!(target: "epoch-manager", "starting node and launching first epoch");
 
@@ -240,7 +281,7 @@ where
 
         // read the network config or use the default
         let network_config = NetworkConfig::read_config(&self.tn_datadir)?;
-        self.spawn_node_networks(node_task_spawner, &network_config).await?;
+        self.spawn_node_networks(node_task_spawner, &network_config, epoch).await?;
         let primary_network_handle =
             self.primary_network_handle.as_ref().expect("primary network").clone();
         primary_network_handle
@@ -264,7 +305,7 @@ where
             self.consensus_chain.clone(),
             self.consensus_bus.clone(),
             self.key_config.clone(),
-            primary_network_handle,
+            primary_network_handle.clone(),
             node_task_manager.get_spawner(),
             self.node_shutdown.subscribe(),
         );
@@ -281,6 +322,55 @@ where
         if let Some(port) = self.builder.healthcheck {
             let _ = HealthcheckServer::spawn(node_task_manager.get_spawner(), port).await;
         }
+
+        // Do a sanity check, request any pack files for complete epochs we are missing.
+        request_missing_packs(&self.consensus_bus, &self.consensus_chain).await;
+        // spawn three critical workers that will fetch epoch pack files from an epoch work queue.
+        // Note, these workers will just go dormant once we have caught up- that's ok.
+        for i in 0..3 {
+            let shutdown = self.node_shutdown.subscribe();
+            let consensus_bus = self.consensus_bus.clone();
+            let primary_network_handle = primary_network_handle.clone();
+            let consensus_chain = self.consensus_chain.clone();
+            node_task_manager.spawn_critical_task(
+                format!("epoch-consensus-worker-{i}"),
+                async move {
+                    spawn_fetch_consensus(
+                        shutdown,
+                        consensus_bus,
+                        primary_network_handle,
+                        i,
+                        consensus_chain,
+                    )
+                    .await;
+                    Ok(())
+                },
+            );
+        }
+        // Fire up a app scoped task to fetch rencent consensus.
+        // This will not be used by CVVs but won't hurt anything and
+        // will be used when not active or catching up and needs to
+        // run with app scope (not epoch).
+        let shutdown = self.node_shutdown.subscribe();
+        let consensus_bus = self.consensus_bus.clone();
+        let primary_network_handle = primary_network_handle.clone();
+        let consensus_chain = self.consensus_chain.clone();
+        let db = self.consensus_db.clone();
+        let task_spawner = node_task_manager.get_spawner();
+        let rx_consensus_request = consensus_bus.subscribe_consensus_request_queue();
+        node_task_manager.spawn_critical_task("fetch-recent-consensus", async move {
+            spawn_fetch_recent_consensus(
+                db,
+                consensus_bus,
+                primary_network_handle,
+                consensus_chain,
+                shutdown,
+                task_spawner,
+                rx_consensus_request,
+            )
+            .await;
+            Ok(())
+        });
 
         // await all tasks on epoch-task-manager or node shutdown
         let result = tokio::select! {
@@ -309,6 +399,7 @@ where
         &mut self,
         node_task_spawner: TaskSpawner,
         network_config: &NetworkConfig,
+        epoch: Epoch,
     ) -> eyre::Result<()> {
         //
         //=== PRIMARY
@@ -334,7 +425,7 @@ where
                 },
                 res = primary_network.run() => {
                     warn!(target: "epoch-manager", ?res, "primary network stopped");
-                    res
+                    Ok(res?)
                 },
             )
         });
@@ -354,6 +445,7 @@ where
 
         // create long-running network task for worker
         let worker_network = ConsensusNetwork::new_for_worker(
+            DEFAULT_WORKER_ID,
             network_config,
             self.worker_event_stream.clone(),
             self.key_config.clone(),
@@ -373,17 +465,14 @@ where
                 }
                 res = worker_network.run() => {
                     warn!(target: "epoch-manager", ?res, "worker network stopped");
-                    res
+                    Ok(res?)
                 }
             )
         });
 
         // set temporary task spawner - this is updated with each epoch
-        self.worker_network_handle = Some(WorkerNetworkHandle::new(
-            worker_network_handle,
-            node_task_spawner.clone(),
-            network_config.libp2p_config().max_rpc_message_size,
-        ));
+        self.worker_network_handle =
+            Some(WorkerNetworkHandle::new(worker_network_handle, node_task_spawner.clone(), epoch));
 
         Ok(())
     }
@@ -461,7 +550,8 @@ where
             // On restore, use the block's consensus hash from parent_beacon_block_root.
             // Round is set to 0 since we don't persist it; consensus number/hash still allows
             // wait_for_consensus_execution to resolve hash lookups.
-            let consensus_hash = recent_block.parent_beacon_block_root.unwrap_or_default();
+            let consensus_hash: ConsensusHeaderDigest =
+                recent_block.parent_beacon_block_root.unwrap_or_default().into();
             let (epoch, round) = deconstruct_nonce(recent_block.nonce.into());
             let consensus_number = self
                 .consensus_chain
@@ -469,7 +559,7 @@ where
                 .await?
                 .map(|h| h.number)
                 .unwrap_or_default();
-            let consensus_num_hash = BlockNumHash::new(consensus_number, consensus_hash);
+            let consensus_num_hash = ConsensusNumHash::new(consensus_number, consensus_hash);
             self.consensus_bus.recent_blocks().send_modify(|blocks| {
                 blocks.push_latest(round, consensus_num_hash, Some(recent_block))
             });
@@ -495,6 +585,7 @@ where
                 });
             }
             error!(target: "engine", "engine updates ended, node will exit");
+            Err(TaskError::from_message("engine updates ended, node will exit"))
         });
     }
 }

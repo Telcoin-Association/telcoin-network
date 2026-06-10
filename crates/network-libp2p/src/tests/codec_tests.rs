@@ -6,7 +6,7 @@ use crate::{
     TNCodec,
 };
 use libp2p::StreamProtocol;
-use tn_types::{Certificate, CertificateDigest, Header};
+use tn_types::{Certificate, Header, HeaderDigest};
 
 #[tokio::test]
 async fn test_encode_decode_same_message() {
@@ -32,7 +32,7 @@ async fn test_encode_decode_same_message() {
 
     // encode response
     let mut encoded = Vec::new();
-    let response = TestPrimaryResponse::MissingParents(vec![CertificateDigest::new([b'a'; 32])]);
+    let response = TestPrimaryResponse::MissingParents(vec![HeaderDigest::new([b'a'; 32])]);
     codec
         .write_response(&protocol, &mut encoded, response.clone())
         .await

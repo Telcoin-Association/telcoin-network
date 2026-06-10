@@ -8,7 +8,7 @@ use std::{
 
 use crate::archive::{
     crc::{add_crc32, check_crc},
-    data_file::DataFile,
+    data_file::{fsync_directory, DataFile},
     error::{
         commit::CommitError, fetch::FetchError, insert::AppendError, load_header::LoadHeaderError,
     },
@@ -17,7 +17,7 @@ use crate::archive::{
 };
 
 /// Size of a header.
-pub const PDX_HEADER_SIZE: usize = 30;
+pub const PDX_HEADER_SIZE: usize = 26;
 
 /// Header for an pdx (index) file.  This contains file positions at fixed locations for
 /// looking up records by incrementing integer.
@@ -27,7 +27,7 @@ struct PdxHeader {
     type_id: [u8; 8], // The characters "telcoinx"
     version: u16,     // Holds the version number
     uid: u64,         // Unique ID generated on creation
-    appnum: u64,      // Application defined constant
+    appnum: u32,      // Application defined constant
 }
 
 impl PdxHeader {
@@ -48,6 +48,7 @@ impl PdxHeader {
         hdx_file.rewind()?;
         let mut buffer = [0_u8; PDX_HEADER_SIZE];
         let mut buf16 = [0_u8; 2];
+        let mut buf32 = [0_u8; 4];
         let mut buf64 = [0_u8; 8];
         let mut pos = 0;
         hdx_file.read_exact(&mut buffer[..])?;
@@ -66,8 +67,8 @@ impl PdxHeader {
         buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
         let uid = u64::from_le_bytes(buf64);
         pos += 8;
-        buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
-        let appnum = u64::from_le_bytes(buf64);
+        buf32.copy_from_slice(&buffer[pos..(pos + 4)]);
+        let appnum = u32::from_le_bytes(buf32);
         let header = Self { type_id, version, uid, appnum };
         Ok(header)
     }
@@ -83,7 +84,7 @@ impl PdxHeader {
         pos += 2;
         buffer[pos..(pos + 8)].copy_from_slice(&self.uid.to_le_bytes());
         pos += 8;
-        buffer[pos..(pos + 8)].copy_from_slice(&self.appnum.to_le_bytes());
+        buffer[pos..(pos + 4)].copy_from_slice(&self.appnum.to_le_bytes());
         add_crc32(&mut buffer[..]);
         hdx_file.write_all(&buffer[..])?;
         Ok(())
@@ -100,7 +101,7 @@ impl PdxHeader {
     }
 
     /// Application defined constant
-    fn appnum(&self) -> u64 {
+    fn appnum(&self) -> u32 {
         self.appnum
     }
 }
@@ -123,15 +124,25 @@ impl PositionIndex {
         read_only: bool,
     ) -> Result<PositionIndex, LoadHeaderError> {
         let dir = dir.as_ref();
-        let _ = fs::create_dir(dir);
+        let dir_created = fs::create_dir(dir).is_ok();
+        if dir_created {
+            // The index directory is brand new; fsync the parent so the entry survives a crash.
+            if let Some(parent) = dir.parent() {
+                let _ = fsync_directory(parent);
+            }
+        }
         let mut pdx_file = DataFile::open(dir.join("index.pdx"), read_only)?;
 
-        let header = if pdx_file.is_empty() {
+        let was_empty = pdx_file.is_empty();
+        let header = if was_empty {
             if read_only {
                 return Err(LoadHeaderError::ReadOnlyEmpty);
             }
             let mut header = PdxHeader::from_data_header(data_header);
             header.write_header(&mut pdx_file)?;
+            // index.pdx was just created and its header written; fsync the directory so the entry
+            // is durable.
+            let _ = fsync_directory(dir);
             header
         } else {
             let header = PdxHeader::load_header(&mut pdx_file)?;
@@ -269,12 +280,14 @@ impl Iterator for PositionIter {
 mod tests {
     use tempfile::TempDir;
 
+    use crate::archive::pack::PackCompression;
+
     use super::*;
 
     #[test]
     fn test_archive_pdx_index() {
         let tmp_path = TempDir::with_prefix("test_archive_pdx_index").expect("temp dir");
-        let data_header = DataHeader::new(0);
+        let data_header = DataHeader::new(0, PackCompression::ZStd);
         let mut idx: PositionIndex =
             PositionIndex::open_pdx_file(tmp_path.path().join("index.pdx"), &data_header, false)
                 .expect("pdx file");

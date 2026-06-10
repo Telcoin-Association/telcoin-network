@@ -16,8 +16,9 @@ use tn_config::{ConsensusConfig, NetworkConfig};
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, CertificateStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    AuthorityIdentifier, BlockHash, BlockNumHash, EpochRecord, ExecHeader, Notifier, SealedHeader,
-    TaskManager, TnReceiver, TnSender, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    AuthorityIdentifier, ConsensusHeaderDigest, ConsensusNumHash, EpochDigest, EpochRecord,
+    ExecHeader, Header, Notifier, SealedHeader, TaskManager, TnReceiver, TnSender, B256,
+    DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tracing::info;
 
@@ -114,7 +115,7 @@ async fn commit_one_with_leader() {
 
             if outcome == Outcome::Commit {
                 for sub_dag in &committed {
-                    assert_eq!(sub_dag.leader.origin(), &expected_leaders.pop_front().unwrap())
+                    assert_eq!(sub_dag.leader().author(), &expected_leaders.pop_front().unwrap())
                 }
             }
 
@@ -250,7 +251,7 @@ async fn not_enough_support_with_leader_schedule_change() {
 
                 assert_eq!(committed_dag_14.leader_round(), 14);
 
-                assert_eq!(committed_dag_14.leader.origin(), ids.get(2).unwrap());
+                assert_eq!(committed_dag_14.leader().author(), ids.get(2).unwrap());
             }
         }
     }
@@ -348,23 +349,23 @@ async fn test_long_period_of_asynchrony_for_leader_schedule_change() {
                 assert_eq!(committed_dag_14.leader_round(), 14);
 
                 // Two schedule changes have happened during this commit
-                assert!(committed_dag_6.reputation_score.final_of_schedule);
-                assert!(committed_dag_14.reputation_score.final_of_schedule);
+                assert!(committed_dag_6.reputation_scores().final_of_schedule);
+                assert!(committed_dag_14.reputation_scores().final_of_schedule);
 
                 //
                 // We are still using a swap table with no bad list...
-                assert_eq!(committed_dag_6.leader.origin(), ids.get(2).unwrap());
-                assert_eq!(committed_dag_8.leader.origin(), ids.get(3).unwrap());
-                assert_eq!(committed_dag_10.leader.origin(), ids.get(0).unwrap());
-                assert_eq!(committed_dag_12.leader.origin(), ids.get(1).unwrap());
-                assert_eq!(committed_dag_14.leader.origin(), ids.get(2).unwrap());
+                assert_eq!(committed_dag_6.leader().author(), ids.get(2).unwrap());
+                assert_eq!(committed_dag_8.leader().author(), ids.get(3).unwrap());
+                assert_eq!(committed_dag_10.leader().author(), ids.get(0).unwrap());
+                assert_eq!(committed_dag_12.leader().author(), ids.get(1).unwrap());
+                assert_eq!(committed_dag_14.leader().author(), ids.get(2).unwrap());
                 // Note that round 16 (when committed) would be auth 3 except it now has a bad rep.
 
                 // The leaders of round 12 & 14 shouldn't change from the "original" schedule
                 let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
 
-                assert_eq!(committed_dag_12.leader.origin(), &schedule.leader(12).id());
-                assert_eq!(committed_dag_14.leader.origin(), &schedule.leader(14).id());
+                assert_eq!(committed_dag_12.leader().author(), &schedule.leader(12).id());
+                assert_eq!(committed_dag_14.leader().author(), &schedule.leader(14).id());
 
                 assert_eq!(outcome, Outcome::Commit);
             }
@@ -382,7 +383,7 @@ async fn test_long_period_of_asynchrony_for_leader_schedule_change() {
                 // update happened the leader schedule changed and now the Authority
                 // 3 is flagged as low score and it will be swapped with Authority
                 // 0.
-                assert_eq!(committed_dag.leader.origin(), ids.get(0).unwrap());
+                assert_eq!(committed_dag.leader().author(), ids.get(0).unwrap());
                 break;
             }
         }
@@ -431,15 +432,14 @@ async fn commit_one() {
             .unwrap();
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
-    Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain).await;
-    let cb_clone = cb.clone();
+    Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain, None).await;
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
-    });
-    tokio::spawn(async move {
-        let mut rx_primary = cb_clone.subscribe_committed_certificates();
-        while rx_primary.recv().await.is_some() {}
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
 
     // Feed all certificates to the consensus. Only the last certificate should trigger
@@ -450,21 +450,21 @@ async fn commit_one() {
 
     // Ensure the first 4 ordered certificates are from round 1 (they are the parents of the
     // committed leader); then the leader's certificate should be committed.
-    let committed_sub_dag: Arc<CommittedSubDag> = rx_output.recv().await.unwrap();
-    let mut sequence = committed_sub_dag.certificates.iter();
+    let committed_sub_dag: CommittedSubDag = rx_output.recv().await.unwrap();
+    let mut sequence = committed_sub_dag.headers().iter();
     for _ in 1..=4 {
         let output = sequence.next().unwrap();
         assert_eq!(output.round(), 1);
     }
-    let output = sequence.next().unwrap();
+    let output = sequence.next().unwrap(); // The first element is the leader so skip it to get to round 1 headers.
     assert_eq!(output.round(), 2);
 
     // AND the reputation scores have not been updated
-    assert_eq!(committed_sub_dag.reputation_score.total_authorities(), 4);
-    assert!(committed_sub_dag.reputation_score.all_zero());
+    assert_eq!(committed_sub_dag.reputation_scores().total_authorities(), 4);
+    assert!(committed_sub_dag.reputation_scores().all_zero());
 }
 
-/// Run for 11 dag rounds with one dead node node (that is not a leader). We should commit the
+/// Run for 11 dag rounds with one dead node (that is not a leader). We should commit the
 /// leaders of rounds 2, 4, 6 and 10. The leader of round 8 will be missing, but eventually the
 /// leader 10 will get committed.
 #[tokio::test]
@@ -499,16 +499,11 @@ async fn dead_node() {
             .unwrap();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(0, ConsensusNumHash::default(), Some(dummy_parent))
     });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
-    Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain).await;
-    let cb_clone = cb.clone();
-    tokio::spawn(async move {
-        let mut rx_primary = cb_clone.subscribe_committed_certificates();
-        while rx_primary.recv().await.is_some() {}
-    });
+    Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain, None).await;
 
     let cb_clone = cb.clone();
     // Feed all certificates to the consensus.
@@ -520,10 +515,11 @@ async fn dead_node() {
 
     // We should commit 3 leaders (rounds 2, 4 and 6).
     let mut committed = Vec::new();
-    let mut committed_sub_dags: Vec<Arc<CommittedSubDag>> = Vec::new();
+    let mut committed_sub_dags: Vec<CommittedSubDag> = Vec::new();
     for _commit_rounds in 1..=4 {
         let committed_sub_dag = rx_output.recv().await.unwrap();
-        committed.extend(committed_sub_dag.certificates.clone());
+        let headers: Vec<Header> = committed_sub_dag.headers().iter().cloned().collect();
+        committed.extend(headers);
         committed_sub_dags.push(committed_sub_dag);
     }
 
@@ -538,17 +534,17 @@ async fn dead_node() {
 
     // AND check that the consensus scores are the expected ones
     for (index, sub_dag) in committed_sub_dags.iter().enumerate() {
-        assert_eq!(sub_dag.reputation_score.total_authorities(), 4);
+        assert_eq!(sub_dag.reputation_scores().total_authorities(), 4);
 
         // For the first commit we expect to have any only zero scores
         if index == 0 {
-            sub_dag.reputation_score.scores_per_authority.iter().for_each(|(_key, score)| {
+            sub_dag.reputation_scores().scores_per_authority.iter().for_each(|(_key, score)| {
                 assert_eq!(*score, 0_u64);
             });
         } else {
             // For any other commit we expect to always have a +1 score for each authority, as
             // everyone always votes for the leader
-            for (key, score) in &sub_dag.reputation_score.scores_per_authority {
+            for (key, score) in &sub_dag.reputation_scores().scores_per_authority {
                 if key == &dead_node {
                     assert_eq!(*score as usize, 0);
                 } else {
@@ -638,16 +634,11 @@ async fn not_enough_support() {
             .unwrap();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(0, ConsensusNumHash::default(), Some(dummy_parent))
     });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
-    Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain).await;
-    let cb_clone = cb.clone();
-    tokio::spawn(async move {
-        let mut rx_primary = cb_clone.subscribe_committed_certificates();
-        while rx_primary.recv().await.is_some() {}
-    });
+    Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain, None).await;
 
     // Feed all certificates to the consensus. Only the last certificate should trigger
     // commits, so the task should not block.
@@ -656,8 +647,8 @@ async fn not_enough_support() {
     }
 
     // We should commit 2 leaders (rounds 2 and 4).
-    let committed_sub_dag: Arc<CommittedSubDag> = rx_output.recv().await.unwrap();
-    let mut sequence = committed_sub_dag.certificates.iter();
+    let committed_sub_dag: CommittedSubDag = rx_output.recv().await.unwrap();
+    let mut sequence = committed_sub_dag.headers().iter();
     for _ in 1..=3 {
         let output = sequence.next().unwrap();
         assert_eq!(output.round(), 1);
@@ -666,11 +657,11 @@ async fn not_enough_support() {
     assert_eq!(output.round(), 2);
 
     // AND all scores are zero for leader 2 , as this is the first commit
-    assert_eq!(committed_sub_dag.reputation_score.total_authorities(), 4);
-    assert!(committed_sub_dag.reputation_score.all_zero());
+    assert_eq!(committed_sub_dag.reputation_scores().total_authorities(), 4);
+    assert!(committed_sub_dag.reputation_scores().all_zero());
 
-    let committed_sub_dag: Arc<CommittedSubDag> = rx_output.recv().await.unwrap();
-    let mut sequence = committed_sub_dag.certificates.iter();
+    let committed_sub_dag: CommittedSubDag = rx_output.recv().await.unwrap();
+    let mut sequence = committed_sub_dag.headers().iter();
     for _ in 1..=3 {
         let output = sequence.next().unwrap();
         assert_eq!(output.round(), 2);
@@ -685,10 +676,10 @@ async fn not_enough_support() {
     // AND scores should be updated with everyone that has voted for leader of round 2.
     // Only node 0 has voted for the leader of this round, so only their score should exist
     // with value 1, and everything else should be zero.
-    assert_eq!(committed_sub_dag.reputation_score.total_authorities(), 4);
+    assert_eq!(committed_sub_dag.reputation_scores().total_authorities(), 4);
 
     let node_0_name: AuthorityIdentifier = ids.first().unwrap().clone();
-    committed_sub_dag.reputation_score.scores_per_authority.iter().for_each(|(key, score)| {
+    committed_sub_dag.reputation_scores().scores_per_authority.iter().for_each(|(key, score)| {
         if *key == node_0_name {
             assert_eq!(*score, 1_u64);
         } else {
@@ -743,16 +734,11 @@ async fn missing_leader() {
             .unwrap();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(0, ConsensusNumHash::default(), Some(dummy_parent))
     });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
-    Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain).await;
-    let cb_clone = cb.clone();
-    tokio::spawn(async move {
-        let mut rx_primary = cb_clone.subscribe_committed_certificates();
-        while rx_primary.recv().await.is_some() {}
-    });
+    Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain, None).await;
 
     // Feed all certificates to the consensus. We should only commit upon receiving the last
     // certificate, so calls below should not block the task.
@@ -761,8 +747,8 @@ async fn missing_leader() {
     }
 
     // Ensure the commit sequence is as expected.
-    let committed_sub_dag: Arc<CommittedSubDag> = rx_output.recv().await.unwrap();
-    let mut sequence = committed_sub_dag.certificates.iter();
+    let committed_sub_dag: CommittedSubDag = rx_output.recv().await.unwrap();
+    let mut sequence = committed_sub_dag.headers().iter();
     for _ in 1..=3 {
         let output = sequence.next().unwrap();
         assert_eq!(output.round(), 1);
@@ -779,7 +765,7 @@ async fn missing_leader() {
     assert_eq!(output.round(), 4);
 
     // AND all scores are zero since this is the first commit that has happened
-    assert!(committed_sub_dag.reputation_score.all_zero());
+    assert!(committed_sub_dag.reputation_scores().all_zero());
 }
 
 /// Run for 11 dag rounds in ideal conditions (all nodes reference all other nodes).
@@ -820,13 +806,20 @@ async fn committed_round_after_restart() {
         let cb = ConsensusBus::new();
         let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
         cb.app().recent_blocks().send_modify(|blocks| {
-            blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+            blocks.push_latest(0, ConsensusNumHash::default(), Some(dummy_parent))
         });
-        let mut rx_primary = cb.subscribe_committed_certificates();
+        let mut rx_primary = cb.subscribe_committed_own_headers();
         let mut rx_output = cb.subscribe_sequence();
         let mut task_manager = TaskManager::default();
-        Consensus::spawn(config.clone(), &cb, bullshark, &task_manager, consensus_chain.clone())
-            .await;
+        Consensus::spawn(
+            config.clone(),
+            &cb,
+            bullshark,
+            &task_manager,
+            consensus_chain.clone(),
+            None,
+        )
+        .await;
 
         // When `input_round` is 2 * r + 1, r > 1, the previous commit round would be 2 * (r - 1),
         // and the expected commit round after sending in certificates up to `input_round` would
@@ -853,7 +846,7 @@ async fn committed_round_after_restart() {
         if input_round > 1 {
             consensus_number += 1;
             let committed = rx_output.recv().await.unwrap();
-            info!("Received output from consensus, committed_round={}", committed.leader.round());
+            info!("Received output from consensus, committed_round={}", committed.leader().round());
             consensus_chain.write_subdag_for_test(consensus_number, committed).await;
             let (round, _certs) = rx_primary.recv().await.unwrap();
             info!("Received committed certificates from consensus, committed_round={round}",);
@@ -1001,16 +994,16 @@ async fn reset_consensus_scores_on_every_schedule_change() {
     // ensure the leaders of rounds 2 and 4 have been committed
     let mut current_score = 0;
     for sub_dag in all_subdags {
-        if (sub_dag.leader.round() / 2) % NUM_SUB_DAGS_PER_SCHEDULE == 0 {
+        if (sub_dag.leader().round() / 2) % NUM_SUB_DAGS_PER_SCHEDULE == 0 {
             // On every 5th commit we reset the scores and count from the beginning with
             // scores updated to 1, as we expect now every node to have voted for the previous
             // leader.
-            for score in sub_dag.reputation_score.scores_per_authority.values() {
+            for score in sub_dag.reputation_scores().scores_per_authority.values() {
                 assert_eq!(*score as usize, 1);
             }
             current_score = 2;
         } else {
-            for score in sub_dag.reputation_score.scores_per_authority.values() {
+            for score in sub_dag.reputation_scores().scores_per_authority.values() {
                 assert_eq!(*score, current_score);
             }
 
@@ -1018,12 +1011,12 @@ async fn reset_consensus_scores_on_every_schedule_change() {
             // for every commit.
             current_score += 1;
 
-            if ((sub_dag.leader.round() / 2) + 1) % NUM_SUB_DAGS_PER_SCHEDULE == 0 {
+            if ((sub_dag.leader().round() / 2) + 1) % NUM_SUB_DAGS_PER_SCHEDULE == 0 {
                 // if this is going to be the last score update for the current schedule, then
                 // make sure that the `final_of_schedule` will be true
-                assert!(sub_dag.reputation_score.final_of_schedule);
+                assert!(sub_dag.reputation_scores().final_of_schedule);
             } else {
-                assert!(!sub_dag.reputation_score.final_of_schedule);
+                assert!(!sub_dag.reputation_scores().final_of_schedule);
             }
         }
     }
@@ -1038,7 +1031,7 @@ async fn restart_with_new_committee() {
     let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
     let temp_dir = TempDir::new().unwrap();
     let consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).unwrap();
-    let mut prev_epoch_digest = BlockHash::default();
+    let mut prev_epoch_digest = EpochDigest::default();
 
     // Run for a few epochs.
     for epoch in 0..5 {
@@ -1067,9 +1060,9 @@ async fn restart_with_new_committee() {
             committee: committee.bls_keys().iter().copied().collect(),
             next_committee: committee.bls_keys().iter().copied().collect(),
             parent_hash: prev_epoch_digest,
-            final_consensus: BlockNumHash {
+            final_consensus: ConsensusNumHash {
                 number: last.map(|l| l.number).unwrap_or_default(),
-                hash: BlockHash::default(),
+                hash: ConsensusHeaderDigest::default(),
             },
             ..Default::default()
         };
@@ -1077,17 +1070,19 @@ async fn restart_with_new_committee() {
         consensus_chain.new_epoch(previous_epoch, committee.clone()).await.unwrap();
         let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
         cb.app().recent_blocks().send_modify(|blocks| {
-            blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+            blocks.push_latest(0, ConsensusNumHash::default(), Some(dummy_parent))
         });
         let mut rx_output = cb.subscribe_sequence();
         let mut task_manager = TaskManager::default();
-        Consensus::spawn(config.clone(), &cb, bullshark, &task_manager, consensus_chain.clone())
-            .await;
-        let cb_clone = cb.clone();
-        tokio::spawn(async move {
-            let mut rx_primary = cb_clone.subscribe_committed_certificates();
-            while rx_primary.recv().await.is_some() {}
-        });
+        Consensus::spawn(
+            config.clone(),
+            &cb,
+            bullshark,
+            &task_manager,
+            consensus_chain.clone(),
+            None,
+        )
+        .await;
 
         // Make certificates for rounds 1 and 2.
         let genesis =
@@ -1122,7 +1117,7 @@ async fn restart_with_new_committee() {
         // Ensure the first 4 ordered certificates are from round 1 (they are the parents of the
         // committed leader); then the leader's certificate should be committed.
         let committed_sub_dag = rx_output.recv().await.unwrap();
-        let mut sequence = committed_sub_dag.certificates.iter();
+        let mut sequence = committed_sub_dag.headers().iter();
         for _ in 1..=4 {
             let output = sequence.next().unwrap();
             assert_eq!(output.epoch(), epoch);
@@ -1187,13 +1182,13 @@ async fn garbage_collection_basic() {
         sub_dags.iter().for_each(|sub_dag| {
             // ensure nothing has been committed for authority 4
             assert!(
-                !sub_dag.certificates.iter().any(|c| c.header().author() == &slow_node),
+                !sub_dag.headers().iter().any(|c| c.author() == &slow_node),
                 "Slow authority shouldn't be amongst the committed ones"
             );
 
             // Once leader of round 6 is committed then we know that garbage
             // collection has run. In this case no certificate of round 1 should exist.
-            if sub_dag.leader.round() == 6 {
+            if sub_dag.leader().round() == 6 {
                 assert_eq!(
                     state.dag.iter().filter(|(round, _)| **round <= 2).count(),
                     0,
@@ -1208,7 +1203,7 @@ async fn garbage_collection_basic() {
             // leader.round() - 1, except for the latest leader which should be
             // leader.round().
             for (_round, certificates) in
-                state.dag.iter().filter(|(round, _)| **round <= sub_dag.leader.round())
+                state.dag.iter().filter(|(round, _)| **round <= sub_dag.leader().round())
             {
                 assert_eq!(certificates.len(), 4, "We expect to have all the certificates");
             }
@@ -1308,7 +1303,7 @@ async fn slow_node() {
 
                 let sub_dag = sub_dags.first().unwrap();
 
-                for committed in &sub_dag.certificates {
+                for committed in sub_dag.headers() {
                     assert!(
                         committed.round() >= 2,
                         "We don't expect to see any certificate below round 2 because of gc"
@@ -1316,7 +1311,7 @@ async fn slow_node() {
                 }
 
                 let slow_node_total =
-                    sub_dag.certificates.iter().filter(|c| c.origin() == &slow_node).count();
+                    sub_dag.headers().iter().filter(|c| c.author() == &slow_node).count();
 
                 assert_eq!(slow_node_total, 4);
 
@@ -1453,11 +1448,11 @@ async fn not_enough_support_and_missing_leaders_and_gc() {
                     // we expect now to commit two sub dags, those with leader 6 and 2.
                     assert_eq!(sub_dags.len(), 2);
 
-                    assert_eq!(sub_dags[0].leader.round(), 2);
-                    assert_eq!(sub_dags[1].leader.round(), 6);
+                    assert_eq!(sub_dags[0].leader().round(), 2);
+                    assert_eq!(sub_dags[1].leader().round(), 6);
 
-                    assert_eq!(sub_dags[0].certificates.len(), 4);
-                    assert_eq!(sub_dags[1].certificates.len(), 10);
+                    assert_eq!(sub_dags[0].headers().len(), 4);
+                    assert_eq!(sub_dags[1].headers().len(), 10);
 
                     // And GC has collected everything up to round 5.
                     assert_eq!(state.dag.len(), 5);

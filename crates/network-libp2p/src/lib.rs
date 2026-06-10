@@ -35,7 +35,7 @@ pub use libp2p::{
     gossipsub::{Message as GossipMessage, TopicHash},
     identity::PeerId,
     request_response::ResponseChannel,
-    Multiaddr,
+    Multiaddr, Stream,
 };
 #[cfg(test)]
 #[path = "./tests/common.rs"]

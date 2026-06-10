@@ -36,6 +36,11 @@ pub const GENESIS_ACCOUNT_STATE_YAML: &str =
 pub const GOVERNANCE_SAFE_ADDRESS: Address = address!("00000000000000000000000000000000000007a0");
 /// The default issuance address.
 pub const ISSUANCE_ADDRESS: Address = address!("07a07a07a07a07a07a07a07a07a07a07a07a07a0");
+/// The address for the WorkerConfigs contract.
+pub const WORKER_CONFIGS_ADDRESS: Address = address!("Fee0FEe0fee0fEE0FEe0fee0FEE0fEe0feE0FEe0");
+/// The path to WorkerConfigs json (tn-contracts submodule).
+pub const WORKER_CONFIGS_JSON: &str =
+    include_str!("../../../tn-contracts/artifacts/WorkerConfigs.json");
 
 /// The struct for starting a network at genesis.
 #[derive(Debug)]
@@ -182,11 +187,9 @@ impl NetworkGenesis {
 #[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
 pub struct NodeInfo {
     /// The name for the validator. The default value
-    /// is the hashed value of the validator's
-    /// execution address. The operator can overwrite
+    /// is the base58 encoding of the first 8 bytes of the BLS public key
+    /// prepended with 'node-'. The operator can overwrite
     /// this value since it is not used when writing to file.
-    ///
-    /// Keccak256(Address)
     pub name: String,
     /// [BlsPublicKey] to verify signature.
     pub bls_public_key: BlsPublicKey,

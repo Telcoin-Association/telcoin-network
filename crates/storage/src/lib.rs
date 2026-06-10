@@ -12,10 +12,11 @@ pub use redb::database::ReDB;
 use tables::{
     CertificateDigestByOrigin, CertificateDigestByRound, Certificates, ConsensusHeaderCache,
     KadProviderRecords, KadRecords, KadWorkerProviderRecords, KadWorkerRecords, LastProposed,
-    NodeBatchesCache, Payload, Votes,
+    NodeBatchesCache, OurNodeBatchesCache, Payload, ProposedCertificates, Votes,
 };
 // Always build redb, we use it as the default for persistant consensus data.
 pub mod archive;
+pub mod certificate_pack;
 pub mod composite_db;
 pub mod consensus;
 pub mod consensus_pack;
@@ -49,8 +50,10 @@ const VOTES_CF: &str = "votes";
 const CERTIFICATES_CF: &str = "certificates";
 const CERTIFICATE_DIGEST_BY_ROUND_CF: &str = "certificate_digest_by_round";
 const CERTIFICATE_DIGEST_BY_ORIGIN_CF: &str = "certificate_digest_by_origin";
+const PROPOSED_CERTIFICATES_CF: &str = "proposed_certificates";
 const PAYLOAD_CF: &str = "payload";
 const NODE_BATCHES_CACHE_CF: &str = "node_batches_cache";
+const OUR_NODE_BATCHES_CACHE_CF: &str = "our_node_batches_cache";
 const CONSENSUS_HEADER_CACHE_CF: &str = "consensus_header_cache";
 
 const KAD_RECORD_CF: &str = "kad_record";
@@ -77,19 +80,22 @@ macro_rules! tables {
 pub mod tables {
     use super::{PayloadToken, ProposerKey};
     use tn_types::{
-        AuthorityIdentifier, Batch, BlockHash, Certificate, CertificateDigest, ConsensusHeader,
-        Header, Round, TableHint, VoteInfo, WorkerId,
+        AuthorityIdentifier, Batch, BlockHash, Certificate, ConsensusHeader, Header, HeaderDigest,
+        Round, TableHint, VoteInfo, WorkerId,
     };
 
     tables!(
         LastProposed;crate::LAST_PROPOSED_CF;TableHint::Epoch;<ProposerKey, Header>,  // Cleared every epoch
         Votes;crate::VOTES_CF;TableHint::Epoch;<AuthorityIdentifier, VoteInfo>,  // Cleared every epoch
-        Certificates;crate::CERTIFICATES_CF;TableHint::Epoch;<CertificateDigest, Certificate>,  // Cleared every epoch
-        CertificateDigestByRound;crate::CERTIFICATE_DIGEST_BY_ROUND_CF;TableHint::Epoch;<(Round, AuthorityIdentifier), CertificateDigest>,  // Cleared every epoch
-        CertificateDigestByOrigin;crate::CERTIFICATE_DIGEST_BY_ORIGIN_CF;TableHint::Epoch;<(AuthorityIdentifier, Round), CertificateDigest>,  // Cleared every epoch
+        Certificates;crate::CERTIFICATES_CF;TableHint::Epoch;<HeaderDigest, Certificate>,  // Cleared every epoch
+        CertificateDigestByRound;crate::CERTIFICATE_DIGEST_BY_ROUND_CF;TableHint::Epoch;<(Round, AuthorityIdentifier), HeaderDigest>,  // Cleared every epoch
+        CertificateDigestByOrigin;crate::CERTIFICATE_DIGEST_BY_ORIGIN_CF;TableHint::Epoch;<(AuthorityIdentifier, Round), HeaderDigest>,  // Cleared every epoch
+        ProposedCertificates;crate::PROPOSED_CERTIFICATES_CF;TableHint::Epoch;<HeaderDigest, Certificate>,  // Cleared every epoch
         Payload;crate::PAYLOAD_CF;TableHint::Epoch;<(BlockHash, WorkerId), PayloadToken>,  // Cleared every epoch
         // This is a cache to store this nodes batches before consensus, remove once in a ConsensusHeader.
         NodeBatchesCache;crate::NODE_BATCHES_CACHE_CF;TableHint::Cache;<BlockHash, Batch>,
+        // Cache batches we produce until they are accepted (they will move to NodeBatchesCache once accepted).
+        OurNodeBatchesCache;crate::OUR_NODE_BATCHES_CACHE_CF;TableHint::Cache;<BlockHash, Batch>,
         // This is a cache to store ConsensusHeaders during some sync operations, remove once in confirmed consensus output.
         ConsensusHeaderCache;crate::CONSENSUS_HEADER_CACHE_CF;TableHint::Cache;<u64, ConsensusHeader>,
         // These are used for network storage and separate from consensus
@@ -138,9 +144,9 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatab
             const GROWTH: usize = 4 * MEGABYTE;
             const CACHE_GROWTH: usize = 8 * MEGABYTE;
         } else {
-            const EPOCH_MAX: usize = 128 * MEGABYTE;
+            const EPOCH_MAX: usize = 512 * MEGABYTE;
             const KAD_MAX: usize = 64 * MEGABYTE;
-            const CACHE_MAX: usize = 512 * MEGABYTE;
+            const CACHE_MAX: usize = 1024 * MEGABYTE;
             const GROWTH: usize = 8 * MEGABYTE;
             const CACHE_GROWTH: usize = 64 * MEGABYTE;
         }
@@ -161,6 +167,7 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatab
     db.open_table::<Certificates>().expect("failed to open table!");
     db.open_table::<CertificateDigestByRound>().expect("failed to open table!");
     db.open_table::<CertificateDigestByOrigin>().expect("failed to open table!");
+    db.open_table::<ProposedCertificates>().expect("failed to open table!");
     db.open_table::<Payload>().expect("failed to open table!");
     // Kad tables
     db.open_table::<KadRecords>().expect("failed to open table!");
@@ -169,6 +176,7 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatab
     db.open_table::<KadWorkerProviderRecords>().expect("failed to open table!");
     // Cache tables
     db.open_table::<NodeBatchesCache>().expect("failed to open table!");
+    db.open_table::<OurNodeBatchesCache>().expect("failed to open table!");
     db.open_table::<ConsensusHeaderCache>().expect("failed to open table!");
     db
 }
@@ -189,6 +197,7 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatab
     db.open_table::<Certificates>().expect("failed to open table!");
     db.open_table::<CertificateDigestByRound>().expect("failed to open table!");
     db.open_table::<CertificateDigestByOrigin>().expect("failed to open table!");
+    db.open_table::<ProposedCertificates>().expect("failed to open table!");
     db.open_table::<Payload>().expect("failed to open table!");
     // Kad tables
     db.open_table::<KadRecords>().expect("failed to open table!");
@@ -197,6 +206,7 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatab
     db.open_table::<KadWorkerProviderRecords>().expect("failed to open table!");
     // Cache tables
     db.open_table::<NodeBatchesCache>().expect("failed to open table!");
+    db.open_table::<OurNodeBatchesCache>().expect("failed to open table!");
     db.open_table::<ConsensusHeaderCache>().expect("failed to open table!");
     db
 }

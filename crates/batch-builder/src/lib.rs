@@ -164,8 +164,8 @@ impl BatchBuilder {
             if let Err(e) = to_worker.send((batch, ack)).await {
                 error!(target: "worker::batch_builder", ?e, "failed to send next batch to worker");
                 // try to return error if worker channel closed
-                let _ = result.send(Err(e.into()));
-                return;
+                let _ = result.send(Err(BatchBuilderError::WorkerChannelClosed));
+                return Err(e.into());
             }
 
             // wait for worker to ack quorum reached then update pool with mined transactions
@@ -190,6 +190,7 @@ impl BatchBuilder {
                                 | BlockSealError::AntiQuorum
                                 | BlockSealError::Timeout
                                 | BlockSealError::NotValidator
+                                | BlockSealError::FailedToReport
                                 | BlockSealError::FailedQuorum => {
                                     // potentially non-fatal error
                                     //
@@ -212,6 +213,7 @@ impl BatchBuilder {
                     }
                 }
             }
+            Ok(())
         }.instrument(span_clone));
 
         // return oneshot channel for receiving completion status
@@ -353,8 +355,8 @@ mod tests {
     };
     use tn_storage::{open_db, tables::NodeBatchesCache};
     use tn_types::{
-        gas_accumulator::GasAccumulator, test_genesis, BlockHash, Bytes, Certificate,
-        CommittedSubDag, ConsensusOutput, Database, GenesisAccount, TaskManager,
+        gas_accumulator::GasAccumulator, test_genesis, Bytes, Certificate, CommittedSubDag,
+        ConsensusHeaderDigest, ConsensusOutput, Database, GenesisAccount, TaskManager,
         MIN_PROTOCOL_BASE_FEE, U160, U256,
     };
     use tn_worker::{test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle};
@@ -640,10 +642,11 @@ mod tests {
         gas_accumulator.rewards_counter().set_committee(committee);
         // specify leader for consensus output
         let mut leader_cert = Certificate::default();
-        leader_cert.header_mut_for_test().author = leader;
-        let mut subdag = CommittedSubDag::default();
-        subdag.leader = leader_cert;
-        let output = ConsensusOutput::new_with_subdag(Arc::new(subdag), BlockHash::default(), 0);
+        leader_cert.update_header_author_for_test(leader);
+        let mut headers = Vec::new();
+        headers.push(leader_cert.header().clone());
+        let subdag = CommittedSubDag::new_with_headers_for_test(headers);
+        let output = ConsensusOutput::new_with_subdag(subdag, ConsensusHeaderDigest::default(), 0);
 
         // receive new blocks and return non-fatal errors
         // non-fatal errors cause the loop to break and wait for txpool updates

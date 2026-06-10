@@ -109,18 +109,19 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
     ///     pub enable: bool,
     /// }
     ///
-    /// if let Err(err) = telcoin_network_cli::cli::Cli::<MyArgs>::parse()
-    ///     .run(None, |builder, _, tn_datadir, passphrase| {
-    ///         launch_node(builder, tn_datadir, passphrase)
-    ///     })
-    /// {
+    /// if let Err(err) = telcoin_network_cli::cli::Cli::<MyArgs>::parse().run(
+    ///     None,
+    ///     |builder, _, tn_datadir, passphrase, version| {
+    ///         launch_node(builder, tn_datadir, passphrase, version)
+    ///     },
+    /// ) {
     ///     eprintln!("Error: {err:?}");
     ///     std::process::exit(1);
     /// }
     /// ```
     pub fn run<L>(mut self, passphrase: Option<String>, launcher: L) -> eyre::Result<()>
     where
-        L: FnOnce(TnBuilder, Ext, PathBuf, KeyConfig) -> JoinHandle<eyre::Result<()>>,
+        L: FnOnce(TnBuilder, Ext, PathBuf, KeyConfig, &'static str) -> JoinHandle<eyre::Result<()>>,
     {
         let datadir: PathBuf = self.datadir.take().unwrap_or_else(|| {
             dirs_next::data_dir().map(|root| root.join(DEFAULT_ROOT_DIR)).unwrap_or_else(|| {
@@ -265,7 +266,8 @@ mod tests {
             "0",
         ])
         .expect("cli parsed");
-        tn.run(None, |_, _, _, _| tokio::spawn(async { Ok(()) })).expect("generate keys command");
+        tn.run(None, |_, _, _, _, _| tokio::spawn(async { Ok(()) }))
+            .expect("generate keys command");
 
         // Create config files or the run() below will fail.
         Config::load_or_default(&temp_dir.path().to_path_buf(), true, "test").unwrap();
@@ -281,6 +283,6 @@ mod tests {
         .unwrap();
         // run() will create a tokio runtime so we can use tokio::spawn but need to use a normal
         // (non-tokio) test
-        assert!(tn.run(None, |_, _, _, _| { tokio::spawn(async { Ok(()) }) }).is_ok());
+        assert!(tn.run(None, |_, _, _, _, _| { tokio::spawn(async { Ok(()) }) }).is_ok());
     }
 }

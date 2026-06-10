@@ -123,7 +123,7 @@ mod tests {
         ])
         .expect("cli parsed");
 
-        tn.run(Some("gen_keys_test".to_string()), |_, _, _, _| tokio::spawn(async { Ok(()) }))
+        tn.run(Some("gen_keys_test".to_string()), |_, _, _, _, _| tokio::spawn(async { Ok(()) }))
             .expect("generate keys command");
 
         Config::load_from_path_or_default::<NodeInfo>(
@@ -152,7 +152,7 @@ mod tests {
             "0",
         ])
         .expect("cli parsed");
-        tn.run(Some("export_test".to_string()), |_, _, _, _| tokio::spawn(async { Ok(()) }))
+        tn.run(Some("export_test".to_string()), |_, _, _, _, _| tokio::spawn(async { Ok(()) }))
             .expect("generate keys command");
 
         // load node info and verify byte lengths directly
@@ -218,7 +218,7 @@ mod tests {
             "0",
         ])
         .expect("cli parsed");
-        tn.run(Some("calldata_test".to_string()), |_, _, _, _| tokio::spawn(async { Ok(()) }))
+        tn.run(Some("calldata_test".to_string()), |_, _, _, _, _| tokio::spawn(async { Ok(()) }))
             .expect("generate keys command");
 
         let args =

@@ -39,6 +39,8 @@ pub enum LoadHeaderError {
     ReadOnlyEmpty,
     /// Bloom related error- i.e. invalid bloom bits most likely.
     BloomError(BloomError),
+    /// Compression setting is not a valid value.
+    InvalidCompression,
 }
 
 impl Error for LoadHeaderError {}
@@ -62,6 +64,7 @@ impl fmt::Display for LoadHeaderError {
             Self::ReadOnly => write!(f, "attempted to write to read only index"),
             Self::ReadOnlyEmpty => write!(f, "attempted to open index read only with no index"),
             Self::BloomError(e) => write!(f, "bloom error: {e}"),
+            Self::InvalidCompression => write!(f, "invalid compression value"),
         }
     }
 }

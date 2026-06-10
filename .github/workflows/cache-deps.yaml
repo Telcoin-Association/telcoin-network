@@ -22,10 +22,11 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Read nightly version
+        run: echo "RUST_NIGHTLY=$(cat rust-nightly)" >> $GITHUB_ENV
+
       - name: Install nightly toolchain
-        run: |
-          rustup toolchain install nightly-2025-11-04 -c clippy
-          rustup default nightly-2025-11-04
+        run: rustup toolchain install $RUST_NIGHTLY -c clippy,rust-src --profile minimal
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
@@ -34,7 +35,7 @@ jobs:
           cache-on-failure: "true"
 
       - name: Build to populate cache
-        run: cargo clippy --locked --all --all-features -- -D warnings
+        run: cargo +$RUST_NIGHTLY clippy --locked --all --all-features -- -D warnings
 
   warm-test-cache:
     runs-on: ubuntu-latest
@@ -43,10 +44,8 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install nightly toolchain
-        run: |
-          rustup toolchain install nightly-2025-11-04
-          rustup default nightly-2025-11-04
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2

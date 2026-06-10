@@ -10,8 +10,8 @@ use std::{
 use tn_network_libp2p::{types::IntoRpcError, PeerExchangeMap, TNMessage};
 use tn_types::{
     error::HeaderError, AuthorityIdentifier, BlockHash, BlsPublicKey, BlsSignature, Certificate,
-    CertificateDigest, ConsensusHeader, Epoch, EpochCertificate, EpochRecord, EpochVote, Header,
-    Round, Vote, B256,
+    ConsensusHeader, ConsensusHeaderDigest, Epoch, EpochCertificate, EpochDigest, EpochRecord,
+    EpochVote, Header, HeaderDigest, Round, Vote, B256,
 };
 
 /// Info that is published (via gossip) by validators once they reach consensus.
@@ -24,11 +24,11 @@ pub struct ConsensusResult {
     /// the consensus header block number
     pub number: u64,
     /// hash of the consensus header that was reached
-    pub hash: BlockHash,
+    pub hash: ConsensusHeaderDigest,
     /// the validator that produced this result
     pub validator: BlsPublicKey,
     /// the signature of the validator publishing this record
-    /// see digest() below, this is a signature over the has of the epoch, round, number and hash
+    /// see digest() below, this is a signature over the hash of the epoch, round, number and hash
     /// fields
     pub signature: BlsSignature,
 }
@@ -45,7 +45,12 @@ impl ConsensusResult {
     /// Used for generating the signature of the raw data.
     /// This will be the same for all validadors and is what signature signs
     /// (verifying all the data fields not just the hash).
-    pub fn digest_data(epoch: Epoch, round: Round, number: u64, hash: BlockHash) -> BlockHash {
+    pub fn digest_data(
+        epoch: Epoch,
+        round: Round,
+        number: u64,
+        hash: ConsensusHeaderDigest,
+    ) -> BlockHash {
         let mut hasher = tn_types::DefaultHashFunction::new();
         hasher.update(&epoch.to_be_bytes());
         hasher.update(&round.to_be_bytes());
@@ -110,7 +115,7 @@ pub enum PrimaryRequest {
         /// Block number requesting if not None.
         number: u64,
         /// Block hash requesting if not None.
-        hash: BlockHash,
+        hash: ConsensusHeaderDigest,
     },
     /// Exchange peer information.
     ///
@@ -127,7 +132,12 @@ pub enum PrimaryRequest {
         /// Block number requesting if not None.
         epoch: Option<Epoch>,
         /// Block hash requesting if not None.
-        hash: Option<BlockHash>,
+        hash: Option<EpochDigest>,
+    },
+    /// Request to stream a pack file of the consensus data for epoch.
+    StreamEpoch {
+        /// The epoch we are requesting consensus data for.
+        epoch: Epoch,
     },
 }
 
@@ -223,7 +233,7 @@ pub enum PrimaryResponse {
     ///
     /// If the peer was unable to verify parents for a proposed header, they respond requesting
     /// the missing certificate by digest.
-    MissingParents(Vec<CertificateDigest>),
+    MissingParents(Vec<HeaderDigest>),
     /// The requested consensus header.
     ConsensusHeader(Arc<ConsensusHeader>),
     /// The requested epoch record and certificate.
@@ -239,6 +249,15 @@ pub enum PrimaryResponse {
     /// This is an application-layer error response.
     /// This error is likely to succeed in the future and can be retried.
     RecoverableError(PrimaryRPCError),
+    /// Response to stream-based epoch request.
+    ///
+    /// If `ack` is true, the requestor should open a stream with the
+    /// request digest in the header. The responder will send the epoch pack
+    /// over that stream.
+    RequestEpochStream {
+        /// Whether the request is accepted.
+        ack: bool,
+    },
 }
 
 impl PrimaryResponse {
@@ -269,6 +288,8 @@ impl PrimaryResponse {
             | PrimaryNetworkError::UnknownConsensusHeaderDigest(_)
             | PrimaryNetworkError::UnknownConsensusHeaderCert(_)
             | PrimaryNetworkError::Timeout(_)
+            | PrimaryNetworkError::UnknownStreamRequest(_)
+            | PrimaryNetworkError::StreamUnavailable(_)
             | PrimaryNetworkError::InvalidEpochRequest => {
                 Self::Error(PrimaryRPCError(error.to_string()))
             }

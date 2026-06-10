@@ -1,5 +1,7 @@
 FROM rust:1.94-slim-bookworm AS builder
 
+ENV RUSTUP_TOOLCHAIN=1.94
+
 WORKDIR /usr/src/telcoin-network
 
 # install dependencies
@@ -21,10 +23,11 @@ COPY chain-configs/ ./chain-configs/
 COPY tn-contracts/ ./tn-contracts/
 
 # move binary out of cache for subsequent build steps
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=./target \
-    cargo build --bin telcoin-network --release \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=./target,sharing=locked \
+    rm -rf /usr/local/cargo/registry/src \
+    && cargo build --bin telcoin-network --release \
     && mv ./target/release/telcoin-network /tmp/
 
 # production image
