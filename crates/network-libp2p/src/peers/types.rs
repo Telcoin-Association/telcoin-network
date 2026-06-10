@@ -38,14 +38,15 @@ pub(super) enum PeerIdentity {
 /// A peer subject to normal scoring has no basis (`None`). The two provenances are kept
 /// distinct on purpose (issue #715): operator allowlisting is sticky - set at construction
 /// and never altered by epoch rotation - whereas validator status is derived live from the
-/// committee set, so a validator rotating out of committee can never strip operator trust.
+/// tracked committee slots, so a validator rotating out of committee can never strip operator
+/// trust.
 /// Only the exemption *decision* (presence) drives behaviour; the variant is carried for
 /// observability (it names which provenance suppressed a penalty in logs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TrustBasis {
     /// Explicitly allowlisted by the node operator.
     Operator,
-    /// Sits in the current committee (a validator).
+    /// Sits in a tracked committee slot: the previous, current, or next epoch's committee.
     Validator,
 }
 

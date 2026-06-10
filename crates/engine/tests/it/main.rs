@@ -28,8 +28,8 @@ use tn_test_utils::default_test_execution_node;
 use tn_types::{
     gas_accumulator::GasAccumulator, max_batch_gas, now, test_chain_spec_arc, test_genesis,
     Address, Batch, BlockHash, Bloom, Bytes, Certificate, CertifiedBatch, CommittedSubDag,
-    ConsensusOutput, Encodable2718, GenesisAccount, Hash as _, Notifier, ReputationScores,
-    SealedBlock, TaskManager, TransactionTrait as _, B256, EMPTY_WITHDRAWALS,
+    ConsensusHeaderDigest, ConsensusOutput, Encodable2718, GenesisAccount, Hash as _, Notifier,
+    ReputationScores, SealedBlock, TaskManager, TransactionTrait as _, B256, EMPTY_WITHDRAWALS,
     MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tokio::{sync::oneshot, time::timeout};
@@ -64,7 +64,7 @@ fn calc_priority_fees(basefee: u64) -> u64 {
 fn assert_eip4788(
     reth_env: &RethEnv,
     block: &SealedBlock,
-    consensus_hash: B256,
+    consensus_hash: ConsensusHeaderDigest,
 ) -> eyre::Result<()> {
     // for EIP-4788, the storage slot is derived from the timestamp:
     //  - timestamp_slot = to_uint256_be(evm.timestamp) % HISTORY_BUFFER_LENGTH
@@ -83,7 +83,8 @@ fn assert_eip4788(
 
     // assert the block hash was correctly written to the contract
     let root_storage_slot = timestamp_storage_slot + U256::from(HISTORY_BUFFER_LENGTH);
-    let expected_blockhash = U256::from_be_bytes(consensus_hash.0);
+    let expected_blockhash: B256 = consensus_hash.into();
+    let expected_blockhash = U256::from_be_bytes(expected_blockhash.0);
     let stored_value =
         state_provider.storage(BEACON_ROOTS_ADDRESS, root_storage_slot.into())?.unwrap_or_default();
     assert_eq!(
@@ -151,7 +152,8 @@ async fn test_empty_output_skips_execution() -> eyre::Result<()> {
         reputation_scores,
         previous_sub_dag,
     );
-    let consensus_output = ConsensusOutput::new_with_subdag(sub_dag, BlockHash::default(), 0);
+    let consensus_output =
+        ConsensusOutput::new_with_subdag(sub_dag, ConsensusHeaderDigest::default(), 0);
 
     let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
     let reth_env = execution_node.get_reth_env().await;
@@ -256,8 +258,14 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
         reputation_scores,
         previous_sub_dag,
     );
-    let consensus_output =
-        ConsensusOutput::new(subdag, BlockHash::default(), 0, true, VecDeque::new(), vec![]);
+    let consensus_output = ConsensusOutput::new(
+        subdag,
+        ConsensusHeaderDigest::default(),
+        0,
+        true,
+        VecDeque::new(),
+        vec![],
+    );
     let consensus_output_hash = consensus_output.consensus_header_hash();
 
     let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
@@ -353,10 +361,9 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
     // timestamp
     assert_eq!(expected_block.timestamp, consensus_output.committed_at());
     // parent beacon block root is output digest
-    assert_eq!(
-        expected_block.parent_beacon_block_root,
-        Some(consensus_output.consensus_header_hash())
-    );
+    let parent_beacon_block_root: Option<ConsensusHeaderDigest> =
+        expected_block.parent_beacon_block_root.map(|d| d.into());
+    assert_eq!(parent_beacon_block_root, Some(consensus_output.consensus_header_hash()));
     // first block's parent is expected to be genesis
     assert_eq!(expected_block.parent_hash, chain.genesis_hash());
     // expect state roots are different after writing parent hash to BEACON_ROOT_CONTRACT
@@ -431,8 +438,14 @@ async fn test_empty_output_increments_leader_count() -> eyre::Result<()> {
         reputation_scores,
         previous_sub_dag,
     );
-    let consensus_output =
-        ConsensusOutput::new(subdag, BlockHash::default(), 0, false, VecDeque::new(), vec![]);
+    let consensus_output = ConsensusOutput::new(
+        subdag,
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        VecDeque::new(),
+        vec![],
+    );
 
     // verify leader counts start at zero
     let address_counts = gas_accumulator.rewards_counter().get_address_counts();
@@ -716,7 +729,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     );
     let consensus_output_1 = ConsensusOutput::new(
         subdag_1.clone(),
-        BlockHash::default(),
+        ConsensusHeaderDigest::default(),
         0,
         false,
         batch_digests_1.clone(),
@@ -928,7 +941,9 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         // timestamp
         assert_eq!(block.timestamp, expected_output.committed_at());
         // parent beacon block root is output digest
-        assert_eq!(block.parent_beacon_block_root, Some(expected_parent_beacon_block_root));
+        let parent_beacon_block_root: Option<ConsensusHeaderDigest> =
+            block.parent_beacon_block_root.map(|d| d.into());
+        assert_eq!(parent_beacon_block_root, Some(expected_parent_beacon_block_root));
 
         if idx == 0 {
             // first block's parent is expected to be genesis
@@ -1227,7 +1242,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     );
     let consensus_output_1 = ConsensusOutput::new(
         subdag_1.clone(),
-        BlockHash::default(),
+        ConsensusHeaderDigest::default(),
         0,
         false,
         batch_digests_1.clone(),
@@ -1470,7 +1485,9 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         // timestamp
         assert_eq!(block.timestamp, expected_output.committed_at());
         // parent beacon block root is output digest
-        assert_eq!(block.parent_beacon_block_root, Some(expected_parent_beacon_block_root));
+        let parent_beacon_block_root: Option<ConsensusHeaderDigest> =
+            block.parent_beacon_block_root.map(|d| d.into());
+        assert_eq!(parent_beacon_block_root, Some(expected_parent_beacon_block_root));
 
         if idx == 0 {
             // first block's parent is expected to be genesis
@@ -1607,7 +1624,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     );
     let consensus_output_1 = ConsensusOutput::new(
         subdag_1.clone(),
-        BlockHash::default(),
+        ConsensusHeaderDigest::default(),
         0,
         false,
         batch_digests_1,
@@ -1842,7 +1859,7 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
     );
     let consensus_output = ConsensusOutput::new(
         subdag.clone(),
-        BlockHash::default(),
+        ConsensusHeaderDigest::default(),
         0,
         false,
         batch_digests.clone(),
@@ -1987,7 +2004,9 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
         // timestamp
         assert_eq!(block.timestamp, consensus_output.committed_at());
         // parent beacon block root is output digest
-        assert_eq!(block.parent_beacon_block_root, Some(consensus_output_hash));
+        let parent_beacon_block_root: Option<ConsensusHeaderDigest> =
+            block.parent_beacon_block_root.map(|d| d.into());
+        assert_eq!(parent_beacon_block_root, Some(consensus_output_hash));
 
         if idx == 0 {
             // first block's parent is expected to be genesis
@@ -2003,7 +2022,8 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
         }
 
         // mix hash is xor batch's hash and consensus output digest
-        let expected_mix_hash = consensus_output_hash ^ batch_digest;
+        let consensus_output_hash_bytes: B256 = consensus_output_hash.into();
+        let expected_mix_hash = consensus_output_hash_bytes ^ batch_digest;
         assert_eq!(block.mix_hash, expected_mix_hash);
         // bloom expected to be the same bc all proposed transactions should be good
         // ie) no duplicates, etc.
@@ -2147,7 +2167,7 @@ async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
     );
     let consensus_output = ConsensusOutput::new(
         subdag.clone(),
-        BlockHash::default(),
+        ConsensusHeaderDigest::default(),
         0,
         false,
         batch_digests.clone(),

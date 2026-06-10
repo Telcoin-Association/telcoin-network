@@ -9,8 +9,8 @@ use tn_config::KeyConfig;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
 use tn_storage::{consensus::ConsensusChain, epoch_records::EpochRecordDb};
 use tn_types::{
-    BlsAggregateSignature, BlsPublicKey, BlsSignature, Epoch, EpochCertificate, EpochRecord,
-    EpochVote, Noticer, TaskSpawner, TnReceiver as _, B256,
+    BlsAggregateSignature, BlsPublicKey, BlsSignature, Epoch, EpochCertificate, EpochDigest,
+    EpochRecord, EpochVote, Noticer, TaskSpawner, TnReceiver as _,
 };
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::{error, info, warn};
@@ -76,7 +76,7 @@ async fn manage_epoch_votes(
     let mut reached_quorum = false;
     let mut timeout = Duration::from_millis(2500);
     let mut timeouts = 0;
-    let mut alt_recs: HashMap<B256, usize> = HashMap::default();
+    let mut alt_recs: HashMap<EpochDigest, usize> = HashMap::default();
     let mut committee_keys: HashSet<BlsPublicKey> = epoch_rec.committee.iter().copied().collect();
     let committee_size = committee_keys.len() as u64;
     let quorum = epoch_rec.super_quorum();

@@ -34,8 +34,6 @@ pub(super) struct Peer {
     ///
     /// These are used to manage the banning process and are exchanged with peers.
     multiaddrs: HashSet<Multiaddr>,
-    /// The listening multiaddrs advertised by this peer.
-    listening_addrs: Vec<Multiaddr>,
     /// Connection status of the peer.
     connection_status: ConnectionStatus,
     /// Whether the node operator explicitly allowlisted this peer.
@@ -58,15 +56,10 @@ pub(super) struct Peer {
 
 impl Peer {
     /// Create a new operator-allowlisted peer.
-    pub(super) fn new_trusted(
-        bls_public_key: BlsPublicKey,
-        network_key: NetworkPublicKey,
-        listening_addrs: Vec<Multiaddr>,
-    ) -> Peer {
+    pub(super) fn new_trusted(bls_public_key: BlsPublicKey, network_key: NetworkPublicKey) -> Peer {
         Self {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
-            listening_addrs,
             score: Score::new_max(),
             operator_allowlisted: true,
             config: Default::default(),
@@ -77,20 +70,19 @@ impl Peer {
         }
     }
 
-    /// Create a new (non-allowlisted) peer.
+    /// Create a new (non-allowlisted) peer with its known multiaddrs.
     pub(super) fn new(
         bls_public_key: BlsPublicKey,
         network_key: NetworkPublicKey,
-        listening_addrs: Vec<Multiaddr>,
+        addrs: Vec<Multiaddr>,
     ) -> Peer {
         Self {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
-            listening_addrs,
             score: Score::default(),
             operator_allowlisted: false,
             config: Default::default(),
-            multiaddrs: Default::default(),
+            multiaddrs: addrs.into_iter().collect(),
             connection_status: Default::default(),
             connection_direction: Default::default(),
             routable: false,
@@ -104,11 +96,9 @@ impl Peer {
         let mut rng = StdRng::from_seed([0; 32]);
         let bls_public_key = *BlsKeypair::generate(&mut rng).public();
         let network_key: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
-        let listening_addrs = vec![Multiaddr::empty()];
         Self {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
-            listening_addrs,
             score: Score::new_max(),
             operator_allowlisted: false,
             config: Default::default(),
@@ -362,20 +352,6 @@ impl Peer {
     /// from a clean maximum rather than a stale value.
     pub(super) fn reset_score_to_max(&mut self) {
         self.score = Score::new_max();
-    }
-
-    /// Update multiaddrs for the peer.
-    ///
-    /// Returns a boolean indicating if the multiaddr was newly recorded.
-    pub(super) fn update_listening_addrs(&mut self, multiaddrs: Vec<Multiaddr>) -> bool {
-        let mut res = false;
-        for multiaddr in multiaddrs {
-            if !self.listening_addrs.contains(&multiaddr) {
-                self.listening_addrs.push(multiaddr);
-                res = true;
-            }
-        }
-        res
     }
 
     /// Update peer record to indicate participation in kad as a routable peer.

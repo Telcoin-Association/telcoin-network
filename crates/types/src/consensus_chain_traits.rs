@@ -23,7 +23,8 @@ use tokio::io::{AsyncRead, AsyncSeek};
 
 use crate::{
     gas_accumulator::RewardsCounter, AuthorityIdentifier, Batch, BlockHash, CommittedSubDag,
-    Committee, ConsensusHeader, ConsensusOutput, Database, Epoch, EpochRecord, Round, B256,
+    Committee, ConsensusHeader, ConsensusHeaderDigest, ConsensusOutput, Database, Epoch,
+    EpochRecord, Round,
 };
 
 /// Marker trait for an async readable+seekable stream over an epoch's pack
@@ -48,7 +49,7 @@ pub trait ConsensusChainReader: Send + Sync + Clone + 'static {
     fn consensus_header_by_digest(
         &self,
         epoch: Epoch,
-        digest: B256,
+        digest: ConsensusHeaderDigest,
     ) -> impl Future<Output = eyre::Result<Option<ConsensusHeader>>> + Send;
 
     /// Retrieve a consensus header by global number.

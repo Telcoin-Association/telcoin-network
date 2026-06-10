@@ -17,9 +17,9 @@ use tn_reth::{
 use tn_storage::{open_db, tables::NodeBatchesCache};
 use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator},
-    test_genesis, Address, Batch, BatchValidation, BlockHash, Bytes, Certificate, CertifiedBatch,
-    CommittedSubDag, ConsensusOutput, Database, Encodable2718, GenesisAccount, ReputationScores,
-    SealedBatch, TaskManager, MIN_PROTOCOL_BASE_FEE, U160, U256,
+    test_genesis, Address, Batch, BatchValidation, Bytes, Certificate, CertifiedBatch,
+    CommittedSubDag, ConsensusHeaderDigest, ConsensusOutput, Database, Encodable2718,
+    GenesisAccount, ReputationScores, SealedBatch, TaskManager, MIN_PROTOCOL_BASE_FEE, U160, U256,
 };
 use tn_worker::{test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle};
 use tokio::time::timeout;
@@ -500,7 +500,7 @@ async fn test_canonical_notification_updates_pool() {
             None,
         )
         .into(),
-        BlockHash::default(),
+        ConsensusHeaderDigest::default(),
         0,
         false,
         batch_digests,

@@ -24,8 +24,8 @@ use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, tables::Votes};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     error::HeaderError, now, AuthorityIdentifier, BlockHash, BlockHeader, BlockNumHash,
-    BlsPublicKey, Certificate, Database, Epoch, EpochVote, ExecHeader, Hash as _, HeaderDigest,
-    SealedHeader, TaskManager, VoteDigest, VoteInfo, B256,
+    BlsPublicKey, Certificate, ConsensusHeaderDigest, ConsensusNumHash, Database, Epoch, EpochVote,
+    ExecHeader, Hash as _, HeaderDigest, SealedHeader, TaskManager, VoteDigest, VoteInfo, B256,
 };
 use tracing::debug;
 
@@ -96,7 +96,11 @@ async fn create_test_types_with_params(path: &Path, params: Option<Parameters>) 
 
     // set the latest execution result to genesis - test headers are proposed for round 1
     let mut recent = RecentBlocks::new(1);
-    recent.push_latest(0, BlockNumHash::new(0, B256::default()), Some(parent.clone()));
+    recent.push_latest(
+        0,
+        ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+        Some(parent.clone()),
+    );
     cb.app().recent_blocks().send_replace(recent);
 
     let consensus_chain =
@@ -135,7 +139,11 @@ async fn create_test_types_at_epoch(path: &Path, epoch: Epoch) -> TestTypes {
 
     // set the latest execution result to genesis - test headers are proposed for round 1
     let mut recent = RecentBlocks::new(1);
-    recent.push_latest(0, BlockNumHash::new(0, B256::default()), Some(parent.clone()));
+    recent.push_latest(
+        0,
+        ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+        Some(parent.clone()),
+    );
     cb.app().recent_blocks().send_replace(recent);
 
     let consensus_chain =
@@ -725,7 +733,7 @@ async fn test_behind_consensus_committed_round_prevents_false_positive() {
     // Without the fix: effective_exec_round = 18, 18 + 40 = 58 < 59 → false positive!
     // With the fix: effective_exec_round = max(0, 18, 59) = 59, 59 + 40 = 99 > 59 → correct.
     let mut recent = RecentBlocks::new(1);
-    recent.push_latest(18, BlockNumHash::new(0, B256::default()), None);
+    recent.push_latest(18, ConsensusNumHash::new(0, ConsensusHeaderDigest::default()), None);
     consensus_bus.recent_blocks().send_replace(recent);
 
     // Set committed round to 59 (as Bullshark would)
@@ -746,7 +754,7 @@ async fn test_behind_consensus_genuinely_behind() {
     // Incoming gossip is at round 60 in the same epoch.
     // effective_exec_round = max(0, 5, 5) = 5, gc_depth = 40, 5 + 40 = 45 < 60 → behind.
     let mut recent = RecentBlocks::new(1);
-    recent.push_latest(5, BlockNumHash::new(0, B256::default()), None);
+    recent.push_latest(5, ConsensusNumHash::new(0, ConsensusHeaderDigest::default()), None);
     consensus_bus.recent_blocks().send_replace(recent);
     consensus_bus.committed_round_updates().send_replace(5);
 

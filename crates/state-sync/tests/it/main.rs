@@ -10,7 +10,10 @@ use std::collections::{BTreeSet, VecDeque};
 use tempfile::TempDir;
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
 use tn_test_utils_committee::CommitteeFixture;
-use tn_types::{CommittedSubDag, ConsensusHeader, ConsensusOutput, ReputationScores, B256};
+use tn_types::{
+    CommittedSubDag, ConsensusHeader, ConsensusHeaderDigest, ConsensusOutput, ReputationScores,
+    B256,
+};
 
 /// Test that save_consensus correctly persists ConsensusOutput to database.
 #[tokio::test]
@@ -33,7 +36,8 @@ async fn test_sync_save_consensus() {
     let sub_dag = CommittedSubDag::new(certificates.clone(), leader.clone(), 0, reputation, None);
 
     // Create ConsensusOutput using struct initialization
-    let output = ConsensusOutput::new(sub_dag, B256::ZERO, 1, false, VecDeque::new(), vec![]);
+    let output =
+        ConsensusOutput::new(sub_dag, B256::ZERO.into(), 1, false, VecDeque::new(), vec![]);
 
     // Save consensus using state_sync
     state_sync::save_consensus(output, &mut consensus_chain).await.unwrap();
@@ -66,8 +70,8 @@ async fn test_sync_parent_hash_chain() {
     let (_, headers) = fixture.headers_round(0, &genesis);
     let certificates: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
 
-    let mut parent_hash = B256::ZERO;
-    let mut saved_digests: Vec<B256> = vec![B256::ZERO]; // Genesis parent
+    let mut parent_hash: ConsensusHeaderDigest = B256::ZERO.into();
+    let mut saved_digests: Vec<ConsensusHeaderDigest> = vec![B256::ZERO.into()]; // Genesis parent
 
     for i in 1..=3u64 {
         let leader = certificates.last().cloned().unwrap();
@@ -122,12 +126,12 @@ async fn test_sync_lookup_by_hash() {
     let sub_dag = CommittedSubDag::new(certificates, leader, 0, reputation, None);
 
     let output =
-        ConsensusOutput::new(sub_dag.clone(), B256::ZERO, 1, false, VecDeque::new(), vec![]);
+        ConsensusOutput::new(sub_dag.clone(), B256::ZERO.into(), 1, false, VecDeque::new(), vec![]);
 
     state_sync::save_consensus(output, &mut consensus_chain).await.unwrap();
 
     // Compute the expected digest
-    let expected_digest = ConsensusHeader::digest_from_parts(B256::ZERO, &sub_dag, 1);
+    let expected_digest = ConsensusHeader::digest_from_parts(B256::ZERO.into(), &sub_dag, 1);
 
     // Verify we can look up by hash
     let by_hash = consensus_chain.consensus_header_by_digest(0, expected_digest).await.unwrap();
@@ -149,7 +153,7 @@ async fn test_digest_determinism() {
     let reputation = ReputationScores::new(&committee);
     let sub_dag = CommittedSubDag::new(certificates, leader, 0, reputation, None);
 
-    let parent_hash = B256::ZERO;
+    let parent_hash: ConsensusHeaderDigest = B256::ZERO.into();
     let number = 1u64;
 
     // Compute digest multiple times - must be identical
@@ -176,11 +180,11 @@ async fn test_digest_collision_resistance() {
     let sub_dag = CommittedSubDag::new(certificates, leader, 0, reputation, None);
 
     // Same subdag but different parent_hash
-    let digest_parent_zero = ConsensusHeader::digest_from_parts(B256::ZERO, &sub_dag, 1);
+    let digest_parent_zero = ConsensusHeader::digest_from_parts(B256::ZERO.into(), &sub_dag, 1);
     let mut different_parent = [0u8; 32];
     different_parent[31] = 1;
     let digest_parent_one =
-        ConsensusHeader::digest_from_parts(B256::from(different_parent), &sub_dag, 1);
+        ConsensusHeader::digest_from_parts(B256::from(different_parent).into(), &sub_dag, 1);
 
     assert_ne!(
         digest_parent_zero, digest_parent_one,
@@ -188,8 +192,8 @@ async fn test_digest_collision_resistance() {
     );
 
     // Same subdag and parent but different number
-    let digest_num_1 = ConsensusHeader::digest_from_parts(B256::ZERO, &sub_dag, 1);
-    let digest_num_2 = ConsensusHeader::digest_from_parts(B256::ZERO, &sub_dag, 2);
+    let digest_num_1 = ConsensusHeader::digest_from_parts(B256::ZERO.into(), &sub_dag, 1);
+    let digest_num_2 = ConsensusHeader::digest_from_parts(B256::ZERO.into(), &sub_dag, 2);
 
     assert_ne!(digest_num_1, digest_num_2, "Different number must produce different digest");
 }
@@ -214,7 +218,8 @@ async fn test_digest_mismatch_detection() {
     let sub_dag = CommittedSubDag::new(certificates, leader, 0, reputation, None);
 
     // Save block 1 with correct parent (ZERO)
-    let output1 = ConsensusOutput::new(sub_dag, B256::ZERO, 1, false, VecDeque::new(), vec![]);
+    let output1 =
+        ConsensusOutput::new(sub_dag, B256::ZERO.into(), 1, false, VecDeque::new(), vec![]);
     state_sync::save_consensus(output1, &mut consensus_chain).await.unwrap();
 
     // Get block 1's digest
@@ -224,7 +229,7 @@ async fn test_digest_mismatch_detection() {
     // Now simulate verification: if we compute digest with wrong parent, it won't match
     let mut wrong_parent_bytes = [0u8; 32];
     wrong_parent_bytes[31] = 99;
-    let wrong_parent = B256::from(wrong_parent_bytes);
+    let wrong_parent: ConsensusHeaderDigest = B256::from(wrong_parent_bytes).into();
     let computed_with_wrong_parent =
         ConsensusHeader::digest_from_parts(wrong_parent, &block1.sub_dag, 1);
 
@@ -236,7 +241,7 @@ async fn test_digest_mismatch_detection() {
 
     // Verify that correct parent produces matching digest
     let computed_with_correct_parent =
-        ConsensusHeader::digest_from_parts(B256::ZERO, &block1.sub_dag, 1);
+        ConsensusHeader::digest_from_parts(B256::ZERO.into(), &block1.sub_dag, 1);
     assert_eq!(
         computed_with_correct_parent, block1_digest,
         "Computed digest with correct parent must match stored digest"

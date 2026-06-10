@@ -27,8 +27,8 @@ use tn_test_utils::{
     create_signed_certificates_for_rounds, default_test_execution_node, CommitteeFixture,
 };
 use tn_types::{
-    adiri_genesis, gas_accumulator::GasAccumulator, Batch, BlockNumHash, ExecHeader, Notifier,
-    SealedHeader, TaskManager, TnReceiver as _, TnSender as _, B256,
+    adiri_genesis, gas_accumulator::GasAccumulator, Batch, ConsensusHeaderDigest, ConsensusNumHash,
+    ExecHeader, Notifier, SealedHeader, TaskManager, TnReceiver as _, TnSender as _, B256,
     DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::{
@@ -508,7 +508,11 @@ async fn spawn_consensus(
     // spawn consensus to await certificates
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     consensus_bus.app().recent_blocks().send_modify(|blocks| {
-        blocks.push_latest(0, BlockNumHash::new(0, B256::default()), Some(dummy_parent))
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
     });
     Consensus::spawn(config, consensus_bus, bullshark, task_manager, consensus_chain, None).await;
 }
