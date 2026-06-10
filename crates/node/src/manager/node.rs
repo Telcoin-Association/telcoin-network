@@ -323,6 +323,23 @@ where
             let _ = HealthcheckServer::spawn(node_task_manager.get_spawner(), port).await;
         }
 
+        // spawn prometheus metrics endpoint if enabled
+        //
+        // bind errors are propagated (unlike healthcheck) - the operator explicitly
+        // requested the endpoint, so failing to serve it should fail startup
+        if let Some(addr) = self.builder.metrics {
+            let db = self.reth_db.clone();
+            let hooks = tn_metrics::MetricsHooks::default()
+                .with_hook(move || tn_reth::report_db_metrics(&db));
+            tn_metrics::start_metrics_server(
+                addr,
+                &node_task_manager.get_spawner(),
+                self.version_str,
+                hooks,
+            )
+            .await?;
+        }
+
         // Do a sanity check, request any pack files for complete epochs we are missing.
         request_missing_packs(&self.consensus_bus, &self.consensus_chain).await;
         // spawn three critical workers that will fetch epoch pack files from an epoch work queue.

@@ -448,6 +448,9 @@ impl RethConfig {
         };
 
         // metrics args
+        //
+        // NOTE: dead config in TN's hand-rolled init path - the node never launches reth's
+        // metric server. The prometheus endpoint is owned by `tn-metrics` (`--metrics` CLI arg).
         let metrics = MetricArgs {
             prometheus: None,
             push_gateway_url: None,
@@ -579,6 +582,15 @@ impl ChainSpec {
 /// the node launcher to create the DB upfront and reuse.
 pub type RethDb = Arc<DatabaseEnv>;
 
+/// Report sampled reth database metrics (table sizes, page usage, freelist).
+///
+/// Intended as a pre-scrape hook for the prometheus metrics endpoint. Lives here to keep
+/// reth-db types out of the node crate.
+pub fn report_db_metrics(db: &RethDb) {
+    use reth_db::database_metrics::DatabaseMetrics;
+    db.report_metrics();
+}
+
 impl RethEnv {
     /// Create a new Reth DB.
     /// Break this out so this can be created upfront and used even on a
@@ -589,7 +601,9 @@ impl RethEnv {
     ) -> eyre::Result<RethDb> {
         let db_path = db_path.as_ref();
         info!(target: "tn::reth", path = ?db_path, "opening database");
-        Ok(Arc::new(init_db(db_path, reth_config.0.db.database_args())?))
+        // with_metrics: record per-operation db latency metrics (noop unless the global
+        // metrics recorder is installed, i.e. the node runs with `--metrics`)
+        Ok(Arc::new(init_db(db_path, reth_config.0.db.database_args())?.with_metrics()))
     }
 
     /// Produce a new wrapped Reth environment from a config, DB path and task manager.

@@ -24,6 +24,7 @@ tn-config = { workspace = true }
 tn-worker = { workspace = true }
 tn-rpc = { workspace = true }
 eyre = { workspace = true }
+tn-metrics = { workspace = true }
 tn-network-libp2p = { workspace = true }
 tn-reth = { workspace = true }
 state-sync = { workspace = true }
