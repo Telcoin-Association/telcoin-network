@@ -24,6 +24,9 @@ pub type VotingPower = u64;
 /// All authorities have equal voting power in consensus.
 pub const EQUAL_VOTING_POWER: VotingPower = 1;
 
+/// Maximum byte length of an advertised RPC endpoint URL.
+pub const MAX_RPC_URL_LEN: usize = 2048;
+
 /// Optional JSON-RPC endpoint metadata for a validator worker.
 ///
 /// Advertised through the kademlia node record so peers can discover where to
@@ -41,6 +44,9 @@ impl RpcInfo {
     /// Reject endpoints whose scheme is not appropriate for the field
     /// (`http`/`https` for [`Self::http`]; `ws`/`wss` for [`Self::ws`]).
     pub fn validate(&self) -> Result<(), RpcInfoError> {
+        if self.http.as_str().len() > MAX_RPC_URL_LEN {
+            return Err(RpcInfoError::UrlTooLong(self.http.as_str().len()));
+        }
         match self.http.scheme() {
             "http" | "https" => {}
             scheme => {
@@ -48,6 +54,9 @@ impl RpcInfo {
             }
         }
         if let Some(ws) = &self.ws {
+            if ws.as_str().len() > MAX_RPC_URL_LEN {
+                return Err(RpcInfoError::UrlTooLong(ws.as_str().len()));
+            }
             match ws.scheme() {
                 "ws" | "wss" => {}
                 scheme => {
@@ -68,6 +77,9 @@ pub enum RpcInfoError {
     /// The `ws` endpoint scheme is not `ws` or `wss`.
     #[error("invalid ws endpoint scheme `{0}`, expected `ws` or `wss`")]
     InvalidWsScheme(String),
+    /// An endpoint URL exceeds [`MAX_RPC_URL_LEN`].
+    #[error("rpc endpoint URL length {0} exceeds maximum of {max} bytes", max = MAX_RPC_URL_LEN)]
+    UrlTooLong(usize),
 }
 
 /// A multiaddr and network public key for a libp2p node.
@@ -993,6 +1005,33 @@ mod tests {
             http: "https://validator.example.com:8545/".parse().expect("http url"),
             ws: Some("wss://validator.example.com:8546/".parse().expect("ws url")),
         };
+        assert!(good.validate().is_ok());
+    }
+
+    /// `RpcInfo::validate` rejects endpoints whose URL exceeds `MAX_RPC_URL_LEN`.
+    #[test]
+    fn rpc_info_validate_rejects_oversized_url() {
+        use crate::{RpcInfo, RpcInfoError, MAX_RPC_URL_LEN};
+
+        // an http URL whose length exceeds the cap is rejected, even with a valid scheme
+        let bad = RpcInfo {
+            http: format!("https://x.example/{}", "a".repeat(MAX_RPC_URL_LEN))
+                .parse()
+                .expect("http url"),
+            ws: None,
+        };
+        assert!(bad.http.as_str().len() > MAX_RPC_URL_LEN);
+        assert!(matches!(bad.validate(), Err(RpcInfoError::UrlTooLong(_))));
+
+        // a scheme-valid URL just under the cap still passes
+        let prefix = "https://x.example/";
+        let good = RpcInfo {
+            http: format!("{prefix}{}", "a".repeat(MAX_RPC_URL_LEN - prefix.len() - 1))
+                .parse()
+                .expect("http url"),
+            ws: None,
+        };
+        assert!(good.http.as_str().len() < MAX_RPC_URL_LEN);
         assert!(good.validate().is_ok());
     }
 }

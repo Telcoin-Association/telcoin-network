@@ -418,7 +418,13 @@ where
         info!(target: "network-kad", ?record, "Providing our record to kademlia for peer {:?}", self.swarm.local_peer_id());
         let key = record.key.clone();
         if let Err(err) = self.swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One) {
-            error!(target: "network-kad", "Failed to store record locally: {err}");
+            match &err {
+                kad::store::Error::ValueTooLarge => error!(
+                    target: "network-kad",
+                    "node record exceeds kad value-size limit; RPC endpoint NOT advertised to peers ({err})"
+                ),
+                _ => error!(target: "network-kad", "Failed to store record locally: {err}"),
+            }
         }
         if let Err(err) = self.swarm.behaviour_mut().kademlia.start_providing(key) {
             error!(target: "network-kad", "Failed to start providing key: {err}");
