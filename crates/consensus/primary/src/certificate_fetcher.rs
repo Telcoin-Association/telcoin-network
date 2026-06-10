@@ -266,6 +266,7 @@ impl<DB: Database> CertificateFetcher<DB> {
         let task_spawner = self.task_spawner.clone();
         let authority_id = self.authority_id.clone();
         let fallback_delay = self.parallel_fetch_request_delay_interval;
+        let metrics = self.consensus_bus.app().metrics().clone();
         let (tx, rx) = oneshot::channel();
 
         // store receiver for polling in `Self::run`
@@ -284,6 +285,7 @@ impl<DB: Database> CertificateFetcher<DB> {
                     state_sync,
                     task_spawner,
                     fallback_delay,
+                    metrics,
                 )
                 .await;
 
@@ -354,6 +356,7 @@ impl<DB: Database> CertificateFetcher<DB> {
 /// Fetch missing certificates from peers and process them.
 /// Tries peers in random order with parallel requests.
 #[instrument(level = "debug", skip_all, fields(lower_bound = request.exclusive_lower_bound))]
+#[allow(clippy::too_many_arguments)]
 async fn fetch_and_process_certificates<DB: Database>(
     authority_id: Option<AuthorityIdentifier>,
     network: PrimaryNetworkHandle,
@@ -362,9 +365,11 @@ async fn fetch_and_process_certificates<DB: Database>(
     state_sync: StateSynchronizer<DB>,
     task_spawner: TaskSpawner,
     fallback_delay: Duration,
+    metrics: crate::PrimaryMetrics,
 ) -> CertManagerResult<()> {
     let start_time = Instant::now();
     let lower_bound = request.exclusive_lower_bound;
+    metrics.certificate_fetches_total.increment(1);
 
     // get randomized list of peers
     let mut peers: Vec<_> = committee
@@ -403,6 +408,8 @@ async fn fetch_and_process_certificates<DB: Database>(
         lower_bound = lower_bound,
         "certificates fetched"
     );
+    metrics.certificates_fetched_total.increment(num_certificates as u64);
+    metrics.certificate_fetch_duration_seconds.record(start_time.elapsed());
 
     Ok(())
 }

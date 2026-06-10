@@ -338,6 +338,13 @@ where
                 hooks,
             )
             .await?;
+
+            // mirror consensus watch channels (rounds, heights, node mode) into gauges
+            tn_primary::spawn_bus_metrics_mirror(
+                &self.consensus_bus,
+                &node_task_manager.get_spawner(),
+                self.node_shutdown.subscribe(),
+            );
         }
 
         // Do a sanity check, request any pack files for complete epochs we are missing.
