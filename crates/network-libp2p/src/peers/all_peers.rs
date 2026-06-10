@@ -759,12 +759,13 @@ impl AllPeers {
                 || current_committee.contains(bls_public_key)
                 || next_committee.contains(bls_public_key)
         };
-        if matches!(id, PeerIdentity::Confirmed(bls_public_key) if in_committee(bls_public_key)) {
-            Some(TrustBasis::Validator)
-        } else if peer.is_operator_allowlisted() {
-            Some(TrustBasis::Operator)
-        } else {
-            None
+        match id {
+            PeerIdentity::Confirmed(bls_public_key) if in_committee(bls_public_key) => {
+                Some(TrustBasis::Validator)
+            }
+            PeerIdentity::Confirmed(_) | PeerIdentity::Unidentified(_) => {
+                peer.is_operator_allowlisted().then_some(TrustBasis::Operator)
+            }
         }
     }
 
