@@ -69,11 +69,17 @@ pub fn spawn_bus_metrics_mirror(
     let mut rx_round = bus.primary_round_updates().subscribe();
     let mut rx_committed = bus.committed_round_updates().subscribe();
     let mut rx_mode = bus.node_mode().subscribe();
+    let mut rx_recent = bus.recent_blocks().subscribe();
+    let mut rx_published = bus.last_published_consensus_num_hash().subscribe();
 
     // prime gauges with current values
     metrics.round.set(*rx_round.borrow_and_update() as f64);
     metrics.committed_round.set(*rx_committed.borrow_and_update() as f64);
     set_node_mode_gauges(&rx_mode.borrow_and_update());
+    let mut executed_height =
+        rx_recent.borrow_and_update().latest_consensus_block_num_hash().number;
+    let mut gossip_height = rx_published.borrow_and_update().1;
+    set_consensus_height_gauges(executed_height, gossip_height);
 
     task_spawner.spawn_task("bus-metrics-mirror", async move {
         loop {
@@ -98,11 +104,36 @@ pub fn spawn_bus_metrics_mirror(
                     let mode = *rx_mode.borrow_and_update();
                     set_node_mode_gauges(&mode);
                 }
+                res = rx_recent.changed() => {
+                    if res.is_err() {
+                        break;
+                    }
+                    executed_height =
+                        rx_recent.borrow_and_update().latest_consensus_block_num_hash().number;
+                    set_consensus_height_gauges(executed_height, gossip_height);
+                }
+                res = rx_published.changed() => {
+                    if res.is_err() {
+                        break;
+                    }
+                    gossip_height = rx_published.borrow_and_update().1;
+                    set_consensus_height_gauges(executed_height, gossip_height);
+                }
             }
         }
         debug!(target: "primary::metrics", "bus metrics mirror shutting down");
         Ok(())
     });
+}
+
+/// Consensus-height gauges and the falling-behind alarm.
+///
+/// `sync_distance` is how far the latest verified gossip height is ahead of local
+/// execution - a persistently growing value means this node is falling behind.
+fn set_consensus_height_gauges(executed: u64, gossip: u64) {
+    metrics::gauge!("tn_node.last_executed_consensus_height").set(executed as f64);
+    metrics::gauge!("tn_node.latest_gossip_consensus_height").set(gossip as f64);
+    metrics::gauge!("tn_node.consensus_sync_distance").set(gossip.saturating_sub(executed) as f64);
 }
 
 /// One-hot `tn_node_mode{mode=...}` gauges: exactly one of the three series is 1.
