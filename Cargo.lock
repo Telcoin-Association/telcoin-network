@@ -11611,6 +11611,9 @@ version = "0.1.0"
 dependencies = [
  "eyre",
  "futures",
+ "metrics",
+ "metrics-util",
+ "reth-metrics",
  "state-sync",
  "tempfile",
  "thiserror 1.0.69",

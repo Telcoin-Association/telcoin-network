@@ -1,6 +1,6 @@
 //! Subscriber gathers all information needed from consensus and forwards to the execution engine.
 
-use crate::{errors::SubscriberResult, SubscriberError};
+use crate::{errors::SubscriberResult, metrics::ExecutorMetrics, SubscriberError};
 use futures::{stream::FuturesOrdered, StreamExt};
 use state_sync::{last_consensus_parent, save_consensus, spawn_state_sync};
 use std::{
@@ -53,6 +53,8 @@ struct Inner {
     consensus_chain: ConsensusChain,
     /// Epoch boundary time.
     epoch_boundary: TimestampSec,
+    /// Prometheus metrics for consensus output assembly.
+    metrics: ExecutorMetrics,
 }
 
 /// Spawn the subscriber in the correct mode based on the validator status for the current epoch.
@@ -80,6 +82,7 @@ pub fn spawn_subscriber<DB: Database>(
             client,
             consensus_chain: consensus_chain.clone(),
             epoch_boundary,
+            metrics: ExecutorMetrics::default(),
         }),
     };
     match mode {
@@ -488,6 +491,7 @@ impl<DB: Database> Subscriber<DB> {
                     warn!(target: "subscriber", ?digest, ?batch_digests, "failed to remove fetched batch - possible duplicate");
                     if !fetched_digests.contains(digest) {
                         error!(target: "subscriber", ?digest, "[Protocol violation] Batch not found in fetched batches from workers of certificate signers");
+                        self.inner.metrics.protocol_violations_total.increment(1);
                         return Err(SubscriberError::MissingFetchedBatch(*digest));
                     }
                 }
@@ -513,6 +517,9 @@ impl<DB: Database> Subscriber<DB> {
             total_txs = total_txs,
             "consensus output ready"
         );
+        self.inner.metrics.outputs_ready_total.increment(1);
+        self.inner.metrics.output_transactions.record(total_txs as f64);
+        self.inner.metrics.output_batches.record(batch_digests.len() as f64);
 
         debug!(target: "subscriber", "returning output to subscriber");
         Ok(ConsensusOutput::new(
@@ -540,6 +547,7 @@ impl<DB: Database> Subscriber<DB> {
             Ok(resp) => resp,
             Err(e) => {
                 error!(target: "subscriber", "Failed to fetch batches from peers: {e:?}");
+                self.inner.metrics.batch_fetch_failures_total.increment(1);
                 return Err(SubscriberError::ClientRequestsFailed);
             }
         };
