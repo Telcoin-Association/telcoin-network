@@ -690,10 +690,18 @@ impl NodeRecord {
     /// Decode a [NodeRecord] from bytes, falling back to the pre-`rpc` legacy
     /// layout (with `rpc: None`) for records produced by pre-upgrade software.
     ///
-    /// The fallback order is deterministic: legacy bytes always fail the
-    /// current-layout decode (the first signature byte of a compressed BLS
-    /// signature is never a valid `Option` tag), and current bytes always fail
-    /// the legacy decode (trailing bytes).
+    /// The fallback order is deterministic because the two layouts are mutually
+    /// exclusive under BCS. `NetworkInfo` ends with `rpc: Option<RpcInfo>`, encoded
+    /// as a single Option tag byte (`0x00`/`0x01`). The legacy layout ends with
+    /// `signature: BlsSignature`, which BCS encodes via `serialize_bytes` as a
+    /// ULEB128 length prefix (`0x30` = 48) followed by the 48 signature bytes.
+    ///
+    /// - Legacy bytes fail the current decode: where the current decoder expects the
+    ///   `rpc` Option tag, legacy bytes hold the signature's `0x30` length prefix,
+    ///   which is neither `0x00` nor `0x01`, so BCS rejects it.
+    /// - Current bytes fail the legacy decode: the legacy decoder reads the `rpc`
+    ///   Option tag (`0x00`/`0x01`) as the signature's length prefix, yielding a
+    ///   0- or 1-byte slice that `BlsSignature` rejects as an invalid signature.
     ///
     /// Does NOT verify the signature — use [Self::decode_and_verify] when
     /// authenticity matters.
