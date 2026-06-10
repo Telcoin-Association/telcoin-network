@@ -577,6 +577,12 @@ where
     /// Returns `None` if the authority is unknown or has not advertised RPC info.
     /// Callers that need fresh data should call [`Self::find_authorities`] first
     /// and wait for discovery to complete.
+    ///
+    /// RPC info is advertised only on worker [`NodeRecord`]s, so this is meaningful
+    /// on a worker network handle; a primary handle always returns `None`. Together
+    /// with [`Self::get_all_validator_rpcs`] this backs a worker gateway: a load
+    /// balancer that discovers validators' advertised worker RPC endpoints and
+    /// routes client traffic across them.
     pub async fn get_validator_rpc(&self, bls_key: BlsPublicKey) -> NetworkResult<Option<RpcInfo>> {
         let (reply, rx) = oneshot::channel();
         self.sender.send(NetworkCommand::GetValidatorRpc { bls_key, reply }).await?;
@@ -588,6 +594,11 @@ where
     /// Returns the RPC info for every known authority that has advertised it.
     /// Callers that need fresh data should call [`Self::find_authorities`] first
     /// and wait for discovery to complete.
+    ///
+    /// Only worker [`NodeRecord`]s carry RPC info, so this returns entries on a
+    /// worker network handle and an empty list on a primary handle. This is the
+    /// discovery primitive behind a worker gateway that maps client traffic across
+    /// every validator's advertised worker RPC endpoint.
     pub async fn get_all_validator_rpcs(&self) -> NetworkResult<Vec<(BlsPublicKey, RpcInfo)>> {
         let (reply, rx) = oneshot::channel();
         self.sender.send(NetworkCommand::GetAllValidatorRpcs { reply }).await?;
