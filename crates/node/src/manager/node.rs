@@ -9,7 +9,7 @@ use crate::{
     health::HealthcheckServer,
     manager::spawn_epoch_vote_collector,
 };
-use eyre::eyre;
+use eyre::{eyre, WrapErr as _};
 use tn_config::{KeyConfig, NetworkConfig, TelcoinDirs};
 use tn_network_libp2p::{types::NetworkEvent, ConsensusNetwork};
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode, QueChannel};
@@ -348,7 +348,8 @@ where
         // endpoint rather than advertising something peers will reject.
         let worker_rpc = self.builder.tn_config.node_info.p2p_info.worker.rpc.clone();
         if let Some(rpc) = &worker_rpc {
-            rpc.validate()?;
+            rpc.validate()
+                .wrap_err("invalid `node_info.p2p_info.worker.rpc` endpoint in node config")?;
         }
 
         // create long-running network task for worker
