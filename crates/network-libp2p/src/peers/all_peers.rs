@@ -134,6 +134,57 @@ impl AllPeers {
         removed
     }
 
+    /// Release the status-counter bookkeeping held by a record dropped outside the normal
+    /// status-transition path (displaced by [`Self::add_trusted_peer`] or [`Self::upsert_peer`]).
+    ///
+    /// `disconnected_peers` counts records in `Disconnected` status and `banned_peers` tracks
+    /// records in `Banned` status; a record removed without passing through
+    /// [`Self::update_connection_status`] must release them here so pruning math stays accurate.
+    fn release_displaced_record(&mut self, displaced: &Peer) {
+        match displaced.connection_status() {
+            ConnectionStatus::Disconnected { .. } => {
+                self.disconnected_peers = self.disconnected_peers.saturating_sub(1);
+            }
+            ConnectionStatus::Banned { .. } => {
+                let _ = self.banned_peers.remove_banned_peer(displaced.known_ip_addresses());
+            }
+            ConnectionStatus::Connected { .. }
+            | ConnectionStatus::Dialing { .. }
+            | ConnectionStatus::Disconnecting { .. }
+            | ConnectionStatus::Unknown => {}
+        }
+    }
+
+    /// Normalize the transport-liveness status of a record carried across a network-key
+    /// rotation.
+    ///
+    /// Reputation (score, trust, ban) is a property of the domain identity and survives the
+    /// rotation, but `Connected`/`Dialing`/`Disconnecting` describe the rotated-away key's
+    /// connection, which no longer belongs to this record. Left in place they wedge the new
+    /// identity: `can_dial` reports false and dial attempts short-circuit with
+    /// `AlreadyConnected` even though no connection exists for the new peer id, and no
+    /// libp2p event for the new id ever corrects the record. Live transport states map onto
+    /// `Disconnected` (or `Banned` when a ban was pending) with matching counter bookkeeping.
+    fn normalize_carried_status(&mut self, peer: &mut Peer) {
+        match *peer.connection_status() {
+            ConnectionStatus::Connected { .. }
+            | ConnectionStatus::Dialing { .. }
+            | ConnectionStatus::Disconnecting { banned: false } => {
+                peer.set_connection_status(ConnectionStatus::Disconnected {
+                    instant: Instant::now(),
+                });
+                self.disconnected_peers = self.disconnected_peers.saturating_add(1);
+            }
+            ConnectionStatus::Disconnecting { banned: true } => {
+                peer.set_connection_status(ConnectionStatus::Banned { instant: Instant::now() });
+                self.banned_peers.add_banned_peer(peer);
+            }
+            ConnectionStatus::Disconnected { .. }
+            | ConnectionStatus::Banned { .. }
+            | ConnectionStatus::Unknown => {}
+        }
+    }
+
     /// Create a peer that is "trusted".
     ///
     /// This overwrites peer records and unbans ips.
@@ -143,12 +194,20 @@ impl AllPeers {
         network_key: NetworkPublicKey,
     ) {
         let peer_id: PeerId = network_key.clone().into();
-        let trusted_peer = Peer::new_trusted(bls_public_key, network_key);
-        let _ = self.banned_peers.remove_banned_peer(trusted_peer.known_ip_addresses());
-        // overwrite any prior record and key the peer by its confirmed (bls) identity
-        self.peers.remove(&PeerIdentity::Unidentified(peer_id));
+        let confirmed = PeerIdentity::Confirmed(bls_public_key);
+        let current = self.identity_for(&peer_id);
+        // overwrite any prior record: anonymous under this peer id, confirmed under a different
+        // bls key that previously presented this network key, or confirmed under a previous
+        // network key; each displaced record is removed through `evict` / released so no
+        // `bls_by_peer_id` entry or status counter goes stale
+        if let Some(displaced) = (current != confirmed).then(|| self.evict(&current)).flatten() {
+            self.release_displaced_record(&displaced);
+        }
+        if let Some(displaced) = self.evict(&confirmed) {
+            self.release_displaced_record(&displaced);
+        }
         self.bls_by_peer_id.insert(peer_id, bls_public_key);
-        self.peers.insert(PeerIdentity::Confirmed(bls_public_key), trusted_peer);
+        self.peers.insert(confirmed, Peer::new_trusted(bls_public_key, network_key));
     }
 
     /// Create a peer.
@@ -159,18 +218,35 @@ impl AllPeers {
         addrs: Vec<Multiaddr>,
     ) {
         let peer_id: PeerId = network_key.clone().into();
-        // migrate any existing record (anonymous or already-confirmed) onto the confirmed identity,
-        // preserving its accumulated state; otherwise create a fresh peer
+        let confirmed = PeerIdentity::Confirmed(bls_public_key);
         let current = self.identity_for(&peer_id);
-        let peer = match self.peers.remove(&current) {
-            Some(mut peer) => {
-                peer.update_net(bls_public_key, network_key, addrs);
-                peer
-            }
-            None => Peer::new(bls_public_key, network_key, addrs),
-        };
+        // network-key rotation: a record already stored under the confirmed identity is not
+        // reachable from the new peer id, so displace it through `evict` to clear the
+        // `bls_by_peer_id` entry derived from its previous network key
+        let rotated = (current != confirmed).then(|| self.evict(&confirmed)).flatten();
+        // migrate any record reachable from the new peer id (anonymous-inbound promotion or a
+        // repeat upsert); a rotated record it displaces releases its counter bookkeeping
+        // NOTE: when the anonymous record wins this merge it keeps its fresh score, so a banned
+        // peer that reconnects anonymously before its kad record arrives sheds its ban here
+        // (pre-existing semantics); carrying reputation across the merge is a possible follow-up
+        let migrated = self.peers.remove(&current);
+        if let (Some(_), Some(displaced)) = (migrated.as_ref(), rotated.as_ref()) {
+            self.release_displaced_record(displaced);
+        }
+        // otherwise the rotated record carries forward (same domain peer, new transport key),
+        // preserving its accumulated reputation; its transport status describes the old key's
+        // connection, so it is normalized onto the new identity; a peer never seen before
+        // starts fresh
+        let carried = migrated.is_none();
+        let mut peer = migrated
+            .or(rotated)
+            .unwrap_or_else(|| Peer::new(bls_public_key, network_key.clone(), Vec::new()));
+        if carried {
+            self.normalize_carried_status(&mut peer);
+        }
+        peer.update_net(bls_public_key, network_key, addrs);
         self.bls_by_peer_id.insert(peer_id, bls_public_key);
-        self.peers.insert(PeerIdentity::Confirmed(bls_public_key), peer);
+        self.peers.insert(confirmed, peer);
     }
 
     /// Handle reported action.
@@ -231,7 +307,20 @@ impl AllPeers {
         peer_id: &PeerId,
         new_status: &NewConnectionStatus,
     ) -> ConnectionStatus {
-        let id = self.identity_for(peer_id);
+        let resolved = self.identity_for(peer_id);
+        // self-heal a stale resolution-index entry: a confirmed identity with no backing record
+        // violates the `bls_by_peer_id` iff-invariant; repair the index and treat the peer as
+        // unidentified so a keyless default record is never stored under a confirmed key (such
+        // a record has no recoverable peer id, so `evict` could never clear its index entry)
+        let id = if matches!(resolved, PeerIdentity::Confirmed(_))
+            && !self.peers.contains_key(&resolved)
+        {
+            error!(target: "peer-manager", ?peer_id, "bls_by_peer_id entry found without a confirmed record - repairing index");
+            self.bls_by_peer_id.remove(peer_id);
+            PeerIdentity::Unidentified(*peer_id)
+        } else {
+            resolved
+        };
         if !self.peers.contains_key(&id) {
             // initialize unknown peer and log warning if status update is invalid for unknown peers
             if !new_status.valid_initial_state() {
