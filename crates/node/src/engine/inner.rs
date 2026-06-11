@@ -18,8 +18,8 @@ use tn_reth::{
 use tn_rpc::{EngineToPrimary, TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator},
-    Address, BatchSender, BatchValidation, BlockHeader, BlsPublicKey, ConsensusOutput,
-    EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId, B256,
+    Address, BatchSender, BatchValidation, BlockHeader, BlsPublicKey, ConsensusHeaderDigest,
+    ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId,
     MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::WorkerNetworkHandle;
@@ -206,7 +206,7 @@ impl ExecutionNodeInner {
     ///
     /// This returns the hash of the last executed ConsensusHeader on the consensus chain.
     /// since the execution layer is confirming the last executing block.
-    pub(super) fn last_executed_output(&self) -> eyre::Result<B256> {
+    pub(super) fn last_executed_output(&self) -> eyre::Result<ConsensusHeaderDigest> {
         // NOTE: The payload_builder only extends canonical tip and sets finalized after
         // entire output is successfully executed. This ensures consistent recovery state.
         //
@@ -223,7 +223,7 @@ impl ExecutionNodeInner {
             .map(|opt| opt.parent_beacon_block_root.unwrap_or_default())
             .unwrap_or_else(Default::default);
 
-        Ok(last_round_of_consensus)
+        Ok(last_round_of_consensus.into())
     }
 
     /// Return a vector of the last 'number' executed block headers.

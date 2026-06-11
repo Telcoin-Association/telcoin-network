@@ -24,8 +24,9 @@ use tn_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
     now, to_intent_message, try_decode, AuthorityIdentifier, BlockHash, BlsPublicKey, Certificate,
-    ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord, Hash as _, Header,
-    HeaderDigest, ProtocolSignature, Round, SignatureVerificationState, TnSender as _, Vote, B256,
+    ConsensusHeader, ConsensusHeaderDigest, Database, Epoch, EpochCertificate, EpochDigest,
+    EpochRecord, Hash as _, Header, HeaderDigest, ProtocolSignature, Round,
+    SignatureVerificationState, TnSender as _, Vote, B256,
 };
 use tokio::{io::AsyncReadExt, sync::Mutex as TokioMutex, time::timeout};
 use tracing::{debug, error, info, warn};
@@ -845,7 +846,7 @@ where
     pub(super) async fn retrieve_consensus_header(
         &self,
         number: u64,
-        hash: BlockHash,
+        hash: ConsensusHeaderDigest,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
         let mut my_number = self.consensus_chain.latest_consensus_number();
         // If we are behind then wait up to two seconds to catch up.
@@ -870,7 +871,7 @@ where
     pub(super) async fn retrieve_epoch_record(
         &self,
         epoch: Option<Epoch>,
-        hash: Option<BlockHash>,
+        hash: Option<EpochDigest>,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
         let (record, certificate) = match (epoch, hash) {
             (_, Some(hash)) => self.get_epoch_by_hash(hash).await?,
@@ -885,7 +886,7 @@ where
     async fn get_header_by_hash(
         &self,
         number: u64,
-        hash: BlockHash,
+        hash: ConsensusHeaderDigest,
     ) -> PrimaryNetworkResult<ConsensusHeader> {
         let epoch = self.consensus_chain.epochs().number_to_epoch(number);
         match self.consensus_chain.consensus_header_by_digest(epoch, hash).await {
@@ -920,7 +921,7 @@ where
     /// Retrieve the consensus header by hash
     async fn get_epoch_by_hash(
         &self,
-        hash: BlockHash,
+        hash: EpochDigest,
     ) -> PrimaryNetworkResult<(EpochRecord, EpochCertificate)> {
         match self.consensus_chain.epochs().get_epoch_by_hash(hash).await {
             Some((record, Some(cert))) => Ok((record, cert)),

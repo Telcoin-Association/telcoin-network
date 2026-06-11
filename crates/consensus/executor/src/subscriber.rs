@@ -17,9 +17,9 @@ use tn_primary::{
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{
     encode, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash, BlsSigner as _,
-    CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput, Database,
-    Hash as _, Noticer, TaskManager, TaskSpawner, Timestamp, TimestampSec, TnReceiver, TnSender,
-    B256,
+    CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusHeaderDigest,
+    ConsensusOutput, Database, Hash as _, Noticer, TaskManager, TaskSpawner, Timestamp,
+    TimestampSec, TnReceiver, TnSender,
 };
 use tracing::{debug, error, info, instrument, warn};
 
@@ -254,7 +254,7 @@ impl<DB: Database> Subscriber<DB> {
     ///
     /// This method is called on startup to retrieve the needed information to build the next
     /// `ConsensusHeader` off of this parent.
-    async fn get_last_executed_consensus(&self) -> SubscriberResult<(BlockHash, u64)> {
+    async fn get_last_executed_consensus(&self) -> SubscriberResult<(ConsensusHeaderDigest, u64)> {
         let result = last_consensus_parent(&self.consensus_bus, &self.inner.consensus_chain).await;
 
         info!(
@@ -434,7 +434,7 @@ impl<DB: Database> Subscriber<DB> {
     async fn fetch_batches(
         &self,
         sub_dag: CommittedSubDag,
-        parent_hash: B256,
+        parent_hash: ConsensusHeaderDigest,
         number: u64,
     ) -> SubscriberResult<ConsensusOutput> {
         let num_blocks = sub_dag.num_primary_batches();

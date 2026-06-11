@@ -9,7 +9,7 @@ use tn_config::{KeyConfig, TelcoinDirs};
 use tn_primary::ConsensusBusApp;
 use tn_rpc::{EngineToPrimary, RpcNodeInfo};
 use tn_storage::consensus::ConsensusChain;
-use tn_types::{BlockHash, ConsensusHeader, Epoch, EpochCertificate, EpochRecord};
+use tn_types::{ConsensusHeader, Epoch, EpochCertificate, EpochDigest, EpochRecord};
 use tokio::task::JoinHandle;
 
 pub mod engine;
@@ -84,7 +84,10 @@ impl EngineToPrimaryRpc {
     }
 
     /// Retrieve the consensus header by hash
-    async fn get_epoch_by_hash(&self, hash: BlockHash) -> Option<(EpochRecord, EpochCertificate)> {
+    async fn get_epoch_by_hash(
+        &self,
+        hash: EpochDigest,
+    ) -> Option<(EpochRecord, EpochCertificate)> {
         if let Some((r, Some(c))) = self.consensus_chain.epochs().get_epoch_by_hash(hash).await {
             Some((r, c))
         } else {
@@ -101,7 +104,7 @@ impl EngineToPrimary for EngineToPrimaryRpc {
     async fn epoch(
         &self,
         epoch: Option<Epoch>,
-        hash: Option<BlockHash>,
+        hash: Option<EpochDigest>,
     ) -> Option<(EpochRecord, EpochCertificate)> {
         match (epoch, hash) {
             (_, Some(hash)) => self.get_epoch_by_hash(hash).await,

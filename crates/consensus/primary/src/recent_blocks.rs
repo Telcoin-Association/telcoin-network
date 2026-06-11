@@ -1,7 +1,9 @@
 //! Track the most recent execution blocks for the consensus layer.
 
 use std::collections::VecDeque;
-use tn_types::{BlockHash, BlockNumHash, Round, SealedHeader};
+use tn_types::{
+    BlockHash, BlockNumHash, ConsensusHeaderDigest, ConsensusNumHash, Round, SealedHeader,
+};
 
 /// Tracks 'num_blocks' most recently executed block hashes and numbers.
 #[derive(Clone, Debug)]
@@ -12,7 +14,7 @@ pub struct RecentBlocks {
     executed_blocks: VecDeque<SealedHeader>,
     /// Recent consensus output number/hash (both skipped and executed).
     /// Used by `contains_consensus` to resolve wait_for_consensus_execution.
-    recent_consensus_num_hashes: VecDeque<BlockNumHash>,
+    recent_consensus_num_hashes: VecDeque<ConsensusNumHash>,
 }
 
 impl RecentBlocks {
@@ -38,7 +40,7 @@ impl RecentBlocks {
     pub fn push_latest(
         &mut self,
         latest_consensus_round: Round,
-        consensus_num_hash: BlockNumHash,
+        consensus_num_hash: ConsensusNumHash,
         latest_canonical_tip: Option<SealedHeader>,
     ) {
         self.last_consensus_round = latest_consensus_round;
@@ -87,14 +89,14 @@ impl RecentBlocks {
     }
 
     /// Is hash (consensus output) in a recent block we have executed?
-    pub fn contains_consensus(&self, hash: BlockHash) -> bool {
+    pub fn contains_consensus(&self, hash: ConsensusHeaderDigest) -> bool {
         // Check dedicated consensus num/hash tracker (covers both skipped and executed rounds)
         if self.recent_consensus_num_hashes.iter().any(|num_hash| num_hash.hash == hash) {
             return true;
         }
         // Fallback: check block's parent_beacon_block_root
         for block in &self.executed_blocks {
-            if block.parent_beacon_block_root == Some(hash) {
+            if block.parent_beacon_block_root == Some(hash.into()) {
                 return true;
             }
         }
@@ -102,7 +104,7 @@ impl RecentBlocks {
     }
 
     /// Return the number/hash of the latest processed consensus output.
-    pub fn latest_consensus_block_num_hash(&self) -> BlockNumHash {
+    pub fn latest_consensus_block_num_hash(&self) -> ConsensusNumHash {
         self.recent_consensus_num_hashes.back().copied().unwrap_or_else(Default::default)
     }
 
@@ -115,12 +117,12 @@ impl RecentBlocks {
 #[cfg(test)]
 mod tests {
     use super::RecentBlocks;
-    use tn_types::{BlockHash, BlockNumHash, ExecHeader, SealedHeader};
+    use tn_types::{ConsensusHeaderDigest, ConsensusNumHash, ExecHeader, SealedHeader};
 
     #[test]
     fn tracks_latest_consensus_num_hash_for_skipped_rounds() {
         let mut recent = RecentBlocks::new(4);
-        let consensus_num_hash = BlockNumHash::new(10, BlockHash::from([1u8; 32]));
+        let consensus_num_hash = ConsensusNumHash::new(10, ConsensusHeaderDigest::from([1u8; 32]));
 
         recent.push_latest(1, consensus_num_hash, None);
 
@@ -132,7 +134,7 @@ mod tests {
     #[test]
     fn tracks_latest_execution_and_consensus_after_execution() {
         let mut recent = RecentBlocks::new(4);
-        let consensus_num_hash = BlockNumHash::new(11, BlockHash::from([2u8; 32]));
+        let consensus_num_hash = ConsensusNumHash::new(11, ConsensusHeaderDigest::from([2u8; 32]));
         let mut header = ExecHeader::default();
         header.number = 7;
         let executed = SealedHeader::seal_slow(header);

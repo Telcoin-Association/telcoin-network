@@ -14,9 +14,9 @@ use std::{
 
 use parking_lot::Mutex;
 use tn_types::{
-    gas_accumulator::RewardsCounter, AuthorityIdentifier, Batch, BlockHash, BlockNumHash,
-    CommittedSubDag, Committee, ConsensusChainReader, ConsensusChainWriter, ConsensusHeader,
-    ConsensusOutput, Epoch, EpochRecord, ReadStream, Round, B256,
+    gas_accumulator::RewardsCounter, AuthorityIdentifier, Batch, BlockHash, CommittedSubDag,
+    Committee, ConsensusChainReader, ConsensusChainWriter, ConsensusHeader, ConsensusHeaderDigest,
+    ConsensusNumHash, ConsensusOutput, Epoch, EpochRecord, ReadStream, Round,
 };
 use tokio::{
     fs::File as AsyncFile,
@@ -310,7 +310,7 @@ impl ConsensusChain {
             epoch: 0,
             committee: committee.bls_keys().iter().copied().collect(),
             next_committee: committee.bls_keys().iter().copied().collect(),
-            final_consensus: BlockNumHash::new(1000, BlockHash::default()),
+            final_consensus: ConsensusNumHash::new(1000, ConsensusHeaderDigest::default()),
             ..Default::default()
         };
         me.new_epoch(rec.clone(), committee).await?;
@@ -366,10 +366,11 @@ impl ConsensusChain {
         timeout: Duration,
     ) -> Result<(), ConsensusChainError> {
         let epoch = epoch_record.epoch;
+        let epoch_final_hash = epoch_record.final_consensus.hash;
         if let Ok(pack) = self.get_static(epoch).await {
             if let Some(last_header) = pack.latest_consensus_header().await {
                 if epoch_record.final_consensus.number == last_header.number
-                    && epoch_record.final_consensus.hash == last_header.digest()
+                    && epoch_final_hash == last_header.digest()
                 {
                     // If we already have a complete pack file then we are done, no need to
                     // stream...
@@ -404,7 +405,7 @@ impl ConsensusChain {
                         // the expected final_consensus then the entire pack
                         // file should be valid.
                         if epoch_record.final_consensus.number != last_header.number
-                            || epoch_record.final_consensus.hash != last_header.digest()
+                            || epoch_final_hash != last_header.digest()
                         {
                             // Invalid final consensus header...
                             return Err(ConsensusChainError::InvalidImport);
@@ -458,8 +459,9 @@ impl ConsensusChain {
             if let Some((epoch_record, _)) = self.epochs().get_epoch_by_number(epoch).await {
                 match pack.latest_consensus_header().await {
                     Some(last_header) => {
+                        let epoch_final_hash = epoch_record.final_consensus.hash;
                         if epoch_record.final_consensus.number == last_header.number
-                            && epoch_record.final_consensus.hash == last_header.digest()
+                            && epoch_final_hash == last_header.digest()
                         {
                             drop(pack);
                             // Remove the other open file.
@@ -531,7 +533,7 @@ impl ConsensusChain {
     pub async fn consensus_header_by_digest(
         &self,
         epoch: Epoch,
-        digest: B256,
+        digest: ConsensusHeaderDigest,
     ) -> Result<Option<ConsensusHeader>, ConsensusChainError> {
         if let Some(pack) = &self.current_pack() {
             if epoch == pack.epoch() {
@@ -659,7 +661,7 @@ impl ConsensusChain {
     pub async fn write_subdag_for_test(&self, number: u64, sub_dag: CommittedSubDag) {
         let output = ConsensusOutput::new(
             sub_dag,
-            BlockHash::default(),
+            ConsensusHeaderDigest::default(),
             number,
             false,
             VecDeque::new(),
@@ -744,7 +746,7 @@ impl ConsensusChainReader for ConsensusChain {
     async fn consensus_header_by_digest(
         &self,
         epoch: Epoch,
-        digest: B256,
+        digest: ConsensusHeaderDigest,
     ) -> eyre::Result<Option<ConsensusHeader>> {
         ConsensusChain::consensus_header_by_digest(self, epoch, digest).await.map_err(Into::into)
     }
@@ -972,7 +974,8 @@ mod test {
     use std::{sync::Arc, time::Duration};
 
     use tn_types::{
-        test_genesis, BlockHash, BlockNumHash, ConsensusHeader, Epoch, EpochRecord, Hash as _, B256,
+        test_genesis, ConsensusHeader, ConsensusHeaderDigest, ConsensusNumHash, Epoch, EpochRecord,
+        Hash as _,
     };
 
     use crate::{
@@ -1034,7 +1037,7 @@ mod test {
         }
         let last = outputs.last().unwrap();
         let mut epoch_record = previous_epoch.clone();
-        epoch_record.final_consensus = BlockNumHash::new(last.number(), last.digest().into());
+        epoch_record.final_consensus = ConsensusNumHash::new(last.number(), last.digest());
         for i in 0..num_outputs {
             let output_db =
                 consensus_chain.get_consensus_output_current(i as u64 + 1).await.unwrap();
@@ -1080,7 +1083,7 @@ mod test {
 
         let num_outputs = 100;
         let mut outputs = Vec::new();
-        let mut parent = BlockHash::default();
+        let mut parent = ConsensusHeaderDigest::default();
         for i in 0..num_outputs {
             let consensus_output =
                 make_test_output(&committee, i % 4, chain.clone(), (i as u64) + 1, parent);
@@ -1099,7 +1102,10 @@ mod test {
             committee: committee.bls_keys().iter().copied().collect(),
             next_committee: committee.bls_keys().iter().copied().collect(),
             parent_hash: previous_epoch.digest(),
-            final_consensus: BlockNumHash { number: 100, hash: BlockHash::default() },
+            final_consensus: ConsensusNumHash {
+                number: 100,
+                hash: ConsensusHeaderDigest::default(),
+            },
             ..Default::default()
         };
         let committee = committee.advance_epoch_for_test(1);
@@ -1129,7 +1135,10 @@ mod test {
             committee: committee.bls_keys().iter().copied().collect(),
             next_committee: committee.bls_keys().iter().copied().collect(),
             parent_hash: previous_epoch.digest(),
-            final_consensus: BlockNumHash { number: 200, hash: BlockHash::default() },
+            final_consensus: ConsensusNumHash {
+                number: 200,
+                hash: ConsensusHeaderDigest::default(),
+            },
             ..Default::default()
         };
         let committee = committee.advance_epoch_for_test(2);
@@ -1183,7 +1192,7 @@ mod test {
         // Now by digest
         for i in 0..(num_outputs * 3) {
             let epoch = (i / num_outputs) as Epoch;
-            let digest: B256 = outputs[i].digest().into();
+            let digest = outputs[i].digest();
             let header_db =
                 consensus_chain.consensus_header_by_digest(epoch, digest).await.unwrap().unwrap();
             assert_eq!(digest, header_db.digest(), "consensus headers mismatch (by digest) {i}");
@@ -1202,7 +1211,7 @@ mod test {
         }
         for i in 0..(num_outputs * 3) {
             let epoch = i / num_outputs;
-            let digest: B256 = outputs[i].digest().into();
+            let digest = outputs[i].digest();
             let header_db = consensus_chain
                 .consensus_header_by_digest(epoch as u32, digest)
                 .await
