@@ -177,8 +177,8 @@ impl AllPeers {
     ///
     /// This method is called when the application layer identifies a problem and reports a peer.
     pub(super) fn process_penalty(&mut self, peer_id: &PeerId, penalty: Penalty) -> PeerAction {
-        let exemption = self.trust_basis(peer_id);
         let id = self.identity_for(peer_id);
+        let exemption = self.trust_basis_for(&id);
         if let Some(peer) = self.peers.get_mut(&id) {
             let prior_reputation = peer.reputation();
             let new_reputation = peer.apply_penalty(penalty, exemption);
@@ -774,9 +774,15 @@ impl AllPeers {
     /// `None` means the peer is subject to the normal score model.
     fn trust_basis(&self, peer_id: &PeerId) -> Option<TrustBasis> {
         let id = self.identity_for(peer_id);
-        self.peers.get(&id).and_then(|peer| {
+        self.trust_basis_for(&id)
+    }
+
+    /// The [TrustBasis] exempting the peer with the already-resolved identity `id`, if it is
+    /// known and exempt.
+    fn trust_basis_for(&self, id: &PeerIdentity) -> Option<TrustBasis> {
+        self.peers.get(id).and_then(|peer| {
             Self::exemption(
-                &id,
+                id,
                 peer,
                 &self.previous_committee,
                 &self.current_committee,
