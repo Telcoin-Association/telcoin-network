@@ -3,6 +3,7 @@
 use std::{
     fs,
     io::{self, Read as _, Seek as _, SeekFrom, Write as _},
+    marker::PhantomData,
     path::{Path, PathBuf},
 };
 
@@ -106,23 +107,29 @@ impl PdxHeader {
     }
 }
 
-/// Header for an hdx (index) file.  This contains the hash buckets for lookups.
-/// This file is not a log file and the header and buckets will change in place over time.
-/// This data in the file will be followed by a CRC32 checksum value to verify it.
+/// PoristionIndex, an index that is a simple index to position in a DB file.
 #[derive(Debug)]
-pub struct PositionIndex {
+pub struct PositionIndex<T> {
     _header: PdxHeader,
     pdx_file: DataFile,
     _index_dir: PathBuf,
+    _phantom: PhantomData<T>,
 }
 
-impl PositionIndex {
+impl<T: PosIndexValue> PositionIndex<T> {
+    /// True if the pdx file at dir and filename exists.
+    pub fn pdx_file_exists<P: AsRef<Path>>(dir: P, file_name: &str) -> bool {
+        let dir = dir.as_ref();
+        dir.join(file_name).exists()
+    }
+
     /// Open a PDX index file and return the open index.
     pub fn open_pdx_file<P: AsRef<Path>>(
         dir: P,
         data_header: &DataHeader,
+        file_name: &str,
         read_only: bool,
-    ) -> Result<PositionIndex, LoadHeaderError> {
+    ) -> Result<PositionIndex<T>, LoadHeaderError> {
         let dir = dir.as_ref();
         let dir_created = fs::create_dir(dir).is_ok();
         if dir_created {
@@ -131,7 +138,7 @@ impl PositionIndex {
                 let _ = fsync_directory(parent);
             }
         }
-        let mut pdx_file = DataFile::open(dir.join("index.pdx"), read_only)?;
+        let mut pdx_file = DataFile::open(dir.join(file_name), read_only)?;
 
         let was_empty = pdx_file.is_empty();
         let header = if was_empty {
@@ -158,12 +165,13 @@ impl PositionIndex {
             }
             header
         };
-        Ok(Self { _header: header, pdx_file, _index_dir: dir.to_owned() })
+        Ok(Self { _header: header, pdx_file, _index_dir: dir.to_owned(), _phantom: PhantomData })
     }
 
     /// Return the number of values in this index.
     pub fn len(&self) -> usize {
-        (self.pdx_file.len().saturating_sub(PDX_HEADER_SIZE as u64) / 8) as usize
+        let len = self.pdx_file.len() as usize;
+        len.saturating_sub(PDX_HEADER_SIZE) / T::buffer_len()
     }
 
     /// True if there are no keys stored in this index.
@@ -172,26 +180,29 @@ impl PositionIndex {
     }
 
     /// Return an iterator over file positions with up to len items.
-    pub fn iter(&mut self, len: usize) -> Result<PositionIter, std::io::Error> {
+    pub fn iter(&mut self, len: usize) -> Result<PositionIter<T>, std::io::Error> {
         let data_len = if len < self.len() { len } else { self.len() };
-        let mut data = vec![0_u8; data_len * 8];
+        let buffer_len = T::buffer_len();
+        let mut data = vec![0_u8; data_len * buffer_len];
         self.pdx_file.seek(SeekFrom::Start(PDX_HEADER_SIZE as u64))?;
         self.pdx_file.read_exact(data.as_mut_slice())?;
         Ok(PositionIter::new(data))
     }
 
     /// Return a reverse iterator over file positions with up to len items.
-    pub fn rev_iter(&mut self, len: usize) -> Result<PositionIter, std::io::Error> {
+    pub fn rev_iter(&mut self, len: usize) -> Result<PositionIter<T>, std::io::Error> {
         let data_len = if len < self.len() { len } else { self.len() };
-        let mut data = vec![0_u8; data_len * 8];
-        self.pdx_file.seek(SeekFrom::End(-(data_len as i64 * 8)))?;
+        let buffer_len = T::buffer_len();
+        let mut data = vec![0_u8; data_len * buffer_len];
+        self.pdx_file.seek(SeekFrom::End(-(data_len as i64 * buffer_len as i64)))?;
         self.pdx_file.read_exact(data.as_mut_slice())?;
         Ok(PositionIter::new_rev(data))
     }
 
     /// Truncate the index to key (inclusive).
     pub fn truncate_to_index(&mut self, key: u64) -> Result<(), io::Error> {
-        let pos = PDX_HEADER_SIZE as u64 + (key * 8) + 8;
+        let buffer_len = T::buffer_len() as u64;
+        let pos = PDX_HEADER_SIZE as u64 + (key * buffer_len) + buffer_len;
         self.pdx_file.set_len(pos)
     }
 
@@ -202,8 +213,8 @@ impl PositionIndex {
     }
 }
 
-impl Index<u64> for PositionIndex {
-    fn save(&mut self, key: u64, record_pos: u64) -> Result<(), AppendError> {
+impl<T: PosIndexValue> Index<u64, T> for PositionIndex<T> {
+    fn save(&mut self, key: u64, value: T) -> Result<(), AppendError> {
         if self.len() != key as usize {
             Err(AppendError::SerializeValue(format!(
                 "{} must add the next item by position, expected {} got {key}",
@@ -211,17 +222,21 @@ impl Index<u64> for PositionIndex {
                 self.len()
             )))
         } else {
-            self.pdx_file.write_all(&record_pos.to_le_bytes())?;
+            let mut buffer = [0_u8; 32];
+            let buffer_len = T::buffer_len();
+            value.encode(&mut buffer[0..buffer_len]);
+            self.pdx_file.write_all(&buffer[0..buffer_len])?;
             Ok(())
         }
     }
 
-    fn load(&mut self, key: u64) -> Result<u64, FetchError> {
-        let pos = PDX_HEADER_SIZE as u64 + (key * 8);
+    fn load(&mut self, key: u64) -> Result<T, FetchError> {
+        let buffer_len = T::buffer_len();
+        let pos = PDX_HEADER_SIZE as u64 + (key * buffer_len as u64);
         self.pdx_file.seek(SeekFrom::Start(pos))?;
-        let mut buf = [0_u8; 8];
-        self.pdx_file.read_exact(&mut buf[..])?;
-        Ok(u64::from_le_bytes(buf))
+        let mut buf = [0_u8; 32];
+        self.pdx_file.read_exact(&mut buf[..buffer_len])?;
+        T::decode(&buf[..buffer_len])
     }
 
     fn sync(&mut self) -> Result<(), CommitError> {
@@ -233,46 +248,110 @@ impl Index<u64> for PositionIndex {
 
 /// Iterator of u64 record positions from a position index.
 #[derive(Debug)]
-pub struct PositionIter {
+pub struct PositionIter<T> {
     data: Vec<u8>,
     pos: usize,
     done: bool,
     reverse: bool,
+    _phantom: PhantomData<T>,
 }
 
-impl PositionIter {
+impl<T: PosIndexValue> PositionIter<T> {
     /// New position iter over data.
     fn new(data: Vec<u8>) -> Self {
         let done = data.is_empty();
-        Self { data, pos: 0, done, reverse: false }
+        Self { data, pos: 0, done, reverse: false, _phantom: PhantomData }
     }
 
     /// New reverse iter over data.
     fn new_rev(data: Vec<u8>) -> Self {
         let done = data.is_empty();
-        let pos = data.len().saturating_sub(8);
-        Self { data, pos, done, reverse: true }
+        let pos = data.len().saturating_sub(T::buffer_len());
+        Self { data, pos, done, reverse: true, _phantom: PhantomData }
     }
 }
 
-impl Iterator for PositionIter {
-    type Item = u64;
+impl<T: PosIndexValue> Iterator for PositionIter<T> {
+    type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
         if !self.done {
-            let mut buf = [0_u8; 8];
-            buf.copy_from_slice(&self.data[self.pos..self.pos + 8]);
+            let mut buf = [0_u8; 32];
+            let buffer_len = T::buffer_len();
+            buf[..buffer_len].copy_from_slice(&self.data[self.pos..self.pos + buffer_len]);
             if self.reverse {
                 self.done = self.pos == 0;
-                self.pos = self.pos.saturating_sub(8);
+                self.pos = self.pos.saturating_sub(buffer_len);
             } else {
-                self.pos = self.pos.saturating_add(8);
+                self.pos = self.pos.saturating_add(buffer_len);
                 self.done = self.pos >= self.data.len();
             }
-            Some(u64::from_le_bytes(buf))
+            Some(T::decode(&buf[..buffer_len]).ok()?)
         } else {
             None
         }
+    }
+}
+
+/// Trait that index values must implement in order to encode/decode themselves
+/// into bytes to read/write to disk.
+/// These must ALWAYS encode/decode to the same number of bytes.
+pub trait PosIndexValue {
+    /// Encode an item into a byte array.
+    fn encode(&self, buffer: &mut [u8]);
+    /// Decode a byte array into an item.
+    fn decode(bytes: &[u8]) -> Result<Self, FetchError>
+    where
+        Self: Sized;
+    /// How many bytes needed for a buffer.
+    fn buffer_len() -> usize;
+}
+
+impl PosIndexValue for u64 {
+    fn encode(&self, buffer: &mut [u8]) {
+        if buffer.len() != 8 {
+            panic!("u64 buffer not 8 bytes");
+        }
+        buffer.copy_from_slice(&self.to_le_bytes());
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, FetchError> {
+        if bytes.len() != 8 {
+            panic!("u64 buffer not 8 bytes");
+        }
+        let mut buf = [0_u8; 8];
+        buf.copy_from_slice(bytes);
+        Ok(u64::from_le_bytes(buf))
+    }
+
+    fn buffer_len() -> usize {
+        8
+    }
+}
+
+impl PosIndexValue for (u64, u64) {
+    fn encode(&self, buffer: &mut [u8]) {
+        if buffer.len() != 16 {
+            panic!("(u64, u64) buffer not 16 bytes");
+        }
+        buffer[..8].copy_from_slice(&self.0.to_le_bytes());
+        buffer[8..].copy_from_slice(&self.1.to_le_bytes());
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, FetchError> {
+        if bytes.len() != 16 {
+            panic!("(u64, u64) buffer not 16 bytes");
+        }
+        let mut buf = [0_u8; 8];
+        buf.copy_from_slice(&bytes[..8]);
+        let one = u64::from_le_bytes(buf);
+        buf.copy_from_slice(&bytes[8..]);
+        let two = u64::from_le_bytes(buf);
+        Ok((one, two))
+    }
+
+    fn buffer_len() -> usize {
+        16
     }
 }
 
@@ -285,12 +364,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_archive_pdx_index() {
+    fn test_archive_pdx_index_single() {
         let tmp_path = TempDir::with_prefix("test_archive_pdx_index").expect("temp dir");
         let data_header = DataHeader::new(0, PackCompression::ZStd);
-        let mut idx: PositionIndex =
-            PositionIndex::open_pdx_file(tmp_path.path().join("index.pdx"), &data_header, false)
-                .expect("pdx file");
+        let mut idx: PositionIndex<u64> = PositionIndex::open_pdx_file(
+            tmp_path.path().join("index.pdx"),
+            &data_header,
+            "index.pdx",
+            false,
+        )
+        .expect("pdx file");
         for i in 0..1_000_000 {
             idx.save(i, i * 100).expect("add to index");
         }
@@ -298,9 +381,13 @@ mod tests {
             assert_eq!(idx.load(i).expect("load idx"), i * 100, "failed on iteration {i}");
         }
         drop(idx);
-        let mut idx: PositionIndex =
-            PositionIndex::open_pdx_file(tmp_path.path().join("index.pdx"), &data_header, false)
-                .expect("pdx file");
+        let mut idx: PositionIndex<u64> = PositionIndex::open_pdx_file(
+            tmp_path.path().join("index.pdx"),
+            &data_header,
+            "index.pdx",
+            false,
+        )
+        .expect("pdx file");
         for i in (0..1_000_000).rev() {
             assert_eq!(
                 idx.load(i).expect(&format!("load idx {i}")),
@@ -311,9 +398,13 @@ mod tests {
         idx.save(1_000_000, 66).expect("add to index");
         assert_eq!(idx.load(1_000_000).expect("load idx"), 66);
         drop(idx);
-        let mut idx: PositionIndex =
-            PositionIndex::open_pdx_file(tmp_path.path().join("index.pdx"), &data_header, true)
-                .expect("pdx file");
+        let mut idx: PositionIndex<u64> = PositionIndex::open_pdx_file(
+            tmp_path.path().join("index.pdx"),
+            &data_header,
+            "index.pdx",
+            true,
+        )
+        .expect("pdx file");
         for i in (0..1_000_000).rev() {
             assert_eq!(
                 idx.load(i).expect(&format!("load idx {i}")),
@@ -341,5 +432,68 @@ mod tests {
         }
 
         assert_eq!(idx.load(1_000_000).expect("load idx"), 66);
+    }
+
+    #[test]
+    fn test_archive_pdx_index_double() {
+        let tmp_path = TempDir::with_prefix("test_archive_pdx_index_double").expect("temp dir");
+        let data_header = DataHeader::new(0, PackCompression::ZStd);
+        let mut idx: PositionIndex<(u64, u64)> =
+            PositionIndex::open_pdx_file(tmp_path.path(), &data_header, "index2.pdx", false)
+                .expect("pdx file");
+        for i in 0..1_000_000 {
+            idx.save(i, (i, i * 100)).expect("add to index");
+        }
+        for i in 0..1_000_000 {
+            assert_eq!(idx.load(i).expect("load idx"), (i, i * 100), "failed on iteration {i}");
+        }
+        drop(idx);
+        let mut idx: PositionIndex<(u64, u64)> =
+            PositionIndex::open_pdx_file(tmp_path.path(), &data_header, "index2.pdx", false)
+                .expect("pdx file");
+        for i in (0..1_000_000).rev() {
+            assert_eq!(
+                idx.load(i).expect(&format!("load idx {i}")),
+                (i, i * 100),
+                "failed on iteration {i}"
+            );
+        }
+        idx.save(1_000_000, (66, 66)).expect("add to index");
+        assert_eq!(idx.load(1_000_000).expect("load idx"), (66, 66));
+        drop(idx);
+        let mut idx: PositionIndex<(u64, u64)> =
+            PositionIndex::open_pdx_file(tmp_path.path(), &data_header, "index2.pdx", true)
+                .expect("pdx file");
+        for i in (0..1_000_000).rev() {
+            assert_eq!(
+                idx.load(i).expect(&format!("load idx {i}")),
+                (i, i * 100),
+                "failed on iteration {i}"
+            );
+        }
+
+        // Test reverse iter.
+        let iter = idx.rev_iter(1000).unwrap();
+        assert_eq!(iter.count(), 1000, "asked for 1000 items");
+        let mut iter = idx.rev_iter(1000).unwrap();
+        assert_eq!(iter.next().unwrap(), (66, 66), "last record wrong");
+        let d = 999_999;
+        for (i, pos) in iter.enumerate() {
+            assert_eq!(
+                pos,
+                ((d - i) as u64, ((d - i) * 100) as u64),
+                "failed rev on iteration {i}"
+            );
+        }
+
+        // Test iter
+        let iter = idx.iter(1000).unwrap();
+        assert_eq!(iter.count(), 1000, "asked for 1000 items");
+        let iter = idx.iter(1000).unwrap();
+        for (i, pos) in iter.enumerate() {
+            assert_eq!(pos, (i as u64, (i * 100) as u64), "failed rev on iteration {i}");
+        }
+
+        assert_eq!(idx.load(1_000_000).expect("load idx"), (66, 66));
     }
 }

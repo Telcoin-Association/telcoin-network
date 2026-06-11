@@ -404,7 +404,7 @@ struct Inner {
     /// Log file for [`EpochCertificate`] entries.
     certs: Pack<EpochCertificate>,
     /// Position index: (epoch - start_epoch) → byte offset in `records`.
-    epoch_idx: PositionIndex,
+    epoch_idx: PositionIndex<u64>,
     /// Hash index: EpochRecord digest → byte offset in `records`.
     record_digests: HdxIndex,
     /// Hash index: EpochCertificate epoch_hash → byte offset in `certs`.
@@ -429,7 +429,7 @@ impl Inner {
     /// Truncate records and its indexes back to a consistent state.
     fn heal_records(
         records: &mut Pack<EpochRecord>,
-        epoch_idx: &mut PositionIndex,
+        epoch_idx: &mut PositionIndex<u64>,
         record_digests: &HdxIndex,
     ) -> Result<(), EpochDbError> {
         let records_len = records.file_len();
@@ -495,9 +495,10 @@ impl Inner {
             PackCompression::ZStd,
         )?;
 
-        let mut epoch_idx = PositionIndex::open_pdx_file(
+        let mut epoch_idx: PositionIndex<u64> = PositionIndex::open_pdx_file(
             base_dir.join(Self::EPOCH_POS_NAME),
             records.header(),
+            "index.pdx",
             false,
         )
         .map_err(OpenError::IndexFileOpen)?;

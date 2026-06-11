@@ -735,8 +735,7 @@ impl ConsensusChain {
                 let _ = recents.pop_front();
             }
         }
-        let pack = ConsensusPack::open_static(&self.base_path, epoch);
-        pack.persist().await?; // Surface any open errors.
+        let pack = ConsensusPack::open_static(&self.base_path, epoch)?;
         self.recent_packs.lock().push_back(pack.clone());
         Ok(pack)
     }
