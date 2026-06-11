@@ -1,14 +1,53 @@
-//! Closing epoch responsibilities
+//! Epoch teardown.
 //!
+//! The methods here form the closing half of [`EpochManager`]'s per-epoch
+//! lifecycle. `run_epoch` (in the sibling `epochs` module) calls them in
+//! sequence once an epoch ends, whether that end was a clean epoch boundary or
+//! an early exit.
+//!
+//! Teardown recovers our own batches that never reached consensus — orphaned by
+//! the epoch change or a restart — back into the mempool so their transactions
+//! are not lost. On a non-boundary exit it also drains any consensus output that
+//! was committed but not yet forwarded, sending it to the engine to avoid
+//! orphaning finalized blocks. It then writes the finalized [`EpochRecord`] for
+//! the just-closed epoch and clears the epoch-scoped consensus DB tables so the
+//! next epoch starts from a clean slate. Historic data survives in the
+//! `ConsensusChain` store; only the per-epoch working tables are cleared.
+
+use crate::{engine::ExecutionNode, manager::EpochManager, primary::PrimaryNode};
+use eyre::eyre;
+use tn_config::TelcoinDirs;
+use tn_reth::recover_raw_transaction;
+use tn_storage::tables::{
+    CertificateDigestByOrigin, CertificateDigestByRound, Certificates, LastProposed,
+    NodeBatchesCache, OurNodeBatchesCache, Payload, ProposedCertificates, Votes,
+};
+use tn_types::{
+    Batch, BlockHash, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput,
+    Database as TNDatabase, Epoch, EpochDigest, EpochRecord, TaskManager, TnReceiver,
+};
+use tn_worker::{quorum_waiter::QuorumWaiterTrait, Worker};
+use tokio::sync::mpsc;
+use tracing::{error, info, info_span, warn, Instrument};
 
 impl<P, DB> EpochManager<P, DB>
 where
     P: TelcoinDirs + Clone + 'static,
     DB: TNDatabase,
 {
-    /// Collect any of our batches that never got into consensus (at epoch change or node restart)
-    /// and Re-introduce them into the mempool for inclusion in future batches.
-    async fn orphan_batches<QuorumWaiter: QuorumWaiterTrait>(
+    /// Recover our own batches that never reached the consensus chain.
+    ///
+    /// Batches get orphaned when the epoch changes — or the node restarts —
+    /// before they are included in a certificate. Their transactions would be
+    /// lost otherwise, so we reintroduce them. An active CVV re-injects each
+    /// transaction into its worker's mempool to be repackaged next epoch; a
+    /// non-CVV is not building batches, so it disburses the batch directly.
+    ///
+    /// [`OurNodeBatchesCache`] is read and then immediately cleared: the cached
+    /// batches are now defunct since their contents are back in flight. Recovery
+    /// runs as a spawned task on the epoch [`TaskManager`] so it does not block
+    /// the rest of teardown.
+    pub(super) async fn orphan_batches<QuorumWaiter: QuorumWaiterTrait>(
         &mut self,
         epoch_task_manager: &TaskManager,
         engine: ExecutionNode,
@@ -57,12 +96,22 @@ where
         Ok(())
     }
 
-    /// We stopped waiting on the epoch boundary so lets make sure that the consensus queue
-    /// is sent to the engine. If we don't do this it is possible that a quick
-    /// exit could orphan output (for instance a CVV that is behind).
-    /// We need to go until all the consensus output in DB has been sent to the engine (if it was
-    /// saved it should have been sent).
-    async fn send_leftover_consensus_output_to_engine(
+    /// Flush any committed-but-unforwarded consensus output to the engine on a
+    /// non-boundary exit.
+    ///
+    /// When the epoch ends early (e.g. a CVV that is behind), output may have
+    /// been committed without yet reaching the engine; forwarding it here keeps
+    /// it from being orphaned. Two phases cover the two ways output can be left
+    /// behind. Phase 1 drains whatever is still queued in the broadcast channel.
+    /// Phase 2 backfills the gap the channel cannot cover: during subscriber
+    /// shutdown, output is saved to the pack-file DB but may never be
+    /// broadcast, so we load every entry between `last_forwarded_consensus_number`
+    /// and the DB latest and forward those too.
+    ///
+    /// Returns the [`ConsensusHeaderDigest`] of the first output committed at or
+    /// past the epoch boundary, signalling that an epoch-boundary output was
+    /// reached; `None` if no such output was found.
+    pub(super) async fn send_leftover_consensus_output_to_engine(
         &mut self,
         consensus_output: &mut impl TnReceiver<ConsensusOutput>,
         to_engine: &mpsc::Sender<ConsensusOutput>,
@@ -112,9 +161,21 @@ where
         None
     }
 
-    /// Record the epoch record for just completed epoch in our DB.
-    /// Also record this in the manager for posible signing/collection of signatures.
-    async fn write_epoch_record(
+    /// Persist the finalized [`EpochRecord`] for the just-completed epoch and
+    /// publish it on `epoch_record_watch` for downstream signing or signature
+    /// collection.
+    ///
+    /// Epoch 0 is a special case: it starts with an unsigned "dummy" record so
+    /// the initial committee is available before any certificate exists. Once a
+    /// real cert is present we must overwrite that filler, which is why epoch 0
+    /// only short-circuits on a record that already carries a certificate
+    /// (`Some(_)`) — skipping this would leave the dummy in place and break sync.
+    /// For later epochs an existing record short-circuits unconditionally.
+    ///
+    /// When building a fresh record, the previous epoch's `next_committee` must
+    /// match this epoch's committee; a mismatch means the committee handoff is
+    /// inconsistent and is treated as an error rather than silently recorded.
+    pub(super) async fn write_epoch_record(
         &mut self,
         primary: &PrimaryNode<DB>,
         engine: &ExecutionNode,
@@ -188,11 +249,17 @@ where
         Ok(())
     }
 
-    /// Clear the epoch-related tables for consensus.
+    /// Clear the epoch-scoped consensus tables so the next epoch starts clean.
     ///
-    /// These tables are epoch-specific. Complete historic data is stored
-    /// in the `ConsensusChain` data store.
-    fn clear_consensus_db_for_next_epoch(&self) -> eyre::Result<()> {
+    /// These tables hold only the working state of a single epoch — proposals,
+    /// votes, certificates and their indexes, and the batch cache — so they are
+    /// reset at every boundary. Complete historic data lives in the
+    /// `ConsensusChain` store and is unaffected.
+    ///
+    /// [`OurNodeBatchesCache`] is deliberately left intact: `orphan_batches`
+    /// still reads it to recover our un-consensed batches and clears it itself
+    /// once recovery is done. Clearing it here would drop those batches.
+    pub(super) fn clear_consensus_db_for_next_epoch(&self) -> eyre::Result<()> {
         self.consensus_db.clear_table::<LastProposed>()?;
         self.consensus_db.clear_table::<Votes>()?;
         self.consensus_db.clear_table::<Certificates>()?;

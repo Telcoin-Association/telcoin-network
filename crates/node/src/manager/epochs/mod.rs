@@ -1,80 +1,86 @@
-//! The impl for node manager type's epoch functions.
+//! Per-epoch orchestration for the node manager.
 //!
-//! This oversees the tasks that run for each epoch. Some consensus-related
-//! tasks run for one epoch. Other resources are shared across epochs.
-//! This file defines the struct and the epoch scoped code.
+//! [`EpochManager`] itself lives in the sibling `node` module; this module is the per-epoch
+//! orchestrator that drives one epoch's lifecycle from the manager's lifetime-scoped loop.
+//!
+//! `run_epoch` runs a single epoch start to finish: read the committee and epoch info from chain,
+//! open the epoch's pack files, optionally replay consensus output missed before a restart,
+//! configure consensus, create the primary and worker consensus components, run until the epoch
+//! boundary or shutdown, close the epoch, and clear the epoch-scoped consensus DB tables so the
+//! next epoch starts clean. Each epoch's short-running tasks live on their own [`TaskManager`] that
+//! is torn down at the boundary; resources owned by the [`EpochManager`] (networks, DBs, channels)
+//! persist across epochs.
+//!
+//! The epoch-start setup and epoch-teardown sequences are split into the child `start` and `close`
+//! modules. This module also holds the helpers both of them call back into — `process_output`,
+//! `parse_listener_address_for_swarm`, `wait_for_network_peers` — plus the [`RunEpochMode`] /
+//! [`ReplayResult`] types that thread control flow through the loop.
 
-use crate::{
-    engine::ExecutionNode,
-    manager::EpochManager,
-    primary::PrimaryNode,
-    worker::{worker_task_manager_name, WorkerNode},
-    EngineToPrimaryRpc,
-};
-use eyre::{eyre, OptionExt};
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    sync::Arc,
-    time::Duration,
-};
-use tn_config::{Config, ConfigFmt, ConfigTrait as _, ConsensusConfig, NetworkConfig, TelcoinDirs};
+use crate::{engine::ExecutionNode, manager::EpochManager, worker::worker_task_manager_name};
+use std::{collections::HashSet, time::Duration};
+use tn_config::{NetworkConfig, TelcoinDirs};
 use tn_executor::subscriber::spawn_subscriber;
-use tn_network_libp2p::{error::NetworkError, types::NetworkHandle, TNMessage};
-use tn_primary::{
-    network::{PrimaryNetwork, PrimaryNetworkHandle},
-    ConsensusBus, NodeMode, StateSynchronizer,
-};
-use tn_reth::{
-    recover_raw_transaction,
-    system_calls::{
-        ConsensusRegistry::{self, EpochInfo},
-        EpochState,
-    },
-};
-use tn_rpc::RpcNodeInfo;
-use tn_storage::{
-    certificate_pack::CertificatePack,
-    tables::{
-        CertificateDigestByOrigin, CertificateDigestByRound, Certificates, LastProposed,
-        NodeBatchesCache, OurNodeBatchesCache, Payload, ProposedCertificates, Votes,
-    },
-};
+use tn_network_libp2p::{types::NetworkHandle, TNMessage};
+use tn_primary::ConsensusBus;
+use tn_storage::{certificate_pack::CertificatePack, tables::OurNodeBatchesCache};
 use tn_types::{
-    gas_accumulator::GasAccumulator, Batch, BatchValidation, BlockHash, BlsPublicKey, BlsSigner,
-    Committee, CommitteeBuilder, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput,
-    Database as TNDatabase, Epoch, EpochDigest, EpochRecord, Multiaddr, NetworkPublicKey, Notifier,
-    P2pNode, TaskJoinError, TaskManager, TaskSpawner, TnReceiver, DEFAULT_WORKER_ID,
+    gas_accumulator::GasAccumulator, BlsPublicKey, Committee, ConsensusHeaderDigest,
+    ConsensusOutput, Database as TNDatabase, EpochRecord, Multiaddr, NetworkPublicKey, Notifier,
+    TaskJoinError, TaskManager, TaskSpawner, TnReceiver,
 };
-use tn_worker::{quorum_waiter::QuorumWaiterTrait, Worker, WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, info_span, warn, Instrument};
+use tracing::{error, info, warn};
 mod close;
 mod start;
 
-/// The epoch-specific task manager name.
+/// Name of the per-epoch [`TaskManager`], created fresh and torn down each epoch.
 const EPOCH_TASK_MANAGER: &str = "Epoch Task Manager";
 
-/// Result from replaying missed consensus outputs.
+/// Outcome of replaying consensus output that was validated but not yet executed before a restart.
+///
+/// Replay happens before consensus is reconfigured, so both hashes describe progress made purely by
+/// re-forwarding persisted output to the engine. The two fields are independent: replay can cross
+/// the epoch boundary (`epoch_close_hash` set) without ever needing the caller to wait on a
+/// mid-epoch `last_replayed_hash`, and vice versa.
 struct ReplayResult {
-    /// If the epoch boundary was crossed during replay, this is the hash to close the epoch with.
+    /// Set when replay reached the epoch boundary: the consensus header hash the caller must close
+    /// the epoch with before starting the next one. Drives the replay-and-close early return.
     epoch_close_hash: Option<ConsensusHeaderDigest>,
-    /// The hash of the last consensus output that was actually forwarded to the engine.
+    /// Hash of the last output actually forwarded to the engine during replay, or `None` if
+    /// nothing was replayed. The caller waits on this (never on DB-latest, which may have been
+    /// persisted but never sent) to confirm execution caught up before live consensus resumes.
     last_replayed_hash: Option<ConsensusHeaderDigest>,
 }
 
-/// Modes for an epoch.
+/// Why `run_epoch` is being entered, and on exit what kind of transition just happened.
+///
+/// The manager's loop (`run_epochs` in the `node` module) passes one in to start an epoch and gets
+/// one back describing the boundary that was crossed, then feeds that returned mode into the next
+/// iteration. Two behaviors gate on it: whether to replay missed consensus on entry
+/// ([`RunEpochMode::replay_consensus`]) and whether this is the one-time process startup
+/// ([`RunEpochMode::initial_epoch`]).
 #[derive(Debug, Copy, Clone)]
-pub(crate) enum RunEpochMode {
-    /// This is the initial epoch when the system starts, will need to get established.
+pub(super) enum RunEpochMode {
+    /// First epoch after process start. Triggers the one-time network init and a consensus replay,
+    /// since output validated before the previous shutdown may still need to reach the engine.
     Initial,
-    /// We re-ran an epoch as a result of a node change (CVV is to far behind or CVV has caught up
-    /// for instance).
+    /// The epoch was re-entered for the same committee because the node's role changed mid-epoch
+    /// (e.g. a CVV that fell too far behind and must resync, or one that has caught back up)
+    /// rather than because the boundary was crossed. No replay: live consensus state is still
+    /// trusted.
     ModeChange,
-    /// This a fresh new epoch on an already running node.
+    /// A fresh epoch on an already-running node, entered after the previous epoch closed cleanly
+    /// at its boundary. Replays consensus as a safety net against a restart racing the
+    /// boundary.
     NewEpoch,
 }
 
 impl RunEpochMode {
+    /// Whether to re-forward consensus output persisted but possibly unexecuted before a restart.
+    ///
+    /// Skipped only for [`RunEpochMode::ModeChange`], where the node never went down and live state
+    /// is authoritative; the startup ([`RunEpochMode::Initial`]) and boundary-crossing
+    /// ([`RunEpochMode::NewEpoch`]) paths both replay because either could follow a crash.
     fn replay_consensus(&self) -> bool {
         match self {
             RunEpochMode::ModeChange => false,
@@ -82,6 +88,9 @@ impl RunEpochMode {
         }
     }
 
+    /// Whether this is the process's first epoch. Used as one input to the network-first-init
+    /// decision; the actual gate also accounts for the replay-and-close restart path, which can
+    /// defer real network setup past the [`RunEpochMode::Initial`] iteration.
     fn initial_epoch(&self) -> bool {
         matches!(self, RunEpochMode::Initial)
     }
@@ -92,8 +101,39 @@ where
     P: TelcoinDirs + Clone + 'static,
     DB: TNDatabase,
 {
-    /// Run a single epoch.
-    pub(crate) async fn run_epoch(
+    /// Drive one epoch from setup through teardown.
+    ///
+    /// Ordered phases:
+    /// 1. Build an epoch-scoped [`ConsensusBus`] over the application channels and read the
+    ///    committee plus epoch timing from chain (the epoch's primary does not exist yet). Derive
+    ///    `self.epoch_boundary` and backfill a dummy epoch-0 [`EpochRecord`] if missing so later
+    ///    lookups can treat epoch 0 like any other.
+    /// 2. Create the per-epoch [`TaskManager`] and open the epoch pack files via `open_epoch_pack`.
+    /// 3. If the mode calls for replay, re-forward any missed consensus output. If that replay
+    ///    crosses the epoch boundary, close the epoch immediately, clear the consensus DB, and
+    ///    return early as [`RunEpochMode::NewEpoch`] — consensus is never configured this
+    ///    iteration. Otherwise, block until the engine has executed the last replayed output before
+    ///    going live.
+    /// 4. Subscribe to consensus output, configure consensus, and create the primary/worker
+    ///    components. The one-time per-process network setup is gated on `network_first_init`,
+    ///    which is driven by `self.network_initialized` (not by [`RunEpochMode::Initial`]) so the
+    ///    replay-and-close return above can defer setup to a following iteration without skipping
+    ///    it.
+    /// 5. Start the primary (if this node is an active CVV), the subscriber, the worker batch
+    ///    builder, and the engine batch builder; reattach any orphaned batches.
+    /// 6. `tokio::select!` over three exits: node shutdown, the epoch boundary
+    ///    (`wait_for_epoch_boundary`), and the epoch task manager ending early (a CVV resync or a
+    ///    task error). Only the boundary arm closes the epoch and writes its [`EpochRecord`].
+    /// 7. Notify consensus shutdown, abort and drain the epoch task manager, then resolve the
+    ///    outcome. On a non-boundary exit, drain leftover output to the engine: if that drain hits
+    ///    the boundary, close the epoch here too. Clear epoch-scoped DB tables when a boundary was
+    ///    crossed.
+    ///
+    /// The returned [`RunEpochMode`] tells the caller (`run_epochs` in the `node` module) which
+    /// transition occurred: [`RunEpochMode::NewEpoch`] when the boundary was crossed (advance the
+    /// epoch), or [`RunEpochMode::ModeChange`] when the loop exited without crossing it (re-run the
+    /// same epoch, typically a role/resync change).
+    pub(super) async fn run_epoch(
         &mut self,
         engine: &ExecutionNode,
         network_config: &NetworkConfig,
@@ -347,7 +387,17 @@ where
         Ok(res)
     }
 
-    /// Open/re-use if open the epoch pack files for the current epoch.
+    /// Open (or reuse, if already open) the epoch pack files for the current epoch.
+    ///
+    /// Seeds the consensus chain for the new epoch, which requires the previous epoch's
+    /// [`EpochRecord`]. Resolving that record is the awkward part: it may already be in the DB, it
+    /// may be the synthetic epoch-0 filler, or it may be missing because a restart is catching up
+    /// across multiple boundaries faster than the epoch record collector can fetch records. In the
+    /// missing case this nudges `requested_missing_epoch` (only ever upward, never clobbering a
+    /// higher value already set by the gossip handler), pre-dials committee peers so the collector
+    /// has connections — without that pre-dial this blocks waiting for a record while the very task
+    /// that would supply it has not started — then waits up to 30s, erroring if it still does not
+    /// arrive.
     async fn open_epoch_pack(
         &mut self,
         committee: Committee,
@@ -426,6 +476,14 @@ where
         Ok(())
     }
 
+    /// Forward one consensus output to the engine and record progress.
+    ///
+    /// If the leader's commit timestamp has reached `self.epoch_boundary`, the output is flagged as
+    /// the epoch's close so the engine finalizes the epoch on execution. The output's batches are
+    /// evicted from [`OurNodeBatchesCache`] (they have reached execution, so we no longer need to
+    /// rebroadcast them), then the output is sent. `last_forwarded_consensus_number` is updated
+    /// only after the send succeeds, so the restart-replay and leftover-drain paths can rely on
+    /// it marking what actually reached the engine rather than what was merely dequeued.
     async fn process_output(
         &mut self,
         to_engine: &mpsc::Sender<ConsensusOutput>,
@@ -450,10 +508,13 @@ where
         Ok(())
     }
 
-    /// Monitor consensus output for the last block of the epoch.
+    /// Forward live consensus output until the epoch's final commit, then return its hash.
     ///
-    /// This method forwards all consensus output to the engine for execution.
-    /// Once the epoch boundary is reached, the manager initiates the epoch transitions.
+    /// Each output is handed to `process_output` for execution. The first output whose commit
+    /// timestamp reaches `self.epoch_boundary` is the epoch's last: it is flagged as the close,
+    /// stashed in `self.last_consensus_header`, forwarded, and its [`ConsensusHeaderDigest`]
+    /// returned so the caller can drive `close_epoch` and track execution to that point. Errors
+    /// only if the output stream ends before any boundary output arrives.
     async fn wait_for_epoch_boundary(
         &mut self,
         to_engine: &mpsc::Sender<ConsensusOutput>,
@@ -488,8 +549,11 @@ where
         Err(eyre::eyre!("invalid wait for epoch end"))
     }
 
-    /// Use accumulated gas information to set each workers base fee for the epoch.
-    /// Currently a no-op.
+    /// Recompute each worker's next-epoch base fee from the epoch's accumulated gas usage.
+    ///
+    /// Currently a no-op: it walks every worker's [`GasAccumulator`] totals but does not yet feed a
+    /// new base fee back into batch production. The loop is the seam where EIP-1559-style base fee
+    /// adjustment will hook in; until then base fees carry over unchanged.
     fn adjust_base_fees(&self, gas_accumulator: &GasAccumulator) {
         for worker_id in 0..gas_accumulator.num_workers() {
             let worker_id = worker_id as u16;
@@ -499,7 +563,14 @@ where
         }
     }
 
-    /// Close an epoch after wait_for_epoch_boundary returns.
+    /// Finalize an epoch once its boundary output has been identified.
+    ///
+    /// Begins shutting consensus down (when a [`Notifier`] is supplied) so it winds down in
+    /// parallel while the engine finishes executing up to `target_hash`, then blocks until that
+    /// execution is confirmed. Afterward it runs the (currently no-op) base fee adjustment and
+    /// clears the [`GasAccumulator`] so the next epoch starts from zero. Called both on the
+    /// normal boundary path and on the restart replay-and-close path, which passes `None`
+    /// because there is no live consensus to stop.
     async fn close_epoch(
         &self,
         shutdown_consensus: Option<Notifier>,
@@ -516,496 +587,13 @@ where
         Ok(())
     }
 
-    /// Configure consensus for the current epoch.
+    /// Resolve a swarm listener [`Multiaddr`] from an env var, falling back to a default.
     ///
-    /// This method reads the canonical tip to read the epoch information needed
-    /// to create the current committee and the consensus config.
-    async fn configure_consensus(
-        &mut self,
-        engine: &ExecutionNode,
-        network_config: &NetworkConfig,
-    ) -> eyre::Result<ConsensusConfig<DB>> {
-        // retrieve epoch information from canonical tip
-        let (committee, epoch_info, epoch_start) =
-            self.get_committee_with_epoch_start_info(engine).await?;
-        let validators = committee.bls_keys();
-
-        self.epoch_boundary = epoch_start + epoch_info.epochDuration as u64;
-        debug!(target: "epoch-manager", new_epoch_boundary=self.epoch_boundary, "resetting epoch boundary");
-
-        debug!(target: "epoch-manager", ?validators, "creating committee for validators");
-
-        let next_committee_keys = engine.validators_for_epoch(committee.epoch() + 1).await?;
-
-        // create config for consensus
-        let consensus_config = ConsensusConfig::new_for_epoch(
-            self.builder.tn_config.clone(),
-            self.consensus_db.clone(),
-            self.key_config.clone(),
-            committee,
-            network_config.clone(),
-            next_committee_keys,
-        )?;
-
-        Ok(consensus_config)
-    }
-
-    /// Create the [Committee] for the current epoch.
-    ///
-    /// This is the first step for configuring consensus.
-    async fn create_committee_from_state(
-        &self,
-        epoch: Epoch,
-        validators: HashMap<BlsPublicKey, &ConsensusRegistry::ValidatorInfo>,
-    ) -> eyre::Result<Committee> {
-        info!(target: "epoch-manager", "creating committee from state");
-
-        // the network must be live
-        let committee = if epoch == 0 {
-            // read from fs for genesis
-            Config::load_from_path_or_default::<Committee>(
-                self.tn_datadir.committee_path(),
-                ConfigFmt::YAML,
-            )?
-        } else {
-            let mut committee_builder = CommitteeBuilder::new(epoch);
-            for (key, bootstrap) in &self.bootstrap_servers {
-                committee_builder.add_bootstrap_server(
-                    *key,
-                    bootstrap.primary.clone(),
-                    bootstrap.worker.clone(),
-                );
-            }
-
-            for validator in validators {
-                committee_builder.add_authority(validator.0, validator.1.validatorAddress);
-            }
-            committee_builder.build()
-        };
-
-        Ok(committee)
-    }
-
-    /// Create a [PrimaryNode].
-    ///
-    /// This also creates the [PrimaryNetwork].
-    async fn create_primary_node_components(
-        &mut self,
-        consensus_config: &ConsensusConfig<DB>,
-        epoch_task_spawner: TaskSpawner,
-        initial_epoch: bool,
-        consensus_bus: ConsensusBus,
-        previous_committee_keys: HashSet<BlsPublicKey>,
-    ) -> eyre::Result<PrimaryNode<DB>> {
-        let state_sync = StateSynchronizer::new(
-            consensus_config.clone(),
-            consensus_bus.clone(),
-            epoch_task_spawner.clone(),
-        );
-        let network_handle = self
-            .primary_network_handle
-            .as_ref()
-            .ok_or_eyre("primary network handle missing from epoch manager")?
-            .clone();
-
-        // create the epoch-specific `PrimaryNetwork`
-        self.spawn_primary_network_for_epoch(
-            consensus_config,
-            state_sync.clone(),
-            epoch_task_spawner.clone(),
-            &network_handle,
-            initial_epoch,
-            consensus_bus.clone(),
-            previous_committee_keys,
-        )
-        .await?;
-
-        // spawn primary - create node and spawn network
-        let primary =
-            PrimaryNode::new(consensus_config.clone(), consensus_bus, network_handle, state_sync);
-
-        Ok(primary)
-    }
-
-    /// Create a [WorkerNode].
-    #[allow(clippy::too_many_arguments)]
-    async fn spawn_worker_node_components(
-        &mut self,
-        consensus_config: &ConsensusConfig<DB>,
-        engine: &ExecutionNode,
-        epoch_task_spawner: TaskSpawner,
-        initial_epoch: bool,
-        engine_to_primary: EngineToPrimaryRpc,
-        gas_accumulator: GasAccumulator,
-        previous_committee_keys: HashSet<BlsPublicKey>,
-    ) -> eyre::Result<WorkerNode<DB>> {
-        // only support one worker for now (with id 0) - otherwise, loop here
-        let worker_id = DEFAULT_WORKER_ID;
-        let base_fee = gas_accumulator.base_fee(worker_id);
-
-        // update the network handle's task spawner for reporting batches in the epoch
-        {
-            let network_handle = self
-                .worker_network_handle
-                .as_mut()
-                .ok_or_eyre("worker network handle missing from epoch manager")?;
-
-            network_handle.update_task_spawner(epoch_task_spawner.clone());
-            network_handle.update_epoch(consensus_config.committee().epoch());
-            // initialize worker components on startup
-            // This will use the new epoch_task_spawner and epoch on network_handle.
-            // Also initialize if workers are empty: this happens when the first epoch returns
-            // early from replay_missed_consensus (epoch boundary hit) before create_consensus
-            // is reached, leaving workers uninitialized.
-            if initial_epoch || !engine.are_workers_initialized().await {
-                engine
-                    .initialize_worker_components(
-                        worker_id,
-                        network_handle.clone(),
-                        engine_to_primary,
-                    )
-                    .await?;
-            } else {
-                // We updated our epoch task spawner so make sure worker network tasks are
-                // restarted.
-                engine.respawn_worker_network_tasks(network_handle.clone()).await;
-            }
-        }
-
-        let network_handle = self
-            .worker_network_handle
-            .as_ref()
-            .ok_or_eyre("worker network handle missing from epoch manager")?
-            .clone();
-
-        let validator = engine
-            .new_batch_validator(&worker_id, base_fee, consensus_config.committee().epoch())
-            .await;
-        self.spawn_worker_network_for_epoch(
-            consensus_config,
-            &worker_id,
-            validator.clone(),
-            epoch_task_spawner,
-            &network_handle,
-            initial_epoch,
-            previous_committee_keys,
-        )
-        .await?;
-
-        let worker = WorkerNode::new(
-            worker_id,
-            consensus_config.clone(),
-            network_handle.clone(),
-            validator,
-            self.consensus_chain.clone(),
-        );
-
-        Ok(worker)
-    }
-
-    /// Create the primary network for the specific epoch.
-    ///
-    /// This is not the swarm level, but the [PrimaryNetwork] interface.
-    #[allow(clippy::too_many_arguments)]
-    async fn spawn_primary_network_for_epoch(
-        &mut self,
-        consensus_config: &ConsensusConfig<DB>,
-        state_sync: StateSynchronizer<DB>,
-        epoch_task_spawner: TaskSpawner,
-        network_handle: &PrimaryNetworkHandle,
-        initial_epoch: bool,
-        consensus_bus: ConsensusBus,
-        previous_committee_keys: HashSet<BlsPublicKey>,
-    ) -> eyre::Result<()> {
-        // get event streams for the primary network handler
-        let rx_event_stream = self.consensus_bus.subscribe_primary_network_events();
-
-        // set committee for network to prevent banning
-        debug!(target: "epoch-manager", auth=?consensus_config.authority_id(), "spawning primary network for epoch");
-        let committee_keys: HashSet<BlsPublicKey> = consensus_config
-            .committee()
-            .authorities()
-            .into_iter()
-            .map(|a| *a.protocol_key())
-            .collect();
-
-        let bootstrap_peers = consensus_config
-            .committee()
-            .bootstrap_servers()
-            .iter()
-            .map(|(k, v)| (*k, v.primary.clone()))
-            .collect();
-        let next_committee_keys: HashSet<BlsPublicKey> =
-            consensus_config.next_committee_keys().iter().copied().collect();
-        Self::init_network_for_epoch(
-            network_handle.inner_handle(),
-            bootstrap_peers,
-            previous_committee_keys,
-            committee_keys.clone(),
-            next_committee_keys,
-            initial_epoch,
-        )
-        .await?;
-
-        // start listening if the network needs to be initialized
-        if initial_epoch {
-            let primary_address = Self::parse_listener_address_for_swarm(
-                "PRIMARY_LISTENER_MULTIADDR",
-                consensus_config.primary_networkkey(),
-                consensus_config.primary_address(),
-            )?;
-            info!(target: "epoch-manager", ?primary_address, "listening to {primary_address}");
-            network_handle.inner_handle().start_listening(primary_address).await?;
-        }
-
-        // update the authorized publishers for gossip every epoch
-        network_handle
-            .inner_handle()
-            .subscribe_with_publishers(
-                tn_config::LibP2pConfig::primary_topic(),
-                committee_keys.into_iter().collect(),
-            )
-            .await?;
-
-        if network_handle.connected_peers_count().await.unwrap_or(0) == 0
-            || self.consensus_bus.is_cvv()
-        {
-            // always dial peers for the new epoch
-            // do this if a CVV (may need to connect to the other CVVs) or if we don't have any
-            // peers if we are not a committee member and have peers then do not pester
-            // the committee
-            for (_authority_id, bls_pubkey) in consensus_config
-                .committee()
-                .others_primaries_by_id(consensus_config.authority_id().as_ref())
-            {
-                self.dial_peer_bls(
-                    network_handle.inner_handle().clone(),
-                    bls_pubkey,
-                    epoch_task_spawner.clone(),
-                );
-            }
-        }
-
-        Self::wait_for_network_peers(network_handle.inner_handle(), "primary network").await?;
-
-        // spawn primary network
-        PrimaryNetwork::new(
-            rx_event_stream,
-            network_handle.clone(),
-            consensus_config.clone(),
-            consensus_bus.app().clone(),
-            state_sync,
-            epoch_task_spawner.clone(), // tasks should abort with epoch
-            self.consensus_chain.clone(),
-        )
-        .spawn(&epoch_task_spawner);
-
-        Ok(())
-    }
-
-    /// Dial peer.
-    fn dial_peer_bls<Req: TNMessage, Res: TNMessage>(
-        &self,
-        handle: NetworkHandle<Req, Res>,
-        bls_pubkey: BlsPublicKey,
-        node_task_spawner: TaskSpawner,
-    ) {
-        if bls_pubkey == self.key_config.public_key() {
-            // Don't try to dial ourselves.
-            return;
-        }
-        // spawn dials on long-running task manager
-        let task_name = format!("DialPeer {bls_pubkey}");
-        node_task_spawner.spawn_task(task_name, async move {
-            let mut backoff = 1;
-            let mut retries = 0;
-
-            debug!(target: "epoch-manager", ?bls_pubkey, "dialing peer");
-            while let Err(e) = handle.dial_by_bls(bls_pubkey).await {
-                // ignore errors for peers that are already connected or being dialed
-                if matches!(e, NetworkError::AlreadyConnected(_))
-                    || matches!(e, NetworkError::AlreadyDialing(_))
-                {
-                    return Ok(());
-                }
-                retries += 1;
-
-                warn!(target: "epoch-manager", "failed to dial {bls_pubkey}: {e}");
-                tokio::time::sleep(Duration::from_secs(backoff)).await;
-                if backoff < 120 {
-                    backoff += backoff;
-                }
-                let peers = handle.connected_peer_count().await.unwrap_or(0);
-                // We have been trying for a while (at least two max backoffs at 120 secs), if we
-                // have any other peers give up.
-                if retries > 10 && peers > 0 {
-                    warn!(target = "dial_peer", "failed to reach peer {bls_pubkey}, giving up");
-                    return Ok(()); // failing to reach a peer is expected now and then
-                }
-            }
-            Ok(())
-        });
-    }
-
-    /// Create the worker network.
-    #[allow(clippy::too_many_arguments)]
-    async fn spawn_worker_network_for_epoch(
-        &mut self,
-        consensus_config: &ConsensusConfig<DB>,
-        worker_id: &u16,
-        validator: Arc<dyn BatchValidation>,
-        epoch_task_spawner: TaskSpawner,
-        network_handle: &WorkerNetworkHandle,
-        initial_epoch: bool,
-        previous_committee_keys: HashSet<BlsPublicKey>,
-    ) -> eyre::Result<()> {
-        // get event streams for the worker network handler
-        let rx_event_stream = self.worker_event_stream.subscribe();
-        debug!(target: "epoch-manager", "spawning worker network for epoch");
-
-        let committee_keys: HashSet<BlsPublicKey> = consensus_config
-            .committee()
-            .authorities()
-            .into_iter()
-            .map(|a| *a.protocol_key())
-            .collect();
-
-        let bootstrap_peers = consensus_config
-            .committee()
-            .bootstrap_servers()
-            .iter()
-            .map(|(k, v)| (*k, v.worker.clone()))
-            .collect();
-        let next_committee_keys: HashSet<BlsPublicKey> =
-            consensus_config.next_committee_keys().iter().copied().collect();
-        Self::init_network_for_epoch(
-            network_handle.inner_handle(),
-            bootstrap_peers,
-            previous_committee_keys,
-            committee_keys.clone(),
-            next_committee_keys,
-            initial_epoch,
-        )
-        .await?;
-
-        // start listening if the network needs to be initialized
-        if initial_epoch {
-            let worker_address = Self::parse_listener_address_for_swarm(
-                "WORKER_LISTENER_MULTIADDR",
-                consensus_config.primary_networkkey(),
-                consensus_config.worker_address(),
-            )?;
-            network_handle.inner_handle().start_listening(worker_address).await?;
-        }
-
-        let worker_address = consensus_config.worker_address();
-
-        // always attempt to dial peers for the new epoch
-        // the network's peer manager will intercept dial attempts for peers that are already
-        // connected
-        debug!(target: "epoch-manager", ?worker_address, "spawning worker network for epoch");
-        for (_, peer) in consensus_config
-            .committee()
-            .others_primaries_by_id(consensus_config.authority().as_ref().map(|a| a.id()).as_ref())
-        {
-            self.dial_peer_bls(
-                network_handle.inner_handle().clone(),
-                peer,
-                epoch_task_spawner.clone(),
-            );
-        }
-
-        Self::wait_for_network_peers(network_handle.inner_handle(), "worker network").await?;
-
-        // update the authorized publishers for gossip every epoch
-        network_handle
-            .inner_handle()
-            .subscribe(tn_config::LibP2pConfig::worker_txn_topic())
-            .await?;
-        // Get gossip from committee members about batches.
-        // Useful for non-CVVs to prefetch and harmless for CVVs.
-        network_handle
-            .inner_handle()
-            .subscribe_with_publishers(
-                tn_config::LibP2pConfig::worker_batch_topic(),
-                committee_keys.into_iter().collect(),
-            )
-            .await?;
-
-        // spawn worker network
-        WorkerNetwork::new(
-            rx_event_stream,
-            network_handle.clone(),
-            consensus_config.clone(),
-            *worker_id,
-            validator,
-            self.consensus_chain.clone(),
-        )
-        .spawn(&epoch_task_spawner);
-
-        Ok(())
-    }
-
-    /// Helper method to identify the node's mode:
-    /// - "Committee-voting Validator" (CVV)
-    /// - "Committee-voting Validator Inactive" (CVVInactive - syncing to rejoin)
-    /// - "Observer"
-    ///
-    /// This method also updates the `ConsensusBus::node_mode()`.
-    async fn identify_node_mode(
-        &self,
-        consensus_config: &ConsensusConfig<DB>,
-        consensus_bus: &ConsensusBus,
-    ) -> eyre::Result<NodeMode> {
-        if self.consensus_bus.is_cvv_inactive() {
-            // If we have an inactive mode then it was set so keep it for now.
-            return Ok(NodeMode::CvvInactive);
-        }
-        debug!(target: "epoch-manager", authority_id=?consensus_config.authority_id(), "identifying node mode..." );
-        let in_committee = consensus_config
-            .authority_id()
-            .map(|id| consensus_config.in_committee(&id))
-            .unwrap_or(false);
-        state_sync::prime_consensus(
-            consensus_bus.app(),
-            consensus_config,
-            self.consensus_chain.clone(),
-        )
-        .await;
-        let mode = if !in_committee || self.builder.tn_config.observer {
-            NodeMode::Observer
-        } else {
-            // Assume we are caught up, will be demoted to inactive if this is not true...
-            NodeMode::CvvActive
-        };
-
-        debug!(target: "epoch-manager", ?mode, "node mode identified");
-        // update consensus bus
-        self.consensus_bus.node_mode().send_modify(|v| *v = mode);
-
-        Ok(mode)
-    }
-
-    /// Clear the epoch-related tables for consensus.
-    ///
-    /// These tables are epoch-specific. Complete historic data is stored
-    /// in the `ConsensusChain` data store.
-    fn clear_consensus_db_for_next_epoch(&self) -> eyre::Result<()> {
-        self.consensus_db.clear_table::<LastProposed>()?;
-        self.consensus_db.clear_table::<Votes>()?;
-        self.consensus_db.clear_table::<Certificates>()?;
-        self.consensus_db.clear_table::<CertificateDigestByRound>()?;
-        self.consensus_db.clear_table::<CertificateDigestByOrigin>()?;
-        self.consensus_db.clear_table::<ProposedCertificates>()?;
-        self.consensus_db.clear_table::<Payload>()?;
-        self.consensus_db.clear_table::<NodeBatchesCache>()?;
-        // Note do not clear OurNodeBatchesCache here- we need to keep those until we process the
-        // orphans and clear then.
-        Ok(())
-    }
-
-    /// Helper method for parsing provided env var with fallback [Multiaddr]. This is useful to
-    /// override the primary/worker swarm listner address for cloud deployments.
+    /// Lets cloud deployments override the primary/worker listen address (e.g. to bind a
+    /// container's external address) without changing config. When the env var is set, the
+    /// parsed address has the node's [`NetworkPublicKey`] appended as a `/p2p/` component to
+    /// match the format produced by keytool generation; an unparseable value or one carrying a
+    /// conflicting `/p2p/` key is an error. When unset, `fallback` is returned as-is.
     fn parse_listener_address_for_swarm(
         env_var: &str,
         network_pubkey: NetworkPublicKey,
@@ -1033,33 +621,12 @@ where
             .unwrap_or(Ok(fallback))
     }
 
-    /// Initialize a network handle for a new epoch.
+    /// Block until the given [`NetworkHandle`] has at least one connected peer.
     ///
-    /// On the initial epoch this registers bootstrap peers and starts listening (the one-time,
-    /// per-process setup gated on `initial_epoch`). Every epoch sets the
-    /// previous/current/next committee slots directly from authoritative state via
-    /// `update_committees`.
-    ///
-    /// On the initial epoch, bootstrap peers must be added BEFORE `update_committees` so that
-    /// `known_peers` is populated when the peer manager resolves the committees.
-    async fn init_network_for_epoch<Req: TNMessage, Res: TNMessage>(
-        handle: &NetworkHandle<Req, Res>,
-        bootstrap_peers: BTreeMap<BlsPublicKey, P2pNode>,
-        previous_committee_keys: HashSet<BlsPublicKey>,
-        committee_keys: HashSet<BlsPublicKey>,
-        next_committee_keys: HashSet<BlsPublicKey>,
-        initial_epoch: bool,
-    ) -> eyre::Result<()> {
-        if initial_epoch {
-            handle.add_bootstrap_peers(bootstrap_peers).await?;
-        }
-        handle
-            .update_committees(previous_committee_keys, committee_keys, next_committee_keys)
-            .await?;
-        Ok(())
-    }
-
-    /// Block until the network has connected to at least one peer, with retries.
+    /// Polls the peer count every 500ms, logging periodically, and gives up after 240 attempts
+    /// (~2 minutes) with an error rather than letting epoch startup hang forever on a network that
+    /// cannot bootstrap. Generic over the [`TNMessage`] request/response types so it serves both
+    /// the primary and worker networks.
     async fn wait_for_network_peers<Req: TNMessage, Res: TNMessage>(
         handle: &NetworkHandle<Req, Res>,
         network_name: &str,
