@@ -48,6 +48,8 @@ use tn_types::{
 use tn_worker::{quorum_waiter::QuorumWaiterTrait, Worker, WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, info_span, warn, Instrument};
+mod close;
+mod start;
 
 /// The epoch-specific task manager name.
 const EPOCH_TASK_MANAGER: &str = "Epoch Task Manager";

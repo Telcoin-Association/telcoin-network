@@ -28,8 +28,7 @@ use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-mod epoch;
-use epoch::RunEpochMode;
+use super::epochs::RunEpochMode;
 
 /// The long-running task manager name.
 const NODE_TASK_MANAGER: &str = "Node Task Manager";
