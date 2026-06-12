@@ -116,14 +116,7 @@ pub struct ConsensusPack {
     error: watch::Receiver<Option<PackError>>,
     epoch: Epoch,
     committee: Committee,
-}
-
-/// In case of an error consume the command loop so any waiting calls will error out.
-fn clear_pack_loop(mut rx: Receiver<PackMessage>) {
-    rx.close();
-    while let Ok(msg) = rx.try_recv() {
-        drop(msg);
-    }
+    compression: PackCompression,
 }
 
 fn run_pack_loop(
@@ -211,17 +204,17 @@ impl ConsensusPack {
         let path: PathBuf = path.into();
         let (tx_error, error) = watch::channel(None);
         let epoch = committee.epoch();
-        let committee_clone = committee.clone();
-        let handle = std::thread::spawn(move || {
-            match Inner::open_append(path, &previous_epoch, committee_clone) {
-                Ok(inner) => run_pack_loop(inner, rx, tx_error),
-                Err(e) => {
-                    tx_error.send_replace(Some(e));
-                    clear_pack_loop(rx);
-                }
-            }
-        });
-        Ok(Self { tx, handle: Arc::new(Mutex::new(Some(handle))), error, epoch, committee })
+        let inner = Inner::open_append(path.clone(), &previous_epoch, committee.clone())?;
+        let compression = inner.data.header().compression();
+        let handle = std::thread::spawn(move || run_pack_loop(inner, rx, tx_error));
+        Ok(Self {
+            tx,
+            handle: Arc::new(Mutex::new(Some(handle))),
+            error,
+            epoch,
+            committee,
+            compression,
+        })
     }
 
     /// Open up the files for previous epoch in append mode.  Will fail if files do not exist.
@@ -230,9 +223,17 @@ impl ConsensusPack {
         let path: PathBuf = path.into();
         let (tx_error, error) = watch::channel(None);
         let inner = Inner::open_append_exists(path.clone(), epoch)?;
+        let compression = inner.data.header().compression();
         let committee = inner.epoch_meta.committee.clone();
         let handle = std::thread::spawn(move || run_pack_loop(inner, rx, tx_error));
-        Ok(Self { tx, handle: Arc::new(Mutex::new(Some(handle))), error, epoch, committee })
+        Ok(Self {
+            tx,
+            handle: Arc::new(Mutex::new(Some(handle))),
+            error,
+            epoch,
+            committee,
+            compression,
+        })
     }
 
     /// Open up the static files for previous epoch.  These will be read only.
@@ -243,9 +244,17 @@ impl ConsensusPack {
         let path: PathBuf = path.into();
         let (tx_error, error) = watch::channel(None);
         let inner = Inner::open_static(path.clone(), epoch)?;
+        let compression = inner.data.header().compression();
         let committee = inner.epoch_meta.committee.clone();
         let handle = std::thread::spawn(move || run_pack_loop(inner, rx, tx_error));
-        Ok(Self { tx, handle: Arc::new(Mutex::new(Some(handle))), error, epoch, committee })
+        Ok(Self {
+            tx,
+            handle: Arc::new(Mutex::new(Some(handle))),
+            error,
+            epoch,
+            committee,
+            compression,
+        })
     }
 
     /// Create a new set of epoch static files to write consensus output into.
@@ -269,11 +278,19 @@ impl ConsensusPack {
             timeout,
         )
         .await?;
+        let compression = inner.data.header().compression();
         let committee = inner.epoch_meta.committee.clone();
         let handle = std::thread::spawn(move || {
             run_pack_loop(inner, rx, tx_error);
         });
-        Ok(Self { tx, handle: Arc::new(Mutex::new(Some(handle))), error, epoch, committee })
+        Ok(Self {
+            tx,
+            handle: Arc::new(Mutex::new(Some(handle))),
+            error,
+            epoch,
+            committee,
+            compression,
+        })
     }
 
     /// Return the epoch for this pack file.
@@ -312,8 +329,7 @@ impl ConsensusPack {
         };
         let cursor = Cursor::new(bytes);
         let reader = BufReader::new(cursor);
-        bytes_to_output(reader, PackCompression::ZStd, Duration::from_secs(5), &self.committee)
-            .await
+        bytes_to_output(reader, self.compression, Duration::from_secs(5), &self.committee).await
     }
 
     /// True if consensus header by digest is found by digest.
@@ -587,24 +603,21 @@ impl Inner {
             // This code should only effect OG testnet nodes and should not need
             // to be maintained forever.
             let mut old_idx: PositionIndex<u64> =
-                PositionIndex::open_pdx_file(&base_dir, data.header(), "index.pdx", false)
+                PositionIndex::open_pdx_file(&base_dir, data.header(), "index.pdx", true)
                     .map_err(OpenError::IndexFileOpen)?;
-            let _ = std::fs::remove_dir_all(base_dir.join("index_pos.pdx.tmp"));
+            let _ = std::fs::remove_file(base_dir.join("index_pos.pdx.tmp"));
             let mut new_idx: PositionIndex<IndexPositions> =
-                PositionIndex::open_pdx_file(&base_dir, data.header(), "index_pos.pdx.tmp", true)
+                PositionIndex::open_pdx_file(&base_dir, data.header(), "index_pos.pdx.tmp", false)
                     .map_err(OpenError::IndexFileOpen)?;
             for i in 0..old_idx.len() {
                 let idx = i as u64;
                 let pos = old_idx.load(idx)?;
                 let start = if idx > 0 {
-                    if let Ok(prev_pos) = old_idx.load(idx - 1) {
-                        let record_size = data.record_size(prev_pos)?;
-                        prev_pos + record_size as u64
-                    } else {
-                        DATA_HEADER_BYTES as u64
-                    }
+                    let prev_pos = old_idx.load(idx - 1)?;
+                    let record_size = data.record_size(prev_pos)?;
+                    prev_pos + record_size as u64
                 } else {
-                    DATA_HEADER_BYTES as u64
+                    DATA_HEADER_BYTES as u64 + data.record_size(DATA_HEADER_BYTES as u64)? as u64
                 };
                 let record_size = data.record_size(pos)?;
                 let end = pos + record_size as u64;
@@ -614,7 +627,7 @@ impl Inner {
             }
             drop(new_idx);
             std::fs::rename(base_dir.join("index_pos.pdx.tmp"), base_dir.join("index_pos.pdx"))?;
-            let _ = std::fs::remove_dir_all(base_dir.join("index.pdx"));
+            let _ = std::fs::remove_file(base_dir.join("index.pdx"));
         }
         let consensus_pos_idx =
             PositionIndex::open_pdx_file(&base_dir, data.header(), "index_pos.pdx", read_only)
@@ -1073,19 +1086,18 @@ impl Inner {
 
     fn read_last_committed(&mut self) -> Result<HashMap<AuthorityIdentifier, Round>, PackError> {
         let mut res = HashMap::new();
-        if let Ok(iter) = self.consensus_pos_idx.rev_iter(50) {
-            for pos in iter {
-                let pos = pos?;
-                let block = self.data.fetch(pos.consensus_header)?.into_consensus()?;
-                let id = block.sub_dag.leader().author().clone();
-                let round = block.sub_dag.leader_round();
-                let headers = block.sub_dag.headers();
-                res.entry(id).and_modify(|r| *r = max(*r, round)).or_insert_with(|| round);
-                for h in headers {
-                    res.entry(h.author().clone())
-                        .and_modify(|r| *r = max(*r, h.round()))
-                        .or_insert_with(|| h.round());
-                }
+        let iter = self.consensus_pos_idx.rev_iter(50)?;
+        for pos in iter {
+            let pos = pos?;
+            let block = self.data.fetch(pos.consensus_header)?.into_consensus()?;
+            let id = block.sub_dag.leader().author().clone();
+            let round = block.sub_dag.leader_round();
+            let headers = block.sub_dag.headers();
+            res.entry(id).and_modify(|r| *r = max(*r, round)).or_insert_with(|| round);
+            for h in headers {
+                res.entry(h.author().clone())
+                    .and_modify(|r| *r = max(*r, h.round()))
+                    .or_insert_with(|| h.round());
             }
         }
         Ok(res)
@@ -1094,18 +1106,17 @@ impl Inner {
     fn read_latest_commit_with_final_reputation_scores(
         &mut self,
     ) -> Result<Option<CommittedSubDag>, PackError> {
-        if let Ok(iter) = self.consensus_pos_idx.rev_iter(1000) {
-            for pos in iter {
-                let pos = pos?;
-                let commit = self.data.fetch(pos.consensus_header)?.into_consensus()?.sub_dag;
-                // found a final of schedule score, so we'll return that
-                if commit.reputation_scores().final_of_schedule {
-                    debug!(
-                        "Found latest final reputation scores: {:?} from commit",
-                        commit.reputation_scores(),
-                    );
-                    return Ok(Some(commit));
-                }
+        let iter = self.consensus_pos_idx.rev_iter(1000)?;
+        for pos in iter {
+            let pos = pos?;
+            let commit = self.data.fetch(pos.consensus_header)?.into_consensus()?.sub_dag;
+            // found a final of schedule score, so we'll return that
+            if commit.reputation_scores().final_of_schedule {
+                debug!(
+                    "Found latest final reputation scores: {:?} from commit",
+                    commit.reputation_scores(),
+                );
+                return Ok(Some(commit));
             }
         }
         debug!("No final reputation scores have been found");
@@ -1174,7 +1185,8 @@ impl Inner {
     }
 }
 
-/// Create a new set of epoch static files to write consensus output into.
+/// Take an async stream of bytes that in pack file representation of ConsensusOutput and return the
+/// ConsensusOutput.
 pub async fn bytes_to_output<R: AsyncRead + Unpin>(
     stream: R,
     compression: PackCompression,
@@ -1187,7 +1199,7 @@ pub async fn bytes_to_output<R: AsyncRead + Unpin>(
     iter_to_output(&mut stream_iter, timeout, committee).await
 }
 
-/// Create a new set of epoch static files to write consensus output into.
+/// Take an iter over PackRecords that represent a ConsensusOutput and return the ConsensusOutput.
 async fn iter_to_output<R: AsyncRead + Unpin>(
     stream_iter: &mut AsyncPackIter<PackRecord, R>,
     timeout: Duration,
