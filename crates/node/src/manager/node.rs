@@ -10,6 +10,7 @@ use crate::{
     engine::{ExecutionNode, TnBuilder},
     health::HealthcheckServer,
     manager::spawn_epoch_vote_collector,
+    metrics::EpochMetrics,
 };
 use eyre::eyre;
 use state_sync::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_recent_consensus};
@@ -29,7 +30,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 mod epoch;
-use epoch::RunEpochMode;
+pub(crate) use epoch::RunEpochMode;
 
 /// The long-running task manager name.
 const NODE_TASK_MANAGER: &str = "Node Task Manager";
@@ -95,6 +96,9 @@ pub(crate) struct EpochManager<P, DB> {
 
     /// The version string for the running node.
     version_str: &'static str,
+
+    /// Prometheus metrics for the epoch lifecycle.
+    metrics: EpochMetrics,
 }
 
 /// Restore the [`GasAccumulator`] state after a mid-epoch restart.
@@ -231,6 +235,7 @@ where
             consensus_chain,
             bootstrap_servers,
             version_str,
+            metrics: EpochMetrics::default(),
         }
     }
 
@@ -321,6 +326,30 @@ where
         // spawn node healthcheck service if enabled
         if let Some(port) = self.builder.healthcheck {
             let _ = HealthcheckServer::spawn(node_task_manager.get_spawner(), port).await;
+        }
+
+        // spawn prometheus metrics endpoint if enabled
+        //
+        // bind errors are propagated (unlike healthcheck) - the operator explicitly
+        // requested the endpoint, so failing to serve it should fail startup
+        if let Some(addr) = self.builder.metrics {
+            let db = self.reth_db.clone();
+            let hooks = tn_metrics::MetricsHooks::default()
+                .with_hook(move || tn_reth::report_db_metrics(&db));
+            tn_metrics::start_metrics_server(
+                addr,
+                &node_task_manager.get_spawner(),
+                self.version_str,
+                hooks,
+            )
+            .await?;
+
+            // mirror consensus watch channels (rounds, heights, node mode) into gauges
+            tn_primary::spawn_bus_metrics_mirror(
+                &self.consensus_bus,
+                &node_task_manager.get_spawner(),
+                self.node_shutdown.subscribe(),
+            );
         }
 
         // Do a sanity check, request any pack files for complete epochs we are missing.

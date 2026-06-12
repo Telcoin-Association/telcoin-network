@@ -124,6 +124,13 @@ where
             self.accept_verified_certificates(unlocked).await?;
         }
 
+        // gauge certificates parked awaiting missing parents
+        self.consensus_bus
+            .app()
+            .metrics()
+            .certificates_pending
+            .set(self.pending.num_pending() as f64);
+
         result
     }
 

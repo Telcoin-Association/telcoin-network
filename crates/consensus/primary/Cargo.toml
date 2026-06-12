@@ -34,6 +34,8 @@ tn-network-libp2p = { workspace = true }
 roaring = { workspace = true }
 serde = { workspace = true }
 async-trait = { workspace = true }
+metrics = { workspace = true }
+reth-metrics = { workspace = true }
 
 # test-utils
 tn-reth = { workspace = true, features = ["test-utils"], optional = true }
@@ -43,6 +45,7 @@ tempfile = { workspace = true, optional = true }
 [dev-dependencies]
 async-trait = { workspace = true }
 futures = { workspace = true }
+metrics-util = { workspace = true }
 proptest = { workspace = true }
 tracing = { workspace = true }
 tn-storage = { workspace = true, features = ["test-utils"] }

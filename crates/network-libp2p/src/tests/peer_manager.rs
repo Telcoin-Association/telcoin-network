@@ -26,7 +26,10 @@ fn create_test_peer_manager(network_config: Option<NetworkConfig>) -> PeerManage
     let mut authorities = all_nodes.authorities();
     let authority_1 = authorities.next().expect("first authority");
     let config = authority_1.consensus_config();
-    PeerManager::new(config.network_config().peer_config())
+    PeerManager::new(
+        config.network_config().peer_config(),
+        crate::metrics::PeerManagerMetrics::new_for(&crate::types::NetworkType::Primary),
+    )
 }
 
 /// Helper function to extract events of a certain type
@@ -547,7 +550,10 @@ async fn test_is_validator() {
     let mut authorities = all_nodes.authorities();
     let authority_1 = authorities.next().expect("first authority");
     let config = authority_1.consensus_config();
-    let mut peer_manager = PeerManager::new(config.network_config().peer_config());
+    let mut peer_manager = PeerManager::new(
+        config.network_config().peer_config(),
+        crate::metrics::PeerManagerMetrics::new_for(&crate::types::NetworkType::Primary),
+    );
     let validator = *authority_1.authority().protocol_key();
     let validator_peer_id: PeerId = config.key_config().primary_network_public_key().into();
     let random_peer_id = PeerId::random();

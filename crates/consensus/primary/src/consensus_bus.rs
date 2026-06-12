@@ -3,8 +3,8 @@
 //! arguments.
 
 use crate::{
-    certificate_fetcher::CertificateFetcherCommand, proposer::OurDigestMessage,
-    state_sync::CertificateManagerCommand, RecentBlocks,
+    certificate_fetcher::CertificateFetcherCommand, metrics::PrimaryMetrics,
+    proposer::OurDigestMessage, state_sync::CertificateManagerCommand, RecentBlocks,
 };
 use parking_lot::Mutex;
 use std::{
@@ -239,6 +239,11 @@ pub struct ConsensusBusAppInner {
         Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(EpochRecord, EpochRecord)>>>,
     /// Channel to request consensus headers to cache.
     consensus_request_queue: QueChannel<(Epoch, u64, ConsensusHeaderDigest)>,
+    /// Prometheus metrics for the primary's consensus pipeline.
+    ///
+    /// Lives on the app-lifetime bus because the bus already reaches every consensus
+    /// component (proposer, certifier, certificate manager, consensus driver).
+    metrics: PrimaryMetrics,
 }
 
 /// The thread-safe inner type that holds all the channels for inner-consensus
@@ -299,6 +304,9 @@ impl ConsensusBusApp {
                 epoch_request_queue_tx,
                 epoch_request_queue_rx,
                 consensus_request_queue: QueChannel::new(),
+                // new_with_labels (not Default): binds to the recorder active at bus
+                // construction instead of caching the first-bound recorder process-wide
+                metrics: PrimaryMetrics::new_with_labels(Vec::<metrics::Label>::new()),
             }),
         }
     }
@@ -338,6 +346,11 @@ impl ConsensusBusApp {
                 false
             }
         })
+    }
+
+    /// Prometheus metrics handles for the primary's consensus pipeline.
+    pub fn metrics(&self) -> &PrimaryMetrics {
+        &self.inner.metrics
     }
 
     /// Signals a new round

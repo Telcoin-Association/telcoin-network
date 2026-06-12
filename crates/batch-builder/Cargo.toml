@@ -19,10 +19,13 @@ tokio = { workspace = true, features = ["sync", "time"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 eyre = { workspace = true }
+metrics = { workspace = true }
+reth-metrics = { workspace = true }
 
 [dev-dependencies]
 # unit tests
 assert_matches = { workspace = true }
+metrics-util = { workspace = true }
 tempfile = { workspace = true }
 tn-reth = { workspace = true, features = ["test-utils"] }
 

@@ -175,6 +175,7 @@ pub async fn spawn_fetch_consensus(
                     continue;
                 }
                 info!(target: "state-sync", "epoch consensus fetcher {task_index} retrieving epoch {epoch}");
+                crate::STATE_SYNC_METRICS.epoch_pack_fetches_total.increment(1);
                 let mut attempts = 1;
                 loop {
                     tokio::select! {
