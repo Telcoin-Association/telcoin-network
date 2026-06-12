@@ -65,7 +65,7 @@ pub use alloy::{
     rpc::types::{AccessList, Withdrawals},
     signers::Signature as EthSignature,
     sol,
-    sol_types::{SolType, SolValue},
+    sol_types::{SolCall, SolType, SolValue},
 };
 pub use libp2p::{multiaddr::Protocol, Multiaddr};
 pub use reth_primitives::{
