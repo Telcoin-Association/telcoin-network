@@ -1477,6 +1477,7 @@ pub(crate) mod test {
         collections::VecDeque,
         fs::{File, OpenOptions},
         io::{Seek as _, SeekFrom},
+        path::Path,
         sync::Arc,
         time::Duration,
     };
@@ -1491,7 +1492,12 @@ pub(crate) mod test {
     };
 
     use crate::{
-        consensus_pack::{ConsensusPack, Inner},
+        archive::{
+            index::Index as _,
+            pack::{DataHeader, PackCompression},
+            position_index::index::PositionIndex,
+        },
+        consensus_pack::{ConsensusPack, IndexPositions, Inner},
         mem_db::MemDatabase,
     };
 
@@ -1891,6 +1897,141 @@ pub(crate) mod test {
         .expect("stream import");
         compare_outputs(&pack.get_consensus_output(1).await.expect("dup batch output"), &output_1);
         compare_outputs(&pack.get_consensus_output(2).await.expect("output after dup"), &output_2);
+        drop(pack);
+    }
+
+    /// Convert a pack directory's position index into the legacy format written by older
+    /// nodes: an "index.pdx" of u64 consensus header positions and no "index_pos.pdx".
+    /// The pack data file is identical between the two formats so this faithfully
+    /// recreates an old pack directory for migration testing.
+    fn make_legacy_index(epoch_dir: &Path) {
+        let idx_dir = epoch_dir.join("idx");
+        let header = DataHeader::new(0, PackCompression::ZStd);
+        let mut new_idx: PositionIndex<IndexPositions> =
+            PositionIndex::open_pdx_file(&idx_dir, &header, "index_pos.pdx", true)
+                .expect("open new index");
+        let mut old_idx: PositionIndex<u64> =
+            PositionIndex::open_pdx_file(&idx_dir, &header, "index.pdx", false)
+                .expect("open legacy index");
+        assert!(old_idx.is_empty(), "legacy index must start empty");
+        for i in 0..new_idx.len() as u64 {
+            let positions = new_idx.load(i).expect("new index entry");
+            old_idx.save(i, positions.consensus_header).expect("save legacy entry");
+        }
+        old_idx.sync().expect("sync legacy index");
+        drop(old_idx);
+        drop(new_idx);
+        std::fs::remove_file(idx_dir.join("index_pos.pdx")).expect("remove new index");
+    }
+
+    /// Test the one time migration of a legacy position index (consensus header positions
+    /// only) to the new index containing consensus output byte ranges.  Covers the append
+    /// path, the read only static path and recovery from a stale tmp file left by a crash
+    /// between the tmp write and the rename.
+    #[tokio::test]
+    async fn test_consensus_pack_index_migration() {
+        let temp_dir = TempDir::with_prefix("test_consensus_pack_migration").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        let idx_dir = epoch_dir.join("idx");
+
+        // Build a pack with the current format.
+        let pack =
+            ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone())
+                .expect("open pack");
+        let num_outputs = 10;
+        let mut outputs = Vec::new();
+        let mut parent = ConsensusHeader::default().digest();
+        for i in 0..num_outputs {
+            let output = make_test_output(&committee, i % 4, chain.clone(), i as u64 + 1, parent);
+            parent = output.digest().into();
+            outputs.push(output.clone());
+            pack.save_consensus_output(output).await.unwrap();
+        }
+        pack.persist().await.expect("persist");
+        drop(pack);
+
+        // Migrate on the append path.  Reading the first output verifies the migrated
+        // byte range starts after the EpochMeta record.
+        make_legacy_index(&epoch_dir);
+        assert!(PositionIndex::<u64>::pdx_file_exists(&idx_dir, "index.pdx"));
+        assert!(!PositionIndex::<u64>::pdx_file_exists(&idx_dir, "index_pos.pdx"));
+        let pack =
+            ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone())
+                .expect("open legacy pack for append");
+        assert!(
+            PositionIndex::<u64>::pdx_file_exists(&idx_dir, "index_pos.pdx"),
+            "migration creates the new index"
+        );
+        assert!(
+            !PositionIndex::<u64>::pdx_file_exists(&idx_dir, "index.pdx"),
+            "migration removes the old index"
+        );
+        for (i, output) in outputs.iter().enumerate() {
+            let output_db = pack
+                .get_consensus_output(i as u64 + 1)
+                .await
+                .expect(&format!("output {} after append migration", i + 1));
+            compare_outputs(&output_db, output);
+        }
+        // The pack keeps working for new appends after migration.
+        let output = make_test_output(&committee, 0, chain.clone(), num_outputs as u64 + 1, parent);
+        outputs.push(output.clone());
+        pack.save_consensus_output(output).await.unwrap();
+        let output_db = pack
+            .get_consensus_output(num_outputs as u64 + 1)
+            .await
+            .expect("appended output after migration");
+        compare_outputs(&output_db, outputs.last().unwrap());
+        pack.persist().await.expect("persist");
+        drop(pack);
+
+        // Migrate on the read only static path.
+        make_legacy_index(&epoch_dir);
+        let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open legacy pack static");
+        for (i, output) in outputs.iter().enumerate() {
+            let output_db = pack
+                .get_consensus_output(i as u64 + 1)
+                .await
+                .expect(&format!("output {} after static migration", i + 1));
+            compare_outputs(&output_db, output);
+        }
+        drop(pack);
+
+        // Migrate with a stale partial tmp file left by a "crash" between the tmp write
+        // and the rename.  The migration must discard it and rebuild.
+        make_legacy_index(&epoch_dir);
+        {
+            let header = DataHeader::new(0, PackCompression::ZStd);
+            let mut stale: PositionIndex<IndexPositions> =
+                PositionIndex::open_pdx_file(&idx_dir, &header, "index_pos.pdx.tmp", false)
+                    .expect("open stale tmp");
+            stale.save(0, IndexPositions::new(1, 1, 1)).expect("save stale entry");
+            stale.sync().expect("sync stale tmp");
+        }
+        assert!(PositionIndex::<u64>::pdx_file_exists(&idx_dir, "index_pos.pdx.tmp"));
+        let pack =
+            ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone())
+                .expect("open legacy pack with stale tmp");
+        assert!(
+            !PositionIndex::<u64>::pdx_file_exists(&idx_dir, "index_pos.pdx.tmp"),
+            "stale tmp removed by migration"
+        );
+        for (i, output) in outputs.iter().enumerate() {
+            let output_db = pack
+                .get_consensus_output(i as u64 + 1)
+                .await
+                .expect(&format!("output {} after stale tmp migration", i + 1));
+            compare_outputs(&output_db, output);
+        }
         drop(pack);
     }
 }
