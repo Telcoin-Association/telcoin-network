@@ -222,7 +222,7 @@ impl<T: PosIndexValue> Index<u64, T> for PositionIndex<T> {
                 self.len()
             )))
         } else {
-            let mut buffer = [0_u8; 32];
+            let mut buffer = [0_u8; VALUE_MAX_BYTES];
             let buffer_len = T::buffer_len();
             value.encode(&mut buffer[0..buffer_len]);
             self.pdx_file.write_all(&buffer[0..buffer_len])?;
@@ -234,7 +234,7 @@ impl<T: PosIndexValue> Index<u64, T> for PositionIndex<T> {
         let buffer_len = T::buffer_len();
         let pos = PDX_HEADER_SIZE as u64 + (key * buffer_len as u64);
         self.pdx_file.seek(SeekFrom::Start(pos))?;
-        let mut buf = [0_u8; 32];
+        let mut buf = [0_u8; VALUE_MAX_BYTES];
         self.pdx_file.read_exact(&mut buf[..buffer_len])?;
         T::decode(&buf[..buffer_len])
     }
@@ -276,7 +276,7 @@ impl<T: PosIndexValue> Iterator for PositionIter<T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if !self.done {
-            let mut buf = [0_u8; 32];
+            let mut buf = [0_u8; VALUE_MAX_BYTES];
             let buffer_len = T::buffer_len();
             buf[..buffer_len].copy_from_slice(&self.data[self.pos..self.pos + buffer_len]);
             if self.reverse {
@@ -292,6 +292,10 @@ impl<T: PosIndexValue> Iterator for PositionIter<T> {
         }
     }
 }
+
+/// The max number of bytes an implementor of PosIndexValue can encode into, decode from.
+/// PosIndexValue::buffer_len() can not exceed this value- other code will panic if so.
+const VALUE_MAX_BYTES: usize = 32;
 
 /// Trait that index values must implement in order to encode/decode themselves
 /// into bytes to read/write to disk.

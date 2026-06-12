@@ -32,6 +32,7 @@ use tokio::{
 use tracing::{debug, error, warn};
 
 use crate::archive::{
+    data_file::fsync_directory,
     digest_index::index::HdxIndex,
     error::{fetch::FetchError, open::OpenError},
     fxhasher::FxHasher,
@@ -617,15 +618,21 @@ impl Inner {
                 } else {
                     DATA_HEADER_BYTES as u64 + data.record_size(DATA_HEADER_BYTES as u64)? as u64
                 };
-                let pos = old_idx.load(idx)?;
-                let record_size = data.record_size(pos)?;
+                let Ok(pos) = old_idx.load(idx) else {
+                    break;
+                };
+                let Ok(record_size) = data.record_size(pos) else {
+                    break;
+                };
                 end = pos + record_size as u64;
                 new_idx
                     .save(idx, IndexPositions::new(pos, start, end))
                     .map_err(|e| PackError::IndexAppend(format!("batch {e}")))?;
             }
             drop(new_idx);
+            drop(old_idx);
             std::fs::rename(base_dir.join("index_pos.pdx.tmp"), base_dir.join("index_pos.pdx"))?;
+            fsync_directory(&base_dir)?;
             let _ = std::fs::remove_file(base_dir.join("index.pdx"));
         }
         let consensus_pos_idx =
@@ -1262,12 +1269,9 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
             return Ok(ConsensusOutput::new_with_subdag(sub_dag, parent_hash, header.number));
         }
 
-        let mut batch_set: HashSet<BlockHash> = HashSet::new();
-
         let mut batch_digests = VecDeque::with_capacity(num_certs);
         for header in sub_dag.headers() {
             for (digest, _) in header.payload().iter() {
-                batch_set.insert(*digest);
                 batch_digests.push_back(*digest);
             }
         }
