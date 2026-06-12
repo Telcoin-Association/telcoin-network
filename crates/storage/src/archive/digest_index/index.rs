@@ -741,7 +741,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> Drop for HdxIndex<KSIZE, S> {
     }
 }
 
-impl<const KSIZE: usize, S: BuildHasher + Default> Index<B256> for HdxIndex<KSIZE, S> {
+impl<const KSIZE: usize, S: BuildHasher + Default> Index<B256, u64> for HdxIndex<KSIZE, S> {
     fn save(&mut self, key: B256, record_pos: u64) -> Result<(), AppendError> {
         if self.read_only {
             Err(AppendError::ReadOnly)

@@ -130,8 +130,10 @@ async fn test_consensus_store_read_latest_final_reputation_scores() {
     }
 
     // WHEN we try to read the final schedule. The one of sub dag sequence 12 should be returned
-    let commit =
-        consensus_chain.read_latest_commit_with_final_reputation_scores(committee.epoch()).await;
+    let commit = consensus_chain
+        .read_latest_commit_with_final_reputation_scores(committee.epoch())
+        .await
+        .unwrap();
 
     // THEN no commit is returned
     assert!(commit.is_none());
@@ -155,6 +157,7 @@ async fn test_consensus_store_read_latest_final_reputation_scores() {
     let commit = consensus_chain
         .read_latest_commit_with_final_reputation_scores(committee.epoch())
         .await
+        .unwrap()
         .unwrap();
 
     assert!(commit.reputation_scores().final_of_schedule);
