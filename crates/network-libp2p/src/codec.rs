@@ -13,11 +13,22 @@ use std::{
 };
 use tn_types::encode_into_buffer;
 
+/// Maximum number of bytes pulled from the wire in a single read while streaming in the compressed
+/// body.
+///
+/// Reading the body in bounded increments keeps committed memory proportional to the bytes that
+/// have actually arrived rather than to the attacker-declared length prefix.
+const BODY_READ_CHUNK_SIZE: usize = 8 * 1024;
+
 /// Decode a single length-prefixed, snappy-compressed BCS message from an async reader.
 ///
 /// Wire format: `[4-byte uncompressed_len][4-byte compressed_len][compressed_data]`
 ///
 /// The caller provides reusable buffers to avoid repeated allocation.
+///
+/// The length prefixes are only used to bound the read; the buffers grow with the bytes that
+/// actually arrive, so a peer that declares a large body and then withholds it cannot force a large
+/// up-front allocation.
 pub async fn decode_message<T, M>(
     io: &mut T,
     decode_buffer: &mut Vec<u8>,
@@ -55,17 +66,38 @@ where
         ));
     }
 
-    // resize buffers to reported sizes
-    decode_buffer.resize(uncompressed_len, 0);
-    compressed_buffer.resize(compressed_len, 0);
+    // Stream the compressed body in bounded chunks so committed memory tracks the bytes that
+    // actually arrive rather than the attacker-declared `compressed_len`. A peer that declares a
+    // large body but withholds it stalls here holding only what it has sent, until the request
+    // timeout reaps the stream, instead of forcing a large zero-filled allocation up front.
+    let mut remaining = compressed_len;
+    let mut chunk = [0u8; BODY_READ_CHUNK_SIZE];
+    while remaining > 0 {
+        let want = remaining.min(chunk.len());
+        let read = io.read(&mut chunk[..want]).await?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "compressed body shorter than reported compressed size",
+            ));
+        }
+        compressed_buffer.extend_from_slice(&chunk[..read]);
+        remaining -= read;
+    }
 
-    // read compressed data
-    io.read_exact(compressed_buffer).await?;
-
-    // decompress
+    // Decompress, bounding the output to the validated `uncompressed_len` so a malformed snappy
+    // stream cannot expand past `max_message_size`, and growing `decode_buffer` only as bytes are
+    // produced rather than committing it up front.
     let reader = std::io::Cursor::new(&*compressed_buffer);
-    let mut decoder = FrameDecoder::new(reader);
-    decoder.read_exact(decode_buffer)?;
+    let mut decoder = FrameDecoder::new(reader).take(uncompressed_len as u64);
+    decoder.read_to_end(decode_buffer)?;
+
+    // the decompressed output must match the reported uncompressed length
+    if decode_buffer.len() != uncompressed_len {
+        return Err(std::io::Error::other(
+            "decompressed size does not match reported uncompressed size",
+        ));
+    }
 
     // deserialize
     bcs::from_bytes(decode_buffer).map_err(std::io::Error::other)
