@@ -1545,6 +1545,75 @@ pub(crate) mod test {
         )
     }
 
+    /// Make a test output with two certificates from different authorities that share one
+    /// batch digest.  The shared batch is only stored once in the pack file but must be
+    /// assigned to both certificates when the output is rebuilt.
+    fn make_test_output_shared_batch(
+        committee: &Committee,
+        chain: Arc<RethChainSpec>,
+        number: u64,
+        parent: ConsensusHeaderDigest,
+    ) -> ConsensusOutput {
+        let mut batches = tn_reth::test_utils::batches(chain, 3);
+        let batch_2 = batches.pop().expect("three batches");
+        let batch_1 = batches.pop().expect("three batches");
+        let batch_0 = batches.pop().expect("three batches");
+
+        let authorities = committee.authorities();
+        let authority_a = authorities.first().expect("first in 4 auth committee");
+        let authority_b = authorities.get(1).expect("second in 4 auth committee");
+
+        let mut cert_a = Certificate::default();
+        cert_a.update_header_author_for_test(authority_a.id());
+        for batch in [&batch_0, &batch_1] {
+            let builder =
+                HeaderBuilder::from_header(cert_a.header()).with_payload_batch(batch, 0_u16);
+            cert_a.update_header_for_test(builder.build());
+        }
+        cert_a.update_header_round_for_test(1);
+        cert_a.update_header_epoch_for_test(committee.epoch());
+
+        let mut cert_b = Certificate::default();
+        cert_b.update_header_author_for_test(authority_b.id());
+        // batch_1 is shared with cert_a's payload.
+        for batch in [&batch_1, &batch_2] {
+            let builder =
+                HeaderBuilder::from_header(cert_b.header()).with_payload_batch(batch, 0_u16);
+            cert_b.update_header_for_test(builder.build());
+        }
+        cert_b.update_header_round_for_test(1);
+        cert_b.update_header_epoch_for_test(committee.epoch());
+
+        let sub_dag = CommittedSubDag::new(
+            vec![cert_a.clone(), cert_b.clone()],
+            cert_b,
+            1,
+            ReputationScores::default(),
+            None,
+        );
+        let batch_digests: VecDeque<BlockHash> =
+            [batch_0.digest(), batch_1.digest(), batch_1.digest(), batch_2.digest()]
+                .into_iter()
+                .collect();
+        ConsensusOutput::new(
+            sub_dag,
+            parent,
+            number,
+            false,
+            batch_digests,
+            vec![
+                CertifiedBatch {
+                    address: authority_a.execution_address(),
+                    batches: vec![batch_0, batch_1.clone()],
+                },
+                CertifiedBatch {
+                    address: authority_b.execution_address(),
+                    batches: vec![batch_1, batch_2],
+                },
+            ],
+        )
+    }
+
     pub(crate) fn compare_outputs(output1: &ConsensusOutput, output2: &ConsensusOutput) {
         assert_eq!(output1.digest(), output2.digest(), "Consensus Output have different hashes");
         assert_eq!(
@@ -1760,5 +1829,68 @@ pub(crate) mod test {
         let stream2_len = stream.seek(SeekFrom::End(0)).expect("stream length");
         drop(stream);
         assert_eq!(stream_len, stream2_len);
+    }
+
+    /// Regression test: one batch digest referenced by two certificates within a single
+    /// consensus output.  The batch is stored once in the pack file and must be assigned
+    /// to both certificates when the output is rebuilt (previously failed with
+    /// PackError::MissingBatch).
+    #[tokio::test]
+    async fn test_consensus_pack_dup_batch_across_certs() {
+        let temp_dir = TempDir::with_prefix("test_consensus_pack_dup").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let pack =
+            ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone())
+                .expect("open pack");
+
+        // Output 1 contains the shared batch, output 2 is a normal output to confirm
+        // the pack continues cleanly after a duplicate.
+        let output_1 = make_test_output_shared_batch(
+            &committee,
+            chain.clone(),
+            1,
+            ConsensusHeader::default().digest(),
+        );
+        let output_2 = make_test_output(&committee, 2, chain.clone(), 2, output_1.digest().into());
+        pack.save_consensus_output(output_1.clone()).await.unwrap();
+        pack.save_consensus_output(output_2.clone()).await.unwrap();
+
+        compare_outputs(&pack.get_consensus_output(1).await.expect("dup batch output"), &output_1);
+        compare_outputs(&pack.get_consensus_output(2).await.expect("output after dup"), &output_2);
+        pack.persist().await.expect("persist");
+        drop(pack);
+
+        // Read back through the read only static path.
+        let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static");
+        compare_outputs(&pack.get_consensus_output(1).await.expect("dup batch output"), &output_1);
+        compare_outputs(&pack.get_consensus_output(2).await.expect("output after dup"), &output_2);
+        drop(pack);
+
+        // Stream into a new pack (peer epoch sync path) and read back.
+        let temp_dir2 = TempDir::with_prefix("test_consensus_pack_dup2").expect("temp dir");
+        let stream = tokio::fs::File::open(temp_dir.path().join("epoch-0").join(Inner::DATA_NAME))
+            .await
+            .expect("log file");
+        let pack = ConsensusPack::stream_import(
+            temp_dir2.path(),
+            stream,
+            0,
+            &previous_epoch,
+            2,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("stream import");
+        compare_outputs(&pack.get_consensus_output(1).await.expect("dup batch output"), &output_1);
+        compare_outputs(&pack.get_consensus_output(2).await.expect("output after dup"), &output_2);
+        drop(pack);
     }
 }
