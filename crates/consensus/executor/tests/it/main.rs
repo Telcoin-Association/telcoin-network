@@ -82,7 +82,8 @@ async fn test_output_to_header() -> eyre::Result<()> {
         &mut consensus_chain,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     )
-    .await;
+    .await
+    .unwrap();
     let bullshark = Bullshark::new(
         committee.clone(),
         num_sub_dags_per_schedule,
@@ -104,10 +105,11 @@ async fn test_output_to_header() -> eyre::Result<()> {
         &consensus_bus,
         bullshark,
         &task_manager,
-        consensus_chain,
+        &consensus_chain,
         None,
     )
-    .await;
+    .await
+    .unwrap();
 
     // forward certificates to trigger subdag commit
     for certificate in certificates.iter() {
@@ -195,7 +197,8 @@ async fn test_executor_output_ordering() -> eyre::Result<()> {
         &mut consensus_chain,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     )
-    .await;
+    .await
+    .unwrap();
     let bullshark = Bullshark::new(
         committee.clone(),
         num_sub_dags_per_schedule,
@@ -217,10 +220,11 @@ async fn test_executor_output_ordering() -> eyre::Result<()> {
         &consensus_bus,
         bullshark,
         &task_manager2,
-        consensus_chain.clone(),
+        &consensus_chain,
         None,
     )
-    .await;
+    .await
+    .unwrap();
 
     for certificate in certificates.iter() {
         consensus_bus.new_certificates().send(certificate.clone()).await.unwrap();
@@ -299,7 +303,8 @@ async fn test_executor_batch_fetching() -> eyre::Result<()> {
         &mut consensus_chain,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     )
-    .await;
+    .await
+    .unwrap();
     let bullshark = Bullshark::new(
         committee.clone(),
         num_sub_dags_per_schedule,
@@ -321,10 +326,11 @@ async fn test_executor_batch_fetching() -> eyre::Result<()> {
         &consensus_bus,
         bullshark,
         &task_manager2,
-        consensus_chain,
+        &consensus_chain,
         None,
     )
-    .await;
+    .await
+    .unwrap();
 
     for certificate in certificates.iter() {
         consensus_bus.new_certificates().send(certificate.clone()).await.unwrap();
@@ -491,7 +497,8 @@ async fn test_duplicate_batch_digest() -> eyre::Result<()> {
         &mut consensus_chain,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     )
-    .await;
+    .await
+    .unwrap();
     let bullshark = Bullshark::new(
         committee.clone(),
         num_sub_dags_per_schedule,
@@ -513,10 +520,11 @@ async fn test_duplicate_batch_digest() -> eyre::Result<()> {
         &consensus_bus,
         bullshark,
         &task_manager2,
-        consensus_chain,
+        &consensus_chain,
         None,
     )
-    .await;
+    .await
+    .unwrap();
 
     // feed all certificates to trigger subdag commits
     for certificate in all_certificates.iter() {

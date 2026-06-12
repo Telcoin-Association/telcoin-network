@@ -182,6 +182,24 @@ where
         })
     }
 
+    /// Open the iterator using reader as a data source.
+    /// Produces an iterator over all the (key, values).  All and records
+    /// are returned in insert order.
+    /// This version only expects a chunk of records not a complete pack file (no header for
+    /// instance).
+    pub async fn open_partial(
+        reader: R,
+        compression: PackCompression,
+    ) -> Result<Self, LoadHeaderError> {
+        Ok(AsyncPackIter {
+            _val: PhantomData,
+            reader,
+            buffer: Vec::new(),
+            decompress_buffer: Vec::new(),
+            compression,
+        })
+    }
+
     /// Read the next record or return an error if an overflow bucket.
     /// This expects the file cursor to be positioned at the records first byte.
     async fn read_record_file(

@@ -37,6 +37,10 @@ pub enum TnEngineError {
     /// The output's leader is unknown.
     #[error("Unknown authority for block rewards {0}")]
     UnknownAuthority(AuthorityIdentifier),
+    /// A ConsensusOutput produced a different number of batches and batch digests.
+    /// This should not happen outside of a bug in ConsensusOutput production...
+    #[error("Uneven number of sealed blocks from batches and batch digests, batches {0}, batch digests {1}")]
+    ConsensusOutputUnevenBatches(usize, usize),
 }
 
 impl From<oneshot::error::RecvError> for TnEngineError {
