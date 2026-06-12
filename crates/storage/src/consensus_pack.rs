@@ -599,28 +599,27 @@ impl Inner {
             && !PositionIndex::<T>::pdx_file_exists(&base_dir, "index_pos.pdx")
         {
             warn!(target: "consensus_pack", "Found old but not new position index, updating");
-            // We have an old index but , need to create a new one and build it.
+            // We have an old index but, need to create a new one and build it.
             // This code should only effect OG testnet nodes and should not need
             // to be maintained forever.
             let mut old_idx: PositionIndex<u64> =
-                PositionIndex::open_pdx_file(&base_dir, data.header(), "index.pdx", true)
+                PositionIndex::open_pdx_file(&base_dir, data.header(), "index.pdx", false)
                     .map_err(OpenError::IndexFileOpen)?;
             let _ = std::fs::remove_file(base_dir.join("index_pos.pdx.tmp"));
             let mut new_idx: PositionIndex<IndexPositions> =
                 PositionIndex::open_pdx_file(&base_dir, data.header(), "index_pos.pdx.tmp", false)
                     .map_err(OpenError::IndexFileOpen)?;
+            let mut end = 0;
             for i in 0..old_idx.len() {
                 let idx = i as u64;
-                let pos = old_idx.load(idx)?;
                 let start = if idx > 0 {
-                    let prev_pos = old_idx.load(idx - 1)?;
-                    let record_size = data.record_size(prev_pos)?;
-                    prev_pos + record_size as u64
+                    end
                 } else {
                     DATA_HEADER_BYTES as u64 + data.record_size(DATA_HEADER_BYTES as u64)? as u64
                 };
+                let pos = old_idx.load(idx)?;
                 let record_size = data.record_size(pos)?;
-                let end = pos + record_size as u64;
+                end = pos + record_size as u64;
                 new_idx
                     .save(idx, IndexPositions::new(pos, start, end))
                     .map_err(|e| PackError::IndexAppend(format!("batch {e}")))?;
