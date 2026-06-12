@@ -76,6 +76,9 @@ async fn test_epoch_boundary_inner(
         timeout(Duration::from_secs((EPOCH_DURATION * 2 + 11) as u64), pending.watch()).await??;
     }
 
+    // cross-check the `tn` namespace ConsensusRegistry endpoints against direct eth_call reads
+    assert_tn_registry_endpoints(&provider).await?;
+
     // retrieve current committee
     let consensus_registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &provider);
     let mut current_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
@@ -173,6 +176,81 @@ async fn test_epoch_boundary_inner(
         // return error if loop didn't return
         Err(eyre::eyre!("new validator not shuffled into committee!"))
     }
+}
+
+/// Cross-check the `tn` namespace ConsensusRegistry endpoints against direct `eth_call` reads.
+///
+/// Both read paths resolve state at the canonical tip, so results must match modulo an epoch
+/// rolling between requests (handled by retrying).
+async fn assert_tn_registry_endpoints<P: Provider>(provider: &P) -> eyre::Result<()> {
+    let consensus_registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, provider);
+
+    // the epoch can roll between reads, so retry until all reads land in the same epoch
+    let mut attempts = 0;
+    let epoch_info = loop {
+        let from_contract = consensus_registry.getCurrentEpochInfo().call().await?;
+        let from_tn: ConsensusRegistry::EpochInfo =
+            provider.raw_request("tn_getCurrentEpochInfo".into(), ()).await?;
+        let epoch_from_tn: u32 = provider.raw_request("tn_getCurrentEpoch".into(), ()).await?;
+        if from_tn == from_contract && epoch_from_tn == from_tn.epochId {
+            break from_tn;
+        }
+        attempts += 1;
+        assert!(
+            attempts < 3,
+            "tn registry endpoints never converged with eth_call reads: \
+             tn={from_tn:?} contract={from_contract:?} epoch={epoch_from_tn}"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
+
+    // all validators regardless of status
+    let validators: Vec<ConsensusRegistry::ValidatorInfo> =
+        provider.raw_request("tn_getValidators".into(), ("Any",)).await?;
+    assert!(!validators.is_empty(), "tn_getValidators(\"Any\") returned no validators");
+
+    // `Undefined` (0) reverts on-chain: expect an eth_call-style error (code 3 with revert
+    // bytes in `data`) rather than a leaked internal error string
+    let revert_err = provider
+        .raw_request::<_, Vec<ConsensusRegistry::ValidatorInfo>>(
+            "tn_getValidators".into(),
+            ("Undefined",),
+        )
+        .await
+        .expect_err("tn_getValidators(\"Undefined\") must revert");
+    let resp = revert_err.as_error_resp().expect("revert surfaces as a JSON-RPC error response");
+    assert_eq!(resp.code, 3, "on-chain revert must map to code 3: {resp:?}");
+    assert!(
+        resp.message.starts_with("execution reverted"),
+        "revert message must match eth_call style: {resp:?}"
+    );
+    assert!(resp.as_revert_data().is_some(), "revert bytes must be in error data: {resp:?}");
+
+    // a guaranteed-absent epoch record returns EIP-1474 resource-not-found
+    let not_found_err = provider
+        .raw_request::<_, (EpochRecord, EpochCertificate)>("tn_epochRecord".into(), (u32::MAX,))
+        .await
+        .expect_err("epoch record for u32::MAX must not exist");
+    let resp = not_found_err.as_error_resp().expect("not found surfaces as a JSON-RPC error");
+    assert_eq!(resp.code, -32001, "missing record must map to -32001: {resp:?}");
+
+    // round-trip a known validator: committee members are guaranteed to be registered
+    let known_validator =
+        *epoch_info.committee.first().ok_or_else(|| eyre::eyre!("empty committee"))?;
+    let from_contract = consensus_registry.getValidator(known_validator).call().await?;
+    let from_tn: ConsensusRegistry::ValidatorInfo =
+        provider.raw_request("tn_getValidator".into(), (known_validator,)).await?;
+    assert_eq!(from_tn, from_contract, "tn_getValidator mismatch for {known_validator}");
+
+    // concurrent-burst smoke test: fire 3x the 64-permit semaphore bound at once.
+    // the RPC-layer guard must queue excess reads (not reject), so every request resolves Ok.
+    // catches deadlock or spurious rejection in the acquire-before-spawn path.
+    let burst = (0..192).map(|_| provider.raw_request::<_, u32>("tn_getCurrentEpoch".into(), ()));
+    for res in futures::future::join_all(burst).await {
+        res.expect("tn_getCurrentEpoch must succeed under concurrent load");
+    }
+
+    Ok(())
 }
 
 async fn loop_epochs(start: u32, iterations: u32, rpc_url: &str) -> eyre::Result<u32> {

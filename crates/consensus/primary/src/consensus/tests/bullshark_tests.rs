@@ -432,7 +432,7 @@ async fn commit_one() {
             .unwrap();
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
-    Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain, None).await;
+    Consensus::spawn(config, &cb, bullshark, &task_manager, &consensus_chain, None).await.unwrap();
     let dummy_parent = SealedHeader::new(ExecHeader::default(), B256::default());
     cb.app().recent_blocks().send_modify(|blocks| {
         blocks.push_latest(
@@ -503,7 +503,7 @@ async fn dead_node() {
     });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
-    Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain, None).await;
+    Consensus::spawn(config, &cb, bullshark, &task_manager, &consensus_chain, None).await.unwrap();
 
     let cb_clone = cb.clone();
     // Feed all certificates to the consensus.
@@ -638,7 +638,7 @@ async fn not_enough_support() {
     });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
-    Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain, None).await;
+    Consensus::spawn(config, &cb, bullshark, &task_manager, &consensus_chain, None).await.unwrap();
 
     // Feed all certificates to the consensus. Only the last certificate should trigger
     // commits, so the task should not block.
@@ -738,7 +738,7 @@ async fn missing_leader() {
     });
     let mut rx_output = cb.subscribe_sequence();
     let task_manager = TaskManager::default();
-    Consensus::spawn(config, &cb, bullshark, &task_manager, consensus_chain, None).await;
+    Consensus::spawn(config, &cb, bullshark, &task_manager, &consensus_chain, None).await.unwrap();
 
     // Feed all certificates to the consensus. We should only commit upon receiving the last
     // certificate, so calls below should not block the task.
@@ -811,15 +811,9 @@ async fn committed_round_after_restart() {
         let mut rx_primary = cb.subscribe_committed_own_headers();
         let mut rx_output = cb.subscribe_sequence();
         let mut task_manager = TaskManager::default();
-        Consensus::spawn(
-            config.clone(),
-            &cb,
-            bullshark,
-            &task_manager,
-            consensus_chain.clone(),
-            None,
-        )
-        .await;
+        Consensus::spawn(config.clone(), &cb, bullshark, &task_manager, &consensus_chain, None)
+            .await
+            .unwrap();
 
         // When `input_round` is 2 * r + 1, r > 1, the previous commit round would be 2 * (r - 1),
         // and the expected commit round after sending in certificates up to `input_round` would
@@ -1074,15 +1068,9 @@ async fn restart_with_new_committee() {
         });
         let mut rx_output = cb.subscribe_sequence();
         let mut task_manager = TaskManager::default();
-        Consensus::spawn(
-            config.clone(),
-            &cb,
-            bullshark,
-            &task_manager,
-            consensus_chain.clone(),
-            None,
-        )
-        .await;
+        Consensus::spawn(config.clone(), &cb, bullshark, &task_manager, &consensus_chain, None)
+            .await
+            .unwrap();
 
         // Make certificates for rounds 1 and 2.
         let genesis =

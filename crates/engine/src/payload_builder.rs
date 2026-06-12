@@ -53,6 +53,13 @@ pub fn execute_consensus_output(
         output.batch_digests().len(),
         "uneven number of sealed blocks from batches and batch digests"
     );
+    // This should maybe panic but for prod code at least error out since this an invalid condition.
+    if batches.len() != output.batch_digests().len() {
+        return Err(TnEngineError::ConsensusOutputUnevenBatches(
+            batches.len(),
+            output.batch_digests().len(),
+        ));
+    }
 
     // ensure at least 1 block for empty output when close_epoch is true
     let mut executed_blocks = Vec::with_capacity(batches.len().max(1));

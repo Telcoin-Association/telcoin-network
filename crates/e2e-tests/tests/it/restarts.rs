@@ -485,6 +485,14 @@ fn test_observer_late_join_catchup() -> eyre::Result<()> {
     let key = get_key("test-source");
     let to_account = address_from_word("late-join-target");
     send_and_confirm(&client_urls[0], &client_urls[1], &key, to_account, 0)?;
+
+    // node1 confirmed the first transfer (EL block 1). The next call reads its baseline
+    // balance from node2, so wait for node2 to catch up to that block first — otherwise a
+    // stale baseline of 0 makes `expected` 10 TEL too low while the confirm poll observes
+    // the full 20 TEL, failing the assertion. Mirrors the barrier in run_observer_tests.
+    let target_block = get_block_number(&client_urls[1])?;
+    wait_for_block(&client_urls[2], target_block)?;
+
     send_and_confirm(&client_urls[1], &client_urls[2], &key, to_account, 1)?;
 
     // Record current validator consensus height

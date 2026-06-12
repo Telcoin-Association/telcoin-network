@@ -16,8 +16,11 @@ jsonrpsee-types = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }
 
 [dev-dependencies]
+alloy = { workspace = true }
 
 [lints]
 workspace = true

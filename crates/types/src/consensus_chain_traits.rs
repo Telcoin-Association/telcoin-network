@@ -81,14 +81,14 @@ pub trait ConsensusChainReader: Send + Sync + Clone + 'static {
     fn read_last_committed(
         &self,
         epoch: Epoch,
-    ) -> impl Future<Output = HashMap<AuthorityIdentifier, Round>> + Send;
+    ) -> impl Future<Output = eyre::Result<HashMap<AuthorityIdentifier, Round>>> + Send;
 
     /// Read the final committed sub dag of `epoch` together with its
     /// finalised reputation scores.
     fn read_latest_commit_with_final_reputation_scores(
         &self,
         epoch: Epoch,
-    ) -> impl Future<Output = Option<CommittedSubDag>> + Send;
+    ) -> impl Future<Output = eyre::Result<Option<CommittedSubDag>>> + Send;
 
     /// Load a consensus output from the current epoch by number.
     fn get_consensus_output_current(

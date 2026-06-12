@@ -6,6 +6,7 @@
 
 use std::fmt::Debug;
 use thiserror::Error;
+use tn_primary::consensus::ConsensusError;
 use tn_storage::StoreError;
 use tn_types::{AuthorityIdentifier, BlockHash, HeaderDigest, WorkerId};
 
@@ -137,4 +138,8 @@ pub enum SubscriberError {
     /// are behaving correctly and may indicate either a worker bug or data corruption.
     #[error("A fetched batch is missing from the collection: {0}")]
     MissingFetchedBatch(BlockHash),
+
+    /// An error from spawning consensus.
+    #[error("Consensus error (from spawn): {0}")]
+    Consensus(#[from] ConsensusError),
 }

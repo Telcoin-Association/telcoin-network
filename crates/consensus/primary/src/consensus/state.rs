@@ -12,12 +12,11 @@ use std::{
 use tn_config::ConsensusConfig;
 use tn_storage::{
     certificate_pack::{CertificatePack, PackError},
-    consensus::ConsensusChain,
     CertificateStore,
 };
 use tn_types::{
-    now, AuthorityIdentifier, Certificate, CommittedSubDag, Committee, Database, Hash as _,
-    HeaderDigest, Noticer, Round, TaskManager, TnReceiver, TnSender,
+    now, AuthorityIdentifier, Certificate, CommittedSubDag, Committee, ConsensusChainReader,
+    Database, Hash as _, HeaderDigest, Noticer, Round, TaskManager, TnReceiver, TnSender,
 };
 use tracing::{debug, error, info, instrument};
 
@@ -282,13 +281,13 @@ impl<DB: Database> Consensus<DB> {
         consensus_bus: &ConsensusBus,
         protocol: Bullshark,
         task_manager: &TaskManager,
-        consensus_chain: ConsensusChain,
+        consensus_chain: &impl ConsensusChainReader,
         certificate_pack: Option<CertificatePack>,
-    ) {
+    ) -> Result<(), ConsensusError> {
         let rx_shutdown = consensus_config.shutdown().subscribe();
         // The consensus state (everything else is immutable).
         let current_epoch = consensus_config.epoch();
-        let recovered_last_committed = consensus_chain.read_last_committed(current_epoch).await;
+        let recovered_last_committed = consensus_chain.read_last_committed(current_epoch).await?;
 
         debug!(target: "epoch-manager", ?recovered_last_committed, "recovered last committed for epoch {}", current_epoch);
         let last_committed_round = recovered_last_committed
@@ -349,6 +348,7 @@ impl<DB: Database> Consensus<DB> {
                 Ok(s.run(rx_new_certificates).await?)
             });
         }
+        Ok(())
     }
 
     async fn run(
