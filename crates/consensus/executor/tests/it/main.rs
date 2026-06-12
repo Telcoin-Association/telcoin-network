@@ -18,9 +18,10 @@ use tn_primary::{
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
 use tn_test_utils::{create_signed_certificates_for_rounds, CommitteeFixture};
 use tn_types::{
-    now, test_chain_spec_arc, Batch, BlockHash, ConsensusHeaderDigest, ConsensusNumHash,
-    ExecHeader, Hash as _, HeaderBuilder, HeaderDigest, SealedHeader, TaskManager, TnReceiver as _,
-    TnSender as _, WorkerId, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    now, test_chain_spec_arc, Batch, BlockHash, CommittedSubDag, ConsensusHeaderDigest,
+    ConsensusNumHash, ExecHeader, Hash as _, HeaderBuilder, HeaderDigest, ReputationScores,
+    SealedHeader, TaskManager, TnReceiver as _, TnSender as _, WorkerId, B256,
+    DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::sync::mpsc;
 
@@ -554,6 +555,156 @@ async fn test_duplicate_batch_digest() -> eyre::Result<()> {
         "Expected at least {expected_outputs} outputs, got {outputs_received}"
     );
     assert!(found_shared_digest, "The shared batch digest should appear in at least one output");
+
+    Ok(())
+}
+
+/// Test a single output containing one batch digest referenced by two certificates.
+///
+/// The subscriber must clone the duplicate so `batch_digests` and the flattened batches
+/// stay aligned: every flattened index maps to its own digest (block digest/mix hash
+/// binding) and the final index satisfies `close_epoch_for_last_batch` (epoch closing
+/// system calls).  Feeds a crafted subdag directly to the subscriber, bypassing Bullshark,
+/// so the duplicate is deterministically within one output.
+#[tokio::test]
+async fn test_subscriber_dup_batch_across_certs() -> eyre::Result<()> {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config().clone();
+    let task_manager = TaskManager::new("dup batch alignment tests");
+    let rx_shutdown = config.shutdown().subscribe();
+    let consensus_bus = ConsensusBus::new();
+    let temp_dir = TempDir::with_prefix("test_subscriber_dup_batch").unwrap();
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
+
+    let mut consensus_output = consensus_bus.app().subscribe_consensus_output();
+
+    // network mock to handle publish commands
+    let (tx, mut rx) = mpsc::channel(5);
+    tokio::spawn(async move {
+        while let Some(com) = rx.recv().await {
+            if let NetworkCommand::Publish { topic: _, msg: _, reply } = com {
+                reply.send(Ok(MessageId::new(&[0]))).unwrap();
+            }
+        }
+    });
+    let network = PrimaryNetworkHandle::new_for_test(tx);
+
+    spawn_subscriber(
+        config.clone(),
+        rx_shutdown,
+        consensus_bus.clone(),
+        &task_manager,
+        network,
+        consensus_chain.clone(),
+        u64::max_value(),
+    );
+    tokio::task::yield_now().await;
+
+    // three batches; batch_1 is shared between the two certificates
+    let chain = test_chain_spec_arc();
+    let batch_0 = tn_reth::test_utils::batch(chain.clone());
+    let batch_1 = tn_reth::test_utils::batch(chain.clone());
+    let batch_2 = tn_reth::test_utils::batch(chain);
+    let mock_batches: HashMap<BlockHash, Batch> = [
+        (batch_0.digest(), batch_0.clone()),
+        (batch_1.digest(), batch_1.clone()),
+        (batch_2.digest(), batch_2.clone()),
+    ]
+    .into_iter()
+    .collect();
+    let mock_client = Arc::new(MockPrimaryToWorkerClient { batches: mock_batches });
+    config.local_network().set_primary_to_worker_local_handler(mock_client);
+
+    // two round 1 certificates from different authorities sharing batch_1
+    let authorities: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let parents: BTreeSet<HeaderDigest> = fixture.genesis().collect();
+    let header_a = HeaderBuilder::default()
+        .author(authorities[0].clone())
+        .round(1)
+        .epoch(0)
+        .parents(parents.clone())
+        .created_at(now())
+        .with_payload_batch(&batch_0, 0)
+        .with_payload_batch(&batch_1, 0)
+        .build();
+    let cert_a = fixture.certificate(&header_a);
+    let header_b = HeaderBuilder::default()
+        .author(authorities[1].clone())
+        .round(1)
+        .epoch(0)
+        .parents(parents)
+        .created_at(now())
+        .with_payload_batch(&batch_1, 0)
+        .with_payload_batch(&batch_2, 0)
+        .build();
+    let cert_b = fixture.certificate(&header_b);
+
+    let sub_dag = CommittedSubDag::new(
+        vec![cert_a, cert_b.clone()],
+        cert_b,
+        1,
+        ReputationScores::default(),
+        None,
+    );
+    // expected digests in subdag iteration order (contains the duplicate)
+    let expected_digests: Vec<BlockHash> =
+        sub_dag.headers().iter().flat_map(|header| header.payload().keys().copied()).collect();
+    assert_eq!(expected_digests.len(), 4, "two payloads of two with one shared digest");
+
+    // feed the subdag straight to the subscriber
+    consensus_bus.sequence().send(sub_dag).await?;
+
+    let mut output = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        consensus_output.recv().await
+    })
+    .await
+    .expect("timed out waiting for consensus output — subscriber may have crashed")
+    .expect("consensus output");
+
+    // digests and flattened batches must stay aligned, including the duplicate
+    assert_eq!(output.batch_digests().len(), expected_digests.len());
+    let flattened = output.flatten_batches();
+    assert_eq!(
+        flattened.len(),
+        output.batch_digests().len(),
+        "uneven number of batches and batch digests"
+    );
+    for (index, (cert_idx, batch_idx)) in flattened.iter().enumerate() {
+        let batch = &output.batches()[*cert_idx].batches[*batch_idx];
+        let digest = output.get_batch_digest(index).expect("digest for index");
+        assert_eq!(digest, expected_digests[index], "wrong digest order at index {index}");
+        assert_eq!(
+            batch.digest(),
+            digest,
+            "batch executed at index {index} bound to the wrong digest"
+        );
+    }
+
+    // both certificates carry their full batch lists (duplicate cloned into the second)
+    let batches = output.batches();
+    assert_eq!(batches.len(), 2);
+    assert_eq!(batches[0].batches.len(), 2);
+    assert_eq!(batches[1].batches.len(), 2);
+    assert_eq!(batches[1].batches[0].digest(), batch_1.digest(), "duplicate batch not cloned");
+
+    // the last flattened index closes the epoch (engine applies closing system calls)
+    output.set_epoch_close();
+    let last = output.batch_digests().len() - 1;
+    for index in 0..last {
+        assert_eq!(
+            output.close_epoch_for_last_batch(index),
+            Some(false),
+            "index {index} must not close the epoch"
+        );
+    }
+    assert_eq!(
+        output.close_epoch_for_last_batch(last),
+        Some(true),
+        "last batch must close the epoch"
+    );
 
     Ok(())
 }
