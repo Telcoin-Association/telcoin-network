@@ -119,9 +119,15 @@ pub async fn start_metrics_server(
                                 body,
                             );
                             // write response, ignore errors (client disconnect, etc.)
-                            // then drop connection
-                            let _ = socket.write_all(response.as_bytes()).await;
-                            let _ = socket.shutdown().await;
+                            // then drop connection. the timeout bounds a client that
+                            // connects but never drains the body - without it, TCP
+                            // backpressure would block write_all indefinitely and freeze
+                            // the whole metrics task, including histogram upkeep.
+                            let _ = time::timeout(Duration::from_secs(5), async {
+                                let _ = socket.write_all(response.as_bytes()).await;
+                                let _ = socket.shutdown().await;
+                            })
+                            .await;
                         }
                         // transient accept errors (e.g. fd exhaustion) must not kill the node
                         Err(e) => debug!(target: "tn::metrics", ?e, "metrics endpoint accept error"),
