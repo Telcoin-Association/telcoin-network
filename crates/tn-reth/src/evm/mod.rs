@@ -18,6 +18,7 @@ use reth_revm::{
 use std::ops::{Deref, DerefMut};
 use tn_types::{Address, Bytes, TxKind, U256};
 mod block;
+mod bls_precompile;
 mod config;
 mod context;
 mod factory;
@@ -26,6 +27,7 @@ mod tel_precompile;
 mod utils;
 use crate::evm::handler::TNEvmHandler;
 pub(crate) use block::*;
+pub use bls_precompile::{add_bls_precompile, BLS_G1_PRECOMPILE_ADDRESS};
 pub(crate) use config::*;
 pub(crate) use context::*;
 pub(crate) use factory::*;
