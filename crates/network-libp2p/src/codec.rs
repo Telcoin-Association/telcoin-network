@@ -88,8 +88,9 @@ where
     // Decompress, bounding the output to the validated `uncompressed_len` so a malformed snappy
     // stream cannot expand past `max_message_size`, and growing `decode_buffer` only as bytes are
     // produced rather than committing it up front.
+    let decode_limit = u64::try_from(uncompressed_len).map_err(std::io::Error::other)?;
     let reader = std::io::Cursor::new(&*compressed_buffer);
-    let mut decoder = FrameDecoder::new(reader).take(uncompressed_len as u64);
+    let mut decoder = FrameDecoder::new(reader).take(decode_limit);
     decoder.read_to_end(decode_buffer)?;
 
     // the decompressed output must match the reported uncompressed length
