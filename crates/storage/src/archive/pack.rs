@@ -215,7 +215,6 @@ where
 
     /// Read raw bytes from the file.  Will return an error if not able to read all the bytes.
     fn read_bytes(&mut self, start_pos: u64, end_pos: u64) -> Result<Vec<u8>, FetchError> {
-        // +1, end_pos is inclusive
         let mut bytes = vec![0; end_pos.saturating_sub(start_pos) as usize];
         self.data_file.seek(SeekFrom::Start(start_pos))?;
         self.data_file.read_exact(&mut bytes[..])?;

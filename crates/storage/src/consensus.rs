@@ -624,16 +624,19 @@ impl ConsensusChain {
     }
 
     /// Read the last committed rounds for authorities from an epoch.
-    pub async fn read_last_committed(&self, epoch: Epoch) -> HashMap<AuthorityIdentifier, Round> {
+    pub async fn read_last_committed(
+        &self,
+        epoch: Epoch,
+    ) -> Result<HashMap<AuthorityIdentifier, Round>, ConsensusChainError> {
         if let Some(pack) = &self.current_pack() {
             if pack.epoch() == epoch {
-                return pack.read_last_committed().await;
+                return Ok(pack.read_last_committed().await?);
             }
         }
         if let Ok(pack) = self.get_static(epoch).await {
-            pack.read_last_committed().await
+            Ok(pack.read_last_committed().await?)
         } else {
-            HashMap::new()
+            Ok(HashMap::new())
         }
     }
 
@@ -641,16 +644,16 @@ impl ConsensusChain {
     pub async fn read_latest_commit_with_final_reputation_scores(
         &self,
         epoch: Epoch,
-    ) -> Option<CommittedSubDag> {
+    ) -> Result<Option<CommittedSubDag>, ConsensusChainError> {
         if let Some(pack) = &self.current_pack() {
             if pack.epoch() == epoch {
-                return pack.read_latest_commit_with_final_reputation_scores().await;
+                return Ok(pack.read_latest_commit_with_final_reputation_scores().await?);
             }
         }
         if let Ok(pack) = self.get_static(epoch).await {
-            pack.read_latest_commit_with_final_reputation_scores().await
+            Ok(pack.read_latest_commit_with_final_reputation_scores().await?)
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -776,15 +779,18 @@ impl ConsensusChainReader for ConsensusChain {
         ConsensusChain::latest_consensus_epoch(self)
     }
 
-    async fn read_last_committed(&self, epoch: Epoch) -> HashMap<AuthorityIdentifier, Round> {
-        ConsensusChain::read_last_committed(self, epoch).await
+    async fn read_last_committed(
+        &self,
+        epoch: Epoch,
+    ) -> eyre::Result<HashMap<AuthorityIdentifier, Round>> {
+        Ok(ConsensusChain::read_last_committed(self, epoch).await?)
     }
 
     async fn read_latest_commit_with_final_reputation_scores(
         &self,
         epoch: Epoch,
-    ) -> Option<CommittedSubDag> {
-        ConsensusChain::read_latest_commit_with_final_reputation_scores(self, epoch).await
+    ) -> eyre::Result<Option<CommittedSubDag>> {
+        Ok(ConsensusChain::read_latest_commit_with_final_reputation_scores(self, epoch).await?)
     }
 
     async fn get_consensus_output_current(&self, number: u64) -> eyre::Result<ConsensusOutput> {

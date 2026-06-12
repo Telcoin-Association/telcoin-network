@@ -497,7 +497,8 @@ async fn spawn_consensus(
         &mut consensus_chain,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     )
-    .await;
+    .await
+    .unwrap();
     let bullshark = Bullshark::new(
         committee.clone(),
         3,
@@ -514,5 +515,7 @@ async fn spawn_consensus(
             Some(dummy_parent),
         )
     });
-    Consensus::spawn(config, consensus_bus, bullshark, task_manager, consensus_chain, None).await;
+    Consensus::spawn(config, consensus_bus, bullshark, task_manager, &consensus_chain, None)
+        .await
+        .unwrap();
 }

@@ -272,7 +272,7 @@ impl<T: PosIndexValue> PositionIter<T> {
 }
 
 impl<T: PosIndexValue> Iterator for PositionIter<T> {
-    type Item = T;
+    type Item = Result<T, FetchError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if !self.done {
@@ -286,7 +286,7 @@ impl<T: PosIndexValue> Iterator for PositionIter<T> {
                 self.pos = self.pos.saturating_add(buffer_len);
                 self.done = self.pos >= self.data.len();
             }
-            Some(T::decode(&buf[..buffer_len]).ok()?)
+            Some(T::decode(&buf[..buffer_len]))
         } else {
             None
         }
@@ -417,10 +417,10 @@ mod tests {
         let iter = idx.rev_iter(1000).unwrap();
         assert_eq!(iter.count(), 1000, "asked for 1000 items");
         let mut iter = idx.rev_iter(1000).unwrap();
-        assert_eq!(iter.next().unwrap(), 66, "last record wrong");
+        assert_eq!(iter.next().unwrap().unwrap(), 66, "last record wrong");
         let d = 999_999;
         for (i, pos) in iter.enumerate() {
-            assert_eq!(pos, ((d - i) * 100) as u64, "failed rev on iteration {i}");
+            assert_eq!(pos.unwrap(), ((d - i) * 100) as u64, "failed rev on iteration {i}");
         }
 
         // Test iter
@@ -428,7 +428,7 @@ mod tests {
         assert_eq!(iter.count(), 1000, "asked for 1000 items");
         let iter = idx.iter(1000).unwrap();
         for (i, pos) in iter.enumerate() {
-            assert_eq!(pos, (i * 100) as u64, "failed rev on iteration {i}");
+            assert_eq!(pos.unwrap(), (i * 100) as u64, "failed rev on iteration {i}");
         }
 
         assert_eq!(idx.load(1_000_000).expect("load idx"), 66);
@@ -476,11 +476,11 @@ mod tests {
         let iter = idx.rev_iter(1000).unwrap();
         assert_eq!(iter.count(), 1000, "asked for 1000 items");
         let mut iter = idx.rev_iter(1000).unwrap();
-        assert_eq!(iter.next().unwrap(), (66, 66), "last record wrong");
+        assert_eq!(iter.next().unwrap().unwrap(), (66, 66), "last record wrong");
         let d = 999_999;
         for (i, pos) in iter.enumerate() {
             assert_eq!(
-                pos,
+                pos.unwrap(),
                 ((d - i) as u64, ((d - i) * 100) as u64),
                 "failed rev on iteration {i}"
             );
@@ -491,7 +491,7 @@ mod tests {
         assert_eq!(iter.count(), 1000, "asked for 1000 items");
         let iter = idx.iter(1000).unwrap();
         for (i, pos) in iter.enumerate() {
-            assert_eq!(pos, (i as u64, (i * 100) as u64), "failed rev on iteration {i}");
+            assert_eq!(pos.unwrap(), (i as u64, (i * 100) as u64), "failed rev on iteration {i}");
         }
 
         assert_eq!(idx.load(1_000_000).expect("load idx"), (66, 66));

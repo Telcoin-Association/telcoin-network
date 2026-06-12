@@ -99,8 +99,8 @@ enum PackMessage {
     ConsensusHeaderNumber(u64, oneshot::Sender<Result<ConsensusHeader, PackError>>),
     Persist(oneshot::Sender<Result<(), PackError>>),
     BytesForConsensus(u64, oneshot::Sender<Result<Vec<u8>, PackError>>),
-    ReadLastCommitted(oneshot::Sender<HashMap<AuthorityIdentifier, Round>>),
-    ReadLatestFinalRep(oneshot::Sender<Option<CommittedSubDag>>),
+    ReadLastCommitted(oneshot::Sender<Result<HashMap<AuthorityIdentifier, Round>, PackError>>),
+    ReadLatestFinalRep(oneshot::Sender<Result<Option<CommittedSubDag>, PackError>>),
     ContainsBatch(B256, oneshot::Sender<bool>),
     Batch(B256, oneshot::Sender<Option<Batch>>),
     CountLeaders(Round, RewardsCounter, oneshot::Sender<Result<(), PackError>>),
@@ -303,13 +303,13 @@ impl ConsensusPack {
 
     /// Load and return the consensus output form this epoch.
     pub async fn get_consensus_output(&self, number: u64) -> Result<ConsensusOutput, PackError> {
+        self.get_error()?;
         let (tx, rx) = oneshot::channel();
         let bytes = if self.tx.send(PackMessage::BytesForConsensus(number, tx)).await.is_ok() {
             rx.await.map_err(|_| PackError::ReceiveFailed)??
         } else {
             return Err(PackError::SendFailed);
         };
-        self.get_error()?;
         let cursor = Cursor::new(bytes);
         let reader = BufReader::new(cursor);
         bytes_to_output(reader, PackCompression::ZStd, Duration::from_secs(5), &self.committee)
@@ -374,19 +374,31 @@ impl ConsensusPack {
     }
 
     /// Read the last committed rounds for authorities from the epoch.
-    pub async fn read_last_committed(&self) -> HashMap<AuthorityIdentifier, Round> {
+    pub async fn read_last_committed(
+        &self,
+    ) -> Result<HashMap<AuthorityIdentifier, Round>, PackError> {
         let (tx, rx) = oneshot::channel();
         let _ = self.tx.send(PackMessage::ReadLastCommitted(tx)).await;
-        rx.await.unwrap_or_default()
+        if let Ok(r) = rx.await {
+            r
+        } else {
+            Err(PackError::SendFailed)
+        }
     }
 
     /// Reads from storage the latest commit sub dag from the epoch where its
     /// ReputationScores are marked as "final". If none exists then this
     /// method returns `None`.
-    pub async fn read_latest_commit_with_final_reputation_scores(&self) -> Option<CommittedSubDag> {
+    pub async fn read_latest_commit_with_final_reputation_scores(
+        &self,
+    ) -> Result<Option<CommittedSubDag>, PackError> {
         let (tx, rx) = oneshot::channel();
         let _ = self.tx.send(PackMessage::ReadLatestFinalRep(tx)).await;
-        rx.await.unwrap_or_default()
+        if let Ok(r) = rx.await {
+            r
+        } else {
+            Err(PackError::SendFailed)
+        }
     }
 
     /// Return the latest consensus header by reading directly from the pack index.
@@ -438,8 +450,9 @@ pub const DATA_NAME: &str = Inner::DATA_NAME;
 struct Inner {
     data: Pack<PackRecord>,
     /// Positional index pointing to the first byte of ConsensusHeader, the first byte of the first
-    /// Batch and the last byte of the ConsensusHeader at a position. In short the first and
-    /// last byte of the encoded data for a ConsensusOutput as well as just the ConsensusHeader.
+    /// Batch and the byte past the end of the ConsensusHeader at a position. In short the first
+    /// and last (exclusive) bytes of the encoded data for a ConsensusOutput as well as just
+    /// the ConsensusHeader.
     consensus_pos_idx: PositionIndex<IndexPositions>,
     consensus_digests: HdxIndex,
     batch_digests: HdxIndex,
@@ -546,11 +559,24 @@ impl Inner {
     }
 
     /// Open a PDX index file and return the open index.
-    /// This will handle an update of the index on older testnet epochs.
     fn open_pdx_file<P: AsRef<Path>, T: PosIndexValue>(
         dir: P,
         data_header: &DataHeader,
         read_only: bool,
+    ) -> Result<PositionIndex<T>, PackError> {
+        let base_dir = dir.as_ref().join(Self::CONSENSUS_POS_NAME);
+        let consensus_pos_idx =
+            PositionIndex::open_pdx_file(&base_dir, data_header, "index_pos.pdx", read_only)
+                .map_err(OpenError::IndexFileOpen)?;
+        Ok(consensus_pos_idx)
+    }
+
+    /// Open a PDX index file and return the open index.
+    /// This will handle an update of the index on older testnet epochs.
+    fn open_pdx_file_with_update<P: AsRef<Path>, T: PosIndexValue>(
+        dir: P,
+        read_only: bool,
+        data: &mut Pack<PackRecord>,
     ) -> Result<PositionIndex<T>, PackError> {
         let base_dir = dir.as_ref().join(Self::CONSENSUS_POS_NAME);
         if PositionIndex::<T>::pdx_file_exists(&base_dir, "index.pdx")
@@ -561,28 +587,37 @@ impl Inner {
             // This code should only effect OG testnet nodes and should not need
             // to be maintained forever.
             let mut old_idx: PositionIndex<u64> =
-                PositionIndex::open_pdx_file(&base_dir, data_header, "index.pdx", false)
+                PositionIndex::open_pdx_file(&base_dir, data.header(), "index.pdx", false)
                     .map_err(OpenError::IndexFileOpen)?;
+            let _ = std::fs::remove_dir_all(base_dir.join("index_pos.pdx.tmp"));
             let mut new_idx: PositionIndex<IndexPositions> =
-                PositionIndex::open_pdx_file(&base_dir, data_header, "index_pos.pdx", read_only)
+                PositionIndex::open_pdx_file(&base_dir, data.header(), "index_pos.pdx.tmp", true)
                     .map_err(OpenError::IndexFileOpen)?;
             for i in 0..old_idx.len() {
                 let idx = i as u64;
                 let pos = old_idx.load(idx)?;
-                // We save the consensus header position and 0 out the consensus output fields.
-                // We can get away with this (vs doing an expesive regen of the actual values)
-                // because we use this to get ConsensusOutput and this is only ever done on the
-                // current pack file.  Only older testnet nodes will be effected by this and they
-                // should never go to previous pack files.  We will let at least one epoch pass and
-                // new packs will have new indexes.  Syncing nodes will generate the proper indexes
-                // from the beginning (even for older epochs).
+                let start = if idx > 0 {
+                    if let Ok(prev_pos) = old_idx.load(idx - 1) {
+                        let record_size = data.record_size(prev_pos)?;
+                        prev_pos + record_size as u64
+                    } else {
+                        DATA_HEADER_BYTES as u64
+                    }
+                } else {
+                    DATA_HEADER_BYTES as u64
+                };
+                let record_size = data.record_size(pos)?;
+                let end = pos + record_size as u64;
                 new_idx
-                    .save(idx, IndexPositions::new(pos, 0, 0))
+                    .save(idx, IndexPositions::new(pos, start, end))
                     .map_err(|e| PackError::IndexAppend(format!("batch {e}")))?;
             }
+            drop(new_idx);
+            std::fs::rename(base_dir.join("index_pos.pdx.tmp"), base_dir.join("index_pos.pdx"))?;
+            let _ = std::fs::remove_dir_all(base_dir.join("index.pdx"));
         }
         let consensus_pos_idx =
-            PositionIndex::open_pdx_file(&base_dir, data_header, "index_pos.pdx", read_only)
+            PositionIndex::open_pdx_file(&base_dir, data.header(), "index_pos.pdx", read_only)
                 .map_err(OpenError::IndexFileOpen)?;
         Ok(consensus_pos_idx)
     }
@@ -623,7 +658,7 @@ impl Inner {
             data.append(&PackRecord::EpochMeta(epoch_meta.clone()))
                 .map_err(|e| PackError::Append(e.to_string()))?;
         }
-        let mut consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false)?;
+        let mut consensus_pos_idx = Self::open_pdx_file_with_update(&base_dir, false, &mut data)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
         let mut consensus_digests = HdxIndex::open_hdx_file(
             base_dir.join(Self::CONSENSUS_HASH_NAME),
@@ -670,7 +705,7 @@ impl Inner {
             .fetch(DATA_HEADER_BYTES as u64)
             .map_err(|e| PackError::EpochLoad(e.to_string()))?
             .into_epoch()?;
-        let mut consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false)?;
+        let mut consensus_pos_idx = Self::open_pdx_file_with_update(&base_dir, false, &mut data)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
         let consensus_digests = HdxIndex::open_hdx_file(
             base_dir.join(Self::CONSENSUS_HASH_NAME),
@@ -712,7 +747,7 @@ impl Inner {
             .fetch(DATA_HEADER_BYTES as u64)
             .map_err(|e| PackError::EpochLoad(e.to_string()))?
             .into_epoch()?;
-        let mut consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), true)?;
+        let mut consensus_pos_idx = Self::open_pdx_file_with_update(&base_dir, true, &mut data)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
         let consensus_digests = HdxIndex::open_hdx_file(
             base_dir.join(Self::CONSENSUS_HASH_NAME),
@@ -1036,13 +1071,12 @@ impl Inner {
         self.consensus_header_by_number(latest_number).ok()
     }
 
-    fn read_last_committed(&mut self) -> HashMap<AuthorityIdentifier, Round> {
+    fn read_last_committed(&mut self) -> Result<HashMap<AuthorityIdentifier, Round>, PackError> {
         let mut res = HashMap::new();
         if let Ok(iter) = self.consensus_pos_idx.rev_iter(50) {
-            for block in iter.filter_map(|pos| {
-                let block = self.data.fetch(pos.consensus_header);
-                block.ok().map(|b| b.into_consensus().ok()).unwrap_or_default()
-            }) {
+            for pos in iter {
+                let pos = pos?;
+                let block = self.data.fetch(pos.consensus_header)?.into_consensus()?;
                 let id = block.sub_dag.leader().author().clone();
                 let round = block.sub_dag.leader_round();
                 let headers = block.sub_dag.headers();
@@ -1054,31 +1088,28 @@ impl Inner {
                 }
             }
         }
-        res
+        Ok(res)
     }
 
-    fn read_latest_commit_with_final_reputation_scores(&mut self) -> Option<CommittedSubDag> {
+    fn read_latest_commit_with_final_reputation_scores(
+        &mut self,
+    ) -> Result<Option<CommittedSubDag>, PackError> {
         if let Ok(iter) = self.consensus_pos_idx.rev_iter(1000) {
-            for commit in iter.filter_map(|pos| {
-                let block = self.data.fetch(pos.consensus_header);
-                if let Some(block) = block.ok().map(|b| b.into_consensus().ok()) {
-                    block.map(|b| b.sub_dag)
-                } else {
-                    None
-                }
-            }) {
+            for pos in iter {
+                let pos = pos?;
+                let commit = self.data.fetch(pos.consensus_header)?.into_consensus()?.sub_dag;
                 // found a final of schedule score, so we'll return that
                 if commit.reputation_scores().final_of_schedule {
                     debug!(
                         "Found latest final reputation scores: {:?} from commit",
                         commit.reputation_scores(),
                     );
-                    return Some(commit);
+                    return Ok(Some(commit));
                 }
             }
         }
         debug!("No final reputation scores have been found");
-        None
+        Ok(None)
     }
 
     /// True if the pack contains the batch for digest.
@@ -1122,6 +1153,7 @@ impl Inner {
         let headers = self.consensus_pos_idx.len();
         let iter = self.consensus_pos_idx.rev_iter(headers)?;
         for pos in iter {
+            let pos = pos?;
             let header = self
                 .data
                 .fetch(pos.consensus_header)
@@ -1243,7 +1275,12 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
                     // Handle the case with dup batches.  This should be rare to non-existant so not
                     // worried about the poor efficiency here.  This allows us
                     // to remove in the common case to avoid a batch clone.
-                    if let Some(batch) = cert_batches.iter().find(|b| b.digest() == *digest) {
+                    if let Some(batch) = batches
+                        .iter()
+                        .flat_map(|cb: &CertifiedBatch| cb.batches.iter())
+                        .chain(cert_batches.iter())
+                        .find(|b| b.digest() == *digest)
+                    {
                         cert_batches.push(batch.clone());
                     } else {
                         return Err(PackError::MissingBatch);
