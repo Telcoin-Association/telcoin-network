@@ -20,7 +20,7 @@ sol!(
     contract ConsensusRegistry {
         /// The validator's eligibility status for being
         /// considered in the next committee.
-        #[derive(Debug, PartialEq)]
+        #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
         enum ValidatorStatus {
             /// Undefined status - default value.
             Undefined,
@@ -41,7 +41,7 @@ sol!(
         }
 
         /// The validator's information.
-        #[derive(Debug)]
+        #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
         struct ValidatorInfo {
             /// The address based on ECDSA public key.
             address validatorAddress;
@@ -65,7 +65,7 @@ sol!(
         }
 
         /// The epoch info stored on-chain.
-        #[derive(PartialEq, Debug)]
+        #[derive(PartialEq, Debug, serde::Serialize, serde::Deserialize)]
         struct EpochInfo {
             /// The committee of validators responsible for the epoch.
             address[] committee;
@@ -158,7 +158,8 @@ sol!(
         function getCurrentEpochInfo() external view returns (EpochInfo memory currentEpochInfo);
         /// Return committee epoch info for a specific epoch.
         function getEpochInfo(uint32 epoch) public view returns (EpochInfo memory epochInfo);
-        /// Return the validators by status. Pass `0` for status to return all validators.
+        /// Return the validators by status. Pass `Any` (6) for status to return all
+        /// validators. `Undefined` (0) reverts on-chain.
         function getValidators(uint8 status) public view returns (ValidatorInfo[] memory);
         /// Fetch the committee for a given epoch.
         function getCommitteeValidators(uint32 epoch) external view returns (ValidatorInfo[] memory);
@@ -172,7 +173,7 @@ sol!(
         function proofOfPossessionMessage(
             bytes memory blsPubkey,
             address validatorAddress
-        ) external pure returns (bytes memory);
+        ) external view returns (bytes memory);
         /// Mint an NFT for validator to stake.
         function mint(address validatorAddress) external override onlyOwner;
         /// Stake to the consensus registry.
@@ -186,6 +187,20 @@ sol!(
         function getRewards(address validatorAddress) public view virtual returns (uint256);
         /// Returns the next committee size
         function getNextCommitteeSize() external view returns (uint16);
+        /// Returns the current stake config version.
+        function getCurrentStakeVersion() external view returns (uint8);
+        /// Returns true if the BLS pubkey belongs to a known validator.
+        function isValidator(bytes calldata blsPubkey) external view returns (bool);
+        /// Returns true if the validator's stake originates from a delegator.
+        function isDelegated(address validatorAddress) external view returns (bool);
+        /// Returns true if the validator is permanently retired.
+        function isRetired(address validatorAddress) external view returns (bool);
+        /// Returns the validator's (outstandingBalance, initialStake, rewards).
+        function getBalanceBreakdown(address validatorAddress) external view returns (uint256, uint256, uint256);
+        /// Returns the EIP-712 digest a validator signs to accept a delegation.
+        function delegationDigest(bytes memory blsPubkey, address validatorAddress, address delegator) external view returns (bytes32);
+        /// Issuance not yet distributed to validators (public variable getter).
+        function undistributedIssuance() external view returns (uint256);
         /// Sets the GSMA region identifier for a validator (0=unspecified, 1-255=assigned regions).
         /// Only callable by governance (owner).
         function setValidatorRegion(address validatorAddress, uint8 region) external;
