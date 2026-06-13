@@ -257,7 +257,7 @@ async fn test_last_committed_persists() {
     consensus_chain.persist_current().await.unwrap();
 
     // Read last committed state
-    let last_committed = consensus_chain.read_last_committed(committee.epoch()).await;
+    let last_committed = consensus_chain.read_last_committed(committee.epoch()).await.unwrap();
 
     // Should have entries for authorities that were leaders
     assert!(!last_committed.is_empty(), "Should have last committed entries for authorities");

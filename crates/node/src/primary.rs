@@ -74,15 +74,15 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
         &self,
         consensus_bus: &ConsensusBus,
         task_manager: &TaskManager,
-        mut consensus_chain: ConsensusChain,
+        consensus_chain: ConsensusChain,
         certificate_pack: Option<CertificatePack>,
     ) -> SubscriberResult<LeaderSchedule> {
         let leader_schedule = LeaderSchedule::from_store(
             self.consensus_config.committee().clone(),
-            &mut consensus_chain,
+            &consensus_chain,
             DEFAULT_BAD_NODES_STAKE_THRESHOLD,
         )
-        .await;
+        .await?;
 
         // Spawn the consensus core who only sequences transactions.
         let ordering_engine = Bullshark::new(
@@ -96,10 +96,10 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
             consensus_bus,
             ordering_engine,
             task_manager,
-            consensus_chain.clone(),
+            &consensus_chain,
             certificate_pack,
         )
-        .await;
+        .await?;
 
         Ok(leader_schedule)
     }

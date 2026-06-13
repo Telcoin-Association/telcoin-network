@@ -51,6 +51,7 @@ fn create_test_peers<Req: TNMessage, Res: TNMessage>(
                 task_manager.get_spawner(),
                 NetworkType::Primary,
                 config.primary_address(),
+                None,
             )
             .expect("peer1 network created");
 
@@ -166,6 +167,7 @@ where
             task_manager.get_spawner(),
             NetworkType::Primary,
             config_1.primary_address(),
+            None,
         )
         .expect("peer1 network created");
     let network_handle_1 = peer1_network.network_handle();
@@ -188,6 +190,7 @@ where
             task_manager.get_spawner(),
             NetworkType::Primary,
             config_2.primary_address(),
+            None,
         )
         .expect("peer2 network created");
     let network_handle_2 = peer2_network.network_handle();
@@ -662,6 +665,7 @@ async fn test_primary_worker_protocol_isolation() -> eyre::Result<()> {
         task_manager.get_spawner(),
         NetworkType::Primary,
         config_1.primary_address(),
+        None,
     )
     .expect("primary network created");
     let primary = primary_network.network_handle();
@@ -684,6 +688,7 @@ async fn test_primary_worker_protocol_isolation() -> eyre::Result<()> {
         task_manager.get_spawner(),
         NetworkType::Worker(0),
         config_2.worker_address(),
+        None,
     )
     .expect("worker network created");
     let worker = worker_network.network_handle();
@@ -2188,6 +2193,349 @@ async fn test_newer_kad_record_replaced() -> eyre::Result<()> {
     assert_eq!(store_record.key, peer2_new_record.key);
     assert_eq!(store_record.value, peer2_new_record.value);
     assert_eq!(store_record.publisher, peer2_new_record.publisher);
+
+    Ok(())
+}
+
+/// A validator that advertises an [`RpcInfo`] on its worker [`NodeRecord`] is
+/// discoverable from a new node that joins the network and runs
+/// `find_authorities`. The new node's `get_all_validator_rpcs` exposes exactly
+/// the advertised entry, and lookups for non-advertising validators return
+/// `None`.
+#[tokio::test]
+async fn test_advertise_rpc_via_kad() -> eyre::Result<()> {
+    use crate::types::RpcInfo;
+
+    let num_network_peers = 5;
+
+    // Set up multiple peers with the default config
+    let (mut target_peer, mut committee, _) =
+        create_test_peers::<TestWorkerRequest, TestWorkerResponse>(
+            NonZeroUsize::new(num_network_peers).unwrap(),
+            None,
+        );
+
+    // inject an RPC descriptor into target peer's signed node record before spawn —
+    // simulates a validator that configured an `rpc` endpoint.
+    let rpc = RpcInfo {
+        http: "https://node1.example:8545/".parse().expect("http url"),
+        ws: Some("wss://node1.example:8546/".parse().expect("ws url")),
+    };
+    let mut target_network = target_peer.network.take().expect("target network is some");
+    let mut target_info = target_network.node_record.info.clone();
+    target_info.rpc = Some(rpc.clone());
+    let target_signature =
+        target_peer.config.key_config().request_signature_direct(&encode(&target_info));
+    target_network.node_record = NodeRecord { info: target_info, signature: target_signature };
+
+    let target_peer_bls = target_peer.config.key_config().primary_public_key();
+    let target_peer_net = target_peer.config.primary_networkkey();
+    let target_peer_addr = target_peer.config.primary_address();
+    let id = target_peer.config.authority().as_ref().expect("authority").id();
+    tokio::spawn(async move {
+        let res = target_network.run().await;
+        debug!(target: "network", ?id, ?res, "network shutdown");
+    });
+    target_peer.network_handle.start_listening(target_peer_addr.clone()).await?;
+
+    // spawn the rest of the committee, connect each to target
+    for peer in committee.iter_mut() {
+        let peer_network = peer.network.take().expect("peer network is some");
+        let id = peer.config.authority().as_ref().expect("authority").id();
+        tokio::spawn(async move {
+            let res = peer_network.run().await;
+            debug!(target: "network", ?id, ?res, "network shutdown");
+        });
+        peer.network_handle.start_listening(peer.config.primary_address()).await?;
+        peer.network_handle
+            .add_trusted_peer_and_dial(
+                target_peer_bls,
+                target_peer_net.clone(),
+                target_peer_addr.clone(),
+            )
+            .await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+
+    // spawn the 6th non-validator peer
+    let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let NetworkPeer { config: nvv_config, network_handle: nvv, network, .. } = peer1;
+    tokio::spawn(async move {
+        network.run().await.expect("nvv network run failed!");
+    });
+    nvv.start_listening(nvv_config.primary_address()).await?;
+    nvv.add_trusted_peer_and_dial(
+        target_peer_bls,
+        target_peer_net.clone(),
+        target_peer_addr.clone(),
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+
+    // ask the network to locate every committee member via kad
+    let authorities: Vec<BlsPublicKey> =
+        committee.iter().map(|p| p.config.key_config().primary_public_key()).collect();
+    nvv.find_authorities(authorities.clone()).await?;
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 5)).await;
+
+    // snapshot the advertised RPCs known on the NVV; only the target advertised
+    let mut all = nvv.get_all_validator_rpcs().await?;
+    all.sort_by_key(|(bls, _)| *bls);
+    assert_eq!(all.len(), 1, "exactly one advertised rpc expected; got {all:?}");
+    let (key, advertised) = &all[0];
+    assert_eq!(*key, target_peer_bls);
+    assert_eq!(*advertised, rpc);
+
+    // direct lookup for the advertising peer matches
+    assert_eq!(nvv.get_validator_rpc(target_peer_bls).await?, Some(rpc));
+    // and a non-advertising peer returns None
+    let other_bls = committee[0].config.key_config().primary_public_key();
+    assert_eq!(nvv.get_validator_rpc(other_bls).await?, None);
+
+    Ok(())
+}
+
+/// Documents the rolling-upgrade contract: a pre-upgrade kad record (no `rpc`
+/// field) decodes through the legacy fallback, verifies against the legacy
+/// encoding it was signed over, and is promoted into `known_peers` with
+/// `rpc: None`. The honest not-yet-upgraded sender is not penalized.
+#[tokio::test]
+async fn test_pre_upgrade_record_accepted_with_default_rpc() -> eyre::Result<()> {
+    use libp2p::kad;
+    use serde::{Deserialize, Serialize};
+    use tn_types::{BlsSignature, Multiaddr, NetworkPublicKey, TimestampSec};
+
+    /// Pre-upgrade NetworkInfo shape (no `rpc` field). Field order MUST mirror
+    /// the historical layout so encoded bytes match what an old peer would
+    /// have written to disk.
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    struct OldNetworkInfo {
+        pubkey: NetworkPublicKey,
+        multiaddrs: Vec<Multiaddr>,
+        timestamp: TimestampSec,
+    }
+
+    /// Pre-upgrade NodeRecord shape.
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    struct OldNodeRecord {
+        info: OldNetworkInfo,
+        signature: BlsSignature,
+    }
+
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let owner_bls = peer2.config.key_config().primary_public_key();
+    let owner_peer_id = *peer2.network.swarm.local_peer_id();
+
+    // build a valid pre-upgrade record signed with peer2's BLS key
+    let old_info = OldNetworkInfo {
+        pubkey: peer2.config.key_config().primary_network_public_key(),
+        multiaddrs: vec![peer2.config.primary_address()],
+        timestamp: now(),
+    };
+    let signature = peer2.config.key_config().request_signature_direct(&encode(&old_info));
+    let old_record = OldNodeRecord { info: old_info, signature };
+
+    let kad_record = kad::Record {
+        key: kad::RecordKey::new(&owner_bls),
+        value: encode(&old_record),
+        publisher: Some(owner_peer_id),
+        expires: None,
+    };
+
+    // peer_record_valid accepts pre-upgrade bytes via the legacy decode
+    // fallback; the missing rpc field defaults to None.
+    let (key, node_record) =
+        network.peer_record_valid(&kad_record).expect("legacy record accepted");
+    assert_eq!(key, owner_bls);
+    assert!(node_record.info.rpc.is_none());
+    assert_eq!(node_record.info.multiaddrs, vec![peer2.config.primary_address()]);
+
+    // an inbound put request stores the record and promotes it into `known_peers`
+    network.process_kad_put_request(owner_peer_id, kad_record.clone())?;
+    assert!(network.swarm.behaviour_mut().kademlia.store_mut().get(&kad_record.key).is_some());
+
+    let (peer_id, multiaddrs) = network
+        .swarm
+        .behaviour()
+        .peer_manager
+        .auth_to_peer(owner_bls)
+        .expect("legacy record promoted into known_peers");
+    assert_eq!(peer_id, owner_peer_id);
+    assert_eq!(multiaddrs, vec![peer2.config.primary_address()]);
+
+    // no rpc was advertised so lookups return None
+    assert!(network.swarm.behaviour().peer_manager.get_rpc(&owner_bls).is_none());
+    assert!(network.swarm.behaviour().peer_manager.all_rpcs().is_empty());
+
+    // honest pre-upgrade sender is not penalized
+    assert!(!network.swarm.behaviour().peer_manager.peer_banned(&owner_peer_id));
+
+    Ok(())
+}
+
+/// A signed record advertising an RPC endpoint with a well-formed URL but the
+/// wrong scheme is accepted (the signature is authentic) and promoted with the
+/// malformed endpoint stripped, without penalizing the sender.
+#[tokio::test]
+async fn test_malformed_rpc_scheme_stripped_on_promotion() -> eyre::Result<()> {
+    use libp2p::kad;
+
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let owner_bls = peer2.config.key_config().primary_public_key();
+    let owner_peer_id = *peer2.network.swarm.local_peer_id();
+
+    // parseable url with a scheme RpcInfo::validate rejects
+    let rpc = RpcInfo { http: "ftp://validator.example.com:8545/".parse()?, ws: None };
+    let key_config = peer2.config.key_config();
+    let node_record = NodeRecord::build(
+        key_config.primary_network_public_key(),
+        peer2.config.primary_address(),
+        Some(rpc),
+        |data| key_config.request_signature_direct(data),
+    );
+
+    let kad_record = kad::Record {
+        key: kad::RecordKey::new(&owner_bls),
+        value: encode(&node_record),
+        publisher: Some(owner_peer_id),
+        expires: None,
+    };
+
+    network.process_kad_put_request(owner_peer_id, kad_record.clone())?;
+
+    // the record was stored — the signature is authentic
+    assert!(network.swarm.behaviour_mut().kademlia.store_mut().get(&kad_record.key).is_some());
+
+    // promoted into known_peers with multiaddrs intact but the rpc stripped
+    let (peer_id, multiaddrs) = network
+        .swarm
+        .behaviour()
+        .peer_manager
+        .auth_to_peer(owner_bls)
+        .expect("record promoted into known_peers");
+    assert_eq!(peer_id, owner_peer_id);
+    assert_eq!(multiaddrs, vec![peer2.config.primary_address()]);
+    assert!(network.swarm.behaviour().peer_manager.get_rpc(&owner_bls).is_none());
+    assert!(network.swarm.behaviour().peer_manager.all_rpcs().is_empty());
+
+    // the sender was not penalized
+    assert!(!network.swarm.behaviour().peer_manager.peer_banned(&owner_peer_id));
+
+    Ok(())
+}
+
+/// Startup over a kad store holding a pre-upgrade record and a corrupt record:
+/// the node constructs cleanly (no panicking decode), the legacy peer is
+/// promoted into `known_peers` with `rpc: None`, and the corrupt record is
+/// purged from the persistent store. The legacy record's original signed bytes
+/// are preserved.
+#[tokio::test]
+async fn test_startup_tolerates_legacy_and_corrupt_kad_records() -> eyre::Result<()> {
+    use libp2p::kad;
+    use serde::{Deserialize, Serialize};
+    use tn_types::{BlsKeypair, BlsSignature, Multiaddr, NetworkPublicKey, TimestampSec};
+
+    /// Pre-upgrade NetworkInfo shape (no `rpc` field).
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    struct OldNetworkInfo {
+        pubkey: NetworkPublicKey,
+        multiaddrs: Vec<Multiaddr>,
+        timestamp: TimestampSec,
+    }
+
+    /// Pre-upgrade NodeRecord shape.
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    struct OldNodeRecord {
+        info: OldNetworkInfo,
+        signature: BlsSignature,
+    }
+
+    let all_nodes = CommitteeFixture::builder(MemDatabase::default)
+        .with_network_config(NetworkConfig::default())
+        .build();
+    let mut authorities = all_nodes.authorities();
+    let authority_1 = authorities.next().expect("first authority");
+    let authority_2 = authorities.next().expect("second authority");
+    let config_1 = authority_1.consensus_config();
+    let config_2 = authority_2.consensus_config();
+    let task_manager = TaskManager::default();
+
+    let owner_bls = config_2.key_config().primary_public_key();
+    let garbage_bls = *BlsKeypair::generate(&mut rand::rng()).public();
+    let db = MemDatabase::default();
+
+    // seed the DB before the network starts, simulating records that survived
+    // a node restart from before the upgrade
+    {
+        let mut kad_store = KadStore::new(db.clone(), config_1.key_config(), NetworkType::Primary);
+
+        // valid pre-upgrade record signed by authority 2 over the legacy encoding
+        let old_info = OldNetworkInfo {
+            pubkey: config_2.key_config().primary_network_public_key(),
+            multiaddrs: vec![config_2.primary_address()],
+            timestamp: now(),
+        };
+        let signature = config_2.key_config().request_signature_direct(&encode(&old_info));
+        let old_record = OldNodeRecord { info: old_info, signature };
+        kad_store.put(kad::Record {
+            key: kad::RecordKey::new(&owner_bls),
+            value: encode(&old_record),
+            publisher: None,
+            expires: None,
+        })?;
+
+        // garbage bytes under a valid BLS key — fails both decode layouts
+        kad_store.put(kad::Record {
+            key: kad::RecordKey::new(&garbage_bls),
+            value: vec![0xde, 0xad, 0xbe, 0xef],
+            publisher: None,
+            expires: None,
+        })?;
+    }
+
+    // construct the network over the seeded DB — this is the startup path that
+    // panicked on pre-upgrade bytes before the compat decode
+    let (tx, _network_events) = mpsc::channel(10);
+    let network_key = config_1.key_config().primary_network_keypair().clone();
+    let network = ConsensusNetwork::<
+        TestWorkerRequest,
+        TestWorkerResponse,
+        MemDatabase,
+        mpsc::Sender<NetworkEvent<TestWorkerRequest, TestWorkerResponse>>,
+    >::new(
+        config_1.network_config(),
+        tx,
+        config_1.key_config().clone(),
+        network_key,
+        db.clone(),
+        task_manager.get_spawner(),
+        NetworkType::Primary,
+        config_1.primary_address(),
+        None,
+    )
+    .expect("network constructs over a store holding legacy + corrupt records");
+
+    // the legacy peer was promoted with multiaddrs intact and rpc defaulted
+    let (_, multiaddrs) = network
+        .swarm
+        .behaviour()
+        .peer_manager
+        .auth_to_peer(owner_bls)
+        .expect("legacy peer in known_peers");
+    assert_eq!(multiaddrs, vec![config_2.primary_address()]);
+    assert!(network.swarm.behaviour().peer_manager.get_rpc(&owner_bls).is_none());
+
+    // the corrupt record was purged from the persistent store; the legacy
+    // record's original signed bytes were preserved
+    let store = KadStore::new(db, config_1.key_config(), NetworkType::Primary);
+    assert!(store.get(&kad::RecordKey::new(&garbage_bls)).is_none(), "corrupt record purged");
+    assert!(store.get(&kad::RecordKey::new(&owner_bls)).is_some(), "legacy record preserved");
 
     Ok(())
 }
