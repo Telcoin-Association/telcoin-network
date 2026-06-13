@@ -34,12 +34,14 @@ impl Default for NodeP2pInfo {
                     .parse()
                     .expect("multiaddr parsed for primary"),
                 network_key: NetworkKeypair::generate_ed25519().public().into(),
+                rpc: None,
             },
             worker: P2pNode {
                 network_address: format!("/ip4/{}/udp/{}/quic-v1", &host, worker_udp_port)
                     .parse()
                     .expect("multiaddr parsed for primary"),
                 network_key: NetworkKeypair::generate_ed25519().public().into(),
+                rpc: None,
             },
         }
     }

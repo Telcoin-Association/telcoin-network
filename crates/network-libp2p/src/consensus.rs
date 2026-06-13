@@ -11,7 +11,7 @@ use crate::{
     stream::{StreamBehavior, StreamEvent},
     types::{
         KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo, NetworkResponseMessage,
-        NetworkResponseSender, NetworkResult, NetworkType, NodeRecord,
+        NetworkResponseSender, NetworkResult, NetworkType, NodeRecord, RpcInfo,
     },
     PeerExchangeMap,
 };
@@ -37,8 +37,8 @@ use std::{
 };
 use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig};
 use tn_types::{
-    decode, encode, now, try_decode, BlsPublicKey, BlsSigner, Database, NetworkKeypair,
-    NetworkPublicKey, TaskSpawner, TnSender, WorkerId,
+    encode, now, BlsPublicKey, BlsSigner, Database, NetworkKeypair, NetworkPublicKey, TaskSpawner,
+    TnSender, WorkerId,
 };
 use tokio::sync::{
     mpsc::{Receiver, Sender},
@@ -204,10 +204,12 @@ where
             task_manager,
             NetworkType::Primary,
             external_addr,
+            None,
         )
     }
 
     /// Convenience method for spawning a worker network instance.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_for_worker(
         worker_id: WorkerId,
         network_config: &NetworkConfig,
@@ -216,6 +218,7 @@ where
         db: DB,
         task_manager: TaskSpawner,
         external_addr: Multiaddr,
+        rpc: Option<RpcInfo>,
     ) -> NetworkResult<Self> {
         let network_key = key_config.worker_network_keypair().clone();
         Self::new(
@@ -227,6 +230,7 @@ where
             task_manager,
             NetworkType::Worker(worker_id),
             external_addr,
+            rpc,
         )
     }
 
@@ -241,6 +245,7 @@ where
         task_spawner: TaskSpawner,
         network_type: NetworkType,
         external_addr: Multiaddr,
+        rpc: Option<RpcInfo>,
     ) -> NetworkResult<Self> {
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             // explicitly set default
@@ -276,25 +281,43 @@ where
             .set_publication_interval(Some(libp2p.kad_publication_interval))
             .set_query_timeout(Duration::from_secs(60))
             .set_provider_record_ttl(Some(libp2p.kad_record_ttl));
-        let kad_store = KadStore::new(db.clone(), &key_config, network_type);
+        let mut kad_store = KadStore::new(db.clone(), &key_config, network_type);
+
+        // Load the Kad records from DB for the local peer cache, decoding with a legacy
+        // fallback so records persisted by pre-upgrade software still load. Collect
+        // corrupt entries (undecodable values or broken keys) for removal.
+        let mut known = Vec::new();
+        let mut corrupt = Vec::new();
+        for record in kad_store.records() {
+            match BlsPublicKey::from_literal_bytes(record.key.as_ref()) {
+                Ok(key) => match NodeRecord::try_decode_compat(record.value.as_ref()) {
+                    Some(node_record) => known.push((key, node_record.info)),
+                    None => corrupt.push(record.key.clone()),
+                },
+                // How did we get a KAD record with a broken key?
+                Err(error) => {
+                    error!(target: "network-kad", ?error, "Invalid/corrupt KAD DB store!");
+                    corrupt.push(record.key.clone());
+                }
+            }
+        }
+
+        // Purge corrupt records before the store is cloned into the kademlia behaviour
+        // so its record accounting stays accurate.
+        for key in corrupt {
+            warn!(target: "network-kad", ?key, "removing undecodable record from kad store");
+            kad_store.remove(&key);
+        }
+
         let kademlia = kad::Behaviour::with_config(peer_id, kad_store.clone(), kad_config);
 
         // create custom behavior
         let mut behavior =
             TNBehavior::new(gossipsub, req_res, kademlia, network_config.peer_config());
 
-        // Load the Kad records from DB into the local peer cache.
-        for record in kad_store.records() {
-            match BlsPublicKey::from_literal_bytes(record.key.as_ref()) {
-                Ok(key) => {
-                    let record: NodeRecord = decode(&record.value);
-                    behavior.peer_manager.add_known_peer(key, record.info);
-                }
-                // How did we get a KAD record with a broken key?
-                Err(error) => {
-                    error!(target: "network-kad", ?error, "Invalid/corrupt KAD DB store!");
-                }
-            }
+        // Promote the surviving records into the local peer cache.
+        for (key, info) in known {
+            behavior.peer_manager.add_known_peer(key, info);
         }
 
         let network_pubkey = keypair.public().into();
@@ -327,7 +350,7 @@ where
         let (handle, commands) = tokio::sync::mpsc::channel(100);
         let config = network_config.libp2p_config().clone();
         let pending_px_disconnects = HashMap::with_capacity(config.max_px_disconnects);
-        let node_record = Self::create_node_record(external_addr, &key_config, network_pubkey);
+        let node_record = Self::create_node_record(external_addr, &key_config, network_pubkey, rpc);
 
         Ok(Self {
             swarm,
@@ -358,8 +381,9 @@ where
         external_addr: Multiaddr,
         key_config: &KeyConfig,
         network_pubkey: NetworkPublicKey,
+        rpc: Option<RpcInfo>,
     ) -> NodeRecord {
-        NodeRecord::build(network_pubkey, external_addr, |data| {
+        NodeRecord::build(network_pubkey, external_addr, rpc, |data| {
             key_config.request_signature_direct(data)
         })
     }
@@ -384,14 +408,13 @@ where
     /// matches the network key.
     fn peer_record_valid(&self, record: &kad::Record) -> Option<(BlsPublicKey, NodeRecord)> {
         let key = BlsPublicKey::from_literal_bytes(record.key.as_ref()).ok()?;
-        let node_record = try_decode::<NodeRecord>(record.value.as_ref()).ok()?;
 
-        // verify bls signature
-        let verified = node_record.verify(&key)?;
+        // decode (with legacy fallback for pre-upgrade peers) and verify bls signature
+        let (pubkey, node_record) = NodeRecord::decode_and_verify(record.value.as_ref(), &key)?;
 
         // verify publisher matches the network public key in the record
         // this prevents replay attacks where malicious nodes republish outdated records
-        let expected_peer_id: PeerId = verified.1.info.pubkey.clone().into();
+        let expected_peer_id: PeerId = node_record.info.pubkey.clone().into();
         if record.publisher != Some(expected_peer_id) {
             warn!(
                 target: "network-kad",
@@ -401,7 +424,7 @@ where
             return None;
         }
 
-        Some(verified)
+        Some((pubkey, node_record))
     }
 
     /// Publish and provide our network addresses and peer id under our BLS public key for
@@ -411,7 +434,13 @@ where
         info!(target: "network-kad", ?record, "Providing our record to kademlia for peer {:?}", self.swarm.local_peer_id());
         let key = record.key.clone();
         if let Err(err) = self.swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One) {
-            error!(target: "network-kad", "Failed to store record locally: {err}");
+            match &err {
+                kad::store::Error::ValueTooLarge => error!(
+                    target: "network-kad",
+                    "node record exceeds kad value-size limit; RPC endpoint NOT advertised to peers ({err})"
+                ),
+                _ => error!(target: "network-kad", "Failed to store record locally: {err}"),
+            }
         }
         if let Err(err) = self.swarm.behaviour_mut().kademlia.start_providing(key) {
             error!(target: "network-kad", "Failed to start providing key: {err}");
@@ -536,6 +565,7 @@ where
                         pubkey: network_pubkey,
                         multiaddrs: vec![addr],
                         timestamp: now(),
+                        rpc: None,
                     },
                     reply,
                 );
@@ -548,6 +578,7 @@ where
                         pubkey: network_pubkey,
                         multiaddrs: vec![addr],
                         timestamp: now(),
+                        rpc: None,
                     },
                 );
                 let _ = reply.send(Ok(()));
@@ -563,6 +594,7 @@ where
                                 pubkey: info.network_key,
                                 multiaddrs: vec![info.network_address],
                                 timestamp: now(),
+                                rpc: None,
                             },
                         );
                     }
@@ -727,6 +759,14 @@ where
             NetworkCommand::FindAuthorities { bls_keys } => {
                 // this will trigger a PeerEvent to fetch records through kad if not in the peer map
                 self.swarm.behaviour_mut().peer_manager.find_authorities(bls_keys);
+            }
+            NetworkCommand::GetValidatorRpc { bls_key, reply } => {
+                let rpc = self.swarm.behaviour().peer_manager.get_rpc(&bls_key);
+                send_or_log_error!(reply, rpc, "GetValidatorRpc");
+            }
+            NetworkCommand::GetAllValidatorRpcs { reply } => {
+                let rpcs = self.swarm.behaviour().peer_manager.all_rpcs();
+                send_or_log_error!(reply, rpcs, "GetAllValidatorRpcs");
             }
             NetworkCommand::OpenStream { peer, reply } => {
                 // Look up the peer's PeerId from their BLS key
@@ -1308,9 +1348,15 @@ where
                     kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(
                         kad::PeerRecord { record, peer },
                     ))) => {
-                        if let Some((key, value)) = self.peer_record_valid(&record) {
-                            trace!(target: "network-kad", "Got record {key} {value:?}");
-                            self.process_kad_query_result(&query_id, record, peer, step.last);
+                        if let Some((key, node_record)) = self.peer_record_valid(&record) {
+                            trace!(target: "network-kad", "Got record {key} {node_record:?}");
+                            self.process_kad_query_result(
+                                &query_id,
+                                key,
+                                node_record,
+                                peer,
+                                step.last,
+                            );
                         } else {
                             trace!(target: "network-kad", "Received invalid peer record!");
 
@@ -1482,10 +1528,10 @@ where
 
         if let Some(existing) = store.get(&record.key) {
             match (
-                try_decode::<NodeRecord>(&existing.value),
-                try_decode::<NodeRecord>(&record.value),
+                NodeRecord::try_decode_compat(&existing.value),
+                NodeRecord::try_decode_compat(&record.value),
             ) {
-                (Ok(existing_record), Ok(new_record)) => {
+                (Some(existing_record), Some(new_record)) => {
                     // return true if the new record is newer
                     existing_record.info.timestamp < new_record.info.timestamp
                 }
@@ -1497,50 +1543,36 @@ where
         }
     }
 
-    /// Logic to process a kad record request.
+    /// Logic to process a kad record query result.
     ///
-    /// This method checks:
-    /// - the peer record is signed
+    /// The record arrives pre-validated — the caller already checked the signature
+    /// and publisher via [`Self::peer_record_valid`]. This method checks:
     /// - the returned key matches the request
     /// - the latest node record is used
     fn process_kad_query_result(
         &mut self,
         query_id: &QueryId,
-        record: kad::Record,
+        key: BlsPublicKey,
+        new_record: NodeRecord,
         peer: Option<PeerId>,
         is_last_step: bool,
     ) {
-        // ensure returned record is valid, otherwise assess penalty
-        if let Some((key, new_record)) = self.peer_record_valid(&record) {
-            trace!(target: "network-kad", "Got record {key} {new_record:?}");
-            // return if query id unknown - should not happen
-            let Some(query) = self.kad_record_queries.get_mut(query_id) else { return };
+        // return if query id unknown - should not happen
+        let Some(query) = self.kad_record_queries.get_mut(query_id) else { return };
 
-            // ensure returned value matches request
-            if query.request == key {
-                match &mut query.result {
-                    None => query.result = Some(new_record),
-                    Some(tracked) if tracked.info.timestamp < new_record.info.timestamp => {
-                        *tracked = new_record
-                    }
-                    Some(_) => {} // keep existing record
+        // ensure returned value matches request
+        if query.request == key {
+            match &mut query.result {
+                None => query.result = Some(new_record),
+                Some(tracked) if tracked.info.timestamp < new_record.info.timestamp => {
+                    *tracked = new_record
                 }
-            } else {
-                // assess penalty for returning record that doesn't match key
-                if let Some(peer_id) = peer {
-                    trace!(target: "network-kad", ?peer_id, "processing fatal penalty for query record key mismatch");
-                    self.swarm
-                        .behaviour_mut()
-                        .peer_manager
-                        .process_penalty(peer_id, Penalty::Fatal);
-                }
+                Some(_) => {} // keep existing record
             }
         } else {
-            // record signature invalid
-            warn!(target: "network-kad", "Received invalid peer record!");
-
-            // assess penalty for invalid peer record
+            // assess penalty for returning record that doesn't match key
             if let Some(peer_id) = peer {
+                trace!(target: "network-kad", ?peer_id, "processing fatal penalty for query record key mismatch");
                 self.swarm.behaviour_mut().peer_manager.process_penalty(peer_id, Penalty::Fatal);
             }
         }

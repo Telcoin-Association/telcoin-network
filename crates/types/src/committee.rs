@@ -12,6 +12,8 @@ use std::{
     str::FromStr,
     sync::Arc,
 };
+use thiserror::Error;
+use url::Url;
 
 /// The epoch number.
 /// Becomes the upper 32 bits of a nonce (with rounds the low bits).
@@ -22,6 +24,64 @@ pub type VotingPower = u64;
 /// All authorities have equal voting power in consensus.
 pub const EQUAL_VOTING_POWER: VotingPower = 1;
 
+/// Maximum byte length of an advertised RPC endpoint URL.
+pub const MAX_RPC_URL_LEN: usize = 2048;
+
+/// Optional JSON-RPC endpoint metadata for a validator worker.
+///
+/// Advertised through the kademlia node record so peers can discover where to
+/// submit transactions to the network. These are application-layer URLs consumed
+/// by external clients (wallets/dapps); they are never dialed by the libp2p swarm.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RpcInfo {
+    /// Required HTTP(S) JSON-RPC endpoint, e.g. `https://validator.example.com:8545/`.
+    pub http: Url,
+    /// Optional WebSocket JSON-RPC endpoint, e.g. `wss://validator.example.com:8546/`.
+    pub ws: Option<Url>,
+}
+
+impl RpcInfo {
+    /// Reject endpoints whose scheme is not appropriate for the field
+    /// (`http`/`https` for [`Self::http`]; `ws`/`wss` for [`Self::ws`]).
+    pub fn validate(&self) -> Result<(), RpcInfoError> {
+        if self.http.as_str().len() > MAX_RPC_URL_LEN {
+            return Err(RpcInfoError::UrlTooLong(self.http.as_str().len()));
+        }
+        match self.http.scheme() {
+            "http" | "https" => {}
+            scheme => {
+                return Err(RpcInfoError::InvalidHttpScheme(scheme.to_string()));
+            }
+        }
+        if let Some(ws) = &self.ws {
+            if ws.as_str().len() > MAX_RPC_URL_LEN {
+                return Err(RpcInfoError::UrlTooLong(ws.as_str().len()));
+            }
+            match ws.scheme() {
+                "ws" | "wss" => {}
+                scheme => {
+                    return Err(RpcInfoError::InvalidWsScheme(scheme.to_string()));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Error returned when validating an [`RpcInfo`].
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum RpcInfoError {
+    /// The `http` endpoint scheme is not `http` or `https`.
+    #[error("invalid http endpoint scheme `{0}`, expected `http` or `https`")]
+    InvalidHttpScheme(String),
+    /// The `ws` endpoint scheme is not `ws` or `wss`.
+    #[error("invalid ws endpoint scheme `{0}`, expected `ws` or `wss`")]
+    InvalidWsScheme(String),
+    /// An endpoint URL exceeds [`MAX_RPC_URL_LEN`].
+    #[error("rpc endpoint URL length {0} exceeds maximum of {max} bytes", max = MAX_RPC_URL_LEN)]
+    UrlTooLong(usize),
+}
+
 /// A multiaddr and network public key for a libp2p node.
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
 pub struct P2pNode {
@@ -29,17 +89,24 @@ pub struct P2pNode {
     pub network_address: Multiaddr,
     /// Network key of the node.
     pub network_key: NetworkPublicKey,
+    /// Optional JSON-RPC endpoint advertised over kademlia (worker nodes only).
+    ///
+    /// Set on the worker [P2pNode] when the operator wants peers to be able to
+    /// discover this validator's JSON-RPC endpoint. `None` on primary nodes and on
+    /// worker nodes that do not expose RPC publicly.
+    #[serde(default)]
+    pub rpc: Option<RpcInfo>,
 }
 
 impl From<(Multiaddr, NetworkPublicKey)> for P2pNode {
     fn from(value: (Multiaddr, NetworkPublicKey)) -> Self {
-        Self { network_address: value.0, network_key: value.1 }
+        Self { network_address: value.0, network_key: value.1, rpc: None }
     }
 }
 
 impl From<(NetworkPublicKey, Multiaddr)> for P2pNode {
     fn from(value: (NetworkPublicKey, Multiaddr)) -> Self {
-        Self { network_address: value.1, network_key: value.0 }
+        Self { network_address: value.1, network_key: value.0, rpc: None }
     }
 }
 
@@ -888,5 +955,94 @@ mod tests {
             result,
             Err(ParseAuthorityIdentifierError::InvalidLength { expected: 32, actual: 4 })
         ));
+    }
+
+    /// Pre-upgrade `P2pNode` YAML (no `rpc_*` keys) must still deserialize and
+    /// produce `None` for both new fields. Guards the no-flag-day promise we
+    /// give to the YAML config layer.
+    #[test]
+    fn p2p_node_yaml_legacy_deserializes_with_default_rpc() {
+        use crate::{NetworkKeypair, P2pNode};
+
+        // build a legacy YAML payload using a real generated network key. We
+        // emit the bs58 encoding directly to avoid serde_yaml document markers.
+        let public = NetworkKeypair::generate_ed25519().public();
+        let key_bs58 = bs58::encode(public.encode_protobuf()).into_string();
+        let legacy_yaml =
+            format!("network_address: /ip4/127.0.0.1/udp/49584/quic-v1\nnetwork_key: {key_bs58}\n");
+        let parsed: P2pNode = serde_yaml::from_str(&legacy_yaml).expect("legacy YAML deserialize");
+        assert!(parsed.rpc.is_none());
+    }
+
+    /// New-format YAML (with an `rpc` key) must round-trip through serde_yaml.
+    #[test]
+    fn p2p_node_yaml_with_rpc_roundtrip() {
+        use crate::{NetworkKeypair, P2pNode, RpcInfo};
+
+        let original = P2pNode {
+            network_address: "/ip4/127.0.0.1/udp/49584/quic-v1".parse().expect("multiaddr"),
+            network_key: NetworkKeypair::generate_ed25519().public().clone().into(),
+            rpc: Some(RpcInfo {
+                http: "https://validator.example.com:8545/".parse().expect("http url"),
+                ws: Some("wss://validator.example.com:8546/".parse().expect("ws url")),
+            }),
+        };
+        let yaml = serde_yaml::to_string(&original).expect("serialize");
+        let parsed: P2pNode = serde_yaml::from_str(&yaml).expect("deserialize");
+        assert_eq!(parsed, original);
+    }
+
+    /// `RpcInfo::validate` rejects endpoints with an inappropriate scheme.
+    #[test]
+    fn rpc_info_validate_rejects_wrong_scheme() {
+        use crate::{RpcInfo, RpcInfoError};
+
+        // ftp is not a valid http(s) scheme
+        let bad_http = RpcInfo {
+            http: "ftp://validator.example.com:8545/".parse().expect("ftp url"),
+            ws: None,
+        };
+        assert!(matches!(bad_http.validate(), Err(RpcInfoError::InvalidHttpScheme(_))));
+
+        // a plain http url is not a valid ws(s) scheme
+        let bad_ws = RpcInfo {
+            http: "https://validator.example.com:8545/".parse().expect("http url"),
+            ws: Some("http://validator.example.com:8546/".parse().expect("http url")),
+        };
+        assert!(matches!(bad_ws.validate(), Err(RpcInfoError::InvalidWsScheme(_))));
+
+        // well-formed endpoints pass
+        let good = RpcInfo {
+            http: "https://validator.example.com:8545/".parse().expect("http url"),
+            ws: Some("wss://validator.example.com:8546/".parse().expect("ws url")),
+        };
+        assert!(good.validate().is_ok());
+    }
+
+    /// `RpcInfo::validate` rejects endpoints whose URL exceeds `MAX_RPC_URL_LEN`.
+    #[test]
+    fn rpc_info_validate_rejects_oversized_url() {
+        use crate::{RpcInfo, RpcInfoError, MAX_RPC_URL_LEN};
+
+        // an http URL whose length exceeds the cap is rejected, even with a valid scheme
+        let bad = RpcInfo {
+            http: format!("https://x.example/{}", "a".repeat(MAX_RPC_URL_LEN))
+                .parse()
+                .expect("http url"),
+            ws: None,
+        };
+        assert!(bad.http.as_str().len() > MAX_RPC_URL_LEN);
+        assert!(matches!(bad.validate(), Err(RpcInfoError::UrlTooLong(_))));
+
+        // a scheme-valid URL just under the cap still passes
+        let prefix = "https://x.example/";
+        let good = RpcInfo {
+            http: format!("{prefix}{}", "a".repeat(MAX_RPC_URL_LEN - prefix.len() - 1))
+                .parse()
+                .expect("http url"),
+            ws: None,
+        };
+        assert!(good.http.as_str().len() < MAX_RPC_URL_LEN);
+        assert!(good.validate().is_ok());
     }
 }
