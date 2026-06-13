@@ -11,7 +11,7 @@ use crate::{
     stream::{StreamBehavior, StreamEvent},
     types::{
         KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo, NetworkResponseMessage,
-        NetworkResponseSender, NetworkResult, NetworkType, NodeRecord,
+        NetworkResponseSender, NetworkResult, NetworkType, NodeRecord, ResponseChannel,
     },
     PeerExchangeMap,
 };
@@ -682,7 +682,11 @@ where
                 }
             }
             NetworkCommand::SendResponse { response, channel, reply } => {
-                let res = self.swarm.behaviour_mut().req_res.send_response(channel, response);
+                let res = self
+                    .swarm
+                    .behaviour_mut()
+                    .req_res
+                    .send_response(channel.into_inner(), response);
                 send_or_log_error!(reply, res, "SendResponse");
             }
             NetworkCommand::PendingRequestCount { reply } => {
@@ -874,7 +878,7 @@ where
                             if let Err(e) = self.event_stream.try_send(NetworkEvent::Request {
                                 peer: bls,
                                 request,
-                                channel,
+                                channel: ResponseChannel::new(peer, channel),
                                 cancel,
                             }) {
                                 error!(target: "network", topics=?self.authorized_publishers.keys(), ?request_id, ?e, "failed to forward request!");
@@ -895,7 +899,7 @@ where
                             }
                         } else if let Err(e) = self.event_stream.try_send(NetworkEvent::Error(
                             format!("requesting peer unknown: {peer:?}"),
-                            channel,
+                            ResponseChannel::new(peer, channel),
                         )) {
                             error!(target: "network", topics=?self.authorized_publishers.keys(), ?request_id, ?e, "failed to forward request!");
                             // ignore failures at the epoch boundary
@@ -987,7 +991,7 @@ where
 
                 // try to forward error to original caller
                 let _ = self.outbound_requests.remove(&(peer, request_id)).map(|ack| {
-                    let _ = ack.send(Err(error.into()));
+                    let _ = ack.send(Err(NetworkError::Outbound(error.into())));
                 });
             }
             ReqResEvent::InboundFailure { peer, request_id, error, connection_id: _ } => {
