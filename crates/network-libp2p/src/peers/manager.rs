@@ -12,7 +12,7 @@ use crate::{
     error::NetworkError,
     peers::status::ConnectionStatus,
     send_or_log_error,
-    types::{NetworkInfo, NetworkResult},
+    types::{NetworkInfo, NetworkResult, RpcInfo},
 };
 use libp2p::{core::ConnectedPoint, kad::PeerInfo, multiaddr::Protocol, Multiaddr, PeerId};
 use rand::seq::{IteratorRandom as _, SliceRandom as _};
@@ -680,7 +680,21 @@ impl PeerManager {
 
     /// Add a known peer to the known list.
     /// Used for bootstrap servers or possibly committee members.
-    pub(crate) fn add_known_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
+    pub(crate) fn add_known_peer(&mut self, bls_key: BlsPublicKey, mut info: NetworkInfo) {
+        // signature verification proves authenticity but not scheme correctness; drop a
+        // malformed advertised endpoint so only well-formed RPC info is ever cached in
+        // `known_peers`. the rest of the (signed, authentic) record is still usable.
+        if let Some(rpc) = &info.rpc {
+            if let Err(err) = rpc.validate() {
+                warn!(
+                    target: "peer-manager",
+                    ?err,
+                    ?bls_key,
+                    "dropping malformed advertised RPC endpoint from peer record"
+                );
+                info.rpc = None;
+            }
+        }
         trace!(target: "peer-manager", ?bls_key, "adding known peer");
         self.peers.upsert_peer(bls_key, info.pubkey.clone(), info.multiaddrs.clone());
         self.known_peers.insert(bls_key, info);
@@ -707,6 +721,20 @@ impl PeerManager {
         // emit event for kad to try to discover
         trace!(target: "peer-manager", ?missing, "requesting kad records");
         self.events.push_back(PeerEvent::MissingAuthorities(missing));
+    }
+
+    /// Return the most-recently-fetched [RpcInfo] for the given authority,
+    /// if any has been advertised.
+    pub(crate) fn get_rpc(&self, bls_key: &BlsPublicKey) -> Option<RpcInfo> {
+        self.known_peers.get(bls_key).and_then(|info| info.rpc.clone())
+    }
+
+    /// Return a snapshot of every known authority that has advertised an [RpcInfo].
+    pub(crate) fn all_rpcs(&self) -> Vec<(BlsPublicKey, RpcInfo)> {
+        self.known_peers
+            .iter()
+            .filter_map(|(bls, info)| info.rpc.clone().map(|rpc| (*bls, rpc)))
+            .collect()
     }
 
     /// Find the peer id for an authority.

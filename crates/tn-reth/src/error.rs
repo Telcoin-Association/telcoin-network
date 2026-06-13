@@ -1,5 +1,6 @@
 //! Error type to wrap various Reth errors.
 
+use alloy::primitives::Bytes;
 use reth::rpc::{builder::error::RpcError, server_types::eth::EthApiError};
 use reth_errors::BlockExecutionError;
 use reth_provider::ProviderError;
@@ -56,4 +57,23 @@ impl<T> From<std::sync::mpsc::SendError<T>> for TnRethError {
     fn from(_: std::sync::mpsc::SendError<T>) -> Self {
         Self::TreeChannelClosed
     }
+}
+
+/// Failure reading the on-chain `ConsensusRegistry`.
+///
+/// Distinguishes a user-triggerable on-chain revert (revert bytes surfaced to RPC
+/// clients eth_call-style) from internal node failures (never leaked to clients).
+#[derive(Debug, thiserror::Error)]
+pub enum RegistryReadError {
+    /// The EVM call reverted on-chain.
+    #[error("execution reverted{}", .reason.as_ref().map(|r| format!(": {r}")).unwrap_or_default())]
+    Revert {
+        /// Raw ABI-encoded revert bytes.
+        output: Bytes,
+        /// Decoded human-readable reason, if available.
+        reason: Option<String>,
+    },
+    /// Non-revert failure: state provider/DB, EVM construction, Halt, ABI decode.
+    #[error("{0}")]
+    Internal(String),
 }

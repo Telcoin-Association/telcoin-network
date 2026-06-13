@@ -8,9 +8,9 @@ use std::{
     fmt::{Debug, Formatter},
     sync::Arc,
 };
-use tn_storage::consensus::ConsensusChain;
 use tn_types::{
-    Authority, AuthorityIdentifier, Certificate, Committee, ReputationScores, Round, VotingPower,
+    Authority, AuthorityIdentifier, Certificate, Committee, ConsensusChainReader, ReputationScores,
+    Round, VotingPower,
 };
 use tracing::{debug, trace};
 
@@ -252,12 +252,12 @@ impl LeaderSchedule {
     /// for the LeaderSchedule.
     pub async fn from_store(
         committee: Committee,
-        consensus_chain: &mut ConsensusChain,
+        consensus_chain: &impl ConsensusChainReader,
         bad_nodes_percent_threshold: u64,
-    ) -> Self {
+    ) -> eyre::Result<Self> {
         let table = consensus_chain
             .read_latest_commit_with_final_reputation_scores(committee.epoch())
-            .await;
+            .await?;
         let table = table.map_or(LeaderSwapTable::default(), |subdag| {
             LeaderSwapTable::new(
                 &committee,
@@ -267,7 +267,7 @@ impl LeaderSchedule {
             )
         });
         // create the schedule
-        Self::new(committee, table)
+        Ok(Self::new(committee, table))
     }
 
     /// Atomically updates the leader swap table with the new provided one. Any leader queried from

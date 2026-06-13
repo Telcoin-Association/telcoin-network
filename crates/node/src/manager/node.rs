@@ -17,7 +17,7 @@ use crate::{
     health::HealthcheckServer,
     manager::spawn_epoch_vote_collector,
 };
-use eyre::eyre;
+use eyre::{eyre, WrapErr as _};
 use state_sync::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_recent_consensus};
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, TelcoinDirs};
 use tn_network_libp2p::{types::NetworkEvent, ConsensusNetwork};
@@ -480,6 +480,16 @@ where
         // primary network handle
         self.primary_network_handle = Some(PrimaryNetworkHandle::new(primary_network_handle));
 
+        // pass through the worker's RPC descriptor so peers can discover this
+        // validator's JSON-RPC endpoint via kademlia. validators that did not
+        // configure RPC leave the descriptor `None`. fail fast on a misconfigured
+        // endpoint rather than advertising something peers will reject.
+        let worker_rpc = self.builder.tn_config.node_info.p2p_info.worker.rpc.clone();
+        if let Some(rpc) = &worker_rpc {
+            rpc.validate()
+                .wrap_err("invalid `node_info.p2p_info.worker.rpc` endpoint in node config")?;
+        }
+
         // create long-running network task for worker
         let worker_network = ConsensusNetwork::new_for_worker(
             DEFAULT_WORKER_ID,
@@ -489,6 +499,7 @@ where
             self.consensus_db.clone(),
             node_task_spawner.clone(),
             self.builder.tn_config.node_info.worker_network_address().clone(),
+            worker_rpc,
         )?;
         let worker_network_handle = worker_network.network_handle();
         let node_shutdown = self.node_shutdown.subscribe();

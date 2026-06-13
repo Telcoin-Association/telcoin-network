@@ -58,6 +58,11 @@ where
         self.inner.fetch(pos)
     }
 
+    /// Read raw bytes from the file.  Will return an error if not able to read all the bytes.
+    pub fn read_bytes(&mut self, start_pos: u64, end_pos: u64) -> Result<Vec<u8>, FetchError> {
+        self.inner.read_bytes(start_pos, end_pos)
+    }
+
     /// Read the record size (with crc32) at position.
     /// Will produce an error for IO or or for a failed CRC32 integrity check.
     pub fn record_size(&mut self, pos: u64) -> Result<u32, FetchError> {
@@ -206,6 +211,14 @@ where
     /// Fetch the value stored at key.  Will return an error if not found.
     fn fetch(&mut self, pos: u64) -> Result<V, FetchError> {
         self.read_record(pos)
+    }
+
+    /// Read raw bytes from the file.  Will return an error if not able to read all the bytes.
+    fn read_bytes(&mut self, start_pos: u64, end_pos: u64) -> Result<Vec<u8>, FetchError> {
+        let mut bytes = vec![0; end_pos.saturating_sub(start_pos) as usize];
+        self.data_file.seek(SeekFrom::Start(start_pos))?;
+        self.data_file.read_exact(&mut bytes[..])?;
+        Ok(bytes)
     }
 
     /// Do the actual insert so the public function can rollback easily on an error.
