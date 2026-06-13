@@ -20,37 +20,18 @@ use crate::{engine::ExecutionNode, manager::EpochManager, worker::worker_task_ma
 use std::{collections::HashSet, time::Duration};
 use tn_config::{NetworkConfig, TelcoinDirs};
 use tn_executor::subscriber::spawn_subscriber;
-use tn_network_libp2p::{types::NetworkHandle, TNMessage};
 use tn_primary::ConsensusBus;
 use tn_storage::{certificate_pack::CertificatePack, tables::OurNodeBatchesCache};
 use tn_types::{
     gas_accumulator::GasAccumulator, BlsPublicKey, Committee, ConsensusHeaderDigest,
-    ConsensusOutput, Database as TNDatabase, EpochRecord, Multiaddr, NetworkPublicKey, Notifier,
-    TaskJoinError, TaskManager, TaskSpawner, TnReceiver,
+    ConsensusOutput, Database as TNDatabase, EpochRecord, Notifier, TaskJoinError, TaskManager,
+    TaskSpawner, TnReceiver,
 };
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
-mod close;
-mod start;
 
 /// Name of the per-epoch [`TaskManager`], created fresh and torn down each epoch.
 const EPOCH_TASK_MANAGER: &str = "Epoch Task Manager";
-
-/// Outcome of replaying consensus output that was validated but not yet executed before a restart.
-///
-/// Replay happens before consensus is reconfigured, so both hashes describe progress made purely by
-/// re-forwarding persisted output to the engine. The two fields are independent: replay can cross
-/// the epoch boundary (`epoch_close_hash` set) without ever needing the caller to wait on a
-/// mid-epoch `last_replayed_hash`, and vice versa.
-struct ReplayResult {
-    /// Set when replay reached the epoch boundary: the consensus header hash the caller must close
-    /// the epoch with before starting the next one. Drives the replay-and-close early return.
-    epoch_close_hash: Option<ConsensusHeaderDigest>,
-    /// Hash of the last output actually forwarded to the engine during replay, or `None` if
-    /// nothing was replayed. The caller waits on this (never on DB-latest, which may have been
-    /// persisted but never sent) to confirm execution caught up before live consensus resumes.
-    last_replayed_hash: Option<ConsensusHeaderDigest>,
-}
 
 /// Why `run_epoch` is being entered, and on exit what kind of transition just happened.
 ///
@@ -183,8 +164,8 @@ where
             // If we are starting up then make sure that any consensus we previously validated goes
             // to the engine and is executed.  Otherwise we could miss consensus execution.
             gas_accumulator.rewards_counter().set_committee(committee.clone());
-            let replay = self.replay_missed_consensus(committee, to_engine).await?;
-            if let Some(target_hash) = replay.epoch_close_hash {
+            let mut replay = self.replay_missed_consensus(committee, to_engine).await?;
+            if let Some(target_hash) = replay.take_epoch_close_hash() {
                 // If things go down at exactly the wrong time we might have to replay the epoch end
                 // so account for that.
                 self.close_epoch(None, &gas_accumulator, target_hash).await?;
@@ -193,7 +174,7 @@ where
             }
             // Only wait for consensus that was actually forwarded to the engine.
             // Waiting on DB-latest consensus could hang if it was saved but never sent.
-            if let Some(last_hash) = replay.last_replayed_hash {
+            if let Some(last_hash) = replay.take_last_replayed_hash() {
                 info!(target: "epoch-manager", "Waiting for execution of replayed consensus {last_hash}");
                 self.consensus_bus.wait_for_consensus_execution(last_hash).await?;
                 info!(target: "epoch-manager", "Confirmed execution of replayed consensus {last_hash}");
@@ -484,7 +465,7 @@ where
     /// rebroadcast them), then the output is sent. `last_forwarded_consensus_number` is updated
     /// only after the send succeeds, so the restart-replay and leftover-drain paths can rely on
     /// it marking what actually reached the engine rather than what was merely dequeued.
-    async fn process_output(
+    pub(super) async fn process_output(
         &mut self,
         to_engine: &mpsc::Sender<ConsensusOutput>,
         mut output: ConsensusOutput,
@@ -584,68 +565,6 @@ where
         self.consensus_bus.wait_for_consensus_execution(target_hash).await?;
         self.adjust_base_fees(gas_accumulator);
         gas_accumulator.clear(); // Clear the accumlated values for next epoch.
-        Ok(())
-    }
-
-    /// Resolve a swarm listener [`Multiaddr`] from an env var, falling back to a default.
-    ///
-    /// Lets cloud deployments override the primary/worker listen address (e.g. to bind a
-    /// container's external address) without changing config. When the env var is set, the
-    /// parsed address has the node's [`NetworkPublicKey`] appended as a `/p2p/` component to
-    /// match the format produced by keytool generation; an unparseable value or one carrying a
-    /// conflicting `/p2p/` key is an error. When unset, `fallback` is returned as-is.
-    fn parse_listener_address_for_swarm(
-        env_var: &str,
-        network_pubkey: NetworkPublicKey,
-        fallback: Multiaddr,
-    ) -> eyre::Result<Multiaddr> {
-        std::env::var(env_var)
-            .map(|addr| {
-                addr.parse()
-                    .map_err(|e| {
-                        eyre::eyre!(
-                            "Failed to parse listener multiaddr from env {env_var} ({addr})\n{e}"
-                        )
-                    })
-                    // add Protocol::P2p to multiaddr to maintain consistency with
-                    // bin/telcoin-network/src/keytool/generate.rs
-                    .and_then(|multi: Multiaddr| {
-                        multi.with_p2p(network_pubkey.into()).map_err(|_| {
-                            eyre::eyre!(
-                                "{env_var} multiaddr contains a different P2P protocol {:?}",
-                                std::env::var(env_var)
-                            )
-                        })
-                    })
-            })
-            .unwrap_or(Ok(fallback))
-    }
-
-    /// Block until the given [`NetworkHandle`] has at least one connected peer.
-    ///
-    /// Polls the peer count every 500ms, logging periodically, and gives up after 240 attempts
-    /// (~2 minutes) with an error rather than letting epoch startup hang forever on a network that
-    /// cannot bootstrap. Generic over the [`TNMessage`] request/response types so it serves both
-    /// the primary and worker networks.
-    async fn wait_for_network_peers<Req: TNMessage, Res: TNMessage>(
-        handle: &NetworkHandle<Req, Res>,
-        network_name: &str,
-    ) -> eyre::Result<()> {
-        let mut peers = handle.connected_peer_count().await.unwrap_or(0);
-        let mut retries = 0;
-        while peers == 0 {
-            retries += 1;
-            if retries > 240 {
-                return Err(eyre::eyre!(
-                    "{network_name} unable to join, cannot connect to any peers!"
-                ));
-            }
-            if retries % 10 == 0 {
-                error!(target: "epoch-manager", "failed to join the {network_name}!");
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            peers = handle.connected_peer_count().await.unwrap_or(0);
-        }
         Ok(())
     }
 }

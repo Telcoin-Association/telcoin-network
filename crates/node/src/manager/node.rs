@@ -34,7 +34,10 @@ use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use super::epochs::RunEpochMode;
+mod close_epoch;
+mod run_epoch;
+mod start_epoch;
+use run_epoch::RunEpochMode;
 
 /// Name of the process-lifetime [`TaskManager`] that owns tasks outliving any single epoch
 /// (p2p networks, engine updates, consensus fetchers).
@@ -55,23 +58,23 @@ pub(crate) const WORKER_TASK_BASE: &str = "Worker Task";
 #[derive(Debug)]
 pub(crate) struct EpochManager<P, DB> {
     /// The builder for node configuration
-    pub(super) builder: TnBuilder,
+    builder: TnBuilder,
     /// The data directory
-    pub(super) tn_datadir: P,
+    tn_datadir: P,
     /// Primary network handle.
-    pub(super) primary_network_handle: Option<PrimaryNetworkHandle>,
+    primary_network_handle: Option<PrimaryNetworkHandle>,
     /// Worker network handle.
-    pub(super) worker_network_handle: Option<WorkerNetworkHandle>,
+    worker_network_handle: Option<WorkerNetworkHandle>,
     /// Key config - loaded once for application lifetime.
-    pub(super) key_config: KeyConfig,
+    key_config: KeyConfig,
     /// The epoch manager's [Notifier] to shutdown all node processes.
-    pub(super) node_shutdown: Notifier,
+    node_shutdown: Notifier,
     /// The timestamp to close the current epoch.
     ///
     /// The manager monitors leader timestamps for the epoch boundary.
     /// If the timestamp of the leader is >= the epoch_boundary then the
     /// manager closes the epoch after the engine executes all data.
-    pub(super) epoch_boundary: TimestampSec,
+    epoch_boundary: TimestampSec,
     /// Whether the long-running p2p networks have completed their one-time, per-process setup
     /// (start listening, register bootstrap peers).
     ///
@@ -84,39 +87,39 @@ pub(crate) struct EpochManager<P, DB> {
     ///
     /// Committee slots are NOT gated on this flag. They are set every epoch from authoritative
     /// state via `update_committees`.
-    pub(super) network_initialized: bool,
+    network_initialized: bool,
     /// Reth (MDBX) database handle. Held for the whole process so the execution engine can be
     /// recreated without reopening storage.
     reth_db: RethDb,
     /// Consensus (REDB) database handle. Held for the whole process; shared with the p2p networks
     /// and per-epoch consensus components.
-    pub(super) consensus_db: DB,
+    consensus_db: DB,
     /// Application-scoped consensus bus. Survives epoch boundaries and is reset between epochs via
     /// `reset_for_epoch`; carries `recent_blocks`, node mode, and other cross-component state.
-    pub(super) consensus_bus: ConsensusBusApp,
+    consensus_bus: ConsensusBusApp,
     /// Persistent event stream for the long-running worker network. Outlives any single epoch so
     /// the worker swarm does not have to be rebuilt on each transition.
-    pub(super) worker_event_stream: QueChannel<NetworkEvent<WorkerRequest, WorkerResponse>>,
+    worker_event_stream: QueChannel<NetworkEvent<WorkerRequest, WorkerResponse>>,
 
     /// Final consensus header of the epoch that just closed, carried into the next epoch so it can
     /// be used as the starting point for the new epoch's chain.
-    pub(super) last_consensus_header: Option<ConsensusHeader>,
+    last_consensus_header: Option<ConsensusHeader>,
 
     /// Highest consensus number actually forwarded to the execution engine (not merely persisted
     /// to the DB). Carried across epochs to avoid waiting on consensus that was stored but never
     /// sent to the engine.
-    pub(super) last_forwarded_consensus_number: u64,
+    last_forwarded_consensus_number: u64,
 
     /// Handle to the epoch pack files that durably store consensus data. Persisted on startup and
     /// at shutdown; read by the fetch tasks that backfill missing epochs.
-    pub(super) consensus_chain: ConsensusChain,
+    consensus_chain: ConsensusChain,
 
     /// Bootstrap servers loaded once from the genesis committee, used to seed peer discovery on
     /// the long-running networks.
-    pub(super) bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapServer>,
+    bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapServer>,
 
     /// Static version string for the running node, reported by node-info surfaces.
-    pub(super) version_str: &'static str,
+    version_str: &'static str,
 }
 
 /// Restore the [`GasAccumulator`] state after a mid-epoch restart.

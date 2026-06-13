@@ -1,5 +1,4 @@
 pub(crate) mod epoch_votes;
-mod epochs;
 mod node;
 
 pub use node::*;
