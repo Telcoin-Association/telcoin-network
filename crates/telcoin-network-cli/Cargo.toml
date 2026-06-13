@@ -48,6 +48,7 @@ tn-types = { workspace = true }
 tn-node = { workspace = true }
 tn-reth = { workspace = true }
 tn-config = { workspace = true }
+tn-storage = { workspace = true }
 rayon = { workspace = true }
 dirs-next = { workspace = true }
 bs58 = { workspace = true }

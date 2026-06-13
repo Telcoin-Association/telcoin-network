@@ -1,6 +1,6 @@
 //! CLI definition and entrypoint to executable
 use crate::{
-    genesis, keytool, node,
+    db, genesis, keytool, node,
     open_telemetry::init_opentracing_subscriber,
     version::{LONG_VERSION, SHORT_VERSION},
     NoArgs,
@@ -182,6 +182,10 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
                 let _guard = self.logs.init_tracing()?;
                 command.execute(datadir, passphrase)
             }
+            Commands::Db(command) => {
+                let _guard = self.logs.init_tracing()?;
+                command.execute(datadir)
+            }
         }
     }
 }
@@ -201,6 +205,10 @@ pub enum Commands<Ext: clap::Args + fmt::Debug = NoArgs> {
     /// Start the node
     #[command(name = "node")]
     Node(Box<node::NodeCommand<Ext>>),
+
+    /// Inspect and validate consensus epoch pack files.
+    #[command(name = "db")]
+    Db(db::DbArgs),
 }
 
 #[cfg(test)]
