@@ -66,7 +66,7 @@ pub enum NetworkError {
     SendResponse,
     /// Failed to send request/response outbound to peer.
     #[error("Outbound failure: {0}")]
-    Outbound(#[from] OutboundFailure),
+    Outbound(#[from] RpcFailure),
     /// Failed to create gossipsub behavior.
     #[error("{0}")]
     GossipBehavior(&'static str),
@@ -111,6 +111,43 @@ pub enum NetworkError {
     Stream(#[from] StreamError),
 }
 
+/// Reasons an outbound request-response RPC failed.
+///
+/// Crate-owned mirror of libp2p's [`OutboundFailure`] so the public
+/// [`NetworkError`] surface does not name a libp2p type. The variants and their
+/// `Display` text mirror the upstream enum exactly, so converting from
+/// [`OutboundFailure`] is loss-free.
+#[derive(Debug, Error)]
+pub enum RpcFailure {
+    /// The request could not be sent because dialing the peer failed.
+    #[error("Failed to dial the requested peer")]
+    DialFailure,
+    /// The request timed out before a response was received.
+    #[error("Timeout while waiting for a response")]
+    Timeout,
+    /// The connection closed before a response was received.
+    #[error("Connection was closed before a response was received")]
+    ConnectionClosed,
+    /// The remote supports none of the requested protocols.
+    #[error("The remote supports none of the requested protocols")]
+    UnsupportedProtocols,
+    /// An I/O failure happened on the outbound stream.
+    #[error("IO error on outbound stream: {0}")]
+    Io(std::io::Error),
+}
+
+impl From<OutboundFailure> for RpcFailure {
+    fn from(failure: OutboundFailure) -> Self {
+        match failure {
+            OutboundFailure::DialFailure => Self::DialFailure,
+            OutboundFailure::Timeout => Self::Timeout,
+            OutboundFailure::ConnectionClosed => Self::ConnectionClosed,
+            OutboundFailure::UnsupportedProtocols => Self::UnsupportedProtocols,
+            OutboundFailure::Io(e) => Self::Io(e),
+        }
+    }
+}
+
 impl From<oneshot::error::RecvError> for NetworkError {
     fn from(e: oneshot::error::RecvError) -> Self {
         Self::AckChannelClosed(e.to_string())
@@ -138,5 +175,39 @@ impl<T> From<mpsc::error::TrySendError<T>> for NetworkError {
 impl From<&DialError> for NetworkError {
     fn from(e: &DialError) -> Self {
         Self::Dial(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NetworkError, RpcFailure};
+    use libp2p::request_response::OutboundFailure;
+    use std::io;
+
+    /// Every `OutboundFailure` variant maps to the matching `RpcFailure`
+    /// variant and preserves the upstream `Display` text, so wrapping it in
+    /// `NetworkError::Outbound` stays identical to the previous direct
+    /// `#[from] OutboundFailure`.
+    #[test]
+    fn rpc_failure_mirrors_outbound_failure() {
+        let cases = [
+            OutboundFailure::DialFailure,
+            OutboundFailure::Timeout,
+            OutboundFailure::ConnectionClosed,
+            OutboundFailure::UnsupportedProtocols,
+            OutboundFailure::Io(io::Error::other("boom")),
+        ];
+
+        for failure in cases {
+            let expected = failure.to_string();
+            let mapped = RpcFailure::from(failure);
+            assert_eq!(
+                mapped.to_string(),
+                expected,
+                "RpcFailure Display must match libp2p verbatim"
+            );
+            let wrapped = NetworkError::Outbound(mapped);
+            assert_eq!(wrapped.to_string(), format!("Outbound failure: {expected}"));
+        }
     }
 }
