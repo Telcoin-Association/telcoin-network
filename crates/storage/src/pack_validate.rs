@@ -174,17 +174,7 @@ pub fn validate_pack_file(
     // epoch fails here with an open error) and needs no sidecar index files.
     let pack = Pack::<PackRecord>::open(path, epoch as u64, true, PackCompression::ZStd)?;
 
-    // ---- Pass 1: global batch presence. ----
-    // Collect every batch digest present anywhere in the file. This is what lets us tell an
-    // *absent* batch (a real data gap) apart from a *misordered* one (present, wrong group).
-    let mut all_batch_digests: HashSet<BlockHash> = HashSet::new();
-    for record in pack.raw_iter().map_err(|e| PackError::ReadError(e.to_string()))? {
-        if let PackRecord::Batch(batch) = record? {
-            all_batch_digests.insert(batch.digest());
-        }
-    }
-
-    // ---- Pass 2: mirror `Inner::stream_import`, but collect every issue instead of bailing. ----
+    // ---- Single pass: mirror `Inner::stream_import`, but collect every issue instead of bailing.
     let mut issues = Vec::new();
     let mut batch_count: u64 = 0;
     let mut consensus_count: u64 = 0;
@@ -232,6 +222,11 @@ pub fn validate_pack_file(
     let mut batches: HashSet<BlockHash> = HashSet::new();
     let mut referenced_batches: HashSet<BlockHash> = HashSet::new();
 
+    // Persistent, never-cleared set of every batch digest seen anywhere in the file. This is what
+    // lets us tell an *absent* batch (a real data gap) apart from a *misordered* one (present,
+    // wrong group). Classification is deferred until end-of-loop, when this set is complete.
+    let mut all_batch_digests: HashSet<BlockHash> = HashSet::new();
+
     for record in iter {
         match record? {
             PackRecord::EpochMeta(_) => {
@@ -242,7 +237,11 @@ pub fn validate_pack_file(
             }
             PackRecord::Batch(batch) => {
                 batch_count += 1;
-                batches.insert(batch.digest());
+                // Compute the (re-encode + hash) digest once and record it in both the per-group
+                // set and the persistent global set.
+                let digest = batch.digest();
+                batches.insert(digest);
+                all_batch_digests.insert(digest);
             }
             PackRecord::Consensus(consensus_header) => {
                 consensus_count += 1;
@@ -261,18 +260,19 @@ pub fn validate_pack_file(
                     }
                 }
 
-                // 2. Every referenced batch must be present in *this* header's group.
+                // 2. Every referenced batch must be present in *this* header's group. The global
+                // set is not yet complete here (a referenced batch may appear later in the file),
+                // so record the issue with a placeholder class and resolve it after the loop.
                 for header in consensus_header.sub_dag.headers() {
                     for (digest, _) in header.payload().iter() {
                         if batches.contains(digest) {
                             referenced_batches.insert(*digest);
                         } else {
-                            let class = if all_batch_digests.contains(digest) {
-                                BatchClass::Misordered
-                            } else {
-                                BatchClass::Absent
-                            };
-                            issues.push(PackIssue::MissingBatch { number, digest: *digest, class });
+                            issues.push(PackIssue::MissingBatch {
+                                number,
+                                digest: *digest,
+                                class: BatchClass::Absent,
+                            });
                         }
                     }
                 }
@@ -289,6 +289,20 @@ pub fn validate_pack_file(
                 referenced_batches.clear();
                 expected_parent = Some(consensus_header.digest());
             }
+        }
+    }
+
+    // The global set is now complete. Resolve every deferred `MissingBatch` class in place: a
+    // digest present anywhere in the file is `Misordered`, otherwise it is a genuine `Absent` gap.
+    // This is a cheap pass over `issues` (bounded by the number of missing references), not another
+    // file traversal.
+    for issue in issues.iter_mut() {
+        if let PackIssue::MissingBatch { digest, class, .. } = issue {
+            *class = if all_batch_digests.contains(digest) {
+                BatchClass::Misordered
+            } else {
+                BatchClass::Absent
+            };
         }
     }
 
