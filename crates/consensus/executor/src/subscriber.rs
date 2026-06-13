@@ -491,7 +491,14 @@ impl<DB: Database> Subscriber<DB> {
                         .find(|b| b.digest() == *digest)
                     {
                         warn!(target: "subscriber", ?digest, ?batch_digests, "failed to remove fetched batch - duplicate");
-                        cert_batches.push(batch.clone());
+                        if sub_dag.leader_epoch() != 74
+                            || self.config.config().genesis().config.chain_id != 2017
+                        {
+                            // Epoch 74 of adiri testnet had a bug with duplicate batches.
+                            // We have to recreate it in order to sync testnet so we skip this push
+                            // on adiri in epoch 74.
+                            cert_batches.push(batch.clone());
+                        }
                     } else {
                         error!(target: "subscriber", ?digest, "[Protocol violation] Batch not found in fetched batches from workers of certificate signers");
                         return Err(SubscriberError::MissingFetchedBatch(*digest));
