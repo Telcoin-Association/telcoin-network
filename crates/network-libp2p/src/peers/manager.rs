@@ -12,7 +12,7 @@ use crate::{
     error::NetworkError,
     peers::status::ConnectionStatus,
     send_or_log_error,
-    types::{NetworkInfo, NetworkResult},
+    types::{NetworkInfo, NetworkResult, RpcInfo},
 };
 use libp2p::{core::ConnectedPoint, kad::PeerInfo, multiaddr::Protocol, Multiaddr, PeerId};
 use rand::seq::{IteratorRandom as _, SliceRandom as _};
@@ -508,7 +508,7 @@ impl PeerManager {
         let ready_to_prune = connected_peers
             .iter()
             .filter_map(|(peer_id, peer)| {
-                if !self.is_peer_validator(peer_id) && !peer.is_trusted() {
+                if !self.is_peer_validator(peer_id) && !peer.is_operator_allowlisted() {
                     Some(*peer_id)
                 } else {
                     None
@@ -597,10 +597,10 @@ impl PeerManager {
         self.peers.get_peer(peer_id).map(|peer| peer.score().aggregate_score())
     }
 
-    /// Bool indicating if the peer is trusted or a validator.
+    /// Bool indicating if the peer is operator-allowlisted or a validator.
     pub(crate) fn peer_is_important(&self, peer_id: &PeerId) -> bool {
         self.is_peer_validator(peer_id)
-            || self.peers.get_peer(peer_id).map(|p| p.is_trusted()).unwrap_or_default()
+            || self.peers.get_peer(peer_id).map(|p| p.is_operator_allowlisted()).unwrap_or_default()
     }
 
     /// Set the previous/current/next committees directly from authoritative state, every epoch.
@@ -680,7 +680,21 @@ impl PeerManager {
 
     /// Add a known peer to the known list.
     /// Used for bootstrap servers or possibly committee members.
-    pub(crate) fn add_known_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
+    pub(crate) fn add_known_peer(&mut self, bls_key: BlsPublicKey, mut info: NetworkInfo) {
+        // signature verification proves authenticity but not scheme correctness; drop a
+        // malformed advertised endpoint so only well-formed RPC info is ever cached in
+        // `known_peers`. the rest of the (signed, authentic) record is still usable.
+        if let Some(rpc) = &info.rpc {
+            if let Err(err) = rpc.validate() {
+                warn!(
+                    target: "peer-manager",
+                    ?err,
+                    ?bls_key,
+                    "dropping malformed advertised RPC endpoint from peer record"
+                );
+                info.rpc = None;
+            }
+        }
         trace!(target: "peer-manager", ?bls_key, "adding known peer");
         self.peers.upsert_peer(bls_key, info.pubkey.clone(), info.multiaddrs.clone());
         self.known_peers.insert(bls_key, info);
@@ -707,6 +721,20 @@ impl PeerManager {
         // emit event for kad to try to discover
         trace!(target: "peer-manager", ?missing, "requesting kad records");
         self.events.push_back(PeerEvent::MissingAuthorities(missing));
+    }
+
+    /// Return the most-recently-fetched [RpcInfo] for the given authority,
+    /// if any has been advertised.
+    pub(crate) fn get_rpc(&self, bls_key: &BlsPublicKey) -> Option<RpcInfo> {
+        self.known_peers.get(bls_key).and_then(|info| info.rpc.clone())
+    }
+
+    /// Return a snapshot of every known authority that has advertised an [RpcInfo].
+    pub(crate) fn all_rpcs(&self) -> Vec<(BlsPublicKey, RpcInfo)> {
+        self.known_peers
+            .iter()
+            .filter_map(|(bls, info)| info.rpc.clone().map(|rpc| (*bls, rpc)))
+            .collect()
     }
 
     /// Find the peer id for an authority.

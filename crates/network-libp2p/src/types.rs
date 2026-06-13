@@ -13,8 +13,12 @@ use libp2p::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use tn_types::{
-    encode, now, BlsPublicKey, BlsSignature, NetworkPublicKey, P2pNode, TimestampSec, WorkerId,
+    encode, now, try_decode, BlsPublicKey, BlsSignature, NetworkPublicKey, P2pNode, TimestampSec,
+    WorkerId,
 };
+// Re-export the shared RPC endpoint type so callers can keep referring to
+// `network_libp2p::types::RpcInfo`. The canonical definition lives in `tn_types`.
+pub use tn_types::RpcInfo;
 use tokio::sync::{mpsc, oneshot};
 
 #[cfg(test)]
@@ -383,6 +387,18 @@ where
         /// Channel for returning the established stream to application layer.
         reply: oneshot::Sender<NetworkResult<Stream>>,
     },
+    /// Look up the most-recently-fetched RPC info for a known authority.
+    GetValidatorRpc {
+        /// The authority's BLS public key.
+        bls_key: BlsPublicKey,
+        /// The reply to caller.
+        reply: oneshot::Sender<Option<RpcInfo>>,
+    },
+    /// Snapshot of all known authority RPCs.
+    GetAllValidatorRpcs {
+        /// The reply to caller.
+        reply: oneshot::Sender<Vec<(BlsPublicKey, RpcInfo)>>,
+    },
     /// Read a single record from the local kad store by BLS key.
     ///
     /// Test-only observation hook used to assert local-store eviction
@@ -659,6 +675,39 @@ where
         self.sender.send(NetworkCommand::OpenStream { peer, reply }).await?;
         rx.await.map_err(Into::into)
     }
+
+    /// Look up the most-recently-fetched RPC info for a known authority.
+    ///
+    /// Returns `None` if the authority is unknown or has not advertised RPC info.
+    /// Callers that need fresh data should call [`Self::find_authorities`] first
+    /// and wait for discovery to complete.
+    ///
+    /// RPC info is advertised only on worker [`NodeRecord`]s, so this is meaningful
+    /// on a worker network handle; a primary handle always returns `None`. Together
+    /// with [`Self::get_all_validator_rpcs`] this backs a worker gateway: a load
+    /// balancer that discovers validators' advertised worker RPC endpoints and
+    /// routes client traffic across them.
+    pub async fn get_validator_rpc(&self, bls_key: BlsPublicKey) -> NetworkResult<Option<RpcInfo>> {
+        let (reply, rx) = oneshot::channel();
+        self.sender.send(NetworkCommand::GetValidatorRpc { bls_key, reply }).await?;
+        rx.await.map_err(Into::into)
+    }
+
+    /// Snapshot of all known authority RPCs.
+    ///
+    /// Returns the RPC info for every known authority that has advertised it.
+    /// Callers that need fresh data should call [`Self::find_authorities`] first
+    /// and wait for discovery to complete.
+    ///
+    /// Only worker [`NodeRecord`]s carry RPC info, so this returns entries on a
+    /// worker network handle and an empty list on a primary handle. This is the
+    /// discovery primitive behind a worker gateway that maps client traffic across
+    /// every validator's advertised worker RPC endpoint.
+    pub async fn get_all_validator_rpcs(&self) -> NetworkResult<Vec<(BlsPublicKey, RpcInfo)>> {
+        let (reply, rx) = oneshot::channel();
+        self.sender.send(NetworkCommand::GetAllValidatorRpcs { reply }).await?;
+        rx.await.map_err(Into::into)
+    }
 }
 
 /// List of addresses for a node, signature will be the nodes BLS signature
@@ -675,13 +724,53 @@ pub struct NodeRecord {
     pub signature: BlsSignature,
 }
 
+/// Pre-`rpc` [NetworkInfo] layout.
+///
+/// BCS is not self-describing, so records encoded and signed by pre-upgrade
+/// software fail to decode under the current schema. This mirror preserves the
+/// exact historical field order so legacy bytes can still be decoded (and their
+/// signatures verified over the legacy encoding).
+#[derive(Serialize, Deserialize)]
+struct LegacyNetworkInfo {
+    /// The node's [NetworkPublicKey].
+    pubkey: NetworkPublicKey,
+    /// Network address for node.
+    multiaddrs: Vec<Multiaddr>,
+    /// The timestamps when this was published.
+    timestamp: TimestampSec,
+}
+
+/// Pre-`rpc` [NodeRecord] layout. See [LegacyNetworkInfo].
+#[derive(Serialize, Deserialize)]
+struct LegacyNodeRecord {
+    /// The network information contained within the record.
+    info: LegacyNetworkInfo,
+    /// Signature of the info field with the node's BLS key.
+    signature: BlsSignature,
+}
+
+impl From<LegacyNodeRecord> for NodeRecord {
+    fn from(legacy: LegacyNodeRecord) -> Self {
+        let LegacyNodeRecord {
+            info: LegacyNetworkInfo { pubkey, multiaddrs, timestamp },
+            signature,
+        } = legacy;
+        Self { info: NetworkInfo { pubkey, multiaddrs, timestamp, rpc: None }, signature }
+    }
+}
+
 impl NodeRecord {
     /// Helper method to build a signed node record.
-    pub fn build<F>(pubkey: NetworkPublicKey, multiaddr: Multiaddr, signer: F) -> NodeRecord
+    pub fn build<F>(
+        pubkey: NetworkPublicKey,
+        multiaddr: Multiaddr,
+        rpc: Option<RpcInfo>,
+        signer: F,
+    ) -> NodeRecord
     where
         F: FnOnce(&[u8]) -> BlsSignature,
     {
-        let info = NetworkInfo { pubkey, multiaddrs: vec![multiaddr], timestamp: now() };
+        let info = NetworkInfo { pubkey, multiaddrs: vec![multiaddr], timestamp: now(), rpc };
         let data = encode(&info);
         let signature = signer(&data);
         Self { info, signature }
@@ -701,6 +790,51 @@ impl NodeRecord {
     pub fn info(&self) -> &NetworkInfo {
         &self.info
     }
+
+    /// Decode a [NodeRecord] from bytes, falling back to the pre-`rpc` legacy
+    /// layout (with `rpc: None`) for records produced by pre-upgrade software.
+    ///
+    /// The fallback order is deterministic because the two layouts are mutually
+    /// exclusive under BCS. `NetworkInfo` ends with `rpc: Option<RpcInfo>`, encoded
+    /// as a single Option tag byte (`0x00`/`0x01`). The legacy layout ends with
+    /// `signature: BlsSignature`, which BCS encodes via `serialize_bytes` as a
+    /// ULEB128 length prefix (`0x30` = 48) followed by the 48 signature bytes.
+    ///
+    /// - Legacy bytes fail the current decode: where the current decoder expects the `rpc` Option
+    ///   tag, legacy bytes hold the signature's `0x30` length prefix, which is neither `0x00` nor
+    ///   `0x01`, so BCS rejects it.
+    /// - Current bytes fail the legacy decode: the legacy decoder reads the `rpc` Option tag
+    ///   (`0x00`/`0x01`) as the signature's length prefix, yielding a 0- or 1-byte slice that
+    ///   `BlsSignature` rejects as an invalid signature.
+    ///
+    /// Does NOT verify the signature — use [Self::decode_and_verify] when
+    /// authenticity matters.
+    pub fn try_decode_compat(value: &[u8]) -> Option<NodeRecord> {
+        try_decode::<NodeRecord>(value)
+            .ok()
+            .or_else(|| try_decode::<LegacyNodeRecord>(value).ok().map(Into::into))
+    }
+
+    /// Decode a [NodeRecord] (with legacy fallback) and verify its BLS
+    /// signature against the layout it was actually signed over.
+    ///
+    /// Legacy records were signed over the legacy `info` encoding; re-encoding
+    /// under the current schema would insert the `rpc` Option tag and break
+    /// verification, so each layout verifies against its own re-encoding.
+    pub fn decode_and_verify(
+        value: &[u8],
+        key: &BlsPublicKey,
+    ) -> Option<(BlsPublicKey, NodeRecord)> {
+        if let Ok(record) = try_decode::<NodeRecord>(value) {
+            return record.verify(key);
+        }
+        let legacy = try_decode::<LegacyNodeRecord>(value).ok()?;
+        if legacy.signature.verify_raw(&encode(&legacy.info), key) {
+            Some((*key, legacy.into()))
+        } else {
+            None
+        }
+    }
 }
 
 /// The network information needed for consensus.
@@ -713,6 +847,12 @@ pub struct NetworkInfo {
     /// The timestamps when this was published.
     /// Useful for nodes to compare latest records.
     pub timestamp: TimestampSec,
+    /// Optional JSON-RPC endpoint information for this node.
+    ///
+    /// Populated only on worker [NodeRecord]s of validators that opt-in to
+    /// advertising RPC publicly. `None` on primary records and on validators
+    /// that do not expose RPC publicly.
+    pub rpc: Option<RpcInfo>,
 }
 
 /// Outbound kad query from this node.
