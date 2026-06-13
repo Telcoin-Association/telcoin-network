@@ -315,6 +315,36 @@ fn test_is_validator() {
     assert!(!all_peers.is_peer_validator(&PeerId::random()));
 }
 
+/// Regression guard for issue #715: a validator's exemption is derived from committee
+/// membership, not a stored flag, so rotating out of the committee revokes the exemption
+/// (and, because operator trust is separate, never touches an operator allowlist).
+#[test]
+fn test_committee_rotation_revokes_validator_exemption() {
+    ensure_score_config(None);
+    let mut all_peers = AllPeers::new(Duration::from_secs(5), 10, 10);
+
+    // a committee validator that the operator did NOT allowlist
+    let mut rng = StdRng::from_seed([0; 32]);
+    let bls = *BlsKeypair::generate(&mut rng).public();
+    let net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let peer_id: PeerId = net.clone().into();
+    all_peers.upsert_peer(bls, net, vec![]);
+    all_peers.current_committee.insert(bls);
+
+    // while in the committee the peer is exempt: a fatal penalty is suppressed and its
+    // reputation is unaffected
+    let action = all_peers.process_penalty(&peer_id, Penalty::Fatal);
+    assert!(matches!(action, PeerAction::NoAction));
+    assert_eq!(all_peers.get_peer(&peer_id).unwrap().reputation(), Reputation::Trusted);
+
+    // rotate the validator out of the committee
+    all_peers.current_committee.clear();
+
+    // the exemption is gone: the same fatal penalty now lands and the peer is banned
+    let _ = all_peers.process_penalty(&peer_id, Penalty::Fatal);
+    assert_eq!(all_peers.get_peer(&peer_id).unwrap().reputation(), Reputation::Banned);
+}
+
 #[test]
 fn test_ip_and_peer_banned() {
     let mut all_peers = create_all_peers(None);
@@ -776,7 +806,7 @@ fn test_update_committees_no_change() {
     assert!(all_peers.is_peer_validator(&x_id));
     assert!(all_peers.current_committee.contains(&x_bls));
     assert!(all_peers.next_committee.contains(&x_bls));
-    assert!(all_peers.get_peer(&x_id).unwrap().is_trusted());
+    assert_eq!(all_peers.trust_basis(&x_id), Some(TrustBasis::Validator));
 }
 
 #[test]
@@ -871,9 +901,9 @@ fn test_update_committees_tracks_undiscovered_member_then_trusts_on_discovery() 
     // ... and the lazy-trust hook applies committee membership immediately
     let actions = all_peers.apply_membership_if_committee(bls);
 
-    // now the member resolves: validator + trusted, the moment discovery completed
+    // now the member resolves: validator + exempt, the moment discovery completed
     assert!(all_peers.is_peer_validator(&peer_id));
-    assert!(all_peers.get_peer(&peer_id).unwrap().is_trusted());
+    assert_eq!(all_peers.trust_basis(&peer_id), Some(TrustBasis::Validator));
     // a freshly discovered, never-banned peer needs no unban action
     assert!(actions.is_empty());
 }
@@ -909,9 +939,10 @@ fn test_undiscovered_committee_member_banned_then_unbanned_on_discovery() {
     assert!(all_peers.get_peer(&peer_id).is_some(), "member record must be retained");
     assert!(all_peers.is_peer_validator(&peer_id), "discovered member is now a validator");
     assert!(!all_peers.peer_banned(&peer_id), "discovered committee member must be unbanned");
-    assert!(
-        all_peers.get_peer(&peer_id).unwrap().is_trusted(),
-        "discovered member must be trusted"
+    assert_eq!(
+        all_peers.trust_basis(&peer_id),
+        Some(TrustBasis::Validator),
+        "discovered member must be exempt as a validator"
     );
     assert!(
         actions.iter().any(|(id, action)| id == &peer_id && matches!(action, PeerAction::Unban(_))),
@@ -932,7 +963,7 @@ fn test_apply_membership_if_committee_is_noop_for_non_member() {
 
     assert!(actions.is_empty());
     assert!(!all_peers.is_peer_validator(&peer_id));
-    assert!(!all_peers.get_peer(&peer_id).unwrap().is_trusted());
+    assert_eq!(all_peers.trust_basis(&peer_id), None);
 }
 
 #[test]
@@ -940,22 +971,22 @@ fn test_update_committees_in_window_peer_stays_trusted() {
     let mut rng = StdRng::from_seed([16; 32]);
     let mut all_peers = create_all_peers(None);
 
-    // M starts in the current committee and is made trusted by update_committees
+    // M starts in the current committee and is exempt as a validator
     let (m_bls, m_net, m_id) = committee_member(&mut rng);
     discover(&mut all_peers, m_bls, &m_net);
     all_peers.update_committees(HashSet::new(), HashSet::from([m_bls]), HashSet::new());
-    assert!(all_peers.get_peer(&m_id).unwrap().is_trusted());
+    assert_eq!(all_peers.trust_basis(&m_id), Some(TrustBasis::Validator));
 
     // next epoch: M moves to the previous slot (still in-window) alongside a disjoint current
     let (other_bls, other_net, _other_id) = committee_member(&mut rng);
     discover(&mut all_peers, other_bls, &other_net);
     all_peers.update_committees(HashSet::from([m_bls]), HashSet::from([other_bls]), HashSet::new());
 
-    // M is still inside the three-slot window (now in previous), so it stays trusted -- not via a
-    // one-way ratchet, but because it is still a tracked committee member.
+    // M is still inside the three-slot window (now in previous), so it stays exempt -- not via a
+    // one-way ratchet, but because the exemption derives from its tracked membership.
     assert!(all_peers.previous_committee.contains(&m_bls));
     assert!(all_peers.is_peer_validator(&m_id));
-    assert!(all_peers.get_peer(&m_id).unwrap().is_trusted());
+    assert_eq!(all_peers.trust_basis(&m_id), Some(TrustBasis::Validator));
 }
 
 #[test]
@@ -963,11 +994,11 @@ fn test_update_committees_demotes_peer_that_exits_window() {
     let mut rng = StdRng::from_seed([22; 32]);
     let mut all_peers = create_all_peers(None);
 
-    // E starts trusted as a current-committee member
+    // E starts exempt as a current-committee member
     let (e_bls, e_net, e_id) = committee_member(&mut rng);
     discover(&mut all_peers, e_bls, &e_net);
     all_peers.update_committees(HashSet::new(), HashSet::from([e_bls]), HashSet::new());
-    assert!(all_peers.get_peer(&e_id).unwrap().is_trusted());
+    assert_eq!(all_peers.trust_basis(&e_id), Some(TrustBasis::Validator));
     assert!(all_peers.is_peer_validator(&e_id));
 
     // next epoch's three slots do not include E at all
@@ -975,8 +1006,9 @@ fn test_update_committees_demotes_peer_that_exits_window() {
     discover(&mut all_peers, f_bls, &f_net);
     all_peers.update_committees(HashSet::new(), HashSet::from([f_bls]), HashSet::new());
 
-    // E fell out of the window: demoted to untrusted and no longer counts as a validator
-    assert!(!all_peers.get_peer(&e_id).unwrap().is_trusted());
+    // E fell out of the window: the validator exemption is gone (derived from the slots, so no
+    // demotion pass is needed) and E no longer counts as a validator
+    assert_eq!(all_peers.trust_basis(&e_id), None);
     assert!(!all_peers.is_peer_validator(&e_id));
 }
 
@@ -990,15 +1022,16 @@ fn test_update_committees_does_not_demote_operator_trusted_peer_never_in_committ
     let op_net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
     let op_id: PeerId = op_net.clone().into();
     all_peers.add_trusted_peer(op_bls, op_net);
-    assert!(all_peers.get_peer(&op_id).unwrap().is_trusted());
+    assert_eq!(all_peers.trust_basis(&op_id), Some(TrustBasis::Operator));
 
     // a committee update that does not involve the operator peer
     let (c_bls, c_net, _c_id) = committee_member(&mut rng);
     discover(&mut all_peers, c_bls, &c_net);
     all_peers.update_committees(HashSet::new(), HashSet::from([c_bls]), HashSet::new());
 
-    // the operator peer was never tracked in a committee slot, so demotion does not touch it
-    assert!(all_peers.get_peer(&op_id).unwrap().is_trusted());
+    // operator trust is stored at construction and never altered by epoch rotation, so the
+    // committee update does not touch the operator peer's exemption
+    assert_eq!(all_peers.trust_basis(&op_id), Some(TrustBasis::Operator));
 }
 
 #[test]
@@ -1041,15 +1074,15 @@ fn test_update_committees_populates_previous() {
 
     assert_eq!(all_peers.previous_committee, HashSet::from([p_bls]));
     assert!(all_peers.is_peer_validator(&p_id));
-    assert!(all_peers.get_peer(&p_id).unwrap().is_trusted());
+    assert_eq!(all_peers.trust_basis(&p_id), Some(TrustBasis::Validator));
 }
 
 #[test]
 fn test_update_committees_invariants_under_random_committees() {
     // Property-style coverage without a proptest dependency: across many epochs with random
     // committees in each slot, every slot must equal exactly the (bls) set it was given, every
-    // discovered union member is trusted, and every peer tracked last round but absent this round
-    // is demoted to untrusted.
+    // discovered union member is exempt as a validator, and every peer tracked last round but
+    // absent this round re-enters the normal score model.
     let mut rng = StdRng::from_seed([42; 32]);
     let mut all_peers = create_all_peers(None);
 
@@ -1070,22 +1103,24 @@ fn test_update_committees_invariants_under_random_committees() {
         assert_eq!(all_peers.current_committee, curr_bls, "current slot after round {round}");
         assert_eq!(all_peers.next_committee, next_bls, "next slot after round {round}");
 
-        // every discovered member of the new window is trusted
+        // every discovered member of the new window is exempt as a validator
         let union: HashSet<PeerId> =
             prev_ids.iter().chain(curr_ids.iter()).chain(next_ids.iter()).copied().collect();
         for id in &union {
-            assert!(
-                all_peers.get_peer(id).unwrap().is_trusted(),
-                "union member {id} should be trusted after round {round}"
+            assert_eq!(
+                all_peers.trust_basis(id),
+                Some(TrustBasis::Validator),
+                "union member {id} should be exempt after round {round}"
             );
         }
 
-        // every peer tracked last round but absent this round is demoted (all ids are distinct
-        // across rounds, so the entire prior union should now be untrusted)
+        // every peer tracked last round but absent this round loses its exemption (all ids are
+        // distinct across rounds, so the entire prior union re-enters the score model)
         for id in prev_union.difference(&union) {
-            assert!(
-                !all_peers.get_peer(id).unwrap().is_trusted(),
-                "exited peer {id} should be untrusted after round {round}"
+            assert_eq!(
+                all_peers.trust_basis(id),
+                None,
+                "exited peer {id} should re-enter the score model after round {round}"
             );
         }
 

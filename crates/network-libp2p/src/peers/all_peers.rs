@@ -8,7 +8,7 @@ use super::{
     peer::Peer,
     score::ReputationUpdate,
     status::ConnectionStatus,
-    types::{ConnectionDirection, PeerIdentity},
+    types::{ConnectionDirection, PeerIdentity, TrustBasis},
     PeerExchangeMap, Penalty,
 };
 use crate::{
@@ -178,9 +178,10 @@ impl AllPeers {
     /// This method is called when the application layer identifies a problem and reports a peer.
     pub(super) fn process_penalty(&mut self, peer_id: &PeerId, penalty: Penalty) -> PeerAction {
         let id = self.identity_for(peer_id);
+        let exemption = self.trust_basis_for(&id);
         if let Some(peer) = self.peers.get_mut(&id) {
             let prior_reputation = peer.reputation();
-            let new_reputation = peer.apply_penalty(penalty);
+            let new_reputation = peer.apply_penalty(penalty, exemption);
             debug!(target: "peer-manager", ?peer_id, ?prior_reputation, ?new_reputation);
 
             if new_reputation == prior_reputation {
@@ -249,8 +250,9 @@ impl AllPeers {
 
         // ensure peer is banned if the new state is Banned
         if matches!(new_status, &NewConnectionStatus::Banned) {
+            let exemption = self.trust_basis(peer_id);
             if let Some(peer) = self.peers.get_mut(&id) {
-                peer.ensure_banned(peer_id);
+                peer.ensure_banned(peer_id, exemption);
             } else {
                 // unreachable
                 error!(target: "peer-manager", ?peer_id, "impossible - peer was just created if it didn't already exist");
@@ -303,8 +305,13 @@ impl AllPeers {
     /// See [Self::apply_penalty] for ban logic.
     fn update_peer_scores(&mut self) -> Vec<(PeerId, PeerAction)> {
         // filter peers that are eligible to become unbanned
+        let previous_committee = &self.previous_committee;
+        let current_committee = &self.current_committee;
+        let next_committee = &self.next_committee;
         let unbanned_peers = self.peers.iter_mut().filter_map(|(id, peer)| {
-            let update = peer.heartbeat();
+            let exemption =
+                Self::exemption(id, peer, previous_committee, current_committee, next_committee);
+            let update = peer.heartbeat(exemption);
             match update {
                 ReputationUpdate::Unbanned => {
                     Self::peer_id_for(id, peer)
@@ -734,6 +741,56 @@ impl AllPeers {
         }
     }
 
+    /// The [TrustBasis] exempting `peer` from the score model this epoch, if any.
+    ///
+    /// Validator status is derived live from the three tracked committee slots (it is never
+    /// stored on the peer, so it cannot drift out of sync with rotation); operator allowlisting
+    /// is read from the peer. Validator takes precedence in the reported basis as it is the
+    /// operationally significant signal when a penalty is suppressed.
+    fn exemption(
+        id: &PeerIdentity,
+        peer: &Peer,
+        previous_committee: &HashSet<BlsPublicKey>,
+        current_committee: &HashSet<BlsPublicKey>,
+        next_committee: &HashSet<BlsPublicKey>,
+    ) -> Option<TrustBasis> {
+        let in_committee = |bls_public_key: &BlsPublicKey| {
+            previous_committee.contains(bls_public_key)
+                || current_committee.contains(bls_public_key)
+                || next_committee.contains(bls_public_key)
+        };
+        match id {
+            PeerIdentity::Confirmed(bls_public_key) if in_committee(bls_public_key) => {
+                Some(TrustBasis::Validator)
+            }
+            PeerIdentity::Confirmed(_) | PeerIdentity::Unidentified(_) => {
+                peer.is_operator_allowlisted().then_some(TrustBasis::Operator)
+            }
+        }
+    }
+
+    /// The [TrustBasis] exempting the peer identified by `peer_id`, if it is known and exempt.
+    ///
+    /// `None` means the peer is subject to the normal score model.
+    fn trust_basis(&self, peer_id: &PeerId) -> Option<TrustBasis> {
+        let id = self.identity_for(peer_id);
+        self.trust_basis_for(&id)
+    }
+
+    /// The [TrustBasis] exempting the peer with the already-resolved identity `id`, if it is
+    /// known and exempt.
+    fn trust_basis_for(&self, id: &PeerIdentity) -> Option<TrustBasis> {
+        self.peers.get(id).and_then(|peer| {
+            Self::exemption(
+                id,
+                peer,
+                &self.previous_committee,
+                &self.current_committee,
+                &self.next_committee,
+            )
+        })
+    }
+
     /// Boolean indicating if the ip address is associated with a banned peer.
     pub(super) fn ip_banned(&self, ip: &IpAddr) -> bool {
         self.banned_peers.ip_banned(ip)
@@ -926,30 +983,21 @@ impl AllPeers {
     /// The complete committee sets are stored directly, keyed by [BlsPublicKey]. Committee
     /// membership is a consensus-domain fact that is always known, so a member whose libp2p
     /// [PeerId] has not been discovered yet is still retained in its slot and counts as a
-    /// validator; the unban/trust pass for it then runs lazily once discovery confirms its
-    /// network identity (see [`Self::apply_membership_if_committee`]).
+    /// validator; the unban pass for it then runs lazily once discovery confirms its network
+    /// identity (see [`Self::apply_membership_if_committee`]).
     ///
-    /// Any member that was tracked in one of the three slots before this update but is absent from
-    /// all three afterward is demoted via [`Peer::make_untrusted`] when a `Confirmed` record exists
-    /// for it, bounding committee-derived trust to the three-slot window. Members of the new
-    /// committees whose network identity is known are forgiven any bans and marked `trusted`; a
-    /// member appearing in more than one committee is processed once. The demote and re-trust sets
-    /// are disjoint by construction, so no member is demoted then re-trusted in a single call.
+    /// No trust flag is stored on peers: a member's validator exemption is derived live from the
+    /// three committee slots (issue #715), so overwriting the slots is itself the demotion - a
+    /// member absent from all three slots re-enters the normal score model immediately, while
+    /// operator-allowlisted peers keep their exemption regardless. Members of the new committees
+    /// whose network identity is known are forgiven any bans and have their scores primed to max;
+    /// a member appearing in more than one committee is processed once.
     pub(super) fn update_committees(
         &mut self,
         previous: HashSet<BlsPublicKey>,
         current: HashSet<BlsPublicKey>,
         next: HashSet<BlsPublicKey>,
     ) -> Vec<(PeerId, PeerAction)> {
-        // capture the members tracked across all three slots before the overwrite
-        let previously_tracked: HashSet<BlsPublicKey> = self
-            .previous_committee
-            .iter()
-            .chain(self.current_committee.iter())
-            .chain(self.next_committee.iter())
-            .copied()
-            .collect();
-
         // the union of the three new committees
         let new_union: HashSet<BlsPublicKey> =
             previous.iter().chain(current.iter()).chain(next.iter()).copied().collect();
@@ -960,24 +1008,22 @@ impl AllPeers {
         self.current_committee = current;
         self.next_committee = next;
 
-        // demote any member that fell out of all three slots if we hold a confirmed record for it,
-        // returning it to the normal score model
-        for bls_key in previously_tracked.difference(&new_union) {
-            if let Some(peer) = self.peers.get_mut(&PeerIdentity::Confirmed(*bls_key)) {
-                peer.make_untrusted();
-            }
-        }
-
-        // unban + trust every member with a known network identity once; unknown members are
-        // handled lazily on discovery
+        // unban every member with a known network identity once and prime its score; unknown
+        // members are handled lazily on discovery. members that fell out of all three slots
+        // need no demotion: their validator exemption derives from the slots just overwritten
         self.apply_committee_membership(new_union)
     }
 
-    /// Forgive bans and refresh trust for a committee WITHOUT touching the committee slots.
+    /// Forgive bans for a committee's members WITHOUT touching the committee slots.
     ///
     /// Used only by the deadlock-breaker pre-dial path: it unbans committee peers so a subsequent
     /// dial loop can connect, but leaves previous/current/next untouched because the real slot
     /// update follows shortly after via `update_committees`.
+    ///
+    /// Because validator exemption is derived from the slots, members not already in a slot are
+    /// NOT penalty-exempt during this window (intentional: exemption only ever follows
+    /// authoritative slot state). They are unbanned with scores primed to max, and the exemption
+    /// begins when `update_committees` writes the slots.
     pub(super) fn mark_committee_for_dial(
         &mut self,
         committee: HashSet<BlsPublicKey>,
@@ -985,13 +1031,15 @@ impl AllPeers {
         self.apply_committee_membership(committee)
     }
 
-    /// Lazily apply committee trust to a single member the moment its network identity is learned.
+    /// Lazily apply committee membership to a single member the moment its network identity is
+    /// learned.
     ///
     /// Called from the discovery path ([`super::manager::PeerManager::add_known_peer`]) after a
     /// peer is re-keyed onto its `Confirmed` identity. If the member belongs to any tracked
-    /// committee slot it is unbanned/trusted immediately, closing the trust window for members
-    /// that were tracked by [`Self::update_committees`] before their [PeerId] was known. A
-    /// no-op for peers that are not in any tracked committee.
+    /// committee slot it is unbanned and its score primed immediately, closing the window for
+    /// members that were tracked by [`Self::update_committees`] before their [PeerId] was known
+    /// (the validator exemption itself derives from the slots, so it already applies). A no-op
+    /// for peers that are not in any tracked committee.
     pub(super) fn apply_membership_if_committee(
         &mut self,
         bls_key: BlsPublicKey,
@@ -1006,14 +1054,17 @@ impl AllPeers {
         }
     }
 
-    /// Forgive bans and mark each committee member with a known network identity `trusted`.
+    /// Forgive bans and prime the score of each committee member with a known network identity.
     ///
     /// Operates per [BlsPublicKey] against the existing `Confirmed` peer records: a member with no
-    /// record yet (its libp2p [PeerId] has not been discovered) is skipped here and trusted later
-    /// via [`Self::apply_membership_if_committee`]. For members with a record, the banned status is
-    /// forgiven, IPs associated with the committee node are reset, and the peer is marked `trusted`
-    /// so it won't incur any additional penalties. Returns the unban actions for the manager to
-    /// apply; the committee slots are owned by the callers.
+    /// record yet (its libp2p [PeerId] has not been discovered) is skipped here and handled later
+    /// via [`Self::apply_membership_if_committee`]. For members with a record, the banned status
+    /// is forgiven, IPs associated with the committee node are reset, and the peer's score is
+    /// reset to max. No trust flag is stored: the member's validator exemption is derived from
+    /// the committee slots, so it incurs no penalties while tracked (members of the pre-dial
+    /// path may not be in a slot yet; their exemption begins once `update_committees` lands).
+    /// Returns the unban actions for the manager to apply; the committee slots are owned by the
+    /// callers.
     fn apply_committee_membership(
         &mut self,
         members: impl IntoIterator<Item = BlsPublicKey>,
@@ -1052,9 +1103,10 @@ impl AllPeers {
                 | ConnectionStatus::Connected { .. } => { /* nothing to do */ }
             }
 
-            // mark the member trusted regardless of connection status
+            // update peer regardless of connection status; validator trust is derived from the
+            // committee slots, so we only prime the score (no trust flag is stored)
             if let Some(peer) = self.peers.get_mut(&identity) {
-                peer.make_trusted();
+                peer.reset_score_to_max();
                 self.banned_peers.remove_validator_ip(&peer_id, peer.known_ip_addresses());
             }
         }
