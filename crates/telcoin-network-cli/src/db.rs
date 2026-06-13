@@ -3,12 +3,15 @@
 use clap::Parser;
 use comfy_table::{Cell, Row, Table as ComfyTable};
 use human_bytes::human_bytes;
-use reth_db::DatabaseEnv;
-use reth_db::Database as _;
-use reth_db::mdbx::DatabaseArguments;
 use reth_db::mdbx::open_db_read_only;
+use reth_db::mdbx::DatabaseArguments;
+use reth_db::static_file::iter_static_files;
+use reth_db::Database as _;
+use reth_db::DatabaseEnv;
+use reth_provider::providers::StaticFileProvider;
+use std::{fs, path::PathBuf};
 use tn_config::TelcoinDirs as _;
-use std::path::PathBuf;
+use tn_reth::traits::TNPrimitives;
 
 /// Inspect the execution database and print read-only statistics.
 #[derive(Debug, Parser)]
@@ -19,9 +22,19 @@ impl DbCommand {
     pub fn execute(&self, datadir: PathBuf) -> eyre::Result<()> {
         let db_path = datadir.reth_db_path();
         let db = open_db_read_only(&db_path, DatabaseArguments::default())?;
+        println!("{}", static_files_summary_table_for_datadir(&datadir)?);
+        println!("");
         println!("{}", db_stats_table(&db)?);
         Ok(())
     }
+}
+
+#[derive(Debug, Clone)]
+struct StaticFileSegmentStats {
+    segment: String,
+    block_range: String,
+    tx_range: String,
+    total_size: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,11 +92,117 @@ fn stats_table(stats: &[TableStats]) -> ComfyTable {
     table
 }
 
+#[cfg(test)]
+mod tests {
+    use super::static_files_summary_table;
+
+    #[test]
+    fn static_files_summary_table_renders_segment_breakdown() {
+        let table = static_files_summary_table(&[super::StaticFileSegmentStats {
+            segment: "headers".to_string(),
+            block_range: "0..=9".to_string(),
+            tx_range: "N/A".to_string(),
+            total_size: 10,
+        }]);
+
+        let rendered = table.to_string();
+        assert!(rendered.contains("Segment"), "missing segment header: {rendered}");
+        assert!(rendered.contains("headers"), "missing segment name: {rendered}");
+        assert!(rendered.contains("0..=9"), "missing block range: {rendered}");
+        assert!(rendered.contains("Total"), "missing total row: {rendered}");
+    }
+}
+
+fn static_files_summary_table_for_datadir(datadir: &PathBuf) -> eyre::Result<ComfyTable> {
+    let static_files_dir = datadir.join("static_files");
+    let static_file_provider =
+        StaticFileProvider::<TNPrimitives>::read_only(&static_files_dir, false)?;
+
+    let mut stats = Vec::new();
+    for (segment, ranges) in iter_static_files(&static_files_dir)?.into_iter() {
+        let mut segment_size = 0_u64;
+
+        for (block_range, header) in &ranges {
+            let fixed_block_range =
+                static_file_provider.find_fixed_range(segment, block_range.start());
+            let jar_provider = static_file_provider
+                .get_segment_provider_for_range(segment, || Some(fixed_block_range), None)?
+                .ok_or_else(|| eyre::eyre!("Failed to get static file provider for {segment:?}"))?;
+
+            segment_size = segment_size.saturating_add(
+                fs::metadata(jar_provider.data_path())?.len()
+                    + fs::metadata(jar_provider.index_path())?.len()
+                    + fs::metadata(jar_provider.offsets_path())?.len()
+                    + fs::metadata(jar_provider.config_path())?.len(),
+            );
+
+            drop(jar_provider);
+            static_file_provider.remove_cached_provider(segment, fixed_block_range.end());
+
+            if header.tx_range().is_some() {
+                continue;
+            }
+        }
+
+        stats.push(StaticFileSegmentStats {
+            segment: segment.to_string(),
+            block_range: ranges
+                .first()
+                .and_then(|(range, _)| Some(format!("{}..={}", range.start(), range.end())))
+                .unwrap_or_default(),
+            tx_range: ranges
+                .iter()
+                .find_map(|(_, header)| {
+                    header.tx_range().map(|range| format!("{}..={}", range.start(), range.end()))
+                })
+                .unwrap_or_else(|| "N/A".to_string()),
+            total_size: segment_size,
+        });
+    }
+
+    Ok(static_files_summary_table(&stats))
+}
+
+fn static_files_summary_table(stats: &[StaticFileSegmentStats]) -> ComfyTable {
+    let mut table = ComfyTable::new();
+    table.load_preset(comfy_table::presets::ASCII_MARKDOWN);
+    table.set_header(["Segment", "Block Range", "Transaction Range", "Size"]);
+
+    let mut total_size = 0_u64;
+    for stat in stats {
+        total_size = total_size.saturating_add(stat.total_size);
+        let mut row = Row::new();
+        row.add_cell(Cell::new(&stat.segment))
+            .add_cell(Cell::new(&stat.block_range))
+            .add_cell(Cell::new(&stat.tx_range))
+            .add_cell(Cell::new(human_bytes(stat.total_size as f64)));
+        table.add_row(row);
+    }
+
+    let max_widths = table.column_max_content_widths();
+    let mut separator = Row::new();
+    for width in max_widths {
+        separator.add_cell(Cell::new("-".repeat(width as usize)));
+    }
+    table.add_row(separator);
+
+    let mut total_row = Row::new();
+    total_row
+        .add_cell(Cell::new("Total"))
+        .add_cell(Cell::new(""))
+        .add_cell(Cell::new(""))
+        .add_cell(Cell::new(human_bytes(total_size as f64)));
+    table.add_row(total_row);
+
+    table
+}
+
 fn db_stats_table(db: &DatabaseEnv) -> eyre::Result<ComfyTable> {
     let mut stats = Vec::new();
 
     db.view(|tx| {
-        let mut db_tables = reth_db::Tables::ALL.iter().map(|table| table.name()).collect::<Vec<_>>();
+        let mut db_tables =
+            reth_db::Tables::ALL.iter().map(|table| table.name()).collect::<Vec<_>>();
         db_tables.sort();
 
         for db_table in db_tables {
@@ -114,4 +233,3 @@ fn db_stats_table(db: &DatabaseEnv) -> eyre::Result<ComfyTable> {
 
     Ok(stats_table(&stats))
 }
-

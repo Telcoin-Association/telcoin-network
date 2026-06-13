@@ -11296,6 +11296,7 @@ dependencies = [
  "opentelemetry_sdk",
  "rayon",
  "reth-db",
+ "reth-provider",
  "secp256k1 0.31.1",
  "serde_json",
  "serde_yaml",

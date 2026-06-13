@@ -19,6 +19,7 @@ const-str = { workspace = true }
 fdlimit = { workspace = true }
 human_bytes = "0.4.3"
 reth-db = { workspace = true }
+reth-provider = { workspace = true }
 secp256k1 = { workspace = true, features = [
     "global-context",
     "rand",
