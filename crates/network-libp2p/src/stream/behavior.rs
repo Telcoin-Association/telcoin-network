@@ -159,20 +159,28 @@ impl StreamBehavior {
         addrs: Vec<Multiaddr>,
         reply: oneshot::Sender<NetworkResult<Stream>>,
     ) {
-        if self.pending.len() >= MAX_PENDING_OPENS {
-            let _ = reply.send(Err(NetworkError::Stream(StreamError::TooManyPending)));
-            return;
+        match () {
+            () if self.pending.len() >= MAX_PENDING_OPENS => {
+                let _ = reply.send(Err(NetworkError::Stream(StreamError::TooManyPending)));
+            }
+            () if self.connected.contains(&peer) => {
+                self.queue_open(peer, addrs, reply, OpenPhase::Connected)
+            }
+            () if addrs.is_empty() => {
+                let _ = reply.send(Err(NetworkError::Stream(StreamError::NotConnected)));
+            }
+            () => self.queue_open(peer, addrs, reply, OpenPhase::NeedsDial),
         }
+    }
 
-        let phase = if self.connected.contains(&peer) {
-            OpenPhase::Connected
-        } else if addrs.is_empty() {
-            let _ = reply.send(Err(NetworkError::Stream(StreamError::NotConnected)));
-            return;
-        } else {
-            OpenPhase::NeedsDial
-        };
-
+    /// Enqueue an outbound open with a fresh deadline.
+    fn queue_open(
+        &mut self,
+        peer: PeerId,
+        addrs: Vec<Multiaddr>,
+        reply: oneshot::Sender<NetworkResult<Stream>>,
+        phase: OpenPhase,
+    ) {
         self.pending.push(PendingOpen {
             peer,
             addrs,
