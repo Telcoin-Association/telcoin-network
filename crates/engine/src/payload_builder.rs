@@ -55,10 +55,16 @@ pub fn execute_consensus_output(
     );
     // This should maybe panic but for prod code at least error out since this an invalid condition.
     if batches.len() != output.batch_digests().len() {
-        return Err(TnEngineError::ConsensusOutputUnevenBatches(
-            batches.len(),
-            output.batch_digests().len(),
-        ));
+        if output.number() != 832748 || reth_env.chainspec().chain_id() != 2017 {
+            // ADIRI BUG
+            // Epoch 74 consensus number 832748 of adiri testnet had a bug with duplicate batches.
+            // We have to recreate it in order to sync testnet so we skip this push
+            // on adiri for 832748.
+            return Err(TnEngineError::ConsensusOutputUnevenBatches(
+                batches.len(),
+                output.batch_digests().len(),
+            ));
+        }
     }
 
     // ensure at least 1 block for empty output when close_epoch is true
