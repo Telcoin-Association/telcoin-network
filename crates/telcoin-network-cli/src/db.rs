@@ -9,7 +9,7 @@ use reth_db::static_file::iter_static_files;
 use reth_db::Database as _;
 use reth_db::DatabaseEnv;
 use reth_provider::providers::StaticFileProvider;
-use std::{fs, path::PathBuf};
+use std::{fs, path::{Path, PathBuf}};
 use tn_config::TelcoinDirs as _;
 use tn_reth::traits::TNPrimitives;
 
@@ -126,7 +126,8 @@ fn stats_table(stats: &[TableStats]) -> ComfyTable {
 
 #[cfg(test)]
 mod tests {
-    use super::static_files_summary_table;
+    use super::{file_len_if_exists, static_files_summary_table};
+    use std::fs;
 
     #[test]
     fn static_files_summary_table_renders_segment_breakdown() {
@@ -142,6 +143,24 @@ mod tests {
         assert!(rendered.contains("headers"), "missing segment name: {rendered}");
         assert!(rendered.contains("0..=9"), "missing block range: {rendered}");
         assert!(rendered.contains("Total"), "missing total row: {rendered}");
+    }
+
+    #[test]
+    fn file_len_if_exists_returns_zero_for_missing_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let existing_path = temp_dir.path().join("present.bin");
+        fs::write(&existing_path, [1_u8, 2, 3, 4]).unwrap();
+
+        assert_eq!(file_len_if_exists(&existing_path).unwrap(), 4);
+        assert_eq!(file_len_if_exists(&temp_dir.path().join("missing.bin")).unwrap(), 0);
+    }
+}
+
+fn file_len_if_exists(path: &Path) -> eyre::Result<u64> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -165,10 +184,10 @@ fn static_files_summary_table_for_datadir(datadir: &PathBuf) -> eyre::Result<Opt
                 .ok_or_else(|| eyre::eyre!("Failed to get static file provider for {segment:?}"))?;
 
             segment_size = segment_size.saturating_add(
-                fs::metadata(jar_provider.data_path())?.len()
-                    + fs::metadata(jar_provider.index_path())?.len()
-                    + fs::metadata(jar_provider.offsets_path())?.len()
-                    + fs::metadata(jar_provider.config_path())?.len(),
+                file_len_if_exists(jar_provider.data_path())?
+                    + file_len_if_exists(&jar_provider.index_path())?
+                    + file_len_if_exists(&jar_provider.offsets_path())?
+                    + file_len_if_exists(&jar_provider.config_path())?,
             );
 
             drop(jar_provider);
