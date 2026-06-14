@@ -1,6 +1,6 @@
 //! DB diagnostics command.
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use comfy_table::{Cell, Row, Table as ComfyTable};
 use human_bytes::human_bytes;
 use reth_db::mdbx::open_db_read_only;
@@ -15,16 +15,31 @@ use tn_reth::traits::TNPrimitives;
 
 /// Inspect the execution database and print read-only statistics.
 #[derive(Debug, Parser)]
-pub struct DbCommand;
+pub struct DbCommand {
+    /// Database diagnostics subcommand.
+    #[command(subcommand)]
+    command: DbSubcommand,
+}
+
+/// Supported database diagnostics subcommands.
+#[derive(Debug, Subcommand)]
+enum DbSubcommand {
+    /// Print execution database statistics.
+    Stats,
+}
 
 impl DbCommand {
     /// Execute the database diagnostics command.
     pub fn execute(&self, datadir: PathBuf) -> eyre::Result<()> {
-        let db_path = datadir.reth_db_path();
-        let db = open_db_read_only(&db_path, DatabaseArguments::default())?;
-        println!("{}", static_files_summary_table_for_datadir(&datadir)?);
-        println!("");
-        println!("{}", db_stats_table(&db)?);
+        match self.command {
+            DbSubcommand::Stats => {
+                let db_path = datadir.reth_db_path();
+                let db = open_db_read_only(&db_path, DatabaseArguments::default())?;
+                println!("{}", static_files_summary_table_for_datadir(&datadir)?);
+                println!("");
+                println!("{}", db_stats_table(&db)?);
+            }
+        }
         Ok(())
     }
 }

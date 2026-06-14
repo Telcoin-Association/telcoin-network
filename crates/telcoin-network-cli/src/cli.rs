@@ -224,6 +224,11 @@ mod tests {
         assert_eq!(tn.logs.color, ColorMode::Always);
     }
 
+    #[test]
+    fn parse_db_stats_subcommand() {
+        let _ = Cli::<NoArgs>::try_parse_args_from(["tn", "db", "stats"]).expect("cli parsed");
+    }
+
     /// Tests that the help message is parsed correctly. This ensures that clap args are configured
     /// correctly and no conflicts are introduced via attributes that would result in a panic at
     /// runtime
