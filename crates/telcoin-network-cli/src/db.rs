@@ -16,6 +16,13 @@ use tn_reth::traits::TNPrimitives;
 /// Inspect the execution database and print read-only statistics.
 #[derive(Debug, Parser)]
 pub struct DbCommand {
+    /// The path to the data directory. Overrides the global --datadir flag when specified here.
+    ///
+    /// Placing --datadir between 'db' and the subcommand mirrors the reth CLI style:
+    ///   telcoin-network db --datadir /app/data stats
+    #[arg(long, value_name = "DATA_DIR")]
+    datadir: Option<PathBuf>,
+
     /// Database diagnostics subcommand.
     #[command(subcommand)]
     command: DbSubcommand,
@@ -30,7 +37,12 @@ enum DbSubcommand {
 
 impl DbCommand {
     /// Execute the database diagnostics command.
-    pub fn execute(&self, datadir: PathBuf) -> eyre::Result<()> {
+    ///
+    /// `global_datadir` is the value of the top-level `--datadir` flag (if any). The
+    /// per-subcommand `--datadir` on `DbCommand` takes precedence when provided, enabling
+    /// the reth-style invocation: `telcoin-network db --datadir PATH stats`.
+    pub fn execute(&self, global_datadir: PathBuf) -> eyre::Result<()> {
+        let datadir = self.datadir.clone().unwrap_or(global_datadir);
         match self.command {
             DbSubcommand::Stats => {
                 let db_path = datadir.reth_db_path();
