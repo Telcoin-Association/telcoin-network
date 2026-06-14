@@ -35,8 +35,13 @@ impl DbCommand {
             DbSubcommand::Stats => {
                 let db_path = datadir.reth_db_path();
                 let db = open_db_read_only(&db_path, DatabaseArguments::default())?;
-                println!("{}", static_files_summary_table_for_datadir(&datadir)?);
-                println!("");
+                if let Some(static_files_table) = static_files_summary_table_for_datadir(&datadir)? {
+                    println!("{static_files_table}");
+                    println!();
+                } else {
+                    println!("(no static files directory found at {})", datadir.join("static_files").display());
+                    println!();
+                }
                 println!("{}", db_stats_table(&db)?);
             }
         }
@@ -128,8 +133,11 @@ mod tests {
     }
 }
 
-fn static_files_summary_table_for_datadir(datadir: &PathBuf) -> eyre::Result<ComfyTable> {
+fn static_files_summary_table_for_datadir(datadir: &PathBuf) -> eyre::Result<Option<ComfyTable>> {
     let static_files_dir = datadir.join("static_files");
+    if !static_files_dir.exists() {
+        return Ok(None);
+    }
     let static_file_provider =
         StaticFileProvider::<TNPrimitives>::read_only(&static_files_dir, false)?;
 
@@ -175,7 +183,7 @@ fn static_files_summary_table_for_datadir(datadir: &PathBuf) -> eyre::Result<Com
         });
     }
 
-    Ok(static_files_summary_table(&stats))
+    Ok(Some(static_files_summary_table(&stats)))
 }
 
 fn static_files_summary_table(stats: &[StaticFileSegmentStats]) -> ComfyTable {
