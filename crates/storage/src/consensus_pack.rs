@@ -1258,15 +1258,19 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
             }
         }
     }
-    if let Some(header) = header {
-        let parent_hash = header.parent_hash;
-        let deliver = header.sub_dag;
+    if let Some(consensus_header) = header {
+        let parent_hash = consensus_header.parent_hash;
+        let deliver = consensus_header.sub_dag;
         let num_blocks = deliver.num_primary_batches();
         let num_certs = deliver.len();
 
         let sub_dag = deliver;
         if num_blocks == 0 {
-            return Ok(ConsensusOutput::new_with_subdag(sub_dag, parent_hash, header.number));
+            return Ok(ConsensusOutput::new_with_subdag(
+                sub_dag,
+                parent_hash,
+                consensus_header.number,
+            ));
         }
 
         let mut batch_digests = VecDeque::with_capacity(num_certs);
@@ -1296,7 +1300,17 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
                         .chain(cert_batches.iter())
                         .find(|b| b.digest() == *digest)
                     {
+                        // We don't have easy access to the chain id...
+                        //if consensus_header.number != 832748
+                        //    || self.config.config().genesis().config.chain_id != 2017
+                        //{
+                        // ADIRI BUG
+                        // Epoch 74 consensus number 832748 of adiri testnet had a bug with
+                        // duplicate batches. We have to recreate it in
+                        // order to sync testnet so we skip this push
+                        // on adiri for 832748.
                         cert_batches.push(batch.clone());
+                        //}
                     } else {
                         return Err(PackError::MissingBatch);
                     }
@@ -1313,7 +1327,14 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
                 return Err(PackError::MissingAuthority);
             }
         }
-        Ok(ConsensusOutput::new(sub_dag, parent_hash, header.number, false, batch_digests, batches))
+        Ok(ConsensusOutput::new(
+            sub_dag,
+            parent_hash,
+            consensus_header.number,
+            false,
+            batch_digests,
+            batches,
+        ))
     } else {
         Err(PackError::NotConsensus)
     }

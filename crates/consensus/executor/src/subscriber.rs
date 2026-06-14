@@ -491,12 +491,14 @@ impl<DB: Database> Subscriber<DB> {
                         .find(|b| b.digest() == *digest)
                     {
                         warn!(target: "subscriber", ?digest, ?batch_digests, "failed to remove fetched batch - duplicate");
-                        if sub_dag.leader_epoch() != 74
+                        if number != 832748
                             || self.config.config().genesis().config.chain_id != 2017
                         {
-                            // Epoch 74 of adiri testnet had a bug with duplicate batches.
-                            // We have to recreate it in order to sync testnet so we skip this push
-                            // on adiri in epoch 74.
+                            // ADIRI BUG
+                            // Epoch 74 consensus number 832748 of adiri testnet had a bug with
+                            // duplicate batches. We have to recreate it
+                            // in order to sync testnet so we skip this push
+                            // on adiri for 832748.
                             cert_batches.push(batch.clone());
                         }
                     } else {
