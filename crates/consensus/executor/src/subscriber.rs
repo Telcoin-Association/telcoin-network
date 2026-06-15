@@ -491,9 +491,11 @@ impl<DB: Database> Subscriber<DB> {
                         .find(|b| b.digest() == *digest)
                     {
                         warn!(target: "subscriber", ?digest, ?batch_digests, "failed to remove fetched batch - duplicate");
-                        if number != 832748
-                            || self.config.config().genesis().config.chain_id != 2017
-                        {
+                        #[cfg(not(feature = "adiri"))]
+                        cert_batches.push(batch.clone());
+
+                        #[cfg(feature = "adiri")]
+                        if sub_dag.leader_epoch() > 150 {
                             // ADIRI BUG
                             // Epoch 74 consensus number 832748 of adiri testnet had a bug with
                             // duplicate batches. We have to recreate it

@@ -1300,17 +1300,18 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
                         .chain(cert_batches.iter())
                         .find(|b| b.digest() == *digest)
                     {
-                        // We don't have easy access to the chain id...
-                        //if consensus_header.number != 832748
-                        //    || self.config.config().genesis().config.chain_id != 2017
-                        //{
-                        // ADIRI BUG
-                        // Epoch 74 consensus number 832748 of adiri testnet had a bug with
-                        // duplicate batches. We have to recreate it in
-                        // order to sync testnet so we skip this push
-                        // on adiri for 832748.
+                        #[cfg(not(feature = "adiri"))]
                         cert_batches.push(batch.clone());
-                        //}
+
+                        #[cfg(feature = "adiri")]
+                        if sub_dag.leader_epoch() > 150 {
+                            // ADIRI BUG
+                            // Epoch 74 consensus number 832748 of adiri testnet had a bug with
+                            // duplicate batches. We have to recreate it in
+                            // order to sync testnet so we skip this push
+                            // on adiri for 832748.
+                            cert_batches.push(batch.clone());
+                        }
                     } else {
                         return Err(PackError::MissingBatch);
                     }
