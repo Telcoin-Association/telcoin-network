@@ -241,10 +241,15 @@ impl AllPeers {
         let mut peer = migrated
             .or(rotated)
             .unwrap_or_else(|| Peer::new(bls_public_key, network_key.clone(), Vec::new()));
+        // apply the rotated-to keys and addresses before normalizing: when a carried record is
+        // mid-ban (`Disconnecting { banned: true }`), `normalize_carried_status` completes the ban
+        // through `add_banned_peer`, which reads the record's `known_ip_addresses`. `update_net`
+        // extends (does not replace) the address set, so updating first records the address the
+        // peer presents on the rotated-to key against the ban, not just the rotated-away one
+        peer.update_net(bls_public_key, network_key, addrs);
         if carried {
             self.normalize_carried_status(&mut peer);
         }
-        peer.update_net(bls_public_key, network_key, addrs);
         self.bls_by_peer_id.insert(peer_id, bls_public_key);
         self.peers.insert(confirmed, peer);
     }

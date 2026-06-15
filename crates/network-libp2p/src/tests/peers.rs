@@ -379,6 +379,71 @@ fn test_upsert_peer_rotation_normalizes_carried_connected_status() {
 }
 
 #[test]
+fn test_upsert_peer_rotation_normalizes_carried_pending_ban_status() {
+    let mut all_peers = create_all_peers(None);
+    let (bls, net1, peer_id_1, net2, peer_id_2) = rotation_keys(35);
+    let addr = create_multiaddr(None);
+
+    // the peer is mid-ban under its first network key (disconnecting with the ban pending, not
+    // yet completed to Banned) when the rotated kad record arrives
+    all_peers.upsert_peer(bls, net1, vec![addr.clone()]);
+    all_peers
+        .update_connection_status(&peer_id_1, NewConnectionStatus::Disconnecting { banned: true });
+    assert_eq!(all_peers.banned_peers.total(), 0);
+
+    all_peers.upsert_peer(bls, net2, vec![addr]);
+
+    // the carried Disconnecting { banned: true } status normalizes onto the new identity as
+    // Banned with the banned counter incremented, so the pending ban survives the rotation
+    let peer = all_peers.get_peer(&peer_id_2).expect("rotated peer resolves");
+    assert!(matches!(peer.connection_status(), ConnectionStatus::Banned { .. }));
+    assert_eq!(all_peers.banned_peers.total(), 1);
+    assert_eq!(all_peers.disconnected_peers, 0);
+
+    // iff-invariant: the old peer id no longer resolves, the new one does, one confirmed record
+    assert!(all_peers.bls_for_peer(&peer_id_1).is_none());
+    assert_eq!(all_peers.bls_for_peer(&peer_id_2), Some(bls));
+    assert_eq!(all_peers.peers.len(), 1);
+}
+
+#[test]
+fn test_upsert_peer_rotation_pending_ban_records_rotated_address() {
+    let mut all_peers = create_all_peers(None);
+    let (bls, net1, peer_id_1, net2, _peer_id_2) = rotation_keys(36);
+
+    // a separate peer is already banned on the address the rotating peer will present, leaving
+    // that ip one ban short of the per-ip block threshold
+    let rotated_ip = IpAddr::V4("192.168.77.1".parse().unwrap());
+    let rotated_addr = create_multiaddr(Some(rotated_ip));
+    let other = PeerId::random();
+    all_peers.update_connection_status(
+        &other,
+        NewConnectionStatus::Connected {
+            multiaddr: rotated_addr.clone(),
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+    all_peers.update_connection_status(&other, NewConnectionStatus::Disconnecting { banned: true });
+    all_peers.update_connection_status(&other, NewConnectionStatus::Disconnected);
+    assert!(!all_peers.ip_banned(&rotated_ip), "a single ban is below the per-ip threshold");
+
+    // the rotating peer is mid-ban under its first network key, presenting a different address
+    let old_addr = create_multiaddr(Some(IpAddr::V4("10.0.0.1".parse().unwrap())));
+    all_peers.upsert_peer(bls, net1, vec![old_addr]);
+    all_peers
+        .update_connection_status(&peer_id_1, NewConnectionStatus::Disconnecting { banned: true });
+
+    // it rotates and presents the shared address: normalizing the carried pending ban must record
+    // the rotated-to address (not just the rotated-away one), pushing the shared ip over the
+    // threshold; with the ban recorded before the address update the ip would stay below it
+    all_peers.upsert_peer(bls, net2, vec![rotated_addr]);
+    assert!(
+        all_peers.ip_banned(&rotated_ip),
+        "the rotated-to address must be banned when the carried pending ban is normalized"
+    );
+}
+
+#[test]
 fn test_upsert_peer_merge_releases_displaced_banned_record() {
     let mut all_peers = create_all_peers(None);
     let (bls, net1, peer_id_1, net2, peer_id_2) = rotation_keys(28);
