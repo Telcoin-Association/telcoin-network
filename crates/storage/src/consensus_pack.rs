@@ -937,6 +937,17 @@ impl Inner {
         let consensus_number = consensus.number();
         // Adjusted consensus index for this pack file.
         let consensus_idx = consensus_number.saturating_sub(self.epoch_meta.start_consensus_number);
+        let epoch = consensus.sub_dag().leader_epoch();
+        if epoch != self.epoch_meta.epoch {
+            // Trying to save to the wrong epoch...
+            return Err(PackError::InvalidEpoch(
+                epoch,
+                format!(
+                    "Tried to save output from epoch {epoch} to the pack file for epoch {}",
+                    self.epoch_meta.epoch
+                ),
+            ));
+        }
         // Make sure this number is valid before we write anything...
         if (consensus_idx as usize) < self.consensus_pos_idx.len() {
             // If we have saved this output already then ignore it.
