@@ -1665,6 +1665,44 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
+    async fn test_pack_save_wrong_epoch_rejected() {
+        let temp_dir = TempDir::with_prefix("test_pack_wrong_epoch").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let pack = ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee.clone())
+            .expect("open pack");
+
+        // An output whose leader epoch differs from the pack's epoch must be rejected by
+        // Inner::save_consensus_output rather than appended at a saturated index.
+        let next_committee = committee.advance_epoch_for_test(1);
+        let parent = ConsensusHeader::default().digest();
+        let wrong = make_test_output(&next_committee, 0, chain.clone(), 1, parent);
+        assert_ne!(wrong.sub_dag().leader_epoch(), committee.epoch());
+        pack.save_consensus_output(wrong).await.expect("queued to pack thread");
+
+        // The rejection is delivered asynchronously via the watch channel; poll for it.
+        let mut err = None;
+        for _ in 0..100 {
+            if let Err(e) = pack.get_error() {
+                err = Some(e);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            matches!(err, Some(super::PackError::InvalidEpoch(..))),
+            "expected InvalidEpoch, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_consensus_pack() {
         let temp_dir = TempDir::with_prefix("test_consensus_pack").expect("temp dir");
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
