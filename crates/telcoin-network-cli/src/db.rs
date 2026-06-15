@@ -9,7 +9,10 @@ use reth_db::static_file::iter_static_files;
 use reth_db::Database as _;
 use reth_db::DatabaseEnv;
 use reth_provider::providers::StaticFileProvider;
-use std::{fs, path::{Path, PathBuf}};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 use tn_config::TelcoinDirs as _;
 use tn_reth::traits::TNPrimitives;
 
@@ -47,11 +50,15 @@ impl DbCommand {
             DbSubcommand::Stats => {
                 let db_path = datadir.reth_db_path();
                 let db = open_db_read_only(&db_path, DatabaseArguments::default())?;
-                if let Some(static_files_table) = static_files_summary_table_for_datadir(&datadir)? {
+                if let Some(static_files_table) = static_files_summary_table_for_datadir(&datadir)?
+                {
                     println!("{static_files_table}");
                     println!();
                 } else {
-                    println!("(no static files directory found at {})", datadir.join("static_files").display());
+                    println!(
+                        "(no static files directory found at {})",
+                        datadir.join("static_files").display()
+                    );
                     println!();
                 }
                 println!("{}", db_stats_table(&db)?);
@@ -124,38 +131,6 @@ fn stats_table(stats: &[TableStats]) -> ComfyTable {
     table
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{file_len_if_exists, static_files_summary_table};
-    use std::fs;
-
-    #[test]
-    fn static_files_summary_table_renders_segment_breakdown() {
-        let table = static_files_summary_table(&[super::StaticFileSegmentStats {
-            segment: "headers".to_string(),
-            block_range: "0..=9".to_string(),
-            tx_range: "N/A".to_string(),
-            total_size: 10,
-        }]);
-
-        let rendered = table.to_string();
-        assert!(rendered.contains("Segment"), "missing segment header: {rendered}");
-        assert!(rendered.contains("headers"), "missing segment name: {rendered}");
-        assert!(rendered.contains("0..=9"), "missing block range: {rendered}");
-        assert!(rendered.contains("Total"), "missing total row: {rendered}");
-    }
-
-    #[test]
-    fn file_len_if_exists_returns_zero_for_missing_file() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let existing_path = temp_dir.path().join("present.bin");
-        fs::write(&existing_path, [1_u8, 2, 3, 4]).unwrap();
-
-        assert_eq!(file_len_if_exists(&existing_path).unwrap(), 4);
-        assert_eq!(file_len_if_exists(&temp_dir.path().join("missing.bin")).unwrap(), 0);
-    }
-}
-
 fn file_len_if_exists(path: &Path) -> eyre::Result<u64> {
     match fs::metadata(path) {
         Ok(metadata) => Ok(metadata.len()),
@@ -164,7 +139,7 @@ fn file_len_if_exists(path: &Path) -> eyre::Result<u64> {
     }
 }
 
-fn static_files_summary_table_for_datadir(datadir: &PathBuf) -> eyre::Result<Option<ComfyTable>> {
+fn static_files_summary_table_for_datadir(datadir: &Path) -> eyre::Result<Option<ComfyTable>> {
     let static_files_dir = datadir.join("static_files");
     if !static_files_dir.exists() {
         return Ok(None);
@@ -202,7 +177,7 @@ fn static_files_summary_table_for_datadir(datadir: &PathBuf) -> eyre::Result<Opt
             segment: segment.to_string(),
             block_range: ranges
                 .first()
-                .and_then(|(range, _)| Some(format!("{}..={}", range.start(), range.end())))
+                .map(|(range, _)| format!("{}..={}", range.start(), range.end()))
                 .unwrap_or_default(),
             tx_range: ranges
                 .iter()
@@ -270,7 +245,7 @@ fn db_stats_table(db: &DatabaseEnv) -> eyre::Result<ComfyTable> {
             let branch_pages = table_stats.branch_pages();
             let overflow_pages = table_stats.overflow_pages();
             let num_pages = leaf_pages + branch_pages + overflow_pages;
-            let table_size = page_size.saturating_mul(num_pages as usize) as u64;
+            let table_size = page_size.saturating_mul(num_pages) as u64;
 
             stats.push(TableStats {
                 name: db_table,
@@ -286,4 +261,36 @@ fn db_stats_table(db: &DatabaseEnv) -> eyre::Result<ComfyTable> {
     })??;
 
     Ok(stats_table(&stats))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{file_len_if_exists, static_files_summary_table};
+    use std::fs;
+
+    #[test]
+    fn static_files_summary_table_renders_segment_breakdown() {
+        let table = static_files_summary_table(&[super::StaticFileSegmentStats {
+            segment: "headers".to_string(),
+            block_range: "0..=9".to_string(),
+            tx_range: "N/A".to_string(),
+            total_size: 10,
+        }]);
+
+        let rendered = table.to_string();
+        assert!(rendered.contains("Segment"), "missing segment header: {rendered}");
+        assert!(rendered.contains("headers"), "missing segment name: {rendered}");
+        assert!(rendered.contains("0..=9"), "missing block range: {rendered}");
+        assert!(rendered.contains("Total"), "missing total row: {rendered}");
+    }
+
+    #[test]
+    fn file_len_if_exists_returns_zero_for_missing_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let existing_path = temp_dir.path().join("present.bin");
+        fs::write(&existing_path, [1_u8, 2, 3, 4]).unwrap();
+
+        assert_eq!(file_len_if_exists(&existing_path).unwrap(), 4);
+        assert_eq!(file_len_if_exists(&temp_dir.path().join("missing.bin")).unwrap(), 0);
+    }
 }
