@@ -100,6 +100,16 @@ pub enum NetworkError {
     /// The requested peer is not on our local store.
     #[error("Requested peer is not in our local store.")]
     PeerMissing,
+    /// The peer's BLS identity has not been resolved yet.
+    ///
+    /// The peer is connected, but it connected before its `NodeRecord` populated
+    /// the confirmed-identity index, so no `BlsPublicKey` can be attached to its
+    /// message or response. This is a transient resolution gap, distinct from
+    /// [`NetworkError::PeerMissing`] ("not in our local store"): the underlying
+    /// payload is genuine, so a caller should treat it as a retryable race rather
+    /// than a failed exchange.
+    #[error("Peer identity not yet resolved.")]
+    PeerUnresolved,
     /// Kademlia error.
     #[error("Failed to get kad record: {0}")]
     GetKademliaRecord(#[from] GetRecordError),

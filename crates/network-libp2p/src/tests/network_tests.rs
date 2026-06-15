@@ -7,12 +7,13 @@ use crate::common::{
 };
 use assert_matches::assert_matches;
 use eyre::eyre;
+use rand::{rngs::StdRng, SeedableRng as _};
 use std::num::NonZeroUsize;
 use tn_config::{ConsensusConfig, NetworkConfig};
 use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
-use tn_types::{Certificate, Header, TaskManager};
+use tn_types::{BlsKeypair, Certificate, Header, TaskManager};
 use tokio::{sync::mpsc, time::timeout};
 
 /// Test topic for gossip.
@@ -2537,5 +2538,27 @@ async fn test_startup_tolerates_legacy_and_corrupt_kad_records() -> eyre::Result
     assert!(store.get(&kad::RecordKey::new(&garbage_bls)).is_none(), "corrupt record purged");
     assert!(store.get(&kad::RecordKey::new(&owner_bls)).is_some(), "legacy record preserved");
 
+    Ok(())
+}
+
+/// Regression for issue #743: a response from a peer whose BLS identity is not
+/// yet resolved must surface as the transient `PeerUnresolved`, never the
+/// misleading `PeerMissing`, because the response payload itself is genuine.
+#[test]
+fn unresolved_response_reports_peer_unresolved_not_peer_missing() -> eyre::Result<()> {
+    let response = TestWorkerResponse::MissingBatches { batches: vec![] };
+    let result = resolve_response(None, response);
+    assert_matches!(result, Err(NetworkError::PeerUnresolved));
+    Ok(())
+}
+
+/// A resolved responder identity is attached to the genuine response payload.
+#[test]
+fn resolved_response_attaches_identity_to_payload() -> eyre::Result<()> {
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([7; 32])).public();
+    let response = TestWorkerResponse::MissingBatches { batches: vec![] };
+    let NetworkResponseMessage { peer, result } = resolve_response(Some(bls), response.clone())?;
+    assert_eq!(peer, bls);
+    assert_eq!(result, response);
     Ok(())
 }
