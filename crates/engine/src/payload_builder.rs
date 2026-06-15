@@ -62,11 +62,12 @@ pub fn execute_consensus_output(
         ));
 
         #[cfg(feature = "adiri")]
-        if epoch > 150 {
+        if epoch > tn_types::forks::ADIRI_DUP_BATCH_EPOCH {
             // ADIRI BUG
-            // Epoch 74 consensus number 832748 of adiri testnet had a bug with duplicate batches.
-            // We have to recreate it in order to sync testnet so we skip this push
-            // on adiri for 832748.
+            // Epoch 74 and possibly other early epochs of adiri testnet had a bug with duplicate
+            // batches. We have to recreate it in order to sync testnet so we skip this
+            // error (it will happen and needs to be ignored) on adiri with early
+            // epochs.
             return Err(TnEngineError::ConsensusOutputUnevenBatches(
                 batches.len(),
                 output.batch_digests().len(),
