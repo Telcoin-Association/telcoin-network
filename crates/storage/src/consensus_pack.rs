@@ -960,17 +960,28 @@ impl Inner {
             return Ok(ConsensusOutput::new_with_subdag(sub_dag, parent_hash, number));
         }
 
+        // replay must mirror live execution exactly: a duplicate digest (identical batch
+        // certified by two headers in one sub-dag) is only kept on first occurrence so
+        // `batch_digests` stays 1:1 with the loaded batches
         let mut batch_set: HashSet<BlockHash> = HashSet::new();
 
         let mut batch_digests = VecDeque::with_capacity(num_certs);
         for header in sub_dag.headers() {
             for (digest, _) in header.payload().iter() {
-                batch_set.insert(*digest);
-                batch_digests.push_back(*digest);
+                if batch_set.insert(*digest) {
+                    batch_digests.push_back(*digest);
+                } else {
+                    // pre-fork outputs (testnet history) kept duplicate digests
+                    #[cfg(feature = "faucet")]
+                    if !tn_types::ForkId::DedupBatchDigests.is_active(sub_dag.leader_epoch()) {
+                        batch_digests.push_back(*digest);
+                    }
+                }
             }
         }
 
         // map all fetched batches to their respective certificates for applying block rewards
+        let mut loaded: HashSet<BlockHash> = HashSet::new();
         let mut batches = Vec::with_capacity(num_certs);
         for header in sub_dag.headers() {
             // create collection of batches to execute for this certificate
@@ -978,6 +989,11 @@ impl Inner {
 
             // retrieve fetched batch by digest
             for digest in header.payload().keys() {
+                // live execution only ever executed the first occurrence of a duplicate
+                // batch (both pre- and post-fork) — never load it twice
+                if !loaded.insert(*digest) {
+                    continue;
+                }
                 let position = self
                     .batch_digests
                     .load(*digest)
@@ -1378,6 +1394,121 @@ pub(crate) mod test {
             for (b1, b2) in batch.batches.iter().zip(batch2.batches.iter()) {
                 assert_eq!(b1, b2, "Batches (with certified batch) not the same");
             }
+        }
+    }
+
+    /// Build an output whose sub-dag has two headers sharing one payload digest.
+    ///
+    /// The duplicate batch appears in both the first certificate and the leader, mirroring
+    /// an identical batch certified by two headers within one committed sub-dag.
+    fn make_dup_digest_output(
+        committee: &Committee,
+        chain: Arc<RethChainSpec>,
+        number: u64,
+        parent: ConsensusHeaderDigest,
+    ) -> ConsensusOutput {
+        let batches = tn_reth::test_utils::batches(chain, 3);
+        let shared = batches[0].clone();
+        let batch_x = batches[1].clone();
+        let batch_y = batches[2].clone();
+
+        let authority_a = committee.authorities().first().expect("authority 0").id();
+        let authority_b = committee.authorities().get(1).expect("authority 1").id();
+        let address_a =
+            committee.authorities().first().expect("authority 0").execution_address();
+        let address_b = committee.authorities().get(1).expect("authority 1").execution_address();
+
+        let mut cert_a = Certificate::default();
+        cert_a.update_header_author_for_test(authority_a);
+        for batch in [&shared, &batch_x] {
+            let mut builder = HeaderBuilder::from_header(cert_a.header());
+            builder = builder.with_payload_batch(batch, 0_u16);
+            cert_a.update_header_for_test(builder.build());
+        }
+        cert_a.update_header_round_for_test(1);
+        cert_a.update_header_epoch_for_test(committee.epoch());
+
+        let mut leader = Certificate::default();
+        leader.update_header_author_for_test(authority_b);
+        for batch in [&shared, &batch_y] {
+            let mut builder = HeaderBuilder::from_header(leader.header());
+            builder = builder.with_payload_batch(batch, 0_u16);
+            leader.update_header_for_test(builder.build());
+        }
+        leader.update_header_round_for_test(2);
+        leader.update_header_epoch_for_test(committee.epoch());
+
+        let subdag = CommittedSubDag::new(
+            vec![cert_a, leader.clone()],
+            leader,
+            number,
+            ReputationScores::default(),
+            None,
+        );
+
+        // the saved digest list mirrors the raw payload order (with the duplicate); only
+        // the stored batches and the header matter for replay
+        let batch_digests: VecDeque<BlockHash> =
+            [&shared, &batch_x, &shared, &batch_y].iter().map(|b| b.digest()).collect();
+        ConsensusOutput::new(
+            subdag,
+            parent,
+            number,
+            false,
+            batch_digests,
+            vec![
+                CertifiedBatch { address: address_a, batches: vec![shared.clone(), batch_x] },
+                CertifiedBatch { address: address_b, batches: vec![shared, batch_y] },
+            ],
+        )
+    }
+
+    /// Pack replay of a sub-dag with a duplicate batch digest must mirror live execution:
+    /// the duplicate batch is only loaded once, and `batch_digests` keeps or drops the
+    /// duplicate depending on the `DedupBatchDigests` fork.
+    #[tokio::test]
+    async fn test_pack_replay_duplicate_batch_digest() {
+        let temp_dir = TempDir::with_prefix("test_pack_dup_digest").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let pack =
+            ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee.clone())
+                .expect("open pack");
+
+        let parent = ConsensusHeader::default().digest();
+        let output = make_dup_digest_output(&committee, chain, 1, parent);
+        pack.save_consensus_output(output).await.expect("output saved");
+
+        let replayed = pack.get_consensus_output(1).await.expect("output replayed");
+
+        // the duplicate batch is only ever loaded once (live execution never executed the
+        // second occurrence, pre- or post-fork)
+        let flattened: Vec<_> =
+            replayed.batches().iter().flat_map(|cb| cb.batches.iter()).collect();
+        assert_eq!(flattened.len(), 3, "duplicate batch must only load once");
+
+        let epoch = replayed.sub_dag().leader_epoch();
+        if tn_types::ForkId::DedupBatchDigests.is_active(epoch) {
+            // post-fork: digests deduped and 1:1 aligned with loaded batches
+            assert_eq!(replayed.batch_digests().len(), flattened.len());
+            for (i, batch) in flattened.iter().enumerate() {
+                assert_eq!(
+                    batch.digest(),
+                    replayed.batch_digests()[i],
+                    "digest at index {i} must match its batch"
+                );
+            }
+        } else {
+            // legacy (faucet build, pre-activation): the duplicate digest is kept while
+            // the batch still loads once - matches what live patched nodes executed
+            assert_eq!(replayed.batch_digests().len(), flattened.len() + 1);
         }
     }
 

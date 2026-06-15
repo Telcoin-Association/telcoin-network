@@ -20,18 +20,20 @@ pub use batch::{build_batch, BatchBuilderOutput};
 use error::{BatchBuilderError, BatchBuilderResult};
 use futures_util::{FutureExt, StreamExt};
 use std::{
+    collections::HashSet,
     future::Future,
     pin::Pin,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
     time::Duration,
 };
 use tn_reth::{CanonStateNotificationStream, ChangedAccount, RethEnv, TxPool as _, WorkerTxPool};
 use tn_types::{
-    error::BlockSealError, Address, BatchBuilderArgs, BatchSender, Epoch, SealedBlock, TaskSpawner,
-    TxHash, WorkerId,
+    error::BlockSealError, Address, BatchBuilderArgs, BatchSender, BlockHash, Epoch, SealedBlock,
+    TaskSpawner, TxHash, WorkerId,
 };
 use tokio::{sync::oneshot, time::Interval};
-use tracing::{debug, error, field, info_span, Instrument};
+use tracing::{debug, error, field, info_span, warn, Instrument};
 
 mod batch;
 mod error;
@@ -92,6 +94,14 @@ pub struct BatchBuilder {
     base_fee: u64,
     /// The epoch we are building batches for.
     epoch: Epoch,
+    /// Digests of batches that reached quorum this epoch.
+    ///
+    /// If the pool re-accepts transactions that were already mined into a quorum'd batch
+    /// (resubmitted before any canonical block executed them), the builder produces a
+    /// byte-identical batch with the same digest. Re-proposing it would put the digest in
+    /// two headers, so the rebuild is acked locally instead of sent to the worker.
+    /// Lock is never held across an await; the builder runs one pending task at a time.
+    quorum_batch_digests: Arc<Mutex<HashSet<BlockHash>>>,
 }
 
 impl BatchBuilder {
@@ -123,6 +133,7 @@ impl BatchBuilder {
             worker_id,
             base_fee,
             epoch,
+            quorum_batch_digests: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -147,6 +158,7 @@ impl BatchBuilder {
         let (result, done) = oneshot::channel();
         let worker_id = self.worker_id;
         let base_fee = self.base_fee;
+        let quorum_batch_digests = self.quorum_batch_digests.clone();
 
         let span = info_span!(target: "telcoin", "propose-batch", batch = field::Empty, worker_id, base_fee, epoch = self.epoch);
         let span_clone = span.clone();
@@ -158,7 +170,19 @@ impl BatchBuilder {
             // this is safe to call without a semaphore bc it's held as a single `Option`
             let BatchBuilderOutput { batch, mined_transactions, changed_accounts } = build_batch(build_args, worker_id, base_fee);
             let batch = batch.seal_slow();
-            span.record("batch", batch.digest().to_string());
+            let digest = batch.digest();
+            span.record("batch", digest.to_string());
+
+            // an identical batch already reached quorum this epoch (resubmitted txs rebuilt
+            // the same batch byte-for-byte) - don't re-propose the digest; ack locally so
+            // the pool drops the transactions exactly as a real quorum ack would
+            if quorum_batch_digests.lock().expect("quorum batch digests lock poisoned").contains(&digest) {
+                warn!(target: "worker::batch_builder", ?digest, "rebuilt batch identical to one that already reached quorum - skipping proposal");
+                if let Err(e) = result.send(Ok(MinedBatchResult { mined_transactions, changed_accounts })) {
+                    error!(target: "worker::batch_builder", ?e, "failed to send block builder result to block builder task");
+                }
+                return Ok(());
+            }
 
             // forward to worker and wait for ack that quorum was reached
             if let Err(e) = to_worker.send((batch, ack)).await {
@@ -174,6 +198,12 @@ impl BatchBuilder {
                     match res {
                         Ok(_) => {
                             debug!(target: "worker::batch-builder", ?res, "received ack");
+                            // only quorum'd digests are recorded: quorum failures must be
+                            // able to rebuild and re-propose the same batch
+                            quorum_batch_digests
+                                .lock()
+                                .expect("quorum batch digests lock poisoned")
+                                .insert(digest);
                             // signal to Self that this task is complete
                             if let Err(e) = result.send(Ok(MinedBatchResult { mined_transactions, changed_accounts })) {
                                 error!(target: "worker::batch_builder", ?e, "failed to send block builder result to block builder task");
@@ -837,5 +867,169 @@ mod tests {
         // assert all transactions mined
         let pending_pool_len = txpool.pool_size().pending;
         assert_eq!(pending_pool_len, 0);
+    }
+
+    /// Helper that waits for the pending pool to drain to zero.
+    async fn wait_for_pool_drain(txpool: &WorkerTxPool) {
+        timeout(Duration::from_secs(5), async {
+            while txpool.pool_size().pending > 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("pending pool drained");
+    }
+
+    /// Root-cause prevention test for the duplicate-batch incident: transactions removed
+    /// from the pool at quorum are resubmitted before any canonical block executes them.
+    /// The pool re-accepts them and the builder rebuilds a byte-identical batch (same
+    /// digest). The rebuild must NOT be re-proposed to the worker - it is acked locally so
+    /// the pool drains exactly as a real quorum ack would.
+    #[tokio::test]
+    async fn test_duplicate_rebuild_not_resent_after_quorum() {
+        let tmp_dir = TempDir::new().unwrap();
+        let TestTools { mut tx_factory, execution_components, task_manager } =
+            get_test_tools(tmp_dir.path());
+        let TestExecutionComponents { reth_env, txpool, chain, .. } = execution_components;
+        let address = Address::from(U160::from(33));
+        let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
+
+        // short max delay so the builder re-wakes quickly after the pool refills
+        let batch_builder = BatchBuilder::new(
+            &reth_env,
+            txpool.clone(),
+            to_worker,
+            address,
+            Duration::from_millis(100),
+            task_manager.get_spawner(),
+            0,
+            MIN_PROTOCOL_BASE_FEE,
+            0,
+        );
+
+        let gas_price = reth_env.get_gas_price().unwrap();
+        let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
+
+        // create 3 transactions - keep them for resubmission
+        let transactions: Vec<_> = (0..3)
+            .map(|_| {
+                tx_factory.create_eip1559(
+                    chain.clone(),
+                    None,
+                    gas_price,
+                    Some(Address::ZERO),
+                    value, // 1 TEL
+                    Bytes::new(),
+                )
+            })
+            .collect();
+
+        for tx in &transactions {
+            let added_result = tx_factory.submit_tx_to_pool(tx.clone(), txpool.clone()).await;
+            assert_matches!(added_result, hash if &hash == tx.hash());
+        }
+        assert_eq!(txpool.pool_size().pending, 3);
+
+        let _batch_builder_task = tokio::spawn(Box::pin(batch_builder));
+
+        let duration = std::time::Duration::from_secs(5);
+
+        // receive the proposed batch and ack quorum
+        let (sealed_batch, ack) = timeout(duration, from_batch_builder.recv())
+            .await
+            .expect("block builder's sender didn't drop")
+            .expect("batch was built");
+        assert_eq!(sealed_batch.batch().transactions().len(), 3);
+        let first_digest = sealed_batch.digest();
+        let _ = ack.send(Ok(()));
+
+        // pool drains after the quorum ack
+        wait_for_pool_drain(&txpool).await;
+
+        // resubmit the SAME raw transactions (mirrors the incident: no canonical block
+        // executed them, so the pool re-accepts)
+        for tx in &transactions {
+            let added_result = tx_factory.submit_tx_to_pool(tx.clone(), txpool.clone()).await;
+            assert_matches!(added_result, hash if &hash == tx.hash());
+        }
+        assert_eq!(txpool.pool_size().pending, 3);
+
+        // the rebuilt batch has the same digest and must NOT be sent to the worker
+        let resend = timeout(Duration::from_secs(2), from_batch_builder.recv()).await;
+        assert!(
+            resend.is_err(),
+            "identical rebuild of quorum'd batch {first_digest} must not be re-proposed"
+        );
+
+        // the local ack still cleans the pool
+        wait_for_pool_drain(&txpool).await;
+    }
+
+    /// Quorum failures must be able to rebuild and re-propose the SAME batch: only
+    /// quorum'd digests are deduped, never failed proposals.
+    #[tokio::test]
+    async fn test_failed_quorum_rebuilds_same_digest() {
+        let tmp_dir = TempDir::new().unwrap();
+        let TestTools { mut tx_factory, execution_components, task_manager } =
+            get_test_tools(tmp_dir.path());
+        let TestExecutionComponents { reth_env, txpool, chain, .. } = execution_components;
+        let address = Address::from(U160::from(33));
+        let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
+
+        // short max delay so the builder retries quickly after the failed quorum
+        let batch_builder = BatchBuilder::new(
+            &reth_env,
+            txpool.clone(),
+            to_worker,
+            address,
+            Duration::from_millis(100),
+            task_manager.get_spawner(),
+            0,
+            MIN_PROTOCOL_BASE_FEE,
+            0,
+        );
+
+        let gas_price = reth_env.get_gas_price().unwrap();
+        let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
+
+        for _ in 0..3 {
+            tx_factory
+                .create_and_submit_eip1559_pool_tx(
+                    chain.clone(),
+                    gas_price,
+                    Address::ZERO,
+                    value, // 1 TEL
+                    txpool.clone(),
+                )
+                .await;
+        }
+        assert_eq!(txpool.pool_size().pending, 3);
+
+        let _batch_builder_task = tokio::spawn(Box::pin(batch_builder));
+
+        let duration = std::time::Duration::from_secs(5);
+
+        // first proposal fails quorum
+        let (sealed_batch, ack) = timeout(duration, from_batch_builder.recv())
+            .await
+            .expect("block builder's sender didn't drop")
+            .expect("batch was built");
+        let failed_digest = sealed_batch.digest();
+        let _ = ack.send(Err(BlockSealError::FailedQuorum));
+
+        // the builder rebuilds and re-proposes the SAME batch - no false dedup
+        let (sealed_batch, ack) = timeout(duration, from_batch_builder.recv())
+            .await
+            .expect("block builder's sender didn't drop")
+            .expect("batch was rebuilt after failed quorum");
+        assert_eq!(
+            sealed_batch.digest(),
+            failed_digest,
+            "failed-quorum batches must be re-proposed with the same digest"
+        );
+        let _ = ack.send(Ok(()));
+
+        // quorum ack drains the pool
+        wait_for_pool_drain(&txpool).await;
     }
 }

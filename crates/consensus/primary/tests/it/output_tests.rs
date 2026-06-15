@@ -1,9 +1,13 @@
 use indexmap::IndexMap;
-use std::{collections::BTreeSet, num::NonZeroUsize};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    num::NonZeroUsize,
+};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    AuthorityIdentifier, Certificate, CommittedSubDag, HeaderBuilder, ReputationScores,
+    AuthorityIdentifier, BlockHash, Certificate, CommittedSubDag, ConsensusHeaderDigest,
+    ConsensusOutput, HeaderBuilder, ReputationScores,
 };
 
 #[test]
@@ -94,6 +98,47 @@ fn test_monotonically_incremented_commit_timestamps() {
     // THEN the latest sub dag should have the highest committed timestamp - basically the
     // same as the previous commit round
     assert_eq!(sub_dag_round_4.commit_timestamp(), sub_dag_round_2.commit_timestamp());
+}
+
+#[test]
+fn test_close_epoch_for_last_batch() {
+    let digests: VecDeque<BlockHash> = (0..3).map(|_| BlockHash::random()).collect();
+
+    // aligned epoch-closing output with 3 digests: only the last index closes
+    let output = ConsensusOutput::new(
+        CommittedSubDag::default(),
+        ConsensusHeaderDigest::default(),
+        0,
+        true,
+        digests.clone(),
+        vec![],
+    );
+    assert_eq!(output.close_epoch_for_last_batch(0), Some(false));
+    assert_eq!(output.close_epoch_for_last_batch(1), Some(false));
+    assert_eq!(output.close_epoch_for_last_batch(2), Some(true));
+
+    // empty epoch-closing output: the single empty block closes
+    let output = ConsensusOutput::new(
+        CommittedSubDag::default(),
+        ConsensusHeaderDigest::default(),
+        0,
+        true,
+        VecDeque::new(),
+        vec![],
+    );
+    assert_eq!(output.close_epoch_for_last_batch(0), Some(true));
+
+    // output that doesn't close the epoch never reports a closing batch
+    let output = ConsensusOutput::new(
+        CommittedSubDag::default(),
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        digests,
+        vec![],
+    );
+    assert_eq!(output.close_epoch_for_last_batch(0), None);
+    assert_eq!(output.close_epoch_for_last_batch(2), None);
 }
 
 #[test]

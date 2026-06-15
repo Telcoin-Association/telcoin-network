@@ -3,7 +3,7 @@
 #![allow(unused_crate_dependencies)]
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
 use tempfile::TempDir;
@@ -19,8 +19,8 @@ use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
 use tn_test_utils::{create_signed_certificates_for_rounds, CommitteeFixture};
 use tn_types::{
     now, test_chain_spec_arc, Batch, BlockHash, ConsensusHeaderDigest, ConsensusNumHash,
-    ExecHeader, Hash as _, HeaderBuilder, HeaderDigest, SealedHeader, TaskManager, TnReceiver as _,
-    TnSender as _, WorkerId, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    ExecHeader, ForkId, Hash as _, HeaderBuilder, HeaderDigest, SealedHeader, TaskManager,
+    TnReceiver as _, TnSender as _, WorkerId, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::sync::mpsc;
 
@@ -445,8 +445,12 @@ async fn test_duplicate_batch_digest() -> eyre::Result<()> {
         let mut round_digests = BTreeSet::new();
 
         for (idx, auth_id) in authorities.iter().enumerate() {
-            // authority[2] gets the shared batch in rounds 2 and 3
-            let use_shared = idx == 2 && (round == 2 || round == 3);
+            // authorities[1..=3] share the batch in round 2: at most one of them is the
+            // round-2 leader (committed in its own sub-dag), so at least two of these
+            // certificates commit in the SAME sub-dag - a deterministic intra-output
+            // duplicate. authority[2] also reuses it in round 3 (cross-output duplicate).
+            let use_shared =
+                ((1..=3).contains(&idx) && round == 2) || (idx == 2 && round == 3);
 
             let (batch_map, payload_entries) = if use_shared {
                 // include the shared batch plus some random ones
@@ -526,6 +530,7 @@ async fn test_duplicate_batch_digest() -> eyre::Result<()> {
     let expected_outputs = 2;
     let mut outputs_received = 0;
     let mut found_shared_digest = false;
+    let mut saw_intra_output_duplicate = false;
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         while let Some(output) = consensus_output.recv().await {
@@ -534,6 +539,61 @@ async fn test_duplicate_batch_digest() -> eyre::Result<()> {
                 if *digest == shared_digest {
                     found_shared_digest = true;
                 }
+            }
+
+            // payload counts from the committed sub-dag are the source of truth
+            let total_payload: usize =
+                output.sub_dag().headers().iter().map(|h| h.payload().len()).sum();
+            let unique_digests: HashSet<BlockHash> = output
+                .sub_dag()
+                .headers()
+                .iter()
+                .flat_map(|h| h.payload().keys().copied())
+                .collect();
+            let dup_count = total_payload - unique_digests.len();
+            if dup_count > 0 {
+                saw_intra_output_duplicate = true;
+            }
+
+            // batches are always deduped: first occurrence wins
+            let flattened = output.flatten_batches();
+            assert_eq!(
+                flattened.len(),
+                unique_digests.len(),
+                "fetched batches must contain each unique digest exactly once"
+            );
+
+            // NOTE: under `faucet` the placeholder activation epoch keeps the fork
+            // inactive at the fixture's epoch 0, exercising the legacy path. Relies
+            // on nextest's process-per-test isolation (no test override pollution).
+            if ForkId::DedupBatchDigests.is_active(output.leader().epoch()) {
+                // post-fork (and all non-faucet builds): digests stay 1:1 with batches
+                assert_eq!(
+                    output.batch_digests().len(),
+                    flattened.len(),
+                    "batch_digests must stay 1:1 with deduped batches"
+                );
+                for (i, (cert_idx, batch_idx)) in flattened.iter().enumerate() {
+                    assert_eq!(
+                        output.batches()[*cert_idx].batches[*batch_idx].digest(),
+                        output.batch_digests()[i],
+                        "digest at flattened index {i} must match its batch"
+                    );
+                }
+                let unique_in_output: HashSet<BlockHash> =
+                    output.batch_digests().iter().copied().collect();
+                assert_eq!(
+                    unique_in_output.len(),
+                    output.batch_digests().len(),
+                    "no digest may appear twice in one output"
+                );
+            } else {
+                // legacy pre-activation (faucet builds): duplicates stay in batch_digests
+                assert_eq!(
+                    output.batch_digests().len(),
+                    flattened.len() + dup_count,
+                    "legacy outputs keep duplicate digests"
+                );
             }
 
             outputs_received += 1;
@@ -554,6 +614,10 @@ async fn test_duplicate_batch_digest() -> eyre::Result<()> {
         "Expected at least {expected_outputs} outputs, got {outputs_received}"
     );
     assert!(found_shared_digest, "The shared batch digest should appear in at least one output");
+    assert!(
+        saw_intra_output_duplicate,
+        "test must exercise a duplicate digest within a single output"
+    );
 
     Ok(())
 }

@@ -52,6 +52,8 @@ tn-storage = { workspace = true, features = ["test-utils"] }
 [features]
 default = []
 test-utils = ["tracing-subscriber", "clap"]
+# testnet builds: compile legacy pre-fork branches (see src/fork.rs)
+faucet = []
 
 [lints]
 workspace = true

@@ -447,11 +447,28 @@ impl<DB: Database> Subscriber<DB> {
 
         let mut batch_set: BTreeSet<BlockHash> = BTreeSet::new();
 
+        // `batch_digests` must stay 1:1 with the deduped batches below: a duplicate digest
+        // (identical batch certified by two headers in one committed sub-dag) is only kept on
+        // first occurrence so the engine assigns the correct digest to every block and the
+        // epoch-closing system call fires on the true last batch
         let mut batch_digests = VecDeque::with_capacity(num_certs);
         for header in sub_dag.headers() {
             for (digest, _) in header.payload().iter() {
-                batch_set.insert(*digest);
-                batch_digests.push_back(*digest);
+                if batch_set.insert(*digest) {
+                    batch_digests.push_back(*digest);
+                } else {
+                    warn!(
+                        target: "subscriber",
+                        ?digest,
+                        certificate = ?header.digest(),
+                        "duplicate batch digest in committed sub-dag"
+                    );
+                    // pre-fork outputs (testnet history) kept duplicate digests
+                    #[cfg(feature = "faucet")]
+                    if !tn_types::ForkId::DedupBatchDigests.is_active(sub_dag.leader_epoch()) {
+                        batch_digests.push_back(*digest);
+                    }
+                }
             }
         }
 
@@ -485,7 +502,7 @@ impl<DB: Database> Subscriber<DB> {
                     cert_batches.push(batch);
                 } else {
                     // if the batch is a duplicate, the engine will ignore
-                    warn!(target: "subscriber", ?digest, ?batch_digests, "failed to remove fetched batch - possible duplicate");
+                    warn!(target: "subscriber", ?digest, certificate = ?header.digest(), "failed to remove fetched batch - possible duplicate");
                     if !fetched_digests.contains(digest) {
                         error!(target: "subscriber", ?digest, "[Protocol violation] Batch not found in fetched batches from workers of certificate signers");
                         return Err(SubscriberError::MissingFetchedBatch(*digest));

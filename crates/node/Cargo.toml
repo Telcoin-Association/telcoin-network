@@ -43,5 +43,15 @@ tn-network-types = { workspace = true }
 tempfile = { workspace = true }
 tn-test-utils-committee = { workspace = true }
 
+[features]
+default = []
+faucet = [
+    "tn-reth/faucet",
+    "tn-types/faucet",
+    "tn-executor/faucet",
+    "tn-engine/faucet",
+    "tn-storage/faucet",
+]
+
 [lints]
 workspace = true

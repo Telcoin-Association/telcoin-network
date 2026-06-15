@@ -105,7 +105,7 @@ test-cargo:
 
 # run faucet integration test
 test-faucet:
-	cargo nextest run --package telcoin-network --features faucet --test it ;
+	cargo nextest run --package e2e-tests --features faucet --test it faucet ;
 
 # run restart integration tests
 test-restarts:

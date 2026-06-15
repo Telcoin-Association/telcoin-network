@@ -133,6 +133,83 @@ async fn test_equivocation_protection_after_restart() {
     }
 }
 
+/// Duplicate digests from workers are acked but only queued once.
+#[tokio::test]
+async fn test_duplicate_our_digest_ingestion() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+
+    let cb = ConsensusBus::new();
+    let task_manager = TaskManager::default();
+    let mut proposer = Proposer::new(
+        primary.consensus_config(),
+        primary.consensus_config().authority_id().expect("authority"),
+        cb.clone(),
+        LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+        task_manager.get_spawner(),
+    );
+
+    let digest = B256::random();
+    let worker_id = 0;
+
+    // first delivery is acked and queued
+    let (tx_ack_1, rx_ack_1) = tokio::sync::oneshot::channel();
+    proposer.handle_our_digest(OurDigestMessage { digest, worker_id, ack_channel: tx_ack_1 });
+    assert!(rx_ack_1.await.is_ok(), "first digest should be acked");
+
+    // duplicate delivery is acked but dropped
+    let (tx_ack_2, rx_ack_2) = tokio::sync::oneshot::channel();
+    proposer.handle_our_digest(OurDigestMessage { digest, worker_id, ack_channel: tx_ack_2 });
+    assert!(rx_ack_2.await.is_ok(), "duplicate digest should still be acked");
+
+    assert_eq!(proposer.digests.len(), 1, "duplicate digest should not be queued twice");
+    assert_eq!(proposer.digests[0].digest, digest);
+}
+
+/// Retransmits of uncommitted headers bypass the ingestion dedup.
+///
+/// A digest already recorded in `seen_digests` (it was ingested, proposed, and the header
+/// failed to commit) must still be re-queued by `process_committed_headers`.
+#[tokio::test]
+async fn test_retransmit_path_not_deduped() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+    let author = primary.id();
+
+    let cb = ConsensusBus::new();
+    let task_manager = TaskManager::default();
+    let mut proposer = Proposer::new(
+        primary.consensus_config(),
+        primary.consensus_config().authority_id().expect("authority"),
+        cb.clone(),
+        LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+        task_manager.get_spawner(),
+    );
+
+    // ingest the digest through the worker path - records it in seen_digests
+    let digest = B256::random();
+    let (tx_ack, rx_ack) = tokio::sync::oneshot::channel();
+    proposer.handle_our_digest(OurDigestMessage { digest, worker_id: 0, ack_channel: tx_ack });
+    assert!(rx_ack.await.is_ok());
+    assert!(proposer.seen_digests.contains(&digest));
+
+    // simulate the digest draining into a proposed header that never commits
+    proposer.digests.clear();
+    proposer.proposed_headers.insert(3, build_test_header(&author, 3, &[digest]));
+    proposer.proposed_headers.insert(4, build_test_header(&author, 4, &[B256::random()]));
+
+    // committing round 4 skips round 3 => its digests must be retransmitted
+    proposer.process_committed_headers(5, vec![4]);
+
+    assert_eq!(proposer.digests.len(), 1, "uncommitted digest should be re-queued");
+    assert_eq!(
+        proposer.digests[0].digest, digest,
+        "retransmit path must not be affected by seen_digests"
+    );
+}
+
 /// Helper to build a header with the given author, round, and payload digests.
 fn build_test_header(author: &AuthorityIdentifier, round: Round, digests: &[BlockHash]) -> Header {
     let mut payload = IndexMap::new();

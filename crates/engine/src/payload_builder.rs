@@ -47,12 +47,35 @@ pub fn execute_consensus_output(
     let _guard = span.enter();
     debug!(target: "engine", ?output, "executing output");
 
-    // assert vecs match
-    debug_assert_eq!(
-        batches.len(),
-        output.batch_digests().len(),
-        "uneven number of sealed blocks from batches and batch digests"
-    );
+    // the lists must align 1:1 or blocks would execute with the wrong batch digest
+    // (ommers hash) and mix hash (prev randao)
+    let misaligned = batches.len() != output.batch_digests().len();
+    // pre-fork outputs (testnet history) kept duplicate digests in `batch_digests` while
+    // `batches` deduped — tolerate the misalignment to reproduce canonical history
+    #[cfg(feature = "faucet")]
+    let misaligned = if misaligned && !tn_types::ForkId::DedupBatchDigests.is_active(epoch) {
+        tracing::warn!(
+            target: "engine",
+            batches = batches.len(),
+            digests = output.batch_digests().len(),
+            "executing misaligned legacy output (pre-DedupBatchDigests)"
+        );
+        false
+    } else {
+        misaligned
+    };
+    if misaligned {
+        error!(
+            target: "engine",
+            batches = batches.len(),
+            digests = output.batch_digests().len(),
+            "uneven number of sealed blocks from batches and batch digests"
+        );
+        return Err(TnEngineError::BatchDigestMismatch {
+            batches: batches.len(),
+            digests: output.batch_digests().len(),
+        });
+    }
 
     // ensure at least 1 block for empty output when close_epoch is true
     let mut executed_blocks = Vec::with_capacity(batches.len().max(1));

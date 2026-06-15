@@ -2255,3 +2255,352 @@ async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
 
     Ok(())
 }
+
+/// An epoch-closing output with deduped, aligned lists fires the epoch-closing system
+/// call on the LAST block.
+///
+/// Regression test for the duplicate-batch incident: pre-fix, a duplicate digest stayed in
+/// `batch_digests` while `batches` deduped, so the last flattened batch index never reached
+/// `batch_digests.len() - 1` and `close_epoch_for_last_batch` never returned `Some(true)` —
+/// the epoch-closing system call was silently skipped on all validators.
+#[tokio::test]
+async fn test_close_epoch_with_deduped_batches() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let tmp_dir = TempDir::new().expect("temp dir");
+    let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+    let mut batches = tn_reth::test_utils::batches(chain, 3);
+
+    // seed accounts so batches execute
+    let genesis = test_genesis();
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution node
+    let gas_accumulator = GasAccumulator::new(1);
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &tmp_dir.path().join("exc-node"),
+        Some(gas_accumulator.rewards_counter()),
+    )?;
+
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let authority_1 =
+        committee.authorities().first().expect("first in 4 auth committee for tests").id();
+    let batch_producer =
+        committee.authorities().get(2).expect("authority in committee").execution_address();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    for batch in batches.iter_mut() {
+        batch.beneficiary = batch_producer;
+        batch.base_fee_per_gas = MIN_PROTOCOL_BASE_FEE;
+        execute_test_batch(batch);
+    }
+
+    // deduped + aligned lists: the shape the subscriber produces post-fork when the
+    // committed sub-dag contained a duplicate batch digest
+    let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+    let mut leader = Certificate::default();
+    leader.update_header_author_for_test(authority_1);
+    let sub_dag_index = 1;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    let subdag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
+        leader,
+        sub_dag_index,
+        ReputationScores::default(),
+        None,
+    );
+    let consensus_output = ConsensusOutput::new(
+        subdag,
+        ConsensusHeaderDigest::default(),
+        0,
+        true, // close the epoch
+        batch_digests,
+        vec![CertifiedBatch { address: batch_producer, batches: batches.clone() }],
+    );
+
+    // execution
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
+    let max_round = None;
+    let parent = chain.sealed_genesis_header();
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let reth_env = execution_node.get_reth_env().await;
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        max_round,
+        from_consensus,
+        parent,
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator.clone(),
+        engine_update_tx,
+    );
+
+    let broadcast_result = to_engine.send(consensus_output.clone()).await;
+    assert!(broadcast_result.is_ok());
+    drop(to_engine);
+
+    let (tx, rx) = oneshot::channel();
+    task_manager.spawn_task("test task eng", async move {
+        let res = engine.await;
+        let _ = tx.send(res);
+        Ok(())
+    });
+
+    let engine_task = timeout(Duration::from_secs(10), rx).await??;
+    assert_matches!(engine_task, Err(TnEngineError::ConsensusOutputStreamClosed));
+
+    // one block per deduped batch - no extra empty blocks
+    let last_block_num = reth_env.last_block_number()?;
+    assert_eq!(last_block_num, batches.len() as u64);
+
+    let executed_blocks = reth_env.block_with_senders_range(1..=last_block_num)?;
+
+    // the epoch-closing system call fires on the LAST block only
+    let last_block = executed_blocks.last().expect("blocks executed");
+    let expected_extra: Bytes = consensus_output.keccak_leader_sigs().to_vec().into();
+    assert_eq!(
+        last_block.extra_data, expected_extra,
+        "last block must carry the epoch-closing randomness in extra_data"
+    );
+    assert_ne!(
+        last_block.withdrawals_root,
+        Some(EMPTY_WITHDRAWALS),
+        "epoch-closing block must commit reward withdrawals"
+    );
+    for block in &executed_blocks[..executed_blocks.len() - 1] {
+        assert_eq!(
+            block.extra_data,
+            Bytes::default(),
+            "only the last block may close the epoch"
+        );
+        assert_eq!(
+            block.withdrawals_root,
+            Some(EMPTY_WITHDRAWALS),
+            "non-closing blocks have empty withdrawals"
+        );
+    }
+
+    Ok(())
+}
+
+/// A misaligned output (duplicate digest in `batch_digests`, deduped `batches`) is a hard
+/// error - any future desync fails loudly instead of silently executing blocks with the
+/// wrong batch digest and mix hash.
+#[cfg(not(feature = "faucet"))]
+#[tokio::test]
+async fn test_misaligned_output_hard_errors() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let tmp_dir = TempDir::new().expect("temp dir");
+    let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+    let batches = tn_reth::test_utils::batches(chain.clone(), 3);
+
+    // create execution node
+    let gas_accumulator = GasAccumulator::new(1);
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &tmp_dir.path().join("exc-node"),
+        Some(gas_accumulator.rewards_counter()),
+    )?;
+
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let authority_1 =
+        committee.authorities().first().expect("first in 4 auth committee for tests").id();
+    let batch_producer =
+        committee.authorities().get(2).expect("authority in committee").execution_address();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    // legacy-shaped corruption: duplicate digest in `batch_digests` while `batches` dedups
+    let mut batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+    let duplicate = *batch_digests.front().expect("3 batches");
+    batch_digests.insert(1, duplicate);
+    assert_eq!(batch_digests.len(), batches.len() + 1);
+
+    let mut leader = Certificate::default();
+    leader.update_header_author_for_test(authority_1);
+    let sub_dag_index = 1;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    let subdag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
+        leader,
+        sub_dag_index,
+        ReputationScores::default(),
+        None,
+    );
+    let consensus_output = ConsensusOutput::new(
+        subdag,
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        batch_digests,
+        vec![CertifiedBatch { address: batch_producer, batches }],
+    );
+
+    // execution
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
+    let max_round = None;
+    let parent = chain.sealed_genesis_header();
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let reth_env = execution_node.get_reth_env().await;
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        max_round,
+        from_consensus,
+        parent,
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator.clone(),
+        engine_update_tx,
+    );
+
+    let broadcast_result = to_engine.send(consensus_output).await;
+    assert!(broadcast_result.is_ok());
+    drop(to_engine);
+
+    let (tx, rx) = oneshot::channel();
+    task_manager.spawn_task("test task eng", async move {
+        let res = engine.await;
+        let _ = tx.send(res);
+        Ok(())
+    });
+
+    let engine_task = timeout(Duration::from_secs(10), rx).await??;
+    assert_matches!(engine_task, Err(TnEngineError::BatchDigestMismatch { batches: 3, digests: 4 }));
+
+    // no blocks were executed
+    assert_eq!(reth_env.last_block_number()?, 0);
+
+    Ok(())
+}
+
+/// Pre-activation (testnet replay), a misaligned legacy output still executes - this
+/// documents the legacy semantics required to reproduce canonical history byte-for-byte:
+/// one block per deduped batch, each taking its digest by flattened index (so every block
+/// after the duplicate carries the WRONG digest).
+#[cfg(feature = "faucet")]
+#[tokio::test]
+async fn test_misaligned_output_tolerated_pre_activation() -> eyre::Result<()> {
+    use tn_types::ForkId;
+
+    let _guard = IT_TEST_GUARD.lock();
+    // ensure the placeholder activation epoch applies (fork inactive at epoch 0)
+    ForkId::DedupBatchDigests.clear_activation_for_test();
+
+    let tmp_dir = TempDir::new().expect("temp dir");
+    let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+    let mut batches = tn_reth::test_utils::batches(chain, 3);
+
+    // seed accounts so batches execute
+    let genesis = test_genesis();
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution node
+    let gas_accumulator = GasAccumulator::new(1);
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &tmp_dir.path().join("exc-node"),
+        Some(gas_accumulator.rewards_counter()),
+    )?;
+
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let authority_1 =
+        committee.authorities().first().expect("first in 4 auth committee for tests").id();
+    let batch_producer =
+        committee.authorities().get(2).expect("authority in committee").execution_address();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    for batch in batches.iter_mut() {
+        batch.beneficiary = batch_producer;
+        batch.base_fee_per_gas = MIN_PROTOCOL_BASE_FEE;
+        execute_test_batch(batch);
+    }
+
+    // the historical misaligned shape: duplicate digest kept, batches deduped
+    let mut batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+    let duplicate = *batch_digests.front().expect("3 batches");
+    batch_digests.insert(1, duplicate);
+    assert_eq!(batch_digests.len(), batches.len() + 1);
+
+    let mut leader = Certificate::default();
+    leader.update_header_author_for_test(authority_1);
+    let sub_dag_index = 1;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    let subdag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
+        leader,
+        sub_dag_index,
+        ReputationScores::default(),
+        None,
+    );
+    let consensus_output = ConsensusOutput::new(
+        subdag,
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        batch_digests.clone(),
+        vec![CertifiedBatch { address: batch_producer, batches: batches.clone() }],
+    );
+
+    // execution
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
+    let max_round = None;
+    let parent = chain.sealed_genesis_header();
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let reth_env = execution_node.get_reth_env().await;
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        max_round,
+        from_consensus,
+        parent,
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator.clone(),
+        engine_update_tx,
+    );
+
+    let broadcast_result = to_engine.send(consensus_output).await;
+    assert!(broadcast_result.is_ok());
+    drop(to_engine);
+
+    let (tx, rx) = oneshot::channel();
+    task_manager.spawn_task("test task eng", async move {
+        let res = engine.await;
+        let _ = tx.send(res);
+        Ok(())
+    });
+
+    let engine_task = timeout(Duration::from_secs(10), rx).await??;
+    // misalignment tolerated: engine runs to stream close, not a BatchDigestMismatch error
+    assert_matches!(engine_task, Err(TnEngineError::ConsensusOutputStreamClosed));
+
+    // one block per fetched batch (NOT per digest)
+    let last_block_num = reth_env.last_block_number()?;
+    assert_eq!(last_block_num, batches.len() as u64);
+
+    // each block takes its digest by flattened index: blocks after the duplicate carry
+    // the WRONG digest (ommers_hash) - the historical pre-fork behavior
+    let executed_blocks = reth_env.block_with_senders_range(1..=last_block_num)?;
+    for (idx, block) in executed_blocks.iter().enumerate() {
+        assert_eq!(
+            block.ommers_hash, batch_digests[idx],
+            "legacy blocks take digests by flattened index"
+        );
+    }
+
+    Ok(())
+}

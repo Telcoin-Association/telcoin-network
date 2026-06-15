@@ -37,6 +37,17 @@ pub enum TnEngineError {
     /// The output's leader is unknown.
     #[error("Unknown authority for block rewards {0}")]
     UnknownAuthority(AuthorityIdentifier),
+    /// The output's batches and batch digests are misaligned.
+    ///
+    /// Executing a misaligned output would assign the wrong digest (ommers hash) and
+    /// mix hash to every block after the misalignment.
+    #[error("Consensus output misaligned: {batches} batches but {digests} batch digests")]
+    BatchDigestMismatch {
+        /// Number of flattened batches in the output.
+        batches: usize,
+        /// Number of batch digests in the output.
+        digests: usize,
+    },
 }
 
 impl From<oneshot::error::RecvError> for TnEngineError {

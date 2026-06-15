@@ -22,7 +22,7 @@ use crate::{
 };
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
 };
 use tn_config::ConsensusConfig;
 use tn_storage::ProposerStore;
@@ -117,6 +117,14 @@ pub(crate) struct Proposer<DB: ProposerStore> {
     /// Holds the batches' digests waiting to be included in the next header.
     /// Digests are roughly oldest to newest, and popped in FIFO order from the front.
     digests: VecDeque<ProposerDigest>,
+    /// Every digest ingested from workers this epoch.
+    ///
+    /// Workers must never deliver the same digest twice (the batch builder dedups
+    /// rebuilds of quorum'd batches), but if one slips through, proposing it in two
+    /// headers could land the digest twice in one committed sub-dag. Only worker
+    /// ingestion is deduped — retransmits of uncommitted headers re-enter
+    /// `self.digests` directly and are always legitimate.
+    seen_digests: HashSet<BlockHash>,
     /// Holds the map of proposed previous round headers and their digest messages, to ensure that
     /// all batches' digest included will eventually be re-sent.
     proposed_headers: BTreeMap<Round, Header>,
@@ -164,6 +172,7 @@ impl<DB: Database> Proposer<DB> {
             last_parents: genesis,
             last_leader: None,
             digests: VecDeque::with_capacity(2 * config.parameters().max_header_num_of_batches),
+            seen_digests: HashSet::new(),
             proposed_headers: BTreeMap::new(),
             leader_schedule,
             advance_round: true,
@@ -535,6 +544,28 @@ impl<DB: Database> Proposer<DB> {
         }
     }
 
+    /// Ingest a digest from one of this primary's workers whose batch reached quorum.
+    ///
+    /// Always acks so the worker knows the digest is recorded. A digest already seen this
+    /// epoch is dropped instead of queued: it is either pending in `self.digests` or
+    /// tracked in a proposed header, and queuing it again would propose the same digest in
+    /// two headers.
+    fn handle_our_digest(&mut self, msg: OurDigestMessage) {
+        // parse message into parts
+        let (ack, digest) = msg.process();
+        let _ = ack.send(());
+        if self.seen_digests.insert(digest.digest) {
+            self.digests.push_back(digest);
+        } else {
+            warn!(
+                target: "primary::proposer",
+                authority=?self.authority_id,
+                digest=?digest.digest,
+                "ignoring duplicate batch digest from worker"
+            );
+        }
+    }
+
     /// Conditions are met to propose the next header.
     ///
     /// This method ensures proposer is protected against equivocation and sends the next header to
@@ -690,11 +721,7 @@ impl<DB: Database> Proposer<DB> {
                 Some(msg) = rx_our_digests.recv() =>
                 {
                     debug!(target: "primary::proposer", authority=?self.authority_id, round=self.round, "received digest");
-
-                    // parse message into parts
-                    let (ack, digest) = msg.process();
-                    let _ = ack.send(());
-                    self.digests.push_back(digest);
+                    self.handle_our_digest(msg);
                 }
                 // check for new parent certificates
                 // synchronizer sends collection of certificates when there is quorum (2f+1)
