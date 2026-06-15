@@ -1,7 +1,7 @@
 //! Epoch teardown.
 //!
 //! The methods here form the closing half of [`EpochManager`]'s per-epoch
-//! lifecycle. `run_epoch` (in the sibling `epochs` module) calls them in
+//! lifecycle. `run_epoch` (in the sibling `run_epoch` module) calls them in
 //! sequence once an epoch ends, whether that end was a clean epoch boundary or
 //! an early exit.
 //!

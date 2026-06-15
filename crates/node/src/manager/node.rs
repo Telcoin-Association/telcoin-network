@@ -6,7 +6,7 @@
 //! the epoch loop: `run` builds the process-lifetime components, then `run_epochs` repeatedly
 //! invokes `run_epoch` until shutdown.
 //!
-//! Per-epoch orchestration lives in the sibling `epochs` module. Code here is concerned with
+//! Per-epoch orchestration lives in the sibling `run_epoch` module. Code here is concerned with
 //! what survives across epochs; code there is concerned with setting up and tearing down a single
 //! epoch's consensus components.
 
