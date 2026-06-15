@@ -3,11 +3,11 @@
 use clap::{Parser, Subcommand};
 use comfy_table::{Cell, Row, Table as ComfyTable};
 use human_bytes::human_bytes;
-use reth_db::mdbx::open_db_read_only;
-use reth_db::mdbx::DatabaseArguments;
-use reth_db::static_file::iter_static_files;
-use reth_db::Database as _;
-use reth_db::DatabaseEnv;
+use reth_db::{
+    mdbx::{open_db_read_only, DatabaseArguments},
+    static_file::iter_static_files,
+    Database as _, DatabaseEnv,
+};
 use reth_provider::providers::StaticFileProvider;
 use std::{
     fs,
