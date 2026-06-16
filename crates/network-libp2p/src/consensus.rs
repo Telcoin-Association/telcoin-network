@@ -1422,6 +1422,22 @@ where
                             .peer_manager
                             .process_peers_for_discovery(result.peers);
                     }
+                    kad::QueryResult::GetClosestPeers(Err(err)) => {
+                        // A timed-out query still carries the peers it located before
+                        // expiring. Recover them for discovery instead of letting the
+                        // catch-all discard the whole query: discovery only runs when
+                        // the node is short on peers, and that same low-connectivity
+                        // state is what makes queries slow enough to time out, so
+                        // dropping the partial results starves discovery exactly when
+                        // it is most needed.
+                        let peers = partial_peers_from_get_closest_timeout(err);
+                        debug!(
+                            target: "network-kad",
+                            recovered = peers.len(),
+                            "GetClosestPeers timed out; recovering partial discovery results"
+                        );
+                        self.swarm.behaviour_mut().peer_manager.process_peers_for_discovery(peers);
+                    }
                     _ => {}
                 }
             }
@@ -1642,4 +1658,17 @@ where
             .field("swarm", &"<swarm>") // Skip detailed debug for swarm
             .finish()
     }
+}
+
+/// Peers a kademlia `GetClosestPeers` query located before it timed out.
+///
+/// Kademlia reports a timed-out query as [`kad::GetClosestPeersError::Timeout`],
+/// whose payload carries the closest peers found so far. Those peers are still
+/// valid discovery candidates, so they are recovered for the discovery pool
+/// rather than discarded along with the failed query.
+pub(crate) fn partial_peers_from_get_closest_timeout(
+    err: kad::GetClosestPeersError,
+) -> Vec<kad::PeerInfo> {
+    let kad::GetClosestPeersError::Timeout { peers, .. } = err;
+    peers
 }
