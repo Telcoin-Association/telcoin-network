@@ -550,26 +550,24 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         // Make sure we only keep the first (most recent) key if we find duplicates.
         let mut rec_hashes = BTreeSet::new();
         while let Some((rec_hash, rec_pos)) = self.next_bucket_element(&mut iter) {
-            if rec_pos > 0 {
-                let hash = B256::from_slice(rec_hash);
-                if !rec_hashes.contains(&hash) {
-                    let bucket = self.hash_to_bucket(rec_hash);
-                    if bucket != split_bucket && bucket != new_bucket {
-                        panic!(
-                            "got bucket {}, expected {} or {}, mod {}",
-                            bucket,
-                            split_bucket,
-                            self.buckets() - 1,
-                            self.modulus
-                        );
-                    }
-                    if bucket == split_bucket {
-                        self.save_to_bucket_buffer(rec_hash, rec_pos, &mut buffer, false)?;
-                    } else {
-                        self.save_to_bucket_buffer(rec_hash, rec_pos, &mut buffer2, false)?;
-                    }
-                    rec_hashes.insert(hash);
+            let hash = B256::from_slice(rec_hash);
+            if !rec_hashes.contains(&hash) {
+                let bucket = self.hash_to_bucket(rec_hash);
+                if bucket != split_bucket && bucket != new_bucket {
+                    panic!(
+                        "got bucket {}, expected {} or {}, mod {}",
+                        bucket,
+                        split_bucket,
+                        self.buckets() - 1,
+                        self.modulus
+                    );
                 }
+                if bucket == split_bucket {
+                    self.save_to_bucket_buffer(rec_hash, rec_pos, &mut buffer, false)?;
+                } else {
+                    self.save_to_bucket_buffer(rec_hash, rec_pos, &mut buffer2, false)?;
+                }
+                rec_hashes.insert(hash);
             }
         }
         if iter.crc_failure() {
@@ -792,14 +790,14 @@ mod tests {
             let mut hasher = DefaultHashFunction::new();
             hasher.update(&format!("idx-{i}").into_bytes());
             let hash = B256::from_slice(hasher.finalize().as_bytes());
-            idx.save(hash, i).expect("add to index");
+            idx.save(hash, i).expect(&format!("add to index {i}"));
         }
         for i in 0..1_000_000 {
             let mut hasher = DefaultHashFunction::new();
             hasher.update(&format!("idx-{i}").into_bytes());
             let hash = B256::from_slice(hasher.finalize().as_bytes());
             assert!(idx.test_bloom_contains(hash));
-            assert_eq!(idx.load(hash).expect("load idx"), i);
+            assert_eq!(idx.load(hash).expect(&format!("load idx {i}")), i);
         }
         drop(idx);
 
