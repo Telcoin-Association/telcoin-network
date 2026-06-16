@@ -11,21 +11,22 @@
 //!
 //! Mirrors [`tel_precompile`](super::tel_precompile): a [`DynPrecompile`] registered via
 //! [`add_bls_precompile`] and dispatched by 4-byte selector. The ABI matches `BlsG1.sol`, so
-//! `ConsensusRegistry`'s existing library `delegatecall`s resolve to this precompile unchanged.
+//! `ConsensusRegistry`'s `BlsG1.verifyProofOfPossession` `delegatecall` resolves to this
+//! precompile.
 //!
 //! | Selector | Behavior |
 //! |----------|----------|
-//! | `verifyProofOfPossession(bytes,bytes,address)` | Verify a PoP from uncompressed G1 sig + G2 pubkey. The one crypto entrypoint. |
-//! | `proofOfPossessionMessage(bytes,address)` | Return the exact bytes the PoP is signed/verified over (used for revert reasons). |
+//! | `verifyProofOfPossession(bytes,bytes,address)` | Verify a PoP from a compressed G1 sig + G2 pubkey. The one crypto entrypoint. |
 //!
 //! # Encoding
 //!
-//! The signature/pubkey arguments are the protocol's own `blst::min_sig` `serialize()` output
-//! (96-byte uncompressed G1 signature, 192-byte uncompressed G2 pubkey) - the identical bytes the
-//! genesis assembly and `stake`/`delegateStake` callers already pass to `BlsG1`. The precompile
-//! feeds them straight back into `blst` via [`BlsSignature::from_uncompressed_bytes`] /
-//! [`BlsPublicKey::from_uncompressed_bytes`]; no EIP-2537 re-encoding or point (de)compression is
-//! performed here.
+//! The signature/pubkey arguments are the protocol's own `blst::min_sig` compressed encodings
+//! (48-byte compressed G1 signature, 96-byte compressed G2 pubkey) - the identical bytes the
+//! genesis assembly and `stake`/`delegateStake` callers pass as the `ProofOfPossession` signature
+//! and the stored `blsPubkey`. A strict length gate (exactly 48 / 96 bytes) is applied before
+//! decoding, so only the compressed form is accepted: the bytes are fed into `blst` via
+//! [`BlsSignature::from_bytes`] / [`BlsPublicKey::from_literal_bytes`], which decompress the points
+//! internally; no uncompressed input is accepted.
 use alloy::{
     primitives::address,
     sol,
@@ -33,10 +34,7 @@ use alloy::{
 };
 use alloy_evm::precompiles::{DynPrecompile, PrecompileInput, PrecompilesMap};
 use reth_revm::precompile::{PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult};
-use tn_types::{
-    proof_of_possession_message_bytes, verify_proof_of_possession_bls, Address, BlsPublicKey,
-    BlsSignature, Bytes,
-};
+use tn_types::{verify_proof_of_possession_bls, Address, BlsPublicKey, BlsSignature, Bytes};
 
 /// Canonical address of the BLS proof-of-possession precompile: `0x…b151`.
 ///
@@ -45,34 +43,25 @@ use tn_types::{
 pub const BLS_G1_PRECOMPILE_ADDRESS: Address = address!("000000000000000000000000000000000000b151");
 
 sol! {
-    /// Verifies a validator's BLS12-381 proof of possession from raw uncompressed inputs.
+    /// Verifies a validator's BLS12-381 proof of possession from compressed inputs.
     ///
-    /// `uncompressedSignature`: 96-byte uncompressed G1 point. `uncompressedPubkey`: 192-byte
-    /// uncompressed G2 point. Both as produced by `blst::min_sig` `serialize`.
+    /// `signature`: 48-byte compressed G1 point. `pubkey`: 96-byte compressed G2 point. Both as
+    /// produced by `blst::min_sig` `to_bytes` / `compress`.
     function verifyProofOfPossession(
-        bytes uncompressedSignature,
-        bytes uncompressedPubkey,
+        bytes signature,
+        bytes pubkey,
         address validatorAddress
     ) external view returns (bool);
-
-    /// Returns the proof-of-possession message bytes a validator signs / is verified against.
-    function proofOfPossessionMessage(
-        bytes uncompressedPubkey,
-        address validatorAddress
-    ) external pure returns (bytes);
 }
 
 /// Gas charged for a proof-of-possession verification.
 ///
 /// Priced to reflect the equivalent EIP-2537 work the verification represents: a 2-pairing check
-/// (`37_700 + 2 * 32_600 = 102_900`) plus hash-to-curve and point decoding, rounded up. This keeps
-/// the on-chain cost proportional to the cryptography while remaining well within a normal
+/// (`37_700 + 2 * 32_600 = 102_900`) plus hash-to-curve and point decompression, rounded up. This
+/// keeps the on-chain cost proportional to the cryptography while remaining well within a normal
 /// transaction's gas budget (`stake` / `delegateStake` run with a 1M default limit). The native
 /// implementation completes in microseconds; the charge exists for metering, not compute time.
 const VERIFY_POP_GAS_COST: u64 = 150_000;
-
-/// Gas charged for building the proof-of-possession message (pure serialization, no pairing).
-const POP_MESSAGE_GAS_COST: u64 = 5_000;
 
 /// Registers the BLS precompile at [`BLS_G1_PRECOMPILE_ADDRESS`] in the given map.
 ///
@@ -107,7 +96,6 @@ fn dispatch(data: &[u8], gas: u64) -> PrecompileResult {
 
     match selector {
         verifyProofOfPossessionCall::SELECTOR => handle_verify_pop(calldata, gas),
-        proofOfPossessionMessageCall::SELECTOR => handle_pop_message(calldata, gas),
         _ => Err(PrecompileError::Other("Unknown function selector".into())),
     }
 }
@@ -125,49 +113,32 @@ fn handle_verify_pop(calldata: &[u8], gas_limit: u64) -> PrecompileResult {
     // never disagree. A malformed point or failed pairing yields `false` (not a revert), matching
     // `BlsG1.verifyProofOfPossession`'s boolean contract; the caller (`ConsensusRegistry`) is what
     // turns `false` into its own `InvalidProofOfPossession` revert.
-    let verified = verify_pop(
-        &decoded.uncompressedSignature,
-        &decoded.uncompressedPubkey,
-        decoded.validatorAddress,
-    );
+    let verified = verify_pop(&decoded.signature, &decoded.pubkey, decoded.validatorAddress);
 
     Ok(PrecompileOutput::new(VERIFY_POP_GAS_COST, Bytes::from(verified.abi_encode())))
 }
 
-/// Decode the uncompressed inputs and run the `blst` proof-of-possession check. Any decode or
+/// Decode the compressed inputs and run the `blst` proof-of-possession check. Any decode or
 /// verification failure maps to `false` so a bad proof can never panic or revert the precompile.
-fn verify_pop(uncompressed_sig: &[u8], uncompressed_pubkey: &[u8], address: Address) -> bool {
-    let Ok(pubkey) = BlsPublicKey::from_uncompressed_bytes(uncompressed_pubkey) else {
+///
+/// The explicit length gate is the functional enforcement of the compressed-only encoding: blst's
+/// `deserialize` accepts *either* encoding by length, so without this gate a 96-byte uncompressed
+/// signature or 192-byte uncompressed pubkey would still decode. Requiring exactly 48 / 96 bytes
+/// rejects the uncompressed forms up front; [`BlsSignature::from_bytes`] /
+/// [`BlsPublicKey::from_literal_bytes`] then require the compression flag, so a 96-byte flag-clear
+/// pubkey is rejected too. Subgroup and infinity checks remain at verify time (unchanged).
+fn verify_pop(compressed_sig: &[u8], compressed_pubkey: &[u8], address: Address) -> bool {
+    if compressed_sig.len() != 48 || compressed_pubkey.len() != 96 {
+        return false;
+    }
+    let Ok(pubkey) = BlsPublicKey::from_literal_bytes(compressed_pubkey) else {
         return false;
     };
-    let Ok(sig) = BlsSignature::from_uncompressed_bytes(uncompressed_sig) else {
+    let Ok(sig) = BlsSignature::from_bytes(compressed_sig) else {
         return false;
     };
 
     verify_proof_of_possession_bls(&sig, &pubkey, &address).is_ok()
-}
-
-/// `proofOfPossessionMessage(bytes,address) -> bytes`.
-///
-/// Returns the canonical message bytes (`encode(IntentMessage)`) the PoP is verified against, so
-/// the message reported here and the message verified by [`handle_verify_pop`] are produced by the
-/// same code. A malformed pubkey reverts (it cannot be the basis of any valid message).
-fn handle_pop_message(calldata: &[u8], gas_limit: u64) -> PrecompileResult {
-    if gas_limit < POP_MESSAGE_GAS_COST {
-        return Err(PrecompileError::OutOfGas);
-    }
-
-    let decoded = proofOfPossessionMessageCall::abi_decode_raw(calldata)
-        .map_err(|e| PrecompileError::Other(format!("proofOfPossessionMessage: {e}").into()))?;
-
-    let pubkey =
-        BlsPublicKey::from_uncompressed_bytes(&decoded.uncompressedPubkey).map_err(|e| {
-            PrecompileError::Other(format!("invalid uncompressed pubkey: {e:?}").into())
-        })?;
-    let message = proof_of_possession_message_bytes(&pubkey, &decoded.validatorAddress)
-        .map_err(|e| PrecompileError::Other(format!("message build failed: {e}").into()))?;
-
-    Ok(PrecompileOutput::new(POP_MESSAGE_GAS_COST, Bytes::from(Bytes::from(message).abi_encode())))
 }
 
 #[cfg(test)]
@@ -176,12 +147,12 @@ mod tests {
     use rand::{rngs::StdRng, SeedableRng};
     use tn_types::{generate_proof_of_possession_bls_for_test, BlsKeypair};
 
-    /// A deterministic keypair + the uncompressed sig/pubkey bytes of a valid PoP for `address`.
+    /// A valid PoP's compressed sig/pubkey bytes for `address`.
     ///
-    /// `sig`/`pubkey` are `blst::min_sig` `serialize()` output (96-byte G1 sig, 192-byte G2
-    /// pubkey), the exact bytes the protocol passes to `BlsG1` / this precompile.
+    /// `sig`/`pubkey` are `blst::min_sig` compressed `to_bytes()` output (48-byte G1 sig, 96-byte
+    /// G2 pubkey), the exact bytes the protocol passes as the `ProofOfPossession` signature and the
+    /// stored `blsPubkey`.
     struct Vector {
-        keypair: BlsKeypair,
         address: Address,
         sig: Vec<u8>,
         pubkey: Vec<u8>,
@@ -193,16 +164,16 @@ mod tests {
         let address = Address::repeat_byte(address_byte);
         let proof = generate_proof_of_possession_bls_for_test(&keypair, &address)
             .expect("generate test PoP");
-        let sig = proof.serialize().to_vec();
-        let pubkey = keypair.public().serialize().to_vec();
-        Vector { keypair, address, sig, pubkey }
+        let sig = proof.to_bytes().to_vec();
+        let pubkey = keypair.public().to_bytes().to_vec();
+        Vector { address, sig, pubkey }
     }
 
     /// ABI-encodes a `verifyProofOfPossession` call (selector + args), as a caller would.
     fn encode_verify(sig: &[u8], pubkey: &[u8], address: Address) -> Vec<u8> {
         verifyProofOfPossessionCall {
-            uncompressedSignature: Bytes::copy_from_slice(sig),
-            uncompressedPubkey: Bytes::copy_from_slice(pubkey),
+            signature: Bytes::copy_from_slice(sig),
+            pubkey: Bytes::copy_from_slice(pubkey),
             validatorAddress: address,
         }
         .abi_encode()
@@ -223,6 +194,34 @@ mod tests {
             let v = vector(seed, addr);
             assert!(verify_pop(&v.sig, &v.pubkey, v.address), "seed {seed} addr {addr:#x}");
         }
+    }
+
+    /// S1 (load-bearing): the precompile is compressed-only. A *valid* 96-byte uncompressed
+    /// signature and 192-byte uncompressed pubkey - the pre-change encoding - must be rejected by
+    /// the length gate. blst's `deserialize` would otherwise accept these valid points, so this
+    /// (not random wrong-length bytes) is the proof that the gate is the enforcement.
+    #[test]
+    fn verify_pop_rejects_valid_uncompressed_inputs() {
+        let keypair = BlsKeypair::generate(&mut StdRng::from_seed([7u8; 32]));
+        let address = Address::repeat_byte(0x42);
+        let proof = generate_proof_of_possession_bls_for_test(&keypair, &address)
+            .expect("generate test PoP");
+
+        let uncompressed_sig = proof.serialize().to_vec();
+        let uncompressed_pubkey = keypair.public().serialize().to_vec();
+        assert_eq!(uncompressed_sig.len(), 96, "uncompressed G1 signature");
+        assert_eq!(uncompressed_pubkey.len(), 192, "uncompressed G2 pubkey");
+
+        // the same key in compressed form verifies, proving the inputs are otherwise valid
+        let compressed_sig = proof.to_bytes().to_vec();
+        let compressed_pubkey = keypair.public().to_bytes().to_vec();
+        assert!(verify_pop(&compressed_sig, &compressed_pubkey, address), "compressed control");
+
+        // ...but the valid uncompressed encodings are rejected by the length gate
+        assert!(
+            !verify_pop(&uncompressed_sig, &uncompressed_pubkey, address),
+            "uncompressed gated"
+        );
     }
 
     /// A proof bound to a different address must fail (the address is part of the signed message).
@@ -250,31 +249,32 @@ mod tests {
         assert!(!verify_pop(&v.sig, &other.pubkey, v.address));
     }
 
-    /// Identity/infinity points and all-zero inputs return `false`, never panic
-    /// (port of the Solidity zero-point / infinity-point rejection cases).
+    /// Identity/infinity points and all-zero inputs return `false`, never panic. All-zero is not a
+    /// valid compressed point (a valid compressed infinity carries the `0xc0` flag).
     #[test]
     fn verify_pop_rejects_zero_and_infinity_points() {
         let v = vector(7, 0x42);
-        // all-zero sig + pubkey (the uncompressed infinity-point encoding)
-        assert!(!verify_pop(&[0u8; 96], &[0u8; 192], Address::ZERO));
+        // all-zero sig + pubkey at the compressed lengths
+        assert!(!verify_pop(&[0u8; 48], &[0u8; 96], Address::ZERO));
         // zero signature against an otherwise valid pubkey/address
-        assert!(!verify_pop(&[0u8; 96], &v.pubkey, v.address));
+        assert!(!verify_pop(&[0u8; 48], &v.pubkey, v.address));
         // zero pubkey against an otherwise valid signature/address
-        assert!(!verify_pop(&v.sig, &[0u8; 192], v.address));
+        assert!(!verify_pop(&v.sig, &[0u8; 96], v.address));
     }
 
-    /// Wrong-length sig/pubkey inputs are rejected without panicking (port of the Solidity
-    /// `invalidPubkeyLength` length-validation cases: empty, short, and over-long).
+    /// Wrong-length sig/pubkey inputs are rejected by the length gate without panicking.
     #[test]
     fn verify_pop_rejects_wrong_length_inputs() {
         let v = vector(7, 0x42);
 
-        // pubkey lengths that are not the 192-byte uncompressed G2 form
-        for len in [0usize, 32, 48, 64, 95, 96, 128, 191, 193, 256] {
+        // pubkey lengths that are not the 96-byte compressed G2 form (incl. the 192-byte
+        // uncompressed)
+        for len in [0usize, 32, 47, 48, 95, 97, 128, 192, 256] {
             assert!(!verify_pop(&v.sig, &vec![0u8; len], v.address), "pubkey len {len}");
         }
-        // signature lengths that are not the 96-byte uncompressed G1 form
-        for len in [0usize, 32, 48, 95, 97, 128, 192] {
+        // signature lengths that are not the 48-byte compressed G1 form (incl. the 96-byte
+        // uncompressed)
+        for len in [0usize, 32, 47, 49, 96, 128, 192] {
             assert!(!verify_pop(&vec![0u8; len], &v.pubkey, v.address), "sig len {len}");
         }
     }
@@ -312,65 +312,6 @@ mod tests {
     fn dispatch_verify_out_of_gas() {
         let v = vector(7, 0x42);
         let res = dispatch(&encode_verify(&v.sig, &v.pubkey, v.address), VERIFY_POP_GAS_COST - 1);
-        assert!(matches!(res, Err(PrecompileError::OutOfGas)));
-    }
-
-    /// `proofOfPossessionMessage` returns exactly the bytes verification signs over, so the message
-    /// reported on-chain and the message checked by `verify` come from one code path. Signing the
-    /// returned message yields a proof that verifies.
-    #[test]
-    fn dispatch_message_matches_signed_bytes_and_round_trips() {
-        let v = vector(7, 0x42);
-        let calldata = proofOfPossessionMessageCall {
-            uncompressedPubkey: Bytes::copy_from_slice(&v.pubkey),
-            validatorAddress: v.address,
-        }
-        .abi_encode();
-
-        let out = dispatch(&calldata, POP_MESSAGE_GAS_COST).expect("dispatch ok");
-        assert_eq!(out.gas_used, POP_MESSAGE_GAS_COST);
-
-        let returned = <Bytes as SolValue>::abi_decode(&out.bytes).expect("decode bytes return");
-        let expected = proof_of_possession_message_bytes(v.keypair.public(), &v.address)
-            .expect("build expected message");
-        assert_eq!(returned.as_ref(), expected.as_slice());
-
-        // the verifier accepts the proof signed over exactly this message
-        assert!(verify_pop(&v.sig, &v.pubkey, v.address));
-    }
-
-    /// The message is bound to the validator address: a different address yields different bytes.
-    #[test]
-    fn dispatch_message_is_address_bound() {
-        let v = vector(7, 0x42);
-        let msg_a = proof_of_possession_message_bytes(v.keypair.public(), &v.address).unwrap();
-        let msg_b =
-            proof_of_possession_message_bytes(v.keypair.public(), &Address::repeat_byte(0x43))
-                .unwrap();
-        assert_ne!(msg_a, msg_b);
-    }
-
-    /// A malformed pubkey to `proofOfPossessionMessage` reverts (it cannot form any valid message).
-    #[test]
-    fn dispatch_message_rejects_malformed_pubkey() {
-        let calldata = proofOfPossessionMessageCall {
-            uncompressedPubkey: Bytes::from_static(&[0xAB; 10]),
-            validatorAddress: Address::ZERO,
-        }
-        .abi_encode();
-        assert!(dispatch(&calldata, POP_MESSAGE_GAS_COST).is_err());
-    }
-
-    /// Building the message with less gas than the fixed cost is metered as out-of-gas.
-    #[test]
-    fn dispatch_message_out_of_gas() {
-        let v = vector(7, 0x42);
-        let calldata = proofOfPossessionMessageCall {
-            uncompressedPubkey: Bytes::copy_from_slice(&v.pubkey),
-            validatorAddress: v.address,
-        }
-        .abi_encode();
-        let res = dispatch(&calldata, POP_MESSAGE_GAS_COST - 1);
         assert!(matches!(res, Err(PrecompileError::OutOfGas)));
     }
 

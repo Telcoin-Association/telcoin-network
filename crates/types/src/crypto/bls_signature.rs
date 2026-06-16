@@ -28,19 +28,6 @@ impl BlsSignature {
         Ok(Self(sig))
     }
 
-    /// Decode a signature from its 96-byte uncompressed (serialized) G1 form, as produced by
-    /// [`blst::min_sig::Signature::serialize`].
-    ///
-    /// Unlike [`Self::from_bytes`] (which expects the 48-byte compressed form), this accepts the
-    /// uncompressed bytes the protocol passes to the on-chain `BlsG1` library as a proof of
-    /// possession. Used by the native BLS precompile so it can verify the exact bytes the
-    /// consensus layer produced, without re-implementing point (de)compression.
-    pub fn from_uncompressed_bytes(bytes: &[u8]) -> eyre::Result<Self> {
-        let sig = CoreBlsSignature::deserialize(bytes)
-            .map_err(|_| eyre::eyre!("Invalid uncompressed signature bytes!"))?;
-        Ok(Self(sig))
-    }
-
     /// Verify a signature over a message (raw bytes) with public key.
     pub fn verify_raw(&self, message: &[u8], public_key: &BlsPublicKey) -> bool {
         self.verify(true, message, DST_G1, &[], public_key, true) == blst::BLST_ERROR::BLST_SUCCESS
@@ -210,20 +197,6 @@ pub fn construct_proof_of_possession_message(
     Ok(msg)
 }
 
-/// Returns the exact serialized bytes that a proof of possession is signed over and verified
-/// against, i.e. `encode(construct_proof_of_possession_message(pubkey, address))`.
-///
-/// This is the canonical equivalent of `BlsG1.proofOfPossessionMessage` on-chain. The native BLS
-/// precompile returns these bytes so the message it verifies and the message it reports are one and
-/// the same, with no second (drift-prone) implementation of the intent encoding.
-pub fn proof_of_possession_message_bytes(
-    bls_pubkey: &BlsPublicKey,
-    address: &Address,
-) -> eyre::Result<Vec<u8>> {
-    let msg = construct_proof_of_possession_message(bls_pubkey, address)?;
-    Ok(encode(&msg))
-}
-
 /// A trait for sign and verify over an intent message, instead of the message itself. See more at
 /// [struct IntentMessage].
 pub trait ProtocolSignature {
@@ -370,6 +343,26 @@ mod tests {
 
     fn make_intent_msg() -> IntentMessage<Vec<u8>> {
         to_intent_message(b"test payload".to_vec())
+    }
+
+    /// The PoP message is byte-stable regardless of how the `BlsPublicKey` was decoded: a key
+    /// decoded from its 96-byte compressed form rebuilds a byte-identical message. This is the
+    /// basis of the no-regeneration guarantee - switching the transport encoding to compressed
+    /// does not change the signed message, so every previously issued proof of possession still
+    /// verifies.
+    #[test]
+    fn construct_pop_message_stable_across_compressed_roundtrip() {
+        let keypair = BlsKeypair::generate(&mut StdRng::from_seed([3u8; 32]));
+        let address = Address::repeat_byte(0x11);
+        let original = keypair.public();
+        // decode the same key from its compressed bytes (the path the precompile uses)
+        let from_compressed =
+            BlsPublicKey::from_literal_bytes(&original.to_bytes()).expect("compressed roundtrip");
+
+        let msg_a = encode(&construct_proof_of_possession_message(original, &address).unwrap());
+        let msg_b =
+            encode(&construct_proof_of_possession_message(&from_compressed, &address).unwrap());
+        assert_eq!(msg_a, msg_b, "compressed-decoded key rebuilds a byte-identical PoP message");
     }
 
     // --- BlsSignature::from_bytes ---

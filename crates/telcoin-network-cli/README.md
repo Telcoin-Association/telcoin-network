@@ -598,8 +598,7 @@ JSON (`--json`):
 ```json
 {
 	"blsPubkey": "0x...",
-	"uncompressedPubkey": "0x...",
-	"uncompressedSignature": "0x..."
+	"signature": "0x..."
 }
 ```
 
@@ -616,12 +615,11 @@ function stake(
 ) public
 
 struct ProofOfPossession {
-    bytes uncompressedPubkey;    // 192 bytes
-    bytes uncompressedSignature; // 96 bytes
+    bytes signature; // 48 bytes (compressed G1)
 }
 ```
 
-The compressed BLS public key is 96 bytes. The proof of possession binds the BLS key to the validator's execution address.
+The compressed BLS public key is 96 bytes and the proof-of-possession signature is 48 bytes. The proof of possession binds the BLS key to the validator's execution address; the native precompile verifies the signature directly against the compressed `blsPubkey`.
 
 ## Observer mode
 
