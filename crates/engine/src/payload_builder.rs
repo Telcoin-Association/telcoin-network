@@ -55,10 +55,24 @@ pub fn execute_consensus_output(
     );
     // This should maybe panic but for prod code at least error out since this an invalid condition.
     if batches.len() != output.batch_digests().len() {
+        #[cfg(not(feature = "adiri"))]
         return Err(TnEngineError::ConsensusOutputUnevenBatches(
             batches.len(),
             output.batch_digests().len(),
         ));
+
+        #[cfg(feature = "adiri")]
+        if epoch > tn_types::forks::ADIRI_DUP_BATCH_EPOCH {
+            // ADIRI BUG
+            // Epoch 74 and possibly other early epochs of adiri testnet had a bug with duplicate
+            // batches. We have to recreate it in order to sync testnet so we skip this
+            // error (it will happen and needs to be ignored) on adiri with early
+            // epochs.
+            return Err(TnEngineError::ConsensusOutputUnevenBatches(
+                batches.len(),
+                output.batch_digests().len(),
+            ));
+        }
     }
 
     // ensure at least 1 block for empty output when close_epoch is true

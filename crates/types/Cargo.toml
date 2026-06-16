@@ -53,6 +53,7 @@ tn-storage = { workspace = true, features = ["test-utils"] }
 [features]
 default = []
 test-utils = ["tracing-subscriber", "clap"]
+adiri = []
 
 [lints]
 workspace = true
