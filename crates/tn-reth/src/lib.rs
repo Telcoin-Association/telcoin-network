@@ -1191,8 +1191,7 @@ impl RethEnv {
                 };
                 let bls_pubkey: tn_types::Bytes = v.bls_public_key.to_bytes().into();
                 let proof = ConsensusRegistry::ProofOfPossession {
-                    uncompressedPubkey: v.bls_public_key.serialize().into(),
-                    uncompressedSignature: v.proof_of_possession.serialize().into(),
+                    signature: v.proof_of_possession.to_bytes().into(),
                 };
 
                 (validator, (bls_pubkey, proof))
@@ -1938,8 +1937,7 @@ mod tests {
             calldata,
         );
         let proof = ConsensusRegistry::ProofOfPossession {
-            uncompressedPubkey: new_validator.bls_public_key.serialize().into(),
-            uncompressedSignature: new_validator.proof_of_possession.serialize().into(),
+            signature: new_validator.proof_of_possession.to_bytes().into(),
         };
         let calldata = ConsensusRegistry::stakeCall {
             blsPubkey: new_validator.bls_public_key.to_bytes().into(),
