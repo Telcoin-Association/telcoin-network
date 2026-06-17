@@ -4,12 +4,13 @@
 //! connection limits, every connection receives the full rendered registry. Node operators
 //! must protect the endpoint with a firewall.
 
-use std::{fmt, net::SocketAddr, time::Duration};
+use std::{fmt, net::SocketAddr, sync::Arc, time::Duration};
 
 use tn_types::TaskSpawner;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
+    sync::oneshot,
     time,
 };
 use tracing::{debug, info};
@@ -48,6 +49,10 @@ impl MetricsHooks {
     }
 
     /// Add a hook to run before each scrape.
+    ///
+    /// Hooks run on the blocking thread pool (see [`start_metrics_server`]), so synchronous
+    /// db reads or other blocking sampling are acceptable. They still execute inline with the
+    /// scrape response, so avoid unbounded work that would delay every scrape.
     pub fn with_hook(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
         self.hooks.push(Box::new(hook));
         self
@@ -65,8 +70,12 @@ impl MetricsHooks {
 ///
 /// Installs the global recorder if it isn't installed yet (idempotent - the node CLI
 /// installs it much earlier, before reth components are constructed). Registers a static
-/// `tn_info{version=...} 1` gauge for dashboards, then spawns a critical task that serves
-/// scrapes and runs registry upkeep every 5s (drains stale histogram samples).
+/// `tn_info{version=...} 1` gauge for dashboards, then spawns two non-critical tasks: one serves
+/// scrapes, the other runs registry upkeep every 5s (drains stale histogram samples) on its own
+/// cadence so upkeep never waits behind an in-flight scrape.
+///
+/// Each scrape's synchronous work - the pre-scrape hooks and the full-registry render - runs on
+/// the blocking pool via the task spawner, so it never pins a shared runtime worker.
 ///
 /// # Security Considerations
 ///
@@ -91,48 +100,72 @@ pub async fn start_metrics_server(
 
     info!(target: "tn::metrics", ?listen_on, "prometheus metrics endpoint listening");
 
-    task_spawner.spawn_task("metrics", async move {
+    // share hooks across per-scrape blocking tasks; clone the spawner so the serve loop can
+    // offload synchronous work (hooks + render) to the blocking pool.
+    let hooks = Arc::new(hooks);
+    let spawner = task_spawner.clone();
+
+    // registry upkeep runs on its own task so it ticks on a steady 5s cadence regardless of
+    // scrape activity - draining stale histogram samples must never wait behind an in-flight
+    // scrape's render + write. run_upkeep is a cheap sample drain and is safe to run while a
+    // render is in flight on the blocking pool (the handle is Send + Sync and is already used
+    // concurrently with metric recording across the node).
+    let upkeep_handle = handle.clone();
+    task_spawner.spawn_task("metrics-upkeep", async move {
         let mut upkeep = time::interval(Duration::from_secs(5));
         upkeep.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
-
         loop {
-            tokio::select! {
-                _ = upkeep.tick() => handle.run_upkeep(),
-                accepted = listener.accept() => {
-                    match accepted {
-                        Ok((mut socket, _)) => {
-                            // drain the request before responding - closing a socket with
-                            // unread bytes in the kernel buffer sends RST instead of FIN,
-                            // resetting the response mid-flight on the scraper's side. the
-                            // timeout bounds idle probes that connect but never send.
-                            let mut buf = [0u8; 1024];
-                            let _ = time::timeout(
-                                Duration::from_secs(2),
-                                socket.read(&mut buf),
-                            )
-                            .await;
-                            hooks.run();
-                            let body = handle.render();
-                            let response = format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                                body.len(),
-                                body,
-                            );
-                            // write response, ignore errors (client disconnect, etc.)
-                            // then drop connection. the timeout bounds a client that
-                            // connects but never drains the body - without it, TCP
-                            // backpressure would block write_all indefinitely and freeze
-                            // the whole metrics task, including histogram upkeep.
-                            let _ = time::timeout(Duration::from_secs(5), async {
-                                let _ = socket.write_all(response.as_bytes()).await;
-                                let _ = socket.shutdown().await;
-                            })
-                            .await;
-                        }
-                        // transient accept errors (e.g. fd exhaustion) must not kill the node
-                        Err(e) => debug!(target: "tn::metrics", ?e, "metrics endpoint accept error"),
+            upkeep.tick().await;
+            upkeep_handle.run_upkeep();
+        }
+    });
+
+    task_spawner.spawn_task("metrics", async move {
+        loop {
+            match listener.accept().await {
+                Ok((mut socket, _)) => {
+                    // drain the request before responding - closing a socket with
+                    // unread bytes in the kernel buffer sends RST instead of FIN,
+                    // resetting the response mid-flight on the scraper's side. the
+                    // timeout bounds idle probes that connect but never send.
+                    let mut buf = [0u8; 1024];
+                    let _ = time::timeout(Duration::from_secs(2), socket.read(&mut buf)).await;
+                    // offload the pre-scrape hooks and full-registry render to the
+                    // blocking pool: both are synchronous (the db hook walks every
+                    // table plus the mdbx freelist; render serializes the whole
+                    // registry), so running them inline would pin a shared runtime
+                    // worker. the body returns over the oneshot; a panicking hook
+                    // drops the sender, so we skip the scrape instead of stalling.
+                    let (tx, rx) = oneshot::channel();
+                    let hooks = hooks.clone();
+                    let render = handle.clone();
+                    spawner.spawn_blocking_task("metrics-render", move || {
+                        hooks.run();
+                        let _ = tx.send(render.render());
+                        Ok(())
+                    });
+                    if let Ok(body) = rx.await {
+                        // write the status line + headers and the body as separate frames so
+                        // the rendered registry (potentially several MB) is not copied a
+                        // second time just to prepend the status line. ignore errors (client
+                        // disconnect, etc.) then drop the connection. the timeout bounds a
+                        // client that connects but never drains the body - without it, TCP
+                        // backpressure would block write_all indefinitely and freeze this
+                        // serve task.
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len(),
+                        );
+                        let _ = time::timeout(Duration::from_secs(5), async {
+                            let _ = socket.write_all(header.as_bytes()).await;
+                            let _ = socket.write_all(body.as_bytes()).await;
+                            let _ = socket.shutdown().await;
+                        })
+                        .await;
                     }
                 }
+                // transient accept errors (e.g. fd exhaustion) must not kill the node
+                Err(e) => debug!(target: "tn::metrics", ?e, "metrics endpoint accept error"),
             }
         }
     });
