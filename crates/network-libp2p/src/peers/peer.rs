@@ -11,7 +11,6 @@ use libp2p::{
     PeerId,
 };
 use std::{collections::HashSet, net::IpAddr, time::Instant};
-use tn_config::PeerConfig;
 use tn_types::{BlsPublicKey, NetworkPublicKey};
 use tracing::{error, warn};
 
@@ -26,8 +25,6 @@ pub(super) struct Peer {
     bls_public_key: Option<BlsPublicKey>,
     /// The peers network public key (libp2p public key).
     network_key: Option<NetworkPublicKey>,
-    /// The config
-    config: PeerConfig,
     /// The peer's score - used to derive [Reputation].
     score: Score,
     /// The multiaddrs this node has witnessed the peer using.
@@ -62,7 +59,6 @@ impl Peer {
             network_key: Some(network_key),
             score: Score::new_max(),
             operator_allowlisted: true,
-            config: Default::default(),
             multiaddrs: Default::default(),
             connection_status: Default::default(),
             connection_direction: Default::default(),
@@ -81,7 +77,6 @@ impl Peer {
             network_key: Some(network_key),
             score: Score::default(),
             operator_allowlisted: false,
-            config: Default::default(),
             multiaddrs: addrs.into_iter().collect(),
             connection_status: Default::default(),
             connection_direction: Default::default(),
@@ -101,7 +96,6 @@ impl Peer {
             network_key: Some(network_key),
             score: Score::new_max(),
             operator_allowlisted: false,
-            config: Default::default(),
             multiaddrs: Default::default(),
             connection_status: Default::default(),
             connection_direction: Default::default(),
@@ -137,11 +131,7 @@ impl Peer {
 
     /// Return a peer's reputation based on the aggregate score.
     pub(super) fn reputation(&self) -> Reputation {
-        match self.score.aggregate_score() {
-            score if score <= self.config.min_score_for_ban => Reputation::Banned,
-            score if score <= self.config.min_score_for_disconnect => Reputation::Disconnected,
-            _ => Reputation::Trusted,
-        }
+        self.score.reputation()
     }
 
     /// Return an iterator of known ip addresses for a peer.

@@ -18,16 +18,16 @@ Score deltas are applied in `crates/network-libp2p/src/peers/score.rs:84-100`.
 
 ## 2. Score Model Invariants
 
-- Score range: `[min_score, max_score]` = `[-100.0, 100.0]`. `crates/config/src/network.rs:438-439`.
-- Default starting score: `0.0`. `crates/config/src/network.rs:436`.
-- Ban threshold (`min_score_before_ban`): `-50.0`. `crates/config/src/network.rs:443`.
-- Disconnect threshold (`min_score_before_disconnect`): `-20.0`. `crates/config/src/network.rs:442`.
-- Score halflife: `300.0` seconds; decay factor is `e^(-ln(2)/halflife * dt)`. `crates/config/src/network.rs:440`, `crates/network-libp2p/src/peers/score.rs:130-132`.
-- `banned_before_decay_secs`: `30 * 60` (30 min). When a peer crosses the ban threshold, `last_updated` is pushed forward by this duration so the score does not decay during the lockout. `crates/config/src/network.rs:441`, `crates/network-libp2p/src/peers/score.rs:149-154`.
+- Score range: `[min_score, max_score]` = `[-100.0, 100.0]`. `crates/config/src/network.rs:416-417`.
+- Default starting score: `0.0`. `crates/config/src/network.rs:415`.
+- Ban threshold (`min_score_before_ban`): `-50.0`. `crates/config/src/network.rs:428`.
+- Disconnect threshold (`min_score_before_disconnect`): `-20.0`. `crates/config/src/network.rs:427`.
+- Score halflife: `300.0` seconds; decay factor is `e^(-ln(2)/halflife * dt)`. `crates/config/src/network.rs:421`, `crates/network-libp2p/src/peers/score.rs:130-132`.
+- `banned_before_decay_secs`: `30 * 60` (30 min). When a peer crosses the ban threshold, `last_updated` is pushed forward by this duration so the score does not decay during the lockout. `crates/config/src/network.rs:426`, `crates/network-libp2p/src/peers/score.rs:149-154`.
 - Exempt peers skip penalty application entirely — `Peer::apply_penalty` short-circuits when the caller passes a `TrustBasis` (operator allowlist or committee validator); validator status is derived from the three tracked committee slots (previous/current/next) in `AllPeers::trust_basis`, not stored on the peer. `crates/network-libp2p/src/peers/peer.rs`, `crates/network-libp2p/src/peers/all_peers.rs`.
 - Penalty application has no debouncing: every `process_penalty` call evaluates reputation immediately and may produce a ban on the same call. `crates/network-libp2p/src/peers/all_peers.rs:111-147`.
 - Bans surface to the rest of the swarm as `PeerEvent::Banned`, pushed by `process_ban`. `crates/network-libp2p/src/peers/manager.rs:389-401`.
-- `Penalty::Fatal` always crosses the ban threshold on the first call because `min_score` (`-100`) is less than `min_score_before_ban` (`-50`). `crates/network-libp2p/src/peers/score.rs:93`, `crates/config/src/network.rs:439,443`.
+- `Penalty::Fatal` always crosses the ban threshold on the first call because `min_score` (`-100`) is less than `min_score_before_ban` (`-50`). `crates/network-libp2p/src/peers/score.rs:93`, `crates/config/src/network.rs:417,428`.
 - Only the `Banned`/`Disconnected`/`Trusted` reputation transitions trigger a `PeerAction`. If the new reputation equals the prior reputation, `process_penalty` returns `PeerAction::NoAction`. `crates/network-libp2p/src/peers/all_peers.rs:117-119`.
 
 ## 3. Penalty Application Sites — Network Layer

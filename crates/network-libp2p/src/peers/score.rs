@@ -159,6 +159,31 @@ impl Score {
         let config = global_score_config();
         self.aggregate_score <= config.min_score_before_ban
     }
+
+    /// Derive the peer's [Reputation] from its aggregate score.
+    ///
+    /// The ban and disconnect thresholds are read from the global [ScoreConfig], which is the
+    /// single source of truth for scoring and is initialized from the operator's config via
+    /// [`init_peer_score_config`]. Reading them here (rather than from a per-peer config copy)
+    /// is what makes operator-set thresholds actually take effect (issue #746). The ban
+    /// threshold is the same `min_score_before_ban` used by [`Score::is_banned`], so the
+    /// reputation decision and the decay lockout stay consistent.
+    pub(super) fn reputation(&self) -> Reputation {
+        let config = global_score_config();
+        reputation_for(self.aggregate_score, &config)
+    }
+}
+
+/// Map an aggregate score onto a [Reputation] using the ban/disconnect thresholds in `config`.
+///
+/// Split out from [`Score::reputation`] so the threshold logic can be exercised against an
+/// arbitrary [ScoreConfig] without touching the process-global config.
+fn reputation_for(aggregate_score: f64, config: &ScoreConfig) -> Reputation {
+    match aggregate_score {
+        score if score <= config.min_score_before_ban => Reputation::Banned,
+        score if score <= config.min_score_before_disconnect => Reputation::Disconnected,
+        _ => Reputation::Trusted,
+    }
 }
 
 impl Eq for Score {}
@@ -216,4 +241,40 @@ pub(super) enum ReputationUpdate {
     Disconnect,
     /// The updated score resulted no effective change for the peer's reputation.
     None,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a [ScoreConfig] with the given ban/disconnect thresholds, defaulting the rest.
+    fn config_with(min_score_before_disconnect: f64, min_score_before_ban: f64) -> ScoreConfig {
+        ScoreConfig { min_score_before_disconnect, min_score_before_ban, ..ScoreConfig::default() }
+    }
+
+    #[test]
+    fn reputation_honors_operator_thresholds() {
+        // Default-equivalent thresholds: ban at -50, disconnect at -20.
+        let strict = config_with(-20.0, -50.0);
+        // Operator relaxes both thresholds to tolerate honest peers that fall behind during WAN
+        // sync lag (the scenario in #689). Before #746 these overrides were silently ignored.
+        let relaxed = config_with(-90.0, -95.0);
+
+        // A score of -60 is well past the strict ban threshold...
+        assert_eq!(reputation_for(-60.0, &strict), Reputation::Banned);
+        // ...but the operator's relaxed config keeps the same peer trusted.
+        assert_eq!(reputation_for(-60.0, &relaxed), Reputation::Trusted);
+    }
+
+    #[test]
+    fn reputation_threshold_boundaries() {
+        let config = config_with(-20.0, -50.0);
+
+        // At or below a threshold counts as crossing it; ban takes precedence over disconnect.
+        assert_eq!(reputation_for(-50.0, &config), Reputation::Banned);
+        assert_eq!(reputation_for(-49.9, &config), Reputation::Disconnected);
+        assert_eq!(reputation_for(-20.0, &config), Reputation::Disconnected);
+        assert_eq!(reputation_for(-19.9, &config), Reputation::Trusted);
+        assert_eq!(reputation_for(0.0, &config), Reputation::Trusted);
+    }
 }
