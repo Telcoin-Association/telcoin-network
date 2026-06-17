@@ -282,6 +282,13 @@ pub struct ConsensusChain {
     /// Simple cache of recent pack files.
     recent_packs: Arc<Mutex<VecDeque<ConsensusPack>>>,
     epochs: Arc<EpochRecordDb>,
+    /// Serializes epoch-{N} directory mutation between `new_epoch` (open/append)
+    /// and `stream_import` (remove+rename), preventing a transient-ENOENT crash.
+    ///
+    /// Both critical sections cross `.await` points, so this is a `tokio::sync::Mutex`
+    /// (not the `parking_lot::Mutex` used for the other fields). Always acquired *before*
+    /// `current_pack`/`recent_packs` to keep a single lock order and avoid deadlock.
+    pack_install: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ConsensusChain {
@@ -297,7 +304,8 @@ impl ConsensusChain {
         ));
         let recent_packs = Arc::new(Mutex::new(VecDeque::default()));
         let epochs = Arc::new(EpochRecordDb::open(&base_path)?);
-        Ok(Self { base_path, current_pack, latest_consensus, recent_packs, epochs })
+        let pack_install = Arc::new(tokio::sync::Mutex::new(()));
+        Ok(Self { base_path, current_pack, latest_consensus, recent_packs, epochs, pack_install })
     }
 
     /// Create a new empty consensus chain with a dummy epoch 0 pack ready.
@@ -325,6 +333,11 @@ impl ConsensusChain {
         previous_epoch: EpochRecord,
         committee: Committee,
     ) -> Result<(), ConsensusChainError> {
+        // Serialize the open/append + current_pack swap against stream_import's
+        // remove+rename of the same epoch-{N} directory. Held across the whole
+        // function (open_append is local file creation — fast). Acquired before
+        // current_pack/recent_packs to preserve lock order.
+        let _install = self.pack_install.lock().await;
         if previous_epoch.epoch != committee.epoch().saturating_sub(1) {
             return Err(ConsensusChainError::PrevCommitteeEpochMismatch);
         }
@@ -416,6 +429,12 @@ impl ConsensusChain {
                         return Err(ConsensusChainError::EmptyImport);
                     }
                 }
+                // Acquire the install lock only now — after the (multi-second) network
+                // download has finished writing into the temp import dir. It must NOT wrap
+                // the download (that would block unrelated epoch transitions on network I/O).
+                // Held through the remove+rename and cache invalidation below so new_epoch's
+                // open_append cannot observe the transient window where epoch-{N} is unlinked.
+                let _install = self.pack_install.lock().await;
                 let mut current_pack = self.current_pack.lock();
                 let replace_current = if let Some(current_pack) = &*current_pack {
                     current_pack.epoch() == epoch
