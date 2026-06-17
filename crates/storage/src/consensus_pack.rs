@@ -1221,7 +1221,7 @@ impl Inner {
 /// terminating `Consensus` record.  This caps memory use when reading a (possibly hostile)
 /// peer stream; a legitimate ConsensusOutput references far fewer batches than this.
 #[cfg(not(test))]
-const MAX_BATCHES_PER_OUTPUT: usize = 100_000;
+const MAX_BATCHES_PER_OUTPUT: usize = 1_000;
 /// Lowered in tests so the cap can be exercised cheaply; legitimate test outputs use only a
 /// handful of batches, well under this.
 #[cfg(test)]
