@@ -15,8 +15,8 @@
 //! # Structure
 //!
 //! Mirrors [`tel_precompile`](super::tel_precompile): a [`DynPrecompile`] registered via
-//! [`add_bls_precompile`] and dispatched by 4-byte selector. The ABI matches `BlsG1.sol`, so
-//! `ConsensusRegistry`'s `BlsG1.blsVerify` `delegatecall` resolves to this precompile.
+//! [`add_bls_precompile`] and dispatched by 4-byte selector. The ABI matches `IBlsG1`, so
+//! `ConsensusRegistry`'s `blsVerify` staticcall resolves to this precompile.
 //!
 //! | Selector | Behavior |
 //! |----------|----------|
@@ -43,8 +43,8 @@ use tn_types::{bls_verify_secure, Address, BlsPublicKey, BlsSignature, Bytes};
 
 /// Canonical address of the BLS verification precompile: `0x…b151`.
 ///
-/// Matches `BLS_G1_ADDRESS` in `tn-contracts/src/consensus/BlsG1.sol`. `ConsensusRegistry` is
-/// linked against this address at genesis, so its `BlsG1.*` library `delegatecall`s land here.
+/// Matches `BLS_G1_ADDRESS` in `tn-contracts/src/interfaces/IBlsG1.sol`. `ConsensusRegistry`
+/// staticcalls this address, so its BLS verification lands here.
 pub const BLS_G1_PRECOMPILE_ADDRESS: Address = address!("000000000000000000000000000000000000b151");
 
 sol! {

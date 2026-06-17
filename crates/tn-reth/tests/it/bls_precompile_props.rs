@@ -1,12 +1,12 @@
 //! Property-based tests for the native BLS signature-verification precompile (`0x…b151`).
 //!
-//! These exercise the precompile through the real EVM call path (the same one `ConsensusRegistry`'s
-//! linked `BlsG1` library reaches via `delegatecall`), verifying its observable contract across
-//! randomized inputs:
+//! These exercise the precompile through the real EVM call path (the same one `ConsensusRegistry`
+//! reaches via a low-level `staticcall`), verifying its observable contract across randomized
+//! inputs:
 //! - A correctly-generated proof of possession verifies; a different message (wrong address) /
 //!   wrong key / wrong signature do not.
 //! - Malformed or wrong-length point bytes (including the valid uncompressed encodings) return
-//!   `false` rather than reverting (matching `BlsG1.blsVerify`'s boolean contract), and never
+//!   `false` rather than reverting (matching `IBlsG1.blsVerify`'s boolean contract), and never
 //!   panic.
 //! - Calldata validation: short calldata and unknown selectors revert.
 //!
@@ -31,7 +31,7 @@ sol! {
     ) external view returns (bool);
 }
 
-/// Canonical address the BLS precompile is registered at (matches `BlsG1`'s link address). The
+/// Canonical address the BLS precompile is registered at (matches `BLS_G1_ADDRESS`). The
 /// integration crate cannot see the crate-internal constant, so it is pinned here independently -
 /// which also guards against the address silently drifting.
 const BLS_G1_PRECOMPILE_ADDRESS: Address = address!("000000000000000000000000000000000000b151");
@@ -42,7 +42,7 @@ const VERIFY_GAS: u64 = 1_000_000;
 
 /// A valid proof-of-possession vector: the compressed `blst::min_sig` `to_bytes()` bytes (48-byte
 /// G1 signature, 96-byte G2 pubkey) and the proof-of-possession message they were produced over -
-/// the exact bytes the protocol passes to `BlsG1` / this precompile.
+/// the exact bytes the protocol passes to this precompile.
 struct Vector {
     sig: Vec<u8>,
     pubkey: Vec<u8>,
@@ -267,36 +267,36 @@ proptest! {
 }
 
 // ==============================
-// `DELEGATECALL` relay (the `ConsensusRegistry` path)
+// `STATICCALL` relay (the `ConsensusRegistry` path)
 // ==============================
 
-/// Address hosting the `DELEGATECALL` relay contract.
+/// Address hosting the `STATICCALL` relay contract.
 const RELAY_ADDR: Address = address!("dddd0000000000000000000000000000000000b1");
 
-/// Minimal runtime bytecode that forwards calldata to `0x…b151` via `DELEGATECALL` and returns the
-/// precompile's output verbatim. This is exactly how `ConsensusRegistry`'s linked `BlsG1` library
-/// reaches the precompile, so it proves that integration path resolves to our native code.
+/// Minimal runtime bytecode that forwards calldata to `0x…b151` via `STATICCALL` and returns the
+/// precompile's output verbatim. This is exactly how `ConsensusRegistry` reaches the precompile (a
+/// low-level staticcall), so it proves that integration path resolves to our native code.
 ///
 /// Disassembly:
 /// ```text
 ///   CALLDATASIZE; PUSH1 0; PUSH1 0; CALLDATACOPY      // mem[0..csize] = calldata
 ///   PUSH1 0; PUSH1 0; CALLDATASIZE; PUSH1 0;          // retSize, retOffset, argsSize, argsOffset
-///   PUSH2 0xb151; GAS; DELEGATECALL; POP              // delegatecall to BLS precompile
+///   PUSH2 0xb151; GAS; STATICCALL; POP                // staticcall to BLS precompile
 ///   RETURNDATASIZE; PUSH1 0; PUSH1 0; RETURNDATACOPY  // mem[0..rsize] = returndata
 ///   RETURNDATASIZE; PUSH1 0; RETURN                   // return mem[0..rsize]
 /// ```
 const RELAY_BYTECODE: &[u8] = &[
     0x36, 0x60, 0x00, 0x60, 0x00, 0x37, // CALLDATACOPY(0, 0, CALLDATASIZE)
-    0x60, 0x00, 0x60, 0x00, 0x36, 0x60, 0x00, 0x61, 0xb1, 0x51, 0x5a, 0xf4,
-    0x50, // PUSH2 0xb151; GAS; DELEGATECALL; POP
+    0x60, 0x00, 0x60, 0x00, 0x36, 0x60, 0x00, 0x61, 0xb1, 0x51, 0x5a, 0xfa,
+    0x50, // PUSH2 0xb151; GAS; STATICCALL; POP
     0x3d, 0x60, 0x00, 0x60, 0x00, 0x3e, // RETURNDATACOPY(0, 0, RETURNDATASIZE)
     0x3d, 0x60, 0x00, 0xf3, // RETURN(0, RETURNDATASIZE)
 ];
 
-/// A valid proof verifies, and a tampered one is rejected, when reached via `DELEGATECALL` - the
-/// same way `ConsensusRegistry`'s `BlsG1.blsVerify` library call lands here.
+/// A valid proof verifies, and a tampered one is rejected, when reached via `STATICCALL` - the
+/// same way `ConsensusRegistry`'s `blsVerify` staticcall lands here.
 #[test]
-fn test_delegatecall_verify_pop() {
+fn test_staticcall_verify_pop() {
     let address = Address::repeat_byte(0x42);
     let v = vector([7; 32], address);
     let other = vector([7; 32], Address::repeat_byte(0x43));
@@ -307,7 +307,7 @@ fn test_delegatecall_verify_pop() {
     // Valid PoP through the relay -> true.
     let ok =
         env.exec_to(USER, RELAY_ADDR, verify_calldata(&v.sig, &v.pubkey, &v.message), VERIFY_GAS);
-    assert!(decode_bool(&ok), "valid PoP must verify via DELEGATECALL");
+    assert!(decode_bool(&ok), "valid PoP must verify via STATICCALL");
 
     // Different-address message through the relay -> false (still a successful call returning
     // `false`).
@@ -317,5 +317,5 @@ fn test_delegatecall_verify_pop() {
         verify_calldata(&v.sig, &v.pubkey, &other.message),
         VERIFY_GAS,
     );
-    assert!(!decode_bool(&bad), "wrong-address PoP must be rejected via DELEGATECALL");
+    assert!(!decode_bool(&bad), "wrong-address PoP must be rejected via STATICCALL");
 }
