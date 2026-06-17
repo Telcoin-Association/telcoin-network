@@ -520,8 +520,8 @@ impl Inner {
     fn trunc_and_heal(
         data: &mut Pack<PackRecord>,
         consensus_pos_idx: &mut PositionIndex<IndexPositions>,
-        consensus_digests: &HdxIndex,
-        batch_digests: &HdxIndex,
+        consensus_digests: &mut HdxIndex,
+        batch_digests: &mut HdxIndex,
     ) -> Result<(), PackError> {
         let pack_len = data.file_len();
         let consensus_final = consensus_digests.data_file_length();
@@ -572,6 +572,12 @@ impl Inner {
                 data.truncate(new_pack_len)?;
             }
         }
+        // Reconcile the digest indexes' tracked data file length with the (possibly truncated)
+        // pack so files_consistent holds even if no save follows this heal.  Lookups use the
+        // live pack length, so this only affects the consistency check on a later open.
+        let healed_len = data.file_len();
+        consensus_digests.set_data_file_length(healed_len);
+        batch_digests.set_data_file_length(healed_len);
         Ok(())
     }
 
@@ -704,8 +710,8 @@ impl Inner {
         Self::trunc_and_heal(
             &mut data,
             &mut consensus_pos_idx,
-            &consensus_digests,
-            &batch_digests,
+            &mut consensus_digests,
+            &mut batch_digests,
         )?;
         Ok(Self { data, consensus_digests, consensus_pos_idx, batch_digests, epoch_meta })
     }
@@ -726,7 +732,7 @@ impl Inner {
             .into_epoch()?;
         let mut consensus_pos_idx = Self::open_pdx_file_with_update(&base_dir, false, &mut data)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
-        let consensus_digests = HdxIndex::open_hdx_file(
+        let mut consensus_digests = HdxIndex::open_hdx_file(
             base_dir.join(Self::CONSENSUS_HASH_NAME),
             data.header(),
             builder,
@@ -734,7 +740,7 @@ impl Inner {
         )
         .map_err(OpenError::IndexFileOpen)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
-        let batch_digests = HdxIndex::open_hdx_file(
+        let mut batch_digests = HdxIndex::open_hdx_file(
             base_dir.join(Self::BATCH_HASH_NAME),
             data.header(),
             builder,
@@ -746,8 +752,8 @@ impl Inner {
         Self::trunc_and_heal(
             &mut data,
             &mut consensus_pos_idx,
-            &consensus_digests,
-            &batch_digests,
+            &mut consensus_digests,
+            &mut batch_digests,
         )?;
         Ok(Self { data, consensus_digests, consensus_pos_idx, batch_digests, epoch_meta })
     }
@@ -1066,6 +1072,15 @@ impl Inner {
 
     /// Read and return all the bytes for consensus number (all batches and the consensus header).
     fn bytes_for_consensus(&mut self, number: u64) -> Result<Vec<u8>, PackError> {
+        // Validate the range like consensus_header_by_number; without this a number below
+        // start_consensus_number would saturate to index 0 and silently return the epoch's
+        // first output instead of an error.
+        if number < self.epoch_meta.start_consensus_number {
+            return Err(PackError::ConsensusNumberTooLow);
+        }
+        if number >= self.epoch_meta.start_consensus_number + self.consensus_pos_idx.len() as u64 {
+            return Err(PackError::ConsensusNumberTooHigh);
+        }
         let rec_pos_idx = number.saturating_sub(self.epoch_meta.start_consensus_number);
         let IndexPositions { consensus_header: _, output_start, output_end } = self
             .consensus_pos_idx
@@ -1191,6 +1206,16 @@ impl Inner {
     }
 }
 
+/// Upper bound on how many `Batch` records `iter_to_output` will buffer before the
+/// terminating `Consensus` record.  This caps memory use when reading a (possibly hostile)
+/// peer stream; a legitimate ConsensusOutput references far fewer batches than this.
+#[cfg(not(test))]
+const MAX_BATCHES_PER_OUTPUT: usize = 100_000;
+/// Lowered in tests so the cap can be exercised cheaply; legitimate test outputs use only a
+/// handful of batches, well under this.
+#[cfg(test)]
+const MAX_BATCHES_PER_OUTPUT: usize = 50;
+
 /// Take an async stream of bytes that in pack file representation of ConsensusOutput and return the
 /// ConsensusOutput.
 pub async fn bytes_to_output<R: AsyncRead + Unpin>(
@@ -1227,12 +1252,22 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
     let mut header = None;
     let mut available_batches = HashMap::new();
     let mut referenced_batches = HashSet::new();
+    let mut batch_records = 0_usize;
     while let Some(record) = next(stream_iter, timeout).await? {
         match record {
             PackRecord::EpochMeta(_epoch_meta) => {
                 return Err(PackError::EpochLoad("unexpected epoch meta data found".to_string()))
             }
             PackRecord::Batch(batch) => {
+                // Bound how many batch records a (possibly hostile) stream can deliver before the
+                // terminating Consensus record arrives.  Without this an `EpochMeta`/`Consensus`
+                // -less flood of Batch records would grow `available_batches` until OOM; the
+                // per-record size cap (MAX_RECORD_SIZE) only bounds individual records.  A
+                // legitimate ConsensusOutput references far fewer batches than this.
+                batch_records += 1;
+                if batch_records > MAX_BATCHES_PER_OUTPUT {
+                    return Err(PackError::TooManyBatches(MAX_BATCHES_PER_OUTPUT));
+                }
                 let batch_digest = batch.digest();
                 available_batches.insert(batch_digest, batch);
             }
@@ -1432,13 +1467,14 @@ pub enum PackError {
     CorruptPack,
     ConsensusNumberTooLow,
     ConsensusNumberTooHigh,
+    TooManyBatches(usize),
 }
 
 impl Error for PackError {}
 impl Display for PackError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PackError::IO(error) => write!(f, "IO({error}"),
+            PackError::IO(error) => write!(f, "IO({error})"),
             PackError::MissingBatch => write!(f, "Missing Batch"),
             PackError::BatchLoad(error) => write!(f, "Batch Load Error ({error})"),
             PackError::EpochLoad(error) => write!(f, "Epoch Load Error ({error})"),
@@ -1474,6 +1510,9 @@ impl Display for PackError {
             PackError::ConsensusNumberTooLow => write!(f, "Consensus number too low for this file"),
             PackError::ConsensusNumberTooHigh => {
                 write!(f, "Consensus number too high for this file")
+            }
+            PackError::TooManyBatches(max) => {
+                write!(f, "Too many batches buffered for one consensus output (max {max})")
             }
         }
     }
@@ -2059,5 +2098,124 @@ pub(crate) mod test {
             compare_outputs(&output_db, output);
         }
         drop(pack);
+    }
+
+    fn test_previous_epoch(committee: &Committee) -> EpochRecord {
+        EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        }
+    }
+
+    /// CP1: a peer stream that floods batch records without a terminating Consensus record must
+    /// be rejected with TooManyBatches instead of buffering them all into memory.
+    #[tokio::test]
+    async fn test_iter_to_output_caps_buffered_batches() {
+        use crate::{
+            archive::pack::{Pack, DATA_HEADER_BYTES},
+            consensus_pack::{bytes_to_output, MAX_BATCHES_PER_OUTPUT, PackError, PackRecord},
+        };
+        use std::io::Cursor;
+
+        let temp_dir = TempDir::with_prefix("test_cp_batch_cap").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+
+        // Build a record stream of more batch records than the cap with no Consensus record.
+        let path = temp_dir.path().join("batch_only");
+        {
+            let mut pack: Pack<PackRecord> =
+                Pack::open(&path, 0, false, PackCompression::ZStd).expect("open pack");
+            let batch = tn_reth::test_utils::batches(chain.clone(), 1).pop().expect("one batch");
+            for _ in 0..(MAX_BATCHES_PER_OUTPUT + 5) {
+                pack.append(&PackRecord::Batch(batch.clone())).expect("append batch");
+            }
+            pack.commit().expect("commit");
+        }
+        // bytes_to_output uses open_partial (no header) so feed the records past the data header.
+        let file_bytes = std::fs::read(&path).expect("read file");
+        let records = file_bytes[DATA_HEADER_BYTES..].to_vec();
+
+        let res = bytes_to_output(
+            Cursor::new(records),
+            PackCompression::ZStd,
+            Duration::from_secs(5),
+            &committee,
+        )
+        .await;
+        assert!(matches!(res, Err(PackError::TooManyBatches(_))), "expected TooManyBatches");
+    }
+
+    /// CP2: get_consensus_output with a number below start_consensus_number must error rather
+    /// than saturating to index 0 and silently returning the first output.
+    #[tokio::test]
+    async fn test_get_consensus_output_rejects_below_range() {
+        let temp_dir = TempDir::with_prefix("test_cp_oob_number").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        let pack = ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee.clone())
+            .expect("open pack");
+        let mut parent = ConsensusHeader::default().digest();
+        for i in 0..3 {
+            let output = make_test_output(&committee, i % 4, chain.clone(), (i as u64) + 1, parent);
+            parent = output.digest().into();
+            pack.save_consensus_output(output).await.unwrap();
+        }
+        // start_consensus_number is 1 for epoch 0; 0 is below range.
+        assert!(pack.get_consensus_output(0).await.is_err(), "number below start must error");
+        assert!(pack.get_consensus_output(1).await.is_ok(), "in-range number works");
+    }
+
+    /// CP3: a pack healed on open (truncating a damaged tail) but not followed by a save must
+    /// still reconcile the index lengths, so a later read-only open passes the consistency check.
+    #[tokio::test]
+    async fn test_heal_without_save_then_open_static() {
+        let temp_dir = TempDir::with_prefix("test_cp_heal_static").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        {
+            let pack =
+                ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone())
+                    .expect("open pack");
+            let mut parent = ConsensusHeader::default().digest();
+            for i in 0..5 {
+                let output =
+                    make_test_output(&committee, i % 4, chain.clone(), (i as u64) + 1, parent);
+                parent = output.digest().into();
+                pack.save_consensus_output(output).await.unwrap();
+            }
+            pack.persist().await.expect("persist");
+        }
+
+        // Damage the tail of the data file (truncate last byte of the last record).
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        {
+            let f = OpenOptions::new().read(true).write(true).open(&data_path).expect("open data");
+            let len = f.metadata().expect("meta").len();
+            f.set_len(len - 1).expect("truncate");
+        }
+
+        // Open append: heals (truncates the damaged record) but we do NOT save afterward.
+        {
+            let pack =
+                ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone())
+                    .expect("open append heals");
+            pack.persist().await.expect("persist after heal");
+        }
+
+        // A read-only open runs files_consistent; with the index lengths reconciled during heal
+        // this must succeed rather than reporting CorruptPack.
+        let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static after heal");
+        // The healed pack dropped the damaged 5th output; the first four remain readable.
+        assert!(pack.get_consensus_output(1).await.is_ok());
+        assert!(pack.get_consensus_output(4).await.is_ok());
     }
 }
