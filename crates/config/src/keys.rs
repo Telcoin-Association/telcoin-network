@@ -234,8 +234,8 @@ impl KeyConfig {
     ///
     /// The proof of possession is a [BlsSignature] over [`construct_proof_of_possession_message`]:
     /// `intentPrefix || compressedBlsPubkey || address`. Using the compressed key keeps the message
-    /// cheaply reconstructable by the on-chain `ConsensusRegistry`, which verifies it via the native
-    /// BLS precompile.
+    /// cheaply reconstructable by the on-chain `ConsensusRegistry`, which verifies it via the
+    /// native BLS precompile.
     pub fn generate_proof_of_possession_bls(
         &self,
         address: &Address,

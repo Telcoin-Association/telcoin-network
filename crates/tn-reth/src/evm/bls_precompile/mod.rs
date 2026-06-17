@@ -1,16 +1,16 @@
 //! Native BLS12-381 signature-verification precompile.
 //!
 //! A native `blst` (`min_sig`) signature verifier registered at [`BLS_G1_PRECOMPILE_ADDRESS`]
-//! (`0x…b151`). It verifies that a compressed signature is valid, under a compressed public key, over
-//! a caller-supplied message - the **same** `blst` path the consensus layer uses to *produce*
+//! (`0x…b151`). It verifies that a compressed signature is valid, under a compressed public key,
+//! over a caller-supplied message - the **same** `blst` path the consensus layer uses to *produce*
 //! signatures ([`tn_types::bls_verify_secure`]). Having one implementation behind both signing and
 //! verification removes the byte-for-byte drift risk between the Rust signer and an independent
 //! on-chain reimplementation.
 //!
-//! It is a **generic** primitive: the message is opaque to the precompile, so any contract can verify
-//! any BLS-signed message. `ConsensusRegistry` is one caller - it builds its proof-of-possession
-//! message (`intentPrefix || compressedPubkey || address`) and verifies it here - but the precompile
-//! hard-codes nothing about proof-of-possession.
+//! It is a **generic** primitive: the message is opaque to the precompile, so any contract can
+//! verify any BLS-signed message. `ConsensusRegistry` is one caller - it builds its
+//! proof-of-possession message (`intentPrefix || compressedPubkey || address`) and verifies it here
+//! - but the precompile hard-codes nothing about proof-of-possession.
 //!
 //! # Structure
 //!
@@ -25,10 +25,10 @@
 //! # Encoding
 //!
 //! The signature/pubkey arguments are the protocol's own `blst::min_sig` compressed encodings
-//! (48-byte compressed G1 signature, 96-byte compressed G2 pubkey) - the identical bytes the genesis
-//! assembly and `stake`/`delegateStake` callers pass as the `ProofOfPossession` signature and the
-//! stored `blsPubkey`. A strict length gate (exactly 48 / 96 bytes) is applied before decoding, so
-//! only the compressed form is accepted: the bytes are fed into `blst` via
+//! (48-byte compressed G1 signature, 96-byte compressed G2 pubkey) - the identical bytes the
+//! genesis assembly and `stake`/`delegateStake` callers pass as the `ProofOfPossession` signature
+//! and the stored `blsPubkey`. A strict length gate (exactly 48 / 96 bytes) is applied before
+//! decoding, so only the compressed form is accepted: the bytes are fed into `blst` via
 //! [`BlsSignature::from_bytes`] / [`BlsPublicKey::from_literal_bytes`], which decompress the points
 //! internally; no uncompressed input is accepted. The `message` is verified as raw bytes
 //! (hash-to-curve with the protocol DST happens inside the verify).
@@ -43,8 +43,8 @@ use tn_types::{bls_verify_secure, Address, BlsPublicKey, BlsSignature, Bytes};
 
 /// Canonical address of the BLS verification precompile: `0x…b151`.
 ///
-/// Matches `BLS_G1_ADDRESS` in `tn-contracts/src/consensus/BlsG1.sol`. `ConsensusRegistry` is linked
-/// against this address at genesis, so its `BlsG1.*` library `delegatecall`s land here.
+/// Matches `BLS_G1_ADDRESS` in `tn-contracts/src/consensus/BlsG1.sol`. `ConsensusRegistry` is
+/// linked against this address at genesis, so its `BlsG1.*` library `delegatecall`s land here.
 pub const BLS_G1_PRECOMPILE_ADDRESS: Address = address!("000000000000000000000000000000000000b151");
 
 sol! {
@@ -72,8 +72,8 @@ sol! {
 /// bytes). As a generic primitive, `blsVerify` accepts an arbitrary `message` whose hash-to-curve
 /// cost scales with its length; in practice that length is bounded by the calldata gas the caller
 /// already pays to supply it. Before any non-proof-of-possession caller relies on `blsVerify` with
-/// large messages, add a per-word component to this charge (mirroring EIP-2537 hash-to-curve pricing)
-/// or cap `message.len()`.
+/// large messages, add a per-word component to this charge (mirroring EIP-2537 hash-to-curve
+/// pricing) or cap `message.len()`.
 const BLS_VERIFY_GAS_COST: u64 = 150_000;
 
 /// Registers the BLS precompile at [`BLS_G1_PRECOMPILE_ADDRESS`] in the given map.
@@ -97,8 +97,8 @@ fn bls_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
 /// Selector dispatch: extracts the 4-byte selector from calldata and routes to the handler.
 ///
 /// Split out from [`bls_precompile`] so the selector routing, gas metering, and ABI round-trips can
-/// be unit-tested directly with raw calldata, without constructing a full [`PrecompileInput`] (which
-/// would require a live EVM for its [`EvmInternals`](alloy_evm::EvmInternals) field).
+/// be unit-tested directly with raw calldata, without constructing a full [`PrecompileInput`]
+/// (which would require a live EVM for its [`EvmInternals`](alloy_evm::EvmInternals) field).
 fn dispatch(data: &[u8], gas: u64) -> PrecompileResult {
     let Some((selector, calldata)) = data.split_first_chunk::<4>() else {
         return Err(PrecompileError::Other("Invalid input: too short".into()));
@@ -119,10 +119,11 @@ fn handle_bls_verify(calldata: &[u8], gas_limit: u64) -> PrecompileResult {
     let decoded = blsVerifyCall::abi_decode_raw(calldata)
         .map_err(|e| PrecompileError::Other(format!("blsVerify: {e}").into()))?;
 
-    // Reuse the exact crypto the consensus layer uses to *produce* signatures, so signer and verifier
-    // can never disagree. A malformed point or failed verification yields `false` (not a revert),
-    // matching `BlsG1.blsVerify`'s boolean contract; the caller (`ConsensusRegistry`) is what turns
-    // `false` into its own `InvalidProofOfPossession` revert.
+    // Reuse the exact crypto the consensus layer uses to *produce* signatures, so signer and
+    // verifier can never disagree. A malformed point or failed verification yields `false` (not
+    // a revert), matching `BlsG1.blsVerify`'s boolean contract; the caller
+    // (`ConsensusRegistry`) is what turns `false` into its own `InvalidProofOfPossession`
+    // revert.
     let verified = bls_verify(&decoded.signature, &decoded.pubkey, &decoded.message);
 
     Ok(PrecompileOutput::new(BLS_VERIFY_GAS_COST, Bytes::from(verified.abi_encode())))
@@ -161,17 +162,17 @@ mod tests {
     };
 
     /// A valid signature over a representative message (the consensus proof-of-possession message),
-    /// plus the compressed `blst::min_sig` sig/pubkey bytes the protocol passes on-chain (48-byte G1
-    /// sig, 96-byte G2 pubkey).
+    /// plus the compressed `blst::min_sig` sig/pubkey bytes the protocol passes on-chain (48-byte
+    /// G1 sig, 96-byte G2 pubkey).
     struct Vector {
         sig: Vec<u8>,
         pubkey: Vec<u8>,
         message: Vec<u8>,
     }
 
-    /// Builds a valid (signature, pubkey, message) vector from a fixed RNG seed and address byte. The
-    /// message is the proof-of-possession message; the signature is produced over it by the same
-    /// signer path the protocol uses, so signer and precompile agree by construction.
+    /// Builds a valid (signature, pubkey, message) vector from a fixed RNG seed and address byte.
+    /// The message is the proof-of-possession message; the signature is produced over it by the
+    /// same signer path the protocol uses, so signer and precompile agree by construction.
     fn vector(seed: u8, address_byte: u8) -> Vector {
         let keypair = BlsKeypair::generate(&mut StdRng::from_seed([seed; 32]));
         let address = Address::repeat_byte(address_byte);
@@ -212,10 +213,10 @@ mod tests {
         }
     }
 
-    /// S1 (load-bearing): the precompile is compressed-only. A *valid* 96-byte uncompressed signature
-    /// and 192-byte uncompressed pubkey - the pre-change encoding - must be rejected by the length
-    /// gate. blst's `deserialize` would otherwise accept these valid points, so this (not random
-    /// wrong-length bytes) is the proof that the gate is the enforcement.
+    /// S1 (load-bearing): the precompile is compressed-only. A *valid* 96-byte uncompressed
+    /// signature and 192-byte uncompressed pubkey - the pre-change encoding - must be rejected
+    /// by the length gate. blst's `deserialize` would otherwise accept these valid points, so
+    /// this (not random wrong-length bytes) is the proof that the gate is the enforcement.
     #[test]
     fn bls_verify_rejects_valid_uncompressed_inputs() {
         let keypair = BlsKeypair::generate(&mut StdRng::from_seed([7u8; 32]));
@@ -283,11 +284,13 @@ mod tests {
     fn bls_verify_rejects_wrong_length_inputs() {
         let v = vector(7, 0x42);
 
-        // pubkey lengths that are not the 96-byte compressed G2 form (incl. the 192-byte uncompressed)
+        // pubkey lengths that are not the 96-byte compressed G2 form (incl. the 192-byte
+        // uncompressed)
         for len in [0usize, 32, 47, 48, 95, 97, 128, 192, 256] {
             assert!(!bls_verify(&v.sig, &vec![0u8; len], &v.message), "pubkey len {len}");
         }
-        // signature lengths that are not the 48-byte compressed G1 form (incl. the 96-byte uncompressed)
+        // signature lengths that are not the 48-byte compressed G1 form (incl. the 96-byte
+        // uncompressed)
         for len in [0usize, 32, 47, 49, 96, 128, 192] {
             assert!(!bls_verify(&vec![0u8; len], &v.pubkey, &v.message), "sig len {len}");
         }
@@ -306,8 +309,8 @@ mod tests {
         assert_eq!(out.gas_used, BLS_VERIFY_GAS_COST);
     }
 
-    /// An invalid signature returns ABI-encoded `false` rather than reverting: the precompile mirrors
-    /// `BlsG1.blsVerify`'s boolean contract, leaving the revert to `ConsensusRegistry`.
+    /// An invalid signature returns ABI-encoded `false` rather than reverting: the precompile
+    /// mirrors `BlsG1.blsVerify`'s boolean contract, leaving the revert to `ConsensusRegistry`.
     #[test]
     fn dispatch_verify_invalid_returns_false_not_revert() {
         let v = vector(7, 0x42);

@@ -3,10 +3,11 @@
 //! These exercise the precompile through the real EVM call path (the same one `ConsensusRegistry`'s
 //! linked `BlsG1` library reaches via `delegatecall`), verifying its observable contract across
 //! randomized inputs:
-//! - A correctly-generated proof of possession verifies; a different message (wrong address) / wrong
-//!   key / wrong signature do not.
+//! - A correctly-generated proof of possession verifies; a different message (wrong address) /
+//!   wrong key / wrong signature do not.
 //! - Malformed or wrong-length point bytes (including the valid uncompressed encodings) return
-//!   `false` rather than reverting (matching `BlsG1.blsVerify`'s boolean contract), and never panic.
+//!   `false` rather than reverting (matching `BlsG1.blsVerify`'s boolean contract), and never
+//!   panic.
 //! - Calldata validation: short calldata and unknown selectors revert.
 //!
 //! The precompile is a generic BLS verifier; `ConsensusRegistry`'s proof-of-possession message
@@ -39,9 +40,9 @@ const BLS_G1_PRECOMPILE_ADDRESS: Address = address!("000000000000000000000000000
 /// harness limit is insufficient; mirror the 1M budget `stake`/`delegateStake` run with.
 const VERIFY_GAS: u64 = 1_000_000;
 
-/// A valid proof-of-possession vector: the compressed `blst::min_sig` `to_bytes()` bytes (48-byte G1
-/// signature, 96-byte G2 pubkey) and the proof-of-possession message they were produced over - the
-/// exact bytes the protocol passes to `BlsG1` / this precompile.
+/// A valid proof-of-possession vector: the compressed `blst::min_sig` `to_bytes()` bytes (48-byte
+/// G1 signature, 96-byte G2 pubkey) and the proof-of-possession message they were produced over -
+/// the exact bytes the protocol passes to `BlsG1` / this precompile.
 struct Vector {
     sig: Vec<u8>,
     pubkey: Vec<u8>,
@@ -54,11 +55,7 @@ fn vector(seed: [u8; 32], address: Address) -> Vector {
     let message = construct_proof_of_possession_message(keypair.public(), &address);
     let proof =
         generate_proof_of_possession_bls_for_test(&keypair, &address).expect("generate test PoP");
-    Vector {
-        sig: proof.to_bytes().to_vec(),
-        pubkey: keypair.public().to_bytes().to_vec(),
-        message,
-    }
+    Vector { sig: proof.to_bytes().to_vec(), pubkey: keypair.public().to_bytes().to_vec(), message }
 }
 
 /// ABI-encodes a `blsVerify` call.
@@ -308,10 +305,12 @@ fn test_delegatecall_verify_pop() {
     env.deploy_code(RELAY_ADDR, Bytes::from_static(RELAY_BYTECODE));
 
     // Valid PoP through the relay -> true.
-    let ok = env.exec_to(USER, RELAY_ADDR, verify_calldata(&v.sig, &v.pubkey, &v.message), VERIFY_GAS);
+    let ok =
+        env.exec_to(USER, RELAY_ADDR, verify_calldata(&v.sig, &v.pubkey, &v.message), VERIFY_GAS);
     assert!(decode_bool(&ok), "valid PoP must verify via DELEGATECALL");
 
-    // Different-address message through the relay -> false (still a successful call returning `false`).
+    // Different-address message through the relay -> false (still a successful call returning
+    // `false`).
     let bad = env.exec_to(
         USER,
         RELAY_ADDR,

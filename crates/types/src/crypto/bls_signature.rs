@@ -182,10 +182,11 @@ pub fn verify_proof_of_possession_bls(
     }
 }
 
-/// Verify a BLS signature over a raw `message` under `public_key`, with full security (signature and
-/// public-key subgroup checks) and the protocol [`DST_G1`]. This is the generic primitive the native
-/// BLS precompile exposes: proof-of-possession is just one message it can verify, so any caller can
-/// verify an arbitrary BLS-signed message without the verifier hard-coding the message's meaning.
+/// Verify a BLS signature over a raw `message` under `public_key`, with full security (signature
+/// and public-key subgroup checks) and the protocol [`DST_G1`]. This is the generic primitive the
+/// native BLS precompile exposes: proof-of-possession is just one message it can verify, so any
+/// caller can verify an arbitrary BLS-signed message without the verifier hard-coding the message's
+/// meaning.
 pub fn bls_verify_secure(
     signature: &BlsSignature,
     public_key: &BlsPublicKey,
@@ -200,7 +201,8 @@ pub fn bls_verify_secure(
 /// (`0x000000`). Using the compressed pubkey and the raw address makes this cheaply reconstructable
 /// on-chain, so the `ConsensusRegistry` builds the identical bytes and verifies them through the
 /// native BLS precompile ([`bls_verify_secure`]). Returned as raw bytes (not wrapped in an
-/// [`IntentMessage`]) since both the signer and the on-chain verifier operate on the bytes directly.
+/// [`IntentMessage`]) since both the signer and the on-chain verifier operate on the bytes
+/// directly.
 pub fn construct_proof_of_possession_message(
     bls_pubkey: &BlsPublicKey,
     address: &Address,

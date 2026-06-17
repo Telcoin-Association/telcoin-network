@@ -718,8 +718,9 @@ pub fn test_genesis_with_consensus_registry(num_validators: usize) -> Genesis {
     let initial_stake_config = ConsensusRegistry::StakeConfig {
         stakeAmount: U256::from(parse_ether("1_000_000").expect("parse stake amount")),
         minWithdrawAmount: U256::from(parse_ether("1_000").expect("parse min withdraw amount")),
-        // Keep issuance even: reward tests assert `epochIssuance.div_ceil(2)` against the contract's
-        // floor split between two leaders, which only agree when the issuance divides exactly.
+        // Keep issuance even: reward tests assert `epochIssuance.div_ceil(2)` against the
+        // contract's floor split between two leaders, which only agree when the issuance
+        // divides exactly.
         epochIssuance: U256::from(parse_ether("2_000_000").expect("parse epoch issuance")),
         epochDuration: 60 * 60 * 24, // 24h
     };
