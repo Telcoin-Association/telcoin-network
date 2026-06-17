@@ -7,7 +7,7 @@ pub use libp2p::gossipsub::MessageId;
 use libp2p::{
     core::transport::ListenerId,
     gossipsub::{PublishError, SubscriptionError, TopicHash},
-    request_response::ResponseChannel,
+    request_response::ResponseChannel as Libp2pResponseChannel,
     Multiaddr, PeerId, Stream, StreamProtocol, TransportError,
 };
 use serde::{Deserialize, Serialize};
@@ -92,6 +92,42 @@ impl NetworkType {
                     .expect("worker kad protocol name starts with '/'")
             }
         }
+    }
+}
+
+/// A channel for sending the response to an inbound RPC, bound to the peer that
+/// opened the exchange.
+///
+/// This is the crate-owned equivalent of libp2p's
+/// [`ResponseChannel`](libp2p::request_response::ResponseChannel): it wraps the
+/// same response sink but also carries the [`PeerId`] captured when the inbound
+/// request was accepted, so the requesting peer's identity travels with the
+/// channel instead of being re-derived from a side map at response time. Keeping the
+/// type crate-owned also keeps libp2p's request-response types out of the public
+/// API, so a libp2p upgrade does not ripple into the consumer crates.
+#[derive(Debug)]
+pub struct ResponseChannel<Res> {
+    /// The peer that opened this exchange.
+    peer_id: PeerId,
+    /// The underlying libp2p response sink.
+    inner: Libp2pResponseChannel<Res>,
+}
+
+impl<Res> ResponseChannel<Res> {
+    /// Bind a libp2p response channel to the peer that opened the exchange.
+    pub(crate) fn new(peer_id: PeerId, inner: Libp2pResponseChannel<Res>) -> Self {
+        Self { peer_id, inner }
+    }
+
+    /// The peer that opened this exchange.
+    pub fn peer_id(&self) -> &PeerId {
+        &self.peer_id
+    }
+
+    /// Consume the wrapper, returning the underlying libp2p response sink so the
+    /// swarm task can deliver the response.
+    pub(crate) fn into_inner(self) -> Libp2pResponseChannel<Res> {
+        self.inner
     }
 }
 
