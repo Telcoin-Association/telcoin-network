@@ -25,8 +25,8 @@ pub enum LoadHeaderError {
     InvalidIndexUID,
     /// The HDX index app number did not match the data file.
     InvalidIndexAppNum,
-    /// The HDX index bucket geometry (bucket size / elements per bucket) did not match the
-    /// compile-time layout, so this binary cannot safely read the index.
+    /// The index record geometry (bucket/record size) did not match the compile-time layout,
+    /// so this binary cannot safely read the index.
     InvalidIndexGeometry,
     /// The salt when hashed with provided hasher did not produce the pepper.
     InvalidHasher,

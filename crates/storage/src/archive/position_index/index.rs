@@ -130,6 +130,12 @@ impl<T: PosIndexValue> PositionIndex<T> {
         file_name: &str,
         read_only: bool,
     ) -> Result<PositionIndex<T>, LoadHeaderError> {
+        // Values are encoded/decoded through a fixed VALUE_MAX_BYTES stack buffer; a larger
+        // stride would panic on the slice operations in save/load.
+        debug_assert!(
+            T::buffer_len() <= VALUE_MAX_BYTES,
+            "PosIndexValue::buffer_len() exceeds VALUE_MAX_BYTES"
+        );
         let dir = dir.as_ref();
         let dir_created = fs::create_dir(dir).is_ok();
         if dir_created {
@@ -165,7 +171,26 @@ impl<T: PosIndexValue> PositionIndex<T> {
             }
             header
         };
-        Ok(Self { _header: header, pdx_file, _index_dir: dir.to_owned(), _phantom: PhantomData })
+        let mut index =
+            Self { _header: header, pdx_file, _index_dir: dir.to_owned(), _phantom: PhantomData };
+        // The file must always be a whole number of records after the header.  A misaligned
+        // tail means either a torn final record (crash mid-write) or a file written with a
+        // different value type than `T`.
+        let buffer_len = T::buffer_len() as u64;
+        let record_bytes = index.pdx_file.len().saturating_sub(PDX_HEADER_SIZE as u64);
+        if !record_bytes.is_multiple_of(buffer_len) {
+            if read_only {
+                // Can't repair a read-only file, and a stride mismatch means this `T` cannot
+                // read it safely; reject rather than return garbage.
+                return Err(LoadHeaderError::InvalidIndexGeometry);
+            }
+            // Writable: drop a torn trailing partial record so appends stay aligned.  Without
+            // this, the next append (always at the true EOF) would land mid-stride and shift
+            // every subsequent record.
+            let aligned = PDX_HEADER_SIZE as u64 + (index.len() as u64 * buffer_len);
+            index.pdx_file.set_len(aligned)?;
+        }
+        Ok(index)
     }
 
     /// Return the number of values in this index.
@@ -199,8 +224,13 @@ impl<T: PosIndexValue> PositionIndex<T> {
         Ok(PositionIter::new_rev(data))
     }
 
-    /// Truncate the index to key (inclusive).
+    /// Truncate the index to key (inclusive).  `key` must be an existing index; truncating
+    /// to a key at or beyond the current length would otherwise *extend* the file with
+    /// zero-filled records, so this is a no-op in that case.
     pub fn truncate_to_index(&mut self, key: u64) -> Result<(), io::Error> {
+        if key as usize >= self.len() {
+            return Ok(());
+        }
         let buffer_len = T::buffer_len() as u64;
         let pos = PDX_HEADER_SIZE as u64 + (key * buffer_len) + buffer_len;
         self.pdx_file.set_len(pos)
@@ -231,6 +261,9 @@ impl<T: PosIndexValue> Index<u64, T> for PositionIndex<T> {
     }
 
     fn load(&mut self, key: u64) -> Result<T, FetchError> {
+        if key as usize >= self.len() {
+            return Err(FetchError::NotFound);
+        }
         let buffer_len = T::buffer_len();
         let pos = PDX_HEADER_SIZE as u64 + (key * buffer_len as u64);
         self.pdx_file.seek(SeekFrom::Start(pos))?;
@@ -499,5 +532,78 @@ mod tests {
         }
 
         assert_eq!(idx.load(1_000_000).expect("load idx"), (66, 66));
+    }
+
+    // A torn trailing record (crash mid-write leaves a partial final record) must be dropped
+    // on reopen so that append-mode writes stay record-aligned.  Without the heal, the next
+    // save lands mid-stride and corrupts every subsequent record.
+    #[test]
+    fn test_archive_pdx_torn_tail_heals() {
+        let tmp_path = TempDir::with_prefix("test_archive_pdx_torn").expect("temp dir");
+        let data_header = DataHeader::new(0, PackCompression::ZStd);
+        let file = tmp_path.path().join("torn.pdx");
+
+        {
+            let mut idx: PositionIndex<u64> =
+                PositionIndex::open_pdx_file(tmp_path.path(), &data_header, "torn.pdx", false)
+                    .expect("pdx file");
+            for i in 0..10 {
+                idx.save(i, i * 100).expect("add to index");
+            }
+            idx.sync().expect("sync");
+        }
+
+        // Simulate a torn final record: append a few stray (sub-record) bytes.
+        let before = fs::metadata(&file).expect("metadata").len();
+        {
+            let mut f = fs::OpenOptions::new().append(true).open(&file).expect("open append");
+            f.write_all(&[0xAB, 0xCD, 0xEF]).expect("write torn bytes");
+            f.sync_all().expect("sync");
+        }
+        assert_eq!(fs::metadata(&file).expect("metadata").len(), before + 3);
+
+        // Reopen for write: the torn tail should be truncated away.
+        let mut idx: PositionIndex<u64> =
+            PositionIndex::open_pdx_file(tmp_path.path(), &data_header, "torn.pdx", false)
+                .expect("pdx file");
+        assert_eq!(idx.len(), 10, "torn tail should not count as a record");
+        assert_eq!(
+            fs::metadata(&file).expect("metadata").len(),
+            before,
+            "torn bytes should be truncated"
+        );
+
+        // The next append must be aligned, and all records must read back correctly.
+        idx.save(10, 1000).expect("add to index");
+        for i in 0..=10 {
+            assert_eq!(idx.load(i).expect("load idx"), i * 100, "failed on iteration {i}");
+        }
+    }
+
+    // Reopening a file written with a different value type (different stride) must be rejected
+    // rather than silently misread.  A u64 file of an odd record count is not a whole number
+    // of (u64, u64) records, so the alignment guard catches it.
+    #[test]
+    fn test_archive_pdx_geometry_mismatch() {
+        let tmp_path = TempDir::with_prefix("test_archive_pdx_geometry").expect("temp dir");
+        let data_header = DataHeader::new(0, PackCompression::ZStd);
+
+        {
+            let mut idx: PositionIndex<u64> =
+                PositionIndex::open_pdx_file(tmp_path.path(), &data_header, "geo.pdx", false)
+                    .expect("pdx file");
+            // Odd count -> 3 * 8 = 24 bytes, not a multiple of the 16-byte (u64, u64) stride.
+            for i in 0..3 {
+                idx.save(i, i).expect("add to index");
+            }
+            idx.sync().expect("sync");
+        }
+
+        let res: Result<PositionIndex<(u64, u64)>, _> =
+            PositionIndex::open_pdx_file(tmp_path.path(), &data_header, "geo.pdx", true);
+        assert!(
+            matches!(res, Err(LoadHeaderError::InvalidIndexGeometry)),
+            "expected InvalidIndexGeometry, got {res:?}"
+        );
     }
 }

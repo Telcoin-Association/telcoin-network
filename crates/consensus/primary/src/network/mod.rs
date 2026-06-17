@@ -456,6 +456,7 @@ impl PrimaryNetworkHandle {
                 PackError::InvalidConsensusChain
                 | PackError::ExtraBatches
                 | PackError::MissingBatches
+                | PackError::TooManyBatches(_)
                 | PackError::CorruptPack
                 | PackError::InvalidEpoch(_, _) => Some(Penalty::Severe),
                 PackError::IO(_)

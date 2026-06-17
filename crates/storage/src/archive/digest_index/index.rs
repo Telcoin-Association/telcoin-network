@@ -406,7 +406,10 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     /// This can be useful for tracking information about another file but
     /// does not effect the index.
     pub fn set_data_file_length(&mut self, data_file_length: u64) {
-        self.header.data_file_length = data_file_length;
+        if self.header.data_file_length != data_file_length {
+            self.header.data_file_length = data_file_length;
+            self.synced = false;
+        }
     }
 
     /// Get the data_file_length field.
@@ -813,14 +816,14 @@ mod tests {
             let mut hasher = DefaultHashFunction::new();
             hasher.update(&format!("idx-{i}").into_bytes());
             let hash = B256::from_slice(hasher.finalize().as_bytes());
-            idx.save(hash, i).expect(&format!("add to index {i}"));
+            idx.save(hash, i).unwrap_or_else(|e| panic!("add to index {i}: {e}"));
         }
         for i in 0..1_000_000 {
             let mut hasher = DefaultHashFunction::new();
             hasher.update(&format!("idx-{i}").into_bytes());
             let hash = B256::from_slice(hasher.finalize().as_bytes());
             assert!(idx.test_bloom_contains(hash));
-            assert_eq!(idx.load(hash).expect(&format!("load idx {i}")), i);
+            assert_eq!(idx.load(hash).unwrap_or_else(|e| panic!("load idx {i}: {e}")), i);
         }
         drop(idx);
 
