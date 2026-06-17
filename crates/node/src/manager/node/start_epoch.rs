@@ -91,6 +91,7 @@ where
                 error!(target: "epoch-manager", "error sending consensus output to engine: {}", e);
                 return Err(e);
             }
+            self.metrics.replayed_outputs_total.increment(1);
             last_replayed_hash = Some(output_hash);
             if is_epoch_close {
                 return Ok(ReplayResult {

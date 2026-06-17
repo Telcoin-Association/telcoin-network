@@ -161,7 +161,6 @@ impl PendingCertificateManager {
     }
 
     /// Returns the number of pending certificates.
-    #[cfg(test)]
     pub(super) fn num_pending(&self) -> usize {
         self.pending.len()
     }

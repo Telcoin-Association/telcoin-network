@@ -45,6 +45,7 @@ tracing-opentelemetry = { workspace = true }
 
 alloy = { workspace = true }
 tn-types = { workspace = true }
+tn-metrics = { workspace = true }
 tn-node = { workspace = true }
 tn-reth = { workspace = true }
 tn-config = { workspace = true }

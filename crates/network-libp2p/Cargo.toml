@@ -36,7 +36,12 @@ snap = { workspace = true }
 rand = { workspace = true }
 serde_with = { workspace = true }
 
+# metrics
+metrics = { workspace = true }
+reth-metrics = { workspace = true }
+
 [dev-dependencies]
+metrics-util = { workspace = true }
 tempfile = { workspace = true }
 tn-reth = { workspace = true, features = ["test-utils"] }
 eyre = { workspace = true }

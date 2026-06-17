@@ -5,6 +5,7 @@
 
 use crate::{
     batch_fetcher::BatchFetcher,
+    metrics::WorkerMetrics,
     network::primary::PrimaryReceiverHandler,
     quorum_waiter::{QuorumWaiter, QuorumWaiterTrait},
     WorkerNetworkHandle,
@@ -41,6 +42,7 @@ pub fn new_worker<DB: Database>(
         network_handle.clone(),
         consensus_config.node_storage().clone(),
         consensus_chain,
+        WorkerMetrics::new_for_worker(id),
     );
     consensus_config.local_network().set_primary_to_worker_local_handler(Arc::new(
         PrimaryReceiverHandler {
@@ -80,7 +82,12 @@ fn new_worker_internal<DB: Database>(
     // before forwarding the batch to the `Processor`
     // Only have a quorum waiter if we are an authority (validator).
     let quorum_waiter = consensus_config.authority().clone().map(|authority| {
-        QuorumWaiter::new(authority, consensus_config.committee().clone(), network_handle.clone())
+        QuorumWaiter::new(
+            authority,
+            consensus_config.committee().clone(),
+            network_handle.clone(),
+            WorkerMetrics::new_for_worker(id),
+        )
     });
 
     Worker::new(
@@ -112,6 +119,8 @@ pub struct Worker<DB, QW> {
     timeout: Duration,
     /// Worker network handle.
     network_handle: WorkerNetworkHandle,
+    /// Prometheus metrics for this worker.
+    metrics: WorkerMetrics,
 }
 
 // Need to implement clone directly because of the rx_batches field.
@@ -128,6 +137,7 @@ impl<DB: Clone, QW: Clone> Clone for Worker<DB, QW> {
             rx_batches: None,
             timeout: self.timeout,
             network_handle: self.network_handle.clone(),
+            metrics: self.metrics.clone(),
         }
     }
 }
@@ -158,6 +168,7 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
             rx_batches: Some(rx_batches),
             timeout,
             network_handle,
+            metrics: WorkerMetrics::new_for_worker(id),
         }
     }
 
@@ -239,6 +250,7 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
                             num_txs = batch.transactions.len(),
                             "batch sealed"
                         );
+                        self.metrics.record_batch_sealed(batch.size(), batch.transactions.len());
                         // Publish the digest for any nodes listening to this gossip (non-committee
                         // members). Note, ignore error- this should not
                         // happen and should not cause an issue (except the

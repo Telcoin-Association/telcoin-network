@@ -6,6 +6,7 @@ use crate::{
     codec::{TNCodec, TNMessage},
     error::NetworkError,
     kad::KadStore,
+    metrics::{PeerManagerMetrics, SwarmMetrics},
     peers::{self, PeerEvent, PeerManager, Penalty},
     send_or_log_error,
     stream::{StreamBehavior, StreamEvent},
@@ -92,8 +93,9 @@ where
         req_res: request_response::Behaviour<C>,
         kademlia: kad::Behaviour<KadStore<DB>>,
         peer_config: &PeerConfig,
+        metrics: PeerManagerMetrics,
     ) -> Self {
-        let peer_manager = PeerManager::new(peer_config);
+        let peer_manager = PeerManager::new(peer_config, metrics);
         let stream = StreamBehavior::new();
         Self { peer_manager, gossipsub, req_res, kademlia, stream }
     }
@@ -176,6 +178,8 @@ where
     /// the record in their persistent kad store. This list is per-process-lifetime in case nodes
     /// restart.
     published_to_peers: HashSet<PeerId>,
+    /// Prometheus metrics for swarm-level events (gossip, requests).
+    metrics: SwarmMetrics,
 }
 
 impl<Req, Res, DB, Events> ConsensusNetwork<Req, Res, DB, Events>
@@ -312,8 +316,13 @@ where
         let kademlia = kad::Behaviour::with_config(peer_id, kad_store.clone(), kad_config);
 
         // create custom behavior
-        let mut behavior =
-            TNBehavior::new(gossipsub, req_res, kademlia, network_config.peer_config());
+        let mut behavior = TNBehavior::new(
+            gossipsub,
+            req_res,
+            kademlia,
+            network_config.peer_config(),
+            PeerManagerMetrics::new_for(&network_type),
+        );
 
         // Promote the surviving records into the local peer cache.
         for (key, info) in known {
@@ -368,6 +377,7 @@ where
             task_spawner,
             node_record,
             published_to_peers: HashSet::new(),
+            metrics: SwarmMetrics::new_for(&network_type),
         })
     }
 
@@ -487,6 +497,10 @@ where
                     }
                 },
             }
+
+            // refresh in-flight gauges once per loop iteration (scrape-interval freshness)
+            self.metrics
+                .set_pending(self.pending_px_disconnects.len(), self.outbound_requests.len());
         }
     }
 
@@ -629,6 +643,9 @@ where
             NetworkCommand::Publish { topic, msg, reply } => {
                 let res =
                     self.swarm.behaviour_mut().gossipsub.publish(TopicHash::from_raw(topic), msg);
+                if res.is_ok() {
+                    self.metrics.record_gossip_published();
+                }
                 send_or_log_error!(reply, res, "Publish");
             }
             NetworkCommand::Subscribe { topic, publishers, reply } => {
@@ -820,6 +837,7 @@ where
         match event {
             GossipEvent::Message { propagation_source, message_id, message } => {
                 trace!(target: "network", topic=?self.authorized_publishers.keys(), ?propagation_source, ?message_id, ?message, "message received from publisher");
+                self.metrics.record_gossip_received();
                 // verify message was published by authorized node
                 let msg_acceptance = self.verify_gossip(&message);
                 let valid = msg_acceptance.is_accepted();
@@ -852,6 +870,7 @@ where
                         }
                     }
                 } else {
+                    self.metrics.record_gossip_rejected();
                     let GossipMessage { source, topic, .. } = message;
                     warn!(
                         target: "network",
@@ -979,6 +998,15 @@ where
                     debug!(target: "network", "outbound failure expected because of px disconnect");
                     return Ok(());
                 }
+
+                let failure_kind = match &error {
+                    ReqResOutboundFailure::DialFailure => "dial",
+                    ReqResOutboundFailure::ConnectionClosed => "connection",
+                    ReqResOutboundFailure::Io(_) => "io",
+                    ReqResOutboundFailure::Timeout => "timeout",
+                    ReqResOutboundFailure::UnsupportedProtocols => "unsupported",
+                };
+                self.metrics.record_outbound_failure(failure_kind);
 
                 // Differentiate transport-level failures (peer disconnect, dial fail) from
                 // protocol-level violations. Transport failures are common on WAN and should

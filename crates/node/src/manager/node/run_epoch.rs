@@ -41,7 +41,7 @@ const EPOCH_TASK_MANAGER: &str = "Epoch Task Manager";
 /// ([`RunEpochMode::replay_consensus`]) and whether this is the one-time process startup
 /// ([`RunEpochMode::initial_epoch`]).
 #[derive(Debug, Copy, Clone)]
-pub(super) enum RunEpochMode {
+pub(crate) enum RunEpochMode {
     /// First epoch after process start. Triggers the one-time network init and a consensus replay,
     /// since output validated before the previous shutdown may still need to reach the engine.
     Initial,
@@ -123,6 +123,8 @@ where
         gas_accumulator: GasAccumulator,
     ) -> eyre::Result<RunEpochMode> {
         info!(target: "epoch-manager", "Starting epoch");
+        // counts epoch transitions AND mid-epoch restarts (recovery/flapping signal)
+        self.metrics.record_epoch_run(&epoch_mode);
 
         // Create a new bus wrapping the application channels and adding the epoch specific
         // channels.
@@ -133,6 +135,8 @@ where
         let (committee, epoch_info, epoch_start) =
             self.get_committee_with_epoch_start_info(engine).await?;
         self.epoch_boundary = epoch_start + epoch_info.epochDuration as u64;
+        self.metrics.current.set(committee.epoch() as f64);
+        self.metrics.boundary_timestamp_seconds.set(self.epoch_boundary as f64);
         // Produce a "dummy" epoch 0 EpochRecord if missing.
         // This will let us use simple code to find any epoch including 0 at startup.
         if !self.consensus_chain.epochs().contains_epoch(0).await {

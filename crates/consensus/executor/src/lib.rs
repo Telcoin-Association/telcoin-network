@@ -2,6 +2,7 @@
 //! Process consensus output and execute every transaction.
 
 mod errors;
+mod metrics;
 pub mod subscriber;
 pub use errors::{SubscriberError, SubscriberResult};
 

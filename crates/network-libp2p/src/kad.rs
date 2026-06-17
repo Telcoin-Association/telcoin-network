@@ -193,7 +193,18 @@ impl<DB: Database> KadStore<DB> {
                 db.iter::<KadWorkerProviderRecords>().count(),
             ),
         };
-        Self { db, node_key, config, num_records, num_providers, kad_type }
+        let store = Self { db, node_key, config, num_records, num_providers, kad_type };
+        store.update_records_gauge();
+        store
+    }
+
+    /// Mirror `num_records` into the prometheus gauge.
+    fn update_records_gauge(&self) {
+        metrics::gauge!(
+            "tn_network.kad_records",
+            "network" => crate::metrics::network_label(&self.kad_type),
+        )
+        .set(self.num_records as f64);
     }
 
     fn key_to_hash(&self, key: &RecordKey) -> BlockHash {
@@ -235,6 +246,7 @@ impl<DB: Database> KadStore<DB> {
             }
         }
         self.num_records = self.num_records.saturating_sub(evicted);
+        self.update_records_gauge();
         evicted
     }
 
@@ -351,6 +363,7 @@ impl<DB: Database> RecordStore for KadStore<DB> {
                 }
             }
             self.num_records += 1;
+            self.update_records_gauge();
         }
         match self.kad_type {
             NetworkType::Primary => self
@@ -375,6 +388,7 @@ impl<DB: Database> RecordStore for KadStore<DB> {
         {
             // Record was removed so dec num_records.
             self.num_records -= 1;
+            self.update_records_gauge();
         }
     }
 

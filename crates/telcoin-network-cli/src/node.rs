@@ -114,6 +114,15 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         // Does not do anything on windows.
         raise_fd_limit()?;
 
+        // Install the global metrics recorder before any reth components are constructed
+        // (in particular before `RethEnv::new_database`). Reth's derive-style metric
+        // handles bind to whatever recorder is installed at construction time; anything
+        // registered against the default noop recorder is silently lost. Nodes without
+        // `--metrics` keep the zero-overhead noop recorder.
+        if self.metrics.is_some() {
+            tn_metrics::install_recorder()?;
+        }
+
         // limit global rayon thread pool for batch validator
         //
         // ensure 2 cores are reserved unless the system only has 1 core

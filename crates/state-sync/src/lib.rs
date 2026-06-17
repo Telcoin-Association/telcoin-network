@@ -23,6 +23,8 @@ use tracing::{debug, error, info, warn};
 mod epoch;
 pub use epoch::spawn_epoch_record_collector;
 mod consensus;
+mod metrics;
+use crate::metrics::STATE_SYNC_METRICS;
 use consensus::spawn_track_recent_consensus;
 pub use consensus::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_recent_consensus};
 
@@ -230,6 +232,9 @@ async fn spawn_stream_consensus_headers<DB: Database>(
                     return Ok(());
                 }
                 last_consensus_height = last_consensus_header.number;
+                STATE_SYNC_METRICS
+                    .headers_fetched_total
+                    .increment(last_consensus_height.saturating_sub(prev_height));
 
                 if last_consensus_height >= pending_header.number {
                     break; // Fully caught up to the target.
@@ -237,6 +242,7 @@ async fn spawn_stream_consensus_headers<DB: Database>(
                 if last_consensus_height == prev_height {
                     // No progress: the backward traversal hasn't yet cached this block.
                     no_progress_count += 1;
+                    STATE_SYNC_METRICS.no_progress_total.increment(1);
                     if no_progress_count >= MAX_NO_PROGRESS {
                         warn!(target: "state-sync", ?epoch, last_consensus_height, target=pending_header.number,
                             "could not catch up to consensus target after retries, waiting for next gossip update");

@@ -2,8 +2,10 @@
 //! Worker components to create and sync batches.
 
 mod batch_fetcher;
+mod metrics;
 mod network;
 mod worker;
+pub use crate::metrics::WorkerMetrics;
 pub use network::{
     PendingBatchStream, WorkerNetwork, WorkerNetworkHandle, WorkerRequest, WorkerResponse,
     MAX_BATCH_DIGESTS_PER_REQUEST, MAX_CONCURRENT_BATCH_STREAMS, MAX_PENDING_REQUESTS_PER_PEER,
