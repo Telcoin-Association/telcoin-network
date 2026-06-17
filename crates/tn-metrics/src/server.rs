@@ -91,7 +91,7 @@ pub async fn start_metrics_server(
 
     info!(target: "tn::metrics", ?listen_on, "prometheus metrics endpoint listening");
 
-    task_spawner.spawn_critical_task("metrics", async move {
+    task_spawner.spawn_task("metrics", async move {
         let mut upkeep = time::interval(Duration::from_secs(5));
         upkeep.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
