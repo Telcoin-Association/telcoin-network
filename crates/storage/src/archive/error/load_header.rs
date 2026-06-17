@@ -60,7 +60,7 @@ impl fmt::Display for LoadHeaderError {
             Self::InvalidIndexVersion => write!(f, "invalid index version"),
             Self::InvalidIndexUID => write!(f, "invalid index uid"),
             Self::InvalidIndexAppNum => write!(f, "invalid index appnum"),
-            Self::InvalidIndexGeometry => write!(f, "invalid index record geometry"),
+            Self::InvalidIndexGeometry => write!(f, "invalid index bucket geometry"),
             Self::InvalidHasher => write!(f, "invalid hash algorithm"),
             Self::InvalidOverflowVersion => write!(f, "invalid index overflow version"),
             Self::InvalidOverflowUID => write!(f, "invalid index overflow uid"),

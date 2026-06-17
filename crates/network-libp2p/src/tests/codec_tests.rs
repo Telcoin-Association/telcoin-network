@@ -225,3 +225,127 @@ async fn test_malicious_prefix_deceives_peer_to_read_message_and_fails() {
     let res = honest_peer.read_response(&protocol, &mut encoded.as_ref()).await;
     assert!(res.is_err());
 }
+
+/// Build the 8-byte length header a malicious peer would send: a 1 MiB uncompressed length (passes
+/// the `<= max_message_size` check) paired with a ~1.2 MB compressed length (passes the
+/// `<= snap::raw::max_compress_len(1 MiB)` check, which is ~1_223_370).
+fn malicious_header(uncompressed_len: u32, compressed_len: u32) -> Vec<u8> {
+    let mut header = Vec::with_capacity(8);
+    header.extend_from_slice(&uncompressed_len.to_le_bytes());
+    header.extend_from_slice(&compressed_len.to_le_bytes());
+    header
+}
+
+/// Regression test for issue #728: a peer that sends only the 8-byte length header and withholds
+/// the body must not cause the decoder to commit memory proportional to the declared prefixes.
+#[tokio::test]
+async fn test_header_only_does_not_commit_declared_buffers() {
+    let max_chunk_size = 1024 * 1024; // 1mb
+    let header = malicious_header(1024 * 1024, 1_200_000);
+    assert_eq!(header.len(), 8, "attacker input is only the 8-byte header");
+
+    let mut decode_buffer = Vec::new();
+    let mut compressed_buffer = Vec::new();
+    // reader yields the 8 header bytes then EOF (no body)
+    let mut reader = header.as_slice();
+    let res = decode_message::<_, TestPrimaryRequest>(
+        &mut reader,
+        &mut decode_buffer,
+        &mut compressed_buffer,
+        max_chunk_size,
+    )
+    .await;
+
+    // the decode fails because the body never arrives
+    assert!(res.is_err(), "decode must fail when the body is withheld");
+
+    // crucially, neither buffer was sized to the attacker-declared prefixes: with no body
+    // delivered, both hold zero bytes rather than the ~2.15 MiB the prefixes declared
+    assert_eq!(compressed_buffer.len(), 0, "no body arrived, so no compressed bytes are committed");
+    assert_eq!(decode_buffer.len(), 0, "decompression never ran, so no bytes are committed");
+}
+
+/// Regression test for issue #728: a peer that declares a large compressed body but delivers only
+/// part of it before closing commits memory proportional to what it actually sent, not the declared
+/// prefix.
+#[tokio::test]
+async fn test_partial_body_commits_only_delivered_bytes() {
+    let max_chunk_size = 1024 * 1024; // 1mb
+    let compressed_len: u32 = 1_000_000;
+    let delivered = 4096; // only a small slice of the declared body is sent
+
+    let mut wire = malicious_header(1024 * 1024, compressed_len);
+    wire.resize(wire.len() + delivered, 0);
+
+    let mut decode_buffer = Vec::new();
+    let mut compressed_buffer = Vec::new();
+    let mut reader = wire.as_slice();
+    let res = decode_message::<_, TestPrimaryRequest>(
+        &mut reader,
+        &mut decode_buffer,
+        &mut compressed_buffer,
+        max_chunk_size,
+    )
+    .await;
+
+    // fails because fewer bytes arrived than the declared compressed length
+    assert!(res.is_err(), "decode must fail on a short body");
+
+    // only the delivered bytes were committed, far below the ~1 MB the prefix declared
+    assert_eq!(
+        compressed_buffer.len(),
+        delivered,
+        "committed memory tracks delivered bytes, not the declared compressed_len"
+    );
+}
+
+/// Reader that yields a fixed header then stalls forever on the body read, modeling a peer that
+/// sends the length prefixes and withholds the body.
+struct HeaderThenStall {
+    header: Vec<u8>,
+    pos: usize,
+}
+
+impl futures::AsyncRead for HeaderThenStall {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        if this.pos < this.header.len() {
+            let n = (buf.len()).min(this.header.len() - this.pos);
+            buf[..n].copy_from_slice(&this.header[this.pos..this.pos + n]);
+            this.pos += n;
+            std::task::Poll::Ready(Ok(n))
+        } else {
+            // body never arrives
+            std::task::Poll::Pending
+        }
+    }
+}
+
+/// Regression test for issue #728: while parked awaiting a withheld body, the decoder holds only
+/// the bytes that have arrived (none), not the declared prefixes.
+#[tokio::test]
+async fn test_withheld_body_holds_no_declared_memory_while_parked() {
+    let mut reader = HeaderThenStall { header: malicious_header(1024 * 1024, 1_200_000), pos: 0 };
+    let mut decode_buffer = Vec::new();
+    let mut compressed_buffer = Vec::new();
+
+    let fut = decode_message::<_, TestPrimaryRequest>(
+        &mut reader,
+        &mut decode_buffer,
+        &mut compressed_buffer,
+        1024 * 1024,
+    );
+
+    // the body never arrives; the read stays parked until our short test timeout fires (on the wire
+    // the libp2p request timeout, 10s by default, governs the hold)
+    let res = tokio::time::timeout(std::time::Duration::from_millis(200), fut).await;
+    assert!(res.is_err(), "future stays parked at the body read while the body is withheld");
+
+    // while parked, nothing proportional to the declared prefixes was committed
+    assert_eq!(compressed_buffer.len(), 0, "no body bytes arrived while parked");
+    assert_eq!(decode_buffer.len(), 0, "decompression never ran while parked");
+}

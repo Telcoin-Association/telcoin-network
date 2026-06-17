@@ -494,8 +494,19 @@ impl ConsensusChain {
         if number > self.latest_consensus.number() {
             let epoch = consensus.sub_dag().leader_epoch();
             if let Some(pack) = &self.current_pack() {
-                pack.save_consensus_output(consensus).await?;
-                self.latest_consensus.update(epoch, number).await;
+                if epoch != pack.epoch() {
+                    // The output's epoch does not match the current pack. Saving it would either
+                    // corrupt this pack or poison its async error channel. The pack
+                    // layer also rejects this (defense in depth), but the reject is asynchronous so
+                    // we must guard here to avoid advancing latest_consensus to a wrong-epoch
+                    // pointer for data that was never persisted.
+                    // This is an error and should not happen on a properly working node.
+                    error!(target: "consensus-chain", epoch, pack_epoch = pack.epoch(), number, "Refused to save consensus output: epoch does not match the current pack.");
+                    return Err(ConsensusChainError::InvalidPackEpoch(pack.epoch(), epoch));
+                } else {
+                    pack.save_consensus_output(consensus).await?;
+                    self.latest_consensus.update(epoch, number).await;
+                }
             } else if let Ok(pack) = self.get_static(epoch).await {
                 // We may be replaying consensus from old epochs and not have a current pack to save
                 // too.
@@ -874,6 +885,7 @@ pub enum ConsensusChainError {
     EmptyImport,
     InvalidImport,
     StreamUnavailable,
+    InvalidPackEpoch(Epoch, Epoch),
 }
 
 impl Error for ConsensusChainError {}
@@ -897,6 +909,9 @@ impl Display for ConsensusChainError {
             }
             ConsensusChainError::StreamUnavailable => {
                 write!(f, "Incomplete data to stream a pack file")
+            }
+            ConsensusChainError::InvalidPackEpoch(pack_epoch, epoch) => {
+                write!(f, "Tried to save an output from epoch {epoch} into the current pack epoch {pack_epoch}")
             }
         }
     }
@@ -984,7 +999,7 @@ mod test {
     };
 
     use crate::{
-        consensus::ConsensusChain,
+        consensus::{ConsensusChain, ConsensusChainError},
         consensus_pack::test::{compare_outputs, make_test_output},
         mem_db::MemDatabase,
     };
@@ -1012,6 +1027,59 @@ mod test {
         assert_eq!(latest.epoch(), 2);
         assert_eq!(latest.number(), 20);
         assert_eq!(latest.current_slot(), ConsensusSlot::Slot2);
+    }
+
+    #[tokio::test]
+    async fn test_save_consensus_output_wrong_epoch_rejected() {
+        let temp_dir = TempDir::with_prefix("test_wrong_epoch").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).unwrap();
+        consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+
+        // Save a few legitimate epoch-0 outputs.
+        let mut parent = ConsensusHeader::default().digest();
+        for i in 0..3u64 {
+            let output =
+                make_test_output(&committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+            parent = output.digest().into();
+            consensus_chain.save_consensus_output(output).await.unwrap();
+        }
+        assert_eq!(consensus_chain.latest_consensus.number(), 3);
+        assert_eq!(consensus_chain.latest_consensus.epoch(), 0);
+
+        // Feed an output whose leader epoch is 1 while the current pack is still epoch 0.
+        // It must be rejected with InvalidPackEpoch before latest_consensus advances or the data
+        // is saved.
+        let next_committee = committee.advance_epoch_for_test(1);
+        let wrong = make_test_output(&next_committee, 0, chain.clone(), 4, parent);
+        assert_eq!(wrong.sub_dag().leader_epoch(), 1, "test output must be from epoch 1");
+        let err = consensus_chain
+            .save_consensus_output(wrong)
+            .await
+            .expect_err("wrong-epoch output must be rejected");
+        assert!(
+            matches!(err, ConsensusChainError::InvalidPackEpoch(0, 1)),
+            "expected InvalidPackEpoch(0, 1), got {err:?}"
+        );
+
+        assert_eq!(
+            consensus_chain.latest_consensus.number(),
+            3,
+            "latest_consensus must not advance on a wrong-epoch output"
+        );
+        assert_eq!(consensus_chain.latest_consensus.epoch(), 0);
+        assert!(
+            consensus_chain.get_consensus_output_current(4).await.is_err(),
+            "wrong-epoch output must not be persisted to the epoch-0 pack"
+        );
     }
 
     #[tokio::test]
