@@ -2164,7 +2164,7 @@ pub(crate) mod test {
     async fn test_iter_to_output_caps_buffered_batches() {
         use crate::{
             archive::pack::{Pack, DATA_HEADER_BYTES},
-            consensus_pack::{bytes_to_output, MAX_BATCHES_PER_OUTPUT, PackError, PackRecord},
+            consensus_pack::{bytes_to_output, PackError, PackRecord, MAX_BATCHES_PER_OUTPUT},
         };
         use std::io::Cursor;
 
@@ -2231,9 +2231,12 @@ pub(crate) mod test {
         let previous_epoch = test_previous_epoch(&committee);
 
         {
-            let pack =
-                ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone())
-                    .expect("open pack");
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                previous_epoch.clone(),
+                committee.clone(),
+            )
+            .expect("open pack");
             let mut parent = ConsensusHeader::default().digest();
             for i in 0..5 {
                 let output =
@@ -2254,9 +2257,12 @@ pub(crate) mod test {
 
         // Open append: heals (truncates the damaged record) but we do NOT save afterward.
         {
-            let pack =
-                ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone())
-                    .expect("open append heals");
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                previous_epoch.clone(),
+                committee.clone(),
+            )
+            .expect("open append heals");
             pack.persist().await.expect("persist after heal");
         }
 
