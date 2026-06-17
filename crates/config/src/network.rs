@@ -288,10 +288,6 @@ pub struct PeerConfig {
     pub target_num_peers: usize,
     /// The timeout for dialing a peer.
     pub dial_timeout: Duration,
-    /// The threshold before a peer is disconnected
-    pub min_score_for_disconnect: f64,
-    /// The threshold before a peer is banned.
-    pub min_score_for_ban: f64,
     /// A fraction of `Self::target_num_peers` that is allowed to connect to this node in excess of
     /// `PeerManager::target_num_peers`.
     ///
@@ -335,8 +331,6 @@ impl Default for PeerConfig {
             heartbeat_interval: 30,
             target_num_peers,
             dial_timeout: Duration::from_secs(15),
-            min_score_for_disconnect: -20.0,
-            min_score_for_ban: -50.0,
             peer_excess_factor: 0.3,
             priority_peer_excess: 0.2,
             target_outbound_only_factor: 0.3,
@@ -395,9 +389,6 @@ impl PeerConfig {
 pub struct ScoreConfig {
     /// The default score for new peers.
     pub default_score: f64,
-    /// The threshold for a peer's score before they are banned, regardless of any other scoring
-    /// parameters.
-    pub min_application_score_before_ban: f64,
     /// The maximum score a peer can obtain.
     pub max_score: f64,
     /// The minimum score a peer can obtain.
@@ -406,9 +397,15 @@ pub struct ScoreConfig {
     pub score_halflife: f64,
     /// The minimum amount of time (seconds) a peer is banned before their score begins to decay.
     pub banned_before_decay_secs: u64,
-    /// Minimum score before a peer is disconnected.
+    /// Aggregate score at or below which a peer is disconnected.
+    ///
+    /// This is the live disconnect threshold read by the reputation decision; lowering it makes
+    /// the node more tolerant of misbehaving peers before disconnecting them.
     pub min_score_before_disconnect: f64,
-    /// Minimum score before a peer is banned.
+    /// Aggregate score at or below which a peer is banned.
+    ///
+    /// This is the live ban threshold: it drives both the reputation decision and the ban/decay
+    /// lockout, so the two always agree.
     pub min_score_before_ban: f64,
 }
 
@@ -416,7 +413,6 @@ impl Default for ScoreConfig {
     fn default() -> Self {
         ScoreConfig {
             default_score: 0.0,
-            min_application_score_before_ban: -60.0,
             max_score: 100.0,
             min_score: -100.0,
             // 5-minute halflife: transient WAN penalties (peer flap, slow request) decay

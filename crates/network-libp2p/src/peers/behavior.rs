@@ -137,8 +137,7 @@ impl NetworkBehaviour for PeerManager {
             }
             FromSwarm::ExternalAddrConfirmed(_) => {
                 // The external address was confirmed: possible to support NAT traversal
-                //
-                // TODO: Issue #254 update metrics here
+                self.metrics.record_external_addr_confirmed();
             }
             _ => {
                 // `FromSwarm` is non-exhaustive
@@ -230,6 +229,7 @@ impl PeerManager {
                     &peer_id,
                     ConnectionType::IncomingConnection { multiaddr: send_back_addr.clone() },
                 );
+                self.metrics.record_connection_established("in");
                 send_back_addr.clone()
             }
             ConnectedPoint::Dialer { address, .. } => {
@@ -237,11 +237,10 @@ impl PeerManager {
                     &peer_id,
                     ConnectionType::OutgoingConnection { multiaddr: address.clone() },
                 );
+                self.metrics.record_connection_established("out");
                 address.clone()
             }
         };
-
-        // TODO: Issue #254 update metrics
 
         // check connection limits
         if self.peer_limit_reached(endpoint) && !self.peer_is_important(&peer_id) {
@@ -284,7 +283,7 @@ impl PeerManager {
         // when this happens, the peer manager still needs to register this peer
         self.register_disconnected(&peer_id);
 
-        // TODO: Issue #254 update metrics
+        self.metrics.record_connection_closed();
     }
 
     /// Dial attempt failed.
@@ -292,6 +291,7 @@ impl PeerManager {
     /// NOTE: `AllPeers` is only updated if the peer is _not_ already connected. It's possible that
     /// an outgoing dial attempt fails because the peer connected during the dial.
     fn on_dial_failure(&mut self, peer_id: Option<PeerId>, error: &DialError) {
+        self.metrics.record_dial_failure();
         if let Some(peer_id) = peer_id {
             if !self.is_connected(&peer_id) {
                 self.register_disconnected(&peer_id);

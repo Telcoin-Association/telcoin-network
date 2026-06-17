@@ -282,6 +282,13 @@ pub struct ConsensusChain {
     /// Simple cache of recent pack files.
     recent_packs: Arc<Mutex<VecDeque<ConsensusPack>>>,
     epochs: Arc<EpochRecordDb>,
+    /// Serializes epoch-{N} directory mutation between `new_epoch` (open/append)
+    /// and `stream_import` (remove+rename), preventing a transient-ENOENT crash.
+    ///
+    /// Both critical sections cross `.await` points, so this is a `tokio::sync::Mutex`
+    /// (not the `parking_lot::Mutex` used for the other fields). Always acquired *before*
+    /// `current_pack`/`recent_packs` to keep a single lock order and avoid deadlock.
+    pack_install: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ConsensusChain {
@@ -297,7 +304,8 @@ impl ConsensusChain {
         ));
         let recent_packs = Arc::new(Mutex::new(VecDeque::default()));
         let epochs = Arc::new(EpochRecordDb::open(&base_path)?);
-        Ok(Self { base_path, current_pack, latest_consensus, recent_packs, epochs })
+        let pack_install = Arc::new(tokio::sync::Mutex::new(()));
+        Ok(Self { base_path, current_pack, latest_consensus, recent_packs, epochs, pack_install })
     }
 
     /// Create a new empty consensus chain with a dummy epoch 0 pack ready.
@@ -325,6 +333,11 @@ impl ConsensusChain {
         previous_epoch: EpochRecord,
         committee: Committee,
     ) -> Result<(), ConsensusChainError> {
+        // Serialize the open/append + current_pack swap against stream_import's
+        // remove+rename of the same epoch-{N} directory. Held across the whole
+        // function (open_append is local file creation — fast). Acquired before
+        // current_pack/recent_packs to preserve lock order.
+        let _install = self.pack_install.lock().await;
         if previous_epoch.epoch != committee.epoch().saturating_sub(1) {
             return Err(ConsensusChainError::PrevCommitteeEpochMismatch);
         }
@@ -416,6 +429,12 @@ impl ConsensusChain {
                         return Err(ConsensusChainError::EmptyImport);
                     }
                 }
+                // Acquire the install lock only now — after the (multi-second) network
+                // download has finished writing into the temp import dir. It must NOT wrap
+                // the download (that would block unrelated epoch transitions on network I/O).
+                // Held through the remove+rename and cache invalidation below so new_epoch's
+                // open_append cannot observe the transient window where epoch-{N} is unlinked.
+                let _install = self.pack_install.lock().await;
                 let mut current_pack = self.current_pack.lock();
                 let replace_current = if let Some(current_pack) = &*current_pack {
                     current_pack.epoch() == epoch
@@ -494,8 +513,19 @@ impl ConsensusChain {
         if number > self.latest_consensus.number() {
             let epoch = consensus.sub_dag().leader_epoch();
             if let Some(pack) = &self.current_pack() {
-                pack.save_consensus_output(consensus).await?;
-                self.latest_consensus.update(epoch, number).await;
+                if epoch != pack.epoch() {
+                    // The output's epoch does not match the current pack. Saving it would either
+                    // corrupt this pack or poison its async error channel. The pack
+                    // layer also rejects this (defense in depth), but the reject is asynchronous so
+                    // we must guard here to avoid advancing latest_consensus to a wrong-epoch
+                    // pointer for data that was never persisted.
+                    // This is an error and should not happen on a properly working node.
+                    error!(target: "consensus-chain", epoch, pack_epoch = pack.epoch(), number, "Refused to save consensus output: epoch does not match the current pack.");
+                    return Err(ConsensusChainError::InvalidPackEpoch(pack.epoch(), epoch));
+                } else {
+                    pack.save_consensus_output(consensus).await?;
+                    self.latest_consensus.update(epoch, number).await;
+                }
             } else if let Ok(pack) = self.get_static(epoch).await {
                 // We may be replaying consensus from old epochs and not have a current pack to save
                 // too.
@@ -874,6 +904,7 @@ pub enum ConsensusChainError {
     EmptyImport,
     InvalidImport,
     StreamUnavailable,
+    InvalidPackEpoch(Epoch, Epoch),
 }
 
 impl Error for ConsensusChainError {}
@@ -897,6 +928,9 @@ impl Display for ConsensusChainError {
             }
             ConsensusChainError::StreamUnavailable => {
                 write!(f, "Incomplete data to stream a pack file")
+            }
+            ConsensusChainError::InvalidPackEpoch(pack_epoch, epoch) => {
+                write!(f, "Tried to save an output from epoch {epoch} into the current pack epoch {pack_epoch}")
             }
         }
     }
@@ -976,7 +1010,13 @@ mod test {
     use tempfile::TempDir;
 
     use crate::consensus::{ConsensusSlot, LatestConsensus};
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
 
     use tn_types::{
         test_genesis, ConsensusHeader, ConsensusHeaderDigest, ConsensusNumHash, Epoch, EpochRecord,
@@ -984,7 +1024,7 @@ mod test {
     };
 
     use crate::{
-        consensus::ConsensusChain,
+        consensus::{ConsensusChain, ConsensusChainError},
         consensus_pack::test::{compare_outputs, make_test_output},
         mem_db::MemDatabase,
     };
@@ -1012,6 +1052,59 @@ mod test {
         assert_eq!(latest.epoch(), 2);
         assert_eq!(latest.number(), 20);
         assert_eq!(latest.current_slot(), ConsensusSlot::Slot2);
+    }
+
+    #[tokio::test]
+    async fn test_save_consensus_output_wrong_epoch_rejected() {
+        let temp_dir = TempDir::with_prefix("test_wrong_epoch").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).unwrap();
+        consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+
+        // Save a few legitimate epoch-0 outputs.
+        let mut parent = ConsensusHeader::default().digest();
+        for i in 0..3u64 {
+            let output =
+                make_test_output(&committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+            parent = output.digest().into();
+            consensus_chain.save_consensus_output(output).await.unwrap();
+        }
+        assert_eq!(consensus_chain.latest_consensus.number(), 3);
+        assert_eq!(consensus_chain.latest_consensus.epoch(), 0);
+
+        // Feed an output whose leader epoch is 1 while the current pack is still epoch 0.
+        // It must be rejected with InvalidPackEpoch before latest_consensus advances or the data
+        // is saved.
+        let next_committee = committee.advance_epoch_for_test(1);
+        let wrong = make_test_output(&next_committee, 0, chain.clone(), 4, parent);
+        assert_eq!(wrong.sub_dag().leader_epoch(), 1, "test output must be from epoch 1");
+        let err = consensus_chain
+            .save_consensus_output(wrong)
+            .await
+            .expect_err("wrong-epoch output must be rejected");
+        assert!(
+            matches!(err, ConsensusChainError::InvalidPackEpoch(0, 1)),
+            "expected InvalidPackEpoch(0, 1), got {err:?}"
+        );
+
+        assert_eq!(
+            consensus_chain.latest_consensus.number(),
+            3,
+            "latest_consensus must not advance on a wrong-epoch output"
+        );
+        assert_eq!(consensus_chain.latest_consensus.epoch(), 0);
+        assert!(
+            consensus_chain.get_consensus_output_current(4).await.is_err(),
+            "wrong-epoch output must not be persisted to the epoch-0 pack"
+        );
     }
 
     #[tokio::test]
@@ -1067,6 +1160,112 @@ mod test {
                 consensus_chain2.get_consensus_output_current(i as u64 + 1).await.unwrap();
             let output = outputs.get(i as usize).unwrap();
             compare_outputs(&output_db, output);
+        }
+    }
+
+    /// Regression test for the `pack_install` lock.
+    ///
+    /// A validator that restarts while behind runs two subsystems against the same
+    /// on-disk `epoch-{N}` directory at once: the epoch-transition loop (`new_epoch` ->
+    /// `open_append`, which creates/opens `epoch-{N}/data`) and state-sync (`stream_import`,
+    /// which does `remove_dir_all(epoch-{N})` immediately followed by
+    /// `rename(import/epoch-{N} -> epoch-{N})`). Without serialization, `new_epoch` can open
+    /// `epoch-{N}/data` in the tiny window after the directory was removed and before the
+    /// imported one is renamed into place, getting ENOENT and failing the epoch transition;
+    /// `stream_import`'s `rename` can likewise fail with ENOTEMPTY if `new_epoch` re-created
+    /// the directory inside that window.
+    ///
+    /// This drives both methods concurrently against the same epoch over many iterations,
+    /// each on a fresh chain so the import always performs the full remove+rename rather
+    /// than short-circuiting on an already-complete pack. It passes reliably with the lock
+    /// and fails intermittently if the lock acquisition in either method is removed or
+    /// reordered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_new_epoch_stream_import_race() {
+        // Build a complete epoch-0 pack on a source chain to stream from each iteration.
+        let source_dir = TempDir::with_prefix("test_race_source").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let source = ConsensusChain::new(source_dir.path().to_owned()).unwrap();
+        source.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+
+        let num_outputs = 50;
+        let mut parent = ConsensusHeader::default().digest();
+        let mut last = None;
+        for i in 0..num_outputs {
+            let output = make_test_output(&committee, i % 4, chain.clone(), (i as u64) + 1, parent);
+            parent = output.digest().into();
+            last = Some(output.clone());
+            source.save_consensus_output(output).await.unwrap();
+        }
+        source.persist_current().await.expect("persist");
+        let last = last.expect("at least one output");
+        let mut epoch_record = previous_epoch.clone();
+        epoch_record.final_consensus = ConsensusNumHash::new(last.number(), last.digest());
+        source.epochs().save_record(epoch_record.clone()).await.expect("save epoch");
+
+        let iterations = 50;
+        for iter in 0..iterations {
+            // A fresh target each iteration guarantees `stream_import` does the real
+            // remove+rename instead of returning early on an existing complete pack.
+            let target_dir = TempDir::with_prefix("test_race_target").expect("temp dir");
+            let target = Arc::new(ConsensusChain::new(target_dir.path().to_owned()).unwrap());
+            let stream = source.get_epoch_stream(0).await.expect("source epoch stream");
+
+            // Hammer `new_epoch` for the whole duration of the single concurrent
+            // `stream_import` below, clearing the cached pack before each call so it actually
+            // runs `open_append` (rather than short-circuiting) and lands inside the import's
+            // remove->rename window.
+            let done = Arc::new(AtomicBool::new(false));
+            let new_epoch_task = {
+                let target = target.clone();
+                let previous_epoch = previous_epoch.clone();
+                let committee = committee.clone();
+                let done = done.clone();
+                tokio::spawn(async move {
+                    let mut result = Ok(());
+                    while !done.load(Ordering::Relaxed) {
+                        *target.current_pack.lock() = None;
+                        if let Err(e) =
+                            target.new_epoch(previous_epoch.clone(), committee.clone()).await
+                        {
+                            result = Err(e);
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    result
+                })
+            };
+
+            let import_result = target
+                .stream_import(stream, &epoch_record, &previous_epoch, Duration::from_secs(5))
+                .await;
+            done.store(true, Ordering::Relaxed);
+            let new_epoch_result = new_epoch_task.await.expect("new_epoch task panicked");
+
+            assert!(
+                import_result.is_ok(),
+                "stream_import lost the race with new_epoch on iteration {iter}: {import_result:?}"
+            );
+            assert!(
+                new_epoch_result.is_ok(),
+                "new_epoch lost the race with stream_import on iteration {iter}: {new_epoch_result:?}"
+            );
+
+            // The imported epoch-0 pack must be complete and readable after all the racing.
+            *target.current_pack.lock() = None;
+            let pack = target.get_static(0).await.expect("epoch-0 pack readable after race");
+            let header = pack.latest_consensus_header().await.expect("epoch-0 has a final header");
+            assert_eq!(header.number, epoch_record.final_consensus.number, "final header number");
+            assert_eq!(header.digest(), epoch_record.final_consensus.hash, "final header digest");
         }
     }
 

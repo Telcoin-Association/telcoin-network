@@ -448,7 +448,27 @@ Enable with `--metrics <ADDR:PORT>`:
 telcoin-network node --metrics 127.0.0.1:9101
 ```
 
-Scrape the endpoint with Prometheus or any compatible collector.
+The endpoint serves the Prometheus text format (`Content-Type: text/plain; version=0.0.4`)
+and exposes two namespaces:
+
+- `tn_*` — telcoin-network instrumentation: consensus (`tn_primary_*`), batches
+  (`tn_worker_*`, `tn_batch_builder_*`), execution (`tn_engine_*`, `tn_executor_*`),
+  networking (`tn_network_*`, labeled `network={primary,worker}`), epoch lifecycle
+  (`tn_epoch_*`), and node health (`tn_node_*`, including `tn_node_mode` and
+  `tn_node_consensus_sync_distance`).
+- `reth_*` — reth's built-in instrumentation (database, transaction pool, provider) plus
+  process metrics (`reth_process_*`), named identically to a stock reth node so upstream
+  dashboards work unchanged.
+
+A Grafana dashboard covering both namespaces ships at
+`etc/grafana/telcoin-node-metrics.json`.
+
+If the address cannot be bound, node startup fails — the flag is an explicit request for
+the endpoint, not best-effort.
+
+Warning: like the health check, the endpoint answers any connection without limits or
+authentication. Bind to loopback and relay with a local collector (Prometheus, Grafana
+Alloy), or place the port behind a firewall.
 
 ### OpenTelemetry tracing
 
@@ -491,6 +511,9 @@ RUST_LOG=info,consensus=debug,evm=trace telcoin-network node ...
 ## Multi-instance setup
 
 The `--instance` flag adjusts port numbers so multiple nodes can run on the same machine without conflicts. Instance numbers range from 0 to 200. This configuration is only recommended for spawning local networks and should not be used in production environments.
+
+Note: `--instance` does NOT offset `--metrics` (or `--healthcheck`) — pass a distinct
+address per instance, as in the example below.
 
 ### Port offset formula
 

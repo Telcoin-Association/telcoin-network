@@ -6,12 +6,13 @@ use crate::{
     codec::{TNCodec, TNMessage},
     error::NetworkError,
     kad::KadStore,
+    metrics::{PeerManagerMetrics, SwarmMetrics},
     peers::{self, PeerEvent, PeerManager, Penalty},
     send_or_log_error,
     stream::{StreamBehavior, StreamEvent},
     types::{
         KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo, NetworkResponseMessage,
-        NetworkResponseSender, NetworkResult, NetworkType, NodeRecord, RpcInfo,
+        NetworkResponseSender, NetworkResult, NetworkType, NodeRecord, ResponseChannel, RpcInfo,
     },
     PeerExchangeMap,
 };
@@ -92,8 +93,9 @@ where
         req_res: request_response::Behaviour<C>,
         kademlia: kad::Behaviour<KadStore<DB>>,
         peer_config: &PeerConfig,
+        metrics: PeerManagerMetrics,
     ) -> Self {
-        let peer_manager = PeerManager::new(peer_config);
+        let peer_manager = PeerManager::new(peer_config, metrics);
         let stream = StreamBehavior::new();
         Self { peer_manager, gossipsub, req_res, kademlia, stream }
     }
@@ -176,6 +178,8 @@ where
     /// the record in their persistent kad store. This list is per-process-lifetime in case nodes
     /// restart.
     published_to_peers: HashSet<PeerId>,
+    /// Prometheus metrics for swarm-level events (gossip, requests).
+    metrics: SwarmMetrics,
 }
 
 impl<Req, Res, DB, Events> ConsensusNetwork<Req, Res, DB, Events>
@@ -312,8 +316,13 @@ where
         let kademlia = kad::Behaviour::with_config(peer_id, kad_store.clone(), kad_config);
 
         // create custom behavior
-        let mut behavior =
-            TNBehavior::new(gossipsub, req_res, kademlia, network_config.peer_config());
+        let mut behavior = TNBehavior::new(
+            gossipsub,
+            req_res,
+            kademlia,
+            network_config.peer_config(),
+            PeerManagerMetrics::new_for(&network_type),
+        );
 
         // Promote the surviving records into the local peer cache.
         for (key, info) in known {
@@ -368,6 +377,7 @@ where
             task_spawner,
             node_record,
             published_to_peers: HashSet::new(),
+            metrics: SwarmMetrics::new_for(&network_type),
         })
     }
 
@@ -487,6 +497,10 @@ where
                     }
                 },
             }
+
+            // refresh in-flight gauges once per loop iteration (scrape-interval freshness)
+            self.metrics
+                .set_pending(self.pending_px_disconnects.len(), self.outbound_requests.len());
         }
     }
 
@@ -629,6 +643,9 @@ where
             NetworkCommand::Publish { topic, msg, reply } => {
                 let res =
                     self.swarm.behaviour_mut().gossipsub.publish(TopicHash::from_raw(topic), msg);
+                if res.is_ok() {
+                    self.metrics.record_gossip_published();
+                }
                 send_or_log_error!(reply, res, "Publish");
             }
             NetworkCommand::Subscribe { topic, publishers, reply } => {
@@ -714,7 +731,11 @@ where
                 }
             }
             NetworkCommand::SendResponse { response, channel, reply } => {
-                let res = self.swarm.behaviour_mut().req_res.send_response(channel, response);
+                let res = self
+                    .swarm
+                    .behaviour_mut()
+                    .req_res
+                    .send_response(channel.into_inner(), response);
                 send_or_log_error!(reply, res, "SendResponse");
             }
             NetworkCommand::PendingRequestCount { reply } => {
@@ -770,8 +791,9 @@ where
             }
             NetworkCommand::OpenStream { peer, reply } => {
                 // Look up the peer's PeerId from their BLS key
-                let peer_id = match self.swarm.behaviour().peer_manager.auth_to_peer(peer) {
-                    Some((id, _addrs)) => id,
+                let (peer_id, addrs) = match self.swarm.behaviour().peer_manager.auth_to_peer(peer)
+                {
+                    Some((id, addrs)) => (id, addrs),
                     None => {
                         debug!(
                             target: "network",
@@ -792,7 +814,7 @@ where
                 // Pass the reply channel directly to the stream behavior.
                 // The stream (or error) will be returned to the caller via oneshot
                 // without any intermediate tracking.
-                self.swarm.behaviour_mut().stream.open_stream(peer_id, reply);
+                self.swarm.behaviour_mut().stream.open_stream(peer_id, addrs, reply);
             }
             #[cfg(test)]
             NetworkCommand::KadStoreGet { key, reply } => {
@@ -816,6 +838,7 @@ where
         match event {
             GossipEvent::Message { propagation_source, message_id, message } => {
                 trace!(target: "network", topic=?self.authorized_publishers.keys(), ?propagation_source, ?message_id, ?message, "message received from publisher");
+                self.metrics.record_gossip_received();
                 // verify message was published by authorized node
                 let msg_acceptance = self.verify_gossip(&message);
                 let valid = msg_acceptance.is_accepted();
@@ -832,8 +855,11 @@ where
 
                 // process gossip in application layer
                 if valid {
-                    // We should not be able to recieve a message from an unknown peer so this
-                    // should always work.
+                    // A peer is `Connected` before its `NodeRecord` resolves its BLS
+                    // identity, so a live mesh neighbor can relay a message before
+                    // `peer_to_bls` can resolve it. This is rare on a warm node but
+                    // reachable, so handle the unresolved case explicitly instead of
+                    // dropping an accepted message with no trace.
                     if let Some(bls) =
                         self.swarm.behaviour().peer_manager.peer_to_bls(&propagation_source)
                     {
@@ -846,8 +872,22 @@ where
                             // During epoch change the event_stream reciever can be closed.
                             return Ok(());
                         }
+                    } else {
+                        // The message was accepted into the mesh (and re-propagated),
+                        // but this node cannot yet resolve the relaying peer's BLS
+                        // identity, so it is not delivered to the local consensus
+                        // layer. Warn so the drop is observable rather than silent;
+                        // the node recovers the payload via sync once the identity
+                        // resolves.
+                        warn!(
+                            target: "network",
+                            ?propagation_source,
+                            ?message_id,
+                            "accepted gossip not delivered locally: relaying peer's BLS identity is not yet resolved"
+                        );
                     }
                 } else {
+                    self.metrics.record_gossip_rejected();
                     let GossipMessage { source, topic, .. } = message;
                     warn!(
                         target: "network",
@@ -914,7 +954,7 @@ where
                             if let Err(e) = self.event_stream.try_send(NetworkEvent::Request {
                                 peer: bls,
                                 request,
-                                channel,
+                                channel: ResponseChannel::new(peer, channel),
                                 cancel,
                             }) {
                                 error!(target: "network", topics=?self.authorized_publishers.keys(), ?request_id, ?e, "failed to forward request!");
@@ -935,7 +975,7 @@ where
                             }
                         } else if let Err(e) = self.event_stream.try_send(NetworkEvent::Error(
                             format!("requesting peer unknown: {peer:?}"),
-                            channel,
+                            ResponseChannel::new(peer, channel),
                         )) {
                             error!(target: "network", topics=?self.authorized_publishers.keys(), ?request_id, ?e, "failed to forward request!");
                             // ignore failures at the epoch boundary
@@ -951,16 +991,13 @@ where
 
                         // try to forward response to original caller
                         let _ = self.outbound_requests.remove(&(peer, request_id)).map(|ack| {
-                            if let Some(key) =
-                                self.swarm.behaviour().peer_manager.peer_to_bls(&peer)
-                            {
-                                let _ = ack.send(Ok(NetworkResponseMessage {
-                                    peer: key,
-                                    result: response,
-                                }));
-                            } else {
-                                let _ = ack.send(Err(NetworkError::PeerMissing));
-                            }
+                            // The response payload is genuine (we still hold the
+                            // matching outbound request). If the responder's BLS
+                            // identity has not resolved yet, report a transient
+                            // `PeerUnresolved` rather than a misleading `PeerMissing`
+                            // so the caller does not retry a request that succeeded.
+                            let resolved = self.swarm.behaviour().peer_manager.peer_to_bls(&peer);
+                            let _ = ack.send(resolve_response(resolved, response));
                         });
                     }
                 }
@@ -975,6 +1012,15 @@ where
                     debug!(target: "network", "outbound failure expected because of px disconnect");
                     return Ok(());
                 }
+
+                let failure_kind = match &error {
+                    ReqResOutboundFailure::DialFailure => "dial",
+                    ReqResOutboundFailure::ConnectionClosed => "connection",
+                    ReqResOutboundFailure::Io(_) => "io",
+                    ReqResOutboundFailure::Timeout => "timeout",
+                    ReqResOutboundFailure::UnsupportedProtocols => "unsupported",
+                };
+                self.metrics.record_outbound_failure(failure_kind);
 
                 // Differentiate transport-level failures (peer disconnect, dial fail) from
                 // protocol-level violations. Transport failures are common on WAN and should
@@ -1027,7 +1073,7 @@ where
 
                 // try to forward error to original caller
                 let _ = self.outbound_requests.remove(&(peer, request_id)).map(|ack| {
-                    let _ = ack.send(Err(error.into()));
+                    let _ = ack.send(Err(NetworkError::Outbound(error.into())));
                 });
             }
             ReqResEvent::InboundFailure { peer, request_id, error, connection_id: _ } => {
@@ -1295,6 +1341,23 @@ where
                     warn!(target: "network", ?peer, "received inbound stream from unknown peer");
                 }
             }
+            StreamEvent::OutboundFailure { peer, failure }
+            | StreamEvent::InboundFailure { peer, failure } => {
+                // Classified for scoring but reported metrics-only until telemetry
+                // confirms the classification does not fire on healthy peers (see
+                // #739). Once confirmed, the matching penalty is enforced via
+                // `peer_manager.process_penalty(peer, penalty)`.
+                failure.penalty().map_or_else(
+                    || trace!(target: "network", ?peer, ?failure, "stream failure (no penalty)"),
+                    |penalty| {
+                        debug!(
+                            target: "network",
+                            ?peer, ?failure, ?penalty,
+                            "stream failure classified (metrics-only, not enforced)"
+                        )
+                    },
+                );
+            }
         }
         Ok(())
     }
@@ -1421,6 +1484,22 @@ where
                             .behaviour_mut()
                             .peer_manager
                             .process_peers_for_discovery(result.peers);
+                    }
+                    kad::QueryResult::GetClosestPeers(Err(err)) => {
+                        // A timed-out query still carries the peers it located before
+                        // expiring. Recover them for discovery instead of letting the
+                        // catch-all discard the whole query: discovery only runs when
+                        // the node is short on peers, and that same low-connectivity
+                        // state is what makes queries slow enough to time out, so
+                        // dropping the partial results starves discovery exactly when
+                        // it is most needed.
+                        let peers = partial_peers_from_get_closest_timeout(err);
+                        debug!(
+                            target: "network-kad",
+                            recovered = peers.len(),
+                            "GetClosestPeers timed out; recovering partial discovery results"
+                        );
+                        self.swarm.behaviour_mut().peer_manager.process_peers_for_discovery(peers);
                     }
                     _ => {}
                 }
@@ -1642,4 +1721,33 @@ where
             .field("swarm", &"<swarm>") // Skip detailed debug for swarm
             .finish()
     }
+}
+
+/// Peers a kademlia `GetClosestPeers` query located before it timed out.
+///
+/// Kademlia reports a timed-out query as [`kad::GetClosestPeersError::Timeout`],
+/// whose payload carries the closest peers found so far. Those peers are still
+/// valid discovery candidates, so they are recovered for the discovery pool
+/// rather than discarded along with the failed query.
+pub(crate) fn partial_peers_from_get_closest_timeout(
+    err: kad::GetClosestPeersError,
+) -> Vec<kad::PeerInfo> {
+    let kad::GetClosestPeersError::Timeout { peers, .. } = err;
+    peers
+}
+
+/// Pair a response payload with the responding peer's resolved BLS identity.
+///
+/// The payload is genuine whenever this node still holds the matching outbound
+/// request, so a peer whose identity has not resolved yet (it connected before
+/// its `NodeRecord` populated the confirmed-identity index) is reported as a
+/// transient [`NetworkError::PeerUnresolved`] rather than the misleading
+/// [`NetworkError::PeerMissing`].
+fn resolve_response<Res: TNMessage>(
+    resolved: Option<BlsPublicKey>,
+    response: Res,
+) -> NetworkResult<NetworkResponseMessage<Res>> {
+    resolved
+        .map(|peer| NetworkResponseMessage { peer, result: response })
+        .ok_or(NetworkError::PeerUnresolved)
 }

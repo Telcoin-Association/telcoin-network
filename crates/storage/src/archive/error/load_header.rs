@@ -25,6 +25,9 @@ pub enum LoadHeaderError {
     InvalidIndexUID,
     /// The HDX index app number did not match the data file.
     InvalidIndexAppNum,
+    /// The index record geometry (bucket/record size) did not match the compile-time layout,
+    /// so this binary cannot safely read the index.
+    InvalidIndexGeometry,
     /// The salt when hashed with provided hasher did not produce the pepper.
     InvalidHasher,
     /// The ODX index overflow file version was wrong.
@@ -57,6 +60,7 @@ impl fmt::Display for LoadHeaderError {
             Self::InvalidIndexVersion => write!(f, "invalid index version"),
             Self::InvalidIndexUID => write!(f, "invalid index uid"),
             Self::InvalidIndexAppNum => write!(f, "invalid index appnum"),
+            Self::InvalidIndexGeometry => write!(f, "invalid index bucket geometry"),
             Self::InvalidHasher => write!(f, "invalid hash algorithm"),
             Self::InvalidOverflowVersion => write!(f, "invalid index overflow version"),
             Self::InvalidOverflowUID => write!(f, "invalid index overflow uid"),

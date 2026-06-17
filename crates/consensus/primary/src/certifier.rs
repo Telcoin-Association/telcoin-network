@@ -52,6 +52,8 @@ pub(crate) struct Certifier<DB> {
     /// Should not generally happen but can lead to leader cert equivocation
     /// if it does so be really sure.
     proposal_lock: Arc<Mutex<()>>,
+    /// Prometheus metrics for vote collection and certificate formation.
+    metrics: crate::PrimaryMetrics,
 }
 
 impl<DB: Database> Certifier<DB> {
@@ -72,6 +74,7 @@ impl<DB: Database> Certifier<DB> {
 
         // spawn long-running task to gossip own certificates
         let task_spawner = task_manager.get_spawner();
+        let metrics = consensus_bus.app().metrics().clone();
         // Subscribe before spawning so the channel is active before any messages are sent.
         let rx_headers = consensus_bus.subscribe_headers();
         task_manager.spawn_critical_task("certifier task", async move {
@@ -106,6 +109,7 @@ impl<DB: Database> Certifier<DB> {
                 task_spawner,
                 new_proposal: Notifier::new(),
                 proposal_lock: Arc::new(Mutex::new(())),
+                metrics,
             }
             .run(rx_headers)
             .await;
@@ -251,6 +255,7 @@ impl<DB: Database> Certifier<DB> {
     #[instrument(level = "debug", skip_all, fields(round = header.round(), epoch = header.epoch()))]
     async fn propose_header(&self, header: Header) -> DagResult<Certificate> {
         debug!(target: "primary::certifier", auth=?self.authority_id, "proposing header");
+        let proposal_start = std::time::Instant::now();
 
         // only propose headers in current epoch
         if header.epoch() != self.committee.epoch() {
@@ -325,6 +330,7 @@ impl<DB: Database> Certifier<DB> {
                         // happy path
                         Some(Ok(vote)) => {
                             let authority_id = vote.author.clone();
+                            self.metrics.votes_received_total.increment(1);
                             // prevent invalid votes from derailing certification process
                             certificate = match votes_aggregator.append(
                                 vote,
@@ -334,6 +340,7 @@ impl<DB: Database> Certifier<DB> {
                                 Ok(cert) => cert,
                                 Err(e) => {
                                     error!(target: "primary::certifier", "received an invalid vote from {authority_id:?}: {e:?}");
+                                    self.metrics.invalid_votes_total.increment(1);
                                     None
                                 }
                             }
@@ -346,6 +353,7 @@ impl<DB: Database> Certifier<DB> {
                                 auth=?self.authority_id,
                                 "failed to get vote for header {header:?}: {e:?}"
                             );
+                            self.metrics.vote_request_failures_total.increment(1);
                         }
 
                         // all sending channels have dropped
@@ -387,6 +395,9 @@ impl<DB: Database> Certifier<DB> {
         })?;
 
         debug!(target: "primary::certifier", auth=?self.authority_id, "Assembled {certificate:?}");
+
+        self.metrics.certificates_formed_total.increment(1);
+        self.metrics.certificate_form_duration_seconds.record(proposal_start.elapsed());
 
         Ok(certificate)
     }

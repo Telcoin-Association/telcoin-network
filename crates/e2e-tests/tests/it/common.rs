@@ -324,6 +324,19 @@ pub(crate) fn start_validator(
     test: &str,
     run: u32,
 ) -> Child {
+    start_validator_with_args(instance, bin, base_dir, rpc_port, test, run, &[])
+}
+
+/// Start a validator node process with additional CLI arguments (e.g. `--metrics`).
+pub(crate) fn start_validator_with_args(
+    instance: usize,
+    bin: &'static CargoRun,
+    base_dir: &Path,
+    rpc_port: u16,
+    test: &str,
+    run: u32,
+    extra_args: &[&str],
+) -> Child {
     let data_dir = base_dir.join(format!("validator-{}", instance + 1));
     let ws_port = get_available_tcp_port("127.0.0.1").expect("ws port");
     // IPC: use temp-dir-based path to avoid cross-test conflicts
@@ -345,6 +358,8 @@ pub(crate) fn start_validator(
         .arg(ipc_path.to_string_lossy().as_ref())
         .arg("--node-name")
         .arg(format!("{test}-node{instance}"));
+
+    command.args(extra_args);
 
     setup_log_dir(&mut command, instance, test, run);
 
@@ -557,7 +572,7 @@ pub(crate) fn send_tel(
     to_addr.copy_from_slice(to_account.as_slice());
     let (from_account, _, _) = decode_key(key)?;
     let new_transaction = LegacyTransaction {
-        chain: 0x7e1,
+        chain: 0xde7e1,
         nonce,
         to: Some(to_addr),
         value: amount,

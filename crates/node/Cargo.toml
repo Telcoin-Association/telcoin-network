@@ -24,6 +24,7 @@ tn-config = { workspace = true }
 tn-worker = { workspace = true }
 tn-rpc = { workspace = true }
 eyre = { workspace = true }
+tn-metrics = { workspace = true }
 tn-network-libp2p = { workspace = true }
 tn-reth = { workspace = true }
 state-sync = { workspace = true }
@@ -32,8 +33,11 @@ tn-batch-builder = { workspace = true }
 tn-batch-validator = { workspace = true }
 jsonrpsee = { workspace = true }
 roaring = { workspace = true }
+metrics = { workspace = true }
+reth-metrics = { workspace = true }
 
 [dev-dependencies]
+metrics-util = { workspace = true }
 rand = { workspace = true }
 tn-primary = { workspace = true, features = ["test-utils"] }
 tn-types = { workspace = true, features = ["test-utils"] }

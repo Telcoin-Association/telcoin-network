@@ -4,7 +4,7 @@ use std::{
     future::{ready, Ready},
 };
 
-use crate::stream::behavior::TN_STREAM_PROTOCOL;
+use crate::{stream::behavior::TN_STREAM_PROTOCOL, Penalty};
 
 /// Protocol upgrade for streaming data.
 ///
@@ -45,19 +45,104 @@ impl OutboundUpgrade<Stream> for TNStreamProtocol {
     }
 }
 
-/// Errors that can occur during streaming operations.
+/// Errors returned to the caller of an outbound stream open.
 #[derive(Debug)]
 pub enum StreamError {
     /// The protocol upgrade failed during stream negotiation.
     UpgradeFailed,
+    /// The peer was not connected and could not be dialed (no known address).
+    NotConnected,
+    /// The open attempt timed out before a stream was established.
+    Timeout,
+    /// Too many outbound stream opens are already pending.
+    TooManyPending,
 }
 
 impl std::fmt::Display for StreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UpgradeFailed => write!(f, "Protocol upgrade failed"),
+            Self::NotConnected => write!(f, "Peer not connected and could not be dialed"),
+            Self::Timeout => write!(f, "Timed out before a stream was established"),
+            Self::TooManyPending => write!(f, "Too many pending stream opens"),
         }
     }
 }
 
 impl std::error::Error for StreamError {}
+
+/// A classified stream failure used to score the remote peer.
+///
+/// Mirrors the request-response failure taxonomy so the stream path and the RPC
+/// path penalize comparable misbehaviour comparably. Every variant is reported
+/// for telemetry first; enforcement is enabled once telemetry confirms it does
+/// not fire on healthy peers (see `process_stream_event`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum StreamFailure {
+    /// Dialing the peer failed (transport-level; not necessarily the peer's fault).
+    DialFailure,
+    /// The open or negotiation timed out.
+    Timeout,
+    /// The peer supports none of our stream protocols.
+    UnsupportedProtocol,
+    /// An I/O error occurred while negotiating the stream.
+    Io(std::io::ErrorKind),
+    /// The peer exceeded the inbound stream rate limit.
+    InboundRateLimited,
+}
+
+impl StreamFailure {
+    /// The penalty this failure would incur, or `None` when it is not the
+    /// peer's fault.
+    ///
+    /// Mirrors the request-response failure taxonomy so the stream path and the
+    /// RPC path score comparable misbehaviour comparably. Reported metrics-only
+    /// for now; see `process_stream_event`.
+    pub(crate) fn penalty(&self) -> Option<Penalty> {
+        match self {
+            // transport-level: the peer went away or could not be reached
+            Self::DialFailure => None,
+            // stalled open
+            Self::Timeout => Some(Penalty::Mild),
+            // the peer speaks none of our stream protocols
+            Self::UnsupportedProtocol => Some(Penalty::Severe),
+            // transport flaps on WAN are not faults; other IO is likely a violation
+            Self::Io(kind) => match kind {
+                std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::Interrupted => None,
+                _ => Some(Penalty::Medium),
+            },
+            // application-level abuse of the inbound stream path
+            Self::InboundRateLimited => Some(Penalty::Medium),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StreamFailure;
+    use crate::Penalty;
+    use std::io::ErrorKind;
+
+    /// The stream penalty taxonomy must mirror the request-response one: transport
+    /// faults are not penalized, stalls are mild, unsupported protocols are severe.
+    #[test]
+    fn penalty_mapping_mirrors_reqres() {
+        assert!(StreamFailure::DialFailure.penalty().is_none());
+        assert!(matches!(StreamFailure::Timeout.penalty(), Some(Penalty::Mild)));
+        assert!(matches!(StreamFailure::UnsupportedProtocol.penalty(), Some(Penalty::Severe)));
+        assert!(matches!(StreamFailure::InboundRateLimited.penalty(), Some(Penalty::Medium)));
+        // transport flaps on WAN are not the peer's fault
+        assert!(StreamFailure::Io(ErrorKind::ConnectionReset).penalty().is_none());
+        assert!(StreamFailure::Io(ErrorKind::BrokenPipe).penalty().is_none());
+        // a genuine protocol/codec IO error is a fault
+        assert!(matches!(
+            StreamFailure::Io(ErrorKind::InvalidData).penalty(),
+            Some(Penalty::Medium)
+        ));
+    }
+}

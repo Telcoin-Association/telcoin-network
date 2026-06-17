@@ -114,6 +114,15 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         // Does not do anything on windows.
         raise_fd_limit()?;
 
+        // Install the global metrics recorder before any reth components are constructed
+        // (in particular before `RethEnv::new_database`). Reth's derive-style metric
+        // handles bind to whatever recorder is installed at construction time; anything
+        // registered against the default noop recorder is silently lost. Nodes without
+        // `--metrics` keep the zero-overhead noop recorder.
+        if self.metrics.is_some() {
+            tn_metrics::install_recorder()?;
+        }
+
         // limit global rayon thread pool for batch validator
         //
         // ensure 2 cores are reserved unless the system only has 1 core
@@ -141,6 +150,22 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         } else {
             Config::load(&tn_datadir, self.observer, SHORT_VERSION)?
         };
+        #[cfg(not(feature = "adiri"))]
+        if tn_config.genesis().config.chain_id == 2017 {
+            // If we are trying to start an Adiri node without the adiri feature flag then error
+            // out.
+            return Err(eyre::eyre!(
+                "Must compile with adiri feature flag in order to connect to adiri (testnet)!"
+            ));
+        }
+        #[cfg(feature = "adiri")]
+        if tn_config.genesis().config.chain_id != 2017 {
+            // If we are trying to start an Adiri node without the adiri feature flag then error
+            // out.
+            return Err(eyre::eyre!(
+                "Must NOT compile with adiri feature flag when connecting to non-adiri (testnet) networks!"
+            ));
+        }
         debug!(target: "cli", validator = ?tn_config.node_info.name, "tn datadir for node command: {tn_datadir:?}");
         info!(target: "cli", validator = ?tn_config.node_info.name, "config loaded");
 

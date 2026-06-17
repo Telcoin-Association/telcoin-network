@@ -34,6 +34,11 @@ const ITEM_BYTES: usize = BLOOM_SIZE_BITS.ilog2().div_ceil(8) as usize;
 #[allow(clippy::assertions_on_constants)]
 const _: () = assert!(BLOOM_SIZE_BYTES.is_power_of_two());
 
+// accrue/contains read BLOOM_BITS_PER_ITEM * ITEM_BYTES bytes out of each 32-byte B256;
+// keep that within the hash width so indexing can never run past the key.
+#[allow(clippy::assertions_on_constants)]
+const _: () = assert!(BLOOM_BITS_PER_ITEM * ITEM_BYTES <= 32);
+
 #[derive(Clone, Debug)]
 /// Implement a simple bloom filter for hashes used in digest indexes.
 pub struct Bloom {

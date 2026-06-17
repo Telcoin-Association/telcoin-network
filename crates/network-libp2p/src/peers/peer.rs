@@ -3,7 +3,7 @@
 use super::{
     score::{Reputation, ReputationUpdate, Score},
     status::ConnectionStatus,
-    types::ConnectionDirection,
+    types::{ConnectionDirection, TrustBasis},
     Penalty,
 };
 use libp2p::{
@@ -11,7 +11,6 @@ use libp2p::{
     PeerId,
 };
 use std::{collections::HashSet, net::IpAddr, time::Instant};
-use tn_config::PeerConfig;
 use tn_types::{BlsPublicKey, NetworkPublicKey};
 use tracing::{error, warn};
 
@@ -26,8 +25,6 @@ pub(super) struct Peer {
     bls_public_key: Option<BlsPublicKey>,
     /// The peers network public key (libp2p public key).
     network_key: Option<NetworkPublicKey>,
-    /// The config
-    config: PeerConfig,
     /// The peer's score - used to derive [Reputation].
     score: Score,
     /// The multiaddrs this node has witnessed the peer using.
@@ -36,8 +33,12 @@ pub(super) struct Peer {
     multiaddrs: HashSet<Multiaddr>,
     /// Connection status of the peer.
     connection_status: ConnectionStatus,
-    /// Trusted peers are specifically included by node operators.
-    is_trusted: bool,
+    /// Whether the node operator explicitly allowlisted this peer.
+    ///
+    /// This is *operator* trust only: it is set at construction and never altered by epoch
+    /// rotation. Validator (committee) trust is NOT stored here - it is derived from the
+    /// committee sets in `AllPeers` - so the two provenances can never be conflated (issue #715).
+    operator_allowlisted: bool,
     /// Direction of the most recent connection with this peer.
     ///
     /// `None` if this peer was never connected.
@@ -51,14 +52,13 @@ pub(super) struct Peer {
 }
 
 impl Peer {
-    /// Create a new trusted peer.
+    /// Create a new operator-allowlisted peer.
     pub(super) fn new_trusted(bls_public_key: BlsPublicKey, network_key: NetworkPublicKey) -> Peer {
         Self {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
             score: Score::new_max(),
-            is_trusted: true,
-            config: Default::default(),
+            operator_allowlisted: true,
             multiaddrs: Default::default(),
             connection_status: Default::default(),
             connection_direction: Default::default(),
@@ -66,7 +66,7 @@ impl Peer {
         }
     }
 
-    /// Create a new peer with its known multiaddrs.
+    /// Create a new (non-allowlisted) peer with its known multiaddrs.
     pub(super) fn new(
         bls_public_key: BlsPublicKey,
         network_key: NetworkPublicKey,
@@ -76,8 +76,7 @@ impl Peer {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
             score: Score::default(),
-            is_trusted: false,
-            config: Default::default(),
+            operator_allowlisted: false,
             multiaddrs: addrs.into_iter().collect(),
             connection_status: Default::default(),
             connection_direction: Default::default(),
@@ -96,8 +95,7 @@ impl Peer {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
             score: Score::new_max(),
-            is_trusted: false,
-            config: Default::default(),
+            operator_allowlisted: false,
             multiaddrs: Default::default(),
             connection_status: Default::default(),
             connection_direction: Default::default(),
@@ -133,11 +131,7 @@ impl Peer {
 
     /// Return a peer's reputation based on the aggregate score.
     pub(super) fn reputation(&self) -> Reputation {
-        match self.score.aggregate_score() {
-            score if score <= self.config.min_score_for_ban => Reputation::Banned,
-            score if score <= self.config.min_score_for_disconnect => Reputation::Disconnected,
-            _ => Reputation::Trusted,
-        }
+        self.score.reputation()
     }
 
     /// Return an iterator of known ip addresses for a peer.
@@ -154,18 +148,25 @@ impl Peer {
     }
 
     /// Apply a penalty to the peer's score.
-    pub(super) fn apply_penalty(&mut self, penalty: Penalty) -> Reputation {
-        if self.is_trusted {
-            // Trusted peers (current-epoch committee, configured allowlist) bypass
-            // the score model entirely. Severe/Fatal suppressions are operationally
-            // significant: they hint that a committee member is misbehaving in ways
-            // that would normally ban an untrusted peer. Surface as a warn! so ops
-            // can correlate downstream issues with the original signal.
+    ///
+    /// `exemption` is the peer's [TrustBasis] for the current epoch, if any. Exempt peers
+    /// (operator allowlist or committee validators) bypass the score model entirely.
+    pub(super) fn apply_penalty(
+        &mut self,
+        penalty: Penalty,
+        exemption: Option<TrustBasis>,
+    ) -> Reputation {
+        if let Some(basis) = exemption {
+            // Exempt peers bypass the score model entirely. Severe/Fatal suppressions are
+            // operationally significant: they hint that an exempt peer (committee member or
+            // operator allowlist) is misbehaving in ways that would normally ban an untrusted
+            // peer. Surface as a warn! so ops can correlate downstream issues with the signal.
             if matches!(penalty, Penalty::Severe | Penalty::Fatal) {
                 warn!(
                     target: "peer-manager",
                     ?penalty,
-                    "skipping severe/fatal penalty for trusted peer"
+                    ?basis,
+                    "skipping severe/fatal penalty for exempt peer"
                 );
             }
         } else {
@@ -177,13 +178,17 @@ impl Peer {
     }
 
     /// Ensure the peer's status is banned.
-    pub(super) fn ensure_banned(&mut self, peer_id: &PeerId) {
+    ///
+    /// `exemption` is forwarded to [Self::apply_penalty]: an exempt peer (operator allowlist or
+    /// committee validator) bypasses the score model, so the `Fatal` here is suppressed and the
+    /// peer is not banned - the same protection exempt peers had before.
+    pub(super) fn ensure_banned(&mut self, peer_id: &PeerId, exemption: Option<TrustBasis>) {
         match self.reputation() {
             Reputation::Banned => {}
             _ => {
                 // if the score isn't low enough to ban, this function has been called incorrectly.
                 error!(target: "peer-manager", ?peer_id, "banning a peer with a good score");
-                self.apply_penalty(Penalty::Fatal);
+                self.apply_penalty(Penalty::Fatal, exemption);
             }
         }
     }
@@ -278,11 +283,13 @@ impl Peer {
         self.known_ip_addresses().filter(|ip| !already_banned_ips.contains(ip)).collect::<Vec<_>>()
     }
 
-    /// Heartbeat maintenance applies decaying penalty rates to a non-trusted peer's score.
+    /// Heartbeat maintenance applies decaying penalty rates to a non-exempt peer's score.
     ///
-    /// The peer's reputation could change. This returns reputation update for the manager to react.
-    pub(super) fn heartbeat(&mut self) -> ReputationUpdate {
-        if !self.is_trusted {
+    /// `exemption` is the peer's [TrustBasis] for the current epoch, if any; exempt peers skip
+    /// score decay. The peer's reputation could change. This returns the reputation update for
+    /// the manager to react to.
+    pub(super) fn heartbeat(&mut self, exemption: Option<TrustBasis>) -> ReputationUpdate {
+        if exemption.is_none() {
             let prev_reputation = self.reputation();
             self.score.update();
             let new_reputation = self.reputation();
@@ -314,9 +321,12 @@ impl Peer {
         ReputationUpdate::None
     }
 
-    /// Boolean indicating if the peer is trusted.
-    pub(super) fn is_trusted(&self) -> bool {
-        self.is_trusted
+    /// Whether the node operator explicitly allowlisted this peer.
+    ///
+    /// This is operator trust only and is never affected by epoch rotation. Validator
+    /// (committee) trust is derived from the committee sets in `AllPeers`, not stored here.
+    pub(super) fn is_operator_allowlisted(&self) -> bool {
+        self.operator_allowlisted
     }
 
     /// Extract relevant information for peer exchange.
@@ -324,25 +334,14 @@ impl Peer {
         self.network_key.as_ref().map(|network_key| (network_key.clone(), self.multiaddrs.clone()))
     }
 
-    /// Update a peer record to make it trusted.
-    pub(super) fn make_trusted(&mut self) {
-        if !self.is_trusted {
-            self.is_trusted = true;
-            self.score = Score::new_max();
-        }
-    }
-
-    /// Revoke a peer's trusted status, returning it to the normal score model.
+    /// Reset the peer's score to the maximum.
     ///
-    /// Called when a peer rotates out of all three committee slots. Only the flag is cleared;
-    /// the score is left as-is so the demoted peer gets a soft landing (heartbeat decay and
-    /// penalties resume immediately now that `is_trusted` is false).
-    ///
-    /// NOTE: `is_trusted` currently conflates committee-derived trust with operator-allowlist
-    /// trust (`new_trusted`/`add_trusted_peer`); demoting clears both for a peer that was in a
-    /// committee.
-    pub(super) fn make_untrusted(&mut self) {
-        self.is_trusted = false;
+    /// Called when a peer enters the committee. Trust is not stored on the peer (validator
+    /// status is derived from the committee sets), but a committee member's score is primed to
+    /// the maximum so that, should it later rotate out and re-enter the score model, it starts
+    /// from a clean maximum rather than a stale value.
+    pub(super) fn reset_score_to_max(&mut self) {
+        self.score = Score::new_max();
     }
 
     /// Update peer record to indicate participation in kad as a routable peer.

@@ -61,7 +61,7 @@ use reth::{
     },
 };
 use reth_chainspec::{BaseFeeParams, EthChainSpec};
-use reth_db::{init_db, DatabaseEnv};
+use reth_db::init_db;
 use reth_db_common::init::init_genesis;
 use reth_discv4::NatResolver;
 use reth_engine_tree::{
@@ -80,10 +80,9 @@ use reth_node_builder::{
 };
 use reth_node_core::node_config::DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB;
 use reth_provider::{
-    providers::{BlockchainProvider, StaticFileProvider},
-    BlockIdReader as _, BlockNumReader, BlockReader, CanonChainTracker,
-    CanonStateSubscriptions as _, ChainStateBlockReader, ChainStateBlockWriter, DBProvider,
-    DatabaseProviderFactory, HeaderProvider as _, ProviderFactory, StateProviderBox,
+    providers::BlockchainProvider, BlockIdReader as _, BlockNumReader, BlockReader,
+    CanonChainTracker, CanonStateSubscriptions as _, ChainStateBlockReader, ChainStateBlockWriter,
+    DBProvider, DatabaseProviderFactory, HeaderProvider as _, ProviderFactory, StateProviderBox,
     StateProviderFactory, TransactionVariant,
 };
 use reth_revm::{
@@ -137,13 +136,20 @@ pub use reth_chain_state::{
 };
 pub use reth_chainspec::ChainSpec as RethChainSpec;
 pub use reth_cli_util::{parse_duration_from_secs, parse_socket_address};
+pub use reth_db::{
+    mdbx::{open_db_read_only, DatabaseArguments, Error as RethMdbxError},
+    static_file::iter_static_files,
+    Database as RethDatabaseT, DatabaseEnv, Tables,
+};
 pub use reth_errors::{ProviderError, RethError};
 pub use reth_node_core::{
     args::{ColorMode, LogArgs},
     node_config::DEFAULT_PERSISTENCE_THRESHOLD,
 };
 pub use reth_primitives_traits::crypto::secp256k1::sign_message;
-pub use reth_provider::{CanonStateNotificationStream, ChangedAccount};
+pub use reth_provider::{
+    providers::StaticFileProvider, CanonStateNotificationStream, ChangedAccount,
+};
 pub use reth_rpc_eth_types::EthApiError;
 pub use reth_tracing::{FileWorkerGuard, Layers};
 pub use reth_transaction_pool::{
@@ -448,6 +454,9 @@ impl RethConfig {
         };
 
         // metrics args
+        //
+        // NOTE: dead config in TN's hand-rolled init path - the node never launches reth's
+        // metric server. The prometheus endpoint is owned by `tn-metrics` (`--metrics` CLI arg).
         let metrics = MetricArgs {
             prometheus: None,
             push_gateway_url: None,
@@ -579,6 +588,15 @@ impl ChainSpec {
 /// the node launcher to create the DB upfront and reuse.
 pub type RethDb = Arc<DatabaseEnv>;
 
+/// Report sampled reth database metrics (table sizes, page usage, freelist).
+///
+/// Intended as a pre-scrape hook for the prometheus metrics endpoint. Lives here to keep
+/// reth-db types out of the node crate.
+pub fn report_db_metrics(db: &RethDb) {
+    use reth_db::database_metrics::DatabaseMetrics;
+    db.report_metrics();
+}
+
 impl RethEnv {
     /// Create a new Reth DB.
     /// Break this out so this can be created upfront and used even on a
@@ -589,7 +607,9 @@ impl RethEnv {
     ) -> eyre::Result<RethDb> {
         let db_path = db_path.as_ref();
         info!(target: "tn::reth", path = ?db_path, "opening database");
-        Ok(Arc::new(init_db(db_path, reth_config.0.db.database_args())?))
+        // with_metrics: record per-operation db latency metrics (noop unless the global
+        // metrics recorder is installed, i.e. the node runs with `--metrics`)
+        Ok(Arc::new(init_db(db_path, reth_config.0.db.database_args())?.with_metrics()))
     }
 
     /// Produce a new wrapped Reth environment from a config, DB path and task manager.

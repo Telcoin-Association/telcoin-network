@@ -13,9 +13,11 @@ authors = [
 
 [dependencies]
 clap = { workspace = true, features = ["derive", "env"] }
+comfy-table = "7.2.2"
 eyre = { workspace = true }
 const-str = { workspace = true }
 fdlimit = { workspace = true }
+human_bytes = "0.4.3"
 secp256k1 = { workspace = true, features = [
     "global-context",
     "rand",
@@ -45,6 +47,7 @@ tracing-opentelemetry = { workspace = true }
 
 alloy = { workspace = true }
 tn-types = { workspace = true }
+tn-metrics = { workspace = true }
 tn-node = { workspace = true }
 tn-reth = { workspace = true }
 tn-config = { workspace = true }
@@ -66,3 +69,6 @@ vergen = { version = "8.0.0", features = ["build", "cargo", "git", "gitcl"] }
 
 [lints]
 workspace = true
+
+[features]
+adiri = []

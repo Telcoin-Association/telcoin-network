@@ -5,9 +5,9 @@ use reth_chainspec::ChainSpec;
 use serde::{Deserialize, Serialize};
 use std::{fs::File, io::Write, time::Duration};
 use tn_types::{
-    get_available_tcp_port, get_available_udp_port, test_genesis, Address, BlsPublicKey,
-    BlsSignature, Genesis, Multiaddr, NetworkPublicKey, MAINNET_COMMITTEE, MAINNET_GENESIS,
-    MAINNET_PARAMETERS, TESTNET_COMMITTEE, TESTNET_GENESIS, TESTNET_PARAMETERS,
+    get_available_udp_port, test_genesis, Address, BlsPublicKey, BlsSignature, Genesis,
+    NetworkPublicKey, MAINNET_COMMITTEE, MAINNET_GENESIS, MAINNET_PARAMETERS, TESTNET_COMMITTEE,
+    TESTNET_GENESIS, TESTNET_PARAMETERS,
 };
 use tracing::info;
 
@@ -314,29 +314,6 @@ impl Default for NetworkAdminServerParameters {
                 .expect("udp port is available for primary"),
             worker_network_admin_server_base_port: get_available_udp_port(host)
                 .expect("udp port is available for worker admin server"),
-        }
-    }
-}
-
-/// Prometheus metrics multiaddr.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct PrometheusMetricsParameters {
-    /// Socket address the server should be listening to.
-    pub socket_addr: Multiaddr,
-}
-
-impl Default for PrometheusMetricsParameters {
-    fn default() -> Self {
-        let host = "127.0.0.1";
-        Self {
-            socket_addr: format!(
-                "/ip4/{}/tcp/{}/http",
-                host,
-                get_available_tcp_port(host)
-                    .expect("os has available TCP port for default prometheus metrics")
-            )
-            .parse()
-            .expect("default prometheus metrics to parse available socket addr on localhost"),
         }
     }
 }

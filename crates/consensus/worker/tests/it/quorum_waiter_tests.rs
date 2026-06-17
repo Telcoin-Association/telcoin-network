@@ -9,7 +9,7 @@ use tn_test_utils::CommitteeFixture;
 use tn_types::{test_chain_spec_arc, BlsPublicKey, TaskManager};
 use tn_worker::{
     quorum_waiter::{QuorumWaiter, QuorumWaiterError, QuorumWaiterTrait as _},
-    WorkerNetworkHandle, WorkerRPCError, WorkerRequest, WorkerResponse,
+    WorkerMetrics, WorkerNetworkHandle, WorkerRPCError, WorkerRequest, WorkerResponse,
 };
 use tokio::sync::mpsc;
 
@@ -25,8 +25,12 @@ async fn test_wait_for_quorum_happy_path() {
     let network =
         WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
     // Spawn a `QuorumWaiter` instance.
-    let quorum_waiter =
-        QuorumWaiter::new(my_primary.authority().clone(), committee.clone(), network);
+    let quorum_waiter = QuorumWaiter::new(
+        my_primary.authority().clone(),
+        committee.clone(),
+        network,
+        WorkerMetrics::new_for_worker(0),
+    );
 
     // Make a batch.
     let chain = test_chain_spec_arc();
@@ -72,8 +76,12 @@ async fn test_batch_rejected_timeout() {
     let network =
         WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
     // Spawn a `QuorumWaiter` instance.
-    let quorum_waiter =
-        QuorumWaiter::new(my_primary.authority().clone(), committee.clone(), network);
+    let quorum_waiter = QuorumWaiter::new(
+        my_primary.authority().clone(),
+        committee.clone(),
+        network,
+        WorkerMetrics::new_for_worker(0),
+    );
 
     // Make a batch.
     let chain = test_chain_spec_arc();
@@ -122,8 +130,12 @@ async fn test_batch_some_rejected_stake_still_passes() {
     let network =
         WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
     // Spawn a `QuorumWaiter` instance.
-    let quorum_waiter =
-        QuorumWaiter::new(my_primary.authority().clone(), committee.clone(), network);
+    let quorum_waiter = QuorumWaiter::new(
+        my_primary.authority().clone(),
+        committee.clone(),
+        network,
+        WorkerMetrics::new_for_worker(0),
+    );
 
     // Make a batch.
     let chain = test_chain_spec_arc();
@@ -191,8 +203,12 @@ async fn test_batch_rejected_quorum() {
     let network =
         WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
     // Spawn a `QuorumWaiter` instance.
-    let quorum_waiter =
-        QuorumWaiter::new(my_primary.authority().clone(), committee.clone(), network);
+    let quorum_waiter = QuorumWaiter::new(
+        my_primary.authority().clone(),
+        committee.clone(),
+        network,
+        WorkerMetrics::new_for_worker(0),
+    );
 
     // Make a batch.
     let chain = test_chain_spec_arc();
@@ -249,8 +265,12 @@ async fn test_batch_rejected_antiquorum() {
     let network =
         WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
     // Spawn a `QuorumWaiter` instance.
-    let quorum_waiter =
-        QuorumWaiter::new(my_primary.authority().clone(), committee.clone(), network);
+    let quorum_waiter = QuorumWaiter::new(
+        my_primary.authority().clone(),
+        committee.clone(),
+        network,
+        WorkerMetrics::new_for_worker(0),
+    );
 
     // Make a batch.
     let chain = test_chain_spec_arc();
@@ -295,8 +315,12 @@ async fn test_batch_early_anti_quorum() {
     let network =
         WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
     // Spawn a `QuorumWaiter` instance.
-    let quorum_waiter =
-        QuorumWaiter::new(my_primary.authority().clone(), committee.clone(), network);
+    let quorum_waiter = QuorumWaiter::new(
+        my_primary.authority().clone(),
+        committee.clone(),
+        network,
+        WorkerMetrics::new_for_worker(0),
+    );
 
     // Make a batch.
     let chain = test_chain_spec_arc();
@@ -370,8 +394,12 @@ async fn test_network_error_retry_then_quorum() {
     let (sender, mut network_rx) = mpsc::channel(100);
     let network =
         WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
-    let quorum_waiter =
-        QuorumWaiter::new(my_primary.authority().clone(), committee.clone(), network);
+    let quorum_waiter = QuorumWaiter::new(
+        my_primary.authority().clone(),
+        committee.clone(),
+        network,
+        WorkerMetrics::new_for_worker(0),
+    );
 
     // Make a batch.
     let chain = test_chain_spec_arc();
@@ -422,8 +450,12 @@ async fn test_network_error_partial_retry_success() {
     let (sender, mut network_rx) = mpsc::channel(100);
     let network =
         WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
-    let quorum_waiter =
-        QuorumWaiter::new(my_primary.authority().clone(), committee.clone(), network);
+    let quorum_waiter = QuorumWaiter::new(
+        my_primary.authority().clone(),
+        committee.clone(),
+        network,
+        WorkerMetrics::new_for_worker(0),
+    );
 
     // Make a batch.
     let chain = test_chain_spec_arc();
@@ -495,8 +527,12 @@ async fn test_network_error_all_retries_exhausted() {
     let (sender, mut network_rx) = mpsc::channel(100);
     let network =
         WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
-    let quorum_waiter =
-        QuorumWaiter::new(my_primary.authority().clone(), committee.clone(), network);
+    let quorum_waiter = QuorumWaiter::new(
+        my_primary.authority().clone(),
+        committee.clone(),
+        network,
+        WorkerMetrics::new_for_worker(0),
+    );
 
     // Make a batch.
     let chain = test_chain_spec_arc();

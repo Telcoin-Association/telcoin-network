@@ -1,10 +1,10 @@
 //! Subscriber gathers all information needed from consensus and forwards to the execution engine.
 
-use crate::{errors::SubscriberResult, SubscriberError};
+use crate::{errors::SubscriberResult, metrics::ExecutorMetrics, SubscriberError};
 use futures::{stream::FuturesOrdered, StreamExt};
 use state_sync::{last_consensus_parent, save_consensus, spawn_state_sync};
 use std::{
-    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -53,6 +53,8 @@ struct Inner {
     consensus_chain: ConsensusChain,
     /// Epoch boundary time.
     epoch_boundary: TimestampSec,
+    /// Prometheus metrics for consensus output assembly.
+    metrics: ExecutorMetrics,
 }
 
 /// Spawn the subscriber in the correct mode based on the validator status for the current epoch.
@@ -80,6 +82,7 @@ pub fn spawn_subscriber<DB: Database>(
             client,
             consensus_chain: consensus_chain.clone(),
             epoch_boundary,
+            metrics: ExecutorMetrics::default(),
         }),
     };
     match mode {
@@ -458,7 +461,6 @@ impl<DB: Database> Subscriber<DB> {
         // SAFETY: 10-node committees * 6-round commit max * 5 batch max = 300 max batch digests
         // possible 32bytes * 300 = 9.6 kb => well within 1MB max message size
         let mut fetched_batches = self.fetch_batches_from_peers(batch_set).await?;
-        let fetched_digests: HashSet<BlockHash> = fetched_batches.keys().copied().collect();
 
         let mut batches = Vec::with_capacity(num_certs);
         // map all fetched batches to their respective certificates for applying block rewards
@@ -485,9 +487,28 @@ impl<DB: Database> Subscriber<DB> {
                     cert_batches.push(batch);
                 } else {
                     // if the batch is a duplicate, the engine will ignore
-                    warn!(target: "subscriber", ?digest, ?batch_digests, "failed to remove fetched batch - possible duplicate");
-                    if !fetched_digests.contains(digest) {
+                    if let Some(batch) = batches
+                        .iter()
+                        .flat_map(|cb: &CertifiedBatch| cb.batches.iter())
+                        .chain(cert_batches.iter())
+                        .find(|b| b.digest() == *digest)
+                    {
+                        warn!(target: "subscriber", ?digest, ?batch_digests, "failed to remove fetched batch - duplicate");
+                        #[cfg(not(feature = "adiri"))]
+                        cert_batches.push(batch.clone());
+
+                        #[cfg(feature = "adiri")]
+                        if sub_dag.leader_epoch() > tn_types::forks::ADIRI_DUP_BATCH_EPOCH {
+                            // ADIRI BUG
+                            // Epoch 74 and possibly other early epochs of adiri testnet had a bug
+                            // with duplicate batches. We have to
+                            // recreate it in order to sync testnet so we skip this push
+                            // on adiri with early epochs.
+                            cert_batches.push(batch.clone());
+                        }
+                    } else {
                         error!(target: "subscriber", ?digest, "[Protocol violation] Batch not found in fetched batches from workers of certificate signers");
+                        self.inner.metrics.protocol_violations_total.increment(1);
                         return Err(SubscriberError::MissingFetchedBatch(*digest));
                     }
                 }
@@ -513,6 +534,9 @@ impl<DB: Database> Subscriber<DB> {
             total_txs = total_txs,
             "consensus output ready"
         );
+        self.inner.metrics.outputs_ready_total.increment(1);
+        self.inner.metrics.output_transactions.record(total_txs as f64);
+        self.inner.metrics.output_batches.record(batch_digests.len() as f64);
 
         debug!(target: "subscriber", "returning output to subscriber");
         Ok(ConsensusOutput::new(
@@ -540,6 +564,7 @@ impl<DB: Database> Subscriber<DB> {
             Ok(resp) => resp,
             Err(e) => {
                 error!(target: "subscriber", "Failed to fetch batches from peers: {e:?}");
+                self.inner.metrics.batch_fetch_failures_total.increment(1);
                 return Err(SubscriberError::ClientRequestsFailed);
             }
         };

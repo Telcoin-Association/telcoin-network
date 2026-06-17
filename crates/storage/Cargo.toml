@@ -47,6 +47,7 @@ redb = []
 reth-libmdbx = ["dep:reth-libmdbx", "dep:page_size"]
 default = ["reth-libmdbx"]
 test-utils = []
+adiri = []
 
 [lints]
 workspace = true

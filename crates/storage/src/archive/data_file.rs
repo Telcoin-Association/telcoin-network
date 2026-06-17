@@ -169,8 +169,10 @@ impl DataFile {
     }
 
     /// Refresh the data_file_end, useful for readonly DBs to sync.
-    pub fn refresh_data_file_end(&mut self) {
-        self.data_file_end = self.data_file.seek(SeekFrom::End(0)).unwrap_or(self.data_file_end);
+    /// The file is append-only so already-buffered bytes stay valid; only the end advances.
+    pub fn refresh_data_file_end(&mut self) -> io::Result<()> {
+        self.data_file_end = self.data_file.seek(SeekFrom::End(0))?;
+        Ok(())
     }
 
     /// Delete the file.
@@ -232,6 +234,11 @@ impl Read for DataFile {
     /// overlapping records so this will not read across them in one call.  This will not happen
     /// on a proper DB although the Read contract should handle this fine.
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // Read's contract: an empty target buffer reads nothing.  Handle it here so the
+        // read-buffer path's zero-size invariant check below stays a genuine assertion.
+        if buf.is_empty() {
+            return Ok(0);
+        }
         if self.seek_pos >= self.data_file_end {
             let write_pos = (self.seek_pos - self.data_file_end) as usize;
             if write_pos < self.write_buffer.len() {
@@ -370,5 +377,27 @@ impl Drop for DataFile {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_read_empty_buffer_returns_zero() {
+        let tmp = TempDir::with_prefix("test_data_file_empty_read").expect("temp dir");
+        let path = tmp.path().join("data");
+        let mut df = DataFile::open(&path, false).expect("open");
+        df.write_all(&[1, 2, 3, 4, 5]).expect("write");
+        df.flush().expect("flush");
+        df.seek(SeekFrom::Start(0)).expect("seek");
+        // An empty read must return Ok(0), not panic.
+        assert_eq!(df.read(&mut []).expect("empty read"), 0);
+        // A normal read still works afterward.
+        let mut buf = [0_u8; 5];
+        df.read_exact(&mut buf).expect("read");
+        assert_eq!(buf, [1, 2, 3, 4, 5]);
     }
 }

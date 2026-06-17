@@ -223,6 +223,7 @@ impl<DB: Database> Proposer<DB> {
             num_parents = parents.len(),
             "header proposed"
         );
+        consensus_bus.app().metrics().headers_proposed_total.increment(1);
 
         if enabled!(target: "primary::proposer", tracing::Level::TRACE) {
             let mut msg = format!("Created header {header:?} with parent certificates:\n");
@@ -719,6 +720,13 @@ impl<DB: Database> Proposer<DB> {
                     min_delay_timed_out = true;
                 }
             }
+            // gauge the backlog of digests waiting for inclusion in a header
+            self.consensus_bus
+                .app()
+                .metrics()
+                .proposer_pending_digests
+                .set(self.digests.len() as f64);
+
             if pending_header.is_some() {
                 // continue the loop, don't try to propose a header since we are already working
                 // on one.

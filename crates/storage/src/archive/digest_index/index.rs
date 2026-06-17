@@ -264,14 +264,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     /// Each bucket element is a (KSIZE bytes, u64)- (digest, record_pos).
     pub const BUCKET_ELEMENT_SIZE: usize = KSIZE + 8;
     /// Number of buckets to allocate in a fresh index.
-    /// Test builds use fewer buckets to avoid ~130MB of zero-initialized file I/O per HDX file
-    /// during epoch init (open_epoch_pack → ConsensusPack::open_append). The index auto-grows
-    /// via split_one_bucket() if capacity is exceeded.
-    #[cfg(all(feature = "test-utils", not(test)))]
     pub const INITIAL_BUCKETS: usize = 1_000;
-    /// Number of buckets to allocate in a fresh index.
-    #[cfg(any(not(feature = "test-utils"), test))]
-    pub const INITIAL_BUCKETS: usize = 100_000;
     /// Number of elements each bucket can hold before overflowing.
     pub const BUCKET_ELEMENTS: usize = 32;
     /// How large (in bytes) is each bucket.
@@ -351,6 +344,16 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             if header.uid() != data_header.uid() {
                 return Err(LoadHeaderError::InvalidIndexUID);
             }
+            // The on-disk bucket geometry must match this binary's compile-time layout.
+            // Reads size buffers from the header (bucket_size) while the bucket/overflow
+            // iterators index using the compile-time BUCKET_SIZE / BUCKET_ELEMENT_SIZE
+            // (derived from KSIZE and BUCKET_ELEMENTS).  A mismatch would silently corrupt
+            // reads, so reject it up front like the other header fields.
+            if header.bucket_size() != Self::BUCKET_SIZE as u16
+                || header.bucket_elements() != Self::BUCKET_ELEMENTS as u16
+            {
+                return Err(LoadHeaderError::InvalidIndexGeometry);
+            }
             // Check the salt/pepper.  This will make sure you are using the same hasher and it
             // seems to be stable (not the default Rust hasher for instance) since
             // changing the hasher would invalidate the index.
@@ -403,7 +406,10 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     /// This can be useful for tracking information about another file but
     /// does not effect the index.
     pub fn set_data_file_length(&mut self, data_file_length: u64) {
-        self.header.data_file_length = data_file_length;
+        if self.header.data_file_length != data_file_length {
+            self.header.data_file_length = data_file_length;
+            self.synced = false;
+        }
     }
 
     /// Get the data_file_length field.
@@ -501,14 +507,19 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     fn save_bucket_cache(&mut self) -> Result<(), io::Error> {
         let bucket_size = self.header.bucket_size as usize;
         let header_size = self.header.header_size();
-        for (bucket, mut buffer) in self.dirty_bucket_cache.drain() {
+        // Drain into a local buffer first so we can call &mut self helpers below; the heap
+        // buffers are moved (not copied) so this is cheap.
+        let dirty: Vec<(u64, Vec<u8>)> = self.dirty_bucket_cache.drain().collect();
+        for (bucket, mut buffer) in dirty {
             let bucket_pos: u64 =
                 (header_size + BLOOM_SIZE_BYTES + (bucket as usize * bucket_size)) as u64;
             add_crc32(&mut buffer[..]);
             // Seeking and writing past the file end extends it.
             self.hdx_file.seek(SeekFrom::Start(bucket_pos))?;
             self.hdx_file.write_all(&buffer[..])?;
-            self.bucket_cache.insert(bucket, buffer);
+            // Route through the FIFO-bounded cache so the clean cache stays capped at
+            // CACHED_BUCKETS rather than retaining every bucket ever flushed.
+            self.add_bucket_to_cache(bucket, buffer);
         }
         self.dirty_bucket_cache.shrink_to_fit();
         Ok(())
@@ -557,26 +568,24 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         // Make sure we only keep the first (most recent) key if we find duplicates.
         let mut rec_hashes = BTreeSet::new();
         while let Some((rec_hash, rec_pos)) = self.next_bucket_element(&mut iter) {
-            if rec_pos > 0 {
-                let hash = B256::from_slice(rec_hash);
-                if !rec_hashes.contains(&hash) {
-                    let bucket = self.hash_to_bucket(rec_hash);
-                    if bucket != split_bucket && bucket != new_bucket {
-                        panic!(
-                            "got bucket {}, expected {} or {}, mod {}",
-                            bucket,
-                            split_bucket,
-                            self.buckets() - 1,
-                            self.modulus
-                        );
-                    }
-                    if bucket == split_bucket {
-                        self.save_to_bucket_buffer(rec_hash, rec_pos, &mut buffer, false)?;
-                    } else {
-                        self.save_to_bucket_buffer(rec_hash, rec_pos, &mut buffer2, false)?;
-                    }
-                    rec_hashes.insert(hash);
+            let hash = B256::from_slice(rec_hash);
+            if !rec_hashes.contains(&hash) {
+                let bucket = self.hash_to_bucket(rec_hash);
+                if bucket != split_bucket && bucket != new_bucket {
+                    panic!(
+                        "got bucket {}, expected {} or {}, mod {}",
+                        bucket,
+                        split_bucket,
+                        self.buckets() - 1,
+                        self.modulus
+                    );
                 }
+                if bucket == split_bucket {
+                    self.save_to_bucket_buffer(rec_hash, rec_pos, &mut buffer, false)?;
+                } else {
+                    self.save_to_bucket_buffer(rec_hash, rec_pos, &mut buffer2, false)?;
+                }
+                rec_hashes.insert(hash);
             }
         }
         if iter.crc_failure() {
@@ -732,6 +741,14 @@ impl<const KSIZE: usize, S: BuildHasher + Default> Drop for HdxIndex<KSIZE, S> {
                     tracing::error!("HdxIndex: failed to flush file on drop: {e}");
                 }
             }
+            // Sync the overflow log before the index, mirroring sync().  The hdx buckets
+            // reference odx overflow records by position; if the hdx is durable but the odx
+            // tail is lost, those positions dangle.
+            if let Err(e) = self.odx_file.sync_all() {
+                if !std::thread::panicking() {
+                    tracing::error!("HdxIndex: failed to sync overflow file on drop: {e}");
+                }
+            }
             if let Err(e) = self.hdx_file.sync_all() {
                 if !std::thread::panicking() {
                     tracing::error!("HdxIndex: failed to sync file on drop: {e}");
@@ -799,14 +816,14 @@ mod tests {
             let mut hasher = DefaultHashFunction::new();
             hasher.update(&format!("idx-{i}").into_bytes());
             let hash = B256::from_slice(hasher.finalize().as_bytes());
-            idx.save(hash, i).expect("add to index");
+            idx.save(hash, i).unwrap_or_else(|e| panic!("add to index {i}: {e}"));
         }
         for i in 0..1_000_000 {
             let mut hasher = DefaultHashFunction::new();
             hasher.update(&format!("idx-{i}").into_bytes());
             let hash = B256::from_slice(hasher.finalize().as_bytes());
             assert!(idx.test_bloom_contains(hash));
-            assert_eq!(idx.load(hash).expect("load idx"), i);
+            assert_eq!(idx.load(hash).unwrap_or_else(|e| panic!("load idx {i}: {e}")), i);
         }
         drop(idx);
 
@@ -843,5 +860,37 @@ mod tests {
             assert!(idx.test_bloom_contains(hash));
             assert_eq!(idx.load(hash).expect("load idx"), i);
         }
+    }
+
+    // Reopening an index whose on-disk bucket geometry does not match this binary's
+    // compile-time layout must fail rather than silently misread.  A different KSIZE
+    // produces a different BUCKET_SIZE, which is exactly the mismatch we guard against.
+    #[test]
+    fn test_archive_hdx_index_geometry_mismatch() {
+        let tmp_dir = TempDir::with_prefix("test_archive_hdx_geometry").expect("temp dir");
+        let tmp_path = tmp_dir.path();
+        let data_header = DataHeader::new(0, crate::archive::pack::PackCompression::ZStd);
+
+        // Create an index with the default 32-byte keys.
+        {
+            let builder = BuildHasherDefault::<FxHasher>::default();
+            let mut idx: HdxIndex =
+                HdxIndex::open_hdx_file(tmp_path.join("index.hdx"), &data_header, builder, false)
+                    .expect("hdx file");
+            let mut hasher = DefaultHashFunction::new();
+            hasher.update(b"idx-0");
+            let hash = B256::from_slice(hasher.finalize().as_bytes());
+            idx.save(hash, 1).expect("add to index");
+            idx.sync().expect("sync");
+        }
+
+        // Reopen with a different key size (16) -> different BUCKET_SIZE -> rejected.
+        let builder = BuildHasherDefault::<FxHasher>::default();
+        let res =
+            HdxIndex::<16>::open_hdx_file(tmp_path.join("index.hdx"), &data_header, builder, false);
+        assert!(
+            matches!(res, Err(LoadHeaderError::InvalidIndexGeometry)),
+            "expected InvalidIndexGeometry, got {res:?}"
+        );
     }
 }

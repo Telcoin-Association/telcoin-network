@@ -13,6 +13,7 @@ members = [
     "crates/network-types",
     "crates/network-libp2p",
     "crates/state-sync",
+    "crates/tn-metrics",
     "crates/tn-reth",
     "crates/e2e-tests",
     "crates/telcoin-network-cli",
@@ -69,7 +70,10 @@ futures = "0.3"
 tokio = { version = "1.44", default-features = false }
 tracing = "0.1.0"
 tracing-subscriber = { version = "0.3.20", default-features = false }
-metrics = "0.23.0"                                     # Needed for `metrics-macro` to resolve the crate using `::metrics` notation
+metrics = "0.24"                                       # Must stay in sync with reth's `metrics` version - a mismatch silently splits the global recorder
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+metrics-process = "2.4"
+metrics-util = "0.20"
 serde_json = "1.0.94"
 humantime-serde = "1.1"
 fdlimit = "0.3.0"
@@ -123,6 +127,7 @@ reth-eth-wire = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-cli-util = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-libmdbx = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-metrics = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 
 # eth
 alloy = { version = "1.6.3", features = ["full"] }
@@ -141,6 +146,7 @@ assert_matches = { version = "1.5.0" }
 
 # common
 tn-types = { path = "./crates/types" }
+tn-metrics = { path = "./crates/tn-metrics" }
 tn-reth = { path = "./crates/tn-reth" }
 tn-node = { path = "./crates/node" }
 tn-config = { path = "./crates/config" }
@@ -211,8 +217,6 @@ opentelemetry-otlp = "0.31.0"
 opentelemetry-stdout = "0.31.0"
 opentelemetry-semantic-conventions = "0.31.0"
 tracing-opentelemetry = "0.32"
-# consensus metrics
-axum = { version = "0.8.6", default-features = false }
 # healthcheck
 http = { version = "1.3.1" }
 backoff = { version = "0.4.0", features = [

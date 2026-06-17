@@ -215,7 +215,16 @@ where
 
     /// Read raw bytes from the file.  Will return an error if not able to read all the bytes.
     fn read_bytes(&mut self, start_pos: u64, end_pos: u64) -> Result<Vec<u8>, FetchError> {
-        let mut bytes = vec![0; end_pos.saturating_sub(start_pos) as usize];
+        // Validate the range against the file length before allocating so a corrupt or
+        // oversized bound (the position index has no per-record CRC) errors instead of
+        // triggering a huge up-front allocation that would only fail at read_exact.
+        if start_pos > end_pos || end_pos > self.data_file.len() {
+            return Err(FetchError::IO(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "read_bytes range out of bounds",
+            )));
+        }
+        let mut bytes = vec![0; (end_pos - start_pos) as usize];
         self.data_file.seek(SeekFrom::Start(start_pos))?;
         self.data_file.read_exact(&mut bytes[..])?;
         Ok(bytes)
@@ -968,5 +977,71 @@ mod tests {
             Some(Err(FetchError::IO(_))) | Some(Err(FetchError::DeserializeValue(_))) => {}
             other => panic!("expected IO or DeserializeValue error, got {other:?}"),
         }
+    }
+
+    /// Build a valid pack, then patch the header's version field to 1 and recompute the
+    /// header CRC so the corruption survives the integrity check.  Both the sync and async
+    /// open paths must reject the unexpected version (the async path historically did not).
+    fn build_pack_with_bad_version() -> (TempDir, std::path::PathBuf) {
+        let tmp_path = TempDir::with_prefix("test_pack_bad_version").expect("temp dir");
+        let path = tmp_path.path().join("pack_badver");
+        {
+            let mut pack: TestPack =
+                Pack::open(&path, 0, false, PackCompression::ZStd).expect("open pack");
+            pack.append(&TestRec { idx: 1, name: "v".to_string() }).expect("append");
+            pack.commit().expect("commit");
+        }
+        // Patch version (bytes 6..8) to 1 and re-stamp the header CRC over bytes [0, 24).
+        let mut header = [0_u8; DATA_HEADER_BYTES];
+        {
+            let mut file = OpenOptions::new().read(true).write(true).open(&path).expect("open rw");
+            file.read_exact(&mut header).expect("read header");
+            header[6..8].copy_from_slice(&1_u16.to_le_bytes());
+            add_crc32(&mut header);
+            file.seek(SeekFrom::Start(0)).expect("seek");
+            file.write_all(&header).expect("write header");
+            file.flush().expect("flush");
+        }
+        (tmp_path, path)
+    }
+
+    #[test]
+    fn test_pack_iter_rejects_bad_version_sync() {
+        let (_tmp, path) = build_pack_with_bad_version();
+        let file = File::open(&path).expect("open file");
+        match PackIter::<TestRec, _>::open(file, 0) {
+            Err(LoadHeaderError::InvalidVersion) => {}
+            other => panic!("expected InvalidVersion, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pack_iter_rejects_bad_version_async() {
+        use crate::archive::pack_iter::AsyncPackIter;
+
+        let (_tmp, path) = build_pack_with_bad_version();
+        let file = tokio::fs::File::open(&path).await.expect("open file");
+        match AsyncPackIter::<TestRec, _>::open(file, 0).await {
+            Err(LoadHeaderError::InvalidVersion) => {}
+            other => panic!("expected InvalidVersion, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn test_read_bytes_rejects_out_of_range() {
+        let tmp_path = TempDir::with_prefix("test_read_bytes_oob").expect("temp dir");
+        let path = tmp_path.path().join("pack_oob");
+        let mut pack: TestPack =
+            Pack::open(&path, 0, false, PackCompression::None).expect("open pack");
+        pack.append(&TestRec { idx: 1, name: "x".to_string() }).expect("append");
+        pack.commit().expect("commit");
+
+        // An end far past EOF must error without attempting a giant allocation.
+        assert!(pack.read_bytes(0, u64::MAX).is_err());
+        // An inverted range must error.
+        assert!(pack.read_bytes(100, 10).is_err());
+        // A valid in-range request still works.
+        let len = pack.file_len();
+        assert!(pack.read_bytes(0, len).is_ok());
     }
 }

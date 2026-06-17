@@ -15,8 +15,8 @@ use tn_storage::{
     CertificateStore,
 };
 use tn_types::{
-    AuthorityIdentifier, Certificate, CommittedSubDag, Committee, ConsensusChainReader, Database,
-    Hash as _, HeaderDigest, Noticer, Round, TaskManager, TnReceiver, TnSender,
+    now, AuthorityIdentifier, Certificate, CommittedSubDag, Committee, ConsensusChainReader,
+    Database, Hash as _, HeaderDigest, Noticer, Round, TaskManager, TnReceiver, TnSender,
 };
 use tracing::{debug, error, info, instrument};
 
@@ -443,6 +443,13 @@ impl<DB: Database> Consensus<DB> {
                         own_rounds_committed.push(header.round())
                     }
                 }
+
+                // Metric: subdag committed + commit latency (second granularity - the
+                // leader timestamp is in whole seconds; flags pathological commits)
+                let metrics = self.consensus_bus.app().metrics();
+                metrics.subdags_committed_total.increment(1);
+                let leader_created = *committed_sub_dag.leader().created_at();
+                metrics.commit_latency_seconds.record(now().saturating_sub(leader_created) as f64);
 
                 // NOTE: The size of the sub-dag can be arbitrarily large (depending on the network
                 // condition and Byzantine leaders).

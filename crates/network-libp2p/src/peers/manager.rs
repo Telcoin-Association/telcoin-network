@@ -10,6 +10,7 @@ use super::{
 };
 use crate::{
     error::NetworkError,
+    metrics::PeerManagerMetrics,
     peers::status::ConnectionStatus,
     send_or_log_error,
     types::{NetworkInfo, NetworkResult, RpcInfo},
@@ -71,11 +72,13 @@ pub(crate) struct PeerManager {
     /// These peers are not connected and reserved for dial attempts at heartbeat intervals if
     /// connections drop.
     discovery_peers: HashMap<PeerId, Vec<Multiaddr>>,
+    /// Prometheus metrics for peer lifecycle events.
+    pub(super) metrics: PeerManagerMetrics,
 }
 
 impl PeerManager {
     /// Create a new instance of Self.
-    pub(crate) fn new(config: &PeerConfig) -> Self {
+    pub(crate) fn new(config: &PeerConfig, metrics: PeerManagerMetrics) -> Self {
         let heartbeat =
             tokio::time::interval(tokio::time::Duration::from_secs(config.heartbeat_interval));
 
@@ -98,6 +101,7 @@ impl PeerManager {
             dial_requests: Default::default(),
             temporarily_banned,
             discovery_peers: Default::default(),
+            metrics,
         }
     }
 
@@ -265,6 +269,12 @@ impl PeerManager {
             banned_count,
             "peer metrics heartbeat"
         );
+        self.metrics.set_peer_counts(
+            connected_count,
+            self.known_peers.len(),
+            self.discovery_peers.len(),
+            banned_count,
+        );
 
         // enforce connection limits
         self.prune_connected_peers();
@@ -373,6 +383,7 @@ impl PeerManager {
     /// Some reports are propagated to libp2p network layer. Caller is responsible
     /// for specifying the severity of the penalty to apply.
     pub(crate) fn process_penalty(&mut self, peer_id: PeerId, penalty: Penalty) {
+        self.metrics.record_penalty(&penalty);
         let action = self.peers.process_penalty(&peer_id, penalty);
 
         debug!(target: "peer-manager", ?peer_id, ?action, "processed penalty");
@@ -383,6 +394,7 @@ impl PeerManager {
     ///
     /// The peer is disconnected and is banned from network layer.
     fn process_ban(&mut self, peer_id: &PeerId) {
+        self.metrics.record_peer_banned();
         // ensure unbanned events are removed for this peer
         self.events.retain(|event| {
             if let PeerEvent::Unbanned(unbanned_peer_id) = event {
@@ -508,7 +520,7 @@ impl PeerManager {
         let ready_to_prune = connected_peers
             .iter()
             .filter_map(|(peer_id, peer)| {
-                if !self.is_peer_validator(peer_id) && !peer.is_trusted() {
+                if !self.is_peer_validator(peer_id) && !peer.is_operator_allowlisted() {
                     Some(*peer_id)
                 } else {
                     None
@@ -597,10 +609,10 @@ impl PeerManager {
         self.peers.get_peer(peer_id).map(|peer| peer.score().aggregate_score())
     }
 
-    /// Bool indicating if the peer is trusted or a validator.
+    /// Bool indicating if the peer is operator-allowlisted or a validator.
     pub(crate) fn peer_is_important(&self, peer_id: &PeerId) -> bool {
         self.is_peer_validator(peer_id)
-            || self.peers.get_peer(peer_id).map(|p| p.is_trusted()).unwrap_or_default()
+            || self.peers.get_peer(peer_id).map(|p| p.is_operator_allowlisted()).unwrap_or_default()
     }
 
     /// Set the previous/current/next committees directly from authoritative state, every epoch.
