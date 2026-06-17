@@ -1,10 +1,14 @@
 //! Unit tests for peer manager
 
 use super::*;
-use crate::common::{create_multiaddr, random_ip_addr};
+use crate::{
+    common::{create_multiaddr, random_ip_addr},
+    consensus::partial_peers_from_get_closest_timeout,
+};
 use assert_matches::assert_matches;
 use libp2p::{
     core::Endpoint,
+    kad::GetClosestPeersError,
     swarm::{ConnectionId, NetworkBehaviour as _},
 };
 use rand::{rngs::StdRng, SeedableRng as _};
@@ -1028,6 +1032,29 @@ async fn test_process_peers_for_discovery_filters_duplicates() {
 
     // should only have one entry
     assert_eq!(peer_manager.discovery_peers.len(), 1);
+    assert_eq!(peer_manager.discovery_peers.remove(&peer_id), Some(vec![addr]));
+}
+
+#[tokio::test]
+async fn test_get_closest_peers_timeout_recovers_partial_peers() {
+    // Regression: a kademlia `GetClosestPeers` query that times out still reports
+    // the peers it located before expiring, and those peers must reach the
+    // discovery pool instead of being discarded along with the failed query.
+    let mut peer_manager = create_test_peer_manager(None);
+    let peer_id = PeerId::random();
+    let addr = create_multiaddr(None);
+    let peer_info = PeerInfo { peer_id, addrs: vec![addr.clone()] };
+
+    // kademlia surfaces a timeout carrying the closest peers found so far
+    let err = GetClosestPeersError::Timeout { key: peer_id.to_bytes(), peers: vec![peer_info] };
+
+    // the recovery helper must hand back exactly the peers the query located
+    let recovered = partial_peers_from_get_closest_timeout(err);
+    assert_eq!(recovered.len(), 1);
+
+    // feeding them through the discovery sink registers the peer as a discovery
+    // candidate, exactly as a successful query would have
+    peer_manager.process_peers_for_discovery(recovered);
     assert_eq!(peer_manager.discovery_peers.remove(&peer_id), Some(vec![addr]));
 }
 
