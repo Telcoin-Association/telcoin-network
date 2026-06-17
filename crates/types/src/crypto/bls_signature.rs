@@ -4,7 +4,7 @@ use super::{BlsKeypair, BlsPublicKey, Intent, IntentMessage, IntentScope, Signer
 use crate::encode;
 use alloy::primitives::Address;
 use blst::min_sig::{
-    AggregateSignature as CoreBlsAggregateSignature, PublicKey, Signature as CoreBlsSignature,
+    AggregateSignature as CoreBlsAggregateSignature, Signature as CoreBlsSignature,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -160,41 +160,55 @@ pub fn generate_proof_of_possession_bls_for_test(
     keypair: &BlsKeypair,
     address: &Address,
 ) -> eyre::Result<BlsSignature> {
-    let msg = construct_proof_of_possession_message(keypair.public(), address)?;
-    let sig = BlsSignature::new_secure(&msg, keypair);
-
-    Ok(sig)
+    let msg = construct_proof_of_possession_message(keypair.public(), address);
+    Ok(keypair.sign(&msg))
 }
 
-/// Verify proof of possession against the expected intent message,
-///
-/// The intent message is expected to contain the validator's public key
-/// and the [Genesis] for the network.
+/// Verify a validator's BLS proof of possession: that `proof` is a valid signature, under
+/// `public_key`, over [`construct_proof_of_possession_message`] for `address`. Reconstructs the
+/// expected message (binding the key and the address) and verifies it through the generic
+/// [`bls_verify_secure`] primitive.
 pub fn verify_proof_of_possession_bls(
     proof: &BlsSignature,
     public_key: &BlsPublicKey,
     address: &Address,
 ) -> eyre::Result<()> {
     public_key.validate().map_err(|_| eyre::eyre!("Bls Public Key not valid!"))?;
-    let msg = construct_proof_of_possession_message(public_key, address)?;
-    if proof.verify_secure(&msg, public_key) {
+    let msg = construct_proof_of_possession_message(public_key, address);
+    if bls_verify_secure(proof, public_key, &msg) {
         Ok(())
     } else {
         Err(eyre::eyre!("Failed to verify proof of possession!"))
     }
 }
 
+/// Verify a BLS signature over a raw `message` under `public_key`, with full security (signature and
+/// public-key subgroup checks) and the protocol [`DST_G1`]. This is the generic primitive the native
+/// BLS precompile exposes: proof-of-possession is just one message it can verify, so any caller can
+/// verify an arbitrary BLS-signed message without the verifier hard-coding the message's meaning.
+pub fn bls_verify_secure(
+    signature: &BlsSignature,
+    public_key: &BlsPublicKey,
+    message: &[u8],
+) -> bool {
+    signature.verify(true, message, DST_G1, &[], public_key, true) == blst::BLST_ERROR::BLST_SUCCESS
+}
+
+/// The proof-of-possession message a validator signs to prove control of its BLS key and bind it to
+/// its execution `address`. Layout: `intentPrefix(3) || compressedBlsPubkey(96) || address(20)` =
+/// 119 raw bytes, where `intentPrefix` is the serialized telcoin proof-of-possession [`Intent`]
+/// (`0x000000`). Using the compressed pubkey and the raw address makes this cheaply reconstructable
+/// on-chain, so the `ConsensusRegistry` builds the identical bytes and verifies them through the
+/// native BLS precompile ([`bls_verify_secure`]). Returned as raw bytes (not wrapped in an
+/// [`IntentMessage`]) since both the signer and the on-chain verifier operate on the bytes directly.
 pub fn construct_proof_of_possession_message(
     bls_pubkey: &BlsPublicKey,
     address: &Address,
-) -> eyre::Result<IntentMessage<Vec<u8>>> {
-    let mut msg_unprefixed = PublicKey::serialize(bls_pubkey).to_vec();
-    let address_bytes = encode(address);
-    msg_unprefixed.extend_from_slice(address_bytes.as_slice());
-
-    let msg = IntentMessage::new(Intent::telcoin(IntentScope::ProofOfPossession), msg_unprefixed);
-
-    Ok(msg)
+) -> Vec<u8> {
+    let mut message = encode(&Intent::telcoin(IntentScope::ProofOfPossession));
+    message.extend_from_slice(bls_pubkey.to_bytes().as_slice());
+    message.extend_from_slice(address.as_slice());
+    message
 }
 
 /// A trait for sign and verify over an intent message, instead of the message itself. See more at
@@ -359,10 +373,32 @@ mod tests {
         let from_compressed =
             BlsPublicKey::from_literal_bytes(&original.to_bytes()).expect("compressed roundtrip");
 
-        let msg_a = encode(&construct_proof_of_possession_message(original, &address).unwrap());
-        let msg_b =
-            encode(&construct_proof_of_possession_message(&from_compressed, &address).unwrap());
+        let msg_a = construct_proof_of_possession_message(original, &address);
+        let msg_b = construct_proof_of_possession_message(&from_compressed, &address);
         assert_eq!(msg_a, msg_b, "compressed-decoded key rebuilds a byte-identical PoP message");
+    }
+
+    /// Guards the on-chain message layout: `ConsensusRegistry` reconstructs this exact byte string
+    /// (`intentPrefix(3 = 0x000000) || compressedPubkey(96) || address(20)`), so any drift in the
+    /// layout or the intent prefix must be mirrored on-chain.
+    #[test]
+    fn pop_message_layout_is_onchain_constructible() {
+        let keypair = BlsKeypair::generate(&mut StdRng::from_seed([7u8; 32]));
+        let address = Address::repeat_byte(0x22);
+        let msg = construct_proof_of_possession_message(keypair.public(), &address);
+
+        assert_eq!(msg.len(), 3 + 96 + 20, "PoP message is intent(3) + pubkey(96) + address(20)");
+        assert_eq!(
+            &msg[0..3],
+            &[0u8, 0, 0],
+            "telcoin proof-of-possession intent prefix is 0x000000"
+        );
+        assert_eq!(
+            &msg[3..99],
+            keypair.public().to_bytes().as_slice(),
+            "compressed pubkey segment"
+        );
+        assert_eq!(&msg[99..119], address.as_slice(), "address segment");
     }
 
     // --- BlsSignature::from_bytes ---
