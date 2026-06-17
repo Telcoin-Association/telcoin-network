@@ -791,8 +791,9 @@ where
             }
             NetworkCommand::OpenStream { peer, reply } => {
                 // Look up the peer's PeerId from their BLS key
-                let peer_id = match self.swarm.behaviour().peer_manager.auth_to_peer(peer) {
-                    Some((id, _addrs)) => id,
+                let (peer_id, addrs) = match self.swarm.behaviour().peer_manager.auth_to_peer(peer)
+                {
+                    Some((id, addrs)) => (id, addrs),
                     None => {
                         debug!(
                             target: "network",
@@ -813,7 +814,7 @@ where
                 // Pass the reply channel directly to the stream behavior.
                 // The stream (or error) will be returned to the caller via oneshot
                 // without any intermediate tracking.
-                self.swarm.behaviour_mut().stream.open_stream(peer_id, reply);
+                self.swarm.behaviour_mut().stream.open_stream(peer_id, addrs, reply);
             }
             #[cfg(test)]
             NetworkCommand::KadStoreGet { key, reply } => {
@@ -1326,6 +1327,23 @@ where
                 } else {
                     warn!(target: "network", ?peer, "received inbound stream from unknown peer");
                 }
+            }
+            StreamEvent::OutboundFailure { peer, failure }
+            | StreamEvent::InboundFailure { peer, failure } => {
+                // Classified for scoring but reported metrics-only until telemetry
+                // confirms the classification does not fire on healthy peers (see
+                // #739). Once confirmed, the matching penalty is enforced via
+                // `peer_manager.process_penalty(peer, penalty)`.
+                failure.penalty().map_or_else(
+                    || trace!(target: "network", ?peer, ?failure, "stream failure (no penalty)"),
+                    |penalty| {
+                        debug!(
+                            target: "network",
+                            ?peer, ?failure, ?penalty,
+                            "stream failure classified (metrics-only, not enforced)"
+                        )
+                    },
+                );
             }
         }
         Ok(())
