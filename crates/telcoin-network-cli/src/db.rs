@@ -16,13 +16,6 @@ use tn_reth::{
 /// Inspect the execution database and print read-only statistics.
 #[derive(Debug, Parser)]
 pub struct DbCommand {
-    /// The path to the data directory. Overrides the global --datadir flag when specified here.
-    ///
-    /// Placing --datadir between 'db' and the subcommand mirrors the reth CLI style:
-    ///   telcoin-network db --datadir /app/data stats
-    #[arg(long, value_name = "DATA_DIR")]
-    datadir: Option<PathBuf>,
-
     /// Database diagnostics subcommand.
     #[command(subcommand)]
     command: DbSubcommand,
@@ -38,11 +31,11 @@ enum DbSubcommand {
 impl DbCommand {
     /// Execute the database diagnostics command.
     ///
-    /// `global_datadir` is the value of the top-level `--datadir` flag (if any). The
-    /// per-subcommand `--datadir` on `DbCommand` takes precedence when provided, enabling
-    /// the reth-style invocation: `telcoin-network db --datadir PATH stats`.
-    pub fn execute(&self, global_datadir: PathBuf) -> eyre::Result<()> {
-        let datadir = self.datadir.clone().unwrap_or(global_datadir);
+    /// `datadir` is the resolved top-level `--datadir`. Because that flag is global, clap
+    /// propagates it to every level, so it can be placed before `db`, between `db` and the
+    /// subcommand (reth-style, `telcoin-network db --datadir PATH stats`), or after the
+    /// subcommand.
+    pub fn execute(&self, datadir: PathBuf) -> eyre::Result<()> {
         match self.command {
             DbSubcommand::Stats => {
                 let db_path = datadir.reth_db_path();
@@ -176,12 +169,19 @@ fn static_files_summary_table_for_datadir(datadir: &Path) -> eyre::Result<Option
                 }
                 _ => String::new(),
             },
-            tx_range: ranges
-                .iter()
-                .find_map(|(_, header)| {
-                    header.tx_range().map(|range| format!("{}..={}", range.start(), range.end()))
-                })
-                .unwrap_or_else(|| "N/A".to_string()),
+            // Tx ranges can be empty (e.g. the Headers segment), so span the first non-empty
+            // jar's start to the last non-empty jar's end — mirroring `block_range` above, not
+            // just the first jar's range.
+            tx_range: {
+                let start =
+                    ranges.iter().find_map(|(_, header)| header.tx_range().map(|r| r.start()));
+                let end =
+                    ranges.iter().rev().find_map(|(_, header)| header.tx_range().map(|r| r.end()));
+                match (start, end) {
+                    (Some(start), Some(end)) => format!("{start}..={end}"),
+                    _ => "N/A".to_string(),
+                }
+            },
             total_size: segment_size,
         });
     }
@@ -293,16 +293,16 @@ mod tests {
     }
 
     #[test]
-    fn parses_per_subcommand_datadir_between_db_and_stats() {
-        // The documented invocation places --datadir between `db` and the subcommand. clap does
-        // not propagate the global --datadir into `db` (which defines its own), so the
-        // per-subcommand flag must capture the value here.
+    fn global_datadir_parses_between_db_and_stats() {
+        // `--datadir` is a global flag, so clap accepts it between `db` and the subcommand (the
+        // reth-style invocation) and captures it on the top-level Cli — no per-subcommand flag
+        // is needed.
         let cli = Cli::<NoArgs>::try_parse_args_from(["tn", "db", "--datadir", "/tmp/x", "stats"])
             .expect("cli parsed");
-        let Commands::Db(cmd) = cli.command else {
+        assert_eq!(cli.datadir.as_deref(), Some(Path::new("/tmp/x")));
+        let Commands::Db(_) = cli.command else {
             panic!("expected the db subcommand");
         };
-        assert_eq!(cmd.datadir.as_deref(), Some(Path::new("/tmp/x")));
     }
 
     #[test]
