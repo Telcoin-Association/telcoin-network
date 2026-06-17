@@ -147,8 +147,9 @@ pub use reth_node_core::{
     node_config::DEFAULT_PERSISTENCE_THRESHOLD,
 };
 pub use reth_primitives_traits::crypto::secp256k1::sign_message;
-pub use reth_provider::providers::StaticFileProvider;
-pub use reth_provider::{CanonStateNotificationStream, ChangedAccount};
+pub use reth_provider::{
+    providers::StaticFileProvider, CanonStateNotificationStream, ChangedAccount,
+};
 pub use reth_rpc_eth_types::EthApiError;
 pub use reth_tracing::{FileWorkerGuard, Layers};
 pub use reth_transaction_pool::{
