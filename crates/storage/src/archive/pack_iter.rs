@@ -173,6 +173,15 @@ where
     /// are returned in insert order.
     pub async fn open(mut reader: R, uid_idx: u64) -> Result<Self, LoadHeaderError> {
         let header = DataHeader::load_header_async(&mut reader, uid_idx).await?;
+        // Mirror PackIter::open / PackInner::open_data_file: reject unexpected version/appnum
+        // so the (peer-facing) async path rejects future/foreign formats instead of parsing
+        // them with current-format logic.
+        if header.version() != 0 {
+            return Err(LoadHeaderError::InvalidVersion);
+        }
+        if header.appnum() != 1 {
+            return Err(LoadHeaderError::InvalidAppNum);
+        }
         Ok(AsyncPackIter {
             _val: PhantomData,
             reader,
