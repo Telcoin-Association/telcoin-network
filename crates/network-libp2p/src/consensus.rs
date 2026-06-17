@@ -855,8 +855,11 @@ where
 
                 // process gossip in application layer
                 if valid {
-                    // We should not be able to recieve a message from an unknown peer so this
-                    // should always work.
+                    // A peer is `Connected` before its `NodeRecord` resolves its BLS
+                    // identity, so a live mesh neighbor can relay a message before
+                    // `peer_to_bls` can resolve it. This is rare on a warm node but
+                    // reachable, so handle the unresolved case explicitly instead of
+                    // dropping an accepted message with no trace.
                     if let Some(bls) =
                         self.swarm.behaviour().peer_manager.peer_to_bls(&propagation_source)
                     {
@@ -869,6 +872,19 @@ where
                             // During epoch change the event_stream reciever can be closed.
                             return Ok(());
                         }
+                    } else {
+                        // The message was accepted into the mesh (and re-propagated),
+                        // but this node cannot yet resolve the relaying peer's BLS
+                        // identity, so it is not delivered to the local consensus
+                        // layer. Warn so the drop is observable rather than silent;
+                        // the node recovers the payload via sync once the identity
+                        // resolves.
+                        warn!(
+                            target: "network",
+                            ?propagation_source,
+                            ?message_id,
+                            "accepted gossip not delivered locally: relaying peer's BLS identity is not yet resolved"
+                        );
                     }
                 } else {
                     self.metrics.record_gossip_rejected();
@@ -975,16 +991,13 @@ where
 
                         // try to forward response to original caller
                         let _ = self.outbound_requests.remove(&(peer, request_id)).map(|ack| {
-                            if let Some(key) =
-                                self.swarm.behaviour().peer_manager.peer_to_bls(&peer)
-                            {
-                                let _ = ack.send(Ok(NetworkResponseMessage {
-                                    peer: key,
-                                    result: response,
-                                }));
-                            } else {
-                                let _ = ack.send(Err(NetworkError::PeerMissing));
-                            }
+                            // The response payload is genuine (we still hold the
+                            // matching outbound request). If the responder's BLS
+                            // identity has not resolved yet, report a transient
+                            // `PeerUnresolved` rather than a misleading `PeerMissing`
+                            // so the caller does not retry a request that succeeded.
+                            let resolved = self.swarm.behaviour().peer_manager.peer_to_bls(&peer);
+                            let _ = ack.send(resolve_response(resolved, response));
                         });
                     }
                 }
@@ -1692,4 +1705,20 @@ where
             .field("swarm", &"<swarm>") // Skip detailed debug for swarm
             .finish()
     }
+}
+
+/// Pair a response payload with the responding peer's resolved BLS identity.
+///
+/// The payload is genuine whenever this node still holds the matching outbound
+/// request, so a peer whose identity has not resolved yet (it connected before
+/// its `NodeRecord` populated the confirmed-identity index) is reported as a
+/// transient [`NetworkError::PeerUnresolved`] rather than the misleading
+/// [`NetworkError::PeerMissing`].
+fn resolve_response<Res: TNMessage>(
+    resolved: Option<BlsPublicKey>,
+    response: Res,
+) -> NetworkResult<NetworkResponseMessage<Res>> {
+    resolved
+        .map(|peer| NetworkResponseMessage { peer, result: response })
+        .ok_or(NetworkError::PeerUnresolved)
 }
