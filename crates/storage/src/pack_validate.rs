@@ -87,15 +87,18 @@ pub enum PackIssue {
         /// The unreferenced batch digest.
         digest: BlockHash,
     },
-    /// A consensus number exceeds the epoch's known final consensus number.
+    /// A consensus header's `number` is not the next sequential value.
     ///
-    /// Only emitted when a final number is known (not for a bare-file validate, which has no
-    /// authoritative final number to compare against).
-    ConsensusNumberTooHigh {
-        /// The offending consensus number.
-        number: u64,
-        /// The epoch's final consensus number.
-        final_number: u64,
+    /// Mirrors the importer's [`Inner::save_consensus_output`](crate::consensus_pack) check, which
+    /// rejects any output whose number is not exactly `start_consensus_number +
+    /// headers_written_so_far`. `expected` is position-based (derived from how many headers
+    /// preceded this one, not from the previous header's recorded number), so a single bad
+    /// header does not cascade into spurious issues for every following header.
+    NonSequentialConsensusNumber {
+        /// The number this header should have carried, given its position in the stream.
+        expected: u64,
+        /// The `number` actually recorded on the header.
+        found: u64,
     },
     /// The `EpochMeta` record failed cross-checks (epoch mismatch, or full linkage when a previous
     /// [`EpochRecord`] is supplied).
@@ -249,6 +252,22 @@ pub fn validate_pack_file(
                 first_consensus_number.get_or_insert(number);
                 last_consensus_number = Some(number);
 
+                // 0. Sequential numbering, mirroring `Inner::save_consensus_output`. The expected
+                // number is position-based: `start + (headers seen before this one)`. Because the
+                // header `number` is hashed into the digest, a *missing/reordered* header normally
+                // trips the `parent_hash` chain check below — but a corrupted number on the final
+                // header has no successor to catch it, and the importer rejects any non-sequential
+                // number outright, so check it explicitly here. Keeping `expected` position-based
+                // (not "previous number + 1") means one bad header doesn't cascade into spurious
+                // issues for every following header.
+                let expected_number = start_consensus_number + (consensus_count - 1);
+                if number != expected_number {
+                    issues.push(PackIssue::NonSequentialConsensusNumber {
+                        expected: expected_number,
+                        found: number,
+                    });
+                }
+
                 // 1. Chain continuity (skip when we have no anchor yet).
                 if let Some(parent) = expected_parent {
                     if consensus_header.parent_hash != parent {
@@ -329,7 +348,7 @@ impl Display for PackValidationReport {
         let mut missing_absent = 0usize;
         let mut missing_misordered = 0usize;
         let mut extra = 0usize;
-        let mut too_high = 0usize;
+        let mut non_sequential = 0usize;
         let mut meta = 0usize;
         for issue in &self.issues {
             match issue {
@@ -339,7 +358,7 @@ impl Display for PackValidationReport {
                     missing_misordered += 1
                 }
                 PackIssue::ExtraBatch { .. } => extra += 1,
-                PackIssue::ConsensusNumberTooHigh { .. } => too_high += 1,
+                PackIssue::NonSequentialConsensusNumber { .. } => non_sequential += 1,
                 PackIssue::EpochMetaMismatch { .. } => meta += 1,
             }
         }
@@ -364,7 +383,7 @@ impl Display for PackValidationReport {
             missing_absent + missing_misordered
         )?;
         writeln!(f, "  extra batches:          {extra}")?;
-        writeln!(f, "  consensus num too high: {too_high}")?;
+        writeln!(f, "  non-sequential numbers: {non_sequential}")?;
         writeln!(f, "  epoch meta mismatches:  {meta}")?;
 
         if self.issues.is_empty() {
@@ -386,8 +405,8 @@ impl Display for PackValidationReport {
                 PackIssue::ExtraBatch { number, digest } => {
                     writeln!(f, "  consensus {number}  EXTRA BATCH    {digest}")?
                 }
-                PackIssue::ConsensusNumberTooHigh { number, final_number } => {
-                    writeln!(f, "  consensus {number}  NUMBER TOO HIGH (final is {final_number})")?
+                PackIssue::NonSequentialConsensusNumber { expected, found } => {
+                    writeln!(f, "  consensus {found}  NON-SEQUENTIAL  (expected {expected})")?
                 }
                 PackIssue::EpochMetaMismatch { detail } => writeln!(f, "  EPOCH META     {detail}")?,
             }
@@ -578,5 +597,81 @@ mod test {
         assert!(extra, "expected ExtraBatch at consensus 5; issues: {:?}", report.issues);
         // Nothing should be classified Absent — the batch is still in the file.
         assert_eq!(report.missing_batch_count(BatchClass::Absent), 0);
+    }
+
+    /// Overwrite the `number` field of the consensus header that currently carries `current`.
+    fn set_consensus_number(records: &mut [PackRecord], current: u64, new: u64) {
+        let rec = records
+            .iter_mut()
+            .find(|r| matches!(r, PackRecord::Consensus(h) if h.number == current))
+            .expect("consensus header present");
+        if let PackRecord::Consensus(h) = rec {
+            h.number = new;
+        }
+    }
+
+    /// A corrupted `number` on the *final* header has no successor to trip the `parent_hash` chain
+    /// check, so only the explicit sequential-number check (mirroring the importer) catches it.
+    #[test]
+    fn test_validate_non_sequential_trailing_header() {
+        let (temp_dir, committee, chain) = setup();
+        let outputs = make_outputs(&committee, chain, 5);
+        let (mut records, _) = build_records(epoch0_meta(&committee), &outputs);
+
+        // The 5th (last) header should carry number 5; corrupt it to 99.
+        set_consensus_number(&mut records, 5, 99);
+
+        let path = temp_dir.path().join("data");
+        write_records(&path, &records);
+
+        let report = validate_pack_file(&path, 0, None).expect("validate");
+        assert_eq!(report.verdict, Verdict::Invalid);
+        let non_seq = report.issues.iter().any(|i| {
+            matches!(i, PackIssue::NonSequentialConsensusNumber { expected: 5, found: 99 })
+        });
+        assert!(
+            non_seq,
+            "expected NonSequentialConsensusNumber(expected 5, found 99); issues: {:?}",
+            report.issues
+        );
+        // The chain check alone misses this: the final header has no successor whose parent_hash
+        // would mismatch, so no ChainBreak fires — the sequential check is what catches it.
+        let chain_breaks =
+            report.issues.iter().filter(|i| matches!(i, PackIssue::ChainBreak { .. })).count();
+        assert_eq!(chain_breaks, 0, "trailing-number corruption should not trip ChainBreak");
+    }
+
+    /// A corrupted middle header number fires exactly one sequential-number issue: `expected` is
+    /// position-based, so the corruption does not cascade into a spurious issue on every following
+    /// header.
+    #[test]
+    fn test_validate_non_sequential_middle_header() {
+        let (temp_dir, committee, chain) = setup();
+        let outputs = make_outputs(&committee, chain, 5);
+        let (mut records, _) = build_records(epoch0_meta(&committee), &outputs);
+
+        // The header at position 3 should carry number 3; corrupt it to 7.
+        set_consensus_number(&mut records, 3, 7);
+
+        let path = temp_dir.path().join("data");
+        write_records(&path, &records);
+
+        let report = validate_pack_file(&path, 0, None).expect("validate");
+        assert_eq!(report.verdict, Verdict::Invalid);
+        let non_seq: Vec<_> = report
+            .issues
+            .iter()
+            .filter(|i| matches!(i, PackIssue::NonSequentialConsensusNumber { .. }))
+            .collect();
+        assert_eq!(
+            non_seq.len(),
+            1,
+            "expected exactly one non-sequential issue (no cascade); issues: {:?}",
+            report.issues
+        );
+        assert!(matches!(
+            non_seq[0],
+            PackIssue::NonSequentialConsensusNumber { expected: 3, found: 7 }
+        ));
     }
 }
