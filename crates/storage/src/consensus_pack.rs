@@ -937,6 +937,17 @@ impl Inner {
         let consensus_number = consensus.number();
         // Adjusted consensus index for this pack file.
         let consensus_idx = consensus_number.saturating_sub(self.epoch_meta.start_consensus_number);
+        let epoch = consensus.sub_dag().leader_epoch();
+        if epoch != self.epoch_meta.epoch {
+            // Trying to save to the wrong epoch...
+            return Err(PackError::InvalidEpoch(
+                epoch,
+                format!(
+                    "Tried to save output from epoch {epoch} to the pack file for epoch {}",
+                    self.epoch_meta.epoch
+                ),
+            ));
+        }
         // Make sure this number is valid before we write anything...
         if (consensus_idx as usize) < self.consensus_pos_idx.len() {
             // If we have saved this output already then ignore it.
@@ -1258,15 +1269,19 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
             }
         }
     }
-    if let Some(header) = header {
-        let parent_hash = header.parent_hash;
-        let deliver = header.sub_dag;
+    if let Some(consensus_header) = header {
+        let parent_hash = consensus_header.parent_hash;
+        let deliver = consensus_header.sub_dag;
         let num_blocks = deliver.num_primary_batches();
         let num_certs = deliver.len();
 
         let sub_dag = deliver;
         if num_blocks == 0 {
-            return Ok(ConsensusOutput::new_with_subdag(sub_dag, parent_hash, header.number));
+            return Ok(ConsensusOutput::new_with_subdag(
+                sub_dag,
+                parent_hash,
+                consensus_header.number,
+            ));
         }
 
         let mut batch_digests = VecDeque::with_capacity(num_certs);
@@ -1296,7 +1311,18 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
                         .chain(cert_batches.iter())
                         .find(|b| b.digest() == *digest)
                     {
+                        #[cfg(not(feature = "adiri"))]
                         cert_batches.push(batch.clone());
+
+                        #[cfg(feature = "adiri")]
+                        if sub_dag.leader_epoch() > tn_types::forks::ADIRI_DUP_BATCH_EPOCH {
+                            // ADIRI BUG
+                            // Epoch 74 and possibly other early epochs of adiri testnet had a bug
+                            // with duplicate batches. We have to
+                            // recreate it in order to sync testnet so we skip this push
+                            // on adiri with early epochs.
+                            cert_batches.push(batch.clone());
+                        }
                     } else {
                         return Err(PackError::MissingBatch);
                     }
@@ -1313,7 +1339,14 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
                 return Err(PackError::MissingAuthority);
             }
         }
-        Ok(ConsensusOutput::new(sub_dag, parent_hash, header.number, false, batch_digests, batches))
+        Ok(ConsensusOutput::new(
+            sub_dag,
+            parent_hash,
+            consensus_header.number,
+            false,
+            batch_digests,
+            batches,
+        ))
     } else {
         Err(PackError::NotConsensus)
     }
@@ -1651,6 +1684,44 @@ pub(crate) mod test {
                 assert_eq!(b1, b2, "Batches (with certified batch) not the same");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_pack_save_wrong_epoch_rejected() {
+        let temp_dir = TempDir::with_prefix("test_pack_wrong_epoch").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let pack = ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee.clone())
+            .expect("open pack");
+
+        // An output whose leader epoch differs from the pack's epoch must be rejected by
+        // Inner::save_consensus_output rather than appended at a saturated index.
+        let next_committee = committee.advance_epoch_for_test(1);
+        let parent = ConsensusHeader::default().digest();
+        let wrong = make_test_output(&next_committee, 0, chain.clone(), 1, parent);
+        assert_ne!(wrong.sub_dag().leader_epoch(), committee.epoch());
+        pack.save_consensus_output(wrong).await.expect("queued to pack thread");
+
+        // The rejection is delivered asynchronously via the watch channel; poll for it.
+        let mut err = None;
+        for _ in 0..100 {
+            if let Err(e) = pack.get_error() {
+                err = Some(e);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            matches!(err, Some(super::PackError::InvalidEpoch(..))),
+            "expected InvalidEpoch, got {err:?}"
+        );
     }
 
     #[tokio::test]

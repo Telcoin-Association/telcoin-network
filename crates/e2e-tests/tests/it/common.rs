@@ -572,7 +572,7 @@ pub(crate) fn send_tel(
     to_addr.copy_from_slice(to_account.as_slice());
     let (from_account, _, _) = decode_key(key)?;
     let new_transaction = LegacyTransaction {
-        chain: 0x7e1,
+        chain: 0xde7e1,
         nonce,
         to: Some(to_addr),
         value: amount,

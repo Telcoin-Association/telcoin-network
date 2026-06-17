@@ -142,7 +142,12 @@ async fn test_add_trusted_peer() {
     // Add trusted peer
     peer_manager.add_trusted_peer_and_dial(
         peer_bls,
-        NetworkInfo { pubkey: peer_netkey, multiaddrs: vec![multiaddr.clone()], timestamp: now() },
+        NetworkInfo {
+            pubkey: peer_netkey,
+            multiaddrs: vec![multiaddr.clone()],
+            timestamp: now(),
+            rpc: None,
+        },
         sender,
     );
 
@@ -562,6 +567,7 @@ async fn test_is_validator() {
         pubkey: config.key_config().primary_network_public_key(),
         multiaddrs: vec![config.primary_address()],
         timestamp: now(),
+        rpc: None,
     };
     peer_manager.add_known_peer(validator, info);
 
@@ -624,8 +630,12 @@ async fn test_prepare_committee_dial_unbans_without_touching_slots() {
     let bls = *BlsKeypair::generate(&mut rng).public();
     let netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
     let peer_id: PeerId = netkey.clone().into();
-    let info =
-        NetworkInfo { pubkey: netkey, multiaddrs: vec![create_multiaddr(None)], timestamp: now() };
+    let info = NetworkInfo {
+        pubkey: netkey,
+        multiaddrs: vec![create_multiaddr(None)],
+        timestamp: now(),
+        rpc: None,
+    };
     peer_manager.add_known_peer(bls, info);
 
     // manually temp-ban the peer
@@ -657,8 +667,12 @@ async fn test_add_known_peer_closes_validator_gap_on_discovery() {
     let bls = *BlsKeypair::generate(&mut rng).public();
     let netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
     let peer_id: PeerId = netkey.clone().into();
-    let info =
-        NetworkInfo { pubkey: netkey, multiaddrs: vec![create_multiaddr(None)], timestamp: now() };
+    let info = NetworkInfo {
+        pubkey: netkey,
+        multiaddrs: vec![create_multiaddr(None)],
+        timestamp: now(),
+        rpc: None,
+    };
 
     // set the current committee with the member present by bls, BEFORE discovering its peer id
     peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
@@ -740,7 +754,12 @@ async fn test_peers_for_exchange() {
         let bls = *BlsKeypair::generate(&mut rng).public();
         peer_manager.add_known_peer(
             bls,
-            NetworkInfo { pubkey: network_key, multiaddrs: vec![addr], timestamp: now() },
+            NetworkInfo {
+                pubkey: network_key,
+                multiaddrs: vec![addr],
+                timestamp: now(),
+                rpc: None,
+            },
         );
     }
 

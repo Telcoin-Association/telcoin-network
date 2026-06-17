@@ -107,8 +107,8 @@ pub struct GenesisArgs {
     #[arg(long)]
     pub min_header_delay_ms: Option<u64>,
     /// Numeric chain id that will go in the genesis.
-    /// Default is 0x7e1 (2017).
-    #[arg(long, default_value_t = 2017, value_parser=maybe_hex)]
+    /// Default is 0xde7e1 (911329).  Used mostly for testing.
+    #[arg(long, default_value_t = 911329, value_parser=maybe_hex)]
     pub chain_id: u64,
     /// Per-worker fee config overrides at genesis.
     ///

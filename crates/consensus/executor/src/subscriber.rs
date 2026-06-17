@@ -4,7 +4,7 @@ use crate::{errors::SubscriberResult, metrics::ExecutorMetrics, SubscriberError}
 use futures::{stream::FuturesOrdered, StreamExt};
 use state_sync::{last_consensus_parent, save_consensus, spawn_state_sync};
 use std::{
-    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -461,7 +461,6 @@ impl<DB: Database> Subscriber<DB> {
         // SAFETY: 10-node committees * 6-round commit max * 5 batch max = 300 max batch digests
         // possible 32bytes * 300 = 9.6 kb => well within 1MB max message size
         let mut fetched_batches = self.fetch_batches_from_peers(batch_set).await?;
-        let fetched_digests: HashSet<BlockHash> = fetched_batches.keys().copied().collect();
 
         let mut batches = Vec::with_capacity(num_certs);
         // map all fetched batches to their respective certificates for applying block rewards
@@ -488,8 +487,26 @@ impl<DB: Database> Subscriber<DB> {
                     cert_batches.push(batch);
                 } else {
                     // if the batch is a duplicate, the engine will ignore
-                    warn!(target: "subscriber", ?digest, ?batch_digests, "failed to remove fetched batch - possible duplicate");
-                    if !fetched_digests.contains(digest) {
+                    if let Some(batch) = batches
+                        .iter()
+                        .flat_map(|cb: &CertifiedBatch| cb.batches.iter())
+                        .chain(cert_batches.iter())
+                        .find(|b| b.digest() == *digest)
+                    {
+                        warn!(target: "subscriber", ?digest, ?batch_digests, "failed to remove fetched batch - duplicate");
+                        #[cfg(not(feature = "adiri"))]
+                        cert_batches.push(batch.clone());
+
+                        #[cfg(feature = "adiri")]
+                        if sub_dag.leader_epoch() > tn_types::forks::ADIRI_DUP_BATCH_EPOCH {
+                            // ADIRI BUG
+                            // Epoch 74 and possibly other early epochs of adiri testnet had a bug
+                            // with duplicate batches. We have to
+                            // recreate it in order to sync testnet so we skip this push
+                            // on adiri with early epochs.
+                            cert_batches.push(batch.clone());
+                        }
+                    } else {
                         error!(target: "subscriber", ?digest, "[Protocol violation] Batch not found in fetched batches from workers of certificate signers");
                         self.inner.metrics.protocol_violations_total.increment(1);
                         return Err(SubscriberError::MissingFetchedBatch(*digest));

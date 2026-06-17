@@ -39,6 +39,7 @@ assert_matches = { workspace = true }
 [features]
 default = []
 test-utils = ["dep:eyre"]
+adiri = []
 
 [lints]
 workspace = true

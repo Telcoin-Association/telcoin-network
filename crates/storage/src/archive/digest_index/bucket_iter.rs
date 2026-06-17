@@ -106,14 +106,25 @@ impl<'bucket> BucketIter<'bucket> {
         self.overflow_buffer.resize(HdxIndex::<KSIZE, S>::BUCKET_SIZE, 0);
         // For reading u64 values, needs an array.
         let mut buf64 = [0_u8; 8];
-        odx_file.seek(SeekFrom::Start(self.overflow_pos)).ok()?;
+        // Position of the record we are about to read; the overflow log is append-only so
+        // any chained overflow record it points to must live at an earlier offset.
+        let current_pos = self.overflow_pos;
+        odx_file.seek(SeekFrom::Start(current_pos)).ok()?;
         odx_file.read_exact(&mut self.overflow_buffer[..]).ok()?;
         if !check_crc(&self.overflow_buffer) {
             self.crc_failure = true;
             return None;
         }
         buf64.copy_from_slice(&self.overflow_buffer[0..8]);
-        self.overflow_pos = u64::from_le_bytes(buf64);
+        let next_overflow_pos = u64::from_le_bytes(buf64);
+        // A non-terminal link must point strictly backwards.  Anything else (a forward
+        // pointer or a cycle) means the log is corrupt; treat it like a CRC failure rather
+        // than looping forever.
+        if next_overflow_pos != 0 && next_overflow_pos >= current_pos {
+            self.crc_failure = true;
+            return None;
+        }
+        self.overflow_pos = next_overflow_pos;
         let mut buf = [0_u8; 4];
         buf.copy_from_slice(&self.overflow_buffer[8..12]);
         self.elements = u32::from_le_bytes(buf);

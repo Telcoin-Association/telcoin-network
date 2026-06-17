@@ -38,25 +38,25 @@ fn run_restart_tests1(
         info.get("execution_address").unwrap(),
         "0x1111111111111111111111111111111111111111"
     );
-    assert_eq!(info.get("chain_id").unwrap(), &serde_json::Value::Number(2017.into()));
+    assert_eq!(info.get("chain_id").unwrap(), &serde_json::Value::Number(911329.into()));
     let info = get_node_info(&client_urls[1]).unwrap();
     assert_eq!(
         info.get("execution_address").unwrap(),
         "0x2222222222222222222222222222222222222222"
     );
-    assert_eq!(info.get("chain_id").unwrap(), &serde_json::Value::Number(2017.into()));
+    assert_eq!(info.get("chain_id").unwrap(), &serde_json::Value::Number(911329.into()));
     let info = get_node_info(&client_urls[2]).unwrap();
     assert_eq!(
         info.get("execution_address").unwrap(),
         "0x3333333333333333333333333333333333333333"
     );
-    assert_eq!(info.get("chain_id").unwrap(), &serde_json::Value::Number(2017.into()));
+    assert_eq!(info.get("chain_id").unwrap(), &serde_json::Value::Number(911329.into()));
     let info = get_node_info(&client_urls[3]).unwrap();
     assert_eq!(
         info.get("execution_address").unwrap(),
         "0x4444444444444444444444444444444444444444"
     );
-    assert_eq!(info.get("chain_id").unwrap(), &serde_json::Value::Number(2017.into()));
+    assert_eq!(info.get("chain_id").unwrap(), &serde_json::Value::Number(911329.into()));
     let key = get_key("test-source");
     let to_account = address_from_word("testing");
 

@@ -93,7 +93,7 @@ async fn collect_epoch_records(
                     // Should not be here but if so just skipping won't really help...
                     // Reduce last_epoch by one and once this loop finishes skipping we can
                     // try to get the missing epoch again.
-                    return epoch - 1;
+                    return epoch.saturating_sub(1);
                 };
                 // Verify the epoch has the expected parent and committee and is signed by
                 // that committee.
@@ -110,7 +110,7 @@ async fn collect_epoch_records(
                             ?e,
                             "failed to save epoch record/cert for epoch {epoch}",
                         );
-                        return epoch - 1;
+                        return epoch.saturating_sub(1);
                     }
                     result_epoch = epoch;
                     info!(
@@ -133,7 +133,7 @@ async fn collect_epoch_records(
                         ?epoch_valid,
                         "got an invalid epoch record, epoch {epoch}",
                     );
-                    return epoch - 1;
+                    return epoch.saturating_sub(1);
                 }
             }
             Err(err) => {

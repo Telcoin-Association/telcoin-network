@@ -1,10 +1,11 @@
 //! Prometheus metrics for the node's epoch lifecycle.
 
-use crate::manager::RunEpochMode;
 use reth_metrics::{
     metrics::{Counter, Gauge},
     Metrics,
 };
+
+use crate::manager::RunEpochMode;
 
 /// Metrics for the epoch manager.
 ///

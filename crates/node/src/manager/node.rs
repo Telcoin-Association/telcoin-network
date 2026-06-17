@@ -1,8 +1,14 @@
-//! The node/epoch manager type.
+//! Node/application-lifetime layer of the epoch manager.
 //!
-//! This oversees the tasks that run for each epoch. Some consensus-related
-//! tasks run for one epoch. Other resources are shared across epochs.
-//! This file defines the struct and the node/application scoped code.
+//! This file owns the [`EpochManager`] struct and the resources that live for the entire process:
+//! the long-running primary/worker p2p networks, the execution engine, the consensus DB, the
+//! consensus chain (epoch pack files), and the app-scoped fetch/collector tasks. It also drives
+//! the epoch loop: `run` builds the process-lifetime components, then `run_epochs` repeatedly
+//! invokes `run_epoch` until shutdown.
+//!
+//! Per-epoch orchestration lives in the sibling `run_epoch` module. Code here is concerned with
+//! what survives across epochs; code there is concerned with setting up and tearing down a single
+//! epoch's consensus components.
 
 use std::collections::BTreeMap;
 
@@ -12,7 +18,7 @@ use crate::{
     manager::spawn_epoch_vote_collector,
     metrics::EpochMetrics,
 };
-use eyre::eyre;
+use eyre::{eyre, WrapErr as _};
 use state_sync::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_recent_consensus};
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, TelcoinDirs};
 use tn_network_libp2p::{types::NetworkEvent, ConsensusNetwork};
@@ -29,16 +35,27 @@ use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-mod epoch;
-pub(crate) use epoch::RunEpochMode;
+mod close_epoch;
+mod run_epoch;
+mod start_epoch;
+pub(crate) use run_epoch::RunEpochMode;
 
-/// The long-running task manager name.
+/// Name of the process-lifetime [`TaskManager`] that owns tasks outliving any single epoch
+/// (p2p networks, engine updates, consensus fetchers).
 const NODE_TASK_MANAGER: &str = "Node Task Manager";
 
 /// The worker's base task manager name. This is used by `fn worker_task_manager_name(id)`.
 pub(crate) const WORKER_TASK_BASE: &str = "Worker Task";
 
-/// The long-running type that oversees epoch transitions.
+/// The long-running owner that oversees epoch transitions.
+///
+/// One instance exists for the lifetime of the process. It holds the resources that must survive
+/// across epochs (p2p network handles, consensus DB, consensus bus, consensus chain) alongside the
+/// small amount of cross-epoch carry-over state that the next epoch needs to start correctly -
+/// notably [`last_consensus_header`](Self::last_consensus_header),
+/// [`last_forwarded_consensus_number`](Self::last_forwarded_consensus_number), and
+/// [`network_initialized`](Self::network_initialized). Per-epoch consensus components are built and
+/// dropped inside the epoch loop rather than stored here.
 #[derive(Debug)]
 pub(crate) struct EpochManager<P, DB> {
     /// The builder for node configuration
@@ -72,29 +89,37 @@ pub(crate) struct EpochManager<P, DB> {
     /// Committee slots are NOT gated on this flag. They are set every epoch from authoritative
     /// state via `update_committees`.
     network_initialized: bool,
-    /// Reth DB, keep for entire execution.
+    /// Reth (MDBX) database handle. Held for the whole process so the execution engine can be
+    /// recreated without reopening storage.
     reth_db: RethDb,
-    /// Consensus DB, keep for entire execution.
+    /// Consensus (REDB) database handle. Held for the whole process; shared with the p2p networks
+    /// and per-epoch consensus components.
     consensus_db: DB,
-    /// ConsensusBus for the application life.
+    /// Application-scoped consensus bus. Survives epoch boundaries and is reset between epochs via
+    /// `reset_for_epoch`; carries `recent_blocks`, node mode, and other cross-component state.
     consensus_bus: ConsensusBusApp,
-    /// Persistent event stream for worker network events.
+    /// Persistent event stream for the long-running worker network. Outlives any single epoch so
+    /// the worker swarm does not have to be rebuilt on each transition.
     worker_event_stream: QueChannel<NetworkEvent<WorkerRequest, WorkerResponse>>,
 
-    /// The last consenses header for a closing epoch.
+    /// Final consensus header of the epoch that just closed, carried into the next epoch so it can
+    /// be used as the starting point for the new epoch's chain.
     last_consensus_header: Option<ConsensusHeader>,
 
-    /// Track the last consensus number that was actually forwarded to the execution engine.
-    /// This prevents waiting on consensus that was saved to the DB but never sent to the engine.
+    /// Highest consensus number actually forwarded to the execution engine (not merely persisted
+    /// to the DB). Carried across epochs to avoid waiting on consensus that was stored but never
+    /// sent to the engine.
     last_forwarded_consensus_number: u64,
 
-    /// Access to the epoch pack files storing consensus data.
+    /// Handle to the epoch pack files that durably store consensus data. Persisted on startup and
+    /// at shutdown; read by the fetch tasks that backfill missing epochs.
     consensus_chain: ConsensusChain,
 
-    /// The nodes bootstrap servers.
+    /// Bootstrap servers loaded once from the genesis committee, used to seed peer discovery on
+    /// the long-running networks.
     bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapServer>,
 
-    /// The version string for the running node.
+    /// Static version string for the running node, reported by node-info surfaces.
     version_str: &'static str,
 
     /// Prometheus metrics for the epoch lifecycle.
@@ -163,7 +188,10 @@ pub async fn catchup_accumulator(
     Ok(())
 }
 
-/// Create a consensus DB that lives for program lifetime.
+/// Open the process-lifetime consensus DB, creating its directory if absent.
+///
+/// The returned handle is meant to be held for the whole process and shared across epochs; it is
+/// not reopened per epoch.
 pub(crate) fn open_consensus_db<P: TelcoinDirs + 'static>(tn_datadir: &P) -> DatabaseType {
     let consensus_db_path = tn_datadir.consensus_db_path();
 
@@ -181,7 +209,13 @@ where
     P: TelcoinDirs + Clone + 'static,
     DB: TNDatabase,
 {
-    /// Create a new instance of [Self].
+    /// Construct the manager and its process-lifetime state.
+    ///
+    /// Opens the consensus chain, builds the application-scoped consensus bus (forced into
+    /// `Observer` mode when configured as an observer), and loads bootstrap servers from the
+    /// genesis committee. Network handles are left `None` until [`run`](Self::run) spawns the
+    /// networks. Panics if the consensus chain cannot be opened, since that is unrecoverable at
+    /// startup.
     pub(crate) async fn new(
         builder: TnBuilder,
         tn_datadir: P,
@@ -239,7 +273,19 @@ where
         }
     }
 
-    /// Run the node, handling epoch transitions.
+    /// Build the process-lifetime components, then drive the epoch loop until shutdown.
+    ///
+    /// Startup proceeds in order: create the execution engine and start it, recover the
+    /// [`GasAccumulator`] via [`catchup_accumulator`], spawn the long-running p2p networks
+    /// ([`spawn_node_networks`](Self::spawn_node_networks)), subscribe the primary to the
+    /// epoch-vote and consensus-output gossip topics, spawn the epoch-record and vote
+    /// collectors, restore execution state ([`try_restore_state`](Self::try_restore_state)),
+    /// and spawn the engine-update task. It then requests any missing epoch pack files and
+    /// launches the app-scoped consensus fetch workers.
+    ///
+    /// Finally it selects over two futures: the node task manager running to exit, and the epoch
+    /// loop ([`run_epochs`](Self::run_epochs)). Whichever resolves first ends the node; the
+    /// consensus chain is persisted and remaining tasks are awaited before returning.
     pub(crate) async fn run(&mut self) -> eyre::Result<()> {
         // Surface any errors that may have been triggered on create.
         self.consensus_chain.persist_current().await?;
@@ -420,10 +466,11 @@ where
         result
     }
 
-    /// Startup for the node. This creates all components on startup before starting the first
-    /// epoch.
+    /// Spawn the process-lifetime primary and worker [`ConsensusNetwork`] swarms.
     ///
-    /// This will create the long-running primary/worker [ConsensusNetwork]s for p2p swarm.
+    /// Each swarm runs as a critical task until node shutdown. The resulting network handles are
+    /// stored on the manager for use by every epoch; the worker handle is seeded with the starting
+    /// `epoch` and its task spawner is refreshed on each epoch transition.
     async fn spawn_node_networks(
         &mut self,
         node_task_spawner: TaskSpawner,
@@ -462,6 +509,16 @@ where
         // primary network handle
         self.primary_network_handle = Some(PrimaryNetworkHandle::new(primary_network_handle));
 
+        // pass through the worker's RPC descriptor so peers can discover this
+        // validator's JSON-RPC endpoint via kademlia. validators that did not
+        // configure RPC leave the descriptor `None`. fail fast on a misconfigured
+        // endpoint rather than advertising something peers will reject.
+        let worker_rpc = self.builder.tn_config.node_info.p2p_info.worker.rpc.clone();
+        if let Some(rpc) = &worker_rpc {
+            rpc.validate()
+                .wrap_err("invalid `node_info.p2p_info.worker.rpc` endpoint in node config")?;
+        }
+
         // create long-running network task for worker
         let worker_network = ConsensusNetwork::new_for_worker(
             DEFAULT_WORKER_ID,
@@ -471,6 +528,7 @@ where
             self.consensus_db.clone(),
             node_task_spawner.clone(),
             self.builder.tn_config.node_info.worker_network_address().clone(),
+            worker_rpc,
         )?;
         let worker_network_handle = worker_network.network_handle();
         let node_shutdown = self.node_shutdown.subscribe();
@@ -495,7 +553,13 @@ where
         Ok(())
     }
 
-    /// Execute a loop to start new epochs until shutdown.
+    /// Loop, starting a new epoch on each iteration until shutdown.
+    ///
+    /// Begins in [`RunEpochMode::Initial`]; each `run_epoch` call returns the [`RunEpochMode`] to
+    /// carry into the next iteration, so the mode threads epoch-to-epoch state (e.g. whether this
+    /// is a fresh start or a continuation). Any epoch error aborts the loop. After each epoch
+    /// the consensus bus is reset and the task yields so the wrapping select can cancel it on
+    /// shutdown; the loop also checks the shutdown notifier before starting the next epoch.
     async fn run_epochs(
         &mut self,
         engine: &ExecutionNode,
@@ -539,7 +603,10 @@ where
         }
     }
 
-    /// Helper method to create all engine components.
+    /// Build the execution engine and its underlying reth environment.
+    ///
+    /// The reth env is wired to the shared `reth_db`, the configured base-fee address, and the
+    /// accumulator's rewards counter so execution and reward accounting stay consistent.
     fn create_engine(
         &self,
         engine_task_manager: &TaskManager,
@@ -559,7 +626,12 @@ where
         Ok(engine)
     }
 
-    /// Helper method to restore execution state for the consensus components.
+    /// Prime the consensus bus `recent_blocks` watch from the last executed blocks.
+    ///
+    /// On restart the in-memory `recent_blocks` history is empty; this backfills it (up to the
+    /// watch's capacity) so consensus components can resolve recent consensus number/hash lookups.
+    /// Each block's consensus hash is recovered from `parent_beacon_block_root`; round is set to 0
+    /// because it is not persisted, which is sufficient for hash resolution during catch-up.
     async fn try_restore_state(&self, engine: &ExecutionNode) -> eyre::Result<()> {
         // prime the recent_blocks watch with latest executed blocks
         let block_capacity = self.consensus_bus.recent_blocks_capacity();
@@ -588,6 +660,11 @@ where
 
     /// Spawn a task to update `ConsensusBus::recent_blocks` every time the engine processes a
     /// consensus output (with or without blocks).
+    ///
+    /// This is the live counterpart to [`try_restore_state`](Self::try_restore_state): the latter
+    /// seeds `recent_blocks` once at startup, this keeps it current thereafter. If the engine
+    /// update channel closes the engine is gone, so the task returns an error to bring the node
+    /// down.
     fn spawn_engine_update_task(
         &self,
         mut engine_update: mpsc::Receiver<EngineUpdate>,
