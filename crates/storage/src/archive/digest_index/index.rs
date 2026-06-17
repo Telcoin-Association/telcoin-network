@@ -406,7 +406,10 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     /// This can be useful for tracking information about another file but
     /// does not effect the index.
     pub fn set_data_file_length(&mut self, data_file_length: u64) {
-        self.header.data_file_length = data_file_length;
+        if self.header.data_file_length != data_file_length {
+            self.header.data_file_length = data_file_length;
+            self.synced = false;
+        }
     }
 
     /// Get the data_file_length field.
