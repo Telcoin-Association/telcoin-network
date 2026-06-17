@@ -151,7 +151,7 @@ fn static_files_summary_table_for_datadir(datadir: &Path) -> eyre::Result<Option
     for (segment, ranges) in iter_static_files(&static_files_dir)?.into_iter() {
         let mut segment_size = 0_u64;
 
-        for (block_range, header) in &ranges {
+        for (block_range, _header) in &ranges {
             let fixed_block_range =
                 static_file_provider.find_fixed_range(segment, block_range.start());
             let jar_provider = static_file_provider
@@ -167,18 +167,18 @@ fn static_files_summary_table_for_datadir(datadir: &Path) -> eyre::Result<Option
 
             drop(jar_provider);
             static_file_provider.remove_cached_provider(segment, fixed_block_range.end());
-
-            if header.tx_range().is_some() {
-                continue;
-            }
         }
 
         stats.push(StaticFileSegmentStats {
             segment: segment.to_string(),
-            block_range: ranges
-                .first()
-                .map(|(range, _)| format!("{}..={}", range.start(), range.end()))
-                .unwrap_or_default(),
+            // `ranges` is sorted ascending by block end, so span the first jar's start to the last
+            // jar's end to report the full block range a segment covers (not just its first jar).
+            block_range: match (ranges.first(), ranges.last()) {
+                (Some((first, _)), Some((last, _))) => {
+                    format!("{}..={}", first.start(), last.end())
+                }
+                _ => String::new(),
+            },
             tx_range: ranges
                 .iter()
                 .find_map(|(_, header)| {
@@ -235,7 +235,15 @@ fn db_stats_table(db: &DatabaseEnv) -> eyre::Result<ComfyTable> {
         db_tables.sort();
 
         for db_table in db_tables {
-            let table_db = tx.inner().open_db(Some(db_table))?;
+            // A read-only transaction cannot create a sub-database, so a table that was never
+            // written reports `NotFound`. Skip it rather than aborting the whole report — this
+            // keeps `db stats` working against an older on-disk DB whose schema
+            // predates a table later added to `Tables::ALL` (schema skew).
+            let table_db = match tx.inner().open_db(Some(db_table)) {
+                Ok(table_db) => table_db,
+                Err(reth_db::mdbx::Error::NotFound) => continue,
+                Err(err) => return Err(eyre::eyre!("Could not open table {db_table}: {err}")),
+            };
             let table_stats = tx.inner().db_stat(table_db.dbi()).map_err(|err| {
                 eyre::eyre!("Could not read statistics for table {db_table}: {err}")
             })?;
@@ -266,7 +274,11 @@ fn db_stats_table(db: &DatabaseEnv) -> eyre::Result<ComfyTable> {
 #[cfg(test)]
 mod tests {
     use super::{file_len_if_exists, static_files_summary_table};
-    use std::fs;
+    use crate::{
+        cli::{Cli, Commands},
+        NoArgs,
+    };
+    use std::{fs, path::Path};
 
     #[test]
     fn static_files_summary_table_renders_segment_breakdown() {
@@ -282,6 +294,19 @@ mod tests {
         assert!(rendered.contains("headers"), "missing segment name: {rendered}");
         assert!(rendered.contains("0..=9"), "missing block range: {rendered}");
         assert!(rendered.contains("Total"), "missing total row: {rendered}");
+    }
+
+    #[test]
+    fn parses_per_subcommand_datadir_between_db_and_stats() {
+        // The documented invocation places --datadir between `db` and the subcommand. clap does
+        // not propagate the global --datadir into `db` (which defines its own), so the
+        // per-subcommand flag must capture the value here.
+        let cli = Cli::<NoArgs>::try_parse_args_from(["tn", "db", "--datadir", "/tmp/x", "stats"])
+            .expect("cli parsed");
+        let Commands::Db(cmd) = cli.command else {
+            panic!("expected the db subcommand");
+        };
+        assert_eq!(cmd.datadir.as_deref(), Some(Path::new("/tmp/x")));
     }
 
     #[test]
