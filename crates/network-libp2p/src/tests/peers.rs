@@ -162,6 +162,413 @@ fn test_upsert_peer_seeds_multiaddrs_for_new_peer() {
     assert!(peer.known_ip_addresses().any(|ip| Some(ip) == expected_ip));
 }
 
+/// Build a peer with a bls key and two network keys for rotation scenarios:
+/// (bls, first network key, its peer id, rotated network key, its peer id).
+fn rotation_keys(seed: u8) -> (BlsPublicKey, NetworkPublicKey, PeerId, NetworkPublicKey, PeerId) {
+    let mut rng = StdRng::from_seed([seed; 32]);
+    let bls = *BlsKeypair::generate(&mut rng).public();
+    let net1: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let peer_id_1: PeerId = net1.clone().into();
+    let net2: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let peer_id_2: PeerId = net2.clone().into();
+    (bls, net1, peer_id_1, net2, peer_id_2)
+}
+
+#[test]
+fn test_upsert_peer_network_key_rotation() {
+    let mut all_peers = create_all_peers(None);
+    let (bls, net1, peer_id_1, net2, peer_id_2) = rotation_keys(21);
+    let addr = create_multiaddr(None);
+
+    // known peer via its first network key, driven to a non-default status so the counter
+    // bookkeeping is observable
+    all_peers.upsert_peer(bls, net1, vec![addr.clone()]);
+    all_peers.update_connection_status(
+        &peer_id_1,
+        NewConnectionStatus::Connected {
+            multiaddr: addr.clone(),
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+    all_peers.update_connection_status(&peer_id_1, NewConnectionStatus::Disconnected);
+    assert_eq!(all_peers.disconnected_peers, 1);
+
+    // rotate the network key, same bls key
+    all_peers.upsert_peer(bls, net2, vec![addr.clone()]);
+
+    // iff-invariant: the old peer id no longer resolves, the new one does, and exactly one
+    // confirmed record exists
+    assert!(all_peers.bls_for_peer(&peer_id_1).is_none());
+    assert_eq!(all_peers.bls_for_peer(&peer_id_2), Some(bls));
+    assert_eq!(all_peers.bls_by_peer_id.len(), 1);
+    assert_eq!(all_peers.peers.len(), 1);
+    assert!(all_peers.peers.contains_key(&PeerIdentity::Confirmed(bls)));
+    assert!(all_peers.get_peer(&peer_id_1).is_none());
+
+    // accumulated state survives the rotation: the record's recoverable peer id follows the
+    // new key, its status is untouched, and the status counters are unchanged
+    let peer = all_peers.get_peer(&peer_id_2).expect("rotated peer resolves");
+    assert_eq!(peer.peer_id(), Some(peer_id_2));
+    assert!(matches!(peer.connection_status(), ConnectionStatus::Disconnected { .. }));
+    assert_eq!(all_peers.disconnected_peers, 1);
+    assert_eq!(all_peers.banned_peers.total(), 0);
+
+    // after the record is evicted (as pruning would), no orphaned index entry remains;
+    // evict alone does not manage counters (the pruning paths decrement separately)
+    all_peers.evict(&PeerIdentity::Confirmed(bls));
+    assert!(all_peers.bls_by_peer_id.is_empty());
+    assert_eq!(all_peers.disconnected_peers, 1);
+
+    // a late event carrying the rotated-away peer id creates a normal unidentified record
+    // instead of resurrecting a keyless record under the confirmed key
+    all_peers.update_connection_status(&peer_id_1, NewConnectionStatus::Dialing);
+    assert!(all_peers.peers.contains_key(&PeerIdentity::Unidentified(peer_id_1)));
+    assert!(!all_peers.peers.contains_key(&PeerIdentity::Confirmed(bls)));
+    assert!(all_peers.bls_by_peer_id.is_empty());
+}
+
+#[test]
+fn test_upsert_peer_network_key_rotation_banned_peer() {
+    let mut all_peers = create_all_peers(None);
+    let (bls, net1, peer_id_1, net2, peer_id_2) = rotation_keys(22);
+    let addr = create_multiaddr(None);
+
+    // ban the peer under its first network key
+    all_peers.upsert_peer(bls, net1, vec![addr.clone()]);
+    all_peers
+        .update_connection_status(&peer_id_1, NewConnectionStatus::Disconnecting { banned: true });
+    all_peers.update_connection_status(&peer_id_1, NewConnectionStatus::Disconnected);
+    assert_eq!(all_peers.banned_peers.total(), 1);
+
+    // rotation does not reset the ban: the record carries forward under the new key with its
+    // banned status and bookkeeping intact
+    all_peers.upsert_peer(bls, net2, vec![addr]);
+    assert!(all_peers.bls_for_peer(&peer_id_1).is_none());
+    assert_eq!(all_peers.bls_for_peer(&peer_id_2), Some(bls));
+    assert_eq!(all_peers.peers.len(), 1);
+    let peer = all_peers.get_peer(&peer_id_2).expect("rotated peer resolves");
+    assert!(matches!(peer.connection_status(), ConnectionStatus::Banned { .. }));
+    assert_eq!(all_peers.banned_peers.total(), 1);
+    assert_eq!(all_peers.disconnected_peers, 0);
+}
+
+#[test]
+fn test_upsert_peer_rotation_releases_displaced_record_counters() {
+    let mut all_peers = create_all_peers(None);
+    let (bls, net1, peer_id_1, net2, peer_id_2) = rotation_keys(23);
+    let addr = create_multiaddr(None);
+
+    // disconnected record under the confirmed identity from the first network key
+    all_peers.upsert_peer(bls, net1, vec![addr.clone()]);
+    all_peers.update_connection_status(
+        &peer_id_1,
+        NewConnectionStatus::Connected {
+            multiaddr: addr.clone(),
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+    all_peers.update_connection_status(&peer_id_1, NewConnectionStatus::Disconnected);
+    assert_eq!(all_peers.disconnected_peers, 1);
+
+    // the peer reconnects anonymously with its rotated key before publishing a kad record
+    let addr2 = create_multiaddr(None);
+    all_peers.update_connection_status(
+        &peer_id_2,
+        NewConnectionStatus::Connected {
+            multiaddr: addr2.clone(),
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+    assert_eq!(all_peers.peers.len(), 2);
+
+    // the kad record arrives: the anonymous record is promoted onto the confirmed identity and
+    // the displaced (disconnected) record releases its counter as it is dropped
+    all_peers.upsert_peer(bls, net2, vec![addr2]);
+    assert_eq!(all_peers.peers.len(), 1);
+    assert!(all_peers.bls_for_peer(&peer_id_1).is_none());
+    assert_eq!(all_peers.bls_for_peer(&peer_id_2), Some(bls));
+    assert_eq!(all_peers.bls_by_peer_id.len(), 1);
+    let peer = all_peers.get_peer(&peer_id_2).expect("promoted peer resolves");
+    assert!(matches!(peer.connection_status(), ConnectionStatus::Connected { .. }));
+    assert_eq!(all_peers.disconnected_peers, 0);
+}
+
+#[test]
+fn test_add_trusted_peer_network_key_rotation() {
+    let mut all_peers = create_all_peers(None);
+    let (bls, net1, peer_id_1, net2, peer_id_2) = rotation_keys(24);
+
+    all_peers.add_trusted_peer(bls, net1);
+    assert_eq!(all_peers.bls_for_peer(&peer_id_1), Some(bls));
+
+    // rotate the network key, same bls key
+    all_peers.add_trusted_peer(bls, net2);
+
+    // iff-invariant: the old peer id no longer resolves, the new one does, and exactly one
+    // confirmed record exists with a recoverable peer id for the new key
+    assert!(all_peers.bls_for_peer(&peer_id_1).is_none());
+    assert_eq!(all_peers.bls_for_peer(&peer_id_2), Some(bls));
+    assert_eq!(all_peers.bls_by_peer_id.len(), 1);
+    assert_eq!(all_peers.peers.len(), 1);
+    let peer = all_peers.get_peer(&peer_id_2).expect("rotated trusted peer resolves");
+    assert_eq!(peer.peer_id(), Some(peer_id_2));
+    assert_eq!(peer.reputation(), Reputation::Trusted);
+}
+
+#[test]
+fn test_add_trusted_peer_preserves_banned_total() {
+    let mut all_peers = create_all_peers(None);
+    let (bls, net1, _, _, _) = rotation_keys(25);
+
+    // ban an unrelated peer
+    let banned_peer = PeerId::random();
+    all_peers.update_connection_status(
+        &banned_peer,
+        NewConnectionStatus::Disconnecting { banned: true },
+    );
+    all_peers.update_connection_status(&banned_peer, NewConnectionStatus::Disconnected);
+    assert_eq!(all_peers.banned_peers.total(), 1);
+
+    // adding a trusted peer displaces no record, so the banned total is untouched
+    all_peers.add_trusted_peer(bls, net1);
+    assert_eq!(all_peers.banned_peers.total(), 1);
+}
+
+#[test]
+fn test_ensure_peer_exists_repairs_stale_index_entry() {
+    let mut all_peers = create_all_peers(None);
+    let (bls, _, peer_id_1, _, _) = rotation_keys(26);
+
+    // manufacture an iff-invariant violation: an index entry with no confirmed record
+    all_peers.bls_by_peer_id.insert(peer_id_1, bls);
+
+    // an event for the stale peer id repairs the index instead of storing a keyless default
+    // record under the confirmed key
+    all_peers.update_connection_status(&peer_id_1, NewConnectionStatus::Dialing);
+    assert!(all_peers.bls_by_peer_id.is_empty());
+    assert!(all_peers.peers.contains_key(&PeerIdentity::Unidentified(peer_id_1)));
+    assert!(!all_peers.peers.contains_key(&PeerIdentity::Confirmed(bls)));
+}
+
+#[test]
+fn test_upsert_peer_rotation_normalizes_carried_connected_status() {
+    let mut all_peers = create_all_peers(None);
+    let (bls, net1, peer_id_1, net2, peer_id_2) = rotation_keys(27);
+    let addr = create_multiaddr(None);
+
+    // the peer is connected under its first network key when the rotated kad record arrives
+    all_peers.upsert_peer(bls, net1, vec![addr.clone()]);
+    all_peers.update_connection_status(
+        &peer_id_1,
+        NewConnectionStatus::Connected {
+            multiaddr: addr.clone(),
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+
+    all_peers.upsert_peer(bls, net2, vec![addr]);
+
+    // the carried record's Connected status described the old key's transport; it is
+    // normalized to Disconnected (with the counter incremented) so the new identity is
+    // immediately dialable instead of wedged behind a phantom connection
+    let peer = all_peers.get_peer(&peer_id_2).expect("rotated peer resolves");
+    assert!(matches!(peer.connection_status(), ConnectionStatus::Disconnected { .. }));
+    assert!(peer.can_dial());
+    assert_eq!(all_peers.disconnected_peers, 1);
+    assert_eq!(all_peers.banned_peers.total(), 0);
+}
+
+#[test]
+fn test_upsert_peer_rotation_normalizes_carried_pending_ban_status() {
+    let mut all_peers = create_all_peers(None);
+    let (bls, net1, peer_id_1, net2, peer_id_2) = rotation_keys(35);
+    let addr = create_multiaddr(None);
+
+    // the peer is mid-ban under its first network key (disconnecting with the ban pending, not
+    // yet completed to Banned) when the rotated kad record arrives
+    all_peers.upsert_peer(bls, net1, vec![addr.clone()]);
+    all_peers
+        .update_connection_status(&peer_id_1, NewConnectionStatus::Disconnecting { banned: true });
+    assert_eq!(all_peers.banned_peers.total(), 0);
+
+    all_peers.upsert_peer(bls, net2, vec![addr]);
+
+    // the carried Disconnecting { banned: true } status normalizes onto the new identity as
+    // Banned with the banned counter incremented, so the pending ban survives the rotation
+    let peer = all_peers.get_peer(&peer_id_2).expect("rotated peer resolves");
+    assert!(matches!(peer.connection_status(), ConnectionStatus::Banned { .. }));
+    assert_eq!(all_peers.banned_peers.total(), 1);
+    assert_eq!(all_peers.disconnected_peers, 0);
+
+    // iff-invariant: the old peer id no longer resolves, the new one does, one confirmed record
+    assert!(all_peers.bls_for_peer(&peer_id_1).is_none());
+    assert_eq!(all_peers.bls_for_peer(&peer_id_2), Some(bls));
+    assert_eq!(all_peers.peers.len(), 1);
+}
+
+#[test]
+fn test_upsert_peer_rotation_pending_ban_records_rotated_address() {
+    let mut all_peers = create_all_peers(None);
+    let (bls, net1, peer_id_1, net2, _peer_id_2) = rotation_keys(36);
+
+    // a separate peer is already banned on the address the rotating peer will present, leaving
+    // that ip one ban short of the per-ip block threshold
+    let rotated_ip = IpAddr::V4("192.168.77.1".parse().unwrap());
+    let rotated_addr = create_multiaddr(Some(rotated_ip));
+    let other = PeerId::random();
+    all_peers.update_connection_status(
+        &other,
+        NewConnectionStatus::Connected {
+            multiaddr: rotated_addr.clone(),
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+    all_peers.update_connection_status(&other, NewConnectionStatus::Disconnecting { banned: true });
+    all_peers.update_connection_status(&other, NewConnectionStatus::Disconnected);
+    assert!(!all_peers.ip_banned(&rotated_ip), "a single ban is below the per-ip threshold");
+
+    // the rotating peer is mid-ban under its first network key, presenting a different address
+    let old_addr = create_multiaddr(Some(IpAddr::V4("10.0.0.1".parse().unwrap())));
+    all_peers.upsert_peer(bls, net1, vec![old_addr]);
+    all_peers
+        .update_connection_status(&peer_id_1, NewConnectionStatus::Disconnecting { banned: true });
+
+    // it rotates and presents the shared address: normalizing the carried pending ban must record
+    // the rotated-to address (not just the rotated-away one), pushing the shared ip over the
+    // threshold; with the ban recorded before the address update the ip would stay below it
+    all_peers.upsert_peer(bls, net2, vec![rotated_addr]);
+    assert!(
+        all_peers.ip_banned(&rotated_ip),
+        "the rotated-to address must be banned when the carried pending ban is normalized"
+    );
+}
+
+#[test]
+fn test_upsert_peer_merge_releases_displaced_banned_record() {
+    let mut all_peers = create_all_peers(None);
+    let (bls, net1, peer_id_1, net2, peer_id_2) = rotation_keys(28);
+    let addr = create_multiaddr(None);
+
+    // ban the peer under its first network key
+    all_peers.upsert_peer(bls, net1, vec![addr.clone()]);
+    all_peers
+        .update_connection_status(&peer_id_1, NewConnectionStatus::Disconnecting { banned: true });
+    all_peers.update_connection_status(&peer_id_1, NewConnectionStatus::Disconnected);
+    assert_eq!(all_peers.banned_peers.total(), 1);
+
+    // the peer reconnects anonymously with its rotated key, then its kad record arrives;
+    // the anonymous record wins the merge and the displaced banned record releases its
+    // bookkeeping as it is dropped (the ban itself is shed: pre-existing merge semantics)
+    let addr2 = create_multiaddr(None);
+    all_peers.update_connection_status(
+        &peer_id_2,
+        NewConnectionStatus::Connected {
+            multiaddr: addr2.clone(),
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+    all_peers.upsert_peer(bls, net2, vec![addr2]);
+    assert_eq!(all_peers.banned_peers.total(), 0);
+    assert_eq!(all_peers.disconnected_peers, 0);
+    assert_eq!(all_peers.peers.len(), 1);
+    assert!(all_peers.bls_for_peer(&peer_id_1).is_none());
+    assert_eq!(all_peers.bls_for_peer(&peer_id_2), Some(bls));
+    let peer = all_peers.get_peer(&peer_id_2).expect("promoted peer resolves");
+    assert!(matches!(peer.connection_status(), ConnectionStatus::Connected { .. }));
+}
+
+#[test]
+fn test_add_trusted_peer_releases_displaced_anonymous_record_counters() {
+    let mut all_peers = create_all_peers(None);
+    let (bls, net1, peer_id_1, _, _) = rotation_keys(29);
+    let addr = create_multiaddr(None);
+
+    // anonymous peer connects then disconnects under the peer id the operator later trusts
+    all_peers.update_connection_status(
+        &peer_id_1,
+        NewConnectionStatus::Connected {
+            multiaddr: addr,
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+    all_peers.update_connection_status(&peer_id_1, NewConnectionStatus::Disconnected);
+    assert_eq!(all_peers.disconnected_peers, 1);
+
+    // the displaced anonymous record releases its counter as it is overwritten
+    all_peers.add_trusted_peer(bls, net1);
+    assert_eq!(all_peers.disconnected_peers, 0);
+    assert_eq!(all_peers.peers.len(), 1);
+    assert_eq!(all_peers.bls_for_peer(&peer_id_1), Some(bls));
+}
+
+#[test]
+fn test_add_trusted_peer_rotation_releases_displaced_record_counters() {
+    let mut all_peers = create_all_peers(None);
+    let (bls, net1, peer_id_1, net2, peer_id_2) = rotation_keys(30);
+    let addr = create_multiaddr(None);
+
+    // disconnected confirmed record under the first network key
+    all_peers.upsert_peer(bls, net1, vec![addr.clone()]);
+    all_peers.update_connection_status(
+        &peer_id_1,
+        NewConnectionStatus::Connected {
+            multiaddr: addr,
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+    all_peers.update_connection_status(&peer_id_1, NewConnectionStatus::Disconnected);
+    assert_eq!(all_peers.disconnected_peers, 1);
+
+    // trusting the peer under a rotated network key displaces the old record through the
+    // proper path: counter released, index re-keyed
+    all_peers.add_trusted_peer(bls, net2);
+    assert_eq!(all_peers.disconnected_peers, 0);
+    assert!(all_peers.bls_for_peer(&peer_id_1).is_none());
+    assert_eq!(all_peers.bls_for_peer(&peer_id_2), Some(bls));
+    assert_eq!(all_peers.peers.len(), 1);
+}
+
+#[test]
+fn test_add_trusted_peer_rekeys_network_key_bound_to_other_bls() {
+    let mut all_peers = create_all_peers(None);
+    let (bls_x, net1, peer_id_1, _, _) = rotation_keys(31);
+    let mut rng = StdRng::from_seed([32; 32]);
+    let bls_y = *BlsKeypair::generate(&mut rng).public();
+    let addr = create_multiaddr(None);
+
+    // the network key is first bound to a different bls identity
+    all_peers.upsert_peer(bls_x, net1.clone(), vec![addr]);
+    assert_eq!(all_peers.bls_for_peer(&peer_id_1), Some(bls_x));
+
+    // trusting bls_y with the same network key must displace the bls_x record, not orphan it
+    // (an orphaned record's later eviction would delete the legitimate index entry)
+    all_peers.add_trusted_peer(bls_y, net1);
+    assert_eq!(all_peers.peers.len(), 1);
+    assert!(!all_peers.peers.contains_key(&PeerIdentity::Confirmed(bls_x)));
+    assert!(all_peers.peers.contains_key(&PeerIdentity::Confirmed(bls_y)));
+    assert_eq!(all_peers.bls_by_peer_id.len(), 1);
+    assert_eq!(all_peers.bls_for_peer(&peer_id_1), Some(bls_y));
+}
+
+#[test]
+fn test_upsert_peer_rekeys_network_key_bound_to_other_bls() {
+    let mut all_peers = create_all_peers(None);
+    let (bls_x, net1, peer_id_1, _, _) = rotation_keys(33);
+    let mut rng = StdRng::from_seed([34; 32]);
+    let bls_y = *BlsKeypair::generate(&mut rng).public();
+    let addr = create_multiaddr(None);
+
+    // the network key is first bound to a different bls identity, then re-presented with a
+    // new bls key; the record migrates onto the new confirmed identity and the index follows
+    all_peers.upsert_peer(bls_x, net1.clone(), vec![addr.clone()]);
+    all_peers.upsert_peer(bls_y, net1, vec![addr]);
+    assert_eq!(all_peers.peers.len(), 1);
+    assert!(!all_peers.peers.contains_key(&PeerIdentity::Confirmed(bls_x)));
+    assert!(all_peers.peers.contains_key(&PeerIdentity::Confirmed(bls_y)));
+    assert_eq!(all_peers.bls_by_peer_id.len(), 1);
+    assert_eq!(all_peers.bls_for_peer(&peer_id_1), Some(bls_y));
+}
+
 #[test]
 fn test_connected_peers_by_score() {
     let mut all_peers = create_all_peers(None);

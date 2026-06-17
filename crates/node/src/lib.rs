@@ -16,6 +16,7 @@ pub mod engine;
 mod error;
 mod health;
 mod manager;
+mod metrics;
 pub mod primary;
 pub mod worker;
 pub use manager::catchup_accumulator;

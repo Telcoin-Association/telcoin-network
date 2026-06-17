@@ -8,6 +8,7 @@ mod epochs;
 #[cfg(feature = "faucet")]
 mod faucet;
 mod genesis_tests;
+mod metrics;
 mod restarts;
 mod staking;
 mod sync;

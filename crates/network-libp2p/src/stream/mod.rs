@@ -7,7 +7,7 @@
 //! ## Protocol Flow
 //!
 //! 1. **Requestor** negotiates via request-response
-//! 2. **Requestor** opens a stream to the responder using `/tn-stream/1.0.0`
+//! 2. **Requestor** opens a stream to the responder using `/tn-stream/0.0.1`
 //! 3. Both sides use the raw stream for application-specific data transfer
 //! 4. Transfer completes and the stream closes
 

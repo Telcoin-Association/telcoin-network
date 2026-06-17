@@ -45,6 +45,7 @@ tracing-opentelemetry = { workspace = true }
 
 alloy = { workspace = true }
 tn-types = { workspace = true }
+tn-metrics = { workspace = true }
 tn-node = { workspace = true }
 tn-reth = { workspace = true }
 tn-config = { workspace = true }
@@ -65,3 +66,6 @@ vergen = { version = "8.0.0", features = ["build", "cargo", "git", "gitcl"] }
 
 [lints]
 workspace = true
+
+[features]
+adiri = []

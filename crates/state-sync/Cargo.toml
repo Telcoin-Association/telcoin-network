@@ -17,8 +17,11 @@ tn-storage = { workspace = true }
 tn-types = { workspace = true }
 tn-config = { workspace = true }
 tn-primary = { workspace = true }
+metrics = { workspace = true }
+reth-metrics = { workspace = true }
 
 [dev-dependencies]
+metrics-util = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros"] }
 tn-storage = { workspace = true, features = ["test-utils"] }

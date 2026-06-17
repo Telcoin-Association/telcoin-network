@@ -55,10 +55,24 @@ pub fn execute_consensus_output(
     );
     // This should maybe panic but for prod code at least error out since this an invalid condition.
     if batches.len() != output.batch_digests().len() {
+        #[cfg(not(feature = "adiri"))]
         return Err(TnEngineError::ConsensusOutputUnevenBatches(
             batches.len(),
             output.batch_digests().len(),
         ));
+
+        #[cfg(feature = "adiri")]
+        if epoch > tn_types::forks::ADIRI_DUP_BATCH_EPOCH {
+            // ADIRI BUG
+            // Epoch 74 and possibly other early epochs of adiri testnet had a bug with duplicate
+            // batches. We have to recreate it in order to sync testnet so we skip this
+            // error (it will happen and needs to be ignored) on adiri with early
+            // epochs.
+            return Err(TnEngineError::ConsensusOutputUnevenBatches(
+                batches.len(),
+                output.batch_digests().len(),
+            ));
+        }
     }
 
     // ensure at least 1 block for empty output when close_epoch is true
@@ -72,6 +86,7 @@ pub fn execute_consensus_output(
             // Skip execution entirely — no batches and epoch is not closing.
             // Leader count was already incremented above for rewards tracking.
             info!(target: "engine", "skipping execution for empty non-epoch-closing output");
+            crate::metrics::ENGINE_METRICS.empty_outputs_skipped_total.increment(1);
             span.record("executed_blocks", "0");
             // Notify consensus that this round was processed (no block produced)
             engine_update_tx.try_send((leader_round, consensus_num_hash, None)).map_err(|e| {
@@ -200,6 +215,8 @@ fn execute_payload(
     // update header for next block execution in loop
     let canonical_header = next_canonical_block.recovered_block.clone_sealed_header();
     info!(target: "engine", hash = canonical_header.hash().to_string(), number = canonical_header.number, "next block executed");
+    crate::metrics::ENGINE_METRICS.blocks_executed_total.increment(1);
+    crate::metrics::ENGINE_METRICS.block_gas_used.record(canonical_header.gas_used as f64);
     canonical_in_memory_state.set_pending_block(next_canonical_block.clone());
     canonical_in_memory_state
         .update_chain(NewCanonicalChain::Commit { new: vec![next_canonical_block.clone()] });
