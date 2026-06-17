@@ -101,8 +101,8 @@ impl NetworkType {
 /// This is the crate-owned equivalent of libp2p's
 /// [`ResponseChannel`](libp2p::request_response::ResponseChannel): it wraps the
 /// same response sink but also carries the [`PeerId`] captured when the inbound
-/// request was accepted, so the answerer's identity travels with the channel
-/// instead of being re-derived from a side map at response time. Keeping the
+/// request was accepted, so the requesting peer's identity travels with the
+/// channel instead of being re-derived from a side map at response time. Keeping the
 /// type crate-owned also keeps libp2p's request-response types out of the public
 /// API, so a libp2p upgrade does not ripple into the consumer crates.
 #[derive(Debug)]

@@ -61,7 +61,7 @@ pub enum NetworkError {
     /// Error converted from [std::num::TryFromIntError]
     #[error(transparent)]
     TryFromIntError(#[from] std::num::TryFromIntError),
-    /// Libp2p `ResponseChannel` already closed due to timeout or loss of connection.
+    /// `ResponseChannel` already closed due to timeout or loss of connection.
     #[error("Response channel closed.")]
     SendResponse,
     /// Failed to send request/response outbound to peer.
