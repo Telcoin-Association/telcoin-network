@@ -65,3 +65,6 @@ vergen = { version = "8.0.0", features = ["build", "cargo", "git", "gitcl"] }
 
 [lints]
 workspace = true
+
+[features]
+adiri = []

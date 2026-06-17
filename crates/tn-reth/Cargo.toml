@@ -75,6 +75,7 @@ tn-reth = { workspace = true, features = ["test-utils"] }
 default = []
 faucet = []
 test-utils = ["dep:secp256k1"]
+adiri = ["faucet"]
 
 [lints]
 workspace = true

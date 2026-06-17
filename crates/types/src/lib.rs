@@ -26,6 +26,7 @@ mod task_manager;
 mod worker;
 #[macro_use]
 pub mod error;
+pub mod forks;
 
 pub use codec::*;
 pub use committee::*;
