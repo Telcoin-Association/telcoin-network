@@ -813,14 +813,14 @@ mod tests {
             let mut hasher = DefaultHashFunction::new();
             hasher.update(&format!("idx-{i}").into_bytes());
             let hash = B256::from_slice(hasher.finalize().as_bytes());
-            idx.save(hash, i).expect(&format!("add to index {i}"));
+            idx.save(hash, i).unwrap_or_else(|e| panic!("add to index {i}: {e}"));
         }
         for i in 0..1_000_000 {
             let mut hasher = DefaultHashFunction::new();
             hasher.update(&format!("idx-{i}").into_bytes());
             let hash = B256::from_slice(hasher.finalize().as_bytes());
             assert!(idx.test_bloom_contains(hash));
-            assert_eq!(idx.load(hash).expect(&format!("load idx {i}")), i);
+            assert_eq!(idx.load(hash).unwrap_or_else(|e| panic!("load idx {i}: {e}")), i);
         }
         drop(idx);
 
