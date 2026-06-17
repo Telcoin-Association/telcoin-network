@@ -1,6 +1,6 @@
 //! CLI definition and entrypoint to executable
 use crate::{
-    genesis, keytool, node,
+    db, genesis, keytool, node,
     open_telemetry::init_opentracing_subscriber,
     version::{LONG_VERSION, SHORT_VERSION},
     NoArgs,
@@ -132,6 +132,10 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
         self.logs.log_file_directory = self.logs.log_file_directory.join("telcoin-network-logs");
 
         match self.command {
+            Commands::Db(command) => {
+                let _guard = self.logs.init_tracing()?;
+                command.execute(datadir)
+            }
             Commands::Genesis(command) => {
                 let _guard = self.logs.init_tracing()?;
                 command.execute(datadir)
@@ -189,6 +193,10 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
 /// Commands to be executed
 #[derive(Debug, Subcommand)]
 pub enum Commands<Ext: clap::Args + fmt::Debug = NoArgs> {
+    /// Inspect and diagnose the execution database.
+    #[command(name = "db")]
+    Db(db::DbCommand),
+
     /// Genesis ceremony for starting the network.
     #[command(name = "genesis")]
     Genesis(Box<genesis::GenesisArgs>),
@@ -214,6 +222,11 @@ mod tests {
     fn parse_color_mode() {
         let tn = Cli::try_parse_args_from(["tn", "node", "--color", "always"]).unwrap();
         assert_eq!(tn.logs.color, ColorMode::Always);
+    }
+
+    #[test]
+    fn parse_db_stats_subcommand() {
+        let _ = Cli::<NoArgs>::try_parse_args_from(["tn", "db", "stats"]).expect("cli parsed");
     }
 
     /// Tests that the help message is parsed correctly. This ensures that clap args are configured
