@@ -3,18 +3,15 @@
 use clap::{Parser, Subcommand};
 use comfy_table::{Cell, Row, Table as ComfyTable};
 use human_bytes::human_bytes;
-use reth_db::{
-    mdbx::{open_db_read_only, DatabaseArguments},
-    static_file::iter_static_files,
-    Database as _, DatabaseEnv,
-};
-use reth_provider::providers::StaticFileProvider;
 use std::{
     fs,
     path::{Path, PathBuf},
 };
 use tn_config::TelcoinDirs as _;
-use tn_reth::traits::TNPrimitives;
+use tn_reth::{
+    iter_static_files, open_db_read_only, traits::TNPrimitives, DatabaseArguments, DatabaseEnv,
+    RethDatabaseT as _, RethMdbxError, StaticFileProvider, Tables,
+};
 
 /// Inspect the execution database and print read-only statistics.
 #[derive(Debug, Parser)]
@@ -230,8 +227,7 @@ fn db_stats_table(db: &DatabaseEnv) -> eyre::Result<ComfyTable> {
     let mut stats = Vec::new();
 
     db.view(|tx| {
-        let mut db_tables =
-            reth_db::Tables::ALL.iter().map(|table| table.name()).collect::<Vec<_>>();
+        let mut db_tables = Tables::ALL.iter().map(|table| table.name()).collect::<Vec<_>>();
         db_tables.sort();
 
         for db_table in db_tables {
@@ -241,7 +237,7 @@ fn db_stats_table(db: &DatabaseEnv) -> eyre::Result<ComfyTable> {
             // predates a table later added to `Tables::ALL` (schema skew).
             let table_db = match tx.inner().open_db(Some(db_table)) {
                 Ok(table_db) => table_db,
-                Err(reth_db::mdbx::Error::NotFound) => continue,
+                Err(RethMdbxError::NotFound) => continue,
                 Err(err) => return Err(eyre::eyre!("Could not open table {db_table}: {err}")),
             };
             let table_stats = tx.inner().db_stat(table_db.dbi()).map_err(|err| {
