@@ -72,8 +72,10 @@ fn main() {
                 // Need to ask and confirm before it used to encrypt.
                 passphrase = read_passphrase();
             }
-            Commands::Db(_) => {} // DB diagnostics are read-only and do not require keys.
-            Commands::Genesis(_) => {} // Don't need the passphrase..
+            // DB diagnostics are read-only and do not require keys.
+            Commands::Db(_) => passphrase = Some("".to_string()),
+            // Don't need the passphrase..
+            Commands::Genesis(_) => passphrase = Some("".to_string()),
             Commands::Node(_) => {
                 // Simple ask once and app will error out later if this is wrong.
                 passphrase =
