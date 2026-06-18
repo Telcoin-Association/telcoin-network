@@ -12,6 +12,8 @@ use tn_reth::{
     iter_static_files, open_db_read_only, traits::TNPrimitives, DatabaseArguments, DatabaseEnv,
     RethDatabaseT as _, RethMdbxError, StaticFileProvider, Tables,
 };
+use tn_storage::consensus_pack::{ConsensusPack, RewriteOutcome, DATA_NAME};
+use tn_types::Epoch;
 
 /// Inspect the execution database and print read-only statistics.
 #[derive(Debug, Parser)]
@@ -26,6 +28,23 @@ pub struct DbCommand {
 enum DbSubcommand {
     /// Print execution database statistics.
     Stats,
+    /// Rewrite pre-fork consensus epoch packs into the current serialization.
+    ///
+    /// Epoch packs written before the v0.11.0-adiri fork store an `EpochMeta` whose committee
+    /// predates `P2pNode.rpc`, so they only decode via a legacy compat fallback. This rewrites
+    /// each affected epoch in place — preserving the original at `epoch-{N}.bak-<unix-secs>` — so
+    /// the packs decode under the current format and can be served to peers. Stop the node first.
+    MigrateConsensusPacks {
+        /// Limit the migration to a single epoch. Default: every `epoch-{N}` dir found.
+        #[arg(long)]
+        epoch: Option<Epoch>,
+        /// Probe each pack and report what would change, without modifying anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Force a migrate even if it appears up to date (will rebuild indexes for instance).
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 impl DbCommand {
@@ -36,7 +55,7 @@ impl DbCommand {
     /// subcommand (reth-style, `telcoin-network db --datadir PATH stats`), or after the
     /// subcommand.
     pub fn execute(&self, datadir: PathBuf) -> eyre::Result<()> {
-        match self.command {
+        match &self.command {
             DbSubcommand::Stats => {
                 let db_path = datadir.reth_db_path();
                 let db = open_db_read_only(&db_path, DatabaseArguments::default())?;
@@ -52,6 +71,9 @@ impl DbCommand {
                     println!();
                 }
                 println!("{}", db_stats_table(&db)?);
+            }
+            DbSubcommand::MigrateConsensusPacks { epoch, dry_run, force } => {
+                migrate_consensus_packs(datadir, *epoch, *dry_run, *force)?;
             }
         }
         Ok(())
@@ -267,6 +289,161 @@ fn db_stats_table(db: &DatabaseEnv) -> eyre::Result<ComfyTable> {
     Ok(stats_table(&stats))
 }
 
+/// `data` file length for `epoch-{epoch}` under `epochs_dir`, or 0 if absent.
+fn epoch_data_len(epochs_dir: &Path, epoch: Epoch) -> u64 {
+    file_len_if_exists(&epochs_dir.join(format!("epoch-{epoch}")).join(DATA_NAME)).unwrap_or(0)
+}
+
+/// One row of the migration summary table.
+struct MigrationRow {
+    epoch: Epoch,
+    status: &'static str,
+    records: String,
+    size: String,
+    note: String,
+}
+
+fn migration_table(rows: &[MigrationRow]) -> ComfyTable {
+    let mut table = ComfyTable::new();
+    table.load_preset(comfy_table::presets::ASCII_MARKDOWN);
+    table.set_header(["Epoch", "Status", "Records", "Size", "Note"]);
+    for row in rows {
+        let mut r = Row::new();
+        r.add_cell(Cell::new(row.epoch))
+            .add_cell(Cell::new(row.status))
+            .add_cell(Cell::new(&row.records))
+            .add_cell(Cell::new(&row.size))
+            .add_cell(Cell::new(&row.note));
+        table.add_row(r);
+    }
+    table
+}
+
+/// Rewrite pre-fork consensus epoch packs under `datadir` into the current serialization.
+///
+/// Enumerates `epoch-{N}` dirs under the consensus epochs directory; `only_epoch` limits to one.
+/// `dry_run` performs only the read-only probe and changes nothing. Prints a summary table and
+/// returns an error (non-zero exit) if any epoch failed.
+fn migrate_consensus_packs(
+    datadir: PathBuf,
+    only_epoch: Option<Epoch>,
+    dry_run: bool,
+    force: bool,
+) -> eyre::Result<()> {
+    let epochs_dir = datadir.epochs_db_path();
+    if !epochs_dir.exists() {
+        eyre::bail!("no consensus epochs directory at {}", epochs_dir.display());
+    }
+
+    // Collect `epoch-{N}` dirs. The exact-parse skips backups (`epoch-{N}.bak-*`) and the scratch
+    // dir, whose names do not parse as a bare epoch number.
+    let mut epochs = Vec::new();
+    for entry in fs::read_dir(&epochs_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+        let Some(rest) = name.strip_prefix("epoch-") else { continue };
+        let Ok(epoch) = rest.parse::<Epoch>() else { continue };
+        if only_epoch.is_none() || only_epoch == Some(epoch) {
+            epochs.push(epoch);
+        }
+    }
+    epochs.sort_unstable();
+
+    if epochs.is_empty() {
+        if let Some(e) = only_epoch {
+            eyre::bail!("no epoch-{e} directory under {}", epochs_dir.display());
+        }
+        println!("No epoch packs found under {}", epochs_dir.display());
+        return Ok(());
+    }
+
+    let mut rows = Vec::with_capacity(epochs.len());
+    let mut failures = 0_usize;
+
+    if dry_run {
+        for epoch in epochs {
+            let row = match ConsensusPack::epoch_pack_needs_rewrite(&epochs_dir, epoch) {
+                Ok(needs) => MigrationRow {
+                    epoch,
+                    status: if needs { "would migrate" } else { "current" },
+                    records: "-".to_string(),
+                    size: human_bytes(epoch_data_len(&epochs_dir, epoch) as f64),
+                    note: String::new(),
+                },
+                Err(e) => {
+                    failures += 1;
+                    MigrationRow {
+                        epoch,
+                        status: "failed",
+                        records: "-".to_string(),
+                        size: "-".to_string(),
+                        note: e.to_string(),
+                    }
+                }
+            };
+            rows.push(row);
+        }
+    } else {
+        // Scratch dir under consensus-db (same filesystem as `epochs`) so the rewrite's final
+        // swap is an atomic rename. Cleaned up at the end.
+        let tmp_dir = datadir.consensus_db_path().join(".migrate-tmp");
+        let _ = fs::create_dir_all(&tmp_dir);
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        for epoch in epochs {
+            let outcome = runtime.block_on(ConsensusPack::rewrite_legacy_epoch(
+                &epochs_dir,
+                epoch,
+                &tmp_dir,
+                force,
+            ));
+            let row = match outcome {
+                Ok(RewriteOutcome::AlreadyCurrent) => MigrationRow {
+                    epoch,
+                    status: "current",
+                    records: "-".to_string(),
+                    size: human_bytes(epoch_data_len(&epochs_dir, epoch) as f64),
+                    note: String::new(),
+                },
+                Ok(RewriteOutcome::Migrated { records, size_before, size_after, backup }) => {
+                    MigrationRow {
+                        epoch,
+                        status: "migrated",
+                        records: records.to_string(),
+                        size: format!(
+                            "{} → {}",
+                            human_bytes(size_before as f64),
+                            human_bytes(size_after as f64)
+                        ),
+                        note: format!("backup: {}", backup.display()),
+                    }
+                }
+                Err(e) => {
+                    failures += 1;
+                    MigrationRow {
+                        epoch,
+                        status: "failed",
+                        records: "-".to_string(),
+                        size: "-".to_string(),
+                        note: e.to_string(),
+                    }
+                }
+            };
+            rows.push(row);
+        }
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    println!("{}", migration_table(&rows));
+
+    if failures > 0 {
+        eyre::bail!("{failures} epoch pack(s) failed to migrate; see the table above");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{file_len_if_exists, static_files_summary_table};
@@ -303,6 +480,31 @@ mod tests {
         let Commands::Db(_) = cli.command else {
             panic!("expected the db subcommand");
         };
+    }
+
+    #[test]
+    fn migrate_consensus_packs_subcommand_parses() {
+        let cli = Cli::<NoArgs>::try_parse_args_from([
+            "tn",
+            "db",
+            "--datadir",
+            "/tmp/x",
+            "migrate-consensus-packs",
+            "--epoch",
+            "5",
+            "--dry-run",
+        ])
+        .expect("cli parsed");
+        assert_eq!(cli.datadir.as_deref(), Some(Path::new("/tmp/x")));
+        let Commands::Db(db) = cli.command else { panic!("expected the db subcommand") };
+        match db.command {
+            super::DbSubcommand::MigrateConsensusPacks { epoch, dry_run, force } => {
+                assert_eq!(epoch, Some(5));
+                assert!(dry_run);
+                assert!(!force);
+            }
+            other => panic!("expected migrate-consensus-packs, got {other:?}"),
+        }
     }
 
     #[test]

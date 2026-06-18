@@ -30,8 +30,15 @@ use crate::archive::{
     fxhasher::FxHasher,
     index::Index as _,
     pack::{Pack, PackCompression, DATA_HEADER_BYTES},
+    pack_iter::TryDecodeRecord,
     position_index::index::PositionIndex,
 };
+
+// Both record types are wire-stable across the v0.11.0-adiri fork (`EpochRecord` is a
+// `Vec<BlsPublicKey>` + hashes; `EpochCertificate` is hash + signature + bitmap), so they use the
+// default current-format decode with no legacy fallback. See [`TryDecodeRecord`].
+impl TryDecodeRecord for EpochRecord {}
+impl TryDecodeRecord for EpochCertificate {}
 
 enum EpochDbMessage {
     /// Save a "dummy" epoch 0 [`EpochRecord`] without a certificate.

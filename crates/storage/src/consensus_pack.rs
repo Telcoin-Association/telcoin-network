@@ -11,16 +11,16 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tn_types::{
-    gas_accumulator::RewardsCounter, AuthorityIdentifier, Batch, BlockHash, BlockNumHash,
-    BlsPublicKey, CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader,
-    ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch, EpochRecord, Hash as _, Round,
-    B256,
+    gas_accumulator::RewardsCounter, try_decode, AuthorityIdentifier, Batch, BlockHash,
+    BlockNumHash, BlsPublicKey, CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader,
+    ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch, EpochRecord, Hash as _,
+    LegacyCommittee, Round, B256,
 };
 use tokio::{
     io::{AsyncRead, BufReader},
@@ -38,7 +38,7 @@ use crate::archive::{
     fxhasher::FxHasher,
     index::Index as _,
     pack::{DataHeader, Pack, PackCompression, DATA_HEADER_BYTES},
-    pack_iter::AsyncPackIter,
+    pack_iter::{AsyncPackIter, TryDecodeRecord},
     position_index::index::{PosIndexValue, PositionIndex},
 };
 
@@ -89,6 +89,100 @@ impl PackRecord {
         } else {
             Err(PackError::NotEpoch)
         }
+    }
+}
+
+/// Pre-`rpc` [`EpochMeta`] wire layout. See [`tn_types::LegacyCommittee`].
+///
+/// The only field whose on-disk format changed across the v0.11.0-adiri fork is `committee`:
+/// #730 added `P2pNode.rpc`, and the committee's bootstrap servers embed `P2pNode`. Swapping in
+/// [`LegacyCommittee`] (rpc stripped) lets an epoch pack written before the fork decode its
+/// first record; every other field is wire-identical (the #724 `BlockNumHash` →
+/// `ConsensusNumHash` change for `genesis_consensus` is byte-for-byte the same: `u64` + 32-byte
+/// hash).
+#[derive(Deserialize)]
+struct LegacyEpochMeta {
+    /// The epoch this record is for.
+    epoch: Epoch,
+    /// The active committee for this epoch (pre-`rpc` layout).
+    committee: LegacyCommittee,
+    /// The first consensus block number of this epoch.
+    start_consensus_number: u64,
+    /// The execution genesis for this epoch.
+    genesis_exec_state: BlockNumHash,
+    /// The "genesis" consensus header of this epoch.
+    genesis_consensus: ConsensusNumHash,
+}
+
+impl From<LegacyEpochMeta> for EpochMeta {
+    fn from(legacy: LegacyEpochMeta) -> Self {
+        let LegacyEpochMeta {
+            epoch,
+            committee,
+            start_consensus_number,
+            genesis_exec_state,
+            genesis_consensus,
+        } = legacy;
+        Self {
+            epoch,
+            committee: committee.into(),
+            start_consensus_number,
+            genesis_exec_state,
+            genesis_consensus,
+        }
+    }
+}
+
+/// Pre-`rpc` [`PackRecord`] wire layout, used only to decode the first (`EpochMeta`) record of
+/// an epoch pack written before the fork.
+///
+/// The variant order matches [`PackRecord`] so the BCS enum discriminant lines up. Only the
+/// `EpochMeta` variant differs (it carries a [`LegacyEpochMeta`]); `Batch`/`Consensus` reuse the
+/// current, wire-stable types and exist only to keep the discriminant indexes aligned — we only
+/// ever read the first record, which is always `EpochMeta` (index 0), so their payloads are
+/// decoded-but-never-inspected, hence `allow(dead_code)`.
+#[derive(Deserialize)]
+#[allow(dead_code)]
+enum LegacyPackRecord {
+    EpochMeta(LegacyEpochMeta),
+    Batch(Batch),
+    Consensus(Box<ConsensusHeader>),
+}
+
+impl LegacyPackRecord {
+    fn into_epoch(self) -> Result<EpochMeta, PackError> {
+        if let Self::EpochMeta(epoch) = self {
+            Ok(epoch.into())
+        } else {
+            Err(PackError::NotEpoch)
+        }
+    }
+}
+
+/// The only [`TryDecodeRecord`] override: try the current format, then fall back to the pre-fork
+/// (`P2pNode.rpc`-less) layout. The fallback is the single decode chokepoint shared by every
+/// reader — sync `PackIter`, async `AsyncPackIter` (full and partial peer streams), and
+/// random-access `Pack::fetch` — so historic imports and live p2p streams of a pre-fork epoch
+/// behave identically.
+impl TryDecodeRecord for PackRecord {
+    fn try_decode_record(bytes: &[u8]) -> Result<Self, FetchError> {
+        if let Ok(rec) = try_decode::<PackRecord>(bytes) {
+            return Ok(rec);
+        }
+        // Only the first (`EpochMeta`) record of a pre-fork pack carries the rpc-stripped
+        // committee; `Batch`/`Consensus` records are wire-stable, so a genuine decode failure on
+        // those falls through here and fails the legacy decode too — still fatal. `bytes` is
+        // already CRC-verified, so this can never mask corruption (that errors earlier).
+        let meta = try_decode::<LegacyPackRecord>(bytes)
+            .map_err(|e| FetchError::DeserializeValue(e.to_string()))?
+            .into_epoch()
+            .map_err(|e| FetchError::DeserializeValue(e.to_string()))?;
+        warn!(
+            target: "consensus_pack",
+            epoch = meta.epoch,
+            "decoded pre-upgrade epoch meta via legacy compat; rpc stripped"
+        );
+        Ok(PackRecord::EpochMeta(meta))
     }
 }
 
@@ -193,6 +287,29 @@ impl Drop for ConsensusPack {
     }
 }
 
+/// Per-record read timeout used when [`ConsensusPack::rewrite_legacy_epoch`] streams an old pack
+/// through `stream_import`. Reads come from a local file, so this only guards against a truncated
+/// or wedged record, not a slow peer.
+const REWRITE_RECORD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Outcome of [`ConsensusPack::rewrite_legacy_epoch`] for a single epoch.
+#[derive(Debug, Clone)]
+pub enum RewriteOutcome {
+    /// The pack's first record already decoded under the current format; nothing was changed.
+    AlreadyCurrent,
+    /// The pack was rewritten into the current serialization.
+    Migrated {
+        /// Number of consensus-header (output) records carried over.
+        records: usize,
+        /// `data` file length before the rewrite.
+        size_before: u64,
+        /// `data` file length after the rewrite.
+        size_after: u64,
+        /// Path the original epoch directory was preserved at.
+        backup: PathBuf,
+    },
+}
+
 impl ConsensusPack {
     /// Opens a new epoch pack for append.  Will create a new set of epoch static
     /// files to write consensus output into if they do not exist.
@@ -235,6 +352,15 @@ impl ConsensusPack {
             committee,
             compression,
         })
+    }
+
+    /// Filesystem path to the epoch pack's primary `data` file for `epoch` under `path`.
+    ///
+    /// Lets a caller tell a genuinely fresh epoch (no pack on disk yet) apart from a pack
+    /// that exists but fails to open, so the latter can fail loudly instead of being
+    /// silently dropped to `None` and resurfacing later as a misleading `NoCurrentEpoch`.
+    pub fn epoch_pack_path<P: AsRef<Path>>(path: P, epoch: Epoch) -> PathBuf {
+        path.as_ref().join(format!("epoch-{epoch}")).join(DATA_NAME)
     }
 
     /// Open up the static files for previous epoch.  These will be read only.
@@ -458,6 +584,182 @@ impl ConsensusPack {
         } else {
             Err(PackError::SendFailed)
         }
+    }
+
+    /// True if the epoch-`epoch` pack under `epochs_dir` still uses the pre-fork (legacy)
+    /// `EpochMeta` serialization and therefore needs rewriting.
+    ///
+    /// Read-only and cheap: opens only the `data` file and probes its first record under the
+    /// current format. Used for the `--dry-run` report and as the rewrite's idempotency guard.
+    pub fn epoch_pack_needs_rewrite<P: AsRef<Path>>(
+        epochs_dir: P,
+        epoch: Epoch,
+    ) -> Result<bool, PackError> {
+        let mut data = Pack::<PackRecord>::open(
+            Self::epoch_pack_path(epochs_dir.as_ref(), epoch),
+            epoch as u64,
+            true,
+            PackCompression::ZStd,
+        )?;
+        Ok(!Self::first_record_is_current(&mut data)?)
+    }
+
+    /// True if the pack's first `EpochMeta` record decodes under the *current* `PackRecord` format
+    /// with no legacy fallback. Reads the raw bytes then attempts only the current decode
+    /// (deliberately not `try_decode_record`, whose fallback would mask a legacy record).
+    fn first_record_is_current(data: &mut Pack<PackRecord>) -> Result<bool, PackError> {
+        let bytes = data
+            .fetch_raw(DATA_HEADER_BYTES as u64)
+            .map_err(|e| PackError::EpochLoad(e.to_string()))?;
+        Ok(try_decode::<PackRecord>(&bytes).is_ok())
+    }
+
+    /// Count `Consensus` (output) records in a pack by iterating the data file. The first record
+    /// (`EpochMeta`) decodes via the compat fallback when legacy; `Batch`/`Consensus` records are
+    /// wire-stable so they decode directly.
+    fn count_consensus_records(data: &Pack<PackRecord>) -> Result<usize, PackError> {
+        let mut count = 0_usize;
+        for rec in data.raw_iter().map_err(|e| PackError::ReadError(e.to_string()))? {
+            if let PackRecord::Consensus(_) =
+                rec.map_err(|e| PackError::ReadError(e.to_string()))?
+            {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Rewrite a pre-fork (legacy) epoch pack into the current serialization, in place.
+    ///
+    /// Pipes the old `data` file through [`stream_import`](Self::stream_import) — the exact path a
+    /// peer uses — so a migrated pack is byte-for-byte what a fresh sync would produce: the legacy
+    /// `EpochMeta` is decoded via the compat fallback and re-appended in the current format
+    /// (adding the rpc `Option` byte), every output is rebuilt and re-indexed, and the in-pack
+    /// consensus chain is verified.
+    ///
+    /// `epochs_dir` holds the `epoch-{N}` subdirs (`consensus-db/epochs`). `tmp_dir` is scratch
+    /// space **on the same filesystem** as `epochs_dir` so the final swap is an atomic rename: the
+    /// rewrite is staged at `tmp_dir/epoch-{N}`, verified, then swapped in, and the original is
+    /// preserved at `epochs_dir/epoch-{N}.bak-<unix-secs>`.
+    ///
+    /// Idempotent — a pack already in the current format returns [`RewriteOutcome::AlreadyCurrent`]
+    /// without touching disk. No `EpochRecordDb` is needed: the verification inputs are synthesised
+    /// from the pack's own `EpochMeta`, and the real integrity check is the in-pack consensus chain
+    /// that `stream_import` validates (parent links, monotonic numbers, batch references).
+    pub async fn rewrite_legacy_epoch<P1: AsRef<Path>, P2: AsRef<Path>>(
+        epochs_dir: P1,
+        epoch: Epoch,
+        tmp_dir: P2,
+        force: bool,
+    ) -> Result<RewriteOutcome, PackError> {
+        let epochs_dir = epochs_dir.as_ref();
+        let tmp_dir = tmp_dir.as_ref();
+        let epoch_dir = epochs_dir.join(format!("epoch-{epoch}"));
+        let pack_path = Self::epoch_pack_path(epochs_dir, epoch);
+
+        // Probe + read meta (tolerant) + count outputs, reading only the old `data` file. The old
+        // indexes are never read — the rewrite rebuilds them from the record stream — so they get
+        // carried into the backup untouched.
+        let (epoch_meta, output_count, size_before) = {
+            let mut old =
+                Pack::<PackRecord>::open(&pack_path, epoch as u64, true, PackCompression::ZStd)?;
+            if !force && Self::first_record_is_current(&mut old)? {
+                return Ok(RewriteOutcome::AlreadyCurrent);
+            }
+            let raw = old
+                .fetch_raw(DATA_HEADER_BYTES as u64)
+                .map_err(|e| PackError::EpochLoad(e.to_string()))?;
+            let epoch_meta = PackRecord::try_decode_record(&raw)
+                .map_err(|e| PackError::EpochLoad(e.to_string()))?
+                .into_epoch()?;
+            let output_count = Self::count_consensus_records(&old)?;
+            (epoch_meta, output_count, old.file_len())
+        };
+
+        // Synthesise the previous epoch from this pack's own EpochMeta so stream_import's
+        // verify_epoch_meta holds without an EpochRecordDb (final_state / final_consensus / next
+        // committee all derive from the meta).
+        let previous_epoch = EpochRecord {
+            epoch: epoch.saturating_sub(1),
+            final_state: epoch_meta.genesis_exec_state,
+            final_consensus: epoch_meta.genesis_consensus,
+            next_committee: epoch_meta.committee.bls_keys().into_iter().collect(),
+            ..Default::default()
+        };
+        let final_consensus_number =
+            epoch_meta.start_consensus_number.saturating_add(output_count as u64).saturating_sub(1);
+
+        // Stream the old `data` file into a fresh, current-format pack at tmp_dir/epoch-{N}.
+        let tmp_epoch_dir = tmp_dir.join(format!("epoch-{epoch}"));
+        let _ = std::fs::remove_dir_all(&tmp_epoch_dir); // drop any stale partial from a prior run
+        std::fs::create_dir_all(tmp_dir)?;
+        let size_after = {
+            let stream = tokio::fs::File::open(&pack_path).await?;
+            let pack = Self::stream_import(
+                tmp_dir,
+                stream,
+                epoch,
+                &previous_epoch,
+                final_consensus_number,
+                REWRITE_RECORD_TIMEOUT,
+            )
+            .await?;
+            pack.persist().await?;
+            drop(pack); // join the writer thread so the staged files are durable before we verify
+                        // Verify the staged pack BEFORE the destructive swap: it must open consistently, its
+                        // first record must decode under the current path (no fallback), and it must carry the
+                        // same number of outputs as the original.
+            Self::verify_rewritten(tmp_dir, epoch, output_count)?
+        };
+
+        // Atomic swap with a timestamped backup of the original epoch dir.
+        let stamp =
+            SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or_default();
+        let backup = epochs_dir.join(format!("epoch-{epoch}.bak-{stamp}"));
+        std::fs::rename(&epoch_dir, &backup)?;
+        if let Err(e) = std::fs::rename(&tmp_epoch_dir, &epoch_dir) {
+            // Restore so we never leave the operator without an epoch dir.
+            let _ = std::fs::rename(&backup, &epoch_dir);
+            return Err(e.into());
+        }
+        fsync_directory(epochs_dir)?;
+
+        // Confirm the swapped-in pack opens cleanly at its real location.
+        drop(Self::open_static(epochs_dir, epoch)?);
+
+        Ok(RewriteOutcome::Migrated { records: output_count, size_before, size_after, backup })
+    }
+
+    /// Open the staged/migrated pack read-only and assert it is sound: `open_static` runs
+    /// `files_consistent` (indexes match the data file), the first record decodes under the
+    /// current path with no fallback, and the output count matches `expected_outputs`. Returns the
+    /// rewritten `data` file length.
+    fn verify_rewritten<P: AsRef<Path>>(
+        dir: P,
+        epoch: Epoch,
+        expected_outputs: usize,
+    ) -> Result<u64, PackError> {
+        drop(Self::open_static(dir.as_ref(), epoch)?);
+
+        let mut data = Pack::<PackRecord>::open(
+            Self::epoch_pack_path(dir.as_ref(), epoch),
+            epoch as u64,
+            true,
+            PackCompression::ZStd,
+        )?;
+        if !Self::first_record_is_current(&mut data)? {
+            return Err(PackError::EpochLoad(
+                "rewritten pack first record does not decode under the current format".to_string(),
+            ));
+        }
+        let output_count = Self::count_consensus_records(&data)?;
+        if output_count != expected_outputs {
+            return Err(PackError::InvalidConsensusNumber(
+                expected_outputs as u64,
+                output_count as u64,
+            ));
+        }
+        Ok(data.file_len())
     }
 }
 
@@ -716,6 +1018,21 @@ impl Inner {
         Ok(Self { data, consensus_digests, consensus_pos_idx, batch_digests, epoch_meta })
     }
 
+    /// Read and decode the `EpochMeta` first record of an epoch pack.
+    ///
+    /// Tolerance for packs written before the v0.11.0-adiri fork now lives in
+    /// [`PackRecord::try_decode_record`], which `data.fetch` routes through: it tries the current
+    /// format, then falls back to the rpc-stripped [`LegacyPackRecord`] layout for the one
+    /// pre-fork record that needs it (defaulting `rpc` to `None`). IO / CRC / size errors stay
+    /// fatal, and a record that decodes as neither layout is fatal too — preserving the
+    /// loud-failure contract that surfaces real corruption at startup. The on-disk record is
+    /// never rewritten; new appends use the current format.
+    fn fetch_epoch_meta(data: &mut Pack<PackRecord>) -> Result<EpochMeta, PackError> {
+        data.fetch(DATA_HEADER_BYTES as u64)
+            .map_err(|e| PackError::EpochLoad(e.to_string()))?
+            .into_epoch()
+    }
+
     /// Open up the files for previous epoch in append mode.  Will fail if files do not exist.
     fn open_append_exists<P: AsRef<Path>>(path: P, epoch: Epoch) -> Result<Self, PackError> {
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
@@ -726,10 +1043,7 @@ impl Inner {
             false,
             PackCompression::ZStd,
         )?;
-        let epoch_meta = data
-            .fetch(DATA_HEADER_BYTES as u64)
-            .map_err(|e| PackError::EpochLoad(e.to_string()))?
-            .into_epoch()?;
+        let epoch_meta = Self::fetch_epoch_meta(&mut data)?;
         let mut consensus_pos_idx = Self::open_pdx_file_with_update(&base_dir, false, &mut data)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
         let mut consensus_digests = HdxIndex::open_hdx_file(
@@ -768,10 +1082,7 @@ impl Inner {
             true,
             PackCompression::ZStd,
         )?;
-        let epoch_meta = data
-            .fetch(DATA_HEADER_BYTES as u64)
-            .map_err(|e| PackError::EpochLoad(e.to_string()))?
-            .into_epoch()?;
+        let epoch_meta = Self::fetch_epoch_meta(&mut data)?;
         let mut consensus_pos_idx = Self::open_pdx_file_with_update(&base_dir, true, &mut data)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
         let consensus_digests = HdxIndex::open_hdx_file(
@@ -1571,11 +1882,119 @@ pub(crate) mod test {
         archive::{
             index::Index as _,
             pack::{DataHeader, PackCompression},
+            pack_iter::TryDecodeRecord,
             position_index::index::PositionIndex,
         },
         consensus_pack::{ConsensusPack, IndexPositions, Inner},
         mem_db::MemDatabase,
     };
+
+    // A CRC-valid-but-undecodable first record is built with `Pack<u8>` (see the undecodable
+    // fatal test); a single raw byte is enough to exercise the "decodes as neither layout" path.
+    impl TryDecodeRecord for u8 {}
+
+    /// Pre-fork (`#730`-less) wire mirrors plus a builder, shared by the legacy-decode tests.
+    ///
+    /// Field order MUST match the historical structs so the BCS bytes are exactly what a pre-fork
+    /// binary wrote: `P2pNode` without `rpc`, `CommitteeInner`'s serialized fields (`authorities`,
+    /// `epoch`, `bootstrap_servers`), `EpochMeta`, and `PackRecord` (EpochMeta at variant index 0).
+    pub(crate) mod legacy_wire {
+        use std::collections::BTreeMap;
+
+        use serde::{Deserialize, Serialize};
+        use tn_types::{
+            encode, Authority, BlockNumHash, BlsPublicKey, Committee, ConsensusNumHash, Epoch,
+            Multiaddr, NetworkPublicKey,
+        };
+
+        use crate::archive::pack_iter::TryDecodeRecord;
+
+        // Fields are private (the tests only build these via `wire_epoch_meta` and use them as
+        // opaque records to encode / append); the derives serialize private fields fine.
+        #[derive(Debug, Serialize, Deserialize)]
+        pub(super) struct WireP2pNode {
+            network_address: Multiaddr,
+            network_key: NetworkPublicKey,
+        }
+        #[derive(Debug, Serialize, Deserialize)]
+        pub(super) struct WireBootstrap {
+            primary: WireP2pNode,
+            worker: WireP2pNode,
+        }
+        #[derive(Debug, Serialize, Deserialize)]
+        pub(super) struct WireCommittee {
+            authorities: BTreeMap<BlsPublicKey, Authority>,
+            epoch: Epoch,
+            bootstrap_servers: BTreeMap<BlsPublicKey, WireBootstrap>,
+        }
+        #[derive(Debug, Serialize, Deserialize)]
+        pub(super) struct WireEpochMeta {
+            epoch: Epoch,
+            committee: WireCommittee,
+            start_consensus_number: u64,
+            genesis_exec_state: BlockNumHash,
+            genesis_consensus: ConsensusNumHash,
+        }
+        #[derive(Debug, Serialize, Deserialize)]
+        pub(super) enum WirePackRecord {
+            EpochMeta(WireEpochMeta),
+        }
+        impl TryDecodeRecord for WirePackRecord {}
+
+        /// Re-encode `committee` in the pre-`rpc` layout (drop every `P2pNode.rpc`), wrapped as the
+        /// `EpochMeta` first record of a pack.
+        pub(super) fn wire_epoch_meta(
+            committee: &Committee,
+            start_consensus_number: u64,
+            genesis_exec_state: BlockNumHash,
+            genesis_consensus: ConsensusNumHash,
+        ) -> WirePackRecord {
+            let epoch = committee.epoch();
+            let authorities: BTreeMap<BlsPublicKey, Authority> =
+                committee.authorities().into_iter().map(|a| (*a.protocol_key(), a)).collect();
+            let bootstrap_servers: BTreeMap<BlsPublicKey, WireBootstrap> = committee
+                .bootstrap_servers()
+                .into_iter()
+                .map(|(key, server)| {
+                    (
+                        key,
+                        WireBootstrap {
+                            primary: WireP2pNode {
+                                network_address: server.primary.network_address,
+                                network_key: server.primary.network_key,
+                            },
+                            worker: WireP2pNode {
+                                network_address: server.worker.network_address,
+                                network_key: server.worker.network_key,
+                            },
+                        },
+                    )
+                })
+                .collect();
+            WirePackRecord::EpochMeta(WireEpochMeta {
+                epoch,
+                committee: WireCommittee { authorities, epoch, bootstrap_servers },
+                start_consensus_number,
+                genesis_exec_state,
+                genesis_consensus,
+            })
+        }
+
+        /// BCS bytes of the legacy `EpochMeta` first record for `committee`.
+        pub(super) fn wire_epoch_meta_bytes(
+            committee: &Committee,
+            start_consensus_number: u64,
+            genesis_exec_state: BlockNumHash,
+            genesis_consensus: ConsensusNumHash,
+        ) -> Vec<u8> {
+            encode(&wire_epoch_meta(
+                committee,
+                start_consensus_number,
+                genesis_exec_state,
+                genesis_consensus,
+            ))
+        }
+    }
 
     pub(crate) fn make_test_output(
         committee: &Committee,
@@ -2272,5 +2691,394 @@ pub(crate) mod test {
         // The healed pack dropped the damaged 5th output; the first four remain readable.
         assert!(pack.get_consensus_output(1).await.is_ok());
         assert!(pack.get_consensus_output(4).await.is_ok());
+    }
+
+    /// CP4 (the v0.11.0-adiri startup blocker): an epoch pack whose first `EpochMeta` record was
+    /// written before #730 added `P2pNode.rpc` must still open. Its committee's bootstrap-server
+    /// `P2pNode`s lack the trailing rpc Option byte, so the current decoder fails with "expected
+    /// option type"; `open_append_exists` must fall back to the legacy layout and default `rpc`
+    /// to `None`, preserving the committee.
+    #[tokio::test]
+    async fn test_open_append_exists_decodes_pre_rpc_epoch_pack() {
+        use crate::archive::pack::Pack;
+        use tn_types::{encode, try_decode, BlockNumHash, ConsensusNumHash};
+
+        let temp_dir = TempDir::with_prefix("test_cp_pre_rpc").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let epoch = committee.epoch();
+
+        // Re-encode the fixture committee in the pre-`rpc` layout (drops every `P2pNode.rpc`).
+        let wire = legacy_wire::wire_epoch_meta(
+            &committee,
+            1,
+            BlockNumHash::default(),
+            ConsensusNumHash::default(),
+        );
+
+        // These bytes decode ONLY via the legacy layout — proving the compat path is exercised and
+        // not a fluke of the fixture happening to be current-format compatible. (If the committee
+        // carried no bootstrap `P2pNode`s the two layouts would coincide and the current decode
+        // would succeed, failing the first assertion.)
+        let bcs = encode(&wire);
+        assert!(
+            try_decode::<super::PackRecord>(&bcs).is_err(),
+            "pre-rpc bytes must NOT decode as the current PackRecord",
+        );
+        assert!(
+            try_decode::<super::LegacyPackRecord>(&bcs).is_ok(),
+            "pre-rpc bytes must decode as the legacy PackRecord",
+        );
+
+        // Write the legacy record as the first (EpochMeta) record of an epoch pack on disk.
+        let epoch_dir = temp_dir.path().join(format!("epoch-{epoch}"));
+        std::fs::create_dir_all(&epoch_dir).expect("create epoch dir");
+        {
+            let mut pack: Pack<legacy_wire::WirePackRecord> = Pack::open(
+                epoch_dir.join(Inner::DATA_NAME),
+                epoch as u64,
+                false,
+                PackCompression::ZStd,
+            )
+            .expect("open wire pack");
+            pack.append(&wire).expect("append legacy epoch meta");
+            pack.commit().expect("commit wire pack");
+        }
+
+        // The real open path must succeed via the legacy fallback and preserve the committee.
+        let pack = ConsensusPack::open_append_exists(temp_dir.path(), epoch)
+            .expect("pre-rpc epoch pack opens via legacy compat");
+        assert_eq!(pack.epoch(), epoch);
+        let opened = &pack.committee;
+        assert_eq!(opened.epoch(), committee.epoch());
+        assert_eq!(opened.size(), committee.size());
+        for (key, original) in committee.bootstrap_servers() {
+            let restored = opened.get_bootstrap(&key).expect("bootstrap server preserved");
+            assert_eq!(restored.primary.network_address, original.primary.network_address);
+            assert_eq!(restored.worker.network_address, original.worker.network_address);
+            assert!(restored.primary.rpc.is_none(), "primary rpc defaulted to None");
+            assert!(restored.worker.rpc.is_none(), "worker rpc defaulted to None");
+        }
+        drop(pack);
+    }
+
+    /// The legacy fallback must not regress the hot path: a current-format epoch pack still opens
+    /// through `open_append_exists` via the fast decode (no fallback, no warning).
+    #[tokio::test]
+    async fn test_open_append_exists_current_format_fast_path() {
+        let temp_dir = TempDir::with_prefix("test_cp_current_fast").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        // Create a normal current-format pack (EpochMeta + a few outputs) and close it.
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                previous_epoch.clone(),
+                committee.clone(),
+            )
+            .expect("open append");
+            let mut parent = ConsensusHeader::default().digest();
+            for i in 0..3 {
+                let output =
+                    make_test_output(&committee, i % 4, chain.clone(), (i as u64) + 1, parent);
+                parent = output.digest().into();
+                pack.save_consensus_output(output).await.unwrap();
+            }
+            pack.persist().await.expect("persist");
+        }
+
+        // Reopen the current-format pack through the same path the legacy fix touches.
+        let pack = ConsensusPack::open_append_exists(temp_dir.path(), committee.epoch())
+            .expect("current-format pack opens via fast path");
+        assert_eq!(pack.epoch(), committee.epoch());
+        assert_eq!(pack.committee.size(), committee.size());
+        assert!(pack.get_consensus_output(1).await.is_ok(), "data readable after reopen");
+    }
+
+    /// A CRC-valid first record that decodes as neither the current nor the legacy `PackRecord`
+    /// must stay fatal — the legacy fallback widens what we accept, but only to the one proven
+    /// pre-fork layout, never to genuine garbage.
+    #[tokio::test]
+    async fn test_open_append_exists_undecodable_record_is_fatal() {
+        use crate::archive::pack::Pack;
+        use tn_types::Epoch;
+
+        let temp_dir = TempDir::with_prefix("test_cp_undecodable").expect("temp dir");
+        let epoch: Epoch = 0;
+        let epoch_dir = temp_dir.path().join(format!("epoch-{epoch}"));
+        std::fs::create_dir_all(&epoch_dir).expect("create epoch dir");
+
+        // A valid header + a CRC-valid record whose payload is `[0x05]`: a BCS enum variant index
+        // of 5, which neither `PackRecord` nor `LegacyPackRecord` (each with 3 variants) accepts.
+        // So the current decode fails with DeserializeValue, the legacy decode also fails, and the
+        // open must surface the error rather than silently widening acceptance.
+        {
+            let mut pack: Pack<u8> = Pack::open(
+                epoch_dir.join(Inner::DATA_NAME),
+                epoch as u64,
+                false,
+                PackCompression::ZStd,
+            )
+            .expect("open raw pack");
+            pack.append(&5_u8).expect("append undecodable record");
+            pack.commit().expect("commit");
+        }
+
+        let err = ConsensusPack::open_append_exists(temp_dir.path(), epoch)
+            .expect_err("an undecodable first record must be fatal");
+        assert!(matches!(err, super::PackError::EpochLoad(_)), "expected EpochLoad, got {err:?}");
+    }
+
+    /// CP5 — the p2p-stream blocker Step 4 missed: a pre-rpc `EpochMeta` first record must decode
+    /// through *every* reader, not just the local `open_*` path. Exercises the sync `PackIter`, the
+    /// async `AsyncPackIter::open` (historic full-epoch import), and `AsyncPackIter::open_partial`
+    /// (live output stream) — all now route decode through `PackRecord::try_decode_record`.
+    #[tokio::test]
+    async fn test_pack_iters_decode_pre_rpc_first_record() {
+        use super::{LegacyPackRecord, PackRecord};
+        use crate::archive::{
+            pack::{Pack, DATA_HEADER_BYTES},
+            pack_iter::{AsyncPackIter, PackIter},
+        };
+        use std::io::Cursor;
+        use tn_types::{try_decode, BlockNumHash, ConsensusNumHash};
+
+        let temp_dir = TempDir::with_prefix("test_cp_iter_pre_rpc").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let epoch = committee.epoch();
+
+        // Guard: the decompressed record bytes decode ONLY via the legacy layout.
+        let bcs = legacy_wire::wire_epoch_meta_bytes(
+            &committee,
+            1,
+            BlockNumHash::default(),
+            ConsensusNumHash::default(),
+        );
+        assert!(try_decode::<PackRecord>(&bcs).is_err(), "guard: bytes must be legacy-only");
+        assert!(try_decode::<LegacyPackRecord>(&bcs).is_ok(), "guard: legacy layout decodes");
+
+        // Write a one-record pack (header + framed, zstd-compressed legacy EpochMeta) the same way
+        // a real pack would, so the readers hit the production decompress + decode path.
+        let data_path = temp_dir.path().join("data");
+        let wire = legacy_wire::wire_epoch_meta(
+            &committee,
+            1,
+            BlockNumHash::default(),
+            ConsensusNumHash::default(),
+        );
+        {
+            let mut pack: Pack<legacy_wire::WirePackRecord> =
+                Pack::open(&data_path, epoch as u64, false, PackCompression::ZStd)
+                    .expect("open wire pack");
+            pack.append(&wire).expect("append legacy meta");
+            pack.commit().expect("commit");
+        }
+        let file_bytes = std::fs::read(&data_path).expect("read data");
+
+        // 1. Sync PackIter over the full pack (header + record).
+        {
+            let file = std::fs::File::open(&data_path).expect("open file");
+            let mut iter =
+                PackIter::<PackRecord, _>::open(file, epoch as u64).expect("sync iter open");
+            match iter.next() {
+                Some(Ok(PackRecord::EpochMeta(meta))) => assert_eq!(meta.epoch, epoch),
+                other => panic!("sync PackIter expected EpochMeta via fallback, got {other:?}"),
+            }
+        }
+
+        // 2. Async AsyncPackIter::open over the full pack (historic full-epoch import path).
+        {
+            let file = tokio::fs::File::open(&data_path).await.expect("open file");
+            let mut iter = AsyncPackIter::<PackRecord, _>::open(file, epoch as u64)
+                .await
+                .expect("async iter open");
+            match iter.next().await {
+                Some(Ok(PackRecord::EpochMeta(meta))) => assert_eq!(meta.epoch, epoch),
+                other => {
+                    panic!("AsyncPackIter::open expected EpochMeta via fallback, got {other:?}")
+                }
+            }
+        }
+
+        // 3. AsyncPackIter::open_partial over just the records, no header (live output path).
+        {
+            let records = file_bytes[DATA_HEADER_BYTES..].to_vec();
+            let mut iter = AsyncPackIter::<PackRecord, _>::open_partial(
+                Cursor::new(records),
+                PackCompression::ZStd,
+            )
+            .await
+            .expect("partial iter open");
+            match iter.next().await {
+                Some(Ok(PackRecord::EpochMeta(meta))) => assert_eq!(meta.epoch, epoch),
+                other => panic!("open_partial expected EpochMeta via fallback, got {other:?}"),
+            }
+        }
+    }
+
+    /// The fallback must not regress the hot path: a current-format first record decodes directly,
+    /// with the raw bytes accepted by the current decoder (no fallback) and the async iterator
+    /// yielding it.
+    #[tokio::test]
+    async fn test_pack_iter_current_first_record_fast_path() {
+        use super::PackRecord;
+        use crate::archive::{
+            pack::{Pack, DATA_HEADER_BYTES},
+            pack_iter::AsyncPackIter,
+        };
+        use tn_types::try_decode;
+
+        let temp_dir = TempDir::with_prefix("test_cp_iter_current").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        {
+            let pack =
+                ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee.clone())
+                    .expect("open append");
+            pack.persist().await.expect("persist");
+        }
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+
+        // The raw first-record bytes are accepted by the current decoder — i.e. the fast path.
+        {
+            let mut pack: Pack<PackRecord> =
+                Pack::open(&data_path, 0, true, PackCompression::ZStd).expect("open");
+            let raw = pack.fetch_raw(DATA_HEADER_BYTES as u64).expect("fetch_raw");
+            assert!(try_decode::<PackRecord>(&raw).is_ok(), "current first record uses fast path");
+        }
+
+        // And the async iterator yields it.
+        let file = tokio::fs::File::open(&data_path).await.expect("open");
+        let mut iter =
+            AsyncPackIter::<PackRecord, _>::open(file, 0).await.expect("async iter open");
+        assert!(
+            matches!(iter.next().await, Some(Ok(PackRecord::EpochMeta(_)))),
+            "current EpochMeta decodes via the async iterator",
+        );
+    }
+
+    /// CP6: `rewrite_legacy_epoch` turns a pre-fork epoch pack into a current-format one that opens
+    /// with no legacy fallback, preserves every output and the committee, backs up the original,
+    /// and is idempotent (a second run is a no-op).
+    #[tokio::test]
+    async fn test_rewrite_legacy_epoch() {
+        use super::{PackRecord, RewriteOutcome};
+        use crate::archive::pack::{Pack, DATA_HEADER_BYTES};
+
+        let root = TempDir::with_prefix("test_cp_rewrite").expect("temp dir");
+        let epochs_dir = root.path().join("epochs");
+        let tmp_dir = root.path().join("tmp");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let epoch = committee.epoch(); // 0
+        let previous_epoch = test_previous_epoch(&committee);
+
+        // 1. Build a normal current-format pack in scratch and capture its outputs.
+        let scratch = TempDir::with_prefix("test_cp_rewrite_src").expect("temp dir");
+        let num_outputs = 8_u64;
+        let mut outputs = Vec::new();
+        {
+            let pack =
+                ConsensusPack::open_append(scratch.path(), previous_epoch, committee.clone())
+                    .expect("open append");
+            let mut parent = ConsensusHeader::default().digest();
+            for i in 0..num_outputs {
+                let output =
+                    make_test_output(&committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+                parent = output.digest();
+                outputs.push(output.clone());
+                pack.save_consensus_output(output).await.unwrap();
+            }
+            pack.persist().await.expect("persist");
+        }
+        let scratch_data = scratch.path().join(format!("epoch-{epoch}")).join(Inner::DATA_NAME);
+
+        // 2. Read the current EpochMeta and the length of its on-disk record, so we can keep the
+        //    (wire-stable) output records that follow it.
+        let (meta, current_meta_len) = {
+            let mut p: Pack<PackRecord> =
+                Pack::open(&scratch_data, epoch as u64, true, PackCompression::ZStd).expect("open");
+            let meta =
+                p.fetch(DATA_HEADER_BYTES as u64).expect("fetch meta").into_epoch().expect("meta");
+            let len = p.record_size(DATA_HEADER_BYTES as u64).expect("record_size") as usize;
+            (meta, len)
+        };
+        let scratch_bytes = std::fs::read(&scratch_data).expect("read scratch");
+        let outputs_bytes = scratch_bytes[DATA_HEADER_BYTES + current_meta_len..].to_vec();
+
+        // 3. Forge a faithful pre-fork pack: a legacy (rpc-stripped) first record carrying the same
+        //    meta fields, concatenated in front of the verbatim output records.
+        let legacy_prefix = {
+            let src = scratch.path().join("legacy_meta");
+            let wire = legacy_wire::wire_epoch_meta(
+                &committee,
+                meta.start_consensus_number,
+                meta.genesis_exec_state,
+                meta.genesis_consensus,
+            );
+            let mut lp: Pack<legacy_wire::WirePackRecord> =
+                Pack::open(&src, epoch as u64, false, PackCompression::ZStd).expect("open legacy");
+            lp.append(&wire).expect("append legacy meta");
+            lp.commit().expect("commit");
+            drop(lp);
+            std::fs::read(&src).expect("read legacy prefix")
+        };
+        let epoch_dir = epochs_dir.join(format!("epoch-{epoch}"));
+        std::fs::create_dir_all(&epoch_dir).expect("create epoch dir");
+        let mut legacy_data = legacy_prefix;
+        legacy_data.extend_from_slice(&outputs_bytes);
+        std::fs::write(epoch_dir.join(Inner::DATA_NAME), &legacy_data).expect("write legacy data");
+
+        // The forged pack must be detected as legacy (its first record is legacy-only).
+        assert!(
+            ConsensusPack::epoch_pack_needs_rewrite(&epochs_dir, epoch).expect("probe"),
+            "forged pack must be detected as legacy",
+        );
+
+        // 4. Rewrite.
+        let outcome = ConsensusPack::rewrite_legacy_epoch(&epochs_dir, epoch, &tmp_dir, false)
+            .await
+            .expect("rewrite");
+        let backup = match outcome {
+            RewriteOutcome::Migrated { records, backup, .. } => {
+                assert_eq!(records, num_outputs as usize, "all outputs carried over");
+                backup
+            }
+            RewriteOutcome::AlreadyCurrent => panic!("expected Migrated"),
+        };
+        assert!(backup.exists(), "original epoch dir preserved as backup");
+
+        // 5. The rewritten pack now decodes on the fast path (no fallback) ...
+        assert!(
+            !ConsensusPack::epoch_pack_needs_rewrite(&epochs_dir, epoch).expect("probe2"),
+            "rewritten pack is current-format",
+        );
+        // ... preserves every output, read back through the real static path ...
+        let pack = ConsensusPack::open_static(&epochs_dir, epoch).expect("open static");
+        for (i, original) in outputs.iter().enumerate() {
+            let got = pack.get_consensus_output(i as u64 + 1).await.expect("output");
+            compare_outputs(&got, original);
+        }
+        // ... and preserves the committee (with rpc defaulted to None).
+        assert_eq!(pack.committee.size(), committee.size());
+        for (key, original) in committee.bootstrap_servers() {
+            let restored = pack.committee.get_bootstrap(&key).expect("bootstrap preserved");
+            assert_eq!(restored.primary.network_address, original.primary.network_address);
+            assert!(restored.primary.rpc.is_none(), "rpc defaulted to None");
+        }
+        drop(pack);
+
+        // 6. Idempotent: a second rewrite is a no-op.
+        let again = ConsensusPack::rewrite_legacy_epoch(&epochs_dir, epoch, &tmp_dir, false)
+            .await
+            .expect("rewrite 2");
+        assert!(matches!(again, RewriteOutcome::AlreadyCurrent), "second run is AlreadyCurrent");
     }
 }

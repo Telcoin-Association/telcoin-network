@@ -298,10 +298,38 @@ impl ConsensusChain {
     /// Create a new empty consensus chain.
     pub fn new(base_path: PathBuf) -> Result<ConsensusChain, ConsensusChainError> {
         let latest_consensus = LatestConsensus::new(&base_path)?;
-        // If we have a pack for the last epoch open it so we can read data early.
-        let current_pack = Arc::new(Mutex::new(
-            ConsensusPack::open_append_exists(&base_path, latest_consensus.epoch()).ok(),
-        ));
+        let epoch = latest_consensus.epoch();
+        // Open the current epoch's pack so we can read its data early. Two cases must NOT be
+        // conflated:
+        //   - no pack on disk yet            -> genuinely fresh epoch; `None` is correct.
+        //   - pack on disk but it won't open -> fatal. An unreadable current-epoch pack (e.g. an
+        //     old on-disk format left by a binary upgrade) must fail loudly here, naming the file
+        //     and the underlying `PackError`, instead of being silently dropped to `None` and
+        //     resurfacing three call-frames away (`count_leaders` / `get_consensus_output_current`)
+        //     as the misleading `NoCurrentEpoch`.
+        let pack_path = ConsensusPack::epoch_pack_path(&base_path, epoch);
+        let current_pack = if pack_path.exists() {
+            match ConsensusPack::open_append_exists(&base_path, epoch) {
+                Ok(pack) => Some(pack),
+                Err(source) => {
+                    error!(
+                        target: "epoch-manager",
+                        epoch,
+                        ?source,
+                        path = %pack_path.display(),
+                        "failed to open existing consensus pack for current epoch",
+                    );
+                    return Err(ConsensusChainError::CurrentPackOpen {
+                        epoch,
+                        path: pack_path,
+                        source,
+                    });
+                }
+            }
+        } else {
+            None
+        };
+        let current_pack = Arc::new(Mutex::new(current_pack));
         let recent_packs = Arc::new(Mutex::new(VecDeque::default()));
         let epochs = Arc::new(EpochRecordDb::open(&base_path)?);
         let pack_install = Arc::new(tokio::sync::Mutex::new(()));
@@ -896,6 +924,15 @@ impl ConsensusChainWriter for ConsensusChain {
 pub enum ConsensusChainError {
     PackError(PackError),
     NoCurrentEpoch,
+    /// The current epoch's pack file exists on disk but could not be opened (e.g. an
+    /// incompatible on-disk format after a binary upgrade). Carries the epoch, the offending
+    /// pack file, and the underlying error so the failure is actionable at startup instead of
+    /// resurfacing later as the misleading `NoCurrentEpoch`.
+    CurrentPackOpen {
+        epoch: Epoch,
+        path: PathBuf,
+        source: PackError,
+    },
     IO(std::io::Error),
     EpochMismatch,
     PrevCommitteeEpochMismatch,
@@ -913,6 +950,11 @@ impl Display for ConsensusChainError {
         match self {
             ConsensusChainError::PackError(e) => write!(f, "Pack Error: {e}"),
             ConsensusChainError::NoCurrentEpoch => write!(f, "No current epoch set"),
+            ConsensusChainError::CurrentPackOpen { epoch, path, source } => write!(
+                f,
+                "Failed to open existing consensus pack for current epoch {epoch} at {}: {source}",
+                path.display()
+            ),
             ConsensusChainError::IO(e) => write!(f, "IO Error: {e}"),
             ConsensusChainError::EpochMismatch => {
                 write!(f, "Current epoch does not contain the latest consensus header")
@@ -1025,7 +1067,10 @@ mod test {
 
     use crate::{
         consensus::{ConsensusChain, ConsensusChainError},
-        consensus_pack::test::{compare_outputs, make_test_output},
+        consensus_pack::{
+            test::{compare_outputs, make_test_output},
+            ConsensusPack,
+        },
         mem_db::MemDatabase,
     };
     use tn_reth::RethChainSpec;
@@ -1105,6 +1150,42 @@ mod test {
             consensus_chain.get_consensus_output_current(4).await.is_err(),
             "wrong-epoch output must not be persisted to the epoch-0 pack"
         );
+    }
+
+    /// A current-epoch pack that exists on disk but cannot be opened (e.g. an old on-disk
+    /// format left behind by a binary upgrade) must make `ConsensusChain::new` fail loudly with
+    /// a descriptive error, rather than silently dropping the pack to `None` — which later
+    /// resurfaces three call-frames away (`count_leaders` / `get_consensus_output_current`) as the
+    /// misleading `NoCurrentEpoch`.
+    #[tokio::test]
+    async fn test_existing_unreadable_current_pack_is_fatal() {
+        let temp_dir = TempDir::with_prefix("test_unreadable_current_pack").expect("temp dir");
+        let base = temp_dir.path().to_owned();
+
+        // A fresh datadir has no pack for the current epoch yet. That is the legitimate
+        // "fresh epoch" case and must stay non-fatal (the current pack is simply `None`).
+        ConsensusChain::new(base.clone())
+            .expect("a fresh consensus dir with no current-epoch pack must open cleanly");
+
+        // Simulate an on-disk pack for the current epoch (0) that this binary cannot decode:
+        // a non-empty `data` file whose header does not validate.
+        let pack_path = ConsensusPack::epoch_pack_path(&base, 0);
+        std::fs::create_dir_all(pack_path.parent().expect("pack path has a parent dir"))
+            .expect("create epoch dir");
+        std::fs::write(&pack_path, b"old incompatible consensus pack format")
+            .expect("write fixture pack");
+
+        // Opening must now fail loudly, naming the epoch and the offending file (and carrying the
+        // underlying `PackError`), instead of returning `Ok` with a silent `None`.
+        let err = ConsensusChain::new(base.clone())
+            .expect_err("an existing but unreadable current-epoch pack must be fatal");
+        match err {
+            ConsensusChainError::CurrentPackOpen { epoch, path, .. } => {
+                assert_eq!(epoch, 0, "error must name the current epoch");
+                assert_eq!(path, pack_path, "error must name the offending pack file");
+            }
+            other => panic!("expected CurrentPackOpen, got {other:?}"),
+        }
     }
 
     #[tokio::test]
