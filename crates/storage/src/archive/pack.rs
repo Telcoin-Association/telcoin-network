@@ -58,6 +58,14 @@ where
         self.inner.fetch(pos)
     }
 
+    /// Fetch the raw (decompressed, CRC-verified) record bytes at `pos` without deserializing.
+    ///
+    /// Lets a caller re-decode a record under a different schema than `V` — used for the
+    /// legacy epoch-pack compat path after `V`'s decode fails on a pre-upgrade record.
+    pub fn fetch_raw(&mut self, pos: u64) -> Result<Vec<u8>, FetchError> {
+        self.inner.fetch_raw(pos)
+    }
+
     /// Read raw bytes from the file.  Will return an error if not able to read all the bytes.
     pub fn read_bytes(&mut self, start_pos: u64, end_pos: u64) -> Result<Vec<u8>, FetchError> {
         self.inner.read_bytes(start_pos, end_pos)
@@ -354,10 +362,15 @@ where
         Ok((data_file, header))
     }
 
-    /// Read the record at position.
-    /// Returns the (key, value) tuple
-    /// Will produce an error for IO or or for a failed CRC32 integrity check.
-    fn read_record(&mut self, position: u64) -> Result<V, FetchError> {
+    /// Read the raw (decompressed) value bytes for the record at `position`.
+    ///
+    /// Performs the seek, value-size read, CRC32 integrity check, and (if enabled)
+    /// decompression, returning a slice into an internal buffer that is valid until the next
+    /// call touching that buffer. Shared by [`Self::read_record`] (the decode path) and
+    /// [`Self::fetch_raw`] (which copies the slice for a legacy compat decode). Keeping this
+    /// allocation-free preserves the hot read path; the copy only happens on the rare fallback.
+    /// Will produce an error for IO or for a failed CRC32 integrity check.
+    fn read_record_buffer(&mut self, position: u64) -> Result<&[u8], FetchError> {
         self.data_file.seek(SeekFrom::Start(position))?;
         let mut crc32_hasher = crc32fast::Hasher::new();
         let mut val_size_buf = [0_u8; 4];
@@ -377,8 +390,8 @@ where
         if calc_crc32 != read_crc32 {
             return Err(FetchError::CrcFailed);
         }
-        let buffer = match self.header.compression {
-            PackCompression::None => &self.value_buffer,
+        match self.header.compression {
+            PackCompression::None => Ok(&self.value_buffer),
             PackCompression::ZStd => {
                 let mut decoder = zstd::stream::read::Decoder::new(&self.value_buffer[..])?;
                 decoder.window_log_max(24)?;
@@ -389,12 +402,25 @@ where
                 if self.compression_buffer.len() as u64 > MAX_RECORD_SIZE as u64 {
                     return Err(FetchError::RequestedDecompressSizeTooLarge(MAX_RECORD_SIZE));
                 }
-                &self.compression_buffer
+                Ok(&self.compression_buffer)
             }
-        };
-        let val =
-            try_decode::<V>(buffer).map_err(|e| FetchError::DeserializeValue(e.to_string()))?;
-        Ok(val)
+        }
+    }
+
+    /// Read and decode the record at position.
+    /// Will produce an error for IO, a failed CRC32 integrity check, or a decode failure.
+    fn read_record(&mut self, position: u64) -> Result<V, FetchError> {
+        let buffer = self.read_record_buffer(position)?;
+        try_decode::<V>(buffer).map_err(|e| FetchError::DeserializeValue(e.to_string()))
+    }
+
+    /// Read the raw (decompressed, CRC-verified) value bytes for the record at `position`.
+    ///
+    /// Unlike [`Self::read_record`] this does not deserialize, so a caller can re-interpret the
+    /// bytes under a different schema (e.g. a legacy wire-format compat decode). Allocates a
+    /// `Vec`; use [`Self::read_record`] on the hot path.
+    fn fetch_raw(&mut self, position: u64) -> Result<Vec<u8>, FetchError> {
+        Ok(self.read_record_buffer(position)?.to_vec())
     }
 
     /// Read the record size (with crc32) at position.

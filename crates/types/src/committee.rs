@@ -298,6 +298,85 @@ impl PartialEq for Committee {
 
 impl Eq for Committee {}
 
+/// Pre-`rpc` [`P2pNode`] wire layout.
+///
+/// BCS is non–self-describing and positional, so appending the trailing
+/// `rpc: Option<RpcInfo>` field to [`P2pNode`] (#730, the v0.11.0-adiri fork) changed the
+/// on-disk byte layout: every encoded `P2pNode` now carries one extra Option discriminant
+/// byte. Records written by pre-fork software lack that byte, so they only decode through this
+/// mirror, which reproduces the exact historical layout. The `#[serde(default)]` on
+/// `P2pNode.rpc` does nothing here — it only rescues the human-readable YAML config path, not
+/// the positional BCS read.
+#[derive(Debug, Deserialize)]
+struct LegacyP2pNode {
+    /// The network address of the node.
+    network_address: Multiaddr,
+    /// Network key of the node.
+    network_key: NetworkPublicKey,
+}
+
+impl From<LegacyP2pNode> for P2pNode {
+    fn from(legacy: LegacyP2pNode) -> Self {
+        let LegacyP2pNode { network_address, network_key } = legacy;
+        // `rpc` is bootstrap-server discovery metadata, not consensus-affecting; defaulting it
+        // to `None` is identical to `P2pNode::from((addr, key))`.
+        Self { network_address, network_key, rpc: None }
+    }
+}
+
+/// Pre-`rpc` [`BootstrapServer`] wire layout. See [`LegacyP2pNode`].
+#[derive(Debug, Deserialize)]
+struct LegacyBootstrapServer {
+    /// The p2p info of the primary.
+    primary: LegacyP2pNode,
+    /// The p2p info of the worker.
+    worker: LegacyP2pNode,
+}
+
+impl From<LegacyBootstrapServer> for BootstrapServer {
+    fn from(legacy: LegacyBootstrapServer) -> Self {
+        let LegacyBootstrapServer { primary, worker } = legacy;
+        Self { primary: primary.into(), worker: worker.into() }
+    }
+}
+
+/// Pre-`rpc` [`Committee`] wire layout.
+///
+/// Mirrors the serialized fields of the private `CommitteeInner` in their on-disk order
+/// (`authorities`, `epoch`, `bootstrap_servers`); the `#[serde(skip)]` index/threshold fields
+/// are never on the wire. Only the bootstrap-server `P2pNode`s changed format (#730), so this
+/// reuses [`Authority`] as-is (its `AuthorityInner` layout is unchanged) and swaps in
+/// [`LegacyBootstrapServer`]. The [`From`] conversion rebuilds a real [`Committee`], recomputing
+/// the skipped indexes and thresholds via `CommitteeInner::load`, exactly as the normal
+/// [`Committee`] deserialize does.
+#[derive(Debug, Deserialize)]
+pub struct LegacyCommittee {
+    /// The authorities of the epoch.
+    authorities: BTreeMap<BlsPublicKey, Authority>,
+    /// The epoch number of this committee.
+    epoch: Epoch,
+    /// The bootstrap servers (pre-`rpc` layout).
+    bootstrap_servers: BTreeMap<BlsPublicKey, LegacyBootstrapServer>,
+}
+
+impl From<LegacyCommittee> for Committee {
+    fn from(legacy: LegacyCommittee) -> Self {
+        let LegacyCommittee { authorities, epoch, bootstrap_servers } = legacy;
+        let bootstrap_servers =
+            bootstrap_servers.into_iter().map(|(key, server)| (key, server.into())).collect();
+        let mut inner = CommitteeInner {
+            authorities,
+            authorities_by_id: BTreeMap::default(),
+            epoch,
+            quorum_threshold: 0,
+            validity_threshold: 0,
+            bootstrap_servers,
+        };
+        inner.load();
+        Self { inner: Arc::new(inner) }
+    }
+}
+
 // Every authority gets uniquely identified by the AuthorityIdentifier
 // The type can be easily swapped without needing to change anything else in the implementation.
 // Currently it is the hash of the authorities BLS key (which will be stable).
@@ -990,6 +1069,93 @@ mod tests {
         let yaml = serde_yaml::to_string(&original).expect("serialize");
         let parsed: P2pNode = serde_yaml::from_str(&yaml).expect("deserialize");
         assert_eq!(parsed, original);
+    }
+
+    /// Pre-upgrade epoch packs encode `P2pNode` without the trailing `rpc` Option byte (the
+    /// layout before #730). Because BCS is positional, those committee bytes only decode through
+    /// [`super::LegacyCommittee`]; the [`From`] conversion must rebuild a real [`Committee`] with
+    /// every bootstrap-server `rpc` defaulted to `None` and the skipped thresholds recomputed.
+    /// Mirrors the kad `NodeRecord` legacy-compat test.
+    #[test]
+    fn legacy_committee_decodes_pre_rpc_bytes_with_default_rpc() {
+        use crate::{encode, try_decode, Epoch, NetworkPublicKey};
+        use serde::Serialize;
+
+        // Wire mirrors of the pre-`rpc` layout. Field order MUST match the historical
+        // `CommitteeInner` serialized fields (`authorities`, `epoch`, `bootstrap_servers`) and
+        // the pre-`rpc` `P2pNode`, so the encoded bytes match what old software wrote.
+        #[derive(Serialize)]
+        struct OldP2pNode {
+            network_address: Multiaddr,
+            network_key: NetworkPublicKey,
+        }
+        #[derive(Serialize)]
+        struct OldBootstrapServer {
+            primary: OldP2pNode,
+            worker: OldP2pNode,
+        }
+        #[derive(Serialize)]
+        struct OldCommittee {
+            authorities: BTreeMap<BlsPublicKey, Authority>,
+            epoch: Epoch,
+            bootstrap_servers: BTreeMap<BlsPublicKey, OldBootstrapServer>,
+        }
+
+        let mut rng = rng();
+        let num_authorities = 4_u64;
+        let authorities = (0..num_authorities)
+            .map(|i| {
+                let keypair = BlsKeypair::generate(&mut rng);
+                (
+                    *keypair.public(),
+                    Authority::new(*keypair.public(), Address::repeat_byte(i as u8)),
+                )
+            })
+            .collect::<BTreeMap<BlsPublicKey, Authority>>();
+        let bootstrap_servers = authorities
+            .keys()
+            .map(|key| {
+                let primary = NetworkKeypair::generate_ed25519();
+                let worker = NetworkKeypair::generate_ed25519();
+                (
+                    *key,
+                    OldBootstrapServer {
+                        primary: OldP2pNode {
+                            network_address: Multiaddr::empty(),
+                            network_key: primary.public().clone().into(),
+                        },
+                        worker: OldP2pNode {
+                            network_address: Multiaddr::empty(),
+                            network_key: worker.public().clone().into(),
+                        },
+                    },
+                )
+            })
+            .collect::<BTreeMap<BlsPublicKey, OldBootstrapServer>>();
+
+        let epoch: Epoch = 160;
+        let legacy_bytes =
+            encode(&OldCommittee { authorities: authorities.clone(), epoch, bootstrap_servers });
+
+        // Pre-fork bytes decode through the legacy mirror and convert to a real Committee.
+        let legacy: super::LegacyCommittee =
+            try_decode(&legacy_bytes).expect("legacy committee decodes");
+        let committee: Committee = legacy.into();
+
+        // Epoch and authorities are preserved; the From conversion recomputed thresholds.
+        assert_eq!(committee.epoch(), epoch);
+        assert_eq!(committee.size(), num_authorities as usize);
+        assert_eq!(committee.quorum_threshold(), 3);
+        assert_eq!(committee.validity_threshold(), 2);
+        for key in authorities.keys() {
+            assert!(committee.authority_by_key(key).is_some(), "authority preserved");
+            let bootstrap = committee.get_bootstrap(key).expect("bootstrap server preserved");
+            assert!(bootstrap.primary.rpc.is_none(), "primary rpc defaulted to None");
+            assert!(bootstrap.worker.rpc.is_none(), "worker rpc defaulted to None");
+        }
+
+        // Garbage is rejected, not silently accepted.
+        assert!(try_decode::<super::LegacyCommittee>(&[0xde, 0xad, 0xbe, 0xef]).is_err());
     }
 
     /// `RpcInfo::validate` rejects endpoints with an inappropriate scheme.

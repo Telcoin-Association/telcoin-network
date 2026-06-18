@@ -17,10 +17,10 @@ use std::{
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tn_types::{
-    gas_accumulator::RewardsCounter, AuthorityIdentifier, Batch, BlockHash, BlockNumHash,
-    BlsPublicKey, CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader,
-    ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch, EpochRecord, Hash as _, Round,
-    B256,
+    gas_accumulator::RewardsCounter, try_decode, AuthorityIdentifier, Batch, BlockHash,
+    BlockNumHash, BlsPublicKey, CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader,
+    ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch, EpochRecord, Hash as _,
+    LegacyCommittee, Round, B256,
 };
 use tokio::{
     io::{AsyncRead, BufReader},
@@ -86,6 +86,73 @@ impl PackRecord {
     fn into_epoch(self) -> Result<EpochMeta, PackError> {
         if let Self::EpochMeta(epoch) = self {
             Ok(epoch)
+        } else {
+            Err(PackError::NotEpoch)
+        }
+    }
+}
+
+/// Pre-`rpc` [`EpochMeta`] wire layout. See [`tn_types::LegacyCommittee`].
+///
+/// The only field whose on-disk format changed across the v0.11.0-adiri fork is `committee`:
+/// #730 added `P2pNode.rpc`, and the committee's bootstrap servers embed `P2pNode`. Swapping in
+/// [`LegacyCommittee`] (rpc stripped) lets an epoch pack written before the fork decode its
+/// first record; every other field is wire-identical (the #724 `BlockNumHash` →
+/// `ConsensusNumHash` change for `genesis_consensus` is byte-for-byte the same: `u64` + 32-byte
+/// hash).
+#[derive(Deserialize)]
+struct LegacyEpochMeta {
+    /// The epoch this record is for.
+    epoch: Epoch,
+    /// The active committee for this epoch (pre-`rpc` layout).
+    committee: LegacyCommittee,
+    /// The first consensus block number of this epoch.
+    start_consensus_number: u64,
+    /// The execution genesis for this epoch.
+    genesis_exec_state: BlockNumHash,
+    /// The "genesis" consensus header of this epoch.
+    genesis_consensus: ConsensusNumHash,
+}
+
+impl From<LegacyEpochMeta> for EpochMeta {
+    fn from(legacy: LegacyEpochMeta) -> Self {
+        let LegacyEpochMeta {
+            epoch,
+            committee,
+            start_consensus_number,
+            genesis_exec_state,
+            genesis_consensus,
+        } = legacy;
+        Self {
+            epoch,
+            committee: committee.into(),
+            start_consensus_number,
+            genesis_exec_state,
+            genesis_consensus,
+        }
+    }
+}
+
+/// Pre-`rpc` [`PackRecord`] wire layout, used only to decode the first (`EpochMeta`) record of
+/// an epoch pack written before the fork.
+///
+/// The variant order matches [`PackRecord`] so the BCS enum discriminant lines up. Only the
+/// `EpochMeta` variant differs (it carries a [`LegacyEpochMeta`]); `Batch`/`Consensus` reuse the
+/// current, wire-stable types and exist only to keep the discriminant indexes aligned — we only
+/// ever read the first record, which is always `EpochMeta` (index 0), so their payloads are
+/// decoded-but-never-inspected, hence `allow(dead_code)`.
+#[derive(Deserialize)]
+#[allow(dead_code)]
+enum LegacyPackRecord {
+    EpochMeta(LegacyEpochMeta),
+    Batch(Batch),
+    Consensus(Box<ConsensusHeader>),
+}
+
+impl LegacyPackRecord {
+    fn into_epoch(self) -> Result<EpochMeta, PackError> {
+        if let Self::EpochMeta(epoch) = self {
+            Ok(epoch.into())
         } else {
             Err(PackError::NotEpoch)
         }
@@ -725,6 +792,42 @@ impl Inner {
         Ok(Self { data, consensus_digests, consensus_pos_idx, batch_digests, epoch_meta })
     }
 
+    /// Read and decode the `EpochMeta` first record of an epoch pack, tolerating packs written
+    /// before the v0.11.0-adiri fork.
+    ///
+    /// The first record of every epoch pack is a [`PackRecord::EpochMeta`]. #730 added
+    /// `P2pNode.rpc`; because BCS is positional and non–self-describing, the current `EpochMeta`
+    /// decoder misreads the (now-missing) trailing rpc Option byte on each bootstrap-server node
+    /// in a pre-fork pack and fails with a deserialization error ("expected option type"). When
+    /// that specific failure occurs we re-read the raw record bytes and decode them under the
+    /// rpc-stripped [`LegacyPackRecord`] layout, defaulting `rpc` to `None`.
+    ///
+    /// Only a genuine deserialization mismatch ([`FetchError::DeserializeValue`]) triggers the
+    /// fallback; IO / CRC / size errors stay fatal, preserving the loud-failure contract that
+    /// surfaces real corruption (and truly unreadable files) at startup. A legacy decode that
+    /// also fails is likewise fatal. The on-disk record is never rewritten — compat-on-read is
+    /// idempotent across restarts and new appends use the current format.
+    fn fetch_epoch_meta(data: &mut Pack<PackRecord>, epoch: Epoch) -> Result<EpochMeta, PackError> {
+        match data.fetch(DATA_HEADER_BYTES as u64) {
+            Ok(record) => record.into_epoch(),
+            Err(FetchError::DeserializeValue(_)) => {
+                let bytes = data
+                    .fetch_raw(DATA_HEADER_BYTES as u64)
+                    .map_err(|e| PackError::EpochLoad(e.to_string()))?;
+                let epoch_meta = try_decode::<LegacyPackRecord>(&bytes)
+                    .map_err(|e| PackError::EpochLoad(e.to_string()))?
+                    .into_epoch()?;
+                warn!(
+                    target: "consensus_pack",
+                    epoch,
+                    "read pre-upgrade epoch meta via legacy compat; rpc stripped"
+                );
+                Ok(epoch_meta)
+            }
+            Err(e) => Err(PackError::EpochLoad(e.to_string())),
+        }
+    }
+
     /// Open up the files for previous epoch in append mode.  Will fail if files do not exist.
     fn open_append_exists<P: AsRef<Path>>(path: P, epoch: Epoch) -> Result<Self, PackError> {
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
@@ -735,10 +838,7 @@ impl Inner {
             false,
             PackCompression::ZStd,
         )?;
-        let epoch_meta = data
-            .fetch(DATA_HEADER_BYTES as u64)
-            .map_err(|e| PackError::EpochLoad(e.to_string()))?
-            .into_epoch()?;
+        let epoch_meta = Self::fetch_epoch_meta(&mut data, epoch)?;
         let mut consensus_pos_idx = Self::open_pdx_file_with_update(&base_dir, false, &mut data)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
         let mut consensus_digests = HdxIndex::open_hdx_file(
@@ -777,10 +877,7 @@ impl Inner {
             true,
             PackCompression::ZStd,
         )?;
-        let epoch_meta = data
-            .fetch(DATA_HEADER_BYTES as u64)
-            .map_err(|e| PackError::EpochLoad(e.to_string()))?
-            .into_epoch()?;
+        let epoch_meta = Self::fetch_epoch_meta(&mut data, epoch)?;
         let mut consensus_pos_idx = Self::open_pdx_file_with_update(&base_dir, true, &mut data)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
         let consensus_digests = HdxIndex::open_hdx_file(
@@ -2281,5 +2378,204 @@ pub(crate) mod test {
         // The healed pack dropped the damaged 5th output; the first four remain readable.
         assert!(pack.get_consensus_output(1).await.is_ok());
         assert!(pack.get_consensus_output(4).await.is_ok());
+    }
+
+    /// CP4 (the v0.11.0-adiri startup blocker): an epoch pack whose first `EpochMeta` record was
+    /// written before #730 added `P2pNode.rpc` must still open. Its committee's bootstrap-server
+    /// `P2pNode`s lack the trailing rpc Option byte, so the current decoder fails with "expected
+    /// option type"; `open_append_exists` must fall back to the legacy layout and default `rpc`
+    /// to `None`, preserving the committee.
+    #[tokio::test]
+    async fn test_open_append_exists_decodes_pre_rpc_epoch_pack() {
+        use crate::archive::pack::Pack;
+        use serde::{Deserialize, Serialize};
+        use std::collections::BTreeMap;
+        use tn_types::{
+            encode, try_decode, Authority, BlockNumHash, BlsPublicKey, ConsensusNumHash, Epoch,
+            Multiaddr, NetworkPublicKey,
+        };
+
+        // Wire mirrors of the pre-`rpc` on-disk layout. Field order MUST match the historical
+        // structs so the encoded bytes match what a pre-fork binary wrote: `P2pNode` without
+        // `rpc`, `CommitteeInner`'s serialized fields (`authorities`, `epoch`,
+        // `bootstrap_servers`), `EpochMeta`, and `PackRecord` (EpochMeta at variant index 0).
+        #[derive(Debug, Serialize, Deserialize)]
+        struct WireP2pNode {
+            network_address: Multiaddr,
+            network_key: NetworkPublicKey,
+        }
+        #[derive(Debug, Serialize, Deserialize)]
+        struct WireBootstrap {
+            primary: WireP2pNode,
+            worker: WireP2pNode,
+        }
+        #[derive(Debug, Serialize, Deserialize)]
+        struct WireCommittee {
+            authorities: BTreeMap<BlsPublicKey, Authority>,
+            epoch: Epoch,
+            bootstrap_servers: BTreeMap<BlsPublicKey, WireBootstrap>,
+        }
+        #[derive(Debug, Serialize, Deserialize)]
+        struct WireEpochMeta {
+            epoch: Epoch,
+            committee: WireCommittee,
+            start_consensus_number: u64,
+            genesis_exec_state: BlockNumHash,
+            genesis_consensus: ConsensusNumHash,
+        }
+        #[derive(Debug, Serialize, Deserialize)]
+        enum WirePackRecord {
+            EpochMeta(WireEpochMeta),
+        }
+
+        let temp_dir = TempDir::with_prefix("test_cp_pre_rpc").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let epoch = committee.epoch();
+
+        // Re-encode the fixture committee in the pre-`rpc` layout (drop every `P2pNode.rpc`).
+        let authorities: BTreeMap<BlsPublicKey, Authority> =
+            committee.authorities().into_iter().map(|a| (*a.protocol_key(), a)).collect();
+        let bootstrap_servers: BTreeMap<BlsPublicKey, WireBootstrap> = committee
+            .bootstrap_servers()
+            .into_iter()
+            .map(|(key, server)| {
+                (
+                    key,
+                    WireBootstrap {
+                        primary: WireP2pNode {
+                            network_address: server.primary.network_address,
+                            network_key: server.primary.network_key,
+                        },
+                        worker: WireP2pNode {
+                            network_address: server.worker.network_address,
+                            network_key: server.worker.network_key,
+                        },
+                    },
+                )
+            })
+            .collect();
+        assert!(!bootstrap_servers.is_empty(), "fixture committee must embed P2pNodes");
+
+        let wire = WirePackRecord::EpochMeta(WireEpochMeta {
+            epoch,
+            committee: WireCommittee { authorities: authorities.clone(), epoch, bootstrap_servers },
+            start_consensus_number: 1,
+            genesis_exec_state: BlockNumHash::default(),
+            genesis_consensus: ConsensusNumHash::default(),
+        });
+
+        // These bytes decode ONLY via the legacy layout — proving the compat path is exercised
+        // and not a fluke of the fixture happening to be current-format compatible.
+        let bcs = encode(&wire);
+        assert!(
+            try_decode::<super::PackRecord>(&bcs).is_err(),
+            "pre-rpc bytes must NOT decode as the current PackRecord",
+        );
+        assert!(
+            try_decode::<super::LegacyPackRecord>(&bcs).is_ok(),
+            "pre-rpc bytes must decode as the legacy PackRecord",
+        );
+
+        // Write the legacy record as the first (EpochMeta) record of an epoch pack on disk.
+        let epoch_dir = temp_dir.path().join(format!("epoch-{epoch}"));
+        std::fs::create_dir_all(&epoch_dir).expect("create epoch dir");
+        {
+            let mut pack: Pack<WirePackRecord> = Pack::open(
+                epoch_dir.join(Inner::DATA_NAME),
+                epoch as u64,
+                false,
+                PackCompression::ZStd,
+            )
+            .expect("open wire pack");
+            pack.append(&wire).expect("append legacy epoch meta");
+            pack.commit().expect("commit wire pack");
+        }
+
+        // The real open path must succeed via the legacy fallback and preserve the committee.
+        let pack = ConsensusPack::open_append_exists(temp_dir.path(), epoch)
+            .expect("pre-rpc epoch pack opens via legacy compat");
+        assert_eq!(pack.epoch(), epoch);
+        let opened = &pack.committee;
+        assert_eq!(opened.epoch(), committee.epoch());
+        assert_eq!(opened.size(), committee.size());
+        for (key, original) in committee.bootstrap_servers() {
+            let restored = opened.get_bootstrap(&key).expect("bootstrap server preserved");
+            assert_eq!(restored.primary.network_address, original.primary.network_address);
+            assert_eq!(restored.worker.network_address, original.worker.network_address);
+            assert!(restored.primary.rpc.is_none(), "primary rpc defaulted to None");
+            assert!(restored.worker.rpc.is_none(), "worker rpc defaulted to None");
+        }
+        drop(pack);
+    }
+
+    /// The legacy fallback must not regress the hot path: a current-format epoch pack still opens
+    /// through `open_append_exists` via the fast decode (no fallback, no warning).
+    #[tokio::test]
+    async fn test_open_append_exists_current_format_fast_path() {
+        let temp_dir = TempDir::with_prefix("test_cp_current_fast").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        // Create a normal current-format pack (EpochMeta + a few outputs) and close it.
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                previous_epoch.clone(),
+                committee.clone(),
+            )
+            .expect("open append");
+            let mut parent = ConsensusHeader::default().digest();
+            for i in 0..3 {
+                let output =
+                    make_test_output(&committee, i % 4, chain.clone(), (i as u64) + 1, parent);
+                parent = output.digest().into();
+                pack.save_consensus_output(output).await.unwrap();
+            }
+            pack.persist().await.expect("persist");
+        }
+
+        // Reopen the current-format pack through the same path the legacy fix touches.
+        let pack = ConsensusPack::open_append_exists(temp_dir.path(), committee.epoch())
+            .expect("current-format pack opens via fast path");
+        assert_eq!(pack.epoch(), committee.epoch());
+        assert_eq!(pack.committee.size(), committee.size());
+        assert!(pack.get_consensus_output(1).await.is_ok(), "data readable after reopen");
+    }
+
+    /// A CRC-valid first record that decodes as neither the current nor the legacy `PackRecord`
+    /// must stay fatal — the legacy fallback widens what we accept, but only to the one proven
+    /// pre-fork layout, never to genuine garbage.
+    #[tokio::test]
+    async fn test_open_append_exists_undecodable_record_is_fatal() {
+        use crate::archive::pack::Pack;
+        use tn_types::Epoch;
+
+        let temp_dir = TempDir::with_prefix("test_cp_undecodable").expect("temp dir");
+        let epoch: Epoch = 0;
+        let epoch_dir = temp_dir.path().join(format!("epoch-{epoch}"));
+        std::fs::create_dir_all(&epoch_dir).expect("create epoch dir");
+
+        // A valid header + a CRC-valid record whose payload is `[0x05]`: a BCS enum variant index
+        // of 5, which neither `PackRecord` nor `LegacyPackRecord` (each with 3 variants) accepts.
+        // So the current decode fails with DeserializeValue, the legacy decode also fails, and the
+        // open must surface the error rather than silently widening acceptance.
+        {
+            let mut pack: Pack<u8> = Pack::open(
+                epoch_dir.join(Inner::DATA_NAME),
+                epoch as u64,
+                false,
+                PackCompression::ZStd,
+            )
+            .expect("open raw pack");
+            pack.append(&5_u8).expect("append undecodable record");
+            pack.commit().expect("commit");
+        }
+
+        let err = ConsensusPack::open_append_exists(temp_dir.path(), epoch)
+            .expect_err("an undecodable first record must be fatal");
+        assert!(matches!(err, super::PackError::EpochLoad(_)), "expected EpochLoad, got {err:?}");
     }
 }
