@@ -93,6 +93,23 @@ impl NetworkType {
             }
         }
     }
+
+    /// Bulk-sync streaming wire protocol, isolated per role (and per worker).
+    ///
+    /// The stream behaviour registers this alongside the legacy
+    /// `/tn-stream/0.0.1` upgrade so a responder accepts it; the typed
+    /// [`SyncFrame`](crate::sync::SyncFrame) layer rides on streams negotiated
+    /// with this protocol. Additive for now: no call site opens it until the
+    /// per-exchange cutovers migrate the bulk paths.
+    pub(crate) fn sync_protocol(&self) -> StreamProtocol {
+        match self {
+            Self::Primary => StreamProtocol::new("/tn-primary-sync/1.0.0"),
+            Self::Worker(id) => {
+                StreamProtocol::try_from_owned(format!("/tn-worker-{id}-sync/1.0.0"))
+                    .expect("worker sync protocol name starts with '/'")
+            }
+        }
+    }
 }
 
 /// A channel for sending the response to an inbound RPC, bound to the peer that

@@ -21,7 +21,7 @@ use crate::{
         handler::{HandlerCommand, StreamHandler, StreamHandlerEvent},
         upgrade::{StreamError, StreamFailure},
     },
-    types::NetworkResult,
+    types::{NetworkResult, NetworkType},
 };
 
 /// The protocol identifier for streaming data.
@@ -113,6 +113,9 @@ struct InboundWindow {
 /// error if the peer cannot be reached or the open times out. Inbound streams
 /// are rate limited per peer, and failures are classified for peer scoring.
 pub(crate) struct StreamBehavior {
+    /// Protocols every connection handler advertises (legacy `/tn-stream` first,
+    /// then the per-role sync protocol), cloned into each new handler.
+    protocols: Vec<StreamProtocol>,
     /// Events to emit to the swarm/application.
     events: VecDeque<StreamEvent>,
     /// Outbound opens being driven to completion.
@@ -136,9 +139,15 @@ impl std::fmt::Debug for StreamBehavior {
 }
 
 impl StreamBehavior {
-    /// Create a new instance of the stream behavior.
-    pub(crate) fn new() -> Self {
+    /// Create a new instance of the stream behavior for `network_type`.
+    ///
+    /// Handlers advertise the legacy `/tn-stream/0.0.1` upgrade first, so
+    /// existing opens keep negotiating it, followed by the role's sync protocol,
+    /// so a responder also accepts inbound sync streams.
+    pub(crate) fn new(network_type: NetworkType) -> Self {
+        let protocols = vec![TN_STREAM_PROTOCOL, network_type.sync_protocol()];
         Self {
+            protocols,
             events: VecDeque::new(),
             pending: Vec::new(),
             connected: HashSet::new(),
@@ -269,12 +278,6 @@ impl StreamBehavior {
     }
 }
 
-impl Default for StreamBehavior {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl NetworkBehaviour for StreamBehavior {
     type ConnectionHandler = StreamHandler;
     type ToSwarm = StreamEvent;
@@ -286,7 +289,7 @@ impl NetworkBehaviour for StreamBehavior {
         _: &Multiaddr,
         _: &Multiaddr,
     ) -> Result<THandler<Self>, ConnectionDenied> {
-        Ok(StreamHandler::new())
+        Ok(StreamHandler::new(self.protocols.clone()))
     }
 
     fn handle_established_outbound_connection(
@@ -297,7 +300,7 @@ impl NetworkBehaviour for StreamBehavior {
         _: Endpoint,
         _: PortUse,
     ) -> Result<THandler<Self>, ConnectionDenied> {
-        Ok(StreamHandler::new())
+        Ok(StreamHandler::new(self.protocols.clone()))
     }
 
     fn on_swarm_event(&mut self, event: FromSwarm<'_>) {
@@ -403,8 +406,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registers_sync_protocol_after_legacy() {
+        // a worker advertises its per-worker sync protocol, legacy first
+        let worker = StreamBehavior::new(NetworkType::Worker(3));
+        assert_eq!(
+            worker.protocols,
+            vec![TN_STREAM_PROTOCOL, StreamProtocol::new("/tn-worker-3-sync/1.0.0")]
+        );
+        // a primary advertises its own sync protocol, legacy first
+        let primary = StreamBehavior::new(NetworkType::Primary);
+        assert_eq!(
+            primary.protocols,
+            vec![TN_STREAM_PROTOCOL, StreamProtocol::new("/tn-primary-sync/1.0.0")]
+        );
+    }
+
+    #[tokio::test]
     async fn open_to_unreachable_peer_fails_fast_with_not_connected() {
-        let mut behavior = StreamBehavior::new();
+        let mut behavior = StreamBehavior::new(NetworkType::Primary);
         let peer = PeerId::random();
         let (tx, rx) = oneshot::channel();
 
@@ -418,7 +437,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_when_connected_is_queued_for_dispatch() {
-        let mut behavior = StreamBehavior::new();
+        let mut behavior = StreamBehavior::new(NetworkType::Primary);
         let peer = PeerId::random();
         behavior.connected.insert(peer);
         let (tx, _rx) = oneshot::channel();
@@ -431,7 +450,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_when_disconnected_with_addrs_needs_dial() {
-        let mut behavior = StreamBehavior::new();
+        let mut behavior = StreamBehavior::new(NetworkType::Primary);
         let peer = PeerId::random();
         let (tx, _rx) = oneshot::channel();
 
@@ -443,7 +462,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_over_capacity_is_rejected() {
-        let mut behavior = StreamBehavior::new();
+        let mut behavior = StreamBehavior::new(NetworkType::Primary);
         let peer = PeerId::random();
         behavior.connected.insert(peer);
         for _ in 0..MAX_PENDING_OPENS {
@@ -461,7 +480,7 @@ mod tests {
 
     #[tokio::test]
     async fn connection_promotes_awaiting_open() {
-        let mut behavior = StreamBehavior::new();
+        let mut behavior = StreamBehavior::new(NetworkType::Primary);
         let peer = PeerId::random();
         let (tx, _rx) = oneshot::channel();
         behavior.open_stream(peer, vec![addr()], tx);
@@ -478,7 +497,7 @@ mod tests {
         // The peer may connect (via another behaviour's dial) while our open is
         // still NeedsDial; it must dispatch rather than dial an already-connected
         // peer (which would fail the PeerCondition::Disconnected dial).
-        let mut behavior = StreamBehavior::new();
+        let mut behavior = StreamBehavior::new(NetworkType::Primary);
         let peer = PeerId::random();
         let (tx, _rx) = oneshot::channel();
         behavior.open_stream(peer, vec![addr()], tx);
@@ -491,7 +510,7 @@ mod tests {
 
     #[tokio::test]
     async fn dial_failure_fails_awaiting_open() {
-        let mut behavior = StreamBehavior::new();
+        let mut behavior = StreamBehavior::new(NetworkType::Primary);
         let peer = PeerId::random();
         let (tx, rx) = oneshot::channel();
         behavior.open_stream(peer, vec![addr()], tx);
@@ -506,7 +525,7 @@ mod tests {
 
     #[tokio::test]
     async fn expired_open_times_out_and_reports_failure() {
-        let mut behavior = StreamBehavior::new();
+        let mut behavior = StreamBehavior::new(NetworkType::Primary);
         let peer = PeerId::random();
         let (tx, rx) = oneshot::channel();
         behavior.open_stream(peer, vec![addr()], tx);
@@ -526,7 +545,7 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_rate_limit_trips_after_threshold() {
-        let mut behavior = StreamBehavior::new();
+        let mut behavior = StreamBehavior::new(NetworkType::Primary);
         let peer = PeerId::random();
         for _ in 0..MAX_INBOUND_PER_WINDOW {
             assert!(!behavior.inbound_rate_limited(peer));
@@ -536,7 +555,7 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_window_resets_after_interval() {
-        let mut behavior = StreamBehavior::new();
+        let mut behavior = StreamBehavior::new(NetworkType::Primary);
         let peer = PeerId::random();
         for _ in 0..=MAX_INBOUND_PER_WINDOW {
             behavior.inbound_rate_limited(peer);
@@ -550,7 +569,7 @@ mod tests {
 
     #[tokio::test]
     async fn disconnect_requeues_connected_open_for_dial() {
-        let mut behavior = StreamBehavior::new();
+        let mut behavior = StreamBehavior::new(NetworkType::Primary);
         let peer = PeerId::random();
         behavior.connected.insert(peer);
         let (tx, _rx) = oneshot::channel();
@@ -565,7 +584,7 @@ mod tests {
 
     #[tokio::test]
     async fn push_event_sheds_when_full() {
-        let mut behavior = StreamBehavior::new();
+        let mut behavior = StreamBehavior::new(NetworkType::Primary);
         let peer = PeerId::random();
         for _ in 0..MAX_EVENTS {
             behavior
