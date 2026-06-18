@@ -19,7 +19,12 @@ use crate::archive::{
     fxhasher::FxHasher,
     index::Index as _,
     pack::{Pack, PackCompression, DATA_HEADER_BYTES},
+    pack_iter::TryDecodeRecord,
 };
+
+// `Certificate` is wire-stable across the v0.11.0-adiri fork, so it uses the default
+// current-format decode (no legacy fallback). See [`TryDecodeRecord`].
+impl TryDecodeRecord for Certificate {}
 
 enum PackMessage {
     Save(Certificate),

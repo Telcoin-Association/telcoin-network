@@ -2,7 +2,7 @@
 //! other nodes.
 
 use serde::{de::DeserializeOwned, Serialize};
-use tn_types::{encode_into_buffer, try_decode};
+use tn_types::encode_into_buffer;
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 
 use crate::archive::{
@@ -11,7 +11,7 @@ use crate::archive::{
         load_header::LoadHeaderError, open::OpenError, rename::RenameError,
     },
     fxhasher::FxHasher,
-    pack_iter::{PackIter, MAX_RECORD_SIZE},
+    pack_iter::{PackIter, TryDecodeRecord, MAX_RECORD_SIZE},
 };
 
 use super::{crc::add_crc32, data_file::DataFile};
@@ -54,7 +54,13 @@ where
     }
 
     /// Fetch the value stored at key.  Will return an error if not found.
-    pub fn fetch(&mut self, pos: u64) -> Result<V, FetchError> {
+    ///
+    /// Bounded on [`TryDecodeRecord`] (not the whole impl) so a `Pack<V>` of a write-only or
+    /// non-decodable `V` can still be opened and appended to; only reads need the decoder.
+    pub fn fetch(&mut self, pos: u64) -> Result<V, FetchError>
+    where
+        V: TryDecodeRecord,
+    {
         self.inner.fetch(pos)
     }
 
@@ -149,7 +155,10 @@ where
     /// Return an iterator over the key values in insertion order.
     /// Note this iterator only uses the data file not the indexes.
     /// This iterator will not see any data in the write cache.
-    pub fn raw_iter(&self) -> Result<PackIter<V, File>, LoadHeaderError> {
+    pub fn raw_iter(&self) -> Result<PackIter<V, File>, LoadHeaderError>
+    where
+        V: TryDecodeRecord,
+    {
         self.inner.raw_iter()
     }
 }
@@ -217,7 +226,10 @@ where
     }
 
     /// Fetch the value stored at key.  Will return an error if not found.
-    fn fetch(&mut self, pos: u64) -> Result<V, FetchError> {
+    fn fetch(&mut self, pos: u64) -> Result<V, FetchError>
+    where
+        V: TryDecodeRecord,
+    {
         self.read_record(pos)
     }
 
@@ -409,9 +421,12 @@ where
 
     /// Read and decode the record at position.
     /// Will produce an error for IO, a failed CRC32 integrity check, or a decode failure.
-    fn read_record(&mut self, position: u64) -> Result<V, FetchError> {
+    fn read_record(&mut self, position: u64) -> Result<V, FetchError>
+    where
+        V: TryDecodeRecord,
+    {
         let buffer = self.read_record_buffer(position)?;
-        try_decode::<V>(buffer).map_err(|e| FetchError::DeserializeValue(e.to_string()))
+        V::try_decode_record(buffer)
     }
 
     /// Read the raw (decompressed, CRC-verified) value bytes for the record at `position`.
@@ -469,7 +484,10 @@ where
     /// Return an iterator over the key values in insertion order.
     /// Note this iterator only uses the data file not the indexes.
     /// This iterator will not see any data in the write cache.
-    fn raw_iter(&self) -> Result<PackIter<V, File>, LoadHeaderError> {
+    fn raw_iter(&self) -> Result<PackIter<V, File>, LoadHeaderError>
+    where
+        V: TryDecodeRecord,
+    {
         let dat_file = { self.data_file.try_clone()? };
         PackIter::open(dat_file, self.uid_idx)
     }
@@ -661,6 +679,7 @@ mod tests {
         idx: u64,
         name: String,
     }
+    impl TryDecodeRecord for TestRec {}
     type TestPack = Pack<TestRec>;
 
     fn archive_pack_(compression: PackCompression) {

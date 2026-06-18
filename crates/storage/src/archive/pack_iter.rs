@@ -21,6 +21,28 @@ use crate::archive::{
 /// an upper bound on memory allocations for a record.
 pub(crate) const MAX_RECORD_SIZE: u32 = 16 * 1024 * 1024;
 
+/// Decode a single pack record from its raw (decompressed, CRC-verified) bytes.
+///
+/// Making decode a property of the stored type gives every reader one chokepoint: the sync
+/// [`PackIter`], the async [`AsyncPackIter`] (including partial peer streams via
+/// `open_partial`), and random-access `Pack::fetch` all go through `try_decode_record`, so they
+/// can never drift in how they interpret a record. The provided default is the plain
+/// current-format decode; a type whose on-disk layout changed compatibly across a fork (e.g.
+/// `PackRecord` across the v0.11.0-adiri `P2pNode.rpc` addition) overrides this to add a legacy
+/// fallback. Mirrors `NodeRecord::try_decode_compat` in network-libp2p.
+///
+/// Marker-style (no required methods): implement it with an empty body for the common case
+/// (`impl TryDecodeRecord for Foo {}`); override `try_decode_record` only where a fallback is
+/// needed.
+pub trait TryDecodeRecord: Sized + DeserializeOwned {
+    /// Decode `bytes` into `Self`. Default: current-format decode, mapping any decode failure to
+    /// [`FetchError::DeserializeValue`]. `bytes` is already decompressed and CRC-verified, so a
+    /// failure here is a genuine schema mismatch, never corruption.
+    fn try_decode_record(bytes: &[u8]) -> Result<Self, FetchError> {
+        try_decode::<Self>(bytes).map_err(|e| FetchError::DeserializeValue(e.to_string()))
+    }
+}
+
 /// Iterate over a Db's key, value pairs in insert order.
 /// This iterator is "raw", it does not use any indexes just the data file.
 #[derive(Debug)]
@@ -38,7 +60,7 @@ where
 
 impl<V, R> PackIter<V, R>
 where
-    V: Debug + Serialize + DeserializeOwned,
+    V: Debug + Serialize + DeserializeOwned + TryDecodeRecord,
     R: Read + Seek,
 {
     /// Open the iterator using reader as a data source.
@@ -122,13 +144,13 @@ where
                 decompress_buffer
             }
         };
-        try_decode::<V>(&buffer[..]).map_err(|e| FetchError::DeserializeValue(e.to_string()))
+        V::try_decode_record(&buffer[..])
     }
 }
 
 impl<V, R: Read + Seek> Iterator for PackIter<V, R>
 where
-    V: Debug + Serialize + DeserializeOwned,
+    V: Debug + Serialize + DeserializeOwned + TryDecodeRecord,
 {
     type Item = Result<V, FetchError>;
 
@@ -165,7 +187,7 @@ where
 
 impl<V, R> AsyncPackIter<V, R>
 where
-    V: Debug + Serialize + DeserializeOwned,
+    V: Debug + Serialize + DeserializeOwned + TryDecodeRecord,
     R: AsyncRead + Unpin,
 {
     /// Open the iterator using reader as a data source.
@@ -258,7 +280,7 @@ where
                 decompress_buffer
             }
         };
-        try_decode::<V>(&buffer[..]).map_err(|e| FetchError::DeserializeValue(e.to_string()))
+        V::try_decode_record(&buffer[..])
     }
 
     /// Return the next V when available.
