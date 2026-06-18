@@ -181,11 +181,6 @@ sol!(
         function getCommitteeBlsPubkeys(uint32 epoch) external view returns (bytes[] memory);
         /// Fetch the `ValidatorInfo` for a give address.
         function getValidator(address validatorAddress) external view returns (ValidatorInfo memory);
-        /// Returns the BLS12-381 proof of possession message: `blsPubkey || validatorAddress`
-        function proofOfPossessionMessage(
-            bytes memory blsPubkey,
-            address validatorAddress
-        ) external view returns (bytes memory);
         /// Mint an NFT for validator to stake.
         function mint(address validatorAddress) external override onlyOwner;
         /// Stake to the consensus registry.
