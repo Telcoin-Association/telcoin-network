@@ -231,7 +231,7 @@ Source: `crates/consensus/primary/src/network/mod.rs:448-489`.
 | `CrcError`                                                                                                                                                                                                                                                                                                          | `Mild`   | `crates/consensus/primary/src/network/mod.rs:478-480` |
 | `EmptyImport`                                                                                                                                                                                                                                                                                                       | `Severe` | `crates/consensus/primary/src/network/mod.rs:481-483` |
 | `InvalidImport`                                                                                                                                                                                                                                                                                                     | `Severe` | `crates/consensus/primary/src/network/mod.rs:481-483` |
-| `StreamUnavailable` / `NoCurrentEpoch` / `EpochDbError(_)` / `IO(_)`                                                                                                                                                                                                                                                | None     | `crates/consensus/primary/src/network/mod.rs:484-487` |
+| `StreamUnavailable` / `NoCurrentEpoch` / `CurrentPackOpen { .. }` / `EpochDbError(_)` / `IO(_)`                                                                                                                                                                                                                     | None     | `crates/consensus/primary/src/network/mod.rs:484-487` |
 
 ## 6. Restraint Invariants (no-penalty cases)
 
@@ -249,7 +249,7 @@ These are deliberate tolerances for benign failures. Changing any of these from
 - `HeaderError::InvalidEpoch { .. }` — explicitly `None`; epoch boundary mismatch is not penalized. `crates/consensus/primary/src/error/network.rs:166-169`.
 - `HeaderError::PendingCertificateOneshot` / `TNSend` / `ClosedWatchChannel` — local channel/task failures. `crates/consensus/primary/src/error/network.rs:166-169`.
 - All `PackError` IO/load/persist/internal variants — local failures. `crates/consensus/primary/src/network/mod.rs:460-476`.
-- `ConsensusChainError::StreamUnavailable` / `NoCurrentEpoch` / `EpochDbError` / `IO` — local failures during epoch pack streaming. `crates/consensus/primary/src/network/mod.rs:484-487`.
+- `ConsensusChainError::StreamUnavailable` / `NoCurrentEpoch` / `CurrentPackOpen` / `EpochDbError` / `IO` — local failures opening or streaming an epoch pack (`CurrentPackOpen` is a local startup failure to open our own current-epoch pack). `crates/consensus/primary/src/network/mod.rs:484-487`.
 - A rejected kad put record from a banned source/publisher with `record.publisher.is_some()` — no extra penalty is stacked on top of the existing ban. `crates/network-libp2p/src/consensus.rs:1375-1388`.
 
 ## 7. Ban Lifecycle
