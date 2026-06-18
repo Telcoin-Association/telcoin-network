@@ -14,6 +14,8 @@ const EXECUTION_REVERTED: i32 = 3;
 const RESOURCE_NOT_FOUND: i32 = -32001;
 /// JSON-RPC 2.0 internal error.
 const INTERNAL_ERROR: i32 = -32603;
+/// JSON-RPC 2.0 invalid params.
+const INVALID_PARAMS: i32 = -32602;
 
 /// Error type for public RPC endpoints in the `tn` namespace.
 #[derive(Debug, Error)]
@@ -32,6 +34,9 @@ pub enum TNRpcError {
     /// Internal failure reading the registry. Detail logged server-side only.
     #[error("consensus registry read failed")]
     Internal,
+    /// Caller supplied an invalid parameter (e.g. a malformed BLS public key).
+    #[error("{0}")]
+    InvalidParams(String),
 }
 
 impl From<TNRpcError> for jsonrpsee_types::ErrorObject<'static> {
@@ -42,6 +47,7 @@ impl From<TNRpcError> for jsonrpsee_types::ErrorObject<'static> {
                 rpc_error(EXECUTION_REVERTED, message, Some(&output))
             }
             TNRpcError::Internal => rpc_error(INTERNAL_ERROR, error.to_string(), None),
+            TNRpcError::InvalidParams(msg) => rpc_error(INVALID_PARAMS, msg, None),
         }
     }
 }
@@ -96,6 +102,14 @@ mod tests {
         let err: ErrorObject<'static> = TNRpcError::Internal.into();
         assert_eq!(err.code(), -32603);
         assert_eq!(err.message(), "consensus registry read failed");
+        assert!(err.data().is_none());
+    }
+
+    #[test]
+    fn invalid_params_maps_to_invalid_params_code() {
+        let err: ErrorObject<'static> = TNRpcError::InvalidParams("bad pubkey".to_string()).into();
+        assert_eq!(err.code(), -32602);
+        assert_eq!(err.message(), "bad pubkey");
         assert!(err.data().is_none());
     }
 }
