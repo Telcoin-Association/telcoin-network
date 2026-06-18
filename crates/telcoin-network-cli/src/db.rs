@@ -41,6 +41,9 @@ enum DbSubcommand {
         /// Probe each pack and report what would change, without modifying anything.
         #[arg(long)]
         dry_run: bool,
+        /// Force a migrate even if it appears up to date (will rebuild indexes for instance).
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -69,8 +72,8 @@ impl DbCommand {
                 }
                 println!("{}", db_stats_table(&db)?);
             }
-            DbSubcommand::MigrateConsensusPacks { epoch, dry_run } => {
-                migrate_consensus_packs(datadir, *epoch, *dry_run)?;
+            DbSubcommand::MigrateConsensusPacks { epoch, dry_run, force } => {
+                migrate_consensus_packs(datadir, *epoch, *dry_run, *force)?;
             }
         }
         Ok(())
@@ -325,6 +328,7 @@ fn migrate_consensus_packs(
     datadir: PathBuf,
     only_epoch: Option<Epoch>,
     dry_run: bool,
+    force: bool,
 ) -> eyre::Result<()> {
     let epochs_dir = datadir.epochs_db_path();
     if !epochs_dir.exists() {
@@ -389,8 +393,12 @@ fn migrate_consensus_packs(
         let _ = fs::create_dir_all(&tmp_dir);
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         for epoch in epochs {
-            let outcome =
-                runtime.block_on(ConsensusPack::rewrite_legacy_epoch(&epochs_dir, epoch, &tmp_dir));
+            let outcome = runtime.block_on(ConsensusPack::rewrite_legacy_epoch(
+                &epochs_dir,
+                epoch,
+                &tmp_dir,
+                force,
+            ));
             let row = match outcome {
                 Ok(RewriteOutcome::AlreadyCurrent) => MigrationRow {
                     epoch,
@@ -490,9 +498,10 @@ mod tests {
         assert_eq!(cli.datadir.as_deref(), Some(Path::new("/tmp/x")));
         let Commands::Db(db) = cli.command else { panic!("expected the db subcommand") };
         match db.command {
-            super::DbSubcommand::MigrateConsensusPacks { epoch, dry_run } => {
+            super::DbSubcommand::MigrateConsensusPacks { epoch, dry_run, force } => {
                 assert_eq!(epoch, Some(5));
                 assert!(dry_run);
+                assert!(!force);
             }
             other => panic!("expected migrate-consensus-packs, got {other:?}"),
         }

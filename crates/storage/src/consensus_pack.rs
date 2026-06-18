@@ -650,6 +650,7 @@ impl ConsensusPack {
         epochs_dir: P1,
         epoch: Epoch,
         tmp_dir: P2,
+        force: bool,
     ) -> Result<RewriteOutcome, PackError> {
         let epochs_dir = epochs_dir.as_ref();
         let tmp_dir = tmp_dir.as_ref();
@@ -662,7 +663,7 @@ impl ConsensusPack {
         let (epoch_meta, output_count, size_before) = {
             let mut old =
                 Pack::<PackRecord>::open(&pack_path, epoch as u64, true, PackCompression::ZStd)?;
-            if Self::first_record_is_current(&mut old)? {
+            if !force && Self::first_record_is_current(&mut old)? {
                 return Ok(RewriteOutcome::AlreadyCurrent);
             }
             let raw = old
@@ -3042,7 +3043,7 @@ pub(crate) mod test {
         );
 
         // 4. Rewrite.
-        let outcome = ConsensusPack::rewrite_legacy_epoch(&epochs_dir, epoch, &tmp_dir)
+        let outcome = ConsensusPack::rewrite_legacy_epoch(&epochs_dir, epoch, &tmp_dir, false)
             .await
             .expect("rewrite");
         let backup = match outcome {
@@ -3075,7 +3076,7 @@ pub(crate) mod test {
         drop(pack);
 
         // 6. Idempotent: a second rewrite is a no-op.
-        let again = ConsensusPack::rewrite_legacy_epoch(&epochs_dir, epoch, &tmp_dir)
+        let again = ConsensusPack::rewrite_legacy_epoch(&epochs_dir, epoch, &tmp_dir, false)
             .await
             .expect("rewrite 2");
         assert!(matches!(again, RewriteOutcome::AlreadyCurrent), "second run is AlreadyCurrent");
