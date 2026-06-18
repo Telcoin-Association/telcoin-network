@@ -11,8 +11,7 @@ use sha2::Sha256;
 use std::sync::Arc;
 use tn_types::{
     construct_proof_of_possession_message, Address, BlsKeypair, BlsPublicKey, BlsSignature,
-    BlsSigner, DefaultHashFunction, NetworkKeypair, NetworkPublicKey, ProtocolSignature as _,
-    Signer,
+    BlsSigner, DefaultHashFunction, NetworkKeypair, NetworkPublicKey, Signer,
 };
 
 /// The work factor for PBKDF2 is implemented through an iteration count, which is based on the
@@ -222,18 +221,16 @@ impl KeyConfig {
     /// holder of authority protocol key, and also ensures that the authority
     /// protocol public key exists.
     ///
-    /// The proof of possession is a [BlsSignature] committed over the intent message
-    /// `intent || message` (See more at [IntentMessage] and [Intent]).
-    /// The message is constructed as: EIP2537([BlsPublicKey]) || [Address].
-    /// Where the public key is uncompressed with G2 point coordinates padded to 64-byte EVM words
+    /// The proof of possession is a [BlsSignature] over [`construct_proof_of_possession_message`]:
+    /// `intentPrefix || compressedBlsPubkey || address`. Using the compressed key keeps the message
+    /// cheaply reconstructable by the on-chain `ConsensusRegistry`, which verifies it via the
+    /// native BLS precompile.
     pub fn generate_proof_of_possession_bls(
         &self,
         address: &Address,
     ) -> eyre::Result<BlsSignature> {
-        let msg = construct_proof_of_possession_message(&self.primary_public_key(), address)?;
-        let sig = BlsSignature::new_secure(&msg.clone(), &self.inner.primary_keypair);
-
-        Ok(sig)
+        let msg = construct_proof_of_possession_message(&self.primary_public_key(), address);
+        Ok(self.inner.primary_keypair.sign(&msg))
     }
 
     /// Derive a NetworkKeypair from a BLS signature, seed string and [DefaultHashFunction].

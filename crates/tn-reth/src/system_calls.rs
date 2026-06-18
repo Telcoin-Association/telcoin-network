@@ -123,12 +123,12 @@ sol!(
             uint32 epochDuration;
         }
 
-        /// Represents a proof of possession for a validator's BLS public key
-        /// Uses a 192-byte uncompressed public key and 96-byte uncompressed PoP
+        /// Represents a validator's BLS12-381 proof of possession: a 48-byte compressed G1
+        /// signature, verified by the native precompile against the separately-supplied 96-byte
+        /// compressed `blsPubkey`.
         #[derive(Debug)]
         struct ProofOfPossession {
-            bytes uncompressedPubkey;
-            bytes uncompressedSignature;
+            bytes signature;
         }
 
         /// Initialize the contract.
@@ -140,7 +140,7 @@ sol!(
             ValidatorInfo[] memory initialValidators_,
             /// The initial validators' BLS12-381 public keys.
             bytes[] memory blsPubkeys_,
-            /// The initial validators' uncompressed proofs of possession
+            /// The initial validators' proofs of possession
             ProofOfPossession[] memory proofsOfPossession,
             /// The address of the owner.
             address owner_
@@ -172,11 +172,6 @@ sol!(
         function getCommitteeBlsPubkeys(uint32 epoch) external view returns (bytes[] memory);
         /// Fetch the `ValidatorInfo` for a give address.
         function getValidator(address validatorAddress) external view returns (ValidatorInfo memory);
-        /// Returns the BLS12-381 proof of possession message: `blsPubkey || validatorAddress`
-        function proofOfPossessionMessage(
-            bytes memory blsPubkey,
-            address validatorAddress
-        ) external view returns (bytes memory);
         /// Mint an NFT for validator to stake.
         function mint(address validatorAddress) external override onlyOwner;
         /// Stake to the consensus registry.

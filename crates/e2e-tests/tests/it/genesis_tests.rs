@@ -95,15 +95,14 @@ async fn test_genesis_with_consensus_registry_accounts() -> eyre::Result<()> {
         CONSENSUS_REGISTRY_JSON,
         Some("deployedBytecode.object"),
     )?;
-    let unlinked_runtimecode =
+    let registry_runtimecode =
         registry_runtimecode_binding.as_str().ok_or_eyre("Couldn't fetch bytecode")?;
-    // BlsG1 is a native precompile at `BLS_G1_PRECOMPILE_ADDRESS`: the registry runtime bytecode is
-    // linked against that address, and the address itself carries a single `0xfe` (INVALID)
-    // placeholder byte rather than deployed library code. See
+    // The registry calls the BLS precompile directly at `BLS_G1_PRECOMPILE_ADDRESS` (no linked
+    // library), so its deployed bytecode is used as-is. The precompile address itself carries a
+    // single `0xfe` (INVALID) byte of code rather than deployed library code. See
     // `create_consensus_registry_genesis_accounts`.
     let blsg1_address = BLS_G1_PRECOMPILE_ADDRESS.to_string();
-    let registry_deployed_bytecode =
-        RethEnv::link_solidity_library(unlinked_runtimecode, &blsg1_address)?;
+    let registry_deployed_bytecode = Bytes::from_hex(registry_runtimecode)?;
 
     let blsg1_deployed_bytecode = "0xfe";
 
@@ -134,10 +133,7 @@ async fn test_genesis_with_consensus_registry_accounts() -> eyre::Result<()> {
         .request("eth_getCode", rpc_params!(blsg1_address))
         .await
         .expect("Failed to fetch BLS G1 bytecode");
-    assert_eq!(
-        Bytes::from_hex(&returned_registry_bytecode)?,
-        Bytes::from(registry_deployed_bytecode)
-    );
+    assert_eq!(Bytes::from_hex(&returned_registry_bytecode)?, registry_deployed_bytecode);
     assert_eq!(
         Bytes::from_hex(&returned_issuance_bytecode)?,
         Bytes::from_hex(issuance_deployed_bytecode)?

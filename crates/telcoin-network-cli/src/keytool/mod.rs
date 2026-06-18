@@ -162,23 +162,19 @@ mod tests {
         )
         .expect("node info loaded");
 
-        let compressed = node_info.bls_public_key.to_bytes();
-        let uncompressed_pk = node_info.bls_public_key.serialize();
-        let uncompressed_sig = node_info.proof_of_possession.serialize();
+        let compressed_pubkey = node_info.bls_public_key.to_bytes();
+        let compressed_sig = node_info.proof_of_possession.to_bytes();
 
-        assert_eq!(compressed.len(), 96, "compressed BLS pubkey should be 96 bytes");
-        assert_eq!(uncompressed_pk.len(), 192, "uncompressed BLS pubkey should be 192 bytes");
-        assert_eq!(uncompressed_sig.len(), 96, "uncompressed PoP signature should be 96 bytes");
+        assert_eq!(compressed_pubkey.len(), 96, "compressed BLS pubkey should be 96 bytes");
+        assert_eq!(compressed_sig.len(), 48, "compressed PoP signature should be 48 bytes");
 
         // verify hex encoding produces valid 0x-prefixed strings
-        let compressed_hex = format!("0x{}", hex::encode(compressed));
-        let uncompressed_pk_hex = format!("0x{}", hex::encode(uncompressed_pk));
-        let uncompressed_sig_hex = format!("0x{}", hex::encode(uncompressed_sig));
+        let compressed_pubkey_hex = format!("0x{}", hex::encode(compressed_pubkey));
+        let compressed_sig_hex = format!("0x{}", hex::encode(compressed_sig));
 
-        assert!(compressed_hex.starts_with("0x"));
-        assert_eq!(compressed_hex.len(), 2 + 96 * 2); // 0x + 96 bytes hex
-        assert_eq!(uncompressed_pk_hex.len(), 2 + 192 * 2); // 0x + 192 bytes hex
-        assert_eq!(uncompressed_sig_hex.len(), 2 + 96 * 2); // 0x + 96 bytes hex
+        assert!(compressed_pubkey_hex.starts_with("0x"));
+        assert_eq!(compressed_pubkey_hex.len(), 2 + 96 * 2); // 0x + 96 bytes hex
+        assert_eq!(compressed_sig_hex.len(), 2 + 48 * 2); // 0x + 48 bytes hex
 
         // also test that ExportStakingArgs::execute works with directory path
         let args =

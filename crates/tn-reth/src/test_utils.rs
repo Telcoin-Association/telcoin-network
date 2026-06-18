@@ -679,6 +679,65 @@ pub fn seeded_genesis_from_random_batches<'a>(
     (genesis, txs, senders)
 }
 
+/// Build a complete test [`Genesis`] with the `ConsensusRegistry` deployed and seeded with
+/// `num_validators` deterministic, active validators (the current registry ABI, with the
+/// per-status `EnumerableSet`s populated by the constructor).
+///
+/// [`tn_types::test_genesis`] embeds the *static* testnet registry artifact, which predates the
+/// `getValidatorsInfo` integration ABI. Tests that close an epoch (and therefore make that system
+/// call) must build their chain from this helper so the genesis carries the current registry and a
+/// live committee, rather than the stale static one.
+pub fn test_genesis_with_consensus_registry(num_validators: usize) -> Genesis {
+    use alloy::primitives::utils::parse_ether;
+    use rand::{rngs::StdRng, SeedableRng as _};
+    use tn_config::NodeInfo;
+    use tn_types::{generate_proof_of_possession_bls_for_test, BlsKeypair, NodeP2pInfo};
+
+    // deterministic validators so the genesis is reproducible across runs
+    let validators: Vec<NodeInfo> = (0..num_validators)
+        .map(|i| {
+            let mut rng = StdRng::seed_from_u64(i as u64);
+            let bls = BlsKeypair::generate(&mut rng);
+            // distinct, non-zero execution address per validator
+            let execution_address = Address::from_slice(&[i as u8 + 1; 20]);
+            let proof_of_possession =
+                generate_proof_of_possession_bls_for_test(&bls, &execution_address)
+                    .expect("failed to generate proof of possession for test validator");
+            NodeInfo {
+                name: format!("validator-{i}"),
+                bls_public_key: *bls.public(),
+                p2p_info: NodeP2pInfo::default(),
+                execution_address,
+                proof_of_possession,
+            }
+        })
+        .collect();
+
+    let initial_stake_config = ConsensusRegistry::StakeConfig {
+        stakeAmount: U256::from(parse_ether("1_000_000").expect("parse stake amount")),
+        minWithdrawAmount: U256::from(parse_ether("1_000").expect("parse min withdraw amount")),
+        // Keep issuance even: reward tests assert `epochIssuance.div_ceil(2)` against the
+        // contract's floor split between two leaders, which only agree when the issuance
+        // divides exactly.
+        epochIssuance: U256::from(parse_ether("2_000_000").expect("parse epoch issuance")),
+        epochDuration: 60 * 60 * 24, // 24h
+    };
+
+    // Deploy the registry from the default test factory account: `test_genesis` funds it with a
+    // max balance and it is code-less, so it can sign the pre-genesis create. A Safe such as
+    // `GOVERNANCE_SAFE_ADDRESS` carries deployed code, which EIP-3607 rejects as a tx sender.
+    let owner = address!("0xb14d3c4f5fbfbcfb98af2d330000d49c95b93aa7");
+
+    RethEnv::create_consensus_registry_genesis_accounts(
+        validators,
+        test_genesis(),
+        initial_stake_config,
+        owner,
+        vec![(0u8, 30_000_000u64)],
+    )
+    .expect("failed to build test genesis with consensus registry")
+}
+
 /// Helper function to create a committee for tests from on-chain data.
 pub async fn create_committee_from_state(epoch_state: EpochState) -> eyre::Result<Committee> {
     // deconstruct epoch information
