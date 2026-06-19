@@ -11722,6 +11722,7 @@ name = "tn-node"
 version = "0.1.0"
 dependencies = [
  "eyre",
+ "futures",
  "jsonrpsee",
  "metrics",
  "metrics-util",

@@ -1,6 +1,7 @@
-use std::panic::AssertUnwindSafe;
+//! Exex helper functions for EpochManager.
 
 use futures::FutureExt as _;
+use std::panic::AssertUnwindSafe;
 use tn_types::TaskError;
 use tracing::{error, warn};
 
