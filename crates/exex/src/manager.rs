@@ -31,8 +31,12 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tracing::{debug, error, warn};
 
-/// Notification channel capacity per ExEx.
-const EXEX_CHANNEL_CAPACITY: usize = 64;
+/// Default notification channel capacity per ExEx.
+///
+/// Operators can override this per-ExEx via `TnBuilder::install_exex_with_capacity`
+/// — a heavyweight indexer on a high-throughput chain may need a wider buffer to
+/// avoid a `Lagged` → replay → fall-behind catch-up thrash loop.
+const EXEX_CHANNEL_CAPACITY: usize = 256;
 
 /// Per-ExEx delivery state: the notification sender, lag tracking, and the event
 /// receiver used for `FinishedHeight` reporting.
@@ -359,7 +363,10 @@ impl TnExExManagerHandle {
     }
 }
 
-/// Returns the ExEx notification channel capacity.
+/// Returns the default ExEx notification channel capacity.
+///
+/// Used when an ExEx is registered with `TnBuilder::install_exex`; use
+/// `install_exex_with_capacity` to override it per-ExEx.
 pub const fn exex_channel_capacity() -> usize {
     EXEX_CHANNEL_CAPACITY
 }

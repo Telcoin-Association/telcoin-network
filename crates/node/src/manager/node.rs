@@ -383,8 +383,8 @@ where
             let mut exex_txs = Vec::new();
             let mut event_rxs = Vec::new();
 
-            for (name, install_fn) in self.builder.exex_fns.drain(..) {
-                let (notif_tx, notif_rx) = mpsc::channel(tn_exex::exex_channel_capacity());
+            for (name, capacity, install_fn) in self.builder.exex_fns.drain(..) {
+                let (notif_tx, notif_rx) = mpsc::channel(capacity);
                 let (event_tx, event_rx) = mpsc::channel(EXEX_EVENT_CAPACITY);
 
                 let ctx = tn_exex::TnExExContext {

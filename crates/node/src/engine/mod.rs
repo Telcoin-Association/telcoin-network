@@ -56,9 +56,11 @@ pub struct TnBuilder {
     pub reth_db: RethDb,
     /// Registered ExEx install functions.
     ///
-    /// Each entry is a `(name, install_fn)` pair. These are consumed during node
-    /// startup to spawn ExEx tasks on the node-level task manager.
-    pub exex_fns: Vec<(String, ExExInstallFn)>,
+    /// Each entry is a `(name, notification_channel_capacity, install_fn)` tuple.
+    /// These are consumed during node startup to spawn ExEx tasks on the
+    /// node-level task manager, each with its own bounded notification channel of
+    /// the given capacity.
+    pub exex_fns: Vec<(String, usize, ExExInstallFn)>,
 }
 
 impl TnBuilder {
@@ -67,12 +69,37 @@ impl TnBuilder {
     /// ExExes are long-running tasks that receive notifications about the full
     /// transaction lifecycle: certificate accepted, consensus committed, and
     /// chain executed.
+    ///
+    /// The notification channel uses the default capacity
+    /// ([`tn_exex::exex_channel_capacity`]); use [`install_exex_with_capacity`]
+    /// to size it for a heavyweight ExEx on a high-throughput chain.
+    ///
+    /// [`install_exex_with_capacity`]: Self::install_exex_with_capacity
     pub fn install_exex<F, Fut>(&mut self, name: impl Into<String>, install_fn: F) -> &mut Self
     where
         F: FnOnce(tn_exex::TnExExContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = eyre::Result<()>> + Send + 'static,
     {
-        self.exex_fns.push((name.into(), Box::new(|ctx| Box::pin(install_fn(ctx)))));
+        self.install_exex_with_capacity(name, tn_exex::exex_channel_capacity(), install_fn)
+    }
+
+    /// Register an ExEx plugin with an explicit notification channel capacity.
+    ///
+    /// A larger capacity lets a persistently-slightly-slow ExEx absorb bursts
+    /// without dropping notifications (which would surface as
+    /// [`TnExExNotification::Lagged`](tn_exex::TnExExNotification::Lagged) and
+    /// force a replay). See [`install_exex`](Self::install_exex) for the default.
+    pub fn install_exex_with_capacity<F, Fut>(
+        &mut self,
+        name: impl Into<String>,
+        capacity: usize,
+        install_fn: F,
+    ) -> &mut Self
+    where
+        F: FnOnce(tn_exex::TnExExContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = eyre::Result<()>> + Send + 'static,
+    {
+        self.exex_fns.push((name.into(), capacity, Box::new(|ctx| Box::pin(install_fn(ctx)))));
         self
     }
 }
