@@ -1,7 +1,13 @@
 //! DB diagnostics command.
+//!
+//! `db stats` prints read-only statistics for the execution database. `db validate` walks a
+//! consensus epoch pack's `data` stream and reports integrity issues, reproducing the importer's
+//! `MissingBatches` check and classifying each missing batch as Absent (a real data gap) vs
+//! Misordered (present, but in the wrong consensus-header group).
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use comfy_table::{Cell, Row, Table as ComfyTable};
+use eyre::{bail, eyre};
 use human_bytes::human_bytes;
 use std::{
     fs,
@@ -12,8 +18,10 @@ use tn_reth::{
     iter_static_files, open_db_read_only, traits::TNPrimitives, DatabaseArguments, DatabaseEnv,
     RethDatabaseT as _, RethMdbxError, StaticFileProvider, Tables,
 };
+use tn_storage::{consensus_pack::DATA_NAME, pack_validate::validate_pack_file};
+use tn_types::Epoch;
 
-/// Inspect the execution database and print read-only statistics.
+/// Inspect and diagnose telcoin-network databases.
 #[derive(Debug, Parser)]
 pub struct DbCommand {
     /// Database diagnostics subcommand.
@@ -26,6 +34,9 @@ pub struct DbCommand {
 enum DbSubcommand {
     /// Print execution database statistics.
     Stats,
+
+    /// Validate a consensus epoch pack file: walk the `data` stream and report integrity issues.
+    Validate(DbValidateArgs),
 }
 
 impl DbCommand {
@@ -36,7 +47,7 @@ impl DbCommand {
     /// subcommand (reth-style, `telcoin-network db --datadir PATH stats`), or after the
     /// subcommand.
     pub fn execute(&self, datadir: PathBuf) -> eyre::Result<()> {
-        match self.command {
+        match &self.command {
             DbSubcommand::Stats => {
                 let db_path = datadir.reth_db_path();
                 let db = open_db_read_only(&db_path, DatabaseArguments::default())?;
@@ -53,9 +64,85 @@ impl DbCommand {
                 }
                 println!("{}", db_stats_table(&db)?);
             }
+            DbSubcommand::Validate(args) => args.execute()?,
         }
         Ok(())
     }
+}
+
+/// Validate a consensus epoch pack file.
+#[derive(Debug, Args)]
+pub struct DbValidateArgs {
+    /// Path to a pack `data` stream file, or an `epoch-NN` directory containing one.
+    ///
+    /// The `data` stream is self-contained for validation — the sidecar `idx`/`hash`/`bhash`
+    /// indexes are not required.
+    pub path: PathBuf,
+
+    /// Epoch number of the pack.
+    ///
+    /// Required unless it can be derived from an `epoch-NN` directory in the path. The header
+    /// `uid` is derived from the epoch, so an incorrect value fails to open the file.
+    #[arg(long)]
+    pub epoch: Option<Epoch>,
+}
+
+impl DbValidateArgs {
+    /// Validate the pack and print the report to stdout.
+    fn execute(&self) -> eyre::Result<()> {
+        let (data_file, epoch) = resolve_data_file_and_epoch(&self.path, self.epoch)?;
+
+        let report = validate_pack_file(&data_file, epoch, None)
+            .map_err(|e| eyre!("failed to validate pack {}: {e}", data_file.display()))?;
+
+        // Report goes to stdout (tracing/logs go to stderr/file).
+        print!("{report}");
+        Ok(())
+    }
+}
+
+/// Resolve the user-supplied `path` to a concrete `data` file and an epoch.
+///
+/// Accepts:
+/// - a bare `data` file (epoch from `--epoch`, else an `epoch-NN` parent directory),
+/// - an `epoch-NN` directory (epoch from the directory name, overridable with `--epoch`),
+/// - any directory containing a `data` file (epoch from `--epoch`).
+fn resolve_data_file_and_epoch(
+    path: &Path,
+    epoch_opt: Option<Epoch>,
+) -> eyre::Result<(PathBuf, Epoch)> {
+    let (data_file, dir_for_epoch) = if path.is_dir() {
+        let candidate = path.join(DATA_NAME);
+        if !candidate.is_file() {
+            bail!("directory {} does not contain a `{DATA_NAME}` pack file", path.display());
+        }
+        (candidate, Some(path.to_path_buf()))
+    } else if path.is_file() {
+        (path.to_path_buf(), path.parent().map(Path::to_path_buf))
+    } else {
+        bail!("path does not exist: {}", path.display());
+    };
+
+    let epoch = match epoch_opt {
+        Some(epoch) => epoch,
+        None => dir_for_epoch.as_deref().and_then(epoch_from_dir_name).ok_or_else(|| {
+            eyre!(
+                "could not determine epoch from {}; pass --epoch <N> \
+                 (or point at an `epoch-NN` directory)",
+                path.display()
+            )
+        })?,
+    };
+
+    Ok((data_file, epoch))
+}
+
+/// Parse an epoch out of an `epoch-NN` directory name.
+fn epoch_from_dir_name(dir: &Path) -> Option<Epoch> {
+    dir.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("epoch-"))
+        .and_then(|num| num.parse::<Epoch>().ok())
 }
 
 #[derive(Debug, Clone)]
@@ -313,5 +400,14 @@ mod tests {
 
         assert_eq!(file_len_if_exists(&existing_path).unwrap(), 4);
         assert_eq!(file_len_if_exists(&temp_dir.path().join("missing.bin")).unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_db_validate_subcommand() {
+        let cli = Cli::<NoArgs>::try_parse_args_from(["tn", "db", "validate", "/tmp/epoch-3"])
+            .expect("cli parsed");
+        let Commands::Db(_) = cli.command else {
+            panic!("expected the db subcommand");
+        };
     }
 }

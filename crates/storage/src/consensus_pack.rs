@@ -802,58 +802,6 @@ impl Inner {
         Ok(Self { data, consensus_digests, consensus_pos_idx, batch_digests, epoch_meta })
     }
 
-    /// Verify a streamed EpochMeta record is valid.
-    fn verify_epoch_meta(
-        epoch: Epoch,
-        previous_epoch: &EpochRecord,
-        epoch_meta: &EpochMeta,
-    ) -> Result<(), PackError> {
-        if epoch != epoch_meta.epoch {
-            return Err(PackError::InvalidEpoch(
-                epoch,
-                format!("meta data epoch is {}", epoch_meta.epoch),
-            ));
-        }
-        let start_consensus_number =
-            if epoch == 0 { 1 } else { previous_epoch.final_consensus.number + 1 };
-        if start_consensus_number != epoch_meta.start_consensus_number {
-            return Err(PackError::InvalidEpoch(
-                epoch,
-                format!(
-                    "expected start consensus number {start_consensus_number}, got {}",
-                    epoch_meta.start_consensus_number
-                ),
-            ));
-        }
-        if previous_epoch.final_state != epoch_meta.genesis_exec_state {
-            return Err(PackError::InvalidEpoch(
-                epoch,
-                format!(
-                    "expected final state {:?} meta final state {:?}",
-                    previous_epoch.final_state, epoch_meta.genesis_exec_state
-                ),
-            ));
-        }
-        if previous_epoch.final_consensus != epoch_meta.genesis_consensus {
-            return Err(PackError::InvalidEpoch(
-                epoch,
-                format!(
-                    "expected final consensus {:?} meta final consensus {:?}",
-                    previous_epoch.final_consensus, epoch_meta.genesis_consensus
-                ),
-            ));
-        }
-        let committee: BTreeSet<BlsPublicKey> =
-            previous_epoch.next_committee.iter().copied().collect();
-        if epoch_meta.committee.bls_keys() != committee {
-            return Err(PackError::InvalidEpoch(
-                epoch,
-                "epoch meta has unexpected committee".to_string(),
-            ));
-        }
-        Ok(())
-    }
-
     /// Create a new set of epoch static files to write consensus output into.
     async fn stream_import<P: AsRef<Path>, R: AsyncRead + Unpin>(
         path: P,
@@ -888,7 +836,7 @@ impl Inner {
         } else {
             return Err(PackError::NotEpoch);
         };
-        Self::verify_epoch_meta(epoch, previous_epoch, &epoch_meta)?;
+        verify_epoch_meta(epoch, previous_epoch, &epoch_meta)?;
         data.append(&PackRecord::EpochMeta(epoch_meta.clone()))
             .map_err(|e| PackError::Append(e.to_string()))?;
         let consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false)?;
@@ -1215,6 +1163,61 @@ impl Inner {
         }
         Ok(())
     }
+}
+
+/// Verify a streamed [`EpochMeta`] record links correctly to the previous epoch's record.
+///
+/// Extracted from [`Inner::stream_import`] as a free function (it is stateless) so the offline pack
+/// validator ([`crate::pack_validate`]) can reuse the exact same epoch-linkage checks without
+/// duplicating them.
+pub(crate) fn verify_epoch_meta(
+    epoch: Epoch,
+    previous_epoch: &EpochRecord,
+    epoch_meta: &EpochMeta,
+) -> Result<(), PackError> {
+    if epoch != epoch_meta.epoch {
+        return Err(PackError::InvalidEpoch(
+            epoch,
+            format!("meta data epoch is {}", epoch_meta.epoch),
+        ));
+    }
+    let start_consensus_number =
+        if epoch == 0 { 1 } else { previous_epoch.final_consensus.number + 1 };
+    if start_consensus_number != epoch_meta.start_consensus_number {
+        return Err(PackError::InvalidEpoch(
+            epoch,
+            format!(
+                "expected start consensus number {start_consensus_number}, got {}",
+                epoch_meta.start_consensus_number
+            ),
+        ));
+    }
+    if previous_epoch.final_state != epoch_meta.genesis_exec_state {
+        return Err(PackError::InvalidEpoch(
+            epoch,
+            format!(
+                "expected final state {:?} meta final state {:?}",
+                previous_epoch.final_state, epoch_meta.genesis_exec_state
+            ),
+        ));
+    }
+    if previous_epoch.final_consensus != epoch_meta.genesis_consensus {
+        return Err(PackError::InvalidEpoch(
+            epoch,
+            format!(
+                "expected final consensus {:?} meta final consensus {:?}",
+                previous_epoch.final_consensus, epoch_meta.genesis_consensus
+            ),
+        ));
+    }
+    let committee: BTreeSet<BlsPublicKey> = previous_epoch.next_committee.iter().copied().collect();
+    if epoch_meta.committee.bls_keys() != committee {
+        return Err(PackError::InvalidEpoch(
+            epoch,
+            "epoch meta has unexpected committee".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Upper bound on how many `Batch` records `iter_to_output` will buffer before the
