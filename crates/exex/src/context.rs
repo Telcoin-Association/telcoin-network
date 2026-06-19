@@ -29,12 +29,25 @@ pub struct TnExExContext {
     /// harmless (the next report carries a higher height). Never `await` a send
     /// here; an ExEx must not be able to back-pressure the manager.
     pub events: mpsc::Sender<TnExExEvent>,
-    /// Read-only handle to reth's blockchain provider for querying chain
-    /// state/history.
+    /// Read-only handle to reth for querying chain state and history.
     ///
-    /// `RethEnv`'s public surface exposes no DB-mutating methods, so ExExes use
-    /// it for reads only (block/receipt/state lookups, replay). It is *not*
-    /// intended as a write capability; ExEx code must treat it as read-only.
+    /// `RethEnv`'s public surface exposes no DB-mutating methods, so ExExes use it
+    /// for reads only. It is *not* a write capability; ExEx code must treat it as
+    /// read-only.
+    ///
+    /// Reads commonly useful to an ExEx (see [`RethEnv`] for the full surface):
+    ///
+    /// - `last_block_number()` / `canonical_tip()` / `finalized_header()` —
+    ///   current chain position.
+    /// - `sealed_block_by_number(n)` / `sealed_block_with_senders(..)` — a full
+    ///   block, optionally with recovered senders.
+    /// - `header_by_number(n)` / `sealed_header_by_number(n)` — a single header.
+    /// - `blocks_for_range(start..=end)` — sealed headers across a block range.
+    /// - `replay_block_as_chain(n)` — a historical block rebuilt as a `Chain`
+    ///   (receipts included, empty `BundleState`); this is what
+    ///   [`replay_from`](Self::replay_from) uses.
+    /// - `latest()` — a state provider for account/storage queries against the
+    ///   latest committed state.
     pub reth_env: RethEnv,
 }
 

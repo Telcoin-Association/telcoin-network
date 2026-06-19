@@ -14,6 +14,31 @@
 //! TN uses Bullshark BFT consensus with immediate finality. There are no reorgs,
 //! no WAL, and no reorg handling needed.
 //!
+//! # Building an ExEx
+//!
+//! An ExEx is an `async fn(`[`TnExExContext`]`) -> eyre::Result<()>` registered
+//! with `TnBuilder::install_exex` (or `install_exex_with_capacity` to size its
+//! notification buffer for a heavyweight consumer). It runs as an isolated,
+//! non-critical task: a slow, stuck, or panicking ExEx can never stall consensus,
+//! delay execution, or crash the node — at worst it stops receiving live
+//! notifications and must reconcile via replay.
+//!
+//! Two worked examples ship in the `examples/` directory:
+//!
+//! - **`exex-lifecycle`** — the "hello world": logs every notification type.
+//! - **`exex-indexer`** — a stateful skeleton modelling the full contract:
+//!   replay-on-startup, uniform replay/live processing,
+//!   [`Lagged`](TnExExNotification::Lagged) reconciliation, and progress
+//!   reporting. Start here for an indexer or block explorer, a rollup
+//!   data-availability feed, an MEV or analytics pipeline, or a bridge monitor.
+//!
+//! ## Reading chain state
+//!
+//! Beyond the notification payload, [`reth_env`](TnExExContext::reth_env) is the
+//! ExEx's handle for reading the chain — historical blocks, headers, receipts, and
+//! account/storage state. See [`TnExExContext::reth_env`] for the available reads;
+//! it is read-only in practice (its public surface exposes no DB-mutating methods).
+//!
 //! # Replay vs. live: state-diff fidelity
 //!
 //! The authoritative catch-up path is [replay](TnExExContext::replay_from): on
