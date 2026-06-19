@@ -17,7 +17,7 @@
 //! [`TnExExNotification::Lagged`] marker carrying a best-effort count, so the
 //! ExEx can detect the gap and reconcile via [`replay`](crate::replay).
 
-use crate::{TnExExEvent, TnExExNotification};
+use crate::{Chain, TnExExEvent, TnExExNotification};
 use futures::StreamExt;
 use reth_provider::CanonStateNotification;
 use std::{
@@ -171,6 +171,23 @@ impl TnExExManager {
         }
     }
 
+    /// Handle a canonical commit: detect any block-number gap (reth drops
+    /// canonical-stream lag silently), surface it as `Lagged`, then deliver the
+    /// executed chain. Shared by the `Commit` and degraded `Reorg` arms.
+    fn handle_canon_commit(&mut self, new: Arc<Chain>) {
+        let range = new.range();
+        if let Some(missed) = canon_gap(&mut self.last_canon_tip, *range.start(), *range.end()) {
+            warn!(
+                target: "exex::manager",
+                missed,
+                first = *range.start(),
+                "canonical ChainExecuted gap detected; surfacing Lagged",
+            );
+            self.fan_out(&TnExExNotification::Lagged { missed });
+        }
+        self.fan_out(&TnExExNotification::ChainExecuted { new });
+    }
+
     /// Poll all event receivers for FinishedHeight updates and recompute the
     /// minimum finished height across all ExExes.
     fn poll_events(&mut self, cx: &mut Context<'_>) {
@@ -273,31 +290,26 @@ impl futures::Future for TnExExManager {
         loop {
             match this.canon_state_stream.poll_next_unpin(cx) {
                 Poll::Ready(Some(notification)) => match notification {
-                    CanonStateNotification::Commit { new } => {
-                        // reth's canonical-state stream drops broadcast lag
-                        // silently, so a starved manager can miss commits. Detect
-                        // the resulting block-number discontinuity and surface a
-                        // `Lagged` marker before delivering, so stateful ExExes
-                        // reconcile rather than carry a silent hole.
-                        let range = new.range();
-                        if let Some(missed) =
-                            canon_gap(&mut this.last_canon_tip, *range.start(), *range.end())
-                        {
-                            warn!(
-                                target: "exex::manager",
-                                missed,
-                                first = *range.start(),
-                                "canonical ChainExecuted gap detected; surfacing Lagged",
-                            );
-                            this.fan_out(&TnExExNotification::Lagged { missed });
-                        }
-                        this.fan_out(&TnExExNotification::ChainExecuted { new });
-                    }
-                    // TN's BFT consensus has immediate finality, so reth only ever
-                    // emits `Commit`.
+                    // reth's canonical-state stream drops broadcast lag silently,
+                    // so a starved manager can miss commits. `handle_canon_commit`
+                    // detects the resulting discontinuity and surfaces a `Lagged`
+                    // marker before delivering, so stateful ExExes reconcile rather
+                    // than carry a silent hole.
+                    CanonStateNotification::Commit { new } => this.handle_canon_commit(new),
+                    // TN's BFT consensus has immediate finality, so reth should
+                    // only ever emit `Commit`. A `Reorg` violates that invariant —
+                    // log it loudly, but degrade gracefully by treating the new
+                    // side as a commit. The manager is spawned once and never
+                    // respawned, so panicking here (it previously did) would kill
+                    // the shared fan-out for every ExEx for the node's lifetime.
                     CanonStateNotification::Reorg { old, new } => {
-                        error!(target: "exex::manager", old = ?old, new = ?new, "Reorg notification received for finalized state");
-                        unreachable!("reorgs impossible")
+                        error!(
+                            target: "exex::manager",
+                            old_blocks = old.len(),
+                            new_blocks = new.len(),
+                            "unexpected Reorg for finalized state; degrading to commit of the new side",
+                        );
+                        this.handle_canon_commit(new);
                     }
                 },
                 Poll::Ready(None) => {
