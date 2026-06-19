@@ -13,6 +13,27 @@
 //!
 //! TN uses Bullshark BFT consensus with immediate finality. There are no reorgs,
 //! no WAL, and no reorg handling needed.
+//!
+//! # Replay vs. live: state-diff fidelity
+//!
+//! The authoritative catch-up path is [replay](TnExExContext::replay_from): on
+//! startup — and after a [`Lagged`](TnExExNotification::Lagged) gap — a stateful
+//! ExEx replays historical blocks from its last processed height, then follows
+//! live notifications. Both paths deliver
+//! [`ChainExecuted`](TnExExNotification::ChainExecuted), but with one asymmetry a
+//! stateful consumer must account for:
+//!
+//! - **Live** `ChainExecuted` carries the full `BundleState` (the account/storage
+//!   diffs produced by execution).
+//! - **Replayed** `ChainExecuted` carries block data and **receipts** but an
+//!   **empty `BundleState`**: that state is already committed to the DB and is not
+//!   re-derived during replay.
+//!
+//! Block- and receipt-level consumers (transaction counts, gas, logs, events)
+//! therefore process both paths identically. A consumer that needs account or
+//! storage *diffs* must read them from [`reth_env`](TnExExContext::reth_env) by
+//! block number on the replay path. Letting the replay and live paths diverge
+//! here is the most common source of "works live, corrupts on catch-up" bugs.
 
 #![doc(
     html_logo_url = "https://www.telco.in/logos/TEL.svg",
