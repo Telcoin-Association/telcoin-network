@@ -28,7 +28,7 @@ use std::{
 use tn_reth::CanonStateNotificationStream;
 use tn_types::{BlockNumber, Certificate, CommittedSubDag};
 use tokio::sync::{broadcast, mpsc, watch};
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tracing::{debug, error, warn};
 
 /// Notification channel capacity per ExEx.
@@ -126,6 +126,10 @@ pub struct TnExExManager {
     exexes: Vec<ExExHandle>,
     /// Watch sender for the minimum finished height across all ExExes.
     min_finished_height_tx: watch::Sender<Option<BlockNumber>>,
+    /// Highest canonical block delivered as `ChainExecuted`. Used to detect gaps
+    /// when reth's canonical-state stream drops notifications (it skips broadcast
+    /// lag silently). `None` until the first commit.
+    last_canon_tip: Option<BlockNumber>,
 }
 
 impl TnExExManager {
@@ -152,6 +156,7 @@ impl TnExExManager {
             committed_sub_dags_stream: BroadcastStream::new(rx_committed_sub_dags),
             exexes,
             min_finished_height_tx,
+            last_canon_tip: None,
         };
 
         let handle = TnExExManagerHandle { min_finished_height: min_finished_height_rx };
@@ -209,8 +214,11 @@ impl futures::Future for TnExExManager {
                     };
                     this.fan_out(&notification);
                 }
-                Poll::Ready(Some(Err(e))) => {
-                    warn!(target: "exex::manager", ?e, "own certificates stream error");
+                Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(n)))) => {
+                    // Surface the broadcast lag so the `Lagged` contract is uniform
+                    // across every manager-side input, not just the canon stream.
+                    this.fan_out(&TnExExNotification::Lagged { missed: n });
+                    warn!(target: "exex::manager", missed = n, "own certificates stream lagged; surfaced Lagged");
                 }
                 Poll::Ready(None) => {
                     debug!(target: "exex::manager", "own certificates stream ended");
@@ -230,8 +238,9 @@ impl futures::Future for TnExExManager {
                     };
                     this.fan_out(&notification);
                 }
-                Poll::Ready(Some(Err(e))) => {
-                    warn!(target: "exex::manager", ?e, "peer certificates stream error");
+                Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(n)))) => {
+                    this.fan_out(&TnExExNotification::Lagged { missed: n });
+                    warn!(target: "exex::manager", missed = n, "peer certificates stream lagged; surfaced Lagged");
                 }
                 Poll::Ready(None) => {
                     debug!(target: "exex::manager", "peer certificates stream ended");
@@ -248,8 +257,9 @@ impl futures::Future for TnExExManager {
                     let notification = TnExExNotification::ConsensusCommitted { sub_dag };
                     this.fan_out(&notification);
                 }
-                Poll::Ready(Some(Err(e))) => {
-                    warn!(target: "exex::manager", ?e, "committed sub-dags stream error");
+                Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(n)))) => {
+                    this.fan_out(&TnExExNotification::Lagged { missed: n });
+                    warn!(target: "exex::manager", missed = n, "committed sub-dags stream lagged; surfaced Lagged");
                 }
                 Poll::Ready(None) => {
                     debug!(target: "exex::manager", "committed sub-dags stream ended");
@@ -264,8 +274,24 @@ impl futures::Future for TnExExManager {
             match this.canon_state_stream.poll_next_unpin(cx) {
                 Poll::Ready(Some(notification)) => match notification {
                     CanonStateNotification::Commit { new } => {
-                        let notification = TnExExNotification::ChainExecuted { new };
-                        this.fan_out(&notification);
+                        // reth's canonical-state stream drops broadcast lag
+                        // silently, so a starved manager can miss commits. Detect
+                        // the resulting block-number discontinuity and surface a
+                        // `Lagged` marker before delivering, so stateful ExExes
+                        // reconcile rather than carry a silent hole.
+                        let range = new.range();
+                        if let Some(missed) =
+                            canon_gap(&mut this.last_canon_tip, *range.start(), *range.end())
+                        {
+                            warn!(
+                                target: "exex::manager",
+                                missed,
+                                first = *range.start(),
+                                "canonical ChainExecuted gap detected; surfacing Lagged",
+                            );
+                            this.fan_out(&TnExExNotification::Lagged { missed });
+                        }
+                        this.fan_out(&TnExExNotification::ChainExecuted { new });
                     }
                     // TN's BFT consensus has immediate finality, so reth only ever
                     // emits `Commit`.
@@ -322,6 +348,22 @@ pub const fn exex_channel_capacity() -> usize {
     EXEX_CHANNEL_CAPACITY
 }
 
+/// Returns `Some(missed)` — the count of skipped block numbers — when `first`
+/// is not contiguous with the last delivered canonical tip, and advances
+/// `last_tip` monotonically to `tip`.
+///
+/// Returns `None` on the first commit (no baseline) and for contiguous or
+/// out-of-order/duplicate commits. `last_tip` never moves backward.
+fn canon_gap(last_tip: &mut Option<BlockNumber>, first: BlockNumber, tip: BlockNumber) -> Option<u64> {
+    let missed = match *last_tip {
+        Some(prev) if first > prev.saturating_add(1) => Some(first - prev - 1),
+        _ => None,
+    };
+    // Advance monotonically; an out-of-order/duplicate commit never rewinds.
+    *last_tip = Some((*last_tip).map_or(tip, |p| p.max(tip)));
+    missed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,5 +416,30 @@ mod tests {
         // Exactly one notification, no spurious Lagged marker.
         assert!(matches!(rx.try_recv(), Ok(TnExExNotification::Lagged { missed: FILLER })));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn canon_gap_detects_discontinuities_and_advances_monotonically() {
+        let mut tip = None;
+
+        // First commit: no baseline → no gap, tip set to the commit's tip.
+        assert_eq!(canon_gap(&mut tip, 1, 3), None);
+        assert_eq!(tip, Some(3));
+
+        // Contiguous multi-block commit (4..=6 follows 3) → no gap.
+        assert_eq!(canon_gap(&mut tip, 4, 6), None);
+        assert_eq!(tip, Some(6));
+
+        // Contiguous single-block commit (7 follows 6) → no gap.
+        assert_eq!(canon_gap(&mut tip, 7, 7), None);
+        assert_eq!(tip, Some(7));
+
+        // Gap: last tip 7, next commit starts at 11 → blocks 8,9,10 missing.
+        assert_eq!(canon_gap(&mut tip, 11, 13), Some(3));
+        assert_eq!(tip, Some(13));
+
+        // Out-of-order/duplicate commit (older range) → no gap, tip never rewinds.
+        assert_eq!(canon_gap(&mut tip, 5, 8), None);
+        assert_eq!(tip, Some(13));
     }
 }

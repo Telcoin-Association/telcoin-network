@@ -62,10 +62,17 @@ pub enum TnExExNotification {
     },
     /// The ExEx fell behind and live notifications were dropped.
     ///
-    /// Emitted when the manager could not deliver one or more notifications
-    /// because this ExEx's channel was full (the manager never blocks consensus,
-    /// so it drops instead). On receipt, a stateful ExEx should reconcile by
-    /// replaying from its last processed height — see
+    /// Emitted in two cases, both surfacing the same "gap exists, go reconcile"
+    /// signal:
+    /// 1. **Downstream (manager → ExEx):** this ExEx's bounded channel was full,
+    ///    so the manager dropped notifications rather than block consensus.
+    /// 2. **Upstream (reth → manager):** the manager itself fell behind one of
+    ///    its source streams (reth's canonical-state stream or a consensus
+    ///    broadcast), which drop lagged items silently. The manager detects the
+    ///    resulting discontinuity and re-emits it as `Lagged`.
+    ///
+    /// On receipt, a stateful ExEx should reconcile by replaying from its last
+    /// processed height — see
     /// [`TnExExContext::replay_from`](crate::TnExExContext::replay_from).
     ///
     /// `missed` is a best-effort count of notifications dropped since the last
