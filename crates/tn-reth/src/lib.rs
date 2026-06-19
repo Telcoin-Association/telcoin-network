@@ -938,6 +938,14 @@ impl RethEnv {
     /// a `Chain` suitable for ExEx replay notifications.
     ///
     /// Returns `None` if the block does not exist in the database.
+    ///
+    /// # Replay fidelity
+    ///
+    /// The returned `Chain` carries an **empty `BundleState`**: account/storage
+    /// diffs are already committed to the DB at execution time and are not
+    /// re-derived here. ExExes that need historical state diffs must read them
+    /// from the provider by block number. Live `ChainExecuted` notifications
+    /// (from `finish_executing_output`) *do* carry the full `BundleState`.
     pub fn replay_block_as_chain(
         &self,
         block_number: BlockNumber,
@@ -951,12 +959,16 @@ impl RethEnv {
             return Ok(None);
         };
 
-        // Read receipts for this block
+        // Read receipts for this block. The block exists (read above), so missing
+        // receipts indicate a DB inconsistency; an empty block legitimately
+        // returns `Some(vec![])`. Treat `None` as an error rather than silently
+        // yielding an empty receipt set (which would make a non-empty block look
+        // empty to a stateful indexer).
         let receipts = self
             .inner
             .blockchain_provider
             .receipts_by_block(BlockHashOrNumber::Number(block_number))?
-            .unwrap_or_default();
+            .ok_or(TnRethError::ReplayReceiptsMissing(block_number))?;
 
         // Construct a minimal ExecutionOutcome with receipts only (no bundle state)
         let execution_outcome = ExecutionOutcome::new(
