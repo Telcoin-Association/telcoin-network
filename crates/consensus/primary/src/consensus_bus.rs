@@ -563,6 +563,38 @@ impl ConsensusBusApp {
         &self.inner.exex_committed_sub_dags
     }
 
+    /// Send `value` on `sender` only when at least one ExEx receiver is listening.
+    ///
+    /// The clone is skipped entirely when no ExEx is registered — the broadcast
+    /// payload can be arbitrarily large on the sub-DAG path, so this guard keeps the
+    /// hot path cheap.
+    fn notify_exex<T: Clone>(sender: &broadcast::Sender<T>, value: &T) {
+        if sender.receiver_count() > 0 {
+            let _ = sender.send(value.clone());
+        }
+    }
+
+    /// Notify ExEx subscribers about a certificate produced by this node.
+    pub fn notify_exex_own_certificate(&self, certificate: &Certificate) {
+        Self::notify_exex(&self.inner.exex_own_certificates, certificate);
+    }
+
+    /// Notify ExEx subscribers about an accepted peer certificate.
+    pub fn notify_exex_peer_certificate(&self, certificate: &Certificate) {
+        Self::notify_exex(&self.inner.exex_peer_certificates, certificate);
+    }
+
+    /// Notify ExEx subscribers about a committed sub-DAG.
+    ///
+    /// The sub-DAG clone is O(n) and can be arbitrarily large (Byzantine leaders),
+    /// so it is skipped entirely when no ExEx is listening.
+    pub fn notify_exex_committed_sub_dag(&self, sub_dag: &CommittedSubDag) {
+        let sender = &self.inner.exex_committed_sub_dags;
+        if sender.receiver_count() > 0 {
+            let _ = sender.send(Arc::new(sub_dag.clone()));
+        }
+    }
+
     /// Subscribe to own certificate notifications (ExEx).
     pub fn subscribe_exex_own_certificates(&self) -> broadcast::Receiver<Certificate> {
         self.inner.exex_own_certificates.subscribe()
