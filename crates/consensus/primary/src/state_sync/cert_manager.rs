@@ -211,7 +211,12 @@ where
                 .map_err(|_| CertManagerError::FatalAppendParent)?;
 
             // notify ExEx subscribers about peer certificate
-            let _ = self.consensus_bus.app().exex_peer_certificates().send(cert.clone());
+            // (skip the clone entirely when no ExEx is listening — this is a
+            // high-volume path)
+            let exex_peer = self.consensus_bus.app().exex_peer_certificates();
+            if exex_peer.receiver_count() > 0 {
+                let _ = exex_peer.send(cert.clone());
+            }
 
             // send to consensus for processing into the DAG
             self.consensus_bus.new_certificates().send(cert).await.inspect_err(|e| {

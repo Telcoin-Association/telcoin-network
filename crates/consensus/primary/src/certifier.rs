@@ -454,7 +454,11 @@ impl<DB: Database> Certifier<DB> {
                         }
 
                         // notify ExEx subscribers about own certificate
-                        let _ = self.consensus_bus.app().exex_own_certificates().send(certificate.clone());
+                        // (skip the clone entirely when no ExEx is listening)
+                        let exex_own = self.consensus_bus.app().exex_own_certificates();
+                        if exex_own.receiver_count() > 0 {
+                            let _ = exex_own.send(certificate.clone());
+                        }
 
                         // try to publish the certificate on gossip network
                         if let Err(e) = self.network.publish_certificate(certificate).await {

@@ -453,11 +453,13 @@ impl<DB: Database> Consensus<DB> {
                 metrics.commit_latency_seconds.record(now().saturating_sub(leader_created) as f64);
 
                 // notify ExEx subscribers about committed sub-DAG
-                let _ = self
-                    .consensus_bus
-                    .app()
-                    .exex_committed_sub_dags()
-                    .send(Arc::new(committed_sub_dag.clone()));
+                //
+                // The sub-DAG clone is O(n) and can be arbitrarily large (Byzantine
+                // leaders), so skip it entirely when no ExEx is listening.
+                let exex_sub_dags = self.consensus_bus.app().exex_committed_sub_dags();
+                if exex_sub_dags.receiver_count() > 0 {
+                    let _ = exex_sub_dags.send(Arc::new(committed_sub_dag.clone()));
+                }
 
                 // NOTE: The size of the sub-dag can be arbitrarily large (depending on the network
                 // condition and Byzantine leaders).

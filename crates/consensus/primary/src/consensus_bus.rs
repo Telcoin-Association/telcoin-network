@@ -992,3 +992,37 @@ impl std::fmt::Display for WaitForExecutionElapsed {
         write!(f, "{self:?}")
     }
 }
+
+#[cfg(test)]
+mod exex_receiver_count_tests {
+    use super::ConsensusBusApp;
+
+    #[test]
+    fn exex_senders_have_no_receivers_until_subscribed() {
+        // The hot-path send sites guard on `receiver_count() > 0` so they skip the
+        // (potentially large) clone+send when no ExEx is registered. That
+        // optimization relies on the bus starting with zero ExEx receivers — the
+        // initial receivers are dropped at construction.
+        let bus = ConsensusBusApp::new();
+        assert_eq!(bus.exex_own_certificates().receiver_count(), 0);
+        assert_eq!(bus.exex_peer_certificates().receiver_count(), 0);
+        assert_eq!(bus.exex_committed_sub_dags().receiver_count(), 0);
+
+        // Subscribing (as the ExEx manager does) makes the guards fire.
+        let own = bus.subscribe_exex_own_certificates();
+        let peer = bus.subscribe_exex_peer_certificates();
+        let sub_dags = bus.subscribe_exex_committed_sub_dags();
+        assert_eq!(bus.exex_own_certificates().receiver_count(), 1);
+        assert_eq!(bus.exex_peer_certificates().receiver_count(), 1);
+        assert_eq!(bus.exex_committed_sub_dags().receiver_count(), 1);
+
+        // Dropping the subscriptions (e.g. the non-critical manager dies) returns
+        // to zero, so the guards skip work again.
+        drop(own);
+        drop(peer);
+        drop(sub_dags);
+        assert_eq!(bus.exex_own_certificates().receiver_count(), 0);
+        assert_eq!(bus.exex_peer_certificates().receiver_count(), 0);
+        assert_eq!(bus.exex_committed_sub_dags().receiver_count(), 0);
+    }
+}
