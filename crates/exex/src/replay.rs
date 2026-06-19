@@ -18,6 +18,10 @@ use tn_types::BlockNumber;
 /// `TnExExNotification::ChainExecuted` for each block.
 ///
 /// If `current_block > end_block`, the stream is immediately empty.
+///
+/// Replayed `ChainExecuted` notifications carry an **empty `BundleState`** (state
+/// diffs are read from the DB by block number, not re-derived here) — see
+/// [`RethEnv::replay_block_as_chain`](tn_reth::RethEnv::replay_block_as_chain).
 #[derive(Debug)]
 pub struct ReplayStream {
     reth_env: RethEnv,

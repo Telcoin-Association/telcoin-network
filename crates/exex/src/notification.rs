@@ -20,6 +20,16 @@ pub use reth_execution_types::Chain;
 /// 3. **Chain executed** — blocks have been executed and added to the canonical chain
 ///
 /// All stages produce final, irrevocable state thanks to BFT consensus.
+///
+/// # Delivery contract
+///
+/// Live delivery is **best-effort**: the manager fans out with a non-blocking
+/// `try_send` so it can never block consensus or execution. When an ExEx cannot
+/// keep up, notifications are dropped and the gap is surfaced as [`Lagged`] — at
+/// which point the ExEx should reconcile via [`replay`](crate::replay). Replay
+/// is the **authoritative** path; treat live notifications as at-least-once.
+///
+/// [`Lagged`]: TnExExNotification::Lagged
 #[derive(Debug, Clone)]
 pub enum TnExExNotification {
     /// A certificate has been accepted (either our own or a peer's).
@@ -32,7 +42,6 @@ pub enum TnExExNotification {
         /// Whether this certificate was produced by the local node.
         is_own: bool,
     },
-
     /// A sub-DAG has been committed by the Bullshark consensus protocol.
     ///
     /// This means the certificates in the sub-DAG are ordered and will
@@ -42,7 +51,6 @@ pub enum TnExExNotification {
         /// The committed sub-DAG containing ordered certificates.
         sub_dag: Arc<CommittedSubDag>,
     },
-
     /// New blocks have been executed and added to the canonical chain.
     ///
     /// This is the final stage — the transactions have been executed by the
@@ -51,5 +59,20 @@ pub enum TnExExNotification {
     ChainExecuted {
         /// The new chain segment containing blocks, receipts, and state changes.
         new: Arc<Chain>,
+    },
+    /// The ExEx fell behind and live notifications were dropped.
+    ///
+    /// Emitted when the manager could not deliver one or more notifications
+    /// because this ExEx's channel was full (the manager never blocks consensus,
+    /// so it drops instead). On receipt, a stateful ExEx should reconcile by
+    /// replaying from its last processed height — see
+    /// [`TnExExContext::replay_from`](crate::TnExExContext::replay_from).
+    ///
+    /// `missed` is a best-effort count of notifications dropped since the last
+    /// successful delivery; treat it as a "gap exists, go reconcile" signal
+    /// rather than an exact tally.
+    Lagged {
+        /// Best-effort count of notifications dropped since the last delivery.
+        missed: u64,
     },
 }

@@ -4,13 +4,18 @@ use tn_types::BlockNumber;
 
 /// Event sent from an ExEx back to the manager.
 ///
-/// ExExes use these events to communicate processing progress back to the
-/// node, enabling coordination for data pruning.
+/// ExExes use these events to report processing progress back to the node.
 #[derive(Debug, Clone)]
 pub enum TnExExEvent {
     /// Signal that the ExEx has durably processed all blocks up to this height.
     ///
-    /// Used for pruning coordination — the node won't prune data below the
-    /// minimum finished height across all ExExes.
+    /// The manager aggregates these into a minimum finished height across all
+    /// ExExes, exposed via
+    /// [`TnExExManagerHandle::min_finished_height`](crate::TnExExManagerHandle::min_finished_height).
+    ///
+    /// This is the coordination point for future pruning support: a pruner would
+    /// avoid removing data below this height so ExExes can still catch up via
+    /// replay. **It is currently informational only** — TN runs in archive mode
+    /// (pruning disabled), so nothing consumes it yet.
     FinishedHeight(BlockNumber),
 }
