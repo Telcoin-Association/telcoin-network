@@ -25,6 +25,7 @@ members = [
     "crates/consensus/worker",
 
     # examples
+    "examples/exex-indexer",
     "examples/exex-lifecycle",
 
     # execution
