@@ -119,7 +119,7 @@ impl ExExHandle {
 
 /// The ExEx manager fans out lifecycle notifications to all registered ExExes.
 ///
-/// It implements [`Future`] following the same pattern as `ExecutorEngine`.
+/// It implements [`Future`](std::future::Future) following the same pattern as `ExecutorEngine`.
 /// The manager runs for the lifetime of the node (spawned on `node_task_manager`).
 pub struct TnExExManager {
     /// Subscription to canonical state notifications from reth's BlockchainProvider.
