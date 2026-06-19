@@ -103,8 +103,11 @@ pub async fn lifecycle_tracker_exex(mut ctx: TnExExContext) -> eyre::Result<()> 
                     "Chain executed"
                 );
 
-                // Report finished height so the node knows we've processed up to here
-                ctx.events.send(TnExExEvent::FinishedHeight(tip_number))?;
+                // Report finished height so the node knows we've processed up to
+                // here. `try_send` is non-blocking; `FinishedHeight` is
+                // latest-wins, so a dropped report on a momentarily-full channel
+                // is harmless (the next report carries a higher height).
+                let _ = ctx.events.try_send(TnExExEvent::FinishedHeight(tip_number));
             }
 
             TnExExNotification::Lagged { missed } => {

@@ -41,8 +41,12 @@ struct ExExHandle {
     name: String,
     /// Bounded, non-blocking notification sender.
     notifications: mpsc::Sender<TnExExNotification>,
-    /// Event receiver for progress reports from the ExEx.
-    events: mpsc::UnboundedReceiver<TnExExEvent>,
+    /// Bounded event receiver for progress reports from the ExEx.
+    ///
+    /// `FinishedHeight` is latest-wins, so a small bounded channel is sufficient
+    /// — the ExEx reports with a non-blocking `try_send`, and only the maximum
+    /// reported height matters.
+    events: mpsc::Receiver<TnExExEvent>,
     /// Highest durably-processed height reported by the ExEx, if any.
     finished_height: Option<BlockNumber>,
     /// Notifications dropped since the last successful delivery.
@@ -56,7 +60,7 @@ impl ExExHandle {
     fn new(
         name: String,
         notifications: mpsc::Sender<TnExExNotification>,
-        events: mpsc::UnboundedReceiver<TnExExEvent>,
+        events: mpsc::Receiver<TnExExEvent>,
     ) -> Self {
         Self { name, notifications, events, finished_height: None, dropped: 0 }
     }
@@ -140,7 +144,7 @@ impl TnExExManager {
         rx_peer_certs: broadcast::Receiver<Certificate>,
         rx_committed_sub_dags: broadcast::Receiver<Arc<CommittedSubDag>>,
         exex_txs: Vec<(String, mpsc::Sender<TnExExNotification>)>,
-        event_rxs: Vec<mpsc::UnboundedReceiver<TnExExEvent>>,
+        event_rxs: Vec<mpsc::Receiver<TnExExEvent>>,
     ) -> (Self, TnExExManagerHandle) {
         let exexes: Vec<ExExHandle> = exex_txs
             .into_iter()
@@ -391,7 +395,7 @@ mod tests {
     #[tokio::test]
     async fn full_channel_drops_then_surfaces_lagged_marker() {
         let (tx, mut rx) = mpsc::channel(2);
-        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let (_event_tx, event_rx) = mpsc::channel(4);
         let mut handle = ExExHandle::new("test".to_string(), tx, event_rx);
 
         // Fill the channel (capacity 2).
@@ -420,7 +424,7 @@ mod tests {
     #[tokio::test]
     async fn delivers_without_lagged_when_not_full() {
         let (tx, mut rx) = mpsc::channel(4);
-        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let (_event_tx, event_rx) = mpsc::channel(4);
         let mut handle = ExExHandle::new("test".to_string(), tx, event_rx);
 
         handle.send(&filler());

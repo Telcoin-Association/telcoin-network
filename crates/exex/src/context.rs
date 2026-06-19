@@ -21,8 +21,14 @@ pub struct TnExExContext {
     /// Live delivery is best-effort (see [`TnExExNotification`]); replay is the
     /// authoritative catch-up path.
     pub notifications: mpsc::Receiver<TnExExNotification>,
-    /// Channel to send events (e.g., FinishedHeight) back to the manager.
-    pub events: mpsc::UnboundedSender<TnExExEvent>,
+    /// Bounded channel to report events (e.g., `FinishedHeight`) back to the
+    /// manager.
+    ///
+    /// Report with a non-blocking `try_send` — `FinishedHeight` is latest-wins,
+    /// so dropping an intermediate report when the channel is momentarily full is
+    /// harmless (the next report carries a higher height). Never `await` a send
+    /// here; an ExEx must not be able to back-pressure the manager.
+    pub events: mpsc::Sender<TnExExEvent>,
     /// Read-only handle to reth's blockchain provider for querying chain
     /// state/history.
     ///

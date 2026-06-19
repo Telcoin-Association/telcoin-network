@@ -46,6 +46,12 @@ const NODE_TASK_MANAGER: &str = "Node Task Manager";
 /// The worker's base task manager name. This is used by `fn worker_task_manager_name(id)`.
 pub(crate) const WORKER_TASK_BASE: &str = "Worker Task";
 
+/// Capacity of the ExEx → manager `events` channel.
+///
+/// `FinishedHeight` is latest-wins, so this only needs to absorb a short burst;
+/// a small bound is enough and keeps a buggy ExEx from growing it without limit.
+const EXEX_EVENT_CAPACITY: usize = 16;
+
 /// The long-running owner that oversees epoch transitions.
 ///
 /// One instance exists for the lifetime of the process. It holds the resources that must survive
@@ -379,7 +385,7 @@ where
 
             for (name, install_fn) in self.builder.exex_fns.drain(..) {
                 let (notif_tx, notif_rx) = mpsc::channel(tn_exex::exex_channel_capacity());
-                let (event_tx, event_rx) = mpsc::unbounded_channel();
+                let (event_tx, event_rx) = mpsc::channel(EXEX_EVENT_CAPACITY);
 
                 let ctx = tn_exex::TnExExContext {
                     notifications: notif_rx,
