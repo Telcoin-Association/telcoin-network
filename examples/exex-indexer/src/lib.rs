@@ -5,16 +5,15 @@
 //! analytics pipeline, or bridge monitor — that must not lose or double-count
 //! data across restarts and lag. It models the four things such an ExEx must do:
 //!
-//! 1. **Replay on startup.** Load the last durably-indexed height and replay
-//!    from there *before* processing live notifications, so a restart resumes
-//!    exactly where it left off instead of silently skipping history.
-//! 2. **Process replay and live uniformly.** The same `index_chain` handles a
-//!    [`ChainExecuted`] whether it arrived via replay or the live channel.
-//! 3. **Reconcile on [`Lagged`].** When the node signals dropped notifications,
-//!    replay from the last indexed height to fill the gap rather than carry a
-//!    silent hole.
-//! 4. **Report progress.** Send [`FinishedHeight`] (non-blocking) so the node
-//!    knows how far this ExEx has durably processed.
+//! 1. **Replay on startup.** Load the last durably-indexed height and replay from there *before*
+//!    processing live notifications, so a restart resumes exactly where it left off instead of
+//!    silently skipping history.
+//! 2. **Process replay and live uniformly.** The same `index_chain` handles a [`ChainExecuted`]
+//!    whether it arrived via replay or the live channel.
+//! 3. **Reconcile on [`Lagged`].** When the node signals dropped notifications, replay from the
+//!    last indexed height to fill the gap rather than carry a silent hole.
+//! 4. **Report progress.** Send [`FinishedHeight`] (non-blocking) so the node knows how far this
+//!    ExEx has durably processed.
 //!
 //! # State-diff fidelity (replay vs. live)
 //!

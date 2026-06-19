@@ -377,7 +377,11 @@ pub const fn exex_channel_capacity() -> usize {
 ///
 /// Returns `None` on the first commit (no baseline) and for contiguous or
 /// out-of-order/duplicate commits. `last_tip` never moves backward.
-fn canon_gap(last_tip: &mut Option<BlockNumber>, first: BlockNumber, tip: BlockNumber) -> Option<u64> {
+fn canon_gap(
+    last_tip: &mut Option<BlockNumber>,
+    first: BlockNumber,
+    tip: BlockNumber,
+) -> Option<u64> {
     let missed = match *last_tip {
         Some(prev) if first > prev.saturating_add(1) => Some(first - prev - 1),
         _ => None,

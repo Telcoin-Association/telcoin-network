@@ -64,12 +64,11 @@ pub enum TnExExNotification {
     ///
     /// Emitted in two cases, both surfacing the same "gap exists, go reconcile"
     /// signal:
-    /// 1. **Downstream (manager → ExEx):** this ExEx's bounded channel was full,
-    ///    so the manager dropped notifications rather than block consensus.
-    /// 2. **Upstream (reth → manager):** the manager itself fell behind one of
-    ///    its source streams (reth's canonical-state stream or a consensus
-    ///    broadcast), which drop lagged items silently. The manager detects the
-    ///    resulting discontinuity and re-emits it as `Lagged`.
+    /// 1. **Downstream (manager → ExEx):** this ExEx's bounded channel was full, so the manager
+    ///    dropped notifications rather than block consensus.
+    /// 2. **Upstream (reth → manager):** the manager itself fell behind one of its source streams
+    ///    (reth's canonical-state stream or a consensus broadcast), which drop lagged items
+    ///    silently. The manager detects the resulting discontinuity and re-emits it as `Lagged`.
     ///
     /// On receipt, a stateful ExEx should reconcile by replaying from its last
     /// processed height — see

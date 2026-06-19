@@ -37,17 +37,16 @@ pub struct TnExExContext {
     ///
     /// Reads commonly useful to an ExEx (see [`RethEnv`] for the full surface):
     ///
-    /// - `last_block_number()` / `canonical_tip()` / `finalized_header()` —
-    ///   current chain position.
-    /// - `sealed_block_by_number(n)` / `sealed_block_with_senders(..)` — a full
-    ///   block, optionally with recovered senders.
+    /// - `last_block_number()` / `canonical_tip()` / `finalized_header()` — current chain
+    ///   position.
+    /// - `sealed_block_by_number(n)` / `sealed_block_with_senders(..)` — a full block, optionally
+    ///   with recovered senders.
     /// - `header_by_number(n)` / `sealed_header_by_number(n)` — a single header.
     /// - `blocks_for_range(start..=end)` — sealed headers across a block range.
-    /// - `replay_block_as_chain(n)` — a historical block rebuilt as a `Chain`
-    ///   (receipts included, empty `BundleState`); this is what
-    ///   [`replay_from`](Self::replay_from) uses.
-    /// - `latest()` — a state provider for account/storage queries against the
-    ///   latest committed state.
+    /// - `replay_block_as_chain(n)` — a historical block rebuilt as a `Chain` (receipts included,
+    ///   empty `BundleState`); this is what [`replay_from`](Self::replay_from) uses.
+    /// - `latest()` — a state provider for account/storage queries against the latest committed
+    ///   state.
     pub reth_env: RethEnv,
 }
 

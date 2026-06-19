@@ -26,11 +26,10 @@
 //! Two worked examples ship in the `examples/` directory:
 //!
 //! - **`exex-lifecycle`** — the "hello world": logs every notification type.
-//! - **`exex-indexer`** — a stateful skeleton modelling the full contract:
-//!   replay-on-startup, uniform replay/live processing,
-//!   [`Lagged`](TnExExNotification::Lagged) reconciliation, and progress
-//!   reporting. Start here for an indexer or block explorer, a rollup
-//!   data-availability feed, an MEV or analytics pipeline, or a bridge monitor.
+//! - **`exex-indexer`** — a stateful skeleton modelling the full contract: replay-on-startup,
+//!   uniform replay/live processing, [`Lagged`](TnExExNotification::Lagged) reconciliation, and
+//!   progress reporting. Start here for an indexer or block explorer, a rollup data-availability
+//!   feed, an MEV or analytics pipeline, or a bridge monitor.
 //!
 //! ## Reading chain state
 //!
@@ -48,11 +47,11 @@
 //! [`ChainExecuted`](TnExExNotification::ChainExecuted), but with one asymmetry a
 //! stateful consumer must account for:
 //!
-//! - **Live** `ChainExecuted` carries the full `BundleState` (the account/storage
-//!   diffs produced by execution).
-//! - **Replayed** `ChainExecuted` carries block data and **receipts** but an
-//!   **empty `BundleState`**: that state is already committed to the DB and is not
-//!   re-derived during replay.
+//! - **Live** `ChainExecuted` carries the full `BundleState` (the account/storage diffs produced by
+//!   execution).
+//! - **Replayed** `ChainExecuted` carries block data and **receipts** but an **empty
+//!   `BundleState`**: that state is already committed to the DB and is not re-derived during
+//!   replay.
 //!
 //! Block- and receipt-level consumers (transaction counts, gas, logs, events)
 //! therefore process both paths identically. A consumer that needs account or
