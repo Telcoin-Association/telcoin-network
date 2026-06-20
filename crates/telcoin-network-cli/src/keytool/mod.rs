@@ -2,6 +2,7 @@
 
 mod export_staking_args;
 mod generate;
+mod pop;
 use self::{export_staking_args::ExportStakingArgs, generate::NodeType};
 use clap::{Args, Subcommand};
 use eyre::{eyre, Context};
@@ -40,17 +41,17 @@ impl KeyArgs {
     pub fn execute(&self, datadir: PathBuf, passphrase: Option<String>) -> eyre::Result<()> {
         match &self.command {
             // generate keys
-            KeySubcommand::Generate(args) => {
-                let args = match &args.node_type {
-                    NodeType::ValidatorKeys(args) => args,
-                    NodeType::ObserverKeys(args) => args,
-                };
-                let authority_key_path = datadir.node_keys_path();
-                // initialize path and warn users if overwriting keys
-                self.init_path(&authority_key_path, args.force)?;
-                // execute and store keypath
-                args.execute(&datadir, passphrase)?;
-            }
+            KeySubcommand::Generate(args) => match &args.node_type {
+                // validator/observer mint fresh keys, so prepare (and guard) the key dir
+                NodeType::ValidatorKeys(a) | NodeType::ObserverKeys(a) => {
+                    // initialize path and warn users if overwriting keys
+                    self.init_path(datadir.node_keys_path(), a.force)?;
+                    // execute and store keypath
+                    a.execute(&datadir, passphrase)?;
+                }
+                // pop re-signs against existing keys - never creates or overwrites keys
+                NodeType::Pop(a) => a.execute(&datadir, passphrase)?,
+            },
             // export staking args from node-info.yaml (does not use datadir or passphrase)
             KeySubcommand::ExportStakingArgs(args) => {
                 args.execute()?;
@@ -94,11 +95,11 @@ impl KeyArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::export_staking_args::ExportStakingArgs;
+    use super::{export_staking_args::ExportStakingArgs, pop::PopArgs};
     use crate::{cli::Cli, NoArgs};
     use clap::Parser;
     use tn_config::{Config, ConfigFmt, ConfigTrait, NodeInfo};
-    use tn_types::hex;
+    use tn_types::{hex, verify_proof_of_possession_bls, Address};
 
     /// Test that generate keys command works.
     /// This test also ensures that confy is able to
@@ -241,5 +242,115 @@ mod tests {
             "--calldata",
         ]);
         assert!(result.is_err(), "--json and --calldata should be mutually exclusive");
+    }
+
+    /// The target devnet execution address used in the `generate pop` tests.
+    fn new_test_address() -> Address {
+        Address::from_slice(
+            &hex::decode("b4E5ED8167873a3CF3C405Aa7155948Db869DBE3").expect("addr hex"),
+        )
+    }
+
+    /// `generate pop` re-signs the proof of possession for a new execution address
+    /// using the node's *existing* keys: the BLS key, p2p info, and name are
+    /// unchanged; only `execution_address` and `proof_of_possession` change, and
+    /// the new PoP verifies for the new address but not the old one.
+    #[tokio::test]
+    async fn test_generate_pop() {
+        let tempdir = tempfile::TempDir::new().expect("tempdir created");
+        let temp_path = tempdir.path();
+
+        // generate base keys + node-info (old execution address = zero address).
+        // passphrase `None` -> cleartext keyfile, so `generate pop` (also `None`)
+        // can read the same keys back.
+        let tn = Cli::<NoArgs>::try_parse_from([
+            "telcoin-network",
+            "keytool",
+            "generate",
+            "validator",
+            "--datadir",
+            temp_path.to_str().expect("tempdir path clean"),
+            "--address",
+            "0",
+        ])
+        .expect("cli parsed");
+        tn.run(None, |_, _, _, _, _| tokio::spawn(async { Ok(()) }))
+            .expect("generate keys command");
+
+        let node_info_path = temp_path.join("node-info.yaml");
+        let before = Config::load_from_path::<NodeInfo>(&node_info_path, ConfigFmt::YAML)
+            .expect("node info loaded before pop");
+
+        // Re-sign the PoP for a new execution address. Call `execute` directly
+        // rather than via a second `run`, to avoid re-initializing global tracing
+        // within a single test (mirrors `test_export_staking_args`).
+        let new_addr = new_test_address();
+        let datadir = temp_path.to_path_buf();
+        PopArgs { address: new_addr }.execute(&datadir, None).expect("generate pop");
+
+        let after = Config::load_from_path::<NodeInfo>(&node_info_path, ConfigFmt::YAML)
+            .expect("node info loaded after pop");
+
+        // BLS identity, p2p info (network keys + addresses), and name are untouched.
+        assert_eq!(before.bls_public_key, after.bls_public_key, "BLS public key must not change");
+        assert_eq!(before.p2p_info, after.p2p_info, "p2p info must not change");
+        assert_eq!(before.name, after.name, "node name must not change");
+
+        // Execution address and proof of possession are updated.
+        assert_eq!(before.execution_address, Address::ZERO, "old address was the zero address");
+        assert_eq!(after.execution_address, new_addr, "execution address should be the new addr");
+        assert_ne!(
+            before.proof_of_possession, after.proof_of_possession,
+            "proof of possession must be re-signed"
+        );
+
+        // The new PoP verifies for the new address, but not the old one.
+        assert!(
+            verify_proof_of_possession_bls(
+                &after.proof_of_possession,
+                &after.bls_public_key,
+                &new_addr
+            )
+            .is_ok(),
+            "new PoP must verify for the new execution address"
+        );
+        assert!(
+            verify_proof_of_possession_bls(
+                &after.proof_of_possession,
+                &after.bls_public_key,
+                &Address::ZERO
+            )
+            .is_err(),
+            "new PoP must NOT verify for the old execution address"
+        );
+    }
+
+    /// `generate pop` errors clearly when keys / node-info are missing, rather
+    /// than panicking or silently creating new keys.
+    #[tokio::test]
+    async fn test_generate_pop_missing_keys_errors() {
+        let tempdir = tempfile::TempDir::new().expect("tempdir created");
+        let datadir = tempdir.path().to_path_buf();
+        let result = PopArgs { address: new_test_address() }.execute(&datadir, None);
+        assert!(result.is_err(), "generate pop must error when keys are missing");
+    }
+
+    /// The `generate pop` subcommand and its `proof-of-possession` alias are
+    /// wired into clap.
+    #[test]
+    fn test_generate_pop_cli_parses() {
+        for name in ["pop", "proof-of-possession"] {
+            let parsed = Cli::<NoArgs>::try_parse_from([
+                "telcoin-network",
+                "keytool",
+                "generate",
+                name,
+                "--datadir",
+                "/tmp/does-not-matter",
+                "--address",
+                "0",
+            ]);
+            assert!(parsed.is_ok(), "`generate {name}` should parse");
+        }
     }
 }

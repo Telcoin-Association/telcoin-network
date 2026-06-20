@@ -1,10 +1,27 @@
 //! Generate subcommand
 
-use crate::args::clap_address_parser;
+use crate::{args::clap_address_parser, keytool::pop::PopArgs};
 use clap::{value_parser, Args, Subcommand};
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NodeInfo, TelcoinDirs};
 use tn_types::{get_available_udp_port, Address, Multiaddr, Protocol};
 use tracing::info;
+
+/// Sign the proof of possession for `address` from `key_config` and write the
+/// PoP-derived fields into `node_info`. Shared by `generate validator|observer`
+/// (fresh keys) and `generate pop` (existing keys), so both produce identical
+/// `bls_public_key` / `proof_of_possession` / `execution_address` / `name` values.
+pub(crate) fn set_proof_of_possession(
+    node_info: &mut NodeInfo,
+    key_config: &KeyConfig,
+    address: Address,
+) -> eyre::Result<()> {
+    node_info.bls_public_key = key_config.primary_public_key();
+    node_info.proof_of_possession = key_config.generate_proof_of_possession_bls(&address)?;
+    node_info.execution_address = address;
+    node_info.name =
+        format!("node-{}", bs58::encode(&node_info.bls_public_key.to_bytes()[0..8]).into_string());
+    Ok(())
+}
 
 /// Generate keypairs and save them to a file.
 #[derive(Debug, Clone, Args)]
@@ -24,6 +41,10 @@ pub enum NodeType {
     /// Generate all observer (non-validator) keys and write them to file.
     #[command(name = "observer")]
     ObserverKeys(KeygenArgs),
+    /// Re-sign the proof of possession for a new execution address using the
+    /// existing BLS keys (does not generate or overwrite any keys).
+    #[command(name = "pop", alias = "proof-of-possession")]
+    Pop(PopArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -98,13 +119,7 @@ impl KeygenArgs {
         passphrase: Option<String>,
     ) -> eyre::Result<()> {
         let key_config = KeyConfig::generate_and_save(tn_datadir, passphrase)?;
-        let proof = key_config.generate_proof_of_possession_bls(&self.address)?;
-        node_info.bls_public_key = key_config.primary_public_key();
-        node_info.proof_of_possession = proof;
-        node_info.name = format!(
-            "node-{}",
-            bs58::encode(&node_info.bls_public_key.to_bytes()[0..8]).into_string()
-        );
+        set_proof_of_possession(node_info, &key_config, self.address)?;
 
         // network keypair for authority
         let network_publickey = key_config.primary_network_public_key();
@@ -172,8 +187,7 @@ impl KeygenArgs {
 
         self.update_keys(&mut node_info, tn_datadir, passphrase)?;
 
-        // add execution address
-        node_info.execution_address = self.address;
+        // execution address is set inside `set_proof_of_possession` (called by `update_keys`)
         Config::write_to_path(tn_datadir.node_info_path(), &node_info, ConfigFmt::YAML)?;
 
         Ok(())
