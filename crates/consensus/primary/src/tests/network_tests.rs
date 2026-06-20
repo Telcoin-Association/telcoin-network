@@ -24,8 +24,9 @@ use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, tables::Votes};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     error::HeaderError, now, AuthorityIdentifier, BlockHash, BlockHeader, BlockNumHash,
-    BlsPublicKey, Certificate, ConsensusHeaderDigest, ConsensusNumHash, Database, Epoch, EpochVote,
-    ExecHeader, Hash as _, HeaderDigest, SealedHeader, TaskManager, VoteDigest, VoteInfo, B256,
+    BlsPublicKey, Certificate, CommittedSubDag, ConsensusHeaderDigest, ConsensusNumHash, Database,
+    Epoch, EpochVote, ExecHeader, Hash as _, HeaderDigest, ReputationScores, SealedHeader,
+    TaskManager, VoteDigest, VoteInfo, B256,
 };
 use tracing::debug;
 
@@ -152,6 +153,51 @@ async fn create_test_types_at_epoch(path: &Path, epoch: Epoch) -> TestTypes {
     let handler =
         RequestHandler::new(config.clone(), cb.app().clone(), synchronizer, consensus_chain);
     TestTypes { committee, handler, parent, consensus_bus, task_manager }
+}
+
+#[tokio::test]
+async fn test_retrieve_consensus_output() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let committee_obj = committee.committee();
+
+    // Populate a few consensus outputs in the epoch-0 pack. Numbers start at 1 so each is greater
+    // than the latest consensus number and is actually saved (mirror of storage_tests.rs).
+    for number in 1..=3u64 {
+        let cert = Certificate::default();
+        let sub_dag = CommittedSubDag::new(
+            vec![cert.clone()],
+            cert,
+            number,
+            ReputationScores::new(&committee_obj),
+            None,
+        );
+        handler.consensus_chain().write_subdag_for_test(number, sub_dag).await;
+    }
+
+    // The server serves the raw output bytes for every stored number.
+    for number in 1..=3u64 {
+        let resp = handler
+            .retrieve_consensus_output(number)
+            .await
+            .expect("stored consensus output should be served");
+        match resp {
+            PrimaryResponse::ConsensusOutput(bytes) => {
+                assert!(!bytes.is_empty(), "served output {number} bytes must not be empty");
+            }
+            other => panic!("expected ConsensusOutput response for {number}, got {other:?}"),
+        }
+    }
+
+    // A number we do not have is a benign miss: it errors and carries no penalty.
+    let err = handler
+        .retrieve_consensus_output(999)
+        .await
+        .expect_err("unknown consensus output must error");
+    assert_matches!(err, PrimaryNetworkError::UnknownConsensusOutput(999));
+    let penalty: Option<tn_network_libp2p::Penalty> = (&err).into();
+    assert!(penalty.is_none(), "an unknown consensus output must not penalize the peer");
 }
 
 #[tokio::test]
