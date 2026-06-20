@@ -117,6 +117,15 @@ pub enum PrimaryRequest {
         /// Block hash requesting if not None.
         hash: ConsensusHeaderDigest,
     },
+    /// Request the raw (serialized) consensus output bytes for a consensus chain number.
+    ///
+    /// Unlike [`Self::ConsensusHeader`], this returns the full pack-file encoded output
+    /// (batches + consensus header) rather than just the header, so a peer can reconstruct
+    /// the [`tn_types::ConsensusOutput`] without separately fetching its batches.
+    ConsensusOutput {
+        /// The consensus chain number being requested.
+        number: u64,
+    },
     /// Exchange peer information.
     ///
     /// This "request" is sent to peers when this node disconnects
@@ -236,6 +245,8 @@ pub enum PrimaryResponse {
     MissingParents(Vec<HeaderDigest>),
     /// The requested consensus header.
     ConsensusHeader(Arc<ConsensusHeader>),
+    /// The requested raw (serialized) consensus output bytes.
+    ConsensusOutput(Arc<Vec<u8>>),
     /// The requested epoch record and certificate.
     EpochRecord { record: EpochRecord, certificate: EpochCertificate },
     /// Exchange peer information.
@@ -287,6 +298,7 @@ impl PrimaryResponse {
             | PrimaryNetworkError::InvalidTopic
             | PrimaryNetworkError::UnknownConsensusHeaderDigest(_)
             | PrimaryNetworkError::UnknownConsensusHeaderCert(_)
+            | PrimaryNetworkError::UnknownConsensusOutput(_)
             | PrimaryNetworkError::Timeout(_)
             | PrimaryNetworkError::UnknownStreamRequest(_)
             | PrimaryNetworkError::StreamUnavailable(_)

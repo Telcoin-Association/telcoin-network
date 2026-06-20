@@ -41,6 +41,9 @@ pub(crate) enum PrimaryNetworkError {
     /// Unknown consensus header certificate.
     #[error("Unknown consensus header certificate for: {0}")]
     UnknownConsensusHeaderCert(ConsensusHeaderDigest),
+    /// Unknown consensus output (raw bytes) for the requested number.
+    #[error("Unknown consensus output: {0}")]
+    UnknownConsensusOutput(u64),
     /// Peer that is not committee published invalid gosip.
     /// Temparily disabled, will be back soon.
     #[error("Peer {0} is not in the committee!")]
@@ -112,9 +115,10 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
                 | CertManagerError::ChannelClosed
                 | CertManagerError::TNSend(_) => None,
             },
-            // Benign "miss": observers legitimately request not-yet-served headers.
+            // Benign "miss": observers legitimately request not-yet-served headers/outputs.
             // No penalty so honest sync flows are not banned during catch-up.
-            PrimaryNetworkError::UnknownConsensusHeaderDigest(_) => None,
+            PrimaryNetworkError::UnknownConsensusHeaderDigest(_)
+            | PrimaryNetworkError::UnknownConsensusOutput(_) => None,
             PrimaryNetworkError::InvalidRequest(_)
             | PrimaryNetworkError::UnknownStreamRequest(_)
             | PrimaryNetworkError::UnknownConsensusHeaderCert(_) => Some(Penalty::Mild),

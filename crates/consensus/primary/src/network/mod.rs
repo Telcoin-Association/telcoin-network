@@ -207,6 +207,9 @@ impl PrimaryNetworkHandle {
             PrimaryResponse::ConsensusHeader(_consensus_header) => Err(NetworkError::RPCError(
                 "Got wrong response, not a vote is consensus header!".to_string(),
             )),
+            PrimaryResponse::ConsensusOutput(_bytes) => Err(NetworkError::RPCError(
+                "Got wrong response, not a vote is consensus output!".to_string(),
+            )),
             PrimaryResponse::EpochRecord { .. } => Err(NetworkError::RPCError(
                 "Got wrong response, not a vote is epoch record!".to_string(),
             )),
@@ -608,6 +611,9 @@ where
                 PrimaryRequest::ConsensusHeader { number, hash } => {
                     self.process_consensus_output_request(peer, number, hash, channel, cancel)
                 }
+                PrimaryRequest::ConsensusOutput { number } => {
+                    self.process_consensus_output_bytes_request(peer, number, channel, cancel)
+                }
                 PrimaryRequest::PeerExchange { .. } => {
                     warn!(target: "primary::network", "primary application received unexpected peer exchange message");
                 }
@@ -730,6 +736,48 @@ where
                             );
                         }
                         let response = header.into_response();
+                        let _ = network_handle.handle.send_response(response, channel).await;
+                    }
+                // cancel notification from network layer
+                _ = cancel => (),
+            }
+            Ok(())
+        });
+    }
+
+    /// Attempt to retrieve raw consensus output bytes from the database.
+    fn process_consensus_output_bytes_request(
+        &self,
+        peer: BlsPublicKey,
+        number: u64,
+        channel: ResponseChannel<PrimaryResponse>,
+        cancel: oneshot::Receiver<()>,
+    ) {
+        // clone for spawned tasks
+        let request_handler = self.request_handler.clone();
+        let network_handle = self.network_handle.clone();
+        let task_name = format!("ConsensusOutputBytesReq-{peer}");
+        self.task_spawner.spawn_task(task_name, async move {
+            tokio::select! {
+                output =
+                    request_handler.retrieve_consensus_output(number) => {
+                        // Route through the central PrimaryNetworkError → Penalty mapping
+                        // so every handler in this file applies penalties consistently.
+                        // The only reachable variant from this path is
+                        // UnknownConsensusOutput, which the central table maps to None —
+                        // peers legitimately request not-yet-served outputs during catch-up.
+                        if let Err(ref e) = output {
+                            if let Some(penalty) = e.into() {
+                                network_handle.report_penalty(peer, penalty).await;
+                            }
+                            let my_number = request_handler.consensus_chain().latest_consensus_number();
+                            tracing::debug!(
+                                target: "primary::network",
+                                ?e, ?my_number, ?number, ?peer,
+                                "consensus output request could not be served"
+                            );
+                        }
+                        let response = output.into_response();
                         let _ = network_handle.handle.send_response(response, channel).await;
                     }
                 // cancel notification from network layer

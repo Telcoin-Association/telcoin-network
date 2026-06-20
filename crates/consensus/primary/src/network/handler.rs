@@ -867,6 +867,36 @@ where
         Ok(PrimaryResponse::ConsensusHeader(Arc::new(header)))
     }
 
+    /// Retrieve the raw (serialized) consensus output bytes from local storage.
+    ///
+    /// Returns the full pack-file encoded output for `number` so a peer can reconstruct the
+    /// [`tn_types::ConsensusOutput`] (batches + consensus header) without a separate batch fetch.
+    pub(super) async fn retrieve_consensus_output(
+        &self,
+        number: u64,
+    ) -> PrimaryNetworkResult<PrimaryResponse> {
+        let mut my_number = self.consensus_chain.latest_consensus_number();
+        // If we are behind then wait up to two seconds to catch up.
+        let mut count = 0;
+        if number.saturating_sub(my_number) < 4 {
+            // Only wait if we are close.
+            while my_number < number {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                my_number = self.consensus_chain.latest_consensus_number();
+                if count >= 20 {
+                    // Don't wait more than 2 seconds for this to show up.
+                    return Err(PrimaryNetworkError::UnknownConsensusOutput(number));
+                }
+                count += 1;
+            }
+        }
+        match self.consensus_chain.consensus_output_bytes_by_number(number).await {
+            Ok(Some(bytes)) => Ok(PrimaryResponse::ConsensusOutput(Arc::new(bytes))),
+            // Missing locally, or the requested number is outside the pack's range.
+            _ => Err(PrimaryNetworkError::UnknownConsensusOutput(number)),
+        }
+    }
+
     /// Retrieve an epoch record from local storage.
     pub(super) async fn retrieve_epoch_record(
         &self,
