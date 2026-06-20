@@ -308,6 +308,60 @@ impl PrimaryNetworkHandle {
         Err(NetworkError::RPCError("Could not get the consensus header!".to_string()))
     }
 
+    /// Request the raw (serialized) consensus output bytes for `number` from a specific peer.
+    ///
+    /// Returns the pack-file encoded output (batches + consensus header). The caller is
+    /// responsible for deserializing it (with the epoch's committee) and verifying the result;
+    /// the bytes cannot be cheaply validated at the network layer.
+    pub async fn request_consensus_output_from_peer(
+        &self,
+        peer: BlsPublicKey,
+        number: u64,
+    ) -> NetworkResult<Vec<u8>> {
+        let request = PrimaryRequest::ConsensusOutput { number };
+        let res = self.handle.send_request(request, peer).await?;
+        let res = res.await??.result;
+        match res {
+            PrimaryResponse::ConsensusOutput(bytes) => Ok(Arc::unwrap_or_clone(bytes)),
+            PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
+            _ => Err(NetworkError::RPCError(
+                "Got wrong response, not a consensus output!".to_string(),
+            )),
+        }
+    }
+
+    /// Request the raw (serialized) consensus output bytes for `number` from a random peer,
+    /// trying up to three times from three different peers.
+    ///
+    /// Returns the pack-file encoded output (batches + consensus header). The caller is
+    /// responsible for deserializing it (with the epoch's committee) and verifying the result;
+    /// the bytes cannot be cheaply validated at the network layer.
+    pub async fn request_consensus_output(&self, number: u64) -> NetworkResult<Vec<u8>> {
+        const TIMEOUT: Duration = Duration::from_secs(10);
+        let request = PrimaryRequest::ConsensusOutput { number };
+        // Try up to three times (from three peers) to get the output.
+        // This could be a lot more complicated but this KISS method should work fine.
+        for _ in 0..3 {
+            let res = self.handle.send_request_any(request.clone()).await?;
+            let res = match tokio::time::timeout(TIMEOUT, res).await {
+                Ok(r) => r,
+                Err(_) => {
+                    tracing::warn!(target: "primary::network", ?number, "request_consensus_output timed out waiting for peer response");
+                    continue;
+                }
+            };
+            let res = res?;
+            if let Ok(NetworkResponseMessage {
+                peer: _,
+                result: PrimaryResponse::ConsensusOutput(bytes),
+            }) = res
+            {
+                return Ok(Arc::unwrap_or_clone(bytes));
+            }
+        }
+        Err(NetworkError::RPCError("Could not get the consensus output!".to_string()))
+    }
+
     /// Request consensus header from a random peer up to three times from three different peers.
     pub async fn request_epoch_cert(
         &self,
