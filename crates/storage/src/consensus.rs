@@ -597,6 +597,25 @@ impl ConsensusChain {
         }
     }
 
+    /// Retrieve the raw consensus output bytes by number.
+    pub async fn consensus_output_bytes_by_number(
+        &self,
+        number: u64,
+    ) -> Result<Option<Vec<u8>>, ConsensusChainError> {
+        let epoch = self.epochs.number_to_epoch(number);
+        if let Some(pack) = &self.current_pack() {
+            if epoch == pack.epoch() {
+                return Ok(Some(pack.get_consensus_output_bytes(number).await?));
+            }
+        }
+        if let Ok(pack) = self.get_static(epoch).await {
+            Ok(Some(pack.get_consensus_output_bytes(number).await?))
+        } else {
+            // Don't have this epoch data.
+            Ok(None)
+        }
+    }
+
     /// Return true if we have a complete pack file for epoch_record.
     pub async fn is_epoch_complete(&self, epoch_record: &EpochRecord) -> bool {
         match self.consensus_header_by_number(epoch_record.final_consensus.number).await {
@@ -788,6 +807,10 @@ impl ConsensusChainReader for ConsensusChain {
         number: u64,
     ) -> eyre::Result<Option<ConsensusHeader>> {
         ConsensusChain::consensus_header_by_number(self, number).await.map_err(Into::into)
+    }
+
+    async fn consensus_output_bytes_by_number(&self, number: u64) -> eyre::Result<Option<Vec<u8>>> {
+        ConsensusChain::consensus_output_bytes_by_number(self, number).await.map_err(Into::into)
     }
 
     async fn consensus_header_latest(&self) -> eyre::Result<Option<ConsensusHeader>> {
