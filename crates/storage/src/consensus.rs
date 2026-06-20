@@ -1186,6 +1186,69 @@ mod test {
         }
     }
 
+    #[tokio::test]
+    async fn test_consensus_output_bytes_by_number() {
+        use crate::{archive::pack::PackCompression, consensus_pack::bytes_to_output};
+        use std::io::Cursor;
+        use tokio::io::BufReader;
+
+        let temp_dir = TempDir::with_prefix("test_output_bytes").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).unwrap();
+        consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+
+        // Save some outputs, keeping the originals to compare against.
+        let num_outputs = 10;
+        let mut outputs = Vec::new();
+        let mut parent = ConsensusHeader::default().digest();
+        for i in 0..num_outputs {
+            let output = make_test_output(&committee, i % 4, chain.clone(), (i as u64) + 1, parent);
+            parent = output.digest().into();
+            outputs.push(output.clone());
+            consensus_chain.save_consensus_output(output).await.unwrap();
+        }
+
+        // Each saved number returns Some(bytes) that decode back to the original output.
+        for i in 0..num_outputs {
+            let number = i as u64 + 1;
+            let bytes = consensus_chain
+                .consensus_output_bytes_by_number(number)
+                .await
+                .expect("query ok")
+                .expect("bytes present");
+            assert!(!bytes.is_empty(), "bytes for {number} should not be empty");
+            // Packs are always written with ZStd, mirror get_consensus_output's decode path.
+            let reader = BufReader::new(Cursor::new(bytes));
+            let decoded =
+                bytes_to_output(reader, PackCompression::ZStd, Duration::from_secs(5), &committee)
+                    .await
+                    .expect("decode output bytes");
+            compare_outputs(&decoded, &outputs[i]);
+        }
+
+        // A number below the pack's start is out of range and must error.
+        assert!(
+            consensus_chain.consensus_output_bytes_by_number(0).await.is_err(),
+            "number below start must error"
+        );
+
+        // A fresh chain with no epoch opened has no data and returns Ok(None).
+        let empty_dir = TempDir::with_prefix("test_output_bytes_empty").expect("temp dir");
+        let empty_chain = ConsensusChain::new(empty_dir.path().to_owned()).unwrap();
+        assert!(
+            empty_chain.consensus_output_bytes_by_number(1).await.expect("query ok").is_none(),
+            "missing data must return None"
+        );
+    }
+
     /// Regression test for the `pack_install` lock.
     ///
     /// A validator that restarts while behind runs two subsystems against the same
