@@ -23,7 +23,7 @@
 //! ## Protocols
 //!
 //! The frames ride on streams negotiated with the per-role sync protocols
-//! (`/tn-primary-sync/1.0.0`, `/tn-worker-{id}-sync/1.0.0`), which the stream
+//! (`/tn-primary-sync/0.0.1`, `/tn-worker-{id}-sync/0.0.1`), which the stream
 //! behaviour registers alongside the legacy `/tn-stream/0.0.1` upgrade. This
 //! layer is inert for now: no call site opens a sync stream until the
 //! per-exchange cutovers migrate the worker batch, epoch pack, and missing

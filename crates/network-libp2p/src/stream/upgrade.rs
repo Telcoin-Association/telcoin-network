@@ -155,7 +155,7 @@ mod tests {
     #[test]
     fn protocol_info_preserves_order() {
         let legacy = StreamProtocol::new("/tn-stream/0.0.1");
-        let sync = StreamProtocol::new("/tn-primary-sync/1.0.0");
+        let sync = StreamProtocol::new("/tn-primary-sync/0.0.1");
         let upgrade = TNStreamProtocol::new(vec![legacy.clone(), sync.clone()]);
         let advertised: Vec<_> = upgrade.protocol_info().collect();
         assert_eq!(advertised, vec![legacy, sync]);

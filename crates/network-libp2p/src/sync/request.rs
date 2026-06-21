@@ -6,7 +6,7 @@ use tn_types::{AuthorityIdentifier, BlockHash, Epoch, Round};
 
 /// A bulk-sync request from a worker, carried in the opening
 /// [`SyncFrame::Req`](crate::sync::SyncFrame::Req) of a
-/// `/tn-worker-{id}-sync/1.0.0` exchange.
+/// `/tn-worker-{id}-sync/0.0.1` exchange.
 ///
 /// The variant order is the wire format: this enum's BCS discriminant rides on
 /// the wire inside the `Req` frame, so variants must not be reordered or removed
@@ -28,7 +28,7 @@ pub enum WorkerSyncRequest {
 }
 
 /// A bulk-sync request from a primary, carried in the opening
-/// [`SyncFrame::Req`](crate::sync::SyncFrame::Req) of a `/tn-primary-sync/1.0.0`
+/// [`SyncFrame::Req`](crate::sync::SyncFrame::Req) of a `/tn-primary-sync/0.0.1`
 /// exchange.
 ///
 /// The variant order is the wire format: this enum's BCS discriminant rides on
@@ -110,7 +110,7 @@ mod tests {
     /// The request enums' BCS discriminants ride on the wire (inside the `Req`
     /// frame), so pin them exactly as `frame_tags_are_stable` pins the frame
     /// tags. A reorder would keep the round-trip tests green while changing the
-    /// 1.0.0 framing seen by a deployed peer; this catches it.
+    /// 0.0.1 framing seen by a deployed peer; this catches it.
     #[test]
     fn request_tags_are_stable() {
         let worker =

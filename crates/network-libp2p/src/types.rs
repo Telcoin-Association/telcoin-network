@@ -103,9 +103,9 @@ impl NetworkType {
     /// per-exchange cutovers migrate the bulk paths.
     pub(crate) fn sync_protocol(&self) -> StreamProtocol {
         match self {
-            Self::Primary => StreamProtocol::new("/tn-primary-sync/1.0.0"),
+            Self::Primary => StreamProtocol::new("/tn-primary-sync/0.0.1"),
             Self::Worker(id) => {
-                StreamProtocol::try_from_owned(format!("/tn-worker-{id}-sync/1.0.0"))
+                StreamProtocol::try_from_owned(format!("/tn-worker-{id}-sync/0.0.1"))
                     .expect("worker sync protocol name starts with '/'")
             }
         }

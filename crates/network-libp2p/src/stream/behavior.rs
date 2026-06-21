@@ -411,13 +411,13 @@ mod tests {
         let worker = StreamBehavior::new(NetworkType::Worker(3));
         assert_eq!(
             worker.protocols,
-            vec![TN_STREAM_PROTOCOL, StreamProtocol::new("/tn-worker-3-sync/1.0.0")]
+            vec![TN_STREAM_PROTOCOL, StreamProtocol::new("/tn-worker-3-sync/0.0.1")]
         );
         // a primary advertises its own sync protocol, legacy first
         let primary = StreamBehavior::new(NetworkType::Primary);
         assert_eq!(
             primary.protocols,
-            vec![TN_STREAM_PROTOCOL, StreamProtocol::new("/tn-primary-sync/1.0.0")]
+            vec![TN_STREAM_PROTOCOL, StreamProtocol::new("/tn-primary-sync/0.0.1")]
         );
     }
 
