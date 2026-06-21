@@ -145,19 +145,35 @@ impl<DB: Database> Subscriber<DB> {
             // before run_epoch() winds down.
             return Ok(());
         }
-        let consensus_output = self
-            .fetch_batches(
+        // Prefer a verified output from the consensus chain: it already contains the full output
+        // (with batches), so we can skip the separate worker-network batch fetch during
+        // bulk catch-up. Falls back to fetching batches when the output is not staged (e.g.
+        // live tail).
+        let number = consensus_header.number;
+        let consensus_output = if let Ok(Some(output)) =
+            self.inner.consensus_chain.consensus_output_by_number(number).await
+        {
+            output
+        } else {
+            self.fetch_batches(
                 consensus_header.sub_dag.clone(),
                 consensus_header.parent_hash,
-                consensus_header.number,
+                number,
             )
-            .await?;
+            .await?
+        };
 
         let mut consensus_chain = self.inner.consensus_chain.clone();
         // This save will essentially mark this consensus output as written in stone (added to the
         // consensus chain). This does NOT imply execution although it will be sent off for
         // execution.
         save_consensus(consensus_output.clone(), &mut consensus_chain).await?;
+
+        // Once we've drained through the staged partial pack's final output, it has all been
+        // written to the main pack in order — drop the staging dir.
+        if self.inner.consensus_chain.staging_final() == Some(number) {
+            self.inner.consensus_chain.clear_staging();
+        }
 
         let last_round = consensus_output.leader_round();
 

@@ -280,6 +280,14 @@ impl LatestConsensus {
     }
 }
 
+/// A verified prefix of an in-progress epoch streamed from a peer, held in a side directory for
+/// catch-up reads. `final_number` is the highest consensus number it contains.
+#[derive(Debug, Clone)]
+struct StagingPack {
+    pack: ConsensusPack,
+    final_number: u64,
+}
+
 /// Implement a databse for consensus data.
 #[derive(Debug, Clone)]
 pub struct ConsensusChain {
@@ -299,6 +307,13 @@ pub struct ConsensusChain {
     /// (not the `parking_lot::Mutex` used for the other fields). Always acquired *before*
     /// `current_pack`/`recent_packs` to keep a single lock order and avoid deadlock.
     pack_install: Arc<tokio::sync::Mutex<()>>,
+    /// Read-only "staging" pack holding a verified PREFIX of an (in-progress) epoch streamed from
+    /// a peer for catch-up. Unlike `current_pack`, this lives in its own `staging-{epoch}`
+    /// directory and is NEVER renamed over the live `epoch-{N}` dir, so importing it cannot
+    /// race the in-order build of the main pack. Outputs are read from here during catch-up,
+    /// then written to the main pack in order through the normal save path; cleared once
+    /// drained.
+    staging: Arc<Mutex<Option<StagingPack>>>,
 }
 
 impl ConsensusChain {
@@ -315,7 +330,19 @@ impl ConsensusChain {
         let recent_packs = Arc::new(Mutex::new(VecDeque::default()));
         let epochs = Arc::new(EpochRecordDb::open(&base_path)?);
         let pack_install = Arc::new(tokio::sync::Mutex::new(()));
-        Ok(Self { base_path, current_pack, latest_consensus, recent_packs, epochs, pack_install })
+        // Any staging dirs left from a previous run are stale; start clean. The staging pack only
+        // ever holds transient, re-fetchable catch-up data.
+        Self::remove_all_staging_dirs(&base_path);
+        let staging = Arc::new(Mutex::new(None));
+        Ok(Self {
+            base_path,
+            current_pack,
+            latest_consensus,
+            recent_packs,
+            epochs,
+            pack_install,
+            staging,
+        })
     }
 
     /// Create a new empty consensus chain with a dummy epoch 0 pack ready.
@@ -392,12 +419,17 @@ impl ConsensusChain {
         let epoch = epoch_record.epoch;
         let epoch_final_hash = epoch_record.final_consensus.hash;
         if let Ok(pack) = self.get_static(epoch).await {
-            if let Some(last_header) = pack.latest_consensus_header().await {
-                if epoch_record.final_consensus.number == last_header.number
-                    && epoch_final_hash == last_header.digest()
-                {
-                    // If we already have a complete pack file then we are done, no need to
-                    // stream...
+            // Idempotency / anti-truncation guard: if we already contain the requested final
+            // consensus header, there is nothing to import. Checking *by number* (rather than only
+            // the pack's latest header) means a PARTIAL request whose final is `(n, hash)` is a
+            // no-op when we already hold `n` — even inside a longer pack — so we never
+            // remove+rename `epoch-{N}` down to a shorter prefix and truncate data. For
+            // a number we don't have, this lookup errors, so an incomplete pack still
+            // streams as before.
+            if let Ok(have) =
+                pack.consensus_header_by_number(epoch_record.final_consensus.number).await
+            {
+                if have.digest() == epoch_final_hash {
                     return Ok(());
                 }
             }
@@ -540,6 +572,90 @@ impl ConsensusChain {
         Ok((Box::new(stream), end))
     }
 
+    /// Remove any leftover `staging-*` directories under `base_path` (stale from a prior run).
+    fn remove_all_staging_dirs(base_path: &Path) {
+        if let Ok(entries) = std::fs::read_dir(base_path) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_str().is_some_and(|n| n.starts_with("staging-")) {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+    }
+
+    /// Import a verified PARTIAL pack (a prefix of an in-progress epoch streamed from a peer) into
+    /// a side "staging" directory and keep it open for reading.
+    ///
+    /// This intentionally does NOT use [`Self::stream_import`] (which removes+renames the live
+    /// `epoch-{N}` dir): the staged pack lives in `staging-{epoch}` and is only ever read, so a
+    /// node that is concurrently building the same epoch in order (via
+    /// [`Self::save_consensus_output`]) cannot race it. Verifies the streamed prefix ends
+    /// exactly at `epoch_record.final_consensus`.
+    pub async fn import_partial_to_staging<R: AsyncRead + Unpin>(
+        &self,
+        stream: R,
+        epoch_record: &EpochRecord,
+        previous_epoch: &EpochRecord,
+        timeout: Duration,
+    ) -> Result<(), ConsensusChainError> {
+        let epoch = epoch_record.epoch;
+        let staging_base = self.base_path.join(format!("staging-{epoch}"));
+        // Start from a clean staging dir; previous attempts (if any) are stale.
+        let _ = std::fs::remove_dir_all(&staging_base);
+        std::fs::create_dir_all(&staging_base)?;
+        let final_number = epoch_record.final_consensus.number;
+        let pack = ConsensusPack::stream_import(
+            &staging_base,
+            stream,
+            epoch,
+            previous_epoch,
+            final_number,
+            timeout,
+        )
+        .await?;
+        pack.persist().await?;
+        // The chain was verified link-by-link as it streamed; confirm the prefix ends exactly at
+        // the requested final consensus so the staged data is trustworthy.
+        match pack.latest_consensus_header().await {
+            Some(last)
+                if last.number == final_number
+                    && last.digest() == epoch_record.final_consensus.hash => {}
+            Some(_) => {
+                let _ = std::fs::remove_dir_all(&staging_base);
+                return Err(ConsensusChainError::InvalidImport);
+            }
+            None => {
+                let _ = std::fs::remove_dir_all(&staging_base);
+                return Err(ConsensusChainError::EmptyImport);
+            }
+        }
+        *self.staging.lock() = Some(StagingPack { pack, final_number });
+        Ok(())
+    }
+
+    /// The highest consensus number held by the staging pack, if any.
+    pub fn staging_final(&self) -> Option<u64> {
+        self.staging.lock().as_ref().map(|s| s.final_number)
+    }
+
+    /// Read a full consensus output (with batches) from the staging pack, if it covers `number`.
+    /// Used for module unit tests.
+    #[cfg(test)]
+    async fn staging_consensus_output(&self, number: u64) -> Option<ConsensusOutput> {
+        let pack = self.staging.lock().as_ref().map(|s| s.pack.clone())?;
+        pack.get_consensus_output(number).await.ok()
+    }
+
+    /// Drop the staging pack and remove its directory. Safe to call when none is staged.
+    pub fn clear_staging(&self) {
+        let staged = self.staging.lock().take();
+        if let Some(staged) = staged {
+            let epoch = staged.pack.epoch();
+            drop(staged);
+            let _ = std::fs::remove_dir_all(self.base_path.join(format!("staging-{epoch}")));
+        }
+    }
+
     /// Save all the batches and consensus header from the ConsensusOutput the pack file for the
     /// current epoch. This should be called "in-order" as consensus is executed.
     pub async fn save_consensus_output(
@@ -609,6 +725,8 @@ impl ConsensusChain {
         }
         if let Ok(pack) = self.get_static(epoch).await {
             Ok(pack.consensus_header_by_digest(digest).await)
+        } else if let Some(staging) = self.staging() {
+            Ok(staging.pack.consensus_header_by_digest(digest).await)
         } else {
             // Don't have this epoch data.
             Ok(None)
@@ -628,6 +746,29 @@ impl ConsensusChain {
         }
         if let Ok(pack) = self.get_static(epoch).await {
             Ok(Some(pack.consensus_header_by_number(number).await?))
+        } else if let Some(staging) = self.staging() {
+            Ok(Some(staging.pack.consensus_header_by_number(number).await?))
+        } else {
+            // Don't have this epoch data.
+            Ok(None)
+        }
+    }
+
+    /// Retrieve the consensus output by number.
+    pub async fn consensus_output_by_number(
+        &self,
+        number: u64,
+    ) -> Result<Option<ConsensusOutput>, ConsensusChainError> {
+        let epoch = self.epochs.number_to_epoch(number);
+        if let Some(pack) = &self.current_pack() {
+            if epoch == pack.epoch() {
+                return Ok(Some(pack.get_consensus_output(number).await?));
+            }
+        }
+        if let Ok(pack) = self.get_static(epoch).await {
+            Ok(Some(pack.get_consensus_output(number).await?))
+        } else if let Some(staging) = self.staging() {
+            Ok(Some(staging.pack.get_consensus_output(number).await?))
         } else {
             // Don't have this epoch data.
             Ok(None)
@@ -647,6 +788,8 @@ impl ConsensusChain {
         }
         if let Ok(pack) = self.get_static(epoch).await {
             Ok(Some(pack.get_consensus_output_bytes(number).await?))
+        } else if let Some(staging) = self.staging() {
+            Ok(Some(staging.pack.get_consensus_output_bytes(number).await?))
         } else {
             // Don't have this epoch data.
             Ok(None)
@@ -806,6 +949,11 @@ impl ConsensusChain {
         self.current_pack.lock().clone()
     }
 
+    /// Return a clone of the current pack.
+    fn staging(&self) -> Option<StagingPack> {
+        self.staging.lock().clone()
+    }
+
     /// Get a static pack file from the cache if available or create and cache if not.
     async fn get_static(&self, epoch: Epoch) -> Result<ConsensusPack, PackError> {
         if let Some(pack) = self.current_pack() {
@@ -849,6 +997,13 @@ impl ConsensusChainReader for ConsensusChain {
 
     async fn consensus_output_bytes_by_number(&self, number: u64) -> eyre::Result<Option<Vec<u8>>> {
         ConsensusChain::consensus_output_bytes_by_number(self, number).await.map_err(Into::into)
+    }
+
+    async fn consensus_output_by_number(
+        &self,
+        number: u64,
+    ) -> eyre::Result<Option<ConsensusOutput>> {
+        ConsensusChain::consensus_output_by_number(self, number).await.map_err(Into::into)
     }
 
     async fn consensus_header_latest(&self) -> eyre::Result<Option<ConsensusHeader>> {
@@ -1343,6 +1498,153 @@ mod test {
             consensus_chain2.get_consensus_output_current(k + 1).await.is_err(),
             "outputs past the partial cutoff must not be present"
         );
+    }
+
+    /// `import_partial_to_staging` must produce a readable verified prefix in a side dir WITHOUT
+    /// touching the live `epoch-{N}` dir, and `clear_staging` must remove it.
+    #[tokio::test]
+    async fn test_import_partial_to_staging() {
+        use tokio::io::AsyncReadExt as _;
+
+        let src_dir = TempDir::with_prefix("test_staging_src").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let source = ConsensusChain::new(src_dir.path().to_owned()).unwrap();
+        source.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+        let num_outputs = 20u64;
+        let mut outputs = Vec::new();
+        let mut parent = ConsensusHeader::default().digest();
+        for i in 0..num_outputs {
+            let output =
+                make_test_output(&committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+            parent = output.digest().into();
+            outputs.push(output.clone());
+            source.save_consensus_output(output).await.unwrap();
+        }
+
+        // Build the partial prefix stream up to `k` from the source's in-progress epoch.
+        let k = 12u64;
+        let (stream, len) = source.get_partial_epoch_stream(0, k).await.expect("partial stream");
+        let limited = stream.take(len);
+        let cutoff = &outputs[(k - 1) as usize];
+        let mut partial_record = previous_epoch.clone();
+        partial_record.final_consensus = ConsensusNumHash::new(cutoff.number(), cutoff.digest());
+
+        // Import into a DESTINATION chain's staging area. The destination has the epoch open but
+        // empty (no outputs written) — staging must not disturb its live `epoch-0` dir.
+        let dst_dir = TempDir::with_prefix("test_staging_dst").expect("temp dir");
+        let dest = ConsensusChain::new(dst_dir.path().to_owned()).unwrap();
+        dest.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+
+        dest.import_partial_to_staging(
+            limited,
+            &partial_record,
+            &previous_epoch,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("staging import of verified prefix");
+
+        assert_eq!(dest.staging_final(), Some(k), "staging final should be k");
+        // Staged outputs (with batches) are readable and match the source.
+        for i in 0..k {
+            let staged = dest.staging_consensus_output(i + 1).await.expect("staged output present");
+            compare_outputs(&staged, &outputs[i as usize]);
+        }
+        // Past the staged cutoff there is nothing.
+        assert!(dest.staging_consensus_output(k + 1).await.is_none());
+        // The live epoch-0 pack was untouched (still empty — staging is a separate dir).
+        assert!(
+            dest.get_consensus_output_current(1).await.is_err(),
+            "staging import must not write into the live epoch dir"
+        );
+        let staging_path = dst_dir.path().join("staging-0");
+        assert!(std::fs::exists(&staging_path).unwrap_or(false), "staging dir should exist");
+
+        // clear_staging drops the pack and removes the dir.
+        dest.clear_staging();
+        assert_eq!(dest.staging_final(), None);
+        assert!(dest.staging_consensus_output(1).await.is_none());
+        assert!(
+            !std::fs::exists(&staging_path).unwrap_or(true),
+            "staging dir should be removed after clear_staging"
+        );
+    }
+
+    /// `stream_import` must be a no-op (and crucially must NOT truncate) when we already hold the
+    /// requested final consensus header — including a PARTIAL request whose final is behind our
+    /// latest. Guards the anti-truncation early-return.
+    #[tokio::test]
+    async fn test_stream_import_idempotent_no_truncation() {
+        let temp_dir = TempDir::with_prefix("test_import_idempotent").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).unwrap();
+        consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+
+        let num_outputs = 20u64;
+        let mut outputs = Vec::new();
+        let mut parent = ConsensusHeader::default().digest();
+        for i in 0..num_outputs {
+            let output =
+                make_test_output(&committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+            parent = output.digest().into();
+            outputs.push(output.clone());
+            consensus_chain.save_consensus_output(output).await.unwrap();
+        }
+        consensus_chain.persist_current().await.expect("persist");
+
+        // A partial import whose final (`k`) is BEHIND our latest must early-return without
+        // touching the pack. The stream is never read, so an empty reader is fine.
+        let k = 12u64;
+        let cutoff = &outputs[(k - 1) as usize];
+        let mut partial_record = previous_epoch.clone();
+        partial_record.final_consensus = ConsensusNumHash::new(cutoff.number(), cutoff.digest());
+        consensus_chain
+            .stream_import(
+                tokio::io::empty(),
+                &partial_record,
+                &previous_epoch,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("partial import of data we already hold must be Ok");
+
+        // Every output is still present — nothing was truncated to the partial prefix.
+        for i in 0..num_outputs {
+            consensus_chain
+                .get_consensus_output_current(i + 1)
+                .await
+                .expect("output still present after no-op partial import");
+        }
+
+        // An exact full-final no-op is also Ok.
+        let last = outputs.last().unwrap();
+        let mut full_record = previous_epoch.clone();
+        full_record.final_consensus = ConsensusNumHash::new(last.number(), last.digest());
+        consensus_chain
+            .stream_import(
+                tokio::io::empty(),
+                &full_record,
+                &previous_epoch,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("exact full import of data we already hold must be Ok");
     }
 
     #[tokio::test]
