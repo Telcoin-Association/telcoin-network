@@ -672,9 +672,10 @@ async fn test_recoverable_error_exhausts_retries_as_network() {
     });
 
     // Retries exhausted → AntiQuorum (network failure), not QuorumRejected.
-    match tokio::time::timeout(Duration::from_secs(5), attest_handle).await {
-        Err(_) => panic!("should not timeout waiting for quorum waiter"),
-        Ok(Ok(r)) => assert_matches!(r, Err(QuorumWaiterError::AntiQuorum)),
-        Ok(Err(_)) => panic!("unexpected recv error!"),
-    }
+    let outcome = tokio::time::timeout(Duration::from_secs(5), attest_handle)
+        .await
+        .expect("should not timeout waiting for quorum waiter")
+        .map_err(QuorumWaiterError::from)
+        .and_then(|inner| inner);
+    assert_matches!(outcome, Err(QuorumWaiterError::AntiQuorum));
 }
