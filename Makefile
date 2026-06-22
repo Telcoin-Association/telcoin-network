@@ -147,7 +147,7 @@ docker-push:
 
 # docker buildx used for multiple processor image building
 docker-builder:
-	docker buildx create --name tn-builder --use ;
+	docker buildx use tn-builder || docker buildx create --name tn-builder --use ;
 
 # inpect and bootstrap docker buildx for multiple processor image building
 docker-builder-init:
