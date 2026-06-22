@@ -4,22 +4,35 @@ use std::{
     future::{ready, Ready},
 };
 
-use crate::{stream::behavior::TN_STREAM_PROTOCOL, Penalty};
+use crate::Penalty;
 
 /// Protocol upgrade for streaming data.
 ///
 /// Both inbound and outbound upgrades simply return the raw stream.
 /// Application-layer correlation (e.g. writing a request digest) is
 /// handled by the caller after the stream is established.
+///
+/// Carries the chain-namespaced [`StreamProtocol`] negotiated on the wire, so a
+/// node only ever establishes streams with peers on the same chain.
 #[derive(Debug, Clone)]
-pub(crate) struct TNStreamProtocol;
+pub(crate) struct TNStreamProtocol {
+    /// The chain-namespaced stream protocol to negotiate.
+    protocol: StreamProtocol,
+}
+
+impl TNStreamProtocol {
+    /// Create a stream-protocol upgrade that negotiates `protocol`.
+    pub(crate) fn new(protocol: StreamProtocol) -> Self {
+        Self { protocol }
+    }
+}
 
 impl UpgradeInfo for TNStreamProtocol {
     type Info = StreamProtocol;
     type InfoIter = std::iter::Once<Self::Info>;
 
     fn protocol_info(&self) -> Self::InfoIter {
-        std::iter::once(TN_STREAM_PROTOCOL)
+        std::iter::once(self.protocol.clone())
     }
 }
 

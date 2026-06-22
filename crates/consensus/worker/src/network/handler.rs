@@ -71,7 +71,9 @@ where
         match gossip {
             WorkerGossip::Batch(epoch, batch_hash) => {
                 ensure!(
-                    topic.to_string().eq(&tn_config::LibP2pConfig::worker_batch_topic()),
+                    topic.to_string().eq(&tn_config::LibP2pConfig::worker_batch_topic(
+                        self.consensus_config.chain_id()
+                    )),
                     WorkerNetworkError::InvalidTopic
                 );
                 let my_epoch = self.consensus_config.epoch();
@@ -127,7 +129,9 @@ where
             }
             WorkerGossip::Txn(tx_bytes) => {
                 ensure!(
-                    topic.to_string().eq(&tn_config::LibP2pConfig::worker_txn_topic()),
+                    topic.to_string().eq(&tn_config::LibP2pConfig::worker_txn_topic(
+                        self.consensus_config.chain_id()
+                    )),
                     WorkerNetworkError::InvalidTopic
                 );
                 if let Some(authority) = self.consensus_config.authority() {

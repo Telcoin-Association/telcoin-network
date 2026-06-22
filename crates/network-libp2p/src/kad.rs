@@ -913,16 +913,27 @@ mod test {
         assert!(matches!(kad_store_worker.put(rec.clone()), Err(Error::MaxRecords)));
     }
 
-    /// Lock the per-role wire-protocol names. These strings are a peer-compatibility
-    /// contract: a silent change would prevent peers from negotiating sessions.
+    /// Lock the per-role, chain-namespaced wire-protocol names. These strings are a
+    /// peer-compatibility contract: a silent change would prevent peers from
+    /// negotiating sessions, and the chain id keeps different chains from ever
+    /// negotiating with each other (issue #765).
     #[test]
-    fn test_network_type_protocol_names() {
-        assert_eq!(NetworkType::Primary.req_res_protocol().as_ref(), "/tn-primary/0.0.1");
-        assert_eq!(NetworkType::Primary.kad_protocol().as_ref(), "/tn-primary-kad/0.0.1");
-        assert_eq!(NetworkType::Worker(0).req_res_protocol().as_ref(), "/tn-worker-0/0.0.1");
-        assert_eq!(NetworkType::Worker(0).kad_protocol().as_ref(), "/tn-worker-0-kad/0.0.1");
-        // worker id is interpolated, not literal
-        assert_eq!(NetworkType::Worker(3).req_res_protocol().as_ref(), "/tn-worker-3/0.0.1");
-        assert_eq!(NetworkType::Worker(3).kad_protocol().as_ref(), "/tn-worker-3-kad/0.0.1");
+    fn test_network_type_protocol_names() -> crate::types::NetworkResult<()> {
+        assert_eq!(NetworkType::Primary.req_res_protocol(2017)?.as_ref(), "/tn-primary-2017/0.0.1");
+        assert_eq!(NetworkType::Primary.kad_protocol(2017)?.as_ref(), "/tn-primary-kad-2017/0.0.1");
+        assert_eq!(
+            NetworkType::Worker(0).req_res_protocol(2017)?.as_ref(),
+            "/tn-worker-0-2017/0.0.1"
+        );
+        assert_eq!(
+            NetworkType::Worker(0).kad_protocol(2017)?.as_ref(),
+            "/tn-worker-0-kad-2017/0.0.1"
+        );
+        // worker id and chain id are both interpolated, not literal
+        assert_eq!(NetworkType::Worker(3).req_res_protocol(7)?.as_ref(), "/tn-worker-3-7/0.0.1");
+        assert_eq!(NetworkType::Worker(3).kad_protocol(7)?.as_ref(), "/tn-worker-3-kad-7/0.0.1");
+        // the bulk-transfer stream protocol is chain-namespaced too (role-agnostic)
+        assert_eq!(crate::types::stream_protocol(2017)?.as_ref(), "/tn-stream-2017/0.0.1");
+        Ok(())
     }
 }

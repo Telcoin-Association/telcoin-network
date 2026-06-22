@@ -29,7 +29,7 @@ use libp2p::{
         ProtocolSupport,
     },
     swarm::{NetworkBehaviour, SwarmEvent},
-    Multiaddr, PeerId, Swarm, SwarmBuilder,
+    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -94,9 +94,10 @@ where
         kademlia: kad::Behaviour<KadStore<DB>>,
         peer_config: &PeerConfig,
         metrics: PeerManagerMetrics,
+        stream_protocol: StreamProtocol,
     ) -> Self {
         let peer_manager = PeerManager::new(peer_config, metrics);
-        let stream = StreamBehavior::new();
+        let stream = StreamBehavior::new(stream_protocol);
         Self { peer_manager, gossipsub, req_res, kademlia, stream }
     }
 }
@@ -268,13 +269,19 @@ where
         let tn_codec =
             TNCodec::<Req, Res>::new(network_config.libp2p_config().max_rpc_message_size);
 
+        // Namespace every wire protocol by the genesis chain id so nodes on
+        // different chains never negotiate a connection. The id is stamped onto
+        // the network config from genesis at node startup; see
+        // `NetworkConfig::set_chain_id`.
+        let chain_id = network_config.libp2p_config().chain_id;
+
         let req_res = request_response::Behaviour::with_codec(
             tn_codec,
-            vec![(network_type.req_res_protocol(), ProtocolSupport::Full)],
+            vec![(network_type.req_res_protocol(chain_id)?, ProtocolSupport::Full)],
             request_response::Config::default(),
         );
         let peer_id: PeerId = keypair.public().into();
-        let mut kad_config = libp2p::kad::Config::new(network_type.kad_protocol());
+        let mut kad_config = libp2p::kad::Config::new(network_type.kad_protocol(chain_id)?);
         // manually add peers
         kad_config.set_kbucket_inserts(kad::BucketInserts::Manual);
         let libp2p = network_config.libp2p_config();
@@ -316,12 +323,14 @@ where
         let kademlia = kad::Behaviour::with_config(peer_id, kad_store.clone(), kad_config);
 
         // create custom behavior
+        let stream_protocol = crate::types::stream_protocol(chain_id)?;
         let mut behavior = TNBehavior::new(
             gossipsub,
             req_res,
             kademlia,
             network_config.peer_config(),
             PeerManagerMetrics::new_for(&network_type),
+            stream_protocol,
         );
 
         // Promote the surviving records into the local peer cache.

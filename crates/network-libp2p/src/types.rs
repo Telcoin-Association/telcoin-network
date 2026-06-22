@@ -74,25 +74,41 @@ pub enum NetworkType {
 }
 
 impl NetworkType {
-    /// Request-response wire protocol, isolated per role (and per worker).
-    pub(crate) fn req_res_protocol(&self) -> StreamProtocol {
+    /// Request-response wire protocol, isolated per role (and per worker) and
+    /// namespaced by `chain_id` so nodes on different chains never negotiate a
+    /// connection.
+    pub(crate) fn req_res_protocol(&self, chain_id: u64) -> NetworkResult<StreamProtocol> {
         match self {
-            Self::Primary => StreamProtocol::new("/tn-primary/0.0.1"),
-            Self::Worker(id) => StreamProtocol::try_from_owned(format!("/tn-worker-{id}/0.0.1"))
-                .expect("worker req-res protocol name starts with '/'"),
+            Self::Primary => owned_protocol(format!("/tn-primary-{chain_id}/0.0.1")),
+            Self::Worker(id) => owned_protocol(format!("/tn-worker-{id}-{chain_id}/0.0.1")),
         }
     }
 
-    /// Kademlia wire protocol, isolated per role (and per worker).
-    pub(crate) fn kad_protocol(&self) -> StreamProtocol {
+    /// Kademlia wire protocol, isolated per role (and per worker) and namespaced
+    /// by `chain_id`.
+    pub(crate) fn kad_protocol(&self, chain_id: u64) -> NetworkResult<StreamProtocol> {
         match self {
-            Self::Primary => StreamProtocol::new("/tn-primary-kad/0.0.1"),
-            Self::Worker(id) => {
-                StreamProtocol::try_from_owned(format!("/tn-worker-{id}-kad/0.0.1"))
-                    .expect("worker kad protocol name starts with '/'")
-            }
+            Self::Primary => owned_protocol(format!("/tn-primary-kad-{chain_id}/0.0.1")),
+            Self::Worker(id) => owned_protocol(format!("/tn-worker-{id}-kad-{chain_id}/0.0.1")),
         }
     }
+}
+
+/// Bulk-transfer stream protocol, namespaced by `chain_id`.
+///
+/// Role-agnostic: primaries and workers run separate swarms, so (matching the
+/// pre-namespacing behaviour) only the chain id is folded in.
+pub(crate) fn stream_protocol(chain_id: u64) -> NetworkResult<StreamProtocol> {
+    owned_protocol(format!("/tn-stream-{chain_id}/0.0.1"))
+}
+
+/// Build an owned [`StreamProtocol`] from a runtime name, surfacing a malformed
+/// name (one that does not start with `/`) as a [`NetworkError`] instead of a panic.
+///
+/// The names this crate builds are always well formed, so the error path is not
+/// expected to fire; returning a result keeps the construction panic-free.
+fn owned_protocol(name: String) -> NetworkResult<StreamProtocol> {
+    StreamProtocol::try_from_owned(name).map_err(|e| NetworkError::ProtocolError(e.to_string()))
 }
 
 /// A channel for sending the response to an inbound RPC, bound to the peer that
