@@ -35,15 +35,14 @@ use tn_storage::{
 };
 use tn_types::{
     encode, BlsPublicKey, BlsSignature, Certificate, ConsensusHeader, ConsensusHeaderDigest,
-    Database, Epoch, EpochCertificate, EpochDigest, EpochRecord, EpochVote, Header, HeaderDigest,
-    Round, TaskError, TaskSpawner, TnReceiver, TnSender, Vote, B256,
+    ConsensusResult, Database, Epoch, EpochCertificate, EpochDigest, EpochRecord, EpochVote,
+    Header, HeaderDigest, Round, TaskError, TaskSpawner, TnReceiver, TnSender, Vote, B256,
 };
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tracing::{debug, info, warn};
 pub mod handler;
 mod message;
-pub use message::ConsensusResult;
 
 #[cfg(test)]
 #[path = "../tests/network_tests.rs"]

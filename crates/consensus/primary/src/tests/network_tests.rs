@@ -3,7 +3,7 @@
 use crate::{
     error::PrimaryNetworkError,
     network::{
-        message::{ConsensusResult, PrimaryGossip, PrimaryResponse},
+        message::{PrimaryGossip, PrimaryResponse},
         MissingCertificatesRequest, PendingEpochStream, RequestHandler,
         MAX_CONCURRENT_EPOCH_STREAMS, PENDING_REQUEST_TIMEOUT,
     },
@@ -21,11 +21,12 @@ use tempfile::TempDir;
 use tn_config::Parameters;
 use tn_network_libp2p::{GossipMessage, TopicHash};
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, tables::Votes};
-use tn_test_utils_committee::CommitteeFixture;
+use tn_test_utils_committee::{AuthorityFixture, CommitteeFixture};
 use tn_types::{
-    error::HeaderError, now, AuthorityIdentifier, BlockHash, BlockHeader, BlockNumHash,
-    BlsPublicKey, Certificate, ConsensusHeaderDigest, ConsensusNumHash, Database, Epoch, EpochVote,
-    ExecHeader, Hash as _, HeaderDigest, SealedHeader, TaskManager, VoteDigest, VoteInfo, B256,
+    encode, error::HeaderError, now, to_intent_message, AuthorityIdentifier, BlockHash,
+    BlockHeader, BlockNumHash, BlsPublicKey, BlsSigner as _, Certificate, ConsensusHeaderDigest,
+    ConsensusNumHash, ConsensusResult, Database, Epoch, EpochVote, ExecHeader, Hash as _,
+    HeaderDigest, Round, SealedHeader, TaskManager, VoteDigest, VoteInfo, B256,
 };
 use tracing::debug;
 
@@ -817,4 +818,111 @@ async fn test_pending_epoch_stream_replacement_preserves_created_at() {
         MAX_CONCURRENT_EPOCH_STREAMS,
         "dropping the evicted pending entry must release its semaphore permit"
     );
+}
+
+// ============================================================================
+// Consensus Result Signature Aggregation Tests
+// ============================================================================
+// These tests cover how the handler counts the validator signatures gossiped for a
+// consensus result. A result is only "published" (forwarded to followers) once a quorum of
+// *distinct* validators have signed it, and each validator must count at most once.
+
+/// Build a gossip message carrying a [`ConsensusResult`] signed by `auth` over the given
+/// `(epoch, round, number, hash)` tuple. Mirrors how the subscriber publishes results: the
+/// signature is over `to_intent_message(ConsensusResult::digest_data(..))`.
+fn signed_consensus_gossip(
+    auth: &AuthorityFixture<MemDatabase>,
+    epoch: Epoch,
+    round: Round,
+    number: u64,
+    hash: ConsensusHeaderDigest,
+) -> GossipMessage {
+    let digest = ConsensusResult::digest_data(epoch, round, number, hash);
+    let config = auth.consensus_config();
+    let key_config = config.key_config();
+    let signature = key_config.request_signature_direct(&encode(&to_intent_message(digest)));
+    let validator = key_config.public_key();
+    let result = ConsensusResult { epoch, round, number, hash, validator, signature };
+    let data = encode(&PrimaryGossip::Consensus(Box::new(result)));
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::consensus_output_topic());
+    GossipMessage { source: None, data, sequence_number: None, topic }
+}
+
+/// A quorum (`1/3 + 1`) of distinct validators signing the same consensus result must cause
+/// the handler to publish it, and not before. This also pins the entry-creation path: the
+/// very first signature must be recorded (a regression here would mean a quorum is never
+/// reached and the result is never published).
+#[tokio::test]
+async fn test_consensus_result_publishes_on_quorum() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    let (epoch, round, number) = (0u32, 1u32, 1u64);
+    let hash = ConsensusHeaderDigest::from(B256::random());
+    let quorum = committee.committee().size() / 3 + 1;
+    let authorities: Vec<_> = committee.authorities().collect();
+    assert!(authorities.len() >= quorum, "need at least a quorum of authorities");
+
+    // Feed distinct signers one at a time; nothing should publish until the quorum-th.
+    for (seen, auth) in authorities.iter().take(quorum).enumerate() {
+        let msg = signed_consensus_gossip(auth, epoch, round, number, hash);
+        handler.process_gossip(&msg).await?;
+
+        if seen + 1 < quorum {
+            assert_eq!(
+                consensus_bus.published_consensus_num_hash(),
+                (0, 0, ConsensusHeaderDigest::default()),
+                "must not publish before a quorum of distinct signers ({} of {quorum})",
+                seen + 1,
+            );
+        }
+    }
+
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (epoch, number, hash),
+        "result must be published once a quorum of distinct signers is reached",
+    );
+    Ok(())
+}
+
+/// The same validator gossiping a result repeatedly must be counted once. Replaying one
+/// signer more times than the quorum must not publish; only adding the remaining *distinct*
+/// signers may.
+#[tokio::test]
+async fn test_consensus_result_duplicate_signature_counted_once() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    let (epoch, round, number) = (0u32, 1u32, 1u64);
+    let hash = ConsensusHeaderDigest::from(B256::random());
+    let quorum = committee.committee().size() / 3 + 1;
+    let authorities: Vec<_> = committee.authorities().collect();
+    assert!(authorities.len() >= quorum, "need at least a quorum of authorities");
+
+    // Replay the first signer's result more than `quorum` times. If duplicates were counted,
+    // this alone would reach quorum and publish — it must not.
+    let dup = signed_consensus_gossip(authorities[0], epoch, round, number, hash);
+    for _ in 0..quorum + 1 {
+        handler.process_gossip(&dup).await?;
+    }
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (0, 0, ConsensusHeaderDigest::default()),
+        "repeated signatures from one validator must count once and stay below quorum",
+    );
+
+    // Add the remaining distinct signers (signer 0 already counted once) to reach quorum.
+    for auth in authorities.iter().take(quorum).skip(1) {
+        let msg = signed_consensus_gossip(auth, epoch, round, number, hash);
+        handler.process_gossip(&msg).await?;
+    }
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (epoch, number, hash),
+        "a quorum of distinct signers must publish even after duplicates were ignored",
+    );
+    Ok(())
 }
