@@ -241,11 +241,14 @@ where
                     let response = match res {
                         Ok(()) => WorkerResponse::ReportBatch,
                         Err(err) => {
-                            let error = err.to_string();
+                            // classify transient responder-side conditions as
+                            // recoverable so the requester retries instead of
+                            // treating this as a permanent rejection
+                            let response = WorkerResponse::into_error_ref(&err);
                             if let Some(penalty) = err.into() {
                                 network_handle.report_penalty(peer, penalty).await;
                             }
-                            WorkerResponse::Error(message::WorkerRPCError(error))
+                            response
                         }
                     };
                     let _ = network_handle.inner_handle().send_response(response, channel).await;
@@ -374,12 +377,15 @@ where
             let msg = match response {
                 Ok(msg) => msg,
                 Err(err) => {
-                    let error = err.to_string();
+                    // classify transient responder-side conditions as recoverable
+                    // so the requester retries instead of treating this as a
+                    // permanent rejection
+                    let response = WorkerResponse::into_error_ref(&err);
                     if let Some(penalty) = err.into() {
                         network_handle.report_penalty(peer, penalty).await;
                     }
 
-                    WorkerResponse::Error(message::WorkerRPCError(error))
+                    response
                 }
             };
 
