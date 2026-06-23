@@ -127,8 +127,18 @@ impl LatestConsensus {
         }
         let mut slot1 = OpenOptions::new().read(true).write(true).open(&slot1_path)?;
         let mut slot2 = OpenOptions::new().read(true).write(true).open(&slot2_path)?;
-        let (slot1_epoch, slot1_number) = Self::read_slot(&mut slot1)?;
-        let (slot2_epoch, slot2_number) = Self::read_slot(&mut slot2)?;
+        // A torn or corrupt slot must not be fatal: the slots are a double-buffered hint and
+        // the pack files are ground truth, so fall back to the other slot (or a fresh (0, 0))
+        // rather than failing to open the chain.  Failing here would panic the node at startup
+        // on a single damaged slot, defeating the whole point of having two of them.
+        let (slot1_epoch, slot1_number) = Self::read_slot(&mut slot1).unwrap_or_else(|e| {
+            warn!(target: "consensus_chain", ?e, "consensus_slot1 unreadable; falling back to the other slot");
+            (0, 0)
+        });
+        let (slot2_epoch, slot2_number) = Self::read_slot(&mut slot2).unwrap_or_else(|e| {
+            warn!(target: "consensus_chain", ?e, "consensus_slot2 unreadable; falling back to the other slot");
+            (0, 0)
+        });
 
         let (tx, mut rx) = mpsc::channel(1000);
         let handle = std::thread::spawn(move || {
@@ -347,7 +357,8 @@ impl ConsensusChain {
             }
             old_pack.persist().await?;
             let mut recents = self.recent_packs.lock();
-            if recents.len() > Self::PACK_CACHE_SIZE {
+            // Evict before pushing so the cache stays capped at PACK_CACHE_SIZE.
+            if recents.len() >= Self::PACK_CACHE_SIZE {
                 let _ = recents.pop_front();
             }
             recents.push_back(old_pack);
@@ -764,7 +775,8 @@ impl ConsensusChain {
                     return Ok(p.clone());
                 }
             }
-            if recents.len() > Self::PACK_CACHE_SIZE {
+            // Evict before the open+push below so the cache stays capped at PACK_CACHE_SIZE.
+            if recents.len() >= Self::PACK_CACHE_SIZE {
                 let _ = recents.pop_front();
             }
         }
@@ -1052,6 +1064,60 @@ mod test {
         assert_eq!(latest.epoch(), 2);
         assert_eq!(latest.number(), 20);
         assert_eq!(latest.current_slot(), ConsensusSlot::Slot2);
+    }
+
+    /// A corrupt slot file must not fail to open the chain; the other (valid) slot is used.
+    /// The slots are a double-buffered hint, so a single damaged slot must be recoverable
+    /// rather than panicking the node at startup.
+    #[tokio::test]
+    async fn test_latest_consensus_recovers_from_corrupt_slot() {
+        use std::{
+            fs::OpenOptions,
+            io::{Seek as _, SeekFrom, Write as _},
+        };
+
+        let temp_dir = TempDir::with_prefix("test_corrupt_slot").unwrap();
+        {
+            let latest = LatestConsensus::new(temp_dir.path()).unwrap();
+            // Two updates so both slots hold data: slot1 = (1, 10), slot2 = (2, 20).
+            latest.update(1, 10).await;
+            latest.update(2, 20).await;
+            latest.persist().await;
+        }
+
+        // Corrupt the slot holding the most recent value (slot2) by flipping a payload byte,
+        // which breaks its CRC.
+        {
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(temp_dir.path().join("consensus_slot2"))
+                .unwrap();
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.write_all(&[0xFF]).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        // Reopen: slot2 is unreadable (CRC fail) but must fall back to slot1's valid value
+        // instead of erroring.
+        let latest = LatestConsensus::new(temp_dir.path()).unwrap();
+        assert_eq!(latest.epoch(), 1, "recovered epoch from the good slot");
+        assert_eq!(latest.number(), 10, "recovered number from the good slot");
+
+        // Corrupting the remaining slot too falls back to a fresh (0, 0).
+        {
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(temp_dir.path().join("consensus_slot1"))
+                .unwrap();
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.write_all(&[0xFF]).unwrap();
+            f.sync_all().unwrap();
+        }
+        let latest = LatestConsensus::new(temp_dir.path()).unwrap();
+        assert_eq!(latest.epoch(), 0, "both slots corrupt -> fresh start");
+        assert_eq!(latest.number(), 0, "both slots corrupt -> fresh start");
     }
 
     #[tokio::test]

@@ -92,6 +92,21 @@ impl NetworkType {
             Self::Worker(id) => owned_protocol(format!("/tn-worker-{id}-kad-{chain_id}/0.0.1")),
         }
     }
+
+    /// Bulk-sync streaming wire protocol, isolated per role (and per worker) and
+    /// namespaced by `chain_id` so nodes on different chains never negotiate it.
+    ///
+    /// The stream behaviour registers this alongside the chain-namespaced
+    /// bulk-transfer `/tn-stream-{chain_id}/0.0.1` upgrade so a responder accepts
+    /// it; the typed [`SyncFrame`](crate::sync::SyncFrame) layer rides on streams
+    /// negotiated with this protocol. Additive for now: no call site opens it
+    /// until the per-exchange cutovers migrate the bulk paths.
+    pub(crate) fn sync_protocol(&self, chain_id: u64) -> NetworkResult<StreamProtocol> {
+        match self {
+            Self::Primary => owned_protocol(format!("/tn-primary-sync-{chain_id}/0.0.1")),
+            Self::Worker(id) => owned_protocol(format!("/tn-worker-{id}-sync-{chain_id}/0.0.1")),
+        }
+    }
 }
 
 /// Bulk-transfer stream protocol, namespaced by `chain_id`.
@@ -100,6 +115,19 @@ impl NetworkType {
 /// pre-namespacing behaviour) only the chain id is folded in.
 pub(crate) fn stream_protocol(chain_id: u64) -> NetworkResult<StreamProtocol> {
     owned_protocol(format!("/tn-stream-{chain_id}/0.0.1"))
+}
+
+/// The chain-namespaced stream protocols a node advertises on the stream
+/// behaviour, in dialer-preference order: the bulk-transfer
+/// `/tn-stream-{chain_id}/0.0.1` first (so existing opens keep negotiating it),
+/// then the per-role sync protocol the typed
+/// [`SyncFrame`](crate::sync::SyncFrame) layer rides on. Both carry the chain id,
+/// so the stream subsystem isolates chains the same way req-res and kad do.
+pub(crate) fn stream_protocols(
+    network_type: NetworkType,
+    chain_id: u64,
+) -> NetworkResult<Vec<StreamProtocol>> {
+    Ok(vec![stream_protocol(chain_id)?, network_type.sync_protocol(chain_id)?])
 }
 
 /// Build an owned [`StreamProtocol`] from a runtime name, surfacing a malformed

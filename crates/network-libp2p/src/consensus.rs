@@ -94,10 +94,10 @@ where
         kademlia: kad::Behaviour<KadStore<DB>>,
         peer_config: &PeerConfig,
         metrics: PeerManagerMetrics,
-        stream_protocol: StreamProtocol,
+        stream_protocols: Vec<StreamProtocol>,
     ) -> Self {
         let peer_manager = PeerManager::new(peer_config, metrics);
-        let stream = StreamBehavior::new(stream_protocol);
+        let stream = StreamBehavior::new(stream_protocols);
         Self { peer_manager, gossipsub, req_res, kademlia, stream }
     }
 }
@@ -323,14 +323,14 @@ where
         let kademlia = kad::Behaviour::with_config(peer_id, kad_store.clone(), kad_config);
 
         // create custom behavior
-        let stream_protocol = crate::types::stream_protocol(chain_id)?;
+        let stream_protocols = crate::types::stream_protocols(network_type, chain_id)?;
         let mut behavior = TNBehavior::new(
             gossipsub,
             req_res,
             kademlia,
             network_config.peer_config(),
             PeerManagerMetrics::new_for(&network_type),
-            stream_protocol,
+            stream_protocols,
         );
 
         // Promote the surviving records into the local peer cache.

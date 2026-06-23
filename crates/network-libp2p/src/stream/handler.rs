@@ -69,8 +69,10 @@ pub(crate) enum StreamHandlerEvent {
 /// is bounded by [`STREAM_OPEN_TIMEOUT`]; failures are classified and reported
 /// to the behaviour for scoring.
 pub(crate) struct StreamHandler {
-    /// The chain-namespaced stream protocol negotiated on this connection.
-    protocol: StreamProtocol,
+    /// Chain-namespaced protocols advertised for inbound listen and outbound
+    /// opens (the bulk-transfer `/tn-stream-{chain}` first, then the per-role
+    /// sync protocol).
+    protocols: Vec<StreamProtocol>,
     /// Pending outbound stream reply channels.
     pending_outbound: VecDeque<oneshot::Sender<NetworkResult<Stream>>>,
     /// Events to send to the behavior.
@@ -87,9 +89,9 @@ impl std::fmt::Debug for StreamHandler {
 }
 
 impl StreamHandler {
-    /// Create a new stream handler negotiating the chain-namespaced `protocol`.
-    pub(crate) fn new(protocol: StreamProtocol) -> Self {
-        Self { protocol, pending_outbound: VecDeque::new(), events: VecDeque::new() }
+    /// Create a new stream handler advertising `protocols` on this connection.
+    pub(crate) fn new(protocols: Vec<StreamProtocol>) -> Self {
+        Self { protocols, pending_outbound: VecDeque::new(), events: VecDeque::new() }
     }
 
     /// Queue an event to the behaviour, dropping it if the buffer is saturated.
@@ -123,7 +125,7 @@ impl ConnectionHandler for StreamHandler {
     type OutboundOpenInfo = oneshot::Sender<NetworkResult<Stream>>;
 
     fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol, Self::InboundOpenInfo> {
-        SubstreamProtocol::new(TNStreamProtocol::new(self.protocol.clone()), ())
+        SubstreamProtocol::new(TNStreamProtocol::new(self.protocols.clone()), ())
     }
 
     fn on_behaviour_event(&mut self, event: Self::FromBehaviour) {
@@ -193,7 +195,7 @@ impl ConnectionHandler for StreamHandler {
         if let Some(reply) = self.pending_outbound.pop_front() {
             return Poll::Ready(ConnectionHandlerEvent::OutboundSubstreamRequest {
                 protocol: SubstreamProtocol::new(
-                    TNStreamProtocol::new(self.protocol.clone()),
+                    TNStreamProtocol::new(self.protocols.clone()),
                     reply,
                 )
                 .with_timeout(STREAM_OPEN_TIMEOUT),
