@@ -5,7 +5,7 @@ use libp2p::{
         },
         ConnectionHandler, ConnectionHandlerEvent, StreamUpgradeError, SubstreamProtocol,
     },
-    Stream,
+    Stream, StreamProtocol,
 };
 use std::{
     collections::VecDeque,
@@ -68,8 +68,10 @@ pub(crate) enum StreamHandlerEvent {
 /// `OutboundOpenInfo`, bypassing the behavior layer entirely. Open negotiation
 /// is bounded by [`STREAM_OPEN_TIMEOUT`]; failures are classified and reported
 /// to the behaviour for scoring.
-#[derive(Default)]
 pub(crate) struct StreamHandler {
+    /// Protocols advertised for inbound listen and outbound opens (legacy
+    /// `/tn-stream` first, then the per-role sync protocol).
+    protocols: Vec<StreamProtocol>,
     /// Pending outbound stream reply channels.
     pending_outbound: VecDeque<oneshot::Sender<NetworkResult<Stream>>>,
     /// Events to send to the behavior.
@@ -86,9 +88,9 @@ impl std::fmt::Debug for StreamHandler {
 }
 
 impl StreamHandler {
-    /// Create a new stream handler.
-    pub(crate) fn new() -> Self {
-        Self { pending_outbound: VecDeque::new(), events: VecDeque::new() }
+    /// Create a new stream handler advertising `protocols` on this connection.
+    pub(crate) fn new(protocols: Vec<StreamProtocol>) -> Self {
+        Self { protocols, pending_outbound: VecDeque::new(), events: VecDeque::new() }
     }
 
     /// Queue an event to the behaviour, dropping it if the buffer is saturated.
@@ -122,7 +124,7 @@ impl ConnectionHandler for StreamHandler {
     type OutboundOpenInfo = oneshot::Sender<NetworkResult<Stream>>;
 
     fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol, Self::InboundOpenInfo> {
-        SubstreamProtocol::new(TNStreamProtocol, ())
+        SubstreamProtocol::new(TNStreamProtocol::new(self.protocols.clone()), ())
     }
 
     fn on_behaviour_event(&mut self, event: Self::FromBehaviour) {
@@ -191,8 +193,11 @@ impl ConnectionHandler for StreamHandler {
         // Request outbound streams, bounding negotiation with a timeout.
         if let Some(reply) = self.pending_outbound.pop_front() {
             return Poll::Ready(ConnectionHandlerEvent::OutboundSubstreamRequest {
-                protocol: SubstreamProtocol::new(TNStreamProtocol, reply)
-                    .with_timeout(STREAM_OPEN_TIMEOUT),
+                protocol: SubstreamProtocol::new(
+                    TNStreamProtocol::new(self.protocols.clone()),
+                    reply,
+                )
+                .with_timeout(STREAM_OPEN_TIMEOUT),
             });
         }
 

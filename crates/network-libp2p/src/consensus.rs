@@ -94,9 +94,10 @@ where
         kademlia: kad::Behaviour<KadStore<DB>>,
         peer_config: &PeerConfig,
         metrics: PeerManagerMetrics,
+        network_type: NetworkType,
     ) -> Self {
         let peer_manager = PeerManager::new(peer_config, metrics);
-        let stream = StreamBehavior::new();
+        let stream = StreamBehavior::new(network_type);
         Self { peer_manager, gossipsub, req_res, kademlia, stream }
     }
 }
@@ -322,6 +323,7 @@ where
             kademlia,
             network_config.peer_config(),
             PeerManagerMetrics::new_for(&network_type),
+            network_type,
         );
 
         // Promote the surviving records into the local peer cache.
