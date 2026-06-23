@@ -287,6 +287,16 @@ where
                         // valid.
                         enough_sigs = (committee.len() / 3) + 1;
                         let mut guard = self.consensus_certs.lock();
+                        if guard.len() > 20 {
+                            // Small sanity check to make it more difficult for a malicious
+                            // committee member to fill up
+                            // consensus_certs.  Attempt to evict any records that don't appear
+                            // relavent when more that 20 entries
+                            // (should not have this many under normal conditions).
+                            // We would expect a malicious validator to flood a lot of singleton
+                            // results.
+                            guard.retain(|k, s| *k == consensus_result_hash || s.len() > 1);
+                        }
                         let set = guard.entry(consensus_result_hash).or_default();
                         set.insert(key);
                         sigs = set.len();
@@ -305,12 +315,6 @@ where
                         // this being verified.
                         info!(target: "primary", "got new consensus {number}/{hash}");
                         self.consensus_bus.publish_consensus_num_hash_if_newer(epoch, number, hash);
-                        // Note a malicious committee member could put memory pressure on this map
-                        // by publishing a lot of invalid results.  This
-                        // would require an actual malicious
-                        // validator (closed set- unlikely) and a LOT of data before the real
-                        // consesus is detected and the map cleared so
-                        // ignoring for now.
                         self.consensus_certs.lock().clear();
                     }
                 } else {
@@ -960,6 +964,13 @@ where
     /// Return a reference to the `ConsensusChain`.
     pub(super) fn consensus_chain(&self) -> &ConsensusChain {
         &self.consensus_chain
+    }
+
+    /// Number of tracked consensus-result digests. Test-only accessor used to assert the
+    /// `consensus_certs` eviction bound (see the `PrimaryGossip::Consensus` handler).
+    #[cfg(test)]
+    pub(crate) fn consensus_certs_len(&self) -> usize {
+        self.consensus_certs.lock().len()
     }
 
     /// Send epoch pack file over stream.

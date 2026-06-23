@@ -926,3 +926,52 @@ async fn test_consensus_result_duplicate_signature_counted_once() -> eyre::Resul
     );
     Ok(())
 }
+
+/// A single committee member flooding distinct singleton results must not grow `consensus_certs`
+/// without bound: once the map exceeds the 20-entry threshold the handler evicts singleton
+/// entries that are not the result currently being processed. The eviction must also not break
+/// legitimate aggregation — a real quorum still publishes afterward.
+#[tokio::test]
+async fn test_consensus_certs_eviction_bounds_map() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    let (epoch, round) = (0u32, 1u32);
+    let quorum = committee.committee().size() / 3 + 1;
+    let authorities: Vec<_> = committee.authorities().collect();
+    assert!(authorities.len() >= quorum, "need at least a quorum of authorities");
+
+    // Flood: 50 distinct one-signature results from a single validator. Each distinct hash maps
+    // to a distinct digest → a new singleton entry, none of which reach quorum, so the map is
+    // never cleared by a publish during the flood.
+    for _ in 0..50 {
+        let hash = ConsensusHeaderDigest::from(B256::random());
+        let msg = signed_consensus_gossip(authorities[0], epoch, round, 1, hash);
+        handler.process_gossip(&msg).await?;
+    }
+
+    // The eviction bound must cap the map well below the 50 distinct inputs (≤ 21: the
+    // threshold of 20 plus the in-flight entry inserted after the retain).
+    assert!(
+        handler.consensus_certs_len() <= 21,
+        "consensus_certs must stay bounded under a singleton flood, got {}",
+        handler.consensus_certs_len(),
+    );
+
+    // A legitimate result must still reach quorum and publish after the eviction path has run.
+    let hash_l = ConsensusHeaderDigest::from(B256::random());
+    for auth in authorities.iter().take(quorum) {
+        let msg = signed_consensus_gossip(auth, epoch, round, 2, hash_l);
+        handler.process_gossip(&msg).await?;
+    }
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (epoch, 2, hash_l),
+        "a legitimate quorum must publish even after singleton eviction",
+    );
+    // Publishing clears the map.
+    assert_eq!(handler.consensus_certs_len(), 0, "map must be cleared after a publish");
+
+    Ok(())
+}
