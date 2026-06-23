@@ -269,15 +269,15 @@ where
                         // possible and don't want to do the cert verify if we can
                         // skip it.  So this seems like the place.  And of course
                         // close any windows to double counting a signature.
-                        let mut guard = self.consensus_certs.lock();
+                        let guard = self.consensus_certs.lock();
                         if guard.get(&consensus_result_hash).and_then(|set| set.get(&key)).is_some()
                         {
                             // We have already counted this signature so ignore.
                             return Ok(());
                         }
-                        // An argument could be made to do this outside the lock.  This would mean
-                        // it happens on duplicates but holds the lock for
-                        // less time.
+                        drop(guard);
+                        // Drop the lock for the expensive verify op. If a dup gets through the Set
+                        // will still only count it once.
                         ensure!(
                             signature
                                 .verify_secure(&to_intent_message(consensus_result_hash), &key),
@@ -286,6 +286,7 @@ where
                         // Once we have seen 1/3 + 1 committe members have signed this it should be
                         // valid.
                         enough_sigs = (committee.len() / 3) + 1;
+                        let mut guard = self.consensus_certs.lock();
                         let set = guard.entry(consensus_result_hash).or_default();
                         set.insert(key);
                         sigs = set.len();
@@ -303,9 +304,13 @@ where
                         // sure it is valid. Receivers will count on
                         // this being verified.
                         info!(target: "primary", "got new consensus {number}/{hash}");
-                        self.consensus_bus
-                            .last_published_consensus_num_hash()
-                            .send_replace((epoch, number, hash));
+                        self.consensus_bus.publish_consensus_num_hash_if_newer(epoch, number, hash);
+                        // Note a malicious committee member could put memory pressure on this map
+                        // by publishing a lot of invalid results.  This
+                        // would require an actual malicious
+                        // validator (closed set- unlikely) and a LOT of data before the real
+                        // consesus is detected and the map cleared so
+                        // ignoring for now.
                         self.consensus_certs.lock().clear();
                     }
                 } else {
