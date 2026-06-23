@@ -754,6 +754,130 @@ async fn test_primary_worker_protocol_isolation() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Issue #777 Part A: a peer whose only req/res failures are `UnsupportedProtocols`
+/// must never be penalized or banned.
+///
+/// Failing to negotiate a common protocol is honest version/role skew, not
+/// misbehavior. Reusing the cross-role setup from
+/// `test_primary_worker_protocol_isolation`, the primary (`/tn-primary/*`) and the
+/// worker (`/tn-worker-0/*`) connect at the transport but cannot negotiate a
+/// req/res protocol, so every request surfaces `OutboundFailure::UnsupportedProtocols`.
+/// Pre-fix each one applied `Penalty::Severe` (−10); the requests below would drive
+/// the score past `min_score_before_ban` (−50) and ban an otherwise-healthy peer.
+#[tokio::test]
+async fn test_unsupported_protocol_does_not_penalize() -> eyre::Result<()> {
+    let mut network_config = NetworkConfig::default();
+    network_config.peer_config_mut().heartbeat_interval = TEST_HEARTBEAT_INTERVAL;
+
+    let all_nodes =
+        CommitteeFixture::builder(MemDatabase::default).with_network_config(network_config).build();
+    let mut authorities = all_nodes.authorities();
+    let config_1 = authorities.next().expect("first authority").consensus_config();
+    let config_2 = authorities.next().expect("second authority").consensus_config();
+    let (tx1, _events_1) = mpsc::channel(10);
+    let (tx2, _events_2) = mpsc::channel(10);
+    let task_manager = TaskManager::default();
+
+    // peer1: PRIMARY role
+    let primary_network = ConsensusNetwork::<
+        TestWorkerRequest,
+        TestWorkerResponse,
+        MemDatabase,
+        mpsc::Sender<NetworkEvent<TestWorkerRequest, TestWorkerResponse>>,
+    >::new(
+        config_1.network_config(),
+        tx1,
+        config_1.key_config().clone(),
+        config_1.key_config().primary_network_keypair().clone(),
+        MemDatabase::default(),
+        task_manager.get_spawner(),
+        NetworkType::Primary,
+        config_1.primary_address(),
+        None,
+    )
+    .expect("primary network created");
+    let primary = primary_network.network_handle();
+    tokio::spawn(async move {
+        primary_network.run().await.expect("primary network run failed!");
+    });
+
+    // peer2: WORKER role
+    let worker_network = ConsensusNetwork::<
+        TestWorkerRequest,
+        TestWorkerResponse,
+        MemDatabase,
+        mpsc::Sender<NetworkEvent<TestWorkerRequest, TestWorkerResponse>>,
+    >::new(
+        config_2.network_config(),
+        tx2,
+        config_2.key_config().clone(),
+        config_2.key_config().worker_network_keypair().clone(),
+        MemDatabase::default(),
+        task_manager.get_spawner(),
+        NetworkType::Worker(0),
+        config_2.worker_address(),
+        None,
+    )
+    .expect("worker network created");
+    let worker = worker_network.network_handle();
+    tokio::spawn(async move {
+        worker_network.run().await.expect("worker network run failed!");
+    });
+
+    primary.start_listening(config_1.primary_address()).await?;
+    worker.start_listening(config_2.worker_address()).await?;
+    let worker_addr = worker.listeners().await?.first().expect("worker listen addr").clone();
+    let worker_peer_id = worker.local_peer_id().await?;
+    let worker_bls = config_2.key_config().primary_public_key();
+
+    // primary dials the worker across roles and establishes the transport connection
+    primary
+        .add_explicit_peer(
+            worker_bls,
+            config_2.key_config().worker_network_public_key(),
+            worker_addr,
+        )
+        .await?;
+    primary.dial_by_bls(worker_bls).await?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        primary.connected_peer_ids().await?.contains(&worker_peer_id),
+        "transport connection across roles should establish"
+    );
+
+    // the primary's view of the worker's score before any failed requests
+    let score_before = primary.peer_score(worker_peer_id).await?.expect("worker tracked");
+
+    // fire enough cross-role requests that, pre-fix, 6 * Severe (−10) = −60 would
+    // cross the ban threshold (−50)
+    for _ in 0..6 {
+        let reply =
+            primary.send_request(TestWorkerRequest::MissingBatches(vec![]), worker_bls).await?;
+        let res = timeout(Duration::from_secs(5), reply).await?.expect("reply channel");
+        assert_matches!(
+            res,
+            Err(NetworkError::Outbound(_)),
+            "cross-role req/res must fail to negotiate a protocol"
+        );
+    }
+
+    // allow any (erroneous) penalty + a heartbeat to propagate
+    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL + 1)).await;
+
+    // the worker is neither penalized nor banned: still connected, score unchanged
+    assert!(
+        primary.connected_peer_ids().await?.contains(&worker_peer_id),
+        "peer must not be disconnected for unsupported-protocol failures"
+    );
+    let score_after = primary.peer_score(worker_peer_id).await?.expect("worker still tracked");
+    assert_eq!(
+        score_before, score_after,
+        "unsupported-protocol failures must not change the peer's score (before={score_before}, after={score_after})"
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_publish_to_one_peer() -> eyre::Result<()> {
     // start honest cvv network

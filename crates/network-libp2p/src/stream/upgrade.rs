@@ -104,8 +104,10 @@ impl StreamFailure {
             Self::DialFailure => None,
             // stalled open
             Self::Timeout => Some(Penalty::Mild),
-            // the peer speaks none of our stream protocols
-            Self::UnsupportedProtocol => Some(Penalty::Severe),
+            // the peer speaks none of our stream protocols: honest version/role
+            // skew, not a fault — not penalized, like `DialFailure` (mirrors the
+            // request-response `UnsupportedProtocols` arm in `consensus.rs`).
+            Self::UnsupportedProtocol => None,
             // transport flaps on WAN are not faults; other IO is likely a violation
             Self::Io(kind) => match kind {
                 std::io::ErrorKind::ConnectionReset
@@ -129,12 +131,13 @@ mod tests {
     use std::io::ErrorKind;
 
     /// The stream penalty taxonomy must mirror the request-response one: transport
-    /// faults are not penalized, stalls are mild, unsupported protocols are severe.
+    /// faults are not penalized, stalls are mild, and unsupported protocols are
+    /// honest version/role skew (not penalized, like `DialFailure`).
     #[test]
     fn penalty_mapping_mirrors_reqres() {
         assert!(StreamFailure::DialFailure.penalty().is_none());
         assert!(matches!(StreamFailure::Timeout.penalty(), Some(Penalty::Mild)));
-        assert!(matches!(StreamFailure::UnsupportedProtocol.penalty(), Some(Penalty::Severe)));
+        assert!(StreamFailure::UnsupportedProtocol.penalty().is_none());
         assert!(matches!(StreamFailure::InboundRateLimited.penalty(), Some(Penalty::Medium)));
         // transport flaps on WAN are not the peer's fault
         assert!(StreamFailure::Io(ErrorKind::ConnectionReset).penalty().is_none());
