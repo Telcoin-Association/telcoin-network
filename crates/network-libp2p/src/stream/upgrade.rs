@@ -4,22 +4,37 @@ use std::{
     future::{ready, Ready},
 };
 
-use crate::{stream::behavior::TN_STREAM_PROTOCOL, Penalty};
+use crate::Penalty;
 
 /// Protocol upgrade for streaming data.
 ///
-/// Both inbound and outbound upgrades simply return the raw stream.
-/// Application-layer correlation (e.g. writing a request digest) is
-/// handled by the caller after the stream is established.
+/// Advertises one or more protocols for negotiation, in dialer-preference
+/// order. Both inbound and outbound upgrades simply return the raw stream
+/// regardless of which protocol negotiated; application-layer correlation (e.g.
+/// writing a request digest, or the typed [`SyncFrame`](crate::sync::SyncFrame)
+/// layer) is handled by the caller after the stream is established.
 #[derive(Debug, Clone)]
-pub(crate) struct TNStreamProtocol;
+pub(crate) struct TNStreamProtocol {
+    /// Protocols advertised for negotiation, in dialer-preference order. The
+    /// legacy `/tn-stream/0.0.1` is first so existing opens keep negotiating it;
+    /// the per-role sync protocol follows so a responder also accepts it.
+    protocols: Vec<StreamProtocol>,
+}
+
+impl TNStreamProtocol {
+    /// Create an upgrade advertising `protocols`, in order (legacy first), for
+    /// both inbound listen and outbound open negotiation.
+    pub(crate) fn new(protocols: Vec<StreamProtocol>) -> Self {
+        Self { protocols }
+    }
+}
 
 impl UpgradeInfo for TNStreamProtocol {
     type Info = StreamProtocol;
-    type InfoIter = std::iter::Once<Self::Info>;
+    type InfoIter = std::vec::IntoIter<StreamProtocol>;
 
     fn protocol_info(&self) -> Self::InfoIter {
-        std::iter::once(TN_STREAM_PROTOCOL)
+        self.protocols.clone().into_iter()
     }
 }
 
@@ -28,8 +43,13 @@ impl InboundUpgrade<Stream> for TNStreamProtocol {
     type Error = Infallible;
     type Future = Ready<Result<Self::Output, Self::Error>>;
 
-    // logic in application layer
-    fn upgrade_inbound(self, stream: Stream, _: Self::Info) -> Self::Future {
+    // The negotiated protocol (`_protocol`) is intentionally discarded for now:
+    // every accepted inbound stream is handed to the application as a raw stream
+    // and read on the legacy digest-correlation path. Once a sync stream can
+    // actually arrive (the step-5 cutover adds the first opener), this is the
+    // seam that must branch on `_protocol` to route a sync-framed stream to the
+    // `SyncFrame` layer instead of the digest reader.
+    fn upgrade_inbound(self, stream: Stream, _protocol: Self::Info) -> Self::Future {
         ready(Ok(stream))
     }
 }
@@ -126,9 +146,22 @@ impl StreamFailure {
 
 #[cfg(test)]
 mod tests {
-    use super::StreamFailure;
+    use super::{StreamFailure, TNStreamProtocol};
     use crate::Penalty;
+    use libp2p::{core::UpgradeInfo, StreamProtocol};
     use std::io::ErrorKind;
+
+    /// The upgrade advertises its protocols in the order given (legacy first),
+    /// which is what keeps existing opens negotiating `/tn-stream` while a
+    /// responder still accepts the registered sync protocol.
+    #[test]
+    fn protocol_info_preserves_order() {
+        let legacy = StreamProtocol::new("/tn-stream/0.0.1");
+        let sync = StreamProtocol::new("/tn-primary-sync/0.0.1");
+        let upgrade = TNStreamProtocol::new(vec![legacy.clone(), sync.clone()]);
+        let advertised: Vec<_> = upgrade.protocol_info().collect();
+        assert_eq!(advertised, vec![legacy, sync]);
+    }
 
     /// The stream penalty taxonomy must mirror the request-response one: transport
     /// faults are not penalized, stalls are mild, and unsupported protocols are
