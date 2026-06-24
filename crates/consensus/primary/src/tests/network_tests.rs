@@ -20,7 +20,12 @@ use std::{
 use tempfile::TempDir;
 use tn_config::Parameters;
 use tn_network_libp2p::{GossipMessage, TopicHash};
-use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, tables::Votes};
+use tn_storage::{
+    consensus::{ConsensusChain, ConsensusChainError},
+    consensus_pack::PackError,
+    mem_db::MemDatabase,
+    tables::Votes,
+};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     error::HeaderError, now, AuthorityIdentifier, BlockHash, BlockHeader, BlockNumHash,
@@ -188,7 +193,12 @@ async fn test_retrieve_consensus_output() {
     // A number we do not have is a benign miss: it errors and carries no penalty.
     let err =
         handler.consensus_output_bytes(999).await.expect_err("unknown consensus output must error");
-    assert_matches!(err, PrimaryNetworkError::UnknownConsensusOutput(999));
+    assert_matches!(
+        err,
+        PrimaryNetworkError::ConsensusChainError(ConsensusChainError::PackError(
+            PackError::ConsensusNumberTooHigh
+        ))
+    );
     let penalty: Option<tn_network_libp2p::Penalty> = (&err).into();
     assert!(penalty.is_none(), "an unknown consensus output must not penalize the peer");
 }

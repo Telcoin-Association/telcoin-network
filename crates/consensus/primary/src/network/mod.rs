@@ -92,6 +92,7 @@ pub enum StreamRequestKind {
 /// Correlation digest for an epoch-pack stream request.
 fn epoch_stream_digest(epoch: Epoch) -> B256 {
     let mut hasher = tn_types::DefaultHashFunction::new();
+    hasher.update(b"epoch-stream");
     hasher.update(&epoch.to_le_bytes());
     B256::from_slice(hasher.finalize().as_bytes())
 }
