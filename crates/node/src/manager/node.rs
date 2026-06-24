@@ -13,7 +13,10 @@
 use crate::{
     engine::{ExecutionNode, TnBuilder},
     health::HealthcheckServer,
-    manager::{exex::run_isolated_exex_future, spawn_epoch_vote_collector},
+    manager::{
+        exex::{run_critical_exex_future, run_isolated_exex_future},
+        spawn_epoch_vote_collector,
+    },
     metrics::EpochMetrics,
 };
 use eyre::{eyre, WrapErr as _};
@@ -380,6 +383,10 @@ where
             let rx_certs = self.consensus_bus.subscribe_exex_certificates();
             let rx_consensus_output = self.consensus_bus.subscribe_exex_consensus_output();
 
+            // Whether ExEx tasks + manager run as critical tasks (operator opt-in
+            // via `Config::exex_critical`; default false → isolated, non-critical).
+            let exex_critical = self.builder.tn_config.exex_critical;
+
             let mut exex_txs = Vec::new();
             let mut event_rxs = Vec::new();
 
@@ -395,13 +402,22 @@ where
                 );
 
                 let exex_fut = install_fn(ctx);
-                // ExExes are optional, possibly third-party extensions: isolate them.
-                // Spawn NON-critical (a stop/error/panic must never shut the node
-                // down); panics are contained inside `run_isolated_exex_future`.
                 let label = format!("exex-{name}");
-                node_task_manager
-                    .get_spawner()
-                    .spawn_task(label.clone(), run_isolated_exex_future(label, exex_fut));
+                let spawner = node_task_manager.get_spawner();
+                if exex_critical {
+                    // Operator opted in: a load-bearing ExEx. Spawn CRITICAL so a
+                    // failure, panic, or clean exit propagates to the task manager
+                    // and shuts the node down.
+                    spawner.spawn_critical_task(
+                        label.clone(),
+                        run_critical_exex_future(label, exex_fut),
+                    );
+                } else {
+                    // Default: optional, possibly third-party extension. Spawn
+                    // NON-critical (a stop/error/panic must never shut the node
+                    // down); panics are contained inside `run_isolated_exex_future`.
+                    spawner.spawn_task(label.clone(), run_isolated_exex_future(label, exex_fut));
+                }
 
                 exex_txs.push((name, notif_tx));
                 event_rxs.push(event_rx);
@@ -418,13 +434,22 @@ where
                 exex_txs,
                 event_rxs,
             );
-            // Manager is non-critical too: if it dies, live ExEx delivery stops
-            // (logged loudly) but the node — host to an optional subsystem — stays up.
-            node_task_manager.get_spawner().spawn_task(
-                "exex-manager",
-                run_isolated_exex_future("exex-manager".to_string(), manager),
-            );
-            info!(target: "epoch-manager", "ExEx manager and tasks spawned (isolated, non-critical)");
+            // The manager follows the same policy as the ExEx tasks it serves.
+            if exex_critical {
+                node_task_manager.get_spawner().spawn_critical_task(
+                    "exex-manager",
+                    run_critical_exex_future("exex-manager".to_string(), manager),
+                );
+                info!(target: "epoch-manager", "ExEx manager and tasks spawned (critical)");
+            } else {
+                // Non-critical: if it dies, live ExEx delivery stops (logged
+                // loudly) but the node — host to an optional subsystem — stays up.
+                node_task_manager.get_spawner().spawn_task(
+                    "exex-manager",
+                    run_isolated_exex_future("exex-manager".to_string(), manager),
+                );
+                info!(target: "epoch-manager", "ExEx manager and tasks spawned (isolated, non-critical)");
+            }
         }
 
         node_task_manager.update_tasks();

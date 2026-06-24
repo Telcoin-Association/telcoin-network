@@ -35,6 +35,33 @@ where
     Ok(())
 }
 
+/// Run an ExEx future as a CRITICAL unit of work.
+///
+/// Used only when `Config::exex_critical` is set — i.e. the operator declared
+/// this ExEx load-bearing and wants its failure to stop the node. This is the
+/// opposite of [`run_isolated_exex_future`]:
+///
+/// - it does **not** `catch_unwind`, so a panic propagates to the task manager as a critical join
+///   error (node-wide shutdown);
+/// - a returned error maps to a [`TaskError`] (critical exit → shutdown);
+/// - a clean finish returns `Ok(())`; the task manager treats a resolved critical task as a
+///   shutdown trigger too (`CriticalExitOk`), unless the node is already shutting down.
+pub(super) async fn run_critical_exex_future<F>(label: String, fut: F) -> Result<(), TaskError>
+where
+    F: std::future::Future<Output = eyre::Result<()>> + Send,
+{
+    match fut.await {
+        Ok(()) => {
+            warn!(target: "exex", %label, "critical ExEx future finished; node will shut down");
+            Ok(())
+        }
+        Err(e) => {
+            error!(target: "exex", %label, ?e, "critical ExEx future failed; node will shut down");
+            Err(TaskError::from_message(format!("critical exex {label} failed: {e}")))
+        }
+    }
+}
+
 /// Extract a human-readable message from a caught panic payload.
 ///
 /// Panic payloads are `&'static str` (from `panic!("literal")`) or `String`
@@ -51,9 +78,11 @@ fn exex_panic_message(panic: &(dyn std::any::Any + Send)) -> String {
 
 #[cfg(test)]
 mod exex_isolation_tests {
-    //! ExEx task isolation (remediation finding #1): a buggy or finished ExEx
-    //! must never shut the node down.
-    use super::run_isolated_exex_future;
+    //! ExEx task spawning behavior. By default a buggy or finished ExEx is
+    //! isolated and must never shut the node down (remediation finding #1). When
+    //! `Config::exex_critical` is set, the operator has declared the ExEx
+    //! load-bearing and a failing one instead shuts the node down.
+    use super::{run_critical_exex_future, run_isolated_exex_future};
     use std::time::Duration;
     use tn_types::{Notifier, TaskError, TaskJoinError, TaskManager};
 
@@ -116,6 +145,44 @@ mod exex_isolation_tests {
         match task_manager.join(Notifier::default()).await {
             Err(TaskJoinError::CriticalExitError(name, _)) => {
                 assert_eq!(name, "node-alive", "shutdown must originate from the critical task");
+            }
+            other => panic!("unexpected join result: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn critical_exex_future_propagates_error_and_clean_finish() {
+        // The critical runner is the opposite of the isolated one: a failing
+        // ExEx surfaces as `Err(TaskError)` (which the task manager turns into a
+        // node-wide shutdown), while a clean finish returns `Ok(())` (the task
+        // manager treats a resolved critical task as a shutdown trigger too).
+        assert!(run_critical_exex_future("error".to_string(), async {
+            Err(eyre::eyre!("load-bearing exex failed"))
+        })
+        .await
+        .is_err());
+
+        assert!(run_critical_exex_future("done".to_string(), async { Ok(()) }).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn critical_exex_failure_shuts_down_node() {
+        // End-to-end counterpart to `panicking_exex_does_not_shut_down_node`: an
+        // ExEx spawned CRITICAL (exactly as `exex_critical = true` does) and
+        // wrapped by `run_critical_exex_future` MUST shut the node down when it
+        // fails. The join reports the critical exex as the shutdown origin.
+        let mut task_manager = TaskManager::default();
+
+        task_manager.spawn_critical_task(
+            "exex-critical",
+            run_critical_exex_future("exex-critical".to_string(), async {
+                Err(eyre::eyre!("load-bearing exex failed"))
+            }),
+        );
+
+        match task_manager.join(Notifier::default()).await {
+            Err(TaskJoinError::CriticalExitError(name, _)) => {
+                assert_eq!(name, "exex-critical", "shutdown must originate from the critical exex");
             }
             other => panic!("unexpected join result: {other:?}"),
         }
