@@ -41,8 +41,11 @@
 //! - [`consensus_chain`](TnExExContext::consensus_chain) — the consensus DB: consensus headers,
 //!   epoch records, and committed sub-DAGs by number or digest.
 //!
-//! Both are read-only in practice (their public surfaces expose no DB-mutating
-//! methods). See [`TnExExContext::reth_env`] for the available EVM reads.
+//! `reth_env` is read-only by construction — its public surface exposes no
+//! DB-mutating methods. `consensus_chain` is meant for reads too, but its public
+//! surface is *not* mutation-free; an ExEx must treat it as a read handle and
+//! never call its writing methods (see [`TnExExContext::consensus_chain`]). See
+//! [`TnExExContext::reth_env`] for the available EVM reads.
 //!
 //! # Replay vs. live: state-diff fidelity
 //!

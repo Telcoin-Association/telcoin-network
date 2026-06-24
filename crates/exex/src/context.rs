@@ -33,7 +33,8 @@ pub struct TnExExContext {
     events: mpsc::Sender<TnExExEvent>,
     /// Read-only handle to reth for EVM chain state and history.
     reth_env: RethEnv,
-    /// Read-only handle to the consensus chain (consensus DB).
+    /// Handle to the consensus chain (consensus DB); exposed for reads via
+    /// [`consensus_chain`](Self::consensus_chain).
     consensus_chain: ConsensusChain,
 }
 
@@ -73,12 +74,17 @@ impl TnExExContext {
         &self.reth_env
     }
 
-    /// Read-only handle to the consensus chain (the consensus DB).
+    /// Handle to the consensus chain (the consensus DB) — for reads only.
     ///
     /// Lets an ExEx read consensus-level data directly — consensus headers, epoch
     /// records, and committed sub-DAGs by number or digest — alongside the
-    /// EVM-level reads available through [`reth_env`](Self::reth_env). Like
-    /// `reth_env`, treat it as read-only.
+    /// EVM-level reads available through [`reth_env`](Self::reth_env).
+    ///
+    /// Unlike `reth_env`, whose public surface is mutation-free, `ConsensusChain`
+    /// also exposes DB-mutating methods, and this handle shares state with the
+    /// live consensus writer (it is `Clone` over `Arc`). Use it for **reads
+    /// only**: calling a mutating method would corrupt the follower's consensus
+    /// DB. The read-only contract here is by convention, not enforced by the type.
     pub fn consensus_chain(&self) -> &ConsensusChain {
         &self.consensus_chain
     }
