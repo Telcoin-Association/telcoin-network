@@ -451,8 +451,6 @@ impl<DB: Database> Consensus<DB> {
                 let leader_created = *committed_sub_dag.leader().created_at();
                 metrics.commit_latency_seconds.record(now().saturating_sub(leader_created) as f64);
 
-                self.consensus_bus.app().notify_exex_committed_sub_dag(&committed_sub_dag);
-
                 // NOTE: The size of the sub-dag can be arbitrarily large (depending on the network
                 // condition and Byzantine leaders).
                 self.consensus_bus

@@ -1,10 +1,9 @@
 //! ExEx Manager — fans out lifecycle notifications to all registered ExExes.
 //!
-//! The manager subscribes to 4 sources:
-//! 1. Own certificates (from ConsensusBus)
-//! 2. Peer certificates (from ConsensusBus)
-//! 3. Committed sub-DAGs (from ConsensusBus)
-//! 4. Canonical state notifications (from reth's BlockchainProvider)
+//! The manager subscribes to 3 sources:
+//! 1. Verified certificates (from ConsensusBus, consensus-following path)
+//! 2. Full consensus outputs (from ConsensusBus, consensus-following path)
+//! 3. Canonical state notifications (from reth's BlockchainProvider)
 //!
 //! It wraps each into the appropriate [`TnExExNotification`] variant and fans out
 //! to all registered ExExes using non-blocking `try_send`.
@@ -12,8 +11,8 @@
 //! # Delivery contract
 //!
 //! Fan-out never blocks: a slow ExEx that fills its bounded channel has
-//! notifications dropped rather than back-pressuring consensus or execution.
-//! Drops are not silent — the next successful delivery is preceded by a
+//! notifications dropped rather than back-pressuring the node. Drops are not
+//! silent — the next successful delivery is preceded by a
 //! [`TnExExNotification::Lagged`] marker carrying a best-effort count, so the
 //! ExEx can detect the gap and reconcile via [`replay`](crate::replay).
 
@@ -26,7 +25,7 @@ use std::{
     task::{Context, Poll},
 };
 use tn_reth::CanonStateNotificationStream;
-use tn_types::{BlockNumber, Certificate, CommittedSubDag};
+use tn_types::{BlockNumber, Certificate, ConsensusOutput};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tracing::{debug, error, warn};
@@ -124,12 +123,10 @@ impl ExExHandle {
 pub struct TnExExManager {
     /// Subscription to canonical state notifications from reth's BlockchainProvider.
     canon_state_stream: CanonStateNotificationStream,
-    /// Stream of own certificates from ConsensusBus.
-    own_certs_stream: BroadcastStream<Certificate>,
-    /// Stream of peer certificates from ConsensusBus.
-    peer_certs_stream: BroadcastStream<Certificate>,
-    /// Stream of committed sub-DAGs from ConsensusBus.
-    committed_sub_dags_stream: BroadcastStream<Arc<CommittedSubDag>>,
+    /// Stream of verified certificates from the consensus-following path.
+    certs_stream: BroadcastStream<Certificate>,
+    /// Stream of full consensus outputs from the consensus-following path.
+    consensus_output_stream: BroadcastStream<ConsensusOutput>,
     /// Per-ExEx delivery state (one per registered ExEx).
     exexes: Vec<ExExHandle>,
     /// Watch sender for the minimum finished height across all ExExes.
@@ -144,9 +141,8 @@ impl TnExExManager {
     /// Create a new ExEx manager.
     pub fn new(
         canon_state_stream: CanonStateNotificationStream,
-        rx_own_certs: broadcast::Receiver<Certificate>,
-        rx_peer_certs: broadcast::Receiver<Certificate>,
-        rx_committed_sub_dags: broadcast::Receiver<Arc<CommittedSubDag>>,
+        rx_certs: broadcast::Receiver<Certificate>,
+        rx_consensus_output: broadcast::Receiver<ConsensusOutput>,
         exex_txs: Vec<(String, mpsc::Sender<TnExExNotification>)>,
         event_rxs: Vec<mpsc::Receiver<TnExExEvent>>,
     ) -> (Self, TnExExManagerHandle) {
@@ -159,9 +155,8 @@ impl TnExExManager {
 
         let manager = Self {
             canon_state_stream,
-            own_certs_stream: BroadcastStream::new(rx_own_certs),
-            peer_certs_stream: BroadcastStream::new(rx_peer_certs),
-            committed_sub_dags_stream: BroadcastStream::new(rx_committed_sub_dags),
+            certs_stream: BroadcastStream::new(rx_certs),
+            consensus_output_stream: BroadcastStream::new(rx_consensus_output),
             exexes,
             min_finished_height_tx,
             last_canon_tip: None,
@@ -229,65 +224,41 @@ impl futures::Future for TnExExManager {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
-        // Poll own certificates stream
+        // Poll verified certificates stream (consensus-following path)
         loop {
-            match this.own_certs_stream.poll_next_unpin(cx) {
+            match this.certs_stream.poll_next_unpin(cx) {
                 Poll::Ready(Some(Ok(cert))) => {
-                    let notification = TnExExNotification::CertificateAccepted {
-                        certificate: Box::new(cert),
-                        is_own: true,
-                    };
+                    let notification =
+                        TnExExNotification::CertificateAccepted { certificate: Box::new(cert) };
                     this.fan_out(&notification);
                 }
                 Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(n)))) => {
                     // Surface the broadcast lag so the `Lagged` contract is uniform
                     // across every manager-side input, not just the canon stream.
                     this.fan_out(&TnExExNotification::Lagged { missed: n });
-                    warn!(target: "exex::manager", missed = n, "own certificates stream lagged; surfaced Lagged");
+                    warn!(target: "exex::manager", missed = n, "certificates stream lagged; surfaced Lagged");
                 }
                 Poll::Ready(None) => {
-                    debug!(target: "exex::manager", "own certificates stream ended");
+                    debug!(target: "exex::manager", "certificates stream ended");
                     return Poll::Ready(Ok(()));
                 }
                 Poll::Pending => break,
             }
         }
 
-        // Poll peer certificates stream
+        // Poll consensus output stream (consensus-following path)
         loop {
-            match this.peer_certs_stream.poll_next_unpin(cx) {
-                Poll::Ready(Some(Ok(cert))) => {
-                    let notification = TnExExNotification::CertificateAccepted {
-                        certificate: Box::new(cert),
-                        is_own: false,
-                    };
+            match this.consensus_output_stream.poll_next_unpin(cx) {
+                Poll::Ready(Some(Ok(output))) => {
+                    let notification = TnExExNotification::ConsensusOutput { output };
                     this.fan_out(&notification);
                 }
                 Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(n)))) => {
                     this.fan_out(&TnExExNotification::Lagged { missed: n });
-                    warn!(target: "exex::manager", missed = n, "peer certificates stream lagged; surfaced Lagged");
+                    warn!(target: "exex::manager", missed = n, "consensus output stream lagged; surfaced Lagged");
                 }
                 Poll::Ready(None) => {
-                    debug!(target: "exex::manager", "peer certificates stream ended");
-                    return Poll::Ready(Ok(()));
-                }
-                Poll::Pending => break,
-            }
-        }
-
-        // Poll committed sub-DAGs stream
-        loop {
-            match this.committed_sub_dags_stream.poll_next_unpin(cx) {
-                Poll::Ready(Some(Ok(sub_dag))) => {
-                    let notification = TnExExNotification::ConsensusCommitted { sub_dag };
-                    this.fan_out(&notification);
-                }
-                Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(n)))) => {
-                    this.fan_out(&TnExExNotification::Lagged { missed: n });
-                    warn!(target: "exex::manager", missed = n, "committed sub-dags stream lagged; surfaced Lagged");
-                }
-                Poll::Ready(None) => {
-                    debug!(target: "exex::manager", "committed sub-dags stream ended");
+                    debug!(target: "exex::manager", "consensus output stream ended");
                     return Poll::Ready(Ok(()));
                 }
                 Poll::Pending => break,

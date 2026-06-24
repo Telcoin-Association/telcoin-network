@@ -375,10 +375,10 @@ where
             let reth_env = engine.get_reth_env().await;
             let canon_stream = reth_env.canonical_block_stream();
 
-            // Subscribe to ConsensusBus broadcast channels for ExEx
-            let rx_own_certs = self.consensus_bus.subscribe_exex_own_certificates();
-            let rx_peer_certs = self.consensus_bus.subscribe_exex_peer_certificates();
-            let rx_committed_sub_dags = self.consensus_bus.subscribe_exex_committed_sub_dags();
+            // Subscribe to ConsensusBus broadcast channels for ExEx (fed from the
+            // consensus-following path, not the validator hot path).
+            let rx_certs = self.consensus_bus.subscribe_exex_certificates();
+            let rx_consensus_output = self.consensus_bus.subscribe_exex_consensus_output();
 
             let mut exex_txs = Vec::new();
             let mut event_rxs = Vec::new();
@@ -412,9 +412,8 @@ where
             // dropped. See `tn_exex::TnExExEvent::FinishedHeight`.
             let (manager, _handle) = tn_exex::TnExExManager::new(
                 canon_stream,
-                rx_own_certs,
-                rx_peer_certs,
-                rx_committed_sub_dags,
+                rx_certs,
+                rx_consensus_output,
                 exex_txs,
                 event_rxs,
             );

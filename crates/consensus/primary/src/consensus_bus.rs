@@ -224,15 +224,18 @@ pub struct ConsensusBusAppInner {
     /// Engine consumes and executes to extend canonical chain.
     consensus_output: broadcast::Sender<ConsensusOutput>,
 
-    /// Broadcast channel for own certificates (ExEx).
-    /// Sent after our header is certified.
-    exex_own_certificates: broadcast::Sender<Certificate>,
-    /// Broadcast channel for peer certificates (ExEx).
-    /// Sent when a peer certificate is accepted and forwarded to consensus.
-    exex_peer_certificates: broadcast::Sender<Certificate>,
-    /// Broadcast channel for committed sub-DAGs (ExEx).
-    /// Sent when Bullshark commits a sub-DAG.
-    exex_committed_sub_dags: broadcast::Sender<Arc<CommittedSubDag>>,
+    /// Broadcast channel for verified certificates (ExEx).
+    ///
+    /// Fed from the consensus-following path (gossip-verified certificates on
+    /// Observer / inactive-CVV nodes), never from the validator hot path. There
+    /// is no own/peer split — a follower has no certificates of its own.
+    exex_certificates: broadcast::Sender<Certificate>,
+    /// Broadcast channel for the full consensus output (ExEx).
+    ///
+    /// Fed from the consensus-following path when a `ConsensusHeader` is
+    /// reconstructed into a `ConsensusOutput` for execution. `ConsensusOutput`
+    /// is cheap to clone (Arc-backed), so no outer `Arc` is needed.
+    exex_consensus_output: broadcast::Sender<ConsensusOutput>,
 
     /// Status of sync?
     tx_sync_status: watch::Sender<NodeMode>,
@@ -293,9 +296,8 @@ impl ConsensusBusApp {
         let (consensus_header, _rx_consensus_header) = broadcast::channel(CHANNEL_CAPACITY);
         let (consensus_output, _rx_consensus_output) = broadcast::channel(100);
 
-        let (exex_own_certificates, _) = broadcast::channel(CHANNEL_CAPACITY);
-        let (exex_peer_certificates, _) = broadcast::channel(CHANNEL_CAPACITY);
-        let (exex_committed_sub_dags, _) = broadcast::channel(CHANNEL_CAPACITY);
+        let (exex_certificates, _) = broadcast::channel(CHANNEL_CAPACITY);
+        let (exex_consensus_output, _) = broadcast::channel(CHANNEL_CAPACITY);
 
         let (tx_epoch_record, _) = watch::channel(None);
 
@@ -312,9 +314,8 @@ impl ConsensusBusApp {
                 tx_last_published_consensus_num_hash,
                 consensus_header,
                 consensus_output,
-                exex_own_certificates,
-                exex_peer_certificates,
-                exex_committed_sub_dags,
+                exex_certificates,
+                exex_consensus_output,
                 tx_sync_status,
                 new_epoch_votes: QueChannel::new(),
                 tx_epoch_record,
@@ -548,66 +549,52 @@ impl ConsensusBusApp {
         self.inner.consensus_header.subscribe()
     }
 
-    /// Broadcast sender for own certificates (ExEx).
-    pub fn exex_own_certificates(&self) -> &broadcast::Sender<Certificate> {
-        &self.inner.exex_own_certificates
+    /// Broadcast sender for verified certificates (ExEx).
+    pub fn exex_certificates(&self) -> &broadcast::Sender<Certificate> {
+        &self.inner.exex_certificates
     }
 
-    /// Broadcast sender for peer certificates (ExEx).
-    pub fn exex_peer_certificates(&self) -> &broadcast::Sender<Certificate> {
-        &self.inner.exex_peer_certificates
-    }
-
-    /// Broadcast sender for committed sub-DAGs (ExEx).
-    pub fn exex_committed_sub_dags(&self) -> &broadcast::Sender<Arc<CommittedSubDag>> {
-        &self.inner.exex_committed_sub_dags
+    /// Broadcast sender for the full consensus output (ExEx).
+    pub fn exex_consensus_output(&self) -> &broadcast::Sender<ConsensusOutput> {
+        &self.inner.exex_consensus_output
     }
 
     /// Send `value` on `sender` only when at least one ExEx receiver is listening.
     ///
     /// The clone is skipped entirely when no ExEx is registered — the broadcast
-    /// payload can be arbitrarily large on the sub-DAG path, so this guard keeps the
-    /// hot path cheap.
+    /// payload (a full `ConsensusOutput`) can be large, so this guard keeps the
+    /// follow path cheap when nobody is listening.
     fn notify_exex<T: Clone>(sender: &broadcast::Sender<T>, value: &T) {
         if sender.receiver_count() > 0 {
             let _ = sender.send(value.clone());
         }
     }
 
-    /// Notify ExEx subscribers about a certificate produced by this node.
-    pub fn notify_exex_own_certificate(&self, certificate: &Certificate) {
-        Self::notify_exex(&self.inner.exex_own_certificates, certificate);
-    }
-
-    /// Notify ExEx subscribers about an accepted peer certificate.
-    pub fn notify_exex_peer_certificate(&self, certificate: &Certificate) {
-        Self::notify_exex(&self.inner.exex_peer_certificates, certificate);
-    }
-
-    /// Notify ExEx subscribers about a committed sub-DAG.
+    /// Notify ExEx subscribers about a verified certificate.
     ///
-    /// The sub-DAG clone is O(n) and can be arbitrarily large (Byzantine leaders),
-    /// so it is skipped entirely when no ExEx is listening.
-    pub fn notify_exex_committed_sub_dag(&self, sub_dag: &CommittedSubDag) {
-        let sender = &self.inner.exex_committed_sub_dags;
-        if sender.receiver_count() > 0 {
-            let _ = sender.send(Arc::new(sub_dag.clone()));
-        }
+    /// Called from the consensus-following path (Observer / inactive CVV) after a
+    /// gossiped certificate verifies against its committee — never from the
+    /// validator hot path.
+    pub fn notify_exex_certificate(&self, certificate: &Certificate) {
+        Self::notify_exex(&self.inner.exex_certificates, certificate);
     }
 
-    /// Subscribe to own certificate notifications (ExEx).
-    pub fn subscribe_exex_own_certificates(&self) -> broadcast::Receiver<Certificate> {
-        self.inner.exex_own_certificates.subscribe()
+    /// Notify ExEx subscribers about a full consensus output.
+    ///
+    /// Called from the consensus-following path when a `ConsensusHeader` is
+    /// reconstructed into a `ConsensusOutput` for execution.
+    pub fn notify_exex_consensus_output(&self, output: &ConsensusOutput) {
+        Self::notify_exex(&self.inner.exex_consensus_output, output);
     }
 
-    /// Subscribe to peer certificate notifications (ExEx).
-    pub fn subscribe_exex_peer_certificates(&self) -> broadcast::Receiver<Certificate> {
-        self.inner.exex_peer_certificates.subscribe()
+    /// Subscribe to verified certificate notifications (ExEx).
+    pub fn subscribe_exex_certificates(&self) -> broadcast::Receiver<Certificate> {
+        self.inner.exex_certificates.subscribe()
     }
 
-    /// Subscribe to committed sub-DAG notifications (ExEx).
-    pub fn subscribe_exex_committed_sub_dags(&self) -> broadcast::Receiver<Arc<CommittedSubDag>> {
-        self.inner.exex_committed_sub_dags.subscribe()
+    /// Subscribe to full consensus output notifications (ExEx).
+    pub fn subscribe_exex_consensus_output(&self) -> broadcast::Receiver<ConsensusOutput> {
+        self.inner.exex_consensus_output.subscribe()
     }
 
     /// Will resolve once we have executed block.
@@ -1031,30 +1018,25 @@ mod exex_receiver_count_tests {
 
     #[test]
     fn exex_senders_have_no_receivers_until_subscribed() {
-        // The hot-path send sites guard on `receiver_count() > 0` so they skip the
-        // (potentially large) clone+send when no ExEx is registered. That
+        // The follow-path send sites guard on `receiver_count() > 0` so they skip
+        // the (potentially large) clone+send when no ExEx is registered. That
         // optimization relies on the bus starting with zero ExEx receivers — the
         // initial receivers are dropped at construction.
         let bus = ConsensusBusApp::new();
-        assert_eq!(bus.exex_own_certificates().receiver_count(), 0);
-        assert_eq!(bus.exex_peer_certificates().receiver_count(), 0);
-        assert_eq!(bus.exex_committed_sub_dags().receiver_count(), 0);
+        assert_eq!(bus.exex_certificates().receiver_count(), 0);
+        assert_eq!(bus.exex_consensus_output().receiver_count(), 0);
 
         // Subscribing (as the ExEx manager does) makes the guards fire.
-        let own = bus.subscribe_exex_own_certificates();
-        let peer = bus.subscribe_exex_peer_certificates();
-        let sub_dags = bus.subscribe_exex_committed_sub_dags();
-        assert_eq!(bus.exex_own_certificates().receiver_count(), 1);
-        assert_eq!(bus.exex_peer_certificates().receiver_count(), 1);
-        assert_eq!(bus.exex_committed_sub_dags().receiver_count(), 1);
+        let certs = bus.subscribe_exex_certificates();
+        let output = bus.subscribe_exex_consensus_output();
+        assert_eq!(bus.exex_certificates().receiver_count(), 1);
+        assert_eq!(bus.exex_consensus_output().receiver_count(), 1);
 
         // Dropping the subscriptions (e.g. the non-critical manager dies) returns
         // to zero, so the guards skip work again.
-        drop(own);
-        drop(peer);
-        drop(sub_dags);
-        assert_eq!(bus.exex_own_certificates().receiver_count(), 0);
-        assert_eq!(bus.exex_peer_certificates().receiver_count(), 0);
-        assert_eq!(bus.exex_committed_sub_dags().receiver_count(), 0);
+        drop(certs);
+        drop(output);
+        assert_eq!(bus.exex_certificates().receiver_count(), 0);
+        assert_eq!(bus.exex_consensus_output().receiver_count(), 0);
     }
 }

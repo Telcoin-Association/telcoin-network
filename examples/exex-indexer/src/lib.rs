@@ -166,7 +166,7 @@ pub async fn indexer_exex(mut ctx: TnExExContext) -> eyre::Result<()> {
             // signals are ignored (handled explicitly so a new variant won't be
             // silently dropped).
             TnExExNotification::CertificateAccepted { .. }
-            | TnExExNotification::ConsensusCommitted { .. } => {}
+            | TnExExNotification::ConsensusOutput { .. } => {}
         }
     }
 

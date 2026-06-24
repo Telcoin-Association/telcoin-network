@@ -1,8 +1,10 @@
 //! Example ExEx: Transaction Lifecycle Tracker
 //!
-//! This ExEx demonstrates every notification type in TN's ExEx system:
-//! 1. **CertificateAccepted** — a header is certified (own or peer)
-//! 2. **ConsensusCommitted** — a sub-DAG is committed by Bullshark
+//! This ExEx demonstrates every notification type in TN's ExEx system. All of
+//! them are produced by the consensus-following (observer) path, not the
+//! validator hot path:
+//! 1. **CertificateAccepted** — a gossip-verified header is certified
+//! 2. **ConsensusOutput** — a full consensus output is reconstructed for execution
 //! 3. **ChainExecuted** — blocks are executed and finalized
 //! 4. **Lagged** — the ExEx fell behind and notifications were dropped
 //!
@@ -48,27 +50,29 @@ pub async fn lifecycle_tracker_exex(mut ctx: TnExExContext) -> eyre::Result<()> 
 
     while let Some(notification) = ctx.notifications.recv().await {
         match notification {
-            TnExExNotification::CertificateAccepted { certificate, is_own } => {
-                // Stage 1: A header has been certified.
-                // The certificate's batches are now included in the consensus DAG.
-                let origin = if is_own { "own" } else { "peer" };
+            TnExExNotification::CertificateAccepted { certificate } => {
+                // Stage 1: A gossip-verified header has been certified on the
+                // consensus-following path. Its batches are now included in the
+                // consensus DAG. Followers have no certificates of their own, so
+                // there is no own/peer distinction.
                 info!(
                     target: "exex::lifecycle",
                     round = certificate.round(),
-                    origin = origin,
                     num_batches = certificate.header().payload().len(),
                     "Certificate accepted"
                 );
             }
 
-            TnExExNotification::ConsensusCommitted { sub_dag } => {
-                // Stage 2: A sub-DAG has been committed by Bullshark.
-                // The certificates are now ordered and will be executed.
+            TnExExNotification::ConsensusOutput { output } => {
+                // Stage 2: A full consensus output was reconstructed from a
+                // verified consensus header. Its certificates are ordered and
+                // will be executed.
+                let sub_dag = output.sub_dag();
                 info!(
                     target: "exex::lifecycle",
                     leader_round = sub_dag.leader().round(),
                     num_certificates = sub_dag.len(),
-                    "Consensus committed sub-DAG"
+                    "Consensus output reconstructed"
                 );
             }
 
