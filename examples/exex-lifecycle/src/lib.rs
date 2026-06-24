@@ -14,7 +14,7 @@
 //! running node — so this is a library crate rather than a binary. Register it
 //! with `TnBuilder::install_exex` (see [`lifecycle_tracker_exex`]).
 
-use tn_exex::{TnExExContext, TnExExEvent, TnExExNotification};
+use tn_exex::{TnExExContext, TnExExNotification};
 use tn_types::BlockHeader as _;
 use tracing::{debug, info, warn};
 
@@ -48,7 +48,7 @@ use tracing::{debug, info, warn};
 pub async fn lifecycle_tracker_exex(mut ctx: TnExExContext) -> eyre::Result<()> {
     info!(target: "exex::lifecycle", "Lifecycle tracker ExEx started");
 
-    while let Some(notification) = ctx.notifications.recv().await {
+    while let Some(notification) = ctx.next_notification().await {
         match notification {
             TnExExNotification::CertificateAccepted { certificate } => {
                 // Stage 1: A gossip-verified header has been certified on the
@@ -108,10 +108,10 @@ pub async fn lifecycle_tracker_exex(mut ctx: TnExExContext) -> eyre::Result<()> 
                 );
 
                 // Report finished height so the node knows we've processed up to
-                // here. `try_send` is non-blocking; `FinishedHeight` is
-                // latest-wins, so a dropped report on a momentarily-full channel
-                // is harmless (the next report carries a higher height).
-                let _ = ctx.events.try_send(TnExExEvent::FinishedHeight(tip_number));
+                // here. `report_finished_height` is non-blocking and latest-wins,
+                // so a dropped report on a momentarily-full channel is harmless
+                // (the next report carries a higher height).
+                ctx.report_finished_height(tip_number);
             }
 
             TnExExNotification::Lagged { missed } => {

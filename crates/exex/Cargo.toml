@@ -11,6 +11,7 @@ description = "Execution Extensions (ExEx) plugin system for Telcoin Network."
 
 [dependencies]
 tn-reth = { workspace = true }
+tn-storage = { workspace = true }
 tn-types = { workspace = true }
 reth-execution-types = { workspace = true }
 reth-provider = { workspace = true }

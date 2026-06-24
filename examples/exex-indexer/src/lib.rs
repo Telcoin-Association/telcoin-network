@@ -27,8 +27,9 @@
 //! # Why not `replay_and_subscribe`?
 //!
 //! [`TnExExContext::replay_and_subscribe`] is the simplest catch-up path, but it
-//! consumes the context (dropping the [`events`] sender) and returns one combined
-//! stream — so it can't both report `FinishedHeight` *and* re-replay to reconcile
+//! consumes the context (dropping the event sender, so progress can no longer be
+//! reported) and returns one combined stream — so it can't both report
+//! [`FinishedHeight`] via [`report_finished_height`] *and* re-replay to reconcile
 //! a `Lagged`. This example uses [`replay_from`] plus the live channel directly to
 //! keep that control. Reach for `replay_and_subscribe` when your ExEx needs
 //! neither.
@@ -36,7 +37,7 @@
 //! [`ChainExecuted`]: tn_exex::TnExExNotification::ChainExecuted
 //! [`Lagged`]: tn_exex::TnExExNotification::Lagged
 //! [`FinishedHeight`]: tn_exex::TnExExEvent::FinishedHeight
-//! [`events`]: tn_exex::TnExExContext::events
+//! [`report_finished_height`]: tn_exex::TnExExContext::report_finished_height
 //! [`replay_from`]: tn_exex::TnExExContext::replay_from
 //! [`TnExExContext::replay_from`]: tn_exex::TnExExContext::replay_from
 //! [`TnExExContext::replay_and_subscribe`]: tn_exex::TnExExContext::replay_and_subscribe
@@ -44,7 +45,7 @@
 
 use futures::StreamExt as _;
 use std::collections::BTreeMap;
-use tn_exex::{Chain, TnExExContext, TnExExEvent, TnExExNotification};
+use tn_exex::{Chain, TnExExContext, TnExExNotification};
 use tn_types::{BlockHeader as _, BlockNumber};
 use tracing::{info, warn};
 
@@ -150,7 +151,7 @@ pub async fn indexer_exex(mut ctx: TnExExContext) -> eyre::Result<()> {
     catch_up(&mut indexer, &ctx).await?;
 
     // 2. Follow live notifications.
-    while let Some(notification) = ctx.notifications.recv().await {
+    while let Some(notification) = ctx.next_notification().await {
         match notification {
             TnExExNotification::ChainExecuted { new } => {
                 indexer.index_chain(&new);
@@ -181,7 +182,7 @@ async fn catch_up(indexer: &mut Indexer, ctx: &TnExExContext) -> eyre::Result<()
     // catch-up target. It also exposes block/receipt/state reads for indexers that
     // need more than the notification payload (e.g. account state on the replay
     // path, where the `BundleState` is empty).
-    let tip = ctx.reth_env.last_block_number()?;
+    let tip = ctx.reth_env().last_block_number()?;
     info!(target: "exex::indexer", start, tip, "catching up via replay");
 
     let mut replay = ctx.replay_from(start)?;
@@ -198,7 +199,7 @@ async fn catch_up(indexer: &mut Indexer, ctx: &TnExExContext) -> eyre::Result<()
 /// Report durable progress to the node (non-blocking; latest-wins).
 fn report_progress(ctx: &TnExExContext, indexer: &Indexer) {
     if let Some(height) = indexer.last_indexed {
-        let _ = ctx.events.try_send(TnExExEvent::FinishedHeight(height));
+        ctx.report_finished_height(height);
     }
 }
 

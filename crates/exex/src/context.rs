@@ -4,32 +4,54 @@ use crate::{replay::ReplayStream, TnExExEvent, TnExExNotification};
 use futures::{stream, StreamExt};
 use std::pin::Pin;
 use tn_reth::RethEnv;
+use tn_storage::consensus::ConsensusChain;
 use tn_types::{BlockHeader as _, BlockNumber};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 /// Everything an ExEx needs to operate, provided at launch.
 ///
-/// Each ExEx receives its own context with:
-/// - A notification stream covering the full transaction lifecycle
-/// - An event channel to report processing progress
-/// - Access to reth's blockchain provider for querying chain state
+/// Each ExEx receives its own context, which gives it:
+/// - live lifecycle notifications via [`next_notification`](Self::next_notification) (or
+///   [`replay_and_subscribe`](Self::replay_and_subscribe) for replay-then-live),
+/// - progress reporting back to the node via
+///   [`report_finished_height`](Self::report_finished_height),
+/// - read-only chain access via [`reth_env`](Self::reth_env) (EVM state) and
+///   [`consensus_chain`](Self::consensus_chain) (consensus DB).
+///
+/// Fields are private on purpose: an ExEx interacts with the context only
+/// through these methods, so third-party ExEx code cannot, for example, `await`
+/// a send that would back-pressure the manager.
 #[derive(Debug)]
 pub struct TnExExContext {
-    /// Async stream of lifecycle notifications (certificates, commits, executions).
+    /// Async stream of lifecycle notifications. Live delivery is best-effort
+    /// (see [`TnExExNotification`]); replay is the authoritative catch-up path.
+    notifications: mpsc::Receiver<TnExExNotification>,
+    /// Bounded channel to report events (e.g. `FinishedHeight`) back to the
+    /// manager. Only ever written via a non-blocking `try_send`, in
+    /// [`report_finished_height`](Self::report_finished_height).
+    events: mpsc::Sender<TnExExEvent>,
+    /// Read-only handle to reth for EVM chain state and history.
+    reth_env: RethEnv,
+    /// Read-only handle to the consensus chain (consensus DB).
+    consensus_chain: ConsensusChain,
+}
+
+impl TnExExContext {
+    /// Create a new ExEx context.
     ///
-    /// Live delivery is best-effort (see [`TnExExNotification`]); replay is the
-    /// authoritative catch-up path.
-    pub notifications: mpsc::Receiver<TnExExNotification>,
-    /// Bounded channel to report events (e.g., `FinishedHeight`) back to the
-    /// manager.
-    ///
-    /// Report with a non-blocking `try_send` — `FinishedHeight` is latest-wins,
-    /// so dropping an intermediate report when the channel is momentarily full is
-    /// harmless (the next report carries a higher height). Never `await` a send
-    /// here; an ExEx must not be able to back-pressure the manager.
-    pub events: mpsc::Sender<TnExExEvent>,
-    /// Read-only handle to reth for querying chain state and history.
+    /// Called by the node when launching an ExEx; third-party ExEx code never
+    /// constructs this directly.
+    pub fn new(
+        notifications: mpsc::Receiver<TnExExNotification>,
+        events: mpsc::Sender<TnExExEvent>,
+        reth_env: RethEnv,
+        consensus_chain: ConsensusChain,
+    ) -> Self {
+        Self { notifications, events, reth_env, consensus_chain }
+    }
+
+    /// Read-only handle to reth for querying EVM chain state and history.
     ///
     /// `RethEnv`'s public surface exposes no DB-mutating methods, so ExExes use it
     /// for reads only. It is *not* a write capability; ExEx code must treat it as
@@ -47,10 +69,40 @@ pub struct TnExExContext {
     ///   empty `BundleState`); this is what [`replay_from`](Self::replay_from) uses.
     /// - `latest()` — a state provider for account/storage queries against the latest committed
     ///   state.
-    pub reth_env: RethEnv,
-}
+    pub fn reth_env(&self) -> &RethEnv {
+        &self.reth_env
+    }
 
-impl TnExExContext {
+    /// Read-only handle to the consensus chain (the consensus DB).
+    ///
+    /// Lets an ExEx read consensus-level data directly — consensus headers, epoch
+    /// records, and committed sub-DAGs by number or digest — alongside the
+    /// EVM-level reads available through [`reth_env`](Self::reth_env). Like
+    /// `reth_env`, treat it as read-only.
+    pub fn consensus_chain(&self) -> &ConsensusChain {
+        &self.consensus_chain
+    }
+
+    /// Report durable progress to the node (non-blocking; latest-wins).
+    ///
+    /// Sends [`TnExExEvent::FinishedHeight`] with a non-blocking `try_send`, so an
+    /// ExEx can never back-pressure the manager — "never await a send" is enforced
+    /// here by construction rather than by convention. `FinishedHeight` is
+    /// latest-wins, so dropping an intermediate report when the channel is
+    /// momentarily full is harmless: the next report carries a higher height.
+    pub fn report_finished_height(&self, height: BlockNumber) {
+        let _ = self.events.try_send(TnExExEvent::FinishedHeight(height));
+    }
+
+    /// Await the next live notification, or `None` once the channel closes.
+    ///
+    /// This is the live-consumption path. For startup catch-up, replay first via
+    /// [`replay_from`](Self::replay_from) or
+    /// [`replay_and_subscribe`](Self::replay_and_subscribe).
+    pub async fn next_notification(&mut self) -> Option<TnExExNotification> {
+        self.notifications.recv().await
+    }
+
     /// Replay historical blocks from `start_block` to the current chain tip.
     ///
     /// Returns a stream of [`TnExExNotification::ChainExecuted`] for each
@@ -95,14 +147,15 @@ impl TnExExContext {
     /// [`replay_from`](Self::replay_from) for replay state-diff fidelity.
     ///
     /// Note: this consumes `self` because the live notification stream is moved
-    /// into the returned combined stream. The [`events`](Self::events) sender is
-    /// dropped, so use [`replay_from`](Self::replay_from) directly if you need to
+    /// into the returned combined stream. The event sender is dropped, so
+    /// [`report_finished_height`](Self::report_finished_height) can no longer be
+    /// called — use [`replay_from`](Self::replay_from) directly if you need to
     /// keep reporting `FinishedHeight` while catching up.
     pub fn replay_and_subscribe(
         self,
         start_block: BlockNumber,
     ) -> impl futures::Stream<Item = eyre::Result<TnExExNotification>> {
-        let TnExExContext { notifications, reth_env, events: _ } = self;
+        let TnExExContext { notifications, reth_env, events: _, consensus_chain: _ } = self;
 
         // Live notifications buffered since context creation (wrapped as `Ok`).
         let live = ReceiverStream::new(notifications).map(Ok);
@@ -118,8 +171,12 @@ impl TnExExContext {
                 })),
             };
 
-        // De-duplicate by monotonic execution height so the overlap window is
-        // not delivered twice.
+        // Guard the replay/live overlap window: while replay runs, live blocks
+        // are buffered on `notifications`, so a block in `[start_block, tip]` can
+        // arrive via BOTH the replay range and the buffered live channel.
+        // De-duplicating by monotonic execution height drops the second copy.
+        // This is unrelated to BFT/reorgs (TN has none) — it is purely the
+        // replay/live seam.
         dedup_chain_executed(replay.chain(live))
     }
 }
@@ -139,7 +196,7 @@ fn keep_height(last_height: &mut Option<BlockNumber>, height: BlockNumber) -> bo
 }
 
 /// Drop any `ChainExecuted` notification whose height was already delivered,
-/// keeping the stream monotonic. Non-execution items (errors, certificate/commit
+/// keeping the stream monotonic. Non-execution items (errors, certificate/output
 /// signals, `Lagged` markers) have no height and always pass through.
 fn dedup_chain_executed(
     stream: impl futures::Stream<Item = eyre::Result<TnExExNotification>>,

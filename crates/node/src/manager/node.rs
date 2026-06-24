@@ -387,11 +387,12 @@ where
                 let (notif_tx, notif_rx) = mpsc::channel(capacity);
                 let (event_tx, event_rx) = mpsc::channel(EXEX_EVENT_CAPACITY);
 
-                let ctx = tn_exex::TnExExContext {
-                    notifications: notif_rx,
-                    events: event_tx,
-                    reth_env: reth_env.clone(),
-                };
+                let ctx = tn_exex::TnExExContext::new(
+                    notif_rx,
+                    event_tx,
+                    reth_env.clone(),
+                    self.consensus_chain.clone(),
+                );
 
                 let exex_fut = install_fn(ctx);
                 // ExExes are optional, possibly third-party extensions: isolate them.

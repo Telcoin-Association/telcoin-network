@@ -33,10 +33,16 @@
 //!
 //! ## Reading chain state
 //!
-//! Beyond the notification payload, [`reth_env`](TnExExContext::reth_env) is the
-//! ExEx's handle for reading the chain — historical blocks, headers, receipts, and
-//! account/storage state. See [`TnExExContext::reth_env`] for the available reads;
-//! it is read-only in practice (its public surface exposes no DB-mutating methods).
+//! Beyond the notification payload, an ExEx has two read-only handles into the
+//! node's databases:
+//!
+//! - [`reth_env`](TnExExContext::reth_env) — EVM chain state and history: historical blocks,
+//!   headers, receipts, and account/storage state.
+//! - [`consensus_chain`](TnExExContext::consensus_chain) — the consensus DB: consensus headers,
+//!   epoch records, and committed sub-DAGs by number or digest.
+//!
+//! Both are read-only in practice (their public surfaces expose no DB-mutating
+//! methods). See [`TnExExContext::reth_env`] for the available EVM reads.
 //!
 //! # Replay vs. live: state-diff fidelity
 //!

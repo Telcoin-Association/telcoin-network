@@ -11667,6 +11667,7 @@ dependencies = [
  "reth-execution-types",
  "reth-provider",
  "tn-reth",
+ "tn-storage",
  "tn-types",
  "tokio",
  "tokio-stream",
