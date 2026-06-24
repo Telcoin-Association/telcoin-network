@@ -857,6 +857,72 @@ async fn test_behind_consensus_genuinely_behind() {
     assert!(result, "genuinely behind node should be detected");
 }
 
+/// Server-side partial epoch streaming: `send_epoch_over_stream` with `Some(stop_number)` must
+/// emit exactly the verifiable prefix (every output up to and including the stop number) of the
+/// in-progress current epoch, and a later cutoff must extend that same prefix.
+#[tokio::test]
+async fn test_send_partial_epoch_over_stream() {
+    use tokio::io::AsyncReadExt as _;
+
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let committee_obj = committee.committee();
+    let peer = *committee.first_authority().authority().protocol_key();
+
+    // Populate the in-progress (never finalized) epoch-0 pack with some outputs.
+    let num_outputs = 15u64;
+    for number in 1..=num_outputs {
+        let cert = Certificate::default();
+        let sub_dag = CommittedSubDag::new(
+            vec![cert.clone()],
+            cert,
+            number,
+            ReputationScores::new(&committee_obj),
+            None,
+        );
+        handler.consensus_chain().write_subdag_for_test(number, sub_dag).await;
+    }
+
+    // The server streams a partial prefix up to consensus number `k`.
+    let k = 9u64;
+    let mut sent = Vec::new();
+    RequestHandler::<MemDatabase>::send_epoch_over_stream(
+        &mut sent,
+        handler.consensus_chain(),
+        0,
+        Some(k),
+        Duration::from_secs(10),
+        peer,
+    )
+    .await
+    .expect("send partial epoch stream");
+
+    // The streamed bytes must equal exactly the verifiable prefix the chain exposes — i.e. the
+    // data file truncated at `output_end(k)`.
+    let (stream, len) =
+        handler.consensus_chain().get_partial_epoch_stream(0, k).await.expect("partial stream");
+    let mut expected = Vec::new();
+    stream.take(len).read_to_end(&mut expected).await.unwrap();
+    assert_eq!(sent.len() as u64, len, "streamed byte count must equal the partial cutoff");
+    assert_eq!(sent, expected, "streamed bytes must equal the verifiable prefix");
+
+    // A later cutoff streams strictly more, and the smaller prefix is a true prefix of it.
+    let mut sent_more = Vec::new();
+    RequestHandler::<MemDatabase>::send_epoch_over_stream(
+        &mut sent_more,
+        handler.consensus_chain(),
+        0,
+        Some(num_outputs),
+        Duration::from_secs(10),
+        peer,
+    )
+    .await
+    .expect("send larger partial stream");
+    assert!(sent_more.len() > sent.len(), "a later cutoff must stream more bytes");
+    assert_eq!(&sent_more[..sent.len()], &sent[..], "smaller prefix must prefix the larger one");
+}
+
 /// A peer that re-requests the same epoch while an entry is already pending must not be
 /// able to reset the cleanup timer. If the replacement path rearmed `created_at`, a peer
 /// could re-request every 20s and hold a slot forever. This test exercises the

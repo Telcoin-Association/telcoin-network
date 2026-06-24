@@ -139,6 +139,18 @@ pub enum PrimaryRequest {
         /// The epoch we are requesting consensus data for.
         epoch: Epoch,
     },
+    /// Request to stream a verifiable PREFIX of an epoch's pack file, stopping after the consensus
+    /// output with `last_consensus_number`.
+    ///
+    /// Unlike [`Self::StreamEpoch`] (which streams a complete epoch), this streams the in-progress
+    /// current epoch up to an already-committed, verifiable point. The number is a chain consensus
+    /// header number, not a pack-relative index.
+    StreamEpochPartial {
+        /// The epoch we are requesting consensus data for.
+        epoch: Epoch,
+        /// The final (inclusive) consensus header number to stream up to.
+        last_consensus_number: u64,
+    },
     /// Request to stream the raw (serialized) consensus output bytes for a consensus chain number.
     ///
     /// Unlike [`Self::ConsensusHeader`], this returns the full pack-file encoded output

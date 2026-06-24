@@ -83,28 +83,45 @@ const CONSENSUS_OUTPUT_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// What a [`PendingStreamRequest`] should stream once the peer opens the stream.
 #[derive(Debug, Clone, Copy)]
 pub enum StreamRequestKind {
-    /// Stream the full pack file for an epoch.
+    /// Stream the full (finished) pack file for an epoch.
     EpochPack(Epoch),
+    /// Stream a verifiable PREFIX of an epoch's pack file, up to and including the consensus
+    /// output with `last_consensus_number` (used for the in-progress current epoch).
+    EpochPackPartial {
+        /// The epoch we are streaming consensus data for.
+        epoch: Epoch,
+        /// The final (inclusive) consensus header number to stream up to.
+        last_consensus_number: u64,
+    },
     /// Stream the raw bytes for a single consensus output (by consensus chain number).
     ConsensusOutput(u64),
 }
 
-/// Correlation digest for an epoch-pack stream request.
-fn epoch_stream_digest(epoch: Epoch) -> B256 {
-    let mut hasher = tn_types::DefaultHashFunction::new();
-    hasher.update(b"epoch-stream");
-    hasher.update(&epoch.to_le_bytes());
-    B256::from_slice(hasher.finalize().as_bytes())
-}
-
 /// Correlation digest for a single consensus-output stream request.
 ///
-/// Domain-separated from [`epoch_stream_digest`] so epoch `N` and output `N` never collide in
-/// the pending-request map for a given peer.
-fn consensus_output_stream_digest(number: u64) -> B256 {
+/// Each kind is domain-separated so distinct requests never collide in the pending map:
+/// - `EpochPack(epoch)` hashes only the epoch — byte-for-byte the original full-stream scheme, so
+///   existing full-stream clients are unaffected.
+/// - `EpochPackPartial { epoch, n }` additionally mixes in the stop number, giving it a distinct
+///   digest from the full-epoch request.
+/// - `ConsensusOutput(n)` is tagged so output `N` never collides with epoch `N`.
+fn stream_request_digest(kind: &StreamRequestKind) -> B256 {
     let mut hasher = tn_types::DefaultHashFunction::new();
-    hasher.update(b"consensus-output");
-    hasher.update(&number.to_le_bytes());
+    match kind {
+        StreamRequestKind::EpochPack(epoch) => {
+            hasher.update(b"epoch-pack");
+            hasher.update(&epoch.to_le_bytes());
+        }
+        StreamRequestKind::EpochPackPartial { epoch, last_consensus_number } => {
+            hasher.update(b"epoch-pack-partial");
+            hasher.update(&epoch.to_le_bytes());
+            hasher.update(&last_consensus_number.to_le_bytes());
+        }
+        StreamRequestKind::ConsensusOutput(number) => {
+            hasher.update(b"consensus-output");
+            hasher.update(&number.to_le_bytes());
+        }
+    }
     B256::from_slice(hasher.finalize().as_bytes())
 }
 
@@ -361,7 +378,7 @@ impl PrimaryNetworkHandle {
         number: u64,
     ) -> NetworkResult<Vec<u8>> {
         let request = PrimaryRequest::StreamConsensusOutput { number };
-        let request_digest = consensus_output_stream_digest(number);
+        let request_digest = stream_request_digest(&StreamRequestKind::ConsensusOutput(number));
         let resp = self.handle.send_request(request, peer).await?.await??;
         let PrimaryResponse::StreamRequestAck { ack } = resp.result else {
             return Err(NetworkError::RPCError(
@@ -393,7 +410,7 @@ impl PrimaryNetworkHandle {
     pub async fn request_consensus_output(&self, number: u64) -> NetworkResult<Vec<u8>> {
         const TIMEOUT: Duration = Duration::from_secs(10);
         let request = PrimaryRequest::StreamConsensusOutput { number };
-        let request_digest = consensus_output_stream_digest(number);
+        let request_digest = stream_request_digest(&StreamRequestKind::ConsensusOutput(number));
         // Try up to three times (from three peers) to get the output.
         // This could be a lot more complicated but this KISS method should work fine.
         for _ in 0..3 {
@@ -515,7 +532,7 @@ impl PrimaryNetworkHandle {
         self.handle.connected_peer_count().await
     }
 
-    /// Attempt to get an epoch pack file from any peer via stream.
+    /// Attempt to get a complete epoch pack file from any peer via stream.
     ///
     /// This method:
     /// 1. Sends a `StreamEpoch` request to negotiate
@@ -528,12 +545,64 @@ impl PrimaryNetworkHandle {
         consensus_chain: &ConsensusChain,
         record_timeout: Duration,
     ) -> NetworkResult<()> {
+        self.request_epoch_pack_inner(
+            epoch_record,
+            previous_epoch,
+            consensus_chain,
+            None,
+            record_timeout,
+        )
+        .await
+    }
+
+    /// Attempt to get a verifiable PREFIX of an epoch's pack file from any peer via stream,
+    /// stopping after consensus number `last_consensus_number`.
+    ///
+    /// Behaves exactly like [`Self::request_epoch_pack`] but negotiates a partial transfer. The
+    /// caller must supply an `epoch_record` whose `final_consensus` matches the partial stop point
+    /// so the streamed prefix verifies. Used to fetch the in-progress current epoch up to a
+    /// known point.
+    pub async fn request_partial_epoch_pack(
+        &self,
+        epoch_record: &EpochRecord,
+        previous_epoch: &EpochRecord,
+        consensus_chain: &ConsensusChain,
+        last_consensus_number: u64,
+        record_timeout: Duration,
+    ) -> NetworkResult<()> {
+        self.request_epoch_pack_inner(
+            epoch_record,
+            previous_epoch,
+            consensus_chain,
+            Some(last_consensus_number),
+            record_timeout,
+        )
+        .await
+    }
+
+    /// Shared implementation for full ([`Self::request_epoch_pack`]) and partial
+    /// ([`Self::request_partial_epoch_pack`]) epoch pack streaming. `last_consensus_number` selects
+    /// the request variant and correlation digest; everything else is identical.
+    async fn request_epoch_pack_inner(
+        &self,
+        epoch_record: &EpochRecord,
+        previous_epoch: &EpochRecord,
+        consensus_chain: &ConsensusChain,
+        last_consensus_number: Option<u64>,
+        record_timeout: Duration,
+    ) -> NetworkResult<()> {
         let epoch = epoch_record.epoch;
         // Try up to three times (from three peers) to get consensus.
         // This could be a lot more complicated but this KISS method should work fine.
         // send request to negotiate stream
-        let request = PrimaryRequest::StreamEpoch { epoch };
-        let request_digest = epoch_stream_digest(epoch);
+        let (request, kind) = match last_consensus_number {
+            None => (PrimaryRequest::StreamEpoch { epoch }, StreamRequestKind::EpochPack(epoch)),
+            Some(last_consensus_number) => (
+                PrimaryRequest::StreamEpochPartial { epoch, last_consensus_number },
+                StreamRequestKind::EpochPackPartial { epoch, last_consensus_number },
+            ),
+        };
+        let request_digest = stream_request_digest(&kind);
 
         for _ in 0..3 {
             // send request and await response from peer
@@ -793,8 +862,16 @@ where
                     self.process_epoch_record_request(peer, epoch, hash, channel, cancel)
                 }
                 PrimaryRequest::StreamEpoch { epoch } => {
-                    self.process_epoch_stream(peer, epoch, channel, cancel)
+                    self.process_epoch_stream(peer, epoch, None, channel, cancel)
                 }
+                PrimaryRequest::StreamEpochPartial { epoch, last_consensus_number } => self
+                    .process_epoch_stream(
+                        peer,
+                        epoch,
+                        Some(last_consensus_number),
+                        channel,
+                        cancel,
+                    ),
                 PrimaryRequest::StreamConsensusOutput { number } => {
                     self.process_consensus_output_stream(peer, number, channel, cancel)
                 }
@@ -1034,16 +1111,25 @@ where
     }
 
     /// Process a request to stream an epoch pack file.
+    ///
+    /// `last_consensus_number` is `None` for a full-epoch transfer and `Some(n)` to stream only the
+    /// verifiable prefix up to consensus number `n` (the in-progress current epoch).
     fn process_epoch_stream(
         &self,
         peer: BlsPublicKey,
         epoch: Epoch,
+        last_consensus_number: Option<u64>,
         channel: ResponseChannel<PrimaryResponse>,
         cancel: oneshot::Receiver<()>,
     ) {
-        let request_digest = epoch_stream_digest(epoch);
-        let ack =
-            self.accept_stream_request(peer, request_digest, StreamRequestKind::EpochPack(epoch));
+        let kind = match last_consensus_number {
+            None => StreamRequestKind::EpochPack(epoch),
+            Some(last_consensus_number) => {
+                StreamRequestKind::EpochPackPartial { epoch, last_consensus_number }
+            }
+        };
+        let request_digest = stream_request_digest(&kind);
+        let ack = self.accept_stream_request(peer, request_digest, kind);
         self.send_stream_ack(ack, channel, cancel, format!("process-request-epoch-{peer}"));
     }
 
@@ -1055,12 +1141,9 @@ where
         channel: ResponseChannel<PrimaryResponse>,
         cancel: oneshot::Receiver<()>,
     ) {
-        let request_digest = consensus_output_stream_digest(number);
-        let ack = self.accept_stream_request(
-            peer,
-            request_digest,
-            StreamRequestKind::ConsensusOutput(number),
-        );
+        let kind = StreamRequestKind::ConsensusOutput(number);
+        let request_digest = stream_request_digest(&kind);
+        let ack = self.accept_stream_request(peer, request_digest, kind);
         self.send_stream_ack(ack, channel, cancel, format!("process-request-output-{peer}"));
     }
 
