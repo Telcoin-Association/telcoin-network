@@ -6,7 +6,7 @@ use super::{
 };
 use crate::{
     error::{CertManagerError, PrimaryNetworkError, PrimaryNetworkResult},
-    network::{message::PrimaryGossip, PendingEpochStream},
+    network::{message::PrimaryGossip, PendingStreamRequest, StreamRequestKind},
     state_sync::{CertificateCollector, StateSynchronizer},
     ConsensusBusApp, NodeMode,
 };
@@ -867,6 +867,39 @@ where
         Ok(PrimaryResponse::ConsensusHeader(Arc::new(header)))
     }
 
+    /// Retrieve the raw (serialized) consensus output bytes from local storage.
+    ///
+    /// Returns the full pack-file encoded output for `number` so a peer can reconstruct the
+    /// [`tn_types::ConsensusOutput`] (batches + consensus header) without a separate batch fetch.
+    /// The bytes are streamed to the requesting peer (see `send_consensus_output_over_stream`),
+    /// because a single output can exceed the request/response message-size limit.
+    pub(super) async fn consensus_output_bytes(
+        &self,
+        number: u64,
+    ) -> PrimaryNetworkResult<Vec<u8>> {
+        let mut my_number = self.consensus_chain.latest_consensus_number();
+        // If we are behind then wait up to two seconds to catch up.
+        let mut count = 0;
+        if number.saturating_sub(my_number) < 4 {
+            // Only wait if we are close.
+            while my_number < number {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                my_number = self.consensus_chain.latest_consensus_number();
+                if count >= 20 {
+                    // Don't wait more than 2 seconds for this to show up.
+                    return Err(PrimaryNetworkError::UnknownConsensusOutput(number));
+                }
+                count += 1;
+            }
+        }
+        match self.consensus_chain.consensus_output_bytes_by_number(number).await {
+            Ok(Some(bytes)) => Ok(bytes),
+            // Missing locally, or the requested number is outside the pack's range.
+            Ok(None) => Err(PrimaryNetworkError::UnknownConsensusOutput(number)),
+            Err(e) => Err(PrimaryNetworkError::ConsensusChainError(e)),
+        }
+    }
+
     /// Retrieve an epoch record from local storage.
     pub(super) async fn retrieve_epoch_record(
         &self,
@@ -978,11 +1011,53 @@ where
         Ok(())
     }
 
-    /// Process request to open stream for an epoch pack.
+    /// Send a single consensus output's raw bytes over a stream.
+    ///
+    /// If the output is unavailable locally, the stream is simply closed with no bytes; the
+    /// requesting peer observes EOF and retries another peer.
+    pub(super) async fn send_consensus_output_over_stream<S>(
+        &self,
+        mut stream: S,
+        number: u64,
+        buffer_timeout: Duration,
+        peer: BlsPublicKey,
+    ) -> PrimaryNetworkResult<()>
+    where
+        S: AsyncWrite + Unpin + Send,
+    {
+        match self.consensus_output_bytes(number).await {
+            Ok(bytes) => {
+                // write in chunks so a single timeout bounds a slow reader
+                for chunk in bytes.chunks(16 * 1024) {
+                    timeout(buffer_timeout, stream.write_all(chunk)).await??;
+                }
+            }
+            Err(e) => {
+                // Benign miss (e.g. not-yet-served during catch-up): close with no bytes so the
+                // peer retries elsewhere. Closing below also handles the unavailable case.
+                debug!(
+                    target: "primary::network",
+                    %peer,
+                    ?number,
+                    ?e,
+                    "consensus output unavailable for stream; closing with no bytes"
+                );
+            }
+        }
+
+        // attempt to close the stream gracefully
+        if let Err(e) = stream.close().await {
+            tracing::warn!(target: "primary::network", %peer, ?number, ?e, "stream close failed");
+        }
+
+        Ok(())
+    }
+
+    /// Process request to open a stream for an epoch pack or a single consensus output.
     pub(super) async fn process_request_epoch_stream(
         &self,
         peer: BlsPublicKey,
-        pending_request: Option<PendingEpochStream>,
+        pending_request: Option<PendingStreamRequest>,
         stream: Stream,
         request_digest: B256,
         consensus_chain: &ConsensusChain,
@@ -999,26 +1074,50 @@ where
             return Err(PrimaryNetworkError::UnknownStreamRequest(request_digest));
         };
 
-        // process request to send batches through stream
-        debug!(
-            target: "primary::network",
-            %peer,
-            ?request_digest,
-            epoch = request.epoch,
-            "processing inbound epoch stream"
-        );
+        match request.kind() {
+            StreamRequestKind::EpochPack(epoch) => {
+                debug!(
+                    target: "primary::network",
+                    %peer,
+                    ?request_digest,
+                    epoch,
+                    "processing inbound epoch stream"
+                );
 
-        // set timeout to prevent slow-read attack
-        Self::send_epoch_over_stream(
-            stream,
-            consensus_chain,
-            request.epoch,
-            SEND_STREAM_BUFFER_TIMEOUT,
-            peer,
-        )
-        .await
-        .inspect_err(
-            |e| warn!(target: "primary::network", %peer, ?e, "failed to send epoch over stream"),
-        )
+                // set timeout to prevent slow-read attack
+                Self::send_epoch_over_stream(
+                    stream,
+                    consensus_chain,
+                    epoch,
+                    SEND_STREAM_BUFFER_TIMEOUT,
+                    peer,
+                )
+                .await
+                .inspect_err(|e| {
+                    warn!(target: "primary::network", %peer, ?e, "failed to send epoch over stream")
+                })
+            }
+            StreamRequestKind::ConsensusOutput(number) => {
+                debug!(
+                    target: "primary::network",
+                    %peer,
+                    ?request_digest,
+                    number,
+                    "processing inbound consensus output stream"
+                );
+
+                // set timeout to prevent slow-read attack
+                self.send_consensus_output_over_stream(
+                    stream,
+                    number,
+                    SEND_STREAM_BUFFER_TIMEOUT,
+                    peer,
+                )
+                .await
+                .inspect_err(|e| {
+                    warn!(target: "primary::network", %peer, ?e, "failed to send consensus output over stream")
+                })
+            }
+        }
     }
 }
