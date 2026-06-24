@@ -895,7 +895,8 @@ where
         match self.consensus_chain.consensus_output_bytes_by_number(number).await {
             Ok(Some(bytes)) => Ok(bytes),
             // Missing locally, or the requested number is outside the pack's range.
-            _ => Err(PrimaryNetworkError::UnknownConsensusOutput(number)),
+            Ok(None) => Err(PrimaryNetworkError::UnknownConsensusOutput(number)),
+            Err(e) => Err(PrimaryNetworkError::ConsensusChainError(e)),
         }
     }
 

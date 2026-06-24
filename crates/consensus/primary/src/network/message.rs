@@ -303,6 +303,7 @@ impl PrimaryResponse {
             | PrimaryNetworkError::Timeout(_)
             | PrimaryNetworkError::UnknownStreamRequest(_)
             | PrimaryNetworkError::StreamUnavailable(_)
+            | PrimaryNetworkError::ConsensusChainError(_)
             | PrimaryNetworkError::InvalidEpochRequest => {
                 Self::Error(PrimaryRPCError(error.to_string()))
             }

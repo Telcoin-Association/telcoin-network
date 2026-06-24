@@ -74,7 +74,8 @@ pub const MAX_PENDING_REQUESTS_PER_PEER: usize = 2;
 ///
 /// Generous upper bound: comfortably above any realistic single output, but caps an
 /// unbounded or malicious stream.
-const MAX_CONSENSUS_OUTPUT_STREAM_BYTES: usize = 16 * 1024 * 1024;
+/// TODO- replace with a size from consensus.  See Issue 782.
+const MAX_CONSENSUS_OUTPUT_STREAM_BYTES: usize = 512 * 1024 * 1024;
 
 /// Per-read timeout while draining a consensus-output stream (slow-peer guard).
 const CONSENSUS_OUTPUT_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(10);
