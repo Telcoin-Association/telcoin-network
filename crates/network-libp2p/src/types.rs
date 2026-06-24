@@ -1,7 +1,8 @@
 //! Constants and trait implementations for network compatibility.
 
 use crate::{
-    codec::TNMessage, error::NetworkError, peers::Penalty, GossipMessage, PeerExchangeMap,
+    codec::TNMessage, error::NetworkError, peers::Penalty, stream::StreamKind, GossipMessage,
+    PeerExchangeMap,
 };
 pub use libp2p::gossipsub::MessageId;
 use libp2p::{
@@ -168,11 +169,15 @@ pub enum NetworkEvent<Req, Res> {
     Error(String, ResponseChannel<Res>),
     /// An inbound stream was established by a peer.
     ///
-    /// The application is responsible for reading any correlation data
-    /// (e.g. request digest) from the raw stream.
+    /// The application routes the raw stream by `kind`: a [`StreamKind::Legacy`]
+    /// stream is read on the digest-correlation path, a [`StreamKind::Sync`]
+    /// stream carries the typed [`SyncFrame`](crate::sync::SyncFrame) layer with
+    /// the request in its first frame.
     InboundStream {
         /// The peer that opened the stream.
         peer: BlsPublicKey,
+        /// The protocol the inbound stream negotiated.
+        kind: StreamKind,
         /// The established raw p2p stream for reading data.
         stream: Stream,
     },
@@ -396,11 +401,16 @@ where
     },
     /// Open a raw stream to a peer for bulk data transfer.
     ///
-    /// Called after a successful request-response negotiation. The caller
-    /// is responsible for writing any correlation data to the stream.
+    /// A [`StreamKind::Legacy`] open negotiates `/tn-stream` and the caller writes
+    /// a correlation digest; a [`StreamKind::Sync`] open negotiates the per-role
+    /// sync protocol and the caller writes a [`SyncFrame`](crate::sync::SyncFrame)
+    /// request. A sync open that fails negotiation is penalty-exempt so the caller
+    /// can fall back to legacy.
     OpenStream {
         /// The peer to open the stream to.
         peer: BlsPublicKey,
+        /// Which protocol the open negotiates.
+        kind: StreamKind,
         /// Channel for returning the established stream to application layer.
         reply: oneshot::Sender<NetworkResult<Stream>>,
     },
@@ -684,12 +694,19 @@ where
 
     /// Open a raw stream to a peer for bulk data transfer.
     ///
-    /// Called after a successful request-response negotiation. The caller is
-    /// responsible for writing any application-layer correlation data (e.g.
-    /// request digest) to the stream after it is established.
-    pub async fn open_stream(&self, peer: BlsPublicKey) -> NetworkResult<NetworkResult<Stream>> {
+    /// `kind` selects the protocol: [`StreamKind::Legacy`] negotiates `/tn-stream`
+    /// (the caller then writes a correlation digest), [`StreamKind::Sync`]
+    /// negotiates the per-role sync protocol (the caller then writes a
+    /// [`SyncFrame`](crate::sync::SyncFrame) request). A sync open that fails
+    /// negotiation returns an error without penalizing the peer, so the caller can
+    /// fall back to the legacy path.
+    pub async fn open_stream(
+        &self,
+        peer: BlsPublicKey,
+        kind: StreamKind,
+    ) -> NetworkResult<NetworkResult<Stream>> {
         let (reply, rx) = oneshot::channel();
-        self.sender.send(NetworkCommand::OpenStream { peer, reply }).await?;
+        self.sender.send(NetworkCommand::OpenStream { peer, kind, reply }).await?;
         rx.await.map_err(Into::into)
     }
 

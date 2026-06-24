@@ -791,7 +791,7 @@ where
                 let rpcs = self.swarm.behaviour().peer_manager.all_rpcs();
                 send_or_log_error!(reply, rpcs, "GetAllValidatorRpcs");
             }
-            NetworkCommand::OpenStream { peer, reply } => {
+            NetworkCommand::OpenStream { peer, kind, reply } => {
                 // Look up the peer's PeerId from their BLS key
                 let (peer_id, addrs) = match self.swarm.behaviour().peer_manager.auth_to_peer(peer)
                 {
@@ -816,7 +816,7 @@ where
                 // Pass the reply channel directly to the stream behavior.
                 // The stream (or error) will be returned to the caller via oneshot
                 // without any intermediate tracking.
-                self.swarm.behaviour_mut().stream.open_stream(peer_id, addrs, reply);
+                self.swarm.behaviour_mut().stream.open_stream(peer_id, kind, addrs, reply);
             }
             #[cfg(test)]
             NetworkCommand::KadStoreGet { key, reply } => {
@@ -1325,18 +1325,21 @@ where
     /// This handles inbound and outbound stream events for bulk data transfer.
     fn process_stream_event(&mut self, event: StreamEvent) -> NetworkResult<()> {
         match event {
-            StreamEvent::InboundStream { peer, stream } => {
+            StreamEvent::InboundStream { peer, kind, stream } => {
                 debug!(
                     target: "network",
                     ?peer,
+                    ?kind,
                     "inbound stream received"
                 );
-                // Forward raw stream to application layer
+                // Forward raw stream to application layer, tagged with the
+                // negotiated protocol so it routes to the sync or legacy reader.
                 if let Some(bls) = self.swarm.behaviour().peer_manager.peer_to_bls(&peer) {
-                    if let Err(e) = self
-                        .event_stream
-                        .try_send(NetworkEvent::InboundStream { peer: bls, stream })
-                    {
+                    if let Err(e) = self.event_stream.try_send(NetworkEvent::InboundStream {
+                        peer: bls,
+                        kind,
+                        stream,
+                    }) {
                         error!(target: "network", ?e, "failed to forward inbound stream");
                     }
                 } else {
