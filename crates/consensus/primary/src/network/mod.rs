@@ -485,6 +485,8 @@ impl PrimaryNetworkHandle {
             }
             ConsensusChainError::StreamUnavailable
             | ConsensusChainError::NoCurrentEpoch
+            // Local startup/disk failure opening our own current-epoch pack - never a peer's fault.
+            | ConsensusChainError::CurrentPackOpen { .. }
             | ConsensusChainError::EpochDbError(_)
             | ConsensusChainError::InvalidPackEpoch(_, _)
             | ConsensusChainError::IO(_) => None,

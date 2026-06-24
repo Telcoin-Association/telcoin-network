@@ -237,6 +237,15 @@ impl ConsensusPack {
         })
     }
 
+    /// Filesystem path to the epoch pack's primary `data` file for `epoch` under `path`.
+    ///
+    /// Lets a caller tell a genuinely fresh epoch (no pack on disk yet) apart from a pack
+    /// that exists but fails to open, so the latter can fail loudly instead of being
+    /// silently dropped to `None` and resurfacing later as a misleading `NoCurrentEpoch`.
+    pub fn epoch_pack_path<P: AsRef<Path>>(path: P, epoch: Epoch) -> PathBuf {
+        path.as_ref().join(format!("epoch-{epoch}")).join(DATA_NAME)
+    }
+
     /// Open up the static files for previous epoch.  These will be read only.
     /// Note, you should call persist() on the returned pack to make sure it
     /// opened cleanly.
