@@ -59,6 +59,7 @@ telcoin-network keytool generate observer \
 | `--address`, `--execution-address` | required                   | EVM address for fee recipient. Pass `0` for the zero address. Env: `EXECUTION_ADDRESS`                                |
 | `--workers`                        | `1`                        | Number of workers for the primary (range: 1-4, must be 1 currently)                                                   |
 | `--force`, `--overwrite`           | `false`                    | Overwrite existing keys. Existing keys are lost permanently                                                           |
+| `--name`                           | auto-derived               | Human-readable node name written to `node-info.yaml` (logging/RPC only). Defaults to `node-<bs58 of BLS key>`         |
 | `--external-primary-addr`          | localhost with random port | External multiaddr for the primary P2P network. Format: `/ip4/HOST/udp/PORT/quic-v1`. Env: `TN_EXTERNAL_PRIMARY_ADDR` |
 | `--external-worker-addrs`          | localhost with random port | Comma-separated multiaddrs for worker P2P networks. Env: `TN_EXTERNAL_WORKER_ADDRS`                                   |
 

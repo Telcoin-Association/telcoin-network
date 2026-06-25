@@ -3,23 +3,48 @@
 use crate::{args::clap_address_parser, keytool::pop::PopArgs};
 use clap::{value_parser, Args, Subcommand};
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NodeInfo, TelcoinDirs};
-use tn_types::{get_available_udp_port, Address, Multiaddr, Protocol};
+use tn_types::{get_available_udp_port, Address, BlsPublicKey, Multiaddr, Protocol};
 use tracing::info;
 
 /// Sign the proof of possession for `address` from `key_config` and write the
-/// PoP-derived fields into `node_info`. Shared by `generate validator|observer`
-/// (fresh keys) and `generate pop` (existing keys), so both produce identical
-/// `bls_public_key` / `proof_of_possession` / `execution_address` / `name` values.
+/// PoP-derived fields (`bls_public_key`, `proof_of_possession`, `execution_address`)
+/// into `node_info`. Shared by `generate validator|observer` (fresh keys) and
+/// `generate pop` (existing keys).
+///
+/// Errors if `node_info` already records a BLS public key that differs from the one
+/// in `key_config`: that means the keys on disk do not belong to this `node-info`
+/// (used by `generate pop` to refuse a wrong / mixed-up datadir). The node name is
+/// intentionally left untouched here - fresh generation sets it in `update_keys`
+/// (honoring `--name`), and `generate pop` preserves the existing name.
 pub(crate) fn set_proof_of_possession(
     node_info: &mut NodeInfo,
     key_config: &KeyConfig,
     address: Address,
 ) -> eyre::Result<()> {
-    node_info.bls_public_key = key_config.primary_public_key();
+    let primary_public_key = key_config.primary_public_key();
+
+    // When re-signing with existing keys (`generate pop`), the keys on disk must
+    // match the BLS key recorded in node-info.yaml. A mismatch means the keys in
+    // this datadir do not belong to this node-info (wrong datadir / mixed-up
+    // files), so refuse rather than silently rewrite the recorded identity.
+    // Skipped for fresh generation, where node_info still holds the default key.
+    if node_info.bls_public_key != BlsPublicKey::default()
+        && node_info.bls_public_key != primary_public_key
+    {
+        return Err(eyre::eyre!(
+            "BLS key mismatch: node-info.yaml records public key {} but the keys \
+             loaded from disk are {}; the keys in this datadir do not match \
+             node-info.yaml (re-run from the correct datadir, or regenerate node-info.yaml)",
+            node_info.bls_public_key,
+            primary_public_key,
+        ));
+    }
+
+    node_info.bls_public_key = primary_public_key;
     node_info.proof_of_possession = key_config.generate_proof_of_possession_bls(&address)?;
     node_info.execution_address = address;
-    node_info.name =
-        format!("node-{}", bs58::encode(&node_info.bls_public_key.to_bytes()[0..8]).into_string());
+    // NOTE: node_info.name is intentionally NOT set here. Fresh generation sets it
+    // in `update_keys` (honoring `--name`); `generate pop` preserves the existing name.
     Ok(())
 }
 
@@ -81,6 +106,14 @@ pub struct KeygenArgs {
     )]
     pub address: Address,
 
+    /// Optional human-readable name for this node.
+    ///
+    /// Recorded in node-info.yaml for logging / RPC metadata only; not used for
+    /// consensus or peer identity. If unset, defaults to `node-` followed by the
+    /// base58 encoding of the first 8 bytes of the BLS public key.
+    #[arg(long = "name")]
+    pub name: Option<String>,
+
     /// The external multiaddr for the primary p2p network. Must be quic-v1 and udp. Recommended do
     /// not include p2p protocol id - the CLI will add this.
     /// For example: /ip4/[HOST]/udp/[PORT]/quic-v1
@@ -120,6 +153,15 @@ impl KeygenArgs {
     ) -> eyre::Result<()> {
         let key_config = KeyConfig::generate_and_save(tn_datadir, passphrase)?;
         set_proof_of_possession(node_info, &key_config, self.address)?;
+
+        // Fresh keys: use the operator-supplied name, else derive from the new BLS key.
+        // (`generate pop` never reaches here, so it preserves the existing name.)
+        node_info.name = self.name.clone().unwrap_or_else(|| {
+            format!(
+                "node-{}",
+                bs58::encode(&node_info.bls_public_key.to_bytes()[0..8]).into_string()
+            )
+        });
 
         // network keypair for authority
         let network_publickey = key_config.primary_network_public_key();

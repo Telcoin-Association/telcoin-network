@@ -9,7 +9,7 @@
 //! Unlike `generate validator|observer`, this never mints a new BLS keypair: it
 //! loads the existing keys and node-info, re-signs against the new address, and
 //! rewrites only the PoP-derived fields. BLS key, network keys, p2p peer IDs,
-//! and (deterministically derived) name are unchanged.
+//! and the node name (operator-set or derived) are preserved.
 
 use crate::{args::clap_address_parser, keytool::generate::set_proof_of_possession};
 use clap::Args;
@@ -48,13 +48,22 @@ impl PopArgs {
         dir: &TND,
         passphrase: Option<String>,
     ) -> eyre::Result<()> {
-        // existing keys - never generated here; error with a hint if absent
+        // existing keys - never generated here; error with an accurate hint
+        // (distinguish "no keys yet" from "keys present but unreadable").
         let key_config = KeyConfig::read_config(dir, passphrase).map_err(|e| {
-            eyre::eyre!(
-                "could not load existing BLS keys from {}: {e}\n\
-                 hint: generate keys first with `keytool generate validator|observer`",
-                dir.node_keys_path().display()
-            )
+            if KeyConfig::keys_exist(dir) {
+                eyre::eyre!(
+                    "could not read existing BLS keys from {}: {e}\n\
+                     hint: the keys exist but could not be read - verify the BLS passphrase is correct",
+                    dir.node_keys_path().display()
+                )
+            } else {
+                eyre::eyre!(
+                    "no BLS keys found at {}: {e}\n\
+                     hint: generate keys first with `keytool generate validator|observer`",
+                    dir.node_keys_path().display()
+                )
+            }
         })?;
 
         // existing node-info - preserves p2p info / network keys; error if absent

@@ -142,6 +142,17 @@ impl KeyConfig {
         })
     }
 
+    /// Returns `true` if BLS key material exists on disk for `tn_datadir`, whether
+    /// stored encrypted (`bls.kw`) or in cleartext (`bls.key`).
+    ///
+    /// Lets callers distinguish "no keys generated yet" from "keys present but
+    /// unreadable" (e.g. an incorrect passphrase) when reporting errors.
+    pub fn keys_exist<TND: TelcoinDirs>(tn_datadir: &TND) -> bool {
+        let keys_dir = tn_datadir.node_keys_path();
+        std::fs::exists(keys_dir.join(BLS_WRAPPED_KEYFILE)).unwrap_or(false)
+            || std::fs::exists(keys_dir.join(BLS_KEYFILE)).unwrap_or(false)
+    }
+
     /// Generate a new random primary BLS key and save to the config file.
     /// Note, this is not very secure in that it is writing the private key to a file...
     pub fn generate_and_save<TND: TelcoinDirs>(
