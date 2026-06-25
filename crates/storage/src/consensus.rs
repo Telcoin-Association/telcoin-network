@@ -127,8 +127,18 @@ impl LatestConsensus {
         }
         let mut slot1 = OpenOptions::new().read(true).write(true).open(&slot1_path)?;
         let mut slot2 = OpenOptions::new().read(true).write(true).open(&slot2_path)?;
-        let (slot1_epoch, slot1_number) = Self::read_slot(&mut slot1)?;
-        let (slot2_epoch, slot2_number) = Self::read_slot(&mut slot2)?;
+        // A torn or corrupt slot must not be fatal: the slots are a double-buffered hint and
+        // the pack files are ground truth, so fall back to the other slot (or a fresh (0, 0))
+        // rather than failing to open the chain.  Failing here would panic the node at startup
+        // on a single damaged slot, defeating the whole point of having two of them.
+        let (slot1_epoch, slot1_number) = Self::read_slot(&mut slot1).unwrap_or_else(|e| {
+            warn!(target: "consensus_chain", ?e, "consensus_slot1 unreadable; falling back to the other slot");
+            (0, 0)
+        });
+        let (slot2_epoch, slot2_number) = Self::read_slot(&mut slot2).unwrap_or_else(|e| {
+            warn!(target: "consensus_chain", ?e, "consensus_slot2 unreadable; falling back to the other slot");
+            (0, 0)
+        });
 
         let (tx, mut rx) = mpsc::channel(1000);
         let handle = std::thread::spawn(move || {
@@ -347,7 +357,8 @@ impl ConsensusChain {
             }
             old_pack.persist().await?;
             let mut recents = self.recent_packs.lock();
-            if recents.len() > Self::PACK_CACHE_SIZE {
+            // Evict before pushing so the cache stays capped at PACK_CACHE_SIZE.
+            if recents.len() >= Self::PACK_CACHE_SIZE {
                 let _ = recents.pop_front();
             }
             recents.push_back(old_pack);
@@ -597,6 +608,25 @@ impl ConsensusChain {
         }
     }
 
+    /// Retrieve the raw consensus output bytes by number.
+    pub async fn consensus_output_bytes_by_number(
+        &self,
+        number: u64,
+    ) -> Result<Option<Vec<u8>>, ConsensusChainError> {
+        let epoch = self.epochs.number_to_epoch(number);
+        if let Some(pack) = &self.current_pack() {
+            if epoch == pack.epoch() {
+                return Ok(Some(pack.get_consensus_output_bytes(number).await?));
+            }
+        }
+        if let Ok(pack) = self.get_static(epoch).await {
+            Ok(Some(pack.get_consensus_output_bytes(number).await?))
+        } else {
+            // Don't have this epoch data.
+            Ok(None)
+        }
+    }
+
     /// Return true if we have a complete pack file for epoch_record.
     pub async fn is_epoch_complete(&self, epoch_record: &EpochRecord) -> bool {
         match self.consensus_header_by_number(epoch_record.final_consensus.number).await {
@@ -764,7 +794,8 @@ impl ConsensusChain {
                     return Ok(p.clone());
                 }
             }
-            if recents.len() > Self::PACK_CACHE_SIZE {
+            // Evict before the open+push below so the cache stays capped at PACK_CACHE_SIZE.
+            if recents.len() >= Self::PACK_CACHE_SIZE {
                 let _ = recents.pop_front();
             }
         }
@@ -788,6 +819,10 @@ impl ConsensusChainReader for ConsensusChain {
         number: u64,
     ) -> eyre::Result<Option<ConsensusHeader>> {
         ConsensusChain::consensus_header_by_number(self, number).await.map_err(Into::into)
+    }
+
+    async fn consensus_output_bytes_by_number(&self, number: u64) -> eyre::Result<Option<Vec<u8>>> {
+        ConsensusChain::consensus_output_bytes_by_number(self, number).await.map_err(Into::into)
     }
 
     async fn consensus_header_latest(&self) -> eyre::Result<Option<ConsensusHeader>> {
@@ -1054,6 +1089,60 @@ mod test {
         assert_eq!(latest.current_slot(), ConsensusSlot::Slot2);
     }
 
+    /// A corrupt slot file must not fail to open the chain; the other (valid) slot is used.
+    /// The slots are a double-buffered hint, so a single damaged slot must be recoverable
+    /// rather than panicking the node at startup.
+    #[tokio::test]
+    async fn test_latest_consensus_recovers_from_corrupt_slot() {
+        use std::{
+            fs::OpenOptions,
+            io::{Seek as _, SeekFrom, Write as _},
+        };
+
+        let temp_dir = TempDir::with_prefix("test_corrupt_slot").unwrap();
+        {
+            let latest = LatestConsensus::new(temp_dir.path()).unwrap();
+            // Two updates so both slots hold data: slot1 = (1, 10), slot2 = (2, 20).
+            latest.update(1, 10).await;
+            latest.update(2, 20).await;
+            latest.persist().await;
+        }
+
+        // Corrupt the slot holding the most recent value (slot2) by flipping a payload byte,
+        // which breaks its CRC.
+        {
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(temp_dir.path().join("consensus_slot2"))
+                .unwrap();
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.write_all(&[0xFF]).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        // Reopen: slot2 is unreadable (CRC fail) but must fall back to slot1's valid value
+        // instead of erroring.
+        let latest = LatestConsensus::new(temp_dir.path()).unwrap();
+        assert_eq!(latest.epoch(), 1, "recovered epoch from the good slot");
+        assert_eq!(latest.number(), 10, "recovered number from the good slot");
+
+        // Corrupting the remaining slot too falls back to a fresh (0, 0).
+        {
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(temp_dir.path().join("consensus_slot1"))
+                .unwrap();
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.write_all(&[0xFF]).unwrap();
+            f.sync_all().unwrap();
+        }
+        let latest = LatestConsensus::new(temp_dir.path()).unwrap();
+        assert_eq!(latest.epoch(), 0, "both slots corrupt -> fresh start");
+        assert_eq!(latest.number(), 0, "both slots corrupt -> fresh start");
+    }
+
     #[tokio::test]
     async fn test_save_consensus_output_wrong_epoch_rejected() {
         let temp_dir = TempDir::with_prefix("test_wrong_epoch").expect("temp dir");
@@ -1161,6 +1250,69 @@ mod test {
             let output = outputs.get(i as usize).unwrap();
             compare_outputs(&output_db, output);
         }
+    }
+
+    #[tokio::test]
+    async fn test_consensus_output_bytes_by_number() {
+        use crate::{archive::pack::PackCompression, consensus_pack::bytes_to_output};
+        use std::io::Cursor;
+        use tokio::io::BufReader;
+
+        let temp_dir = TempDir::with_prefix("test_output_bytes").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).unwrap();
+        consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+
+        // Save some outputs, keeping the originals to compare against.
+        let num_outputs = 10;
+        let mut outputs = Vec::new();
+        let mut parent = ConsensusHeader::default().digest();
+        for i in 0..num_outputs {
+            let output = make_test_output(&committee, i % 4, chain.clone(), (i as u64) + 1, parent);
+            parent = output.digest().into();
+            outputs.push(output.clone());
+            consensus_chain.save_consensus_output(output).await.unwrap();
+        }
+
+        // Each saved number returns Some(bytes) that decode back to the original output.
+        for i in 0..num_outputs {
+            let number = i as u64 + 1;
+            let bytes = consensus_chain
+                .consensus_output_bytes_by_number(number)
+                .await
+                .expect("query ok")
+                .expect("bytes present");
+            assert!(!bytes.is_empty(), "bytes for {number} should not be empty");
+            // Packs are always written with ZStd, mirror get_consensus_output's decode path.
+            let reader = BufReader::new(Cursor::new(bytes));
+            let decoded =
+                bytes_to_output(reader, PackCompression::ZStd, Duration::from_secs(5), &committee)
+                    .await
+                    .expect("decode output bytes");
+            compare_outputs(&decoded, &outputs[i]);
+        }
+
+        // A number below the pack's start is out of range and must error.
+        assert!(
+            consensus_chain.consensus_output_bytes_by_number(0).await.is_err(),
+            "number below start must error"
+        );
+
+        // A fresh chain with no epoch opened has no data and returns Ok(None).
+        let empty_dir = TempDir::with_prefix("test_output_bytes_empty").expect("temp dir");
+        let empty_chain = ConsensusChain::new(empty_dir.path().to_owned()).unwrap();
+        assert!(
+            empty_chain.consensus_output_bytes_by_number(1).await.expect("query ok").is_none(),
+            "missing data must return None"
+        );
     }
 
     /// Regression test for the `pack_install` lock.

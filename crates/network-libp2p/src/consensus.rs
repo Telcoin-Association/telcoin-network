@@ -89,14 +89,16 @@ where
 {
     /// Create a new instance of Self.
     pub(crate) fn new(
+        local_peer_id: PeerId,
         gossipsub: gossipsub::Behaviour,
         req_res: request_response::Behaviour<C>,
         kademlia: kad::Behaviour<KadStore<DB>>,
         peer_config: &PeerConfig,
         metrics: PeerManagerMetrics,
+        network_type: NetworkType,
     ) -> Self {
-        let peer_manager = PeerManager::new(peer_config, metrics);
-        let stream = StreamBehavior::new();
+        let peer_manager = PeerManager::new(local_peer_id, peer_config, metrics);
+        let stream = StreamBehavior::new(network_type);
         Self { peer_manager, gossipsub, req_res, kademlia, stream }
     }
 }
@@ -317,11 +319,13 @@ where
 
         // create custom behavior
         let mut behavior = TNBehavior::new(
+            peer_id,
             gossipsub,
             req_res,
             kademlia,
             network_config.peer_config(),
             PeerManagerMetrics::new_for(&network_type),
+            network_type,
         );
 
         // Promote the surviving records into the local peer cache.
@@ -1058,16 +1062,15 @@ where
                             .peer_manager
                             .process_penalty(peer, Penalty::Mild);
                     }
-                    // Severe = 5 strikes covers the typical rolling-upgrade window where
-                    // a peer sees <=5 req-res handshakes per halflife. Demote to Medium
-                    // if telemetry shows version-skewed peers banned during normal
-                    // upgrades.
+                    // Not penalized. Failing to negotiate a common protocol is honest
+                    // version/role skew (the peer runs a different/older/role-distinct
+                    // protocol set), not misbehavior — the same not-the-peer's-fault
+                    // class as `DialFailure`/`ConnectionClosed` above. Penalizing it
+                    // bans not-yet-upgraded peers during rolling upgrades and would turn
+                    // the #765 chain-id protocol split into a network partition. Warn for
+                    // operator visibility only.
                     ReqResOutboundFailure::UnsupportedProtocols => {
-                        warn!(target: "network", ?peer, ?request_id, "outbound failure: unsupported protocol");
-                        self.swarm
-                            .behaviour_mut()
-                            .peer_manager
-                            .process_penalty(peer, Penalty::Severe);
+                        warn!(target: "network", ?peer, ?request_id, "outbound failure: unsupported protocol (not penalized)");
                     }
                 }
 
@@ -1101,20 +1104,14 @@ where
                                 .process_penalty(peer, Penalty::Medium);
                         }
                     },
-                    // Severe = 5 strikes covers the typical rolling-upgrade window where
-                    // a peer sees <=5 req-res handshakes per halflife. Demote to Medium
-                    // if telemetry shows version-skewed peers banned during normal
-                    // upgrades.
+                    // Not penalized. The local peer supports none of the protocols the
+                    // remote requested: honest version/role skew, not misbehavior (the
+                    // inbound mirror of the outbound arm above). Penalizing it bans
+                    // not-yet-upgraded peers during rolling upgrades and is a prerequisite
+                    // blocker for the #765 chain-id protocol split. Warn for operator
+                    // visibility only.
                     ReqResInboundFailure::UnsupportedProtocols => {
-                        warn!(target: "network", ?peer, ?request_id, ?error, "inbound failure: unsupported protocol");
-
-                        // the local peer supports none of the protocols requested by the remote
-                        // Severe (not Fatal) so version skew during rolling upgrades does not
-                        // instantly ban a peer that is otherwise well-behaved.
-                        self.swarm
-                            .behaviour_mut()
-                            .peer_manager
-                            .process_penalty(peer, Penalty::Severe);
+                        warn!(target: "network", ?peer, ?request_id, ?error, "inbound failure: unsupported protocol (not penalized)");
                     }
                     ReqResInboundFailure::Timeout | ReqResInboundFailure::ConnectionClosed => {
                         // peer dropped or stalled mid-request — expected on WAN, no penalty

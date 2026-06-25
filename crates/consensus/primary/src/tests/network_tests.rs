@@ -156,6 +156,95 @@ async fn create_test_types_at_epoch(path: &Path, epoch: Epoch) -> TestTypes {
 }
 
 #[tokio::test]
+async fn test_retrieve_consensus_output() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let committee_obj = committee.committee();
+
+    // Populate a few consensus outputs in the epoch-0 pack. Numbers start at 1 so each is greater
+    // than the latest consensus number and is actually saved (mirror of storage_tests.rs).
+    for number in 1..=3u64 {
+        let cert = Certificate::default();
+        let sub_dag = CommittedSubDag::new(
+            vec![cert.clone()],
+            cert,
+            number,
+            ReputationScores::new(&committee_obj),
+            None,
+        );
+        handler.consensus_chain().write_subdag_for_test(number, sub_dag).await;
+    }
+
+    // The server serves the raw output bytes for every stored number.
+    for number in 1..=3u64 {
+        let bytes = handler
+            .consensus_output_bytes(number)
+            .await
+            .expect("stored consensus output should be served");
+        assert!(!bytes.is_empty(), "served output {number} bytes must not be empty");
+    }
+
+    // A number we do not have is a benign miss: it errors and carries no penalty.
+    let err =
+        handler.consensus_output_bytes(999).await.expect_err("unknown consensus output must error");
+    assert_matches!(
+        err,
+        PrimaryNetworkError::ConsensusChainError(ConsensusChainError::PackError(
+            PackError::ConsensusNumberTooHigh
+        ))
+    );
+    let penalty: Option<tn_network_libp2p::Penalty> = (&err).into();
+    assert!(penalty.is_none(), "an unknown consensus output must not penalize the peer");
+}
+
+/// The server-side stream send writes exactly the stored output bytes and closes the stream.
+/// An unknown number closes the stream with no bytes (the client observes EOF and retries).
+#[tokio::test]
+async fn test_send_consensus_output_over_stream() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let committee_obj = committee.committee();
+    let peer = BlsPublicKey::default();
+
+    for number in 1..=3u64 {
+        let cert = Certificate::default();
+        let sub_dag = CommittedSubDag::new(
+            vec![cert.clone()],
+            cert,
+            number,
+            ReputationScores::new(&committee_obj),
+            None,
+        );
+        handler.consensus_chain().write_subdag_for_test(number, sub_dag).await;
+    }
+
+    // streamed bytes for a stored output must match the bytes returned by the lookup
+    for number in 1..=3u64 {
+        let expected = handler
+            .consensus_output_bytes(number)
+            .await
+            .expect("stored consensus output should be served");
+        let mut streamed: Vec<u8> = Vec::new();
+        handler
+            .send_consensus_output_over_stream(&mut streamed, number, Duration::from_secs(5), peer)
+            .await
+            .expect("streaming a stored output should succeed");
+        assert_eq!(streamed, expected, "streamed bytes must match stored output {number}");
+        assert!(!streamed.is_empty(), "streamed output {number} must not be empty");
+    }
+
+    // an unknown number streams nothing (graceful EOF) rather than erroring the send
+    let mut streamed: Vec<u8> = Vec::new();
+    handler
+        .send_consensus_output_over_stream(&mut streamed, 999, Duration::from_secs(5), peer)
+        .await
+        .expect("streaming an unknown output closes gracefully");
+    assert!(streamed.is_empty(), "unknown output must stream zero bytes");
+}
+
+#[tokio::test]
 async fn test_vote_succeeds() -> eyre::Result<()> {
     // common types
     let temp_dir = TempDir::new().unwrap();
@@ -771,18 +860,19 @@ async fn test_behind_consensus_genuinely_behind() {
 #[tokio::test]
 async fn test_pending_epoch_stream_replacement_preserves_created_at() {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_EPOCH_STREAMS));
-    let mut pending_map: HashMap<(BlsPublicKey, B256), PendingEpochStream> = HashMap::new();
+    let mut pending_map: HashMap<(BlsPublicKey, B256), PendingStreamRequest> = HashMap::new();
 
     let peer = BlsPublicKey::default();
     let digest = B256::random();
     let key = (peer, digest);
     let epoch: u32 = 7;
+    let kind = StreamRequestKind::EpochPack(epoch);
 
     // initial insertion at T0, where T0 is just past the cleanup horizon so we can
     // assert eviction without waiting on wall-clock time
     let t0 = Instant::now() - PENDING_REQUEST_TIMEOUT - Duration::from_secs(1);
     let permit = semaphore.clone().try_acquire_owned().expect("permit available");
-    pending_map.insert(key, PendingEpochStream::new_with_created_at(epoch, permit, t0));
+    pending_map.insert(key, PendingStreamRequest::new_with_created_at(kind, permit, t0));
 
     // simulate a re-request: production code looks up the existing entry's
     // `created_at` and reuses it when building the replacement
@@ -790,7 +880,7 @@ async fn test_pending_epoch_stream_replacement_preserves_created_at() {
     let preserved_created_at =
         pending_map.get(&key).map(|p| p.created_at).unwrap_or_else(Instant::now);
     let replacement =
-        PendingEpochStream { epoch, created_at: preserved_created_at, _permit: new_permit };
+        PendingStreamRequest { kind, created_at: preserved_created_at, _permit: new_permit };
     assert!(pending_map.insert(key, replacement).is_some(), "expected replacement");
 
     // the replacement must carry the original `created_at`, not a fresh one
