@@ -103,6 +103,9 @@ impl WorkerNetworkHandle {
                 "Got wrong response, not a report batch is peer exchange!".to_string(),
             )),
             WorkerResponse::Error(WorkerRPCError(s)) => Err(NetworkError::RPCError(s)),
+            WorkerResponse::RecoverableError(WorkerRPCError(s)) => {
+                Err(NetworkError::RPCRetryable(s))
+            }
         }
     }
 
@@ -283,6 +286,9 @@ impl WorkerNetworkHandle {
                 "Got wrong response: peer exchange instead of stream ack".to_string(),
             )),
             WorkerResponse::Error(WorkerRPCError(s)) => Err(NetworkError::RPCError(s)),
+            WorkerResponse::RecoverableError(WorkerRPCError(s)) => {
+                Err(NetworkError::RPCRetryable(s))
+            }
         }
     }
 

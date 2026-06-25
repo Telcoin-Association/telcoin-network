@@ -2,7 +2,7 @@
 
 use super::CertManagerError;
 use tn_network_libp2p::Penalty;
-use tn_storage::StoreError;
+use tn_storage::{consensus::ConsensusChainError, StoreError};
 use tn_types::{
     error::{CertificateError, HeaderError},
     BcsError, BlockHash, BlsPublicKey, ConsensusHeaderDigest, Epoch, EpochDigest,
@@ -41,6 +41,9 @@ pub(crate) enum PrimaryNetworkError {
     /// Unknown consensus header certificate.
     #[error("Unknown consensus header certificate for: {0}")]
     UnknownConsensusHeaderCert(ConsensusHeaderDigest),
+    /// Unknown consensus output (raw bytes) for the requested number.
+    #[error("Unknown consensus output: {0}")]
+    UnknownConsensusOutput(u64),
     /// Peer that is not committee published invalid gosip.
     /// Temparily disabled, will be back soon.
     #[error("Peer {0} is not in the committee!")]
@@ -65,6 +68,9 @@ pub(crate) enum PrimaryNetworkError {
     /// A requested pack file stream is not available.
     #[error("Pack file is not available to stream for epoch {0}")]
     StreamUnavailable(Epoch),
+    /// Pass through from the consesus chain.
+    #[error("ConsensusChainError {0}")]
+    ConsensusChainError(ConsensusChainError),
 }
 
 impl From<&PrimaryNetworkError> for Option<Penalty> {
@@ -112,9 +118,10 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
                 | CertManagerError::ChannelClosed
                 | CertManagerError::TNSend(_) => None,
             },
-            // Benign "miss": observers legitimately request not-yet-served headers.
+            // Benign "miss": observers legitimately request not-yet-served headers/outputs.
             // No penalty so honest sync flows are not banned during catch-up.
-            PrimaryNetworkError::UnknownConsensusHeaderDigest(_) => None,
+            PrimaryNetworkError::UnknownConsensusHeaderDigest(_)
+            | PrimaryNetworkError::UnknownConsensusOutput(_) => None,
             PrimaryNetworkError::InvalidRequest(_)
             | PrimaryNetworkError::UnknownStreamRequest(_)
             | PrimaryNetworkError::UnknownConsensusHeaderCert(_) => Some(Penalty::Mild),
@@ -128,6 +135,7 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
             | PrimaryNetworkError::Storage(_)
             | PrimaryNetworkError::Timeout(_)
             | PrimaryNetworkError::StreamUnavailable(_)
+            | PrimaryNetworkError::ConsensusChainError(_)
             | PrimaryNetworkError::Internal(_) => None,
         }
     }

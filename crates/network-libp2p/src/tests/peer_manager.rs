@@ -31,6 +31,7 @@ fn create_test_peer_manager(network_config: Option<NetworkConfig>) -> PeerManage
     let authority_1 = authorities.next().expect("first authority");
     let config = authority_1.consensus_config();
     PeerManager::new(
+        PeerId::random(),
         config.network_config().peer_config(),
         crate::metrics::PeerManagerMetrics::new_for(&crate::types::NetworkType::Primary),
     )
@@ -560,6 +561,7 @@ async fn test_is_validator() {
     let authority_1 = authorities.next().expect("first authority");
     let config = authority_1.consensus_config();
     let mut peer_manager = PeerManager::new(
+        PeerId::random(),
         config.network_config().peer_config(),
         crate::metrics::PeerManagerMetrics::new_for(&crate::types::NetworkType::Primary),
     );
@@ -1033,6 +1035,101 @@ async fn test_process_peers_for_discovery_filters_duplicates() {
     // should only have one entry
     assert_eq!(peer_manager.discovery_peers.len(), 1);
     assert_eq!(peer_manager.discovery_peers.remove(&peer_id), Some(vec![addr]));
+}
+
+// Regression (issue #777 Part B): the node's own peer id must never be added to
+// the discovery feed. A self entry (learned via kad closest-peers or peer
+// exchange) would otherwise be selected for a self-dial during the heartbeat.
+#[tokio::test]
+async fn test_self_id_filtered_from_discovery() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let local = peer_manager.local_peer_id;
+    let other = PeerId::random();
+    let addr = create_multiaddr(None);
+
+    // our own id is not eligible; a normal peer is
+    assert!(!peer_manager
+        .eligible_for_discovery(&PeerInfo { peer_id: local, addrs: vec![addr.clone()] }));
+    assert!(peer_manager
+        .eligible_for_discovery(&PeerInfo { peer_id: other, addrs: vec![addr.clone()] }));
+
+    // feeding self + a normal peer through the discovery sink registers only the
+    // normal peer
+    peer_manager.process_peers_for_discovery(vec![
+        PeerInfo { peer_id: local, addrs: vec![addr.clone()] },
+        PeerInfo { peer_id: other, addrs: vec![addr.clone()] },
+    ]);
+    assert!(!peer_manager.discovery_peers.contains_key(&local));
+    assert_eq!(peer_manager.discovery_peers.remove(&other), Some(vec![addr]));
+}
+
+// Regression (issue #777 Part B): routing the node's own peer id through the
+// dial path is a no-op (no dial request, no self-penalty) and reports success so
+// retrying callers do not treat it as a failure.
+#[tokio::test]
+async fn test_self_dial_request_is_noop() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let local = peer_manager.local_peer_id;
+    // mirror the observed hairpin address (192.168.8.1)
+    let hairpin = create_multiaddr(Some(IpAddr::V4(Ipv4Addr::new(192, 168, 8, 1))));
+    let (sender, receiver) = oneshot::channel();
+
+    peer_manager.dial_peer(local, vec![hairpin], Some(sender));
+
+    // no dial request was queued
+    assert!(peer_manager.next_dial_request().is_none());
+    // the caller is told the no-op succeeded (so `dial_peer_bls` does not retry)
+    let result = timeout(Duration::from_millis(500), receiver).await.unwrap().unwrap();
+    assert!(result.is_ok());
+    // the node never scored or tracked itself
+    assert!(!peer_manager.peer_banned(&local));
+    assert!(peer_manager.peer_score(&local).is_none());
+}
+
+// Regression (issue #777 Part B): a penalty targeting the node's own id is a
+// no-op, even a `Fatal` one — a self-connection can never ban the node.
+#[tokio::test]
+async fn test_self_penalty_is_noop() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let local = peer_manager.local_peer_id;
+
+    peer_manager.process_penalty(local, Penalty::Fatal);
+
+    assert!(!peer_manager.peer_banned(&local));
+    assert!(peer_manager.peer_score(&local).is_none());
+    let events = collect_all_events(&mut peer_manager);
+    assert!(extract_events(&events, |e| matches!(e, PeerEvent::Banned(_))).is_empty());
+}
+
+// Regression (issue #777 Part B): a self-connection is denied without scoring at
+// the connection-establishment handlers. The pending-outbound guard is the
+// precise fix for kad auto-dialing our own re-learned record; the established
+// handlers are the backstop. A normal peer is still accepted.
+#[tokio::test]
+async fn test_self_connection_denied() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let local = peer_manager.local_peer_id;
+    let other = PeerId::random();
+    let connection_id = ConnectionId::new_unchecked(0);
+    let addr = create_multiaddr(None);
+
+    // kad-initiated dial of our own id is denied at the pending stage
+    assert!(peer_manager
+        .handle_pending_outbound_connection(connection_id, Some(local), &[], Endpoint::Dialer)
+        .is_err());
+    // a normal peer is allowed to be dialed
+    assert!(peer_manager
+        .handle_pending_outbound_connection(connection_id, Some(other), &[], Endpoint::Dialer)
+        .is_ok());
+
+    // an inbound self-connection (loopback/hairpin) is dropped
+    assert!(peer_manager
+        .handle_established_inbound_connection(connection_id, local, &addr, &addr)
+        .is_err());
+
+    // and no self-penalty was ever recorded by any of the above
+    assert!(!peer_manager.peer_banned(&local));
+    assert!(peer_manager.peer_score(&local).is_none());
 }
 
 #[tokio::test]
