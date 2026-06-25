@@ -134,7 +134,7 @@ mod tests {
     use snap::read::FrameDecoder;
     use std::io::Read;
     use tempfile::TempDir;
-    use tn_types::{max_batch_size, TaskManager};
+    use tn_types::{max_batch_size, Committee, TaskManager};
 
     /// Helper to write batch to buffer and return it
     async fn encode_batch_to_vec(batch: &Batch) -> Vec<u8> {
@@ -303,7 +303,8 @@ mod tests {
         let db = setup_batch_db(&batches);
         let temp_dir = TempDir::new().expect("tempdir");
         let consensus_chain =
-            ConsensusChain::new(temp_dir.path().to_path_buf()).expect("consensus chain");
+            ConsensusChain::new(temp_dir.path().to_path_buf(), Committee::default())
+                .expect("consensus chain");
 
         // collect digests
         let digests: BTreeSet<B256> = batches.iter().map(|b| b.digest()).collect();
@@ -343,7 +344,8 @@ mod tests {
         let db = setup_batch_db(&batches[..2]);
         let temp_dir = TempDir::new().expect("tempdir");
         let consensus_chain =
-            ConsensusChain::new(temp_dir.path().to_path_buf()).expect("consensus chain");
+            ConsensusChain::new(temp_dir.path().to_path_buf(), Committee::default())
+                .expect("consensus chain");
         consensus_chain.persist_current().await.expect("clean open");
 
         // request all 3 digests
@@ -366,7 +368,8 @@ mod tests {
         let digests: BTreeSet<B256> = BTreeSet::new();
         let temp_dir = TempDir::new().expect("tempdir");
         let consensus_chain =
-            ConsensusChain::new(temp_dir.path().to_path_buf()).expect("consensus chain");
+            ConsensusChain::new(temp_dir.path().to_path_buf(), Committee::default())
+                .expect("consensus chain");
 
         let mut output = Vec::new();
         send_batches_over_stream(&mut output, &db, &consensus_chain, &digests, 0)
@@ -387,7 +390,8 @@ mod tests {
         let db = setup_batch_db(&batches);
         let temp_dir = TempDir::new().expect("tempdir");
         let consensus_chain =
-            ConsensusChain::new(temp_dir.path().to_path_buf()).expect("consensus chain");
+            ConsensusChain::new(temp_dir.path().to_path_buf(), Committee::default())
+                .expect("consensus chain");
 
         let digests: BTreeSet<B256> = batches.iter().map(|b| b.digest()).collect();
         assert_eq!(digests.len(), batch_count);

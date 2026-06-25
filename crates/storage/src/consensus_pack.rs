@@ -118,6 +118,7 @@ pub struct ConsensusPack {
     epoch: Epoch,
     committee: Committee,
     compression: PackCompression,
+    is_static: bool,
 }
 
 fn run_pack_loop(
@@ -215,6 +216,7 @@ impl ConsensusPack {
             epoch,
             committee,
             compression,
+            is_static: false,
         })
     }
 
@@ -234,6 +236,7 @@ impl ConsensusPack {
             epoch,
             committee,
             compression,
+            is_static: false,
         })
     }
 
@@ -255,6 +258,7 @@ impl ConsensusPack {
             epoch,
             committee,
             compression,
+            is_static: true,
         })
     }
 
@@ -291,7 +295,13 @@ impl ConsensusPack {
             epoch,
             committee,
             compression,
+            is_static: true,
         })
+    }
+
+    /// Is this packfile static- i.e. complete and read only.
+    pub fn is_static(&self) -> bool {
+        self.is_static
     }
 
     /// Return the epoch for this pack file.
