@@ -86,7 +86,7 @@ impl PopArgs {
         println!("    execution_address:   {}", node_info.execution_address);
         println!("    proof_of_possession: {}", node_info.proof_of_possession);
         println!(
-            "Next: telcoin keytool export-staking-args --node-info {}",
+            "Next: telcoin-network keytool export-staking-args --node-info {}",
             dir.node_info_path().display()
         );
         Ok(())
