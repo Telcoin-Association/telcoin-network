@@ -578,7 +578,7 @@ async fn test_recoverable_error_retry_then_quorum() {
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
     let network =
-        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
+        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0, 0);
     let quorum_waiter = QuorumWaiter::new(
         my_primary.authority().clone(),
         committee.clone(),
@@ -638,7 +638,7 @@ async fn test_recoverable_error_exhausts_retries_as_network() {
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
     let network =
-        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
+        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0, 0);
     let quorum_waiter = QuorumWaiter::new(
         my_primary.authority().clone(),
         committee.clone(),
