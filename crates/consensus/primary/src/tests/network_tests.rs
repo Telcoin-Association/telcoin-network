@@ -4,7 +4,7 @@ use crate::{
     error::PrimaryNetworkError,
     network::{
         message::{PrimaryGossip, PrimaryResponse},
-        MissingCertificatesRequest, PendingEpochStream, RequestHandler,
+        MissingCertificatesRequest, PendingStreamRequest, RequestHandler, StreamRequestKind,
         MAX_CONCURRENT_EPOCH_STREAMS, PENDING_REQUEST_TIMEOUT,
     },
     state_sync::StateSynchronizer,
@@ -20,13 +20,19 @@ use std::{
 use tempfile::TempDir;
 use tn_config::Parameters;
 use tn_network_libp2p::{GossipMessage, TopicHash};
-use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, tables::Votes};
+use tn_storage::{
+    consensus::{ConsensusChain, ConsensusChainError},
+    consensus_pack::PackError,
+    mem_db::MemDatabase,
+    tables::Votes,
+};
 use tn_test_utils_committee::{AuthorityFixture, CommitteeFixture};
 use tn_types::{
     encode, error::HeaderError, now, to_intent_message, AuthorityIdentifier, BlockHash,
-    BlockHeader, BlockNumHash, BlsPublicKey, BlsSigner as _, Certificate, ConsensusHeaderDigest,
-    ConsensusNumHash, ConsensusResult, Database, Epoch, EpochVote, ExecHeader, Hash as _,
-    HeaderDigest, Round, SealedHeader, TaskManager, VoteDigest, VoteInfo, B256,
+    BlockHeader, BlockNumHash, BlsPublicKey, BlsSigner as _, Certificate, CommittedSubDag,
+    ConsensusHeaderDigest, ConsensusNumHash, ConsensusResult, Database, Epoch, EpochVote,
+    ExecHeader, Hash as _, HeaderDigest, ReputationScores, Round, SealedHeader, TaskManager,
+    VoteDigest, VoteInfo, B256,
 };
 use tracing::debug;
 
