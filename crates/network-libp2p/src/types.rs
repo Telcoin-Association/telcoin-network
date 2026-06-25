@@ -162,8 +162,16 @@ pub enum NetworkEvent<Req, Res> {
         /// The oneshot channel if the request gets cancelled at the network level.
         cancel: oneshot::Receiver<()>,
     },
-    /// Gossip message received and propagation source.
-    Gossip(GossipMessage, BlsPublicKey),
+    /// Gossip message received, with the relaying peer's BLS identity when it
+    /// has resolved.
+    ///
+    /// The identity is `None` during the brief window after a peer joins the
+    /// gossipsub mesh and relays a message before its signed `NodeRecord`
+    /// (which carries the BLS key) has been resolved. The payload is delivered
+    /// regardless, because the message author is already authenticated during
+    /// gossip verification; the relayer identity is used only for penalty
+    /// attribution and a log label, never for the payload itself.
+    Gossip(GossipMessage, Option<BlsPublicKey>),
     /// Send an error back the requester.
     Error(String, ResponseChannel<Res>),
     /// An inbound stream was established by a peer.

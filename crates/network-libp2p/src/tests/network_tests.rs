@@ -867,9 +867,14 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
     let event =
         timeout(Duration::from_secs(2), nvv_network_events.recv()).await?.expect("batch received");
 
-    // assert gossip message
-    if let NetworkEvent::Gossip(msg, _) = event {
+    // assert gossip message and that the resolved relayer identity is carried
+    if let NetworkEvent::Gossip(msg, relayer) = event {
         assert_eq!(msg.data, expected_result);
+        assert_eq!(
+            relayer,
+            Some(target_peer_bls),
+            "resolved relayer's BLS identity must be attached to the delivered gossip"
+        );
     } else {
         panic!("unexpected network event received");
     }
@@ -2560,5 +2565,40 @@ fn resolved_response_attaches_identity_to_payload() -> eyre::Result<()> {
     let NetworkResponseMessage { peer, result } = resolve_response(Some(bls), response.clone())?;
     assert_eq!(peer, bls);
     assert_eq!(result, response);
+    Ok(())
+}
+
+/// A minimal accepted gossip payload for delivery-mapping tests.
+fn test_gossip_message() -> GossipMessage {
+    GossipMessage {
+        source: None,
+        data: Vec::from("gossip-payload".as_bytes()),
+        sequence_number: None,
+        topic: TopicHash::from_raw(TEST_TOPIC),
+    }
+}
+
+/// Regression for issue #776: an accepted gossip message whose relaying peer's
+/// BLS identity has not yet resolved must still be delivered (carried as
+/// `None`), never dropped. The author is authenticated during gossip
+/// verification, and gossipsub will not re-deliver the `message_id` once the
+/// identity resolves, so dropping here would lose the message for good.
+#[test]
+fn accepted_gossip_with_unresolved_relayer_is_delivered() -> eyre::Result<()> {
+    let message = test_gossip_message();
+    let event: NetworkEvent<TestWorkerRequest, TestWorkerResponse> =
+        accepted_gossip_event(message.clone(), None);
+    assert_matches!(event, NetworkEvent::Gossip(delivered, None) if delivered.data == message.data);
+    Ok(())
+}
+
+/// A resolved relayer identity is attached to the delivered gossip event.
+#[test]
+fn accepted_gossip_with_resolved_relayer_carries_identity() -> eyre::Result<()> {
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([9; 32])).public();
+    let message = test_gossip_message();
+    let event: NetworkEvent<TestWorkerRequest, TestWorkerResponse> =
+        accepted_gossip_event(message, Some(bls));
+    assert_matches!(event, NetworkEvent::Gossip(_, Some(got)) if got == bls);
     Ok(())
 }
