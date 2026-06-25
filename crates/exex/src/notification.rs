@@ -54,8 +54,21 @@ pub use reth_execution_types::Chain;
 /// [`replay`](crate::replay) — see [`Lagged`] for what replay can and cannot
 /// reconstruct.
 ///
+/// # Ordering
+///
+/// Only [`ChainExecuted`] is ordered: it is delivered in monotonically
+/// increasing block-height order (de-duplicated across the replay/live seam).
+/// There is **no** ordering guarantee *across* variants — the manager drains its
+/// certificate, consensus-output, and canonical-state sources independently, so a
+/// [`CertificateAccepted`], the [`ConsensusOutput`] it belongs to, and the
+/// [`ChainExecuted`] for the resulting blocks may arrive in any relative order.
+/// An ExEx that needs a causal sequence must derive it from the [`ChainExecuted`]
+/// stream, not from the relative arrival of the earlier signals.
+///
 /// [`Lagged`]: TnExExNotification::Lagged
 /// [`ChainExecuted`]: TnExExNotification::ChainExecuted
+/// [`CertificateAccepted`]: TnExExNotification::CertificateAccepted
+/// [`ConsensusOutput`]: TnExExNotification::ConsensusOutput
 #[derive(Debug, Clone)]
 pub enum TnExExNotification {
     /// A gossip-verified certificate has been accepted on the consensus-following
@@ -98,9 +111,10 @@ pub enum TnExExNotification {
     /// Emitted in two cases, both surfacing the same "a gap exists" signal:
     /// 1. **Downstream (manager → ExEx):** this ExEx's bounded channel was full, so the manager
     ///    dropped notifications rather than block.
-    /// 2. **Upstream (source → manager):** the manager itself fell behind one of its source streams
-    ///    (reth's canonical-state stream or a consensus broadcast), which drop lagged items
-    ///    silently. The manager detects the resulting discontinuity and re-emits it as `Lagged`.
+    /// 2. **Upstream (source → manager):** the manager itself fell behind one of its source
+    ///    streams (reth's canonical-state stream or a consensus broadcast), which drop lagged
+    ///    items silently. The manager detects the resulting discontinuity and re-emits it as
+    ///    `Lagged`.
     ///
     /// # What replay can and cannot recover
     ///
@@ -114,8 +128,12 @@ pub enum TnExExNotification {
     /// replay does not reproduce them. An ExEx that needs a gap-free history must
     /// derive it from `ChainExecuted` (plus replay), not from these early signals.
     ///
-    /// `missed` is a best-effort count of notifications dropped since the last
-    /// successful delivery; treat it as "a gap exists" rather than an exact tally.
+    /// `missed` is a best-effort magnitude, **not a single unit**: depending on
+    /// which gap it reports, it counts dropped per-ExEx notifications (downstream),
+    /// lagged broadcast messages from a consensus source stream, or skipped
+    /// canonical block numbers (upstream). Treat it as "a gap of roughly this size
+    /// exists" rather than an exact, uniformly-typed tally — and reconcile via
+    /// replay regardless of its value.
     ///
     /// [`ChainExecuted`]: TnExExNotification::ChainExecuted
     /// [`CertificateAccepted`]: TnExExNotification::CertificateAccepted

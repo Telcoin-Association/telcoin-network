@@ -281,6 +281,12 @@ impl futures::Future for TnExExManager {
                     // side as a commit. The manager is spawned once and never
                     // respawned, so panicking here (it previously did) would kill
                     // the shared fan-out for every ExEx for the node's lifetime.
+                    //
+                    // Note: `old` is discarded, and if `new`'s blocks are not
+                    // strictly newer than the last delivered tip the downstream
+                    // height-dedup (`dedup_chain_executed`) may drop this degraded
+                    // commit. Acceptable precisely because the arm is unreachable
+                    // under TN's immediate-finality consensus.
                     CanonStateNotification::Reorg { old, new } => {
                         error!(
                             target: "exex::manager",
@@ -340,6 +346,22 @@ impl TnExExManagerHandle {
 /// `install_exex_with_capacity` to override it per-ExEx.
 pub const fn exex_channel_capacity() -> usize {
     EXEX_CHANNEL_CAPACITY
+}
+
+/// Resolve an operator-supplied ExEx notification channel capacity to a valid
+/// bounded-channel buffer size.
+///
+/// [`tokio::sync::mpsc::channel`] panics when constructed with a zero-length
+/// buffer, and the capacity passed to `TnBuilder::install_exex_with_capacity` is
+/// otherwise unvalidated. Clamping a `0` up to `1` here keeps a misconfigured
+/// ExEx registration from panicking the node at startup; every other value
+/// passes through unchanged.
+pub const fn resolve_exex_channel_capacity(capacity: usize) -> usize {
+    if capacity == 0 {
+        1
+    } else {
+        capacity
+    }
 }
 
 /// Returns `Some(missed)` — the count of skipped block numbers — when `first`
@@ -414,6 +436,24 @@ mod tests {
         // Exactly one notification, no spurious Lagged marker.
         assert!(matches!(rx.try_recv(), Ok(TnExExNotification::Lagged { missed: FILLER })));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn resolve_exex_channel_capacity_clamps_zero_to_one() {
+        // A `0` capacity (e.g. `install_exex_with_capacity(.., 0, ..)`) would
+        // panic `mpsc::channel(0)` at node startup; it must clamp up to 1.
+        assert_eq!(resolve_exex_channel_capacity(0), 1);
+        // Every other value passes through unchanged.
+        assert_eq!(resolve_exex_channel_capacity(1), 1);
+        assert_eq!(resolve_exex_channel_capacity(256), 256);
+    }
+
+    #[tokio::test]
+    async fn resolved_zero_capacity_builds_a_valid_channel_without_panicking() {
+        // The exact construction the node performs at startup must not panic for
+        // a `0` capacity once routed through `resolve_exex_channel_capacity`.
+        let (tx, _rx) = mpsc::channel::<TnExExNotification>(resolve_exex_channel_capacity(0));
+        assert_eq!(tx.capacity(), 1);
     }
 
     #[test]

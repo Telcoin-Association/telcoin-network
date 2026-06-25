@@ -391,7 +391,11 @@ where
             let mut event_rxs = Vec::new();
 
             for (name, capacity, install_fn) in self.builder.exex_fns.drain(..) {
-                let (notif_tx, notif_rx) = mpsc::channel(capacity);
+                // Clamp an operator-supplied `0` up to `1`: `mpsc::channel(0)`
+                // panics, and the capacity from `install_exex_with_capacity` is
+                // otherwise unvalidated (ExEx review finding #3).
+                let (notif_tx, notif_rx) =
+                    mpsc::channel(tn_exex::resolve_exex_channel_capacity(capacity));
                 let (event_tx, event_rx) = mpsc::channel(EXEX_EVENT_CAPACITY);
 
                 let ctx = tn_exex::TnExExContext::new(

@@ -41,11 +41,13 @@
 //! - [`consensus_chain`](TnExExContext::consensus_chain) — the consensus DB: consensus headers,
 //!   epoch records, and committed sub-DAGs by number or digest.
 //!
-//! `reth_env` is read-only by construction — its public surface exposes no
-//! DB-mutating methods. `consensus_chain` is meant for reads too, but its public
-//! surface is *not* mutation-free; an ExEx must treat it as a read handle and
-//! never call its writing methods (see [`TnExExContext::consensus_chain`]). See
-//! [`TnExExContext::reth_env`] for the available EVM reads.
+//! Both handles are for reads only, and **neither** is mutation-free at the type
+//! level: `reth_env` exposes DB-writing methods (e.g. `finish_executing_output`,
+//! `finalize_block`) and `consensus_chain` exposes consensus-DB writers. An ExEx
+//! must treat both as read handles and never call their writing methods — doing
+//! so would corrupt the follower's state. The read-only contract is by
+//! convention, not enforced by the type (see [`TnExExContext::reth_env`] and
+//! [`TnExExContext::consensus_chain`]).
 //!
 //! # Replay vs. live: state-diff fidelity
 //!
@@ -86,7 +88,9 @@ pub mod replay;
 
 pub use context::TnExExContext;
 pub use event::TnExExEvent;
-pub use manager::{exex_channel_capacity, TnExExManager, TnExExManagerHandle};
+pub use manager::{
+    exex_channel_capacity, resolve_exex_channel_capacity, TnExExManager, TnExExManagerHandle,
+};
 pub use notification::{Chain, TnExExNotification};
 pub use replay::ReplayStream;
 

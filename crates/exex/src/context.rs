@@ -52,16 +52,20 @@ impl TnExExContext {
         Self { notifications, events, reth_env, consensus_chain }
     }
 
-    /// Read-only handle to reth for querying EVM chain state and history.
+    /// Handle to reth for querying EVM chain state and history — for reads only.
     ///
-    /// `RethEnv`'s public surface exposes no DB-mutating methods, so ExExes use it
-    /// for reads only. It is *not* a write capability; ExEx code must treat it as
-    /// read-only.
+    /// Use this **only** for reads. `RethEnv`'s public surface is *not*
+    /// mutation-free: it also exposes DB-writing methods — notably
+    /// `finish_executing_output` (commits blocks and broadcasts a canonical-state
+    /// notification) and `finalize_block` (persists the finalized/safe block
+    /// numbers) — and this handle shares state with the node's live execution
+    /// writer. Calling a writing method from an ExEx would corrupt the follower's
+    /// chain state. The read-only contract here is by convention, not enforced by
+    /// the type.
     ///
     /// Reads commonly useful to an ExEx (see [`RethEnv`] for the full surface):
     ///
-    /// - `last_block_number()` / `canonical_tip()` / `finalized_header()` — current chain
-    ///   position.
+    /// - `last_block_number()` / `canonical_tip()` / `finalized_header()` — current chain position.
     /// - `sealed_block_by_number(n)` / `sealed_block_with_senders(..)` — a full block, optionally
     ///   with recovered senders.
     /// - `header_by_number(n)` / `sealed_header_by_number(n)` — a single header.
