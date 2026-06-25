@@ -330,18 +330,22 @@ where
         )
         .await?;
 
-        // read the network config or use the default
-        let network_config = NetworkConfig::read_config(&self.tn_datadir)?;
+        // read the network config or use the default, then stamp the genesis chain id
+        // onto it so every wire protocol and gossip topic is chain-namespaced (issue
+        // #765). Genesis is the single source of truth; this one value is read by the
+        // network builder, the gossip handles, and the gossip-validation handlers.
+        let mut network_config = NetworkConfig::read_config(&self.tn_datadir)?;
+        network_config.set_chain_id(self.builder.tn_config.genesis().config.chain_id);
         self.spawn_node_networks(node_task_spawner, &network_config, epoch).await?;
         let primary_network_handle =
             self.primary_network_handle.as_ref().expect("primary network").clone();
         primary_network_handle
             .inner_handle()
-            .subscribe(tn_config::LibP2pConfig::epoch_vote_topic())
+            .subscribe(tn_config::LibP2pConfig::epoch_vote_topic(network_config.chain_id()))
             .await?;
         primary_network_handle
             .inner_handle()
-            .subscribe(tn_config::LibP2pConfig::consensus_output_topic())
+            .subscribe(tn_config::LibP2pConfig::consensus_output_topic(network_config.chain_id()))
             .await?;
         state_sync::spawn_epoch_record_collector(
             self.consensus_chain.clone(),
@@ -507,7 +511,8 @@ where
         });
 
         // primary network handle
-        self.primary_network_handle = Some(PrimaryNetworkHandle::new(primary_network_handle));
+        self.primary_network_handle =
+            Some(PrimaryNetworkHandle::new(primary_network_handle, network_config.chain_id()));
 
         // pass through the worker's RPC descriptor so peers can discover this
         // validator's JSON-RPC endpoint via kademlia. validators that did not
@@ -547,8 +552,12 @@ where
         });
 
         // set temporary task spawner - this is updated with each epoch
-        self.worker_network_handle =
-            Some(WorkerNetworkHandle::new(worker_network_handle, node_task_spawner.clone(), epoch));
+        self.worker_network_handle = Some(WorkerNetworkHandle::new(
+            worker_network_handle,
+            node_task_spawner.clone(),
+            epoch,
+            network_config.chain_id(),
+        ));
 
         Ok(())
     }

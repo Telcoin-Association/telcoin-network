@@ -630,8 +630,8 @@ async fn test_outbound_failure_malicious_response() -> eyre::Result<()> {
 /// ingest a *worker's* `NodeRecord` and then dial/RPC it with primary protocols,
 /// penalizing and banning otherwise-healthy peers.
 ///
-/// With `NetworkType::Primary` → `/tn-primary/*` and `NetworkType::Worker(0)` →
-/// `/tn-worker-0/*`, the cross-role substreams never negotiate: kad never exchanges
+/// With `NetworkType::Primary` → `/tn-primary-<chain>/*` and `NetworkType::Worker(0)`
+/// → `/tn-worker-0-<chain>/*`, the cross-role substreams never negotiate: kad never exchanges
 /// records (so the worker's pushed record never resolves on the primary) and a
 /// req/res request surfaces an `OutboundFailure`. Both networks use IDENTICAL
 /// req/res message types here, so the only thing that can differ is the
@@ -739,9 +739,10 @@ async fn test_primary_worker_protocol_isolation() -> eyre::Result<()> {
         "worker resolved primary's BLS key — kad records crossed roles"
     );
 
-    // req/res isolation: a request to the worker cannot negotiate a protocol —
-    // the worker speaks `/tn-worker-0/*`, not the primary's `/tn-primary/*`. With
-    // identical message types, this can ONLY be a protocol-name mismatch.
+    // req/res isolation: a request to the worker cannot negotiate a protocol,
+    // the worker speaks `/tn-worker-0-<chain>/*`, not the primary's
+    // `/tn-primary-<chain>/*`. With identical message types, this can ONLY be a
+    // protocol-name mismatch.
     let req = TestWorkerRequest::MissingBatches(vec![]);
     let reply = primary.send_request(req, worker_bls).await?;
     let res = timeout(Duration::from_secs(5), reply).await?.expect("reply channel");

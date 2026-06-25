@@ -499,7 +499,7 @@ where
         network_handle
             .inner_handle()
             .subscribe_with_publishers(
-                tn_config::LibP2pConfig::primary_topic(),
+                tn_config::LibP2pConfig::primary_topic(consensus_config.chain_id()),
                 committee_keys.into_iter().collect(),
             )
             .await?;
@@ -672,14 +672,14 @@ where
         // update the authorized publishers for gossip every epoch
         network_handle
             .inner_handle()
-            .subscribe(tn_config::LibP2pConfig::worker_txn_topic())
+            .subscribe(tn_config::LibP2pConfig::worker_txn_topic(consensus_config.chain_id()))
             .await?;
         // Get gossip from committee members about batches.
         // Useful for non-CVVs to prefetch and harmless for CVVs.
         network_handle
             .inner_handle()
             .subscribe_with_publishers(
-                tn_config::LibP2pConfig::worker_batch_topic(),
+                tn_config::LibP2pConfig::worker_batch_topic(consensus_config.chain_id()),
                 committee_keys.into_iter().collect(),
             )
             .await?;

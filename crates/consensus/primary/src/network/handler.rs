@@ -202,7 +202,9 @@ where
         match gossip {
             PrimaryGossip::Certificate(mut cert) => {
                 ensure!(
-                    topic.to_string().eq(&tn_config::LibP2pConfig::primary_topic()),
+                    topic.to_string().eq(&tn_config::LibP2pConfig::primary_topic(
+                        self.consensus_config.chain_id()
+                    )),
                     PrimaryNetworkError::InvalidTopic
                 );
                 // process certificate
@@ -242,7 +244,9 @@ where
             }
             PrimaryGossip::Consensus(result) => {
                 ensure!(
-                    topic.to_string().eq(&tn_config::LibP2pConfig::consensus_output_topic()),
+                    topic.to_string().eq(&tn_config::LibP2pConfig::consensus_output_topic(
+                        self.consensus_config.chain_id()
+                    )),
                     PrimaryNetworkError::InvalidTopic
                 );
                 // We want to confirm all the data (including but not limited to the consensus
@@ -305,7 +309,9 @@ where
             }
             PrimaryGossip::EpochVote(vote) => {
                 ensure!(
-                    topic.to_string().eq(&tn_config::LibP2pConfig::epoch_vote_topic()),
+                    topic.to_string().eq(&tn_config::LibP2pConfig::epoch_vote_topic(
+                        self.consensus_config.chain_id()
+                    )),
                     PrimaryNetworkError::InvalidTopic
                 );
                 // Verify the BLS signature

@@ -43,12 +43,19 @@ pub struct WorkerNetworkHandle {
     task_spawner: TaskSpawner,
     /// The current epoch for this node.
     epoch: Epoch,
+    /// The genesis chain id, used to namespace gossip topics this handle publishes.
+    chain_id: u64,
 }
 
 impl WorkerNetworkHandle {
     /// Create a new instance of [Self].
-    pub fn new(handle: NetworkHandle<Req, Res>, task_spawner: TaskSpawner, epoch: Epoch) -> Self {
-        Self { handle, task_spawner, epoch }
+    pub fn new(
+        handle: NetworkHandle<Req, Res>,
+        task_spawner: TaskSpawner,
+        epoch: Epoch,
+        chain_id: u64,
+    ) -> Self {
+        Self { handle, task_spawner, epoch, chain_id }
     }
 
     /// Return a reference to the task spawner.
@@ -64,7 +71,9 @@ impl WorkerNetworkHandle {
     /// Publish a batch digest to the worker network.
     pub(crate) async fn publish_batch(&self, batch_digest: BlockHash) -> NetworkResult<()> {
         let data = encode(&WorkerGossip::Batch(self.epoch, batch_digest));
-        self.handle.publish(tn_config::LibP2pConfig::worker_batch_topic(), data).await?;
+        self.handle
+            .publish(tn_config::LibP2pConfig::worker_batch_topic(self.chain_id), data)
+            .await?;
         Ok(())
     }
 
@@ -72,7 +81,7 @@ impl WorkerNetworkHandle {
     /// Do this when not a committee member so a CVV can include the txn.
     pub(crate) async fn publish_txn(&self, txn: Vec<u8>) -> NetworkResult<()> {
         let data = encode(&WorkerGossip::Txn(txn));
-        self.handle.publish("tn-txn".into(), data).await?;
+        self.handle.publish(tn_config::LibP2pConfig::worker_txn_topic(self.chain_id), data).await?;
         Ok(())
     }
 
@@ -423,7 +432,7 @@ impl WorkerNetworkHandle {
     /// nothing.
     pub fn new_for_test(task_spawner: TaskSpawner) -> Self {
         let (tx, _rx) = tokio::sync::mpsc::channel(5);
-        Self { handle: NetworkHandle::new(tx), task_spawner, epoch: 0 }
+        Self { handle: NetworkHandle::new(tx), task_spawner, epoch: 0, chain_id: 0 }
     }
 
     /// Publicly available for tests.

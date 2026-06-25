@@ -8,22 +8,25 @@ use crate::Penalty;
 
 /// Protocol upgrade for streaming data.
 ///
-/// Advertises one or more protocols for negotiation, in dialer-preference
-/// order. Both inbound and outbound upgrades simply return the raw stream
-/// regardless of which protocol negotiated; application-layer correlation (e.g.
-/// writing a request digest, or the typed [`SyncFrame`](crate::sync::SyncFrame)
-/// layer) is handled by the caller after the stream is established.
+/// Advertises one or more chain-namespaced protocols for negotiation, in
+/// dialer-preference order. Both inbound and outbound upgrades simply return the
+/// raw stream regardless of which protocol negotiated; application-layer
+/// correlation (e.g. writing a request digest, or the typed
+/// [`SyncFrame`](crate::sync::SyncFrame) layer) is handled by the caller after
+/// the stream is established. The protocols carry the chain id, so a node only
+/// ever establishes streams with peers on the same chain.
 #[derive(Debug, Clone)]
 pub(crate) struct TNStreamProtocol {
     /// Protocols advertised for negotiation, in dialer-preference order. The
-    /// legacy `/tn-stream/0.0.1` is first so existing opens keep negotiating it;
-    /// the per-role sync protocol follows so a responder also accepts it.
+    /// chain-namespaced bulk-transfer `/tn-stream-{chain}/0.0.1` is first so
+    /// existing opens keep negotiating it; the per-role sync protocol follows so
+    /// a responder also accepts it.
     protocols: Vec<StreamProtocol>,
 }
 
 impl TNStreamProtocol {
-    /// Create an upgrade advertising `protocols`, in order (legacy first), for
-    /// both inbound listen and outbound open negotiation.
+    /// Create an upgrade advertising `protocols`, in order (bulk-transfer first),
+    /// for both inbound listen and outbound open negotiation.
     pub(crate) fn new(protocols: Vec<StreamProtocol>) -> Self {
         Self { protocols }
     }

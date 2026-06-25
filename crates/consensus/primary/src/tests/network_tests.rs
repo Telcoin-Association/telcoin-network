@@ -503,7 +503,7 @@ async fn test_primary_batch_gossip_topics() {
 
     let gossip = PrimaryGossip::Certificate(Box::new(Certificate::default()));
     let data = tn_types::encode(&gossip);
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::primary_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::primary_topic(0));
     let goodish_msg =
         GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     let res = handler.process_gossip(&goodish_msg).await;
@@ -512,7 +512,7 @@ async fn test_primary_batch_gossip_topics() {
 
     let gossip = PrimaryGossip::Consensus(Box::new(ConsensusResult::default()));
     let data = tn_types::encode(&gossip);
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::consensus_output_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::consensus_output_topic(0));
     let good_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     assert!(handler.process_gossip(&good_msg).await.is_ok());
 
@@ -520,7 +520,7 @@ async fn test_primary_batch_gossip_topics() {
     // and returns InvalidHeader(PeerNotAuthor).
     let gossip = PrimaryGossip::EpochVote(Box::new(EpochVote::default()));
     let data = tn_types::encode(&gossip);
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::epoch_vote_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::epoch_vote_topic(0));
     let good_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     let res = handler.process_gossip(&good_msg).await;
     // Not rejected for InvalidTopic — rejected for invalid signature instead.
@@ -528,7 +528,7 @@ async fn test_primary_batch_gossip_topics() {
 
     let gossip = PrimaryGossip::Certificate(Box::new(Certificate::default()));
     let data = tn_types::encode(&gossip);
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::epoch_vote_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::epoch_vote_topic(0));
     let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     let res = handler.process_gossip(&bad_msg).await;
     // This will be rejected for other reasons, but make sure it is for an invalid topic.
@@ -536,13 +536,13 @@ async fn test_primary_batch_gossip_topics() {
 
     let gossip = PrimaryGossip::Consensus(Box::new(ConsensusResult::default()));
     let data = tn_types::encode(&gossip);
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::primary_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::primary_topic(0));
     let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     assert!(handler.process_gossip(&bad_msg).await.is_err());
 
     let gossip = PrimaryGossip::EpochVote(Box::new(EpochVote::default()));
     let data = tn_types::encode(&gossip);
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::consensus_output_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::consensus_output_topic(0));
     let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     assert!(handler.process_gossip(&bad_msg).await.is_err());
 }
