@@ -130,6 +130,26 @@ pub(crate) fn stream_protocols(
     Ok(vec![stream_protocol(chain_id)?, network_type.sync_protocol(chain_id)?])
 }
 
+/// libp2p gossipsub protocol-id prefix, namespaced by `chain_id` so nodes on
+/// different chains can never negotiate a `/meshsub` gossip substream.
+///
+/// Gossipsub negotiates its own protocol id (libp2p's default `/meshsub/1.1.0`
+/// and `/meshsub/1.0.0`), independent of the req-res/kad/stream names above, so
+/// without folding the chain id in it is the one wire protocol two chains still
+/// share. Feeding this prefix to
+/// [`gossipsub::ConfigBuilder::protocol_id_prefix`](libp2p::gossipsub::ConfigBuilder::protocol_id_prefix)
+/// makes the advertised ids `/tn-meshsub-{chain_id}/1.1.0` and
+/// `/tn-meshsub-{chain_id}/1.0.0` (the builder appends the `/1.1.0` and `/1.0.0`
+/// version suffixes), so cross-chain peers fail multistream-select on gossip the
+/// same way they do on the other families.
+///
+/// The leading `/` is required: `protocol_id_prefix` does not prepend one, and a
+/// prefix without it is a malformed [`StreamProtocol`] that makes
+/// `ConfigBuilder::build` fail.
+pub(crate) fn gossip_protocol_id_prefix(chain_id: u64) -> String {
+    format!("/tn-meshsub-{chain_id}")
+}
+
 /// Build an owned [`StreamProtocol`] from a runtime name, surfacing a malformed
 /// name (one that does not start with `/`) as a [`NetworkError`] instead of a panic.
 ///

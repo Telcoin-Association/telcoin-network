@@ -252,6 +252,12 @@ where
         external_addr: Multiaddr,
         rpc: Option<RpcInfo>,
     ) -> NetworkResult<Self> {
+        // Namespace every wire protocol by the genesis chain id so nodes on
+        // different chains never negotiate a connection. The id is stamped onto
+        // the network config from genesis at node startup; see
+        // `NetworkConfig::set_chain_id`.
+        let chain_id = network_config.libp2p_config().chain_id;
+
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             // explicitly set default
             .heartbeat_interval(Duration::from_secs(1))
@@ -259,6 +265,14 @@ where
             .validation_mode(gossipsub::ValidationMode::Strict)
             // TN specific: filter against authorized_publishers for certain topics
             .validate_messages()
+            // Gossipsub negotiates its own `/meshsub` protocol, independent of the
+            // req-res/kad/stream names below, so without this it is the one wire
+            // protocol two chains still share: namespacing the topics keeps their
+            // messages apart but still lets cross-chain peers negotiate a gossip
+            // substream. Folding the chain id into the protocol id closes that gap.
+            // The builder appends `/1.1.0` and `/1.0.0`, yielding
+            // `/tn-meshsub-{chain_id}/1.1.0` and `/tn-meshsub-{chain_id}/1.0.0`.
+            .protocol_id_prefix(crate::types::gossip_protocol_id_prefix(chain_id))
             .build()?;
         let gossipsub = gossipsub::Behaviour::new(
             gossipsub::MessageAuthenticity::Signed(keypair.clone()),
@@ -268,12 +282,6 @@ where
 
         let tn_codec =
             TNCodec::<Req, Res>::new(network_config.libp2p_config().max_rpc_message_size);
-
-        // Namespace every wire protocol by the genesis chain id so nodes on
-        // different chains never negotiate a connection. The id is stamped onto
-        // the network config from genesis at node startup; see
-        // `NetworkConfig::set_chain_id`.
-        let chain_id = network_config.libp2p_config().chain_id;
 
         let req_res = request_response::Behaviour::with_codec(
             tn_codec,

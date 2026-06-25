@@ -948,4 +948,30 @@ mod test {
         assert_eq!(names, vec!["/tn-stream-2017/0.0.1", "/tn-worker-3-sync-2017/0.0.1"]);
         Ok(())
     }
+
+    /// Lock the chain-namespaced gossipsub protocol-id prefix. Gossip negotiates
+    /// its own `/meshsub` protocol (not the req-res/kad/stream names), so this
+    /// prefix is what keeps two chains from ever sharing a gossip substream. A
+    /// silent change is a peer-compatibility break, and dropping the leading `/`
+    /// would make `gossipsub::ConfigBuilder::build` reject it (issue #765).
+    #[test]
+    fn test_gossip_protocol_id_prefix_is_chain_namespaced() -> crate::types::NetworkResult<()> {
+        use crate::types::gossip_protocol_id_prefix;
+
+        // the chain id is interpolated, not a literal
+        assert_eq!(gossip_protocol_id_prefix(2017), "/tn-meshsub-2017");
+        assert_eq!(gossip_protocol_id_prefix(0), "/tn-meshsub-0");
+        // different chains get different gossip protocol ids
+        assert_ne!(gossip_protocol_id_prefix(1), gossip_protocol_id_prefix(2));
+
+        // the prefix is a valid `/meshsub`-style protocol id: feeding it to a real
+        // gossipsub ConfigBuilder must build. `protocol_id_prefix` appends `/1.1.0`
+        // and `/1.0.0` and does not prepend a `/`, so a prefix without the leading
+        // slash would be a malformed StreamProtocol and `build` would error here.
+        libp2p::gossipsub::ConfigBuilder::default()
+            .protocol_id_prefix(gossip_protocol_id_prefix(2017))
+            .build()
+            .map(|_| ())
+            .map_err(Into::into)
+    }
 }
