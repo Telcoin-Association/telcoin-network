@@ -34,15 +34,14 @@ use tn_storage::{
 };
 use tn_types::{
     encode, BlsPublicKey, BlsSignature, Certificate, ConsensusHeader, ConsensusHeaderDigest,
-    Database, Epoch, EpochCertificate, EpochDigest, EpochRecord, EpochVote, Header, HeaderDigest,
-    Round, TaskError, TaskSpawner, TnReceiver, TnSender, Vote, B256,
+    ConsensusResult, Database, Epoch, EpochCertificate, EpochDigest, EpochRecord, EpochVote,
+    Header, HeaderDigest, Round, TaskError, TaskSpawner, TnReceiver, TnSender, Vote, B256,
 };
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tracing::{debug, info, warn};
 pub mod handler;
 mod message;
-pub use message::ConsensusResult;
 
 #[cfg(test)]
 #[path = "../tests/network_tests.rs"]
@@ -170,23 +169,30 @@ impl PendingStreamRequest {
 #[derive(Clone, Debug)]
 pub struct PrimaryNetworkHandle {
     handle: NetworkHandle<Req, Res>,
+    /// The genesis chain id, used to namespace gossip topics this handle publishes.
+    chain_id: u64,
 }
 
+// Test-only conversion that defaults the chain id to 0. Gated to tests so the only
+// way to build a production handle is `new`, with the genesis chain id supplied
+// explicitly: a 0 here would publish on the `-0` topic suffix while validators read
+// the real id, a silent gossip mismatch.
+#[cfg(test)]
 impl From<NetworkHandle<Req, Res>> for PrimaryNetworkHandle {
     fn from(handle: NetworkHandle<Req, Res>) -> Self {
-        Self { handle }
+        Self { handle, chain_id: 0 }
     }
 }
 
 impl PrimaryNetworkHandle {
     /// Create a new instance of Self.
-    pub fn new(handle: NetworkHandle<Req, Res>) -> Self {
-        Self { handle }
+    pub fn new(handle: NetworkHandle<Req, Res>, chain_id: u64) -> Self {
+        Self { handle, chain_id }
     }
 
     //// Convenience method for creating a new Self for tests.
     pub fn new_for_test(sender: mpsc::Sender<NetworkCommand<Req, Res>>) -> Self {
-        Self { handle: NetworkHandle::new(sender) }
+        Self { handle: NetworkHandle::new(sender), chain_id: 0 }
     }
 
     /// Return a reference to the inner handle.
@@ -197,7 +203,7 @@ impl PrimaryNetworkHandle {
     /// Publish a certificate to the consensus network.
     pub async fn publish_certificate(&self, certificate: Certificate) -> NetworkResult<()> {
         let data = encode(&PrimaryGossip::Certificate(Box::new(certificate)));
-        self.handle.publish(tn_config::LibP2pConfig::primary_topic(), data).await?;
+        self.handle.publish(tn_config::LibP2pConfig::primary_topic(self.chain_id), data).await?;
         Ok(())
     }
 
@@ -219,14 +225,16 @@ impl PrimaryNetworkHandle {
             validator: key,
             signature,
         })));
-        self.handle.publish(tn_config::LibP2pConfig::consensus_output_topic(), data).await?;
+        self.handle
+            .publish(tn_config::LibP2pConfig::consensus_output_topic(self.chain_id), data)
+            .await?;
         Ok(())
     }
 
     /// Publish a certificate to the consensus network.
     pub async fn publish_epoch_vote(&self, vote: EpochVote) -> NetworkResult<()> {
         let data = encode(&PrimaryGossip::EpochVote(Box::new(vote)));
-        self.handle.publish(tn_config::LibP2pConfig::epoch_vote_topic(), data).await?;
+        self.handle.publish(tn_config::LibP2pConfig::epoch_vote_topic(self.chain_id), data).await?;
         Ok(())
     }
 

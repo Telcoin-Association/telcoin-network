@@ -8,22 +8,25 @@ use crate::Penalty;
 
 /// Protocol upgrade for streaming data.
 ///
-/// Advertises one or more protocols for negotiation, in dialer-preference
-/// order. Both inbound and outbound upgrades simply return the raw stream
-/// regardless of which protocol negotiated; application-layer correlation (e.g.
-/// writing a request digest, or the typed [`SyncFrame`](crate::sync::SyncFrame)
-/// layer) is handled by the caller after the stream is established.
+/// Advertises one or more chain-namespaced protocols for negotiation, in
+/// dialer-preference order. Both inbound and outbound upgrades simply return the
+/// raw stream regardless of which protocol negotiated; application-layer
+/// correlation (e.g. writing a request digest, or the typed
+/// [`SyncFrame`](crate::sync::SyncFrame) layer) is handled by the caller after
+/// the stream is established. The protocols carry the chain id, so a node only
+/// ever establishes streams with peers on the same chain.
 #[derive(Debug, Clone)]
 pub(crate) struct TNStreamProtocol {
     /// Protocols advertised for negotiation, in dialer-preference order. The
-    /// legacy `/tn-stream/0.0.1` is first so existing opens keep negotiating it;
-    /// the per-role sync protocol follows so a responder also accepts it.
+    /// chain-namespaced bulk-transfer `/tn-stream-{chain}/0.0.1` is first so
+    /// existing opens keep negotiating it; the per-role sync protocol follows so
+    /// a responder also accepts it.
     protocols: Vec<StreamProtocol>,
 }
 
 impl TNStreamProtocol {
-    /// Create an upgrade advertising `protocols`, in order (legacy first), for
-    /// both inbound listen and outbound open negotiation.
+    /// Create an upgrade advertising `protocols`, in order (bulk-transfer first),
+    /// for both inbound listen and outbound open negotiation.
     pub(crate) fn new(protocols: Vec<StreamProtocol>) -> Self {
         Self { protocols }
     }
@@ -124,8 +127,10 @@ impl StreamFailure {
             Self::DialFailure => None,
             // stalled open
             Self::Timeout => Some(Penalty::Mild),
-            // the peer speaks none of our stream protocols
-            Self::UnsupportedProtocol => Some(Penalty::Severe),
+            // the peer speaks none of our stream protocols: honest version/role
+            // skew, not a fault — not penalized, like `DialFailure` (mirrors the
+            // request-response `UnsupportedProtocols` arm in `consensus.rs`).
+            Self::UnsupportedProtocol => None,
             // transport flaps on WAN are not faults; other IO is likely a violation
             Self::Io(kind) => match kind {
                 std::io::ErrorKind::ConnectionReset
@@ -162,12 +167,13 @@ mod tests {
     }
 
     /// The stream penalty taxonomy must mirror the request-response one: transport
-    /// faults are not penalized, stalls are mild, unsupported protocols are severe.
+    /// faults are not penalized, stalls are mild, and unsupported protocols are
+    /// honest version/role skew (not penalized, like `DialFailure`).
     #[test]
     fn penalty_mapping_mirrors_reqres() {
         assert!(StreamFailure::DialFailure.penalty().is_none());
         assert!(matches!(StreamFailure::Timeout.penalty(), Some(Penalty::Mild)));
-        assert!(matches!(StreamFailure::UnsupportedProtocol.penalty(), Some(Penalty::Severe)));
+        assert!(StreamFailure::UnsupportedProtocol.penalty().is_none());
         assert!(matches!(StreamFailure::InboundRateLimited.penalty(), Some(Penalty::Medium)));
         // transport flaps on WAN are not the peer's fault
         assert!(StreamFailure::Io(ErrorKind::ConnectionReset).penalty().is_none());

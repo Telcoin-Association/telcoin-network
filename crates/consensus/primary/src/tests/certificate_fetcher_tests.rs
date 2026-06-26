@@ -738,40 +738,29 @@ async fn test_gc_round_update_during_fetch() {
     cb.certificate_fetcher().send(CertificateFetcherCommand::Kick).await.unwrap();
 
     // next fetch should use updated gc round
-    loop {
-        match timeout(Duration::from_secs(2), fake_receiver.recv()).await {
-            Ok(Some(NetworkCommand::SendRequest {
-                peer,
-                request: PrimaryRequest::MissingCertificates { inner },
-                reply,
-            })) => {
-                let (_lower_bound, skip_rounds) = inner.get_bounds().unwrap();
-                // verify skip_rounds don't include rounds <= 5
-                for rounds in skip_rounds.values() {
-                    assert!(rounds.iter().all(|&r| r > 5), "should not fetch rounds <= GC round");
-                }
+    let Ok(Some(NetworkCommand::SendRequest {
+        peer,
+        request: PrimaryRequest::MissingCertificates { inner },
+        reply,
+    })) = timeout(Duration::from_secs(2), fake_receiver.recv()).await
+    else {
+        panic!("Should receive fetch request with updated GC round but timedout");
+    };
 
-                reply
-                    .send(Ok(NetworkResponseMessage {
-                        peer,
-                        result: PrimaryResponse::RequestedCertificates(
-                            all_certificates
-                                .iter()
-                                .filter(|c| c.header().round() > 5)
-                                .cloned()
-                                .collect(),
-                        ),
-                    }))
-                    .unwrap();
-
-                // break here to prevent timeout
-                break;
-            }
-            _ => {
-                panic!("Should receive fetch request with updated GC round but timedout");
-            }
-        }
+    let (_lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+    // verify skip_rounds don't include rounds <= 5
+    for rounds in skip_rounds.values() {
+        assert!(rounds.iter().all(|&r| r > 5), "should not fetch rounds <= GC round");
     }
+
+    reply
+        .send(Ok(NetworkResponseMessage {
+            peer,
+            result: PrimaryResponse::RequestedCertificates(
+                all_certificates.iter().filter(|c| c.header().round() > 5).cloned().collect(),
+            ),
+        }))
+        .unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]

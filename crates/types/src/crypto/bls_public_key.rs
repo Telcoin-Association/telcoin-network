@@ -100,6 +100,16 @@ impl BlsPublicKey {
         CorePublicKey::from_bytes(bytes).map(|key| key.into())
     }
 
+    /// Decode a public key from its 192-byte uncompressed (serialized) G2 form, as produced by
+    /// [`blst::min_sig::PublicKey::serialize`].
+    ///
+    /// Unlike [`Self::from_literal_bytes`] (which expects the 96-byte compressed form), this
+    /// accepts the uncompressed bytes the protocol passes to the on-chain `BlsG1` library. Used
+    /// by the native BLS precompile.
+    pub fn from_uncompressed_bytes(bytes: &[u8]) -> Result<Self, BLST_ERROR> {
+        CorePublicKey::deserialize(bytes).map(|key| key.into())
+    }
+
     /// Take the first 8 bytes and convert to a base58 rep String.
     pub fn to_short_string(&self) -> String {
         self.bytes.to_short_string()

@@ -33,7 +33,18 @@ struct TestTypes<DB = MemDatabase> {
 /// Helper function to create an instance of [RequestHandler] for the first authority in the
 /// committee.
 fn create_test_types() -> TestTypes {
-    let committee = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    create_test_types_with_chain_id(0)
+}
+
+/// Like [`create_test_types`], but stamps `chain_id` onto the network config so the
+/// handler validates (and the handle publishes) gossip topics namespaced by that id.
+fn create_test_types_with_chain_id(chain_id: u64) -> TestTypes {
+    let mut network_config = tn_config::NetworkConfig::default();
+    network_config.set_chain_id(chain_id);
+    let committee = CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .with_network_config(network_config)
+        .build();
     let authority = committee.first_authority();
     let config = authority.consensus_config();
     let task_manager = TaskManager::default();
@@ -41,7 +52,7 @@ fn create_test_types() -> TestTypes {
     let batch_validator = Arc::new(NoopBatchValidator);
     let (tx, network_commands_rx) = mpsc::channel(10);
     let network_handle =
-        WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0);
+        WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, chain_id);
     let handler = RequestHandler::new(worker_id, batch_validator, config, network_handle);
     TestTypes { committee, handler, task_manager, network_commands_rx }
 }
@@ -84,24 +95,56 @@ async fn test_batch_gossip_topics() {
     let batch_digest = B256::random();
     let gossip = WorkerGossip::Batch(0, batch_digest);
     let data = tn_types::encode(&gossip);
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(0));
     let good_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     assert!(handler.pub_process_gossip_for_test(&good_msg).await.is_ok());
 
     // Test swapped topics, must fail.
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_txn_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_txn_topic(0));
     let bad_msg = GossipMessage { source: None, data, sequence_number: None, topic };
     assert!(handler.pub_process_gossip_for_test(&bad_msg).await.is_err());
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(0));
     let gossip = WorkerGossip::Txn(vec![]);
     let data = tn_types::encode(&gossip);
     let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     assert!(handler.pub_process_gossip_for_test(&bad_msg).await.is_err());
 
     // Use the correct topic for a txn and make sure it works.
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_txn_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_txn_topic(0));
     let good_msg = GossipMessage { source: None, data, sequence_number: None, topic };
     assert!(handler.pub_process_gossip_for_test(&good_msg).await.is_ok());
+}
+
+/// The handler validates gossip topics against the chain id from its config, not a
+/// hardcoded value: with a non-zero chain id, a message on the chain-0 namespace (what
+/// an un-stamped node would publish) is rejected as an invalid topic. This is the
+/// property that makes the namespacing actually isolate chains.
+#[tokio::test]
+async fn test_batch_gossip_topic_is_chain_namespaced() {
+    let TestTypes { handler, .. } = create_test_types_with_chain_id(2017);
+    let batch_digest = B256::random();
+    let data = tn_types::encode(&WorkerGossip::Batch(0, batch_digest));
+
+    // the config's chain id (2017) is accepted: the topic check passes
+    let good = GossipMessage {
+        source: None,
+        data: data.clone(),
+        sequence_number: None,
+        topic: TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(2017)),
+    };
+    assert!(handler.pub_process_gossip_for_test(&good).await.is_ok());
+
+    // the chain-0 namespace is a different topic and is rejected
+    let bad = GossipMessage {
+        source: None,
+        data,
+        sequence_number: None,
+        topic: TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(0)),
+    };
+    assert_matches!(
+        handler.pub_process_gossip_for_test(&bad).await,
+        Err(WorkerNetworkError::InvalidTopic)
+    );
 }
 
 /// Test that gossip triggers batch fetch via stream-based approach.
@@ -117,7 +160,7 @@ async fn test_batch_gossip_triggers_stream_request() {
     let batch_digest = B256::random();
     let gossip = WorkerGossip::Batch(0, batch_digest);
     let data = tn_types::encode(&gossip);
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(0));
     let msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
 
     task_manager.spawn_task("process-gossip-test", async move {
@@ -168,7 +211,7 @@ async fn test_batch_gossip_stream_accepted_opens_stream() {
     let batch_digest = B256::random();
     let gossip = WorkerGossip::Batch(0, batch_digest);
     let data = tn_types::encode(&gossip);
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(0));
     let msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
 
     task_manager.spawn_task("process-gossip-test", async move {
@@ -250,7 +293,7 @@ async fn test_unknown_stream_request_error_type() {
 async fn test_request_batches_no_peers() {
     let (tx, mut rx) = mpsc::channel(10);
     let task_manager = TaskManager::default();
-    let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0);
+    let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0);
 
     // reply with empty peer list
     tokio::spawn(async move {
@@ -273,7 +316,7 @@ async fn test_request_batches_no_peers() {
 async fn test_request_batches_peer_rejects_tries_next() {
     let (tx, mut rx) = mpsc::channel(10);
     let task_manager = TaskManager::default();
-    let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0);
+    let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0);
 
     let fixture = tn_test_utils::CommitteeFixture::builder(MemDatabase::default)
         .randomize_ports(true)
@@ -400,7 +443,7 @@ async fn test_stream_error_penalties() {
 async fn test_request_batches_truncates_oversized_digests() {
     let (tx, mut rx) = mpsc::channel(10);
     let task_manager = TaskManager::default();
-    let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0);
+    let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0);
 
     let fixture = tn_test_utils::CommitteeFixture::builder(MemDatabase::default)
         .randomize_ports(true)
@@ -639,7 +682,7 @@ async fn test_concurrent_capacity_exactly_max() {
 async fn test_retry_succeeds_after_initial_rejection() {
     let (tx, mut rx) = mpsc::channel(10);
     let task_manager = TaskManager::default();
-    let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0);
+    let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0);
 
     let fixture = tn_test_utils::CommitteeFixture::builder(MemDatabase::default)
         .randomize_ports(true)
@@ -717,7 +760,7 @@ async fn test_retry_succeeds_after_initial_rejection() {
 async fn test_request_batches_peer_fallback_preserves_digests() {
     let (tx, mut rx) = mpsc::channel(10);
     let task_manager = TaskManager::default();
-    let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0);
+    let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0);
 
     let fixture = tn_test_utils::CommitteeFixture::builder(MemDatabase::default)
         .randomize_ports(true)

@@ -379,7 +379,7 @@ pub(super) fn handle_burn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::evm::tel_precompile::test_utils::*;
+    use crate::evm::precompile_test_utils::*;
     use alloy::sol_types::SolCall;
     use tn_config::GOVERNANCE_SAFE_ADDRESS;
     use tn_types::U256;
