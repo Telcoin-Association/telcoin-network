@@ -384,6 +384,14 @@ impl AllPeers {
         // disconnect peers
         for peer_id in peers_to_disconnect {
             self.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
+
+            // these peers exceeded `dial_timeout` while still `Dialing`, so the genuine cause
+            // is a timeout. Report it to the caller (the disconnect transition no longer
+            // notifies; the dialer's reply channel is only consumed here or in `on_dial_failure`).
+            self.notify_dial_result(
+                &peer_id,
+                Err(NetworkError::Dial("dial attempt timedout".to_string())),
+            );
         }
 
         // update scores for all other peers
@@ -621,11 +629,11 @@ impl AllPeers {
                     });
                 }
 
-                // notify caller of dial error if present
-                self.notify_dial_result(
-                    peer_id,
-                    Err(NetworkError::Dial("dial attempt timedout".to_string())),
-                );
+                // NOTE: the dial result (if any) is notified by the caller that knows the real
+                // cause: `on_dial_failure` delivers the genuine `DialError`, and
+                // `heartbeat_maintenance` reports a timeout. This transition must not report a
+                // hardcoded cause, which previously consumed the reply channel before the real
+                // error could be sent.
             }
         }
 

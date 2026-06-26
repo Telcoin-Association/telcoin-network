@@ -633,6 +633,36 @@ fn test_heartbeat_maintenance() {
     assert_eq!(all_peers.disconnected_peers, 1);
 }
 
+// Regression for #745: when a dial exceeds `dial_timeout` and is reaped by the heartbeat,
+// the caller must still be told it was a timeout. This is the one path where "dial attempt
+// timedout" is the genuine cause; the disconnect transition no longer hardcodes it, so the
+// heartbeat is now responsible for notifying the dialer.
+#[test]
+fn test_heartbeat_dial_timeout_notifies_caller() {
+    let mut all_peers = create_all_peers(None);
+    let peer_id = PeerId::random();
+
+    // register a dial with a live reply channel, then age it past the timeout
+    let (sender, mut receiver) = oneshot::channel();
+    all_peers.register_dial_attempt(peer_id, Some(sender));
+    all_peers
+        .get_peer_mut(&peer_id)
+        .expect("peer must exist after register_dial_attempt")
+        .set_connection_status(ConnectionStatus::Dialing {
+            instant: Instant::now() - Duration::from_secs(10),
+        }); // Older than the 5s timeout
+
+    let _ = all_peers.heartbeat_maintenance();
+
+    // the caller is notified of the genuine timeout
+    let result = receiver.try_recv().expect("heartbeat must notify the dialer of the timeout");
+    let err = result.expect_err("dial timeout must be reported as an error");
+    assert_eq!(
+        err.to_string(),
+        NetworkError::Dial("dial attempt timedout".to_string()).to_string()
+    );
+}
+
 #[test]
 fn test_pruning_logic() {
     let config = PeerConfig::default();
