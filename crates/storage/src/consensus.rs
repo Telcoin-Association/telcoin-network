@@ -1669,6 +1669,120 @@ mod test {
         );
     }
 
+    /// With the in-progress epoch open as `current_pack` but only built up to `k`, reads for
+    /// numbers in `(k, m]` must FALL THROUGH to the staged prefix rather than erroring out of
+    /// the current-pack branch. Covers the output, header, and bytes read paths.
+    #[tokio::test]
+    async fn test_reads_fall_through_to_staging_for_open_epoch() {
+        use tokio::io::AsyncReadExt as _;
+
+        let src_dir = TempDir::with_prefix("test_staging_shadow_src").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+
+        // Source: a full in-progress epoch 0 with `num_outputs` outputs.
+        let source = ConsensusChain::new(src_dir.path().to_owned()).unwrap();
+        source.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+        let num_outputs = 20u64;
+        let mut outputs = Vec::new();
+        let mut parent = ConsensusHeader::default().digest();
+        for i in 0..num_outputs {
+            let output =
+                make_test_output(&committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+            parent = output.digest().into();
+            outputs.push(output.clone());
+            source.save_consensus_output(output).await.unwrap();
+        }
+
+        // Build a verified prefix up to `m` to stage into the destination.
+        let m = 12u64;
+        let (stream, len) = source.get_partial_epoch_stream(0, m).await.expect("partial stream");
+        let limited = stream.take(len);
+        let cutoff = &outputs[(m - 1) as usize];
+        let mut partial_record = previous_epoch.clone();
+        partial_record.final_consensus = ConsensusNumHash::new(cutoff.number(), cutoff.digest());
+
+        // Destination: open epoch 0 as the live current pack and build it ONLY up to `k` (k < m),
+        // in order — exactly the state a catching-up node is in.
+        let dst_dir = TempDir::with_prefix("test_staging_shadow_dst").expect("temp dir");
+        let dest = ConsensusChain::new(dst_dir.path().to_owned()).unwrap();
+        dest.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+        let k = 5u64;
+        for i in 0..k {
+            dest.save_consensus_output(outputs[i as usize].clone()).await.unwrap();
+        }
+        dest.import_partial_to_staging(
+            limited,
+            &partial_record,
+            &previous_epoch,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("staging import of verified prefix");
+        assert_eq!(dest.staging_final(), Some(m));
+
+        // Sanity: the live epoch-0 pack really only holds 1..=k — numbers in (k, m] are NOT in it,
+        // so any successful read of them below must have come from staging.
+        assert!(dest.get_consensus_output_current(k).await.is_ok());
+        assert!(
+            dest.get_consensus_output_current(k + 1).await.is_err(),
+            "live current pack must not contain numbers past k"
+        );
+
+        // 1..=k come from the live current pack; (k, m] fall through to staging (the fix). All
+        // three read paths must behave the same.
+        for j in 1..=m {
+            let out = dest
+                .consensus_output_by_number(j)
+                .await
+                .expect("output read should not error")
+                .expect("output should be present (current pack or staging)");
+            compare_outputs(&out, &outputs[(j - 1) as usize]);
+
+            let header = dest
+                .consensus_header_by_number(j)
+                .await
+                .expect("header read should not error")
+                .expect("header should be present (current pack or staging)");
+            assert_eq!(header.number, j);
+
+            assert!(
+                dest.consensus_output_bytes_by_number(j)
+                    .await
+                    .expect("bytes read should not error")
+                    .is_some(),
+                "output bytes should be present (current pack or staging)"
+            );
+        }
+
+        // A number held by neither the live pack nor the staged prefix surfaces an error.
+        assert!(
+            dest.consensus_output_by_number(m + 1).await.is_err(),
+            "a number past both the live pack and staging should error"
+        );
+
+        // After clearing staging, the previously staging-served numbers are gone again, but the
+        // live pack's own numbers remain.
+        dest.clear_staging();
+        assert!(
+            dest.consensus_output_by_number(k + 1).await.is_err(),
+            "after clear_staging, numbers past k are no longer available"
+        );
+        let out = dest
+            .consensus_output_by_number(k)
+            .await
+            .expect("read should not error")
+            .expect("live pack number still present");
+        compare_outputs(&out, &outputs[(k - 1) as usize]);
+    }
+
     /// `stream_import` must be a no-op (and crucially must NOT truncate) when we already hold the
     /// requested final consensus header — including a PARTIAL request whose final is behind our
     /// latest. Guards the anti-truncation early-return.
