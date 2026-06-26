@@ -108,6 +108,9 @@ enum PackMessage {
     CountLeaders(Round, RewardsCounter, oneshot::Sender<Result<(), PackError>>),
     LatestConsensusHeader(oneshot::Sender<Option<ConsensusHeader>>),
     Shutdown,
+    // Flush the write buffer to the data file WITHOUT fsync, so freshly appended bytes
+    /// become visible to other file handles on the same file (visibility, not durability).
+    FlushData(oneshot::Sender<Result<(), PackError>>),
 }
 
 /// Manage a single pack file of consensus data (typically one epoch os the consensus chain).
@@ -176,6 +179,9 @@ fn run_pack_loop(
             PackMessage::Shutdown => {
                 let _ = inner.persist();
                 break;
+            }
+            PackMessage::FlushData(tx) => {
+                let _ = tx.send(inner.flush_data());
             }
         }
     }
@@ -413,6 +419,17 @@ impl ConsensusPack {
         self.get_error()?;
         let (tx, rx) = oneshot::channel();
         let _ = self.tx.send(PackMessage::Persist(tx)).await;
+        rx.await.map_err(|_| match &*self.error.borrow() {
+            Some(e) => e.clone(),
+            None => PackError::ReceiveFailed,
+        })?
+    }
+
+    // public handle method (sibling of `persist`, consensus_pack.rs:412):
+    pub async fn flush_data(&self) -> Result<(), PackError> {
+        self.get_error()?;
+        let (tx, rx) = oneshot::channel();
+        let _ = self.tx.send(PackMessage::FlushData(tx)).await;
         rx.await.map_err(|_| match &*self.error.borrow() {
             Some(e) => e.clone(),
             None => PackError::ReceiveFailed,
@@ -1054,6 +1071,14 @@ impl Inner {
             self.consensus_pos_idx.sync().map_err(|e| PackError::PersistError(e.to_string()))?;
             self.consensus_digests.sync().map_err(|e| PackError::PersistError(e.to_string()))?;
             self.batch_digests.sync().map_err(|e| PackError::PersistError(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    // Inner method (sibling of Inner::persist, consensus_pack.rs:1051) — flush only, no syncs:
+    fn flush_data(&mut self) -> Result<(), PackError> {
+        if !self.data.read_only() {
+            self.data.flush().map_err(|e| PackError::PersistError(e.to_string()))?;
         }
         Ok(())
     }

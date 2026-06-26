@@ -530,10 +530,11 @@ impl ConsensusChain {
     ) -> Result<(Box<dyn ReadStream>, u64), ConsensusChainError> {
         let pack =
             self.get_static(epoch).await.map_err(|_| ConsensusChainError::StreamUnavailable)?;
-        // Flush so the bytes up to the requested output are on disk before we open a raw file
-        // handle (the current epoch's pack may still be buffering later appends).
-        pack.persist().await?;
         let end = pack.consensus_output_end(last_consensus_number).await?;
+        // Flush (no fsync) so every byte counted in `end` is written to the file and thus visible
+        // to the separate AsyncFile handle opened below. Visibility, not durability — avoids the
+        // expensive network-triggerable fsync on the live pack.
+        pack.flush_data().await?;
         let base_dir = self.base_path.join(format!("epoch-{epoch}"));
         let stream = AsyncFile::open(base_dir.join(DATA_NAME)).await?;
         Ok((Box::new(stream), end))
