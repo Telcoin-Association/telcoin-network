@@ -133,35 +133,19 @@ impl<DB: Database> Subscriber<DB> {
     /// Returns the max number of sub-dag to fetch payloads concurrently.
     const MAX_PENDING_PAYLOADS: usize = 1000;
 
-    /// Turns a ConsensusHeader into a ConsensusOutput and sends it down the consensus_output
-    /// channel for execution.
-    #[instrument(level = "debug", skip_all, fields(number = consensus_header.number))]
-    async fn handle_consensus_header(
-        &self,
-        consensus_header: ConsensusHeader,
-    ) -> SubscriberResult<()> {
-        if consensus_header.sub_dag.leader_epoch() > self.inner.committee.epoch() {
+    /// Save a verified, fully-formed ConsensusOutput (delivered by the state-sync forward drain)
+    /// and send it down the consensus_output channel for execution.
+    ///
+    /// The output arrives complete (header + batches) and already verified by state-sync, so there
+    /// is no separate batch fetch here.
+    #[instrument(level = "debug", skip_all, fields(number = output.number()))]
+    async fn handle_sync_output(&self, consensus_output: ConsensusOutput) -> SubscriberResult<()> {
+        if consensus_output.sub_dag().leader_epoch() > self.inner.committee.epoch() {
             // Do not process past our epoch.  Can just NO-OP here to avoid producing bogus output
             // before run_epoch() winds down.
             return Ok(());
         }
-        // Prefer a verified output from the consensus chain: it already contains the full output
-        // (with batches), so we can skip the separate worker-network batch fetch during
-        // bulk catch-up. Falls back to fetching batches when the output is not staged (e.g.
-        // live tail).
-        let number = consensus_header.number;
-        let consensus_output = if let Ok(Some(output)) =
-            self.inner.consensus_chain.consensus_output_by_number(number).await
-        {
-            output
-        } else {
-            self.fetch_batches(
-                consensus_header.sub_dag.clone(),
-                consensus_header.parent_hash,
-                number,
-            )
-            .await?
-        };
+        let number = consensus_output.number();
 
         let mut consensus_chain = self.inner.consensus_chain.clone();
         // This save will essentially mark this consensus output as written in stone (added to the
@@ -199,17 +183,17 @@ impl<DB: Database> Subscriber<DB> {
 
     /// Catch up to current consensus and then try to rejoin as an active CVV.
     async fn catch_up_rejoin_consensus(&self, tasks: TaskSpawner) -> SubscriberResult<()> {
-        // Get a receiver and then stream any missing headers so we don't miss them.
-        let mut rx_consensus_headers = self.consensus_bus.subscribe_consensus_header();
+        // Get a receiver and then stream any missing outputs so we don't miss them.
+        let mut rx_sync_output = self.consensus_bus.subscribe_sync_output();
         spawn_state_sync(
             self.config.clone(),
             self.consensus_bus.clone(),
             tasks,
             self.inner.consensus_chain.clone(),
         );
-        while let Some(consensus_header) = rx_consensus_headers.recv().await {
-            let consensus_header_number = consensus_header.number;
-            self.handle_consensus_header(consensus_header).await?;
+        while let Some(output) = rx_sync_output.recv().await {
+            let consensus_header_number = output.number();
+            self.handle_sync_output(output).await?;
             if let Some(last_consensus_header) =
                 self.consensus_bus.last_consensus_header().borrow().as_ref()
             {
@@ -233,8 +217,8 @@ impl<DB: Database> Subscriber<DB> {
 
     /// Follow along with consensus output but do not try to join consensus.
     async fn follow_consensus(&self, tasks: TaskSpawner) -> SubscriberResult<()> {
-        // Get a receiver then stream any missing headers so we don't miss them.
-        let mut rx_consensus_headers = self.consensus_bus.subscribe_consensus_header();
+        // Get a receiver then stream any missing outputs so we don't miss them.
+        let mut rx_sync_output = self.consensus_bus.subscribe_sync_output();
         spawn_state_sync(
             self.config.clone(),
             self.consensus_bus.clone(),
@@ -242,9 +226,9 @@ impl<DB: Database> Subscriber<DB> {
             self.inner.consensus_chain.clone(),
         );
         let mut processed_count: u64 = 0;
-        while let Some(consensus_header) = rx_consensus_headers.recv().await {
-            let header_number = consensus_header.number;
-            self.handle_consensus_header(consensus_header).await?;
+        while let Some(output) = rx_sync_output.recv().await {
+            let header_number = output.number();
+            self.handle_sync_output(output).await?;
             processed_count += 1;
 
             // Periodically log observer progress (every 100 blocks)
