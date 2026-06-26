@@ -51,7 +51,7 @@ where
                 Ok(epoch_manager) => epoch_manager,
                 Err(err) => {
                     tracing::error!("Error running node (creating EpochManager): {err}");
-                    return Err(err.into());
+                    return Err(err);
                 }
             };
         let result = epoch_manager.run().await;
