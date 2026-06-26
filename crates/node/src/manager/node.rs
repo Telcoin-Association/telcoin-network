@@ -226,10 +226,8 @@ where
         // Note this can only fail if the consensus DB is very broken (bad path for instance).
         // So we will panic for now, this will kill the node on startup for a critical error.
         let committee_zero = if let Ok(committee_zero) =
-            Config::load_from_path_or_default::<Committee>(
-                tn_datadir.committee_path(),
-                ConfigFmt::YAML,
-            ) {
+            Config::load_from_path::<Committee>(tn_datadir.committee_path(), ConfigFmt::YAML)
+        {
             committee_zero
         } else {
             error!(target: "epoch-manager", "Unable to load commitee zero from the genesis committee!");

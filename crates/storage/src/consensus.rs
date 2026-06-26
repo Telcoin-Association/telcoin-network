@@ -330,9 +330,15 @@ impl ConsensusChain {
                 committee_zero,
             )?))
         } else {
-            // If we are running already then we should have a pack for the latest epoch so Ok to
-            // error out here if it's missing.
-            Arc::new(Mutex::new(ConsensusPack::open_static(&base_path, latest_consensus.epoch())?))
+            // If we are running already then we should have a pack for the latest epoch so it is
+            // Ok to error out here if it is missing. Open it in append mode (not static): this
+            // runs trunc_and_heal to repair a torn write from a hard crash mid-epoch, and leaves
+            // the pack writable so the node can resume saving outputs for this epoch without
+            // waiting for new_epoch to flip a read-only pack to append.
+            Arc::new(Mutex::new(ConsensusPack::open_append_exists(
+                &base_path,
+                latest_consensus.epoch(),
+            )?))
         };
         let recent_packs = Arc::new(Mutex::new(VecDeque::default()));
         let epochs = Arc::new(EpochRecordDb::open(&base_path)?);
@@ -1240,6 +1246,67 @@ mod test {
                 .expect(&format!("Failed to get on {i}"));
             let output = outputs.get(i as usize).unwrap();
             compare_outputs(&output_db, output);
+        }
+    }
+
+    /// A node that crashes mid-epoch can leave the pack's data file longer than its indexes
+    /// (a torn write). On restart `ConsensusChain::new` must heal that pack rather than fail to
+    /// open, otherwise the node cannot restart. This opens the latest epoch with
+    /// `open_append_exists` (which runs `trunc_and_heal`); the old `open_static` path returned
+    /// `CorruptPack` here.
+    #[tokio::test]
+    async fn test_new_heals_torn_write_on_restart() {
+        use crate::consensus_pack::DATA_NAME;
+        use std::io::Write as _;
+
+        let temp_dir = TempDir::with_prefix("test_torn_write").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+
+        // Write a handful of outputs and persist, then drop the chain (clean on-disk state).
+        let mut outputs = Vec::new();
+        {
+            let consensus_chain =
+                ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+            consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+            let mut parent = ConsensusHeader::default().digest();
+            for i in 0..5u64 {
+                let output =
+                    make_test_output(&committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+                parent = output.digest().into();
+                outputs.push(output.clone());
+                consensus_chain.save_consensus_output(output).await.unwrap();
+            }
+            consensus_chain.persist_current().await.expect("persist");
+        }
+
+        // Simulate a torn write: append garbage to the data file so its length runs ahead of the
+        // indexes' tracked data-file length (exactly what files_consistent rejects).
+        {
+            let data_path = temp_dir.path().join("epoch-0").join(DATA_NAME);
+            let mut f =
+                std::fs::OpenOptions::new().append(true).open(&data_path).expect("open data file");
+            f.write_all(&[0xAB; 64]).expect("append garbage");
+            f.sync_all().expect("sync");
+        }
+
+        // Restart: new() must open + heal the latest epoch pack rather than erroring.
+        let reopened = ConsensusChain::new(temp_dir.path().to_owned(), committee.clone())
+            .expect("heal on open");
+        // All previously saved outputs are still readable after healing.
+        for (i, output) in outputs.iter().enumerate() {
+            let got = reopened
+                .get_consensus_output_current(i as u64 + 1)
+                .await
+                .expect("output readable after heal");
+            compare_outputs(&got, output);
         }
     }
 
