@@ -885,8 +885,8 @@ where
                     self.process_consensus_output_stream(peer, number, channel, cancel)
                 }
             },
-            NetworkEvent::Gossip(msg, propagation_source) => {
-                self.process_gossip(msg, propagation_source);
+            NetworkEvent::Gossip(msg, relayer) => {
+                self.process_gossip(msg, relayer);
             }
             NetworkEvent::Error(msg, channel) => {
                 let err = PrimaryResponse::Error(PrimaryRPCError(msg));
@@ -1168,18 +1168,21 @@ where
     }
 
     /// Process gossip from committee.
-    fn process_gossip(&self, msg: GossipMessage, propagation_source: BlsPublicKey) {
+    fn process_gossip(&self, msg: GossipMessage, relayer: Option<BlsPublicKey>) {
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
-        let task_name = format!("ProcessGossip-{}-{propagation_source}", msg.topic);
+        let relayer_label =
+            relayer.as_ref().map_or_else(|| "unresolved".to_string(), |bls| bls.to_string());
+        let task_name = format!("ProcessGossip-{}-{relayer_label}", msg.topic);
         // spawn task to process gossip
         self.task_spawner.spawn_task(task_name, async move {
             if let Err(e) = request_handler.process_gossip(&msg).await {
                 warn!(target: "primary::network", ?e, "process_gossip");
-                // convert error into penalty to lower peer score
-                if let Some(penalty) = (&e).into() {
-                    network_handle.report_penalty(propagation_source, penalty).await;
+                // convert error into penalty to lower peer score; only attributable
+                // when the relaying peer's BLS identity has resolved
+                if let Some((relayer, penalty)) = relayer.zip((&e).into()) {
+                    network_handle.report_penalty(relayer, penalty).await;
                 }
                 Err(e.into())
             } else {

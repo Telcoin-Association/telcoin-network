@@ -277,8 +277,8 @@ where
                     warn!(target: "worker::network", "worker application received unexpected peer exchange message");
                 }
             },
-            NetworkEvent::Gossip(msg, propagation_source) => {
-                self.process_gossip(msg, propagation_source);
+            NetworkEvent::Gossip(msg, relayer) => {
+                self.process_gossip(msg, relayer);
             }
             NetworkEvent::Error(msg, channel) => {
                 let err = WorkerResponse::Error(message::WorkerRPCError(msg));
@@ -338,17 +338,20 @@ where
     }
 
     /// Process gossip from a worker.
-    fn process_gossip(&self, msg: GossipMessage, propagation_source: BlsPublicKey) {
+    fn process_gossip(&self, msg: GossipMessage, relayer: Option<BlsPublicKey>) {
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
-        let task_name = format!("process-gossip-{propagation_source}");
+        let relayer_label =
+            relayer.as_ref().map_or_else(|| "unresolved".to_string(), |bls| bls.to_string());
+        let task_name = format!("process-gossip-{relayer_label}");
         self.network_handle.get_task_spawner().spawn_task(task_name, async move {
             if let Err(e) = request_handler.process_gossip(&msg).await {
                 warn!(target: "worker::network", ?e, "process_gossip");
-                // convert error into penalty to lower peer score
-                if let Some(penalty) = e.penalty() {
-                    network_handle.report_penalty(propagation_source, penalty).await;
+                // convert error into penalty to lower peer score; only attributable
+                // when the relaying peer's BLS identity has resolved
+                if let Some((relayer, penalty)) = relayer.zip(e.penalty()) {
+                    network_handle.report_penalty(relayer, penalty).await;
                 }
                 Err(e.into())
             } else {
