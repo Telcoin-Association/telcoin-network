@@ -100,6 +100,7 @@ enum PackMessage {
     ConsensusHeaderNumber(u64, oneshot::Sender<Result<ConsensusHeader, PackError>>),
     Persist(oneshot::Sender<Result<(), PackError>>),
     BytesForConsensus(u64, oneshot::Sender<Result<Vec<u8>, PackError>>),
+    OutputEndForConsensus(u64, oneshot::Sender<Result<u64, PackError>>),
     ReadLastCommitted(oneshot::Sender<Result<HashMap<AuthorityIdentifier, Round>, PackError>>),
     ReadLatestFinalRep(oneshot::Sender<Result<Option<CommittedSubDag>, PackError>>),
     ContainsBatch(B256, oneshot::Sender<bool>),
@@ -107,6 +108,9 @@ enum PackMessage {
     CountLeaders(Round, RewardsCounter, oneshot::Sender<Result<(), PackError>>),
     LatestConsensusHeader(oneshot::Sender<Option<ConsensusHeader>>),
     Shutdown,
+    // Flush the write buffer to the data file WITHOUT fsync, so freshly appended bytes
+    /// become visible to other file handles on the same file (visibility, not durability).
+    FlushData(oneshot::Sender<Result<(), PackError>>),
 }
 
 /// Manage a single pack file of consensus data (typically one epoch os the consensus chain).
@@ -152,6 +156,9 @@ fn run_pack_loop(
             PackMessage::BytesForConsensus(number, tx) => {
                 let _ = tx.send(inner.bytes_for_consensus(number));
             }
+            PackMessage::OutputEndForConsensus(number, tx) => {
+                let _ = tx.send(inner.output_end_for_consensus(number));
+            }
             PackMessage::ReadLastCommitted(tx) => {
                 let _ = tx.send(inner.read_last_committed());
             }
@@ -173,6 +180,9 @@ fn run_pack_loop(
             PackMessage::Shutdown => {
                 let _ = inner.persist();
                 break;
+            }
+            PackMessage::FlushData(tx) => {
+                let _ = tx.send(inner.flush_data());
             }
         }
     }
@@ -354,6 +364,20 @@ impl ConsensusPack {
         }
     }
 
+    /// Return the byte offset in the data file just past the end of the consensus output for
+    /// `number`. Streaming `[0, output_end)` of the data file yields a verifiable prefix of the
+    /// pack containing every output up to and including `number` (plus the data header). Errors
+    /// if `number` is outside the range this pack contains.
+    pub async fn consensus_output_end(&self, number: u64) -> Result<u64, PackError> {
+        self.get_error()?;
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(PackMessage::OutputEndForConsensus(number, tx)).await.is_ok() {
+            rx.await.map_err(|_| PackError::ReceiveFailed)?
+        } else {
+            Err(PackError::SendFailed)
+        }
+    }
+
     /// True if consensus header by digest is found by digest.
     pub async fn contains_consensus_header_number(&self, number: u64) -> Result<bool, PackError> {
         self.get_error()?;
@@ -405,6 +429,17 @@ impl ConsensusPack {
         self.get_error()?;
         let (tx, rx) = oneshot::channel();
         let _ = self.tx.send(PackMessage::Persist(tx)).await;
+        rx.await.map_err(|_| match &*self.error.borrow() {
+            Some(e) => e.clone(),
+            None => PackError::ReceiveFailed,
+        })?
+    }
+
+    // public handle method (sibling of `persist`, consensus_pack.rs:412):
+    pub async fn flush_data(&self) -> Result<(), PackError> {
+        self.get_error()?;
+        let (tx, rx) = oneshot::channel();
+        let _ = self.tx.send(PackMessage::FlushData(tx)).await;
         rx.await.map_err(|_| match &*self.error.borrow() {
             Some(e) => e.clone(),
             None => PackError::ReceiveFailed,
@@ -1050,6 +1085,14 @@ impl Inner {
         Ok(())
     }
 
+    // Inner method (sibling of Inner::persist, consensus_pack.rs:1051) — flush only, no syncs:
+    fn flush_data(&mut self) -> Result<(), PackError> {
+        if !self.data.read_only() {
+            self.data.flush().map_err(|e| PackError::PersistError(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     /// Read and return all the bytes for consensus number (all batches and the consensus header).
     fn bytes_for_consensus(&mut self, number: u64) -> Result<Vec<u8>, PackError> {
         // Validate the range like consensus_header_by_number; without this a number below
@@ -1071,6 +1114,23 @@ impl Inner {
             .read_bytes(output_start, output_end)
             .map_err(|e| PackError::ReadError(e.to_string()))?;
         Ok(bytes)
+    }
+
+    /// Return the byte offset in the data file just past the end of the consensus output for
+    /// `number` (the `output_end` of its index entry). Range-checked like `bytes_for_consensus`.
+    fn output_end_for_consensus(&mut self, number: u64) -> Result<u64, PackError> {
+        if number < self.epoch_meta.start_consensus_number {
+            return Err(PackError::ConsensusNumberTooLow);
+        }
+        if number >= self.epoch_meta.start_consensus_number + self.consensus_pos_idx.len() as u64 {
+            return Err(PackError::ConsensusNumberTooHigh);
+        }
+        let rec_pos_idx = number.saturating_sub(self.epoch_meta.start_consensus_number);
+        let pos = self
+            .consensus_pos_idx
+            .load(rec_pos_idx)
+            .map_err(|e| PackError::ReadError(e.to_string()))?;
+        Ok(pos.output_end)
     }
 
     /// Return the latest consensus header by reading directly from the pack index,

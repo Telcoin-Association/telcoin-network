@@ -630,8 +630,8 @@ async fn test_outbound_failure_malicious_response() -> eyre::Result<()> {
 /// ingest a *worker's* `NodeRecord` and then dial/RPC it with primary protocols,
 /// penalizing and banning otherwise-healthy peers.
 ///
-/// With `NetworkType::Primary` → `/tn-primary/*` and `NetworkType::Worker(0)` →
-/// `/tn-worker-0/*`, the cross-role substreams never negotiate: kad never exchanges
+/// With `NetworkType::Primary` → `/tn-primary-<chain>/*` and `NetworkType::Worker(0)`
+/// → `/tn-worker-0-<chain>/*`, the cross-role substreams never negotiate: kad never exchanges
 /// records (so the worker's pushed record never resolves on the primary) and a
 /// req/res request surfaces an `OutboundFailure`. Both networks use IDENTICAL
 /// req/res message types here, so the only thing that can differ is the
@@ -739,9 +739,10 @@ async fn test_primary_worker_protocol_isolation() -> eyre::Result<()> {
         "worker resolved primary's BLS key — kad records crossed roles"
     );
 
-    // req/res isolation: a request to the worker cannot negotiate a protocol —
-    // the worker speaks `/tn-worker-0/*`, not the primary's `/tn-primary/*`. With
-    // identical message types, this can ONLY be a protocol-name mismatch.
+    // req/res isolation: a request to the worker cannot negotiate a protocol,
+    // the worker speaks `/tn-worker-0-<chain>/*`, not the primary's
+    // `/tn-primary-<chain>/*`. With identical message types, this can ONLY be a
+    // protocol-name mismatch.
     let req = TestWorkerRequest::MissingBatches(vec![]);
     let reply = primary.send_request(req, worker_bls).await?;
     let res = timeout(Duration::from_secs(5), reply).await?.expect("reply channel");
@@ -991,9 +992,14 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
     let event =
         timeout(Duration::from_secs(2), nvv_network_events.recv()).await?.expect("batch received");
 
-    // assert gossip message
-    if let NetworkEvent::Gossip(msg, _) = event {
+    // assert gossip message and that the resolved relayer identity is carried
+    if let NetworkEvent::Gossip(msg, relayer) = event {
         assert_eq!(msg.data, expected_result);
+        assert_eq!(
+            relayer,
+            Some(target_peer_bls),
+            "resolved relayer's BLS identity must be attached to the delivered gossip"
+        );
     } else {
         panic!("unexpected network event received");
     }
@@ -2684,5 +2690,40 @@ fn resolved_response_attaches_identity_to_payload() -> eyre::Result<()> {
     let NetworkResponseMessage { peer, result } = resolve_response(Some(bls), response.clone())?;
     assert_eq!(peer, bls);
     assert_eq!(result, response);
+    Ok(())
+}
+
+/// A minimal accepted gossip payload for delivery-mapping tests.
+fn test_gossip_message() -> GossipMessage {
+    GossipMessage {
+        source: None,
+        data: Vec::from("gossip-payload".as_bytes()),
+        sequence_number: None,
+        topic: TopicHash::from_raw(TEST_TOPIC),
+    }
+}
+
+/// Regression for issue #776: an accepted gossip message whose relaying peer's
+/// BLS identity has not yet resolved must still be delivered (carried as
+/// `None`), never dropped. The author is authenticated during gossip
+/// verification, and gossipsub will not re-deliver the `message_id` once the
+/// identity resolves, so dropping here would lose the message for good.
+#[test]
+fn accepted_gossip_with_unresolved_relayer_is_delivered() -> eyre::Result<()> {
+    let message = test_gossip_message();
+    let event: NetworkEvent<TestWorkerRequest, TestWorkerResponse> =
+        accepted_gossip_event(message.clone(), None);
+    assert_matches!(event, NetworkEvent::Gossip(delivered, None) if delivered.data == message.data);
+    Ok(())
+}
+
+/// A resolved relayer identity is attached to the delivered gossip event.
+#[test]
+fn accepted_gossip_with_resolved_relayer_carries_identity() -> eyre::Result<()> {
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([9; 32])).public();
+    let message = test_gossip_message();
+    let event: NetworkEvent<TestWorkerRequest, TestWorkerResponse> =
+        accepted_gossip_event(message, Some(bls));
+    assert_matches!(event, NetworkEvent::Gossip(_, Some(got)) if got == bls);
     Ok(())
 }

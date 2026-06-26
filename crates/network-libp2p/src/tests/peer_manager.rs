@@ -9,7 +9,7 @@ use assert_matches::assert_matches;
 use libp2p::{
     core::Endpoint,
     kad::GetClosestPeersError,
-    swarm::{ConnectionId, NetworkBehaviour as _},
+    swarm::{ConnectionId, DialError, NetworkBehaviour as _},
 };
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::{
@@ -257,6 +257,42 @@ async fn test_dial_peer_already_connected() {
     let result = timeout(Duration::from_millis(500), receiver).await;
     let channel_result = result.unwrap().unwrap();
     assert!(channel_result.is_err()); // Dial should have failed with an error
+}
+
+// Regression for #745: a dial failure must surface the *real* `DialError` to the
+// caller, not the hardcoded "dial attempt timedout" string. Pre-fix, `on_dial_failure`
+// -> `register_disconnected` consumed the reply channel with the timeout literal before
+// the genuine cause could be delivered, so every distinct failure (wrong key, refused,
+// firewall, timeout) looked identical to an operator onboarding a validator.
+#[tokio::test]
+async fn test_dial_failure_surfaces_real_error() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let peer_id = PeerId::random();
+
+    // register an in-flight dial so a reply channel is pending
+    let (sender, receiver) = oneshot::channel();
+    peer_manager.register_dial_attempt(peer_id, Some(sender));
+
+    // a concrete, non-timeout failure cause
+    let error = DialError::Aborted;
+    let expected = NetworkError::from(&error).to_string();
+    peer_manager.on_dial_failure(Some(peer_id), &error);
+
+    let result = timeout(Duration::from_millis(500), receiver).await.unwrap().unwrap();
+    let err = result.expect_err("dial failure must report an error");
+    assert_eq!(
+        err.to_string(),
+        expected,
+        "the real DialError must reach the caller, not a hardcoded cause"
+    );
+
+    // and specifically not the old hardcoded timeout literal
+    let old_timeout = NetworkError::Dial("dial attempt timedout".to_string()).to_string();
+    assert_ne!(
+        err.to_string(),
+        old_timeout,
+        "regression: the real dial error was erased by the hardcoded timeout string"
+    );
 }
 
 #[tokio::test]

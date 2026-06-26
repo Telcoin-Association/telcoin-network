@@ -29,7 +29,7 @@ use libp2p::{
         ProtocolSupport,
     },
     swarm::{NetworkBehaviour, SwarmEvent},
-    Multiaddr, PeerId, Swarm, SwarmBuilder,
+    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -95,10 +95,11 @@ where
         kademlia: kad::Behaviour<KadStore<DB>>,
         peer_config: &PeerConfig,
         metrics: PeerManagerMetrics,
-        network_type: NetworkType,
+        stream_protocols: (StreamProtocol, StreamProtocol),
     ) -> Self {
         let peer_manager = PeerManager::new(local_peer_id, peer_config, metrics);
-        let stream = StreamBehavior::new(network_type);
+        let (stream_legacy, stream_sync) = stream_protocols;
+        let stream = StreamBehavior::new(stream_legacy, stream_sync);
         Self { peer_manager, gossipsub, req_res, kademlia, stream }
     }
 }
@@ -253,6 +254,12 @@ where
         external_addr: Multiaddr,
         rpc: Option<RpcInfo>,
     ) -> NetworkResult<Self> {
+        // Namespace every wire protocol by the genesis chain id so nodes on
+        // different chains never negotiate a connection. The id is stamped onto
+        // the network config from genesis at node startup; see
+        // `NetworkConfig::set_chain_id`.
+        let chain_id = network_config.libp2p_config().chain_id;
+
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             // explicitly set default
             .heartbeat_interval(Duration::from_secs(1))
@@ -260,6 +267,14 @@ where
             .validation_mode(gossipsub::ValidationMode::Strict)
             // TN specific: filter against authorized_publishers for certain topics
             .validate_messages()
+            // Gossipsub negotiates its own `/meshsub` protocol, independent of the
+            // req-res/kad/stream names below, so without this it is the one wire
+            // protocol two chains still share: namespacing the topics keeps their
+            // messages apart but still lets cross-chain peers negotiate a gossip
+            // substream. Folding the chain id into the protocol id closes that gap.
+            // The builder appends `/1.1.0` and `/1.0.0`, yielding
+            // `/tn-meshsub-{chain_id}/1.1.0` and `/tn-meshsub-{chain_id}/1.0.0`.
+            .protocol_id_prefix(crate::types::gossip_protocol_id_prefix(chain_id))
             .build()?;
         let gossipsub = gossipsub::Behaviour::new(
             gossipsub::MessageAuthenticity::Signed(keypair.clone()),
@@ -272,11 +287,11 @@ where
 
         let req_res = request_response::Behaviour::with_codec(
             tn_codec,
-            vec![(network_type.req_res_protocol(), ProtocolSupport::Full)],
+            vec![(network_type.req_res_protocol(chain_id)?, ProtocolSupport::Full)],
             request_response::Config::default(),
         );
         let peer_id: PeerId = keypair.public().into();
-        let mut kad_config = libp2p::kad::Config::new(network_type.kad_protocol());
+        let mut kad_config = libp2p::kad::Config::new(network_type.kad_protocol(chain_id)?);
         // manually add peers
         kad_config.set_kbucket_inserts(kad::BucketInserts::Manual);
         let libp2p = network_config.libp2p_config();
@@ -318,6 +333,7 @@ where
         let kademlia = kad::Behaviour::with_config(peer_id, kad_store.clone(), kad_config);
 
         // create custom behavior
+        let stream_protocols = crate::types::stream_protocols(network_type, chain_id)?;
         let mut behavior = TNBehavior::new(
             peer_id,
             gossipsub,
@@ -325,7 +341,7 @@ where
             kademlia,
             network_config.peer_config(),
             PeerManagerMetrics::new_for(&network_type),
-            network_type,
+            stream_protocols,
         );
 
         // Promote the surviving records into the local peer cache.
@@ -793,7 +809,7 @@ where
                 let rpcs = self.swarm.behaviour().peer_manager.all_rpcs();
                 send_or_log_error!(reply, rpcs, "GetAllValidatorRpcs");
             }
-            NetworkCommand::OpenStream { peer, reply } => {
+            NetworkCommand::OpenStream { peer, kind, reply } => {
                 // Look up the peer's PeerId from their BLS key
                 let (peer_id, addrs) = match self.swarm.behaviour().peer_manager.auth_to_peer(peer)
                 {
@@ -818,7 +834,7 @@ where
                 // Pass the reply channel directly to the stream behavior.
                 // The stream (or error) will be returned to the caller via oneshot
                 // without any intermediate tracking.
-                self.swarm.behaviour_mut().stream.open_stream(peer_id, addrs, reply);
+                self.swarm.behaviour_mut().stream.open_stream(peer_id, kind, addrs, reply);
             }
             #[cfg(test)]
             NetworkCommand::KadStoreGet { key, reply } => {
@@ -861,34 +877,32 @@ where
                 if valid {
                     // A peer is `Connected` before its `NodeRecord` resolves its BLS
                     // identity, so a live mesh neighbor can relay a message before
-                    // `peer_to_bls` can resolve it. This is rare on a warm node but
-                    // reachable, so handle the unresolved case explicitly instead of
-                    // dropping an accepted message with no trace.
-                    if let Some(bls) =
-                        self.swarm.behaviour().peer_manager.peer_to_bls(&propagation_source)
-                    {
-                        // forward gossip to handler
-                        if let Err(e) =
-                            self.event_stream.try_send(NetworkEvent::Gossip(message, bls))
-                        {
-                            error!(target: "network", topics=?self.authorized_publishers.keys(), ?propagation_source, ?message_id, ?e, "failed to forward gossip!");
-                            // ignore failures at the epoch boundary
-                            // During epoch change the event_stream reciever can be closed.
-                            return Ok(());
-                        }
-                    } else {
-                        // The message was accepted into the mesh (and re-propagated),
-                        // but this node cannot yet resolve the relaying peer's BLS
-                        // identity, so it is not delivered to the local consensus
-                        // layer. Warn so the drop is observable rather than silent;
-                        // the node recovers the payload via sync once the identity
-                        // resolves.
-                        warn!(
+                    // `peer_to_bls` can resolve it. Deliver the accepted payload
+                    // regardless and carry the relayer as `Option`: the author is
+                    // already authenticated by `verify_gossip`, the relayer identity
+                    // is only used for penalty attribution, and dropping here would
+                    // lose the message for good because gossipsub has already cached
+                    // `message_id` and will not re-deliver it once the identity
+                    // resolves. The consumer skips the (unattributable) penalty while
+                    // the relayer is unresolved.
+                    let relayer =
+                        self.swarm.behaviour().peer_manager.peer_to_bls(&propagation_source);
+                    if relayer.is_none() {
+                        debug!(
                             target: "network",
                             ?propagation_source,
                             ?message_id,
-                            "accepted gossip not delivered locally: relaying peer's BLS identity is not yet resolved"
+                            "delivering accepted gossip with unresolved relayer identity; consensus-layer penalty skipped"
                         );
+                    }
+                    // forward gossip to handler
+                    if let Err(e) =
+                        self.event_stream.try_send(accepted_gossip_event(message, relayer))
+                    {
+                        error!(target: "network", topics=?self.authorized_publishers.keys(), ?propagation_source, ?message_id, ?e, "failed to forward gossip!");
+                        // ignore failures at the epoch boundary
+                        // During epoch change the event_stream reciever can be closed.
+                        return Ok(());
                     }
                 } else {
                     self.metrics.record_gossip_rejected();
@@ -1320,18 +1334,21 @@ where
     /// This handles inbound and outbound stream events for bulk data transfer.
     fn process_stream_event(&mut self, event: StreamEvent) -> NetworkResult<()> {
         match event {
-            StreamEvent::InboundStream { peer, stream } => {
+            StreamEvent::InboundStream { peer, kind, stream } => {
                 debug!(
                     target: "network",
                     ?peer,
+                    ?kind,
                     "inbound stream received"
                 );
-                // Forward raw stream to application layer
+                // Forward raw stream to application layer, tagged with the
+                // negotiated protocol so it routes to the sync or legacy reader.
                 if let Some(bls) = self.swarm.behaviour().peer_manager.peer_to_bls(&peer) {
-                    if let Err(e) = self
-                        .event_stream
-                        .try_send(NetworkEvent::InboundStream { peer: bls, stream })
-                    {
+                    if let Err(e) = self.event_stream.try_send(NetworkEvent::InboundStream {
+                        peer: bls,
+                        kind,
+                        stream,
+                    }) {
                         error!(target: "network", ?e, "failed to forward inbound stream");
                     }
                 } else {
@@ -1747,4 +1764,19 @@ fn resolve_response<Res: TNMessage>(
     resolved
         .map(|peer| NetworkResponseMessage { peer, result: response })
         .ok_or(NetworkError::PeerUnresolved)
+}
+
+/// Build the application event for an accepted gossip message.
+///
+/// `relayer` is the relaying peer's BLS identity, or `None` while its
+/// `NodeRecord` has not yet resolved. The accepted payload is delivered in
+/// either case: the author is already authenticated during gossip verification,
+/// and dropping an unresolved-relayer message would lose it permanently because
+/// gossipsub has already cached its `message_id`. The relayer is carried so the
+/// consumer can attribute a penalty only when the identity is known.
+fn accepted_gossip_event<Req, Res>(
+    message: GossipMessage,
+    relayer: Option<BlsPublicKey>,
+) -> NetworkEvent<Req, Res> {
+    NetworkEvent::Gossip(message, relayer)
 }

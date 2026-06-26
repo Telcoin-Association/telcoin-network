@@ -3,7 +3,7 @@
 use crate::{
     error::PrimaryNetworkError,
     network::{
-        message::{ConsensusResult, PrimaryGossip, PrimaryResponse},
+        message::{PrimaryGossip, PrimaryResponse},
         MissingCertificatesRequest, PendingStreamRequest, RequestHandler, StreamRequestKind,
         MAX_CONCURRENT_EPOCH_STREAMS, PENDING_REQUEST_TIMEOUT,
     },
@@ -26,12 +26,13 @@ use tn_storage::{
     mem_db::MemDatabase,
     tables::Votes,
 };
-use tn_test_utils_committee::CommitteeFixture;
+use tn_test_utils_committee::{AuthorityFixture, CommitteeFixture};
 use tn_types::{
-    error::HeaderError, now, AuthorityIdentifier, BlockHash, BlockHeader, BlockNumHash,
-    BlsPublicKey, Certificate, CommittedSubDag, ConsensusHeaderDigest, ConsensusNumHash, Database,
-    Epoch, EpochVote, ExecHeader, Hash as _, HeaderDigest, ReputationScores, SealedHeader,
-    TaskManager, VoteDigest, VoteInfo, B256,
+    encode, error::HeaderError, now, to_intent_message, AuthorityIdentifier, BlockHash,
+    BlockHeader, BlockNumHash, BlsPublicKey, BlsSigner as _, Certificate, CommittedSubDag,
+    ConsensusHeaderDigest, ConsensusNumHash, ConsensusResult, Database, Epoch, EpochVote,
+    ExecHeader, Hash as _, HeaderDigest, ReputationScores, Round, SealedHeader, TaskManager,
+    VoteDigest, VoteInfo, B256,
 };
 use tracing::debug;
 
@@ -503,7 +504,7 @@ async fn test_primary_batch_gossip_topics() {
 
     let gossip = PrimaryGossip::Certificate(Box::new(Certificate::default()));
     let data = tn_types::encode(&gossip);
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::primary_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::primary_topic(0));
     let goodish_msg =
         GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     let res = handler.process_gossip(&goodish_msg).await;
@@ -512,7 +513,7 @@ async fn test_primary_batch_gossip_topics() {
 
     let gossip = PrimaryGossip::Consensus(Box::new(ConsensusResult::default()));
     let data = tn_types::encode(&gossip);
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::consensus_output_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::consensus_output_topic(0));
     let good_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     assert!(handler.process_gossip(&good_msg).await.is_ok());
 
@@ -520,7 +521,7 @@ async fn test_primary_batch_gossip_topics() {
     // and returns InvalidHeader(PeerNotAuthor).
     let gossip = PrimaryGossip::EpochVote(Box::new(EpochVote::default()));
     let data = tn_types::encode(&gossip);
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::epoch_vote_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::epoch_vote_topic(0));
     let good_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     let res = handler.process_gossip(&good_msg).await;
     // Not rejected for InvalidTopic — rejected for invalid signature instead.
@@ -528,7 +529,7 @@ async fn test_primary_batch_gossip_topics() {
 
     let gossip = PrimaryGossip::Certificate(Box::new(Certificate::default()));
     let data = tn_types::encode(&gossip);
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::epoch_vote_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::epoch_vote_topic(0));
     let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     let res = handler.process_gossip(&bad_msg).await;
     // This will be rejected for other reasons, but make sure it is for an invalid topic.
@@ -536,13 +537,13 @@ async fn test_primary_batch_gossip_topics() {
 
     let gossip = PrimaryGossip::Consensus(Box::new(ConsensusResult::default()));
     let data = tn_types::encode(&gossip);
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::primary_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::primary_topic(0));
     let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     assert!(handler.process_gossip(&bad_msg).await.is_err());
 
     let gossip = PrimaryGossip::EpochVote(Box::new(EpochVote::default()));
     let data = tn_types::encode(&gossip);
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::consensus_output_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::consensus_output_topic(0));
     let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     assert!(handler.process_gossip(&bad_msg).await.is_err());
 }
@@ -857,6 +858,72 @@ async fn test_behind_consensus_genuinely_behind() {
     assert!(result, "genuinely behind node should be detected");
 }
 
+/// Server-side partial epoch streaming: `send_epoch_over_stream` with `Some(stop_number)` must
+/// emit exactly the verifiable prefix (every output up to and including the stop number) of the
+/// in-progress current epoch, and a later cutoff must extend that same prefix.
+#[tokio::test]
+async fn test_send_partial_epoch_over_stream() {
+    use tokio::io::AsyncReadExt as _;
+
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let committee_obj = committee.committee();
+    let peer = *committee.first_authority().authority().protocol_key();
+
+    // Populate the in-progress (never finalized) epoch-0 pack with some outputs.
+    let num_outputs = 15u64;
+    for number in 1..=num_outputs {
+        let cert = Certificate::default();
+        let sub_dag = CommittedSubDag::new(
+            vec![cert.clone()],
+            cert,
+            number,
+            ReputationScores::new(&committee_obj),
+            None,
+        );
+        handler.consensus_chain().write_subdag_for_test(number, sub_dag).await;
+    }
+
+    // The server streams a partial prefix up to consensus number `k`.
+    let k = 9u64;
+    let mut sent = Vec::new();
+    RequestHandler::<MemDatabase>::send_epoch_over_stream(
+        &mut sent,
+        handler.consensus_chain(),
+        0,
+        Some(k),
+        Duration::from_secs(10),
+        peer,
+    )
+    .await
+    .expect("send partial epoch stream");
+
+    // The streamed bytes must equal exactly the verifiable prefix the chain exposes — i.e. the
+    // data file truncated at `output_end(k)`.
+    let (stream, len) =
+        handler.consensus_chain().get_partial_epoch_stream(0, k).await.expect("partial stream");
+    let mut expected = Vec::new();
+    stream.take(len).read_to_end(&mut expected).await.unwrap();
+    assert_eq!(sent.len() as u64, len, "streamed byte count must equal the partial cutoff");
+    assert_eq!(sent, expected, "streamed bytes must equal the verifiable prefix");
+
+    // A later cutoff streams strictly more, and the smaller prefix is a true prefix of it.
+    let mut sent_more = Vec::new();
+    RequestHandler::<MemDatabase>::send_epoch_over_stream(
+        &mut sent_more,
+        handler.consensus_chain(),
+        0,
+        Some(num_outputs),
+        Duration::from_secs(10),
+        peer,
+    )
+    .await
+    .expect("send larger partial stream");
+    assert!(sent_more.len() > sent.len(), "a later cutoff must stream more bytes");
+    assert_eq!(&sent_more[..sent.len()], &sent[..], "smaller prefix must prefix the larger one");
+}
+
 /// A peer that re-requests the same epoch while an entry is already pending must not be
 /// able to reset the cleanup timer. If the replacement path rearmed `created_at`, a peer
 /// could re-request every 20s and hold a slot forever. This test exercises the
@@ -913,4 +980,161 @@ async fn test_pending_epoch_stream_replacement_preserves_created_at() {
         MAX_CONCURRENT_EPOCH_STREAMS,
         "dropping the evicted pending entry must release its semaphore permit"
     );
+}
+
+// ============================================================================
+// Consensus Result Signature Aggregation Tests
+// ============================================================================
+// These tests cover how the handler counts the validator signatures gossiped for a
+// consensus result. A result is only "published" (forwarded to followers) once a quorum of
+// *distinct* validators have signed it, and each validator must count at most once.
+
+/// Build a gossip message carrying a [`ConsensusResult`] signed by `auth` over the given
+/// `(epoch, round, number, hash)` tuple. Mirrors how the subscriber publishes results: the
+/// signature is over `to_intent_message(ConsensusResult::digest_data(..))`.
+fn signed_consensus_gossip(
+    auth: &AuthorityFixture<MemDatabase>,
+    epoch: Epoch,
+    round: Round,
+    number: u64,
+    hash: ConsensusHeaderDigest,
+) -> GossipMessage {
+    let digest = ConsensusResult::digest_data(epoch, round, number, hash);
+    let config = auth.consensus_config();
+    let key_config = config.key_config();
+    let signature = key_config.request_signature_direct(&encode(&to_intent_message(digest)));
+    let validator = key_config.public_key();
+    let result = ConsensusResult { epoch, round, number, hash, validator, signature };
+    let data = encode(&PrimaryGossip::Consensus(Box::new(result)));
+    let topic =
+        TopicHash::from_raw(tn_config::LibP2pConfig::consensus_output_topic(config.chain_id()));
+    GossipMessage { source: None, data, sequence_number: None, topic }
+}
+
+/// A quorum (`1/3 + 1`) of distinct validators signing the same consensus result must cause
+/// the handler to publish it, and not before. This also pins the entry-creation path: the
+/// very first signature must be recorded (a regression here would mean a quorum is never
+/// reached and the result is never published).
+#[tokio::test]
+async fn test_consensus_result_publishes_on_quorum() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    let (epoch, round, number) = (0u32, 1u32, 1u64);
+    let hash = ConsensusHeaderDigest::from(B256::random());
+    let quorum = committee.committee().size() / 3 + 1;
+    let authorities: Vec<_> = committee.authorities().collect();
+    assert!(authorities.len() >= quorum, "need at least a quorum of authorities");
+
+    // Feed distinct signers one at a time; nothing should publish until the quorum-th.
+    for (seen, auth) in authorities.iter().take(quorum).enumerate() {
+        let msg = signed_consensus_gossip(auth, epoch, round, number, hash);
+        handler.process_gossip(&msg).await?;
+
+        if seen + 1 < quorum {
+            assert_eq!(
+                consensus_bus.published_consensus_num_hash(),
+                (0, 0, ConsensusHeaderDigest::default()),
+                "must not publish before a quorum of distinct signers ({} of {quorum})",
+                seen + 1,
+            );
+        }
+    }
+
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (epoch, number, hash),
+        "result must be published once a quorum of distinct signers is reached",
+    );
+    Ok(())
+}
+
+/// The same validator gossiping a result repeatedly must be counted once. Replaying one
+/// signer more times than the quorum must not publish; only adding the remaining *distinct*
+/// signers may.
+#[tokio::test]
+async fn test_consensus_result_duplicate_signature_counted_once() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    let (epoch, round, number) = (0u32, 1u32, 1u64);
+    let hash = ConsensusHeaderDigest::from(B256::random());
+    let quorum = committee.committee().size() / 3 + 1;
+    let authorities: Vec<_> = committee.authorities().collect();
+    assert!(authorities.len() >= quorum, "need at least a quorum of authorities");
+
+    // Replay the first signer's result more than `quorum` times. If duplicates were counted,
+    // this alone would reach quorum and publish — it must not.
+    let dup = signed_consensus_gossip(authorities[0], epoch, round, number, hash);
+    for _ in 0..quorum + 1 {
+        handler.process_gossip(&dup).await?;
+    }
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (0, 0, ConsensusHeaderDigest::default()),
+        "repeated signatures from one validator must count once and stay below quorum",
+    );
+
+    // Add the remaining distinct signers (signer 0 already counted once) to reach quorum.
+    for auth in authorities.iter().take(quorum).skip(1) {
+        let msg = signed_consensus_gossip(auth, epoch, round, number, hash);
+        handler.process_gossip(&msg).await?;
+    }
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (epoch, number, hash),
+        "a quorum of distinct signers must publish even after duplicates were ignored",
+    );
+    Ok(())
+}
+
+/// A single committee member flooding distinct singleton results must not grow `consensus_certs`
+/// without bound: once the map exceeds the 20-entry threshold the handler evicts singleton
+/// entries that are not the result currently being processed. The eviction must also not break
+/// legitimate aggregation — a real quorum still publishes afterward.
+#[tokio::test]
+async fn test_consensus_certs_eviction_bounds_map() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    let (epoch, round) = (0u32, 1u32);
+    let quorum = committee.committee().size() / 3 + 1;
+    let authorities: Vec<_> = committee.authorities().collect();
+    assert!(authorities.len() >= quorum, "need at least a quorum of authorities");
+
+    // Flood: 50 distinct one-signature results from a single validator. Each distinct hash maps
+    // to a distinct digest → a new singleton entry, none of which reach quorum, so the map is
+    // never cleared by a publish during the flood.
+    for _ in 0..50 {
+        let hash = ConsensusHeaderDigest::from(B256::random());
+        let msg = signed_consensus_gossip(authorities[0], epoch, round, 1, hash);
+        handler.process_gossip(&msg).await?;
+    }
+
+    // The eviction bound must cap the map well below the 50 distinct inputs (≤ 21: the
+    // threshold of 20 plus the in-flight entry inserted after the retain).
+    assert!(
+        handler.consensus_certs_len() <= 21,
+        "consensus_certs must stay bounded under a singleton flood, got {}",
+        handler.consensus_certs_len(),
+    );
+
+    // A legitimate result must still reach quorum and publish after the eviction path has run.
+    let hash_l = ConsensusHeaderDigest::from(B256::random());
+    for auth in authorities.iter().take(quorum) {
+        let msg = signed_consensus_gossip(auth, epoch, round, 2, hash_l);
+        handler.process_gossip(&msg).await?;
+    }
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (epoch, 2, hash_l),
+        "a legitimate quorum must publish even after singleton eviction",
+    );
+    // Publishing clears the map.
+    assert_eq!(handler.consensus_certs_len(), 0, "map must be cleared after a publish");
+
+    Ok(())
 }

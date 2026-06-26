@@ -24,7 +24,7 @@ use tn_network_libp2p::{
         IntoResponse as _, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResponseMessage,
         NetworkResult,
     },
-    GossipMessage, Penalty, ResponseChannel, Stream,
+    GossipMessage, Penalty, ResponseChannel, Stream, StreamKind,
 };
 use tn_network_types::{WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerToPrimaryClient};
 use tn_storage::{
@@ -34,15 +34,14 @@ use tn_storage::{
 };
 use tn_types::{
     encode, BlsPublicKey, BlsSignature, Certificate, ConsensusHeader, ConsensusHeaderDigest,
-    Database, Epoch, EpochCertificate, EpochDigest, EpochRecord, EpochVote, Header, HeaderDigest,
-    Round, TaskError, TaskSpawner, TnReceiver, TnSender, Vote, B256,
+    ConsensusResult, Database, Epoch, EpochCertificate, EpochDigest, EpochRecord, EpochVote,
+    Header, HeaderDigest, Round, TaskError, TaskSpawner, TnReceiver, TnSender, Vote, B256,
 };
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tracing::{debug, info, warn};
 pub mod handler;
 mod message;
-pub use message::ConsensusResult;
 
 #[cfg(test)]
 #[path = "../tests/network_tests.rs"]
@@ -83,28 +82,45 @@ const CONSENSUS_OUTPUT_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// What a [`PendingStreamRequest`] should stream once the peer opens the stream.
 #[derive(Debug, Clone, Copy)]
 pub enum StreamRequestKind {
-    /// Stream the full pack file for an epoch.
+    /// Stream the full (finished) pack file for an epoch.
     EpochPack(Epoch),
+    /// Stream a verifiable PREFIX of an epoch's pack file, up to and including the consensus
+    /// output with `last_consensus_number` (used for the in-progress current epoch).
+    EpochPackPartial {
+        /// The epoch we are streaming consensus data for.
+        epoch: Epoch,
+        /// The final (inclusive) consensus header number to stream up to.
+        last_consensus_number: u64,
+    },
     /// Stream the raw bytes for a single consensus output (by consensus chain number).
     ConsensusOutput(u64),
 }
 
-/// Correlation digest for an epoch-pack stream request.
-fn epoch_stream_digest(epoch: Epoch) -> B256 {
-    let mut hasher = tn_types::DefaultHashFunction::new();
-    hasher.update(b"epoch-stream");
-    hasher.update(&epoch.to_le_bytes());
-    B256::from_slice(hasher.finalize().as_bytes())
-}
-
 /// Correlation digest for a single consensus-output stream request.
 ///
-/// Domain-separated from [`epoch_stream_digest`] so epoch `N` and output `N` never collide in
-/// the pending-request map for a given peer.
-fn consensus_output_stream_digest(number: u64) -> B256 {
+/// Each kind is domain-separated so distinct requests never collide in the pending map:
+/// - `EpochPack(epoch)` hashes only the epoch — byte-for-byte the original full-stream scheme, so
+///   existing full-stream clients are unaffected.
+/// - `EpochPackPartial { epoch, n }` additionally mixes in the stop number, giving it a distinct
+///   digest from the full-epoch request.
+/// - `ConsensusOutput(n)` is tagged so output `N` never collides with epoch `N`.
+fn stream_request_digest(kind: &StreamRequestKind) -> B256 {
     let mut hasher = tn_types::DefaultHashFunction::new();
-    hasher.update(b"consensus-output");
-    hasher.update(&number.to_le_bytes());
+    match kind {
+        StreamRequestKind::EpochPack(epoch) => {
+            hasher.update(b"epoch-pack");
+            hasher.update(&epoch.to_le_bytes());
+        }
+        StreamRequestKind::EpochPackPartial { epoch, last_consensus_number } => {
+            hasher.update(b"epoch-pack-partial");
+            hasher.update(&epoch.to_le_bytes());
+            hasher.update(&last_consensus_number.to_le_bytes());
+        }
+        StreamRequestKind::ConsensusOutput(number) => {
+            hasher.update(b"consensus-output");
+            hasher.update(&number.to_le_bytes());
+        }
+    }
     B256::from_slice(hasher.finalize().as_bytes())
 }
 
@@ -153,23 +169,30 @@ impl PendingStreamRequest {
 #[derive(Clone, Debug)]
 pub struct PrimaryNetworkHandle {
     handle: NetworkHandle<Req, Res>,
+    /// The genesis chain id, used to namespace gossip topics this handle publishes.
+    chain_id: u64,
 }
 
+// Test-only conversion that defaults the chain id to 0. Gated to tests so the only
+// way to build a production handle is `new`, with the genesis chain id supplied
+// explicitly: a 0 here would publish on the `-0` topic suffix while validators read
+// the real id, a silent gossip mismatch.
+#[cfg(test)]
 impl From<NetworkHandle<Req, Res>> for PrimaryNetworkHandle {
     fn from(handle: NetworkHandle<Req, Res>) -> Self {
-        Self { handle }
+        Self { handle, chain_id: 0 }
     }
 }
 
 impl PrimaryNetworkHandle {
     /// Create a new instance of Self.
-    pub fn new(handle: NetworkHandle<Req, Res>) -> Self {
-        Self { handle }
+    pub fn new(handle: NetworkHandle<Req, Res>, chain_id: u64) -> Self {
+        Self { handle, chain_id }
     }
 
     //// Convenience method for creating a new Self for tests.
     pub fn new_for_test(sender: mpsc::Sender<NetworkCommand<Req, Res>>) -> Self {
-        Self { handle: NetworkHandle::new(sender) }
+        Self { handle: NetworkHandle::new(sender), chain_id: 0 }
     }
 
     /// Return a reference to the inner handle.
@@ -180,7 +203,7 @@ impl PrimaryNetworkHandle {
     /// Publish a certificate to the consensus network.
     pub async fn publish_certificate(&self, certificate: Certificate) -> NetworkResult<()> {
         let data = encode(&PrimaryGossip::Certificate(Box::new(certificate)));
-        self.handle.publish(tn_config::LibP2pConfig::primary_topic(), data).await?;
+        self.handle.publish(tn_config::LibP2pConfig::primary_topic(self.chain_id), data).await?;
         Ok(())
     }
 
@@ -202,14 +225,16 @@ impl PrimaryNetworkHandle {
             validator: key,
             signature,
         })));
-        self.handle.publish(tn_config::LibP2pConfig::consensus_output_topic(), data).await?;
+        self.handle
+            .publish(tn_config::LibP2pConfig::consensus_output_topic(self.chain_id), data)
+            .await?;
         Ok(())
     }
 
     /// Publish a certificate to the consensus network.
     pub async fn publish_epoch_vote(&self, vote: EpochVote) -> NetworkResult<()> {
         let data = encode(&PrimaryGossip::EpochVote(Box::new(vote)));
-        self.handle.publish(tn_config::LibP2pConfig::epoch_vote_topic(), data).await?;
+        self.handle.publish(tn_config::LibP2pConfig::epoch_vote_topic(self.chain_id), data).await?;
         Ok(())
     }
 
@@ -361,7 +386,7 @@ impl PrimaryNetworkHandle {
         number: u64,
     ) -> NetworkResult<Vec<u8>> {
         let request = PrimaryRequest::StreamConsensusOutput { number };
-        let request_digest = consensus_output_stream_digest(number);
+        let request_digest = stream_request_digest(&StreamRequestKind::ConsensusOutput(number));
         let resp = self.handle.send_request(request, peer).await?.await??;
         let PrimaryResponse::StreamRequestAck { ack } = resp.result else {
             return Err(NetworkError::RPCError(
@@ -393,7 +418,7 @@ impl PrimaryNetworkHandle {
     pub async fn request_consensus_output(&self, number: u64) -> NetworkResult<Vec<u8>> {
         const TIMEOUT: Duration = Duration::from_secs(10);
         let request = PrimaryRequest::StreamConsensusOutput { number };
-        let request_digest = consensus_output_stream_digest(number);
+        let request_digest = stream_request_digest(&StreamRequestKind::ConsensusOutput(number));
         // Try up to three times (from three peers) to get the output.
         // This could be a lot more complicated but this KISS method should work fine.
         for _ in 0..3 {
@@ -445,7 +470,7 @@ impl PrimaryNetworkHandle {
         peer: BlsPublicKey,
         request_digest: B256,
     ) -> NetworkResult<Vec<u8>> {
-        let mut stream = self.handle.open_stream(peer).await??;
+        let mut stream = self.handle.open_stream(peer, StreamKind::Legacy).await??;
         stream
             .write_all(request_digest.as_slice())
             .await
@@ -515,7 +540,7 @@ impl PrimaryNetworkHandle {
         self.handle.connected_peer_count().await
     }
 
-    /// Attempt to get an epoch pack file from any peer via stream.
+    /// Attempt to get a complete epoch pack file from any peer via stream.
     ///
     /// This method:
     /// 1. Sends a `StreamEpoch` request to negotiate
@@ -528,12 +553,64 @@ impl PrimaryNetworkHandle {
         consensus_chain: &ConsensusChain,
         record_timeout: Duration,
     ) -> NetworkResult<()> {
+        self.request_epoch_pack_inner(
+            epoch_record,
+            previous_epoch,
+            consensus_chain,
+            None,
+            record_timeout,
+        )
+        .await
+    }
+
+    /// Attempt to get a verifiable PREFIX of an epoch's pack file from any peer via stream,
+    /// stopping after consensus number `last_consensus_number`.
+    ///
+    /// Behaves exactly like [`Self::request_epoch_pack`] but negotiates a partial transfer. The
+    /// caller must supply an `epoch_record` whose `final_consensus` matches the partial stop point
+    /// so the streamed prefix verifies. Used to fetch the in-progress current epoch up to a
+    /// known point.
+    pub async fn request_partial_epoch_pack(
+        &self,
+        epoch_record: &EpochRecord,
+        previous_epoch: &EpochRecord,
+        consensus_chain: &ConsensusChain,
+        last_consensus_number: u64,
+        record_timeout: Duration,
+    ) -> NetworkResult<()> {
+        self.request_epoch_pack_inner(
+            epoch_record,
+            previous_epoch,
+            consensus_chain,
+            Some(last_consensus_number),
+            record_timeout,
+        )
+        .await
+    }
+
+    /// Shared implementation for full ([`Self::request_epoch_pack`]) and partial
+    /// ([`Self::request_partial_epoch_pack`]) epoch pack streaming. `last_consensus_number` selects
+    /// the request variant and correlation digest; everything else is identical.
+    async fn request_epoch_pack_inner(
+        &self,
+        epoch_record: &EpochRecord,
+        previous_epoch: &EpochRecord,
+        consensus_chain: &ConsensusChain,
+        last_consensus_number: Option<u64>,
+        record_timeout: Duration,
+    ) -> NetworkResult<()> {
         let epoch = epoch_record.epoch;
         // Try up to three times (from three peers) to get consensus.
         // This could be a lot more complicated but this KISS method should work fine.
         // send request to negotiate stream
-        let request = PrimaryRequest::StreamEpoch { epoch };
-        let request_digest = epoch_stream_digest(epoch);
+        let (request, kind) = match last_consensus_number {
+            None => (PrimaryRequest::StreamEpoch { epoch }, StreamRequestKind::EpochPack(epoch)),
+            Some(last_consensus_number) => (
+                PrimaryRequest::StreamEpochPartial { epoch, last_consensus_number },
+                StreamRequestKind::EpochPackPartial { epoch, last_consensus_number },
+            ),
+        };
+        let request_digest = stream_request_digest(&kind);
 
         for _ in 0..3 {
             // send request and await response from peer
@@ -574,8 +651,9 @@ impl PrimaryNetworkHandle {
                     "peer ack for stream request"
                 );
 
-                // open raw stream then write request_digest for correlation
-                let mut stream = self.handle.open_stream(peer).await??;
+                // open raw stream then write request_digest for correlation. The
+                // primary still uses the legacy path; its sync cutover is item 6.
+                let mut stream = self.handle.open_stream(peer, StreamKind::Legacy).await??;
                 stream.write_all(request_digest.as_slice()).await.map_err(|e| {
                     NetworkError::RPCError(format!("failed to write request digest: {e}"))
                 })?;
@@ -794,14 +872,22 @@ where
                     self.process_epoch_record_request(peer, epoch, hash, channel, cancel)
                 }
                 PrimaryRequest::StreamEpoch { epoch } => {
-                    self.process_epoch_stream(peer, epoch, channel, cancel)
+                    self.process_epoch_stream(peer, epoch, None, channel, cancel)
                 }
+                PrimaryRequest::StreamEpochPartial { epoch, last_consensus_number } => self
+                    .process_epoch_stream(
+                        peer,
+                        epoch,
+                        Some(last_consensus_number),
+                        channel,
+                        cancel,
+                    ),
                 PrimaryRequest::StreamConsensusOutput { number } => {
                     self.process_consensus_output_stream(peer, number, channel, cancel)
                 }
             },
-            NetworkEvent::Gossip(msg, propagation_source) => {
-                self.process_gossip(msg, propagation_source);
+            NetworkEvent::Gossip(msg, relayer) => {
+                self.process_gossip(msg, relayer);
             }
             NetworkEvent::Error(msg, channel) => {
                 let err = PrimaryResponse::Error(PrimaryRPCError(msg));
@@ -811,9 +897,20 @@ where
                     Ok(())
                 });
             }
-            NetworkEvent::InboundStream { peer, stream } => {
-                self.process_inbound_stream(peer, stream);
-            }
+            NetworkEvent::InboundStream { peer, kind, stream } => match kind {
+                StreamKind::Legacy => self.process_inbound_stream(peer, stream),
+                // the primary registers its sync protocol but opens no sync stream
+                // until the item-6 cutover; drop any unexpected inbound sync stream
+                // (metrics-only during rollout, no penalty)
+                StreamKind::Sync => {
+                    warn!(
+                        target: "primary::network",
+                        %peer,
+                        "dropping unexpected inbound sync stream (primary sync cutover is item 6)"
+                    );
+                    drop(stream);
+                }
+            },
         }
     }
 
@@ -1035,16 +1132,25 @@ where
     }
 
     /// Process a request to stream an epoch pack file.
+    ///
+    /// `last_consensus_number` is `None` for a full-epoch transfer and `Some(n)` to stream only the
+    /// verifiable prefix up to consensus number `n` (the in-progress current epoch).
     fn process_epoch_stream(
         &self,
         peer: BlsPublicKey,
         epoch: Epoch,
+        last_consensus_number: Option<u64>,
         channel: ResponseChannel<PrimaryResponse>,
         cancel: oneshot::Receiver<()>,
     ) {
-        let request_digest = epoch_stream_digest(epoch);
-        let ack =
-            self.accept_stream_request(peer, request_digest, StreamRequestKind::EpochPack(epoch));
+        let kind = match last_consensus_number {
+            None => StreamRequestKind::EpochPack(epoch),
+            Some(last_consensus_number) => {
+                StreamRequestKind::EpochPackPartial { epoch, last_consensus_number }
+            }
+        };
+        let request_digest = stream_request_digest(&kind);
+        let ack = self.accept_stream_request(peer, request_digest, kind);
         self.send_stream_ack(ack, channel, cancel, format!("process-request-epoch-{peer}"));
     }
 
@@ -1056,28 +1162,28 @@ where
         channel: ResponseChannel<PrimaryResponse>,
         cancel: oneshot::Receiver<()>,
     ) {
-        let request_digest = consensus_output_stream_digest(number);
-        let ack = self.accept_stream_request(
-            peer,
-            request_digest,
-            StreamRequestKind::ConsensusOutput(number),
-        );
+        let kind = StreamRequestKind::ConsensusOutput(number);
+        let request_digest = stream_request_digest(&kind);
+        let ack = self.accept_stream_request(peer, request_digest, kind);
         self.send_stream_ack(ack, channel, cancel, format!("process-request-output-{peer}"));
     }
 
     /// Process gossip from committee.
-    fn process_gossip(&self, msg: GossipMessage, propagation_source: BlsPublicKey) {
+    fn process_gossip(&self, msg: GossipMessage, relayer: Option<BlsPublicKey>) {
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
-        let task_name = format!("ProcessGossip-{}-{propagation_source}", msg.topic);
+        let relayer_label =
+            relayer.as_ref().map_or_else(|| "unresolved".to_string(), |bls| bls.to_string());
+        let task_name = format!("ProcessGossip-{}-{relayer_label}", msg.topic);
         // spawn task to process gossip
         self.task_spawner.spawn_task(task_name, async move {
             if let Err(e) = request_handler.process_gossip(&msg).await {
                 warn!(target: "primary::network", ?e, "process_gossip");
-                // convert error into penalty to lower peer score
-                if let Some(penalty) = (&e).into() {
-                    network_handle.report_penalty(propagation_source, penalty).await;
+                // convert error into penalty to lower peer score; only attributable
+                // when the relaying peer's BLS identity has resolved
+                if let Some((relayer, penalty)) = relayer.zip((&e).into()) {
+                    network_handle.report_penalty(relayer, penalty).await;
                 }
                 Err(e.into())
             } else {

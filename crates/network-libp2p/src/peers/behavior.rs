@@ -311,14 +311,16 @@ impl PeerManager {
     ///
     /// NOTE: `AllPeers` is only updated if the peer is _not_ already connected. It's possible that
     /// an outgoing dial attempt fails because the peer connected during the dial.
-    fn on_dial_failure(&mut self, peer_id: Option<PeerId>, error: &DialError) {
+    pub(super) fn on_dial_failure(&mut self, peer_id: Option<PeerId>, error: &DialError) {
         self.metrics.record_dial_failure();
         if let Some(peer_id) = peer_id {
             if !self.is_connected(&peer_id) {
                 self.register_disconnected(&peer_id);
             }
 
-            // return error to dialer
+            // return the genuine dial error to the dialer. `register_disconnected` no longer
+            // consumes the reply channel with a hardcoded cause, so the real `DialError`
+            // (wrong key, refused, firewall, timeout) reaches the caller.
             self.notify_dial_result(&peer_id, Err(error.into()));
         }
     }
