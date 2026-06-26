@@ -200,7 +200,7 @@ impl EngineToPrimary for NoopEngineToPrimary {
     }
 }
 
-/// PR1a: a worker's transaction pool charges the base fee supplied at epoch setup (the
+/// A worker's transaction pool charges the base fee supplied at epoch setup (the
 /// accumulator's per-worker value) instead of a hardcoded `MIN_PROTOCOL_BASE_FEE`, and
 /// `set_worker_base_fee` updates it for the every-epoch (respawn) path.
 #[tokio::test]
@@ -220,7 +220,7 @@ async fn test_worker_pool_base_fee_sourced_from_accumulator() -> eyre::Result<()
     let network_handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
 
     let worker_id: WorkerId = 0;
-    // a deliberately non-MIN value: proves the pool no longer hardcodes MIN_PROTOCOL_BASE_FEE.
+    // a deliberately non-MIN value: proves the pool does't hardcodes MIN_PROTOCOL_BASE_FEE.
     let base_fee = MIN_PROTOCOL_BASE_FEE + 1234;
 
     execution_node
