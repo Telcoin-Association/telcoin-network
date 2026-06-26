@@ -230,15 +230,14 @@ where
         {
             committee_zero
         } else {
-            error!(target: "epoch-manager", "Unable to load commitee zero from the genesis committee!");
+            error!(target: "epoch-manager", "Unable to load committee zero from the genesis committee!");
             return Err(eyre::eyre!(
                 "unable to load committee zero (genesis committee), this is fatal"
             ));
         };
         let epochs_db_path = tn_datadir.epochs_db_path();
         let _ = std::fs::create_dir_all(&epochs_db_path);
-        let consensus_chain =
-            ConsensusChain::new(epochs_db_path, committee_zero).expect("open consensus DB");
+        let consensus_chain = ConsensusChain::new(epochs_db_path, committee_zero)?;
         // shutdown long-running node components
         let node_shutdown = Notifier::new();
 

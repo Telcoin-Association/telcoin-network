@@ -466,10 +466,8 @@ impl ConsensusChain {
                 // Held through the remove+rename and cache invalidation below so new_epoch's
                 // open_append cannot observe the transient window where epoch-{N} is unlinked.
                 let _install = self.pack_install.lock().await;
-                let current_pack = self.current_pack.lock();
-                let replace_current = current_pack.epoch() == epoch;
+                let replace_current = self.current_pack.lock().epoch() == epoch;
                 drop(pack);
-                drop(current_pack);
                 // Make sure we don't have any cruft in the final dir.
                 if std::fs::exists(&base_dir).unwrap_or_default() {
                     // If this exists it is incomplete (see check at start of function).
