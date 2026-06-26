@@ -514,6 +514,32 @@ impl ConsensusChain {
         }
     }
 
+    /// Return a stream reader for the data file of `epoch` together with the number of bytes that
+    /// should be sent to deliver a verifiable PREFIX of the pack: every consensus output up to and
+    /// including `last_consensus_number` (a chain consensus number, not a pack-relative index).
+    ///
+    /// Unlike [`Self::get_epoch_stream`], this does NOT require the epoch pack to be complete, so
+    /// it can stream the in-progress current epoch up to an already-persisted, verifiable
+    /// point. The returned byte length is the `output_end` offset of `last_consensus_number`;
+    /// the caller streams `[0, len)` of the data file. The pack is persisted first so those
+    /// bytes are flushed to disk.
+    pub async fn get_partial_epoch_stream(
+        &self,
+        epoch: Epoch,
+        last_consensus_number: u64,
+    ) -> Result<(Box<dyn ReadStream>, u64), ConsensusChainError> {
+        let pack =
+            self.get_static(epoch).await.map_err(|_| ConsensusChainError::StreamUnavailable)?;
+        let end = pack.consensus_output_end(last_consensus_number).await?;
+        // Flush (no fsync) so every byte counted in `end` is written to the file and thus visible
+        // to the separate AsyncFile handle opened below. Visibility, not durability — avoids the
+        // expensive network-triggerable fsync on the live pack.
+        pack.flush_data().await?;
+        let base_dir = self.base_path.join(format!("epoch-{epoch}"));
+        let stream = AsyncFile::open(base_dir.join(DATA_NAME)).await?;
+        Ok((Box::new(stream), end))
+    }
+
     /// Save all the batches and consensus header from the ConsensusOutput the pack file for the
     /// current epoch. This should be called "in-order" as consensus is executed.
     pub async fn save_consensus_output(
@@ -1250,6 +1276,73 @@ mod test {
             let output = outputs.get(i as usize).unwrap();
             compare_outputs(&output_db, output);
         }
+    }
+
+    /// A partial stream of the in-progress (incomplete) current epoch must deliver a verifiable
+    /// prefix: importing `[0, output_end(k))` yields exactly outputs `1..=k`.
+    #[tokio::test]
+    async fn test_consensus_partial_stream() {
+        use tokio::io::AsyncReadExt as _;
+
+        let temp_dir = TempDir::with_prefix("test_partial_src").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let consensus_chain = ConsensusChain::new(temp_dir.path().to_owned()).unwrap();
+        consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+
+        // Save outputs but DO NOT finish the epoch — this is the in-progress current epoch.
+        let num_outputs = 20u64;
+        let mut outputs = Vec::new();
+        let mut parent = ConsensusHeader::default().digest();
+        for i in 0..num_outputs {
+            let output =
+                make_test_output(&committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+            parent = output.digest().into();
+            outputs.push(output.clone());
+            consensus_chain.save_consensus_output(output).await.unwrap();
+        }
+
+        // Stream a verifiable prefix up to consensus number `k` (well before the latest).
+        let k = 12u64;
+        let (stream, len) = consensus_chain
+            .get_partial_epoch_stream(0, k)
+            .await
+            .expect("partial stream of in-progress epoch");
+        // The network layer enforces the byte limit; emulate that here with `take(len)`.
+        let limited = stream.take(len);
+
+        // The importer verifies against an epoch record whose final_consensus is the stop point.
+        let cutoff = &outputs[(k - 1) as usize];
+        assert_eq!(cutoff.number(), k);
+        let mut partial_record = previous_epoch.clone();
+        partial_record.final_consensus = ConsensusNumHash::new(cutoff.number(), cutoff.digest());
+
+        let temp_dir2 = TempDir::with_prefix("test_partial_dst").expect("temp dir");
+        let consensus_chain2 = ConsensusChain::new(temp_dir2.path().to_owned()).unwrap();
+        consensus_chain2
+            .stream_import(limited, &partial_record, &previous_epoch, Duration::from_secs(5))
+            .await
+            .expect("import verifiable partial prefix");
+        consensus_chain2.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+
+        // Outputs 1..=k are present and match.
+        for i in 0..k {
+            let output_db =
+                consensus_chain2.get_consensus_output_current(i + 1).await.expect("prefix output");
+            compare_outputs(&output_db, &outputs[i as usize]);
+        }
+        // Nothing past the cutoff was streamed.
+        assert!(
+            consensus_chain2.get_consensus_output_current(k + 1).await.is_err(),
+            "outputs past the partial cutoff must not be present"
+        );
     }
 
     #[tokio::test]
