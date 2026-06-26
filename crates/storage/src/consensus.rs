@@ -1481,6 +1481,76 @@ mod test {
         }
     }
 
+    /// An observer that caught up via `stream_import` ends up with a *static* (read-only)
+    /// pack for the imported epoch as its current pack, while replaying that epoch's outputs
+    /// advances `latest_consensus` into it. On restart `ConsensusChain::new` takes the
+    /// "already running" branch (`latest_consensus` is no longer `0/0`) and must re-open the
+    /// imported epoch with `open_append_exists` rather than erroring. This locks in that
+    /// invariant: a node that only ever obtained an epoch by import can still restart and
+    /// serve the data.
+    #[tokio::test]
+    async fn test_new_reopens_imported_epoch_on_restart() {
+        // Build a complete epoch-0 pack on a source chain to stream from.
+        let source_dir = TempDir::with_prefix("test_import_restart_source").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let source = ConsensusChain::new(source_dir.path().to_owned(), committee.clone()).unwrap();
+        source.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+
+        let num_outputs = 10u64;
+        let mut parent = ConsensusHeader::default().digest();
+        let mut outputs = Vec::new();
+        for i in 0..num_outputs {
+            let output =
+                make_test_output(&committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+            parent = output.digest().into();
+            outputs.push(output.clone());
+            source.save_consensus_output(output).await.unwrap();
+        }
+        source.persist_current().await.expect("persist source");
+        let last = outputs.last().expect("at least one output").clone();
+        let mut epoch_record = previous_epoch.clone();
+        epoch_record.final_consensus = ConsensusNumHash::new(last.number(), last.digest());
+        source.epochs().save_record(epoch_record.clone()).await.expect("save epoch record");
+
+        let target_dir = TempDir::with_prefix("test_import_restart_target").expect("temp dir");
+        {
+            let target =
+                ConsensusChain::new(target_dir.path().to_owned(), committee.clone()).unwrap();
+            // Import epoch 0 from the source: the target's current pack becomes a static pack.
+            let stream = source.get_epoch_stream(0).await.expect("source epoch stream");
+            target
+                .stream_import(stream, &epoch_record, &previous_epoch, Duration::from_secs(5))
+                .await
+                .expect("stream import");
+            // Replay the imported outputs the way an executing observer would; this advances
+            // latest_consensus into the (static) imported epoch without rewriting the pack.
+            for output in &outputs {
+                target.save_consensus_output(output.clone()).await.expect("replay imported output");
+            }
+            target.persist_current().await.expect("persist target");
+        }
+
+        // Restart: new() must re-open the imported epoch (open_append_exists) and not error,
+        // even though the only on-disk pack for that epoch came from stream_import.
+        let reopened = ConsensusChain::new(target_dir.path().to_owned(), committee.clone())
+            .expect("reopen imported epoch on restart");
+        for output in &outputs {
+            let got = reopened
+                .get_consensus_output_current(output.number())
+                .await
+                .expect("imported output readable after restart");
+            compare_outputs(&got, output);
+        }
+    }
+
     #[tokio::test]
     async fn test_consensus_store_general() {
         let temp_dir = TempDir::with_prefix("test_consensus_pack").expect("temp dir");
