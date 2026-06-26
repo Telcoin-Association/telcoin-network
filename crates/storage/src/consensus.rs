@@ -29,6 +29,7 @@ use tokio::{
 use tracing::{error, warn};
 
 use crate::{
+    archive::data_file::fsync_directory,
     consensus_pack::{ConsensusPack, PackError, DATA_NAME},
     epoch_records::{EpochDbError, EpochRecordDb},
 };
@@ -485,6 +486,11 @@ impl ConsensusChain {
                 // see the new on-disk pack.
                 self.recent_packs.lock().retain(|p| p.epoch() != epoch);
                 rename_err?;
+                // Make the epoch-{N} directory entry durable in base_path: this commits both
+                // the remove of any stale dir and the renamed-in import before we treat the
+                // import as complete. A failed fsync here means the import is not durable, so
+                // return the error and let it be retried by re-streaming.
+                fsync_directory(&self.base_path)?;
                 if replace_current {
                     // Do this directly, using get_static() will short circuit on the old pack...
                     *self.current_pack.lock() = ConsensusPack::open_static(&self.base_path, epoch)?;

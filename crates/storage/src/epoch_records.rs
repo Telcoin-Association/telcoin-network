@@ -25,6 +25,7 @@ use tokio::sync::{
 use tracing::error;
 
 use crate::archive::{
+    data_file::create_dir_synced,
     digest_index::index::HdxIndex,
     error::{fetch::FetchError, open::OpenError},
     fxhasher::FxHasher,
@@ -479,7 +480,7 @@ impl Inner {
 
     fn open_append<P: AsRef<Path>>(path: P, start_epoch: Epoch) -> Result<Self, EpochDbError> {
         let base_dir = path.as_ref();
-        let _ = std::fs::create_dir_all(base_dir);
+        let _ = create_dir_synced(base_dir);
         let have_records = std::fs::exists(base_dir.join(Self::RECORDS_NAME)).unwrap_or_default();
 
         let mut records = Pack::<EpochRecord>::open(

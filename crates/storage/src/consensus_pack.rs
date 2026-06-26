@@ -32,7 +32,7 @@ use tokio::{
 use tracing::{debug, error, warn};
 
 use crate::archive::{
-    data_file::fsync_directory,
+    data_file::{create_dir_synced, fsync_directory},
     digest_index::index::HdxIndex,
     error::{fetch::FetchError, open::OpenError},
     fxhasher::FxHasher,
@@ -677,7 +677,7 @@ impl Inner {
     ) -> Result<Self, PackError> {
         let epoch = committee.epoch();
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
-        let _ = std::fs::create_dir_all(&base_dir);
+        let _ = create_dir_synced(&base_dir);
         let pack_file = base_dir.join(Self::DATA_NAME);
         let have_pack = std::fs::exists(&pack_file).unwrap_or_default();
         let mut data: Pack<PackRecord> =
@@ -846,7 +846,7 @@ impl Inner {
             }
         }
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
-        let _ = std::fs::create_dir_all(&base_dir);
+        let _ = create_dir_synced(&base_dir);
         let mut stream_iter = AsyncPackIter::<PackRecord, R>::open(stream, epoch as u64)
             .await
             .map_err(|e| PackError::ReadError(e.to_string()))?;
