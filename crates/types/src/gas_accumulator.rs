@@ -23,6 +23,15 @@
 //! 3. **`EpochManager::run_epoch`** — on `Initial` and `NewEpoch` modes, invokes
 //!    `replay_missed_consensus` before starting the live consensus loop, ensuring no rounds are
 //!    skipped or double-counted. State is updated through the normal path (payload_builder).
+//!
+//! ## Base fee on sync and restart (the base-fee-from-chain invariant)
+//!
+//! Base fee is consensus-affecting, so a node that is merely catching up must never recompute it
+//! and risk diverging from the value already baked into the chain. At epoch entry, if the
+//! canonical tip is already in the epoch being entered, each worker's [`BaseFeeContainer`] is
+//! seeded from its most recent on-chain block (`latest_base_fee_per_worker`); otherwise the
+//! container keeps the value the live producer just computed at the boundary. Only the live
+//! producer crossing the boundary computes the next fee forward; everyone else reads the chain.
 
 use crate::{AuthorityIdentifier, Committee, WorkerId};
 
