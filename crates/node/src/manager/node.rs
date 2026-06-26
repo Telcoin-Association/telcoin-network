@@ -10,16 +10,18 @@
 //! what survives across epochs; code there is concerned with setting up and tearing down a single
 //! epoch's consensus components.
 
-use std::collections::BTreeMap;
-
 use crate::{
     engine::{ExecutionNode, TnBuilder},
     health::HealthcheckServer,
-    manager::spawn_epoch_vote_collector,
+    manager::{
+        exex::{run_critical_exex_future, run_isolated_exex_future},
+        spawn_epoch_vote_collector,
+    },
     metrics::EpochMetrics,
 };
 use eyre::{eyre, WrapErr as _};
 use state_sync::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_recent_consensus};
+use std::collections::BTreeMap;
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, TelcoinDirs};
 use tn_network_libp2p::{types::NetworkEvent, ConsensusNetwork};
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode, QueChannel};
@@ -46,6 +48,12 @@ const NODE_TASK_MANAGER: &str = "Node Task Manager";
 
 /// The worker's base task manager name. This is used by `fn worker_task_manager_name(id)`.
 pub(crate) const WORKER_TASK_BASE: &str = "Worker Task";
+
+/// Capacity of the ExEx → manager `events` channel.
+///
+/// `FinishedHeight` is latest-wins, so this only needs to absorb a short burst;
+/// a small bound is enough and keeps a buggy ExEx from growing it without limit.
+const EXEX_EVENT_CAPACITY: usize = 16;
 
 /// The long-running owner that oversees epoch transitions.
 ///
@@ -368,6 +376,89 @@ where
         self.try_restore_state(&engine).await?;
         // spawn task to update the latest execution results for consensus
         self.spawn_engine_update_task(engine_update_rx, &node_task_manager);
+
+        // Spawn ExEx manager and ExEx tasks if any are registered
+        if !self.builder.exex_fns.is_empty() {
+            let reth_env = engine.get_reth_env().await;
+            let canon_stream = reth_env.canonical_block_stream();
+
+            // Subscribe to ConsensusBus broadcast channels for ExEx (fed from the
+            // consensus-following path, not the validator hot path).
+            let rx_certs = self.consensus_bus.subscribe_exex_certificates();
+            let rx_consensus_output = self.consensus_bus.subscribe_exex_consensus_output();
+
+            // Whether ExEx tasks + manager run as critical tasks (operator opt-in
+            // via `Config::exex_critical`; default false → isolated, non-critical).
+            let exex_critical = self.builder.tn_config.exex_critical;
+
+            let mut exex_txs = Vec::new();
+            let mut event_rxs = Vec::new();
+
+            for (name, capacity, install_fn) in self.builder.exex_fns.drain(..) {
+                // Clamp an operator-supplied `0` up to `1`: `mpsc::channel(0)`
+                // panics, and the capacity from `install_exex_with_capacity` is
+                // otherwise unvalidated (ExEx review finding #3).
+                let (notif_tx, notif_rx) =
+                    mpsc::channel(tn_exex::resolve_exex_channel_capacity(capacity));
+                let (event_tx, event_rx) = mpsc::channel(EXEX_EVENT_CAPACITY);
+
+                let ctx = tn_exex::TnExExContext::new(
+                    notif_rx,
+                    event_tx,
+                    reth_env.clone(),
+                    self.consensus_chain.clone(),
+                );
+
+                let exex_fut = install_fn(ctx);
+                let label = format!("exex-{name}");
+                let spawner = node_task_manager.get_spawner();
+                if exex_critical {
+                    // Operator opted in: a load-bearing ExEx. Spawn CRITICAL so a
+                    // failure, panic, or clean exit propagates to the task manager
+                    // and shuts the node down.
+                    spawner.spawn_critical_task(
+                        label.clone(),
+                        run_critical_exex_future(label, exex_fut),
+                    );
+                } else {
+                    // Default: optional, possibly third-party extension. Spawn
+                    // NON-critical (a stop/error/panic must never shut the node
+                    // down); panics are contained inside `run_isolated_exex_future`.
+                    spawner.spawn_task(label.clone(), run_isolated_exex_future(label, exex_fut));
+                }
+
+                exex_txs.push((name, notif_tx));
+                event_rxs.push(event_rx);
+            }
+
+            // NOTE: `_handle` exposes the minimum finished height across ExExes for
+            // future pruning coordination. TN currently runs in archive mode (no
+            // pruning), so there is no consumer yet and the handle is intentionally
+            // dropped. See `tn_exex::TnExExEvent::FinishedHeight`.
+            let (manager, _handle) = tn_exex::TnExExManager::new(
+                canon_stream,
+                rx_certs,
+                rx_consensus_output,
+                exex_txs,
+                event_rxs,
+            );
+            // The manager follows the same policy as the ExEx tasks it serves.
+            if exex_critical {
+                node_task_manager.get_spawner().spawn_critical_task(
+                    "exex-manager",
+                    run_critical_exex_future("exex-manager".to_string(), manager),
+                );
+                info!(target: "epoch-manager", "ExEx manager and tasks spawned (critical)");
+            } else {
+                // Non-critical: if it dies, live ExEx delivery stops (logged
+                // loudly) but the node — host to an optional subsystem — stays up.
+                node_task_manager.get_spawner().spawn_task(
+                    "exex-manager",
+                    run_isolated_exex_future("exex-manager".to_string(), manager),
+                );
+                info!(target: "epoch-manager", "ExEx manager and tasks spawned (isolated, non-critical)");
+            }
+        }
 
         node_task_manager.update_tasks();
 
