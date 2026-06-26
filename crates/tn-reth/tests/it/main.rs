@@ -2,6 +2,7 @@
 
 #![allow(unused_crate_dependencies)]
 
+mod bls_precompile_props;
 mod economics_props;
 mod pipeline_helpers;
 
