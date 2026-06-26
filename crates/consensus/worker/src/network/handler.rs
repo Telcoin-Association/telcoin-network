@@ -74,7 +74,9 @@ where
         match gossip {
             WorkerGossip::Batch(epoch, batch_hash) => {
                 ensure!(
-                    topic.to_string().eq(&tn_config::LibP2pConfig::worker_batch_topic()),
+                    topic.to_string().eq(&tn_config::LibP2pConfig::worker_batch_topic(
+                        self.consensus_config.chain_id()
+                    )),
                     WorkerNetworkError::InvalidTopic
                 );
                 let my_epoch = self.consensus_config.epoch();
@@ -130,7 +132,9 @@ where
             }
             WorkerGossip::Txn(tx_bytes) => {
                 ensure!(
-                    topic.to_string().eq(&tn_config::LibP2pConfig::worker_txn_topic()),
+                    topic.to_string().eq(&tn_config::LibP2pConfig::worker_txn_topic(
+                        self.consensus_config.chain_id()
+                    )),
                     WorkerNetworkError::InvalidTopic
                 );
                 if let Some(authority) = self.consensus_config.authority() {
@@ -296,19 +300,30 @@ where
         // requester stops waiting; it is not a peer fault, so no penalty
         if let Err(e) = served {
             warn!(target: "worker::network", %peer, ?e, "failed to serve sync batch stream");
+            // bound the best-effort error write: a peer that passed admission, read
+            // the `Ack`, then stopped reading would otherwise pin this responder
+            // task on an unbounded write. Mirrors the shed/malformed error writes in
+            // `mod.rs`, which the same constant bounds.
             let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
-            let _ = write_frame(
-                &mut stream,
-                &SyncFrame::<WorkerSyncRequest>::Err(SyncFrameError::Internal),
-                &mut encode_buffer,
-                &mut compressed_buffer,
-                max_frame,
-            )
+            let _ = tokio::time::timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, async {
+                let _ = write_frame(
+                    &mut stream,
+                    &SyncFrame::<WorkerSyncRequest>::Err(SyncFrameError::Internal),
+                    &mut encode_buffer,
+                    &mut compressed_buffer,
+                    max_frame,
+                )
+                .await;
+            })
             .await;
         }
 
-        // attempt to close the stream gracefully
-        let _ = stream.close().await;
+        // attempt to close the stream gracefully, bounded so a peer that stops
+        // reading cannot pin this responder task (and the admission slot it holds)
+        // on the FIN flush: like the shed/malformed paths in `mod.rs`, every
+        // best-effort trailing op on this task is time-bounded.
+        let _ =
+            tokio::time::timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, stream.close()).await;
 
         Ok(())
     }

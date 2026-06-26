@@ -238,6 +238,15 @@ where
         &self.inner.network_config
     }
 
+    /// The chain id used to namespace this node's wire protocols and gossip topics.
+    ///
+    /// Reads the value stamped onto the network config from genesis at node startup,
+    /// so the gossip-validation side (here) and the publish/subscribe side share one
+    /// source. See [`NetworkConfig::set_chain_id`].
+    pub fn chain_id(&self) -> u64 {
+        self.inner.network_config.chain_id()
+    }
+
     /// The current epoch for [Committee].
     pub fn epoch(&self) -> Epoch {
         self.inner.committee.epoch()

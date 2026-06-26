@@ -333,6 +333,17 @@ impl ConsensusPack {
         bytes_to_output(reader, self.compression, Duration::from_secs(5), &self.committee).await
     }
 
+    /// Load and return the pack file bytes for consensus output form this epoch.
+    pub async fn get_consensus_output_bytes(&self, number: u64) -> Result<Vec<u8>, PackError> {
+        self.get_error()?;
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(PackMessage::BytesForConsensus(number, tx)).await.is_ok() {
+            rx.await.map_err(|_| PackError::ReceiveFailed)?
+        } else {
+            Err(PackError::SendFailed)
+        }
+    }
+
     /// True if consensus header by digest is found by digest.
     pub async fn contains_consensus_header_number(&self, number: u64) -> Result<bool, PackError> {
         self.get_error()?;

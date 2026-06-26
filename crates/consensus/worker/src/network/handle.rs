@@ -82,12 +82,25 @@ pub struct WorkerNetworkHandle {
     /// cache is reset each epoch ([`Self::update_epoch`]) so a peer upgraded over
     /// the rotation boundary is re-probed.
     sync_capability: Arc<Mutex<HashMap<BlsPublicKey, bool>>>,
+    /// The genesis chain id, used to namespace gossip topics this handle publishes.
+    chain_id: u64,
 }
 
 impl WorkerNetworkHandle {
     /// Create a new instance of [Self].
-    pub fn new(handle: NetworkHandle<Req, Res>, task_spawner: TaskSpawner, epoch: Epoch) -> Self {
-        Self { handle, task_spawner, epoch, sync_capability: Arc::new(Mutex::new(HashMap::new())) }
+    pub fn new(
+        handle: NetworkHandle<Req, Res>,
+        task_spawner: TaskSpawner,
+        epoch: Epoch,
+        chain_id: u64,
+    ) -> Self {
+        Self {
+            handle,
+            task_spawner,
+            epoch,
+            chain_id,
+            sync_capability: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// Return a reference to the task spawner.
@@ -103,7 +116,9 @@ impl WorkerNetworkHandle {
     /// Publish a batch digest to the worker network.
     pub(crate) async fn publish_batch(&self, batch_digest: BlockHash) -> NetworkResult<()> {
         let data = encode(&WorkerGossip::Batch(self.epoch, batch_digest));
-        self.handle.publish(tn_config::LibP2pConfig::worker_batch_topic(), data).await?;
+        self.handle
+            .publish(tn_config::LibP2pConfig::worker_batch_topic(self.chain_id), data)
+            .await?;
         Ok(())
     }
 
@@ -111,7 +126,7 @@ impl WorkerNetworkHandle {
     /// Do this when not a committee member so a CVV can include the txn.
     pub(crate) async fn publish_txn(&self, txn: Vec<u8>) -> NetworkResult<()> {
         let data = encode(&WorkerGossip::Txn(txn));
-        self.handle.publish("tn-txn".into(), data).await?;
+        self.handle.publish(tn_config::LibP2pConfig::worker_txn_topic(self.chain_id), data).await?;
         Ok(())
     }
 
@@ -373,9 +388,23 @@ impl WorkerNetworkHandle {
         .await
         .map_err(|_elapsed| SyncAttempt::Unsupported)?
         .map_err(|e| {
-            SyncAttempt::Failed(NetworkError::RPCRetryable(format!(
-                "failed to read sync ack frame: {e}"
-            )))
+            // a clean EOF or connection close means the peer did not answer the
+            // sync protocol (e.g. a pre-cutover peer that closed the misread
+            // stream) -> fall back to legacy and cache legacy-only, exactly like
+            // the ack-timeout case above. Any other I/O error after a successful
+            // negotiation is transient -> keep the peer sync-capable, try the next.
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+            ) {
+                SyncAttempt::Unsupported
+            } else {
+                SyncAttempt::Failed(NetworkError::RPCRetryable(format!(
+                    "failed to read sync ack frame: {e}"
+                )))
+            }
         })?;
 
         match first {
@@ -704,6 +733,7 @@ impl WorkerNetworkHandle {
             handle: NetworkHandle::new(tx),
             task_spawner,
             epoch: 0,
+            chain_id: 0,
             sync_capability: Arc::new(Mutex::new(HashMap::new())),
         }
     }

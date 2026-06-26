@@ -8,20 +8,23 @@ use crate::{stream::StreamKind, Penalty};
 
 /// Protocol upgrade for streaming data.
 ///
-/// Advertises one or more protocols for negotiation, in dialer-preference
-/// order. An inbound listen advertises both the legacy `/tn-stream` and the
-/// per-role sync protocol and reports which one negotiated, so the application
-/// can route a sync stream to the [`SyncFrame`](crate::sync::SyncFrame) layer
-/// and a legacy stream to the digest-correlation reader. An outbound open
-/// advertises a single chosen protocol, so the caller already knows which kind
-/// it asked for. Both upgrades return the raw stream; the framing is the
-/// caller's concern.
+/// Advertises one or more chain-namespaced protocols for negotiation, in
+/// dialer-preference order. An inbound listen advertises both the bulk-transfer
+/// `/tn-stream-{chain}` and the per-role sync protocol and reports which one
+/// negotiated, so the application can route a sync stream to the
+/// [`SyncFrame`](crate::sync::SyncFrame) layer and a legacy stream to the
+/// digest-correlation reader. An outbound open advertises a single chosen
+/// protocol, so the caller already knows which kind it asked for. Both upgrades
+/// return the raw stream; the framing is the caller's concern. The protocols
+/// carry the chain id, so a node only ever establishes streams with peers on the
+/// same chain.
 #[derive(Debug, Clone)]
 pub(crate) struct TNStreamProtocol {
     /// Protocols advertised for negotiation, in dialer-preference order. For an
-    /// inbound listen this is `[legacy, sync]` (legacy first, so existing opens
-    /// keep negotiating it); for an outbound open it is the single chosen
-    /// protocol.
+    /// inbound listen this is `[bulk-transfer, sync]` — the chain-namespaced
+    /// `/tn-stream-{chain}/0.0.1` first, so existing opens keep negotiating it,
+    /// then the per-role sync protocol so a responder also accepts it; for an
+    /// outbound open it is the single chosen protocol.
     protocols: Vec<StreamProtocol>,
     /// The per-role sync protocol, used to classify the negotiated protocol of
     /// an inbound stream as [`StreamKind::Sync`] versus [`StreamKind::Legacy`].
@@ -29,8 +32,9 @@ pub(crate) struct TNStreamProtocol {
 }
 
 impl TNStreamProtocol {
-    /// Create an upgrade advertising `protocols`, in order, with `sync` as the
-    /// per-role sync protocol used to classify an inbound negotiation.
+    /// Create an upgrade advertising `protocols`, in order (bulk-transfer first),
+    /// with `sync` as the per-role sync protocol used to classify an inbound
+    /// negotiation.
     pub(crate) fn new(protocols: Vec<StreamProtocol>, sync: StreamProtocol) -> Self {
         Self { protocols, sync }
     }
@@ -138,8 +142,10 @@ impl StreamFailure {
             Self::DialFailure => None,
             // stalled open
             Self::Timeout => Some(Penalty::Mild),
-            // the peer speaks none of our stream protocols
-            Self::UnsupportedProtocol => Some(Penalty::Severe),
+            // the peer speaks none of our stream protocols: honest version/role
+            // skew, not a fault — not penalized, like `DialFailure` (mirrors the
+            // request-response `UnsupportedProtocols` arm in `consensus.rs`).
+            Self::UnsupportedProtocol => None,
             // transport flaps on WAN are not faults; other IO is likely a violation
             Self::Io(kind) => match kind {
                 std::io::ErrorKind::ConnectionReset
@@ -176,12 +182,13 @@ mod tests {
     }
 
     /// The stream penalty taxonomy must mirror the request-response one: transport
-    /// faults are not penalized, stalls are mild, unsupported protocols are severe.
+    /// faults are not penalized, stalls are mild, and unsupported protocols are
+    /// honest version/role skew (not penalized, like `DialFailure`).
     #[test]
     fn penalty_mapping_mirrors_reqres() {
         assert!(StreamFailure::DialFailure.penalty().is_none());
         assert!(matches!(StreamFailure::Timeout.penalty(), Some(Penalty::Mild)));
-        assert!(matches!(StreamFailure::UnsupportedProtocol.penalty(), Some(Penalty::Severe)));
+        assert!(StreamFailure::UnsupportedProtocol.penalty().is_none());
         assert!(matches!(StreamFailure::InboundRateLimited.penalty(), Some(Penalty::Medium)));
         // transport flaps on WAN are not the peer's fault
         assert!(StreamFailure::Io(ErrorKind::ConnectionReset).penalty().is_none());

@@ -33,6 +33,14 @@ mod peer_manager;
 
 /// The type to manage peers.
 pub(crate) struct PeerManager {
+    /// This swarm's own peer id.
+    ///
+    /// Used to recognise and ignore the node's own identity on the dial,
+    /// discovery, connection, and penalty paths so a self-connection (e.g. a
+    /// learned hairpin address routed back to our own id) is never dialed or
+    /// scored. Primary and each worker run separate swarms with distinct
+    /// keypairs, so each `PeerManager` holds exactly one local id.
+    local_peer_id: PeerId,
     /// Config
     config: PeerConfig,
     /// The interval to perform maintenance.
@@ -78,7 +86,11 @@ pub(crate) struct PeerManager {
 
 impl PeerManager {
     /// Create a new instance of Self.
-    pub(crate) fn new(config: &PeerConfig, metrics: PeerManagerMetrics) -> Self {
+    pub(crate) fn new(
+        local_peer_id: PeerId,
+        config: &PeerConfig,
+        metrics: PeerManagerMetrics,
+    ) -> Self {
         let heartbeat =
             tokio::time::interval(tokio::time::Duration::from_secs(config.heartbeat_interval));
 
@@ -93,6 +105,7 @@ impl PeerManager {
         init_peer_score_config(config.score_config);
 
         Self {
+            local_peer_id,
             config: *config,
             heartbeat,
             peers,
@@ -135,6 +148,17 @@ impl PeerManager {
         multiaddrs: Vec<Multiaddr>,
         reply: Option<oneshot::Sender<NetworkResult<()>>>,
     ) {
+        // never dial our own identity (e.g. a self entry that reached the
+        // discovery/dial path via a learned hairpin address). Report success so
+        // retrying callers (`dial_peer_bls`) treat it as a no-op, not a failure
+        // to back off on.
+        if self.is_local_peer(&peer_id) {
+            debug!(target: "peer-manager", ?peer_id, "skipping dial request for local peer id");
+            if let Some(reply) = reply {
+                send_or_log_error!(reply, Ok(()), "DialPeer- Self", peer = peer_id);
+            }
+            return;
+        }
         // return early if peer is banned, connected, or currently being dialed
         if let Some(peer) = self.peers.get_peer(&peer_id) {
             match peer.connection_status() {
@@ -345,6 +369,15 @@ impl PeerManager {
         })
     }
 
+    /// Whether `peer_id` is this swarm's own identity.
+    ///
+    /// A self-connection (the node dialing its own peer id, e.g. via a learned
+    /// hairpin address) is not a real peer: it must never be dialed, registered
+    /// for discovery, accepted as a connection, or penalized.
+    pub(super) fn is_local_peer(&self, peer_id: &PeerId) -> bool {
+        &self.local_peer_id == peer_id
+    }
+
     /// Check if the peer id is banned or associated with any banned ip addresses.
     ///
     /// This is called before accepting new connections. Also checks that the peer
@@ -383,6 +416,14 @@ impl PeerManager {
     /// Some reports are propagated to libp2p network layer. Caller is responsible
     /// for specifying the severity of the penalty to apply.
     pub(crate) fn process_penalty(&mut self, peer_id: PeerId, penalty: Penalty) {
+        // Never penalize our own identity. A self-connection (e.g. a learned
+        // hairpin address routed back to our own peer id) must not feed the
+        // score model and ban the node's own worker. Guard before recording the
+        // metric so a self-event does not pollute penalty counts.
+        if self.is_local_peer(&peer_id) {
+            debug!(target: "peer-manager", ?peer_id, "skipping penalty for local peer id");
+            return;
+        }
         self.metrics.record_penalty(&penalty);
         let action = self.peers.process_penalty(&peer_id, penalty);
 
@@ -804,11 +845,17 @@ impl PeerManager {
     /// Check if peer is eligible for discovery.
     ///
     /// A peer is eligible if:
+    /// - it is not this node's own identity
     /// - it has at least one valid ip address (ipv4/ipv6)
     /// - none of its ip addresses are banned
     /// - it can be dialed (not connected/dialing/banned)
     fn eligible_for_discovery(&self, info: &PeerInfo) -> bool {
-        self.has_valid_unbanned_ips(&info.addrs) && self.peers.can_dial(&info.peer_id)
+        // never add our own identity to the discovery feed; a self entry (learned
+        // via kad closest-peers or peer exchange) would otherwise be selected for
+        // a self-dial during the heartbeat.
+        !self.is_local_peer(&info.peer_id)
+            && self.has_valid_unbanned_ips(&info.addrs)
+            && self.peers.can_dial(&info.peer_id)
     }
 
     /// Process newly discovered peers for potential dial attempts.

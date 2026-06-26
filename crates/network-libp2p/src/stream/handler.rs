@@ -87,9 +87,11 @@ pub(crate) enum StreamHandlerEvent {
 /// is bounded by [`STREAM_OPEN_TIMEOUT`]; failures are classified and reported
 /// to the behaviour for scoring.
 pub(crate) struct StreamHandler {
-    /// The legacy `/tn-stream` protocol, advertised first on inbound listen.
+    /// The chain-namespaced bulk-transfer `/tn-stream-{chain}` protocol,
+    /// advertised first on inbound listen.
     legacy: StreamProtocol,
-    /// The per-role sync protocol, advertised second on inbound listen.
+    /// The chain-namespaced per-role sync protocol, advertised second on inbound
+    /// listen.
     sync: StreamProtocol,
     /// Pending outbound opens.
     pending_outbound: VecDeque<OutboundOpen>,

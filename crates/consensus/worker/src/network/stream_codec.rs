@@ -152,7 +152,9 @@ where
     let mut encode_buffer = Vec::with_capacity(max_size);
     let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(max_size));
 
-    // accept the exchange before streaming any data
+    // accept the exchange before streaming any data, flushing so the requester
+    // receives the `Ack` within its ack timeout even when the first chunk's DB
+    // reads are slow or no batches match (an empty response flushes only at `End`)
     write_frame(
         stream,
         &SyncFrame::<WorkerSyncRequest>::Ack,
@@ -161,6 +163,7 @@ where
         max_frame,
     )
     .await?;
+    stream.flush().await?;
 
     // stream each found batch as its own Data frame (chunked DB reads)
     let digests: Vec<_> = batch_digests.iter().copied().collect();

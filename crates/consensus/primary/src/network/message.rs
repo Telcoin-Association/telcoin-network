@@ -139,6 +139,18 @@ pub enum PrimaryRequest {
         /// The epoch we are requesting consensus data for.
         epoch: Epoch,
     },
+    /// Request to stream the raw (serialized) consensus output bytes for a consensus chain number.
+    ///
+    /// Unlike [`Self::ConsensusHeader`], this returns the full pack-file encoded output
+    /// (batches + consensus header) rather than just the header, so a peer can reconstruct
+    /// the [`tn_types::ConsensusOutput`] without separately fetching its batches.
+    ///
+    /// The output is streamed (rather than returned via request/response) because a single
+    /// output can exceed the request/response codec's message size limit.
+    StreamConsensusOutput {
+        /// The consensus chain number being requested.
+        number: u64,
+    },
 }
 
 // unit test for this struct in primary::src::tests::network_tests::test_missing_certs_request
@@ -249,12 +261,12 @@ pub enum PrimaryResponse {
     /// This is an application-layer error response.
     /// This error is likely to succeed in the future and can be retried.
     RecoverableError(PrimaryRPCError),
-    /// Response to stream-based epoch request.
+    /// Response to a stream-based request (epoch pack or single consensus output).
     ///
     /// If `ack` is true, the requestor should open a stream with the
-    /// request digest in the header. The responder will send the epoch pack
-    /// over that stream.
-    RequestEpochStream {
+    /// request digest in the header. The responder will send the requested
+    /// data over that stream.
+    StreamRequestAck {
         /// Whether the request is accepted.
         ack: bool,
     },
@@ -287,9 +299,11 @@ impl PrimaryResponse {
             | PrimaryNetworkError::InvalidTopic
             | PrimaryNetworkError::UnknownConsensusHeaderDigest(_)
             | PrimaryNetworkError::UnknownConsensusHeaderCert(_)
+            | PrimaryNetworkError::UnknownConsensusOutput(_)
             | PrimaryNetworkError::Timeout(_)
             | PrimaryNetworkError::UnknownStreamRequest(_)
             | PrimaryNetworkError::StreamUnavailable(_)
+            | PrimaryNetworkError::ConsensusChainError(_)
             | PrimaryNetworkError::InvalidEpochRequest => {
                 Self::Error(PrimaryRPCError(error.to_string()))
             }

@@ -29,7 +29,7 @@ use libp2p::{
         ProtocolSupport,
     },
     swarm::{NetworkBehaviour, SwarmEvent},
-    Multiaddr, PeerId, Swarm, SwarmBuilder,
+    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -89,15 +89,17 @@ where
 {
     /// Create a new instance of Self.
     pub(crate) fn new(
+        local_peer_id: PeerId,
         gossipsub: gossipsub::Behaviour,
         req_res: request_response::Behaviour<C>,
         kademlia: kad::Behaviour<KadStore<DB>>,
         peer_config: &PeerConfig,
         metrics: PeerManagerMetrics,
-        network_type: NetworkType,
+        stream_protocols: (StreamProtocol, StreamProtocol),
     ) -> Self {
-        let peer_manager = PeerManager::new(peer_config, metrics);
-        let stream = StreamBehavior::new(network_type);
+        let peer_manager = PeerManager::new(local_peer_id, peer_config, metrics);
+        let (stream_legacy, stream_sync) = stream_protocols;
+        let stream = StreamBehavior::new(stream_legacy, stream_sync);
         Self { peer_manager, gossipsub, req_res, kademlia, stream }
     }
 }
@@ -252,6 +254,12 @@ where
         external_addr: Multiaddr,
         rpc: Option<RpcInfo>,
     ) -> NetworkResult<Self> {
+        // Namespace every wire protocol by the genesis chain id so nodes on
+        // different chains never negotiate a connection. The id is stamped onto
+        // the network config from genesis at node startup; see
+        // `NetworkConfig::set_chain_id`.
+        let chain_id = network_config.libp2p_config().chain_id;
+
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             // explicitly set default
             .heartbeat_interval(Duration::from_secs(1))
@@ -259,6 +267,14 @@ where
             .validation_mode(gossipsub::ValidationMode::Strict)
             // TN specific: filter against authorized_publishers for certain topics
             .validate_messages()
+            // Gossipsub negotiates its own `/meshsub` protocol, independent of the
+            // req-res/kad/stream names below, so without this it is the one wire
+            // protocol two chains still share: namespacing the topics keeps their
+            // messages apart but still lets cross-chain peers negotiate a gossip
+            // substream. Folding the chain id into the protocol id closes that gap.
+            // The builder appends `/1.1.0` and `/1.0.0`, yielding
+            // `/tn-meshsub-{chain_id}/1.1.0` and `/tn-meshsub-{chain_id}/1.0.0`.
+            .protocol_id_prefix(crate::types::gossip_protocol_id_prefix(chain_id))
             .build()?;
         let gossipsub = gossipsub::Behaviour::new(
             gossipsub::MessageAuthenticity::Signed(keypair.clone()),
@@ -271,11 +287,11 @@ where
 
         let req_res = request_response::Behaviour::with_codec(
             tn_codec,
-            vec![(network_type.req_res_protocol(), ProtocolSupport::Full)],
+            vec![(network_type.req_res_protocol(chain_id)?, ProtocolSupport::Full)],
             request_response::Config::default(),
         );
         let peer_id: PeerId = keypair.public().into();
-        let mut kad_config = libp2p::kad::Config::new(network_type.kad_protocol());
+        let mut kad_config = libp2p::kad::Config::new(network_type.kad_protocol(chain_id)?);
         // manually add peers
         kad_config.set_kbucket_inserts(kad::BucketInserts::Manual);
         let libp2p = network_config.libp2p_config();
@@ -317,13 +333,15 @@ where
         let kademlia = kad::Behaviour::with_config(peer_id, kad_store.clone(), kad_config);
 
         // create custom behavior
+        let stream_protocols = crate::types::stream_protocols(network_type, chain_id)?;
         let mut behavior = TNBehavior::new(
+            peer_id,
             gossipsub,
             req_res,
             kademlia,
             network_config.peer_config(),
             PeerManagerMetrics::new_for(&network_type),
-            network_type,
+            stream_protocols,
         );
 
         // Promote the surviving records into the local peer cache.
@@ -1060,16 +1078,15 @@ where
                             .peer_manager
                             .process_penalty(peer, Penalty::Mild);
                     }
-                    // Severe = 5 strikes covers the typical rolling-upgrade window where
-                    // a peer sees <=5 req-res handshakes per halflife. Demote to Medium
-                    // if telemetry shows version-skewed peers banned during normal
-                    // upgrades.
+                    // Not penalized. Failing to negotiate a common protocol is honest
+                    // version/role skew (the peer runs a different/older/role-distinct
+                    // protocol set), not misbehavior — the same not-the-peer's-fault
+                    // class as `DialFailure`/`ConnectionClosed` above. Penalizing it
+                    // bans not-yet-upgraded peers during rolling upgrades and would turn
+                    // the #765 chain-id protocol split into a network partition. Warn for
+                    // operator visibility only.
                     ReqResOutboundFailure::UnsupportedProtocols => {
-                        warn!(target: "network", ?peer, ?request_id, "outbound failure: unsupported protocol");
-                        self.swarm
-                            .behaviour_mut()
-                            .peer_manager
-                            .process_penalty(peer, Penalty::Severe);
+                        warn!(target: "network", ?peer, ?request_id, "outbound failure: unsupported protocol (not penalized)");
                     }
                 }
 
@@ -1103,20 +1120,14 @@ where
                                 .process_penalty(peer, Penalty::Medium);
                         }
                     },
-                    // Severe = 5 strikes covers the typical rolling-upgrade window where
-                    // a peer sees <=5 req-res handshakes per halflife. Demote to Medium
-                    // if telemetry shows version-skewed peers banned during normal
-                    // upgrades.
+                    // Not penalized. The local peer supports none of the protocols the
+                    // remote requested: honest version/role skew, not misbehavior (the
+                    // inbound mirror of the outbound arm above). Penalizing it bans
+                    // not-yet-upgraded peers during rolling upgrades and is a prerequisite
+                    // blocker for the #765 chain-id protocol split. Warn for operator
+                    // visibility only.
                     ReqResInboundFailure::UnsupportedProtocols => {
-                        warn!(target: "network", ?peer, ?request_id, ?error, "inbound failure: unsupported protocol");
-
-                        // the local peer supports none of the protocols requested by the remote
-                        // Severe (not Fatal) so version skew during rolling upgrades does not
-                        // instantly ban a peer that is otherwise well-behaved.
-                        self.swarm
-                            .behaviour_mut()
-                            .peer_manager
-                            .process_penalty(peer, Penalty::Severe);
+                        warn!(target: "network", ?peer, ?request_id, ?error, "inbound failure: unsupported protocol (not penalized)");
                     }
                     ReqResInboundFailure::Timeout | ReqResInboundFailure::ConnectionClosed => {
                         // peer dropped or stalled mid-request — expected on WAN, no penalty
