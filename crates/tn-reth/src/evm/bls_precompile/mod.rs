@@ -98,14 +98,11 @@ fn bls_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
 /// be unit-tested directly with raw calldata, without constructing a full [`PrecompileInput`]
 /// (which would require a live EVM for its [`EvmInternals`](alloy_evm::EvmInternals) field).
 fn dispatch(data: &[u8], gas: u64) -> PrecompileResult {
-    if data.len() < 4 {
+    let Some((selector, calldata)) = data.split_first_chunk::<4>() else {
         return Err(PrecompileError::Other("Invalid input: too short".into()));
-    }
+    };
 
-    let selector: [u8; 4] = data[0..4].try_into().unwrap();
-    let calldata = &data[4..];
-
-    match selector {
+    match *selector {
         verifyProofOfPossessionCall::SELECTOR => handle_verify_pop(calldata, gas),
         proofOfPossessionMessageCall::SELECTOR => handle_pop_message(calldata, gas),
         _ => Err(PrecompileError::Other("Unknown function selector".into())),
