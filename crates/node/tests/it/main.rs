@@ -22,15 +22,18 @@ use tn_primary::{
     ConsensusBus,
 };
 use tn_reth::{test_utils::seeded_genesis_from_random_batches, RethChainSpec};
+use tn_rpc::{EngineToPrimary, RpcNodeInfo};
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
 use tn_test_utils::{
     create_signed_certificates_for_rounds, default_test_execution_node, CommitteeFixture,
 };
 use tn_types::{
-    adiri_genesis, gas_accumulator::GasAccumulator, Batch, ConsensusHeaderDigest, ConsensusNumHash,
-    ExecHeader, Notifier, SealedHeader, TaskManager, TnReceiver as _, TnSender as _, B256,
-    DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    adiri_genesis, gas_accumulator::GasAccumulator, Batch, ConsensusHeader, ConsensusHeaderDigest,
+    ConsensusNumHash, Epoch, EpochCertificate, EpochDigest, EpochRecord, ExecHeader, Notifier,
+    SealedHeader, TaskManager, TnReceiver as _, TnSender as _, WorkerId, B256,
+    DEFAULT_BAD_NODES_STAKE_THRESHOLD, MIN_PROTOCOL_BASE_FEE,
 };
+use tn_worker::WorkerNetworkHandle;
 use tokio::{
     sync::{mpsc, oneshot},
     time::timeout,
@@ -168,6 +171,78 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
     // assert rewards
     assert_eq!(expected, gas_accumulator.rewards_counter().get_address_counts());
     assert_eq!(expected, recovered.rewards_counter().get_address_counts());
+
+    Ok(())
+}
+
+/// No-op [`EngineToPrimary`] for tests that only need worker components initialized.
+///
+/// These methods back the `tn` RPC namespace, which `initialize_worker_components` registers but
+/// never calls during setup (and these tests never issue RPC requests), so the bodies are
+/// `unreachable!`.
+struct NoopEngineToPrimary;
+
+impl EngineToPrimary for NoopEngineToPrimary {
+    fn get_latest_consensus_block(&self) -> ConsensusHeader {
+        unreachable!("EngineToPrimary RPC is not exercised in this test")
+    }
+
+    async fn epoch(
+        &self,
+        _epoch: Option<Epoch>,
+        _hash: Option<EpochDigest>,
+    ) -> Option<(EpochRecord, EpochCertificate)> {
+        unreachable!("EngineToPrimary RPC is not exercised in this test")
+    }
+
+    fn node_info(&self) -> &RpcNodeInfo {
+        unreachable!("EngineToPrimary RPC is not exercised in this test")
+    }
+}
+
+/// A worker's transaction pool charges the base fee supplied at epoch setup (the
+/// accumulator's per-worker value) instead of a hardcoded `MIN_PROTOCOL_BASE_FEE`, and
+/// `set_worker_base_fee` updates it for the every-epoch (respawn) path.
+#[tokio::test]
+async fn test_worker_pool_base_fee_sourced_from_accumulator() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("test_worker_pool_base_fee").unwrap();
+    let chain: Arc<RethChainSpec> = Arc::new(adiri_genesis().into());
+
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &temp_dir.path().join("reth"),
+        None,
+    )?;
+
+    // keep the task manager alive for the test so the worker RPC + network tasks keep running.
+    let task_manager = TaskManager::default();
+    let network_handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
+
+    let worker_id: WorkerId = 0;
+    // a deliberately non-MIN value: proves the pool does't hardcodes MIN_PROTOCOL_BASE_FEE.
+    let base_fee = MIN_PROTOCOL_BASE_FEE + 1234;
+
+    execution_node
+        .initialize_worker_components(worker_id, network_handle, NoopEngineToPrimary, base_fee)
+        .await?;
+
+    let pool = execution_node.get_worker_transaction_pool(&worker_id).await?;
+    assert_eq!(
+        pool.block_info().pending_basefee,
+        base_fee,
+        "worker pool base fee should equal the value passed at setup",
+    );
+
+    // the every-epoch setter updates the pool (covers the respawn path where init is skipped).
+    let new_fee = base_fee + 50;
+    execution_node.set_worker_base_fee(worker_id, new_fee).await;
+    let pool = execution_node.get_worker_transaction_pool(&worker_id).await?;
+    assert_eq!(
+        pool.block_info().pending_basefee,
+        new_fee,
+        "set_worker_base_fee should update the worker pool base fee",
+    );
 
     Ok(())
 }
