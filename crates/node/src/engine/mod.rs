@@ -21,9 +21,9 @@ use tn_reth::{
 };
 use tn_rpc::EngineToPrimary;
 use tn_types::{
-    gas_accumulator::{BaseFeeContainer, GasAccumulator},
-    BatchSender, BatchValidation, BlsPublicKey, ConsensusHeaderDigest, ConsensusOutput,
-    EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId,
+    gas_accumulator::GasAccumulator, BatchSender, BatchValidation, BlsPublicKey,
+    ConsensusHeaderDigest, ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader,
+    TaskSpawner, WorkerId,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::{mpsc, RwLock};
@@ -212,7 +212,7 @@ impl ExecutionNode {
     pub async fn new_batch_validator(
         &self,
         worker_id: &WorkerId,
-        base_fee: BaseFeeContainer,
+        base_fee: u64,
         epoch: Epoch,
     ) -> Arc<dyn BatchValidation> {
         let guard = self.internal.read().await;
