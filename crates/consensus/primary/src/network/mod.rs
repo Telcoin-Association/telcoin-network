@@ -741,6 +741,7 @@ impl PrimaryNetworkHandle {
             | ConsensusChainError::NoCurrentEpoch
             | ConsensusChainError::EpochDbError(_)
             | ConsensusChainError::InvalidPackEpoch(_, _)
+            | ConsensusChainError::CantSaveAndNotAvailable(_)
             | ConsensusChainError::IO(_) => None,
         }
     }

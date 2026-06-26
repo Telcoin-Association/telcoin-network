@@ -222,12 +222,22 @@ where
         consensus_db: DB,
         key_config: KeyConfig,
         version_str: &'static str,
-    ) -> Self {
+    ) -> eyre::Result<Self> {
         // Note this can only fail if the consensus DB is very broken (bad path for instance).
         // So we will panic for now, this will kill the node on startup for a critical error.
+        let committee_zero = if let Ok(committee_zero) =
+            Config::load_from_path::<Committee>(tn_datadir.committee_path(), ConfigFmt::YAML)
+        {
+            committee_zero
+        } else {
+            error!(target: "epoch-manager", "Unable to load committee zero from the genesis committee!");
+            return Err(eyre::eyre!(
+                "unable to load committee zero (genesis committee), this is fatal"
+            ));
+        };
         let epochs_db_path = tn_datadir.epochs_db_path();
         let _ = std::fs::create_dir_all(&epochs_db_path);
-        let consensus_chain = ConsensusChain::new(epochs_db_path).expect("open consensus DB");
+        let consensus_chain = ConsensusChain::new(epochs_db_path, committee_zero)?;
         // shutdown long-running node components
         let node_shutdown = Notifier::new();
 
@@ -251,7 +261,7 @@ where
             BTreeMap::new()
         };
 
-        Self {
+        Ok(Self {
             builder,
             tn_datadir,
             primary_network_handle: None,
@@ -270,7 +280,7 @@ where
             bootstrap_servers,
             version_str,
             metrics: EpochMetrics::default(),
-        }
+        })
     }
 
     /// Build the process-lifetime components, then drive the epoch loop until shutdown.

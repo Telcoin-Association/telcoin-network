@@ -30,6 +30,17 @@ pub(crate) fn fsync_directory(path: &Path) -> Result<(), io::Error> {
     File::open(path)?.sync_all()
 }
 
+/// Create `dir` (and any missing parents) and fsync its parent so the new directory
+/// entry survives a crash. Best-effort fsync (matching the file-create path in
+/// `DataFile::open`); a redundant fsync when `dir` already exists is harmless.
+pub(crate) fn create_dir_synced(dir: &Path) -> Result<(), io::Error> {
+    std::fs::create_dir_all(dir)?;
+    if let Some(parent) = dir.parent() {
+        let _ = fsync_directory(parent);
+    }
+    Ok(())
+}
+
 /// Wrapper around a file that implements read and write buffers and manages
 /// them seamlessly via standard IO traits.
 #[derive(Debug)]
