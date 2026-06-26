@@ -24,7 +24,7 @@ pub struct BlsAggregateSignature(CoreBlsAggregateSignature);
 impl BlsSignature {
     pub fn from_bytes(bytes: &[u8]) -> eyre::Result<Self> {
         let sig = CoreBlsSignature::from_bytes(bytes)
-            .map_err(|_| eyre::eyre!("Invalid signature bytes!"))?;
+            .map_err(|e| eyre::eyre!("Invalid signature bytes! {e:?}"))?;
         Ok(Self(sig))
     }
 
@@ -35,10 +35,8 @@ impl BlsSignature {
     /// uncompressed bytes the protocol passes to the on-chain `BlsG1` library as a proof of
     /// possession. Used by the native BLS precompile so it can verify the exact bytes the
     /// consensus layer produced, without re-implementing point (de)compression.
-    pub fn from_uncompressed_bytes(bytes: &[u8]) -> eyre::Result<Self> {
-        let sig = CoreBlsSignature::deserialize(bytes)
-            .map_err(|_| eyre::eyre!("Invalid uncompressed signature bytes!"))?;
-        Ok(Self(sig))
+    pub fn from_uncompressed_bytes(bytes: &[u8]) -> Result<Self, blst::BLST_ERROR> {
+        CoreBlsSignature::deserialize(bytes).map(Self)
     }
 
     /// Verify a signature over a message (raw bytes) with public key.
