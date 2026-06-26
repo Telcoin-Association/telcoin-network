@@ -10,16 +10,13 @@ use std::{
 };
 use tn_config::ConsensusConfig;
 use tn_network_types::{local::LocalNetwork, PrimaryToWorkerClient};
-use tn_primary::{
-    network::{ConsensusResult, PrimaryNetworkHandle},
-    ConsensusBus, ConsensusBusApp, NodeMode,
-};
+use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus, ConsensusBusApp, NodeMode};
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{
     encode, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash, BlsSigner as _,
     CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusHeaderDigest,
-    ConsensusOutput, Database, Hash as _, Noticer, TaskManager, TaskSpawner, Timestamp,
-    TimestampSec, TnReceiver, TnSender,
+    ConsensusOutput, ConsensusResult, Database, Hash as _, Noticer, TaskManager, TaskSpawner,
+    Timestamp, TimestampSec, TnReceiver, TnSender,
 };
 use tracing::{debug, error, info, instrument, warn};
 

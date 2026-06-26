@@ -1,9 +1,6 @@
 //! Handle specific request types received from the network.
 
-use super::{
-    message::{ConsensusResult, MissingCertificatesRequest},
-    PrimaryResponse,
-};
+use super::{message::MissingCertificatesRequest, PrimaryResponse};
 use crate::{
     error::{CertManagerError, PrimaryNetworkError, PrimaryNetworkResult},
     network::{message::PrimaryGossip, PendingStreamRequest, StreamRequestKind},
@@ -13,7 +10,7 @@ use crate::{
 use futures::{AsyncWrite, AsyncWriteExt as _};
 use parking_lot::Mutex;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
     time::Duration,
 };
@@ -23,10 +20,10 @@ use tn_storage::{consensus::ConsensusChain, CertificateStore, VoteDigestStore};
 use tn_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
-    now, to_intent_message, try_decode, AuthorityIdentifier, BlockHash, BlsPublicKey, Certificate,
-    ConsensusHeader, ConsensusHeaderDigest, Database, Epoch, EpochCertificate, EpochDigest,
-    EpochRecord, Hash as _, Header, HeaderDigest, ProtocolSignature, Round,
-    SignatureVerificationState, TnSender as _, Vote, B256,
+    now, to_intent_message, try_decode, AuthorityIdentifier, BlsPublicKey, Certificate,
+    ConsensusHeader, ConsensusHeaderDigest, ConsensusResult, ConsensusResultDigest, Database,
+    Epoch, EpochCertificate, EpochDigest, EpochRecord, Hash as _, Header, HeaderDigest,
+    ProtocolSignature, Round, SignatureVerificationState, TnSender as _, Vote, B256,
 };
 use tokio::{io::AsyncReadExt, sync::Mutex as TokioMutex, time::timeout};
 use tracing::{debug, error, info, warn};
@@ -63,7 +60,7 @@ pub(crate) struct RequestHandler<DB> {
     /// Used to stop validator equivocation early.
     auth_last_vote: Arc<AuthEquivocationMap>,
     /// Track consensus headers until we hit a simple quorum then send on.
-    consensus_certs: Arc<Mutex<HashMap<BlockHash, u32>>>,
+    consensus_certs: Arc<Mutex<HashMap<ConsensusResultDigest, HashSet<BlsPublicKey>>>>,
     /// Access to the consensus chain data.
     consensus_chain: ConsensusChain,
 }
@@ -269,37 +266,60 @@ where
                         committee.contains(&key),
                         PrimaryNetworkError::PeerNotInCommittee(Box::new(key))
                     );
-                    ensure!(
-                        signature.verify_secure(&to_intent_message(consensus_result_hash), &key),
-                        PrimaryNetworkError::UnknownConsensusHeaderCert(hash)
-                    );
-                    // Once we have seen 1/3 + 1 committe members have signed this it should be
-                    // valid.
-                    let enough_sigs = (committee.len() / 3) + 1;
-                    let sigs = self.consensus_certs.lock().get(&consensus_result_hash).copied();
-                    if let Some(sigs) = sigs {
-                        if (sigs + 1) as usize >= enough_sigs {
-                            if self.behind_consensus(epoch, round, Some(number)).await {
-                                warn!(target: "primary", "consensus result indicates we are behind, go to catchup mode!");
-                                self.consensus_certs.lock().clear();
-                                return Ok(());
-                            }
-
-                            // Make sure we don't get old gossip and go backwards.
-                            // number has to be greater than old_number due to an early check so
-                            // this is safe Only send this when we are
-                            // sure it is valid. Receivers will count on
-                            // this being verified.
-                            info!(target: "primary", "got new consensus {number}/{hash}");
-                            self.consensus_bus
-                                .last_published_consensus_num_hash()
-                                .send_replace((epoch, number, hash));
-                            self.consensus_certs.lock().clear();
-                        } else {
-                            self.consensus_certs.lock().insert(consensus_result_hash, sigs + 1);
+                    let sigs;
+                    let enough_sigs;
+                    {
+                        // Trying to walk the line on keeping this lock non-async, held as short as
+                        // possible and don't want to do the cert verify if we can
+                        // skip it.  So this seems like the place.  And of course
+                        // close any windows to double counting a signature.
+                        let guard = self.consensus_certs.lock();
+                        if guard.get(&consensus_result_hash).and_then(|set| set.get(&key)).is_some()
+                        {
+                            // We have already counted this signature so ignore.
+                            return Ok(());
                         }
-                    } else {
-                        self.consensus_certs.lock().insert(consensus_result_hash, 1);
+                        drop(guard);
+                        // Drop the lock for the expensive verify op. If a dup gets through the Set
+                        // will still only count it once.
+                        ensure!(
+                            signature
+                                .verify_secure(&to_intent_message(consensus_result_hash), &key),
+                            PrimaryNetworkError::UnknownConsensusHeaderCert(hash)
+                        );
+                        // Once we have seen 1/3 + 1 committe members have signed this it should be
+                        // valid.
+                        enough_sigs = (committee.len() / 3) + 1;
+                        let mut guard = self.consensus_certs.lock();
+                        if guard.len() > 20 {
+                            // Small sanity check to make it more difficult for a malicious
+                            // committee member to fill up
+                            // consensus_certs.  Attempt to evict any records that don't appear
+                            // relavent when more that 20 entries
+                            // (should not have this many under normal conditions).
+                            // We would expect a malicious validator to flood a lot of singleton
+                            // results.
+                            guard.retain(|k, s| *k == consensus_result_hash || s.len() > 1);
+                        }
+                        let set = guard.entry(consensus_result_hash).or_default();
+                        set.insert(key);
+                        sigs = set.len();
+                    }
+                    if sigs >= enough_sigs {
+                        if self.behind_consensus(epoch, round, Some(number)).await {
+                            warn!(target: "primary", "consensus result indicates we are behind, go to catchup mode!");
+                            self.consensus_certs.lock().clear();
+                            return Ok(());
+                        }
+
+                        // Make sure we don't get old gossip and go backwards.
+                        // number has to be greater than old_number due to an early check so
+                        // this is safe Only send this when we are
+                        // sure it is valid. Receivers will count on
+                        // this being verified.
+                        info!(target: "primary", "got new consensus {number}/{hash}");
+                        self.consensus_bus.publish_consensus_num_hash_if_newer(epoch, number, hash);
+                        self.consensus_certs.lock().clear();
                     }
                 } else {
                     // Not sure we can sanity check this epoch.  However if it is bogus the code
@@ -983,6 +1003,13 @@ where
     /// Return a reference to the `ConsensusChain`.
     pub(super) fn consensus_chain(&self) -> &ConsensusChain {
         &self.consensus_chain
+    }
+
+    /// Number of tracked consensus-result digests. Test-only accessor used to assert the
+    /// `consensus_certs` eviction bound (see the `PrimaryGossip::Consensus` handler).
+    #[cfg(test)]
+    pub(crate) fn consensus_certs_len(&self) -> usize {
+        self.consensus_certs.lock().len()
     }
 
     /// Send epoch pack file over stream.
