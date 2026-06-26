@@ -378,6 +378,7 @@ impl ConsensusChain {
         if previous_epoch.epoch != committee.epoch().saturating_sub(1) {
             return Err(ConsensusChainError::PrevCommitteeEpochMismatch);
         }
+        let epoch = committee.epoch();
         if let Some(old_pack) = self.current_pack() {
             if old_pack.epoch() == committee.epoch() {
                 return Ok(());
@@ -393,6 +394,14 @@ impl ConsensusChain {
         let pack = ConsensusPack::open_append(&self.base_path, previous_epoch, committee)?;
         pack.persist().await?; // Surface any open errors.
         *self.current_pack.lock() = Some(pack);
+        if let Some(staging_epoch) = self.staging_epoch() {
+            // If we have moved past the staging pack then clear it.
+            // Should get cleared in the normal course but this is
+            // stopgap just in case.
+            if staging_epoch < epoch {
+                self.clear_staging();
+            }
+        }
         Ok(())
     }
 
@@ -591,6 +600,7 @@ impl ConsensusChain {
     /// node that is concurrently building the same epoch in order (via
     /// [`Self::save_consensus_output`]) cannot race it. Verifies the streamed prefix ends
     /// exactly at `epoch_record.final_consensus`.
+    /// NOTE: This is intended to be called ONCE and is currently not tolerant of multiple calls.
     pub async fn import_partial_to_staging<R: AsyncRead + Unpin>(
         &self,
         stream: R,
@@ -636,6 +646,11 @@ impl ConsensusChain {
     /// The highest consensus number held by the staging pack, if any.
     pub fn staging_final(&self) -> Option<u64> {
         self.staging.lock().as_ref().map(|s| s.final_number)
+    }
+
+    /// The epoch of the staging pack, if any.
+    pub fn staging_epoch(&self) -> Option<Epoch> {
+        self.staging.lock().as_ref().map(|s| s.pack.epoch())
     }
 
     /// Read a full consensus output (with batches) from the staging pack, if it covers `number`.
@@ -720,13 +735,31 @@ impl ConsensusChain {
     ) -> Result<Option<ConsensusHeader>, ConsensusChainError> {
         if let Some(pack) = &self.current_pack() {
             if epoch == pack.epoch() {
-                return Ok(pack.consensus_header_by_digest(digest).await);
+                return match pack.consensus_header_by_digest(digest).await {
+                    Some(r) => Ok(Some(r)),
+                    None => {
+                        if let Some(staging) = self.staging() {
+                            // Fallback check on staging before returning an error.
+                            if let Some(r) = staging.pack.consensus_header_by_digest(digest).await {
+                                Ok(Some(r))
+                            } else {
+                                Ok(None)
+                            }
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                };
             }
         }
         if let Ok(pack) = self.get_static(epoch).await {
             Ok(pack.consensus_header_by_digest(digest).await)
         } else if let Some(staging) = self.staging() {
-            Ok(staging.pack.consensus_header_by_digest(digest).await)
+            if epoch == staging.pack.epoch() {
+                Ok(staging.pack.consensus_header_by_digest(digest).await)
+            } else {
+                Ok(None)
+            }
         } else {
             // Don't have this epoch data.
             Ok(None)
@@ -741,13 +774,32 @@ impl ConsensusChain {
         let epoch = self.epochs.number_to_epoch(number);
         if let Some(pack) = &self.current_pack() {
             if epoch == pack.epoch() {
-                return Ok(Some(pack.consensus_header_by_number(number).await?));
+                return match pack.consensus_header_by_number(number).await {
+                    Ok(r) => Ok(Some(r)),
+                    Err(e) => {
+                        if let Some(staging) = self.staging() {
+                            // Fallback check on staging before returning an error.
+                            if let Ok(r) = staging.pack.consensus_header_by_number(number).await {
+                                Ok(Some(r))
+                            } else {
+                                Err(e.into())
+                            }
+                        } else {
+                            Err(e.into())
+                        }
+                    }
+                };
             }
         }
         if let Ok(pack) = self.get_static(epoch).await {
             Ok(Some(pack.consensus_header_by_number(number).await?))
         } else if let Some(staging) = self.staging() {
-            Ok(Some(staging.pack.consensus_header_by_number(number).await?))
+            // Don't expose any staging errors.
+            if epoch == staging.pack.epoch() {
+                Ok(staging.pack.consensus_header_by_number(number).await.ok())
+            } else {
+                Ok(None)
+            }
         } else {
             // Don't have this epoch data.
             Ok(None)
@@ -762,13 +814,33 @@ impl ConsensusChain {
         let epoch = self.epochs.number_to_epoch(number);
         if let Some(pack) = &self.current_pack() {
             if epoch == pack.epoch() {
-                return Ok(Some(pack.get_consensus_output(number).await?));
+                return match pack.get_consensus_output(number).await {
+                    Ok(r) => Ok(Some(r)),
+                    Err(e) => {
+                        if let Some(staging) = self.staging() {
+                            // Fallback check on staging before returning an error.
+                            if let Ok(r) = staging.pack.get_consensus_output(number).await {
+                                Ok(Some(r))
+                            } else {
+                                Err(e.into())
+                            }
+                        } else {
+                            Err(e.into())
+                        }
+                    }
+                };
             }
         }
         if let Ok(pack) = self.get_static(epoch).await {
             Ok(Some(pack.get_consensus_output(number).await?))
         } else if let Some(staging) = self.staging() {
-            Ok(Some(staging.pack.get_consensus_output(number).await?))
+            // Note we don't want to expose staging errors, we either find the record or we don't at
+            // this point.
+            if epoch == staging.pack.epoch() {
+                Ok(staging.pack.get_consensus_output(number).await.ok())
+            } else {
+                Ok(None)
+            }
         } else {
             // Don't have this epoch data.
             Ok(None)
@@ -783,13 +855,32 @@ impl ConsensusChain {
         let epoch = self.epochs.number_to_epoch(number);
         if let Some(pack) = &self.current_pack() {
             if epoch == pack.epoch() {
-                return Ok(Some(pack.get_consensus_output_bytes(number).await?));
+                return match pack.get_consensus_output_bytes(number).await {
+                    Ok(r) => Ok(Some(r)),
+                    Err(e) => {
+                        if let Some(staging) = self.staging() {
+                            // Fallback check on staging before returning an error.
+                            if let Ok(r) = staging.pack.get_consensus_output_bytes(number).await {
+                                Ok(Some(r))
+                            } else {
+                                Err(e.into())
+                            }
+                        } else {
+                            Err(e.into())
+                        }
+                    }
+                };
             }
         }
         if let Ok(pack) = self.get_static(epoch).await {
             Ok(Some(pack.get_consensus_output_bytes(number).await?))
         } else if let Some(staging) = self.staging() {
-            Ok(Some(staging.pack.get_consensus_output_bytes(number).await?))
+            if epoch == staging.pack.epoch() {
+                // Do not expose staging errors, find data or not.
+                Ok(staging.pack.get_consensus_output_bytes(number).await.ok())
+            } else {
+                Ok(None)
+            }
         } else {
             // Don't have this epoch data.
             Ok(None)
@@ -949,7 +1040,7 @@ impl ConsensusChain {
         self.current_pack.lock().clone()
     }
 
-    /// Return a clone of the current pack.
+    /// Return a clone of the staging pack.
     fn staging(&self) -> Option<StagingPack> {
         self.staging.lock().clone()
     }

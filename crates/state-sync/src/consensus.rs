@@ -420,7 +420,7 @@ async fn manage_new_consensus<DB: TNDatabase>(
     let consensus_chain_clone = consensus_chain.clone();
     if first_gossipped_epoch.is_none() {
         *first_gossipped_epoch = Some(epoch);
-        // On the first epoch we will try to do partial pack download to buld retrieve consensus.
+        // On the first epoch we will try to do partial pack download to build retrieve consensus.
         let end_number = last_number.unwrap_or_default();
         let consensus_bus = consensus_bus.clone();
         let network = network.clone();
