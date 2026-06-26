@@ -24,7 +24,7 @@ use tn_network_libp2p::{
         IntoResponse as _, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResponseMessage,
         NetworkResult,
     },
-    GossipMessage, Penalty, ResponseChannel, Stream,
+    GossipMessage, Penalty, ResponseChannel, Stream, StreamKind,
 };
 use tn_network_types::{WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerToPrimaryClient};
 use tn_storage::{
@@ -470,7 +470,7 @@ impl PrimaryNetworkHandle {
         peer: BlsPublicKey,
         request_digest: B256,
     ) -> NetworkResult<Vec<u8>> {
-        let mut stream = self.handle.open_stream(peer).await??;
+        let mut stream = self.handle.open_stream(peer, StreamKind::Legacy).await??;
         stream
             .write_all(request_digest.as_slice())
             .await
@@ -651,8 +651,9 @@ impl PrimaryNetworkHandle {
                     "peer ack for stream request"
                 );
 
-                // open raw stream then write request_digest for correlation
-                let mut stream = self.handle.open_stream(peer).await??;
+                // open raw stream then write request_digest for correlation. The
+                // primary still uses the legacy path; its sync cutover is item 6.
+                let mut stream = self.handle.open_stream(peer, StreamKind::Legacy).await??;
                 stream.write_all(request_digest.as_slice()).await.map_err(|e| {
                     NetworkError::RPCError(format!("failed to write request digest: {e}"))
                 })?;
@@ -895,9 +896,20 @@ where
                     Ok(())
                 });
             }
-            NetworkEvent::InboundStream { peer, stream } => {
-                self.process_inbound_stream(peer, stream);
-            }
+            NetworkEvent::InboundStream { peer, kind, stream } => match kind {
+                StreamKind::Legacy => self.process_inbound_stream(peer, stream),
+                // the primary registers its sync protocol but opens no sync stream
+                // until the item-6 cutover; drop any unexpected inbound sync stream
+                // (metrics-only during rollout, no penalty)
+                StreamKind::Sync => {
+                    warn!(
+                        target: "primary::network",
+                        %peer,
+                        "dropping unexpected inbound sync stream (primary sync cutover is item 6)"
+                    );
+                    drop(stream);
+                }
+            },
         }
     }
 
