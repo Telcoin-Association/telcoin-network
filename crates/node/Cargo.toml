@@ -46,6 +46,8 @@ tn-test-utils = { workspace = true }
 tn-network-types = { workspace = true }
 tempfile = { workspace = true }
 tn-test-utils-committee = { workspace = true }
+# enable test-utils feature for WorkerNetworkHandle::new_for_test in IT tests
+tn-worker = { workspace = true, features = ["test-utils"] }
 
 [lints]
 workspace = true
