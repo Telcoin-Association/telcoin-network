@@ -633,6 +633,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_validator_uses_u64_base_fee() {
+        // A validator built from a plain u64 base fee accepts a batch whose base fee matches and
+        // rejects one that does not -- exercising the BaseFeeContainer -> u64 conversion.
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
+                .unwrap();
+        let tx_pool = reth_env.init_txn_pool().unwrap();
+
+        // pin the validator to a deliberately non-MIN base fee
+        let expected_fee = MIN_PROTOCOL_BASE_FEE + 500;
+        let validator = BatchValidator::new(reth_env, Some(tx_pool), 0, expected_fee, 0);
+
+        let (mut batch, _) = next_valid_sealed_batch(chain).split();
+
+        // matching base fee is accepted
+        batch.base_fee_per_gas = expected_fee;
+        assert_matches!(validator.validate_batch(batch.clone().seal_slow()), Ok(()));
+
+        // mismatched base fee is rejected
+        batch.base_fee_per_gas = expected_fee + 1;
+        assert_matches!(
+            validator.validate_batch(batch.seal_slow()),
+            Err(BatchValidationError::InvalidBaseFee { expected_base_fee: _, base_fee: _ })
+        );
+    }
+
+    #[tokio::test]
     async fn test_invalid_tx_eip4844() {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
