@@ -242,9 +242,39 @@ where
         &self,
         status: ConsensusRegistry::ValidatorStatus,
     ) -> TelcoinNetworkRpcResult<Vec<ConsensusRegistry::ValidatorInfo>> {
-        let calldata =
-            ConsensusRegistry::getValidatorsCall { status: status as u8 }.abi_encode().into();
-        self.registry_read(calldata).await
+        use ConsensusRegistry::ValidatorStatus;
+
+        // `getValidatorsInfo` returns exactly one status set and reverts on the `Undefined`/`Any`
+        // sentinels (the registry no longer folds statuses on-chain). Emulate the documented
+        // `"Any"` => "all validators" behavior by unioning every concrete status set off-chain.
+        // Each validator lives in exactly one set, so the union is a plain concatenation (no
+        // dedup); retired validators intentionally appear in no set, matching the old scan. Any
+        // other status (including `Undefined`) is passed straight through, so `Undefined` still
+        // surfaces the on-chain revert that callers rely on.
+        if status == ValidatorStatus::Any {
+            let mut all = Vec::new();
+            for set_status in [
+                ValidatorStatus::Staked,
+                ValidatorStatus::PendingActivation,
+                ValidatorStatus::Active,
+                ValidatorStatus::PendingExit,
+                ValidatorStatus::Exited,
+            ] {
+                let calldata =
+                    ConsensusRegistry::getValidatorsInfoCall { status: set_status as u8 }
+                        .abi_encode()
+                        .into();
+                let mut infos: Vec<ConsensusRegistry::ValidatorInfo> =
+                    self.registry_read(calldata).await?;
+                all.append(&mut infos);
+            }
+            Ok(all)
+        } else {
+            let calldata = ConsensusRegistry::getValidatorsInfoCall { status: status as u8 }
+                .abi_encode()
+                .into();
+            self.registry_read(calldata).await
+        }
     }
 
     async fn get_committee_validators(
