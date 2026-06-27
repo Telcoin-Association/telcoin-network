@@ -18,13 +18,13 @@
 use crate::error::PrimaryNetworkResult;
 use futures::{
     io::{AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite},
-    AsyncWriteExt as _,
+    AsyncWriteExt as _, TryStreamExt as _,
 };
 use std::time::Duration;
 use tn_network_libp2p::{read_frame, write_frame, DenyReason, PrimarySyncRequest, SyncFrame};
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{BlsPublicKey, Epoch};
-use tokio::io::{AsyncRead as TokioAsyncRead, AsyncReadExt as _};
+use tokio::io::AsyncRead as TokioAsyncRead;
 use tracing::debug;
 
 /// The raw pack bytes carried by a single [`SyncFrame::Data`] frame.
@@ -112,22 +112,29 @@ where
     R: TokioAsyncRead + Unpin + Send,
     S: FuturesAsyncWrite + Unpin + Send,
 {
-    let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
-    let mut buf = vec![0u8; SYNC_PACK_CHUNK_SIZE];
-    loop {
-        let n = reader.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        write_one_frame(
-            stream,
-            &SyncFrame::Data(buf[..n].to_vec()),
-            &mut encode_buffer,
-            &mut compressed_buffer,
-            buffer_timeout,
-        )
-        .await?;
-    }
+    // Chunk the reader into fixed-capacity `Data` frames by folding a `ReaderStream`
+    // (yielding `Ok(<=SYNC_PACK_CHUNK_SIZE bytes)`, ending at EOF, surfacing a read
+    // error). The writer and the two scratch buffers ride the accumulator: this
+    // reuses the buffers across frames and keeps the writer's `&mut` out of the
+    // `FnMut` closure, whose returned future cannot borrow per-call captures. Each
+    // chunk's backing allocation is reclaimed into the `Data` frame without a copy.
+    let (stream, mut encode_buffer, mut compressed_buffer) =
+        tokio_util::io::ReaderStream::with_capacity(reader, SYNC_PACK_CHUNK_SIZE)
+            .try_fold(
+                (stream, Vec::new(), Vec::new()),
+                |(stream, mut encode_buffer, mut compressed_buffer), chunk| async move {
+                    write_one_frame(
+                        stream,
+                        &SyncFrame::Data(chunk.into()),
+                        &mut encode_buffer,
+                        &mut compressed_buffer,
+                        buffer_timeout,
+                    )
+                    .await?;
+                    Ok((stream, encode_buffer, compressed_buffer))
+                },
+            )
+            .await?;
 
     write_one_frame(
         stream,
@@ -230,6 +237,7 @@ where
 mod tests {
     use super::*;
     use tn_network_libp2p::SyncFrameError;
+    use tokio::io::AsyncReadExt as _;
 
     /// Frame `bytes` through [`write_pack_data_frames`] into an in-memory buffer.
     async fn frame_pack(bytes: &[u8]) -> Vec<u8> {
