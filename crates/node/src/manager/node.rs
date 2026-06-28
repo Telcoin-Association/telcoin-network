@@ -375,7 +375,14 @@ where
 
         // spawn node healthcheck service if enabled
         if let Some(port) = self.builder.healthcheck {
-            let _ = HealthcheckServer::spawn(node_task_manager.get_spawner(), port).await;
+            // probe worker 0's readiness per request; capture the engine handle
+            let engine = engine.clone();
+            let worker_ready = move || {
+                let engine = engine.clone();
+                async move { engine.is_worker_initialized(DEFAULT_WORKER_ID).await }
+            };
+            let _ =
+                HealthcheckServer::spawn(node_task_manager.get_spawner(), port, worker_ready).await;
         }
 
         // spawn prometheus metrics endpoint if enabled
