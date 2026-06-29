@@ -37,7 +37,7 @@ use alloy::{
 use alloy_evm::Evm;
 use clap::Parser;
 use dirs::path_to_datadir;
-use error::{RegistryReadError, TnRethError, TnRethResult};
+use error::{RegistryReadError, RegistryReadResult, TnRethError, TnRethResult};
 use evm::TnEvmConfig;
 use eyre::OptionExt;
 use jsonrpsee::Methods;
@@ -1416,19 +1416,48 @@ impl RethEnv {
     ) -> eyre::Result<Vec<ConsensusRegistry::ValidatorInfo>> {
         debug!(target: "engine", "retrieving validators for epoch {epoch}");
         let calldata = ConsensusRegistry::getCommitteeValidatorsCall { epoch }.abi_encode().into();
-        self.read_consensus_registry(calldata)
+        self.read_consensus_registry(calldata).map_err(Into::into)
     }
 
     /// Read the BLS pubkeys for the committee of the provided epoch from the [ConsensusRegistry]
     /// on-chain.
     pub fn bls_pubkeys_for_epoch(&self, epoch: u32) -> eyre::Result<Vec<alloy::primitives::Bytes>> {
         let calldata = ConsensusRegistry::getCommitteeBlsPubkeysCall { epoch }.abi_encode().into();
-        self.read_consensus_registry(calldata)
+        self.read_consensus_registry(calldata).map_err(Into::into)
     }
 
     /// Build an EVM at the canonical tip, execute a read-only [ConsensusRegistry] call, and
     /// decode the returned data to `T`.
-    pub fn read_consensus_registry<T>(&self, calldata: Bytes) -> eyre::Result<T>
+    ///
+    /// Convenience wrapper over [`Self::read_consensus_registry_batch`] for the common
+    /// single-read case (one pinned EVM, one call).
+    pub fn read_consensus_registry<T>(&self, calldata: Bytes) -> RegistryReadResult<T>
+    where
+        T: alloy::sol_types::SolValue,
+        T: From<
+            <<T as alloy::sol_types::SolValue>::SolType as alloy::sol_types::SolType>::RustType,
+        >,
+    {
+        self.read_consensus_registry_batch(vec![calldata])?.pop().ok_or_else(|| {
+            RegistryReadError::Internal("consensus registry batch read returned no result".into())
+        })
+    }
+
+    /// Build a single EVM at the canonical tip and execute several read-only [ConsensusRegistry]
+    /// calls against it, decoding each result to `T`.
+    ///
+    /// Every calldata in a batch must decode to the same Solidity type `T` (current caller: five
+    /// `getValidatorsInfo(status)` reads → `Vec<ValidatorInfo>`).
+    ///
+    /// All calls observe ONE pinned state snapshot, so a multi-call query (e.g. unioning
+    /// per-status validator sets) cannot straddle a block commit and double-count or drop a
+    /// validator that changes status between reads. Each call still runs under its own fresh 30M
+    /// gas budget (`transact_system_call`), so splitting a large query across calls keeps gas
+    /// bounded per call.
+    pub fn read_consensus_registry_batch<T>(
+        &self,
+        calldatas: Vec<Bytes>,
+    ) -> RegistryReadResult<Vec<T>>
     where
         T: alloy::sol_types::SolValue,
         T: From<
@@ -1437,18 +1466,27 @@ impl RethEnv {
     {
         // create EVM with latest state
         let canonical_tip = self.canonical_tip();
-        debug!(target: "engine", ?canonical_tip, "reading consensus registry at canonical tip");
-        let state_provider =
-            self.inner.blockchain_provider.state_by_block_hash(canonical_tip.hash())?;
+        debug!(target: "engine", ?canonical_tip, "reading consensus registry batch at canonical tip");
+        let state_provider = self
+            .inner
+            .blockchain_provider
+            .state_by_block_hash(canonical_tip.hash())
+            .map_err(|e| RegistryReadError::Internal(e.to_string()))?;
         let state = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder().with_database(state).with_bundle_update().build();
-        let mut tn_evm = self
+        let evm_env = self
             .inner
             .evm_config
-            .evm_factory()
-            .create_evm(&mut db, self.inner.evm_config.evm_env(&canonical_tip)?);
+            .evm_env(&canonical_tip)
+            .map_err(|e| RegistryReadError::Internal(e.to_string()))?;
+        let mut tn_evm = self.inner.evm_config.evm_factory().create_evm(&mut db, evm_env);
 
-        self.call_consensus_registry(&mut tn_evm, calldata)
+        // reuse the one pinned EVM for every read; `call_consensus_registry` is non-committing,
+        // so each read sees the same base state.
+        calldatas
+            .into_iter()
+            .map(|calldata| self.call_consensus_registry(&mut tn_evm, calldata))
+            .collect()
     }
 
     /// Extract the epoch number from a header's nonce.
@@ -1458,7 +1496,7 @@ impl RethEnv {
     }
 
     /// Read the curret epoch number from the [ConsensusRegistry] on-chain.
-    fn get_current_epoch_number<DB>(&self, evm: &mut TNEvm<DB>) -> eyre::Result<u32>
+    fn get_current_epoch_number<DB>(&self, evm: &mut TNEvm<DB>) -> RegistryReadResult<u32>
     where
         DB: alloy_evm::Database,
     {
@@ -1470,7 +1508,7 @@ impl RethEnv {
     fn get_current_epoch_info<DB>(
         &self,
         evm: &mut TNEvm<DB>,
-    ) -> eyre::Result<ConsensusRegistry::EpochInfo>
+    ) -> RegistryReadResult<ConsensusRegistry::EpochInfo>
     where
         DB: alloy_evm::Database,
     {
@@ -1483,7 +1521,7 @@ impl RethEnv {
         &self,
         epoch: Epoch,
         evm: &mut TNEvm<DB>,
-    ) -> eyre::Result<Vec<ConsensusRegistry::ValidatorInfo>>
+    ) -> RegistryReadResult<Vec<ConsensusRegistry::ValidatorInfo>>
     where
         DB: alloy_evm::Database,
     {
@@ -1496,7 +1534,7 @@ impl RethEnv {
         &self,
         epoch: Epoch,
         evm: &mut TNEvm<DB>,
-    ) -> eyre::Result<Vec<alloy::primitives::Bytes>>
+    ) -> RegistryReadResult<Vec<alloy::primitives::Bytes>>
     where
         DB: alloy_evm::Database,
     {
@@ -1615,7 +1653,7 @@ impl RethEnv {
         &self,
         evm: &mut TNEvm<DB>,
         calldata: Bytes,
-    ) -> eyre::Result<T>
+    ) -> RegistryReadResult<T>
     where
         DB: alloy_evm::Database,
         T: alloy::sol_types::SolValue,
@@ -1634,18 +1672,15 @@ impl RethEnv {
                 // use SolValue to decode the result
                 alloy::sol_types::SolValue::abi_decode(&data).map_err(|e| {
                     RegistryReadError::Internal(format!("registry return decode failed: {e}"))
-                        .into()
                 })
             }
             ExecutionResult::Revert { output, .. } => Err(RegistryReadError::Revert {
                 reason: alloy::sol_types::decode_revert_reason(&output),
                 output,
-            }
-            .into()),
+            }),
             ExecutionResult::Halt { reason, gas_used } => Err(RegistryReadError::Internal(
                 format!("registry call halted: {reason:?} (gas {gas_used})"),
-            )
-            .into()),
+            )),
         }
     }
 

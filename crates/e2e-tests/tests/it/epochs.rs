@@ -209,6 +209,56 @@ async fn assert_tn_registry_endpoints<P: Provider>(provider: &P) -> eyre::Result
         provider.raw_request("tn_getValidators".into(), ("Any",)).await?;
     assert!(!validators.is_empty(), "tn_getValidators(\"Any\") returned no validators");
 
+    // `"Any"` must equal the union of the five concrete status sets, read at one pinned tip.
+    // The five internal reads can no longer straddle a block commit, so a validator that changes
+    // status mid-read is never double-counted or dropped. The dedup check below is the direct
+    // regression guard; the length check confirms union completeness. The per-status sets are
+    // fetched as separate requests, so an epoch boundary between them could move a validator
+    // between sets; retry until all reads land in one epoch (mirrors the convergence loop above).
+    let statuses = ["Staked", "PendingActivation", "Active", "PendingExit", "Exited"];
+    let mut set_attempts = 0;
+    let (any_set, per_status_total) = loop {
+        let epoch_before: u32 = provider.raw_request("tn_getCurrentEpoch".into(), ()).await?;
+        let any_set: Vec<ConsensusRegistry::ValidatorInfo> =
+            provider.raw_request("tn_getValidators".into(), ("Any",)).await?;
+        let mut per_status_total = 0usize;
+        for status in statuses {
+            let set: Vec<ConsensusRegistry::ValidatorInfo> =
+                provider.raw_request("tn_getValidators".into(), (status,)).await?;
+            per_status_total += set.len();
+        }
+        let epoch_after: u32 = provider.raw_request("tn_getCurrentEpoch".into(), ()).await?;
+        if epoch_before == epoch_after {
+            break (any_set, per_status_total);
+        }
+        set_attempts += 1;
+        assert!(set_attempts < 3, "validator-set reads never landed in a single epoch");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
+
+    // union completeness (best-effort): "Any" holds exactly as many entries as the five status
+    // sets combined. The `epoch_before == epoch_after` guard rules out epoch-boundary transitions,
+    // but this still assumes no mid-epoch status change (e.g. a `stake`/`activate` tx) lands
+    // between the separate per-status RPC requests — true in this quiescent test. The no-duplicate
+    // `HashSet` check below is the load-bearing regression guard: it operates on the single atomic
+    // "Any" response and needs no such assumption.
+    assert_eq!(
+        any_set.len(),
+        per_status_total,
+        "tn_getValidators(\"Any\") length must equal the sum of the five per-status sets"
+    );
+
+    // no double-count: each validator lives in exactly one status set, so the pinned "Any" union
+    // must contain each validator address at most once
+    let mut seen = std::collections::HashSet::new();
+    for info in &any_set {
+        assert!(
+            seen.insert(info.validatorAddress),
+            "tn_getValidators(\"Any\") double-counted validator {}",
+            info.validatorAddress
+        );
+    }
+
     // `Undefined` (0) reverts on-chain: expect an eth_call-style error (code 3 with revert
     // bytes in `data`) rather than a leaked internal error string
     let revert_err = provider

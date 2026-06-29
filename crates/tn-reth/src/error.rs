@@ -77,3 +77,10 @@ pub enum RegistryReadError {
     #[error("{0}")]
     Internal(String),
 }
+
+/// Result of an on-chain `ConsensusRegistry` read.
+///
+/// The error is always a [`RegistryReadError`], so consumers (e.g. the RPC layer) can match
+/// revert-vs-internal directly instead of recovering it via a runtime downcast. Every non-revert
+/// failure — state provider/EVM setup, `Halt`, ABI decode — is a [`RegistryReadError::Internal`].
+pub type RegistryReadResult<T> = Result<T, RegistryReadError>;

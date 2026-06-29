@@ -11,10 +11,11 @@ pub(super) const SYSTEM_ADDRESS: Address = address!("fffffffffffffffffffffffffff
 
 /// Precompile genesis bytecode.
 ///
-/// This is intercepted by revm at runtime and prevents a reth issue where it skips calls with no bytecode.
+/// This is intercepted by revm at runtime and prevents a reth issue where it skips calls with no
+/// bytecode.
 ///
-/// A single `0xfe` (INVALID) byte of code is used so the account is non-empty (never state-pruned) and any call
-/// that bypasses precompile dispatch reverts instead of succeeding against an EOA.
+/// A single `0xfe` (INVALID) byte of code is used so the account is non-empty (never state-pruned)
+/// and any call that bypasses precompile dispatch reverts instead of succeeding against an EOA.
 pub const PRECOMPILE_GENESIS_BYTECODE: &[u8] = &[0xfe];
 
 /// The address for consensus registry.
