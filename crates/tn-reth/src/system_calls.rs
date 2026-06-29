@@ -9,6 +9,14 @@ use tn_types::{Address, Epoch};
 /// The system address.
 pub(super) const SYSTEM_ADDRESS: Address = address!("fffffffffffffffffffffffffffffffffffffffe");
 
+/// Precompile genesis bytecode.
+///
+/// This is intercepted by revm at runtime and prevents a reth issue where it skips calls with no bytecode.
+///
+/// A single `0xfe` (INVALID) byte of code is used so the account is non-empty (never state-pruned) and any call
+/// that bypasses precompile dispatch reverts instead of succeeding against an EOA.
+pub const PRECOMPILE_GENESIS_BYTECODE: &[u8] = &[0xfe];
+
 /// The address for consensus registry.
 pub const CONSENSUS_REGISTRY_ADDRESS: Address =
     address!("07E17e17E17e17E17e17E17E17E17e17e17E17e1");

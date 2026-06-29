@@ -19,7 +19,7 @@ use tn_config::{
     ISSUANCE_JSON,
 };
 use tn_reth::{
-    system_calls::{ConsensusRegistry, CONSENSUS_REGISTRY_ADDRESS},
+    system_calls::{ConsensusRegistry, CONSENSUS_REGISTRY_ADDRESS, PRECOMPILE_GENESIS_BYTECODE},
     test_utils::TransactionFactory,
     RethEnv, BLS_G1_PRECOMPILE_ADDRESS,
 };
@@ -105,8 +105,6 @@ async fn test_genesis_with_consensus_registry_accounts() -> eyre::Result<()> {
     let registry_deployed_bytecode =
         RethEnv::link_solidity_library(unlinked_runtimecode, &blsg1_address)?;
 
-    let blsg1_deployed_bytecode = "0xfe";
-
     let issuance_json_val =
         RethEnv::fetch_value_from_json_str(ISSUANCE_JSON, Some("deployedBytecode.object"))?;
     let issuance_deployed_bytecode =
@@ -144,7 +142,7 @@ async fn test_genesis_with_consensus_registry_accounts() -> eyre::Result<()> {
     );
     assert_eq!(
         Bytes::from_hex(&returned_blsg1_bytecode)?,
-        Bytes::from_hex(blsg1_deployed_bytecode)?
+        Bytes::from(PRECOMPILE_GENESIS_BYTECODE)
     );
 
     // verify all precompile-config.yaml accounts are present in genesis on-chain

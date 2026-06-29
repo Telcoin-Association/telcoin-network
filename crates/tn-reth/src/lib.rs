@@ -26,6 +26,7 @@ mod clippy {
 
 use crate::{
     evm::TNEvm,
+    system_calls::PRECOMPILE_GENESIS_BYTECODE,
     traits::{DefaultEthPayloadTypes, TNExecution},
 };
 use alloy::{
@@ -1268,7 +1269,10 @@ impl RethEnv {
             // (`BLS_G1_PRECOMPILE_ADDRESS`). Mirror the TEL precompile and give it a single `0xfe`
             // (INVALID) byte of code so the account is non-empty (never state-pruned) and any call
             // that bypasses precompile dispatch reverts instead of succeeding against an EOA.
-            (blsg1_address, GenesisAccount::default().with_code(Some(vec![0xfe_u8].into()))),
+            (
+                blsg1_address,
+                GenesisAccount::default().with_code(Some(PRECOMPILE_GENESIS_BYTECODE.into())),
+            ),
             (
                 CONSENSUS_REGISTRY_ADDRESS,
                 GenesisAccount::default()
@@ -2203,7 +2207,7 @@ mod tests {
             epochDuration: epoch_duration,
         };
 
-        let mut governance_multisig =
+        let governance_multisig =
             TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
         let governance = governance_multisig.address();
         let tmp_genesis = tn_types::test_genesis().extend_accounts([
