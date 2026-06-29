@@ -35,8 +35,10 @@ impl BlsSignature {
     /// uncompressed bytes the protocol passes to the on-chain `BlsG1` library as a proof of
     /// possession. Used by the native BLS precompile so it can verify the exact bytes the
     /// consensus layer produced, without re-implementing point (de)compression.
-    pub fn from_uncompressed_bytes(bytes: &[u8]) -> Result<Self, blst::BLST_ERROR> {
-        CoreBlsSignature::deserialize(bytes).map(Self)
+    pub fn from_uncompressed_bytes(bytes: &[u8]) -> eyre::Result<Self> {
+        CoreBlsSignature::deserialize(bytes)
+            .map_err(|e| eyre::eyre!("Invalid uncompressed signature bytes! {e:?}"))
+            .map(Self)
     }
 
     /// Verify a signature over a message (raw bytes) with public key.
