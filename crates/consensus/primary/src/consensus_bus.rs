@@ -223,6 +223,20 @@ pub struct ConsensusBusAppInner {
     /// Broadcast the latest output from consensus after committing to the subdag.
     /// Engine consumes and executes to extend canonical chain.
     consensus_output: broadcast::Sender<ConsensusOutput>,
+
+    /// Broadcast channel for verified certificates (ExEx).
+    ///
+    /// Fed from the consensus-following path (gossip-verified certificates on
+    /// Observer / inactive-CVV nodes), never from the validator hot path. There
+    /// is no own/peer split — a follower has no certificates of its own.
+    exex_certificates: broadcast::Sender<Certificate>,
+    /// Broadcast channel for the full consensus output (ExEx).
+    ///
+    /// Fed from the consensus-following path when a `ConsensusHeader` is
+    /// reconstructed into a `ConsensusOutput` for execution. `ConsensusOutput`
+    /// is cheap to clone (Arc-backed), so no outer `Arc` is needed.
+    exex_consensus_output: broadcast::Sender<ConsensusOutput>,
+
     /// Status of sync?
     tx_sync_status: watch::Sender<NodeMode>,
 
@@ -282,6 +296,9 @@ impl ConsensusBusApp {
         let (consensus_header, _rx_consensus_header) = broadcast::channel(CHANNEL_CAPACITY);
         let (consensus_output, _rx_consensus_output) = broadcast::channel(100);
 
+        let (exex_certificates, _) = broadcast::channel(CHANNEL_CAPACITY);
+        let (exex_consensus_output, _) = broadcast::channel(CHANNEL_CAPACITY);
+
         let (tx_epoch_record, _) = watch::channel(None);
 
         let (epoch_request_queue_tx, epochs_rx) = tokio::sync::mpsc::channel(1024);
@@ -297,6 +314,8 @@ impl ConsensusBusApp {
                 tx_last_published_consensus_num_hash,
                 consensus_header,
                 consensus_output,
+                exex_certificates,
+                exex_consensus_output,
                 tx_sync_status,
                 new_epoch_votes: QueChannel::new(),
                 tx_epoch_record,
@@ -528,6 +547,54 @@ impl ConsensusBusApp {
     /// Provide a subscription(Receiver) to consensus_headers.
     pub fn subscribe_consensus_header(&self) -> impl TnReceiver<ConsensusHeader> {
         self.inner.consensus_header.subscribe()
+    }
+
+    /// Broadcast sender for verified certificates (ExEx).
+    pub fn exex_certificates(&self) -> &broadcast::Sender<Certificate> {
+        &self.inner.exex_certificates
+    }
+
+    /// Broadcast sender for the full consensus output (ExEx).
+    pub fn exex_consensus_output(&self) -> &broadcast::Sender<ConsensusOutput> {
+        &self.inner.exex_consensus_output
+    }
+
+    /// Send `value` on `sender` only when at least one ExEx receiver is listening.
+    ///
+    /// The clone is skipped entirely when no ExEx is registered — the broadcast
+    /// payload (a full `ConsensusOutput`) can be large, so this guard keeps the
+    /// follow path cheap when nobody is listening.
+    fn notify_exex<T: Clone>(sender: &broadcast::Sender<T>, value: &T) {
+        if sender.receiver_count() > 0 {
+            let _ = sender.send(value.clone());
+        }
+    }
+
+    /// Notify ExEx subscribers about a verified certificate.
+    ///
+    /// Called from the consensus-following path (Observer / inactive CVV) after a
+    /// gossiped certificate verifies against its committee — never from the
+    /// validator hot path.
+    pub fn notify_exex_certificate(&self, certificate: &Certificate) {
+        Self::notify_exex(&self.inner.exex_certificates, certificate);
+    }
+
+    /// Notify ExEx subscribers about a full consensus output.
+    ///
+    /// Called from the consensus-following path when a `ConsensusHeader` is
+    /// reconstructed into a `ConsensusOutput` for execution.
+    pub fn notify_exex_consensus_output(&self, output: &ConsensusOutput) {
+        Self::notify_exex(&self.inner.exex_consensus_output, output);
+    }
+
+    /// Subscribe to verified certificate notifications (ExEx).
+    pub fn subscribe_exex_certificates(&self) -> broadcast::Receiver<Certificate> {
+        self.inner.exex_certificates.subscribe()
+    }
+
+    /// Subscribe to full consensus output notifications (ExEx).
+    pub fn subscribe_exex_consensus_output(&self) -> broadcast::Receiver<ConsensusOutput> {
+        self.inner.exex_consensus_output.subscribe()
     }
 
     /// Will resolve once we have executed block.
@@ -942,5 +1009,34 @@ impl Error for WaitForExecutionElapsed {}
 impl std::fmt::Display for WaitForExecutionElapsed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{self:?}")
+    }
+}
+
+#[cfg(test)]
+mod exex_receiver_count_tests {
+    use super::ConsensusBusApp;
+
+    #[test]
+    fn exex_senders_have_no_receivers_until_subscribed() {
+        // The follow-path send sites guard on `receiver_count() > 0` so they skip
+        // the (potentially large) clone+send when no ExEx is registered. That
+        // optimization relies on the bus starting with zero ExEx receivers — the
+        // initial receivers are dropped at construction.
+        let bus = ConsensusBusApp::new();
+        assert_eq!(bus.exex_certificates().receiver_count(), 0);
+        assert_eq!(bus.exex_consensus_output().receiver_count(), 0);
+
+        // Subscribing (as the ExEx manager does) makes the guards fire.
+        let certs = bus.subscribe_exex_certificates();
+        let output = bus.subscribe_exex_consensus_output();
+        assert_eq!(bus.exex_certificates().receiver_count(), 1);
+        assert_eq!(bus.exex_consensus_output().receiver_count(), 1);
+
+        // Dropping the subscriptions (e.g. the non-critical manager dies) returns
+        // to zero, so the guards skip work again.
+        drop(certs);
+        drop(output);
+        assert_eq!(bus.exex_certificates().receiver_count(), 0);
+        assert_eq!(bus.exex_consensus_output().receiver_count(), 0);
     }
 }

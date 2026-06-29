@@ -228,6 +228,14 @@ where
                                 // to rejoin consensus later when caught up.
                                 let _ = self.consensus_config.node_storage().write((*cert).clone());
                             }
+                            // ExEx delivery runs on consensus-following nodes
+                            // (Observer + inactive CVV), never on the active
+                            // validator hot path. The certificate verified against
+                            // its committee just above, so emit it as the earliest
+                            // lifecycle signal for any installed ExEx.
+                            if !self.consensus_bus.is_active_cvv() {
+                                self.consensus_bus.notify_exex_certificate(&cert);
+                            }
                         }
                         Err(e) => warn!(target: "primary", "Recieved invalid cert {e}"),
                     }

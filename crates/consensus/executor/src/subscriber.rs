@@ -166,6 +166,14 @@ impl<DB: Database> Subscriber<DB> {
         self.consensus_bus.committed_round_updates().send_replace(last_round);
         self.consensus_bus.primary_round_updates().send_replace(last_round);
 
+        // ExEx delivery runs on the consensus-following path only — Observer
+        // (`follow_consensus`) and inactive CVV (`catch_up_rejoin_consensus`) both
+        // reach this method, neither runs Bullshark. Hand the full reconstructed
+        // output to any installed ExEx. The active-validator path
+        // (`handle_consensus_output`) deliberately omits this so validators bear
+        // no ExEx overhead.
+        self.consensus_bus.notify_exex_consensus_output(&consensus_output);
+
         if let Err(e) = self.consensus_bus.consensus_output().send(consensus_output).await {
             error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self.inner.authority_id, e);
             return Err(SubscriberError::ClosedChannel("consensus_output".to_string()));

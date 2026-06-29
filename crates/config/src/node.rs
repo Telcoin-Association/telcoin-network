@@ -35,6 +35,16 @@ pub struct Config {
     /// Is this an observer node?
     pub observer: bool,
 
+    /// Spawn ExEx tasks (and the ExEx manager) as critical tasks.
+    ///
+    /// Default `false`: ExExes run isolated and non-critical, so a stuck,
+    /// panicking, or finished ExEx can never shut the node down. Set `true` when
+    /// an ExEx is load-bearing for this deployment and its failure (or clean
+    /// exit) *should* take the node down — e.g. a bridge that must not silently
+    /// stop following the chain.
+    #[serde(default)]
+    pub exex_critical: bool,
+
     /// Reference to the apps version string.
     #[serde(skip)]
     pub version: &'static str,
@@ -56,6 +66,7 @@ impl Config {
             parameters: Default::default(),
             genesis,
             observer: false,
+            exex_critical: false,
             version: "UNKNOWN",
         }
     }
@@ -76,7 +87,7 @@ impl Config {
         let genesis: Genesis =
             Config::load_from_path_or_default(tn_datadir.genesis_file_path(), ConfigFmt::YAML)?;
 
-        Ok(Config { node_info, parameters, genesis, observer, version })
+        Ok(Config { node_info, parameters, genesis, observer, exex_critical: false, version })
     }
 
     /// Load a config from it's component parts.
@@ -92,7 +103,14 @@ impl Config {
         let genesis: Genesis =
             Config::load_from_path(tn_datadir.genesis_file_path(), ConfigFmt::YAML)?;
 
-        Ok(Config { node_info: validator_info, parameters, genesis, observer, version })
+        Ok(Config {
+            node_info: validator_info,
+            parameters,
+            genesis,
+            observer,
+            exex_critical: false,
+            version,
+        })
     }
 
     /// Load a config from it's component parts.
@@ -114,7 +132,14 @@ impl Config {
             File::create_new(committee_path)?.write_all(TESTNET_COMMITTEE.as_bytes())?
         }
 
-        Ok(Config { node_info: validator_info, parameters, genesis, observer, version })
+        Ok(Config {
+            node_info: validator_info,
+            parameters,
+            genesis,
+            observer,
+            exex_critical: false,
+            version,
+        })
     }
 
     /// Load a config from it's component parts.
@@ -136,7 +161,14 @@ impl Config {
             File::create_new(committee_path)?.write_all(MAINNET_COMMITTEE.as_bytes())?
         }
 
-        Ok(Config { node_info: validator_info, parameters, genesis, observer, version })
+        Ok(Config {
+            node_info: validator_info,
+            parameters,
+            genesis,
+            observer,
+            exex_critical: false,
+            version,
+        })
     }
 
     /// Update the authority protocol key.
