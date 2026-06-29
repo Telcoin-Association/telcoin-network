@@ -35,9 +35,9 @@ use tn_storage::{
     PayloadStore,
 };
 use tn_types::{
-    encode, BlsPublicKey, BlsSignature, Certificate, ConsensusHeader, ConsensusHeaderDigest,
-    ConsensusResult, Database, Epoch, EpochCertificate, EpochDigest, EpochRecord, EpochVote,
-    Header, HeaderDigest, Round, TaskError, TaskSpawner, TnReceiver, TnSender, Vote, B256,
+    encode, BlsPublicKey, BlsSignature, Certificate, ConsensusHeaderDigest, ConsensusResult,
+    Database, Epoch, EpochCertificate, EpochDigest, EpochRecord, EpochVote, Header, HeaderDigest,
+    Round, TaskError, TaskSpawner, TnReceiver, TnSender, Vote, B256,
 };
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
@@ -385,9 +385,6 @@ impl PrimaryNetworkHandle {
             PrimaryResponse::MissingParents(parents) => {
                 Ok(RequestVoteResult::MissingParents(parents))
             }
-            PrimaryResponse::ConsensusHeader(_consensus_header) => Err(NetworkError::RPCError(
-                "Got wrong response, not a vote is consensus header!".to_string(),
-            )),
             PrimaryResponse::EpochRecord { .. } => Err(NetworkError::RPCError(
                 "Got wrong response, not a vote is epoch record!".to_string(),
             )),
@@ -413,77 +410,6 @@ impl PrimaryNetworkHandle {
             PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
             _ => Err(NetworkError::RPCError("Got wrong response, not a certificate!".to_string())),
         }
-    }
-
-    /// Request consensus header from specific peer.
-    /// Will verify the returned header matches hash if provided (strong) or number if not (weak).
-    pub async fn request_consensus_from_peer(
-        &self,
-        peer: BlsPublicKey,
-        number: u64,
-        hash: ConsensusHeaderDigest,
-    ) -> NetworkResult<ConsensusHeader> {
-        let request = PrimaryRequest::ConsensusHeader { number, hash };
-        let res = self.handle.send_request(request, peer).await?;
-        let res = res.await??.result;
-        match res {
-            PrimaryResponse::ConsensusHeader(header) => {
-                if header.digest() == hash && header.number == number {
-                    Ok(Arc::unwrap_or_clone(header))
-                } else {
-                    Err(NetworkError::RPCError(format!(
-                        "Returned header does not match number {number}/{} or hash {hash}/{}!",
-                        header.number,
-                        header.digest()
-                    )))
-                }
-            }
-            PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
-            _ => Err(NetworkError::RPCError(
-                "Got wrong response, not a consensus header!".to_string(),
-            )),
-        }
-    }
-
-    /// Request consensus header from a random peer up to three times from three different peers.
-    /// Will verify the returned header matches hash if provided (strong) or number if not (weak).
-    pub async fn request_consensus(
-        &self,
-        number: u64,
-        hash: ConsensusHeaderDigest,
-    ) -> NetworkResult<ConsensusHeader> {
-        const TIMEOUT: Duration = Duration::from_secs(10);
-        let request = PrimaryRequest::ConsensusHeader { number, hash };
-        // Try up to three times (from three peers) to get consensus.
-        // This could be a lot more complicated but this KISS method should work fine.
-        for _ in 0..3 {
-            let res = self.handle.send_request_any(request.clone()).await?;
-            let res = match tokio::time::timeout(TIMEOUT, res).await {
-                Ok(r) => r,
-                Err(_) => {
-                    tracing::warn!(target: "primary::network", ?number, "request_consensus timed out waiting for peer response");
-                    continue;
-                }
-            };
-            let res = res?;
-            if let Ok(NetworkResponseMessage {
-                peer,
-                result: PrimaryResponse::ConsensusHeader(header),
-            }) = res
-            {
-                if header.digest() == hash && header.number == number {
-                    return Ok(Arc::unwrap_or_clone(header));
-                } else {
-                    tracing::warn!(target: "primary::network", "Returned header does not match number {number}/{} or hash {hash}/{}, try again!",
-                        header.number,
-                        header.digest()
-                    );
-                    // Give the naughty peer a penalty.
-                    self.report_penalty(peer, Penalty::Medium).await;
-                }
-            }
-        }
-        Err(NetworkError::RPCError("Could not get the consensus header!".to_string()))
     }
 
     /// Request the raw (serialized) consensus output bytes for `number` from a specific peer.
@@ -1246,9 +1172,6 @@ where
                 PrimaryRequest::MissingCertificates { inner } => {
                     self.process_request_for_missing_certs(peer, inner, channel, cancel)
                 }
-                PrimaryRequest::ConsensusHeader { number, hash } => {
-                    self.process_consensus_output_request(peer, number, hash, channel, cancel)
-                }
                 PrimaryRequest::PeerExchange { .. } => {
                     warn!(target: "primary::network", "primary application received unexpected peer exchange message");
                 }
@@ -1342,49 +1265,6 @@ where
                     let response = result.into_response();
                     let _ = network_handle.handle.send_response(response, channel).await;
                 }
-                // cancel notification from network layer
-                _ = cancel => (),
-            }
-            Ok(())
-        });
-    }
-
-    /// Attempt to retrieve consensus chain header from the database.
-    fn process_consensus_output_request(
-        &self,
-        peer: BlsPublicKey,
-        number: u64,
-        hash: ConsensusHeaderDigest,
-        channel: ResponseChannel<PrimaryResponse>,
-        cancel: oneshot::Receiver<()>,
-    ) {
-        // clone for spawned tasks
-        let request_handler = self.request_handler.clone();
-        let network_handle = self.network_handle.clone();
-        let task_name = format!("ConsensusOutputReq-{peer}");
-        self.task_spawner.spawn_task(task_name, async move {
-            tokio::select! {
-                header =
-                    request_handler.retrieve_consensus_header(number, hash) => {
-                        // Route through the central PrimaryNetworkError → Penalty mapping
-                        // so every handler in this file applies penalties consistently.
-                        // The only reachable variant from this path is
-                        // UnknownConsensusHeaderDigest, which the central table now maps
-                        // to None — observers legitimately request not-yet-served headers.
-                        if let Err(ref e) = header {
-                            if let Some(penalty) = e.into() {
-                                network_handle.report_penalty(peer, penalty).await;
-                            }
-                            let my_number = request_handler.consensus_chain().latest_consensus_number();
-                            tracing::debug!(
-                                target: "primary::network",
-                                ?e, ?my_number, ?number, ?hash, ?peer,
-                                "consensus header request could not be served"
-                            );
-                        }
-                        let response = header.into_response();
-                        let _ = network_handle.handle.send_response(response, channel).await;
-                    }
                 // cancel notification from network layer
                 _ = cancel => (),
             }

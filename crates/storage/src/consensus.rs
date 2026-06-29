@@ -870,7 +870,11 @@ impl ConsensusChain {
         if let Ok(pack) = self.get_static(epoch).await {
             Ok(pack.decode_output(bytes).await?)
         } else if let Some(staging) = self.staging() {
-            Ok(staging.pack.decode_output(bytes).await?)
+            if epoch == staging.pack.epoch() {
+                Ok(staging.pack.decode_output(bytes).await?)
+            } else {
+                Err(ConsensusChainError::NoCurrentEpoch)
+            }
         } else {
             Err(ConsensusChainError::NoCurrentEpoch)
         }

@@ -55,7 +55,7 @@ const PROPOSED_CERTIFICATES_CF: &str = "proposed_certificates";
 const PAYLOAD_CF: &str = "payload";
 const NODE_BATCHES_CACHE_CF: &str = "node_batches_cache";
 const OUR_NODE_BATCHES_CACHE_CF: &str = "our_node_batches_cache";
-const CONSENSUS_HEADER_CACHE_CF: &str = "consensus_header_cache";
+const CONSENSUS_OUTPUT_CACHE_CF: &str = "consensus_output_cache";
 
 const KAD_RECORD_CF: &str = "kad_record";
 const KAD_PROVIDER_RECORD_CF: &str = "kad_provider_record";
@@ -98,9 +98,8 @@ pub mod tables {
         // Cache batches we produce until they are accepted (they will move to NodeBatchesCache once accepted).
         OurNodeBatchesCache;crate::OUR_NODE_BATCHES_CACHE_CF;TableHint::Cache;<BlockHash, Batch>,
         // Cache of verified ConsensusOutputs (header + batches) pulled during sync, keyed by number;
-        // entries are removed once written to confirmed consensus output. (CF name retained for
-        // on-disk compatibility; it is a transient cache cleared on startup.)
-        ConsensusCache;crate::CONSENSUS_HEADER_CACHE_CF;TableHint::Cache;<u64, ConsensusOutput>,
+        // entries are removed once written to confirmed consensus output.
+        ConsensusCache;crate::CONSENSUS_OUTPUT_CACHE_CF;TableHint::Cache;<u64, ConsensusOutput>,
         // These are used for network storage and separate from consensus
         KadRecords;crate::KAD_RECORD_CF;TableHint::Kad;<BlockHash, Vec<u8>>,
         KadProviderRecords;crate::KAD_PROVIDER_RECORD_CF;TableHint::Kad;<BlockHash, Vec<u8>>,
