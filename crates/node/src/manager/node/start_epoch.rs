@@ -525,6 +525,11 @@ where
 
         Self::wait_for_network_peers(network_handle.inner_handle(), "primary network").await?;
 
+        // re-probe each peer's epoch-pack sync capability this epoch: committees
+        // rotate and binaries are upgraded at the boundary, so a peer that could
+        // only speak legacy last epoch may now serve the sync protocol (739, step 6)
+        network_handle.clear_sync_capability();
+
         // spawn primary network
         PrimaryNetwork::new(
             rx_event_stream,

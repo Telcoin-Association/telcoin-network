@@ -15,7 +15,9 @@ use std::{
     time::Duration,
 };
 use tn_config::ConsensusConfig;
-use tn_network_libp2p::{GossipMessage, Stream};
+use tn_network_libp2p::{
+    write_frame, GossipMessage, PrimarySyncRequest, Stream, SyncFrame, SyncFrameError,
+};
 use tn_storage::{consensus::ConsensusChain, CertificateStore, VoteDigestStore};
 use tn_types::{
     ensure,
@@ -32,6 +34,13 @@ use tracing::{debug, error, info, warn};
 /// Prevents slow-reader attacks where a peer accepts a stream but never reads.
 /// Set to an arbitrary 10 seconds to read 16kb buffer.
 const SEND_STREAM_BUFFER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Total timeout for serving an entire epoch pack over the sync protocol.
+///
+/// A backstop above the per-frame [`SEND_STREAM_BUFFER_TIMEOUT`]: a peer that
+/// drip-reads just fast enough to keep resetting the per-frame timer cannot pin
+/// the responder task (and the admission slot it holds) indefinitely.
+const SEND_SYNC_PACK_TIMEOUT: Duration = Duration::from_secs(200);
 
 /// Map to hold vote info to detect invalid votes, equivocation and cache responses in case of
 /// rerequests.
@@ -1218,5 +1227,67 @@ where
                 })
             }
         }
+    }
+
+    /// Serve an inbound epoch-pack sync exchange.
+    ///
+    /// The exchange has already been admitted against the concurrency caps and its
+    /// opening request frame read by the caller. This streams the pack via
+    /// [`send_sync_epoch_pack_over_stream`] under a total timeout. A send failure is
+    /// logged and best-effort signalled with [`SyncFrame::Err`] so the requester
+    /// stops waiting; it is not a peer fault, so no penalty is returned (metrics-only
+    /// during the item-6 rollout, like the legacy responder).
+    ///
+    /// [`send_sync_epoch_pack_over_stream`]: crate::network::sync_codec::send_sync_epoch_pack_over_stream
+    pub(super) async fn process_sync_epoch_pack_stream(
+        &self,
+        peer: BlsPublicKey,
+        mut stream: Stream,
+        epoch: Epoch,
+        consensus_chain: &ConsensusChain,
+    ) -> PrimaryNetworkResult<()> {
+        debug!(target: "primary::network", %peer, epoch, "serving inbound sync epoch pack stream");
+        let max_frame = crate::network::sync_codec::MAX_SYNC_PACK_FRAME_SIZE;
+
+        // bound the whole serve; flatten the timeout's outer Result into the send's
+        let served = timeout(
+            SEND_SYNC_PACK_TIMEOUT,
+            crate::network::sync_codec::send_sync_epoch_pack_over_stream(
+                &mut stream,
+                consensus_chain,
+                epoch,
+                SEND_STREAM_BUFFER_TIMEOUT,
+                peer,
+            ),
+        )
+        .await
+        .map_err(PrimaryNetworkError::from)
+        .and_then(|served| served);
+
+        // a send failure or timeout is logged and best-effort signalled so the
+        // requester stops waiting; it is not a peer fault, so no penalty
+        if let Err(e) = served {
+            warn!(target: "primary::network", %peer, ?e, "failed to serve sync epoch pack stream");
+            // bound the best-effort error write: a peer that read the `Ack` then
+            // stopped reading would otherwise pin this responder task.
+            let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
+            let _ = timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, async {
+                let _ = write_frame(
+                    &mut stream,
+                    &SyncFrame::<PrimarySyncRequest>::Err(SyncFrameError::Internal),
+                    &mut encode_buffer,
+                    &mut compressed_buffer,
+                    max_frame,
+                )
+                .await;
+            })
+            .await;
+        }
+
+        // attempt to close the stream gracefully, bounded so a peer that stops
+        // reading cannot pin this responder task on the FIN flush
+        let _ = timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, stream.close()).await;
+
+        Ok(())
     }
 }
