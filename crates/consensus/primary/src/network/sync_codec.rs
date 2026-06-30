@@ -18,7 +18,7 @@
 use crate::error::PrimaryNetworkResult;
 use futures::{
     io::{AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite},
-    AsyncWriteExt as _, TryStreamExt as _,
+    AsyncWriteExt as _, StreamExt as _, TryStreamExt as _,
 };
 use std::time::Duration;
 use tn_network_libp2p::{read_frame, write_frame, DenyReason, PrimarySyncRequest, SyncFrame};
@@ -311,59 +311,31 @@ where
     )
     .await?;
 
-    let mut batch: Vec<Certificate> = Vec::new();
-    let mut batch_bytes = 0usize;
-    let mut total_bytes = 0usize;
-
-    for cert in certs {
-        let cert = cert?;
-        let cert_bytes = encode(&cert).len();
-        batch.push(cert);
-        batch_bytes += cert_bytes;
-        total_bytes += cert_bytes;
-
-        if batch_bytes >= SYNC_CERT_BATCH_TARGET_SIZE {
-            write_cert_batch_frame(
-                stream,
-                &batch,
-                &mut encode_buffer,
-                &mut compressed_buffer,
-                buffer_timeout,
-            )
-            .await?;
-            batch.clear();
-            batch_bytes = 0;
-        }
-
-        // honest cap: keep a single exchange bounded even though the collector is
-        // only time-bounded. The requester accepts one frame beyond this.
-        if total_bytes >= MAX_SYNC_MISSING_CERTS_RESPONSE_BYTES {
-            break;
-        }
-    }
-
-    // flush the trailing partial batch, if any
-    if !batch.is_empty() {
-        write_cert_batch_frame(
-            stream,
-            &batch,
-            &mut encode_buffer,
-            &mut compressed_buffer,
-            buffer_timeout,
+    // Fold the certificates into target-sized `Data` frames: each step appends the
+    // certificate to the in-progress batch and flushes a frame once the batch reaches
+    // `SYNC_CERT_BATCH_TARGET_SIZE`; `finish` then writes the trailing partial batch
+    // and the closing `End`.
+    //
+    // `scan` enforces the honest response cap on the cumulative encoded size, ending
+    // the stream once `MAX_SYNC_MISSING_CERTS_RESPONSE_BYTES` is reached, including the
+    // certificate that crosses it, matching the requester's one-frame acceptance
+    // margin. Bounding the stream rather than the fold stops the fold from draining the
+    // time-bounded collector past what it will send (at the cost of one boundary read).
+    // A storage error yielded by `certs` short-circuits the fold and propagates so the
+    // caller signals `SyncFrame::Err`.
+    futures::stream::iter(certs)
+        .map(|cert| cert.map(|cert| (encode(&cert).len(), cert)))
+        .scan(0usize, |sent, sized| {
+            let within_cap = *sent < MAX_SYNC_MISSING_CERTS_RESPONSE_BYTES;
+            futures::future::ready(within_cap.then(|| sized.inspect(|(size, _)| *sent += *size)))
+        })
+        .try_fold(
+            CertBatch::new(stream, encode_buffer, compressed_buffer, buffer_timeout),
+            |batch, (size, cert)| batch.push(cert, size),
         )
-        .await?;
-    }
-
-    write_one_frame(
-        stream,
-        &SyncFrame::End,
-        &mut encode_buffer,
-        &mut compressed_buffer,
-        MAX_SYNC_CERT_FRAME_SIZE,
-        buffer_timeout,
-    )
-    .await?;
-    Ok(())
+        .await?
+        .finish()
+        .await
 }
 
 /// Encode `batch` into one [`SyncFrame::Data`] frame (a BCS `Vec<Certificate>`) and
@@ -388,6 +360,86 @@ where
         buffer_timeout,
     )
     .await
+}
+
+/// The in-progress state threaded through [`send_sync_certificates_over_stream`]'s
+/// fold: the certificates gathered for the next [`SyncFrame::Data`] frame and the
+/// reusable encode buffers, carried alongside the stream so each fold step can flush
+/// a full frame in place.
+struct CertBatch<'s, S> {
+    stream: &'s mut S,
+    encode_buffer: Vec<u8>,
+    compressed_buffer: Vec<u8>,
+    batch: Vec<Certificate>,
+    batch_bytes: usize,
+    buffer_timeout: Duration,
+}
+
+impl<'s, S> CertBatch<'s, S>
+where
+    S: FuturesAsyncWrite + Unpin + Send,
+{
+    fn new(
+        stream: &'s mut S,
+        encode_buffer: Vec<u8>,
+        compressed_buffer: Vec<u8>,
+        buffer_timeout: Duration,
+    ) -> Self {
+        Self {
+            stream,
+            encode_buffer,
+            compressed_buffer,
+            batch: Vec::new(),
+            batch_bytes: 0,
+            buffer_timeout,
+        }
+    }
+
+    /// Append one certificate (encoded size `size`), flushing a full
+    /// [`SyncFrame::Data`] frame once the batch reaches [`SYNC_CERT_BATCH_TARGET_SIZE`].
+    async fn push(mut self, cert: Certificate, size: usize) -> PrimaryNetworkResult<Self> {
+        self.batch.push(cert);
+        self.batch_bytes += size;
+        match () {
+            () if self.batch_bytes >= SYNC_CERT_BATCH_TARGET_SIZE => self.flush().await?,
+            () => (),
+        }
+        Ok(self)
+    }
+
+    /// Write the gathered batch as one [`SyncFrame::Data`] frame and reset.
+    async fn flush(&mut self) -> std::io::Result<()> {
+        write_cert_batch_frame(
+            self.stream,
+            &self.batch,
+            &mut self.encode_buffer,
+            &mut self.compressed_buffer,
+            self.buffer_timeout,
+        )
+        .await?;
+        self.batch.clear();
+        self.batch_bytes = 0;
+        Ok(())
+    }
+
+    /// Flush the trailing partial batch, if any, then close the exchange with
+    /// [`SyncFrame::End`].
+    async fn finish(mut self) -> PrimaryNetworkResult<()> {
+        match () {
+            () if !self.batch.is_empty() => self.flush().await?,
+            () => (),
+        }
+        write_one_frame(
+            self.stream,
+            &SyncFrame::End,
+            &mut self.encode_buffer,
+            &mut self.compressed_buffer,
+            MAX_SYNC_CERT_FRAME_SIZE,
+            self.buffer_timeout,
+        )
+        .await
+        .map_err(Into::into)
+    }
 }
 
 /// Read the certificate [`SyncFrame::Data`] frames of an accepted
