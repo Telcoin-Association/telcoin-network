@@ -269,7 +269,7 @@ mod tests {
     use tempfile::TempDir;
     use tn_network_libp2p::error::NetworkError;
     use tn_storage::consensus::ConsensusChain;
-    use tn_types::{max_batch_size, Batch, BlockHash, TaskManager, B256};
+    use tn_types::{max_batch_size, Batch, BlockHash, Committee, TaskManager, B256};
 
     #[tokio::test]
     async fn test_validate_batches_from_stream() {
@@ -450,7 +450,8 @@ mod tests {
         let fetcher = BatchFetcher::new(
             handle,
             db,
-            ConsensusChain::new(temp_dir.path().to_path_buf()).expect("consensus chain"),
+            ConsensusChain::new(temp_dir.path().to_path_buf(), Committee::default())
+                .expect("consensus chain"),
             crate::metrics::WorkerMetrics::new_for_worker(0),
         );
 
@@ -473,7 +474,8 @@ mod tests {
         let fetcher = BatchFetcher::new(
             handle,
             db,
-            ConsensusChain::new(temp_dir.path().to_path_buf()).expect("consensus chain"),
+            ConsensusChain::new(temp_dir.path().to_path_buf(), Committee::default())
+                .expect("consensus chain"),
             crate::metrics::WorkerMetrics::new_for_worker(0),
         );
 
@@ -509,7 +511,8 @@ mod tests {
         let fetcher = BatchFetcher::new(
             handle.clone(),
             db,
-            ConsensusChain::new(temp_dir.path().to_path_buf()).expect("consensus chain"),
+            ConsensusChain::new(temp_dir.path().to_path_buf(), Committee::default())
+                .expect("consensus chain"),
             crate::metrics::WorkerMetrics::new_for_worker(0),
         );
 
