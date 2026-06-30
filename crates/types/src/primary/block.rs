@@ -130,6 +130,9 @@ pub struct ConsensusResult {
     /// see digest() below, this is a signature over the hash of the epoch, round, number and hash
     /// fields
     pub signature: BlsSignature,
+    /// How many bytes then encoded consensus output takes in a pack file (can be used for
+    /// retrieval).
+    pub consensus_bytes: u64,
 }
 
 impl ConsensusResult {
@@ -137,7 +140,7 @@ impl ConsensusResult {
     /// This will be the same for all validadors and is what signature signs
     /// (verifying all the data fields not just the hash).
     pub fn digest(&self) -> ConsensusResultDigest {
-        Self::digest_data(self.epoch, self.round, self.number, self.hash)
+        Self::digest_data(self.epoch, self.round, self.number, self.hash, self.consensus_bytes)
     }
 
     /// Return the digest of the data fields (epoch, round, number and hash).
@@ -149,12 +152,14 @@ impl ConsensusResult {
         round: Round,
         number: u64,
         hash: ConsensusHeaderDigest,
+        consensus_bytes: u64,
     ) -> ConsensusResultDigest {
         let mut hasher = crate::DefaultHashFunction::new();
         hasher.update(&epoch.to_be_bytes());
         hasher.update(&round.to_be_bytes());
         hasher.update(&number.to_be_bytes());
         hasher.update(hash.as_ref());
+        hasher.update(&consensus_bytes.to_be_bytes());
         ConsensusResultDigest(Digest { digest: hasher.finalize().into() })
     }
 }
