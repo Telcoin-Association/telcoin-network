@@ -27,8 +27,6 @@ pub const ISSUANCE_JSON: &str = include_str!("../../../tn-contracts/artifacts/Is
 /// The path to erc1967proxy json (tn-contracts submodule).
 pub const ERC1967PROXY_JSON: &str =
     include_str!("../../../tn-contracts/artifacts/ERC1967Proxy.json");
-/// The path to blsg1 json (tn-contracts submodule).
-pub const BLSG1_JSON: &str = include_str!("../../../tn-contracts/artifacts/BlsG1.json");
 /// The path to the configuration yaml for genesis accounts (tn-contracts submodule).
 pub const GENESIS_ACCOUNT_STATE_YAML: &str =
     include_str!("../../../tn-contracts/deployments/genesis/precompile-config.yaml");

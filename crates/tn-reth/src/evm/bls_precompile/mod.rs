@@ -42,8 +42,7 @@ use tn_types::{
 ///
 /// Matches `BLS_G1_ADDRESS` in `tn-contracts/src/consensus/BlsG1.sol`. `ConsensusRegistry` is
 /// linked against this address at genesis, so its `BlsG1.*` library `delegatecall`s land here.
-pub(crate) const BLS_G1_PRECOMPILE_ADDRESS: Address =
-    address!("000000000000000000000000000000000000b151");
+pub const BLS_G1_PRECOMPILE_ADDRESS: Address = address!("000000000000000000000000000000000000b151");
 
 sol! {
     /// Verifies a validator's BLS12-381 proof of possession from raw uncompressed inputs.
@@ -79,7 +78,7 @@ const POP_MESSAGE_GAS_COST: u64 = 5_000;
 ///
 /// Called from the EVM factory alongside `add_telcoin_precompile`, so the precompile is present for
 /// all execution including pre-genesis registry construction.
-pub(crate) fn add_bls_precompile(map: &mut PrecompilesMap) {
+pub fn add_bls_precompile(map: &mut PrecompilesMap) {
     map.apply_precompile(&BLS_G1_PRECOMPILE_ADDRESS, move |_| {
         Some(DynPrecompile::new_stateful(PrecompileId::Custom("bls_g1".into()), move |input| {
             bls_precompile(input)
@@ -99,14 +98,11 @@ fn bls_precompile(input: PrecompileInput<'_>) -> PrecompileResult {
 /// be unit-tested directly with raw calldata, without constructing a full [`PrecompileInput`]
 /// (which would require a live EVM for its [`EvmInternals`](alloy_evm::EvmInternals) field).
 fn dispatch(data: &[u8], gas: u64) -> PrecompileResult {
-    if data.len() < 4 {
+    let Some((selector, calldata)) = data.split_first_chunk::<4>() else {
         return Err(PrecompileError::Other("Invalid input: too short".into()));
-    }
+    };
 
-    let selector: [u8; 4] = data[0..4].try_into().unwrap();
-    let calldata = &data[4..];
-
-    match selector {
+    match *selector {
         verifyProofOfPossessionCall::SELECTOR => handle_verify_pop(calldata, gas),
         proofOfPossessionMessageCall::SELECTOR => handle_pop_message(calldata, gas),
         _ => Err(PrecompileError::Other("Unknown function selector".into())),
