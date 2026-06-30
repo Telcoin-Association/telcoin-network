@@ -12,14 +12,18 @@ use tn_config::ConsensusConfig;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
 use tn_storage::{consensus::ConsensusChain, tables::ConsensusHeaderCache};
 use tn_types::{
-    ConsensusHeaderDigest, Database as TNDatabase, Epoch, EpochRecord, Noticer, TaskSpawner,
-    TnReceiver, TnSender as _,
+    ConsensusHeaderDigest, ConsensusNumHash, Database as TNDatabase, Epoch, EpochRecord, Noticer,
+    TaskSpawner, TnReceiver, TnSender as _,
 };
 use tracing::{debug, error, info, warn};
 
 /// How long to wait before retrying a failed pack file download.
 const PACK_DOWNLOAD_RETRY_SECS: u64 = 5;
 const PACK_RECORD_TIMEOUT_SECS: u64 = 10;
+/// Minimum number of consensus outputs we must be behind on the in-progress current epoch before
+/// bulk-downloading a verified partial pack (into staging) rather than crawling headers one at a
+/// time. Small gaps stay on the cheap header-by-header path.
+const PARTIAL_PACK_CATCHUP_THRESHOLD: u64 = 5;
 
 enum ConsensusHeaderResult {
     Done,
@@ -115,6 +119,96 @@ async fn request_epochs(
                     .await;
             }
             previous_epoch_record = epoch_record;
+        }
+    }
+}
+
+/// Bulk fast-path for catching up the in-progress current epoch.
+///
+/// When far behind the latest *verified* gossip point, stream a verifiable PREFIX of the current
+/// epoch's pack (up to `number`) into a side STAGING directory via
+/// [`PrimaryNetworkHandle::request_partial_epoch_pack`]. The staged pack is read-only and lives in
+/// its own dir — it is NEVER swapped over the live `epoch-{N}` dir — so importing it cannot race
+/// the node's own in-order pack build. The forward drain ([`catch_up_consensus_from_to`]) then
+/// sources headers/outputs from staging.
+///
+/// `(epoch, number, hash)` comes from verified consensus gossip, so `hash` is a trustworthy stop
+/// point. The bail conditions keep this from firing on a live validator, for completed epochs, or
+/// for small gaps the header path handles cheaply.
+async fn try_partial_pack_catch_up(
+    consensus_bus: &ConsensusBusApp,
+    network: &PrimaryNetworkHandle,
+    consensus_chain: &ConsensusChain,
+    epoch: Epoch,
+    number: u64,
+    hash: ConsensusHeaderDigest,
+) -> bool {
+    // An active validator builds the epoch itself; never run there.
+    if consensus_bus.is_active_cvv() {
+        return false;
+    }
+    // Dedup concurrent attempts.
+    if consensus_chain.already_streaming_epoch(epoch) || consensus_chain.staging_final().is_some() {
+        return false;
+    }
+    // Only for the in-progress current epoch; completed epochs use the full-pack path.
+    if consensus_chain.epochs().record_by_epoch(epoch).await.is_some() {
+        return false;
+    }
+    // Only worth a bulk download when far behind; small gaps stay on the header path.
+    let our_latest = consensus_chain
+        .latest_consensus_header_from_pack(epoch)
+        .await
+        .ok()
+        .flatten()
+        .map(|h| h.number)
+        .unwrap_or(0);
+    if number.saturating_sub(our_latest) <= PARTIAL_PACK_CATCHUP_THRESHOLD {
+        return false;
+    }
+    // The previous epoch is complete; reuse the synthetic-for-epoch-0 shape `request_epochs` uses.
+    let maybe_previous = if epoch == 0 {
+        consensus_chain.epochs().record_by_epoch(0).await.map(|r| EpochRecord {
+            committee: r.committee.clone(),
+            next_committee: r.committee.clone(),
+            ..EpochRecord::default()
+        })
+    } else {
+        consensus_chain.epochs().record_by_epoch(epoch.saturating_sub(1)).await
+    };
+    let Some(previous_epoch_record) = maybe_previous else {
+        return false;
+    };
+    // Only `.epoch` and `.final_consensus` are used for verification; the streamed pack carries and
+    // self-verifies its own committee.
+    let epoch_record = EpochRecord {
+        epoch,
+        committee: previous_epoch_record.next_committee.clone(),
+        final_consensus: ConsensusNumHash::new(number, hash),
+        parent_hash: previous_epoch_record.digest(),
+        ..EpochRecord::default()
+    };
+    info!(target: "state-sync", epoch, number, our_latest, "bulk catching up current epoch via partial pack stream (staging)");
+    match network
+        .request_partial_epoch_pack(
+            &epoch_record,
+            &previous_epoch_record,
+            consensus_chain,
+            number,
+            Duration::from_secs(PACK_RECORD_TIMEOUT_SECS),
+        )
+        .await
+    {
+        Ok(()) => {
+            // Nudge the forward drain to consume the staged prefix.
+            if let Ok(Some(header)) = consensus_chain.consensus_header_by_number(number).await {
+                consensus_bus.send_last_consensus_header_if_newer(header);
+            }
+            true
+        }
+        Err(e) => {
+            warn!(target: "state-sync", epoch, number, ?e, "partial pack catch-up failed; falling back to header-by-header");
+            false
         }
     }
 }
@@ -326,20 +420,29 @@ async fn manage_new_consensus<DB: TNDatabase>(
     let consensus_chain_clone = consensus_chain.clone();
     if first_gossipped_epoch.is_none() {
         *first_gossipped_epoch = Some(epoch);
-    }
-    // Note that the way tasks is used is open to "races" but this is a simple throttle for not
-    // firing too many fetch tasks so not worth the overhead of using a full lock here.  I.e.
-    // one more or less task won't matter.
-    let task_num = tasks.load(Ordering::Relaxed);
-    // Skip for now, this number will be subsumed by gossip once enough tasks end.
-    if task_num < 6 {
+        // On the first epoch we will try to do partial pack download to build retrieve consensus.
         let end_number = last_number.unwrap_or_default();
-        *last_number = Some(number + 1);
-        let tasks_clone = tasks.clone();
-        tasks.fetch_add(1, Ordering::Relaxed);
-        task_spawner.spawn_task(
-            format!("backfilling epoch {epoch} consensus from {number}/{hash} to {end_number}"),
-            async move {
+        let consensus_bus = consensus_bus.clone();
+        let network = network.clone();
+        let consensus_chain = consensus_chain.clone();
+        task_spawner.spawn_task(format!("partial pack catchup epoch {epoch}"), async move {
+            // Bulk fast-path: if we're far behind on the in-progress current epoch, stream a verified
+            // partial pack into staging in one shot instead of only crawling headers.
+            if !try_partial_pack_catch_up(
+                &consensus_bus,
+                &network,
+                &consensus_chain,
+                epoch,
+                number,
+                hash,
+            )
+            .await
+            {
+                info!(target: "state-sync", "Failed to initialize a bulk current epoch {epoch} download, falling back to backwards download");
+                // If this fails then try to do "normal" backwards download.
+                // Note we do this no matter the tasks count "for free"
+                // This should be atypical and must happen and the task count is a loose metric
+                // to avoid tasks running amock anyway.
                 get_consensus_header_range(
                     number,
                     hash,
@@ -350,10 +453,38 @@ async fn manage_new_consensus<DB: TNDatabase>(
                     end_number,
                 )
                 .await;
-                tasks_clone.fetch_sub(1, Ordering::Relaxed);
-                Ok(())
-            },
-        );
+            }
+            Ok(())
+        });
+    } else {
+        // Note that the way tasks is used is open to "races" but this is a simple throttle for not
+        // firing too many fetch tasks so not worth the overhead of using a full lock here.  I.e.
+        // one more or less task won't matter.
+        let task_num = tasks.load(Ordering::Relaxed);
+        // Skip for now, this number will be subsumed by gossip once enough tasks end.
+        if task_num < 6 {
+            let end_number = last_number.unwrap_or_default();
+            *last_number = Some(number + 1);
+            let tasks_clone = tasks.clone();
+            tasks.fetch_add(1, Ordering::Relaxed);
+            task_spawner.spawn_task(
+                format!("backfilling epoch {epoch} consensus from {number}/{hash} to {end_number}"),
+                async move {
+                    get_consensus_header_range(
+                        number,
+                        hash,
+                        &db_clone,
+                        &consensus_bus_clone,
+                        &network_clone,
+                        &consensus_chain_clone,
+                        end_number,
+                    )
+                    .await;
+                    tasks_clone.fetch_sub(1, Ordering::Relaxed);
+                    Ok(())
+                },
+            );
+        }
     }
 
     if *current_fetch_epoch < epoch {

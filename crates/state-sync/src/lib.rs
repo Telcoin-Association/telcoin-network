@@ -317,6 +317,7 @@ async fn catch_up_consensus_from_to<DB: Database>(
             // Block already in local ConsensusChain DB (e.g., processed before a restart).
             // Use it to advance the parent-chain verification; execution will be skipped below
             // since number <= consensus_chain.latest_consensus_number().
+            // Note this will include staged current epoch output.
             header
         } else {
             if number > last_consensus_height + 1 {

@@ -150,12 +150,24 @@ impl ExecutionNode {
         worker_id: WorkerId,
         network_handle: WorkerNetworkHandle,
         engine_to_primary: EP,
+        base_fee: u64,
     ) -> eyre::Result<()>
     where
         EP: EngineToPrimary + Send + Sync + 'static,
     {
         let mut guard = self.internal.write().await;
-        guard.initialize_worker_components(worker_id, network_handle, engine_to_primary).await
+        guard
+            .initialize_worker_components(worker_id, network_handle, engine_to_primary, base_fee)
+            .await
+    }
+
+    /// Update the pending base fee on a worker's transaction pool.
+    ///
+    /// Called every epoch so the pool charges the accumulator's current base fee for the worker,
+    /// including on the respawn path where [`Self::initialize_worker_components`] is skipped.
+    pub async fn set_worker_base_fee(&self, worker_id: WorkerId, base_fee: u64) {
+        let guard = self.internal.read().await;
+        guard.set_worker_base_fee(worker_id, base_fee);
     }
 
     /// Respawn any tasks on the worker network when we get a new epoch task manager.
