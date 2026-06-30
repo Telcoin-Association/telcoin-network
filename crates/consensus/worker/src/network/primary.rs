@@ -147,6 +147,7 @@ mod tests {
     use tempfile::TempDir;
     use tn_batch_validator::NoopBatchValidator;
     use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
+    use tn_test_utils::CommitteeFixture;
     use tn_types::TaskManager;
 
     /// Build a [`PrimaryReceiverHandler`] backed by an in-memory store. Returns the handler, a
@@ -157,8 +158,10 @@ mod tests {
         let temp_dir = TempDir::new().expect("temp dir");
         let task_manager = TaskManager::default();
         let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
         let consensus_chain =
-            ConsensusChain::new(temp_dir.path().to_path_buf()).expect("consensus chain");
+            ConsensusChain::new(temp_dir.path().to_path_buf(), committee).expect("consensus chain");
         let batch_fetcher = BatchFetcher::new(
             handle,
             store.clone(),
