@@ -130,7 +130,7 @@ pub struct ConsensusResult {
     /// see digest() below, this is a signature over the hash of the epoch, round, number and hash
     /// fields
     pub signature: BlsSignature,
-    /// How many bytes then encoded consensus output takes in a pack file (can be used for
+    /// How many bytes the encoded consensus output takes in a pack file (can be used for
     /// retrieval).
     pub consensus_bytes: u64,
 }

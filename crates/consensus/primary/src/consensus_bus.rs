@@ -252,7 +252,7 @@ pub struct ConsensusBusAppInner {
     epoch_request_queue_rx:
         Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(EpochRecord, EpochRecord)>>>,
     /// Channel to request consensus headers to cache.
-    /// Fields are epoch, consensus nuber, consensus digest and consensus output bytes.
+    /// Fields are epoch, consensus number, consensus digest and consensus output bytes.
     consensus_request_queue: QueChannel<(Epoch, u64, ConsensusHeaderDigest, u64)>,
     /// Prometheus metrics for the primary's consensus pipeline.
     ///
