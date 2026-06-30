@@ -138,7 +138,7 @@ impl<DB: Database> Subscriber<DB> {
     ///
     /// The output arrives complete (header + batches) and already verified by state-sync, so there
     /// is no separate batch fetch here.
-    #[instrument(level = "debug", skip_all, fields(number = output.number()))]
+    #[instrument(level = "debug", skip_all, fields(number = consensus_output.number()))]
     async fn handle_sync_output(&self, consensus_output: ConsensusOutput) -> SubscriberResult<()> {
         if consensus_output.sub_dag().leader_epoch() > self.inner.committee.epoch() {
             // Do not process past our epoch.  Can just NO-OP here to avoid producing bogus output

@@ -862,10 +862,9 @@ impl ConsensusChain {
         epoch: Epoch,
         bytes: Vec<u8>,
     ) -> Result<ConsensusOutput, ConsensusChainError> {
-        if let Some(pack) = &self.current_pack() {
-            if epoch == pack.epoch() {
-                return Ok(pack.decode_output(bytes).await?);
-            }
+        let pack = self.current_pack();
+        if epoch == pack.epoch() {
+            return Ok(pack.decode_output(bytes).await?);
         }
         if let Ok(pack) = self.get_static(epoch).await {
             Ok(pack.decode_output(bytes).await?)
