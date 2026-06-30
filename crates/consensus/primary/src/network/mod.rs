@@ -802,10 +802,29 @@ impl PrimaryNetworkHandle {
                     "stream opened - reading and validating epoch pack file..."
                 );
 
-                if let Err(err) = consensus_chain
-                    .stream_import(stream.compat(), epoch_record, previous_epoch, record_timeout)
-                    .await
-                {
+                // A full request imports into the live epoch dir (completed epochs); a partial
+                // request imports into a side "staging" dir so it cannot race the in-order build of
+                // the current epoch's main pack.
+                let import_result = if last_consensus_number.is_some() {
+                    consensus_chain
+                        .import_partial_to_staging(
+                            stream.compat(),
+                            epoch_record,
+                            previous_epoch,
+                            record_timeout,
+                        )
+                        .await
+                } else {
+                    consensus_chain
+                        .stream_import(
+                            stream.compat(),
+                            epoch_record,
+                            previous_epoch,
+                            record_timeout,
+                        )
+                        .await
+                };
+                if let Err(err) = import_result {
                     if let Some(penalty) = Self::consensus_chain_error_to_penalty(&err) {
                         self.report_penalty(peer, penalty).await;
                     }
