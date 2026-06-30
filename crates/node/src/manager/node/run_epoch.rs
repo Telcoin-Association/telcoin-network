@@ -23,9 +23,9 @@ use tn_executor::subscriber::spawn_subscriber;
 use tn_primary::ConsensusBus;
 use tn_storage::{certificate_pack::CertificatePack, tables::OurNodeBatchesCache};
 use tn_types::{
-    gas_accumulator::GasAccumulator, BlsPublicKey, Committee, ConsensusHeaderDigest,
-    ConsensusOutput, Database as TNDatabase, EpochRecord, Notifier, TaskJoinError, TaskManager,
-    TaskSpawner, TnReceiver,
+    gas_accumulator::{compute_next_base_fee_eip1559, GasAccumulator},
+    BlsPublicKey, Committee, ConsensusHeaderDigest, ConsensusOutput, Database as TNDatabase,
+    EpochRecord, Notifier, TaskJoinError, TaskManager, TaskSpawner, TnReceiver,
 };
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -534,20 +534,6 @@ where
         Err(eyre::eyre!("invalid wait for epoch end"))
     }
 
-    /// Recompute each worker's next-epoch base fee from the epoch's accumulated gas usage.
-    ///
-    /// Currently a no-op: it walks every worker's [`GasAccumulator`] totals but does not yet feed a
-    /// new base fee back into batch production. The loop is the seam where EIP-1559-style base fee
-    /// adjustment will hook in; until then base fees carry over unchanged.
-    fn adjust_base_fees(&self, gas_accumulator: &GasAccumulator) {
-        for worker_id in 0..gas_accumulator.num_workers() {
-            let worker_id = worker_id as u16;
-            let (_blocks, _gas_used, _gas_limit) = gas_accumulator.get_values(worker_id);
-            // Change this base fee to update base fee in batches workers create.
-            let _base_fee = gas_accumulator.base_fee(worker_id);
-        }
-    }
-
     /// Finalize an epoch once its boundary output has been identified.
     ///
     /// Begins shutting consensus down (when a [`Notifier`] is supplied) so it winds down in
@@ -567,8 +553,78 @@ where
             s.notify()
         }
         self.consensus_bus.wait_for_consensus_execution(target_hash).await?;
-        self.adjust_base_fees(gas_accumulator);
+        adjust_base_fees(gas_accumulator);
         gas_accumulator.clear(); // Clear the accumlated values for next epoch.
         Ok(())
+    }
+}
+
+/// Recompute each worker's next-epoch base fee from the gas it accumulated this epoch.
+///
+/// Applies the EIP-1559-style adjustment ([`compute_next_base_fee_eip1559`]) per worker. The
+/// target gas is currently hardcoded to `u64::MAX`, which keeps the adjustment inert: against an
+/// unreachable target the fee can only ratchet *down*, and the formula floors every result at
+/// `MIN_PROTOCOL_BASE_FEE`. Because workers start at `MIN`, the fee stays at `MIN` everywhere.
+///
+/// The real per-worker target (from the WorkerConfigs contract) is wired in later; this is the
+/// deterministic seam every committee member runs identically at the epoch boundary.
+fn adjust_base_fees(gas_accumulator: &GasAccumulator) {
+    for worker_id in 0..gas_accumulator.num_workers() {
+        let worker_id = worker_id as u16;
+        let (_blocks, gas_used, _gas_limit) = gas_accumulator.get_values(worker_id);
+        let base_fee = gas_accumulator.base_fee(worker_id);
+        // u64::MAX target => inert: floors at MIN until governance targets are read (PR6).
+        let next_base_fee = compute_next_base_fee_eip1559(base_fee.base_fee(), gas_used, u64::MAX);
+        base_fee.set_base_fee(next_base_fee);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tn_types::MIN_PROTOCOL_BASE_FEE;
+
+    #[test]
+    fn adjust_base_fees_keeps_workers_at_min() {
+        // Production starting point: every worker's base fee defaults to MIN. With the u64::MAX
+        // target the fee can only ratchet down and is floored at MIN, so a worker that starts at
+        // MIN stays at MIN regardless of how much gas it used. This is the inert guarantee that
+        // keeps PR1-PR5 behavior-preserving.
+        let acc = GasAccumulator::new(2);
+        assert_eq!(acc.base_fee(0).base_fee(), MIN_PROTOCOL_BASE_FEE);
+        assert_eq!(acc.base_fee(1).base_fee(), MIN_PROTOCOL_BASE_FEE);
+
+        // worker 0 used a lot of gas; worker 1 used none
+        acc.inc_block(0, 5_000_000, 30_000_000);
+
+        adjust_base_fees(&acc);
+
+        assert_eq!(acc.base_fee(0).base_fee(), MIN_PROTOCOL_BASE_FEE);
+        assert_eq!(acc.base_fee(1).base_fee(), MIN_PROTOCOL_BASE_FEE);
+    }
+
+    #[test]
+    fn adjust_base_fees_ratchets_non_min_fee_down_to_min() {
+        // A worker that somehow holds a non-MIN fee is pulled back down toward MIN every epoch
+        // (proving compute_next_base_fee_eip1559 is wired into adjust_base_fees) and is floored at
+        // MIN. Zero gas used each epoch applies maximal downward pressure against the unreachable
+        // u64::MAX target so the fee converges cleanly to the floor.
+        let acc = GasAccumulator::new(1);
+        acc.base_fee(0).set_base_fee(MIN_PROTOCOL_BASE_FEE * 1000);
+
+        let mut prev = acc.base_fee(0).base_fee();
+        let mut reached_min = false;
+        for _ in 0..500 {
+            adjust_base_fees(&acc);
+            let now = acc.base_fee(0).base_fee();
+            assert!(now <= prev, "fee is non-increasing with a u64::MAX target");
+            assert!(now >= MIN_PROTOCOL_BASE_FEE, "fee never drops below MIN");
+            if now == MIN_PROTOCOL_BASE_FEE {
+                reached_min = true;
+                break;
+            }
+            prev = now;
+        }
+        assert!(reached_min, "fee should ratchet all the way down to MIN");
     }
 }
