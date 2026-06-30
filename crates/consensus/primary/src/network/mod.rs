@@ -1288,6 +1288,19 @@ where
         self.task_spawner.spawn_task(task_name, async move {
             tokio::select! {
                 vote = request_handler.vote(peer, header, parents) => {
+                    // report penalty if any
+                    //
+                    // votes are consensus-critical, so a peer that returns a penalizable
+                    // error must pay the same reputational cost as on every other request
+                    // handler. Route the error through the central PrimaryNetworkError →
+                    // Penalty table before collapsing it into a response, instead of
+                    // silently dropping it.
+                    if let Err(ref e) = vote {
+                        if let Some(penalty) = e.into() {
+                            network_handle.report_penalty(peer, penalty).await;
+                        }
+                    }
+
                     let response = vote.into_response();
                     let _ = network_handle.handle.send_response(response, channel).await;
                 }
