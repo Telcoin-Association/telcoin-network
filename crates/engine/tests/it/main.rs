@@ -187,7 +187,7 @@ async fn test_empty_output_skips_execution() -> eyre::Result<()> {
 
     // spawn engine task
     task_manager.spawn_task("Test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -300,7 +300,7 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
 
     // spawn engine task
     task_manager.spawn_task("Test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -480,7 +480,7 @@ async fn test_empty_output_increments_leader_count() -> eyre::Result<()> {
 
     // spawn engine task
     task_manager.spawn_task("Test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -816,7 +816,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     //
     // one output already queued up, one output waiting in broadcast stream
     task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -1325,7 +1325,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     //
     // one output already queued up, one output waiting in broadcast stream
     task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -1692,7 +1692,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     //
     // one output already queued up, one output waiting in broadcast stream
     task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -1910,7 +1910,7 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
     //
     // one output already queued up, one output waiting in broadcast stream
     task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -2202,7 +2202,7 @@ async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
 
     let (tx, rx) = oneshot::channel();
     task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
