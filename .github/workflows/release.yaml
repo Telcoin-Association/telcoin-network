@@ -1,0 +1,332 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'           # mainnet: strict semver, no suffix
+      - 'v[0-9]+.[0-9]+.[0-9]+-adiri'     # adiri (testnet)
+      - 'v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+'  # rc channel (no :latest)
+
+permissions:
+  contents: write       # create draft release, upload assets
+  packages: write       # push to ghcr.io
+  id-token: write       # OIDC for keyless provenance
+  attestations: write   # actions/attest-build-provenance
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: telcoin-association/telcoin-network
+  RUST_TOOLCHAIN: '1.94'
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.c.outputs.channel }}
+      version: ${{ steps.c.outputs.version }}
+      tag: ${{ github.ref_name }}
+      docker_tags: ${{ steps.c.outputs.docker_tags }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: guard against placeholder release keys
+        run: |
+          set -euo pipefail
+          for f in .github/release-keys/grantkee.pem .github/release-keys/sstanfield.pem; do
+            if [[ ! -s "$f" ]]; then
+              echo "::error file=$f::release-key file is missing or empty" >&2
+              exit 1
+            fi
+            if grep -q 'PLACEHOLDER' "$f"; then
+              echo "::error file=$f::release-key file is still a placeholder — provision a real PEM before tagging a release" >&2
+              exit 1
+            fi
+          done
+
+      - name: verify GPG-signed tag against maintainer allowlist
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # Refuse to run against placeholder GPG keys for the same reason as
+          # the release-keys guard: cosmetic CI pass with no real signature
+          # check is worse than no check at all.
+          shopt -s nullglob
+          allowlist=(.github/maintainer-gpg-keys/*.asc)
+          if [[ ${#allowlist[@]} -eq 0 ]]; then
+            echo "::error::no maintainer GPG keys found in .github/maintainer-gpg-keys/" >&2
+            exit 1
+          fi
+          for f in "${allowlist[@]}"; do
+            if [[ ! -s "$f" ]]; then
+              echo "::error file=$f::maintainer-gpg-keys file is missing or empty" >&2
+              exit 1
+            fi
+            if grep -q 'PLACEHOLDER' "$f"; then
+              echo "::error file=$f::maintainer-gpg-keys file is still a placeholder — provision a real key before tagging a release" >&2
+              exit 1
+            fi
+          done
+
+          # Build a throwaway GPG keyring containing only the allowlisted keys.
+          GNUPGHOME="$(mktemp -d)"
+          chmod 700 "$GNUPGHOME"
+          export GNUPGHOME
+
+          allowed_fpr=()
+          for f in "${allowlist[@]}"; do
+            gpg --batch --quiet --import "$f"
+            while IFS= read -r line; do
+              # `fpr` lines from --with-colons: fpr:::::::::FINGERPRINT::
+              fpr="$(echo "$line" | awk -F: '$1=="fpr" {print $10; exit}')"
+              if [[ -n "$fpr" ]]; then
+                allowed_fpr+=("$fpr")
+              fi
+            done < <(gpg --batch --with-colons --import-options show-only --import "$f")
+          done
+
+          if [[ ${#allowed_fpr[@]} -eq 0 ]]; then
+            echo "::error::failed to extract any allowlisted GPG fingerprints" >&2
+            exit 1
+          fi
+
+          # Verify the tag is signed and capture gpg's output.
+          verify_out="$(git tag -v "$TAG" 2>&1)" || {
+            echo "::error::git tag -v failed for $TAG:" >&2
+            echo "$verify_out" >&2
+            exit 1
+          }
+
+          if ! grep -q 'Good signature' <<< "$verify_out"; then
+            echo "::error::tag $TAG does not carry a Good signature" >&2
+            echo "$verify_out" >&2
+            exit 1
+          fi
+
+          # Extract the full 40-char primary-key fingerprint. GPG prints it on
+          # a "Primary key fingerprint:" line with spaces between groups of
+          # four hex chars; strip the spaces to get the bare fingerprint.
+          # Reject the 16-char short key id form — it is collision-prone.
+          signing_fpr="$(echo "$verify_out" \
+            | grep 'Primary key fingerprint:' \
+            | head -n1 \
+            | sed -E 's/.*Primary key fingerprint:[[:space:]]*//' \
+            | tr -d ' ')"
+          if [[ -z "$signing_fpr" ]]; then
+            echo "::error::could not extract Primary key fingerprint from gpg output" >&2
+            echo "$verify_out" >&2
+            exit 1
+          fi
+
+          matched=0
+          for fpr in "${allowed_fpr[@]}"; do
+            if [[ "$fpr" == "$signing_fpr" ]]; then
+              matched=1
+              break
+            fi
+          done
+          if [[ $matched -eq 0 ]]; then
+            echo "::error::tag $TAG signed by $signing_fpr — not in maintainer allowlist" >&2
+            printf '  allowed: %s\n' "${allowed_fpr[@]}" >&2
+            exit 1
+          fi
+
+          echo ">>> tag $TAG verified against maintainer key $signing_fpr"
+
+      - id: c
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          case "$TAG" in
+            v[0-9]*.[0-9]*.[0-9]*-adiri)
+              CHANNEL=adiri
+              VERSION="${TAG%-adiri}"
+              VERSION="${VERSION#v}"
+              DOCKER_TAGS="${REGISTRY}/${IMAGE_NAME}:${TAG}"$'\n'"${REGISTRY}/${IMAGE_NAME}:adiri"
+              ;;
+            v[0-9]*.[0-9]*.[0-9]*-rc[0-9]*)
+              CHANNEL=rc
+              VERSION="${TAG#v}"
+              DOCKER_TAGS="${REGISTRY}/${IMAGE_NAME}:${TAG}"
+              ;;
+            v[0-9]*.[0-9]*.[0-9]*)
+              CHANNEL=mainnet
+              VERSION="${TAG#v}"
+              DOCKER_TAGS="${REGISTRY}/${IMAGE_NAME}:${TAG}"$'\n'"${REGISTRY}/${IMAGE_NAME}:latest"
+              ;;
+            *)
+              echo "::error::tag $TAG does not match any release channel pattern" >&2
+              exit 1
+              ;;
+          esac
+          {
+            echo "channel=$CHANNEL"
+            echo "version=$VERSION"
+            echo "docker_tags<<EOF"
+            echo "$DOCKER_TAGS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  build-binary:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          submodules: recursive
+
+      - name: install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake libclang-dev pkg-config libssl-dev libapr1-dev
+
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-03-27
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      - name: cargo build
+        run: cargo build --bin telcoin-network --release --target ${{ matrix.target }}
+
+      - name: package tarball + sha256
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/telcoin-network"
+          strip "$BIN"
+          NAME="telcoin-network-${{ needs.meta.outputs.tag }}-${{ matrix.target }}"
+          mkdir -p dist
+          tar -C "$(dirname "$BIN")" -czf "dist/${NAME}.tar.gz" "$(basename "$BIN")"
+          ( cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
+
+      - name: attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: 'dist/*.tar.gz'
+
+      - name: upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bin-${{ matrix.target }}
+          path: dist/
+
+  build-image:
+    needs: meta
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          submodules: recursive
+
+      - name: setup qemu
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+
+      - name: setup buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: registry login
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: build & push
+        id: push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: etc/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ needs.meta.outputs.docker_tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/telcoin-association/telcoin-network
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.meta.outputs.tag }}
+          provenance: mode=max
+          sbom: true
+
+      - name: attest image provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  draft-release:
+    needs: [meta, build-binary, build-image]
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: download artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          pattern: bin-*
+          merge-multiple: true
+
+      - name: aggregate checksums
+        run: |
+          set -euo pipefail
+          ( cd dist && sha256sum *.tar.gz > SHA256SUMS )
+          ls -la dist/
+
+      - name: build release notes
+        env:
+          DIGEST: ${{ needs.build-image.outputs.digest }}
+          TAG: ${{ needs.meta.outputs.tag }}
+          CHANNEL: ${{ needs.meta.outputs.channel }}
+        run: |
+          cat > release-notes.md <<EOF
+          ## Channel
+          ${CHANNEL}
+
+          ## Image
+          \`${REGISTRY}/${IMAGE_NAME}@${DIGEST}\`
+
+          Pull tags:
+          ${{ needs.meta.outputs.docker_tags }}
+
+          ## Verification
+          See [docs/INSTALL.md](https://github.com/telcoin-association/telcoin-network/blob/${TAG}/docs/INSTALL.md).
+
+          This release is **DRAFT** until two maintainer countersignatures land.
+          The CI build provenance below is bound to the workflow + commit; the
+          maintainer signatures attest that two independent humans approved the
+          tagged commit before it ships.
+          EOF
+
+      - name: create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --draft \
+            --generate-notes \
+            --title "$TAG" \
+            --notes-file release-notes.md \
+            dist/*.tar.gz dist/*.sha256 dist/SHA256SUMS
