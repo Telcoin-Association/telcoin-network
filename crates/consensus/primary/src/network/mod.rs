@@ -321,6 +321,7 @@ impl PrimaryNetworkHandle {
     }
 
     /// Publish a consensus block number and hash of the header.
+    #[allow(clippy::too_many_arguments)]
     pub async fn publish_consensus(
         &self,
         epoch: Epoch,
@@ -1100,6 +1101,7 @@ impl PrimaryNetworkHandle {
             | ConsensusChainError::NoCurrentEpoch
             | ConsensusChainError::EpochDbError(_)
             | ConsensusChainError::InvalidPackEpoch(_, _)
+            | ConsensusChainError::CantSaveAndNotAvailable(_)
             | ConsensusChainError::IO(_) => None,
         }
     }

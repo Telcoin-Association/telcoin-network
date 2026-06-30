@@ -29,6 +29,7 @@ mod tel_precompile;
 mod utils;
 use crate::evm::handler::TNEvmHandler;
 pub(crate) use block::*;
+pub use bls_precompile::{add_bls_precompile, BLS_G1_PRECOMPILE_ADDRESS};
 pub(crate) use config::*;
 pub(crate) use context::*;
 pub(crate) use factory::*;

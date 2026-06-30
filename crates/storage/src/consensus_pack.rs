@@ -32,7 +32,7 @@ use tokio::{
 use tracing::{debug, error, warn};
 
 use crate::archive::{
-    data_file::fsync_directory,
+    data_file::{create_dir_synced, fsync_directory},
     digest_index::index::HdxIndex,
     error::{fetch::FetchError, open::OpenError},
     fxhasher::FxHasher,
@@ -121,6 +121,7 @@ pub struct ConsensusPack {
     epoch: Epoch,
     committee: Committee,
     compression: PackCompression,
+    is_static: bool,
 }
 
 fn run_pack_loop(mut inner: Inner, mut rx: Receiver<PackMessage>) {
@@ -210,7 +211,14 @@ impl ConsensusPack {
         let inner = Inner::open_append(path.clone(), &previous_epoch, committee.clone())?;
         let compression = inner.data.header().compression();
         let handle = std::thread::spawn(move || run_pack_loop(inner, rx));
-        Ok(Self { tx, handle: Arc::new(Mutex::new(Some(handle))), epoch, committee, compression })
+        Ok(Self {
+            tx,
+            handle: Arc::new(Mutex::new(Some(handle))),
+            epoch,
+            committee,
+            compression,
+            is_static: false,
+        })
     }
 
     /// Open up the files for previous epoch in append mode.  Will fail if files do not exist.
@@ -221,7 +229,14 @@ impl ConsensusPack {
         let compression = inner.data.header().compression();
         let committee = inner.epoch_meta.committee.clone();
         let handle = std::thread::spawn(move || run_pack_loop(inner, rx));
-        Ok(Self { tx, handle: Arc::new(Mutex::new(Some(handle))), epoch, committee, compression })
+        Ok(Self {
+            tx,
+            handle: Arc::new(Mutex::new(Some(handle))),
+            epoch,
+            committee,
+            compression,
+            is_static: false,
+        })
     }
 
     /// Open up the static files for previous epoch.  These will be read only.
@@ -234,7 +249,14 @@ impl ConsensusPack {
         let compression = inner.data.header().compression();
         let committee = inner.epoch_meta.committee.clone();
         let handle = std::thread::spawn(move || run_pack_loop(inner, rx));
-        Ok(Self { tx, handle: Arc::new(Mutex::new(Some(handle))), epoch, committee, compression })
+        Ok(Self {
+            tx,
+            handle: Arc::new(Mutex::new(Some(handle))),
+            epoch,
+            committee,
+            compression,
+            is_static: true,
+        })
     }
 
     /// Create a new set of epoch static files to write consensus output into.
@@ -262,7 +284,19 @@ impl ConsensusPack {
         let handle = std::thread::spawn(move || {
             run_pack_loop(inner, rx);
         });
-        Ok(Self { tx, handle: Arc::new(Mutex::new(Some(handle))), epoch, committee, compression })
+        Ok(Self {
+            tx,
+            handle: Arc::new(Mutex::new(Some(handle))),
+            epoch,
+            committee,
+            compression,
+            is_static: true,
+        })
+    }
+
+    /// Is this packfile static- i.e. complete and read only.
+    pub fn is_static(&self) -> bool {
+        self.is_static
     }
 
     /// Return the epoch for this pack file.
@@ -646,7 +680,7 @@ impl Inner {
     ) -> Result<Self, PackError> {
         let epoch = committee.epoch();
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
-        let _ = std::fs::create_dir_all(&base_dir);
+        let _ = create_dir_synced(&base_dir);
         let pack_file = base_dir.join(Self::DATA_NAME);
         let have_pack = std::fs::exists(&pack_file).unwrap_or_default();
         let mut data: Pack<PackRecord> =
@@ -815,7 +849,7 @@ impl Inner {
             }
         }
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
-        let _ = std::fs::create_dir_all(&base_dir);
+        let _ = create_dir_synced(&base_dir);
         let mut stream_iter = AsyncPackIter::<PackRecord, R>::open(stream, epoch as u64)
             .await
             .map_err(|e| PackError::ReadError(e.to_string()))?;

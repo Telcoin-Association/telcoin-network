@@ -11,7 +11,7 @@ use alloy::{
     consensus::{SignableTransaction as _, TxEip4844, TxEip4844Variant, TxLegacy},
     eips::eip7594::BlobTransactionSidecarVariant,
     hex,
-    primitives::ChainId,
+    primitives::{utils::parse_ether, ChainId},
     signers::{
         k256::sha2::{Digest as _, Sha256},
         local::PrivateKeySigner,
@@ -32,14 +32,16 @@ use secp256k1::{
     Secp256k1,
 };
 use std::{collections::HashMap, path::Path, str::FromStr, sync::Arc};
+use tn_config::NodeInfo;
 use tn_types::{
-    address, calculate_transaction_root, gas_accumulator::RewardsCounter, keccak256, now,
-    test_chain_spec_arc, test_genesis, AccessList, Address, Batch, BlobTransactionSidecar, Block,
-    BlockBody, BlockHash, BlsPublicKey, Bytes, Committee, CommitteeBuilder, Encodable2718,
-    EthSignature, ExecHeader, ExecutionKeypair, Genesis, GenesisAccount, RecoveredBlock,
-    SealedHeader, TaskManager, Transaction, TransactionSigned, TxEip1559, TxHash, TxKind, WorkerId,
-    B256, EMPTY_OMMER_ROOT_HASH, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS,
-    ETHEREUM_BLOCK_GAS_LIMIT_30M, MIN_PROTOCOL_BASE_FEE, U256,
+    address, calculate_transaction_root, gas_accumulator::RewardsCounter,
+    generate_proof_of_possession_bls_for_test, keccak256, now, test_chain_spec_arc, test_genesis,
+    AccessList, Address, Batch, BlobTransactionSidecar, Block, BlockBody, BlockHash, BlsKeypair,
+    BlsPublicKey, Bytes, Committee, CommitteeBuilder, Encodable2718, EthSignature, ExecHeader,
+    ExecutionKeypair, Genesis, GenesisAccount, NodeP2pInfo, RecoveredBlock, SealedHeader,
+    TaskManager, Transaction, TransactionSigned, TxEip1559, TxHash, TxKind, WorkerId, B256,
+    EMPTY_OMMER_ROOT_HASH, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT_30M,
+    MIN_PROTOCOL_BASE_FEE, U256,
 };
 // re-exports for tests
 pub use crate::evm::precompile_test_utils;
@@ -698,4 +700,75 @@ pub async fn create_committee_from_state(epoch_state: EpochState) -> eyre::Resul
     }
     let committee = committee_builder.build();
     Ok(committee)
+}
+
+/// Build a test genesis whose `ConsensusRegistry` is freshly deployed from the current artifact
+/// (so the new ABI surface like `getValidatorsInfo` exists) and seeded with `num_validators`
+/// active validators forming the genesis committee.
+///
+/// Unlike [`test_genesis`], which embeds the committed testnet `genesis.yaml` verbatim and can
+/// therefore drift from the compiled contract, this deploys the registry at test runtime so the
+/// genesis state always matches the current bytecode. Use it for close-epoch tests that run
+/// system calls reading the registry (e.g. committee shuffling), which revert against the stale
+/// embedded registry.
+///
+/// NOTE: this is sync but must be called from within a tokio runtime (e.g. a `#[tokio::test]`),
+/// because deploying the registry spins up a temporary `RethEnv`.
+pub fn test_genesis_with_consensus_registry(num_validators: usize) -> Genesis {
+    // deterministic committee-eligible validator addresses (0x11.., 0x22.., ...)
+    let all_validators: Vec<Address> = (1..=num_validators)
+        .map(|i| Address::from_slice(&[(i as u8).wrapping_mul(0x11); 20]))
+        .collect();
+
+    // build active validator info with deterministic BLS keys + proofs of possession
+    let validators: Vec<NodeInfo> = all_validators
+        .iter()
+        .enumerate()
+        .map(|(i, addr)| {
+            let mut rng = StdRng::seed_from_u64(i as u64);
+            let bls = BlsKeypair::generate(&mut rng);
+            let bls_pubkey = bls.public();
+            let pop = generate_proof_of_possession_bls_for_test(&bls, addr)
+                .expect("pop generation failed");
+            NodeInfo {
+                name: format!("validator-{i}"),
+                bls_public_key: *bls_pubkey,
+                p2p_info: NodeP2pInfo::default(),
+                execution_address: *addr,
+                proof_of_possession: pop,
+            }
+        })
+        .collect();
+
+    // Mirror the canonical testnet `StakeConfig` (the CLI genesis defaults that built the embedded
+    // testnet genesis) so this drop-in registry matches what `test_genesis` provided before its
+    // bytecode went stale. NOTE: `epochIssuance` (25_806 TEL) is even, so a closed epoch's rewards
+    // split exactly between leaders (close-epoch reward assertions compare against `div_ceil(2)`).
+    let initial_stake_config = ConsensusRegistry::StakeConfig {
+        stakeAmount: U256::from(parse_ether("1_000_000").expect("parse stake amount")),
+        minWithdrawAmount: U256::from(parse_ether("1_000").expect("parse min withdraw amount")),
+        epochIssuance: U256::from(parse_ether("25_806").expect("parse epoch issuance")),
+        epochDuration: 60 * 60 * 8, // 8hrs (testnet default)
+    };
+
+    // deterministic, funded governance owner
+    let governance_multisig =
+        TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
+    let governance = governance_multisig.address();
+    let base_genesis = test_genesis().extend_accounts([(
+        governance,
+        GenesisAccount::default()
+            .with_balance(U256::from(parse_ether("50_000_000").expect("parse governance balance"))),
+    )]);
+
+    // overwrite the embedded registry account at `CONSENSUS_REGISTRY_ADDRESS` with a freshly
+    // deployed registry seeded with the active validators above
+    RethEnv::create_consensus_registry_genesis_accounts(
+        validators,
+        base_genesis,
+        initial_stake_config,
+        governance,
+        vec![(0u8, 30_000_000u64)],
+    )
+    .expect("create consensus registry genesis accounts")
 }

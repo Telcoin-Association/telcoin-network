@@ -19,8 +19,8 @@ use tn_reth::{
     system_calls::EpochState,
     test_utils::{
         calculate_withdrawals_root, create_committee_from_state,
-        seeded_genesis_from_random_batches, TransactionFactory, BEACON_ROOTS_ADDRESS,
-        EMPTY_REQUESTS_HASH, HISTORY_STORAGE_ADDRESS,
+        seeded_genesis_from_random_batches, test_genesis_with_consensus_registry,
+        TransactionFactory, BEACON_ROOTS_ADDRESS, EMPTY_REQUESTS_HASH, HISTORY_STORAGE_ADDRESS,
     },
     FixedBytes, RethChainSpec, RethEnv,
 };
@@ -220,7 +220,7 @@ async fn test_empty_output_skips_execution() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()> {
     let _guard = IT_TEST_GUARD.lock();
-    let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+    let chain: Arc<RethChainSpec> = Arc::new(test_genesis_with_consensus_registry(4).into());
     let tmp_dir = TempDir::new().expect("temp dir");
     // execution node components
     let gas_accumulator = GasAccumulator::new(1); // 1 worker
@@ -539,7 +539,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     let mut batches_2 = tn_reth::test_utils::batches(chain, 4); // create 4 batches
 
     // add eip1559 transactions to set max priority fee per gas so batch producer earns fees
-    let genesis = test_genesis();
+    let genesis = test_genesis_with_consensus_registry(4);
     let mut tx_factory = TransactionFactory::new_random();
     let encoded_tx_priority_fee_1 = tx_factory
         .create_explicit_eip1559(
@@ -1017,7 +1017,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     let mut batches_2 = tn_reth::test_utils::batches(chain, 4); // create 4 batches
 
     // add eip1559 transactions to set max priority fee per gas so batch producer earns fees
-    let genesis = test_genesis();
+    let genesis = test_genesis_with_consensus_registry(4);
     let mut tx_factory = TransactionFactory::new_random();
     let encoded_tx_priority_fee_1 = tx_factory
         .create_explicit_eip1559(

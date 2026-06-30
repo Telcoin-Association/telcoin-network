@@ -171,6 +171,16 @@ impl ExecutionNode {
         !self.internal.read().await.workers.is_empty()
     }
 
+    /// Returns true if the worker identified by `worker_id` has been initialized.
+    ///
+    /// A worker's components (RPC server + transaction pool) are created once on
+    /// the node's first epoch and are not torn down across epoch transitions, so
+    /// this reflects "this worker is up and accepting transactions" rather than
+    /// any per-epoch state. Backs the `/health/workers` readiness endpoint.
+    pub async fn is_worker_initialized(&self, worker_id: WorkerId) -> bool {
+        self.internal.read().await.workers.get(worker_id as usize).is_some()
+    }
+
     /// Batch maker
     pub async fn start_batch_builder(
         &self,
