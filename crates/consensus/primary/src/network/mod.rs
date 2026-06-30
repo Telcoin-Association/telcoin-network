@@ -88,6 +88,17 @@ const CONSENSUS_OUTPUT_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// the legacy digest path) trips this and the requester falls back to legacy.
 const SYNC_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Overall bound on reading a streamed missing-certificates response, on top of the
+/// per-frame timeout. Without it a Byzantine peer that `Ack`s and then drips a tiny
+/// valid `Data` frame just inside the per-frame timeout could keep the requester's
+/// read loop (and its open substream) alive far longer than any honest transfer;
+/// this caps the whole post-`Ack` read so such a peer is dropped and the fan-out
+/// moves on. Comfortably covers a realistic catch-up response (a few MiB) while
+/// keeping an abandoned per-peer fetch task's lifetime in the same ballpark as the
+/// legacy request-response path's network timeout; a peer too slow to finish in this
+/// window is treated as failed and another peer (or the legacy path) is tried.
+const MISSING_CERTS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Timeout for reading the opening request frame of an inbound sync stream, and the
 /// bound on every best-effort trailing write (shed `Deny`, malformed `Err`). A peer
 /// that opens a sync stream but never sends its request, or applies receive
@@ -105,6 +116,15 @@ const SYNC_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// [`request_epoch_pack`]: PrimaryNetworkHandle::request_epoch_pack
 const MAX_EPOCH_SYNC_PROBES: usize = 3;
+
+/// Bound on the opening `Req` frame of an inbound sync stream (and on the tiny
+/// best-effort control writes that follow). The `EpochPack` request is a few bytes,
+/// but a `MissingCertificates` request carries one skip-round bitmap per committee
+/// authority, so this is sized well above the per-pack-chunk bound to admit a large
+/// (but still bounded) request. An oversized request is rejected at read, after
+/// which the requester simply falls back to the legacy path, so this is a safety
+/// bound rather than a hard compatibility limit.
+const MAX_SYNC_REQUEST_FRAME_SIZE: usize = 4 * 1024 * 1024;
 
 /// What a [`PendingStreamRequest`] should stream once the peer opens the stream.
 #[derive(Debug, Clone, Copy)]
@@ -400,18 +420,100 @@ impl PrimaryNetworkHandle {
         }
     }
 
+    /// Fetch missing certificates from `peer` over the typed sync protocol.
+    ///
+    /// Item 7 (#739) cut the certificate fetch fully over to `/tn-primary-sync`: there is
+    /// no legacy request-response fallback. The exchange opens a stream, writes the
+    /// request in the opening frame, reads the `Ack`, and reassembles the streamed
+    /// certificate `Data` frames; any failure (negotiation, shed, transport, or protocol)
+    /// returns an error so the staggered fan-out tries the next peer. The exchange is
+    /// penalty-exempt, and cancelling this future (the fan-out's cancel-on-first-success)
+    /// drops the in-flight substream, resetting it. The returned certificates are
+    /// unverified; the caller validates them.
     pub async fn fetch_certificates(
         &self,
         peer: BlsPublicKey,
         request: MissingCertificatesRequest,
     ) -> NetworkResult<Vec<Certificate>> {
-        let request = PrimaryRequest::MissingCertificates { inner: request };
-        let res = self.handle.send_request(request, peer).await?;
-        let res = res.await??.result;
-        match res {
-            PrimaryResponse::RequestedCertificates(certs) => Ok(certs),
-            PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
-            _ => Err(NetworkError::RPCError("Got wrong response, not a certificate!".to_string())),
+        // open the sync stream, flattening the command-channel and stream-open results. A
+        // peer that does not advertise the protocol surfaces an error here; with no
+        // fallback it is simply a failed peer and the fan-out moves on.
+        let mut stream = self.handle.open_stream(peer, StreamKind::Sync).await.and_then(|s| s)?;
+
+        // write the request in the opening frame
+        let request_frame = SyncFrame::Req(PrimarySyncRequest::MissingCertificates {
+            exclusive_lower_bound: request.exclusive_lower_bound,
+            skip_rounds: request.skip_rounds.clone(),
+        });
+        let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
+        write_frame(
+            &mut stream,
+            &request_frame,
+            &mut encode_buffer,
+            &mut compressed_buffer,
+            MAX_SYNC_REQUEST_FRAME_SIZE,
+        )
+        .await
+        .and(stream.flush().await)
+        .map_err(|e| {
+            NetworkError::RPCRetryable(format!(
+                "failed to write missing certificates sync request frame: {e}"
+            ))
+        })?;
+
+        // read the responder's first frame, bounded by the ack timeout
+        let (mut decode_buffer, mut decompress_buffer) = (Vec::new(), Vec::new());
+        let first = tokio::time::timeout(
+            SYNC_ACK_TIMEOUT,
+            read_frame::<_, PrimarySyncRequest>(
+                &mut stream,
+                &mut decode_buffer,
+                &mut decompress_buffer,
+                sync_codec::MAX_SYNC_CERT_FRAME_SIZE,
+            ),
+        )
+        .await
+        .map_err(|_elapsed| {
+            NetworkError::RPCRetryable(
+                "timed out awaiting missing certificates sync ack".to_string(),
+            )
+        })?
+        .map_err(|e| {
+            NetworkError::RPCRetryable(format!(
+                "failed to read missing certificates sync ack frame: {e}"
+            ))
+        })?;
+
+        match first {
+            // accepted: reassemble the streamed certificate `Data` frames under an overall
+            // read timeout (on top of the per-frame timeout) so a peer that `Ack`s then
+            // drips frames cannot pin the read loop and its substream
+            SyncFrame::Ack => tokio::time::timeout(
+                MISSING_CERTS_RESPONSE_TIMEOUT,
+                sync_codec::read_sync_certificates(&mut stream),
+            )
+            .await
+            .map_err(|_elapsed| {
+                NetworkError::RPCRetryable(
+                    "timed out reading missing certificates over sync stream".to_string(),
+                )
+            })?
+            .map_err(|e| {
+                NetworkError::RPCError(format!(
+                    "failed to read missing certificates over sync stream: {e}"
+                ))
+            }),
+            // the responder is shedding load or declines the request: try another peer
+            SyncFrame::Deny(reason) => Err(NetworkError::RPCRetryable(format!(
+                "peer denied missing certificates sync request: {reason:?}"
+            ))),
+            SyncFrame::Err(err) => Err(NetworkError::RPCError(format!(
+                "peer aborted missing certificates sync exchange: {err:?}"
+            ))),
+            // a well-behaved responder never opens with these
+            SyncFrame::Req(_) | SyncFrame::Data(_) | SyncFrame::End => Err(
+                NetworkError::ProtocolError("unexpected opening sync frame from peer".to_string()),
+            ),
         }
     }
 
@@ -1297,31 +1399,28 @@ where
         });
     }
 
-    /// Attempt to retrieve certificates for a peer that's missing them.
+    /// Answer a legacy request-response `MissingCertificates` request.
+    ///
+    /// Item 7 (#739) cut the certificate fetch fully over to the `/tn-primary-sync`
+    /// protocol, so this request-response path is no longer served: peers fetch
+    /// certificates over sync. The request variant is retained for wire compatibility
+    /// (BCS variant indices stay until the coordinated `/0.0.2` bump, item 9); a legacy
+    /// requester is answered with a typed error rather than served.
     fn process_request_for_missing_certs(
         &self,
         peer: BlsPublicKey,
-        request: MissingCertificatesRequest,
+        _request: MissingCertificatesRequest,
         channel: ResponseChannel<PrimaryResponse>,
         cancel: oneshot::Receiver<()>,
     ) {
-        // clone for spawned tasks
-        let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
-        let task_name = format!("MissingCertsReq-{peer}");
+        let task_name = format!("MissingCertsDeprecated-{peer}");
+        let response = PrimaryResponse::Error(PrimaryRPCError(
+            "missing certificates are served over the sync protocol only".to_string(),
+        ));
         self.task_spawner.spawn_task(task_name, async move {
             tokio::select! {
-                result = request_handler.retrieve_missing_certs(request) => {
-                    // report penalty if any
-                    if let Err(ref e) = result {
-                        if let Some(penalty) = e.into() {
-                            network_handle.report_penalty(peer, penalty).await;
-                        }
-                    }
-
-                    let response = result.into_response();
-                    let _ = network_handle.handle.send_response(response, channel).await;
-                }
+                _ = network_handle.handle.send_response(response, channel) => (),
                 // cancel notification from network layer
                 _ = cancel => (),
             }
@@ -1624,7 +1723,9 @@ where
         let task_name = format!("sync-epoch-pack-{peer}");
         self.task_spawner.spawn_task(task_name, async move {
             let mut stream = stream;
-            let max_frame = sync_codec::MAX_SYNC_PACK_FRAME_SIZE;
+            // bounds the opening `Req` read and the tiny control writes below; the
+            // per-request-type data bounds live in each serve function.
+            let max_frame = MAX_SYNC_REQUEST_FRAME_SIZE;
             let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
 
             // shed load: deny without reading so the requester retries elsewhere
@@ -1675,22 +1776,21 @@ where
                         .process_sync_epoch_pack_stream(peer, stream, epoch, &consensus_chain)
                         .await?;
                 }
-                // `MissingCertificates` over sync is item 7; the primary registers
-                // the request type but does not serve it yet. Decline cleanly.
-                SyncFrame::Req(PrimarySyncRequest::MissingCertificates { .. }) => {
-                    debug!(target: "primary::network", %peer, "declining unimplemented sync request: missing certificates (item 7)");
-                    let _ = tokio::time::timeout(SYNC_REQUEST_READ_TIMEOUT, async {
-                        let _ = write_frame(
-                            &mut stream,
-                            &SyncFrame::<PrimarySyncRequest>::Deny(DenyReason::Unavailable),
-                            &mut encode_buffer,
-                            &mut compressed_buffer,
-                            max_frame,
+                // `MissingCertificates` over sync (item 7): serve the matching
+                // certificates as a streamed `Ack` + `Data`* + `End`, replacing the
+                // legacy request-response `RequestedCertificates` reply.
+                SyncFrame::Req(PrimarySyncRequest::MissingCertificates {
+                    exclusive_lower_bound,
+                    skip_rounds,
+                }) => {
+                    request_handler
+                        .process_sync_missing_certs_stream(
+                            peer,
+                            stream,
+                            exclusive_lower_bound,
+                            skip_rounds,
                         )
-                        .await;
-                        let _ = stream.close().await;
-                    })
-                    .await;
+                        .await?;
                 }
                 // a well-behaved requester always opens with `Req`; anything else is
                 // malformed. Signal it and drop (metrics-only, no penalty).
