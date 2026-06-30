@@ -20,7 +20,6 @@ use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator},
     Address, BatchSender, BatchValidation, BlockHeader, BlsPublicKey, ConsensusHeaderDigest,
     ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId,
-    MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::mpsc;
@@ -137,6 +136,7 @@ impl ExecutionNodeInner {
         worker_id: WorkerId,
         network_handle: WorkerNetworkHandle,
         engine_to_primary: EP,
+        base_fee: u64,
     ) -> eyre::Result<()>
     where
         EP: EngineToPrimary + Send + Sync + 'static,
@@ -146,7 +146,7 @@ impl ExecutionNodeInner {
         let network =
             WorkerNetwork::new(self.reth_env.chainspec(), network_handle, self.tn_config.version);
         let mut tx_pool_latest = transaction_pool.block_info();
-        tx_pool_latest.pending_basefee = MIN_PROTOCOL_BASE_FEE;
+        tx_pool_latest.pending_basefee = base_fee;
         let last_seen = self.reth_env.finalized_block_hash_number_for_startup()?;
         tx_pool_latest.last_seen_block_hash = last_seen.hash;
         tx_pool_latest.last_seen_block_number = last_seen.number;
@@ -173,6 +173,21 @@ impl ExecutionNodeInner {
         }
         self.workers.push(components);
         Ok(())
+    }
+
+    /// Update the pending base fee on a worker's transaction pool.
+    ///
+    /// Called every epoch so the pool charges the base fee the accumulator currently holds for
+    /// the worker. This covers the respawn path, where `initialize_worker_components` is skipped
+    /// but the base fee for the new epoch must still take effect. No-op if the worker's components
+    /// have not been initialized yet.
+    pub(super) fn set_worker_base_fee(&self, worker_id: WorkerId, base_fee: u64) {
+        if let Some(worker) = self.workers.get(worker_id as usize) {
+            let pool = worker.pool();
+            let mut block_info = pool.block_info();
+            block_info.pending_basefee = base_fee;
+            pool.set_block_info(block_info);
+        }
     }
 
     /// Respawn any tasks on the worker network when we get a new epoch task manager.
