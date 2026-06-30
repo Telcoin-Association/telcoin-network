@@ -85,7 +85,8 @@ const CONSENSUS_OUTPUT_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout for the responder's first sync frame (`Ack`/`Deny`) after the epoch-pack
 /// request frame is written. A peer that negotiated the sync protocol but does not
 /// answer (a pre-cutover node that registered the protocol but reads the stream on
-/// the legacy digest path) trips this and the requester falls back to legacy.
+/// the legacy digest path) trips this and is cached unsyncable this epoch, so the
+/// probe moves on to the next peer.
 const SYNC_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Timeout for reading the opening request frame of an inbound sync stream, and the
@@ -95,12 +96,12 @@ const SYNC_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const SYNC_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum number of network sync probe attempts per [`request_epoch_pack`] call
-/// before falling back to the legacy path.
+/// before the full-pack fetch gives up (returns `Err`) for this call.
 ///
 /// This caps probe *attempts* (stream opens), not peers examined: a peer cached
-/// legacy-only this epoch is skipped with only a cache lookup (no network I/O) and
+/// unsyncable this epoch is skipped with only a cache lookup (no network I/O) and
 /// does not count against the budget, so successive calls keep discovering newly
-/// upgraded peers without an all-legacy fleet ever spending more than this many
+/// upgraded peers without an all-unsupported fleet ever spending more than this many
 /// sync opens per call.
 ///
 /// [`request_epoch_pack`]: PrimaryNetworkHandle::request_epoch_pack
@@ -196,7 +197,8 @@ impl PendingStreamRequest {
 enum EpochPackAttempt {
     /// The peer served and the pack was imported into the consensus chain.
     Imported,
-    /// The peer did not answer the sync exchange; fall back to legacy.
+    /// The peer did not answer the sync exchange; cache it unsyncable this epoch
+    /// and skip it on later probes (it must upgrade to be syncable again).
     Unsupported,
     /// The peer answered but the exchange failed; try the next peer.
     Failed(NetworkError),
@@ -266,8 +268,9 @@ pub struct PrimaryNetworkHandle {
     ///
     /// Absent means not yet probed (try the sync protocol); `false` means the peer
     /// did not answer a sync open (a pre-cutover peer that fails negotiation, or one
-    /// that negotiated but never `Ack`ed), so go straight to legacy; `true` means the
-    /// peer served (or is serving) the sync protocol. Cleared each epoch via
+    /// that negotiated but never `Ack`ed), so it is skipped on later probes this epoch
+    /// (full-pack fetch has no legacy fallback); `true` means the peer served (or is
+    /// serving) the sync protocol. Cleared each epoch via
     /// [`Self::clear_sync_capability`] so a peer upgraded over the rotation boundary
     /// is re-probed.
     sync_capability: Arc<Mutex<HashMap<BlsPublicKey, bool>>>,
@@ -302,8 +305,8 @@ impl PrimaryNetworkHandle {
     /// Clear the per-peer epoch-pack sync-capability cache.
     ///
     /// Called at each epoch boundary: committees rotate and binaries are upgraded
-    /// there, so a peer that could only speak legacy last epoch is re-probed for
-    /// the sync protocol this epoch.
+    /// there, so a peer that did not answer the sync protocol last epoch is
+    /// re-probed for it this epoch.
     pub fn clear_sync_capability(&self) {
         self.sync_capability.lock().clear();
     }
@@ -653,12 +656,13 @@ impl PrimaryNetworkHandle {
         self.handle.connected_peer_count().await
     }
 
-    /// Attempt to get a complete epoch pack file from any peer via stream.
+    /// Attempt to get a complete epoch pack file from any peer over the typed
+    /// `/tn-primary-sync` protocol.
     ///
-    /// This method:
-    /// 1. Sends a `StreamEpoch` request to negotiate
-    /// 2. If accepted, opens a stream with the request digest for correlation
-    /// 3. Reads and validates batches from the stream in real-time
+    /// Full-pack fetch is typed-only (no legacy fallback): this returns `Err`, and
+    /// the caller retries, when no connected peer successfully serves a pack over
+    /// the sync protocol (no peers, all unsupported, or all failed to import). See
+    /// [`Self::request_epoch_pack_sync`] for the per-peer probe behavior.
     pub async fn request_epoch_pack(
         &self,
         epoch_record: &EpochRecord,
@@ -702,8 +706,10 @@ impl PrimaryNetworkHandle {
     }
 
     /// Shared implementation for full ([`Self::request_epoch_pack`]) and partial
-    /// ([`Self::request_partial_epoch_pack`]) epoch pack streaming. `last_consensus_number` selects
-    /// the request variant and correlation digest; everything else is identical.
+    /// ([`Self::request_partial_epoch_pack`]) epoch pack streaming. A full pack
+    /// (`last_consensus_number` is `None`) is fetched over the typed sync protocol
+    /// only; a partial prefix (`Some`) still negotiates over the legacy stream path,
+    /// which has no typed sync request variant yet.
     async fn request_epoch_pack_inner(
         &self,
         epoch_record: &EpochRecord,
@@ -714,13 +720,14 @@ impl PrimaryNetworkHandle {
     ) -> NetworkResult<()> {
         let epoch = epoch_record.epoch;
 
-        // Step 6 (#739): a full epoch pack prefers the typed sync protocol, folding
-        // the legacy ack-plus-digest handshake into a single stream open. On failure
-        // it falls back to the legacy path below (per peer, penalty-exempt). The
-        // partial-prefix transfer has no sync request variant yet, so it stays on
-        // legacy.
-        if last_consensus_number.is_none()
-            && self
+        // Full epoch pack is typed-only (#739, step 6): the legacy `StreamEpoch`
+        // fallback was removed so that a full-pack fetch hard-fails (and the caller
+        // retries) when no connected peer serves the `/tn-primary-sync` protocol,
+        // rather than silently syncing over the legacy stream path. This forces
+        // peers to upgrade. The partial-prefix transfer has no typed sync request
+        // variant yet, so it still negotiates over the legacy path below.
+        let Some(last_consensus_number) = last_consensus_number else {
+            return self
                 .request_epoch_pack_sync(
                     epoch,
                     epoch_record,
@@ -728,22 +735,16 @@ impl PrimaryNetworkHandle {
                     consensus_chain,
                     record_timeout,
                 )
-                .await
-                .is_ok()
-        {
-            return Ok(());
-        }
-
-        // Try up to three times (from three peers) to get consensus.
-        // This could be a lot more complicated but this KISS method should work fine.
-        // send request to negotiate stream
-        let (request, kind) = match last_consensus_number {
-            None => (PrimaryRequest::StreamEpoch { epoch }, StreamRequestKind::EpochPack(epoch)),
-            Some(last_consensus_number) => (
-                PrimaryRequest::StreamEpochPartial { epoch, last_consensus_number },
-                StreamRequestKind::EpochPackPartial { epoch, last_consensus_number },
-            ),
+                .await;
         };
+
+        // Partial prefix: negotiate the stream over the legacy path. Try up to three
+        // times (from three peers) to get consensus. This could be a lot more
+        // complicated but this KISS method should work fine.
+        let (request, kind) = (
+            PrimaryRequest::StreamEpochPartial { epoch, last_consensus_number },
+            StreamRequestKind::EpochPackPartial { epoch, last_consensus_number },
+        );
         let request_digest = stream_request_digest(&kind);
 
         for _ in 0..3 {
@@ -786,7 +787,8 @@ impl PrimaryNetworkHandle {
                 );
 
                 // open raw stream then write request_digest for correlation. The
-                // primary still uses the legacy path; its sync cutover is item 6.
+                // partial-prefix transfer still uses the legacy path (no typed sync
+                // request variant yet).
                 let mut stream = self.handle.open_stream(peer, StreamKind::Legacy).await??;
                 stream.write_all(request_digest.as_slice()).await.map_err(|e| {
                     NetworkError::RPCError(format!("failed to write request digest: {e}"))
@@ -834,11 +836,11 @@ impl PrimaryNetworkHandle {
     /// Attempt to fetch and import a full epoch pack over the typed sync protocol.
     ///
     /// Probes up to [`MAX_EPOCH_SYNC_PROBES`] connected peers that are not cached
-    /// legacy-only this epoch, opening a `/tn-primary-sync` stream whose opening
+    /// unsyncable this epoch, opening a `/tn-primary-sync` stream whose opening
     /// frame carries the request. Returns `Ok(())` as soon as one peer serves a pack
-    /// that imports; otherwise `Err` so the caller falls back to the legacy path. A
-    /// peer that does not answer is cached legacy-only (skipping its probe next
-    /// time); the probe is penalty-exempt either way.
+    /// that imports; otherwise `Err` (full-pack fetch has no legacy fallback, so the
+    /// caller retries). A peer that does not answer is cached unsyncable (skipping
+    /// its probe next time); the probe is penalty-exempt either way.
     async fn request_epoch_pack_sync(
         &self,
         epoch: Epoch,
@@ -850,14 +852,14 @@ impl PrimaryNetworkHandle {
         let peers = self.handle.connected_peers().await?;
 
         // Probe candidate peers one at a time (the async analog of a short-circuiting
-        // fold): `filter` drops peers cached legacy-only this epoch for free, `take`
+        // fold): `filter` drops peers cached unsyncable this epoch for free, `take`
         // bounds the network probe attempts, `then` runs each exchange and records its
         // verdict in the capability cache, and `any` stops at the first peer whose pack
         // imports (so no peer past the first success is probed).
         let imported = futures::stream::iter(peers)
             .filter(move |peer| {
-                let known_legacy = self.sync_capability.lock().get(peer) == Some(&false);
-                futures::future::ready(!known_legacy)
+                let known_unsyncable = self.sync_capability.lock().get(peer) == Some(&false);
+                futures::future::ready(!known_unsyncable)
             })
             .take(MAX_EPOCH_SYNC_PROBES)
             .then(move |peer| async move {
@@ -887,7 +889,7 @@ impl PrimaryNetworkHandle {
                         debug!(
                             target: "primary::network",
                             %peer,
-                            "peer did not answer epoch pack sync; will fall back to legacy"
+                            "peer did not answer epoch pack sync; caching unsyncable this epoch"
                         );
                         false
                     }
@@ -944,10 +946,11 @@ impl PrimaryNetworkHandle {
     /// [`ConsensusChain::stream_import`].
     ///
     /// `Err(EpochPackAttempt::Unsupported)` means the peer did not answer the
-    /// protocol (negotiation failed, or it negotiated but never `Ack`ed), so the
-    /// caller falls back to legacy. `Err(EpochPackAttempt::Failed(_))` means a
-    /// transient or exchange-level error once the peer has proved sync-capable, so
-    /// the caller keeps it sync-capable and tries the next peer. A transport I/O
+    /// protocol (negotiation failed, or it negotiated but never `Ack`ed), so it is
+    /// cached unsyncable and skipped on later probes this epoch.
+    /// `Err(EpochPackAttempt::Failed(_))` means a transient or exchange-level error
+    /// once the peer has proved sync-capable, so the caller keeps it sync-capable and
+    /// tries the next peer. A transport I/O
     /// error during the open (`UpgradeIo`) is transient rather than a protocol
     /// mismatch, so it maps to `Failed` instead of poisoning the capability cache.
     async fn try_sync_epoch_pack_exchange(
@@ -962,8 +965,9 @@ impl PrimaryNetworkHandle {
         // open the sync stream, flattening the command-channel and stream-open
         // results. Only a genuine negotiation failure (`UpgradeFailed`) is a
         // pre-cutover peer that does not advertise the protocol -> Unsupported
-        // (penalty-exempt, cached legacy-only). A transient upgrade I/O error or any
-        // other open error is not proof the peer lacks sync -> try next peer.
+        // (penalty-exempt, cached unsyncable this epoch). A transient upgrade I/O
+        // error or any other open error is not proof the peer lacks sync -> try next
+        // peer.
         let mut stream =
             self.handle.open_stream(peer, StreamKind::Sync).await.and_then(|s| s).map_err(|e| {
                 match () {
@@ -989,10 +993,11 @@ impl PrimaryNetworkHandle {
             })?;
 
         // read the responder's first frame. A timeout (outer `Err`) means no `Ack`
-        // -> a peer that negotiated sync but does not serve it, so fall back to
-        // legacy. A read I/O error (inner `Err`) after negotiation is transient ->
-        // try the next peer, unless it is a clean close (a pre-cutover peer that shut
-        // the misread stream), which is also a fall-back-to-legacy signal.
+        // -> a peer that negotiated sync but does not serve it, so cache it
+        // unsyncable and try the next peer. A read I/O error (inner `Err`) after
+        // negotiation is transient -> try the next peer, unless it is a clean close
+        // (a pre-cutover peer that shut the misread stream), which is also an
+        // Unsupported signal.
         let (mut decode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
         let first = tokio::time::timeout(
             SYNC_ACK_TIMEOUT,
