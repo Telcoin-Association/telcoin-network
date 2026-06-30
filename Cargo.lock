@@ -3401,6 +3401,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "exex-indexer"
+version = "0.1.0"
+dependencies = [
+ "eyre",
+ "futures",
+ "tn-exex",
+ "tn-types",
+ "tracing",
+]
+
+[[package]]
+name = "exex-lifecycle"
+version = "0.1.0"
+dependencies = [
+ "eyre",
+ "tn-exex",
+ "tn-types",
+ "tracing",
+]
+
+[[package]]
 name = "eyre"
 version = "0.6.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11639,6 +11660,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tn-exex"
+version = "0.1.0"
+dependencies = [
+ "eyre",
+ "futures",
+ "reth-execution-types",
+ "reth-provider",
+ "tn-reth",
+ "tn-storage",
+ "tn-types",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+]
+
+[[package]]
 name = "tn-metrics"
 version = "0.1.0"
 dependencies = [
@@ -11698,12 +11735,15 @@ name = "tn-node"
 version = "0.1.0"
 dependencies = [
  "eyre",
+ "futures",
  "jsonrpsee",
  "metrics",
  "metrics-util",
  "rand 0.9.2",
  "reth-metrics",
  "roaring 0.10.12",
+ "serde",
+ "serde_json",
  "state-sync",
  "tempfile",
  "thiserror 1.0.69",
@@ -11712,6 +11752,7 @@ dependencies = [
  "tn-config",
  "tn-engine",
  "tn-executor",
+ "tn-exex",
  "tn-metrics",
  "tn-network-libp2p",
  "tn-network-types",

@@ -924,6 +924,46 @@ async fn test_send_partial_epoch_over_stream() {
     assert_eq!(&sent_more[..sent.len()], &sent[..], "smaller prefix must prefix the larger one");
 }
 
+/// A full epoch pack the responder does not hold is shed with
+/// `Deny(Unavailable)`, so a sync requester retries another peer immediately
+/// instead of waiting out its ack timeout. (The `Ack`+`Data`+`End` happy path is
+/// unit-tested in `sync_codec` and exercised end-to-end by the ignored
+/// observer-pack-import e2e test.)
+#[tokio::test]
+async fn test_sync_epoch_pack_unavailable_denies() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let peer = BlsPublicKey::default();
+
+    // epoch 0 has no finalized pack, so the responder cannot serve a full epoch pack
+    let mut out: Vec<u8> = Vec::new();
+    crate::network::sync_codec::send_sync_epoch_pack_over_stream(
+        &mut out,
+        handler.consensus_chain(),
+        0,
+        Duration::from_secs(5),
+        peer,
+    )
+    .await
+    .expect("serving an unavailable pack sheds cleanly without erroring");
+
+    // the first (and only) frame must be Deny(Unavailable)
+    let (mut dec, mut comp) = (Vec::new(), Vec::new());
+    let frame = tn_network_libp2p::read_frame::<_, tn_network_libp2p::PrimarySyncRequest>(
+        &mut futures::io::Cursor::new(out),
+        &mut dec,
+        &mut comp,
+        crate::network::sync_codec::MAX_SYNC_PACK_FRAME_SIZE,
+    )
+    .await
+    .expect("read deny frame");
+    assert_matches!(
+        frame,
+        tn_network_libp2p::SyncFrame::Deny(tn_network_libp2p::DenyReason::Unavailable)
+    );
+}
+
 /// A peer that re-requests the same epoch while an entry is already pending must not be
 /// able to reset the cleanup timer. If the replacement path rearmed `created_at`, a peer
 /// could re-request every 20s and hold a slot forever. This test exercises the

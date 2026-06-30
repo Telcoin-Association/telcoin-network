@@ -4,8 +4,9 @@ use assert_matches::assert_matches;
 use std::{collections::BTreeSet, sync::Arc};
 use tn_batch_validator::NoopBatchValidator;
 use tn_network_libp2p::{
+    error::NetworkError,
     types::{NetworkCommand, NetworkHandle, NetworkResponseMessage},
-    GossipMessage, Penalty, TopicHash,
+    GossipMessage, Penalty, StreamError, StreamKind, TopicHash,
 };
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
@@ -55,6 +56,26 @@ fn create_test_types_with_chain_id(chain_id: u64) -> TestTypes {
         WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, chain_id);
     let handler = RequestHandler::new(worker_id, batch_validator, config, network_handle);
     TestTypes { committee, handler, task_manager, network_commands_rx }
+}
+
+/// Deny a sync-protocol `OpenStream` command, simulating a legacy-only peer so
+/// the requester falls back to the legacy `RequestBatchesStream` path.
+///
+/// Since item 5 makes the worker requester open a `/tn-worker-{id}-sync` stream
+/// first, every legacy-flow test must answer that probe. Returning
+/// [`StreamError::UpgradeFailed`] is exactly what a pre-item-4 peer's failed
+/// negotiation surfaces, so the requester caches the peer as legacy-only and the
+/// rest of the test drives the unchanged legacy handshake. A non-sync command is
+/// returned untouched for the test's own loop to handle.
+fn deny_sync_open(
+    command: NetworkCommand<WorkerRequest, WorkerResponse>,
+) -> Option<NetworkCommand<WorkerRequest, WorkerResponse>> {
+    if let NetworkCommand::OpenStream { kind: StreamKind::Sync, reply, .. } = command {
+        let _ = reply.send(Err(NetworkError::Stream(StreamError::UpgradeFailed)));
+        None
+    } else {
+        Some(command)
+    }
 }
 
 // ============================================================================
@@ -171,6 +192,7 @@ async fn test_batch_gossip_triggers_stream_request() {
     // recv commands
     let expected_peer = committee.last_authority().primary_public_key();
     while let Some(command) = network_commands_rx.recv().await {
+        let Some(command) = deny_sync_open(command) else { continue };
         match command {
             NetworkCommand::ConnectedPeers { reply } => {
                 // request_batches calls this first
@@ -224,6 +246,7 @@ async fn test_batch_gossip_stream_accepted_opens_stream() {
     let mut stream_request_acked = false;
 
     while let Some(command) = network_commands_rx.recv().await {
+        let Some(command) = deny_sync_open(command) else { continue };
         match command {
             NetworkCommand::ConnectedPeers { reply } => {
                 reply.send(vec![expected_peer]).expect("peer sent");
@@ -245,8 +268,9 @@ async fn test_batch_gossip_stream_accepted_opens_stream() {
                     _ => panic!("expected RequestBatchesStream, got {:?}", request),
                 }
             }
-            NetworkCommand::OpenStream { peer, reply } => {
-                // Verify OpenStream is called after ack
+            NetworkCommand::OpenStream { peer, reply, .. } => {
+                // the sync probe was denied above, so this is the legacy open
+                // after the ack
                 assert!(stream_request_acked, "OpenStream should come after ack");
                 assert_eq!(peer, expected_peer);
                 // Don't complete the stream - just verify command was sent
@@ -326,20 +350,23 @@ async fn test_request_batches_peer_rejects_tries_next() {
 
     tokio::spawn(async move {
         while let Some(cmd) = rx.recv().await {
+            let Some(cmd) = deny_sync_open(cmd) else { continue };
             match cmd {
                 NetworkCommand::ConnectedPeers { reply } => {
                     reply.send(vec![peer1, peer2]).expect("send peers");
                 }
-                NetworkCommand::SendRequest { request, reply, .. } => {
-                    if let WorkerRequest::RequestBatchesStream { .. } = request {
-                        // both peers reject
-                        reply
-                            .send(Ok(NetworkResponseMessage {
-                                peer: peer1,
-                                result: WorkerResponse::RequestBatchesStream { ack: false },
-                            }))
-                            .expect("send reject");
-                    }
+                NetworkCommand::SendRequest {
+                    request: WorkerRequest::RequestBatchesStream { .. },
+                    reply,
+                    ..
+                } => {
+                    // both peers reject
+                    reply
+                        .send(Ok(NetworkResponseMessage {
+                            peer: peer1,
+                            result: WorkerResponse::RequestBatchesStream { ack: false },
+                        }))
+                        .expect("send reject");
                 }
                 _ => {}
             }
@@ -452,26 +479,29 @@ async fn test_request_batches_truncates_oversized_digests() {
 
     tokio::spawn(async move {
         while let Some(cmd) = rx.recv().await {
+            let Some(cmd) = deny_sync_open(cmd) else { continue };
             match cmd {
                 NetworkCommand::ConnectedPeers { reply } => {
                     reply.send(vec![peer1]).expect("send peers");
                 }
-                NetworkCommand::SendRequest { request, reply, .. } => {
-                    if let WorkerRequest::RequestBatchesStream { batch_digests, .. } = request {
-                        // assert truncation happened
-                        assert_eq!(
-                            batch_digests.len(),
-                            MAX_BATCH_DIGESTS_PER_REQUEST,
-                            "digests should be truncated to MAX_BATCH_DIGESTS_PER_REQUEST (500)"
-                        );
-                        // reject to end the test
-                        reply
-                            .send(Ok(NetworkResponseMessage {
-                                peer: peer1,
-                                result: WorkerResponse::RequestBatchesStream { ack: false },
-                            }))
-                            .expect("send reject");
-                    }
+                NetworkCommand::SendRequest {
+                    request: WorkerRequest::RequestBatchesStream { batch_digests, .. },
+                    reply,
+                    ..
+                } => {
+                    // assert truncation happened
+                    assert_eq!(
+                        batch_digests.len(),
+                        MAX_BATCH_DIGESTS_PER_REQUEST,
+                        "digests should be truncated to MAX_BATCH_DIGESTS_PER_REQUEST (500)"
+                    );
+                    // reject to end the test
+                    reply
+                        .send(Ok(NetworkResponseMessage {
+                            peer: peer1,
+                            result: WorkerResponse::RequestBatchesStream { ack: false },
+                        }))
+                        .expect("send reject");
                 }
                 _ => {}
             }
@@ -696,31 +726,34 @@ async fn test_retry_succeeds_after_initial_rejection() {
         let mut stream_accepted = false;
 
         while let Some(cmd) = rx.recv().await {
+            let Some(cmd) = deny_sync_open(cmd) else { continue };
             match cmd {
                 NetworkCommand::ConnectedPeers { reply } => {
                     connected_peers_count += 1;
                     reply.send(vec![peer1]).expect("send peers");
                 }
-                NetworkCommand::SendRequest { request, reply, .. } => {
-                    if let WorkerRequest::RequestBatchesStream { .. } = request {
-                        if connected_peers_count <= 1 {
-                            // first attempt: reject
-                            reply
-                                .send(Ok(NetworkResponseMessage {
-                                    peer: peer1,
-                                    result: WorkerResponse::RequestBatchesStream { ack: false },
-                                }))
-                                .expect("send reject");
-                        } else {
-                            // second attempt: accept
-                            reply
-                                .send(Ok(NetworkResponseMessage {
-                                    peer: peer1,
-                                    result: WorkerResponse::RequestBatchesStream { ack: true },
-                                }))
-                                .expect("send accept");
-                            stream_accepted = true;
-                        }
+                NetworkCommand::SendRequest {
+                    request: WorkerRequest::RequestBatchesStream { .. },
+                    reply,
+                    ..
+                } => {
+                    if connected_peers_count <= 1 {
+                        // first attempt: reject
+                        reply
+                            .send(Ok(NetworkResponseMessage {
+                                peer: peer1,
+                                result: WorkerResponse::RequestBatchesStream { ack: false },
+                            }))
+                            .expect("send reject");
+                    } else {
+                        // second attempt: accept
+                        reply
+                            .send(Ok(NetworkResponseMessage {
+                                peer: peer1,
+                                result: WorkerResponse::RequestBatchesStream { ack: true },
+                            }))
+                            .expect("send accept");
+                        stream_accepted = true;
                     }
                 }
                 NetworkCommand::OpenStream { reply, .. } => {
@@ -772,27 +805,30 @@ async fn test_request_batches_peer_fallback_preserves_digests() {
     tokio::spawn(async move {
         let mut request_count = 0u32;
         while let Some(cmd) = rx.recv().await {
+            let Some(cmd) = deny_sync_open(cmd) else { continue };
             match cmd {
                 NetworkCommand::ConnectedPeers { reply } => {
                     reply.send(vec![peer1, peer2]).expect("send peers");
                 }
-                NetworkCommand::SendRequest { request, reply, .. } => {
-                    if let WorkerRequest::RequestBatchesStream { batch_digests, .. } = request {
-                        request_count += 1;
-                        // both peer1 and peer2 should receive exactly 3 digests
-                        assert_eq!(
-                            batch_digests.len(),
-                            expected_count,
-                            "peer {request_count} should receive all {expected_count} digests"
-                        );
-                        // reject to trigger fallback to next peer
-                        reply
-                            .send(Ok(NetworkResponseMessage {
-                                peer: peer2,
-                                result: WorkerResponse::RequestBatchesStream { ack: false },
-                            }))
-                            .unwrap();
-                    }
+                NetworkCommand::SendRequest {
+                    request: WorkerRequest::RequestBatchesStream { batch_digests, .. },
+                    reply,
+                    ..
+                } => {
+                    request_count += 1;
+                    // both peer1 and peer2 should receive exactly 3 digests
+                    assert_eq!(
+                        batch_digests.len(),
+                        expected_count,
+                        "peer {request_count} should receive all {expected_count} digests"
+                    );
+                    // reject to trigger fallback to next peer
+                    reply
+                        .send(Ok(NetworkResponseMessage {
+                            peer: peer2,
+                            result: WorkerResponse::RequestBatchesStream { ack: false },
+                        }))
+                        .unwrap();
                 }
                 _ => {}
             }

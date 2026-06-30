@@ -943,9 +943,9 @@ mod test {
         // a stream node advertises the bulk-transfer protocol first, then the
         // per-role sync protocol; both carry the chain id, and the order is the
         // negotiation-preference contract (existing opens keep using the bulk one)
-        let advertised = crate::types::stream_protocols(NetworkType::Worker(3), 2017)?;
-        let names: Vec<&str> = advertised.iter().map(|p| p.as_ref()).collect();
-        assert_eq!(names, vec!["/tn-stream-2017/0.0.1", "/tn-worker-3-sync-2017/0.0.1"]);
+        let (bulk_transfer, sync) = crate::types::stream_protocols(NetworkType::Worker(3), 2017)?;
+        assert_eq!(bulk_transfer.as_ref(), "/tn-stream-2017/0.0.1");
+        assert_eq!(sync.as_ref(), "/tn-worker-3-sync-2017/0.0.1");
         Ok(())
     }
 

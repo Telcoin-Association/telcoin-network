@@ -59,6 +59,7 @@ telcoin-network keytool generate observer \
 | `--address`, `--execution-address` | required                   | EVM address for fee recipient. Pass `0` for the zero address. Env: `EXECUTION_ADDRESS`                                |
 | `--workers`                        | `1`                        | Number of workers for the primary (range: 1-4, must be 1 currently)                                                   |
 | `--force`, `--overwrite`           | `false`                    | Overwrite existing keys. Existing keys are lost permanently                                                           |
+| `--name`                           | auto-derived               | Human-readable node name written to `node-info.yaml` (logging/RPC only). Defaults to `node-<bs58 of BLS key>`         |
 | `--external-primary-addr`          | localhost with random port | External multiaddr for the primary P2P network. Format: `/ip4/HOST/udp/PORT/quic-v1`. Env: `TN_EXTERNAL_PRIMARY_ADDR` |
 | `--external-worker-addrs`          | localhost with random port | Comma-separated multiaddrs for worker P2P networks. Env: `TN_EXTERNAL_WORKER_ADDRS`                                   |
 
@@ -115,6 +116,27 @@ p2p_info:
     network_key: "4XTTMD3rST8E7..."
 execution_address: "0xefaacf04b92298a88200aa50aa6bb7bfce587b17"
 proof_of_possession: "kFa9r..."
+```
+
+### Rotating the execution address
+
+To stake or earn rewards under a different execution address, the proof of possession has to be re-signed. The PoP commits to the execution address, so the original signature fails on-chain `stake()` verification once the address changes (the symptom is a "proof of possession is incorrect" revert).
+
+`keytool generate pop` re-signs the proof of possession for a new address using the node's *existing* keys. It never generates or overwrites keys — the BLS key, network identity keys, p2p peer IDs, and node name stay byte-for-byte identical. Only `execution_address` and `proof_of_possession` in `node-info.yaml` change.
+
+```bash
+telcoin-network keytool generate pop \
+    --datadir /var/lib/telcoin \
+    --address 0xNEW_EXECUTION_ADDRESS
+```
+
+The command requires existing keys and a `node-info.yaml` under `--datadir`; it errors if either is missing (run `keytool generate validator|observer` first). When the new address differs from the current one it logs a warning, re-signs, and prints the new proof of possession. The `proof-of-possession` alias and the `EXECUTION_ADDRESS` env var both work, mirroring `generate validator|observer`.
+
+After rotating, re-export the staking arguments for the new address (see [Staking registration](#staking-registration)):
+
+```bash
+telcoin-network keytool export-staking-args \
+    --node-info /var/lib/telcoin/node-info.yaml
 ```
 
 ## Genesis ceremony
