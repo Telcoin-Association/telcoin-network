@@ -457,54 +457,71 @@ pub(crate) async fn read_sync_certificates<S>(stream: &mut S) -> std::io::Result
 where
     S: FuturesAsyncRead + Unpin + Send,
 {
-    let mut certificates: Vec<Certificate> = Vec::new();
-    let mut total_bytes = 0usize;
     let (mut decode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
 
-    loop {
-        let frame = tokio::time::timeout(
-            MISSING_CERTS_FRAME_TIMEOUT,
-            read_frame::<_, PrimarySyncRequest>(
-                stream,
-                &mut decode_buffer,
-                &mut compressed_buffer,
-                MAX_SYNC_CERT_FRAME_SIZE,
-            ),
-        )
-        .await
-        .map_err(|_elapsed| {
-            std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "timeout reading missing certificates sync frame",
+    // Unfold the `Data`/`End` stream into the payload of each `Data` frame: the
+    // generator reads one frame per step (each bounded by `MISSING_CERTS_FRAME_TIMEOUT`),
+    // yields the `Data` bytes, ends the stream on `End`, and surfaces an aborted (`Err`)
+    // or out-of-place frame as an error that short-circuits the fold below. The stream
+    // threads the `&mut` stream and reusable decode buffers through its state so each
+    // step reuses them, mirroring the loop's single buffer pair.
+    let data_frames = futures::stream::try_unfold(
+        (stream, &mut decode_buffer, &mut compressed_buffer),
+        |(stream, decode_buffer, compressed_buffer)| async move {
+            let frame = tokio::time::timeout(
+                MISSING_CERTS_FRAME_TIMEOUT,
+                read_frame::<_, PrimarySyncRequest>(
+                    stream,
+                    decode_buffer,
+                    compressed_buffer,
+                    MAX_SYNC_CERT_FRAME_SIZE,
+                ),
             )
-        })??;
+            .await
+            .map_err(|_elapsed| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timeout reading missing certificates sync frame",
+                )
+            })??;
 
-        match frame {
-            SyncFrame::Data(bytes) => {
-                total_bytes += bytes.len();
-                if total_bytes > MAX_SYNC_MISSING_CERTS_ACCEPT_BYTES {
-                    break Err(std::io::Error::other(
-                        "missing certificates sync response exceeded size cap",
-                    ));
+            match frame {
+                SyncFrame::Data(bytes) => {
+                    Ok(Some((bytes, (stream, decode_buffer, compressed_buffer))))
                 }
-                let batch: Vec<Certificate> = try_decode(&bytes).map_err(std::io::Error::other)?;
-                certificates.extend(batch);
-            }
-            SyncFrame::End => break Ok(certificates),
-            SyncFrame::Err(err) => {
-                break Err(std::io::Error::other(format!(
+                SyncFrame::End => Ok(None),
+                SyncFrame::Err(err) => Err(std::io::Error::other(format!(
                     "peer aborted missing certificates sync stream: {err:?}"
-                )))
+                ))),
+                // a well-behaved responder never sends these once streaming
+                SyncFrame::Ack | SyncFrame::Deny(_) | SyncFrame::Req(_) => {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "unexpected sync frame during missing certificates stream",
+                    ))
+                }
             }
-            // a well-behaved responder never sends these once streaming
-            SyncFrame::Ack | SyncFrame::Deny(_) | SyncFrame::Req(_) => {
-                break Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "unexpected sync frame during missing certificates stream",
-                ))
-            }
-        }
-    }
+        },
+    );
+
+    // Fold the `Data` payloads into the certificate vector: each step decodes one
+    // untrusted frame and extends the gathered certificates. The running byte total
+    // bounds the cumulative encoded size by `MAX_SYNC_MISSING_CERTS_ACCEPT_BYTES`
+    // (counting the frame that crosses it, as the loop's `total_bytes` check did) and
+    // short-circuits with an error so the caller drops the exchange and tries another
+    // peer.
+    data_frames
+        .try_fold((Vec::new(), 0usize), |(mut certificates, total_bytes), bytes| async move {
+            let total_bytes = total_bytes + bytes.len();
+            (total_bytes <= MAX_SYNC_MISSING_CERTS_ACCEPT_BYTES).then_some(()).ok_or_else(
+                || std::io::Error::other("missing certificates sync response exceeded size cap"),
+            )?;
+            let batch: Vec<Certificate> = try_decode(&bytes).map_err(std::io::Error::other)?;
+            certificates.extend(batch);
+            Ok((certificates, total_bytes))
+        })
+        .await
+        .map(|(certificates, _total_bytes)| certificates)
 }
 
 #[cfg(test)]
