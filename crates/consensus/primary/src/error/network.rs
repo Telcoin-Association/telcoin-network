@@ -175,6 +175,7 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         HeaderError::PendingCertificateOneshot
         | HeaderError::TNSend(_)
         | HeaderError::InvalidEpoch { .. }
+        | HeaderError::NotCommitteeMember
         | HeaderError::ClosedWatchChannel => None,
     }
 }
