@@ -147,10 +147,7 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
 fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
     match error {
         // mild
-        HeaderError::SyncBatches(_)
-        | HeaderError::TooNew { .. }
-        | HeaderError::Storage(_)
-        | HeaderError::UnknownExecutionResult(_) => Some(Penalty::Mild),
+        HeaderError::SyncBatches(_) | HeaderError::TooNew { .. } => Some(Penalty::Mild),
         // medium
         HeaderError::InvalidParents
         | HeaderError::WrongNumberOfParents(_, _)
@@ -171,8 +168,16 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         | HeaderError::InvalidParentTimestamp { .. }
         | HeaderError::UnkownWorkerId
         | HeaderError::UnknownAuthority(_) => Some(Penalty::Fatal),
-        // ignore
+        // ignore (local/transient, not the peer's fault)
+        //
+        // Storage is our own DB error, and UnknownExecutionResult means a peer is merely
+        // ahead of our execution while we catch up (the vote handler notes "this doesn't
+        // hurt"). Penalizing either would punish an honest peer for a local condition, and
+        // contradicts the sibling PrimaryNetworkError::Storage and *::Timeout arms that
+        // already map to None.
         HeaderError::PendingCertificateOneshot
+        | HeaderError::Storage(_)
+        | HeaderError::UnknownExecutionResult(_)
         | HeaderError::TNSend(_)
         | HeaderError::InvalidEpoch { .. }
         | HeaderError::ClosedWatchChannel => None,
