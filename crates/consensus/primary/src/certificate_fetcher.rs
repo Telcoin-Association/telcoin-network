@@ -17,6 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tn_config::ConsensusConfig;
+use tn_network_libp2p::types::NetworkResult;
 use tn_storage::CertificateStore;
 use tn_types::{
     validate_fetched_certificate, AuthorityIdentifier, BlsPublicKey, Certificate, Committee,
@@ -32,6 +33,33 @@ use tracing::{debug, error, info, instrument, warn};
 #[path = "tests/certificate_fetcher_tests.rs"]
 mod certificate_fetcher_tests;
 
+/// Fetches the certificates a peer is missing.
+///
+/// Abstracts the per-peer network exchange (item 7: a `/tn-primary-sync` stream) so the
+/// fetcher's orchestration — the staggered fan-out, retries, and cancel-on-first-success
+/// — can be exercised in unit tests without a live libp2p stream. Production uses
+/// [`PrimaryNetworkHandle`]; tests inject a mock.
+pub(crate) trait MissingCertFetcher: Clone + Send + Sync + 'static {
+    /// Fetch the certificates `request` asks for from `peer`. The returned certificates
+    /// are unverified; the caller validates them.
+    fn fetch_missing_certificates(
+        &self,
+        peer: BlsPublicKey,
+        request: MissingCertificatesRequest,
+    ) -> impl Future<Output = NetworkResult<Vec<Certificate>>> + Send;
+}
+
+impl MissingCertFetcher for PrimaryNetworkHandle {
+    async fn fetch_missing_certificates(
+        &self,
+        peer: BlsPublicKey,
+        request: MissingCertificatesRequest,
+    ) -> NetworkResult<Vec<Certificate>> {
+        // the inherent sync-only fetch (distinct name, so no trait/inherent collision)
+        self.fetch_certificates(peer, request).await
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum CertificateFetcherCommand {
     /// Fetch the certificate and its ancestors.
@@ -42,15 +70,17 @@ pub enum CertificateFetcherCommand {
 
 /// Fetches missing certificates from peers. Tries peers in random order until one returns
 /// a non-empty response or all peers have been tried.
-pub(crate) struct CertificateFetcher<DB> {
+pub(crate) struct CertificateFetcher<DB, F = PrimaryNetworkHandle> {
     /// Identity of the current authority.
     authority_id: Option<AuthorityIdentifier>,
     /// The committee information.
     committee: Committee,
     /// Persistent storage for certificates. Read-only usage.
     certificate_store: DB,
-    /// Network client to fetch certificates from other primaries.
-    network: PrimaryNetworkHandle,
+    /// Client used to fetch certificates from other primaries (item 7: over the sync
+    /// protocol). Abstracted behind [`MissingCertFetcher`] so the fetcher can be tested
+    /// without a live stream.
+    network: F,
     /// Accepts Certificates into local storage.
     state_sync: StateSynchronizer<DB>,
     /// Used to get Receiver for signal of round changes.
@@ -63,19 +93,17 @@ pub(crate) struct CertificateFetcher<DB> {
     targets: BTreeMap<AuthorityIdentifier, Round>,
     /// Handle to the current fetch task (at most one runs at a time).
     fetch_task: FetchTask,
-    /// The max allowable RPC message size shared with peers (in bytes).
-    max_rpc_message_size: usize,
     /// Delay duration before issuing another parallel fetch request for missing certs.
     parallel_fetch_request_delay_interval: Duration,
     /// Configuration.
     config: ConsensusConfig<DB>,
 }
 
-impl<DB: Database> CertificateFetcher<DB> {
+impl<DB: Database, F: MissingCertFetcher> CertificateFetcher<DB, F> {
     /// Spawn the long-running certificate fetcher.
     pub(crate) fn spawn(
         config: ConsensusConfig<DB>,
-        network: PrimaryNetworkHandle,
+        network: F,
         consensus_bus: ConsensusBus,
         state_sync: StateSynchronizer<DB>,
         task_manager: &TaskManager,
@@ -84,7 +112,6 @@ impl<DB: Database> CertificateFetcher<DB> {
         let committee = config.committee().clone();
         let certificate_store = config.node_storage().clone();
         let rx_shutdown = config.shutdown().subscribe();
-        let max_rpc_message_size = config.network_config().libp2p_config().max_rpc_message_size;
         let task_spawner = task_manager.get_spawner();
         let parallel_fetch_request_delay_interval =
             config.parameters().parallel_fetch_request_delay_interval;
@@ -104,7 +131,6 @@ impl<DB: Database> CertificateFetcher<DB> {
                 task_spawner,
                 targets: BTreeMap::new(),
                 fetch_task: FetchTask::new(),
-                max_rpc_message_size,
                 parallel_fetch_request_delay_interval,
                 config,
             }
@@ -246,17 +272,17 @@ impl<DB: Database> CertificateFetcher<DB> {
             return Ok(());
         }
 
-        // create the fetch request
-        let request = match MissingCertificatesRequest::default()
+        // create the fetch request. `max_response_size` is unset: the sync path streams
+        // the reply and ends it explicitly, so the request-response codec's size cap no
+        // longer applies.
+        let Ok(request) = MissingCertificatesRequest::default()
             .set_bounds(gc_round, written_rounds)
             .map_err(|e| CertManagerError::RequestBounds(e.to_string()))
-            .map(|r| r.set_max_response_size(self.max_rpc_message_size))
-        {
-            Ok(req) => req,
-            Err(e) => {
-                error!(target: "primary::cert_fetcher", ?e, "Failed to create missing cert request");
-                return Ok(());
-            }
+            .inspect_err(|e| {
+                error!(target: "primary::cert_fetcher", ?e, "Failed to create missing cert request")
+            })
+        else {
+            return Ok(());
         };
 
         // spawn the fetch task
@@ -357,9 +383,9 @@ impl<DB: Database> CertificateFetcher<DB> {
 /// Tries peers in random order with parallel requests.
 #[instrument(level = "debug", skip_all, fields(lower_bound = request.exclusive_lower_bound))]
 #[allow(clippy::too_many_arguments)]
-async fn fetch_and_process_certificates<DB: Database>(
+async fn fetch_and_process_certificates<DB: Database, F: MissingCertFetcher>(
     authority_id: Option<AuthorityIdentifier>,
-    network: PrimaryNetworkHandle,
+    network: F,
     committee: Committee,
     request: MissingCertificatesRequest,
     state_sync: StateSynchronizer<DB>,
@@ -417,8 +443,8 @@ async fn fetch_and_process_certificates<DB: Database>(
 /// Try to fetch certificates from multiple peers with staggered requests.
 /// Sends requests to peers one at a time with ~5 second intervals between each.
 /// Returns as soon as one peer provides a non-empty response.
-async fn fetch_from_peers(
-    network: PrimaryNetworkHandle,
+async fn fetch_from_peers<F: MissingCertFetcher>(
+    network: F,
     peers: Vec<BlsPublicKey>,
     request: MissingCertificatesRequest,
     task_spawner: TaskSpawner,
@@ -523,17 +549,17 @@ async fn fetch_from_peers(
 }
 
 /// Spawn a task to fetch certificates from a single peer.
-fn spawn_peer_fetch(
+fn spawn_peer_fetch<F: MissingCertFetcher>(
     task_spawner: &TaskSpawner,
     peer: BlsPublicKey,
     request: MissingCertificatesRequest,
-    network: PrimaryNetworkHandle,
+    network: F,
     tx_results: tokio::sync::mpsc::UnboundedSender<CertManagerResult<Vec<Certificate>>>,
     cancel_signal: Noticer,
 ) {
     task_spawner.spawn_task(format!("fetch-cert-{peer}"), async move {
         tokio::select! {
-            result = network.fetch_certificates(peer, request) => {
+            result = network.fetch_missing_certificates(peer, request) => {
                 let _ = tx_results.send(result.map_err(Into::into));
             }
             _ = cancel_signal => {
