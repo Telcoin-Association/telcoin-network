@@ -102,15 +102,17 @@ pub fn spawn_state_sync<DB: Database>(
 ///
 /// An error here indicates a critical node failure.
 /// Note, if this returns an error then the DB could not be written to- this is probably fatal.
+/// Returns the number of bytes the encoded Output takes on disk IF this is written to the current
+/// pack or 0 otherwise (old consensus).
 pub async fn save_consensus(
     consensus_output: ConsensusOutput,
     consensus_chain: &mut ConsensusChain,
-) -> eyre::Result<()> {
-    consensus_chain.save_consensus_output(consensus_output).await?;
+) -> eyre::Result<u64> {
+    let output_bytes = consensus_chain.save_consensus_output(consensus_output).await?;
     // Note it is ok to leave batches in NodeBatchesCache until the epoch ends (when the table is
     // cleared). Make sure we have persisted the consensus output before we execute.
     consensus_chain.persist_current().await?;
-    Ok(())
+    Ok(output_bytes)
 }
 
 /// Returns the ConsensusHeader that created the last executed block if can be found.

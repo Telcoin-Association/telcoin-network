@@ -1038,13 +1038,15 @@ fn signed_consensus_gossip(
     round: Round,
     number: u64,
     hash: ConsensusHeaderDigest,
+    consensus_bytes: u64,
 ) -> GossipMessage {
-    let digest = ConsensusResult::digest_data(epoch, round, number, hash);
+    let digest = ConsensusResult::digest_data(epoch, round, number, hash, consensus_bytes);
     let config = auth.consensus_config();
     let key_config = config.key_config();
     let signature = key_config.request_signature_direct(&encode(&to_intent_message(digest)));
     let validator = key_config.public_key();
-    let result = ConsensusResult { epoch, round, number, hash, validator, signature };
+    let result =
+        ConsensusResult { epoch, round, number, hash, validator, signature, consensus_bytes };
     let data = encode(&PrimaryGossip::Consensus(Box::new(result)));
     let topic =
         TopicHash::from_raw(tn_config::LibP2pConfig::consensus_output_topic(config.chain_id()));
@@ -1069,13 +1071,13 @@ async fn test_consensus_result_publishes_on_quorum() -> eyre::Result<()> {
 
     // Feed distinct signers one at a time; nothing should publish until the quorum-th.
     for (seen, auth) in authorities.iter().take(quorum).enumerate() {
-        let msg = signed_consensus_gossip(auth, epoch, round, number, hash);
+        let msg = signed_consensus_gossip(auth, epoch, round, number, hash, 0);
         handler.process_gossip(&msg).await?;
 
         if seen + 1 < quorum {
             assert_eq!(
                 consensus_bus.published_consensus_num_hash(),
-                (0, 0, ConsensusHeaderDigest::default()),
+                (0, 0, ConsensusHeaderDigest::default(), 0),
                 "must not publish before a quorum of distinct signers ({} of {quorum})",
                 seen + 1,
             );
@@ -1084,7 +1086,7 @@ async fn test_consensus_result_publishes_on_quorum() -> eyre::Result<()> {
 
     assert_eq!(
         consensus_bus.published_consensus_num_hash(),
-        (epoch, number, hash),
+        (epoch, number, hash, 0),
         "result must be published once a quorum of distinct signers is reached",
     );
     Ok(())
@@ -1107,24 +1109,24 @@ async fn test_consensus_result_duplicate_signature_counted_once() -> eyre::Resul
 
     // Replay the first signer's result more than `quorum` times. If duplicates were counted,
     // this alone would reach quorum and publish — it must not.
-    let dup = signed_consensus_gossip(authorities[0], epoch, round, number, hash);
+    let dup = signed_consensus_gossip(authorities[0], epoch, round, number, hash, 0);
     for _ in 0..quorum + 1 {
         handler.process_gossip(&dup).await?;
     }
     assert_eq!(
         consensus_bus.published_consensus_num_hash(),
-        (0, 0, ConsensusHeaderDigest::default()),
+        (0, 0, ConsensusHeaderDigest::default(), 0),
         "repeated signatures from one validator must count once and stay below quorum",
     );
 
     // Add the remaining distinct signers (signer 0 already counted once) to reach quorum.
     for auth in authorities.iter().take(quorum).skip(1) {
-        let msg = signed_consensus_gossip(auth, epoch, round, number, hash);
+        let msg = signed_consensus_gossip(auth, epoch, round, number, hash, 0);
         handler.process_gossip(&msg).await?;
     }
     assert_eq!(
         consensus_bus.published_consensus_num_hash(),
-        (epoch, number, hash),
+        (epoch, number, hash, 0),
         "a quorum of distinct signers must publish even after duplicates were ignored",
     );
     Ok(())
@@ -1150,7 +1152,7 @@ async fn test_consensus_certs_eviction_bounds_map() -> eyre::Result<()> {
     // never cleared by a publish during the flood.
     for _ in 0..50 {
         let hash = ConsensusHeaderDigest::from(B256::random());
-        let msg = signed_consensus_gossip(authorities[0], epoch, round, 1, hash);
+        let msg = signed_consensus_gossip(authorities[0], epoch, round, 1, hash, 0);
         handler.process_gossip(&msg).await?;
     }
 
@@ -1165,12 +1167,12 @@ async fn test_consensus_certs_eviction_bounds_map() -> eyre::Result<()> {
     // A legitimate result must still reach quorum and publish after the eviction path has run.
     let hash_l = ConsensusHeaderDigest::from(B256::random());
     for auth in authorities.iter().take(quorum) {
-        let msg = signed_consensus_gossip(auth, epoch, round, 2, hash_l);
+        let msg = signed_consensus_gossip(auth, epoch, round, 2, hash_l, 0);
         handler.process_gossip(&msg).await?;
     }
     assert_eq!(
         consensus_bus.published_consensus_num_hash(),
-        (epoch, 2, hash_l),
+        (epoch, 2, hash_l, 0),
         "a legitimate quorum must publish even after singleton eviction",
     );
     // Publishing clears the map.

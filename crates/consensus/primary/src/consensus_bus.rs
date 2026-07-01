@@ -214,8 +214,8 @@ pub struct ConsensusBusAppInner {
 
     /// Watch tracking most recently seen consensus header.
     tx_last_consensus_header: watch::Sender<Option<ConsensusHeader>>,
-    /// Watch tracking the last gossipped consensus block number and hash.
-    tx_last_published_consensus_num_hash: watch::Sender<(Epoch, u64, ConsensusHeaderDigest)>,
+    /// Watch tracking the last gossipped epoch, consensus block number, hash and consensus bytes.
+    tx_last_published_consensus_num_hash: watch::Sender<(Epoch, u64, ConsensusHeaderDigest, u64)>,
 
     /// Consensus header.  Note this can be used to create consensus output to execute for non
     /// validators.
@@ -252,7 +252,8 @@ pub struct ConsensusBusAppInner {
     epoch_request_queue_rx:
         Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(EpochRecord, EpochRecord)>>>,
     /// Channel to request consensus headers to cache.
-    consensus_request_queue: QueChannel<(Epoch, u64, ConsensusHeaderDigest)>,
+    /// Fields are epoch, consensus number, consensus digest and consensus output bytes.
+    consensus_request_queue: QueChannel<(Epoch, u64, ConsensusHeaderDigest, u64)>,
     /// Prometheus metrics for the primary's consensus pipeline.
     ///
     /// Lives on the app-lifetime bus because the bus already reaches every consensus
@@ -288,7 +289,7 @@ impl ConsensusBusApp {
         let (tx_primary_round_updates, _) = watch::channel(0u32);
         let (tx_last_consensus_header, _) = watch::channel(None);
         let (tx_last_published_consensus_num_hash, _) =
-            watch::channel((0, 0, ConsensusHeaderDigest::default()));
+            watch::channel((0, 0, ConsensusHeaderDigest::default(), 0));
 
         let (tx_recent_blocks, _) = watch::channel(RecentBlocks::new(recent_blocks as usize));
         let (tx_sync_status, _) = watch::channel(NodeMode::default());
@@ -427,7 +428,7 @@ impl ConsensusBusApp {
     /// for block number.  DO NOT send unverified values to this watch.
     pub fn last_published_consensus_num_hash(
         &self,
-    ) -> &watch::Sender<(Epoch, u64, ConsensusHeaderDigest)> {
+    ) -> &watch::Sender<(Epoch, u64, ConsensusHeaderDigest, u64)> {
         &self.inner.tx_last_published_consensus_num_hash
     }
 
@@ -438,12 +439,14 @@ impl ConsensusBusApp {
         epoch: Epoch,
         number: u64,
         hash: ConsensusHeaderDigest,
+        consensus_bytes: u64,
     ) -> bool {
         self.last_published_consensus_num_hash().send_if_modified(|state| {
             if number > state.1 {
                 state.0 = epoch;
                 state.1 = number;
                 state.2 = hash;
+                state.3 = consensus_bytes;
                 true
             } else {
                 false
@@ -452,7 +455,7 @@ impl ConsensusBusApp {
     }
 
     /// Returns the latest verified consensus block number and hash from gossip.
-    pub fn published_consensus_num_hash(&self) -> (Epoch, u64, ConsensusHeaderDigest) {
+    pub fn published_consensus_num_hash(&self) -> (Epoch, u64, ConsensusHeaderDigest, u64) {
         *self.inner.tx_last_published_consensus_num_hash.borrow()
     }
 
@@ -734,14 +737,16 @@ impl ConsensusBusApp {
     }
 
     /// Channel to request consensus headers to be fetched and cached.
-    pub fn consensus_request_queue(&self) -> &impl TnSender<(Epoch, u64, ConsensusHeaderDigest)> {
+    pub fn consensus_request_queue(
+        &self,
+    ) -> &impl TnSender<(Epoch, u64, ConsensusHeaderDigest, u64)> {
         &self.inner.consensus_request_queue
     }
 
     /// Subscribe to consensus header fetch queue.
     pub fn subscribe_consensus_request_queue(
         &self,
-    ) -> impl TnReceiver<(Epoch, u64, ConsensusHeaderDigest)> {
+    ) -> impl TnReceiver<(Epoch, u64, ConsensusHeaderDigest, u64)> {
         self.inner.consensus_request_queue.subscribe()
     }
 }

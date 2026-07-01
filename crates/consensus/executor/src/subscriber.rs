@@ -255,7 +255,7 @@ impl<DB: Database> Subscriber<DB> {
                     .borrow()
                     .latest_consensus_block_num_hash()
                     .number;
-                let (_latest_network_epoch, latest_network_consensus, _) =
+                let (_latest_network_epoch, latest_network_consensus, _, _) =
                     self.consensus_bus.published_consensus_num_hash();
                 let consensus_sync_distance =
                     latest_network_consensus.saturating_sub(latest_processed_consensus);
@@ -291,15 +291,14 @@ impl<DB: Database> Subscriber<DB> {
         Ok(result)
     }
 
-    /// Save consensus output and publish or signature once we have all the batches (complete
-    /// ConsensusOutput).
+    /// Save consensus output and publish or signature.
     async fn handle_consensus_output(
         &self,
         consensus_chain: &mut ConsensusChain,
         output: ConsensusOutput,
     ) -> SubscriberResult<()> {
         debug!(target: "subscriber", output=?output.digest(), "saving next output");
-        save_consensus(output.clone(), consensus_chain).await?;
+        let consensus_bytes = save_consensus(output.clone(), consensus_chain).await?;
         debug!(target: "subscriber", "broadcasting output...");
         // Publish the consensus result now that we are totally finished.
         let number = output.number();
@@ -311,7 +310,8 @@ impl<DB: Database> Subscriber<DB> {
         self.consensus_bus.last_consensus_header().send_replace(Some(output.consensus_header()));
         let epoch = output.sub_dag().leader_epoch();
         let round = output.sub_dag().leader_round();
-        let consensus_result_hash = ConsensusResult::digest_data(epoch, round, number, this_digest);
+        let consensus_result_hash =
+            ConsensusResult::digest_data(epoch, round, number, this_digest, consensus_bytes);
         let sig = self
             .config
             .key_config()
@@ -325,6 +325,7 @@ impl<DB: Database> Subscriber<DB> {
                 this_digest,
                 self.config.key_config().public_key(),
                 sig,
+                consensus_bytes,
             )
             .await
         {

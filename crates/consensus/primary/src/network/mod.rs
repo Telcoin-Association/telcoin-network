@@ -324,6 +324,7 @@ impl PrimaryNetworkHandle {
     }
 
     /// Publish a consensus block number and hash of the header.
+    #[allow(clippy::too_many_arguments)]
     pub async fn publish_consensus(
         &self,
         epoch: Epoch,
@@ -332,6 +333,7 @@ impl PrimaryNetworkHandle {
         consensus_header_hash: ConsensusHeaderDigest,
         key: BlsPublicKey,
         signature: BlsSignature,
+        consensus_bytes: u64,
     ) -> NetworkResult<()> {
         let data = encode(&PrimaryGossip::Consensus(Box::new(ConsensusResult {
             epoch,
@@ -340,6 +342,7 @@ impl PrimaryNetworkHandle {
             hash: consensus_header_hash,
             validator: key,
             signature,
+            consensus_bytes,
         })));
         self.handle
             .publish(tn_config::LibP2pConfig::consensus_output_topic(self.chain_id), data)
