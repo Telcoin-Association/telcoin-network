@@ -123,8 +123,11 @@ pub(crate) struct EpochManager<P, DB> {
     /// at shutdown; read by the fetch tasks that backfill missing epochs.
     consensus_chain: ConsensusChain,
 
-    /// Bootstrap servers loaded once from the genesis committee, used to seed peer discovery on
-    /// the long-running networks.
+    /// Bootstrap servers used to seed peer discovery on the long-running networks.
+    ///
+    /// Seeded from the genesis committee file at construction as a fallback, then overridden
+    /// in [`run`](Self::run) when the [`NetworkConfig`] provides a non-empty
+    /// `bootstrap_peers` set. Bootstrap servers are independent of any epoch committee.
     bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapServer>,
 
     /// Static version string for the running node, reported by node-info surfaces.
@@ -220,10 +223,11 @@ where
     /// Construct the manager and its process-lifetime state.
     ///
     /// Opens the consensus chain, builds the application-scoped consensus bus (forced into
-    /// `Observer` mode when configured as an observer), and loads bootstrap servers from the
-    /// genesis committee. Network handles are left `None` until [`run`](Self::run) spawns the
-    /// networks. Panics if the consensus chain cannot be opened, since that is unrecoverable at
-    /// startup.
+    /// `Observer` mode when configured as an observer), and seeds the fallback bootstrap
+    /// servers from the genesis committee (overridden in [`run`](Self::run) when the network
+    /// config supplies its own). Network handles are left `None` until [`run`](Self::run)
+    /// spawns the networks. Panics if the consensus chain cannot be opened, since that is
+    /// unrecoverable at startup.
     pub(crate) async fn new(
         builder: TnBuilder,
         tn_datadir: P,
@@ -245,6 +249,9 @@ where
         };
         let epochs_db_path = tn_datadir.epochs_db_path();
         let _ = std::fs::create_dir_all(&epochs_db_path);
+        // fallback bootstrap peers; `run` overrides these when the network config provides
+        // a non-empty set of its own
+        let bootstrap_servers = committee_zero.bootstrap_servers();
         let consensus_chain = ConsensusChain::new(epochs_db_path, committee_zero)?;
         // shutdown long-running node components
         let node_shutdown = Notifier::new();
@@ -258,16 +265,6 @@ where
             consensus_bus.node_mode().send_replace(NodeMode::Observer);
         }
         let worker_event_stream = QueChannel::new();
-        let bootstrap_servers = if let Ok(committee_zero) =
-            Config::load_from_path_or_default::<Committee>(
-                tn_datadir.committee_path(),
-                ConfigFmt::YAML,
-            ) {
-            committee_zero.bootstrap_servers()
-        } else {
-            error!(target: "epoch-manager", "Unable to load bootstrap servers from the genesis committee!");
-            BTreeMap::new()
-        };
 
         Ok(Self {
             builder,
@@ -354,6 +351,11 @@ where
         // network builder, the gossip handles, and the gossip-validation handlers.
         let mut network_config = NetworkConfig::read_config(&self.tn_datadir)?;
         network_config.set_chain_id(self.builder.tn_config.genesis().config.chain_id);
+        // operator-configured bootstrap peers take precedence over the genesis
+        // committee's servers loaded in `new`
+        if !network_config.bootstrap_peers().is_empty() {
+            self.bootstrap_servers = network_config.bootstrap_peers().clone();
+        }
         self.spawn_node_networks(node_task_spawner, &network_config, epoch).await?;
         let primary_network_handle =
             self.primary_network_handle.as_ref().expect("primary network").clone();

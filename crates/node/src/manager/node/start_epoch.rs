@@ -266,7 +266,8 @@ where
     ///
     /// Epoch 0 has no on-chain history, so the genesis committee is loaded from the
     /// committee file on disk. Every later epoch is built with a [`CommitteeBuilder`] from the
-    /// statically configured bootstrap servers plus the on-chain validator set for that epoch.
+    /// on-chain validator set for that epoch. Bootstrap servers are not baked into the
+    /// committee; they live on the [`EpochManager`] independent of committee rotation.
     async fn create_committee_from_state(
         &self,
         epoch: Epoch,
@@ -283,14 +284,6 @@ where
             )?
         } else {
             let mut committee_builder = CommitteeBuilder::new(epoch);
-            for (key, bootstrap) in &self.bootstrap_servers {
-                committee_builder.add_bootstrap_server(
-                    *key,
-                    bootstrap.primary.clone(),
-                    bootstrap.worker.clone(),
-                );
-            }
-
             for validator in validators {
                 committee_builder.add_authority(validator.0, validator.1.validatorAddress);
             }
@@ -479,12 +472,8 @@ where
             .map(|a| *a.protocol_key())
             .collect();
 
-        let bootstrap_peers = consensus_config
-            .committee()
-            .bootstrap_servers()
-            .iter()
-            .map(|(k, v)| (*k, v.primary.clone()))
-            .collect();
+        let bootstrap_peers =
+            self.bootstrap_servers.iter().map(|(k, v)| (*k, v.primary.clone())).collect();
         let next_committee_keys: HashSet<BlsPublicKey> =
             consensus_config.next_committee_keys().iter().copied().collect();
         Self::init_network_for_epoch(
@@ -640,12 +629,8 @@ where
             .map(|a| *a.protocol_key())
             .collect();
 
-        let bootstrap_peers = consensus_config
-            .committee()
-            .bootstrap_servers()
-            .iter()
-            .map(|(k, v)| (*k, v.worker.clone()))
-            .collect();
+        let bootstrap_peers =
+            self.bootstrap_servers.iter().map(|(k, v)| (*k, v.worker.clone())).collect();
         let next_committee_keys: HashSet<BlsPublicKey> =
             consensus_config.next_committee_keys().iter().copied().collect();
         Self::init_network_for_epoch(

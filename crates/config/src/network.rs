@@ -3,8 +3,8 @@
 use crate::{ConfigFmt, ConfigTrait, TelcoinDirs};
 use libp2p::kad::K_VALUE;
 use serde::{Deserialize, Serialize};
-use std::{num::NonZeroUsize, time::Duration};
-use tn_types::Round;
+use std::{collections::BTreeMap, num::NonZeroUsize, time::Duration};
+use tn_types::{BlsPublicKey, BootstrapServer, Round};
 
 impl ConfigTrait for NetworkConfig {}
 
@@ -24,6 +24,13 @@ pub struct NetworkConfig {
     peer_config: PeerConfig,
     /// The hostname for the validator.
     hostname: String,
+    /// Bootstrap peers for joining the network, keyed by the server operator's BLS public key.
+    ///
+    /// When non-empty, these take precedence over the bootstrap servers recorded in the
+    /// genesis committee file, decoupling network entry points from any committee. An empty
+    /// map (the default) falls back to the genesis committee's bootstrap servers.
+    #[serde(default)]
+    bootstrap_peers: BTreeMap<BlsPublicKey, BootstrapServer>,
 }
 
 impl NetworkConfig {
@@ -74,6 +81,14 @@ impl NetworkConfig {
     /// The human-readable identity for this node.
     pub fn hostname(&self) -> &str {
         &self.hostname
+    }
+
+    /// Return a reference to the configured bootstrap peers.
+    ///
+    /// Empty unless the operator populated `bootstrap_peers` in the network config file;
+    /// callers fall back to the genesis committee's bootstrap servers when empty.
+    pub fn bootstrap_peers(&self) -> &BTreeMap<BlsPublicKey, BootstrapServer> {
+        &self.bootstrap_peers
     }
 
     /// Return a mutable reference to the [PeerConfig].
@@ -558,6 +573,40 @@ hostname: "my-validator"
         assert_eq!(parsed.kad_publication_interval, default.kad_publication_interval);
         assert_eq!(parsed.max_rpc_message_size, default.max_rpc_message_size);
         assert_eq!(parsed.k_bucket_size, default.k_bucket_size);
+    }
+
+    #[test]
+    fn bootstrap_peers_default_to_empty() {
+        // absent from the yaml entirely
+        let parsed: NetworkConfig = serde_yaml::from_str("{}").expect("empty mapping deserializes");
+        assert!(parsed.bootstrap_peers().is_empty());
+
+        // explicitly present but empty
+        let parsed: NetworkConfig = serde_yaml::from_str("bootstrap_peers: {}\n")
+            .expect("empty bootstrap_peers deserializes");
+        assert!(parsed.bootstrap_peers().is_empty());
+    }
+
+    #[test]
+    fn bootstrap_peers_yaml_roundtrip() {
+        use rand::{rngs::StdRng, SeedableRng};
+        use tn_types::{BlsKeypair, Multiaddr, NetworkKeypair, P2pNode};
+
+        let bls = BlsKeypair::generate(&mut StdRng::from_seed([7; 32]));
+        let primary: P2pNode =
+            (Multiaddr::empty(), NetworkKeypair::generate_ed25519().public().clone().into()).into();
+        let worker: P2pNode =
+            (Multiaddr::empty(), NetworkKeypair::generate_ed25519().public().clone().into()).into();
+
+        let mut config = NetworkConfig::default();
+        config.bootstrap_peers.insert(*bls.public(), BootstrapServer::new(primary, worker));
+
+        let yaml = serde_yaml::to_string(&config).expect("serialize network config");
+        let parsed: NetworkConfig =
+            serde_yaml::from_str(&yaml).expect("deserialize network config");
+
+        assert_eq!(parsed.bootstrap_peers(), config.bootstrap_peers());
+        assert_eq!(parsed.bootstrap_peers().len(), 1);
     }
 
     #[test]
