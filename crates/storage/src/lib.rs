@@ -10,7 +10,7 @@ pub use stores::*;
 // Always build redb, we use it as the default for persistant consensus data.
 pub use redb::database::ReDB;
 use tables::{
-    CertificateDigestByOrigin, CertificateDigestByRound, Certificates, ConsensusHeaderCache,
+    CertificateDigestByOrigin, CertificateDigestByRound, Certificates, ConsensusCache,
     KadProviderRecords, KadRecords, KadWorkerProviderRecords, KadWorkerRecords, LastProposed,
     NodeBatchesCache, OurNodeBatchesCache, Payload, ProposedCertificates, Votes,
 };
@@ -55,7 +55,7 @@ const PROPOSED_CERTIFICATES_CF: &str = "proposed_certificates";
 const PAYLOAD_CF: &str = "payload";
 const NODE_BATCHES_CACHE_CF: &str = "node_batches_cache";
 const OUR_NODE_BATCHES_CACHE_CF: &str = "our_node_batches_cache";
-const CONSENSUS_HEADER_CACHE_CF: &str = "consensus_header_cache";
+const CONSENSUS_OUTPUT_CACHE_CF: &str = "consensus_output_cache";
 
 const KAD_RECORD_CF: &str = "kad_record";
 const KAD_PROVIDER_RECORD_CF: &str = "kad_provider_record";
@@ -81,7 +81,7 @@ macro_rules! tables {
 pub mod tables {
     use super::{PayloadToken, ProposerKey};
     use tn_types::{
-        AuthorityIdentifier, Batch, BlockHash, Certificate, ConsensusHeader, Header, HeaderDigest,
+        AuthorityIdentifier, Batch, BlockHash, Certificate, ConsensusOutput, Header, HeaderDigest,
         Round, TableHint, VoteInfo, WorkerId,
     };
 
@@ -97,8 +97,9 @@ pub mod tables {
         NodeBatchesCache;crate::NODE_BATCHES_CACHE_CF;TableHint::Cache;<BlockHash, Batch>,
         // Cache batches we produce until they are accepted (they will move to NodeBatchesCache once accepted).
         OurNodeBatchesCache;crate::OUR_NODE_BATCHES_CACHE_CF;TableHint::Cache;<BlockHash, Batch>,
-        // This is a cache to store ConsensusHeaders during some sync operations, remove once in confirmed consensus output.
-        ConsensusHeaderCache;crate::CONSENSUS_HEADER_CACHE_CF;TableHint::Cache;<u64, ConsensusHeader>,
+        // Cache of verified ConsensusOutputs (header + batches) pulled during sync, keyed by number;
+        // entries are removed once written to confirmed consensus output.
+        ConsensusCache;crate::CONSENSUS_OUTPUT_CACHE_CF;TableHint::Cache;<u64, ConsensusOutput>,
         // These are used for network storage and separate from consensus
         KadRecords;crate::KAD_RECORD_CF;TableHint::Kad;<BlockHash, Vec<u8>>,
         KadProviderRecords;crate::KAD_PROVIDER_RECORD_CF;TableHint::Kad;<BlockHash, Vec<u8>>,
@@ -178,7 +179,7 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatab
     // Cache tables
     db.open_table::<NodeBatchesCache>().expect("failed to open table!");
     db.open_table::<OurNodeBatchesCache>().expect("failed to open table!");
-    db.open_table::<ConsensusHeaderCache>().expect("failed to open table!");
+    db.open_table::<ConsensusCache>().expect("failed to open table!");
     db
 }
 
@@ -208,7 +209,7 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatab
     // Cache tables
     db.open_table::<NodeBatchesCache>().expect("failed to open table!");
     db.open_table::<OurNodeBatchesCache>().expect("failed to open table!");
-    db.open_table::<ConsensusHeaderCache>().expect("failed to open table!");
+    db.open_table::<ConsensusCache>().expect("failed to open table!");
     db
 }
 

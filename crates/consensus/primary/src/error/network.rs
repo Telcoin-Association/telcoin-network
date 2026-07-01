@@ -35,9 +35,6 @@ pub(crate) enum PrimaryNetworkError {
     /// Internal error occurred.
     #[error("Internal error: {0}")]
     Internal(String),
-    /// Unknown consensus header.
-    #[error("Unknown consensus header: {0}")]
-    UnknownConsensusHeaderDigest(ConsensusHeaderDigest),
     /// Unknown consensus header certificate.
     #[error("Unknown consensus header certificate for: {0}")]
     UnknownConsensusHeaderCert(ConsensusHeaderDigest),
@@ -120,8 +117,7 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
             },
             // Benign "miss": observers legitimately request not-yet-served headers/outputs.
             // No penalty so honest sync flows are not banned during catch-up.
-            PrimaryNetworkError::UnknownConsensusHeaderDigest(_)
-            | PrimaryNetworkError::UnknownConsensusOutput(_) => None,
+            PrimaryNetworkError::UnknownConsensusOutput(_) => None,
             PrimaryNetworkError::InvalidRequest(_)
             | PrimaryNetworkError::UnknownStreamRequest(_)
             | PrimaryNetworkError::UnknownConsensusHeaderCert(_) => Some(Penalty::Mild),

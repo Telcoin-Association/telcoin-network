@@ -9,9 +9,8 @@ use std::{
 };
 use tn_network_libp2p::{types::IntoRpcError, PeerExchangeMap, TNMessage};
 use tn_types::{
-    error::HeaderError, AuthorityIdentifier, Certificate, ConsensusHeader, ConsensusHeaderDigest,
-    ConsensusResult, Epoch, EpochCertificate, EpochDigest, EpochRecord, EpochVote, Header,
-    HeaderDigest, Round, Vote,
+    error::HeaderError, AuthorityIdentifier, Certificate, ConsensusResult, Epoch, EpochCertificate,
+    EpochDigest, EpochRecord, EpochVote, Header, HeaderDigest, Round, Vote,
 };
 
 /// Primary messages on the gossip network.
@@ -61,15 +60,6 @@ pub enum PrimaryRequest {
     MissingCertificates {
         /// Inner type with specific helper methods for requesting missing certificates.
         inner: MissingCertificatesRequest,
-    },
-    /// Request a consensus chain header with consensus output.
-    ///
-    /// Both number and hash should match (set them both).
-    ConsensusHeader {
-        /// Block number requesting if not None.
-        number: u64,
-        /// Block hash requesting if not None.
-        hash: ConsensusHeaderDigest,
     },
     /// Exchange peer information.
     ///
@@ -212,8 +202,6 @@ pub enum PrimaryResponse {
     /// If the peer was unable to verify parents for a proposed header, they respond requesting
     /// the missing certificate by digest.
     MissingParents(Vec<HeaderDigest>),
-    /// The requested consensus header.
-    ConsensusHeader(Arc<ConsensusHeader>),
     /// The requested epoch record and certificate.
     EpochRecord { record: EpochRecord, certificate: EpochCertificate },
     /// Exchange peer information.
@@ -263,7 +251,6 @@ impl PrimaryResponse {
             | PrimaryNetworkError::UnavailableEpoch(_)
             | PrimaryNetworkError::UnavailableEpochDigest(_)
             | PrimaryNetworkError::InvalidTopic
-            | PrimaryNetworkError::UnknownConsensusHeaderDigest(_)
             | PrimaryNetworkError::UnknownConsensusHeaderCert(_)
             | PrimaryNetworkError::UnknownConsensusOutput(_)
             | PrimaryNetworkError::Timeout(_)

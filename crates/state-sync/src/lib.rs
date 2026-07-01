@@ -13,7 +13,7 @@ use tn_test_utils_committee as _;
 use std::time::Duration;
 use tn_config::ConsensusConfig;
 use tn_primary::{ConsensusBusApp, NodeMode};
-use tn_storage::{consensus::ConsensusChain, tables::ConsensusHeaderCache};
+use tn_storage::{consensus::ConsensusChain, tables::ConsensusCache};
 use tn_types::{
     ConsensusHeader, ConsensusHeaderDigest, ConsensusOutput, Database, Epoch, TaskError,
     TaskSpawner, TnSender,
@@ -298,44 +298,35 @@ async fn catch_up_consensus_from_to<DB: Database>(
     let mut result_header = from;
     for number in last_consensus_height + 1..=max_consensus_height {
         debug!(target: "state-sync", "trying to get consensus block {number}");
-        let mut remove_cache = false;
-        // Check if we already have this consensus output in our local DB.
-        // We will be verifying and loading these records elsewhere.
-        let consensus_header = if let Ok(Some(header)) = db.get::<ConsensusHeaderCache>(&number) {
-            // Always check the cache first, even if on max_consesus_height so we evict this record
-            // if cached.
-            // Note that the consensus header at number must be consenstent (consensus was reached)
-            // so this is fine. In other words it would be a protocol violation to have
-            // different ConsensusHeaders at the same number.
-            remove_cache = true;
-            header
-        } else if number == max_consensus_height {
-            max_consensus.clone()
-        } else if let Ok(Some(header)) = consensus_chain.consensus_header_by_number(number).await {
-            // Block already in local ConsensusChain DB (e.g., processed before a restart).
-            // Use it to advance the parent-chain verification; execution will be skipped below
-            // since number <= consensus_chain.latest_consensus_number().
-            // Note this will include staged current epoch output.
-            header
+        // Resolve the full, verified ConsensusOutput for this number: from the sync cache (pulled
+        // recent->earliest, verified on insert) or already in a local pack (chain/staging). The
+        // committee was applied at decode time, so this output is complete (header + batches).
+        let mut from_cache = false;
+        let output = if let Ok(Some(output)) = db.get::<ConsensusCache>(&number) {
+            from_cache = true;
+            output
+        } else if let Ok(Some(output)) = consensus_chain.consensus_output_by_number(number).await {
+            // Already in a local pack (processed before a restart, or staged current-epoch output).
+            output
         } else {
             if number > last_consensus_height + 1 {
-                // Only log the warning after we start and hit a missing header.
-                // I.e. We don't want a ton of warnings when we are starting to catch up.
+                // Only log after we start and hit a missing output (avoid a flood at startup).
                 warn!(
                     target: "tn::observer",
                     block_number = number,
-                    "Could not find header (We may be catching up)"
+                    "Could not find consensus output (we may be catching up)"
                 );
             }
-            // We should have all the required headers in local storage by now...
+            // We should have the required outputs in local storage by now...
             return Ok(result_header);
         };
+        let consensus_header = output.consensus_header();
         if consensus_header.sub_dag.leader_epoch() > epoch {
             // Don't outrun the epoch and produce next epochs output.
             return Ok(consensus_header);
         }
-        if remove_cache {
-            let _ = db.remove::<ConsensusHeaderCache>(&number); // Should be done with this now.
+        if from_cache {
+            let _ = db.remove::<ConsensusCache>(&number); // Done with this cache entry.
         }
         if number == last_consensus_height + 1 {
             // We only want to log this once and only when we are doing something.
@@ -359,7 +350,8 @@ async fn catch_up_consensus_from_to<DB: Database>(
             return Err(eyre::eyre!("consensus header digest mismatch!"));
         }
         if consensus_header.number <= consensus_chain.latest_consensus_number() {
-            // We have already processed this consensus so ignore it.
+            // We have already processed this consensus so ignore it (advance the parent chain
+            // only).
             result_header = consensus_header;
             continue;
         }
@@ -383,8 +375,9 @@ async fn catch_up_consensus_from_to<DB: Database>(
                 consensus_bus.recent_blocks().borrow()
             ));
         }
-        consensus_bus.consensus_header().send(consensus_header.clone()).await?;
+        // Deliver the full, verified output (with batches) for execution.
         result_header = consensus_header;
+        consensus_bus.sync_output().send(output).await?;
     }
     Ok(result_header)
 }
