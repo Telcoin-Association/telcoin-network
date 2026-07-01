@@ -263,6 +263,9 @@ where
                 WorkerRequest::ReportBatch { sealed_batch } => {
                     self.process_report_batch(peer, sealed_batch, channel, cancel);
                 }
+                WorkerRequest::ReportTxns { transactions } => {
+                    self.process_report_txns(peer, transactions, channel, cancel);
+                }
                 WorkerRequest::RequestBatchesStream { batch_digests, epoch } => {
                     self.process_request_batches_stream(
                         peer,
@@ -321,6 +324,44 @@ where
                             // classify transient responder-side conditions as
                             // recoverable so the requester retries instead of
                             // treating this as a permanent rejection
+                            let response = WorkerResponse::into_error_ref(&err);
+                            if let Some(penalty) = err.into() {
+                                network_handle.report_penalty(peer, penalty).await;
+                            }
+                            response
+                        }
+                    };
+                    let _ = network_handle.inner_handle().send_response(response, channel).await;
+                },
+                // cancel notification from network layer
+                _ = cancel => (),
+            }
+            Ok(())
+        });
+    }
+
+    /// Process transactions pushed by a peer for committee inclusion.
+    ///
+    /// Spawn a task that hands the transactions to the request handler and acks the peer.
+    fn process_report_txns(
+        &self,
+        peer: BlsPublicKey,
+        transactions: Vec<Vec<u8>>,
+        channel: ResponseChannel<WorkerResponse>,
+        cancel: oneshot::Receiver<()>,
+    ) {
+        // clone for spawned tasks
+        let request_handler = self.request_handler.clone();
+        let network_handle = self.network_handle.clone();
+        self.network_handle.get_task_spawner().spawn_task("process-report-txns", async move {
+            tokio::select! {
+                res = request_handler.process_report_txns(transactions) => {
+                    let response = match res {
+                        Ok(()) => WorkerResponse::ReportTxns,
+                        Err(err) => {
+                            // classify transient responder-side conditions as recoverable so
+                            // the requester retries instead of treating this as a rejection,
+                            // and penalize a peer whose request was invalid (e.g. oversized)
                             let response = WorkerResponse::into_error_ref(&err);
                             if let Some(penalty) = err.into() {
                                 network_handle.report_penalty(peer, penalty).await;

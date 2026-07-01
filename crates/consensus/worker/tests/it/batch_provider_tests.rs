@@ -29,6 +29,7 @@ async fn make_batch() {
         store.clone(),
         timeout,
         WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
+        Vec::new(),
     );
 
     // Send enough transactions to seal a batch.

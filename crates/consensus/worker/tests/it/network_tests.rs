@@ -1,7 +1,10 @@
 //! Test network handler tests.
 
 use assert_matches::assert_matches;
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, Mutex},
+};
 use tn_batch_validator::NoopBatchValidator;
 use tn_network_libp2p::{
     error::NetworkError,
@@ -10,7 +13,9 @@ use tn_network_libp2p::{
 };
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
-use tn_types::{BlsPublicKey, SealedBatch, TaskManager, B256};
+use tn_types::{
+    BatchValidation, BatchValidationError, BlsPublicKey, SealedBatch, TaskManager, B256,
+};
 use tn_worker::{
     PendingBatchStream, RequestHandler, WorkerGossip, WorkerNetworkError, WorkerNetworkHandle,
     WorkerRequest, WorkerResponse, MAX_BATCH_DIGESTS_PER_REQUEST, MAX_CONCURRENT_BATCH_STREAMS,
@@ -56,6 +61,42 @@ fn create_test_types_with_chain_id(chain_id: u64) -> TestTypes {
         WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, chain_id);
     let handler = RequestHandler::new(worker_id, batch_validator, config, network_handle);
     TestTypes { committee, handler, task_manager, network_commands_rx }
+}
+
+/// Like [`create_test_types`], but installs a custom batch validator so a test can
+/// observe how the handler routes transactions to `submit_txn_if_mine`.
+fn create_test_types_with_validator(validator: Arc<dyn BatchValidation>) -> TestTypes {
+    let committee = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let authority = committee.first_authority();
+    let config = authority.consensus_config();
+    let task_manager = TaskManager::default();
+    let (tx, network_commands_rx) = mpsc::channel(10);
+    let network_handle =
+        WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0);
+    let handler = RequestHandler::new(0, validator, config, network_handle);
+    TestTypes { committee, handler, task_manager, network_commands_rx }
+}
+
+/// A batch validator that records every `submit_txn_if_mine` call so tests can assert
+/// how the request handler routes pushed transactions.
+#[derive(Debug, Default)]
+struct RecordingValidator {
+    /// `(tx_bytes, committee_size, committee_slot)` for each call, in order.
+    calls: Arc<Mutex<Vec<(Vec<u8>, u64, u64)>>>,
+}
+
+impl BatchValidation for RecordingValidator {
+    fn validate_batch(&self, _batch: SealedBatch) -> Result<(), BatchValidationError> {
+        Ok(())
+    }
+
+    fn submit_txn_if_mine(&self, tx_bytes: &[u8], committee_size: u64, committee_slot: u64) {
+        self.calls.lock().expect("recording lock").push((
+            tx_bytes.to_vec(),
+            committee_size,
+            committee_slot,
+        ));
+    }
 }
 
 /// Deny a sync-protocol `OpenStream` command, simulating a legacy-only peer so
@@ -120,20 +161,71 @@ async fn test_batch_gossip_topics() {
     let good_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     assert!(handler.pub_process_gossip_for_test(&good_msg).await.is_ok());
 
-    // Test swapped topics, must fail.
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_txn_topic(0));
+    // A batch gossiped on any other topic must be rejected as an invalid topic.
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::epoch_vote_topic(0));
     let bad_msg = GossipMessage { source: None, data, sequence_number: None, topic };
     assert!(handler.pub_process_gossip_for_test(&bad_msg).await.is_err());
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(0));
-    let gossip = WorkerGossip::Txn(vec![]);
-    let data = tn_types::encode(&gossip);
-    let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
-    assert!(handler.pub_process_gossip_for_test(&bad_msg).await.is_err());
+}
 
-    // Use the correct topic for a txn and make sure it works.
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_txn_topic(0));
-    let good_msg = GossipMessage { source: None, data, sequence_number: None, topic };
-    assert!(handler.pub_process_gossip_for_test(&good_msg).await.is_ok());
+// ============================================================================
+// Report Txns Tests
+// ============================================================================
+
+/// A committee member offers every pushed transaction to `submit_txn_if_mine` exactly
+/// once, in order, tagged with this node's own committee size and slot (issue #804: the
+/// RPC replacement for the retired `WorkerGossip::Txn` path).
+#[tokio::test]
+async fn test_process_report_txns_routes_each_txn_to_own_slot() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let validator = Arc::new(RecordingValidator { calls: calls.clone() });
+    let TestTypes { handler, task_manager: _, .. } = create_test_types_with_validator(validator);
+
+    let txns: Vec<Vec<u8>> = vec![vec![1, 2, 3], vec![4, 5, 6], vec![7, 8, 9]];
+    // committee member accepts the pushed txns
+    assert!(handler.pub_process_report_txns(txns.clone()).await.is_ok());
+
+    let recorded = calls.lock().expect("recording lock");
+    // each txn is offered to submit_txn_if_mine exactly once, in order
+    assert_eq!(recorded.len(), txns.len(), "one submit per pushed txn");
+    // every call carries this node's own (stable) committee size + slot, and the slot is a
+    // valid committee index
+    let (_, size, slot) = recorded[0];
+    assert!(size >= 1, "committee size is non-zero");
+    assert!(slot < size, "own slot is a valid committee index");
+    for (i, (bytes, sz, sl)) in recorded.iter().enumerate() {
+        assert_eq!(bytes, &txns[i], "txn {i} bytes preserved and ordered");
+        assert_eq!(*sz, size, "committee size stable across txns");
+        assert_eq!(*sl, slot, "own slot stable across txns");
+    }
+}
+
+/// An empty push is a no-op that still succeeds.
+#[tokio::test]
+async fn test_process_report_txns_empty_is_ok() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let validator = Arc::new(RecordingValidator { calls: calls.clone() });
+    let TestTypes { handler, task_manager: _, .. } = create_test_types_with_validator(validator);
+
+    assert!(handler.pub_process_report_txns(Vec::new()).await.is_ok());
+    assert!(calls.lock().expect("recording lock").is_empty(), "no submits for an empty push");
+}
+
+/// A push whose transaction count exceeds the per-request cap is rejected as an invalid
+/// request (which the dispatcher turns into a peer penalty) and does no per-txn work.
+#[tokio::test]
+async fn test_process_report_txns_rejects_oversized() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let validator = Arc::new(RecordingValidator { calls: calls.clone() });
+    let TestTypes { handler, task_manager: _, .. } = create_test_types_with_validator(validator);
+
+    // above MAX_TXNS_PER_REPORT (5_000); empty payloads suffice since the cap is checked
+    // before any decoding/recovery
+    let txns = vec![Vec::new(); 5_001];
+    assert_matches!(
+        handler.pub_process_report_txns(txns).await,
+        Err(WorkerNetworkError::InvalidRequest(_))
+    );
+    assert!(calls.lock().expect("recording lock").is_empty(), "no submits for a rejected push");
 }
 
 /// The handler validates gossip topics against the chain id from its config, not a
