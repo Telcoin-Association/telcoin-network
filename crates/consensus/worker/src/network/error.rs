@@ -135,6 +135,55 @@ impl WorkerNetworkError {
             | WorkerNetworkError::Internal(_) => None,
         }
     }
+
+    /// Whether this fault is determined purely by the *content* of a message - its
+    /// encoding, declared topic, identity, or count - and is therefore attributable to
+    /// whoever authored that content rather than to the peer that delivered it.
+    ///
+    /// This distinction matters for gossip: the peer in hand is the relayer
+    /// (`propagation_source`), not the author, so an author-content fault must not
+    /// penalize it (see issue #801). Direct request/response paths penalize
+    /// unconditionally because there the peer *is* the originator of the content.
+    ///
+    /// These are the protocol-violation group that [`Self::penalty`] maps to
+    /// [`Penalty::Fatal`] (faults in a message's encoding, declared topic, identity, or
+    /// count). [`Self::BatchValidation`] is also `Fatal` for some subvariants but is
+    /// deliberately excluded: it arises only on the request/response path, where the
+    /// peer *is* the originator and penalizing it is correct. Of this set, only
+    /// [`Self::Bcs`] and [`Self::InvalidTopic`] are currently reachable from the gossip
+    /// handler; the rest are classified for forward-safety.
+    pub fn is_author_content_fault(&self) -> bool {
+        //
+        // explicitly match every error type so the classification is revisited with changes
+        //
+        match self {
+            // content-determined protocol violations
+            WorkerNetworkError::Bcs(_)
+            | WorkerNetworkError::InvalidTopic
+            | WorkerNetworkError::TooManyBatches { .. }
+            | WorkerNetworkError::UnexpectedBatch(_)
+            | WorkerNetworkError::DuplicateBatch(_)
+            | WorkerNetworkError::RequestHashMismatch => true,
+            // Not author-content faults on any current path. `BatchValidation` is
+            // content-determined, but only arises on the request/response path (where
+            // the peer is the originator, so its own penalty is correct) and never
+            // reaches the gossip handler; the rest are transport-peer behavior,
+            // timeouts, or faults local to this node.
+            WorkerNetworkError::BatchValidation(_)
+            | WorkerNetworkError::NonCommitteeBatch
+            | WorkerNetworkError::Internal(_)
+            | WorkerNetworkError::Timeout(_)
+            | WorkerNetworkError::Network(_)
+            | WorkerNetworkError::InvalidRequest(_)
+            | WorkerNetworkError::StreamClosed
+            | WorkerNetworkError::UnknownStreamRequest(_)
+            | WorkerNetworkError::StdIo(_)
+            | WorkerNetworkError::DBInsert(_)
+            | WorkerNetworkError::DBCommit(_)
+            | WorkerNetworkError::DBRead(_)
+            | WorkerNetworkError::BatchEpochMismatch(_, _) => false,
+        }
+    }
 }
 
 impl From<WorkerNetworkError> for Option<Penalty> {
