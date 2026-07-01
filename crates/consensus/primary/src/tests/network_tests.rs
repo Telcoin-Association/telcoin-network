@@ -496,6 +496,87 @@ async fn test_vote_fails_unknown_authority() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Regression for #802: the Byzantine errors the vote RPC returns must be penalizable.
+///
+/// `process_vote_request` now reports `(&err).into()` before collapsing the result into a
+/// response, exactly like every sibling request handler. That wiring only penalizes a
+/// misbehaving peer if the vote handler's error variants map to `Some(Penalty)` in the
+/// central `From<&PrimaryNetworkError>` table. Pin that contract here so a future error
+/// reshuffle that silently downgrades a vote error to `None` (re-opening #802 from the
+/// other side) is caught.
+#[tokio::test]
+async fn test_vote_byzantine_errors_are_penalizable() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    // A vote request whose peer is not the header's author -> PeerNotAuthor.
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1) // parent is 0
+        .build();
+    let not_author = BlsPublicKey::default();
+    let err = handler
+        .vote(not_author, header, Vec::new())
+        .await
+        .expect_err("a vote whose peer is not the header author must fail");
+    assert_matches!(err, PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor));
+    let penalty: Option<tn_network_libp2p::Penalty> = (&err).into();
+    assert_matches!(
+        penalty,
+        Some(tn_network_libp2p::Penalty::Fatal),
+        "a non-author vote must penalize the peer so process_vote_request can report it"
+    );
+
+    // A vote request authored by an authority outside the committee -> UnknownAuthority.
+    let wrong_authority = AuthorityIdentifier::dummy_for_test(100);
+    let header = committee
+        .header_builder_last_authority()
+        .author(wrong_authority.clone())
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1) // parent is 0
+        .build();
+    let peer = *committee.last_authority().authority().protocol_key();
+    let err = handler
+        .vote(peer, header, Vec::new())
+        .await
+        .expect_err("a vote authored by an unknown authority must fail");
+    assert_matches!(
+        err,
+        PrimaryNetworkError::InvalidHeader(HeaderError::UnknownAuthority(ref a))
+            if *a == wrong_authority.to_string()
+    );
+    let penalty: Option<tn_network_libp2p::Penalty> = (&err).into();
+    assert_matches!(
+        penalty,
+        Some(tn_network_libp2p::Penalty::Fatal),
+        "an unknown-authority vote must penalize the peer"
+    );
+
+    Ok(())
+}
+
+/// #802 follow-through: header errors that reflect a LOCAL or transient condition (our own
+/// storage failure, or our execution lagging behind a peer that is merely ahead) must NOT
+/// penalize the peer now that the vote RPC is wired into the penalty pipeline. Pin the
+/// central table so these stay `None`, consistent with the sibling
+/// `PrimaryNetworkError::Storage` and `*::Timeout` arms.
+#[test]
+fn test_local_header_errors_are_not_penalized() {
+    let storage: PrimaryNetworkError = HeaderError::Storage(eyre::eyre!("local db failure")).into();
+    let penalty: Option<tn_network_libp2p::Penalty> = (&storage).into();
+    assert!(penalty.is_none(), "a local storage failure must not penalize the peer");
+
+    let exec_lag: PrimaryNetworkError =
+        HeaderError::UnknownExecutionResult(BlockNumHash::new(0, BlockHash::default())).into();
+    let penalty: Option<tn_network_libp2p::Penalty> = (&exec_lag).into();
+    assert!(
+        penalty.is_none(),
+        "a peer that is merely ahead of our execution must not be penalized"
+    );
+}
+
 /// Test that primary pub/sub is enforcing topics.
 #[tokio::test]
 async fn test_primary_batch_gossip_topics() {

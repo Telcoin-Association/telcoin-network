@@ -461,6 +461,51 @@ async fn test_stream_error_penalties() {
     assert!(penalty.is_none(), "StreamClosed should have no penalty");
 }
 
+/// Author-content faults (issue #801) must be classified so the gossip handler does not
+/// Fatal-ban the relaying peer for a fault that belongs to the message author.
+#[test]
+fn test_is_author_content_fault() {
+    // Faults determined by message content. These are exactly the Fatal
+    // protocol-violation variants; `Bcs` and `InvalidTopic` are the two reachable from
+    // the gossip handler, which previously Fatal-banned the innocent relayer.
+    let author_content = vec![
+        WorkerNetworkError::Bcs(bcs::Error::Eof),
+        WorkerNetworkError::InvalidTopic,
+        WorkerNetworkError::TooManyBatches { expected: 1, received: 5 },
+        WorkerNetworkError::UnexpectedBatch(B256::random()),
+        WorkerNetworkError::DuplicateBatch(B256::random()),
+        WorkerNetworkError::RequestHashMismatch,
+    ];
+    for err in author_content {
+        assert!(
+            err.is_author_content_fault(),
+            "{err:?} is determined by message content and must not penalize a relayer"
+        );
+        // every author-content fault is a Fatal protocol violation: this is exactly the
+        // ban the gossip handler now suppresses for the relaying peer.
+        let penalty: Option<Penalty> = err.into();
+        assert_matches!(penalty, Some(Penalty::Fatal));
+    }
+
+    // Faults attributable to the transport peer's behavior, or local to this node. The
+    // relayer is correctly penalized for these (when a penalty applies at all).
+    let not_author_content = vec![
+        WorkerNetworkError::StreamClosed,
+        WorkerNetworkError::NonCommitteeBatch,
+        WorkerNetworkError::Internal("boom".to_string()),
+        WorkerNetworkError::InvalidRequest("bad request".to_string()),
+        WorkerNetworkError::UnknownStreamRequest(B256::random()),
+        WorkerNetworkError::StdIo(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+        // content-determined and Fatal for some subvariants, but only reachable on the
+        // request/response path (peer == originator), never via gossip (see #801).
+        WorkerNetworkError::BatchValidation(tn_types::BatchValidationError::EmptyBatch),
+        WorkerNetworkError::BatchEpochMismatch(1, 2),
+    ];
+    for err in not_author_content {
+        assert!(!err.is_author_content_fault(), "{err:?} is not a message-content fault");
+    }
+}
+
 // ============================================================================
 // Truncation & Peer Fallback Tests
 // ============================================================================

@@ -30,7 +30,7 @@ use crate::{
     traits::{DefaultEthPayloadTypes, TNExecution},
 };
 use alloy::{
-    hex::{self, ToHexExt},
+    hex,
     primitives::{Bytes, ChainId},
     sol_types::{SolCall, SolConstructor},
 };
@@ -1167,13 +1167,12 @@ impl RethEnv {
             .with_bundle_update()
             .build();
 
-        // The BlsG1 proof-of-possession library is a native precompile registered by the EVM
-        // factory at `BLS_G1_PRECOMPILE_ADDRESS`, so there is nothing to deploy at genesis:
-        // the registry is linked directly against the precompile address. The registry
-        // constructor's PoP verification `delegatecall`s this address and is served
-        // natively by the precompile, which shares the exact `blst` verification the
-        // consensus layer uses to produce the proofs (so the on-chain check cannot drift
-        // from the off-chain encoding).
+        // The BLS proof-of-possession precompile is registered by the EVM factory at
+        // `BLS_G1_PRECOMPILE_ADDRESS`, so there is nothing to deploy at genesis. The registry
+        // constructor's PoP verification staticcalls this address and is served natively by the
+        // precompile, which shares the exact `blst` verification the consensus layer uses to
+        // produce the proofs (so the on-chain check cannot drift from the off-chain
+        // encoding).
         let blsg1_address = BLS_G1_PRECOMPILE_ADDRESS;
 
         // prepare registry deployment
@@ -1191,8 +1190,7 @@ impl RethEnv {
                 };
                 let bls_pubkey: tn_types::Bytes = v.bls_public_key.to_bytes().into();
                 let proof = ConsensusRegistry::ProofOfPossession {
-                    uncompressedPubkey: v.bls_public_key.serialize().into(),
-                    uncompressedSignature: v.proof_of_possession.serialize().into(),
+                    signature: v.proof_of_possession.to_bytes().into(),
                 };
 
                 (validator, (bls_pubkey, proof))
@@ -1219,11 +1217,15 @@ impl RethEnv {
             Self::fetch_value_from_json_str(CONSENSUS_REGISTRY_JSON, Some("bytecode.object"))?;
         let registry_initcode_str =
             registry_initcode_binding.as_str().ok_or_eyre("invalid registry json")?;
-        // link the BlsG1 library address into the registry bytecode
-        let linked_registry_initcode =
-            Self::link_solidity_library(registry_initcode_str, &blsg1_address.encode_hex())?;
-
-        let mut create_registry = linked_registry_initcode;
+        // The registry calls the BLS precompile directly at `BLS_G1_ADDRESS` (no linked library),
+        // so its bytecode carries no link placeholder; deploy it as-is. Guard against a
+        // stale artifact that still contains an unresolved `__$..$__` placeholder.
+        if registry_initcode_str.contains("__$") {
+            eyre::bail!(
+                "ConsensusRegistry initcode has an unresolved library link placeholder; regenerate tn-contracts artifacts"
+            );
+        }
+        let mut create_registry = hex::decode(registry_initcode_str)?;
         create_registry.extend(constructor_args);
 
         // after adding bls proof of possession, registry precompile exceeds size limit so disable
@@ -1296,8 +1298,7 @@ impl RethEnv {
         )?;
         let registry_runtimecode_str =
             registry_runtimecode_binding.as_str().ok_or_eyre("invalid registry json")?;
-        let registry_runtimecode =
-            Self::link_solidity_library(registry_runtimecode_str, &blsg1_address.encode_hex())?;
+        let registry_runtimecode = hex::decode(registry_runtimecode_str)?;
 
         let tmp_worker_configs_storage = state.get(&tmp_worker_configs_address).map(|account| {
             account.storage.iter().map(|(k, v)| ((*k).into(), v.present_value.into())).collect()
@@ -1315,7 +1316,7 @@ impl RethEnv {
         let issuance_runtimecode =
             hex::decode(issuance_json_binding.as_str().ok_or_eyre("invalid issuance json")?)?;
         let genesis = genesis.extend_accounts([
-            // The BLS proof-of-possession library is a precompile at `blsg1_address`
+            // The BLS proof-of-possession precompile lives at `blsg1_address`
             // (`BLS_G1_PRECOMPILE_ADDRESS`). Mirror the TEL precompile and give it a single `0xfe`
             // (INVALID) byte of code so the account is non-empty (never state-pruned) and any call
             // that bypasses precompile dispatch reverts instead of succeeding against an EOA.
@@ -1343,54 +1344,6 @@ impl RethEnv {
         ]);
 
         Ok(genesis)
-    }
-
-    /// Links a library address into contract bytecode
-    ///
-    /// Replaces Solidity's `__$<34 chars of library hash>$__` placeholder
-    pub fn link_solidity_library(
-        bytecode_hex: &str,
-        library_address: &str,
-    ) -> eyre::Result<Vec<u8>> {
-        const PLACEHOLDER_PREFIX: &str = "__$";
-        const PLACEHOLDER_SUFFIX: &str = "$__";
-        const PLACEHOLDER_LEN: usize = 40; // __$ + 34 chars + $__
-        let library_address_unprefixed =
-            library_address.strip_prefix("0x").unwrap_or(library_address);
-        let mut result = String::with_capacity(bytecode_hex.len());
-        let mut chars = bytecode_hex.chars().peekable();
-
-        while let Some(ch) = chars.next() {
-            // check if we're at the start of a placeholder
-            if ch == '_' && chars.peek() == Some(&'_') {
-                let mut potential_placeholder = String::from("_");
-
-                // collect the next 39 characters (we already have the first _)
-                for _ in 1..PLACEHOLDER_LEN {
-                    if let Some(next_ch) = chars.next() {
-                        potential_placeholder.push(next_ch);
-                    } else {
-                        break;
-                    }
-                }
-
-                // check it matches the placeholder pattern
-                if potential_placeholder.starts_with(PLACEHOLDER_PREFIX)
-                    && potential_placeholder.ends_with(PLACEHOLDER_SUFFIX)
-                    && potential_placeholder.len() == PLACEHOLDER_LEN
-                {
-                    // it's a valid placeholder, replace with address
-                    result.push_str(library_address_unprefixed);
-                } else {
-                    // not a placeholder, add the characters back
-                    result.push_str(&potential_placeholder);
-                }
-            } else {
-                result.push(ch);
-            }
-        }
-
-        hex::decode(result).map_err(Into::into)
     }
 
     /// Fetches json info from the given string
@@ -1938,8 +1891,7 @@ mod tests {
             calldata,
         );
         let proof = ConsensusRegistry::ProofOfPossession {
-            uncompressedPubkey: new_validator.bls_public_key.serialize().into(),
-            uncompressedSignature: new_validator.proof_of_possession.serialize().into(),
+            signature: new_validator.proof_of_possession.to_bytes().into(),
         };
         let calldata = ConsensusRegistry::stakeCall {
             blsPubkey: new_validator.bls_public_key.to_bytes().into(),

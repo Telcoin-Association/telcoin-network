@@ -1,6 +1,6 @@
 //! Handle specific request types received from the network.
 
-use super::{message::MissingCertificatesRequest, PrimaryResponse};
+use super::PrimaryResponse;
 use crate::{
     error::{CertManagerError, PrimaryNetworkError, PrimaryNetworkResult},
     network::{message::PrimaryGossip, PendingStreamRequest, StreamRequestKind},
@@ -41,6 +41,14 @@ const SEND_STREAM_BUFFER_TIMEOUT: Duration = Duration::from_secs(10);
 /// drip-reads just fast enough to keep resetting the per-frame timer cannot pin
 /// the responder task (and the admission slot it holds) indefinitely.
 const SEND_SYNC_PACK_TIMEOUT: Duration = Duration::from_secs(200);
+
+/// Total timeout for serving a missing-certificates response over the sync protocol.
+///
+/// The streaming collector is already bounded by its DB-read time limit, but the
+/// number of frames and a slow reader are not, so this backstops the whole serve
+/// (and the admission slot it holds) the same way [`SEND_SYNC_PACK_TIMEOUT`] does
+/// for an epoch pack.
+const SEND_SYNC_CERTS_TIMEOUT: Duration = Duration::from_secs(200);
 
 /// Map to hold vote info to detect invalid votes, equivocation and cache responses in case of
 /// rerequests.
@@ -854,43 +862,6 @@ where
         Ok(())
     }
 
-    /// Process a request from a peer for missing certificates.
-    ///
-    /// This method efficiently retrieves certificates that the requesting peer is missing while
-    /// protecting against malicious requests through:
-    /// - limiting total processing time
-    /// - processing certificates in chunks
-    /// - validating request parameters
-    pub(crate) async fn retrieve_missing_certs(
-        &self,
-        request: MissingCertificatesRequest,
-    ) -> PrimaryNetworkResult<PrimaryResponse> {
-        // validates request is within limits
-        let mut collector = CertificateCollector::new(request, self.consensus_config.clone())?;
-
-        // Create a time-bounded iter for collecting certificates
-        let mut missing = Vec::new();
-
-        // Collect certificates from the stream
-        for cert in collector.by_ref() {
-            missing.push(cert?);
-
-            // yield occassionally to allow the request handler shutdown during network timeout
-            if missing.len() % 10 == 0 {
-                tokio::task::yield_now().await;
-            }
-        }
-
-        debug!(
-            target: "cert-collector",
-            "Collected {} certificates in {}ms",
-            missing.len(),
-            collector.start_time().elapsed().as_millis(),
-        );
-
-        Ok(PrimaryResponse::RequestedCertificates(missing))
-    }
-
     /// Retrieve the raw (serialized) consensus output bytes from local storage.
     ///
     /// Returns the full pack-file encoded output for `number` so a peer can reconstruct the
@@ -1234,6 +1205,98 @@ where
             // bound the best-effort error write: a peer that read the `Ack` then
             // stopped reading would otherwise pin this responder task.
             let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
+            let _ = timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, async {
+                let _ = write_frame(
+                    &mut stream,
+                    &SyncFrame::<PrimarySyncRequest>::Err(SyncFrameError::Internal),
+                    &mut encode_buffer,
+                    &mut compressed_buffer,
+                    max_frame,
+                )
+                .await;
+            })
+            .await;
+        }
+
+        // attempt to close the stream gracefully, bounded so a peer that stops
+        // reading cannot pin this responder task on the FIN flush
+        let _ = timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, stream.close()).await;
+
+        Ok(())
+    }
+
+    /// Serve an inbound missing-certificates sync exchange.
+    ///
+    /// The exchange has already been admitted against the concurrency caps and its
+    /// opening `Req(MissingCertificates { .. })` frame read by the caller. A streaming
+    /// [`CertificateCollector`] (no aggregate response-size cap, only its DB-read time
+    /// limit) drives [`send_sync_certificates_over_stream`], which writes [`SyncFrame::Ack`]
+    /// then the matching certificates as batched `Data` frames terminated by
+    /// [`SyncFrame::End`]. This is the streamed replacement for the legacy
+    /// request-response `RequestedCertificates` reply, without its `max_response_size`
+    /// coupling.
+    ///
+    /// A request whose `skip_rounds` is out of bounds fails the collector build and is
+    /// declined with [`SyncFrame::Err`]`(`[`SyncFrameError::Malformed`]`)` before any
+    /// `Ack`; any later serve failure is logged and best-effort signalled with
+    /// `SyncFrame::Err`. Errors are metrics-only during the rollout (no penalty),
+    /// matching the legacy responder and the epoch-pack sync path.
+    ///
+    /// [`send_sync_certificates_over_stream`]: crate::network::sync_codec::send_sync_certificates_over_stream
+    pub(super) async fn process_sync_missing_certs_stream(
+        &self,
+        peer: BlsPublicKey,
+        mut stream: Stream,
+        exclusive_lower_bound: Round,
+        skip_rounds: Vec<(AuthorityIdentifier, Vec<u8>)>,
+    ) -> PrimaryNetworkResult<()> {
+        debug!(target: "primary::network", %peer, exclusive_lower_bound, "serving inbound sync missing certificates stream");
+        let max_frame = crate::network::sync_codec::MAX_SYNC_CERT_FRAME_SIZE;
+        let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
+
+        // build the streaming collector. An out-of-bounds `skip_rounds` (or an
+        // undecodable bitmap) is a malformed request: decline with `Err(Malformed)`
+        // before any `Ack` and drop (metrics-only, no penalty during rollout).
+        let Ok(collector) = CertificateCollector::new(
+            exclusive_lower_bound,
+            skip_rounds,
+            self.consensus_config.clone(),
+        ) else {
+            warn!(target: "primary::network", %peer, "rejecting malformed sync missing certificates request");
+            let _ = timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, async {
+                let _ = write_frame(
+                    &mut stream,
+                    &SyncFrame::<PrimarySyncRequest>::Err(SyncFrameError::Malformed),
+                    &mut encode_buffer,
+                    &mut compressed_buffer,
+                    max_frame,
+                )
+                .await;
+                stream.close().await
+            })
+            .await;
+            return Ok(());
+        };
+
+        // bound the whole serve; flatten the timeout's outer Result into the send's
+        let served = timeout(
+            SEND_SYNC_CERTS_TIMEOUT,
+            crate::network::sync_codec::send_sync_certificates_over_stream(
+                &mut stream,
+                collector,
+                SEND_STREAM_BUFFER_TIMEOUT,
+            ),
+        )
+        .await
+        .map_err(PrimaryNetworkError::from)
+        .and_then(|served| served);
+
+        // a serve failure or timeout is logged and best-effort signalled so the
+        // requester stops waiting; it is not a peer fault, so no penalty
+        if let Err(e) = served {
+            warn!(target: "primary::network", %peer, ?e, "failed to serve sync missing certificates stream");
+            // bound the best-effort error write: a peer that read the `Ack` then
+            // stopped reading would otherwise pin this responder task.
             let _ = timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, async {
                 let _ = write_frame(
                     &mut stream,
