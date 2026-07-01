@@ -122,12 +122,36 @@ impl WorkerNetworkHandle {
         Ok(())
     }
 
-    /// Publish a transaction (as raw bytes) worker network.
-    /// Do this when not a committee member so a CVV can include the txn.
-    pub(crate) async fn publish_txn(&self, txn: Vec<u8>) -> NetworkResult<()> {
-        let data = encode(&WorkerGossip::Txn(txn));
-        self.handle.publish(tn_config::LibP2pConfig::worker_txn_topic(self.chain_id), data).await?;
-        Ok(())
+    /// Push transactions (as raw bytes) to a committee member via direct RPC.
+    ///
+    /// Use this when not a committee member so a committee validator can include the
+    /// transactions in a batch. This replaces the previous gossip broadcast (issue #804):
+    /// the request is routed to `peer_bls` over the (KAD-discovered) request/response
+    /// protocol instead of flooded on a gossip topic.
+    pub(crate) async fn report_txns(
+        &self,
+        peer_bls: BlsPublicKey,
+        transactions: Vec<Vec<u8>>,
+    ) -> NetworkResult<()> {
+        let request = WorkerRequest::ReportTxns { transactions };
+        let res = self.handle.send_request(request, peer_bls).await?;
+        let res = res.await??.result;
+        match res {
+            WorkerResponse::ReportTxns => Ok(()),
+            WorkerResponse::ReportBatch => Err(NetworkError::RPCError(
+                "Got wrong response, not a report txns is report batch!".to_string(),
+            )),
+            WorkerResponse::RequestBatchesStream { .. } => Err(NetworkError::RPCError(
+                "Got wrong response, not a report txns is stream ack!".to_string(),
+            )),
+            WorkerResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
+                "Got wrong response, not a report txns is peer exchange!".to_string(),
+            )),
+            WorkerResponse::Error(WorkerRPCError(s)) => Err(NetworkError::RPCError(s)),
+            WorkerResponse::RecoverableError(WorkerRPCError(s)) => {
+                Err(NetworkError::RPCRetryable(s))
+            }
+        }
     }
 
     /// Report a new batch to a peer.
@@ -141,6 +165,9 @@ impl WorkerNetworkHandle {
         let res = res.await??.result;
         match res {
             WorkerResponse::ReportBatch => Ok(()),
+            WorkerResponse::ReportTxns => Err(NetworkError::RPCError(
+                "Got wrong response, not a report batch is report txns!".to_string(),
+            )),
             WorkerResponse::RequestBatchesStream { .. } => Err(NetworkError::RPCError(
                 "Got wrong response, not a report batch is stream ack!".to_string(),
             )),
@@ -573,6 +600,9 @@ impl WorkerNetworkHandle {
             }
             WorkerResponse::ReportBatch => Err(NetworkError::RPCError(
                 "Got wrong response: report batch instead of stream ack".to_string(),
+            )),
+            WorkerResponse::ReportTxns => Err(NetworkError::RPCError(
+                "Got wrong response: report txns instead of stream ack".to_string(),
             )),
             WorkerResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
                 "Got wrong response: peer exchange instead of stream ack".to_string(),

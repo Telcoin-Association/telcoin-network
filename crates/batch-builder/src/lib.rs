@@ -417,6 +417,7 @@ mod tests {
             store.clone(),
             timeout,
             WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
+            Vec::new(),
         );
         block_provider.spawn_batch_builder("test batch builder", &task_manager);
 

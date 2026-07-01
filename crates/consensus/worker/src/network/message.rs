@@ -10,10 +10,8 @@ use tn_types::{BlockHash, Epoch, SealedBatch};
 /// Worker messages on the gossip network.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum WorkerGossip {
-    /// A new is available.
+    /// A new batch digest is available so non-committee peers can fetch it.
     Batch(Epoch, BlockHash),
-    /// Transaction- published so a committee member can include in a batch.
-    Txn(Vec<u8>),
 }
 
 // impl TNMessage trait for types
@@ -61,6 +59,19 @@ pub enum WorkerRequest {
         /// The peer information being exchanged.
         peers: PeerExchangeMap,
     },
+    /// Push transactions to a committee member for inclusion in a batch.
+    ///
+    /// Sent by non-committee workers so a committee validator can include the
+    /// transactions they accept, replacing the previous gossip broadcast. Each
+    /// recipient independently keeps only the transactions that fall in its own
+    /// committee shard (see `submit_txn_if_mine`).
+    ///
+    /// Appended last so that adding it does not shift the serialized variant
+    /// discriminants of the existing variants (wire compatibility).
+    ReportTxns {
+        /// The raw (encoded) transactions being submitted.
+        transactions: Vec<Vec<u8>>,
+    },
 }
 
 impl From<PeerExchangeMap> for WorkerRequest {
@@ -107,6 +118,11 @@ pub enum WorkerResponse {
     /// likely to succeed in the future, so the requester should retry rather
     /// than give up on the peer.
     RecoverableError(WorkerRPCError),
+    /// Status 200 response when a peer accepts pushed transactions.
+    ///
+    /// Appended last so that adding it does not shift the serialized variant
+    /// discriminants of the existing variants (wire compatibility).
+    ReportTxns,
 }
 
 impl WorkerResponse {

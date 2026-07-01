@@ -51,6 +51,7 @@ async fn test_make_batch_el_to_cl() {
         store.clone(),
         timeout,
         WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
+        Vec::new(),
     );
     batch_provider.spawn_batch_builder("test builder", &task_manager);
 
