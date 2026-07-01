@@ -97,7 +97,7 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
     );
     let (tx, mut rx) = oneshot::channel();
     task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         debug!(target: "gas-test", ?res, "res:");
         let _ = tx.send(res);
         Ok(())
@@ -301,7 +301,7 @@ async fn test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
     );
     let (tx, mut rx) = oneshot::channel();
     task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         debug!(target: "gas-test", ?res, "res:");
         let _ = tx.send(res);
         Ok(())
@@ -469,7 +469,7 @@ async fn test_catchup_accumulator_partial_execution() -> eyre::Result<()> {
     );
     let (tx, mut rx) = oneshot::channel();
     task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         debug!(target: "gas-test", ?res, "partial res:");
         let _ = tx.send(res);
         Ok(())

@@ -456,7 +456,7 @@ where
             if exex_critical {
                 node_task_manager.get_spawner().spawn_critical_task(
                     "exex-manager",
-                    run_critical_exex_future("exex-manager".to_string(), manager),
+                    run_critical_exex_future("exex-manager".to_string(), manager.run()),
                 );
                 info!(target: "epoch-manager", "ExEx manager and tasks spawned (critical)");
             } else {
@@ -464,7 +464,7 @@ where
                 // loudly) but the node — host to an optional subsystem — stays up.
                 node_task_manager.get_spawner().spawn_task(
                     "exex-manager",
-                    run_isolated_exex_future("exex-manager".to_string(), manager),
+                    run_isolated_exex_future("exex-manager".to_string(), manager.run()),
                 );
                 info!(target: "epoch-manager", "ExEx manager and tasks spawned (isolated, non-critical)");
             }
