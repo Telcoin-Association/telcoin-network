@@ -23,13 +23,18 @@ pub mod kad;
 mod metrics;
 mod peers;
 pub mod stream;
+mod sync;
 pub mod types;
 
 // export types
 pub use codec::{decode_message, encode_message, TNCodec, TNMessage};
 pub use consensus::ConsensusNetwork;
 pub use peers::{PeerExchangeMap, Penalty};
-pub use stream::StreamError;
+pub use stream::{StreamError, StreamKind};
+pub use sync::{
+    read_frame, write_frame, DenyReason, PrimarySyncRequest, SyncFrame, SyncFrameError,
+    WorkerSyncRequest,
+};
 pub use types::ResponseChannel;
 
 // re-export specific libp2p types

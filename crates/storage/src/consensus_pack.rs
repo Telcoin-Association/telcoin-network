@@ -32,7 +32,7 @@ use tokio::{
 use tracing::{debug, error, warn};
 
 use crate::archive::{
-    data_file::fsync_directory,
+    data_file::{create_dir_synced, fsync_directory},
     digest_index::index::HdxIndex,
     error::{fetch::FetchError, open::OpenError},
     fxhasher::FxHasher,
@@ -100,6 +100,7 @@ enum PackMessage {
     ConsensusHeaderNumber(u64, oneshot::Sender<Result<ConsensusHeader, PackError>>),
     Persist(oneshot::Sender<Result<(), PackError>>),
     BytesForConsensus(u64, oneshot::Sender<Result<Vec<u8>, PackError>>),
+    OutputEndForConsensus(u64, oneshot::Sender<Result<u64, PackError>>),
     ReadLastCommitted(oneshot::Sender<Result<HashMap<AuthorityIdentifier, Round>, PackError>>),
     ReadLatestFinalRep(oneshot::Sender<Result<Option<CommittedSubDag>, PackError>>),
     ContainsBatch(B256, oneshot::Sender<bool>),
@@ -107,6 +108,9 @@ enum PackMessage {
     CountLeaders(Round, RewardsCounter, oneshot::Sender<Result<(), PackError>>),
     LatestConsensusHeader(oneshot::Sender<Option<ConsensusHeader>>),
     Shutdown,
+    // Flush the write buffer to the data file WITHOUT fsync, so freshly appended bytes
+    /// become visible to other file handles on the same file (visibility, not durability).
+    FlushData(oneshot::Sender<Result<(), PackError>>),
 }
 
 /// Manage a single pack file of consensus data (typically one epoch os the consensus chain).
@@ -118,6 +122,7 @@ pub struct ConsensusPack {
     epoch: Epoch,
     committee: Committee,
     compression: PackCompression,
+    is_static: bool,
 }
 
 fn run_pack_loop(
@@ -151,6 +156,9 @@ fn run_pack_loop(
             PackMessage::BytesForConsensus(number, tx) => {
                 let _ = tx.send(inner.bytes_for_consensus(number));
             }
+            PackMessage::OutputEndForConsensus(number, tx) => {
+                let _ = tx.send(inner.output_end_for_consensus(number));
+            }
             PackMessage::ReadLastCommitted(tx) => {
                 let _ = tx.send(inner.read_last_committed());
             }
@@ -172,6 +180,9 @@ fn run_pack_loop(
             PackMessage::Shutdown => {
                 let _ = inner.persist();
                 break;
+            }
+            PackMessage::FlushData(tx) => {
+                let _ = tx.send(inner.flush_data());
             }
         }
     }
@@ -215,6 +226,7 @@ impl ConsensusPack {
             epoch,
             committee,
             compression,
+            is_static: false,
         })
     }
 
@@ -234,6 +246,7 @@ impl ConsensusPack {
             epoch,
             committee,
             compression,
+            is_static: false,
         })
     }
 
@@ -255,6 +268,7 @@ impl ConsensusPack {
             epoch,
             committee,
             compression,
+            is_static: true,
         })
     }
 
@@ -291,7 +305,13 @@ impl ConsensusPack {
             epoch,
             committee,
             compression,
+            is_static: true,
         })
+    }
+
+    /// Is this packfile static- i.e. complete and read only.
+    pub fn is_static(&self) -> bool {
+        self.is_static
     }
 
     /// Return the epoch for this pack file.
@@ -331,6 +351,31 @@ impl ConsensusPack {
         let cursor = Cursor::new(bytes);
         let reader = BufReader::new(cursor);
         bytes_to_output(reader, self.compression, Duration::from_secs(5), &self.committee).await
+    }
+
+    /// Load and return the pack file bytes for consensus output form this epoch.
+    pub async fn get_consensus_output_bytes(&self, number: u64) -> Result<Vec<u8>, PackError> {
+        self.get_error()?;
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(PackMessage::BytesForConsensus(number, tx)).await.is_ok() {
+            rx.await.map_err(|_| PackError::ReceiveFailed)?
+        } else {
+            Err(PackError::SendFailed)
+        }
+    }
+
+    /// Return the byte offset in the data file just past the end of the consensus output for
+    /// `number`. Streaming `[0, output_end)` of the data file yields a verifiable prefix of the
+    /// pack containing every output up to and including `number` (plus the data header). Errors
+    /// if `number` is outside the range this pack contains.
+    pub async fn consensus_output_end(&self, number: u64) -> Result<u64, PackError> {
+        self.get_error()?;
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(PackMessage::OutputEndForConsensus(number, tx)).await.is_ok() {
+            rx.await.map_err(|_| PackError::ReceiveFailed)?
+        } else {
+            Err(PackError::SendFailed)
+        }
     }
 
     /// True if consensus header by digest is found by digest.
@@ -384,6 +429,17 @@ impl ConsensusPack {
         self.get_error()?;
         let (tx, rx) = oneshot::channel();
         let _ = self.tx.send(PackMessage::Persist(tx)).await;
+        rx.await.map_err(|_| match &*self.error.borrow() {
+            Some(e) => e.clone(),
+            None => PackError::ReceiveFailed,
+        })?
+    }
+
+    // public handle method (sibling of `persist`, consensus_pack.rs:412):
+    pub async fn flush_data(&self) -> Result<(), PackError> {
+        self.get_error()?;
+        let (tx, rx) = oneshot::channel();
+        let _ = self.tx.send(PackMessage::FlushData(tx)).await;
         rx.await.map_err(|_| match &*self.error.borrow() {
             Some(e) => e.clone(),
             None => PackError::ReceiveFailed,
@@ -656,7 +712,7 @@ impl Inner {
     ) -> Result<Self, PackError> {
         let epoch = committee.epoch();
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
-        let _ = std::fs::create_dir_all(&base_dir);
+        let _ = create_dir_synced(&base_dir);
         let pack_file = base_dir.join(Self::DATA_NAME);
         let have_pack = std::fs::exists(&pack_file).unwrap_or_default();
         let mut data: Pack<PackRecord> =
@@ -802,58 +858,6 @@ impl Inner {
         Ok(Self { data, consensus_digests, consensus_pos_idx, batch_digests, epoch_meta })
     }
 
-    /// Verify a streamed EpochMeta record is valid.
-    fn verify_epoch_meta(
-        epoch: Epoch,
-        previous_epoch: &EpochRecord,
-        epoch_meta: &EpochMeta,
-    ) -> Result<(), PackError> {
-        if epoch != epoch_meta.epoch {
-            return Err(PackError::InvalidEpoch(
-                epoch,
-                format!("meta data epoch is {}", epoch_meta.epoch),
-            ));
-        }
-        let start_consensus_number =
-            if epoch == 0 { 1 } else { previous_epoch.final_consensus.number + 1 };
-        if start_consensus_number != epoch_meta.start_consensus_number {
-            return Err(PackError::InvalidEpoch(
-                epoch,
-                format!(
-                    "expected start consensus number {start_consensus_number}, got {}",
-                    epoch_meta.start_consensus_number
-                ),
-            ));
-        }
-        if previous_epoch.final_state != epoch_meta.genesis_exec_state {
-            return Err(PackError::InvalidEpoch(
-                epoch,
-                format!(
-                    "expected final state {:?} meta final state {:?}",
-                    previous_epoch.final_state, epoch_meta.genesis_exec_state
-                ),
-            ));
-        }
-        if previous_epoch.final_consensus != epoch_meta.genesis_consensus {
-            return Err(PackError::InvalidEpoch(
-                epoch,
-                format!(
-                    "expected final consensus {:?} meta final consensus {:?}",
-                    previous_epoch.final_consensus, epoch_meta.genesis_consensus
-                ),
-            ));
-        }
-        let committee: BTreeSet<BlsPublicKey> =
-            previous_epoch.next_committee.iter().copied().collect();
-        if epoch_meta.committee.bls_keys() != committee {
-            return Err(PackError::InvalidEpoch(
-                epoch,
-                "epoch meta has unexpected committee".to_string(),
-            ));
-        }
-        Ok(())
-    }
-
     /// Create a new set of epoch static files to write consensus output into.
     async fn stream_import<P: AsRef<Path>, R: AsyncRead + Unpin>(
         path: P,
@@ -877,7 +881,7 @@ impl Inner {
             }
         }
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
-        let _ = std::fs::create_dir_all(&base_dir);
+        let _ = create_dir_synced(&base_dir);
         let mut stream_iter = AsyncPackIter::<PackRecord, R>::open(stream, epoch as u64)
             .await
             .map_err(|e| PackError::ReadError(e.to_string()))?;
@@ -888,7 +892,7 @@ impl Inner {
         } else {
             return Err(PackError::NotEpoch);
         };
-        Self::verify_epoch_meta(epoch, previous_epoch, &epoch_meta)?;
+        verify_epoch_meta(epoch, previous_epoch, &epoch_meta)?;
         data.append(&PackRecord::EpochMeta(epoch_meta.clone()))
             .map_err(|e| PackError::Append(e.to_string()))?;
         let consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false)?;
@@ -1081,6 +1085,14 @@ impl Inner {
         Ok(())
     }
 
+    // Inner method (sibling of Inner::persist, consensus_pack.rs:1051) — flush only, no syncs:
+    fn flush_data(&mut self) -> Result<(), PackError> {
+        if !self.data.read_only() {
+            self.data.flush().map_err(|e| PackError::PersistError(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     /// Read and return all the bytes for consensus number (all batches and the consensus header).
     fn bytes_for_consensus(&mut self, number: u64) -> Result<Vec<u8>, PackError> {
         // Validate the range like consensus_header_by_number; without this a number below
@@ -1102,6 +1114,23 @@ impl Inner {
             .read_bytes(output_start, output_end)
             .map_err(|e| PackError::ReadError(e.to_string()))?;
         Ok(bytes)
+    }
+
+    /// Return the byte offset in the data file just past the end of the consensus output for
+    /// `number` (the `output_end` of its index entry). Range-checked like `bytes_for_consensus`.
+    fn output_end_for_consensus(&mut self, number: u64) -> Result<u64, PackError> {
+        if number < self.epoch_meta.start_consensus_number {
+            return Err(PackError::ConsensusNumberTooLow);
+        }
+        if number >= self.epoch_meta.start_consensus_number + self.consensus_pos_idx.len() as u64 {
+            return Err(PackError::ConsensusNumberTooHigh);
+        }
+        let rec_pos_idx = number.saturating_sub(self.epoch_meta.start_consensus_number);
+        let pos = self
+            .consensus_pos_idx
+            .load(rec_pos_idx)
+            .map_err(|e| PackError::ReadError(e.to_string()))?;
+        Ok(pos.output_end)
     }
 
     /// Return the latest consensus header by reading directly from the pack index,
@@ -1215,6 +1244,61 @@ impl Inner {
         }
         Ok(())
     }
+}
+
+/// Verify a streamed [`EpochMeta`] record links correctly to the previous epoch's record.
+///
+/// Extracted from [`Inner::stream_import`] as a free function (it is stateless) so the offline pack
+/// validator ([`crate::pack_validate`]) can reuse the exact same epoch-linkage checks without
+/// duplicating them.
+pub(crate) fn verify_epoch_meta(
+    epoch: Epoch,
+    previous_epoch: &EpochRecord,
+    epoch_meta: &EpochMeta,
+) -> Result<(), PackError> {
+    if epoch != epoch_meta.epoch {
+        return Err(PackError::InvalidEpoch(
+            epoch,
+            format!("meta data epoch is {}", epoch_meta.epoch),
+        ));
+    }
+    let start_consensus_number =
+        if epoch == 0 { 1 } else { previous_epoch.final_consensus.number + 1 };
+    if start_consensus_number != epoch_meta.start_consensus_number {
+        return Err(PackError::InvalidEpoch(
+            epoch,
+            format!(
+                "expected start consensus number {start_consensus_number}, got {}",
+                epoch_meta.start_consensus_number
+            ),
+        ));
+    }
+    if previous_epoch.final_state != epoch_meta.genesis_exec_state {
+        return Err(PackError::InvalidEpoch(
+            epoch,
+            format!(
+                "expected final state {:?} meta final state {:?}",
+                previous_epoch.final_state, epoch_meta.genesis_exec_state
+            ),
+        ));
+    }
+    if previous_epoch.final_consensus != epoch_meta.genesis_consensus {
+        return Err(PackError::InvalidEpoch(
+            epoch,
+            format!(
+                "expected final consensus {:?} meta final consensus {:?}",
+                previous_epoch.final_consensus, epoch_meta.genesis_consensus
+            ),
+        ));
+    }
+    let committee: BTreeSet<BlsPublicKey> = previous_epoch.next_committee.iter().copied().collect();
+    if epoch_meta.committee.bls_keys() != committee {
+        return Err(PackError::InvalidEpoch(
+            epoch,
+            "epoch meta has unexpected committee".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Upper bound on how many `Batch` records `iter_to_output` will buffer before the

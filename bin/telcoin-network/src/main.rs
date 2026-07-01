@@ -84,7 +84,10 @@ fn main() {
             passphrase = None;
         }
     }
-    if passphrase.is_none() && cli.bls_passphrase_source.with_passphrase() {
+    // The `db` subcommand is a read-only inspection tool and never needs the BLS key.
+    let needs_passphrase =
+        cli.bls_passphrase_source.with_passphrase() && !matches!(cli.command, Commands::Db(_));
+    if passphrase.is_none() && needs_passphrase {
         eprintln!(
             "Error passphrase is required, see the option --bls-passphrase-source for options"
         );

@@ -4,8 +4,9 @@ use assert_matches::assert_matches;
 use std::{collections::BTreeSet, sync::Arc};
 use tn_batch_validator::NoopBatchValidator;
 use tn_network_libp2p::{
+    error::NetworkError,
     types::{NetworkCommand, NetworkHandle, NetworkResponseMessage},
-    GossipMessage, Penalty, TopicHash,
+    GossipMessage, Penalty, StreamError, StreamKind, TopicHash,
 };
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::CommitteeFixture;
@@ -33,7 +34,18 @@ struct TestTypes<DB = MemDatabase> {
 /// Helper function to create an instance of [RequestHandler] for the first authority in the
 /// committee.
 fn create_test_types() -> TestTypes {
-    let committee = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    create_test_types_with_chain_id(0)
+}
+
+/// Like [`create_test_types`], but stamps `chain_id` onto the network config so the
+/// handler validates (and the handle publishes) gossip topics namespaced by that id.
+fn create_test_types_with_chain_id(chain_id: u64) -> TestTypes {
+    let mut network_config = tn_config::NetworkConfig::default();
+    network_config.set_chain_id(chain_id);
+    let committee = CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .with_network_config(network_config)
+        .build();
     let authority = committee.first_authority();
     let config = authority.consensus_config();
     let task_manager = TaskManager::default();
@@ -41,9 +53,29 @@ fn create_test_types() -> TestTypes {
     let batch_validator = Arc::new(NoopBatchValidator);
     let (tx, network_commands_rx) = mpsc::channel(10);
     let network_handle =
-        WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0);
+        WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, chain_id);
     let handler = RequestHandler::new(worker_id, batch_validator, config, network_handle);
     TestTypes { committee, handler, task_manager, network_commands_rx }
+}
+
+/// Deny a sync-protocol `OpenStream` command, simulating a legacy-only peer so
+/// the requester falls back to the legacy `RequestBatchesStream` path.
+///
+/// Since item 5 makes the worker requester open a `/tn-worker-{id}-sync` stream
+/// first, every legacy-flow test must answer that probe. Returning
+/// [`StreamError::UpgradeFailed`] is exactly what a pre-item-4 peer's failed
+/// negotiation surfaces, so the requester caches the peer as legacy-only and the
+/// rest of the test drives the unchanged legacy handshake. A non-sync command is
+/// returned untouched for the test's own loop to handle.
+fn deny_sync_open(
+    command: NetworkCommand<WorkerRequest, WorkerResponse>,
+) -> Option<NetworkCommand<WorkerRequest, WorkerResponse>> {
+    if let NetworkCommand::OpenStream { kind: StreamKind::Sync, reply, .. } = command {
+        let _ = reply.send(Err(NetworkError::Stream(StreamError::UpgradeFailed)));
+        None
+    } else {
+        Some(command)
+    }
 }
 
 // ============================================================================
@@ -84,24 +116,56 @@ async fn test_batch_gossip_topics() {
     let batch_digest = B256::random();
     let gossip = WorkerGossip::Batch(0, batch_digest);
     let data = tn_types::encode(&gossip);
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(0));
     let good_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     assert!(handler.pub_process_gossip_for_test(&good_msg).await.is_ok());
 
     // Test swapped topics, must fail.
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_txn_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_txn_topic(0));
     let bad_msg = GossipMessage { source: None, data, sequence_number: None, topic };
     assert!(handler.pub_process_gossip_for_test(&bad_msg).await.is_err());
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(0));
     let gossip = WorkerGossip::Txn(vec![]);
     let data = tn_types::encode(&gossip);
     let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     assert!(handler.pub_process_gossip_for_test(&bad_msg).await.is_err());
 
     // Use the correct topic for a txn and make sure it works.
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_txn_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_txn_topic(0));
     let good_msg = GossipMessage { source: None, data, sequence_number: None, topic };
     assert!(handler.pub_process_gossip_for_test(&good_msg).await.is_ok());
+}
+
+/// The handler validates gossip topics against the chain id from its config, not a
+/// hardcoded value: with a non-zero chain id, a message on the chain-0 namespace (what
+/// an un-stamped node would publish) is rejected as an invalid topic. This is the
+/// property that makes the namespacing actually isolate chains.
+#[tokio::test]
+async fn test_batch_gossip_topic_is_chain_namespaced() {
+    let TestTypes { handler, .. } = create_test_types_with_chain_id(2017);
+    let batch_digest = B256::random();
+    let data = tn_types::encode(&WorkerGossip::Batch(0, batch_digest));
+
+    // the config's chain id (2017) is accepted: the topic check passes
+    let good = GossipMessage {
+        source: None,
+        data: data.clone(),
+        sequence_number: None,
+        topic: TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(2017)),
+    };
+    assert!(handler.pub_process_gossip_for_test(&good).await.is_ok());
+
+    // the chain-0 namespace is a different topic and is rejected
+    let bad = GossipMessage {
+        source: None,
+        data,
+        sequence_number: None,
+        topic: TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(0)),
+    };
+    assert_matches!(
+        handler.pub_process_gossip_for_test(&bad).await,
+        Err(WorkerNetworkError::InvalidTopic)
+    );
 }
 
 /// Test that gossip triggers batch fetch via stream-based approach.
@@ -117,7 +181,7 @@ async fn test_batch_gossip_triggers_stream_request() {
     let batch_digest = B256::random();
     let gossip = WorkerGossip::Batch(0, batch_digest);
     let data = tn_types::encode(&gossip);
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(0));
     let msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
 
     task_manager.spawn_task("process-gossip-test", async move {
@@ -128,6 +192,7 @@ async fn test_batch_gossip_triggers_stream_request() {
     // recv commands
     let expected_peer = committee.last_authority().primary_public_key();
     while let Some(command) = network_commands_rx.recv().await {
+        let Some(command) = deny_sync_open(command) else { continue };
         match command {
             NetworkCommand::ConnectedPeers { reply } => {
                 // request_batches calls this first
@@ -168,7 +233,7 @@ async fn test_batch_gossip_stream_accepted_opens_stream() {
     let batch_digest = B256::random();
     let gossip = WorkerGossip::Batch(0, batch_digest);
     let data = tn_types::encode(&gossip);
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic());
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(0));
     let msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
 
     task_manager.spawn_task("process-gossip-test", async move {
@@ -181,6 +246,7 @@ async fn test_batch_gossip_stream_accepted_opens_stream() {
     let mut stream_request_acked = false;
 
     while let Some(command) = network_commands_rx.recv().await {
+        let Some(command) = deny_sync_open(command) else { continue };
         match command {
             NetworkCommand::ConnectedPeers { reply } => {
                 reply.send(vec![expected_peer]).expect("peer sent");
@@ -202,8 +268,9 @@ async fn test_batch_gossip_stream_accepted_opens_stream() {
                     _ => panic!("expected RequestBatchesStream, got {:?}", request),
                 }
             }
-            NetworkCommand::OpenStream { peer, reply } => {
-                // Verify OpenStream is called after ack
+            NetworkCommand::OpenStream { peer, reply, .. } => {
+                // the sync probe was denied above, so this is the legacy open
+                // after the ack
                 assert!(stream_request_acked, "OpenStream should come after ack");
                 assert_eq!(peer, expected_peer);
                 // Don't complete the stream - just verify command was sent
@@ -250,7 +317,7 @@ async fn test_unknown_stream_request_error_type() {
 async fn test_request_batches_no_peers() {
     let (tx, mut rx) = mpsc::channel(10);
     let task_manager = TaskManager::default();
-    let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0);
+    let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0);
 
     // reply with empty peer list
     tokio::spawn(async move {
@@ -273,7 +340,7 @@ async fn test_request_batches_no_peers() {
 async fn test_request_batches_peer_rejects_tries_next() {
     let (tx, mut rx) = mpsc::channel(10);
     let task_manager = TaskManager::default();
-    let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0);
+    let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0);
 
     let fixture = tn_test_utils::CommitteeFixture::builder(MemDatabase::default)
         .randomize_ports(true)
@@ -283,20 +350,23 @@ async fn test_request_batches_peer_rejects_tries_next() {
 
     tokio::spawn(async move {
         while let Some(cmd) = rx.recv().await {
+            let Some(cmd) = deny_sync_open(cmd) else { continue };
             match cmd {
                 NetworkCommand::ConnectedPeers { reply } => {
                     reply.send(vec![peer1, peer2]).expect("send peers");
                 }
-                NetworkCommand::SendRequest { request, reply, .. } => {
-                    if let WorkerRequest::RequestBatchesStream { .. } = request {
-                        // both peers reject
-                        reply
-                            .send(Ok(NetworkResponseMessage {
-                                peer: peer1,
-                                result: WorkerResponse::RequestBatchesStream { ack: false },
-                            }))
-                            .expect("send reject");
-                    }
+                NetworkCommand::SendRequest {
+                    request: WorkerRequest::RequestBatchesStream { .. },
+                    reply,
+                    ..
+                } => {
+                    // both peers reject
+                    reply
+                        .send(Ok(NetworkResponseMessage {
+                            peer: peer1,
+                            result: WorkerResponse::RequestBatchesStream { ack: false },
+                        }))
+                        .expect("send reject");
                 }
                 _ => {}
             }
@@ -400,7 +470,7 @@ async fn test_stream_error_penalties() {
 async fn test_request_batches_truncates_oversized_digests() {
     let (tx, mut rx) = mpsc::channel(10);
     let task_manager = TaskManager::default();
-    let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0);
+    let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0);
 
     let fixture = tn_test_utils::CommitteeFixture::builder(MemDatabase::default)
         .randomize_ports(true)
@@ -409,26 +479,29 @@ async fn test_request_batches_truncates_oversized_digests() {
 
     tokio::spawn(async move {
         while let Some(cmd) = rx.recv().await {
+            let Some(cmd) = deny_sync_open(cmd) else { continue };
             match cmd {
                 NetworkCommand::ConnectedPeers { reply } => {
                     reply.send(vec![peer1]).expect("send peers");
                 }
-                NetworkCommand::SendRequest { request, reply, .. } => {
-                    if let WorkerRequest::RequestBatchesStream { batch_digests, .. } = request {
-                        // assert truncation happened
-                        assert_eq!(
-                            batch_digests.len(),
-                            MAX_BATCH_DIGESTS_PER_REQUEST,
-                            "digests should be truncated to MAX_BATCH_DIGESTS_PER_REQUEST (500)"
-                        );
-                        // reject to end the test
-                        reply
-                            .send(Ok(NetworkResponseMessage {
-                                peer: peer1,
-                                result: WorkerResponse::RequestBatchesStream { ack: false },
-                            }))
-                            .expect("send reject");
-                    }
+                NetworkCommand::SendRequest {
+                    request: WorkerRequest::RequestBatchesStream { batch_digests, .. },
+                    reply,
+                    ..
+                } => {
+                    // assert truncation happened
+                    assert_eq!(
+                        batch_digests.len(),
+                        MAX_BATCH_DIGESTS_PER_REQUEST,
+                        "digests should be truncated to MAX_BATCH_DIGESTS_PER_REQUEST (500)"
+                    );
+                    // reject to end the test
+                    reply
+                        .send(Ok(NetworkResponseMessage {
+                            peer: peer1,
+                            result: WorkerResponse::RequestBatchesStream { ack: false },
+                        }))
+                        .expect("send reject");
                 }
                 _ => {}
             }
@@ -639,7 +712,7 @@ async fn test_concurrent_capacity_exactly_max() {
 async fn test_retry_succeeds_after_initial_rejection() {
     let (tx, mut rx) = mpsc::channel(10);
     let task_manager = TaskManager::default();
-    let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0);
+    let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0);
 
     let fixture = tn_test_utils::CommitteeFixture::builder(MemDatabase::default)
         .randomize_ports(true)
@@ -653,31 +726,34 @@ async fn test_retry_succeeds_after_initial_rejection() {
         let mut stream_accepted = false;
 
         while let Some(cmd) = rx.recv().await {
+            let Some(cmd) = deny_sync_open(cmd) else { continue };
             match cmd {
                 NetworkCommand::ConnectedPeers { reply } => {
                     connected_peers_count += 1;
                     reply.send(vec![peer1]).expect("send peers");
                 }
-                NetworkCommand::SendRequest { request, reply, .. } => {
-                    if let WorkerRequest::RequestBatchesStream { .. } = request {
-                        if connected_peers_count <= 1 {
-                            // first attempt: reject
-                            reply
-                                .send(Ok(NetworkResponseMessage {
-                                    peer: peer1,
-                                    result: WorkerResponse::RequestBatchesStream { ack: false },
-                                }))
-                                .expect("send reject");
-                        } else {
-                            // second attempt: accept
-                            reply
-                                .send(Ok(NetworkResponseMessage {
-                                    peer: peer1,
-                                    result: WorkerResponse::RequestBatchesStream { ack: true },
-                                }))
-                                .expect("send accept");
-                            stream_accepted = true;
-                        }
+                NetworkCommand::SendRequest {
+                    request: WorkerRequest::RequestBatchesStream { .. },
+                    reply,
+                    ..
+                } => {
+                    if connected_peers_count <= 1 {
+                        // first attempt: reject
+                        reply
+                            .send(Ok(NetworkResponseMessage {
+                                peer: peer1,
+                                result: WorkerResponse::RequestBatchesStream { ack: false },
+                            }))
+                            .expect("send reject");
+                    } else {
+                        // second attempt: accept
+                        reply
+                            .send(Ok(NetworkResponseMessage {
+                                peer: peer1,
+                                result: WorkerResponse::RequestBatchesStream { ack: true },
+                            }))
+                            .expect("send accept");
+                        stream_accepted = true;
                     }
                 }
                 NetworkCommand::OpenStream { reply, .. } => {
@@ -717,7 +793,7 @@ async fn test_retry_succeeds_after_initial_rejection() {
 async fn test_request_batches_peer_fallback_preserves_digests() {
     let (tx, mut rx) = mpsc::channel(10);
     let task_manager = TaskManager::default();
-    let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0);
+    let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0);
 
     let fixture = tn_test_utils::CommitteeFixture::builder(MemDatabase::default)
         .randomize_ports(true)
@@ -729,27 +805,30 @@ async fn test_request_batches_peer_fallback_preserves_digests() {
     tokio::spawn(async move {
         let mut request_count = 0u32;
         while let Some(cmd) = rx.recv().await {
+            let Some(cmd) = deny_sync_open(cmd) else { continue };
             match cmd {
                 NetworkCommand::ConnectedPeers { reply } => {
                     reply.send(vec![peer1, peer2]).expect("send peers");
                 }
-                NetworkCommand::SendRequest { request, reply, .. } => {
-                    if let WorkerRequest::RequestBatchesStream { batch_digests, .. } = request {
-                        request_count += 1;
-                        // both peer1 and peer2 should receive exactly 3 digests
-                        assert_eq!(
-                            batch_digests.len(),
-                            expected_count,
-                            "peer {request_count} should receive all {expected_count} digests"
-                        );
-                        // reject to trigger fallback to next peer
-                        reply
-                            .send(Ok(NetworkResponseMessage {
-                                peer: peer2,
-                                result: WorkerResponse::RequestBatchesStream { ack: false },
-                            }))
-                            .unwrap();
-                    }
+                NetworkCommand::SendRequest {
+                    request: WorkerRequest::RequestBatchesStream { batch_digests, .. },
+                    reply,
+                    ..
+                } => {
+                    request_count += 1;
+                    // both peer1 and peer2 should receive exactly 3 digests
+                    assert_eq!(
+                        batch_digests.len(),
+                        expected_count,
+                        "peer {request_count} should receive all {expected_count} digests"
+                    );
+                    // reject to trigger fallback to next peer
+                    reply
+                        .send(Ok(NetworkResponseMessage {
+                            peer: peer2,
+                            result: WorkerResponse::RequestBatchesStream { ack: false },
+                        }))
+                        .unwrap();
                 }
                 _ => {}
             }

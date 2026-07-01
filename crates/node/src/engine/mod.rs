@@ -12,8 +12,9 @@
 
 use self::inner::ExecutionNodeInner;
 use builder::ExecutionNodeBuilder;
-use std::{net::SocketAddr, sync::Arc};
+use std::{future::Future, net::SocketAddr, sync::Arc};
 use tn_config::Config;
+use tn_exex::ExExInstallFn;
 use tn_reth::{
     system_calls::EpochState, CanonStateNotificationStream, RethConfig, RethDb, RethEnv,
     WorkerTxPool,
@@ -34,7 +35,6 @@ pub use tn_reth::worker::*;
 ///
 /// Used to build the node until upstream reth supports
 /// broader node customization.
-#[derive(Clone, Debug)]
 pub struct TnBuilder {
     /// The node configuration.
     pub node_config: RethConfig,
@@ -54,6 +54,66 @@ pub struct TnBuilder {
     pub healthcheck: Option<u16>,
     /// A reference to the long lived reth DB for the node.
     pub reth_db: RethDb,
+    /// Registered ExEx install functions.
+    ///
+    /// Each entry is a `(name, notification_channel_capacity, install_fn)` tuple.
+    /// These are consumed during node startup to spawn ExEx tasks on the
+    /// node-level task manager, each with its own bounded notification channel of
+    /// the given capacity.
+    pub exex_fns: Vec<(String, usize, ExExInstallFn)>,
+}
+
+impl TnBuilder {
+    /// Register an Execution Extension (ExEx) plugin.
+    ///
+    /// ExExes are long-running tasks that receive notifications about the full
+    /// transaction lifecycle: certificate accepted, consensus committed, and
+    /// chain executed.
+    ///
+    /// The notification channel uses the default capacity
+    /// ([`tn_exex::exex_channel_capacity`]); use [`install_exex_with_capacity`]
+    /// to size it for a heavyweight ExEx on a high-throughput chain.
+    ///
+    /// [`install_exex_with_capacity`]: Self::install_exex_with_capacity
+    pub fn install_exex<F, Fut>(&mut self, name: impl Into<String>, install_fn: F) -> &mut Self
+    where
+        F: FnOnce(tn_exex::TnExExContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = eyre::Result<()>> + Send + 'static,
+    {
+        self.install_exex_with_capacity(name, tn_exex::exex_channel_capacity(), install_fn)
+    }
+
+    /// Register an ExEx plugin with an explicit notification channel capacity.
+    ///
+    /// A larger capacity lets a persistently-slightly-slow ExEx absorb bursts
+    /// without dropping notifications (which would surface as
+    /// [`TnExExNotification::Lagged`](tn_exex::TnExExNotification::Lagged) and
+    /// force a replay). See [`install_exex`](Self::install_exex) for the default.
+    pub fn install_exex_with_capacity<F, Fut>(
+        &mut self,
+        name: impl Into<String>,
+        capacity: usize,
+        install_fn: F,
+    ) -> &mut Self
+    where
+        F: FnOnce(tn_exex::TnExExContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = eyre::Result<()>> + Send + 'static,
+    {
+        self.exex_fns.push((name.into(), capacity, Box::new(|ctx| Box::pin(install_fn(ctx)))));
+        self
+    }
+}
+
+impl std::fmt::Debug for TnBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TnBuilder")
+            .field("node_config", &self.node_config)
+            .field("tn_config", &self.tn_config)
+            .field("metrics", &self.metrics)
+            .field("healthcheck", &self.healthcheck)
+            .field("exex_count", &self.exex_fns.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Wrapper for the inner execution node components.
@@ -90,12 +150,24 @@ impl ExecutionNode {
         worker_id: WorkerId,
         network_handle: WorkerNetworkHandle,
         engine_to_primary: EP,
+        base_fee: u64,
     ) -> eyre::Result<()>
     where
         EP: EngineToPrimary + Send + Sync + 'static,
     {
         let mut guard = self.internal.write().await;
-        guard.initialize_worker_components(worker_id, network_handle, engine_to_primary).await
+        guard
+            .initialize_worker_components(worker_id, network_handle, engine_to_primary, base_fee)
+            .await
+    }
+
+    /// Update the pending base fee on a worker's transaction pool.
+    ///
+    /// Called every epoch so the pool charges the accumulator's current base fee for the worker,
+    /// including on the respawn path where [`Self::initialize_worker_components`] is skipped.
+    pub async fn set_worker_base_fee(&self, worker_id: WorkerId, base_fee: u64) {
+        let guard = self.internal.read().await;
+        guard.set_worker_base_fee(worker_id, base_fee);
     }
 
     /// Respawn any tasks on the worker network when we get a new epoch task manager.
@@ -109,6 +181,16 @@ impl ExecutionNode {
     /// Returns true if worker components have already been initialized.
     pub async fn are_workers_initialized(&self) -> bool {
         !self.internal.read().await.workers.is_empty()
+    }
+
+    /// Returns true if the worker identified by `worker_id` has been initialized.
+    ///
+    /// A worker's components (RPC server + transaction pool) are created once on
+    /// the node's first epoch and are not torn down across epoch transitions, so
+    /// this reflects "this worker is up and accepting transactions" rather than
+    /// any per-epoch state. Backs the `/health/workers` readiness endpoint.
+    pub async fn is_worker_initialized(&self, worker_id: WorkerId) -> bool {
+        self.internal.read().await.workers.get(worker_id as usize).is_some()
     }
 
     /// Batch maker

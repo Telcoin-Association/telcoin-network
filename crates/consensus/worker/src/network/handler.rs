@@ -12,11 +12,14 @@ use crate::{
 use futures::AsyncWriteExt as _;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use tn_config::ConsensusConfig;
-use tn_network_libp2p::{GossipMessage, Stream};
+use tn_network_libp2p::{
+    write_frame, GossipMessage, Stream, SyncFrame, SyncFrameError, WorkerSyncRequest,
+};
 use tn_network_types::{WorkerOthersBatchMessage, WorkerToPrimaryClient};
 use tn_storage::{consensus::ConsensusChain, tables::NodeBatchesCache};
 use tn_types::{
-    ensure, now, try_decode, BatchValidation, BlsPublicKey, Database, SealedBatch, WorkerId, B256,
+    ensure, now, try_decode, BatchValidation, BlsPublicKey, Database, Epoch, SealedBatch, WorkerId,
+    B256,
 };
 use tracing::{debug, warn};
 
@@ -71,7 +74,9 @@ where
         match gossip {
             WorkerGossip::Batch(epoch, batch_hash) => {
                 ensure!(
-                    topic.to_string().eq(&tn_config::LibP2pConfig::worker_batch_topic()),
+                    topic.to_string().eq(&tn_config::LibP2pConfig::worker_batch_topic(
+                        self.consensus_config.chain_id()
+                    )),
                     WorkerNetworkError::InvalidTopic
                 );
                 let my_epoch = self.consensus_config.epoch();
@@ -127,7 +132,9 @@ where
             }
             WorkerGossip::Txn(tx_bytes) => {
                 ensure!(
-                    topic.to_string().eq(&tn_config::LibP2pConfig::worker_txn_topic()),
+                    topic.to_string().eq(&tn_config::LibP2pConfig::worker_txn_topic(
+                        self.consensus_config.chain_id()
+                    )),
                     WorkerNetworkError::InvalidTopic
                 );
                 if let Some(authority) = self.consensus_config.authority() {
@@ -238,6 +245,85 @@ where
 
         // attempt to close the stream gracefully
         let _ = stream.close().await;
+
+        Ok(())
+    }
+
+    /// Serve an admitted inbound sync batch exchange.
+    ///
+    /// The opening [`SyncFrame::Req`] has already been read and validated by the
+    /// caller, and the exchange has been admitted against the concurrency caps.
+    /// This writes the [`SyncFrame::Ack`], streams the requested batches as
+    /// [`SyncFrame::Data`] frames, and ends the stream with [`SyncFrame::End`].
+    ///
+    /// A send failure or storage error is logged and best-effort signalled to the
+    /// requester with a [`SyncFrame::Err`] so it stops waiting; it is not a peer
+    /// fault, so no penalty is returned. Like the legacy responder, the sync
+    /// responder reports errors metrics-only during the item-5 rollout.
+    pub(super) async fn process_sync_batches_stream(
+        &self,
+        peer: BlsPublicKey,
+        mut stream: Stream,
+        batch_digests: BTreeSet<B256>,
+        epoch: Epoch,
+        consensus_chain: &ConsensusChain,
+    ) -> WorkerNetworkResult<()> {
+        debug!(
+            target: "worker::network",
+            %peer,
+            batch_count = batch_digests.len(),
+            epoch,
+            "serving inbound sync batch stream"
+        );
+
+        let store = self.consensus_config.node_storage();
+        let max_frame = crate::network::handle::max_sync_frame_size(epoch);
+
+        // set timeout to prevent slow-read attack; flatten the timeout's outer
+        // `Result` into the send's so a single error path handles both
+        let served = tokio::time::timeout(
+            SEND_STREAM_TIMEOUT,
+            stream_codec::send_sync_batches_over_stream(
+                &mut stream,
+                store,
+                consensus_chain,
+                &batch_digests,
+                epoch,
+                max_frame,
+            ),
+        )
+        .await
+        .map_err(WorkerNetworkError::from)
+        .and_then(|sent| sent);
+
+        // a send failure or timeout is logged and best-effort signalled so the
+        // requester stops waiting; it is not a peer fault, so no penalty
+        if let Err(e) = served {
+            warn!(target: "worker::network", %peer, ?e, "failed to serve sync batch stream");
+            // bound the best-effort error write: a peer that passed admission, read
+            // the `Ack`, then stopped reading would otherwise pin this responder
+            // task on an unbounded write. Mirrors the shed/malformed error writes in
+            // `mod.rs`, which the same constant bounds.
+            let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
+            let _ = tokio::time::timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, async {
+                let _ = write_frame(
+                    &mut stream,
+                    &SyncFrame::<WorkerSyncRequest>::Err(SyncFrameError::Internal),
+                    &mut encode_buffer,
+                    &mut compressed_buffer,
+                    max_frame,
+                )
+                .await;
+            })
+            .await;
+        }
+
+        // attempt to close the stream gracefully, bounded so a peer that stops
+        // reading cannot pin this responder task (and the admission slot it holds)
+        // on the FIN flush: like the shed/malformed paths in `mod.rs`, every
+        // best-effort trailing op on this task is time-bounded.
+        let _ =
+            tokio::time::timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, stream.close()).await;
 
         Ok(())
     }

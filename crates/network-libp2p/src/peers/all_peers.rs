@@ -20,7 +20,6 @@ use crate::{
 use libp2p::{Multiaddr, PeerId};
 use rand::seq::SliceRandom as _;
 use std::{
-    cmp::Reverse,
     collections::{BinaryHeap, HashMap, HashSet},
     net::IpAddr,
     time::{Duration, Instant},
@@ -384,6 +383,14 @@ impl AllPeers {
         // disconnect peers
         for peer_id in peers_to_disconnect {
             self.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
+
+            // these peers exceeded `dial_timeout` while still `Dialing`, so the genuine cause
+            // is a timeout. Report it to the caller (the disconnect transition no longer
+            // notifies; the dialer's reply channel is only consumed here or in `on_dial_failure`).
+            self.notify_dial_result(
+                &peer_id,
+                Err(NetworkError::Dial("dial attempt timedout".to_string())),
+            );
         }
 
         // update scores for all other peers
@@ -621,11 +628,11 @@ impl AllPeers {
                     });
                 }
 
-                // notify caller of dial error if present
-                self.notify_dial_result(
-                    peer_id,
-                    Err(NetworkError::Dial("dial attempt timedout".to_string())),
-                );
+                // NOTE: the dial result (if any) is notified by the caller that knows the real
+                // cause: `on_dial_failure` delivers the genuine `DialError`, and
+                // `heartbeat_maintenance` reports a timeout. This transition must not report a
+                // hardcoded cause, which previously consumed the reply channel before the real
+                // error could be sent.
             }
         }
 
@@ -984,32 +991,36 @@ impl AllPeers {
         (action, pruned_peers)
     }
 
-    /// Filter peers based on connection status.
+    /// Filter peers by connection status and return the `excess` OLDEST of them to prune.
     ///
-    /// This creates a min-heap with the excess number of peers.
+    /// Builds a bounded max-heap keyed by `instant`, so the heap's top is the NEWEST collected
+    /// peer. Once the heap is full, a candidate replaces that top only when the candidate is
+    /// older, so the heap converges on the `excess` oldest peers. Callers evict exactly these
+    /// entries, which keeps the freshest bans/disconnects and drops only stale ones (issue #799).
     /// Used by Self::prune_banned_peers and Self::prune_disconnected_peers.
     fn collect_excess_peers<F>(
         &self,
         excess: usize,
         filter: F,
-    ) -> BinaryHeap<(Reverse<Instant>, PeerIdentity, Vec<IpAddr>)>
+    ) -> BinaryHeap<(Instant, PeerIdentity, Vec<IpAddr>)>
     where
         F: Fn(&ConnectionStatus) -> Option<Instant>,
     {
-        // collection of peers to prune
+        // collection of peers to prune (the oldest `excess`)
         let mut excess_peers = BinaryHeap::with_capacity(excess);
 
         for (id, peer) in &self.peers {
             if let Some(instant) = filter(peer.connection_status()) {
-                // min-heap sorted by instant (oldest first)
-                let entry = (Reverse(instant), *id, peer.known_ip_addresses().collect::<Vec<_>>());
+                // max-heap by instant: the heap's top (peek) is the NEWEST collected peer
+                let entry = (instant, *id, peer.known_ip_addresses().collect::<Vec<_>>());
 
                 if excess_peers.len() < excess {
                     // fill the heap until `excess` elements
                     excess_peers.push(entry);
-                } else if let Some(current_max) = excess_peers.peek() {
-                    // if peer's banned instant is older, replace it
-                    if entry.0 < current_max.0 {
+                } else if let Some(current_newest) = excess_peers.peek() {
+                    // retain the OLDEST `excess`: drop the newest held entry whenever an older
+                    // candidate appears, so recently banned/disconnected peers survive pruning
+                    if entry.0 < current_newest.0 {
                         excess_peers.pop();
                         excess_peers.push(entry);
                     }

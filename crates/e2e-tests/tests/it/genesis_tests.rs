@@ -15,13 +15,13 @@ use jsonrpsee::{
 use std::{collections::HashMap, time::Duration};
 use telcoin_network_cli::args::clap_u256_parser_to_18_decimals;
 use tn_config::{
-    NetworkGenesis, BLSG1_JSON, CONSENSUS_REGISTRY_JSON, DEPLOYMENTS_JSON,
-    GENESIS_ACCOUNT_STATE_YAML, ISSUANCE_ADDRESS, ISSUANCE_JSON,
+    NetworkGenesis, CONSENSUS_REGISTRY_JSON, GENESIS_ACCOUNT_STATE_YAML, ISSUANCE_ADDRESS,
+    ISSUANCE_JSON,
 };
 use tn_reth::{
-    system_calls::{ConsensusRegistry, CONSENSUS_REGISTRY_ADDRESS},
+    system_calls::{ConsensusRegistry, CONSENSUS_REGISTRY_ADDRESS, PRECOMPILE_GENESIS_BYTECODE},
     test_utils::TransactionFactory,
-    RethEnv,
+    RethEnv, BLS_G1_PRECOMPILE_ADDRESS,
 };
 use tn_types::{Address, Bytes, FromHex, GenesisAccount};
 use tracing::debug;
@@ -97,17 +97,13 @@ async fn test_genesis_with_consensus_registry_accounts() -> eyre::Result<()> {
     )?;
     let unlinked_runtimecode =
         registry_runtimecode_binding.as_str().ok_or_eyre("Couldn't fetch bytecode")?;
-    let tao_address_binding = RethEnv::fetch_value_from_json_str(DEPLOYMENTS_JSON, Some("Safe"))?;
-    let tao_address =
-        Address::from_hex(tao_address_binding.as_str().ok_or_eyre("Safe owner address")?)?;
-    let blsg1_address = tao_address.create(0).to_string();
+    // BlsG1 is a native precompile at `BLS_G1_PRECOMPILE_ADDRESS`: the registry runtime bytecode is
+    // linked against that address, and the address itself carries a single `0xfe` (INVALID)
+    // placeholder byte rather than deployed library code. See
+    // `create_consensus_registry_genesis_accounts`.
+    let blsg1_address = BLS_G1_PRECOMPILE_ADDRESS.to_string();
     let registry_deployed_bytecode =
         RethEnv::link_solidity_library(unlinked_runtimecode, &blsg1_address)?;
-
-    let blsg1_runtimecode_binding =
-        RethEnv::fetch_value_from_json_str(BLSG1_JSON, Some("deployedBytecode.object"))?;
-    let blsg1_deployed_bytecode =
-        blsg1_runtimecode_binding.as_str().ok_or_eyre("invalid blsg1 json")?;
 
     let issuance_json_val =
         RethEnv::fetch_value_from_json_str(ISSUANCE_JSON, Some("deployedBytecode.object"))?;
@@ -146,7 +142,7 @@ async fn test_genesis_with_consensus_registry_accounts() -> eyre::Result<()> {
     );
     assert_eq!(
         Bytes::from_hex(&returned_blsg1_bytecode)?,
-        Bytes::from_hex(blsg1_deployed_bytecode)?
+        Bytes::from(PRECOMPILE_GENESIS_BYTECODE)
     );
 
     // verify all precompile-config.yaml accounts are present in genesis on-chain
@@ -218,15 +214,16 @@ async fn test_genesis_with_consensus_registry_accounts() -> eyre::Result<()> {
     assert_eq!(epochIssuance, expected_epoch_issuance);
     assert_eq!(stakeVersion, 0);
 
-    let validators = consensus_registry
+    // `getValidators` returns validator addresses directly (the full structs are available via
+    // `getValidatorsInfo`).
+    let validator_addresses = consensus_registry
         .getValidators(ConsensusRegistry::ValidatorStatus::Active.into())
         .call()
         .await
         .expect("failed active validators read");
 
-    let validator_addresses: Vec<_> = validators.iter().map(|v| v.validatorAddress).collect();
     assert_eq!(committee, validator_addresses);
-    debug!(target: "genesis-test", "active validators??\n{:?}", validators);
+    debug!(target: "genesis-test", "active validators??\n{:?}", validator_addresses);
 
     Ok(())
 }

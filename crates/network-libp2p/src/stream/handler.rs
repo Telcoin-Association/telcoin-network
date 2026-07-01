@@ -5,7 +5,7 @@ use libp2p::{
         },
         ConnectionHandler, ConnectionHandlerEvent, StreamUpgradeError, SubstreamProtocol,
     },
-    Stream,
+    Stream, StreamProtocol,
 };
 use std::{
     collections::VecDeque,
@@ -17,7 +17,10 @@ use tokio::sync::oneshot;
 
 use crate::{
     error::NetworkError,
-    stream::upgrade::{StreamError, StreamFailure, TNStreamProtocol},
+    stream::{
+        upgrade::{StreamError, StreamFailure, TNStreamProtocol},
+        StreamKind,
+    },
     types::NetworkResult,
 };
 
@@ -40,9 +43,22 @@ const MAX_HANDLER_EVENTS: usize = 256;
 pub(crate) enum HandlerCommand {
     /// Open an outbound stream, returning it through the provided channel.
     OpenStream {
+        /// Which protocol the open negotiates ([`StreamKind::Legacy`] or
+        /// [`StreamKind::Sync`]).
+        kind: StreamKind,
         /// Channel for returning the established stream directly to the caller.
         reply: oneshot::Sender<NetworkResult<Stream>>,
     },
+}
+
+/// An in-flight outbound open, carried as the substream's open info so the
+/// handler can answer the caller and classify a failure with the open's kind.
+#[derive(Debug)]
+pub(crate) struct OutboundOpen {
+    /// Which protocol this open negotiates.
+    kind: StreamKind,
+    /// Channel for returning the established stream (or error) to the caller.
+    reply: oneshot::Sender<NetworkResult<Stream>>,
 }
 
 /// Events from handler to behavior.
@@ -50,6 +66,8 @@ pub(crate) enum HandlerCommand {
 pub(crate) enum StreamHandlerEvent {
     /// An inbound stream was successfully established.
     InboundStream {
+        /// The protocol the inbound stream negotiated.
+        kind: StreamKind,
         /// The established stream.
         stream: Stream,
     },
@@ -68,10 +86,15 @@ pub(crate) enum StreamHandlerEvent {
 /// `OutboundOpenInfo`, bypassing the behavior layer entirely. Open negotiation
 /// is bounded by [`STREAM_OPEN_TIMEOUT`]; failures are classified and reported
 /// to the behaviour for scoring.
-#[derive(Default)]
 pub(crate) struct StreamHandler {
-    /// Pending outbound stream reply channels.
-    pending_outbound: VecDeque<oneshot::Sender<NetworkResult<Stream>>>,
+    /// The chain-namespaced bulk-transfer `/tn-stream-{chain}` protocol,
+    /// advertised first on inbound listen.
+    legacy: StreamProtocol,
+    /// The chain-namespaced per-role sync protocol, advertised second on inbound
+    /// listen.
+    sync: StreamProtocol,
+    /// Pending outbound opens.
+    pending_outbound: VecDeque<OutboundOpen>,
     /// Events to send to the behavior.
     events: VecDeque<StreamHandlerEvent>,
 }
@@ -86,9 +109,24 @@ impl std::fmt::Debug for StreamHandler {
 }
 
 impl StreamHandler {
-    /// Create a new stream handler.
-    pub(crate) fn new() -> Self {
-        Self { pending_outbound: VecDeque::new(), events: VecDeque::new() }
+    /// Create a new stream handler advertising the legacy and sync protocols on
+    /// this connection.
+    pub(crate) fn new(legacy: StreamProtocol, sync: StreamProtocol) -> Self {
+        Self { legacy, sync, pending_outbound: VecDeque::new(), events: VecDeque::new() }
+    }
+
+    /// The single protocol an outbound open of `kind` advertises.
+    fn protocol_for(&self, kind: StreamKind) -> StreamProtocol {
+        match kind {
+            StreamKind::Legacy => self.legacy.clone(),
+            StreamKind::Sync => self.sync.clone(),
+        }
+    }
+
+    /// The upgrade an inbound listen advertises: both protocols (legacy first),
+    /// carrying the sync protocol so a negotiated inbound stream is classified.
+    fn listen_upgrade(&self) -> TNStreamProtocol {
+        TNStreamProtocol::new(vec![self.legacy.clone(), self.sync.clone()], self.sync.clone())
     }
 
     /// Queue an event to the behaviour, dropping it if the buffer is saturated.
@@ -107,7 +145,7 @@ fn classify_outbound(error: StreamUpgradeError<Infallible>) -> (StreamFailure, S
         StreamUpgradeError::NegotiationFailed => {
             (StreamFailure::UnsupportedProtocol, StreamError::UpgradeFailed)
         }
-        StreamUpgradeError::Io(e) => (StreamFailure::Io(e.kind()), StreamError::UpgradeFailed),
+        StreamUpgradeError::Io(e) => (StreamFailure::Io(e.kind()), StreamError::UpgradeIo),
         // `TNStreamProtocol`'s upgrade error is `Infallible`, so `Apply` is unconstructable.
         StreamUpgradeError::Apply(infallible) => match infallible {},
     }
@@ -119,19 +157,19 @@ impl ConnectionHandler for StreamHandler {
     type InboundProtocol = TNStreamProtocol;
     type OutboundProtocol = TNStreamProtocol;
     type InboundOpenInfo = ();
-    type OutboundOpenInfo = oneshot::Sender<NetworkResult<Stream>>;
+    type OutboundOpenInfo = OutboundOpen;
 
     fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol, Self::InboundOpenInfo> {
-        SubstreamProtocol::new(TNStreamProtocol, ())
+        SubstreamProtocol::new(self.listen_upgrade(), ())
     }
 
     fn on_behaviour_event(&mut self, event: Self::FromBehaviour) {
         match event {
-            HandlerCommand::OpenStream { reply } => {
+            HandlerCommand::OpenStream { kind, reply } => {
                 if self.pending_outbound.len() >= MAX_PENDING_OUTBOUND {
                     let _ = reply.send(Err(NetworkError::Stream(StreamError::TooManyPending)));
                 } else {
-                    self.pending_outbound.push_back(reply);
+                    self.pending_outbound.push_back(OutboundOpen { kind, reply });
                 }
             }
         }
@@ -149,25 +187,37 @@ impl ConnectionHandler for StreamHandler {
     ) {
         match event {
             ConnectionEvent::FullyNegotiatedInbound(FullyNegotiatedInbound {
-                protocol: stream,
+                protocol: (stream, kind),
                 ..
             }) => {
-                self.push_event(StreamHandlerEvent::InboundStream { stream });
+                self.push_event(StreamHandlerEvent::InboundStream { kind, stream });
             }
             ConnectionEvent::FullyNegotiatedOutbound(FullyNegotiatedOutbound {
                 protocol: stream,
-                info: reply,
+                info: OutboundOpen { reply, .. },
                 ..
             }) => {
-                // Return the stream directly to the caller via oneshot
+                // Return the stream directly to the caller via oneshot. The
+                // caller chose the protocol, so it already knows the kind.
                 let _ = reply.send(Ok(stream));
             }
-            ConnectionEvent::DialUpgradeError(DialUpgradeError { info: reply, error }) => {
-                // Return the error to the caller and report the classified
-                // failure to the behaviour for scoring.
+            ConnectionEvent::DialUpgradeError(DialUpgradeError {
+                info: OutboundOpen { kind, reply },
+                error,
+            }) => {
+                // Return the error to the caller, which drives its fallback.
                 let (failure, stream_error) = classify_outbound(error);
                 let _ = reply.send(Err(NetworkError::Stream(stream_error)));
-                self.push_event(StreamHandlerEvent::OutboundFailure { failure });
+                // A sync open that fails negotiation only means the peer does not
+                // speak the sync protocol yet; the caller falls back to legacy, so
+                // the probe is penalty-exempt (the issue's "Severe suppressed for
+                // new-protocol negotiation failure while a fallback exists"). Every
+                // other failure, and every legacy failure, is still reported.
+                let penalty_exempt_probe = matches!(kind, StreamKind::Sync)
+                    && matches!(failure, StreamFailure::UnsupportedProtocol);
+                if !penalty_exempt_probe {
+                    self.push_event(StreamHandlerEvent::OutboundFailure { failure });
+                }
             }
             _ => {}
         }
@@ -188,11 +238,14 @@ impl ConnectionHandler for StreamHandler {
             return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(event));
         }
 
-        // Request outbound streams, bounding negotiation with a timeout.
-        if let Some(reply) = self.pending_outbound.pop_front() {
+        // Request outbound streams, bounding negotiation with a timeout. The open
+        // advertises only the chosen protocol, so a sync open negotiates sync (or
+        // fails) instead of silently falling back to legacy at the wire level.
+        if let Some(open) = self.pending_outbound.pop_front() {
+            let upgrade =
+                TNStreamProtocol::new(vec![self.protocol_for(open.kind)], self.sync.clone());
             return Poll::Ready(ConnectionHandlerEvent::OutboundSubstreamRequest {
-                protocol: SubstreamProtocol::new(TNStreamProtocol, reply)
-                    .with_timeout(STREAM_OPEN_TIMEOUT),
+                protocol: SubstreamProtocol::new(upgrade, open).with_timeout(STREAM_OPEN_TIMEOUT),
             });
         }
 
@@ -220,6 +273,6 @@ mod tests {
 
         let (failure, error) = classify_outbound(StreamUpgradeError::Io(io::Error::other("boom")));
         assert!(matches!(failure, StreamFailure::Io(_)));
-        assert!(matches!(error, StreamError::UpgradeFailed));
+        assert!(matches!(error, StreamError::UpgradeIo));
     }
 }

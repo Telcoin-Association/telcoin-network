@@ -24,8 +24,21 @@ pub struct BlsAggregateSignature(CoreBlsAggregateSignature);
 impl BlsSignature {
     pub fn from_bytes(bytes: &[u8]) -> eyre::Result<Self> {
         let sig = CoreBlsSignature::from_bytes(bytes)
-            .map_err(|_| eyre::eyre!("Invalid signature bytes!"))?;
+            .map_err(|e| eyre::eyre!("Invalid signature bytes! {e:?}"))?;
         Ok(Self(sig))
+    }
+
+    /// Decode a signature from its 96-byte uncompressed (serialized) G1 form, as produced by
+    /// [`blst::min_sig::Signature::serialize`].
+    ///
+    /// Unlike [`Self::from_bytes`] (which expects the 48-byte compressed form), this accepts the
+    /// uncompressed bytes the protocol passes to the on-chain `BlsG1` library as a proof of
+    /// possession. Used by the native BLS precompile so it can verify the exact bytes the
+    /// consensus layer produced, without re-implementing point (de)compression.
+    pub fn from_uncompressed_bytes(bytes: &[u8]) -> eyre::Result<Self> {
+        CoreBlsSignature::deserialize(bytes)
+            .map_err(|e| eyre::eyre!("Invalid uncompressed signature bytes! {e:?}"))
+            .map(Self)
     }
 
     /// Verify a signature over a message (raw bytes) with public key.
@@ -195,6 +208,20 @@ pub fn construct_proof_of_possession_message(
     let msg = IntentMessage::new(Intent::telcoin(IntentScope::ProofOfPossession), msg_unprefixed);
 
     Ok(msg)
+}
+
+/// Returns the exact serialized bytes that a proof of possession is signed over and verified
+/// against, i.e. `encode(construct_proof_of_possession_message(pubkey, address))`.
+///
+/// This is the canonical equivalent of `BlsG1.proofOfPossessionMessage` on-chain. The native BLS
+/// precompile returns these bytes so the message it verifies and the message it reports are one and
+/// the same, with no second (drift-prone) implementation of the intent encoding.
+pub fn proof_of_possession_message_bytes(
+    bls_pubkey: &BlsPublicKey,
+    address: &Address,
+) -> eyre::Result<Vec<u8>> {
+    let msg = construct_proof_of_possession_message(bls_pubkey, address)?;
+    Ok(encode(&msg))
 }
 
 /// A trait for sign and verify over an intent message, instead of the message itself. See more at

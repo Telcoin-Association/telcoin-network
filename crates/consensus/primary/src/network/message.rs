@@ -9,56 +9,10 @@ use std::{
 };
 use tn_network_libp2p::{types::IntoRpcError, PeerExchangeMap, TNMessage};
 use tn_types::{
-    error::HeaderError, AuthorityIdentifier, BlockHash, BlsPublicKey, BlsSignature, Certificate,
-    ConsensusHeader, ConsensusHeaderDigest, Epoch, EpochCertificate, EpochDigest, EpochRecord,
-    EpochVote, Header, HeaderDigest, Round, Vote, B256,
+    error::HeaderError, AuthorityIdentifier, Certificate, ConsensusHeader, ConsensusHeaderDigest,
+    ConsensusResult, Epoch, EpochCertificate, EpochDigest, EpochRecord, EpochVote, Header,
+    HeaderDigest, Round, Vote,
 };
-
-/// Info that is published (via gossip) by validators once they reach consensus.
-#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
-pub struct ConsensusResult {
-    // epoch for this result (i.e. the current epoch)
-    pub epoch: Epoch,
-    // reound for epoch that consensus was reached on
-    pub round: Round,
-    /// the consensus header block number
-    pub number: u64,
-    /// hash of the consensus header that was reached
-    pub hash: ConsensusHeaderDigest,
-    /// the validator that produced this result
-    pub validator: BlsPublicKey,
-    /// the signature of the validator publishing this record
-    /// see digest() below, this is a signature over the hash of the epoch, round, number and hash
-    /// fields
-    pub signature: BlsSignature,
-}
-
-impl ConsensusResult {
-    /// Return the digest of the data fields (epoch, round, number and hash).
-    /// This will be the same for all validadors and is what signature signs
-    /// (verifying all the data fields not just the hash).
-    pub fn digest(&self) -> BlockHash {
-        Self::digest_data(self.epoch, self.round, self.number, self.hash)
-    }
-
-    /// Return the digest of the data fields (epoch, round, number and hash).
-    /// Used for generating the signature of the raw data.
-    /// This will be the same for all validadors and is what signature signs
-    /// (verifying all the data fields not just the hash).
-    pub fn digest_data(
-        epoch: Epoch,
-        round: Round,
-        number: u64,
-        hash: ConsensusHeaderDigest,
-    ) -> BlockHash {
-        let mut hasher = tn_types::DefaultHashFunction::new();
-        hasher.update(&epoch.to_be_bytes());
-        hasher.update(&round.to_be_bytes());
-        hasher.update(&number.to_be_bytes());
-        hasher.update(hash.as_ref());
-        B256::from_slice(hasher.finalize().as_bytes())
-    }
-}
 
 /// Primary messages on the gossip network.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -138,6 +92,30 @@ pub enum PrimaryRequest {
     StreamEpoch {
         /// The epoch we are requesting consensus data for.
         epoch: Epoch,
+    },
+    /// Request to stream the raw (serialized) consensus output bytes for a consensus chain number.
+    ///
+    /// Unlike [`Self::ConsensusHeader`], this returns the full pack-file encoded output
+    /// (batches + consensus header) rather than just the header, so a peer can reconstruct
+    /// the [`tn_types::ConsensusOutput`] without separately fetching its batches.
+    ///
+    /// The output is streamed (rather than returned via request/response) because a single
+    /// output can exceed the request/response codec's message size limit.
+    StreamConsensusOutput {
+        /// The consensus chain number being requested.
+        number: u64,
+    },
+    /// Request to stream a verifiable PREFIX of an epoch's pack file, stopping after the consensus
+    /// output with `last_consensus_number`.
+    ///
+    /// Unlike [`Self::StreamEpoch`] (which streams a complete epoch), this streams the in-progress
+    /// current epoch up to an already-committed, verifiable point. The number is a chain consensus
+    /// header number, not a pack-relative index.
+    StreamEpochPartial {
+        /// The epoch we are requesting consensus data for.
+        epoch: Epoch,
+        /// The final (inclusive) consensus header number to stream up to.
+        last_consensus_number: u64,
     },
 }
 
@@ -249,12 +227,12 @@ pub enum PrimaryResponse {
     /// This is an application-layer error response.
     /// This error is likely to succeed in the future and can be retried.
     RecoverableError(PrimaryRPCError),
-    /// Response to stream-based epoch request.
+    /// Response to a stream-based request (epoch pack or single consensus output).
     ///
     /// If `ack` is true, the requestor should open a stream with the
-    /// request digest in the header. The responder will send the epoch pack
-    /// over that stream.
-    RequestEpochStream {
+    /// request digest in the header. The responder will send the requested
+    /// data over that stream.
+    StreamRequestAck {
         /// Whether the request is accepted.
         ack: bool,
     },
@@ -287,9 +265,11 @@ impl PrimaryResponse {
             | PrimaryNetworkError::InvalidTopic
             | PrimaryNetworkError::UnknownConsensusHeaderDigest(_)
             | PrimaryNetworkError::UnknownConsensusHeaderCert(_)
+            | PrimaryNetworkError::UnknownConsensusOutput(_)
             | PrimaryNetworkError::Timeout(_)
             | PrimaryNetworkError::UnknownStreamRequest(_)
             | PrimaryNetworkError::StreamUnavailable(_)
+            | PrimaryNetworkError::ConsensusChainError(_)
             | PrimaryNetworkError::InvalidEpochRequest => {
                 Self::Error(PrimaryRPCError(error.to_string()))
             }

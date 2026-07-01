@@ -633,6 +633,36 @@ fn test_heartbeat_maintenance() {
     assert_eq!(all_peers.disconnected_peers, 1);
 }
 
+// Regression for #745: when a dial exceeds `dial_timeout` and is reaped by the heartbeat,
+// the caller must still be told it was a timeout. This is the one path where "dial attempt
+// timedout" is the genuine cause; the disconnect transition no longer hardcodes it, so the
+// heartbeat is now responsible for notifying the dialer.
+#[test]
+fn test_heartbeat_dial_timeout_notifies_caller() {
+    let mut all_peers = create_all_peers(None);
+    let peer_id = PeerId::random();
+
+    // register a dial with a live reply channel, then age it past the timeout
+    let (sender, mut receiver) = oneshot::channel();
+    all_peers.register_dial_attempt(peer_id, Some(sender));
+    all_peers
+        .get_peer_mut(&peer_id)
+        .expect("peer must exist after register_dial_attempt")
+        .set_connection_status(ConnectionStatus::Dialing {
+            instant: Instant::now() - Duration::from_secs(10),
+        }); // Older than the 5s timeout
+
+    let _ = all_peers.heartbeat_maintenance();
+
+    // the caller is notified of the genuine timeout
+    let result = receiver.try_recv().expect("heartbeat must notify the dialer of the timeout");
+    let err = result.expect_err("dial timeout must be reported as an error");
+    assert_eq!(
+        err.to_string(),
+        NetworkError::Dial("dial attempt timedout".to_string()).to_string()
+    );
+}
+
 #[test]
 fn test_pruning_logic() {
     let config = PeerConfig::default();
@@ -703,6 +733,99 @@ fn test_pruning_logic() {
     assert_eq!(all_peers.banned_peers.total(), config.max_banned_peers);
     let expected = peer_num - config.max_banned_peers;
     assert_eq!(pruned.len(), expected); // 1 peer should be pruned
+}
+
+/// Regression guard for issue #799: overflow pruning must evict the OLDEST bans and keep the
+/// NEWEST. The heap previously stored `Reverse(instant)`, so it retained and then evicted the
+/// freshest bans instead. That let a peer banned moments ago be dropped from the ban set and
+/// reconnect (ban evasion). `test_pruning_logic` only asserts the pruned *count*, so it cannot
+/// catch the inverted direction; this test pins down exactly *which* peers survive.
+#[test]
+fn test_prune_banned_evicts_oldest_not_newest() {
+    let config = PeerConfig::default();
+    let excess = 5;
+    let peer_num = config.max_banned_peers + excess;
+    let mut all_peers = create_all_peers(None);
+
+    // rank 1..=peer_num: a larger rank is an OLDER ban (instant further in the past), so the
+    // `excess` largest ranks are the oldest bans and must be the ones pruned.
+    let mut banned = Vec::with_capacity(peer_num);
+    for rank in 1..=peer_num {
+        let peer_id = PeerId::random();
+        all_peers.update_connection_status(
+            &peer_id,
+            NewConnectionStatus::Disconnecting { banned: true },
+        );
+        all_peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
+        all_peers.update_connection_status(&peer_id, NewConnectionStatus::Banned);
+
+        if let Some(peer) = all_peers.get_peer_mut(&peer_id) {
+            if matches!(peer.connection_status(), ConnectionStatus::Banned { .. }) {
+                peer.set_connection_status(ConnectionStatus::Banned {
+                    instant: Instant::now() - Duration::from_secs(rank as u64),
+                });
+            }
+        }
+        banned.push((rank, peer_id));
+    }
+    assert_eq!(all_peers.banned_peers.total(), peer_num);
+
+    // the triggering peer is disconnected (not banned), so it does not affect the banned count:
+    // exactly `excess` bans are pruned, down to `max_banned_peers`.
+    all_peers.register_disconnected(&PeerId::random());
+    assert_eq!(all_peers.banned_peers.total(), config.max_banned_peers);
+
+    // the `excess` OLDEST bans (rank > max_banned_peers) are gone; every newer ban survives.
+    for (rank, peer_id) in &banned {
+        let still_banned = all_peers.peer_banned(peer_id);
+        if *rank > config.max_banned_peers {
+            assert!(!still_banned, "oldest ban (rank {rank}) should have been pruned");
+        } else {
+            assert!(still_banned, "recent ban (rank {rank}) must survive pruning");
+        }
+    }
+}
+
+/// Companion to `test_prune_banned_evicts_oldest_not_newest`: the disconnected caller shares the
+/// same `collect_excess_peers` helper, so it must likewise keep the newest disconnected peers and
+/// evict the oldest. Guards against the two prune callers diverging in future refactors.
+#[test]
+fn test_prune_disconnected_evicts_oldest_not_newest() {
+    let config = PeerConfig::default();
+    let excess = 5;
+    let peer_num = config.max_disconnected_peers + excess;
+    let mut all_peers = create_all_peers(None);
+
+    // rank 1..=peer_num: a larger rank is an OLDER disconnect.
+    let mut disconnected = Vec::with_capacity(peer_num);
+    for rank in 1..=peer_num {
+        let peer_id = PeerId::random();
+        all_peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
+
+        if let Some(peer) = all_peers.get_peer_mut(&peer_id) {
+            if matches!(peer.connection_status(), ConnectionStatus::Disconnected { .. }) {
+                peer.set_connection_status(ConnectionStatus::Disconnected {
+                    instant: Instant::now() - Duration::from_secs(rank as u64),
+                });
+            }
+        }
+        disconnected.push((rank, peer_id));
+    }
+    assert_eq!(all_peers.disconnected_peers, peer_num);
+
+    // the triggering peer is itself disconnected (instant ~now, the newest), so it joins the set
+    // and `excess + 1` of the oldest are pruned: ranks >= max_disconnected_peers.
+    all_peers.register_disconnected(&PeerId::random());
+    assert_eq!(all_peers.disconnected_peers, config.max_disconnected_peers);
+
+    for (rank, peer_id) in &disconnected {
+        let retained = all_peers.get_peer(peer_id).is_some();
+        if *rank >= config.max_disconnected_peers {
+            assert!(!retained, "oldest disconnect (rank {rank}) should have been pruned");
+        } else {
+            assert!(retained, "recent disconnect (rank {rank}) must survive pruning");
+        }
+    }
 }
 
 #[test]

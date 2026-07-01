@@ -913,16 +913,65 @@ mod test {
         assert!(matches!(kad_store_worker.put(rec.clone()), Err(Error::MaxRecords)));
     }
 
-    /// Lock the per-role wire-protocol names. These strings are a peer-compatibility
-    /// contract: a silent change would prevent peers from negotiating sessions.
+    /// Lock the per-role, chain-namespaced wire-protocol names. These strings are a
+    /// peer-compatibility contract: a silent change would prevent peers from
+    /// negotiating sessions, and the chain id keeps different chains from ever
+    /// negotiating with each other (issue #765).
     #[test]
-    fn test_network_type_protocol_names() {
-        assert_eq!(NetworkType::Primary.req_res_protocol().as_ref(), "/tn-primary/0.0.1");
-        assert_eq!(NetworkType::Primary.kad_protocol().as_ref(), "/tn-primary-kad/0.0.1");
-        assert_eq!(NetworkType::Worker(0).req_res_protocol().as_ref(), "/tn-worker-0/0.0.1");
-        assert_eq!(NetworkType::Worker(0).kad_protocol().as_ref(), "/tn-worker-0-kad/0.0.1");
-        // worker id is interpolated, not literal
-        assert_eq!(NetworkType::Worker(3).req_res_protocol().as_ref(), "/tn-worker-3/0.0.1");
-        assert_eq!(NetworkType::Worker(3).kad_protocol().as_ref(), "/tn-worker-3-kad/0.0.1");
+    fn test_network_type_protocol_names() -> crate::types::NetworkResult<()> {
+        assert_eq!(NetworkType::Primary.req_res_protocol(2017)?.as_ref(), "/tn-primary-2017/0.0.1");
+        assert_eq!(NetworkType::Primary.kad_protocol(2017)?.as_ref(), "/tn-primary-kad-2017/0.0.1");
+        assert_eq!(
+            NetworkType::Worker(0).req_res_protocol(2017)?.as_ref(),
+            "/tn-worker-0-2017/0.0.1"
+        );
+        assert_eq!(
+            NetworkType::Worker(0).kad_protocol(2017)?.as_ref(),
+            "/tn-worker-0-kad-2017/0.0.1"
+        );
+        // worker id and chain id are both interpolated, not literal
+        assert_eq!(NetworkType::Worker(3).req_res_protocol(7)?.as_ref(), "/tn-worker-3-7/0.0.1");
+        assert_eq!(NetworkType::Worker(3).kad_protocol(7)?.as_ref(), "/tn-worker-3-kad-7/0.0.1");
+        // the bulk-transfer stream protocol is chain-namespaced too (role-agnostic)
+        assert_eq!(crate::types::stream_protocol(2017)?.as_ref(), "/tn-stream-2017/0.0.1");
+        // the per-role sync protocol is chain-namespaced as well
+        assert_eq!(
+            NetworkType::Primary.sync_protocol(2017)?.as_ref(),
+            "/tn-primary-sync-2017/0.0.1"
+        );
+        assert_eq!(NetworkType::Worker(3).sync_protocol(7)?.as_ref(), "/tn-worker-3-sync-7/0.0.1");
+        // a stream node advertises the bulk-transfer protocol first, then the
+        // per-role sync protocol; both carry the chain id, and the order is the
+        // negotiation-preference contract (existing opens keep using the bulk one)
+        let (bulk_transfer, sync) = crate::types::stream_protocols(NetworkType::Worker(3), 2017)?;
+        assert_eq!(bulk_transfer.as_ref(), "/tn-stream-2017/0.0.1");
+        assert_eq!(sync.as_ref(), "/tn-worker-3-sync-2017/0.0.1");
+        Ok(())
+    }
+
+    /// Lock the chain-namespaced gossipsub protocol-id prefix. Gossip negotiates
+    /// its own `/meshsub` protocol (not the req-res/kad/stream names), so this
+    /// prefix is what keeps two chains from ever sharing a gossip substream. A
+    /// silent change is a peer-compatibility break, and dropping the leading `/`
+    /// would make `gossipsub::ConfigBuilder::build` reject it (issue #765).
+    #[test]
+    fn test_gossip_protocol_id_prefix_is_chain_namespaced() -> crate::types::NetworkResult<()> {
+        use crate::types::gossip_protocol_id_prefix;
+
+        // the chain id is interpolated, not a literal
+        assert_eq!(gossip_protocol_id_prefix(2017), "/tn-meshsub-2017");
+        assert_eq!(gossip_protocol_id_prefix(0), "/tn-meshsub-0");
+        // different chains get different gossip protocol ids
+        assert_ne!(gossip_protocol_id_prefix(1), gossip_protocol_id_prefix(2));
+
+        // the prefix is a valid `/meshsub`-style protocol id: feeding it to a real
+        // gossipsub ConfigBuilder must build. `protocol_id_prefix` appends `/1.1.0`
+        // and `/1.0.0` and does not prepend a `/`, so a prefix without the leading
+        // slash would be a malformed StreamProtocol and `build` would error here.
+        libp2p::gossipsub::ConfigBuilder::default()
+            .protocol_id_prefix(gossip_protocol_id_prefix(2017))
+            .build()
+            .map(|_| ())
+            .map_err(Into::into)
     }
 }

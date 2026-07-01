@@ -73,9 +73,23 @@ pub enum NetworkError {
     /// Failed to build swarm with behavior.
     #[error("SwarmBuilder::with_behaviour failed somehow.")]
     BuildSwarm,
-    /// Request/response RPC Error
+    /// Request/response RPC Error.
+    ///
+    /// A permanent, application-layer rejection from the responder. The
+    /// requester must not retry: the responder will reject an identical request
+    /// the same way (invalid payload, protocol violation, wrong response type).
     #[error("{0}")]
     RPCError(String),
+    /// Retryable request/response RPC error.
+    ///
+    /// The responder hit a transient, recoverable condition (a momentary
+    /// batch-store write failure, internal channel pressure during an epoch
+    /// transition) rather than rejecting the request on its merits. A requester
+    /// should retry with backoff instead of permanently giving up on the peer.
+    /// This is the counterpart of [`NetworkError::RPCError`], which is a
+    /// permanent rejection.
+    #[error("{0}")]
+    RPCRetryable(String),
     /// If a request is made to "any" peer and no peers are currently connected.
     #[error("No connected peers")]
     NoPeers,

@@ -37,6 +37,24 @@ impl NetworkConfig {
         &self.libp2p_config
     }
 
+    /// The chain id used to namespace this node's wire protocols and gossip topics.
+    ///
+    /// Sourced from genesis and stamped via [`Self::set_chain_id`] at node startup.
+    /// Defaults to `0` until set; every protocol and topic reads this one value, so
+    /// an unset id yields a self-consistent `0` namespace rather than a mismatch.
+    pub fn chain_id(&self) -> u64 {
+        self.libp2p_config.chain_id
+    }
+
+    /// Stamp the genesis chain id onto this config.
+    ///
+    /// Called once during node startup so wire protocols and gossip topics read a
+    /// single, genesis-derived source. Genesis is authoritative: this overwrites
+    /// whatever the (non-persisted) field held.
+    pub fn set_chain_id(&mut self, chain_id: u64) {
+        self.libp2p_config.chain_id = chain_id;
+    }
+
     /// Return a mutable reference to the [LibP2pConfig].
     #[cfg(feature = "test-utils")]
     pub fn libp2p_config_mut(&mut self) -> &mut LibP2pConfig {
@@ -120,32 +138,42 @@ pub struct LibP2pConfig {
     /// Must be < `kad_record_ttl`, otherwise records expire before they are
     /// refreshed.
     pub kad_publication_interval: Duration,
+    /// The chain id, used to namespace every libp2p wire protocol and gossip
+    /// topic so nodes on different chains never negotiate a connection or share
+    /// a gossip mesh.
+    ///
+    /// Sourced from `genesis.config.chain_id` and stamped onto this config at
+    /// node startup (see `NetworkConfig::set_chain_id`). It is not an operator
+    /// tunable, so it is intentionally skipped during (de)serialization and
+    /// never written to the config file; genesis is the single source of truth.
+    #[serde(skip)]
+    pub chain_id: u64,
 }
 
 impl LibP2pConfig {
-    /// Return topics for primary.
-    pub fn primary_topic() -> String {
-        String::from("tn-primary")
+    /// Return the primary gossip topic for `chain_id`.
+    pub fn primary_topic(chain_id: u64) -> String {
+        format!("tn-primary-{chain_id}")
     }
 
-    /// Return topics for primary.
-    pub fn consensus_output_topic() -> String {
-        String::from("tn-consensus-output")
+    /// Return the consensus-output gossip topic for `chain_id`.
+    pub fn consensus_output_topic(chain_id: u64) -> String {
+        format!("tn-consensus-output-{chain_id}")
     }
 
-    /// Return topics for epoch votes.
-    pub fn epoch_vote_topic() -> String {
-        String::from("tn-epoch-vote")
+    /// Return the epoch-vote gossip topic for `chain_id`.
+    pub fn epoch_vote_topic(chain_id: u64) -> String {
+        format!("tn-epoch-vote-{chain_id}")
     }
 
-    /// Return topics for worker.
-    pub fn worker_batch_topic() -> String {
-        String::from("tn-worker")
+    /// Return the worker-batch gossip topic for `chain_id`.
+    pub fn worker_batch_topic(chain_id: u64) -> String {
+        format!("tn-worker-{chain_id}")
     }
 
-    /// Return topics for worker.
-    pub fn worker_txn_topic() -> String {
-        String::from("tn-txn")
+    /// Return the worker-transaction gossip topic for `chain_id`.
+    pub fn worker_txn_topic(chain_id: u64) -> String {
+        format!("tn-txn-{chain_id}")
     }
 }
 
@@ -160,6 +188,8 @@ impl Default for LibP2pConfig {
             k_bucket_size: K_VALUE,
             kad_record_ttl: Duration::from_secs(48 * 60 * 60),
             kad_publication_interval: Duration::from_secs(12 * 60 * 60),
+            // Overwritten from genesis at node startup via `NetworkConfig::set_chain_id`.
+            chain_id: 0,
         }
     }
 }
@@ -528,5 +558,45 @@ hostname: "my-validator"
         assert_eq!(parsed.kad_publication_interval, default.kad_publication_interval);
         assert_eq!(parsed.max_rpc_message_size, default.max_rpc_message_size);
         assert_eq!(parsed.k_bucket_size, default.k_bucket_size);
+    }
+
+    #[test]
+    fn gossip_topics_are_chain_namespaced() {
+        // Every gossip topic embeds the chain id so two chains never share a mesh
+        // (issue #765).
+        assert_eq!(LibP2pConfig::primary_topic(2017), "tn-primary-2017");
+        assert_eq!(LibP2pConfig::consensus_output_topic(2017), "tn-consensus-output-2017");
+        assert_eq!(LibP2pConfig::epoch_vote_topic(2017), "tn-epoch-vote-2017");
+        assert_eq!(LibP2pConfig::worker_batch_topic(2017), "tn-worker-2017");
+        assert_eq!(LibP2pConfig::worker_txn_topic(2017), "tn-txn-2017");
+        // a different chain id yields a different topic
+        assert_ne!(LibP2pConfig::primary_topic(1), LibP2pConfig::primary_topic(2));
+    }
+
+    #[test]
+    fn set_chain_id_is_read_back() {
+        let mut config = NetworkConfig::default();
+        assert_eq!(config.chain_id(), 0, "defaults to 0 until stamped from genesis");
+        config.set_chain_id(2017);
+        assert_eq!(config.chain_id(), 2017);
+        assert_eq!(config.libp2p_config().chain_id, 2017);
+    }
+
+    #[test]
+    fn chain_id_is_never_persisted() {
+        // chain_id is genesis-derived, not operator-configurable: it must never be
+        // written to (or read from) the config file, so genesis stays authoritative.
+        let libp2p = LibP2pConfig { chain_id: 2017, ..Default::default() };
+        let yaml = serde_yaml::to_string(&libp2p).expect("serialize libp2p config");
+        assert!(!yaml.contains("chain_id"), "chain_id must not be serialized: {yaml}");
+
+        // The load-bearing guard: a config file that *does* contain an explicit
+        // chain_id (hand-edited by an operator) must ignore it on read, so genesis
+        // stays the only source and cannot be overridden from disk.
+        let from_disk: LibP2pConfig =
+            serde_yaml::from_str("max_rpc_message_size: 1\nchain_id: 999\n")
+                .expect("deserialize libp2p config with an explicit chain_id");
+        assert_eq!(from_disk.chain_id, 0, "an on-disk chain_id must be ignored on read");
+        assert_eq!(from_disk.max_rpc_message_size, 1, "other fields still load");
     }
 }

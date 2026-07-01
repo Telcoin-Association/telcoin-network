@@ -23,7 +23,7 @@ async fn test_wait_for_quorum_happy_path() {
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
     let network =
-        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
+        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0, 0);
     // Spawn a `QuorumWaiter` instance.
     let quorum_waiter = QuorumWaiter::new(
         my_primary.authority().clone(),
@@ -74,7 +74,7 @@ async fn test_batch_rejected_timeout() {
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
     let network =
-        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
+        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0, 0);
     // Spawn a `QuorumWaiter` instance.
     let quorum_waiter = QuorumWaiter::new(
         my_primary.authority().clone(),
@@ -128,7 +128,7 @@ async fn test_batch_some_rejected_stake_still_passes() {
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
     let network =
-        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
+        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0, 0);
     // Spawn a `QuorumWaiter` instance.
     let quorum_waiter = QuorumWaiter::new(
         my_primary.authority().clone(),
@@ -201,7 +201,7 @@ async fn test_batch_rejected_quorum() {
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
     let network =
-        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
+        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0, 0);
     // Spawn a `QuorumWaiter` instance.
     let quorum_waiter = QuorumWaiter::new(
         my_primary.authority().clone(),
@@ -263,7 +263,7 @@ async fn test_batch_rejected_antiquorum() {
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
     let network =
-        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
+        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0, 0);
     // Spawn a `QuorumWaiter` instance.
     let quorum_waiter = QuorumWaiter::new(
         my_primary.authority().clone(),
@@ -313,7 +313,7 @@ async fn test_batch_early_anti_quorum() {
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
     let network =
-        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
+        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0, 0);
     // Spawn a `QuorumWaiter` instance.
     let quorum_waiter = QuorumWaiter::new(
         my_primary.authority().clone(),
@@ -393,7 +393,7 @@ async fn test_network_error_retry_then_quorum() {
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
     let network =
-        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
+        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0, 0);
     let quorum_waiter = QuorumWaiter::new(
         my_primary.authority().clone(),
         committee.clone(),
@@ -449,7 +449,7 @@ async fn test_network_error_partial_retry_success() {
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
     let network =
-        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
+        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0, 0);
     let quorum_waiter = QuorumWaiter::new(
         my_primary.authority().clone(),
         committee.clone(),
@@ -526,7 +526,7 @@ async fn test_network_error_all_retries_exhausted() {
     // setup network
     let (sender, mut network_rx) = mpsc::channel(100);
     let network =
-        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0);
+        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0, 0);
     let quorum_waiter = QuorumWaiter::new(
         my_primary.authority().clone(),
         committee.clone(),
@@ -558,4 +558,124 @@ async fn test_network_error_all_retries_exhausted() {
         Ok(Ok(r)) => assert_matches!(r, Err(QuorumWaiterError::AntiQuorum)),
         Ok(Err(_)) => panic!("unexpected recv error!"),
     }
+}
+
+/// Regression test for issue #747: a responder's `RecoverableError` (a transient,
+/// recoverable condition such as a momentary batch-store write failure) must be
+/// retried, not treated as a permanent rejection. Every peer returns a
+/// recoverable error on its first attempt and accepts on retry, so quorum is
+/// only reachable if recoverable errors land on the retry path.
+#[tokio::test]
+async fn test_recoverable_error_retry_then_quorum() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .committee_size(NonZeroUsize::new(4).unwrap())
+        .build();
+    let committee = fixture.committee();
+    let my_primary = fixture.authorities().next().unwrap();
+    let task_manager = TaskManager::default();
+
+    // setup network
+    let (sender, mut network_rx) = mpsc::channel(100);
+    let network =
+        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0, 0);
+    let quorum_waiter = QuorumWaiter::new(
+        my_primary.authority().clone(),
+        committee.clone(),
+        network,
+        WorkerMetrics::new_for_worker(0),
+    );
+
+    // Make a batch.
+    let chain = test_chain_spec_arc();
+    let sealed_batch = batch(chain).seal_slow();
+
+    let timeout = Duration::from_secs(10);
+    let attest_handle =
+        quorum_waiter.verify_batch(sealed_batch.clone(), timeout, &task_manager.get_spawner());
+
+    // Background handler: every peer returns a recoverable error first, accepts on retry.
+    tokio::spawn(async move {
+        let mut attempt_count: HashMap<BlsPublicKey, u32> = HashMap::new();
+        while let Some(cmd) = network_rx.recv().await {
+            match cmd {
+                NetworkCommand::SendRequest { peer, reply, .. } => {
+                    let count = attempt_count.entry(peer).or_insert(0);
+                    *count += 1;
+                    let result = if *count == 1 {
+                        WorkerResponse::RecoverableError(WorkerRPCError(
+                            "failed to write to batch store".to_string(),
+                        ))
+                    } else {
+                        WorkerResponse::ReportBatch
+                    };
+                    let _ = reply.send(Ok(NetworkResponseMessage { peer, result }));
+                }
+                _ => panic!("unexpected network command!"),
+            }
+        }
+    });
+
+    // All peers accept on retry → quorum reached despite the initial recoverable errors.
+    assert!(attest_handle.await.unwrap().is_ok());
+}
+
+/// Regression test for issue #747: a responder that keeps returning
+/// `RecoverableError` exhausts retries and is counted as a network failure
+/// (`AntiQuorum`), never as rejected stake (`QuorumRejected`). With four
+/// committee members, three rejecting peers would trip `QuorumRejected`, so this
+/// distinguishes "transient, retries exhausted" from "explicitly rejected".
+#[tokio::test]
+async fn test_recoverable_error_exhausts_retries_as_network() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .committee_size(NonZeroUsize::new(4).unwrap())
+        .build();
+    let committee = fixture.committee();
+    let my_primary = fixture.authorities().next().unwrap();
+    let task_manager = TaskManager::default();
+
+    // setup network
+    let (sender, mut network_rx) = mpsc::channel(100);
+    let network =
+        WorkerNetworkHandle::new(NetworkHandle::new(sender), task_manager.get_spawner(), 0, 0);
+    let quorum_waiter = QuorumWaiter::new(
+        my_primary.authority().clone(),
+        committee.clone(),
+        network,
+        WorkerMetrics::new_for_worker(0),
+    );
+
+    // Make a batch.
+    let chain = test_chain_spec_arc();
+    let sealed_batch = batch(chain).seal_slow();
+
+    let timeout = Duration::from_secs(10);
+    let attest_handle =
+        quorum_waiter.verify_batch(sealed_batch.clone(), timeout, &task_manager.get_spawner());
+
+    // Background handler: every attempt from every peer returns a recoverable error.
+    tokio::spawn(async move {
+        while let Some(cmd) = network_rx.recv().await {
+            match cmd {
+                NetworkCommand::SendRequest { peer, reply, .. } => {
+                    let _ = reply.send(Ok(NetworkResponseMessage {
+                        peer,
+                        result: WorkerResponse::RecoverableError(WorkerRPCError(
+                            "failed to write to batch store".to_string(),
+                        )),
+                    }));
+                }
+                _ => panic!("unexpected network command!"),
+            }
+        }
+    });
+
+    // Retries exhausted → AntiQuorum (network failure), not QuorumRejected.
+    let outcome = tokio::time::timeout(Duration::from_secs(5), attest_handle)
+        .await
+        .expect("should not timeout waiting for quorum waiter")
+        .map_err(QuorumWaiterError::from)
+        .and_then(|inner| inner);
+    assert_matches!(outcome, Err(QuorumWaiterError::AntiQuorum));
 }

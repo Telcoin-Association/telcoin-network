@@ -370,7 +370,10 @@ where
     ) -> eyre::Result<WorkerNode<DB>> {
         // only support one worker for now (with id 0) - otherwise, loop here
         let worker_id = DEFAULT_WORKER_ID;
-        let base_fee = gas_accumulator.base_fee(worker_id);
+        let base_fee_container = gas_accumulator.base_fee(worker_id);
+        // u64 snapshot of the worker's base fee for the transaction pool. Base fee is constant
+        // within an epoch, so a snapshot taken at epoch start is valid for the whole epoch.
+        let base_fee = base_fee_container.base_fee();
 
         // update the network handle's task spawner for reporting batches in the epoch
         {
@@ -392,6 +395,7 @@ where
                         worker_id,
                         network_handle.clone(),
                         engine_to_primary,
+                        base_fee,
                     )
                     .await?;
             } else {
@@ -401,6 +405,11 @@ where
             }
         }
 
+        // Ensure the worker's transaction pool charges the accumulator's base fee for this epoch.
+        // On the init path above the pool was created with this value; this call additionally
+        // covers the respawn path, where initialization is skipped.
+        engine.set_worker_base_fee(worker_id, base_fee).await;
+
         let network_handle = self
             .worker_network_handle
             .as_ref()
@@ -408,7 +417,11 @@ where
             .clone();
 
         let validator = engine
-            .new_batch_validator(&worker_id, base_fee, consensus_config.committee().epoch())
+            .new_batch_validator(
+                &worker_id,
+                base_fee_container,
+                consensus_config.committee().epoch(),
+            )
             .await;
         self.spawn_worker_network_for_epoch(
             consensus_config,
@@ -499,7 +512,7 @@ where
         network_handle
             .inner_handle()
             .subscribe_with_publishers(
-                tn_config::LibP2pConfig::primary_topic(),
+                tn_config::LibP2pConfig::primary_topic(consensus_config.chain_id()),
                 committee_keys.into_iter().collect(),
             )
             .await?;
@@ -524,6 +537,11 @@ where
         }
 
         Self::wait_for_network_peers(network_handle.inner_handle(), "primary network").await?;
+
+        // re-probe each peer's epoch-pack sync capability this epoch: committees
+        // rotate and binaries are upgraded at the boundary, so a peer that could
+        // only speak legacy last epoch may now serve the sync protocol (739, step 6)
+        network_handle.clear_sync_capability();
 
         // spawn primary network
         PrimaryNetwork::new(
@@ -672,14 +690,14 @@ where
         // update the authorized publishers for gossip every epoch
         network_handle
             .inner_handle()
-            .subscribe(tn_config::LibP2pConfig::worker_txn_topic())
+            .subscribe(tn_config::LibP2pConfig::worker_txn_topic(consensus_config.chain_id()))
             .await?;
         // Get gossip from committee members about batches.
         // Useful for non-CVVs to prefetch and harmless for CVVs.
         network_handle
             .inner_handle()
             .subscribe_with_publishers(
-                tn_config::LibP2pConfig::worker_batch_topic(),
+                tn_config::LibP2pConfig::worker_batch_topic(consensus_config.chain_id()),
                 committee_keys.into_iter().collect(),
             )
             .await?;

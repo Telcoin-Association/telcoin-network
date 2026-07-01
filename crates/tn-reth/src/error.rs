@@ -41,6 +41,13 @@ pub enum TnRethError {
     /// Executed output must always contain at least one block.
     #[error("Empty execution output from engine.")]
     EmptyExecutionOutput,
+    /// Receipts are missing for a block that exists (DB inconsistency).
+    ///
+    /// Surfaced during ExEx replay: returning an empty receipt set would make a
+    /// non-empty block look empty to a stateful indexer (silent corruption), so
+    /// it is treated as an error instead.
+    #[error("receipts not found for existing block {0} during replay")]
+    ReplayReceiptsMissing(u64),
 }
 
 impl From<TnRethError> for EthApiError {
@@ -77,3 +84,10 @@ pub enum RegistryReadError {
     #[error("{0}")]
     Internal(String),
 }
+
+/// Result of an on-chain `ConsensusRegistry` read.
+///
+/// The error is always a [`RegistryReadError`], so consumers (e.g. the RPC layer) can match
+/// revert-vs-internal directly instead of recovering it via a runtime downcast. Every non-revert
+/// failure — state provider/EVM setup, `Halt`, ABI decode — is a [`RegistryReadError::Internal`].
+pub type RegistryReadResult<T> = Result<T, RegistryReadError>;

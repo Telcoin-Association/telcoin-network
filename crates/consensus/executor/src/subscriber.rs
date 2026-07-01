@@ -10,16 +10,13 @@ use std::{
 };
 use tn_config::ConsensusConfig;
 use tn_network_types::{local::LocalNetwork, PrimaryToWorkerClient};
-use tn_primary::{
-    network::{ConsensusResult, PrimaryNetworkHandle},
-    ConsensusBus, ConsensusBusApp, NodeMode,
-};
+use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus, ConsensusBusApp, NodeMode};
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{
     encode, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash, BlsSigner as _,
     CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusHeaderDigest,
-    ConsensusOutput, Database, Hash as _, Noticer, TaskManager, TaskSpawner, Timestamp,
-    TimestampSec, TnReceiver, TnSender,
+    ConsensusOutput, ConsensusResult, Database, Hash as _, Noticer, TaskManager, TaskSpawner,
+    Timestamp, TimestampSec, TnReceiver, TnSender,
 };
 use tracing::{debug, error, info, instrument, warn};
 
@@ -148,13 +145,23 @@ impl<DB: Database> Subscriber<DB> {
             // before run_epoch() winds down.
             return Ok(());
         }
-        let consensus_output = self
-            .fetch_batches(
+        // Prefer a verified output from the consensus chain: it already contains the full output
+        // (with batches), so we can skip the separate worker-network batch fetch during
+        // bulk catch-up. Falls back to fetching batches when the output is not staged (e.g.
+        // live tail).
+        let number = consensus_header.number;
+        let consensus_output = if let Ok(Some(output)) =
+            self.inner.consensus_chain.consensus_output_by_number(number).await
+        {
+            output
+        } else {
+            self.fetch_batches(
                 consensus_header.sub_dag.clone(),
                 consensus_header.parent_hash,
-                consensus_header.number,
+                number,
             )
-            .await?;
+            .await?
+        };
 
         let mut consensus_chain = self.inner.consensus_chain.clone();
         // This save will essentially mark this consensus output as written in stone (added to the
@@ -162,12 +169,26 @@ impl<DB: Database> Subscriber<DB> {
         // execution.
         save_consensus(consensus_output.clone(), &mut consensus_chain).await?;
 
+        // Once we've drained through the staged partial pack's final output, it has all been
+        // written to the main pack in order — drop the staging dir.
+        if self.inner.consensus_chain.staging_final() == Some(number) {
+            self.inner.consensus_chain.clear_staging();
+        }
+
         let last_round = consensus_output.leader_round();
 
         // We aren't doing consensus now but still need to update these watches before
         // we send the consensus output.
         self.consensus_bus.committed_round_updates().send_replace(last_round);
         self.consensus_bus.primary_round_updates().send_replace(last_round);
+
+        // ExEx delivery runs on the consensus-following path only — Observer
+        // (`follow_consensus`) and inactive CVV (`catch_up_rejoin_consensus`) both
+        // reach this method, neither runs Bullshark. Hand the full reconstructed
+        // output to any installed ExEx. The active-validator path
+        // (`handle_consensus_output`) deliberately omits this so validators bear
+        // no ExEx overhead.
+        self.consensus_bus.notify_exex_consensus_output(&consensus_output);
 
         if let Err(e) = self.consensus_bus.consensus_output().send(consensus_output).await {
             error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self.inner.authority_id, e);

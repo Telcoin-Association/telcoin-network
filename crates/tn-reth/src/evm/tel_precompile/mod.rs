@@ -57,7 +57,7 @@ mod faucet;
 mod helpers;
 /// In-memory EVM test harness (available in tests and with `test-utils` feature).
 #[cfg(any(test, feature = "test-utils"))]
-pub mod test_utils;
+pub(crate) mod test_utils;
 
 // --- Re-exports for external consumers ---
 
@@ -151,7 +151,7 @@ fn telcoin_precompile(mut input: PrecompileInput<'_>) -> PrecompileResult {
 
 #[cfg(test)]
 mod tests {
-    use super::test_utils::*;
+    use crate::evm::precompile_test_utils::*;
     use tn_config::GOVERNANCE_SAFE_ADDRESS;
 
     #[test]

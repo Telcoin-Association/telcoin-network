@@ -72,8 +72,15 @@ impl QuorumWaiter {
     /// Report a batch to a single peer with retry-and-backoff for transient network errors.
     ///
     /// - `Ok(deliver)` — peer accepted the batch
-    /// - `Err(Rejected)` — peer explicitly rejected (RPCError), no retry
+    /// - `Err(Rejected)` — peer explicitly rejected ([`NetworkError::RPCError`]), no retry
     /// - `Err(Network)` — all retry attempts exhausted
+    ///
+    /// Transient errors are retried with exponential backoff before resolving to
+    /// `Err(Network)`. This includes transport failures and a responder's
+    /// [`NetworkError::RPCRetryable`], the recoverable counterpart of
+    /// `RPCError`: a one-off responder-side condition (a momentary batch-store
+    /// write failure, channel pressure during an epoch transition) must land on
+    /// the retry path, not the no-retry rejection path.
     async fn waiter(
         bls: BlsPublicKey,
         network: WorkerNetworkHandle,
@@ -238,13 +245,9 @@ impl QuorumWaiterTrait for QuorumWaiter {
             })
             .await;
 
-            let res = match timeout_res {
-                Ok(res) => match res {
-                    Ok(()) => Ok(()),
-                    Err(e) => Err(e),
-                },
-                Err(_elapsed) => Err(QuorumWaiterError::Timeout),
-            };
+            // collapse the timeout outcome into the quorum result: an elapsed
+            // timeout becomes `Timeout`, otherwise flatten to the inner result.
+            let res = timeout_res.map_err(|_elapsed| QuorumWaiterError::Timeout).flatten();
 
             // success or failure, this measures broadcast + quorum latency
             metrics.record_quorum_wait(quorum_start.elapsed());
