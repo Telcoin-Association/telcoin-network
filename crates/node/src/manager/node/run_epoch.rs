@@ -11,10 +11,10 @@
 //! is torn down at the boundary; resources owned by the [`EpochManager`] (networks, DBs, channels)
 //! persist across epochs.
 //!
-//! The epoch-start setup and epoch-teardown sequences are split into the child `start` and `close`
-//! modules. This module also holds the helpers both of them call back into — `process_output`,
-//! `parse_listener_address_for_swarm`, `wait_for_network_peers` — plus the [`RunEpochMode`] /
-//! [`ReplayResult`] types that thread control flow through the loop.
+//! The epoch-start setup and epoch-teardown sequences are split into the sibling `start_epoch` and
+//! `close_epoch` modules. This module also holds the helpers both of them call back into — notably
+//! `process_output` — plus the [`RunEpochMode`] / [`ReplayResult`] types that thread control flow
+//! through the loop.
 
 use crate::{engine::ExecutionNode, manager::EpochManager, worker::worker_task_manager_name};
 use std::{collections::HashSet, time::Duration};
@@ -37,13 +37,12 @@ const EPOCH_TASK_MANAGER: &str = "Epoch Task Manager";
 ///
 /// The manager's loop (`run_epochs` in the `node` module) passes one in to start an epoch and gets
 /// one back describing the boundary that was crossed, then feeds that returned mode into the next
-/// iteration. Two behaviors gate on it: whether to replay missed consensus on entry
-/// ([`RunEpochMode::replay_consensus`]) and whether this is the one-time process startup
-/// ([`RunEpochMode::initial_epoch`]).
+/// iteration. One behavior gates on it: whether to replay missed consensus on entry
+/// ([`RunEpochMode::replay_consensus`]). It also labels the epoch-transition metrics.
 #[derive(Debug, Copy, Clone)]
 pub(crate) enum RunEpochMode {
-    /// First epoch after process start. Triggers the one-time network init and a consensus replay,
-    /// since output validated before the previous shutdown may still need to reach the engine.
+    /// First epoch after process start. Triggers a consensus replay, since output validated
+    /// before the previous shutdown may still need to reach the engine.
     Initial,
     /// The epoch was re-entered for the same committee because the node's role changed mid-epoch
     /// (e.g. a CVV that fell too far behind and must resync, or one that has caught back up)
@@ -68,13 +67,6 @@ impl RunEpochMode {
             RunEpochMode::Initial | RunEpochMode::NewEpoch => true,
         }
     }
-
-    /// Whether this is the process's first epoch. Used as one input to the network-first-init
-    /// decision; the actual gate also accounts for the replay-and-close restart path, which can
-    /// defer real network setup past the [`RunEpochMode::Initial`] iteration.
-    fn initial_epoch(&self) -> bool {
-        matches!(self, RunEpochMode::Initial)
-    }
 }
 
 impl<P, DB> EpochManager<P, DB>
@@ -87,8 +79,7 @@ where
     /// Ordered phases:
     /// 1. Build an epoch-scoped [`ConsensusBus`] over the application channels and read the
     ///    committee plus epoch timing from chain (the epoch's primary does not exist yet). Derive
-    ///    `self.epoch_boundary` and backfill a dummy epoch-0 [`EpochRecord`] if missing so later
-    ///    lookups can treat epoch 0 like any other.
+    ///    `self.epoch_boundary`.
     /// 2. Create the per-epoch [`TaskManager`] and open the epoch pack files via `open_epoch_pack`.
     /// 3. If the mode calls for replay, re-forward any missed consensus output. If that replay
     ///    crosses the epoch boundary, close the epoch immediately, clear the consensus DB, and
@@ -96,10 +87,8 @@ where
     ///    iteration. Otherwise, block until the engine has executed the last replayed output before
     ///    going live.
     /// 4. Subscribe to consensus output, configure consensus, and create the primary/worker
-    ///    components. The one-time per-process network setup is gated on `network_first_init`,
-    ///    which is driven by `self.network_initialized` (not by [`RunEpochMode::Initial`]) so the
-    ///    replay-and-close return above can defer setup to a following iteration without skipping
-    ///    it.
+    ///    components. The swarms were brought up once at app scope before the epoch loop; here only
+    ///    per-epoch state (committees, publishers, worker components) is refreshed.
     /// 5. Start the primary (if this node is an active CVV), the subscriber, the worker batch
     ///    builder, and the engine batch builder; reattach any orphaned batches.
     /// 6. `tokio::select!` over three exits: node shutdown, the epoch boundary
@@ -137,25 +126,6 @@ where
         self.epoch_boundary = epoch_start + epoch_info.epochDuration as u64;
         self.metrics.current.set(committee.epoch() as f64);
         self.metrics.boundary_timestamp_seconds.set(self.epoch_boundary as f64);
-        // Produce a "dummy" epoch 0 EpochRecord if missing.
-        // This will let us use simple code to find any epoch including 0 at startup.
-        if !self.consensus_chain.epochs().contains_epoch(0).await {
-            if committee.epoch() != 0 {
-                return Err(eyre::eyre!(
-                    "We have epoch 0 in our database if we are past epoch 0, on {}",
-                    committee.epoch()
-                ));
-            }
-            // No keys for epoch 0, fix that.
-            // We are on epoch 0 so load up that committee in Db as well.
-            let committee: Vec<BlsPublicKey> = committee.bls_keys().iter().copied().collect();
-            let next_committee = committee.clone();
-            let epoch_rec =
-                EpochRecord { epoch: 0, committee, next_committee, ..Default::default() };
-            // Save the "dummy" record, should be overwritten once epoch 0 closes.
-            // This will NOT be signed.
-            self.consensus_chain.epochs().save_dummy_epoch0(epoch_rec).await?;
-        }
 
         // The task manager that resets every epoch and manages
         // short-running tasks for the lifetime of the epoch.
@@ -191,29 +161,16 @@ where
         let mut consensus_output = self.consensus_bus.subscribe_consensus_output();
         let consensus_config = self.configure_consensus(engine, network_config).await?;
 
-        // The networks need their one-time, per-process setup (start listening, register bootstrap
-        // peers) on the first iteration that actually reaches `create_consensus`. This is usually
-        // the `Initial` epoch, but the replay above can return early before
-        // `create_consensus` on a restart that replays-and-closes an epoch boundary, so the first
-        // real setup then happens on a following `NewEpoch` iteration. Drive the decision off
-        // whether the network has actually been set up yet (not off `RunEpochMode::Initial`) so the
-        // setup is never skipped on that restart path. (Committee slots are set every epoch
-        // regardless via `update_committees`.)
-        let network_first_init = epoch_mode.initial_epoch() || !self.network_initialized;
-
         // create primary and worker nodes
         let (primary, worker_node) = self
             .create_consensus(
                 engine,
                 &epoch_task_manager,
-                network_first_init,
                 gas_accumulator.clone(),
                 consensus_bus.clone(),
                 consensus_config.clone(),
             )
             .await?;
-        // Networks are now set up; subsequent epochs rotate committees instead of re-seeding.
-        self.network_initialized = true;
         // consensus config for shutdown subscribers
         let consensus_shutdown = primary.shutdown_signal().await;
         let epoch_shutdown_rx = consensus_shutdown.subscribe();

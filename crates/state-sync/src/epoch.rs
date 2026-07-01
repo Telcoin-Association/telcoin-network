@@ -10,10 +10,27 @@ use tn_storage::consensus::ConsensusChain;
 use tn_types::{
     BlsPublicKey, ConsensusHeaderDigest, Epoch, EpochDigest, EpochRecord, Noticer, TaskSpawner,
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// How long to wait before retrying a failed epoch record collection.
 const EPOCH_COLLECT_RETRY_SECS: u64 = 5;
+
+/// Hard cap on the startup record-sync gate.
+///
+/// The gate normally exits after two quick quiescent passes; this deadline bounds startup
+/// when peers keep failing or records keep trickling in. Sized so existing e2e timing
+/// budgets still hold with the soft peer wait that runs before the gate.
+const RECORD_SYNC_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Longest a single gate pass may run without landing a new record in the DB.
+///
+/// A pass stalls rather than fails when every connected peer is itself still starting up
+/// (a whole cohort booting or restarting at once): those peers accept the record request
+/// but are not serving yet, so no response ever comes back quickly. Records save to the DB
+/// as they verify, so cutting a pass after a few seconds and consulting the DB separates
+/// real progress (keep going) from starvation (stop; the epoch record collector takes
+/// over) without burning the whole [`RECORD_SYNC_DEADLINE`].
+const RECORD_SYNC_PASS_CAP: Duration = Duration::from_secs(5);
 
 /// Return true if committee is compatable with epoch_rec_committee.
 /// These will usually be equal but it is possible for a validator to be
@@ -168,6 +185,92 @@ async fn collect_epoch_records(
         }
     }
     result_epoch
+}
+
+/// Sync the quorum-certified [`EpochRecord`] chain to the network tip, blocking until quiescent.
+///
+/// Called once during node startup, before the epoch loop begins, so startup decisions
+/// (current committee, node role) read the network's certified view rather than stale local
+/// state. Runs [`collect_epoch_records`] passes starting from epoch 0 (epochs already
+/// complete locally are skipped cheaply) until two consecutive passes return the same epoch,
+/// the second pass confirming nothing newer was available. Requires the epoch-0 record
+/// (real or dummy) to already be in the DB so record verification can anchor on it.
+///
+/// This never hard-fails. It returns the last confirmed epoch when:
+/// - two consecutive passes agree (the normal, quiescent exit),
+/// - the node has no connected peers (e.g. the first node of a fresh network),
+/// - a pass runs [`RECORD_SYNC_PASS_CAP`] without landing a new record in the DB — peers are
+///   connected but not serving yet, e.g. a whole cohort booting or restarting at once,
+/// - [`RECORD_SYNC_DEADLINE`] expires (a pass cancelled mid-flight is safe: collection is
+///   verify-then-save and idempotent, and the epoch record collector re-runs it once spawned), or
+/// - node shutdown is signaled.
+pub async fn sync_epoch_records_to_tip(
+    consensus_chain: &ConsensusChain,
+    primary_handle: &PrimaryNetworkHandle,
+    consensus_bus: &ConsensusBusApp,
+    node_shutdown: Noticer,
+) -> Epoch {
+    let started = tokio::time::Instant::now();
+    let mut previous_pass: Option<Epoch> = None;
+    let mut latest: Epoch = 0;
+    loop {
+        // a node with no peers has no tip to sync toward (cold genesis boots alone)
+        if primary_handle.connected_peers_count().await.unwrap_or(0) == 0 {
+            info!(target: "epoch-manager", latest, "record sync: no connected peers, proceeding");
+            return latest;
+        }
+        let remaining = RECORD_SYNC_DEADLINE.saturating_sub(started.elapsed());
+        let pass_cap = RECORD_SYNC_PASS_CAP.min(remaining);
+        // collect_epoch_records is not shutdown-aware, so select shutdown per pass
+        let pass = tokio::select! {
+            _ = &node_shutdown => return latest,
+            result = tokio::time::timeout(
+                pass_cap,
+                collect_epoch_records(latest, consensus_chain, primary_handle, consensus_bus),
+            ) => match result {
+                Ok(reached) => reached,
+                Err(_) => {
+                    // the pass was cut mid-flight; records save as they verify, so the db
+                    // shows whether it was progressing or starving on peers that are not
+                    // serving yet (e.g. the whole cohort restarting at once)
+                    let db_latest = consensus_chain
+                        .epochs()
+                        .latest_record()
+                        .await
+                        .map(|record| record.epoch)
+                        .unwrap_or_default();
+                    if db_latest > latest {
+                        db_latest
+                    } else {
+                        warn!(target: "epoch-manager", latest, "record sync pass starved with no progress, proceeding");
+                        return latest;
+                    }
+                }
+            },
+        };
+        if record_sync_quiescent(previous_pass, pass, started.elapsed(), RECORD_SYNC_DEADLINE) {
+            info!(target: "epoch-manager", epoch = pass, "record sync reached the network tip");
+            return pass;
+        }
+        previous_pass = Some(pass);
+        latest = pass;
+    }
+}
+
+/// Decide whether the startup record-sync gate can stop after a completed pass.
+///
+/// Quiescence is *equality* across two consecutive passes: the latest pass confirmed
+/// nothing new past the previous one. `<=` would be wrong here - a pass can return below
+/// its input when it regresses to repair a missing parent record, and that repair must run
+/// again rather than end the gate. The deadline unconditionally ends the gate so a flaky
+/// peer set cannot stall startup.
+fn record_sync_quiescent(
+    previous_pass: Option<Epoch>,
+    current_pass: Epoch,
+    elapsed: Duration,
+    deadline: Duration,
+) -> bool {
+    previous_pass == Some(current_pass) || elapsed >= deadline
 }
 
 /// Spawn a long running task to collect missing epoch records.
@@ -333,6 +436,37 @@ mod tests {
 
         // epoch key 3 is not in committee
         assert!(!epoch_committee_valid(&epoch_rec, &committee));
+    }
+
+    #[test]
+    fn test_record_sync_quiescent_advance_then_stable() {
+        let deadline = Duration::from_secs(20);
+        let early = Duration::from_secs(1);
+        // the first pass has no predecessor to agree with
+        assert!(!record_sync_quiescent(None, 5, early, deadline));
+        // forward progress keeps the gate open
+        assert!(!record_sync_quiescent(Some(5), 8, early, deadline));
+        // two equal passes in a row -> quiescent
+        assert!(record_sync_quiescent(Some(8), 8, early, deadline));
+    }
+
+    #[test]
+    fn test_record_sync_quiescent_regression_keeps_gate_open() {
+        let deadline = Duration::from_secs(20);
+        let early = Duration::from_secs(1);
+        // a pass can return below its predecessor when repairing a missing parent
+        // record; that must not end the gate (why the rule is equality, not <=)
+        assert!(!record_sync_quiescent(Some(8), 7, early, deadline));
+        // and the repaired pass advancing again still keeps it open
+        assert!(!record_sync_quiescent(Some(7), 9, early, deadline));
+    }
+
+    #[test]
+    fn test_record_sync_quiescent_deadline_stops() {
+        let deadline = Duration::from_secs(20);
+        // the deadline ends the gate even when passes are still advancing
+        assert!(record_sync_quiescent(Some(3), 9, Duration::from_secs(20), deadline));
+        assert!(record_sync_quiescent(None, 0, Duration::from_secs(25), deadline));
     }
 
     #[test]

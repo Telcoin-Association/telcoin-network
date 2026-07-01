@@ -7,12 +7,12 @@
 //! [`PrimaryNode`] and [`WorkerNode`] are created together with their per-epoch
 //! [`PrimaryNetwork`]/[`WorkerNetwork`] interfaces.
 //!
-//! Network setup is split into two scopes. The one-time, per-process swarm init
-//! (binding listeners, registering bootstrap peers) is gated on the initial
-//! epoch via the `initial_epoch` flag and [`init_network_for_epoch`]. The
-//! per-epoch work — refreshing committee membership and gossip publishers,
-//! dialing committee peers, and waiting for peers — happens on every epoch so a
-//! long-lived swarm tracks the rotating committee.
+//! The one-time, per-process swarm init (binding listeners, registering and
+//! dialing bootstrap peers) happens at app scope in the parent `node` module
+//! before the epoch loop starts. Everything here is per-epoch work — refreshing
+//! committee membership and gossip publishers, dialing committee peers, and
+//! waiting for peers — repeated every epoch so the long-lived swarm tracks the
+//! rotating committee.
 //!
 //! Before voting starts, any consensus that was committed to the chain but not
 //! yet executed is replayed to the engine, with a guard that refuses to cross an
@@ -24,7 +24,7 @@ use crate::{
 };
 use eyre::{eyre, OptionExt};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::Duration,
 };
@@ -42,7 +42,7 @@ use tn_rpc::RpcNodeInfo;
 use tn_types::{
     gas_accumulator::GasAccumulator, BatchValidation, BlsPublicKey, BlsSigner, Committee,
     CommitteeBuilder, ConsensusHeaderDigest, ConsensusOutput, Database as TNDatabase, Epoch,
-    Multiaddr, NetworkPublicKey, P2pNode, TaskManager, TaskSpawner, DEFAULT_WORKER_ID,
+    TaskManager, TaskSpawner, DEFAULT_WORKER_ID,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::mpsc;
@@ -133,8 +133,7 @@ where
     /// These components are short-lived: they exist only for the current epoch and are torn
     /// down at its close. The node mode is (re)identified first, and the previous epoch's
     /// committee is read from on-chain state so peers from the outgoing committee are not
-    /// banned during the handover. `initial_epoch` is threaded down to gate the one-time
-    /// per-process network setup (see [`init_network_for_epoch`]).
+    /// banned during the handover.
     ///
     /// After both nodes are up, the next two committees' validator keys are prefetched through
     /// the primary and worker network handles so their network info is already resolved when
@@ -143,7 +142,6 @@ where
         &mut self,
         engine: &ExecutionNode,
         epoch_task_manager: &TaskManager,
-        initial_epoch: bool,
         gas_accumulator: GasAccumulator,
         consensus_bus: ConsensusBus,
         consensus_config: ConsensusConfig<DB>,
@@ -164,7 +162,6 @@ where
             .create_primary_node_components(
                 &consensus_config,
                 epoch_task_manager.get_spawner(),
-                initial_epoch,
                 consensus_bus,
                 previous_committee_keys.clone(),
             )
@@ -201,7 +198,6 @@ where
                 &consensus_config,
                 engine,
                 epoch_task_manager.get_spawner(),
-                initial_epoch,
                 engine_to_primary,
                 gas_accumulator,
                 previous_committee_keys,
@@ -304,7 +300,6 @@ where
         &mut self,
         consensus_config: &ConsensusConfig<DB>,
         epoch_task_spawner: TaskSpawner,
-        initial_epoch: bool,
         consensus_bus: ConsensusBus,
         previous_committee_keys: HashSet<BlsPublicKey>,
     ) -> eyre::Result<PrimaryNode<DB>> {
@@ -325,7 +320,6 @@ where
             state_sync.clone(),
             epoch_task_spawner.clone(),
             &network_handle,
-            initial_epoch,
             consensus_bus.clone(),
             previous_committee_keys,
         )
@@ -345,18 +339,16 @@ where
     /// spawner and epoch number before anything else, so batch reporting runs under the
     /// epoch-scoped lifetime.
     ///
-    /// The engine's worker components are initialized on the initial epoch, and also whenever
-    /// the engine reports no workers yet — the latter covers the case where the first epoch
-    /// returned early from [`replay_missed_consensus`] (epoch boundary hit) before reaching
-    /// [`create_consensus`], leaving the workers uninitialized. Otherwise the worker network
-    /// tasks are respawned so they pick up the new epoch task spawner.
-    #[allow(clippy::too_many_arguments)]
+    /// The engine's worker components are initialized whenever the engine reports no workers
+    /// yet — the first epoch that reaches [`create_consensus`] after process start, which is
+    /// usually the initial epoch but can be a later iteration when the first one returned
+    /// early from [`replay_missed_consensus`] (epoch boundary hit). Otherwise the worker
+    /// network tasks are respawned so they pick up the new epoch task spawner.
     async fn spawn_worker_node_components(
         &mut self,
         consensus_config: &ConsensusConfig<DB>,
         engine: &ExecutionNode,
         epoch_task_spawner: TaskSpawner,
-        initial_epoch: bool,
         engine_to_primary: EngineToPrimaryRpc,
         gas_accumulator: GasAccumulator,
         previous_committee_keys: HashSet<BlsPublicKey>,
@@ -377,12 +369,12 @@ where
 
             network_handle.update_task_spawner(epoch_task_spawner.clone());
             network_handle.update_epoch(consensus_config.committee().epoch());
-            // initialize worker components on startup
-            // This will use the new epoch_task_spawner and epoch on network_handle.
-            // Also initialize if workers are empty: this happens when the first epoch returns
-            // early from replay_missed_consensus (epoch boundary hit) before create_consensus
-            // is reached, leaving workers uninitialized.
-            if initial_epoch || !engine.are_workers_initialized().await {
+            // initialize worker components on the first epoch that reaches create_consensus
+            // after process start. This will use the new epoch_task_spawner and epoch on
+            // network_handle. Workers can be uninitialized past the initial iteration when it
+            // returns early from replay_missed_consensus (epoch boundary hit) before
+            // create_consensus is reached.
+            if !engine.are_workers_initialized().await {
                 engine
                     .initialize_worker_components(
                         worker_id,
@@ -422,7 +414,6 @@ where
             validator.clone(),
             epoch_task_spawner,
             &network_handle,
-            initial_epoch,
             previous_committee_keys,
         )
         .await?;
@@ -440,23 +431,21 @@ where
 
     /// Stand up the [`PrimaryNetwork`] interface for this epoch over the shared swarm.
     ///
-    /// This operates on the per-epoch interface, not the swarm itself. Every epoch refreshes
-    /// the previous/current/next committee membership (via [`init_network_for_epoch`]) and the
-    /// gossip publisher set so the network bans and routes against the current committee. The
-    /// listener is bound only on the initial epoch.
+    /// This operates on the per-epoch interface, not the swarm itself (bootstrap peers and
+    /// listeners were handled once at app scope). Every epoch refreshes the
+    /// previous/current/next committee membership (via `update_committees`) and the gossip
+    /// publisher set so the network bans and routes against the current committee.
     ///
     /// Peers are dialed when this node is a CVV (it must reach the other CVVs) or when it has no
     /// connected peers; a non-committee node that already has peers does not pester the
     /// committee. The method then waits for peers before spawning the network on the
     /// epoch-scoped spawner.
-    #[allow(clippy::too_many_arguments)]
     async fn spawn_primary_network_for_epoch(
         &mut self,
         consensus_config: &ConsensusConfig<DB>,
         state_sync: StateSynchronizer<DB>,
         epoch_task_spawner: TaskSpawner,
         network_handle: &PrimaryNetworkHandle,
-        initial_epoch: bool,
         consensus_bus: ConsensusBus,
         previous_committee_keys: HashSet<BlsPublicKey>,
     ) -> eyre::Result<()> {
@@ -472,30 +461,13 @@ where
             .map(|a| *a.protocol_key())
             .collect();
 
-        let bootstrap_peers =
-            self.bootstrap_servers.iter().map(|(k, v)| (*k, v.primary.clone())).collect();
         let next_committee_keys: HashSet<BlsPublicKey> =
             consensus_config.next_committee_keys().iter().copied().collect();
-        Self::init_network_for_epoch(
-            network_handle.inner_handle(),
-            bootstrap_peers,
-            previous_committee_keys,
-            committee_keys.clone(),
-            next_committee_keys,
-            initial_epoch,
-        )
-        .await?;
-
-        // start listening if the network needs to be initialized
-        if initial_epoch {
-            let primary_address = Self::parse_listener_address_for_swarm(
-                "PRIMARY_LISTENER_MULTIADDR",
-                consensus_config.primary_networkkey(),
-                consensus_config.primary_address(),
-            )?;
-            info!(target: "epoch-manager", ?primary_address, "listening to {primary_address}");
-            network_handle.inner_handle().start_listening(primary_address).await?;
-        }
+        // every epoch sets the previous/current/next committee slots from authoritative state
+        network_handle
+            .inner_handle()
+            .update_committees(previous_committee_keys, committee_keys.clone(), next_committee_keys)
+            .await?;
 
         // update the authorized publishers for gossip every epoch
         network_handle
@@ -600,14 +572,13 @@ where
     /// Stand up the [`WorkerNetwork`] interface for this epoch over the shared swarm.
     ///
     /// The worker analogue of [`spawn_primary_network_for_epoch`]: every epoch refreshes
-    /// committee membership (via [`init_network_for_epoch`]) and the gossip subscriptions, while
-    /// the listener binds only on the initial epoch. The worker always dials this epoch's
-    /// committee peers — the peer manager drops dials to peers already connected — then waits
-    /// for peers before spawning the network on the epoch-scoped spawner.
+    /// committee membership (via `update_committees`) and the gossip subscriptions. The worker
+    /// always dials this epoch's committee peers — the peer manager drops dials to peers
+    /// already connected — then waits for peers before spawning the network on the
+    /// epoch-scoped spawner.
     ///
     /// Two topics are subscribed: the worker transaction topic, and the batch topic restricted to
     /// committee publishers so non-CVVs can prefetch batches (harmless for CVVs).
-    #[allow(clippy::too_many_arguments)]
     async fn spawn_worker_network_for_epoch(
         &mut self,
         consensus_config: &ConsensusConfig<DB>,
@@ -615,7 +586,6 @@ where
         validator: Arc<dyn BatchValidation>,
         epoch_task_spawner: TaskSpawner,
         network_handle: &WorkerNetworkHandle,
-        initial_epoch: bool,
         previous_committee_keys: HashSet<BlsPublicKey>,
     ) -> eyre::Result<()> {
         // get event streams for the worker network handler
@@ -629,29 +599,13 @@ where
             .map(|a| *a.protocol_key())
             .collect();
 
-        let bootstrap_peers =
-            self.bootstrap_servers.iter().map(|(k, v)| (*k, v.worker.clone())).collect();
         let next_committee_keys: HashSet<BlsPublicKey> =
             consensus_config.next_committee_keys().iter().copied().collect();
-        Self::init_network_for_epoch(
-            network_handle.inner_handle(),
-            bootstrap_peers,
-            previous_committee_keys,
-            committee_keys.clone(),
-            next_committee_keys,
-            initial_epoch,
-        )
-        .await?;
-
-        // start listening if the network needs to be initialized
-        if initial_epoch {
-            let worker_address = Self::parse_listener_address_for_swarm(
-                "WORKER_LISTENER_MULTIADDR",
-                consensus_config.primary_networkkey(),
-                consensus_config.worker_address(),
-            )?;
-            network_handle.inner_handle().start_listening(worker_address).await?;
-        }
+        // every epoch sets the previous/current/next committee slots from authoritative state
+        network_handle
+            .inner_handle()
+            .update_committees(previous_committee_keys, committee_keys.clone(), next_committee_keys)
+            .await?;
 
         let worker_address = consensus_config.worker_address();
 
@@ -741,66 +695,6 @@ where
         self.consensus_bus.node_mode().send_modify(|v| *v = mode);
 
         Ok(mode)
-    }
-
-    /// Point a network handle at a new epoch's committee membership.
-    ///
-    /// Every epoch sets the previous/current/next committee slots directly from authoritative
-    /// state via `update_committees`. On the initial epoch only, bootstrap peers are registered
-    /// first (the one-time, per-process step gated on `initial_epoch`).
-    ///
-    /// Ordering matters on that initial epoch: bootstrap peers must be added BEFORE
-    /// `update_committees`, so that `known_peers` is already populated when the peer manager
-    /// resolves the committees against it.
-    async fn init_network_for_epoch<Req: TNMessage, Res: TNMessage>(
-        handle: &NetworkHandle<Req, Res>,
-        bootstrap_peers: BTreeMap<BlsPublicKey, P2pNode>,
-        previous_committee_keys: HashSet<BlsPublicKey>,
-        committee_keys: HashSet<BlsPublicKey>,
-        next_committee_keys: HashSet<BlsPublicKey>,
-        initial_epoch: bool,
-    ) -> eyre::Result<()> {
-        if initial_epoch {
-            handle.add_bootstrap_peers(bootstrap_peers).await?;
-        }
-        handle
-            .update_committees(previous_committee_keys, committee_keys, next_committee_keys)
-            .await?;
-        Ok(())
-    }
-
-    /// Resolve a swarm listener [`Multiaddr`] from an env var, falling back to a default.
-    ///
-    /// Lets cloud deployments override the primary/worker listen address (e.g. to bind a
-    /// container's external address) without changing config. When the env var is set, the
-    /// parsed address has the node's [`NetworkPublicKey`] appended as a `/p2p/` component to
-    /// match the format produced by keytool generation; an unparseable value or one carrying a
-    /// conflicting `/p2p/` key is an error. When unset, `fallback` is returned as-is.
-    fn parse_listener_address_for_swarm(
-        env_var: &str,
-        network_pubkey: NetworkPublicKey,
-        fallback: Multiaddr,
-    ) -> eyre::Result<Multiaddr> {
-        std::env::var(env_var)
-            .map(|addr| {
-                addr.parse()
-                    .map_err(|e| {
-                        eyre::eyre!(
-                            "Failed to parse listener multiaddr from env {env_var} ({addr})\n{e}"
-                        )
-                    })
-                    // add Protocol::P2p to multiaddr to maintain consistency with
-                    // bin/telcoin-network/src/keytool/generate.rs
-                    .and_then(|multi: Multiaddr| {
-                        multi.with_p2p(network_pubkey.into()).map_err(|_| {
-                            eyre::eyre!(
-                                "{env_var} multiaddr contains a different P2P protocol {:?}",
-                                std::env::var(env_var)
-                            )
-                        })
-                    })
-            })
-            .unwrap_or(Ok(fallback))
     }
 
     /// Block until the given [`NetworkHandle`] has at least one connected peer.

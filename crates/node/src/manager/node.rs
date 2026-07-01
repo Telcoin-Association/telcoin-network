@@ -21,17 +21,21 @@ use crate::{
 };
 use eyre::{eyre, WrapErr as _};
 use state_sync::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_recent_consensus};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, TelcoinDirs};
-use tn_network_libp2p::{types::NetworkEvent, ConsensusNetwork};
+use tn_network_libp2p::{
+    types::{NetworkEvent, NetworkHandle},
+    ConsensusNetwork, TNMessage,
+};
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, QueChannel};
 use tn_reth::{system_calls::EpochState, RethDb, RethEnv};
 use tn_storage::{consensus::ConsensusChain, open_db, DatabaseType};
 use tn_types::{
     deconstruct_nonce, gas_accumulator::GasAccumulator, BlsPublicKey, BootstrapServer, Committee,
     ConsensusHeader, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput,
-    Database as TNDatabase, EngineUpdate, Epoch, Notifier, TaskError, TaskManager, TaskSpawner,
-    TimestampSec, DEFAULT_WORKER_ID, MIN_PROTOCOL_BASE_FEE,
+    Database as TNDatabase, EngineUpdate, Epoch, EpochRecord, Multiaddr, NetworkPublicKey,
+    Notifier, TaskError, TaskManager, TaskSpawner, TimestampSec, DEFAULT_WORKER_ID,
+    MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::mpsc;
@@ -55,15 +59,20 @@ pub(crate) const WORKER_TASK_BASE: &str = "Worker Task";
 /// a small bound is enough and keeps a buggy ExEx from growing it without limit.
 const EXEX_EVENT_CAPACITY: usize = 16;
 
+/// How long app-level bring-up waits for a first connected peer before proceeding anyway.
+///
+/// Together with the record-sync deadline this bounds worst-case startup delay; both are
+/// sized so existing e2e timing budgets hold.
+const SOFT_PEER_WAIT: Duration = Duration::from_secs(10);
+
 /// The long-running owner that oversees epoch transitions.
 ///
 /// One instance exists for the lifetime of the process. It holds the resources that must survive
 /// across epochs (p2p network handles, consensus DB, consensus bus, consensus chain) alongside the
 /// small amount of cross-epoch carry-over state that the next epoch needs to start correctly -
-/// notably [`last_consensus_header`](Self::last_consensus_header),
-/// [`last_forwarded_consensus_number`](Self::last_forwarded_consensus_number), and
-/// [`network_initialized`](Self::network_initialized). Per-epoch consensus components are built and
-/// dropped inside the epoch loop rather than stored here.
+/// notably [`last_consensus_header`](Self::last_consensus_header) and
+/// [`last_forwarded_consensus_number`](Self::last_forwarded_consensus_number). Per-epoch consensus
+/// components are built and dropped inside the epoch loop rather than stored here.
 #[derive(Debug)]
 pub(crate) struct EpochManager<P, DB> {
     /// The builder for node configuration
@@ -84,19 +93,6 @@ pub(crate) struct EpochManager<P, DB> {
     /// If the timestamp of the leader is >= the epoch_boundary then the
     /// manager closes the epoch after the engine executes all data.
     epoch_boundary: TimestampSec,
-    /// Whether the long-running p2p networks have completed their one-time, per-process setup
-    /// (start listening, register bootstrap peers).
-    ///
-    /// This setup normally runs on the `Initial` epoch, but the `Initial` iteration can return
-    /// early from [`EpochManager::replay_missed_consensus`] - when a restart must replay-and-close
-    /// an epoch boundary - *before* `create_consensus` runs the setup. In that case the setup runs
-    /// on the first following `NewEpoch` iteration instead. Gating on this flag, rather than on
-    /// [`RunEpochMode::Initial`], guarantees the networks are set up exactly once even on that
-    /// restart path (mirrors the `are_workers_initialized` guard used for worker components).
-    ///
-    /// Committee slots are NOT gated on this flag. They are set every epoch from authoritative
-    /// state via `update_committees`.
-    network_initialized: bool,
     /// Reth (MDBX) database handle. Held for the whole process so the execution engine can be
     /// recreated without reopening storage.
     reth_db: RethDb,
@@ -269,7 +265,6 @@ where
             key_config,
             node_shutdown,
             epoch_boundary: Default::default(),
-            network_initialized: false,
             reth_db,
             consensus_db,
             consensus_bus,
@@ -286,12 +281,18 @@ where
     /// Build the process-lifetime components, then drive the epoch loop until shutdown.
     ///
     /// Startup proceeds in order: create the execution engine and start it, recover the
-    /// [`GasAccumulator`] via [`catchup_accumulator`], spawn the long-running p2p networks
-    /// ([`spawn_node_networks`](Self::spawn_node_networks)), subscribe the primary to the
-    /// epoch-vote and consensus-output gossip topics, spawn the epoch-record and vote
-    /// collectors, restore execution state ([`try_restore_state`](Self::try_restore_state)),
-    /// and spawn the engine-update task. It then requests any missing epoch pack files and
-    /// launches the app-scoped consensus fetch workers.
+    /// [`GasAccumulator`] via [`catchup_accumulator`], backfill the dummy epoch-0 record on a
+    /// fresh DB, spawn the long-running p2p networks
+    /// ([`spawn_node_networks`](Self::spawn_node_networks)), and subscribe the primary to the
+    /// epoch-vote and consensus-output gossip topics. The one-time network bring-up follows:
+    /// register bootstrap peers on both swarms, bind their listeners, dial the bootstrap
+    /// servers, and wait briefly (but never fail) for a first peer. With the network up, the
+    /// epoch record chain is synced to the network tip
+    /// ([`state_sync::sync_epoch_records_to_tip`]) so everything after reads current network
+    /// state; only then are the epoch-record and vote collectors spawned, execution state
+    /// restored ([`try_restore_state`](Self::try_restore_state)), and the engine-update task
+    /// started. It then requests any missing epoch pack files and launches the app-scoped
+    /// consensus fetch workers.
     ///
     /// Finally it selects over two futures: the node task manager running to exit, and the epoch
     /// loop ([`run_epochs`](Self::run_epochs)). Whichever resolves first ends the node; the
@@ -340,6 +341,24 @@ where
         )
         .await?;
 
+        // Backfill a "dummy" epoch-0 record if missing so every startup path (record-sync
+        // gate, epoch loop) can treat epoch 0 like any other epoch. It is unsigned and
+        // overwritten by the real record when epoch 0 closes.
+        if !self.consensus_chain.epochs().contains_epoch(0).await {
+            if epoch != 0 {
+                return Err(eyre::eyre!(
+                    "We have epoch 0 in our database if we are past epoch 0, on {epoch}",
+                ));
+            }
+            // on epoch 0 the tip yields the genesis committee - load it into the db too
+            let (committee, _, _) = self.get_committee_with_epoch_start_info(&engine).await?;
+            let committee: Vec<BlsPublicKey> = committee.bls_keys().iter().copied().collect();
+            let next_committee = committee.clone();
+            let epoch_rec =
+                EpochRecord { epoch: 0, committee, next_committee, ..Default::default() };
+            self.consensus_chain.epochs().save_dummy_epoch0(epoch_rec).await?;
+        }
+
         // read the network config or use the default, then stamp the genesis chain id
         // onto it so every wire protocol and gossip topic is chain-namespaced (issue
         // #765). Genesis is the single source of truth; this one value is read by the
@@ -362,6 +381,75 @@ where
             .inner_handle()
             .subscribe(tn_config::LibP2pConfig::consensus_output_topic(network_config.chain_id()))
             .await?;
+
+        // One-time network bring-up at app scope: seed bootstrap peers into the known-peer
+        // tables (this does not dial), bind the swarm listeners so peers can dial us back
+        // during startup (load-bearing for simultaneous cohort restart — a node that isn't
+        // listening cannot be reached by its restarting peers), then explicitly dial the
+        // bootstrap servers so record sync below has peers to talk to.
+        let worker_network_handle =
+            self.worker_network_handle.as_ref().expect("worker network").clone();
+        primary_network_handle
+            .inner_handle()
+            .add_bootstrap_peers(
+                self.bootstrap_servers.iter().map(|(k, v)| (*k, v.primary.clone())).collect(),
+            )
+            .await?;
+        worker_network_handle
+            .inner_handle()
+            .add_bootstrap_peers(
+                self.bootstrap_servers.iter().map(|(k, v)| (*k, v.worker.clone())).collect(),
+            )
+            .await?;
+
+        let node_info = &self.builder.tn_config.node_info;
+        let primary_address = Self::parse_listener_address_for_swarm(
+            "PRIMARY_LISTENER_MULTIADDR",
+            node_info.p2p_info.primary.network_key.clone(),
+            node_info.primary_network_address().clone(),
+        )?;
+        info!(target: "epoch-manager", ?primary_address, "primary network listening");
+        primary_network_handle.inner_handle().start_listening(primary_address).await?;
+        // the worker listener resolves its env override against the primary network key,
+        // matching the per-epoch behavior this replaces
+        let worker_address = Self::parse_listener_address_for_swarm(
+            "WORKER_LISTENER_MULTIADDR",
+            node_info.p2p_info.primary.network_key.clone(),
+            node_info.worker_network_address().clone(),
+        )?;
+        worker_network_handle.inner_handle().start_listening(worker_address).await?;
+
+        for bls_key in self.bootstrap_servers.keys() {
+            self.dial_peer_bls(
+                primary_network_handle.inner_handle().clone(),
+                *bls_key,
+                node_task_manager.get_spawner(),
+            );
+            self.dial_peer_bls(
+                worker_network_handle.inner_handle().clone(),
+                *bls_key,
+                node_task_manager.get_spawner(),
+            );
+        }
+
+        // Give discovery a moment to find a first peer, but never fail here: a lone node
+        // (e.g. cold genesis) proceeds, and the per-epoch peer waits still enforce liveness.
+        Self::wait_for_network_peers_soft(primary_network_handle.inner_handle(), "primary network")
+            .await;
+
+        // Sync the quorum-certified epoch record chain to the network tip before anything
+        // else runs, so startup decisions read current network state rather than stale disk.
+        // The maintenance collector is spawned after this to avoid two concurrent initial
+        // collections.
+        let synced_epoch = state_sync::sync_epoch_records_to_tip(
+            &self.consensus_chain,
+            &primary_network_handle,
+            &self.consensus_bus,
+            self.node_shutdown.subscribe(),
+        )
+        .await;
+        info!(target: "epoch-manager", synced_epoch, "epoch records synced before starting the epoch loop");
+
         state_sync::spawn_epoch_record_collector(
             self.consensus_chain.clone(),
             primary_network_handle.clone(),
@@ -665,6 +753,63 @@ where
         ));
 
         Ok(())
+    }
+
+    /// Wait up to [`SOFT_PEER_WAIT`] for the network to report at least one connected peer.
+    ///
+    /// The soft counterpart to the per-epoch `wait_for_network_peers`: during app-level
+    /// bring-up a node with zero peers is legitimate (the first node of a fresh network, or
+    /// temporarily unreachable bootstrap servers), so this logs and proceeds on timeout
+    /// instead of failing. Polls every 500ms.
+    async fn wait_for_network_peers_soft<Req: TNMessage, Res: TNMessage>(
+        handle: &NetworkHandle<Req, Res>,
+        network_name: &str,
+    ) {
+        let deadline = tokio::time::Instant::now() + SOFT_PEER_WAIT;
+        loop {
+            if handle.connected_peer_count().await.unwrap_or(0) > 0 {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                warn!(target: "epoch-manager", "{network_name}: no peers connected after soft wait, proceeding");
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    /// Resolve a swarm listener [`Multiaddr`] from an env var, falling back to a default.
+    ///
+    /// Lets cloud deployments override the primary/worker listen address (e.g. to bind a
+    /// container's external address) without changing config. When the env var is set, the
+    /// parsed address has the node's [`NetworkPublicKey`] appended as a `/p2p/` component to
+    /// match the format produced by keytool generation; an unparseable value or one carrying a
+    /// conflicting `/p2p/` key is an error. When unset, `fallback` is returned as-is.
+    fn parse_listener_address_for_swarm(
+        env_var: &str,
+        network_pubkey: NetworkPublicKey,
+        fallback: Multiaddr,
+    ) -> eyre::Result<Multiaddr> {
+        std::env::var(env_var)
+            .map(|addr| {
+                addr.parse()
+                    .map_err(|e| {
+                        eyre::eyre!(
+                            "Failed to parse listener multiaddr from env {env_var} ({addr})\n{e}"
+                        )
+                    })
+                    // add Protocol::P2p to multiaddr to maintain consistency with
+                    // bin/telcoin-network/src/keytool/generate.rs
+                    .and_then(|multi: Multiaddr| {
+                        multi.with_p2p(network_pubkey.into()).map_err(|_| {
+                            eyre::eyre!(
+                                "{env_var} multiaddr contains a different P2P protocol {:?}",
+                                std::env::var(env_var)
+                            )
+                        })
+                    })
+            })
+            .unwrap_or(Ok(fallback))
     }
 
     /// Loop, starting a new epoch on each iteration until shutdown.

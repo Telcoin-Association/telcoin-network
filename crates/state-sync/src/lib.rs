@@ -21,7 +21,7 @@ use tn_types::{
 use tracing::{debug, error, info, warn};
 
 mod epoch;
-pub use epoch::spawn_epoch_record_collector;
+pub use epoch::{spawn_epoch_record_collector, sync_epoch_records_to_tip};
 mod consensus;
 mod metrics;
 use crate::metrics::STATE_SYNC_METRICS;
