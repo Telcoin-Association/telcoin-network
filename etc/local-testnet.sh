@@ -181,7 +181,6 @@ if [ "$START" = true ]; then
     CONSENSUS_METRICS="127.0.0.1:9104"
     echo "Starting Observer in background, rpc endpoint http://localhost:8541"
     target/${RELEASE}/telcoin-network node --datadir "${DATADIR}" \
-       --observer \
        --instance 5 \
        --metrics "${CONSENSUS_METRICS}" \
        --log.stdout.format log-fmt \

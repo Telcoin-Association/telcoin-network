@@ -24,7 +24,7 @@ use state_sync::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_recen
 use std::collections::BTreeMap;
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, TelcoinDirs};
 use tn_network_libp2p::{types::NetworkEvent, ConsensusNetwork};
-use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode, QueChannel};
+use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, QueChannel};
 use tn_reth::{system_calls::EpochState, RethDb, RethEnv};
 use tn_storage::{consensus::ConsensusChain, open_db, DatabaseType};
 use tn_types::{
@@ -222,12 +222,11 @@ where
 {
     /// Construct the manager and its process-lifetime state.
     ///
-    /// Opens the consensus chain, builds the application-scoped consensus bus (forced into
-    /// `Observer` mode when configured as an observer), and seeds the fallback bootstrap
-    /// servers from the genesis committee (overridden in [`run`](Self::run) when the network
-    /// config supplies its own). Network handles are left `None` until [`run`](Self::run)
-    /// spawns the networks. Panics if the consensus chain cannot be opened, since that is
-    /// unrecoverable at startup.
+    /// Opens the consensus chain, builds the application-scoped consensus bus, and seeds the
+    /// fallback bootstrap servers from the genesis committee (overridden in
+    /// [`run`](Self::run) when the network config supplies its own). Network handles are left
+    /// `None` until [`run`](Self::run) spawns the networks. Panics if the consensus chain
+    /// cannot be opened, since that is unrecoverable at startup.
     pub(crate) async fn new(
         builder: TnBuilder,
         tn_datadir: P,
@@ -260,10 +259,6 @@ where
 
         let consensus_bus =
             ConsensusBusApp::new_with_recent_blocks(builder.tn_config.parameters.gc_depth);
-        if builder.tn_config.observer {
-            // Don't risk keeping the default CVV active mode...
-            consensus_bus.node_mode().send_replace(NodeMode::Observer);
-        }
         let worker_event_stream = QueChannel::new();
 
         Ok(Self {

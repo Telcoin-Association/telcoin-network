@@ -144,6 +144,11 @@ async fn try_partial_pack_catch_up(
     hash: ConsensusHeaderDigest,
 ) -> bool {
     // An active validator builds the epoch itself; never run there.
+    // note: node_mode holds its default (CvvActive) until the epoch loop's first
+    // identify_node_mode call, so this guard would wrongly skip catch-up for an
+    // observer in that window. the window is currently unreachable - consensus
+    // gossip is only processed by the per-epoch primary network, spawned after the
+    // mode is identified. do not add a producer that calls this before then.
     if consensus_bus.is_active_cvv() {
         return false;
     }

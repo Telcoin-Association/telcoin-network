@@ -156,8 +156,7 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
                         format!("{}-{}", name, key_config.primary_public_key().to_short_string())
                     } else if let Some(instance) = command.instance {
                         format!(
-                            "{}-{}-{}",
-                            if command.observer { "observer" } else { "node" },
+                            "node-{}-{}",
                             instance,
                             key_config.primary_public_key().to_short_string()
                         )
@@ -283,7 +282,7 @@ mod tests {
             .expect("generate keys command");
 
         // Create config files or the run() below will fail.
-        Config::load_or_default(&temp_dir.path().to_path_buf(), true, "test").unwrap();
+        Config::load_or_default(&temp_dir.path().to_path_buf(), "test").unwrap();
         std::env::set_var("RUST_LOG", "info,evm=debug");
         let tn = Cli::try_parse_args_from([
             "tn",

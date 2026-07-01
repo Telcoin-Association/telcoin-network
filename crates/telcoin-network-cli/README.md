@@ -257,7 +257,6 @@ telcoin-network node \
 | --------------------- | -------------- | ---------------------------------------------------------------------------------------------- |
 | `--chain`             | none           | Join a named network (`adiri`, `testnet`, `mainnet`)                                           |
 | `--instance`          | none           | Instance number (0-200) for port offsetting. See [Multi-instance setup](#multi-instance-setup) |
-| `--observer`          | `false`        | Run as an observer (no consensus participation)                                                |
 | `--metrics`           | none           | Enable Prometheus metrics at this socket address (e.g. `127.0.0.1:9101`)                       |
 | `--healthcheck`       | none           | TCP health check port. Env: `HEALTHCHECK_TCP_PORT`                                             |
 | `--node-name`         | auto-generated | Name for OpenTelemetry service identification                                                  |
@@ -645,12 +644,11 @@ The compressed BLS public key is 96 bytes and the proof-of-possession signature 
 
 ## Observer mode
 
-Run a node that follows consensus and executes blocks without participating in voting or block production:
+A node runs as an observer automatically whenever its BLS key is not in the current committee — there is no flag. An observer follows consensus and executes blocks without participating in voting or block production:
 
 ```bash
 telcoin-network node \
     --datadir /var/lib/telcoin \
-    --observer \
     --http
 ```
 
@@ -668,7 +666,7 @@ telcoin-network node \
 
 Observers still require key generation (`keytool generate observer`) and the genesis files. They need the same genesis config and parameters as validators.
 
-An observer generates its own network identity keys for P2P connectivity but never participates in the consensus committee, regardless of whether it is registered on-chain.
+An observer generates its own network identity keys for P2P connectivity. The role is derived from committee membership each epoch: a node whose BLS key joins the committee takes up validator duties at that epoch, and a validator rotated out of the committee runs as an observer until it rejoins.
 
 ## Security considerations
 

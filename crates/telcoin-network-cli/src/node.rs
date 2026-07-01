@@ -53,11 +53,6 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     #[arg(long, value_name = "INSTANCE", global = true,  value_parser = value_parser!(u16).range(..=200))]
     pub instance: Option<u16>,
 
-    /// Is this an observer node?  True if set, an observer will never be in the committee
-    /// but will follow consensus and provide node RPC access.
-    #[arg(long, value_name = "OBSERVER", global = true, default_value_t = false)]
-    pub observer: bool,
-
     /// Sets all ports to unused, allowing the OS to choose random unused ports when sockets are
     /// bound.
     ///
@@ -141,14 +136,12 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             info!(target: "cli", "Overwriting TN config with named chain: {chain:?}");
             match chain {
                 NamedChain::Adiri | NamedChain::TestNet => {
-                    Config::load_adiri(&tn_datadir, self.observer, SHORT_VERSION)?
+                    Config::load_adiri(&tn_datadir, SHORT_VERSION)?
                 }
-                NamedChain::MainNet => {
-                    Config::load_mainnet(&tn_datadir, self.observer, SHORT_VERSION)?
-                }
+                NamedChain::MainNet => Config::load_mainnet(&tn_datadir, SHORT_VERSION)?,
             }
         } else {
-            Config::load(&tn_datadir, self.observer, SHORT_VERSION)?
+            Config::load(&tn_datadir, SHORT_VERSION)?
         };
         #[cfg(not(feature = "adiri"))]
         if tn_config.genesis().config.chain_id == 2017 {
@@ -171,8 +164,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
 
         // get the worker's transaction address from the config
         let Self {
-            chain: _,    // Used above
-            observer: _, // Used above
+            chain: _, // Used above
             metrics,
             instance,
             with_unused_ports,

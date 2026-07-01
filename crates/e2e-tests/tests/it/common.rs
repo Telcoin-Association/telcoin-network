@@ -367,6 +367,9 @@ pub(crate) fn start_validator_with_args(
 }
 
 /// Start a process running an observer node.
+///
+/// Observer keys are not in any committee, so the node derives the observer role from
+/// committee membership on its own; no flag is passed.
 pub(crate) fn start_observer(
     instance: usize,
     bin: &'static CargoRun,
@@ -383,7 +386,6 @@ pub(crate) fn start_observer(
     command
         .env("TN_BLS_PASSPHRASE", "restart_test")
         .arg("node")
-        .arg("--observer")
         .arg("--datadir")
         .arg(&*data_dir.to_string_lossy())
         .arg("--http")

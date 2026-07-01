@@ -704,8 +704,8 @@ where
     /// Decide this epoch's [`NodeMode`] and publish it to [`ConsensusBus::node_mode`].
     ///
     /// An existing `CvvInactive` state is sticky and returned as-is — a node syncing to rejoin
-    /// the committee stays inactive until that resolves elsewhere. Otherwise the node is an
-    /// `Observer` if it is not in this committee (or is configured observer-only), and
+    /// the committee stays inactive until that resolves elsewhere. Otherwise the node's role
+    /// follows committee membership alone: `Observer` if its key is not in this committee,
     /// `CvvActive` if it is. `CvvActive` is optimistic: the node assumes it is caught up and is
     /// demoted to inactive later if that turns out to be false. The chosen mode is written to the
     /// [`ConsensusBus`] before returning.
@@ -729,7 +729,7 @@ where
             self.consensus_chain.clone(),
         )
         .await;
-        let mode = if !in_committee || self.builder.tn_config.observer {
+        let mode = if !in_committee {
             NodeMode::Observer
         } else {
             // Assume we are caught up, will be demoted to inactive if this is not true...
