@@ -10,7 +10,7 @@ use std::{
 
 use tn_config::ConsensusConfig;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
-use tn_storage::{consensus::ConsensusChain, tables::ConsensusHeaderCache};
+use tn_storage::{consensus::ConsensusChain, tables::ConsensusCache};
 use tn_types::{
     ConsensusHeaderDigest, ConsensusNumHash, Database as TNDatabase, Epoch, EpochRecord, Noticer,
     TaskSpawner, TnReceiver, TnSender as _,
@@ -31,11 +31,15 @@ enum ConsensusHeaderResult {
     Retry,
 }
 
-/// Retrieve a consensus header from a peer.
-/// If we are requesting a hash then that hash should
-/// have already been "validated" so the only check we
-/// make is that the returned header matches the hash.
-async fn get_consensus_header<DB: TNDatabase>(
+/// Retrieve a verified consensus OUTPUT (header + batches) for `number` and cache it.
+///
+/// `hash` is the already-verified consensus header digest for `number` — it comes from validated
+/// consensus gossip (the tip) or from a verified descendant's `parent_hash`. We pull the full
+/// output BYTES from a peer (`request_consensus_output`), decode them with the epoch committee, and
+/// verify the decoded header's digest equals `hash` BEFORE caching. This upholds the invariant that
+/// we never cache/execute an output that is not verified (directly by gossip, or as an ancestor of
+/// one). The walk proceeds recent→earliest, so each cached entry is a verified output.
+async fn get_consensus_output<DB: TNDatabase>(
     number: u64,
     hash: ConsensusHeaderDigest,
     db: &DB,
@@ -43,45 +47,53 @@ async fn get_consensus_header<DB: TNDatabase>(
     network: &PrimaryNetworkHandle,
     consensus_chain: &ConsensusChain,
 ) -> ConsensusHeaderResult {
-    // Use the ConsensusChain, once we have a record in a pack file we are done.
-    let chain_contains_header =
-        consensus_chain.consensus_header_by_number(number).await.ok().flatten().is_some();
-    if chain_contains_header {
+    // Already in a pack file (chain/staging) -> done.
+    if consensus_chain.consensus_header_by_number(number).await.ok().flatten().is_some() {
         return ConsensusHeaderResult::Done;
     }
-    if let Ok(Some(block)) = db.get::<ConsensusHeaderCache>(&number) {
-        return if block.number > 0 {
-            ConsensusHeaderResult::Continue(block.number - 1, block.parent_hash)
+    // Already cached (verified when inserted) -> continue from its parent.
+    if let Ok(Some(output)) = db.get::<ConsensusCache>(&number) {
+        let header = output.consensus_header();
+        return if header.number > 0 {
+            ConsensusHeaderResult::Continue(header.number - 1, header.parent_hash)
         } else {
             ConsensusHeaderResult::Done
         };
     }
-    // request consensus from any peer
-    match network.request_consensus(number, hash).await {
-        Ok(header) => {
-            if let Err(e) = db.insert::<ConsensusHeaderCache>(&header.number, &header) {
-                error!(target: "state-sync", ?e, "error saving a consensus header to cache storage!");
-            }
-            // The header we got will match hash (request_consensus() contract).
-            let parent = header.parent_hash;
-            let parent_number = header.number.saturating_sub(1);
-            consensus_bus.send_last_consensus_header_if_newer(header);
-            if number > 0 {
-                ConsensusHeaderResult::Continue(parent_number, parent)
-            } else {
-                ConsensusHeaderResult::Done
-            }
-        }
+    // Pull the full output bytes from any peer.
+    let bytes = match network.request_consensus_output(number).await {
+        Ok(bytes) => bytes,
         Err(e) => {
-            warn!(
-                target: "tn::observer",
-                %e,
-                ?hash,
-                ?number,
-                "failed to fetch consensus header from peer"
-            );
-            ConsensusHeaderResult::Retry
+            warn!(target: "tn::observer", %e, ?hash, ?number, "failed to fetch consensus output from peer");
+            return ConsensusHeaderResult::Retry;
         }
+    };
+    // Decode with the epoch's committee (resolves cert authors -> execution addresses).
+    let epoch = consensus_chain.epochs().number_to_epoch(number);
+    let output = match consensus_chain.decode_consensus_output(epoch, bytes).await {
+        Ok(output) => output,
+        Err(e) => {
+            // Includes the case where we do not yet hold this epoch's committee/pack.
+            warn!(target: "tn::observer", ?e, ?number, "failed to decode consensus output, will retry");
+            return ConsensusHeaderResult::Retry;
+        }
+    };
+    let header = output.consensus_header();
+    // VERIFY: the decoded output must match the already-verified hash. A peer that returns a
+    // wrong/forked output is rejected here and never cached or executed.
+    if header.digest() != hash {
+        warn!(target: "tn::observer", ?number, expected = ?hash, got = ?header.digest(), "consensus output digest mismatch - rejecting");
+        return ConsensusHeaderResult::Retry;
+    }
+    let parent = header.parent_hash;
+    if let Err(e) = db.insert::<ConsensusCache>(&number, &output) {
+        error!(target: "state-sync", ?e, "error saving a consensus output to cache storage!");
+    }
+    consensus_bus.send_last_consensus_header_if_newer(header);
+    if number > 0 {
+        ConsensusHeaderResult::Continue(number - 1, parent)
+    } else {
+        ConsensusHeaderResult::Done
     }
 }
 
@@ -371,7 +383,7 @@ async fn get_consensus_header_range<DB: TNDatabase>(
     let mut count = 1;
     let mut retries = 0;
     loop {
-        match get_consensus_header(number, hash, db, consensus_bus, network, consensus_chain).await
+        match get_consensus_output(number, hash, db, consensus_bus, network, consensus_chain).await
         {
             ConsensusHeaderResult::Continue(next_number, next_hash) => {
                 number = next_number;
@@ -510,7 +522,7 @@ pub async fn spawn_fetch_recent_consensus<DB: TNDatabase>(
     // should not hurt and can clear up an issue if something interferes with eviction.
     // Note, on longer shutdowns this will have no real effect but could lead to churn
     // if a node is being restarted relatively quickly.
-    if let Err(e) = db.clear_table::<ConsensusHeaderCache>() {
+    if let Err(e) = db.clear_table::<ConsensusCache>() {
         error!(target: "state-sync", ?e, "Error clearing consensus header cache, ignoring...");
     }
     // Get the epoch of our last executed consensus.

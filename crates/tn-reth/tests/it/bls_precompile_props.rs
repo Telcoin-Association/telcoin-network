@@ -1,92 +1,82 @@
-//! Property-based tests for the native BLS proof-of-possession precompile (`0x…b151`).
+//! Property-based tests for the native BLS signature-verification precompile (`0x…b151`).
 //!
-//! These exercise the precompile through the real EVM call path (the same one
-//! `ConsensusRegistry`'s linked `BlsG1` library reaches via `delegatecall`), verifying its
-//! observable contract across randomized inputs:
-//! - A correctly-generated proof of possession verifies; wrong address / wrong key / wrong
-//!   signature do not.
-//! - Malformed or wrong-length point bytes return `false` rather than reverting (matching
-//!   `BlsG1.verifyProofOfPossession`'s boolean contract), and never panic.
-//! - `proofOfPossessionMessage` returns exactly the bytes verification signs over and is bound to
-//!   the validator address.
+//! These exercise the precompile through the real EVM call path (the same one `ConsensusRegistry`
+//! reaches via a low-level `staticcall`), verifying its observable contract across randomized
+//! inputs:
+//! - A correctly-generated proof of possession verifies; a different message (wrong address) /
+//!   wrong key / wrong signature do not.
+//! - Malformed or wrong-length point bytes (including the valid uncompressed encodings) return
+//!   `false` rather than reverting (matching `IBlsG1.blsVerify`'s boolean contract), and never
+//!   panic.
 //! - Calldata validation: short calldata and unknown selectors revert.
+//!
+//! The precompile is a generic BLS verifier; `ConsensusRegistry`'s proof-of-possession message
+//! (`intentPrefix || compressedPubkey || address`) is the representative message used here.
 
-use alloy::{
-    primitives::address,
-    sol,
-    sol_types::{SolCall, SolValue},
-};
+use alloy::{primitives::address, sol, sol_types::SolCall};
 use proptest::prelude::*;
 use rand::{rngs::StdRng, SeedableRng};
 use reth_revm::primitives::Address;
-use tn_reth::test_utils::precompile_test_utils::{
-    assert_not_success, decode_bool, extract_output_bytes, TestEnv, USER,
-};
+use tn_reth::test_utils::precompile_test_utils::{assert_not_success, decode_bool, TestEnv, USER};
 use tn_types::{
-    generate_proof_of_possession_bls_for_test, proof_of_possession_message_bytes, BlsKeypair,
-    BlsPublicKey, Bytes,
+    construct_proof_of_possession_message, generate_proof_of_possession_bls_for_test, BlsKeypair,
+    Bytes,
 };
 
 sol! {
-    function verifyProofOfPossession(
-        bytes uncompressedSignature,
-        bytes uncompressedPubkey,
-        address validatorAddress
+    function blsVerify(
+        bytes signature,
+        bytes pubkey,
+        bytes message
     ) external view returns (bool);
-
-    function proofOfPossessionMessage(
-        bytes uncompressedPubkey,
-        address validatorAddress
-    ) external pure returns (bytes);
 }
 
-/// Canonical address the BLS precompile is registered at (matches `BlsG1`'s link address). The
+/// Canonical address the BLS precompile is registered at (matches `BLS_G1_ADDRESS`). The
 /// integration crate cannot see the crate-internal constant, so it is pinned here independently -
 /// which also guards against the address silently drifting.
 const BLS_G1_PRECOMPILE_ADDRESS: Address = address!("000000000000000000000000000000000000b151");
 
-/// Gas limit for verify calls. The precompile charges 150k for a verification, so the default
-/// 100k harness limit is insufficient; mirror the 1M budget `stake`/`delegateStake` run with.
+/// Gas limit for verify calls. The precompile charges 150k for a verification, so the default 100k
+/// harness limit is insufficient; mirror the 1M budget `stake`/`delegateStake` run with.
 const VERIFY_GAS: u64 = 1_000_000;
 
-/// A valid proof-of-possession vector: the keypair plus its uncompressed `blst::min_sig`
-/// `serialize()` bytes (96-byte G1 signature, 192-byte G2 pubkey) - the exact bytes the protocol
-/// passes to `BlsG1` / this precompile.
+/// A valid proof-of-possession vector: the compressed `blst::min_sig` `to_bytes()` bytes (48-byte
+/// G1 signature, 96-byte G2 pubkey) and the proof-of-possession message they were produced over -
+/// the exact bytes the protocol passes to this precompile.
 struct Vector {
-    keypair: BlsKeypair,
     sig: Vec<u8>,
     pubkey: Vec<u8>,
+    message: Vec<u8>,
 }
 
 /// Builds a valid proof of possession for `address` from a deterministic RNG seed.
 fn vector(seed: [u8; 32], address: Address) -> Vector {
     let keypair = BlsKeypair::generate(&mut StdRng::from_seed(seed));
+    let message = construct_proof_of_possession_message(keypair.public(), &address);
     let proof =
         generate_proof_of_possession_bls_for_test(&keypair, &address).expect("generate test PoP");
-    let sig = proof.serialize().to_vec();
-    let pubkey = keypair.public().serialize().to_vec();
-    Vector { keypair, sig, pubkey }
+    Vector { sig: proof.to_bytes().to_vec(), pubkey: keypair.public().to_bytes().to_vec(), message }
 }
 
-/// ABI-encodes a `verifyProofOfPossession` call.
-fn verify_calldata(sig: &[u8], pubkey: &[u8], address: Address) -> Vec<u8> {
-    verifyProofOfPossessionCall {
-        uncompressedSignature: Bytes::copy_from_slice(sig),
-        uncompressedPubkey: Bytes::copy_from_slice(pubkey),
-        validatorAddress: address,
+/// ABI-encodes a `blsVerify` call.
+fn verify_calldata(sig: &[u8], pubkey: &[u8], message: &[u8]) -> Vec<u8> {
+    blsVerifyCall {
+        signature: Bytes::copy_from_slice(sig),
+        pubkey: Bytes::copy_from_slice(pubkey),
+        message: Bytes::copy_from_slice(message),
     }
     .abi_encode()
 }
 
-/// Executes `verifyProofOfPossession` against the precompile and returns the decoded `bool`.
+/// Executes `blsVerify` against the precompile and returns the decoded `bool`.
 ///
 /// Asserts the call itself succeeded - an invalid proof returns `Ok(false)`, not a revert, so a
 /// revert here would be a contract violation and fails the test inside `decode_bool`.
-fn verify(env: &mut TestEnv, sig: &[u8], pubkey: &[u8], address: Address) -> bool {
+fn verify(env: &mut TestEnv, sig: &[u8], pubkey: &[u8], message: &[u8]) -> bool {
     let result = env.exec_to(
         USER,
         BLS_G1_PRECOMPILE_ADDRESS,
-        verify_calldata(sig, pubkey, address),
+        verify_calldata(sig, pubkey, message),
         VERIFY_GAS,
     );
     decode_bool(&result)
@@ -103,10 +93,12 @@ proptest! {
         let address = Address::from(addr);
         let v = vector(seed, address);
         let mut env = TestEnv::new();
-        prop_assert!(verify(&mut env, &v.sig, &v.pubkey, address));
+        prop_assert!(verify(&mut env, &v.sig, &v.pubkey, &v.message));
     }
 
-    /// A proof bound to one address never verifies for a different address.
+    /// A proof bound to one address never verifies against a different address's message (the
+    /// address is bound through the signed message). Same seed -> same key, so only the message
+    /// differs.
     #[test]
     fn prop_wrong_address_rejected(
         seed in any::<[u8; 32]>(),
@@ -114,11 +106,11 @@ proptest! {
         addr_b in any::<[u8; 20]>(),
     ) {
         prop_assume!(addr_a != addr_b);
-        let bound = Address::from(addr_a);
-        let other = Address::from(addr_b);
-        let v = vector(seed, bound);
+        let bound = vector(seed, Address::from(addr_a));
+        let other = vector(seed, Address::from(addr_b));
         let mut env = TestEnv::new();
-        prop_assert!(!verify(&mut env, &v.sig, &v.pubkey, other));
+        // bound's signature/key, but other's (different-address) message -> must fail
+        prop_assert!(!verify(&mut env, &bound.sig, &bound.pubkey, &other.message));
     }
 
     /// A valid signature never verifies against a substituted public key.
@@ -133,8 +125,8 @@ proptest! {
         let a = vector(seed_a, address);
         let b = vector(seed_b, address);
         let mut env = TestEnv::new();
-        // a's signature, b's pubkey -> must fail
-        prop_assert!(!verify(&mut env, &a.sig, &b.pubkey, address));
+        // a's signature, b's pubkey, a's message -> must fail
+        prop_assert!(!verify(&mut env, &a.sig, &b.pubkey, &a.message));
     }
 
     /// A signature from a different key never verifies against the original pubkey.
@@ -149,103 +141,99 @@ proptest! {
         let a = vector(seed_a, address);
         let b = vector(seed_b, address);
         let mut env = TestEnv::new();
-        // b's signature, a's pubkey -> must fail
-        prop_assert!(!verify(&mut env, &b.sig, &a.pubkey, address));
+        // b's signature, a's pubkey, a's message -> must fail
+        prop_assert!(!verify(&mut env, &b.sig, &a.pubkey, &a.message));
     }
 
     /// Random, correctly-sized point bytes return `false` (not a revert) and never panic. The ABI
     /// encoding is well-formed, so the precompile decodes it and reports a failed verification.
     #[test]
     fn prop_garbage_points_return_false(
-        sig in prop::collection::vec(any::<u8>(), 96),
-        pubkey in prop::collection::vec(any::<u8>(), 192),
+        sig in prop::collection::vec(any::<u8>(), 48),
+        pubkey in prop::collection::vec(any::<u8>(), 96),
         addr in any::<[u8; 20]>(),
     ) {
-        let address = Address::from(addr);
+        let v = vector([1u8; 32], Address::from(addr));
         let mut env = TestEnv::new();
-        // Astronomically unlikely to be a valid PoP; the invariant is "false, never panic/revert".
-        prop_assert!(!verify(&mut env, &sig, &pubkey, address));
+        // Astronomically unlikely to be a valid signature; the invariant is "false, never panic/revert".
+        prop_assert!(!verify(&mut env, &sig, &pubkey, &v.message));
     }
 
-    /// Wrong-length pubkey bytes (anything but the 192-byte uncompressed G2 form) return `false`
-    /// against an otherwise valid signature. Mirrors the Solidity `invalidPubkeyLength` cases.
+    /// Wrong-length pubkey bytes (anything but the 96-byte compressed G2 form, including the
+    /// 192-byte uncompressed form) return `false` against an otherwise valid signature.
     #[test]
     fn prop_wrong_length_pubkey_returns_false(
         seed in any::<[u8; 32]>(),
         addr in any::<[u8; 20]>(),
         bad_len in 0usize..256,
     ) {
-        prop_assume!(bad_len != 192);
-        let address = Address::from(addr);
-        let v = vector(seed, address);
+        prop_assume!(bad_len != 96);
+        let v = vector(seed, Address::from(addr));
         let mut env = TestEnv::new();
-        prop_assert!(!verify(&mut env, &v.sig, &vec![0xABu8; bad_len], address));
+        prop_assert!(!verify(&mut env, &v.sig, &vec![0xABu8; bad_len], &v.message));
     }
 
-    /// Wrong-length signature bytes (anything but the 96-byte uncompressed G1 form) return `false`
-    /// against an otherwise valid pubkey.
+    /// Wrong-length signature bytes (anything but the 48-byte compressed G1 form, including the
+    /// 96-byte uncompressed form) return `false` against an otherwise valid pubkey.
     #[test]
     fn prop_wrong_length_signature_returns_false(
         seed in any::<[u8; 32]>(),
         addr in any::<[u8; 20]>(),
         bad_len in 0usize..200,
     ) {
-        prop_assume!(bad_len != 96);
-        let address = Address::from(addr);
-        let v = vector(seed, address);
+        prop_assume!(bad_len != 48);
+        let v = vector(seed, Address::from(addr));
         let mut env = TestEnv::new();
-        prop_assert!(!verify(&mut env, &vec![0xABu8; bad_len], &v.pubkey, address));
+        prop_assert!(!verify(&mut env, &vec![0xABu8; bad_len], &v.pubkey, &v.message));
     }
 }
 
 // ==============================
-// `proofOfPossessionMessage`
+// Compressed-only enforcement (S1)
 // ==============================
 
-/// Decodes the ABI-encoded `bytes` returned by a successful `proofOfPossessionMessage` call.
-fn message_for(env: &mut TestEnv, pubkey: &[u8], address: Address) -> Vec<u8> {
-    let calldata = proofOfPossessionMessageCall {
-        uncompressedPubkey: Bytes::copy_from_slice(pubkey),
-        validatorAddress: address,
-    }
-    .abi_encode();
-    let result = env.exec_to(USER, BLS_G1_PRECOMPILE_ADDRESS, calldata, VERIFY_GAS);
-    <Bytes as SolValue>::abi_decode(&extract_output_bytes(&result)).expect("decode bytes").to_vec()
-}
+/// The precompile is compressed-only: a *valid* 96-byte uncompressed signature and 192-byte
+/// uncompressed pubkey - the pre-change encoding - are rejected by the length gate. blst's
+/// `deserialize` would otherwise accept these valid points, so this (not random wrong-length bytes)
+/// is the proof that the gate is the enforcement.
+#[test]
+fn test_valid_uncompressed_inputs_rejected() {
+    let address = Address::repeat_byte(0x42);
+    let keypair = BlsKeypair::generate(&mut StdRng::from_seed([7; 32]));
+    let message = construct_proof_of_possession_message(keypair.public(), &address);
+    let proof =
+        generate_proof_of_possession_bls_for_test(&keypair, &address).expect("generate test PoP");
 
-proptest! {
-    /// `proofOfPossessionMessage` returns exactly the bytes verification signs over (the tn-types
-    /// `IntentMessage` encoding), and is bound to the validator address.
-    #[test]
-    fn prop_message_matches_types_and_is_address_bound(
-        seed in any::<[u8; 32]>(),
-        addr_a in any::<[u8; 20]>(),
-        addr_b in any::<[u8; 20]>(),
-    ) {
-        let a = Address::from(addr_a);
-        let b = Address::from(addr_b);
-        let v = vector(seed, a);
-        let public: &BlsPublicKey = v.keypair.public();
-        let mut env = TestEnv::new();
+    let uncompressed_sig = proof.serialize().to_vec();
+    let uncompressed_pubkey = keypair.public().serialize().to_vec();
+    assert_eq!(uncompressed_sig.len(), 96, "uncompressed G1 signature");
+    assert_eq!(uncompressed_pubkey.len(), 192, "uncompressed G2 pubkey");
 
-        let from_precompile = message_for(&mut env, &v.pubkey, a);
-        let from_types = proof_of_possession_message_bytes(public, &a).expect("build message");
-        prop_assert_eq!(&from_precompile, &from_types, "precompile message must match tn-types");
-
-        if a != b {
-            let other = message_for(&mut env, &v.pubkey, b);
-            prop_assert_ne!(from_precompile, other, "message must be address-bound");
-        }
-    }
+    let mut env = TestEnv::new();
+    // the compressed control verifies (the key/proof are otherwise valid)
+    assert!(
+        verify(
+            &mut env,
+            &proof.to_bytes().to_vec(),
+            &keypair.public().to_bytes().to_vec(),
+            &message
+        ),
+        "compressed control",
+    );
+    // ...but the valid uncompressed encodings are gated out
+    assert!(
+        !verify(&mut env, &uncompressed_sig, &uncompressed_pubkey, &message),
+        "uncompressed gated"
+    );
 }
 
 // ==============================
 // Calldata validation
 // ==============================
 
-/// The two selectors the precompile implements.
-fn known_selectors() -> [[u8; 4]; 2] {
-    [verifyProofOfPossessionCall::SELECTOR, proofOfPossessionMessageCall::SELECTOR]
+/// The selectors the precompile implements.
+fn known_selectors() -> [[u8; 4]; 1] {
+    [blsVerifyCall::SELECTOR]
 }
 
 proptest! {
@@ -265,12 +253,11 @@ proptest! {
     }
 
     /// Calldata too short to ABI-decode the arguments reverts (the selector is valid but the
-    /// dynamic `bytes`/`address` arguments cannot be parsed).
+    /// dynamic `bytes` arguments cannot be parsed).
     #[test]
-    fn prop_short_calldata_fails(selector_idx in 0usize..2, len in 0usize..32) {
-        let selector = known_selectors()[selector_idx];
+    fn prop_short_calldata_fails(len in 0usize..32) {
         let mut data = Vec::with_capacity(4 + len);
-        data.extend_from_slice(&selector);
+        data.extend_from_slice(&blsVerifyCall::SELECTOR);
         data.extend(std::iter::repeat_n(0u8, len));
 
         let mut env = TestEnv::new();
@@ -280,52 +267,55 @@ proptest! {
 }
 
 // ==============================
-// `DELEGATECALL` relay (the `ConsensusRegistry` path)
+// `STATICCALL` relay (the `ConsensusRegistry` path)
 // ==============================
 
-/// Address hosting the `DELEGATECALL` relay contract.
+/// Address hosting the `STATICCALL` relay contract.
 const RELAY_ADDR: Address = address!("dddd0000000000000000000000000000000000b1");
 
-/// Minimal runtime bytecode that forwards calldata to `0x…b151` via `DELEGATECALL` and returns the
-/// precompile's output verbatim. This is exactly how `ConsensusRegistry`'s linked `BlsG1` library
-/// reaches the precompile, so it proves that integration path resolves to our native code.
+/// Minimal runtime bytecode that forwards calldata to `0x…b151` via `STATICCALL` and returns the
+/// precompile's output verbatim. This is exactly how `ConsensusRegistry` reaches the precompile (a
+/// low-level staticcall), so it proves that integration path resolves to our native code.
 ///
 /// Disassembly:
 /// ```text
 ///   CALLDATASIZE; PUSH1 0; PUSH1 0; CALLDATACOPY      // mem[0..csize] = calldata
 ///   PUSH1 0; PUSH1 0; CALLDATASIZE; PUSH1 0;          // retSize, retOffset, argsSize, argsOffset
-///   PUSH2 0xb151; GAS; DELEGATECALL; POP              // delegatecall to BLS precompile
+///   PUSH2 0xb151; GAS; STATICCALL; POP                // staticcall to BLS precompile
 ///   RETURNDATASIZE; PUSH1 0; PUSH1 0; RETURNDATACOPY  // mem[0..rsize] = returndata
 ///   RETURNDATASIZE; PUSH1 0; RETURN                   // return mem[0..rsize]
 /// ```
 const RELAY_BYTECODE: &[u8] = &[
     0x36, 0x60, 0x00, 0x60, 0x00, 0x37, // CALLDATACOPY(0, 0, CALLDATASIZE)
-    0x60, 0x00, 0x60, 0x00, 0x36, 0x60, 0x00, 0x61, 0xb1, 0x51, 0x5a, 0xf4,
-    0x50, // PUSH2 0xb151; GAS; DELEGATECALL; POP
+    0x60, 0x00, 0x60, 0x00, 0x36, 0x60, 0x00, 0x61, 0xb1, 0x51, 0x5a, 0xfa,
+    0x50, // PUSH2 0xb151; GAS; STATICCALL; POP
     0x3d, 0x60, 0x00, 0x60, 0x00, 0x3e, // RETURNDATACOPY(0, 0, RETURNDATASIZE)
     0x3d, 0x60, 0x00, 0xf3, // RETURN(0, RETURNDATASIZE)
 ];
 
-/// A valid proof verifies, and a tampered one is rejected, when reached via `DELEGATECALL` - the
-/// same way `ConsensusRegistry`'s `BlsG1.verifyProofOfPossession` library call lands here.
+/// A valid proof verifies, and a tampered one is rejected, when reached via `STATICCALL` - the
+/// same way `ConsensusRegistry`'s `blsVerify` staticcall lands here.
 #[test]
-fn test_delegatecall_verify_pop() {
+fn test_staticcall_verify_pop() {
     let address = Address::repeat_byte(0x42);
     let v = vector([7; 32], address);
+    let other = vector([7; 32], Address::repeat_byte(0x43));
 
     let mut env = TestEnv::new();
     env.deploy_code(RELAY_ADDR, Bytes::from_static(RELAY_BYTECODE));
 
     // Valid PoP through the relay -> true.
-    let ok = env.exec_to(USER, RELAY_ADDR, verify_calldata(&v.sig, &v.pubkey, address), VERIFY_GAS);
-    assert!(decode_bool(&ok), "valid PoP must verify via DELEGATECALL");
+    let ok =
+        env.exec_to(USER, RELAY_ADDR, verify_calldata(&v.sig, &v.pubkey, &v.message), VERIFY_GAS);
+    assert!(decode_bool(&ok), "valid PoP must verify via STATICCALL");
 
-    // Wrong address through the relay -> false (still a successful call returning `false`).
+    // Different-address message through the relay -> false (still a successful call returning
+    // `false`).
     let bad = env.exec_to(
         USER,
         RELAY_ADDR,
-        verify_calldata(&v.sig, &v.pubkey, Address::repeat_byte(0x43)),
+        verify_calldata(&v.sig, &v.pubkey, &other.message),
         VERIFY_GAS,
     );
-    assert!(!decode_bool(&bad), "wrong-address PoP must be rejected via DELEGATECALL");
+    assert!(!decode_bool(&bad), "wrong-address PoP must be rejected via STATICCALL");
 }

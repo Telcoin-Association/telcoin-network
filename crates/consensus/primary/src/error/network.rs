@@ -35,9 +35,6 @@ pub(crate) enum PrimaryNetworkError {
     /// Internal error occurred.
     #[error("Internal error: {0}")]
     Internal(String),
-    /// Unknown consensus header.
-    #[error("Unknown consensus header: {0}")]
-    UnknownConsensusHeaderDigest(ConsensusHeaderDigest),
     /// Unknown consensus header certificate.
     #[error("Unknown consensus header certificate for: {0}")]
     UnknownConsensusHeaderCert(ConsensusHeaderDigest),
@@ -165,8 +162,7 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
             },
             // Benign "miss": observers legitimately request not-yet-served headers/outputs.
             // No penalty so honest sync flows are not banned during catch-up.
-            PrimaryNetworkError::UnknownConsensusHeaderDigest(_)
-            | PrimaryNetworkError::UnknownConsensusOutput(_) => None,
+            PrimaryNetworkError::UnknownConsensusOutput(_) => None,
             PrimaryNetworkError::InvalidRequest(_)
             | PrimaryNetworkError::UnknownStreamRequest(_)
             | PrimaryNetworkError::UnknownConsensusHeaderCert(_) => Some(Penalty::Mild),
@@ -192,10 +188,7 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
 fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
     match error {
         // mild
-        HeaderError::SyncBatches(_)
-        | HeaderError::TooNew { .. }
-        | HeaderError::Storage(_)
-        | HeaderError::UnknownExecutionResult(_) => Some(Penalty::Mild),
+        HeaderError::SyncBatches(_) | HeaderError::TooNew { .. } => Some(Penalty::Mild),
         // medium
         HeaderError::InvalidParents
         | HeaderError::WrongNumberOfParents(_, _)
@@ -216,10 +209,19 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         | HeaderError::InvalidParentTimestamp { .. }
         | HeaderError::UnkownWorkerId
         | HeaderError::UnknownAuthority(_) => Some(Penalty::Fatal),
-        // ignore
+        // ignore (local/transient, not the peer's fault)
+        //
+        // Storage is our own DB error, and UnknownExecutionResult means a peer is merely
+        // ahead of our execution while we catch up (the vote handler notes "this doesn't
+        // hurt"). Penalizing either would punish an honest peer for a local condition, and
+        // contradicts the sibling PrimaryNetworkError::Storage and *::Timeout arms that
+        // already map to None.
         HeaderError::PendingCertificateOneshot
+        | HeaderError::Storage(_)
+        | HeaderError::UnknownExecutionResult(_)
         | HeaderError::TNSend(_)
         | HeaderError::InvalidEpoch { .. }
+        | HeaderError::NotCommitteeMember
         | HeaderError::ClosedWatchChannel => None,
     }
 }

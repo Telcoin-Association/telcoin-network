@@ -132,7 +132,7 @@ async fn test_make_batch_el_to_cl() {
     assert_eq!(pending_pool_len, 3);
 
     // spawn batch_builder once worker is ready
-    let _batch_builder = tokio::spawn(Box::pin(batch_builder));
+    let _batch_builder = tokio::spawn(batch_builder.run());
 
     //
     //=== Test batch flow
@@ -294,7 +294,7 @@ async fn test_batch_builder_produces_valid_batches() {
     assert_eq!(pool_size.blob, 0);
 
     // spawn batch_builder once worker is ready
-    let _batch_builder = tokio::spawn(Box::pin(batch_builder));
+    let _batch_builder = tokio::spawn(batch_builder.run());
 
     //
     //=== Test batch flow
@@ -456,7 +456,7 @@ async fn test_canonical_notification_updates_pool() {
     assert_eq!(pending_pool_len, 0);
 
     // spawn batch_builder once worker is ready
-    let _batch_builder = tokio::spawn(Box::pin(batch_builder));
+    let _batch_builder = tokio::spawn(batch_builder.run());
 
     //
     //=== Test block flow

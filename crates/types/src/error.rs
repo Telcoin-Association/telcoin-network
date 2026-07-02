@@ -208,6 +208,9 @@ pub enum HeaderError {
     /// The author is not in the current committee.
     #[error("Received message from unknown authority {0}")]
     UnknownAuthority(String),
+    /// This node is not a member of the current committee and cannot vote.
+    #[error("This node is not a committee member and cannot vote")]
+    NotCommitteeMember,
     /// Worker's ID is not in the cache.
     #[error("Header has an unknown worker ID")]
     UnkownWorkerId,
