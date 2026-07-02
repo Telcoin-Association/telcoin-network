@@ -2,7 +2,8 @@
 
 use crate::{
     certificate_fetcher::{
-        CertificateFetcher, CertificateFetcherCommand, FetchTask, MissingCertFetcher,
+        fetch_from_peers, CertificateFetcher, CertificateFetcherCommand, FetchTask,
+        MissingCertFetcher,
     },
     error::CertManagerError,
     network::MissingCertificatesRequest,
@@ -971,4 +972,55 @@ async fn test_fetch_task_replacement() {
     let result = std::pin::Pin::new(&mut fetch_task).poll(&mut cx);
     assert!(matches!(result, std::task::Poll::Ready(Ok(()))));
     assert!(fetch_task.is_none(), "FetchTask should be empty after completion");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_invalid_cert_from_sole_peer_does_not_panic() {
+    init_test_tracing();
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let task_manager = TaskManager::default();
+
+    let (network, mut fetch_rx) = MockFetcher::new();
+
+    // build one real certificate, then mark it genesis so `validate_fetched_certificate` rejects
+    // it: genesis certs are generated locally and always valid, a peer must never send one
+    let genesis_certs = Certificate::genesis(&fixture.committee());
+    let genesis_parents: BTreeSet<_> = genesis_certs.iter().map(|c| c.digest()).collect();
+    let (_, headers) = fixture.headers_round(1, &genesis_parents);
+    let mut bad_cert = fixture.certificate(headers.first().expect("round 1 produced a header"));
+    bad_cert.set_signature_verification_state(SignatureVerificationState::Genesis);
+
+    // the sole peer answers with the invalid certificate, then signals that it did so
+    let (answered_tx, answered_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        if let Some((_peer, _request, reply)) = fetch_rx.recv().await {
+            let _ = reply.send(Ok(vec![bad_cert]));
+            let _ = answered_tx.send(());
+        }
+    });
+
+    // regression (#822): with a single peer, `peer_index` already equals `peers.len()` when the
+    // response arrives, so logging the rejected cert used to panic on `peers[peer_index]`.
+    // `fetch_from_peers` has no single-peer error-return path, so post-fix it keeps waiting and
+    // the timeout elapses; pre-fix it panics before this future can complete.
+    let outcome = timeout(
+        Duration::from_secs(2),
+        fetch_from_peers(
+            network,
+            vec![BlsPublicKey::default()],
+            MissingCertificatesRequest::default(),
+            task_manager.get_spawner(),
+            Duration::from_millis(100),
+        ),
+    )
+    .await;
+
+    // positive signal that the invalid response was actually delivered, so the rejection/logging
+    // path ran (this is where the pre-fix `peers[peer_index]` panic fires); without it the timeout
+    // assertion alone could pass vacuously if the mock stopped delivering.
+    let delivered = timeout(Duration::from_secs(1), answered_rx).await.ok().and_then(Result::ok);
+    assert!(delivered.is_some(), "sole peer never delivered its response");
+    // and the fix means we reached that path without panicking; the fetch stays pending, so the
+    // outer timeout elapses rather than returning a value.
+    assert!(outcome.is_err(), "fetch_from_peers should still be pending, got {outcome:?}");
 }
