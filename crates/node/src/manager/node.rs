@@ -21,21 +21,24 @@ use crate::{
 };
 use eyre::{eyre, WrapErr as _};
 use state_sync::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_recent_consensus};
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, HashSet},
+    time::Duration,
+};
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, TelcoinDirs};
 use tn_network_libp2p::{
     types::{NetworkEvent, NetworkHandle},
     ConsensusNetwork, TNMessage,
 };
-use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, QueChannel};
+use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode, QueChannel};
 use tn_reth::{system_calls::EpochState, RethDb, RethEnv};
 use tn_storage::{consensus::ConsensusChain, open_db, DatabaseType};
 use tn_types::{
-    deconstruct_nonce, gas_accumulator::GasAccumulator, BlsPublicKey, BootstrapServer, Committee,
-    ConsensusHeader, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput,
-    Database as TNDatabase, EngineUpdate, Epoch, EpochRecord, Multiaddr, NetworkPublicKey,
-    Notifier, TaskError, TaskManager, TaskSpawner, TimestampSec, DEFAULT_WORKER_ID,
-    MIN_PROTOCOL_BASE_FEE,
+    deconstruct_nonce, gas_accumulator::GasAccumulator, BlsPublicKey, BlsSigner as _,
+    BootstrapServer, Committee, ConsensusHeader, ConsensusHeaderDigest, ConsensusNumHash,
+    ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, EpochRecord, Multiaddr,
+    NetworkPublicKey, Notifier, TaskError, TaskManager, TaskSpawner, TimestampSec,
+    DEFAULT_WORKER_ID, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::mpsc;
@@ -282,17 +285,18 @@ where
     ///
     /// Startup proceeds in order: create the execution engine and start it, recover the
     /// [`GasAccumulator`] via [`catchup_accumulator`], backfill the dummy epoch-0 record on a
-    /// fresh DB, spawn the long-running p2p networks
-    /// ([`spawn_node_networks`](Self::spawn_node_networks)), and subscribe the primary to the
-    /// epoch-vote and consensus-output gossip topics. The one-time network bring-up follows:
-    /// register bootstrap peers on both swarms, bind their listeners, dial the bootstrap
-    /// servers, and wait briefly (but never fail) for a first peer. With the network up, the
-    /// epoch record chain is synced to the network tip
+    /// fresh DB, and spawn the long-running p2p networks
+    /// ([`spawn_node_networks`](Self::spawn_node_networks)). The one-time network bring-up
+    /// follows: register bootstrap peers on both swarms, bind their listeners, dial the
+    /// bootstrap servers, and wait briefly (but never fail) for a first peer. With the
+    /// network up, the epoch record chain is synced to the network tip
     /// ([`state_sync::sync_epoch_records_to_tip`]) so everything after reads current network
-    /// state; only then are the epoch-record and vote collectors spawned, execution state
-    /// restored ([`try_restore_state`](Self::try_restore_state)), and the engine-update task
-    /// started. It then requests any missing epoch pack files and launches the app-scoped
-    /// consensus fetch workers.
+    /// state: the epoch-vote and consensus-output gossip topics are subscribed, the node's
+    /// starting role is seeded from the synced records (committee member => `CvvActive`,
+    /// otherwise `Observer`; never `CvvInactive`), the epoch-record and vote collectors are
+    /// spawned, execution state is restored ([`try_restore_state`](Self::try_restore_state)),
+    /// and the engine-update task starts. It then requests any missing epoch pack files and
+    /// launches the app-scoped consensus fetch workers.
     ///
     /// Finally it selects over two futures: the node task manager running to exit, and the epoch
     /// loop ([`run_epochs`](Self::run_epochs)). Whichever resolves first ends the node; the
@@ -373,14 +377,6 @@ where
         self.spawn_node_networks(node_task_spawner, &network_config, epoch).await?;
         let primary_network_handle =
             self.primary_network_handle.as_ref().expect("primary network").clone();
-        primary_network_handle
-            .inner_handle()
-            .subscribe(tn_config::LibP2pConfig::epoch_vote_topic(network_config.chain_id()))
-            .await?;
-        primary_network_handle
-            .inner_handle()
-            .subscribe(tn_config::LibP2pConfig::consensus_output_topic(network_config.chain_id()))
-            .await?;
 
         // One-time network bring-up at app scope: seed bootstrap peers into the known-peer
         // tables (this does not dial), bind the swarm listeners so peers can dial us back
@@ -449,6 +445,35 @@ where
         )
         .await;
         info!(target: "epoch-manager", synced_epoch, "epoch records synced before starting the epoch loop");
+
+        // Subscribe the app gossip topics only now that records are synced, so backlog from
+        // these meshes is not processed against stale state. Both topics stay unrestricted:
+        // epoch votes are published by the *outgoing* committee during handover, and
+        // consensus output must reach nodes whose records lag the real committee — the
+        // handlers BLS-verify content and check committee membership themselves.
+        primary_network_handle
+            .inner_handle()
+            .subscribe(tn_config::LibP2pConfig::epoch_vote_topic(network_config.chain_id()))
+            .await?;
+        primary_network_handle
+            .inner_handle()
+            .subscribe(tn_config::LibP2pConfig::consensus_output_topic(network_config.chain_id()))
+            .await?;
+
+        // Seed the node's starting role from the synced records: in the current committee
+        // (the latest record's next_committee) => CvvActive, else Observer. This one-shot
+        // read never sets CvvInactive (that latch belongs to the epoch loop's demotion
+        // logic), and identify_node_mode re-derives the role from execution state every
+        // epoch thereafter.
+        let my_bls_key = self.key_config.public_key();
+        let startup_mode = if self.current_committee_keys_from_records().await.contains(&my_bls_key)
+        {
+            NodeMode::CvvActive
+        } else {
+            NodeMode::Observer
+        };
+        self.consensus_bus.node_mode().send_replace(startup_mode);
+        info!(target: "epoch-manager", ?startup_mode, "startup node mode seeded from synced epoch records");
 
         state_sync::spawn_epoch_record_collector(
             self.consensus_chain.clone(),
@@ -755,6 +780,16 @@ where
         Ok(())
     }
 
+    /// The current committee's BLS keys according to the latest synced [`EpochRecord`].
+    ///
+    /// Meaningful only after [`state_sync::sync_epoch_records_to_tip`] has run: the latest
+    /// record's `next_committee` names the committee serving *now*, because a record is
+    /// written when its epoch closes. On a fresh DB the dummy epoch-0 record yields the
+    /// genesis committee.
+    async fn current_committee_keys_from_records(&self) -> HashSet<BlsPublicKey> {
+        committee_keys_from_record(self.consensus_chain.epochs().latest_record().await)
+    }
+
     /// Wait up to [`SOFT_PEER_WAIT`] for the network to report at least one connected peer.
     ///
     /// The soft counterpart to the per-epoch `wait_for_network_peers`: during app-level
@@ -941,5 +976,68 @@ where
             error!(target: "engine", "engine updates ended, node will exit");
             Err(TaskError::from_message("engine updates ended, node will exit"))
         });
+    }
+}
+
+/// Extract the *currently serving* committee's keys from the latest synced epoch record.
+///
+/// A record is written when its epoch closes, so its `next_committee` is the committee of
+/// the epoch that follows it - the one running now. `None` (no record at all) yields an
+/// empty set, so callers fall back to `Observer` until the epoch loop identifies the role.
+fn committee_keys_from_record(record: Option<EpochRecord>) -> HashSet<BlsPublicKey> {
+    record.map(|r| r.next_committee.into_iter().collect()).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod startup_role_tests {
+    use super::*;
+    use rand::{rngs::StdRng, SeedableRng};
+    use tn_types::BlsKeypair;
+
+    fn test_keys(count: u8) -> Vec<BlsPublicKey> {
+        (0..count)
+            .map(|i| *BlsKeypair::generate(&mut StdRng::from_seed([i; 32])).public())
+            .collect()
+    }
+
+    #[test]
+    fn committee_keys_come_from_next_committee() {
+        let committee = test_keys(4);
+        let next_committee = test_keys(8)[4..].to_vec();
+        let record = EpochRecord {
+            epoch: 3,
+            committee: committee.clone(),
+            next_committee: next_committee.clone(),
+            ..Default::default()
+        };
+
+        let keys = committee_keys_from_record(Some(record));
+
+        // the record's own committee closed with its epoch; next_committee serves now
+        assert_eq!(keys, next_committee.iter().copied().collect());
+        for closed in &committee {
+            assert!(!keys.contains(closed));
+        }
+    }
+
+    #[test]
+    fn missing_record_yields_empty_set() {
+        assert!(committee_keys_from_record(None).is_empty());
+    }
+
+    #[test]
+    fn dummy_genesis_record_yields_genesis_committee() {
+        // shape of the dummy epoch-0 record saved at startup: committee == next_committee
+        // == genesis keys, so a fresh genesis validator resolves to CvvActive
+        let genesis = test_keys(4);
+        let record = EpochRecord {
+            epoch: 0,
+            committee: genesis.clone(),
+            next_committee: genesis.clone(),
+            ..Default::default()
+        };
+
+        let keys = committee_keys_from_record(Some(record));
+        assert_eq!(keys, genesis.into_iter().collect());
     }
 }
