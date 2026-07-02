@@ -852,6 +852,33 @@ impl ConsensusChain {
         }
     }
 
+    /// Decode raw pack-file `bytes` for `epoch` (e.g. fetched via `request_consensus_output`) into
+    /// a [`ConsensusOutput`], using the committee from the pack we hold for `epoch` (current /
+    /// static / staging). Errors with [`ConsensusChainError::NoCurrentEpoch`] if we have no
+    /// pack for `epoch` (so cannot resolve its committee) — the caller should treat that as
+    /// "not yet decodable".
+    pub async fn decode_consensus_output(
+        &self,
+        epoch: Epoch,
+        bytes: Vec<u8>,
+    ) -> Result<ConsensusOutput, ConsensusChainError> {
+        let pack = self.current_pack();
+        if epoch == pack.epoch() {
+            return Ok(pack.decode_output(bytes).await?);
+        }
+        if let Ok(pack) = self.get_static(epoch).await {
+            Ok(pack.decode_output(bytes).await?)
+        } else if let Some(staging) = self.staging() {
+            if epoch == staging.pack.epoch() {
+                Ok(staging.pack.decode_output(bytes).await?)
+            } else {
+                Err(ConsensusChainError::NoCurrentEpoch)
+            }
+        } else {
+            Err(ConsensusChainError::NoCurrentEpoch)
+        }
+    }
+
     /// Retrieve the raw consensus output bytes by number.
     pub async fn consensus_output_bytes_by_number(
         &self,

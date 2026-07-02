@@ -19,9 +19,8 @@ use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, CertificateStore, PayloadStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    error::HeaderError, now, AuthorityIdentifier, BlockNumHash, Certificate, Committee,
-    ConsensusHeaderDigest, ConsensusNumHash, ExecHeader, Hash as _, SealedHeader,
-    SignatureVerificationState, TaskManager,
+    error::HeaderError, now, BlockNumHash, Certificate, Committee, ConsensusHeaderDigest,
+    ConsensusNumHash, ExecHeader, Hash as _, SealedHeader, TaskManager,
 };
 use tokio::time::timeout;
 

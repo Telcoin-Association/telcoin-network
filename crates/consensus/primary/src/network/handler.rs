@@ -23,9 +23,9 @@ use tn_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
     now, to_intent_message, try_decode, AuthorityIdentifier, BlsPublicKey, Certificate,
-    ConsensusHeader, ConsensusHeaderDigest, ConsensusResult, ConsensusResultDigest, Database,
-    Epoch, EpochCertificate, EpochDigest, EpochRecord, Hash as _, Header, HeaderDigest,
-    ProtocolSignature, ReadStream, Round, SignatureVerificationState, TnSender as _, Vote, B256,
+    ConsensusResult, ConsensusResultDigest, Database, Epoch, EpochCertificate, EpochDigest,
+    EpochRecord, Hash as _, Header, HeaderDigest, ProtocolSignature, ReadStream, Round,
+    SignatureVerificationState, TnSender as _, Vote, B256,
 };
 use tokio::{io::AsyncReadExt, sync::Mutex as TokioMutex, time::timeout};
 use tracing::{debug, error, info, warn};
@@ -108,6 +108,12 @@ where
             consensus_certs: Default::default(),
             consensus_chain,
         }
+    }
+
+    /// Expose the handlers consensus chain- useful for testing.
+    #[cfg(test)]
+    pub(super) fn consensus_chain(&self) -> &ConsensusChain {
+        &self.consensus_chain
     }
 
     /// Detect if we are too far behind the given epoch, round and switch to CVV inactive if we are
@@ -409,7 +415,7 @@ where
             if vote_info.vote_digest == header.digest().into() {
                 let vote = Vote::new(
                     &header,
-                    self.consensus_config.authority_id().expect("only validators can vote"),
+                    self.consensus_config.authority_id().ok_or(HeaderError::NotCommitteeMember)?,
                     self.consensus_config.key_config(),
                 );
 
@@ -715,7 +721,9 @@ where
                     // Make sure we don't vote twice for the same authority in the same epoch/round.
                     let vote = Vote::new(
                         &header,
-                        self.consensus_config.authority_id().expect("only validators can vote"),
+                        self.consensus_config
+                            .authority_id()
+                            .ok_or(HeaderError::NotCommitteeMember)?,
                         self.consensus_config.key_config(),
                     );
                     if vote.digest() != vote_info.vote_digest() {
@@ -765,7 +773,7 @@ where
         // this node hasn't voted yet
         let vote = Vote::new(
             &header,
-            self.consensus_config.authority_id().expect("only validators can vote"),
+            self.consensus_config.authority_id().ok_or(HeaderError::NotCommitteeMember)?,
             self.consensus_config.key_config(),
         );
 
@@ -856,31 +864,6 @@ where
         Ok(())
     }
 
-    /// Retrieve a consensus header from local storage.
-    pub(super) async fn retrieve_consensus_header(
-        &self,
-        number: u64,
-        hash: ConsensusHeaderDigest,
-    ) -> PrimaryNetworkResult<PrimaryResponse> {
-        let mut my_number = self.consensus_chain.latest_consensus_number();
-        // If we are behind then wait up to two seconds to catch up.
-        let mut count = 0;
-        if number.saturating_sub(my_number) < 4 {
-            // Only wait if we are close.
-            while my_number < number {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                my_number = self.consensus_chain.latest_consensus_number();
-                if count >= 20 {
-                    // Don't wait more than 2 seconds for this to show up.
-                    return Err(PrimaryNetworkError::UnknownConsensusHeaderDigest(hash));
-                }
-                count += 1;
-            }
-        }
-        let header = self.get_header_by_hash(number, hash).await?;
-        Ok(PrimaryResponse::ConsensusHeader(Arc::new(header)))
-    }
-
     /// Retrieve the raw (serialized) consensus output bytes from local storage.
     ///
     /// Returns the full pack-file encoded output for `number` so a peer can reconstruct the
@@ -929,19 +912,6 @@ where
         Ok(PrimaryResponse::EpochRecord { record, certificate })
     }
 
-    /// Retrieve the consensus header by hash
-    async fn get_header_by_hash(
-        &self,
-        number: u64,
-        hash: ConsensusHeaderDigest,
-    ) -> PrimaryNetworkResult<ConsensusHeader> {
-        let epoch = self.consensus_chain.epochs().number_to_epoch(number);
-        match self.consensus_chain.consensus_header_by_digest(epoch, hash).await {
-            Ok(Some(header)) => Ok(header),
-            _ => Err(PrimaryNetworkError::UnknownConsensusHeaderDigest(hash)),
-        }
-    }
-
     /// Retrieve the consensus header by number.
     async fn get_epoch_by_number(
         &self,
@@ -986,11 +956,6 @@ where
             }
             None => Err(PrimaryNetworkError::UnavailableEpochDigest(hash)),
         }
-    }
-
-    /// Return a reference to the `ConsensusChain`.
-    pub(super) fn consensus_chain(&self) -> &ConsensusChain {
-        &self.consensus_chain
     }
 
     /// Number of tracked consensus-result digests. Test-only accessor used to assert the

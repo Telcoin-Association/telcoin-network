@@ -11,6 +11,7 @@ use crate::{
     ConsensusBus, ConsensusBusApp, NodeMode, RecentBlocks,
 };
 use assert_matches::assert_matches;
+use rand::{rngs::StdRng, SeedableRng};
 use roaring::RoaringBitmap;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -19,7 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
-use tn_config::Parameters;
+use tn_config::{ConsensusConfig, KeyConfig, Parameters};
 use tn_network_libp2p::{GossipMessage, TopicHash};
 use tn_storage::{
     consensus::{ConsensusChain, ConsensusChainError},
@@ -30,10 +31,10 @@ use tn_storage::{
 use tn_test_utils_committee::{AuthorityFixture, CommitteeFixture};
 use tn_types::{
     encode, error::HeaderError, now, to_intent_message, AuthorityIdentifier, BlockHash,
-    BlockHeader, BlockNumHash, BlsPublicKey, BlsSigner as _, Certificate, CommittedSubDag,
-    ConsensusHeaderDigest, ConsensusNumHash, ConsensusResult, Database, Epoch, EpochVote,
-    ExecHeader, Hash as _, HeaderDigest, ReputationScores, Round, SealedHeader, TaskManager,
-    VoteDigest, VoteInfo, B256,
+    BlockHeader, BlockNumHash, BlsKeypair, BlsPublicKey, BlsSigner as _, Certificate,
+    CommittedSubDag, ConsensusHeaderDigest, ConsensusNumHash, ConsensusResult, Database, Epoch,
+    EpochVote, ExecHeader, Hash as _, HeaderDigest, ReputationScores, Round, SealedHeader,
+    TaskManager, VoteDigest, VoteInfo, B256,
 };
 use tracing::debug;
 
@@ -291,6 +292,74 @@ async fn test_vote_succeeds() -> eyre::Result<()> {
     let res = handler.vote(peer, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
     assert!(res.is_ok());
+    Ok(())
+}
+
+/// Regression test for issue #803: a node that is **not** a member of the current committee must
+/// reject an inbound vote request with a graceful error instead of panicking. The vote path
+/// previously called `authority_id().expect("only validators can vote")`, which aborts the whole
+/// process for any non-validator that reaches it (e.g. an observer served a misrouted request).
+#[tokio::test]
+async fn test_vote_non_committee_member_returns_error() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let committee = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+
+    // Build a ConsensusConfig keyed by an identity that is NOT in the committee, so that
+    // `authority_id()` is `None` (a non-validator / observer node). Reuse the fixture's
+    // genesis-aligned `Config` and `NetworkConfig`, swapping only the signing key.
+    let base = committee.first_authority().consensus_config();
+    let outsider_key =
+        KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
+    let config = ConsensusConfig::new_with_committee_for_test(
+        base.config().clone(),
+        MemDatabase::default(),
+        outsider_key,
+        committee.committee(),
+        base.network_config().clone(),
+    )?;
+    assert!(config.authority_id().is_none(), "outsider key must not be a committee member");
+
+    // Build the handler against the outsider config, mirroring `create_test_types_with_params`.
+    let cb = ConsensusBus::new();
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(config.clone(), cb.clone(), task_manager.get_spawner());
+    synchronizer.spawn(&task_manager);
+
+    // Seed the latest execution result to genesis so a round-1 header passes execution checks.
+    let parent = SealedHeader::seal_slow(ExecHeader::default());
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(
+        0,
+        ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+        Some(parent.clone()),
+    );
+    cb.app().recent_blocks().send_replace(recent);
+
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.committee())
+            .await
+            .unwrap();
+    let handler =
+        RequestHandler::new(config.clone(), cb.app().clone(), synchronizer, consensus_chain);
+
+    // A valid round-1 header proposed by a real committee member (identical to test_vote_succeeds),
+    // so the request passes the peer/author and header validation and reaches the former panic
+    // site.
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1) // parent is 0
+        .build();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    // The non-validator must return a graceful error rather than panicking.
+    let res = handler.vote(peer, header, vec![]).await;
+    debug!(target: "primary::handler_tests", ?res);
+    assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::NotCommitteeMember)));
+
+    // keep the synchronizer's task alive until the vote has been processed
+    drop(task_manager);
     Ok(())
 }
 
