@@ -74,7 +74,7 @@ impl ExecutionNodeInner {
         // spawn tn engine
         self.reth_env.get_task_spawner().spawn_critical_task("consensus engine", async move {
             info!("Engine stated from block {block_num}/{block_hash}, consensus output {consensus_header:?}");
-            let res = tn_engine.await;
+            let res = tn_engine.run().await;
             match &res {
                 Ok(_) => {
                     info!(target: "engine", "TN Engine exited gracefully");
@@ -120,7 +120,7 @@ impl ExecutionNodeInner {
 
         // spawn batch builder task
         epoch_task_spawner.spawn_critical_task("batch builder", async move {
-            let res = batch_builder.await;
+            let res = batch_builder.run().await;
             info!(target: "tn::execution", ?res, "batch builder task exited");
             Ok(res?)
         });

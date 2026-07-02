@@ -15,7 +15,7 @@ authors = [
 tn-types = { workspace = true }
 tn-reth = { workspace = true }
 futures-util = { workspace = true }
-tokio = { workspace = true, features = ["sync", "time"] }
+tokio = { workspace = true, features = ["sync", "time", "macros"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 eyre = { workspace = true }

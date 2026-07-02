@@ -17,17 +17,13 @@
 //! ExEx can detect the gap and reconcile via [`replay`](crate::replay).
 
 use crate::{Chain, TnExExEvent, TnExExNotification};
-use futures::StreamExt;
+use futures::stream::{self, select_all, select_with_strategy, PollNext, StreamExt, TryStreamExt};
 use reth_provider::CanonStateNotification;
-use std::{
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-};
+use std::sync::Arc;
 use tn_reth::CanonStateNotificationStream;
 use tn_types::{BlockNumber, Certificate, ConsensusOutput};
 use tokio::sync::{broadcast, mpsc, watch};
-use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
+use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream, ReceiverStream};
 use tracing::{debug, error, warn};
 
 /// Default notification channel capacity per ExEx.
@@ -44,12 +40,6 @@ struct ExExHandle {
     name: String,
     /// Bounded, non-blocking notification sender.
     notifications: mpsc::Sender<TnExExNotification>,
-    /// Bounded event receiver for progress reports from the ExEx.
-    ///
-    /// `FinishedHeight` is latest-wins, so a small bounded channel is sufficient
-    /// — the ExEx reports with a non-blocking `try_send`, and only the maximum
-    /// reported height matters.
-    events: mpsc::Receiver<TnExExEvent>,
     /// Highest durably-processed height reported by the ExEx, if any.
     finished_height: Option<BlockNumber>,
     /// Notifications dropped since the last successful delivery.
@@ -60,12 +50,8 @@ struct ExExHandle {
 }
 
 impl ExExHandle {
-    fn new(
-        name: String,
-        notifications: mpsc::Sender<TnExExNotification>,
-        events: mpsc::Receiver<TnExExEvent>,
-    ) -> Self {
-        Self { name, notifications, events, finished_height: None, dropped: 0 }
+    fn new(name: String, notifications: mpsc::Sender<TnExExNotification>) -> Self {
+        Self { name, notifications, finished_height: None, dropped: 0 }
     }
 
     /// Deliver a notification without ever blocking.
@@ -118,8 +104,9 @@ impl ExExHandle {
 
 /// The ExEx manager fans out lifecycle notifications to all registered ExExes.
 ///
-/// It implements [`Future`](std::future::Future) following the same pattern as `ExecutorEngine`.
-/// The manager runs for the lifetime of the node (spawned on `node_task_manager`).
+/// It is driven by [`TnExExManager::run`], an `async fn` following the same pattern as
+/// `ExecutorEngine`. The manager runs for the lifetime of the node (spawned on
+/// `node_task_manager`).
 pub struct TnExExManager {
     /// Subscription to canonical state notifications from reth's BlockchainProvider.
     canon_state_stream: CanonStateNotificationStream,
@@ -129,6 +116,11 @@ pub struct TnExExManager {
     consensus_output_stream: BroadcastStream<ConsensusOutput>,
     /// Per-ExEx delivery state (one per registered ExEx).
     exexes: Vec<ExExHandle>,
+    /// Per-ExEx event receivers for `FinishedHeight` reporting, indexed in step with `exexes`.
+    ///
+    /// `FinishedHeight` is latest-wins, so a small bounded channel is sufficient — the ExEx
+    /// reports with a non-blocking `try_send`, and only the maximum reported height matters.
+    event_rxs: Vec<mpsc::Receiver<TnExExEvent>>,
     /// Watch sender for the minimum finished height across all ExExes.
     min_finished_height_tx: watch::Sender<Option<BlockNumber>>,
     /// Highest canonical block delivered as `ChainExecuted`. Used to detect gaps
@@ -146,11 +138,8 @@ impl TnExExManager {
         exex_txs: Vec<(String, mpsc::Sender<TnExExNotification>)>,
         event_rxs: Vec<mpsc::Receiver<TnExExEvent>>,
     ) -> (Self, TnExExManagerHandle) {
-        let exexes: Vec<ExExHandle> = exex_txs
-            .into_iter()
-            .zip(event_rxs)
-            .map(|((name, tx), events)| ExExHandle::new(name, tx, events))
-            .collect();
+        let exexes: Vec<ExExHandle> =
+            exex_txs.into_iter().map(|(name, tx)| ExExHandle::new(name, tx)).collect();
         let (min_finished_height_tx, min_finished_height_rx) = watch::channel(None);
 
         let manager = Self {
@@ -158,6 +147,7 @@ impl TnExExManager {
             certs_stream: BroadcastStream::new(rx_certs),
             consensus_output_stream: BroadcastStream::new(rx_consensus_output),
             exexes,
+            event_rxs,
             min_finished_height_tx,
             last_canon_tip: None,
         };
@@ -167,6 +157,131 @@ impl TnExExManager {
         (manager, handle)
     }
 
+    /// Run the ExEx manager event loop for the lifetime of the node.
+    ///
+    /// The three notification sources and the per-ExEx event receivers are merged into a single
+    /// priority-ordered stream (certificates > consensus output > canonical state > events) and
+    /// folded over [`Router`], which fans each event out to every ExEx and recomputes the minimum
+    /// finished height. The loop ends with `Ok(())` when any source stream closes; it never errors.
+    pub async fn run(self) -> eyre::Result<()> {
+        let Self {
+            canon_state_stream,
+            certs_stream,
+            consensus_output_stream,
+            exexes,
+            event_rxs,
+            min_finished_height_tx,
+            last_canon_tip,
+        } = self;
+
+        let router = Router { exexes, min_finished_height_tx, last_canon_tip };
+
+        // Map each source into a `RouterEvent`. The three source streams carry a trailing `Closed`
+        // sentinel so a stream end terminates the fold (mirroring the old
+        // `Poll::Ready(None) => return Poll::Ready(Ok(()))`); the event streams carry none, since
+        // an ExEx dropping its event sender must not shut down the shared manager.
+        let certs = certs_stream
+            .map(RouterEvent::Cert)
+            .chain(stream::once(async { RouterEvent::Closed("certificates") }));
+        let consensus = consensus_output_stream
+            .map(RouterEvent::Consensus)
+            .chain(stream::once(async { RouterEvent::Closed("consensus output") }));
+        let canon = canon_state_stream
+            .map(RouterEvent::Canon)
+            .chain(stream::once(async { RouterEvent::Closed("canonical state") }));
+        let events = select_all(event_rxs.into_iter().enumerate().map(|(idx, rx)| {
+            ReceiverStream::new(rx).map(move |ev| RouterEvent::Event { idx, ev })
+        }));
+
+        // Biased priority certs > consensus > canon > events via a constant `PollNext::Left`, which
+        // drains the higher-priority stream fully before the next (matching the original sequential
+        // poll order, where each stream was drained to `Pending` before the next was polled).
+        let merged = select_with_strategy(
+            certs,
+            select_with_strategy(
+                consensus,
+                select_with_strategy(canon, events, prefer_left),
+                prefer_left,
+            ),
+            prefer_left,
+        );
+
+        // The fold ends only by observing a closed source stream (signalled as `StreamEnded`); it
+        // never yields a real error, so the result is discarded and the manager reports `Ok(())`.
+        let _ = merged
+            .map(Ok::<RouterEvent, StreamEnded>)
+            .try_fold(router, |mut router, event| async move {
+                router.handle(event)?;
+                Ok(router)
+            })
+            .await;
+
+        Ok(())
+    }
+}
+
+/// Always drains the higher-priority (left) stream first, giving the fixed source order
+/// certs > consensus output > canonical state > events.
+fn prefer_left(_: &mut ()) -> PollNext {
+    PollNext::Left
+}
+
+/// A single merged input to the [`TnExExManager`] event loop.
+enum RouterEvent {
+    /// A verified certificate (or a broadcast-lag marker) from the consensus-following path.
+    Cert(Result<Certificate, BroadcastStreamRecvError>),
+    /// A full consensus output (or a broadcast-lag marker) from the consensus-following path.
+    Consensus(Result<ConsensusOutput, BroadcastStreamRecvError>),
+    /// A canonical state notification from reth's `BlockchainProvider`.
+    Canon(CanonStateNotification),
+    /// A progress event from the ExEx at index `idx` in `exexes`.
+    Event { idx: usize, ev: TnExExEvent },
+    /// A source stream ended; the manager should stop.
+    Closed(&'static str),
+}
+
+/// Signals that a source stream closed, terminating the manager fold.
+struct StreamEnded;
+
+/// Fan-out and finished-height bookkeeping for the manager event loop (the manager's state minus
+/// its input streams), threaded through the fold in [`TnExExManager::run`].
+struct Router {
+    exexes: Vec<ExExHandle>,
+    min_finished_height_tx: watch::Sender<Option<BlockNumber>>,
+    last_canon_tip: Option<BlockNumber>,
+}
+
+impl Router {
+    /// Dispatch a single merged event; `Err(StreamEnded)` stops the fold.
+    fn handle(&mut self, event: RouterEvent) -> Result<(), StreamEnded> {
+        match event {
+            RouterEvent::Cert(res) => {
+                self.deliver_broadcast(res, "certificates", |cert| {
+                    TnExExNotification::CertificateAccepted { certificate: Box::new(cert) }
+                });
+                Ok(())
+            }
+            RouterEvent::Consensus(res) => {
+                self.deliver_broadcast(res, "consensus output", |output| {
+                    TnExExNotification::ConsensusOutput { output }
+                });
+                Ok(())
+            }
+            RouterEvent::Canon(notification) => {
+                self.handle_canon(notification);
+                Ok(())
+            }
+            RouterEvent::Event { idx, ev } => {
+                self.handle_event(idx, ev);
+                Ok(())
+            }
+            RouterEvent::Closed(which) => {
+                debug!(target: "exex::manager", stream = which, "stream ended");
+                Err(StreamEnded)
+            }
+        }
+    }
+
     /// Fan out a notification to all registered ExExes (non-blocking).
     fn fan_out(&mut self, notification: &TnExExNotification) {
         for handle in &mut self.exexes {
@@ -174,36 +289,86 @@ impl TnExExManager {
         }
     }
 
-    /// Handle a canonical commit: detect any block-number gap (reth drops
-    /// canonical-stream lag silently), surface it as `Lagged`, then deliver the
-    /// executed chain. Shared by the `Commit` and degraded `Reorg` arms.
+    /// Deliver a broadcast item, mapping it to its notification — or, when the broadcast lagged,
+    /// surfacing a `Lagged` marker so the contract is uniform across every manager-side input.
+    fn deliver_broadcast<T>(
+        &mut self,
+        res: Result<T, BroadcastStreamRecvError>,
+        kind: &str,
+        into_notification: impl FnOnce(T) -> TnExExNotification,
+    ) {
+        let notification = res.map(into_notification).unwrap_or_else(|err| match err {
+            BroadcastStreamRecvError::Lagged(missed) => {
+                warn!(target: "exex::manager", missed, "{kind} stream lagged; surfaced Lagged");
+                TnExExNotification::Lagged { missed }
+            }
+        });
+        self.fan_out(&notification);
+    }
+
+    /// Handle a canonical state notification.
+    fn handle_canon(&mut self, notification: CanonStateNotification) {
+        match notification {
+            // reth's canonical-state stream drops broadcast lag silently, so a starved manager can
+            // miss commits. `handle_canon_commit` detects the resulting discontinuity and surfaces
+            // a `Lagged` marker before delivering, so stateful ExExes reconcile rather
+            // than carry a silent hole.
+            CanonStateNotification::Commit { new } => self.handle_canon_commit(new),
+            // TN's BFT consensus has immediate finality, so reth should only ever emit `Commit`. A
+            // `Reorg` violates that invariant — log it loudly, but degrade gracefully by treating
+            // the new side as a commit. The manager is spawned once and never respawned, so
+            // panicking here (it previously did) would kill the shared fan-out for every ExEx for
+            // the node's lifetime.
+            //
+            // Note: `old` is discarded, and if `new`'s blocks are not strictly newer than the last
+            // delivered tip the downstream height-dedup (`dedup_chain_executed`) may drop this
+            // degraded commit. Acceptable precisely because the arm is unreachable under TN's
+            // immediate-finality consensus.
+            CanonStateNotification::Reorg { old, new } => {
+                error!(
+                    target: "exex::manager",
+                    old_blocks = old.len(),
+                    new_blocks = new.len(),
+                    "unexpected Reorg for finalized state; degrading to commit of the new side",
+                );
+                self.handle_canon_commit(new);
+            }
+        }
+    }
+
+    /// Handle a canonical commit: detect any block-number gap (reth drops canonical-stream lag
+    /// silently), surface it as `Lagged`, then deliver the executed chain. Shared by the `Commit`
+    /// and degraded `Reorg` arms.
     fn handle_canon_commit(&mut self, new: Arc<Chain>) {
         let range = new.range();
-        if let Some(missed) = canon_gap(&mut self.last_canon_tip, *range.start(), *range.end()) {
+        let first = *range.start();
+        canon_gap(&mut self.last_canon_tip, first, *range.end()).into_iter().for_each(|missed| {
             warn!(
                 target: "exex::manager",
                 missed,
-                first = *range.start(),
+                first,
                 "canonical ChainExecuted gap detected; surfacing Lagged",
             );
             self.fan_out(&TnExExNotification::Lagged { missed });
-        }
+        });
         self.fan_out(&TnExExNotification::ChainExecuted { new });
     }
 
-    /// Poll all event receivers for FinishedHeight updates and recompute the
-    /// minimum finished height across all ExExes.
-    fn poll_events(&mut self, cx: &mut Context<'_>) {
-        for handle in &mut self.exexes {
-            while let Poll::Ready(Some(event)) = handle.events.poll_recv(cx) {
-                match event {
-                    TnExExEvent::FinishedHeight(height) => {
-                        handle.finished_height = Some(height);
-                    }
-                }
+    /// Record an ExEx progress event, then recompute the minimum finished height.
+    fn handle_event(&mut self, idx: usize, event: TnExExEvent) {
+        match event {
+            TnExExEvent::FinishedHeight(height) => {
+                self.exexes
+                    .get_mut(idx)
+                    .into_iter()
+                    .for_each(|handle| handle.finished_height = Some(height));
             }
         }
+        self.recompute_min();
+    }
 
+    /// Recompute the minimum finished height across all ExExes and publish it.
+    fn recompute_min(&mut self) {
         // Minimum finished height: None if any ExEx hasn't reported yet.
         let min_height = self
             .exexes
@@ -215,100 +380,6 @@ impl TnExExManager {
             .flatten();
 
         self.min_finished_height_tx.send_replace(min_height);
-    }
-}
-
-impl futures::Future for TnExExManager {
-    type Output = eyre::Result<()>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-
-        // Poll verified certificates stream (consensus-following path)
-        loop {
-            match this.certs_stream.poll_next_unpin(cx) {
-                Poll::Ready(Some(Ok(cert))) => {
-                    let notification =
-                        TnExExNotification::CertificateAccepted { certificate: Box::new(cert) };
-                    this.fan_out(&notification);
-                }
-                Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(n)))) => {
-                    // Surface the broadcast lag so the `Lagged` contract is uniform
-                    // across every manager-side input, not just the canon stream.
-                    this.fan_out(&TnExExNotification::Lagged { missed: n });
-                    warn!(target: "exex::manager", missed = n, "certificates stream lagged; surfaced Lagged");
-                }
-                Poll::Ready(None) => {
-                    debug!(target: "exex::manager", "certificates stream ended");
-                    return Poll::Ready(Ok(()));
-                }
-                Poll::Pending => break,
-            }
-        }
-
-        // Poll consensus output stream (consensus-following path)
-        loop {
-            match this.consensus_output_stream.poll_next_unpin(cx) {
-                Poll::Ready(Some(Ok(output))) => {
-                    let notification = TnExExNotification::ConsensusOutput { output };
-                    this.fan_out(&notification);
-                }
-                Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(n)))) => {
-                    this.fan_out(&TnExExNotification::Lagged { missed: n });
-                    warn!(target: "exex::manager", missed = n, "consensus output stream lagged; surfaced Lagged");
-                }
-                Poll::Ready(None) => {
-                    debug!(target: "exex::manager", "consensus output stream ended");
-                    return Poll::Ready(Ok(()));
-                }
-                Poll::Pending => break,
-            }
-        }
-
-        // Poll canonical state stream
-        loop {
-            match this.canon_state_stream.poll_next_unpin(cx) {
-                Poll::Ready(Some(notification)) => match notification {
-                    // reth's canonical-state stream drops broadcast lag silently,
-                    // so a starved manager can miss commits. `handle_canon_commit`
-                    // detects the resulting discontinuity and surfaces a `Lagged`
-                    // marker before delivering, so stateful ExExes reconcile rather
-                    // than carry a silent hole.
-                    CanonStateNotification::Commit { new } => this.handle_canon_commit(new),
-                    // TN's BFT consensus has immediate finality, so reth should
-                    // only ever emit `Commit`. A `Reorg` violates that invariant —
-                    // log it loudly, but degrade gracefully by treating the new
-                    // side as a commit. The manager is spawned once and never
-                    // respawned, so panicking here (it previously did) would kill
-                    // the shared fan-out for every ExEx for the node's lifetime.
-                    //
-                    // Note: `old` is discarded, and if `new`'s blocks are not
-                    // strictly newer than the last delivered tip the downstream
-                    // height-dedup (`dedup_chain_executed`) may drop this degraded
-                    // commit. Acceptable precisely because the arm is unreachable
-                    // under TN's immediate-finality consensus.
-                    CanonStateNotification::Reorg { old, new } => {
-                        error!(
-                            target: "exex::manager",
-                            old_blocks = old.len(),
-                            new_blocks = new.len(),
-                            "unexpected Reorg for finalized state; degrading to commit of the new side",
-                        );
-                        this.handle_canon_commit(new);
-                    }
-                },
-                Poll::Ready(None) => {
-                    debug!(target: "exex::manager", "canonical state stream ended");
-                    return Poll::Ready(Ok(()));
-                }
-                Poll::Pending => break,
-            }
-        }
-
-        // Poll ExEx events
-        this.poll_events(cx);
-
-        Poll::Pending
     }
 }
 
@@ -399,8 +470,7 @@ mod tests {
     #[tokio::test]
     async fn full_channel_drops_then_surfaces_lagged_marker() {
         let (tx, mut rx) = mpsc::channel(2);
-        let (_event_tx, event_rx) = mpsc::channel(4);
-        let mut handle = ExExHandle::new("test".to_string(), tx, event_rx);
+        let mut handle = ExExHandle::new("test".to_string(), tx);
 
         // Fill the channel (capacity 2).
         handle.send(&filler());
@@ -428,8 +498,7 @@ mod tests {
     #[tokio::test]
     async fn delivers_without_lagged_when_not_full() {
         let (tx, mut rx) = mpsc::channel(4);
-        let (_event_tx, event_rx) = mpsc::channel(4);
-        let mut handle = ExExHandle::new("test".to_string(), tx, event_rx);
+        let mut handle = ExExHandle::new("test".to_string(), tx);
 
         handle.send(&filler());
         assert_eq!(handle.dropped, 0);
