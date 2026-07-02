@@ -1231,6 +1231,140 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     Ok(())
 }
 
+/// A pruned peer that does not support the dedicated peer-exchange protocol still
+/// receives the goodbye.
+///
+/// The raw swarm below advertises only the legacy `/tn-primary-{chain}/0.0.1`
+/// req-res protocol, exactly the wire surface of a not-yet-upgraded node. The
+/// target's goodbye attempt on `/tn-primary-peer-exchange-{chain}/0.0.1` fails
+/// with `UnsupportedProtocols` (penalty-exempt) and must fall back to the
+/// `PeerExchange` variant embedded in the legacy request enum.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_goodbye_falls_back_to_embedded_exchange_for_legacy_peer() -> eyre::Result<()> {
+    tn_types::test_utils::init_test_tracing();
+    // 4 committee peers fill the target to its limit; validators are protected from
+    // pruning, so the raw legacy peer is deterministically the excess one
+    let committee = NonZeroUsize::new(5).unwrap();
+    let mut network_config = NetworkConfig::default();
+    network_config.peer_config_mut().target_num_peers = 4;
+    network_config.peer_config_mut().peer_excess_factor = 0.1;
+    network_config.peer_config_mut().excess_peers_reconnection_timeout = Duration::from_secs(10);
+    network_config.peer_config_mut().heartbeat_interval = TEST_HEARTBEAT_INTERVAL;
+    network_config.libp2p_config_mut().k_bucket_size = committee;
+
+    let (mut target_peer, mut other_peers, _task_manager) =
+        create_test_peers::<TestWorkerRequest, TestWorkerResponse>(
+            committee,
+            Some(network_config.clone()),
+        );
+
+    // spawn target network
+    let target_network = target_peer.network.take().expect("target network is some");
+    tokio::spawn(async move {
+        let res = target_network.run().await;
+        debug!(target: "network", ?res, "target network shutdown");
+    });
+    target_peer.network_handle.start_listening(target_peer.config.primary_address()).await?;
+    let target_addr = target_peer.config.primary_address();
+    let target_peer_bls = target_peer.config.key_config().primary_public_key();
+    let target_peer_net = target_peer.config.primary_networkkey();
+
+    // fill the target with protected committee peers
+    for peer in other_peers.iter_mut() {
+        let peer_network = peer.network.take().expect("peer network is some");
+        tokio::spawn(async move {
+            let res = peer_network.run().await;
+            debug!(target: "network", ?res, "peer network shutdown");
+        });
+        peer.network_handle.start_listening(peer.config.primary_address()).await?;
+        peer.network_handle
+            .add_explicit_peer(target_peer_bls, target_peer_net.clone(), target_addr.clone())
+            .await?;
+        target_peer
+            .network_handle
+            .add_explicit_peer(
+                peer.config.key_config().primary_public_key(),
+                peer.config.primary_networkkey(),
+                peer.config.primary_address(),
+            )
+            .await?;
+        peer.network_handle.dial_by_bls(target_peer_bls).await?;
+
+        // give time for connection to establish and libp2p state to stabilize
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // raw legacy peer: the target's main req-res protocol only, no dedicated
+    // peer-exchange protocol
+    let chain_id = network_config.libp2p_config().chain_id;
+    let raw_keypair = NetworkKeypair::generate_ed25519();
+    let raw_peer_id: PeerId = raw_keypair.public().into();
+    let legacy_codec = TNCodec::<TestWorkerRequest, TestWorkerResponse>::new(
+        network_config.libp2p_config().max_rpc_message_size,
+    );
+    let legacy_req_res = request_response::Behaviour::with_codec(
+        legacy_codec,
+        vec![(NetworkType::Primary.req_res_protocol(chain_id)?, ProtocolSupport::Full)],
+        request_response::Config::default(),
+    );
+    let mut raw_swarm = SwarmBuilder::with_existing_identity(raw_keypair)
+        .with_tokio()
+        .with_quic()
+        .with_behaviour(|_| legacy_req_res)
+        .map_err(|e| eyre!("raw swarm behaviour: {e:?}"))?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
+        .build();
+
+    // excess dial: accepted (max_peers = ceil(4 * 1.1) = 5), then pruned with px
+    raw_swarm.dial(target_addr.clone())?;
+
+    // drive the raw swarm: capture the legacy embedded goodbye and ack it
+    let (goodbye_tx, goodbye_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let mut goodbye_tx = Some(goodbye_tx);
+        loop {
+            if let SwarmEvent::Behaviour(request_response::Event::Message {
+                message: request_response::Message::Request { request, channel, .. },
+                ..
+            }) = raw_swarm.select_next_some().await
+            {
+                if let TestWorkerRequest::PeerExchange(map) = request {
+                    let ack = TestWorkerResponse::from(PeerExchangeMap::default());
+                    let _ = raw_swarm.behaviour_mut().send_response(channel, ack);
+                    if let Some(tx) = goodbye_tx.take() {
+                        let _ = tx.send(map);
+                    }
+                }
+            }
+        }
+    });
+
+    // the target prunes the excess raw peer on a heartbeat; the goodbye must reach
+    // the legacy peer on the embedded path (which requires the dedicated-protocol
+    // attempt to have failed over)
+    let goodbye = timeout(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 10), goodbye_rx)
+        .await
+        .expect("legacy peer received the goodbye before timeout")?;
+    assert!(
+        !goodbye.0.is_empty(),
+        "the fallback goodbye should carry the target's known peers for discovery"
+    );
+
+    // the ack resolves the pending exchange and the target disconnects promptly
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut still_connected = true;
+    while still_connected && tokio::time::Instant::now() < deadline {
+        still_connected =
+            target_peer.network_handle.connected_peer_ids().await?.contains(&raw_peer_id);
+        if still_connected {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    assert!(!still_connected, "target should disconnect the raw legacy peer after the goodbye");
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_score_decay_and_reconnection() -> eyre::Result<()> {
     // Create a custom config with short halflife for quicker testing

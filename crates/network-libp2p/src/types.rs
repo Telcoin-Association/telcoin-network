@@ -108,6 +108,22 @@ impl NetworkType {
             Self::Worker(id) => owned_protocol(format!("/tn-worker-{id}-sync-{chain_id}/0.0.1")),
         }
     }
+
+    /// Peer-exchange goodbye wire protocol, isolated per role (and per worker) and
+    /// namespaced by `chain_id` so nodes on different chains never negotiate it.
+    ///
+    /// A dedicated request-response protocol for the [`PeerExchangeMap`](crate::PeerExchangeMap)
+    /// a node shares when it gracefully disconnects. Goodbyes prefer this protocol and fall
+    /// back to the variant embedded in the consensus request enums when the peer has not
+    /// upgraded yet (`UnsupportedProtocols` is penalty-exempt).
+    pub(crate) fn peer_exchange_protocol(&self, chain_id: u64) -> NetworkResult<StreamProtocol> {
+        match self {
+            Self::Primary => owned_protocol(format!("/tn-primary-peer-exchange-{chain_id}/0.0.1")),
+            Self::Worker(id) => {
+                owned_protocol(format!("/tn-worker-{id}-peer-exchange-{chain_id}/0.0.1"))
+            }
+        }
+    }
 }
 
 /// Bulk-transfer stream protocol, namespaced by `chain_id`.
