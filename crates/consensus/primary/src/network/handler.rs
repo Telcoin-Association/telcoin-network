@@ -415,7 +415,7 @@ where
             if vote_info.vote_digest == header.digest().into() {
                 let vote = Vote::new(
                     &header,
-                    self.consensus_config.authority_id().expect("only validators can vote"),
+                    self.consensus_config.authority_id().ok_or(HeaderError::NotCommitteeMember)?,
                     self.consensus_config.key_config(),
                 );
 
@@ -721,7 +721,9 @@ where
                     // Make sure we don't vote twice for the same authority in the same epoch/round.
                     let vote = Vote::new(
                         &header,
-                        self.consensus_config.authority_id().expect("only validators can vote"),
+                        self.consensus_config
+                            .authority_id()
+                            .ok_or(HeaderError::NotCommitteeMember)?,
                         self.consensus_config.key_config(),
                     );
                     if vote.digest() != vote_info.vote_digest() {
@@ -771,7 +773,7 @@ where
         // this node hasn't voted yet
         let vote = Vote::new(
             &header,
-            self.consensus_config.authority_id().expect("only validators can vote"),
+            self.consensus_config.authority_id().ok_or(HeaderError::NotCommitteeMember)?,
             self.consensus_config.key_config(),
         );
 
