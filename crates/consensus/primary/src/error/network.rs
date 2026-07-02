@@ -100,7 +100,6 @@ impl PrimaryNetworkError {
             | PrimaryNetworkError::Storage(_)
             | PrimaryNetworkError::InvalidRequest(_)
             | PrimaryNetworkError::Internal(_)
-            | PrimaryNetworkError::UnknownConsensusHeaderDigest(_)
             | PrimaryNetworkError::UnknownConsensusHeaderCert(_)
             | PrimaryNetworkError::UnknownConsensusOutput(_)
             | PrimaryNetworkError::PeerNotInCommittee(_)
