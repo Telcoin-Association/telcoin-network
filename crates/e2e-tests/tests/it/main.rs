@@ -11,6 +11,7 @@ mod genesis_tests;
 mod metrics;
 mod restarts;
 mod staking;
+mod startup;
 mod sync;
 
 fn main() {}

@@ -139,6 +139,27 @@ async fn test_epoch_boundary_inner(
         current_epoch_info = new_epoch_info;
     }
 
+    // Startup-flow regression (rotation): with a 6-node pool and a smaller committee, some
+    // nodes sit outside the committee every epoch. Gossip publishers are re-upserted each
+    // epoch, so every node - committee member or not - must keep executing the chain
+    // (each epoch close produces at least one block on every following node).
+    // note: async provider reads, not the blocking rpc helpers - this test runs on a
+    // current-thread tokio runtime where block_in_place panics.
+    let mut heights = Vec::with_capacity(endpoints.len());
+    for ep in endpoints {
+        let node_provider = ProviderBuilder::new().connect_http(ep.http_url.parse()?);
+        let before = node_provider.get_block_number().await?;
+        heights.push((ep.http_url.clone(), node_provider, before));
+    }
+    tokio::time::sleep(Duration::from_secs(EPOCH_DURATION * 2)).await;
+    for (url, node_provider, before) in heights {
+        let after = node_provider.get_block_number().await?;
+        assert!(
+            after > before,
+            "node {url} stopped following the chain across committee rotation ({before} -> {after})"
+        );
+    }
+
     if shuffled {
         // Verify all nodes have valid (certified) Epoch Records.
         // Poll each epoch individually — certificates are produced asynchronously
