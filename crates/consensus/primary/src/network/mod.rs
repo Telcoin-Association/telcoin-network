@@ -1264,8 +1264,8 @@ where
                     self.process_consensus_output_stream(peer, number, channel, cancel)
                 }
             },
-            NetworkEvent::Gossip(msg, relayer) => {
-                self.process_gossip(msg, relayer);
+            NetworkEvent::Gossip { message, relayer, author } => {
+                self.process_gossip(message, relayer, author);
             }
             NetworkEvent::Error(msg, channel) => {
                 let err = PrimaryResponse::Error(PrimaryRPCError(msg));
@@ -1542,7 +1542,12 @@ where
     }
 
     /// Process gossip from committee.
-    fn process_gossip(&self, msg: GossipMessage, relayer: Option<BlsPublicKey>) {
+    fn process_gossip(
+        &self,
+        msg: GossipMessage,
+        relayer: Option<BlsPublicKey>,
+        author: Option<BlsPublicKey>,
+    ) {
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
@@ -1553,10 +1558,16 @@ where
         self.task_spawner.spawn_task(task_name, async move {
             if let Err(e) = request_handler.process_gossip(&msg).await {
                 warn!(target: "primary::network", ?e, "process_gossip");
-                // convert error into penalty to lower peer score; only attributable
-                // when the relaying peer's BLS identity has resolved
-                if let Some((relayer, penalty)) = relayer.zip((&e).into()) {
-                    network_handle.report_penalty(relayer, penalty).await;
+                // Charge the accountable peer, and only once its BLS identity has resolved. A
+                // content-determined fault (malformed payload / mis-topic) is the message
+                // author's: the network layer forwarded it after a shallow check, so an honest
+                // relayer could not have screened it, and banning the relayer lets a Byzantine
+                // author partition the mesh (issues #801/#819). Every other fault is the relaying
+                // peer's, as before. `zip` skips the penalty when that peer is unresolved or the
+                // error carries no penalty.
+                let charged = if e.is_author_content_fault() { author } else { relayer };
+                if let Some((peer, penalty)) = charged.zip((&e).into()) {
+                    network_handle.report_penalty(peer, penalty).await;
                 }
                 Err(e.into())
             } else {

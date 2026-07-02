@@ -934,7 +934,7 @@ async fn test_publish_to_one_peer() -> eyre::Result<()> {
         timeout(Duration::from_secs(2), nvv_network_events.recv()).await?.expect("batch received");
 
     // assert gossip message
-    if let NetworkEvent::Gossip(msg, _) = event {
+    if let NetworkEvent::Gossip { message: msg, .. } = event {
         assert_eq!(msg.data, expected_result);
     } else {
         panic!("unexpected network event received");
@@ -993,7 +993,7 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
         timeout(Duration::from_secs(2), nvv_network_events.recv()).await?.expect("batch received");
 
     // assert gossip message and that the resolved relayer identity is carried
-    if let NetworkEvent::Gossip(msg, relayer) = event {
+    if let NetworkEvent::Gossip { message: msg, relayer, .. } = event {
         assert_eq!(msg.data, expected_result);
         assert_eq!(
             relayer,
@@ -1208,7 +1208,7 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
 
     while !received && start.elapsed() < timeout {
         match tokio::time::timeout(Duration::from_millis(500), nvv_events.recv()).await {
-            Ok(Some(NetworkEvent::Gossip(msg, from))) => {
+            Ok(Some(NetworkEvent::Gossip { message: msg, relayer: from, .. })) => {
                 assert_eq!(msg.data, expected_msg, "Gossip message data mismatch");
                 debug!(target: "network", ?from, "nvv received gossip from peer");
                 received = true;
@@ -2001,7 +2001,7 @@ async fn test_gossip_explicit_peer_includes_next_committee() -> eyre::Result<()>
     publisher.publish(TEST_TOPIC.into(), expected.clone()).await?;
     let event =
         timeout(Duration::from_secs(2), next_peer_events.recv()).await?.expect("gossip received");
-    if let NetworkEvent::Gossip(msg, _) = event {
+    if let NetworkEvent::Gossip { message: msg, .. } = event {
         assert_eq!(msg.data, expected);
     } else {
         panic!("unexpected network event received");
@@ -2143,7 +2143,7 @@ async fn test_get_kad_records() -> eyre::Result<()> {
 
     // wait for gossip from disconnected peer
     match timeout(Duration::from_secs(5), nvv_events.recv()).await {
-        Ok(Some(NetworkEvent::Gossip(msg, _))) => {
+        Ok(Some(NetworkEvent::Gossip { message: msg, .. })) => {
             let GossipMessage { source, data, .. } = msg;
             assert_eq!(source, Some(target_peer_id));
             assert_eq!(data, expected_msg);
@@ -2712,8 +2712,12 @@ fn test_gossip_message() -> GossipMessage {
 fn accepted_gossip_with_unresolved_relayer_is_delivered() -> eyre::Result<()> {
     let message = test_gossip_message();
     let event: NetworkEvent<TestWorkerRequest, TestWorkerResponse> =
-        accepted_gossip_event(message.clone(), None);
-    assert_matches!(event, NetworkEvent::Gossip(delivered, None) if delivered.data == message.data);
+        accepted_gossip_event(message.clone(), None, None);
+    assert_matches!(
+        event,
+        NetworkEvent::Gossip { message: delivered, relayer: None, author: None }
+            if delivered.data == message.data
+    );
     Ok(())
 }
 
@@ -2723,7 +2727,53 @@ fn accepted_gossip_with_resolved_relayer_carries_identity() -> eyre::Result<()> 
     let bls = *BlsKeypair::generate(&mut StdRng::from_seed([9; 32])).public();
     let message = test_gossip_message();
     let event: NetworkEvent<TestWorkerRequest, TestWorkerResponse> =
-        accepted_gossip_event(message, Some(bls));
-    assert_matches!(event, NetworkEvent::Gossip(_, Some(got)) if got == bls);
+        accepted_gossip_event(message, Some(bls), None);
+    assert_matches!(event, NetworkEvent::Gossip { relayer: Some(got), .. } if got == bls);
     Ok(())
+}
+
+/// Regression for issue #819: a resolved author identity is carried on the delivered gossip
+/// event so the application layer can charge an author-content fault to the author rather than
+/// the forwarding relayer.
+#[test]
+fn accepted_gossip_carries_resolved_author_identity() -> eyre::Result<()> {
+    let author = *BlsKeypair::generate(&mut StdRng::from_seed([11; 32])).public();
+    let message = test_gossip_message();
+    let event: NetworkEvent<TestWorkerRequest, TestWorkerResponse> =
+        accepted_gossip_event(message, None, Some(author));
+    assert_matches!(event, NetworkEvent::Gossip { author: Some(got), .. } if got == author);
+    Ok(())
+}
+
+/// Finding 1 (#819): the network-layer reject path must never Fatal-ban the relaying peer for an
+/// author-attributable reject. An `UnauthorizedAuthor` reject charges the resolved author, and no
+/// one when the author is unresolved (anonymous message or this node's view lag) — but never the
+/// relayer, regardless of whether either identity has resolved.
+#[test]
+fn author_attributable_reject_charges_the_author_never_the_relayer() {
+    for relayer_resolved in [true, false] {
+        assert_eq!(
+            RejectReason::UnauthorizedAuthor.penalty(relayer_resolved, true),
+            RejectPenalty::FatalAuthor
+        );
+        assert_eq!(
+            RejectReason::UnauthorizedAuthor.penalty(relayer_resolved, false),
+            RejectPenalty::Skip
+        );
+    }
+}
+
+/// An oversized payload is the only relayer-attributable reject — the size bound is deterministic
+/// network-wide, so under `Strict` validation an honest peer never forwards one — and it is
+/// charged to the forwarder only once its BLS identity has resolved (the author's resolution is
+/// irrelevant), mirroring the Accept path's unresolved-relayer skip.
+#[test]
+fn oversized_reject_penalizes_only_a_resolved_relayer() {
+    for author_resolved in [true, false] {
+        assert_eq!(
+            RejectReason::TooLarge.penalty(true, author_resolved),
+            RejectPenalty::FatalRelayer
+        );
+        assert_eq!(RejectReason::TooLarge.penalty(false, author_resolved), RejectPenalty::Skip);
+    }
 }
