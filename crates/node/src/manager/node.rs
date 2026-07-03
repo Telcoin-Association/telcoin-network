@@ -179,8 +179,7 @@ pub async fn catchup_accumulator(
 
             // difficulty contains the worker id and batch index:
             // `U256::from(payload.batch_index << 16 | payload.worker_id as usize)`
-            let lower64 = current.difficulty.into_limbs()[0];
-            let worker_id = (lower64 & 0xffff) as u16;
+            let worker_id = worker_id_from_header(&current);
             gas_accumulator.inc_block(worker_id, gas, limit);
         }
 
