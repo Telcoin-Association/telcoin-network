@@ -94,6 +94,18 @@ impl<DB: Database> DbTxMut for LayeredDbTxMut<DB> {
     }
 }
 
+/// A snapshot of the background thread's internal state, for leak observability.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LayeredDbStats {
+    /// Number of boxed key/value inserts retained while waiting for a txn commit.
+    /// Should return to 0 after every commit; sustained growth indicates a leak.
+    pub retained_inserts: usize,
+    /// Number of logical write txns currently overlapped on the physical txn.
+    /// Should be 0 whenever no write txn is outstanding; a value stuck above 0
+    /// means commits have stopped firing (wedged txn count).
+    pub open_txn_count: u64,
+}
+
 /// Run the thread to manage the persistant DB in the background.
 /// If DB needs compaction this thread will compact on startup and once a day after that.
 fn db_run<DB: Database>(db: DB, mem_db: Option<MemDatabase>, rx: Receiver<DBMessage<DB>>) {
@@ -138,7 +150,12 @@ fn db_run<DB: Database>(db: DB, mem_db: Option<MemDatabase>, rx: Receiver<DBMess
                     if let Err(e) = ins.insert_txn(txn) {
                         tracing::error!(target: "layered_db_runner", "DB TXN Insert {}: {e}", ins.name())
                     }
-                    committed_inserts.push(ins);
+                    // The retained insert exists only to clear the cache-mode mirror once the
+                    // txn commits. A full-memory DB (mem_db == None) keeps everything in memory
+                    // forever, so retaining here would leak a clone of every value ever written.
+                    if mem_db.is_some() {
+                        committed_inserts.push(ins);
+                    }
                 } else {
                     if let Err(e) = ins.insert(&db) {
                         tracing::error!(target: "layered_db_runner", "DB Insert {}: {e}", ins.name());
@@ -168,6 +185,12 @@ fn db_run<DB: Database>(db: DB, mem_db: Option<MemDatabase>, rx: Receiver<DBMess
             }
             DBMessage::CaughtUp(tx) => {
                 let _ = tx.send(());
+            }
+            DBMessage::Stats(tx) => {
+                let _ = tx.send(LayeredDbStats {
+                    retained_inserts: committed_inserts.len(),
+                    open_txn_count: txn.as_ref().map(|(_, count)| *count as u64).unwrap_or(0),
+                });
             }
             DBMessage::Shutdown => break,
         }
@@ -228,6 +251,24 @@ impl<DB: Database> LayeredDatabase<DB> {
         let thread =
             Some(Arc::new(std::thread::spawn(move || db_run(db_cloned, mem_db_clone, rx))));
         Self { mem_db, db, tx, thread, full_memory }
+    }
+
+    /// Snapshot the background thread's retained-insert and open-txn counters.
+    ///
+    /// Processed in queue order, so it reflects all operations sent before this call.
+    pub fn stats(&self) -> eyre::Result<LayeredDbStats> {
+        let (tx, mut rx) = oneshot::channel();
+        self.tx.send(DBMessage::Stats(tx)).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
+
+        // Can not use rx.blocking_recv() because it will be called from some tokio tests and that
+        // will panic.
+        loop {
+            match rx.try_recv() {
+                Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(10)),
+                Err(TryRecvError::Closed) => return Err(eyre::eyre!("DB thread gone, FATAL!")),
+                Ok(stats) => return Ok(stats),
+            }
+        }
     }
 }
 
@@ -472,6 +513,7 @@ enum DBMessage<DB: Database> {
     Remove(Box<dyn RemoveTrait<DB>>),
     Clear(Box<dyn ClearTrait<DB>>),
     CaughtUp(tokio::sync::oneshot::Sender<()>),
+    Stats(tokio::sync::oneshot::Sender<LayeredDbStats>),
     Shutdown,
 }
 
@@ -484,6 +526,7 @@ impl<DB: Database> Debug for DBMessage<DB> {
             DBMessage::Remove(_) => write!(f, "Remove"),
             DBMessage::Clear(_) => write!(f, "Clear"),
             DBMessage::CaughtUp(_) => write!(f, "CaughtUp"),
+            DBMessage::Stats(_) => write!(f, "Stats"),
             DBMessage::Shutdown => write!(f, "Shutdown"),
         }
     }
@@ -728,6 +771,47 @@ mod test {
         test_multi_remove(db);
         let db = open_mdbx(&temp_dir.path().join("mdbx_multi_remove_2"), false);
         test_multi_remove(db);
+    }
+
+    #[test]
+    fn test_layereddb_full_memory_does_not_retain_inserts() {
+        use tn_types::DbTxMut as _;
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let db = open_mdbx(&temp_dir.path().join("mdbx_full_memory_no_retain"), true);
+        for i in 0..100_u64 {
+            let mut txn = db.write_txn().expect("write txn");
+            txn.insert::<TestTable>(&i, &i.to_string()).expect("insert");
+            txn.commit().expect("commit");
+        }
+        db.sync_persist();
+        // Full-memory DBs have no cache mirror to clear, so nothing may be retained after
+        // commit; retention here is the unbounded leak (every insert kept forever).
+        let stats = db.stats().expect("stats");
+        assert_eq!(stats, super::LayeredDbStats { retained_inserts: 0, open_txn_count: 0 });
+        // all keys remain readable
+        for i in 0..100_u64 {
+            assert_eq!(db.get::<TestTable>(&i).expect("get"), Some(i.to_string()));
+        }
+    }
+
+    #[test]
+    fn test_layereddb_cache_mode_clears_mem_after_commit() {
+        use tn_types::DbTxMut as _;
+        const K: u64 = 50;
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let db = open_mdbx(&temp_dir.path().join("mdbx_cache_mode_clears_mem"), false);
+        let mut txn = db.write_txn().expect("write txn");
+        for i in 0..K {
+            txn.insert::<TestTable>(&i, &i.to_string()).expect("insert");
+        }
+        txn.commit().expect("commit");
+        db.sync_persist();
+        let stats = db.stats().expect("stats");
+        assert_eq!(stats.retained_inserts, 0, "retained inserts must drain on commit");
+        assert_eq!(stats.open_txn_count, 0);
+        // The mem mirror must be cleared once the disk commit lands: the cache-mode iter
+        // chains disk + mem, so a stale mirror would yield 2K entries instead of K.
+        assert_eq!(db.iter::<TestTable>().count() as u64, K);
     }
 
     #[test]
