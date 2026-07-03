@@ -151,7 +151,7 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
     let recovered = GasAccumulator::new(1);
     recovered.rewards_counter().set_committee(fixture.committee());
 
-    // PR3b: catchup must restore each worker's base fee from the chain. Capture the chain's
+    // Catchup must restore each worker's base fee from the chain. Capture the chain's
     // finalized base fee, poison the recovered accumulator with a different value, and confirm
     // catchup overwrites it with the value read from the chain (not left at the stale value).
     let expected_base_fee = reth_env

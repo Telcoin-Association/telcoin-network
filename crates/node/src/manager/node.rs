@@ -140,8 +140,8 @@ pub(crate) struct EpochManager<P, DB> {
 /// [`tn_types::gas_accumulator`] for the full picture). It runs once at startup, before
 /// execution resumes, and performs the following:
 ///
-/// 1. **Base fee** — restores each worker's base fee from its latest on-chain block this epoch
-///    (via [`latest_base_fee_per_worker`]), preserving the base-fee-from-chain invariant.
+/// 1. **Base fee** — restores each worker's base fee from its latest on-chain block this epoch (via
+///    [`latest_base_fee_per_worker`]), preserving the base-fee-from-chain invariant.
 /// 2. **Gas stats** — iterates every reth block from the epoch's start height through the finalized
 ///    tip, extracting the worker id from each block's `difficulty` field and calling
 ///    [`GasAccumulator::inc_block`] to rebuild per-worker gas totals.
