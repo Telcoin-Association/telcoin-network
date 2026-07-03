@@ -5,13 +5,21 @@ use std::{future::Future, sync::Arc};
 
 use tn_types::{Database, DbTx, DbTxMut, Table, TableHint};
 
-use crate::layered_db::{LayeredDatabase, LayeredDbTxMut};
+use crate::layered_db::{LayeredDatabase, LayeredDbStats, LayeredDbTxMut};
 
 #[derive(Clone, Debug)]
 struct Inner<DB: Database> {
     epoch_db: LayeredDatabase<DB>,
     kad_db: LayeredDatabase<DB>,
     cache_db: LayeredDatabase<DB>,
+}
+
+/// Per-layer [`LayeredDbStats`] for each database in a [`CompositeDatabase`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompositeDbStats {
+    pub epoch: LayeredDbStats,
+    pub kad: LayeredDbStats,
+    pub cache: LayeredDbStats,
 }
 
 /// A composite DB that is composed of multiple [`LayeredDatabase`]s.
@@ -34,6 +42,15 @@ impl<DB: Database> CompositeDatabase<DB> {
             TableHint::Kad => &self.inner.kad_db,
             TableHint::Cache => &self.inner.cache_db,
         }
+    }
+
+    /// Snapshot the background-thread counters of every layered DB, for leak observability.
+    pub fn stats(&self) -> eyre::Result<CompositeDbStats> {
+        Ok(CompositeDbStats {
+            epoch: self.inner.epoch_db.stats()?,
+            kad: self.inner.kad_db.stats()?,
+            cache: self.inner.cache_db.stats()?,
+        })
     }
 }
 
