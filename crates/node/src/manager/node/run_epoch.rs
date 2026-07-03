@@ -147,8 +147,8 @@ where
         // covers syncing and restarting nodes: they execute the fee already baked into the chain.
         // A live producer crossing N->N+1 still has its tip in N here, so seeding is skipped and
         // the value adjust_base_fees computed at the boundary is kept. (See gas_accumulator docs.)
+        let reth_env = engine.get_reth_env().await;
         {
-            let reth_env = engine.get_reth_env().await;
             if let Some(tip) = reth_env.finalized_header()? {
                 let tip_epoch = RethEnv::extract_epoch_from_header(&tip);
                 let chain_fees = if tip_epoch == committee.epoch() {
@@ -208,7 +208,7 @@ where
             if let Some(target_hash) = replay.take_epoch_close_hash() {
                 // If things go down at exactly the wrong time we might have to replay the epoch end
                 // so account for that.
-                self.close_epoch(None, engine, &gas_accumulator, target_hash).await?;
+                self.close_epoch(None, &reth_env, &gas_accumulator, target_hash).await?;
                 self.clear_consensus_db_for_next_epoch()?;
                 return Ok(RunEpochMode::NewEpoch);
             }
@@ -337,7 +337,7 @@ where
                 })?;
                 self.close_epoch(
                     Some(consensus_shutdown.clone()),
-                    engine,
+                    &reth_env,
                     &gas_accumulator,
                     target_hash,
                 )
@@ -398,7 +398,7 @@ where
         {
             // If things go down at exactly the wrong time we might have reached the epoch end
             // so account for that.
-            self.close_epoch(None, engine, &gas_accumulator, target_hash).await?;
+            self.close_epoch(None, &reth_env, &gas_accumulator, target_hash).await?;
             res = RunEpochMode::NewEpoch;
             clear_tables_for_next_epoch = true;
         } else {
@@ -587,7 +587,7 @@ where
     async fn close_epoch(
         &self,
         shutdown_consensus: Option<Notifier>,
-        engine: &ExecutionNode,
+        reth_env: &RethEnv,
         gas_accumulator: &GasAccumulator,
         target_hash: ConsensusHeaderDigest,
     ) -> eyre::Result<()> {
@@ -603,7 +603,7 @@ where
         self.consensus_bus.wait_for_consensus_execution(target_hash).await?;
         // adjust basefees after final execution
         if live_boundary {
-            adjust_base_fees(engine, gas_accumulator).await?;
+            adjust_base_fees(reth_env, gas_accumulator)?;
         }
         gas_accumulator.clear(); // Clear the accumlated values for next epoch.
         Ok(())
@@ -622,10 +622,7 @@ where
 /// Inert on existing chains: the genesis fee strategy is `Eip1559 { target_gas: u64::MAX }`, which
 /// floors every worker at `MIN_PROTOCOL_BASE_FEE`. Fees only move once governance sets a real
 /// per-worker target.
-async fn adjust_base_fees(
-    engine: &ExecutionNode,
-    gas_accumulator: &GasAccumulator,
-) -> eyre::Result<()> {
+fn adjust_base_fees(reth_env: &RethEnv, gas_accumulator: &GasAccumulator) -> eyre::Result<()> {
     let num_workers = gas_accumulator.num_workers();
     // num_workers is the count the GasAccumulator was sized to at startup; get_worker_fee_configs
     // validates it against the on-chain numWorkers() and errors on drift.
@@ -634,7 +631,7 @@ async fn adjust_base_fees(
     // propagates out of close_epoch and aborts the epoch close on the live producer (the error says
     // "node restart required"). This is intentional -- silently guessing a fee would risk consensus
     // divergence. The epoch loop must surface this as a clean shutdown, not a panic/hang.
-    let configs = engine.get_reth_env().await.get_worker_fee_configs(num_workers)?;
+    let configs = reth_env.get_worker_fee_configs(num_workers)?;
     for (worker_id, config) in configs.into_iter().enumerate() {
         let worker_id = worker_id as u16;
         let (_blocks, gas_used, _gas_limit) = gas_accumulator.get_values(worker_id);
