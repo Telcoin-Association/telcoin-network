@@ -507,6 +507,32 @@ where
     ) -> eyre::Result<ConsensusHeaderDigest> {
         // receive output from consensus and forward to engine
         while let Some(mut output) = consensus_output.recv().await {
+            // The engine executes exactly the sequence forwarded here, so enforce continuity
+            // against the last number that actually reached it. A stale output (already
+            // forwarded, e.g. replayed from the DB) would double-execute; a gap (e.g. the
+            // broadcast lagged this receiver) would silently diverge execution from
+            // consensus. Every output is saved to the consensus DB before it is broadcast,
+            // so erroring here lets the restart path replay the gap from the DB.
+            match check_output_continuity(self.last_forwarded_consensus_number, output.number()) {
+                OutputContinuity::Stale => {
+                    warn!(
+                        target: "epoch-manager",
+                        number=output.number(),
+                        last_forwarded=self.last_forwarded_consensus_number,
+                        "skipping already-forwarded consensus output",
+                    );
+                    continue;
+                }
+                OutputContinuity::Gap => {
+                    return Err(eyre::eyre!(
+                        "consensus output gap: expected {} but received {} - restarting to \
+                        replay missed consensus from the DB",
+                        self.last_forwarded_consensus_number + 1,
+                        output.number(),
+                    ));
+                }
+                OutputContinuity::Next => {}
+            }
             // observe epoch boundary to initiate epoch transition
             if output.committed_at() >= self.epoch_boundary {
                 info!(
@@ -570,5 +596,54 @@ where
         self.adjust_base_fees(gas_accumulator);
         gas_accumulator.clear(); // Clear the accumlated values for next epoch.
         Ok(())
+    }
+}
+
+/// How the next consensus output's number relates to the last one forwarded to the engine.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum OutputContinuity {
+    /// Already forwarded (`number <= last_forwarded`): skip as a duplicate.
+    Stale,
+    /// The expected next output (`last_forwarded + 1`): forward it.
+    Next,
+    /// At least one output was missed (`number > last_forwarded + 1`): forwarding would leave
+    /// a silent execution gap.
+    Gap,
+}
+
+/// Classify `number` against the last consensus number actually forwarded to the engine.
+///
+/// Used only on the live-forwarding path ([`EpochManager::wait_for_epoch_boundary`]); the
+/// replay and leftover-drain paths legitimately re-forward numbers at or below
+/// `last_forwarded` and must not be checked.
+fn check_output_continuity(last_forwarded: u64, number: u64) -> OutputContinuity {
+    if number <= last_forwarded {
+        OutputContinuity::Stale
+    } else if number == last_forwarded + 1 {
+        OutputContinuity::Next
+    } else {
+        OutputContinuity::Gap
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_output_continuity, OutputContinuity};
+
+    #[test]
+    fn test_check_output_continuity() {
+        // stale: anything at or below the last forwarded number
+        assert_eq!(check_output_continuity(5, 0), OutputContinuity::Stale);
+        assert_eq!(check_output_continuity(5, 4), OutputContinuity::Stale);
+        assert_eq!(check_output_continuity(5, 5), OutputContinuity::Stale);
+        // next: exactly one past
+        assert_eq!(check_output_continuity(5, 6), OutputContinuity::Next);
+        // genesis: nothing forwarded yet, first output is number 1
+        assert_eq!(check_output_continuity(0, 1), OutputContinuity::Next);
+        // gap: anything further ahead
+        assert_eq!(check_output_continuity(5, 7), OutputContinuity::Gap);
+        assert_eq!(check_output_continuity(5, u64::MAX), OutputContinuity::Gap);
+        // overflow safety at the top of the range
+        assert_eq!(check_output_continuity(u64::MAX, u64::MAX), OutputContinuity::Stale);
     }
 }
