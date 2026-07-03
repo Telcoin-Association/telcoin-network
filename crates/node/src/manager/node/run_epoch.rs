@@ -603,7 +603,7 @@ where
         self.consensus_bus.wait_for_consensus_execution(target_hash).await?;
         // adjust basefees after final execution
         if live_boundary {
-            adjust_base_fees(reth_env, gas_accumulator)?;
+            adjust_base_fees(reth_env, gas_accumulator);
         }
         gas_accumulator.clear(); // Clear the accumlated values for next epoch.
         Ok(())
@@ -619,28 +619,45 @@ where
 /// each worker's base-fee container. This is the deterministic seam every committee member runs
 /// identically at the boundary.
 ///
+/// Infallible: if the contract read fails, worker 0's fee is pinned to [`FALLBACK_BASE_FEE`]
+/// instead of aborting the epoch close (see the FAIL-OPEN note in the body).
+///
 /// Inert on existing chains: the genesis fee strategy is `Eip1559 { target_gas: u64::MAX }`, which
 /// floors every worker at `MIN_PROTOCOL_BASE_FEE`. Fees only move once governance sets a real
 /// per-worker target.
-fn adjust_base_fees(reth_env: &RethEnv, gas_accumulator: &GasAccumulator) -> eyre::Result<()> {
+fn adjust_base_fees(reth_env: &RethEnv, gas_accumulator: &GasAccumulator) {
     let num_workers = gas_accumulator.num_workers();
     // num_workers is the count the GasAccumulator was sized to at startup; get_worker_fee_configs
     // validates it against the on-chain numWorkers() and errors on drift.
     //
-    // FAIL-CLOSED: a contract-read revert or a numWorkers() drift returns Err here, which the `?`
-    // propagates out of close_epoch and aborts the epoch close on the live producer (the error says
-    // "node restart required"). This is intentional -- silently guessing a fee would risk consensus
-    // divergence. The epoch loop must surface this as a clean shutdown, not a panic/hang.
-    let configs = reth_env.get_worker_fee_configs(num_workers)?;
-    for (worker_id, config) in configs.into_iter().enumerate() {
-        let worker_id = worker_id as u16;
-        let (_blocks, gas_used, _gas_limit) = gas_accumulator.get_values(worker_id);
-        let base_fee = gas_accumulator.base_fee(worker_id);
-        let next_base_fee = next_base_fee_for_config(config, base_fee.base_fee(), gas_used);
-        base_fee.set_base_fee(next_base_fee);
+    // FAIL-OPEN: a contract-read revert or a numWorkers() drift must not abort the epoch close
+    // The fallback is deterministic (a fixed 1 GWEI for worker 0), so
+    // every committee member that hits the same on-chain condition lands on the same fee and
+    // consensus should not diverge.
+    match reth_env.get_worker_fee_configs(num_workers) {
+        Ok(configs) => {
+            for (worker_id, config) in configs.into_iter().enumerate() {
+                let worker_id = worker_id as u16;
+                let (_blocks, gas_used, _gas_limit) = gas_accumulator.get_values(worker_id);
+                let base_fee = gas_accumulator.base_fee(worker_id);
+                let next_base_fee = next_base_fee_for_config(config, base_fee.base_fee(), gas_used);
+                base_fee.set_base_fee(next_base_fee);
+            }
+        }
+        Err(e) => {
+            warn!(
+                target: "epoch-manager",
+                ?e,
+                "failed to read worker fee configs at epoch close - falling back to {FALLBACK_BASE_FEE} wei for worker 0"
+            );
+            gas_accumulator.base_fee(0).set_base_fee(FALLBACK_BASE_FEE);
+        }
     }
-    Ok(())
 }
+
+/// Deterministic base fee (1 GWEI) applied to worker 0 when the `WorkerConfigs` contract read
+/// fails at epoch close.
+const FALLBACK_BASE_FEE: u64 = 1_000_000_000;
 
 /// Apply a worker's [`WorkerFeeConfig`] to compute its next-epoch base fee.
 ///
@@ -771,5 +788,13 @@ mod tests {
 
         assert_eq!(acc.base_fee(0).base_fee(), 111); // seeded from chain
         assert_eq!(acc.base_fee(1).base_fee(), 2000); // untouched
+    }
+
+    #[test]
+    fn fallback_base_fee_is_one_gwei() {
+        // The fail-open fallback in adjust_base_fees must stay a fixed 1 GWEI: it is applied
+        // independently by every committee member, so determinism (and thus consensus) depends on
+        // this exact value.
+        assert_eq!(FALLBACK_BASE_FEE, 1_000_000_000);
     }
 }
