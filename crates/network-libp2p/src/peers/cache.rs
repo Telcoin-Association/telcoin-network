@@ -23,7 +23,7 @@ struct Element<Key> {
 /// This implementation requires manually managing the cache.
 /// The cache is intended to only be updated during the peer manager's heartbeat interval.
 #[derive(Debug)]
-pub(super) struct BannedPeerCache<Key> {
+pub(crate) struct BannedPeerCache<Key> {
     /// The duplicate cache.
     map: HashSet<Key>,
     /// A list of keys sorted by the time they were inserted.
@@ -37,14 +37,14 @@ where
     Key: Eq + std::hash::Hash + Clone,
 {
     /// Create a new instance of `Self`.
-    pub(super) fn new(duration: Duration) -> Self {
+    pub(crate) fn new(duration: Duration) -> Self {
         BannedPeerCache { map: HashSet::default(), list: VecDeque::new(), duration }
     }
 
     /// Insert a key and return true if the key does not already exist.
     ///
     /// NOTE: this does not remove expired elements
-    pub(super) fn insert(&mut self, key: Key) -> bool {
+    pub(crate) fn insert(&mut self, key: Key) -> bool {
         // insert into the map
         let is_new = self.map.insert(key.clone());
 
@@ -67,7 +67,7 @@ where
     /// Remove a key from the cache and return true if the key existed.
     ///
     /// NOTE: this does not remove expired elements
-    pub(super) fn remove(&mut self, key: &Key) -> bool {
+    pub(crate) fn remove(&mut self, key: &Key) -> bool {
         if self.map.remove(key) {
             let position = self.list.iter().position(|e| &e.key == key).expect("Key must exist");
             self.list.remove(position).expect("Position is not occupied");
@@ -81,7 +81,7 @@ where
     ///
     /// The method is called during the peer manager's heartbeat interval to limit constant polling
     /// for the cache.
-    pub(super) fn heartbeat(&mut self) -> Vec<Key> {
+    pub(crate) fn heartbeat(&mut self) -> Vec<Key> {
         if self.list.is_empty() {
             return Vec::new();
         }
@@ -105,12 +105,12 @@ where
     }
 
     /// Check if the key is in the cache.
-    pub(super) fn contains(&self, key: &Key) -> bool {
+    pub(crate) fn contains(&self, key: &Key) -> bool {
         self.map.contains(key)
     }
 
     /// Return the number of elements in the cache.
-    pub(super) fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.map.len()
     }
 

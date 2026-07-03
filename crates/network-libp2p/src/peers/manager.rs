@@ -23,9 +23,18 @@ use std::{
     task::Context,
 };
 use tn_config::PeerConfig;
-use tn_types::BlsPublicKey;
+use tn_types::{now, BlsPublicKey};
 use tokio::sync::oneshot;
 use tracing::{debug, error, trace, warn};
+
+/// Evict `known_peers` records that have not been refreshed within this window.
+///
+/// Node records are republished on the kad publication interval (12h), so three missed
+/// publications means the node is gone, unreachable, or rotated away; its record is
+/// refetchable via a kad lookup (`MissingAuthorities`) if it returns. Committee members
+/// (previous, current, or next) and important peers are never evicted regardless of age.
+/// Without eviction the map grows with every peer identity ever learned.
+const KNOWN_PEERS_STALE_TIMEOUT_SECS: u64 = 36 * 60 * 60;
 
 #[cfg(test)]
 #[path = "../tests/peer_manager.rs"]
@@ -308,6 +317,38 @@ impl PeerManager {
 
         // manage discovery peers
         self.discovery_heartbeat();
+
+        // evict stale known-peer records
+        self.prune_stale_known_peers();
+    }
+
+    /// Evict known-peer records older than [`KNOWN_PEERS_STALE_TIMEOUT_SECS`].
+    ///
+    /// Committee members (previous/current/next) and important peers (validators or
+    /// operator-allowlisted) are always retained so bootstrapping and committee dialing keep
+    /// their network info regardless of record age.
+    fn prune_stale_known_peers(&mut self) {
+        let current_time = now();
+        let peers = &self.peers;
+        self.known_peers.retain(|bls_key, info| {
+            if peers.is_committee_bls(bls_key) {
+                return true;
+            }
+            let peer_id: PeerId = info.pubkey.clone().into();
+            if peers.is_peer_validator(&peer_id)
+                || peers.get_peer(&peer_id).map(|p| p.is_operator_allowlisted()).unwrap_or_default()
+            {
+                return true;
+            }
+            // timestamps come from the publisher's clock; saturate so a future-dated record
+            // is simply treated as fresh
+            let stale =
+                current_time.saturating_sub(info.timestamp) > KNOWN_PEERS_STALE_TIMEOUT_SECS;
+            if stale {
+                debug!(target: "peer-manager", ?bls_key, timestamp=info.timestamp, "evicting stale known peer record");
+            }
+            !stale
+        });
     }
 
     /// Apply a [PeerAction].

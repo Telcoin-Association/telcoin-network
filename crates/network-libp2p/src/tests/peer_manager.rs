@@ -1454,3 +1454,56 @@ async fn test_discovery_heartbeat_removes_banned_ip_peers() {
     // discovery peer with banned ip should be removed
     assert!(!peer_manager.discovery_peers.contains_key(&discovery_peer));
 }
+
+#[tokio::test]
+async fn test_prune_stale_known_peers() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let mut rng = StdRng::from_seed([11; 32]);
+    let stale_timestamp = now() - KNOWN_PEERS_STALE_TIMEOUT_SECS - 1;
+
+    // a committee member with an ancient record: never evicted
+    let committee_bls = *BlsKeypair::generate(&mut rng).public();
+    let committee_netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let committee_info = NetworkInfo {
+        pubkey: committee_netkey,
+        multiaddrs: vec![create_multiaddr(None)],
+        timestamp: stale_timestamp,
+        rpc: None,
+    };
+    peer_manager.add_known_peer(committee_bls, committee_info);
+    peer_manager.update_committees(HashSet::new(), HashSet::from([committee_bls]), HashSet::new());
+
+    // a stale non-committee peer: evicted
+    let stale_bls = *BlsKeypair::generate(&mut rng).public();
+    let stale_netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let stale_info = NetworkInfo {
+        pubkey: stale_netkey,
+        multiaddrs: vec![create_multiaddr(None)],
+        timestamp: stale_timestamp,
+        rpc: None,
+    };
+    peer_manager.add_known_peer(stale_bls, stale_info);
+
+    // a fresh non-committee peer: retained
+    let fresh_bls = *BlsKeypair::generate(&mut rng).public();
+    let fresh_netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let fresh_info = NetworkInfo {
+        pubkey: fresh_netkey,
+        multiaddrs: vec![create_multiaddr(None)],
+        timestamp: now(),
+        rpc: None,
+    };
+    peer_manager.add_known_peer(fresh_bls, fresh_info);
+
+    peer_manager.prune_stale_known_peers();
+
+    assert!(
+        peer_manager.known_peers.contains_key(&committee_bls),
+        "committee member must never be evicted, regardless of record age"
+    );
+    assert!(
+        !peer_manager.known_peers.contains_key(&stale_bls),
+        "stale non-committee record must be evicted"
+    );
+    assert!(peer_manager.known_peers.contains_key(&fresh_bls), "fresh record must be retained");
+}
