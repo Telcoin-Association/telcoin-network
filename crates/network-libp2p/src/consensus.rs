@@ -7,7 +7,7 @@ use crate::{
     error::NetworkError,
     kad::KadStore,
     metrics::{PeerManagerMetrics, SwarmMetrics},
-    peers::{self, PeerEvent, PeerManager, Penalty},
+    peers::{self, BannedPeerCache, PeerEvent, PeerManager, Penalty},
     send_or_log_error,
     stream::{StreamBehavior, StreamEvent},
     types::{
@@ -50,6 +50,13 @@ use tracing::{debug, error, info, instrument, trace, warn};
 #[cfg(test)]
 #[path = "tests/network_tests.rs"]
 mod network_tests;
+
+/// How long a peer stays in [`ConsensusNetwork::published_to_peers`] after its last connect.
+///
+/// Within the window, reconnects (flapping peers) do not trigger another direct record push;
+/// each reconnect refreshes the entry. After the window the entry is evicted and a returning
+/// peer simply receives the record again.
+const PUBLISHED_TO_PEERS_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// Custom network libp2p behaviour type for Telcoin Network.
 ///
@@ -173,14 +180,16 @@ where
     ///
     /// The external address is self-reported and unconfirmed.
     node_record: NodeRecord,
-    /// Peers we have already pushed our [NodeRecord] to.
+    /// Peers we have recently pushed our [NodeRecord] to.
     ///
     /// A peer connecting for the first time needs our record before it can resolve
     /// our BLS key, so we push it on `PeerConnected`. A peer that reconnects (or that
     /// flaps repeatedly, as observed with banned peers in adiri testnet) should already have
-    /// the record in their persistent kad store. This list is per-process-lifetime in case nodes
-    /// restart.
-    published_to_peers: HashSet<PeerId>,
+    /// the record in their persistent kad store, so entries dedup the push for
+    /// [`PUBLISHED_TO_PEERS_TTL`] (refreshed on every reconnect). The time bound keeps the
+    /// set from growing with every peer identity ever connected; a re-push after long
+    /// absence is harmless.
+    published_to_peers: BannedPeerCache<PeerId>,
     /// Prometheus metrics for swarm-level events (gossip, requests).
     metrics: SwarmMetrics,
 }
@@ -396,7 +405,7 @@ where
             key_config,
             task_spawner,
             node_record,
-            published_to_peers: HashSet::new(),
+            published_to_peers: BannedPeerCache::new(PUBLISHED_TO_PEERS_TTL),
             metrics: SwarmMetrics::new_for(&network_type),
         })
     }
@@ -1190,6 +1199,12 @@ where
             PeerEvent::PeerDisconnected(peer_id) => {
                 debug!(target: "network", ?peer_id, "peer disconnected event from peer manager");
 
+                // Mirror the add on PeerConnected so the explicit-peer set tracks connected
+                // important peers instead of accumulating every one ever connected (no-op if
+                // the peer was never added). Reconnecting important peers are re-added; the
+                // peer manager owns committee re-dialing, not gossipsub's explicit-peer check.
+                self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+
                 // Check if there are any connections still in the pool
                 if self.swarm.is_connected(&peer_id) {
                     warn!(
@@ -1288,7 +1303,10 @@ where
 
                 // First-time connections need a direct record push so the peer can resolve
                 // our BLS key without waiting for the next kad publication interval. Skip
-                // on reconnects to avoid amplifying the local kad store on flapping peers
+                // on reconnects to avoid amplifying the local kad store on flapping peers.
+                // Connects are the only growth source, so evicting expired entries here
+                // keeps the cache bounded without a dedicated timer.
+                let _ = self.published_to_peers.heartbeat();
                 if self.published_to_peers.insert(peer_id) {
                     self.publish_our_data_to_peer(peer_id);
                 }
@@ -1303,6 +1321,9 @@ where
             }
             PeerEvent::Banned(peer_id) => {
                 warn!(target: "network", ?peer_id, "peer banned");
+                // a banned peer must not linger as a gossipsub explicit peer (explicit peers
+                // are re-dialed by gossipsub and always forwarded to)
+                self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                 // blacklist gossipsub
                 self.swarm.behaviour_mut().gossipsub.blacklist_peer(&peer_id);
                 // remove from kad routing table

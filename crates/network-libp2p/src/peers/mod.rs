@@ -9,6 +9,7 @@ mod peer;
 mod score;
 mod status;
 mod types;
+pub(crate) use cache::BannedPeerCache;
 pub(crate) use manager::PeerManager;
 pub(crate) use types::PeerEvent;
 pub use types::{PeerExchangeMap, Penalty};

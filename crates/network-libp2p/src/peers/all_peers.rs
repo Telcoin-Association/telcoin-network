@@ -826,6 +826,16 @@ impl AllPeers {
         self.bls_by_peer_id.get(peer_id).copied()
     }
 
+    /// Boolean indicating if this bls key belongs to the previous, current, or next committee.
+    ///
+    /// Same membership window as [`Self::is_peer_validator`], keyed directly by
+    /// [`BlsPublicKey`] for callers that do not have (or cannot rely on) a peer record.
+    pub(super) fn is_committee_bls(&self, bls_public_key: &BlsPublicKey) -> bool {
+        self.previous_committee.contains(bls_public_key)
+            || self.current_committee.contains(bls_public_key)
+            || self.next_committee.contains(bls_public_key)
+    }
+
     /// Boolean indicating if this peer is a validator in the previous, current, or next committee.
     ///
     /// Membership spans all three tracked committees so peers from the just-completed epoch are not
