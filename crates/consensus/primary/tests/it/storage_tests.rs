@@ -492,3 +492,41 @@ async fn test_certificate_store_delete_store() {
 
     assert!(store.get::<CertificateDigestByOrigin>(&key_0).unwrap().is_none());
 }
+
+/// Mini-soak of the production certificate write path over the composite DB stack.
+///
+/// Sustained rounds of [`CertificateStore::write`] (one txn + commit per certificate into the
+/// full-memory epoch layer, plus the gc txn) must not retain inserts or leave txns open in the
+/// background layered-DB threads. Regression coverage for the unbounded `committed_inserts`
+/// growth on full-memory DBs that leaked a clone of every certificate ever written.
+#[tokio::test]
+async fn test_certificate_store_soak_no_retained_inserts() {
+    let temp_dir = TempDir::new().unwrap();
+    let store = open_db(temp_dir.path());
+
+    // sustained rounds through the production write path
+    let certs = certificates(20);
+    let count = certs.len();
+    assert!(count >= 80, "expected 4 certs per round for 20 rounds");
+    for cert in &certs {
+        store.write(cert.clone()).expect("write cert");
+    }
+    store.sync_persist();
+
+    let stats = store.stats().expect("stats");
+    assert_eq!(
+        stats.epoch.retained_inserts, 0,
+        "epoch layer retained inserts after {count} certificate writes: {stats:?}"
+    );
+    assert_eq!(stats.epoch.open_txn_count, 0, "epoch layer wedged txn count: {stats:?}");
+    assert_eq!(stats.kad.retained_inserts, 0, "kad layer retained inserts: {stats:?}");
+    assert_eq!(stats.kad.open_txn_count, 0, "kad layer wedged txn count: {stats:?}");
+    assert_eq!(stats.cache.retained_inserts, 0, "cache layer retained inserts: {stats:?}");
+    assert_eq!(stats.cache.open_txn_count, 0, "cache layer wedged txn count: {stats:?}");
+
+    // all certificates remain readable
+    for cert in certs {
+        let read = store.read(cert.digest()).expect("read cert");
+        assert_eq!(read, Some(cert));
+    }
+}
