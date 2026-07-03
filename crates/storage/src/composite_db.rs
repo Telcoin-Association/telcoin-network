@@ -451,6 +451,29 @@ mod test {
     }
 
     #[test]
+    fn test_compositedb_dropped_txn_recovers() {
+        use tn_types::DbTxMut as _;
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let db = open_mdbx(&temp_dir.path().join("mdbx_dropped_txn_1"));
+
+        // drop a composite txn without committing — the underlying layered txn must be
+        // ended so later commits still persist
+        let mut dropped = db.write_txn().expect("write txn");
+        dropped.insert::<TestTable>(&1, &"one".to_string()).expect("insert");
+        drop(dropped);
+
+        let mut txn = db.write_txn().expect("write txn");
+        txn.insert::<TestTable>(&2, &"two".to_string()).expect("insert");
+        txn.commit().expect("commit");
+        db.sync_persist();
+
+        assert_eq!(db.get::<TestTable>(&1).expect("get"), Some("one".to_string()));
+        assert_eq!(db.get::<TestTable>(&2).expect("get"), Some("two".to_string()));
+        let stats = db.stats().expect("stats");
+        assert_eq!(stats, super::CompositeDbStats::default());
+    }
+
+    #[test]
     fn test_compositedb_dbsimpbench() {
         // Init a DB
         let temp_dir = tempdir().expect("failed to create temp dir");
