@@ -48,6 +48,7 @@ pub use alloy::{
     consensus::{
         constants::{EMPTY_OMMER_ROOT_HASH, EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS},
         proofs::calculate_transaction_root,
+        transaction::TransactionMeta,
         BlockHeader, Header as ExecHeader, SignableTransaction, Transaction as TransactionTrait,
         TxEip1559,
     },
@@ -60,8 +61,8 @@ pub use alloy::{
     genesis::{Genesis, GenesisAccount},
     hex::{self, FromHex},
     primitives::{
-        address, hex_literal, keccak256, Address, BlockHash, BlockNumber, Bloom, Bytes, Sealable,
-        TxHash, TxKind, B256, U160, U256,
+        address, hex_literal, keccak256, Address, BlockHash, BlockNumber, Bloom, Bytes, Log,
+        LogData, Sealable, TxHash, TxKind, TxNumber, B256, U160, U256,
     },
     rpc::types::{AccessList, Withdrawals},
     signers::Signature as EthSignature,
@@ -70,6 +71,6 @@ pub use alloy::{
 };
 pub use libp2p::{multiaddr::Protocol, Multiaddr};
 pub use reth_primitives::{
-    Block, BlockBody, EthPrimitives, NodePrimitives, PooledTransaction, Receipt, Recovered,
-    RecoveredBlock, SealedBlock, SealedHeader, Transaction, TransactionSigned,
+    Account, Block, BlockBody, EthPrimitives, NodePrimitives, PooledTransaction, Receipt,
+    Recovered, RecoveredBlock, SealedBlock, SealedHeader, Transaction, TransactionSigned,
 };

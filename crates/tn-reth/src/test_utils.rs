@@ -20,12 +20,10 @@ use alloy::{
 };
 use reth_chainspec::{ChainSpec as RethChainSpec, EthChainSpec};
 use reth_evm::{execute::Executor as _, ConfigureEvm, EvmFactory as _};
-use reth_primitives::{sign_message, Account};
+use reth_primitives::sign_message;
 use reth_primitives_traits::SignerRecoverable;
-use reth_provider::{AccountReader as _, StateProvider, StateProviderBox, StateProviderFactory};
-use reth_revm::{
-    context::result::ResultAndState, database::StateProviderDatabase, db::BundleState, State,
-};
+use reth_provider::{StateProvider, StateProviderBox, StateProviderFactory};
+use reth_revm::{database::StateProviderDatabase, db::BundleState, State};
 use reth_transaction_pool::{EthPoolTransaction, EthPooledTransaction, PoolTransaction};
 use secp256k1::{
     rand::{rngs::StdRng, Rng, SeedableRng as _},
@@ -69,11 +67,6 @@ impl RethEnv {
         Ok(self.inner.blockchain_provider.state_by_block_hash(hash)?)
     }
 
-    /// Retrieve the account balance.
-    pub fn retrieve_account(&self, address: &Address) -> TnRethResult<Option<Account>> {
-        Ok(self.inner.blockchain_provider.basic_account(address)?)
-    }
-
     /// Create an EVM-environment from state provider.
     pub fn tn_evm(&self, hash: BlockHash) -> eyre::Result<TNEvmTestType> {
         let header = self.header(hash)?.expect("provided hash in header table");
@@ -87,21 +80,6 @@ impl RethEnv {
             .evm_config
             .evm_factory()
             .create_evm(db, self.inner.evm_config.evm_env(&header)?))
-    }
-
-    /// Execute a read-only system call against a contract and return the result.
-    ///
-    /// Useful for integration tests that need to read precompile state after
-    /// block execution without importing the `Evm` trait.
-    pub fn read_contract_state(
-        &self,
-        block_hash: BlockHash,
-        contract: Address,
-        calldata: Bytes,
-    ) -> eyre::Result<ResultAndState> {
-        use reth_evm::Evm;
-        let mut evm = self.tn_evm(block_hash)?;
-        Ok(evm.transact_system_call(crate::system_calls::SYSTEM_ADDRESS, contract, calldata)?)
     }
 
     /// Test utility to execute batch and return execution outcome.
