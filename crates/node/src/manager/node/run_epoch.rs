@@ -144,7 +144,7 @@ where
 
         // Base-fee-from-chain seeding: if the canonical tip is already in the epoch we are
         // entering, adopt each worker's latest on-chain base fee rather than recomputing. This
-        // covers syncing and restarting nodes -- they execute the fee already baked into the chain.
+        // covers syncing and restarting nodes: they execute the fee already baked into the chain.
         // A live producer crossing N->N+1 still has its tip in N here, so seeding is skipped and
         // the value adjust_base_fees computed at the boundary is kept. (See gas_accumulator docs.)
         {
@@ -588,12 +588,14 @@ where
         // Only the live producer (Some(shutdown)) holds a complete accumulator for the epoch it
         // just closed and may compute the next fee forward. Restart/leftover paths (None) defer to
         // epoch-start chain seeding so a catching-up node never diverges from the chain.
-        let live_boundary = shutdown_consensus.is_some();
+        let mut live_boundary = false;
         // begin consensus shutdown while engine executes
         if let Some(s) = shutdown_consensus {
-            s.notify()
+            s.notify();
+            live_boundary = true;
         }
         self.consensus_bus.wait_for_consensus_execution(target_hash).await?;
+        // adjust basefees after final execution
         if live_boundary {
             adjust_base_fees(gas_accumulator);
         }
@@ -637,6 +639,7 @@ fn seed_base_fees_from_chain(
     gas_accumulator: &GasAccumulator,
 ) {
     if tip_epoch != entered_epoch {
+        // new epoch - calculate fees from accumulated epoch gas
         return;
     }
     for worker_id in 0..gas_accumulator.num_workers() as u16 {
