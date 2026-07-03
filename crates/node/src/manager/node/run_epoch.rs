@@ -573,7 +573,7 @@ fn adjust_base_fees(gas_accumulator: &GasAccumulator) {
         let worker_id = worker_id as u16;
         let (_blocks, gas_used, _gas_limit) = gas_accumulator.get_values(worker_id);
         let base_fee = gas_accumulator.base_fee(worker_id);
-        // u64::MAX target => inert: floors at MIN until governance targets are read (PR6).
+        // u64::MAX target => inert: floors at MIN until governance targets are read.
         let next_base_fee = compute_next_base_fee_eip1559(base_fee.base_fee(), gas_used, u64::MAX);
         base_fee.set_base_fee(next_base_fee);
     }
@@ -588,8 +588,7 @@ mod tests {
     fn adjust_base_fees_keeps_workers_at_min() {
         // Production starting point: every worker's base fee defaults to MIN. With the u64::MAX
         // target the fee can only ratchet down and is floored at MIN, so a worker that starts at
-        // MIN stays at MIN regardless of how much gas it used. This is the inert guarantee that
-        // keeps PR1-PR5 behavior-preserving.
+        // MIN stays at MIN regardless of how much gas it used.
         let acc = GasAccumulator::new(2);
         assert_eq!(acc.base_fee(0).base_fee(), MIN_PROTOCOL_BASE_FEE);
         assert_eq!(acc.base_fee(1).base_fee(), MIN_PROTOCOL_BASE_FEE);
