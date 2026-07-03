@@ -30,6 +30,25 @@ use tokio::{
     time::error::Elapsed,
 };
 
+/// Capacity for the `sync_output` broadcast.
+///
+/// Items are full [`ConsensusOutput`]s (subdag + batches), so a deep buffer costs hundreds of
+/// MB when a follower lags. The state-sync producer waits for execution to catch up before each
+/// send and fails fast on a digest-chain mismatch, so a deep buffer buys nothing: 1_000 bounds
+/// worst-case memory while still absorbing bursts.
+const SYNC_OUTPUT_CHANNEL_CAPACITY: usize = 1_000;
+/// Capacity for the `exex_certificates` broadcast.
+///
+/// Certificates are small but arrive every round forever; a lagging ExEx reconciles via its
+/// native `Lagged` handling rather than needing a deep buffer.
+const EXEX_CERTIFICATES_CHANNEL_CAPACITY: usize = 1_000;
+/// Capacity for the `exex_consensus_output` broadcast.
+///
+/// Items are full [`ConsensusOutput`]s. ExEx handles `Lagged` natively (surfaced as
+/// `TnExExNotification::Lagged` reconciliation), so match the engine's `consensus_output`
+/// capacity instead of buffering hundreds of MB for a slow ExEx.
+const EXEX_CONSENSUS_OUTPUT_CHANNEL_CAPACITY: usize = 100;
+
 /// Wrapper around a receiver and a subs count to make sure only one of these exists at a time.
 /// Note this does NOT implement Clone on purpose, do not implement it else managing subscriptions
 /// will break.
@@ -294,11 +313,11 @@ impl ConsensusBusApp {
         let (tx_recent_blocks, _) = watch::channel(RecentBlocks::new(recent_blocks as usize));
         let (tx_sync_status, _) = watch::channel(NodeMode::default());
 
-        let (sync_output, _rx_sync_output) = broadcast::channel(CHANNEL_CAPACITY);
+        let (sync_output, _rx_sync_output) = broadcast::channel(SYNC_OUTPUT_CHANNEL_CAPACITY);
         let (consensus_output, _rx_consensus_output) = broadcast::channel(100);
 
-        let (exex_certificates, _) = broadcast::channel(CHANNEL_CAPACITY);
-        let (exex_consensus_output, _) = broadcast::channel(CHANNEL_CAPACITY);
+        let (exex_certificates, _) = broadcast::channel(EXEX_CERTIFICATES_CHANNEL_CAPACITY);
+        let (exex_consensus_output, _) = broadcast::channel(EXEX_CONSENSUS_OUTPUT_CHANNEL_CAPACITY);
 
         let (tx_epoch_record, _) = watch::channel(None);
 
