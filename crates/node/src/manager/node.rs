@@ -55,6 +55,16 @@ pub(crate) const WORKER_TASK_BASE: &str = "Worker Task";
 /// a small bound is enough and keeps a buggy ExEx from growing it without limit.
 const EXEX_EVENT_CAPACITY: usize = 16;
 
+/// Capacity of the manager → engine `to_engine` channel.
+///
+/// Each item is a full [`ConsensusOutput`] (subdag + batches), and the engine additionally
+/// bounds its own backlog at [`tn_engine::MAX_QUEUED_OUTPUTS`], so total in-flight memory is
+/// capped at roughly `TO_ENGINE_CAPACITY + MAX_QUEUED_OUTPUTS` outputs. A deep channel here
+/// would defeat the engine's bound by buffering the backlog one hop upstream; 64 absorbs
+/// bursts (e.g. restart replay) while a persistently full channel backpressures the epoch
+/// manager's forwarder instead of consuming memory.
+const TO_ENGINE_CAPACITY: usize = 64;
+
 /// The long-running owner that oversees epoch transitions.
 ///
 /// One instance exists for the lifetime of the process. It holds the resources that must survive
@@ -339,12 +349,18 @@ where
         // Prime the last forwarded consensus number at startup.
         // Normally this is not needed but is a layer of safety in case
         // run_epoch() does not process any output for some reason.
-        self.last_forwarded_consensus_number = self.consensus_chain.latest_consensus_number();
+        // Use the same anchor the subscriber numbers new output from (pack ground truth,
+        // falling back over the executed tip) rather than the slot-file hint: the hint can be
+        // stale after a hard crash, and a low prime would make `wait_for_epoch_boundary`'s
+        // continuity check report a spurious gap on the first live output (and the leftover
+        // drain re-forward already-executed output).
+        self.last_forwarded_consensus_number =
+            state_sync::last_consensus_parent(&self.consensus_bus, &self.consensus_chain).await.1;
 
         info!(target: "epoch-manager", "starting node and launching first epoch");
 
         // create channels for engine that survive the lifetime of the node
-        let (to_engine, for_engine) = mpsc::channel(1000);
+        let (to_engine, for_engine) = mpsc::channel(TO_ENGINE_CAPACITY);
 
         // Create our epoch gas accumulator, we currently have one worker.
         // All nodes have to agree on the worker count, do not change this for an existing chain.
