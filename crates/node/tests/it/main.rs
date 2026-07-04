@@ -591,6 +591,11 @@ async fn test_sync_num_workers_from_chain_adjusts_to_on_chain_count() -> eyre::R
 
 /// FAIL-OPEN: on a chain without the `WorkerConfigs` contract (older networks), the worker-count
 /// sync must keep the accumulator's current size and return without error.
+///
+/// The accumulator starts at 3 workers (not 1) so the assertion discriminates the fail-open
+/// branch (failed read => keep current count) from a regression that resizes anyway: a failed
+/// read yielding 0 would clamp to 1 in `set_num_workers`, indistinguishable from fail-open when
+/// starting at 1, but a drop from 3 to 1 fails the assertion.
 #[tokio::test]
 async fn test_sync_num_workers_fail_open_when_contract_absent() -> eyre::Result<()> {
     let temp_dir = TempDir::with_prefix("sync_num_workers_fail_open")?;
@@ -603,9 +608,10 @@ async fn test_sync_num_workers_fail_open_when_contract_absent() -> eyre::Result<
     let reth_env = execution_node.get_reth_env().await;
     let epoch_first_block = reth_env.epoch_state_from_canonical_tip()?.epoch_info.blockHeight;
 
-    let gas_accumulator = GasAccumulator::new(1);
+    // 3 sits above the >=1 clamp, so only the Err => keep-current branch preserves it
+    let gas_accumulator = GasAccumulator::new(3);
     sync_num_workers_from_chain(&reth_env, &gas_accumulator, epoch_first_block);
-    assert_eq!(gas_accumulator.num_workers(), 1, "fail-open keeps the current worker count");
+    assert_eq!(gas_accumulator.num_workers(), 3, "fail-open keeps the current worker count");
 
     Ok(())
 }
