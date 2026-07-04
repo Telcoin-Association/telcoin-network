@@ -24,7 +24,7 @@ use std::{
 use tn_config::{NetworkConfig, TelcoinDirs};
 use tn_executor::subscriber::spawn_subscriber;
 use tn_primary::ConsensusBus;
-use tn_reth::RethEnv;
+use tn_reth::{error::StateReadError, RethEnv};
 use tn_storage::{certificate_pack::CertificatePack, tables::OurNodeBatchesCache};
 use tn_types::{
     gas_accumulator::{compute_next_base_fee_eip1559, GasAccumulator, WorkerFeeConfig},
@@ -691,7 +691,7 @@ where
         self.consensus_bus.wait_for_consensus_execution(target_hash).await?;
         // adjust basefees after final execution
         if live_boundary {
-            adjust_base_fees(reth_env, gas_accumulator)?;
+            adjust_base_fees(reth_env, gas_accumulator).await?;
         }
         gas_accumulator.clear(); // Clear the accumlated values for next epoch.
         Ok(())
@@ -713,14 +713,20 @@ where
 /// just added get their configured fee (e.g. `Static`) computed here rather than defaulting to
 /// MIN; epoch-entry sync then confirms the same count from the same block.
 ///
-/// Fails ONLY on an F17 identity violation (below). If a contract read fails, the current
-/// per-worker base fees and worker count are kept unchanged instead of aborting the epoch close
-/// (see the FAIL-OPEN note in the body).
+/// Fails on an F17 identity violation (below) or when a node-local provider fault persists
+/// through [`CLOSE_READ_ATTEMPTS`] tries of either chain read (F4: such a fault is NOT
+/// committee-deterministic, so producing on possibly-stale fees is a safety risk while halting is
+/// only a single-node liveness failure). A CHAIN-GLOBAL read failure instead keeps the current
+/// per-worker base fees and worker count unchanged rather than aborting the epoch close (see the
+/// FAIL-OPEN note in the body).
 ///
 /// Inert on existing chains: the genesis fee strategy is `Eip1559 { target_gas: u64::MAX }`, which
 /// floors every worker at `MIN_PROTOCOL_BASE_FEE`. Fees only move once governance sets a real
 /// per-worker target.
-fn adjust_base_fees(reth_env: &RethEnv, gas_accumulator: &GasAccumulator) -> eyre::Result<()> {
+async fn adjust_base_fees(
+    reth_env: &RethEnv,
+    gas_accumulator: &GasAccumulator,
+) -> eyre::Result<()> {
     // F16 one-header discipline: pin the canonical tip ONCE. Inside `Self::close_epoch` (after
     // `wait_for_consensus_execution`) this IS the epoch's closing block; the F17 identity check
     // and the WorkerConfigs read below both resolve against this single header.
@@ -732,48 +738,77 @@ fn adjust_base_fees(reth_env: &RethEnv, gas_accumulator: &GasAccumulator) -> eyr
     // implicit - it silently depends on the contract's `+1` convention and on no block executing
     // between the close and this read. Assert it against the newly-recorded epoch info at the SAME
     // pinned tip before touching fees, so a future multi-block-boundary or contract change trips
-    // loudly here instead of pricing fees off a non-closing block. A read failure is fail-open
-    // (keep current fees, like the config read); only a proven VIOLATION halts.
-    match reth_env.epoch_state_at_header(&tip) {
-        Ok(epoch_state) => {
-            let block_height = epoch_state.epoch_info.blockHeight;
-            debug_assert_eq!(
-                tip.number + 1,
-                block_height,
-                "close-time base-fee identity: canonical tip {} + 1 != entered-epoch {} \
-                 blockHeight {block_height}",
+    // loudly here instead of pricing fees off a non-closing block.
+    //
+    // READ-FAILURE POLICY (F4): both this identity read and the config read below are consensus
+    // inputs, so their failures are classified by committee determinism (`StateReadError`):
+    // - ChainGlobal (contract absent, revert, decode, arity) is a deterministic product of the
+    //   pinned chain state — every committee member hitting it lands on the same kept-current
+    //   fees/count, so keep-current fail-open is committee-consistent.
+    // - Provider (node-local storage/provider fault) is NOT committee-deterministic: peers may read
+    //   successfully and advance their fees while this node would keep stale ones, and the
+    //   exact-equality basefee validation would then reject every peer batch (and peers reject
+    //   ours) for the entire epoch. Retry briefly, then HALT — never silently keep-current.
+    // Only a proven identity VIOLATION or an exhausted provider fault halts.
+    let (entered_epoch, epoch_info) = match retry_provider_faults(
+        "close-time epoch info (identity check)",
+        || reth_env.get_current_epoch_info_at_header(&tip),
+    )
+    .await
+    {
+        Ok(read) => read,
+        Err(e @ StateReadError::Provider(_)) => {
+            return Err(eyre::eyre!(
+                "node-local provider fault reading epoch info at closing tip {} ({:?}) after \
+                     {CLOSE_READ_ATTEMPTS} attempts - refusing to price base fees this node \
+                     cannot verify: {e}",
                 tip.number,
-                epoch_state.epoch,
-            );
-            if tip.number + 1 != block_height {
-                return Err(eyre::eyre!(
-                    "close-time base-fee identity violated: canonical tip {} + 1 != entered-epoch \
-                     {} blockHeight {block_height} at tip {:?} - refusing to price base fees off a \
-                     non-closing block",
-                    tip.number,
-                    epoch_state.epoch,
-                    tip.hash(),
-                ));
-            }
+                tip.hash(),
+            ));
         }
-        Err(e) => {
+        Err(e @ StateReadError::ChainGlobal(_)) => {
             warn!(
                 target: "epoch-manager",
                 ?e,
                 tip_number = tip.number,
-                "failed to read epoch state at canonical tip for the close-time base-fee identity check - keeping current per-worker base fees and worker count"
+                "chain-global failure reading epoch info at canonical tip for the close-time base-fee identity check - keeping current per-worker base fees and worker count (committee-deterministic)"
             );
             return Ok(());
         }
+    };
+
+    let block_height = epoch_info.blockHeight;
+    debug_assert_eq!(
+        tip.number + 1,
+        block_height,
+        "close-time base-fee identity: canonical tip {} + 1 != entered-epoch {entered_epoch} \
+         blockHeight {block_height}",
+        tip.number,
+    );
+    if tip.number + 1 != block_height {
+        return Err(eyre::eyre!(
+            "close-time base-fee identity violated: canonical tip {} + 1 != entered-epoch \
+             {entered_epoch} blockHeight {block_height} at tip {:?} - refusing to price base fees \
+             off a non-closing block",
+            tip.number,
+            tip.hash(),
+        ));
     }
 
-    // FAIL-OPEN: a contract-read failure must not abort the epoch close. Keep the current
-    // per-worker base fees and worker count untouched -- both are already consensus-consistent
-    // (seeded from the same chain at epoch entry, then held deterministic within the epoch), so
-    // every committee member that hits the same read failure lands on the same state. The count
+    // FAIL-OPEN (CHAIN-GLOBAL FAILURES ONLY): a chain-global config-read failure must not abort
+    // the epoch close. Keep the current per-worker base fees and worker count untouched -- both
+    // are already consensus-consistent (seeded from the same chain at epoch entry, then held
+    // deterministic within the epoch), and a chain-global failure is a deterministic product of
+    // the pinned block, so EVERY committee member hits it and lands on the same state. The count
     // self-heals at the next epoch entry via `sync_num_workers_from_chain`, which fails open the
-    // same way. Pinned to the SAME `tip` the identity check validated (F16 one-header discipline).
-    match reth_env.get_worker_fee_configs_at_block(tip.hash()) {
+    // same way. A node-local provider fault is NOT committee-deterministic (peers may read fine
+    // and move to the new fees), so it must never fail open: retry, then halt. Pinned to the SAME
+    // `tip` the identity check validated (F16 one-header discipline).
+    match retry_provider_faults("close-time worker fee configs", || {
+        reth_env.get_worker_fee_configs_at_block(tip.hash())
+    })
+    .await
+    {
         Ok((_num_workers, configs)) => {
             gas_accumulator.set_num_workers(configs.len());
             for (worker_id, config) in configs.into_iter().enumerate() {
@@ -784,15 +819,62 @@ fn adjust_base_fees(reth_env: &RethEnv, gas_accumulator: &GasAccumulator) -> eyr
                 base_fee.set_base_fee(next_base_fee);
             }
         }
-        Err(e) => {
+        Err(e @ StateReadError::Provider(_)) => {
+            return Err(eyre::eyre!(
+                "node-local provider fault reading worker fee configs at closing tip {} ({:?}) \
+                 after {CLOSE_READ_ATTEMPTS} attempts - refusing to price base fees this node \
+                 cannot verify: {e}",
+                tip.number,
+                tip.hash(),
+            ));
+        }
+        Err(e @ StateReadError::ChainGlobal(_)) => {
             warn!(
                 target: "epoch-manager",
                 ?e,
-                "failed to read worker fee configs at epoch close - keeping current per-worker base fees and worker count"
+                "chain-global failure reading worker fee configs at epoch close - keeping current per-worker base fees and worker count (committee-deterministic)"
             );
         }
     }
     Ok(())
+}
+
+/// Total attempts (first try + retries) for each close-time chain read in [`adjust_base_fees`]
+/// before a node-local provider fault halts the close.
+const CLOSE_READ_ATTEMPTS: u32 = 3;
+
+/// Pause between close-time read retries in [`retry_provider_faults`].
+const CLOSE_READ_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Run `read` up to [`CLOSE_READ_ATTEMPTS`] times, sleeping [`CLOSE_READ_RETRY_BACKOFF`] between
+/// tries, retrying ONLY on [`StateReadError::Provider`].
+///
+/// Provider faults are node-local (a transient I/O error may clear on a re-read), so a bounded
+/// retry preserves liveness before the caller escalates to a halt. Chain-global failures are
+/// deterministic products of the pinned block — re-reading cannot change them — so they return
+/// immediately for the caller's fail-open arm. Success passes straight through.
+async fn retry_provider_faults<T>(
+    what: &'static str,
+    mut read: impl FnMut() -> Result<T, StateReadError>,
+) -> Result<T, StateReadError> {
+    let mut attempt = 1u32;
+    loop {
+        match read() {
+            Err(StateReadError::Provider(detail)) if attempt < CLOSE_READ_ATTEMPTS => {
+                warn!(
+                    target: "epoch-manager",
+                    attempt,
+                    max_attempts = CLOSE_READ_ATTEMPTS,
+                    what,
+                    detail,
+                    "node-local provider fault on close-time read - retrying"
+                );
+                attempt += 1;
+                tokio::time::sleep(CLOSE_READ_RETRY_BACKOFF).await;
+            }
+            other => return other,
+        }
+    }
 }
 
 /// Apply a worker's [`WorkerFeeConfig`] to compute its next-epoch base fee.
@@ -851,7 +933,17 @@ fn seed_base_fees_from_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tn_types::MIN_PROTOCOL_BASE_FEE;
+    use std::{cell::Cell, sync::Arc};
+    use tempfile::TempDir;
+    use tn_config::WORKER_CONFIGS_ADDRESS;
+    use tn_reth::{
+        payload::TNPayload, system_calls::CONSENSUS_REGISTRY_ADDRESS,
+        test_utils::test_genesis_with_consensus_registry, NewCanonicalChain, RethChainSpec,
+    };
+    use tn_types::{
+        BlsSignature, Certificate, CommittedSubDag, ConsensusHeader, ReputationScores,
+        SignatureVerificationState, MIN_PROTOCOL_BASE_FEE,
+    };
 
     #[test]
     fn eip1559_config_with_max_target_is_inert_at_min() {
@@ -938,5 +1030,172 @@ mod tests {
 
         assert_eq!(acc.base_fee(0).base_fee(), 111); // seeded from chain
         assert_eq!(acc.base_fee(1).base_fee(), 2000); // untouched
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_provider_faults_halts_after_exhausting_attempts() {
+        // F4 retry-then-halt: a persistent node-local provider fault is retried exactly
+        // CLOSE_READ_ATTEMPTS times total, then surfaces as the Provider error for the caller
+        // to escalate into a halt.
+        let calls = Cell::new(0u32);
+        let res: Result<(), StateReadError> = retry_provider_faults("test read", || {
+            calls.set(calls.get() + 1);
+            Err(StateReadError::Provider("mdbx i/o fault".into()))
+        })
+        .await;
+
+        assert!(matches!(res, Err(StateReadError::Provider(_))), "exhaustion keeps the class");
+        assert_eq!(calls.get(), CLOSE_READ_ATTEMPTS, "reads exactly CLOSE_READ_ATTEMPTS times");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_provider_faults_recovers_from_transient_fault() {
+        // A transient provider fault (fails once, then reads fine) must NOT halt the node: the
+        // retry absorbs it and the successful value passes through.
+        let calls = Cell::new(0u32);
+        let res = retry_provider_faults("test read", || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                Err(StateReadError::Provider("transient i/o fault".into()))
+            } else {
+                Ok(7u64)
+            }
+        })
+        .await;
+
+        assert_eq!(res.expect("transient fault recovers"), 7);
+        assert_eq!(calls.get(), 2, "one retry after the transient fault");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_provider_faults_does_not_retry_chain_global() {
+        // Chain-global failures are deterministic products of the pinned block - re-reading
+        // cannot change them, so they return immediately for the caller's fail-open arm.
+        let calls = Cell::new(0u32);
+        let res: Result<(), StateReadError> = retry_provider_faults("test read", || {
+            calls.set(calls.get() + 1);
+            Err(StateReadError::ChainGlobal("contract absent".into()))
+        })
+        .await;
+
+        assert!(matches!(res, Err(StateReadError::ChainGlobal(_))));
+        assert_eq!(calls.get(), 1, "chain-global failures are never retried");
+    }
+
+    /// Drive ONE epoch-closing block on `reth_env` (parent = genesis) outside the full engine:
+    /// build the block from a boundary [`ConsensusOutput`] (its payload runs `concludeEpoch`),
+    /// commit it as the canonical head, and finalize it. Afterwards the canonical tip IS an
+    /// epoch-0 closing block, so the F17 close-time identity (`tip + 1 == entered blockHeight`)
+    /// holds for `adjust_base_fees`. Mirrors tn-reth's `execute_payload_and_update_canonical_chain`
+    /// test helper via the public [`RethEnv`] surface.
+    fn execute_epoch_closing_block(
+        reth_env: &RethEnv,
+        chain: &Arc<RethChainSpec>,
+    ) -> eyre::Result<()> {
+        let mut leader = Certificate::default();
+        leader.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
+            BlsSignature::default(),
+        ));
+        leader.update_header_created_at_for_test(tn_types::now());
+        leader.update_header_round_for_test(2);
+        let sub_dag = CommittedSubDag::new(
+            vec![Certificate::default(), leader.clone()],
+            leader,
+            1,
+            ReputationScores::default(),
+            None,
+        );
+        let output = ConsensusOutput::new_closed_with_subdag(
+            sub_dag,
+            ConsensusHeader::default().digest(),
+            1,
+        );
+
+        let parent = chain.sealed_genesis_header();
+        let payload = TNPayload::new_for_test(parent.clone(), &output);
+        let block =
+            reth_env.build_block_from_batch_payload(payload, &Vec::new(), parent.hash(), &[])?;
+        let header = block.recovered_block.clone_sealed_header();
+        let canonical_state = reth_env.canonical_in_memory_state();
+        canonical_state.update_chain(NewCanonicalChain::Commit { new: vec![block.clone()] });
+        canonical_state.set_canonical_head(header.clone());
+        reth_env.finish_executing_output(vec![block], None)?;
+        reth_env.finalize_block(header)?;
+        Ok(())
+    }
+
+    /// F4 keep-current arm (review G1/P0-1 - first coverage of the close-time fail-open): a
+    /// CHAIN-GLOBAL config-read failure (WorkerConfigs contract absent, the alloc-stripped-genesis
+    /// trick) at a REAL closing block returns `Ok` and keeps the per-worker base fees, the worker
+    /// count, and the accumulated gas untouched. The F17 identity read PASSES here (registry
+    /// present, `concludeEpoch` ran in the tip), isolating the failure to the config read's
+    /// fail-open arm.
+    #[tokio::test]
+    async fn adjust_base_fees_keeps_fees_and_count_on_read_failure() -> eyre::Result<()> {
+        // registry genesis WITHOUT the WorkerConfigs account: the config read is guaranteed to
+        // fail chain-globally (call to codeless address succeeds with empty data -> decode fails)
+        let mut genesis = test_genesis_with_consensus_registry(4);
+        genesis.alloc.remove(&WORKER_CONFIGS_ADDRESS);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::with_prefix("adjust_fees_fail_open")?;
+        let task_manager = TaskManager::new("adjust fees fail open");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+
+        // close epoch 0 so the canonical tip is a closing block and the identity gate passes
+        execute_epoch_closing_block(&reth_env, &chain)?;
+        let tip = reth_env.canonical_tip();
+        let (entered_epoch, epoch_info) = reth_env.get_current_epoch_info_at_header(&tip)?;
+        assert_eq!(entered_epoch, 1, "registry state crossed to the entered epoch");
+        assert_eq!(tip.number + 1, epoch_info.blockHeight, "F17 identity holds at the tip");
+
+        // non-default fees, gas, and count on the accumulator
+        let acc = GasAccumulator::new(2);
+        acc.base_fee(0).set_base_fee(4_242);
+        acc.base_fee(1).set_base_fee(9_099);
+        acc.inc_block(0, 1_000_000, 30_000_000);
+        acc.inc_block(1, 2_000_000, 30_000_000);
+
+        // chain-global failure -> keep-current fail-open: Ok, everything untouched
+        adjust_base_fees(&reth_env, &acc).await?;
+
+        assert_eq!(acc.num_workers(), 2, "worker count unchanged");
+        assert_eq!(acc.base_fee(0).base_fee(), 4_242, "worker 0 fee unchanged");
+        assert_eq!(acc.base_fee(1).base_fee(), 9_099, "worker 1 fee unchanged");
+        assert_eq!(acc.get_values(0), (1, 1_000_000, 30_000_000), "worker 0 gas unchanged");
+        assert_eq!(acc.get_values(1), (1, 2_000_000, 30_000_000), "worker 1 gas unchanged");
+
+        Ok(())
+    }
+
+    /// The identity read's fail-open arm follows the same classification: a CHAIN-GLOBAL failure
+    /// there (ConsensusRegistry absent too) keeps fees and count and returns `Ok` without ever
+    /// reaching the config read.
+    #[tokio::test]
+    async fn adjust_base_fees_keeps_fees_when_identity_read_fails_chain_global() -> eyre::Result<()>
+    {
+        // strip BOTH contracts: the identity read itself now fails chain-globally at the
+        // genesis tip (no closing block needed - the read never resolves an epoch to check)
+        let mut genesis = test_genesis_with_consensus_registry(4);
+        genesis.alloc.remove(&WORKER_CONFIGS_ADDRESS);
+        genesis.alloc.remove(&CONSENSUS_REGISTRY_ADDRESS);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::with_prefix("adjust_fees_identity_fail_open")?;
+        let task_manager = TaskManager::new("adjust fees identity fail open");
+        let reth_env = RethEnv::new_for_temp_chain(chain, tmp_dir.path(), &task_manager, None)?;
+
+        let acc = GasAccumulator::new(2);
+        acc.base_fee(0).set_base_fee(4_242);
+        acc.base_fee(1).set_base_fee(9_099);
+        acc.inc_block(0, 1_000_000, 30_000_000);
+
+        adjust_base_fees(&reth_env, &acc).await?;
+
+        assert_eq!(acc.num_workers(), 2, "worker count unchanged");
+        assert_eq!(acc.base_fee(0).base_fee(), 4_242, "worker 0 fee unchanged");
+        assert_eq!(acc.base_fee(1).base_fee(), 9_099, "worker 1 fee unchanged");
+        assert_eq!(acc.get_values(0), (1, 1_000_000, 30_000_000), "worker 0 gas unchanged");
+
+        Ok(())
     }
 }

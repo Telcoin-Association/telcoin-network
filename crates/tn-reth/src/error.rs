@@ -94,3 +94,30 @@ pub enum EvmReadError {
 /// revert-vs-internal directly instead of recovering it via a runtime downcast. Every non-revert
 /// failure — state provider/EVM setup, `Halt`, ABI decode — is an [`EvmReadError::Internal`].
 pub type EvmReadResult<T> = Result<T, EvmReadError>;
+
+/// Failure reading system-contract state at a pinned block, classified by whether the failure is
+/// deterministic across the committee.
+///
+/// [`Provider`](Self::Provider) is a node-local storage/provider fault: the pinned header not
+/// resolving in this node's database, state-provider construction failing, or a database error
+/// surfaced while the EVM lazily reads accounts/storage during the call. Another committee member
+/// issuing the same read at the same block may succeed, so consensus-critical callers must NOT
+/// assume peers share the failure — proceeding on stale values there can diverge from the
+/// committee (retry or halt instead).
+///
+/// [`ChainGlobal`](Self::ChainGlobal) is a deterministic product of the pinned chain state and the
+/// node's own code: contract absent at the block, on-chain revert or halt, ABI decode failure,
+/// arity mismatch, or EVM environment construction. Every node reading the same block observes the
+/// identical failure, so a keep-current fail-open policy stays committee-consistent.
+#[derive(Debug, thiserror::Error)]
+pub enum StateReadError {
+    /// Node-local storage/provider fault; NOT committee-deterministic.
+    #[error("provider fault reading pinned chain state: {0}")]
+    Provider(String),
+    /// Deterministic product of the pinned chain state; identical on every node.
+    #[error("{0}")]
+    ChainGlobal(String),
+}
+
+/// Result of a committee-determinism-classified state read (see [`StateReadError`]).
+pub type StateReadResult<T> = Result<T, StateReadError>;
